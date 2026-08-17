@@ -34,6 +34,7 @@ from qiita_control_plane.repositories.biosample import (
     fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
     fetch_caller_has_biosample_access,
+    get_or_create_biosample_by_ena_accession,
     import_biosample_from_owner_biosample_id,
     insert_biosample,
     update_biosample,
@@ -139,6 +140,79 @@ async def test_insert_biosample_full_columns(ctx):
         "matrix_tube_id": tube_id,
     }
     assert dict(row) == expected
+
+
+# ---------------------------------------------------------------------------
+# get_or_create_biosample_by_ena_accession (ena_import.registration
+# cross-study de-dup). The link-and-idempotency coverage for the (biosample,
+# study) pair now lives in test__sample_helpers.py, parametrized alongside
+# insert_entity_to_study's other specs.
+#
+# Known coverage gap, same shape as get_or_create_study_by_ena_accessions'
+# (tests/repositories/test_study.py): the ON-CONFLICT-DO-NOTHING +
+# fallback-SELECT race path needs a genuinely concurrent second writer to
+# reach the "existing row" branch via collision rather than via the normal
+# create-then-reuse sequence; not exercised here, matching
+# test__sample_helpers.py's documented equivalent gap.
+# ---------------------------------------------------------------------------
+
+
+async def test_get_or_create_biosample_by_ena_accession_creates_on_miss(ctx):
+    ena_acc = unique_accession("SAMEA")
+
+    idx, created = await get_or_create_biosample_by_ena_accession(
+        ctx["pool"],
+        ena_sample_accession=ena_acc,
+        owner_idx=ctx["biosample_owner_idx"],
+        created_by_idx=ctx["principal_idx"],
+    )
+    ctx["created"]["biosample"].append(idx)
+
+    assert created is True
+    row = await ctx["pool"].fetchrow(
+        "SELECT owner_idx, created_by_idx, ena_sample_accession"
+        " FROM qiita.biosample WHERE idx = $1",
+        idx,
+    )
+    assert row["owner_idx"] == ctx["biosample_owner_idx"]
+    assert row["created_by_idx"] == ctx["principal_idx"]
+    assert row["ena_sample_accession"] == ena_acc
+
+
+async def test_get_or_create_biosample_by_ena_accession_reuses_on_hit(ctx):
+    ena_acc = unique_accession("SAMEA")
+
+    first_idx, first_created = await get_or_create_biosample_by_ena_accession(
+        ctx["pool"],
+        ena_sample_accession=ena_acc,
+        owner_idx=ctx["biosample_owner_idx"],
+        created_by_idx=ctx["principal_idx"],
+    )
+    ctx["created"]["biosample"].append(first_idx)
+    assert first_created is True
+
+    # A second caller with a DIFFERENT owner (the cross-study-overlap case,
+    # e.g. a second study importing the same ENA BioSample under a
+    # different importing owner) reuses the same row rather than raising
+    # or minting a duplicate -- owner_idx/created_by_idx are not compared.
+    second_idx, second_created = await get_or_create_biosample_by_ena_accession(
+        ctx["pool"],
+        ena_sample_accession=ena_acc,
+        owner_idx=ctx["principal_idx"],
+        created_by_idx=ctx["principal_idx"],
+    )
+
+    assert second_idx == first_idx
+    assert second_created is False
+    count = await ctx["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample WHERE ena_sample_accession = $1", ena_acc
+    )
+    assert count == 1
+    # The reuse path did not overwrite the original owner.
+    owner = await ctx["pool"].fetchval(
+        "SELECT owner_idx FROM qiita.biosample WHERE idx = $1", first_idx
+    )
+    assert owner == ctx["biosample_owner_idx"]
 
 
 # ---------------------------------------------------------------------------

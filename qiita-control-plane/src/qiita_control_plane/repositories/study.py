@@ -305,3 +305,94 @@ async def create_study(
     )
 
     return study_row
+
+
+# Constraint names create_study's underlying INSERT can trip when a
+# concurrent caller wins the race for the same accession; used by
+# get_or_create_study_by_ena_accessions to distinguish "lost the create
+# race" from any other UniqueViolationError.
+_STUDY_ACCESSION_UNIQUE_CONSTRAINTS = frozenset(
+    {"study_bioproject_accession_unique", "study_ena_study_accession_unique"}
+)
+
+
+async def get_or_create_study_by_ena_accessions(
+    conn: asyncpg.Connection,
+    *,
+    bioproject_accession: str,
+    ena_study_accession: str | None,
+    owner_idx: int,
+    created_by_idx: int,
+    title: str,
+) -> tuple[asyncpg.Record, bool]:
+    """Race-safe find-or-create for an ENA-study import.
+
+    Positional accession mapping is the caller's responsibility (see
+    `ena_import.registration.register_ena_study`): this function only
+    keys the lookup/insert on the two accession values it is handed --
+    it does not itself decide which resolved ENA field maps to which
+    column.
+
+    Looks up an existing study by bioproject_accession first (the cheap,
+    common re-import path, avoiding an unnecessary create attempt). On a
+    miss, attempts create_study inside `async with conn.transaction():`
+    -- a real `BEGIN` if `conn` is not already inside a transaction, a
+    `SAVEPOINT` otherwise (asyncpg's `Connection.transaction()` detects
+    which; see `_sample_helpers.write_global_metadata_or_diagnose` for
+    the same nested-transaction pattern) -- and falls back to the same
+    accession lookup on `asyncpg.UniqueViolationError` from either
+    study_bioproject_accession_unique or study_ena_study_accession_unique.
+    create_study has no ON CONFLICT variant because it is a two-step
+    composer (INSERT + the owner's auto-granted study_access row), so a
+    plain `INSERT ... ON CONFLICT DO NOTHING RETURNING` cannot express
+    "reuse the existing row's access grant too" -- catch-and-refetch is
+    the race-safe shape available to a composer, not a single INSERT.
+
+    Returns (row, created): row is the same RETURNING/fetch_study column
+    shape either way; created is True only on the insert branch.
+    """
+    existing_row = await _fetch_study_by_bioproject_accession(conn, bioproject_accession)
+    if existing_row is not None:
+        return existing_row, False
+
+    try:
+        async with conn.transaction():
+            row = await create_study(
+                conn,
+                owner_idx=owner_idx,
+                created_by_idx=created_by_idx,
+                title=title,
+                ena_study_accession=ena_study_accession,
+                bioproject_accession=bioproject_accession,
+            )
+        return row, True
+    except asyncpg.UniqueViolationError as exc:
+        if exc.constraint_name not in _STUDY_ACCESSION_UNIQUE_CONSTRAINTS:
+            raise
+        # Lost the create race; the winner's row satisfies the same
+        # accession lookup this function started with.
+        existing_row = await _fetch_study_by_bioproject_accession(conn, bioproject_accession)
+        if existing_row is None:
+            # qiita.study has no delete surface, so this branch is not
+            # reachable in practice -- kept as a fail-loud backstop rather
+            # than a silent None return, mirroring insert_sequencing_run's
+            # equivalent guard.
+            raise asyncpg.PostgresError(
+                "find-or-create on study(bioproject_accession="
+                f"{bioproject_accession!r}) collided on insert but the"
+                " existing row is not visible"
+            ) from exc
+        return existing_row, False
+
+
+async def _fetch_study_by_bioproject_accession(
+    conn: asyncpg.Connection, bioproject_accession: str
+) -> asyncpg.Record | None:
+    """Resolve one study row by bioproject_accession, or None on miss."""
+    idxs = await fetch_study_idxs_by_accession(
+        conn, values=[bioproject_accession], accession_field="bioproject_accession"
+    )
+    existing_idx = idxs.get(bioproject_accession)
+    if existing_idx is None:
+        return None
+    return await fetch_study(conn, existing_idx)

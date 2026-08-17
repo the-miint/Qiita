@@ -31,6 +31,11 @@ from . import require_transaction
 # Whether a colliding metadata write overwrites the existing value or raises.
 type MetadataConflictMode = Literal["raise", "upsert"]
 
+# Whether a colliding (entity, study) link row raises or is silently kept. A
+# link row has no value to overwrite — only existence — so its non-raising
+# mode is ON CONFLICT DO NOTHING, not "upsert".
+type LinkConflictMode = Literal["raise", "ignore"]
+
 # How the existing occupant of a metadata slot relates to an attempted write:
 # the two same-kind verdicts, then the two cross-kind ones (a typed value
 # attempted against a missing-reason slot and the reverse), which are not
@@ -2402,6 +2407,7 @@ async def insert_entity_to_study(
     entity_idx: int,
     study_idx: int,
     created_by_idx: int,
+    on_conflict: LinkConflictMode = "raise",
 ) -> None:
     """Insert one (entity, study) link row into spec.link_table.
 
@@ -2410,15 +2416,22 @@ async def insert_entity_to_study(
     Prep-sample inserts may be rejected (asyncpg.RaiseError) if the
     underlying biosample is not linked to the same study.
 
-    Raises asyncpg.UniqueViolationError if (entity_idx, study_idx) already
-    exists, asyncpg.ForeignKeyViolationError on bad refs.
+    on_conflict: "raise" (default) surfaces asyncpg.UniqueViolationError on
+    an existing (entity_idx, study_idx) row; "ignore" is ON CONFLICT DO
+    NOTHING against that same key. Either mode raises
+    asyncpg.ForeignKeyViolationError on bad refs.
     """
     # f-string interpolation of identifiers is safe: spec fields are frozen
     # module-level constants, never reached by caller input.
+    conflict_clause = (
+        f" ON CONFLICT ({spec.link_entity_key_column}, study_idx) DO NOTHING"
+        if on_conflict == "ignore"
+        else ""
+    )
     await conn.execute(
         f"INSERT INTO {spec.link_table} ("
         f"    {spec.link_entity_key_column}, study_idx, created_by_idx"
-        f") VALUES ($1, $2, $3)",
+        f") VALUES ($1, $2, $3)" + conflict_clause,
         entity_idx,
         study_idx,
         created_by_idx,

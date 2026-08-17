@@ -116,7 +116,9 @@ def test_staged_connect_never_installs(monkeypatch, tmp_path):
     conn = connect_with_miint_staged()
     conn.close()
 
-    assert executed == ["LOAD miint;"]
+    # httpfs rides with miint (miint_load_sql); the invariant here is LOAD-only.
+    assert executed == ["LOAD miint; LOAD httpfs;"]
+    assert all("INSTALL" not in sql.upper() for sql in executed)
     assert not any("INSTALL" in sql.upper() for sql in executed)
 
 

@@ -3416,6 +3416,39 @@ async def test_insert_entity_to_study_rejects_duplicate(ctx, spec):
             )
 
 
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_insert_entity_to_study_on_conflict_ignore_is_idempotent(ctx, spec):
+    """on_conflict="ignore" is the ENA-import registration path's building
+    block: re-registering an already-linked (entity, study) pair on re-import
+    is the expected case, not an error -- unlike the "raise" default pinned
+    above."""
+    entity_idx = await _seed_unlinked_entity_for_spec(ctx, spec)
+
+    for _ in range(2):
+        async with ctx["pool"].acquire() as conn:
+            await insert_entity_to_study(
+                conn,
+                spec=spec,
+                entity_idx=entity_idx,
+                study_idx=ctx["study_idx"],
+                created_by_idx=ctx["principal_idx"],
+                on_conflict="ignore",
+            )
+    _track_to_study_link(ctx, spec, entity_idx, ctx["study_idx"])
+
+    count = await ctx["pool"].fetchval(
+        f"SELECT count(*) FROM {spec.link_table}"
+        f" WHERE {spec.link_entity_key_column} = $1 AND study_idx = $2",
+        entity_idx,
+        ctx["study_idx"],
+    )
+    assert count == 1
+
+
 # ---------------------------------------------------------------------------
 # fetch_entity_is_linked_to_study (parametrized over both specs)
 # ---------------------------------------------------------------------------

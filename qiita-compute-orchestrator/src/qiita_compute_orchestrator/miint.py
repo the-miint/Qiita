@@ -256,14 +256,12 @@ def open_miint_conn() -> duckdb.DuckDBPyConnection:
 
 
 def stage_miint_extension() -> str:
-    """Deploy-time staging: FORCE INSTALL miint into the configured
-    extension_directory, then LOAD it to prove the staged build is usable.
+    """Deploy-time staging: install miint (and httpfs, per `miint_install_sql`)
+    into the configured extension_directory, then LOAD to prove it is usable.
 
-    Runs **once per deploy** (via `scripts/stage-miint-extension.sh`), not per
-    job — so FORCE (refresh to the mirror's current build) is the right call
-    here, unlike the retired per-job install. Returns the resolved
-    extension_directory for the caller to report (or the DuckDB default marker
-    when MIINT_EXTENSION_DIRECTORY is unset, e.g. in a dev/test stage)."""
+    Runs once per deploy, so FORCE is right for miint — it refreshes the shared
+    directory to the mirror's current build. Returns the resolved
+    extension_directory for the caller to report."""
     with open_conn() as conn:
         conn.execute(miint_install_sql(force=True))
         conn.execute(miint_load_sql())

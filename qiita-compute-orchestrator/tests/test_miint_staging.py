@@ -32,7 +32,24 @@ def _stable_local_identity(monkeypatch, tmp_path):
     return tmp_path
 
 
-def _write_marker(tmp_path, **overrides) -> None:
+def _stage_httpfs(tmp_path) -> None:
+    """Materialize the staged httpfs file the gate probes for."""
+    staged = miint_staging._staged_extension_path(
+        tmp_path, miint_staging.HTTPFS_EXTENSION, _DUCKDB_VERSION, _PLATFORM
+    )
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(b"")
+
+
+def _write_marker(tmp_path, *, stage_httpfs: bool = True, **overrides) -> None:
+    """Stand in for a completed stage: the marker, plus (by default) the httpfs
+    file `stage_miint_extension` installs alongside miint.
+
+    `stage_httpfs=False` isolates the missing-httpfs case. It defaults to True
+    because the httpfs probe runs *before* the mirror HEAD — without the file,
+    a test aimed at a later check would short-circuit here and pass for the
+    wrong reason.
+    """
     fp = {
         "duckdb_version": _DUCKDB_VERSION,
         "platform": _PLATFORM,
@@ -42,6 +59,8 @@ def _write_marker(tmp_path, **overrides) -> None:
     }
     fp.update(overrides)
     (tmp_path / miint_staging.MARKER_NAME).write_text(json.dumps(fp))
+    if stage_httpfs:
+        _stage_httpfs(tmp_path)
 
 
 def _head_returns(etag='"abc123"', last_modified="Wed, 18 Jun 2026 10:00:00 GMT"):
@@ -76,7 +95,7 @@ def test_mirror_bump_changes_etag_is_not_current(monkeypatch, tmp_path):
 
 
 def _boom(url):  # pragma: no cover — used where the HEAD must not run
-    raise AssertionError("HEAD should not run when the local triple already differs")
+    raise AssertionError("HEAD should not run when a local check already decided")
 
 
 def test_duckdb_version_change_skips_network(monkeypatch, tmp_path):
@@ -90,6 +109,31 @@ def test_repo_change_skips_network(monkeypatch, tmp_path):
     """A repo change (e.g. MIINT_EXTENSION_REPO override) is in the local triple
     too — detectable without a HEAD, like the DuckDB-version change."""
     _write_marker(tmp_path, repo="https://example.test/other-mirror")
+    monkeypatch.setattr(miint_staging, "_head_validators", _boom)
+    assert miint_staging.staging_is_current() is False
+
+
+def test_missing_httpfs_is_not_current(monkeypatch, tmp_path):
+    """A marker matching a current miint build does NOT prove httpfs is staged:
+    the fingerprint covers the miint object only, so a stage taken before httpfs
+    joined the step still matches every other check. Skipping here would skip the
+    INSTALL that stages it, and LOAD never downloads — so both the CO's ENA
+    download job and the CP's ENA resolver would fail at runtime. Local check,
+    so no HEAD should fire."""
+    _write_marker(tmp_path, stage_httpfs=False)
+    monkeypatch.setattr(miint_staging, "_head_validators", _boom)
+    assert miint_staging.staging_is_current() is False
+
+
+def test_httpfs_staged_for_another_duckdb_version_is_not_current(monkeypatch, tmp_path):
+    """httpfs present, but under a different DuckDB version's subdirectory — the
+    staged dir is versioned, so that copy is not loadable by this interpreter."""
+    _write_marker(tmp_path, stage_httpfs=False)
+    stale = miint_staging._staged_extension_path(
+        tmp_path, miint_staging.HTTPFS_EXTENSION, "9.9.9", _PLATFORM
+    )
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"")
     monkeypatch.setattr(miint_staging, "_head_validators", _boom)
     assert miint_staging.staging_is_current() is False
 
@@ -165,7 +209,9 @@ def test_write_marker_survives_head_failure(monkeypatch, tmp_path):
 
 def test_marker_then_check_is_current(monkeypatch, tmp_path):
     """The marker write_staging_marker() produces is exactly what
-    staging_is_current() accepts when the mirror hasn't moved."""
+    staging_is_current() accepts when the mirror hasn't moved — given the
+    httpfs `stage_miint_extension` installs before writing it."""
     monkeypatch.setattr(miint_staging, "_head_validators", _head_returns())
+    _stage_httpfs(tmp_path)
     miint_staging.write_staging_marker()
     assert miint_staging.staging_is_current() is True

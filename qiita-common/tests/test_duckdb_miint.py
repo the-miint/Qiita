@@ -29,7 +29,7 @@ def test_install_sql_defaults_to_plain_install_from_mirror(monkeypatch):
     its cache once; only deploy-time staging passes force=True."""
     monkeypatch.delenv("MIINT_EXTENSION_REPO", raising=False)
     sql = miint_install_sql()
-    assert sql == f"INSTALL miint FROM '{MIINT_MIRROR_URL}';"
+    assert sql == f"INSTALL miint FROM '{MIINT_MIRROR_URL}'; INSTALL httpfs;"
     assert "FORCE" not in sql
     assert "community" not in sql
 
@@ -38,19 +38,34 @@ def test_install_sql_force_for_deploy_staging(monkeypatch):
     """force=True (deploy-time staging only) refreshes the staged build to the
     mirror's current version."""
     monkeypatch.delenv("MIINT_EXTENSION_REPO", raising=False)
-    assert miint_install_sql(force=True) == f"FORCE INSTALL miint FROM '{MIINT_MIRROR_URL}';"
+    # httpfs stays a plain INSTALL under force -- DuckDB's own signed extension.
+    assert (
+        miint_install_sql(force=True)
+        == f"FORCE INSTALL miint FROM '{MIINT_MIRROR_URL}'; INSTALL httpfs;"
+    )
 
 
 def test_install_sql_honors_repo_override(monkeypatch):
     """MIINT_EXTENSION_REPO remains an override for local/dev builds."""
     monkeypatch.setenv("MIINT_EXTENSION_REPO", "/local/repo")
-    assert miint_install_sql() == "INSTALL miint FROM '/local/repo';"
-    assert miint_install_sql(force=True) == "FORCE INSTALL miint FROM '/local/repo';"
+    assert miint_install_sql() == "INSTALL miint FROM '/local/repo'; INSTALL httpfs;"
+    assert (
+        miint_install_sql(force=True) == "FORCE INSTALL miint FROM '/local/repo'; INSTALL httpfs;"
+    )
 
 
 def test_load_sql_is_load_only():
-    """Cluster runtime LOADs the pre-staged extension — no install verb."""
-    assert miint_load_sql() == "LOAD miint;"
+    """Cluster runtime LOADs the pre-staged extensions — no install verb."""
+    sql = miint_load_sql()
+    assert sql == "LOAD miint; LOAD httpfs;"
+    assert "INSTALL" not in sql
+
+
+def test_load_sql_includes_httpfs():
+    """httpfs rides with miint rather than being LOADed per caller: miint reaches
+    the network through DuckDB's filesystem layer, so every miint connection that
+    touches a URL needs it."""
+    assert "LOAD httpfs;" in miint_load_sql()
 
 
 def test_connect_config_allows_unsigned_by_default(monkeypatch):

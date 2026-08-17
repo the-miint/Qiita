@@ -419,13 +419,21 @@ async def _handle_email_drift(pool: asyncpg.Pool, principal_idx: int, jwt_email:
         )
 
 
-async def _build_human_user(pool: asyncpg.Pool, principal_idx: int) -> HumanUser:
-    """Load a HumanUser from the DB for an OIDC-resolved session.
+class PrincipalUnusableError(RuntimeError):
+    """A principal cannot act: no human-user record, or it is disabled/retired.
 
-    Hands back the role's full implied scope ceiling — the PAT mint route
-    narrows this when minting PATs, and per-request token bearers carry
-    their own scope set via the token path (`_resolve_token`), so this
-    function is only used for OIDC-arrived users.
+    A plain `RuntimeError` rather than an `HTTPException` so non-request callers
+    (background tasks, startup reconcile) can use the same loader; the request
+    path maps it to a 401.
+    """
+
+
+async def load_human_user(pool: asyncpg.Pool, principal_idx: int) -> HumanUser:
+    """Load a `HumanUser` by principal_idx, with the role's full implied scope
+    ceiling. Refuses a disabled/retired principal, not just a missing one.
+
+    Raises `PrincipalUnusableError` in both cases. Used by the OIDC session path
+    and by background work that has no request-bound `Principal` to reuse.
     """
     row = await pool.fetchrow(
         "SELECT p.idx, p.system_role, p.disabled, p.retired,"
@@ -436,7 +444,20 @@ async def _build_human_user(pool: asyncpg.Pool, principal_idx: int) -> HumanUser
         principal_idx,
     )
     if row is None:
-        raise HTTPException(status_code=401, detail="user record not found for principal")
+        raise PrincipalUnusableError(
+            f"principal {principal_idx}: user record not found for principal"
+        )
     if row["disabled"] or row["retired"]:
-        raise HTTPException(status_code=401, detail=MSG_PRINCIPAL_DISABLED_OR_RETIRED)
+        raise PrincipalUnusableError(
+            f"principal {principal_idx}: {MSG_PRINCIPAL_DISABLED_OR_RETIRED}"
+        )
     return _human_user_from_row(row, scopes=role_ceiling(row["system_role"]))
+
+
+async def _build_human_user(pool: asyncpg.Pool, principal_idx: int) -> HumanUser:
+    """`load_human_user` for an OIDC-resolved session: the same load, with its
+    refusal surfaced as a 401."""
+    try:
+        return await load_human_user(pool, principal_idx)
+    except PrincipalUnusableError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
