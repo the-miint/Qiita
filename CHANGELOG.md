@@ -905,6 +905,43 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **A sequence two loads both produced was stored twice, and reassembled twice as long
+  (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
+  carry ONE feature across every producer — but each load still wrote that feature's rows in
+  full: the compute job writing the staging Parquet has no DuckLake access to anti-join
+  against, and DuckLake enforces no PK/UNIQUE. Two assembly runs producing the same contig,
+  or two references sharing a sequence, therefore left two rows in `assembled_sequence` /
+  `reference_sequences` and two per `chunk_index` in their chunk tables, so
+  `string_agg(chunk_data, '' ORDER BY chunk_index)` returned the sequence concatenated with
+  itself while `sequence_length_bp` still described one copy. Measured on the deploy
+  2026-08-13: 182,988 `assembled_sequence` rows over 129,290 distinct features, 53,698 of
+  them duplicated. `register_files` now REPLACES those four tables on `feature_idx` — the
+  incoming Parquet's keys are deleted from the lake in the same transaction, ahead of every
+  `ducklake_add_data_files` — so a second load converges instead of accumulating, and the
+  per-table counts ride back to the control plane, which logs them. `REPLACE_KEY_TABLES` in
+  `qiita-data-plane/src/flight_service.rs` is the registry and carries the admission
+  conditions. The assembly tables were latent (absent from `ALLOWED_TABLES`, so nothing
+  reads them over Flight); the reference pair is on the read path. Where a feature's copies
+  differ — the canonical hash keeps a sequence, its reverse complement and its case variants
+  on one `feature_idx` — the newest load's bytes now win; before, both were kept and read
+  back concatenated, which is neither strand and matches no declared length.
+
+- **Concurrent registrations of one feature no longer each kept a copy (#457).** The
+  replace-by-key delete above closes the race only where the feature is ALREADY in the lake:
+  DuckLake detects a conflict where two transactions touch the same existing row, so those
+  writers serialize. When the feature is NEW, nobody's delete matches, nothing conflicts, and
+  every writer commits — measured with 4 concurrent writers of one feature: 1 row when it
+  already existed, 4 when it did not, and 4 for two bare `ducklake_add_data_files` with no
+  delete at all. A registration touching a content-addressed table now bumps the single-row
+  `qiita_lake.registration_lock` inside its transaction, giving concurrent writers a row to
+  contend for (measured: back to 1 row), and retries its own transaction when it loses rather
+  than failing the ticket — it cannot be retried from the top, because its staging files were
+  already moved. Registrations touching none of those tables skip the lock and never contend.
+  `delete_reference` takes the same lock and retry, because it writes two of the same tables:
+  without the lock a registration could add a feature between its snapshot and its commit,
+  where the orphan filter would not see the claim, and without the retry a registration's
+  delete could newly conflict it out.
+
 - **A retired `exported_feature` row could be edited out of the published namespace
   (#448).** Every CHECK on that table is written `retired OR …`, because a detached row has
   lost the columns they test — so a retired row is exactly where they stop guarding, and it

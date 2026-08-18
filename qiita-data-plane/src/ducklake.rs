@@ -8,10 +8,13 @@
 //! with DATA_PATH as a separate option specifying Parquet storage location.
 //! Requires both `ducklake` and `postgres` extensions.
 //!
-//! DuckLake does not support UNIQUE or FK constraints. Data integrity
-//! (no duplicate feature_idx, valid reference_idx) must be enforced
-//! programmatically before insertion — the control plane owns dedup,
-//! the orchestrator verifies before loading.
+//! DuckLake does not support UNIQUE or FK constraints, so data integrity
+//! (no duplicate feature_idx, valid reference_idx) is enforced programmatically.
+//! Mostly before insertion — the control plane owns dedup, the orchestrator
+//! verifies before loading — but not entirely: a feature is shared across
+//! producers, so no producer can know whether the lake already holds it. That
+//! part is enforced AT insertion, by the data plane
+//! (`flight_service::REPLACE_KEY_TABLES`).
 
 use duckdb::Connection;
 
@@ -77,10 +80,13 @@ pub fn set_catalog_options(conn: &Connection) -> Result<(), Box<dyn std::error::
 /// Create the reference data tables in DuckLake if they don't already exist.
 ///
 /// Note on DuckLake constraints: DuckLake does not support UNIQUE, PK, or FK
-/// constraints. Data integrity is enforced upstream:
+/// constraints. Data integrity is enforced upstream, plus one rule at register
+/// time that no upstream producer is in a position to enforce:
 /// - The control plane deduplicates features by sequence_hash before minting feature_idx
 /// - The orchestrator verifies data before loading
 /// - The data plane validates identifier sets programmatically on DoAction
+/// - `reference_sequences` / `reference_sequence_chunks` are additionally
+///   REPLACED on `feature_idx` at register time — `flight_service::REPLACE_KEY_TABLES`
 ///
 /// Per-table storage tuning (compression, row group size) is deferred to a
 /// separate configuration pass — see DuckLake configuration docs.
@@ -530,8 +536,12 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// on (prep_sample_idx, kind, bin_id).
 ///
 /// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
-/// (integrity is enforced upstream — the CP mints feature_idx/dedups on
-/// sequence_hash, the orchestrator verifies before load).
+/// (the CP mints feature_idx/dedups on sequence_hash, the orchestrator verifies
+/// before load, and the data plane replaces on the key at register time).
+/// `assembled_sequence` /
+/// `assembled_sequence_chunks` are additionally REPLACED on `feature_idx` at
+/// register time — `flight_service::REPLACE_KEY_TABLES`, which also says why
+/// `assembly_membership` / `bin_quality` are not.
 ///
 /// NOTE: not yet exposed via Flight (absent from `flight_service::ALLOWED_TABLES`).
 /// register_files loads them and they are SQL-queryable in the catalog; they are
@@ -597,6 +607,31 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
         "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
          table_name => 'assembled_sequence_chunks');"
     ))?;
+    Ok(())
+}
+
+/// Create the one row that registrations into the content-addressed tables
+/// serialize on, and seed it.
+///
+/// Why a lock is needed at all, and what it buys, lives at the one site that
+/// takes it — `flight_service::register_files`. What matters here is the shape:
+/// EXACTLY ONE row, holding a value nothing reads. `register_files` fails loudly
+/// if its UPDATE matches no row, because a lock that silently stopped locking
+/// reintroduces the duplication this table exists to prevent.
+///
+/// The seeding INSERT is guarded so a restart does not add a second row. Two data
+/// planes booting together could still both insert; that degrades nothing — an
+/// extra row is one more thing every writer updates, so they still contend.
+pub fn ensure_registration_lock(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "-- One row, ever. `epoch` is a bump counter, not a timestamp: it is never
+        -- read, and it is a counter rather than a constant only so the UPDATE that
+        -- takes the lock is a real mutation.
+        CREATE TABLE IF NOT EXISTS qiita_lake.registration_lock (epoch BIGINT NOT NULL);
+
+        INSERT INTO qiita_lake.registration_lock (epoch)
+        SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM qiita_lake.registration_lock);",
+    )?;
     Ok(())
 }
 

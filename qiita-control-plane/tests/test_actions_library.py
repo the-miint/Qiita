@@ -493,3 +493,68 @@ def test_reap_staged_reads_removes_files_and_empty_dirs(tmp_path):
     assert reaped == 1
     assert not present.exists()
     assert not present.parent.exists()
+
+
+async def test_register_files_logs_what_a_load_replaced(monkeypatch, caplog):
+    """The data plane replaces content-addressed tables on their key rather than
+    appending (its REPLACE_KEY_TABLES), so a load can supersede rows an earlier one
+    wrote. The per-table counts ride back in `replaced` and are logged."""
+    import json
+    import logging
+
+    from qiita_control_plane.actions import library as lib
+
+    def _fake_do_action(action_type, data_plane_url, token, timeout_seconds=None):
+        return [
+            _FakeResult(
+                json.dumps(
+                    {
+                        "registered": ["/lake/assembled_sequence/wt7-assembled_sequence.parquet"],
+                        "replaced": {"assembled_sequence": 3},
+                    }
+                ).encode()
+            )
+        ]
+
+    monkeypatch.setattr(lib, "_do_action", _fake_do_action)
+
+    with caplog.at_level(logging.INFO, logger=lib.__name__):
+        registered = await lib.register_files(
+            staging_dir="/staging",
+            files={"assembled_sequence.parquet": "assembled_sequence"},
+            work_ticket_idx=7,
+            signing_key=b"\x00" * 32,
+            data_plane_url="grpc://dp:50051",
+        )
+
+    assert registered == ["/lake/assembled_sequence/wt7-assembled_sequence.parquet"]
+    assert "'assembled_sequence': 3" in caplog.text
+
+
+async def test_register_files_stays_quiet_when_nothing_was_replaced(monkeypatch, caplog):
+    """The ordinary load — every key new to the lake — replaces nothing, and a
+    data plane that predates the field returns no `replaced` at all."""
+    import json
+    import logging
+
+    from qiita_control_plane.actions import library as lib
+
+    for body in ({"registered": [], "replaced": {}}, {"registered": []}):
+
+        def _fake_do_action(action_type, data_plane_url, token, timeout_seconds=None, body=body):
+            return [_FakeResult(json.dumps(body).encode())]
+
+        monkeypatch.setattr(lib, "_do_action", _fake_do_action)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=lib.__name__):
+            assert (
+                await lib.register_files(
+                    staging_dir="/staging",
+                    files={"reference_membership.parquet": "reference_membership"},
+                    work_ticket_idx=7,
+                    signing_key=b"\x00" * 32,
+                    data_plane_url="grpc://dp:50051",
+                )
+                == []
+            )
+        assert "replaced" not in caplog.text
