@@ -22,6 +22,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Unbinned assembly contigs are stored, as a third `assembly_membership` kind (#460).**
+  `assembly_hash` hashes the `noLCG.fa` residue — the contigs no DAS_Tool-refined bin
+  claimed — alongside the circular genomes and the refined MAGs, so they are minted a
+  `feature_idx` against the shared `qiita.feature` and recorded under `kind = 'UNBINNED'`
+  with the contig id as `bin_id` (the `(kind, bin_id)` shape `LCG` already uses). Unbinned
+  contigs can be valid sequence, DNA viruses in particular; previously they died with the
+  workspace.
+  **It is the residue, not all of `noLCG.fa`.** The refined MAGs are drawn from those same
+  contigs, so hashing the file whole would give every binned contig a second membership row
+  for one `feature_idx` — the bytes dedup, the membership does not. The exclusion is keyed
+  on the canonical sequence hash, not the contig id. Id preservation through binning and
+  refinement is measured for `hifiasm_meta` only: 198,747/198,747 refined-bin records across
+  57 assembly workspaces on the deploy host carried a first-token contig id identical to
+  their `noLCG.fa` record (whole-header on a 6-ticket subset, 5,660/5,660). It is
+  unmeasured for `myloasm` — no myloasm assembly exists on the host, and its header
+  grammar differs — so an id key would rest on an unmeasured assembler; the same match
+  measured there is what would make one viable. Two consequences of keying on content —
+  a bin holding a contig on the opposite strand still excludes its noLCG record (the
+  canonical hash folds both strands), and noLCG records sharing a canonical sequence
+  leave the residue together.
+  `StepNoData` narrows to match: only an assembler that produced no contig at all is
+  no-data, so a sample whose contigs all went unbinned now stores them. The `kind` value set
+  moves to `qiita_common.assembly_constants`, the contract layer both Python services
+  depend on, and the Postgres and DuckLake `assembly_membership` comments name it instead of
+  enumerating members (a comment-only migration).
+
 - **A published feature table's rows can now be labelled without our identifiers (#448).**
   `POST /exported-feature` mints the public handle for a feature-axis entity, the way
   `/exported-identifier` already does for the sample axis — so a table, its taxonomy sidecar
@@ -904,6 +930,66 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **Re-running `long-read-assembly` over a sample doubled its `assembly_membership` and
+  `bin_quality` rows (#460).** `processing_idx` hashes `{workflow, version, mask_idx,
+  assembler}`, so a second run resolves to the SAME identity whenever those four hold — an
+  edited workflow file included — and the submit path admits it: the prep_sample arm of
+  `_check_disallow_without_delete` binds only the non-terminal states, so a COMPLETED ticket
+  does not block a fresh one, and no assembly result carries a DELETE gate. Both tables were
+  appended rather than replaced, leaving both runs' rows under one `(prep_sample_idx,
+  processing_idx)` with nothing on the row to tell them apart. Measured across two
+  registrations of the same rows: `assembly_membership` 0 → 2 → 4, `bin_quality` 0 → 1 → 2.
+  `register_files` now replaces both on the composite `(prep_sample_idx, processing_idx)`, so
+  a re-run supersedes that sample's rows for that run — a row agreeing on one half of the key
+  (another sample of the same run, the same sample under a different run) is untouched. The
+  replace-by-key statement widened from one key column to a row constructor to carry it; the
+  file paths stay bound parameters.
+  A re-run that yields no refined MAG is the case the key alone does not cover: CheckM
+  covers refined bins only, so `assembly_load` writes `bin_quality` empty-with-schema, the
+  file names no key, and a delete reading it removed nothing — measured, the previous run's
+  MAG rows survived a re-run whose `assembly_membership` was replaced out from under them
+  (`replaced` empty, 1 row before and after; the same load carrying one MAG row replaced it).
+  `bin_quality`'s delete now reads the keys `assembly_membership` names in the same
+  registration, which carries the run's key on every row and is never empty where the load
+  runs at all (`assembly_hash` raises `StepNoData` at zero contigs of any kind).
+  The file stated the delete's cost twice and the two disagreed: `LAKE_COMMIT_BUDGET` read a
+  40k/400k timing as "the DELETE's cost does not grow with the table … so it prunes rather
+  than scanning", while `replace_key_delete_sql` 25 lines above said a `feature_idx` set does
+  not prune. That timing was taken on a contiguous incoming key set, which neither comment
+  said. `replace_key_delete_sql` is now the only site that states it, and the budget points
+  there: what the delete reads follows the SPREAD of the incoming key set against the
+  per-file key ranges, not the key's arity and not the table's size. Measured on DuckDB
+  1.5.4 / ducklake d318a545 — a composite `(prep_sample_idx, processing_idx)` pair scans
+  17,544 rows of 1,000,008 and opens 1 of 57 files; a `feature_idx` set spread over the
+  identity space scans 1,003,121 of 1,003,200 and opens all 57; a `feature_idx` set confined
+  to one narrow window scans 17,602 of 1,003,200 and still opens all 57; a contiguous
+  `feature_idx` block scans 2,000 rows and opens 1 file at both 40k rows over 20 files and
+  400k over 200, where the same key count spread over the identity space scans 39,982 of
+  40,000 and 399,819 of 400,000. The `WITH … DELETE … USING` comparison now reports the mean
+  paired difference and its interval (-0.8 to +1.0 ms across four key sets on statements of
+  3-37 ms, widest 95% CI [-3.2, +2.9] ms) rather than a bare non-significant p-value.
+
+- **`test_assembly_hash`'s canonical-hash oracle mis-complemented a soft-masked contig
+  (#460).** Its hand-rolled reverse complement translated through an upper-case-only table
+  and upper-cased the result afterwards, so a lowercase base passed through uncomplemented
+  and the "reverse strand" it hashed was the plain reverse. Over 2,000 random 16 bp
+  lowercase sequences the oracle disagreed with `canonical_sequence_hash_expr` on 1,362
+  (68.1%); over the same sequences upper-cased, on 0. The oracle now takes its reverse
+  complement from miint's `sequence_dna_reverse_complement` — the scalar the production
+  expression calls — applied to the upper-cased sequence, since that function preserves
+  case. The `LEAST`-over-hashes composition is still re-derived in Python, so a change to
+  how the two hashes combine still fails the oracle. A soft-masked fixture covers it; every
+  sequence the file hashed before was either upper-case or a palindrome.
+  `read_fastx` preserves input case (probed: an all-upper control record comes back
+  unchanged, its lowercase twin comes back lowercase), so the soft-masked fixture reaches
+  `canonical_sequence_hash_expr` still lowercase and the test pins the `upper()` inside that
+  expression rather than a transformation the reader already did. That test now also pins
+  which record's bytes reach the chunks: the fold keeps one representative per hash
+  (`DISTINCT ON (sequence_hash) … ORDER BY sequence_hash, read_id`) and chunks it as read, so
+  a different tie-break stores a different strand and casing with every hash assertion
+  unmoved. One happy-path fixture is no longer a reverse-complement palindrome, so its
+  `_hash` comparison exercises the fold instead of the identity.
 
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
   (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes

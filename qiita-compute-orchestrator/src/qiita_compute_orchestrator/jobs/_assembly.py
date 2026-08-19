@@ -1,13 +1,9 @@
-"""Assembly-scoped shared vocabulary for the long-read-assembly native jobs.
+"""The `assemble` step's output basenames, shared by the native assembly jobs.
 
-The closed `kind` value set stored in the DuckLake/Postgres assembly tables,
-single-sourced here so `assembly_hash` (producer of `bin_map.kind`) and
-`assembly_load` (writer of `assembly_membership.kind` / `bin_quality.kind`) stay
-in lockstep — `bin_quality` joins `assembly_membership` on `kind`, so a drift
-between the two would silently break that join. Plain module constants, not a
-cross-language enum: `kind` is a TEXT column with no Postgres ENUM twin
-(deliberately extensible — a future 'plasmid'/'small_circular' kind is intended),
-so the shared Python constant is the fail-fast guard, not a DB CHECK.
+The `kind` value set those jobs also share lives in the contract layer,
+`qiita_common.assembly_constants` — these basenames do not, because they are
+written by a container entrypoint in this repo's `workflows/` tree and no other
+component resolves them.
 
 A private shared helper, not a dispatchable native job: it exports neither
 `Inputs` nor `execute`, and its leading-underscore name exempts it from the
@@ -16,5 +12,9 @@ boot-time job scan (`scan_native_jobs`).
 
 from __future__ import annotations
 
-KIND_LCG = "LCG"  # a circular genome (large circular genome)
-KIND_MAG = "MAG"  # a refined metagenome-assembled bin
+# Basenames the `assemble` step writes into genomes_dir; it owns when each file is
+# present and when it is not (workflows/long-read-assembly/assemble.sh). The
+# spellings are pinned against that script in
+# tests/test_long_read_assembly_entrypoint_pins.py.
+LCG_FILE = "circular.fa"  # every circular contig, as one multi-FASTA
+NOLCG_FILE = "noLCG.fa"  # the non-circular contigs; the binning input

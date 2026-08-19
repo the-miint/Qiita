@@ -496,9 +496,9 @@ def test_reap_staged_reads_removes_files_and_empty_dirs(tmp_path):
 
 
 async def test_register_files_logs_what_a_load_replaced(monkeypatch, caplog):
-    """The data plane replaces content-addressed tables on their key rather than
-    appending (its REPLACE_KEY_TABLES), so a load can supersede rows an earlier one
-    wrote. The per-table counts ride back in `replaced` and are logged."""
+    """The data plane replaces some tables on their key rather than appending (its
+    REPLACE_KEY_TABLES), so a load can supersede rows an earlier one wrote. The
+    per-table counts ride back in `replaced` and are logged."""
     import json
     import logging
 
