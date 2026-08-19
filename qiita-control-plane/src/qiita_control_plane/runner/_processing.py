@@ -51,26 +51,42 @@ def _build_processing_params(
 ) -> dict[str, Any]:
     """The canonical params a processing_idx hashes — the SINGLE source of truth
     for the run's identity shape. RESULT-AFFECTING inputs only (non-result params
-    like threads/mem never enter the hash):
+    like threads/mem never enter the hash).
 
-      - mask_idx: WHICH masked pass-set is assembled. This is the gating input
-        predicate — assembling mask A vs mask B for the same sample+assembler must
-        be two DISTINCT identities, not a false duplicate. Read from `bound` (the
-        masked-reads resolver binds it before this runs).
+    Each candidate below is entered ONLY when the workflow actually binds it (a
+    None value is dropped), so a workflow's identity carries just its own knobs —
+    assembly hashes {mask_idx, assembler}, amplicon hashes {trim, primer,
+    orient_primer, sortmerna_reference_idx} — and neither pollutes the other's hash
+    (adding a family here never re-hashes another family's existing ids).
+
+    Assembly knobs:
+      - mask_idx: WHICH masked pass-set is assembled. The gating input predicate —
+        assembling mask A vs mask B for the same sample+assembler must be two
+        DISTINCT identities. Bound by the masked-reads resolver before this runs.
       - assembler: the step-1 assembler, defaulting to the action's context_schema
-        default when the submitter omits it (so omitted-vs-explicit-default
-        collapse to one identity). `assembler_default` is passed by the caller
-        straight off `context_schema`, so the default literal lives in ONE place.
+        default when the submitter omits it (so omitted-vs-explicit-default collapse
+        to one identity). `assembler_default` comes straight off `context_schema`.
 
-    As more result-affecting params are parameterized (min-contig-length, DAS_Tool
-    threshold, LCG cutoff) they are added here, and every processing_idx re-hashes
-    fleet-wide."""
-    return {
-        "workflow": action_id,
-        "version": action_version,
+    Amplicon knobs (the denoise result is a function of these + the pool's reads):
+      - trim: bp truncation length.
+      - primer / orient_primer: primer-orientation knobs (dead work when off, but
+        kept in the hash so a protocol that turns orient on is a distinct identity).
+      - sortmerna_reference_idx: the STABLE reference identity (reference_idx, not
+        the ephemeral FASTA path the runner materializes) — a different 16S
+        pre-filter reference is a different result.
+
+    As more result-affecting params are parameterized they are added here."""
+    candidates = {
         "mask_idx": bound.get(MASK_IDX_BINDING),
         "assembler": bound.get(ASSEMBLER_BINDING) or assembler_default,
+        "trim": bound.get("trim"),
+        "primer": bound.get("primer"),
+        "orient_primer": bound.get("orient_primer"),
+        "sortmerna_reference_idx": bound.get("sortmerna_reference_idx"),
     }
+    params: dict[str, Any] = {"workflow": action_id, "version": action_version}
+    params.update({k: v for k, v in candidates.items() if v is not None})
+    return params
 
 
 async def _mint_processing_idx(
