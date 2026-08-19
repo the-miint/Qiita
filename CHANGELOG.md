@@ -26,11 +26,11 @@ duplicates further down are historical strata; leave them where they are.
   walks the path the bundled ingest gestures actually require: create the study with a
   `bioproject_accession`, create its biosamples with `biosample_accession`s, build the
   kl-run-preflight file outside Qiita naming both, then `submit-bcl-convert` or
-  `submit-pacbio-ingest`. The ordering is not stylistic — `_provision_run_pool_roster`
-  resolves every pre-flight row against existing Qiita rows keyed on those two accessions and
-  exits without side effects when either lookup misses, so a study minted without an accession
-  cannot be reached from a sheet at all. That prerequisite was documented nowhere. The runbook
-  also generalizes the pre-flight pre-patching trap that was filed under PacBio: pool identity
+  `submit-pacbio-ingest`. That order is forced: `_provision_run_pool_roster` resolves every
+  pre-flight row against existing Qiita rows keyed on those two accessions and exits without
+  side effects when either lookup misses, so a study minted without an accession cannot be
+  reached from a sheet at all. No runbook stated that prerequisite. The runbook also
+  generalizes the pre-flight pre-patching trap that was filed under PacBio: pool identity
   is the SHA-256 of the blob's bytes and both gestures read those bytes before `open_db_file`
   patches the file in place, so an unpatched submit followed by a re-run mints a second pool on
   either platform.
@@ -922,7 +922,7 @@ duplicates further down are historical strata; leave them where they are.
   `--prep-protocol-idx` help told operators the per-row `study_idx` "comes out of the file"
   via `project.qiita_id`. The pinned kl-run-preflight schema has no such column; the study is
   resolved from `project.bioproject_accession` through `/study/lookup-by-accession`. The help
-  now says that, matching what `submit-pacbio-ingest` already said.
+  now says that, and drops the speculation about a future pre-flight column.
 
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
   (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
@@ -1954,8 +1954,8 @@ duplicates further down are historical strata; leave them where they are.
   run, pool and sequenced-sample yourself and submitting `fastq-to-parquet` against FASTQs you
   already hold. `pacbio-ingest.md` likewise drops where-to-run-the-CLI, the pre-flight
   writability trap and the `--force` rule, keeping only what has no Illumina counterpart. The
-  "no self-service study_access grant" fact moves to `docs/auth.md`, which owns the auth
-  surface, instead of being restated in each runbook.
+  `study_access` grant mechanism moves to `docs/auth.md`, which owns the auth surface; both
+  runbooks now point at it rather than spelling out the INSERT.
 
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that

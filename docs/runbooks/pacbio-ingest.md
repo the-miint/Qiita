@@ -1,17 +1,14 @@
 # PacBio ingest (runbook)
 
 **For:** whoever is ingesting a PacBio run (`qiita submit-pacbio-ingest`). Read it
-before the first ingest on a new deploy — three of its behaviours surprise people.
+before the first ingest on a new deploy — three of the things below surprise people.
 Not needed for Illumina.
 
 This covers only what is specific to PacBio. Everything shared with the Illumina
 path — where to run the CLI, carrying a PAT to a headless host, the study and
 biosample rows the pre-flight rows resolve against, building the pre-flight file
-and pre-patching it, and the `--force` rule — is in
-[`getting-started.md`](getting-started.md).
-
-Paths and identifiers below are from the `qiita-miint.ucsd.edu` deploy; substitute your
-host's checkout path, mounts, and `prep_protocol` indices.
+and pre-patching it, retrying, and the `--force` rule — is in
+[`getting-started.md`](getting-started.md), whose examples this one continues.
 
 ## Submit
 
@@ -19,7 +16,7 @@ host's checkout path, mounts, and `prep_protocol` indices.
 ([`getting-started.md`](getting-started.md), step 4).
 
 ```bash
-qiita --base-url https://qiita-miint.ucsd.edu/ submit-pacbio-ingest \
+qiita submit-pacbio-ingest \
     --run-folder /sequencing/gcore_runs/Knightlab/r84137_20260623_040006 \
     --preflight-blob "$PF" \
     --instrument-run-id r84137_20260623_040006 \
@@ -29,16 +26,14 @@ qiita --base-url https://qiita-miint.ucsd.edu/ submit-pacbio-ingest \
 
 - **`--instrument-run-id` is free-form.** PacBio has no `RunInfo.xml` to read it from,
   so nothing derives or validates it; the run-folder basename is the natural value.
-- **`--prep-protocol-idx` is *not* validated against the platform.** A wrong value is
-  accepted silently, so you have to get it right yourself. The command only accepts
-  `pacbio_absquant` / `pacbio_metag` sheets, and both are metagenomics — so the answer
-  is always the **`long_read_metagenomics`** protocol, never `long_read_amplicon`, no
-  matter what the sheet filename suggests. Look the idx up on your deploy rather than
-  copying a number (`qiita prep-protocol list`); on `qiita-miint` it is **3**, and the
-  amplicon protocol you must *not* pick is 5.
-- **Retry by re-running the identical command.** Run and pool are find-or-create, the
-  roster is create-missing, and already-ingested samples come back `skipped`. Do not
-  reach for `--force`.
+- **The protocol is always `long_read_metagenomics`.** The command only accepts
+  `pacbio_absquant` / `pacbio_metag` sheets and both are metagenomics, so it is never
+  `long_read_amplicon`, no matter what the sheet filename suggests. Look the idx up on
+  your deploy rather than copying a number (`qiita prep-protocol list`); on
+  `qiita-miint` it is **3**, and the amplicon protocol you must *not* pick is 5.
+  Nothing validates this for you — see the protocol note in
+  [`getting-started.md`](getting-started.md), step 5.
+- **A re-run reports already-ingested samples as `skipped`.**
 
 ## `pool-completion` does not report on ingest
 

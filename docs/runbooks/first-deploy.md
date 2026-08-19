@@ -1108,7 +1108,7 @@ End-to-end execution runs through the end-user `qiita` CLI
 the biosample; [`docs/runbooks/user-cli-quickstart.md`](user-cli-quickstart.md)
 carries it from there to a `COMPLETED` ticket.
 
-The walkthrough drives the smoke from a fresh user PAT through to a
+Together the two drive the smoke from a fresh user PAT through to a
 `COMPLETED` ticket and a `reads.parquet` artifact, with verification
 commands at each layer. Compute service-account provisioning per
 [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md)

@@ -156,8 +156,15 @@ async def test_user_authoring_smoke_via_cli(
     created_study_idxs: list[int] = []
 
     try:
+        # Both accession columns are UNIQUE, so a fixed literal would
+        # collide with a prior run against the same database.
+        run_tag = uuid.uuid4().hex[:12]
+
         # 1. study create — USER owns the new study; satisfies the
         #    owner-bypass on every downstream require_study_access.
+        #    --bioproject-accession is the key the bundled ingest gestures
+        #    resolve a pre-flight row's project against; pinned here so it
+        #    cannot be renamed out from under getting-started.md.
         study = _run_cli(
             cp_server,
             user_token,
@@ -165,6 +172,8 @@ async def test_user_authoring_smoke_via_cli(
             "create",
             "--title",
             f"user-cli-smoke-{uuid.uuid4()}",
+            "--bioproject-accession",
+            f"PRJNA-smoke-{run_tag}",
         )
         study_idx = study["study_idx"]
         created_study_idxs.append(study_idx)
@@ -183,6 +192,10 @@ async def test_user_authoring_smoke_via_cli(
             "sample_name",
             "--owner-biosample-id-value",
             "USER-CLI-SMOKE-1",
+            # The pre-flight join key for a biosample, pinned for the same
+            # reason as --bioproject-accession above.
+            "--biosample-accession",
+            f"SAMN-smoke-{run_tag}",
             # host_taxon_id is enforced at intake — supply a missing-value marker
             # (this smoke sample has no host of its own).
             "--metadata",

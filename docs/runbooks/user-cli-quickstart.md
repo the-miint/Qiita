@@ -24,11 +24,11 @@ creator, or per-study `ADMIN` tier — rather than a blanket
   [`getting-started.md`](getting-started.md). They leave you with the
   `$STUDY_IDX` and `$BIOSAMPLE_IDX` this flow starts from.
 
-
 ## 1. Create a sequencing run
 
 The instrument-level container. No role / tier gate — any user with
-`prep_sample:write` (which is in the USER ceiling) can stand one up.
+`prep_sample:write`, which every `user`-role PAT carries (the per-role scope
+ceilings are in [`auth.md`](../auth.md)), can stand one up.
 
 ```bash
 qiita sequencing-run create \
@@ -143,12 +143,8 @@ orchestrator logs.
 
 ## What this flow does NOT cover
 
-- **Cross-study access grants.** Attaching a biosample or sample to a
-  study you do not own needs an `ADMIN`-tier `qiita.study_access` row on
-  that study, which only an operator can issue — see
-  [`auth.md`](../auth.md) under *User self-service*.
-- **Reference-data authoring.** `reference:write` is wet_lab_admin+;
-  end-users consume references but do not author them.
+- **Cross-study access grants** and **reference-data authoring** — see
+  [`getting-started.md`](getting-started.md) under *Not covered here*.
 - **Service-account flows.** End-user PATs do not carry
   `sequence_range:mint` or `reference:register_files`; those scopes
   are on the service-account ceiling for the orchestrator's CO→CP
@@ -158,8 +154,8 @@ orchestrator logs.
 ## Smoke-testing this flow
 
 The integration test `tests/integration/test_user_authoring_smoke.py`
-walks this flow end-to-end from study creation: it stands up a real
-control-plane server
-and shells out to the actual `qiita` CLI for every command, so the
-flag names in this runbook are mechanically pinned against argparse
-drift. Run it via `make test-integration`.
+walks this flow end-to-end, starting from the study and biosample its
+prerequisites name: it stands up a real control-plane server and shells
+out to the actual `qiita` CLI for every command, so the flag names in
+this runbook are mechanically pinned against argparse drift. Run it via
+`make test-integration`.
