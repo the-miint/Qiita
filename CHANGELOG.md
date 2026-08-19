@@ -31,8 +31,8 @@ duplicates further down are historical strata; leave them where they are.
   unchanged, one per SAM record with its CIGAR; the new table records the merged read —
   its query interval, its reference interval (`feature_start > feature_stop` means the
   interval wraps the origin), strand, pooled identity and coverage, and fragment count —
-  and only where that evidence exists. Contig length is deliberately not duplicated:
-  resolving a wrapped interval to bases joins `assembled_sequence.sequence_length_bp`.
+  and only where that evidence exists. Contig length is not duplicated: resolving a
+  wrapped interval to bases joins `assembled_sequence.sequence_length_bp`.
   The table comment carries the resulting contract — a consumer applying a query-coverage
   predicate to `alignment` MUST `LEFT JOIN alignment_circular` on `(alignment_idx,
   prep_sample_idx, sequence_idx)` and judge a matched read on `pooled_coverage`.

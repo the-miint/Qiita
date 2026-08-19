@@ -2926,19 +2926,60 @@ fn delete_read_mask_block(
     }))
 }
 
+/// Delete `where_clause`'s rows from `alignment` and its `alignment_circular`
+/// side table, returning `(alignment count, alignment_circular count)`. The
+/// shared body of `delete_alignment` and `delete_alignment_block`; each builds
+/// its own clause and shapes its own response.
+///
+/// The two tables go in lockstep: `alignment_circular` only ever describes
+/// `alignment` rows under the same `alignment_idx`, so dropping the fragments
+/// while keeping the evidence leaves a read described by rows that are gone.
+///
+/// One DuckLake transaction, so the action is all-or-nothing and the control
+/// plane can safely retry: a failed call leaves both tables' rows fully intact,
+/// so a retry sees the same row set. Logical `DELETE` only. No raw parquet
+/// `unlink` — DuckLake owns file lifecycle and a manual unlink would corrupt the
+/// catalog; orphan parquets are tolerated until a future maintenance pass
+/// (matches `delete_mask`).
+///
+/// `where_clause` is interpolated, `params` binds any `?` it carries.
+fn delete_alignment_rows(
+    conn: &duckdb::Connection,
+    where_clause: &str,
+    params: &[&dyn duckdb::ToSql],
+) -> Result<(usize, usize), Status> {
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let deletes = (|| -> Result<(usize, usize), Status> {
+        let one = |table: &str| -> Result<usize, Status> {
+            let sql = format!("DELETE FROM qiita_lake.{table} WHERE {where_clause}");
+            conn.execute(&sql, params)
+                .map_err(|e| Status::internal(format!("delete failed ({sql}): {e}")))
+        };
+        Ok((one("alignment")?, one("alignment_circular")?))
+    })();
+
+    let counts = match deletes {
+        Ok(counts) => counts,
+        Err(e) => {
+            // Best-effort rollback; surface the original delete error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+    Ok(counts)
+}
+
 /// Logically delete every `alignment` and `alignment_circular` row for one
 /// `alignment_idx` from DuckLake — the whole-alignment purge the
 /// disallow-without-delete resubmission rule needs (a completed
 /// `alignment_sample` must be cleared before re-aligning).
 ///
-/// Both tables go in one transaction. `alignment_circular` only ever describes
-/// `alignment` rows under the same `alignment_idx`, so leaving it behind would
-/// strand evidence pointing at fragments a re-align has replaced.
-///
-/// The alignment twin of `delete_mask`: one DuckLake transaction, logical
-/// `DELETE` only. No raw parquet `unlink` — DuckLake owns file lifecycle and a
-/// manual unlink would corrupt the catalog; orphan parquets are tolerated until a
-/// future maintenance pass (matches `delete_mask`). Idempotent: deleting an
+/// The alignment twin of `delete_mask`; transaction, both-table lockstep and
+/// parquet lifecycle are `delete_alignment_rows`'. Idempotent: deleting an
 /// `alignment_idx` with zero rows is success and returns zero counts, so the
 /// control plane can safely retry. `alignment_idx` is an Ed25519-verified i64.
 ///
@@ -2955,37 +2996,11 @@ fn delete_alignment(
     ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
         .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
-    // Both deletes wrapped in an explicit transaction so the action is
-    // all-or-nothing and the control plane can safely retry: a failed call
-    // leaves both tables' rows fully intact, so a retry sees the same row set.
-    conn.execute_batch("BEGIN TRANSACTION")
-        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
-
-    let deletes = (|| -> Result<(usize, usize), Status> {
-        let one = |table: &str| -> Result<usize, Status> {
-            conn.execute(
-                &format!("DELETE FROM qiita_lake.{table} WHERE alignment_idx = ?"),
-                [&alignment_idx as &dyn duckdb::ToSql],
-            )
-            .map_err(|e| {
-                Status::internal(format!(
-                    "delete failed (DELETE FROM qiita_lake.{table} WHERE alignment_idx = ?): {e}"
-                ))
-            })
-        };
-        Ok((one("alignment")?, one("alignment_circular")?))
-    })();
-
-    let (rows_deleted, circular_rows_deleted) = match deletes {
-        Ok(counts) => counts,
-        Err(e) => {
-            // Best-effort rollback; surface the original delete error.
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
-        }
-    };
-    conn.execute_batch("COMMIT")
-        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+    let (rows_deleted, circular_rows_deleted) = delete_alignment_rows(
+        &conn,
+        "alignment_idx = ?",
+        &[&alignment_idx as &dyn duckdb::ToSql],
+    )?;
 
     Ok(serde_json::json!({
         "alignment_idx": alignment_idx,
@@ -3010,19 +3025,12 @@ fn delete_alignment(
 /// alignment rows (a read produces multiple rows via cross-shard + PE
 /// multiplicity) — exactly what a re-run must replace.
 ///
-/// One clause serves both tables: `alignment_circular` carries `alignment_idx`,
-/// `prep_sample_idx` and `sequence_idx` under the same meaning, and its grain is
-/// one row per read rather than per SAM record, so a member's sub-range selects
-/// the same reads in both. They go in one transaction — a block re-run that
-/// replaced the fragments but kept the old evidence rows would leave a read
-/// described twice.
-///
-/// Mirrors `delete_read_mask_block`: one DuckLake transaction (all-or-nothing,
-/// retriable), logical `DELETE` only (no raw parquet unlink — DuckLake owns file
-/// lifecycle). Idempotent: a fresh block (no rows yet) deletes 0. Empty `members`
-/// is a control-plane bug (the DoAction arm rejects it before this); guarded here
-/// too, returning a zero-count noop. All integers are Ed25519-verified i64s, safe to
-/// inline. Count reporting follows `delete_alignment`.
+/// Mirrors `delete_read_mask_block`; transaction, both-table lockstep and
+/// parquet lifecycle are `delete_alignment_rows`', count reporting is
+/// `delete_alignment`'s. Idempotent: a fresh block (no rows yet) deletes 0.
+/// Empty `members` is a control-plane bug (the DoAction arm rejects it before
+/// this); guarded here too, returning a zero-count noop. All integers are
+/// Ed25519-verified i64s, safe to inline.
 fn delete_alignment_block(
     catalog_connstr: &str,
     data_path: &str,
@@ -3045,43 +3053,15 @@ fn delete_alignment_block(
     // Scope the shared footprint selector to this align-config identity. The
     // `read`/`read_mask` blocks key on sequence_idx; the `alignment` sink and its
     // `alignment_circular` side table also carry a sequence_idx column, so the
-    // SAME clause applies to all three.
+    // SAME clause applies to all three — one row per read on the side table
+    // against one per SAM record on `alignment`, but a member's sub-range selects
+    // the same reads either way.
     let where_clause = format!(
         "alignment_idx = {alignment_idx} AND {}",
         block_read_where_clause(members)
     );
 
-    // Both deletes wrapped in an explicit transaction so the action is
-    // all-or-nothing and the control plane can safely retry: a failed call
-    // leaves both tables' rows fully intact, so a retry sees the same row set.
-    conn.execute_batch("BEGIN TRANSACTION")
-        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
-
-    let deletes = (|| -> Result<(usize, usize), Status> {
-        let one = |table: &str| -> Result<usize, Status> {
-            conn.execute(
-                &format!("DELETE FROM qiita_lake.{table} WHERE {where_clause}"),
-                [],
-            )
-            .map_err(|e| {
-                Status::internal(format!(
-                    "delete failed (DELETE FROM qiita_lake.{table} WHERE {where_clause}): {e}"
-                ))
-            })
-        };
-        Ok((one("alignment")?, one("alignment_circular")?))
-    })();
-
-    let (rows_deleted, circular_rows_deleted) = match deletes {
-        Ok(counts) => counts,
-        Err(e) => {
-            // Best-effort rollback; surface the original delete error.
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
-        }
-    };
-    conn.execute_batch("COMMIT")
-        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+    let (rows_deleted, circular_rows_deleted) = delete_alignment_rows(&conn, &where_clause, &[])?;
 
     Ok(serde_json::json!({
         "alignment_idx": alignment_idx,
@@ -3984,9 +3964,8 @@ mod tests {
         // for prep_a (seq 100) is a different align-config identity.
         //
         // The side table is one row per origin-spanning READ, so it has no
-        // multiplicity twin for seq 100; only the identity columns are populated
-        // (the delete predicate is what this exercises, and the score columns are
-        // not derivable here without an aligner).
+        // multiplicity twin for seq 100. Identity columns only, as in
+        // `delete_alignment_drops_target_idempotently`.
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
              DELETE FROM qiita_lake.alignment_circular \

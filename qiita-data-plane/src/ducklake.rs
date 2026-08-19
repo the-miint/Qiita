@@ -494,11 +494,9 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         --
         -- No producer writes this table yet.
         CREATE TABLE IF NOT EXISTS qiita_lake.alignment_circular (
-            -- Key order mirrors `alignment`'s leading columns, so this table
-            -- prunes on the same DuckLake statistics and the block delete's
-            -- per-member (prep_sample_idx, sequence_idx) predicate applies to it
-            -- unchanged. NOT NULL because these four are what every delete
-            -- predicate names: a NULL is a row no delete can reach.
+            -- `alignment`'s leading four, same names, types and order. NOT
+            -- NULL because these four are what every delete predicate names: a
+            -- NULL is a row no delete can reach.
             alignment_idx   BIGINT NOT NULL,
             prep_sample_idx BIGINT NOT NULL,
             sequence_idx    BIGINT NOT NULL,
@@ -743,6 +741,21 @@ mod tests {
         // them and correctly do NOT re-set them.
         set_catalog_options(&conn).expect("failed to set catalog options");
         conn
+    }
+
+    /// `(column_name, data_type)` for one `qiita_lake` table, in declared order,
+    /// for the schema-drift assertions below.
+    fn table_schema(conn: &Connection, table: &str) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name, data_type FROM information_schema.columns \
+                 WHERE table_name = ? ORDER BY ordinal_position",
+            )
+            .unwrap();
+        stmt.query_map([table], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
     }
 
     /// Guard that cleans up test rows on drop, even if the test panics.
@@ -1034,17 +1047,7 @@ mod tests {
         ensure_alignment_tables(&conn).expect("first ensure_alignment_tables");
         ensure_alignment_tables(&conn).expect("second ensure_alignment_tables (idempotent)");
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT column_name, data_type FROM information_schema.columns \
-                 WHERE table_name = 'alignment' ORDER BY ordinal_position",
-            )
-            .unwrap();
-        let cols: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
+        let cols = table_schema(&conn, "alignment");
         // 5 CP identity columns + the miint SAM columns MINUS the raw subject ids
         // (a.* EXCLUDE (read_id, reference, mate_reference)), in align_sharded COPY
         // order.
@@ -1090,17 +1093,7 @@ mod tests {
         ensure_alignment_tables(&conn).expect("first ensure_alignment_tables");
         ensure_alignment_tables(&conn).expect("second ensure_alignment_tables (idempotent)");
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT column_name, data_type FROM information_schema.columns \
-                 WHERE table_name = 'alignment_circular' ORDER BY ordinal_position",
-            )
-            .unwrap();
-        let cols: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
+        let cols = table_schema(&conn, "alignment_circular");
         let expected: &[(&str, &str)] = &[
             ("alignment_idx", "BIGINT"),
             ("prep_sample_idx", "BIGINT"),
