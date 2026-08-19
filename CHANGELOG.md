@@ -22,6 +22,20 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Rapid 16S amplicon processing: `golay-demux` + `amplicon` workflows (#244).**
+  Two workflows bring EMP-style 16S into Qiita. `golay-demux` (ingest) Golay-barcode
+  demultiplexes a pool's multiplexed FASTQ (R1 + I1 + optional R2) into per-sample reads
+  in the DuckLake `read` table — the analogue of bcl-convert for runs that arrive
+  already-converted-but-multiplexed. `amplicon` (process) denoises a pool's stored reads
+  with deblur (trim → dereplicate → SortMeRNA 16S pre-filter → UCHIME chimera → MAFFT →
+  deblur), **reference-agnostically**: every ASV gets a `feature_idx` from its canonical
+  sequence hash and per-sample counts land in the new DuckLake `amplicon_membership`
+  table (`prep_sample_idx, processing_idx, feature_idx, count`). 16S reads are not masked.
+  The closed-reference (e.g. GG2) feature table is **derived on demand** by intersecting
+  feature_idx with a reference's membership — never stored. The runner materializes the
+  SortMeRNA reference from a loaded `sequence_reference` (by reference_idx, off fixed
+  paths) and streams the pool's raw reads via the `export_read` DoAction.
+
 - **A published feature table's rows can now be labelled without our identifiers (#448).**
   `POST /exported-feature` mints the public handle for a feature-axis entity, the way
   `/exported-identifier` already does for the sample axis — so a table, its taxonomy sidecar

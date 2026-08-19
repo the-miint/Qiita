@@ -51,6 +51,14 @@ _None yet._
   Expect `1`. A `0` means the staged build predates the function — re-stage the extension
   before telling anyone `--tree` works. (#448)
 
+- **Confirm the two amplicon workflows synced.** `golay-demux 1.0.0` and `amplicon 1.0.0`
+  reach `qiita.action` via `qiita-admin actions sync` inside `activate.sh` — no migration.
+  `make verify-deploy` lists `qiita.action`; check both appear. The new DuckLake
+  `amplicon_membership` table is auto-created at data-plane boot (no migration, no action).
+  The `amplicon` workflow additionally needs a SortMeRNA 16S database loaded as an ACTIVE
+  `sequence_reference` (its `reference_idx` is a submit-time context arg) — a per-study data
+  setup, not a deploy step. (#244)
+
 ### 6. After the deploy verifies green
 
 - **Collapse the sequence rows duplicated before this deploy.** `register_files` now
