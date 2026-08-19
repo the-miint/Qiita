@@ -23,10 +23,14 @@ containers emit CheckM's / DAS_Tool's tables verbatim (a plain `cp`, no awk/pyth
 normalization), so DuckDB is the ONE csv framework in this path (never a Python
 csv parser, never a shell transform on the tool tables).
 
-Empty/partial semantics: an LCG-only sample (contigs but no MAG) is a SUCCESS —
-`bin_quality` is written empty (register-files still finds all four tables with
-the right schema). Zero contigs never reaches here
-(assembly_hash raised StepNoData upstream).
+Empty/partial semantics: a sample with contigs but no MAG — circular genomes,
+unbinned residue, or both — is a SUCCESS; `bin_quality` is written empty
+(register-files still finds all four tables with the right schema). Zero contigs
+never reaches here (assembly_hash raised StepNoData upstream).
+
+`bin_quality` is built from CheckM's tables, which cover only the refined bins, so
+it holds MAG rows alone: an LCG or unbinned membership row has no counterpart to
+join, and gets none by construction rather than by filter.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
+from qiita_common.assembly_constants import KIND_MAG
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -45,7 +50,6 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
-from ._assembly import KIND_MAG
 from ._feature_load import (
     build_feature_id_map,
     write_feature_sequence_chunks,
@@ -246,10 +250,10 @@ def _write_bin_quality(
     MAG FASTA stem). DAS_Tool's summary is LEFT-joined on its `bin` column (== the
     same MAG stem) when present, pulling `bin_score` / `bin_set`, else NULL.
 
-    A sample with no CheckM tables (LCG-only, or the CheckM DB was absent) writes a
-    valid EMPTY Parquet with the right schema so register-files always finds the
-    table. Column names are pinned to CheckM 1.x / DAS_Tool 1.1.x (see the module
-    constants)."""
+    A sample with no CheckM tables (no refined bin, or the CheckM DB was absent)
+    writes a valid EMPTY Parquet with the right schema so register-files always
+    finds the table. Column names are pinned to CheckM 1.x / DAS_Tool 1.1.x (see
+    the module constants)."""
     if not (lineage_tsv.is_file() and qa_tsv.is_file()):
         # Empty write — every placeholder NULL, no FROM, WHERE FALSE.
         projection = _BIN_QUALITY_SELECT.format(

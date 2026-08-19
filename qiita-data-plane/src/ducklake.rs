@@ -530,18 +530,18 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// exactly like a reference sequence. The bytes are 64 KB chunks (reassemble via
 /// `string_agg(chunk_data, '' ORDER BY chunk_index)`), never a bulk VARCHAR cell.
 /// `assembly_membership` records which features a prep_sample's assembly contains
-/// and in which bin (a circular LCG genome or a refined MAG) — the DuckLake copy
-/// of `qiita.assembly_membership`, for bulk joins against the sequences.
+/// and in which bin — the DuckLake copy of `qiita.assembly_membership`, for bulk
+/// joins against the sequences.
 /// `bin_quality` is per-MAG CheckM, joined to its contigs via assembly_membership
 /// on (prep_sample_idx, kind, bin_id).
 ///
 /// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
 /// (the CP mints feature_idx/dedups on sequence_hash, the orchestrator verifies
 /// before load, and the data plane replaces on the key at register time).
-/// `assembled_sequence` /
-/// `assembled_sequence_chunks` are additionally REPLACED on `feature_idx` at
-/// register time — `flight_service::REPLACE_KEY_TABLES`, which also says why
-/// `assembly_membership` / `bin_quality` are not.
+/// All four are additionally REPLACED at register time — `assembled_sequence` /
+/// `assembled_sequence_chunks` on `feature_idx`, `assembly_membership` /
+/// `bin_quality` on `(prep_sample_idx, processing_idx)`. The keys and what
+/// admits each table are in `flight_service::REPLACE_KEY_TABLES`.
 ///
 /// NOTE: not yet exposed via Flight (absent from `flight_service::ALLOWED_TABLES`).
 /// register_files loads them and they are SQL-queryable in the catalog; they are
@@ -569,9 +569,9 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 
         -- Which features a (prep_sample, processing) assembly run contains, and in
         -- which bin. processing_idx disambiguates runs (bin_id reused across
-        -- samples AND runs); kind is 'LCG' | 'MAG' (value set owned by the
-        -- producer). The DuckLake copy of qiita.assembly_membership for bulk joins
-        -- with the sequences.
+        -- samples AND runs); the `kind` value set is enumerated in
+        -- qiita-common/src/qiita_common/assembly_constants.py. The DuckLake
+        -- copy of qiita.assembly_membership for bulk joins with the sequences.
         CREATE TABLE IF NOT EXISTS qiita_lake.assembly_membership (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,

@@ -22,6 +22,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Unbinned assembly contigs are stored, as a third `assembly_membership` kind (#460).**
+  `assembly_hash` hashes the `noLCG.fa` residue — the contigs no DAS_Tool-refined bin
+  claimed — alongside the circular genomes and the refined MAGs, so they are minted a
+  `feature_idx` against the shared `qiita.feature` and recorded under `kind = 'UNBINNED'`
+  with the contig id as `bin_id` (the `(kind, bin_id)` shape `LCG` already uses). Unbinned
+  contigs can be valid sequence, DNA viruses in particular; previously they died with the
+  workspace.
+  **It is the residue, not all of `noLCG.fa`.** The refined MAGs are drawn from those same
+  contigs, so hashing the file whole would give every binned contig a second membership row
+  for one `feature_idx` — the bytes dedup, the membership does not. The exclusion is keyed
+  on the canonical sequence hash, not the contig id. Id preservation through binning and
+  refinement is measured for `hifiasm_meta` only: 198,747/198,747 refined-bin records across
+  57 assembly workspaces on the deploy host carried a first-token contig id identical to
+  their `noLCG.fa` record (whole-header on a 6-ticket subset, 5,660/5,660). It is
+  unmeasured for `myloasm` — no myloasm assembly exists on the host, and its header
+  grammar differs — so an id key would rest on an unmeasured assembler; the same match
+  measured there is what would make one viable. Two consequences of keying on content —
+  a bin holding a contig on the opposite strand still excludes its noLCG record (the
+  canonical hash folds both strands), and noLCG records sharing a canonical sequence
+  leave the residue together.
+  `StepNoData` narrows to match: only an assembler that produced no contig at all is
+  no-data, so a sample whose contigs all went unbinned now stores them. The `kind` value set
+  moves to `qiita_common.assembly_constants`, the contract layer both Python services
+  depend on, and the Postgres and DuckLake `assembly_membership` comments name it instead of
+  enumerating members (a comment-only migration).
+
 - **A published feature table's rows can now be labelled without our identifiers (#448).**
   `POST /exported-feature` mints the public handle for a feature-axis entity, the way
   `/exported-identifier` already does for the sample axis — so a table, its taxonomy sidecar
@@ -904,6 +930,21 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **Re-running `long-read-assembly` over a sample doubled its `assembly_membership` and
+  `bin_quality` rows (#460).** `processing_idx` hashes `{workflow, version, mask_idx,
+  assembler}`, so a second run resolves to the SAME identity whenever those four hold — an
+  edited workflow file included — and the submit path admits it: the prep_sample arm of
+  `_check_disallow_without_delete` binds only the non-terminal states, so a COMPLETED ticket
+  does not block a fresh one, and no assembly result carries a DELETE gate. Both tables were
+  appended rather than replaced, leaving both runs' rows under one `(prep_sample_idx,
+  processing_idx)` with nothing on the row to tell them apart. Measured across two
+  registrations of the same rows: `assembly_membership` 0 → 2 → 4, `bin_quality` 0 → 1 → 2.
+  `register_files` now replaces both on the composite `(prep_sample_idx, processing_idx)`, so
+  a re-run supersedes that sample's rows for that run — a row agreeing on one half of the key
+  (another sample of the same run, the same sample under a different run) is untouched. The
+  replace-by-key statement widened from one key column to a row constructor to carry it; the
+  file paths stay bound parameters.
 
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
   (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes

@@ -32,6 +32,12 @@ _None yet._
   than failing or removing them, and the retirement records which identifier was severed.
   (#448)
 
+- `20260818000000_assembly_membership_kind_comment.sql` — plain `make migrate`, no
+  out-of-band setup. Comment only, no schema change: the `qiita.assembly_membership` table
+  comment names the module that enumerates the `kind` value set
+  (`qiita-common/src/qiita_common/assembly_constants.py`) instead of listing its members,
+  which went stale when unbinned contigs became a third kind. (#460)
+
 ### 4. Deploy
 
 _None yet._
@@ -50,6 +56,13 @@ _None yet._
   ```
   Expect `1`. A `0` means the staged build predates the function — re-stage the extension
   before telling anyone `--tree` works. (#448)
+
+- **`long-read-assembly` 1.0.0 is edited in place, not versioned** — `activate.sh`'s
+  `qiita-admin actions sync` re-syncs it, so the `qiita.action` list check `make
+  verify-deploy` already runs is the confirmation it landed. It gained no step and no
+  declared input: the `assembly_hash` step reads one more file (`noLCG.fa`) out of the
+  `genomes_dir` it already binds, so there is no new bind mount, resource, or env var.
+  (#460)
 
 ### 6. After the deploy verifies green
 
@@ -171,7 +184,124 @@ _None yet._
   may be the load — which cannot be retried from the top, because its staging files have
   already been moved. The collapse itself is safe to re-run. (#457)
 
+- **Backfill the unbinned residue onto already-assembled samples — AFTER the collapse
+  above has finished.** The backfill is a series of `register-files` loads, and the collapse
+  quiesce requirement is one-directional: a load that loses a DuckLake conflict is lost
+  outright (its staging files are already moved), while the collapse is safe to re-run. So
+  run the collapse to completion first, then the backfill, and never overlap them.
+
+  Features the collapse reported `ambiguous` and left alone are resolved by this backfill
+  where they belong to a backfilled sample: `register-files` deletes every lake row for a
+  `feature_idx` it carries before adding its own, so the re-registered contig's bytes stand
+  alone afterwards — including for a feature a reference load also produced. Ambiguous
+  features outside these samples stay as the collapse left them.
+
+  **This backfill re-runs the STORAGE TAIL only; it does not re-assemble.** The runner
+  fast-forwards any entry that still has a `completed` row in `qiita.work_ticket_step` and
+  rebuilds its outputs from the ticket workspace (`_reconstruct_completed_outputs` re-reads a
+  SLURM step's verified manifest via `result_step`, using the attempt recorded on that row).
+  Keeping the `assemble` / `assembly_coverage` / `binning` / `bin_refine` / `checkm` rows and
+  dropping the five tail rows therefore replays `assembly_hash` → `mint-features` →
+  `write-assembly-membership` → `assembly_load` → `register-files` against the SAME assembly
+  bytes. A full re-run would instead re-execute `assemble` (baseline 32 CPU / 192 GB / PT16H)
+  and everything after it, and nothing establishes that the assembler and the binners
+  re-derive the same contigs — so it would change the stored `LCG` / `MAG` sequence rather
+  than only add the residue. The retained row is also what names the right attempt directory
+  where a step was retried — 11 of the 57 below have more than one `assemble` attempt on
+  disk — so keep those rows and do not hand-pick a directory by attempt number or mtime.
+
+  **Coverage is bounded by what survived on scratch.** Measured on the deploy host: of 7,234
+  ticket workspaces under `PATH_SCRATCH/ticket`, 57 carry both an `assemble` and a
+  `bin_refine` workspace. Only those can be backfilled this way; a sample whose scratch was
+  reaped cannot. That test is a filter, not a guarantee: the redrive re-reads the manifest of
+  EVERY retained entry, so a ticket missing any of the six surviving workspaces fails at that
+  entry with `CONTRACT_VIOLATION` — loudly, not by skipping it. Enumerate the candidates,
+  then treat each directory name as the `work_ticket_idx`:
+
+  ```bash
+  for d in "$PATH_SCRATCH"/ticket/*/; do
+    [ -d "$d/assemble" ] && [ -d "$d/bin_refine" ] && basename "$d"
+  done
+  ```
+
+  Both terminal outcomes are backfillable and take the same route: `completed` (the sample
+  stored LCG/MAG rows and is missing only the residue) and `no_data` (`assembly_hash` raised
+  StepNoData because every contig went unbinned — those samples gain everything). Per ticket,
+  as the operator (`DATABASE_URL` from `/etc/qiita/control-plane.env`), confirm it is the
+  assembly ticket, then flip it and drop the tail rows in ONE transaction. `qiita-admin
+  ticket force-fail` cannot do this flip — it refuses a terminal ticket by design
+  (`_FORCE_FAIL_ELIGIBLE_STATES` is the non-terminal set), so the UPDATE is by hand and must
+  satisfy `work_ticket_failure_consistent` (`failure_type`, `failure_stage`, `failure_reason`
+  all NOT NULL when `state='failed'`) and `work_ticket_failure_step_name_consistent`
+  (`failure_step_name` NULL unless `failure_stage='step_run'`):
+
+  ```sql
+  -- Substitute <IDX>. Run one ticket at a time; the SELECT is the guard.
+  BEGIN;
+  SELECT work_ticket_idx, action_id, action_version, state, prep_sample_idx
+    FROM qiita.work_ticket WHERE work_ticket_idx = <IDX> FOR UPDATE;
+  -- Expect action_id='long-read-assembly' and state IN ('completed','no_data').
+  -- Anything else — in particular a non-terminal state: ROLLBACK.
+
+  UPDATE qiita.work_ticket
+     SET state = 'failed', failure_type = 'permanent', failure_stage = 'finalize',
+         failure_step_name = NULL,
+         failure_reason = 'operator redrive: replay the storage tail for the unbinned residue'
+   WHERE work_ticket_idx = <IDX> AND state IN ('completed', 'no_data');
+
+  -- The five tail entries, whatever state their rows are in. Named, not indexed, so a
+  -- renumbered workflow cannot silently clear the wrong ones. Dropping a row makes the
+  -- runner re-run that entry; the orphaned attempt dir left on disk is stepped over into a
+  -- fresh attempt dir, never reused. This also clears the still-live `assembly_hash` row a
+  -- StepNoData leaves behind (that path records no terminal step state), which `/run` keeps
+  -- on a FAILED redrive and would otherwise try to re-attach to its dead SLURM job.
+  DELETE FROM qiita.work_ticket_step
+   WHERE work_ticket_idx = <IDX>
+     AND step_name IN ('assembly_hash', 'mint-features', 'write-assembly-membership',
+                       'assembly_load', 'register-files');
+  COMMIT;
+  ```
+
+  Then redrive it and watch it to `completed`:
+
+  ```bash
+  qiita ticket run <IDX>
+  qiita ticket status <IDX>
+  ```
+
+  `processing_idx` is re-minted before the step loop from `{workflow, version, mask_idx,
+  assembler}` and upserts on that hash, so the redrive resolves to the SAME identity the
+  original run used — which is what makes the replace-by-key supersede that sample's
+  `assembly_membership` / `bin_quality` rows instead of doubling them. The Postgres
+  `qiita.assembly_membership` is the asymmetric half: it is written `ON CONFLICT DO NOTHING`,
+  so the redrive ADDS the `UNBINNED` rows and removes nothing. Reusing the stored assembly
+  bytes is what keeps that additive write correct — a redrive over re-assembled contigs would
+  leave the superseded rows behind there. (#460)
+
 ### Notes (no host action)
+
+- **`qiita.assembly_membership.kind` gains a third value, `UNBINNED`.** A
+  long-read-assembly run also records the contigs no refined bin claimed, with the contig
+  id as `bin_id` — the same `(kind, bin_id)` shape `LCG` uses. A consumer filtering on
+  `kind IN ('LCG','MAG')` keeps working (the new value does not match that filter), and
+  until a run is backfilled it keeps seeing exactly the rows it saw; a backfilled run's
+  rows are replaced wholesale by the re-run's (bucket 6). A consumer that reads every row
+  of a run sees more of them, and finds no `bin_quality` row for the new kind (CheckM
+  covers refined bins only, as it already did for `LCG`). A sample whose contigs all went
+  unbinned now completes with stored sequence where it previously ended as a no-data
+  ticket. (#460)
+
+- **Already-assembled samples do not gain the new kind until they are backfilled**, which
+  is the bucket-6 step above, not something the deploy does. Two things that outlive the
+  backfill itself: `qiita ticket run` alone cannot redrive a terminal ticket (`POST
+  /work-ticket/{idx}/run` applies to `pending` / `failed` / `cancelled`, so it 409s on
+  `completed` and on `no_data`) — which is why the backfill flips the state by hand rather
+  than submitting a fresh ticket, since a fresh ticket gets a fresh workspace and would
+  re-assemble. And a sample moving `no_data` → `completed` starts blocking a run-preflight
+  edit on its pool: that gate counts the in-flight and `completed` tickets scoped to the
+  pool or its samples, and `no_data` is deliberately outside that set so edit-then-retry
+  stays possible. Correct any preflight that still needs it before backfilling its samples.
+  (#460)
 
 - **`register-files` now REPLACES the four content-addressed sequence tables on
   `feature_idx` rather than appending.** A load that carries a feature the lake already
@@ -180,7 +310,11 @@ _None yet._
   control-plane log records what each one superseded (`register_files replaced rows in
   content-addressed tables`). Where a feature's two copies differ (a sequence and its
   reverse complement share one `feature_idx`), the newest load's bytes win; before this they
-  were both kept and read back concatenated. Every other lake table is untouched. (#457)
+  were both kept and read back concatenated. (#457) `assembly_membership` and `bin_quality`
+  are replaced too, on the composite `(prep_sample_idx, processing_idx)`: a re-run supersedes
+  that sample's rows for that run, while a row agreeing on only one half of the key — another
+  sample of the same run, or the same sample under a different `processing_idx` — is left
+  alone. Every other lake table is untouched. (#460)
 
 - **`GET …/sequenced-pool/{pool}/alignment` gains a `params_hash` field, and the new
   `qiita feature-table build` requires it.** Additive, so an older client ignores it and

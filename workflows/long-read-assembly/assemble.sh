@@ -50,7 +50,8 @@ mkdir -p "${OUT}"
 # neither when it didn't — so an empty CLASS is an empty file while an empty
 # ASSEMBLY is an empty genomes_dir. Downstream depends on that distinction:
 # assembly_coverage treats a missing OR zero-byte noLCG.fa as "nothing to bin",
-# and assembly_hash raises StepNoData only when neither an LCG nor a MAG exists.
+# and assembly_hash drops the empty files before its scan (its module docstring
+# states the StepNoData boundary).
 # Each arm gets this for free from its writer (a shell `>` redirect truncates into
 # existence; a zero-row COPY still writes its file), so there is no pre-creation
 # step to keep in sync.
