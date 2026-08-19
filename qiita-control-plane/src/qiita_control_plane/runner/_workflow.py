@@ -81,9 +81,11 @@ from ._processing import (
     _workflow_needs_processing,
 )
 from ._read_ingest import (
+    BARCODE_MAP_BINDING,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
     SAMPLE_MAP_BINDING,
+    _resolve_barcode_map,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
@@ -321,6 +323,10 @@ async def run_workflow(
         # it is the upstream `bcl_convert` step's output, bound during the loop.
         if _workflow_declares_input(action.steps, SAMPLE_MAP_BINDING):
             bound.update(await _resolve_sample_map(bound, workspace))
+        # The golay-demux workflow's `golay_demux` step consumes the same shape:
+        # a runner-materialized barcode roster Parquet plus the reads-staging root.
+        if _workflow_declares_input(action.steps, BARCODE_MAP_BINDING):
+            bound.update(await _resolve_barcode_map(bound, workspace))
         if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
 

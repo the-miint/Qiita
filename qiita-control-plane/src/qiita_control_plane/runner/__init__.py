@@ -167,6 +167,7 @@ from ._processing import (
 )
 from ._read_ingest import (
     _REFERENCE_SEQUENCES_TABLE,
+    BARCODE_MAP_BINDING,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
     SAMPLE_MAP_BINDING,
@@ -178,6 +179,7 @@ from ._read_ingest import (
     _do_action_export,
     _do_action_export_read,
     _do_get_reference_sequences_roster,
+    _resolve_barcode_map,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
@@ -245,6 +247,7 @@ __all__: list[str] = [
     "HOST_FILTER_INDEX_TYPE_MINIMAP2",
     "HOST_FILTER_INDEX_TYPE_RYPE",
     "IllegalStatusTransition",
+    "BARCODE_MAP_BINDING",
     "GENOME_MAP_PATH_BINDING",
     "LIBRARY",
     "LibraryPrimitive",
@@ -351,6 +354,7 @@ __all__: list[str] = [
     "_resolve_reference_index_path",
     "_resolve_required_host_index",
     "_resolve_feature_table_bindings",
+    "_resolve_barcode_map",
     "_resolve_sample_map",
     "_resolve_staged_masked_reads",
     "_resolve_staged_reads",
