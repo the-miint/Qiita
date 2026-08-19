@@ -931,6 +931,22 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **`POST /exported-feature` would have published a qiita-derived genome's composed
+  `source_id` verbatim (#461).** `_INSERT_GENOME` offered `qiita.genome.source_id` as the
+  accession candidate for every genome, on the premise that `source_id` is NOT NULL and so
+  the genome kind always has an accession to offer. NOT NULL holds; "is an accession" does
+  not, for `source='qiita'` — a genome assembled from one of our own prep_samples has no
+  external authority behind its source_id, and `export_feature_id` labels rows in a feature
+  table, its taxonomy sidecar and its sheared tree. The statement now offers the accession
+  only for a source on an allowlist of external repositories (`genbank`, `refseq`), so an
+  internal source gets the hybrid's other half — a NULL accession, `accession_published`
+  false, and the minted `QF<idx>` the generated column produces from that pairing. Written
+  as an allowlist rather than `<> 'qiita'` so a further internal source mints a handle
+  until it is listed, instead of publishing. `_INSERT_FEATURE` is untouched: it already
+  reads a nullable `reference_membership.accession`. Latent — nothing writes a
+  `source='qiita'` genome row yet — and a new unit test fails if a `GenomeSource` member is
+  left unclassified by the predicate.
+
 - **Re-running `long-read-assembly` over a sample doubled its `assembly_membership` and
   `bin_quality` rows (#460).** `processing_idx` hashes `{workflow, version, mask_idx,
   assembler}`, so a second run resolves to the SAME identity whenever those four hold — an

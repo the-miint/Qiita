@@ -249,7 +249,13 @@ async def test_403_does_not_enumerate_the_cohort(role_keyed_clients, pool_alignm
     )
     assert resp.status_code == 403, resp.text
     detail = resp.json()["detail"]
-    assert str(seed["ps_b"]) not in detail
+    # Asked of the clauses that name SAMPLES, not of the whole message.
+    # `qiita.study.idx` and `qiita.prep_sample.idx` are separate identity sequences
+    # that run to similar magnitudes across the suite, so a study idx can equal
+    # ps_b — and a bare containment check then reports the study clause naming its
+    # own study as a leak of the sample.
+    named_samples = "; ".join(p for p in detail.split("; ") if "study/studies" not in p)
+    assert str(seed["ps_b"]) not in named_samples
     assert str(seed["study_2"]) in detail  # the study IS named — it is what to go ask for
     assert "no active study link" in detail
 

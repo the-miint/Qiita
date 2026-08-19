@@ -443,6 +443,17 @@ sys.exit(1 if bad else 0)'
   routes (`POST /exported-feature`, `POST /exported-processing`) ship alongside it under
   the scopes their siblings already use — no new scope, so no PAT re-mint. (#448)
 
+- **`POST /exported-feature` labels a `source='qiita'` genome `QF<idx>`, not its
+  `source_id`.** A genome whose `source` is an external repository (`genbank`, `refseq`)
+  still publishes its `source_id` as `export_feature_id`, unchanged. Only a genome derived
+  from one of our own prep_samples is affected — its `source_id` is a name we composed, so
+  it now comes back with `accession: null` and `accession_published: false`. Such a genome
+  is reachable today only through a `qiita reference load` genome map declaring
+  `genome_source='qiita'` with a `prep_sample_idx`; where that has already been done and a
+  handle minted, the existing handle is unchanged (the mint is idempotent and never
+  re-labels a live row), so only genomes minted after this deploy see the new answer.
+  (#461)
+
 ---
 
 ## Deployed history

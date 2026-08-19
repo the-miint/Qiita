@@ -876,18 +876,25 @@ async def seed_bare_feature(pool: asyncpg.Pool) -> int:
     )
 
 
-async def seed_genome(pool: asyncpg.Pool, *, source: str = "refseq") -> tuple[int, str]:
+async def seed_genome(
+    pool: asyncpg.Pool, *, source: str = "refseq", prep_sample_idx: int | None = None
+) -> tuple[int, str]:
     """Insert a `qiita.genome`; return `(genome_idx, source_id)`.
 
     The source_id is returned because `qiita.genome`'s uniqueness is the
     composite `(source, source_id)` — a caller asserting on provenance needs the
     generated accession, and generating it here is what keeps it unique.
+
+    `prep_sample_idx` is required for `source='qiita'` and refused for any other
+    source: `genome_qiita_origin_check` is a biconditional.
     """
     source_id = f"GCF_{uuid.uuid4().hex[:12]}"
     genome_idx = await pool.fetchval(
-        "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2) RETURNING genome_idx",
+        "INSERT INTO qiita.genome (source, source_id, prep_sample_idx)"
+        " VALUES ($1, $2, $3) RETURNING genome_idx",
         source,
         source_id,
+        prep_sample_idx,
     )
     return genome_idx, source_id
 
