@@ -1103,8 +1103,10 @@ End-to-end execution runs through the end-user `qiita` CLI
 (`qiita login` / `qiita study create` / `qiita biosample create` /
 `qiita sequencing-run create` / `qiita sequenced-pool create` /
 `qiita sequenced-sample create` / `qiita ticket submit` /
-`qiita ticket status`). The walkthrough lives at
-[`docs/runbooks/user-cli-quickstart.md`](user-cli-quickstart.md).
+`qiita ticket status`). Steps 0-3 of
+[`docs/runbooks/getting-started.md`](getting-started.md) cover login through
+the biosample; [`docs/runbooks/user-cli-quickstart.md`](user-cli-quickstart.md)
+carries it from there to a `COMPLETED` ticket.
 
 The walkthrough drives the smoke from a fresh user PAT through to a
 `COMPLETED` ticket and a `reads.parquet` artifact, with verification

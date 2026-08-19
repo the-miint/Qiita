@@ -1291,11 +1291,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help=(
-            "Qiita prep_protocol_idx to FK every per-sample row to. Today"
-            " applied uniformly across the whole pool because the preflight"
-            " does not carry a Qiita prep_protocol identifier; a future"
-            " preflight column may let this flag come out of the file like"
-            " the per-row study_idx already does (project.qiita_id)."
+            "Qiita prep_protocol_idx to FK every per-sample row to. Applied"
+            " uniformly across the pool (the preflight carries no Qiita"
+            " prep_protocol identifier), unlike the per-row study_idx, which"
+            " resolves from the preflight's project.bioproject_accession via"
+            " /study/lookup-by-accession."
         ),
     )
     p_submit_bcl.add_argument(

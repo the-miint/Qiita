@@ -1,9 +1,13 @@
 # User CLI quickstart
 
-> End-to-end walkthrough of the `user`-role authoring flow: log in,
-> author a study, register sequencing data, and submit a
-> `fastq-to-parquet` work-ticket — no `wet_lab_admin` or `system_admin`
-> in the loop.
+> Authoring one sequenced sample **by hand** — no pre-flight file — and
+> processing it with a `fastq-to-parquet` work-ticket. The whole flow is
+> `user`-role: no `wet_lab_admin` or `system_admin` in the loop.
+
+Use this when you already hold the FASTQs and want one sample in the
+system. Bringing in a whole sequencing run instead goes through a
+pre-flight file and one bundled command, which creates the run, the pool,
+and every sample for you: [`getting-started.md`](getting-started.md).
 
 Two audiences: an operator runs these steps as a post-deploy smoke
 ([`first-deploy.md`](first-deploy.md) Step 11 links here), and a user
@@ -15,115 +19,13 @@ creator, or per-study `ADMIN` tier — rather than a blanket
 ## Prerequisites
 
 - A working deploy (see [`first-deploy.md`](first-deploy.md)).
-- An OIDC provider that returns the user's email and that the deploy is
-  configured to accept.
-- `qiita` CLI installed and reachable on the user's `$PATH` (built from
-  `qiita-control-plane/src/qiita_control_plane/cli/user.py`; available
-  as a console script after `uv tool install qiita-control-plane`).
+- The `qiita` CLI installed, a PAT in hand, a complete profile, and a
+  study plus a biosample you own — steps 0 through 3 of
+  [`getting-started.md`](getting-started.md). They leave you with the
+  `$STUDY_IDX` and `$BIOSAMPLE_IDX` this flow starts from.
 
-## 0. Log in
 
-```bash
-qiita --base-url https://qiita.example.org login
-```
-
-Opens the AuthRocket LoginRocket Web flow in the browser; the loopback
-HTTP receiver writes a PAT to `~/.qiita/token` (mode `0600`). Subsequent
-commands read the PAT from `$QIITA_TOKEN` (env var, takes precedence)
-or `~/.qiita/token`.
-
-### Headless / remote hosts (carry the PAT)
-
-`qiita login` drives a browser **and** a localhost loopback receiver, so the
-two must be on the **same machine**. On a headless or remote host — an SSH
-session, an HPC login node, a CI runner — that flow can't complete: a browser
-on your laptop would redirect to *your laptop's* localhost, not the remote
-host's. The first-class headless path is to **carry the PAT** rather than log
-in there:
-
-1. On a machine with a browser, log in once and read the minted PAT:
-
-   ```bash
-   qiita --base-url https://qiita.example.org login
-   cat ~/.qiita/token
-   ```
-
-2. On the headless host, point the CLI at the server and hand it the PAT via
-   the environment — `$QIITA_TOKEN` takes precedence over `~/.qiita/token`, so
-   no `login` runs there:
-
-   ```bash
-   export QIITA_CONTROL_PLANE_URL=https://qiita.example.org
-   export QIITA_TOKEN='<paste the PAT>'
-   qiita whoami          # no --base-url / login needed
-   ```
-
-`$QIITA_TOKEN` (+ `$QIITA_CONTROL_PLANE_URL`) is the supported automation entry
-point — CI jobs and service scripts set them directly from a secret store
-instead of calling `login`.
-
-```bash
-qiita whoami
-```
-
-Expected fields:
-
-- `kind: human`
-- `email: <your email>`
-- `system_role: user`
-- `scopes: [...]` — the USER ceiling: `self:profile, self:token,
-  reference:read, biosample:read, biosample:write, prep_sample:read,
-  prep_sample:write, study:read, study:write`.
-
-A 401 means the PAT is missing or revoked; re-run `qiita login` (or, on a
-headless host, re-set `$QIITA_TOKEN` — see "Headless / remote hosts" above).
-
-## 1. Complete your profile (one time)
-
-The PAT-mint path refuses to issue tokens for profile-incomplete users.
-If you skipped this on first login:
-
-```bash
-qiita profile set \
-    --affiliation "Knight Lab" \
-    --address "9500 Gilman Dr, La Jolla, CA 92093" \
-    --phone "+1-858-555-0100"
-```
-
-Optional: `--orcid`, `--receive-processing-emails` /
-`--no-receive-processing-emails`.
-
-## 2. Create a study
-
-```bash
-qiita study create --title "My first user-CLI study"
-```
-
-The route mints the `study` row, sets `owner_idx` to your principal,
-and inserts an `ADMIN`-tier `study_access` row for you in the same
-transaction. The `study_idx` in the response is the handle for every
-downstream call.
-
-## 3. Create a biosample on that study
-
-```bash
-qiita biosample create \
-    --study-idx $STUDY_IDX \
-    --owner-biosample-id-field-name sample_name \
-    --owner-biosample-id-value SAMPLE-1
-```
-
-Auth path: `require_study_access(min_tier=Tier.ADMIN)` admits the
-study owner (owner-bypass) regardless of `study_access` row, so the
-study you just created passes immediately. `--owner-idx` defaults to
-your own principal via `whoami` if omitted.
-
-To add a biosample to a study you don't own, you need an
-`ADMIN`-tier `qiita.study_access` row on that study. There is no
-self-service grant flow yet — an operator inserts the row directly
-(see the limitations section at the end).
-
-## 4. Create a sequencing run
+## 1. Create a sequencing run
 
 The instrument-level container. No role / tier gate — any user with
 `prep_sample:write` (which is in the USER ceiling) can stand one up.
@@ -137,21 +39,20 @@ qiita sequencing-run create \
 The route records you as `created_by_idx`; this is the key the next
 two steps' caller-creator guards check.
 
-## 5. Create a sequenced pool on the run
+## 2. Create a sequenced pool on the run
 
 ```bash
 qiita sequenced-pool create --run-idx $RUN_IDX
 ```
 
 Auth path: `require_caller_owns_run()` admits you because you created
-the run in step 4. Wet-lab admins bypass the creator check.
+the run in step 1. Wet-lab admins bypass the creator check.
 
-Optional `--run-preflight-blob /path/to/file.sqlite` attaches the
-instrument's pre-flight checks; the route stores the raw bytes in
-the `run_preflight_blob` BYTEA column and defaults the filename to
-the file's basename.
+`--run-preflight-blob` attaches a pre-flight file to the pool. Hand-authoring
+does not need one; the bundled ingest gestures pass it themselves
+([`getting-started.md`](getting-started.md)).
 
-## 6. Create a sequenced sample (the prep_sample)
+## 3. Create a sequenced sample (the prep_sample)
 
 ```bash
 qiita sequenced-sample create \
@@ -165,7 +66,7 @@ qiita sequenced-sample create \
 
 `--pool-item-id` is a per-pool unique label for this item (a well
 position or library barcode). **It must also be the filename prefix
-of every fastq this sample's work-ticket processes** — see step 7.
+of every fastq this sample's work-ticket processes** — see step 4.
 The value used here, `filename_prefix`, is a placeholder; substitute
 the actual prefix of your fastq files (for paired-end input,
 `filename_prefix` implies `filename_prefix_R1.fastq` /
@@ -175,7 +76,7 @@ start with this value.
 
 Auth paths:
 
-- `require_caller_owns_pool()` — you created the pool in step 5.
+- `require_caller_owns_pool()` — you created the pool in step 2.
 - `require_caller_has_admin_on_all_studies` over the primary study
   plus every secondary — you own the primary study by owner-bypass.
   Add a secondary study you also have ADMIN on with
@@ -189,7 +90,7 @@ The response carries both `prep_sample_idx` (the supertype) and
 seeded by the migrations (`short_read_metagenomics` is the default
 that ships).
 
-## 7. Submit fastq-to-parquet
+## 4. Submit fastq-to-parquet
 
 ```bash
 qiita ticket submit \
@@ -210,7 +111,7 @@ absolute paths the orchestrator can read (validated by the action's
 `context_schema`).
 
 **Filename-prefix rule.** Every fastq basename must start with the
-`--pool-item-id` you chose in step 6 — here `filename_prefix`. The
+`--pool-item-id` you chose in step 3 — here `filename_prefix`. The
 control plane resolves the prep_sample's `sequenced_pool_item_id` and
 rejects the submission (422) when a basename does not carry that
 prefix, so the filenames alone identify which DB row a fastq belongs
@@ -222,7 +123,7 @@ to. The rule applies to every path you pass:
   the lone forward read is checked against the same prefix.
   Forward-only submission is fully supported.
 
-## 8. Poll for status
+## 5. Poll for status
 
 ```bash
 qiita ticket status $WORK_TICKET_IDX
@@ -233,31 +134,19 @@ action_version`, `scope_target`, `action_context`, `retry_count /
 max_retries`, the `failure_*` surface, and timestamps. Auth: the
 originator (you) passes; wet_lab_admin+ can read any ticket.
 
-State progression:
-
-- `pending` → just submitted, dispatch task scheduled.
-- `queued` → dispatcher has it.
-- `processing` → orchestrator is running the workflow.
-- `completed` → terminal; Parquet has been written under the
-  ticket's workspace and (for fastq-to-parquet) `sequence_range`
-  is populated.
-- `failed` → terminal-for-now; check `failure_type`,
-  `failure_stage`, `failure_step_name`, `failure_reason`. Recovery
-  recipes live in [`fastq-to-parquet-retry-recovery.md`](fastq-to-parquet-retry-recovery.md).
-
-A `processing` state that stalls past the action's
-`walltime_ceiling` is the operator's signal to look at the
+The state progression and the failure surface are the same for every
+action; [`getting-started.md`](getting-started.md) lists them. `completed`
+here means the Parquet is under the ticket's workspace and the sample's
+`sequence_range` is populated. A `processing` state that stalls past the
+action's `walltime_ceiling` is the operator's signal to look at the
 orchestrator logs.
 
 ## What this flow does NOT cover
 
 - **Cross-study access grants.** Attaching a biosample or sample to a
-  study you do not own requires an `ADMIN`-tier `qiita.study_access`
-  row on that study. No CLI or API surface issues those grants today:
-  an operator inserts the row with a direct
-  `INSERT INTO qiita.study_access (study_idx, principal_idx,
-  access_tier, granted_by_idx)` against the database. A self-service
-  grant flow is future work.
+  study you do not own needs an `ADMIN`-tier `qiita.study_access` row on
+  that study, which only an operator can issue — see
+  [`auth.md`](../auth.md) under *User self-service*.
 - **Reference-data authoring.** `reference:write` is wet_lab_admin+;
   end-users consume references but do not author them.
 - **Service-account flows.** End-user PATs do not carry
@@ -269,7 +158,8 @@ orchestrator logs.
 ## Smoke-testing this flow
 
 The integration test `tests/integration/test_user_authoring_smoke.py`
-walks steps 2–8 end-to-end: it stands up a real control-plane server
+walks this flow end-to-end from study creation: it stands up a real
+control-plane server
 and shells out to the actual `qiita` CLI for every command, so the
 flag names in this runbook are mechanically pinned against argparse
 drift. Run it via `make test-integration`.

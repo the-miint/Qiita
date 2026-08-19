@@ -22,6 +22,19 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **A getting-started runbook for bringing a run in (#461).** `docs/runbooks/getting-started.md`
+  walks the path the bundled ingest gestures actually require: create the study with a
+  `bioproject_accession`, create its biosamples with `biosample_accession`s, build the
+  kl-run-preflight file outside Qiita naming both, then `submit-bcl-convert` or
+  `submit-pacbio-ingest`. The ordering is not stylistic — `_provision_run_pool_roster`
+  resolves every pre-flight row against existing Qiita rows keyed on those two accessions and
+  exits without side effects when either lookup misses, so a study minted without an accession
+  cannot be reached from a sheet at all. That prerequisite was documented nowhere. The runbook
+  also generalizes the pre-flight pre-patching trap that was filed under PacBio: pool identity
+  is the SHA-256 of the blob's bytes and both gestures read those bytes before `open_db_file`
+  patches the file in place, so an unpatched submit followed by a re-run mints a second pool on
+  either platform.
+
 - **A published feature table's rows can now be labelled without our identifiers (#448).**
   `POST /exported-feature` mints the public handle for a feature-axis entity, the way
   `/exported-identifier` already does for the sample axis — so a table, its taxonomy sidecar
@@ -904,6 +917,12 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **`submit-bcl-convert --help` named a pre-flight column that does not exist (#461).** The
+  `--prep-protocol-idx` help told operators the per-row `study_idx` "comes out of the file"
+  via `project.qiita_id`. The pinned kl-run-preflight schema has no such column; the study is
+  resolved from `project.bioproject_accession` through `/study/lookup-by-accession`. The help
+  now says that, matching what `submit-pacbio-ingest` already said.
 
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
   (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
@@ -1928,6 +1947,15 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **`user-cli-quickstart.md` is now the by-hand path only, and the landing page points at the
+  new runbook (#461).** It kept a full copy of login, profile, study and biosample creation,
+  which the getting-started runbook now owns; what remains is what is unique to it — minting a
+  run, pool and sequenced-sample yourself and submitting `fastq-to-parquet` against FASTQs you
+  already hold. `pacbio-ingest.md` likewise drops where-to-run-the-CLI, the pre-flight
+  writability trap and the `--force` rule, keeping only what has no Illumina counterpart. The
+  "no self-service study_access grant" fact moves to `docs/auth.md`, which owns the auth
+  surface, instead of being restated in each runbook.
 
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that

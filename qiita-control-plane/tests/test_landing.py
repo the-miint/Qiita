@@ -102,9 +102,7 @@ async def test_landing_links_into_repo_docs(app):
         response = await ac.get("/")
     body = response.text
     assert "https://github.com/the-miint/Qiita#readme" in body
-    assert (
-        "https://github.com/the-miint/Qiita/blob/main/docs/runbooks/user-cli-quickstart.md" in body
-    )
+    assert "https://github.com/the-miint/Qiita/blob/main/docs/runbooks/getting-started.md" in body
     assert "https://github.com/the-miint/Qiita/blob/main/docs/architecture.md" in body
     # Same-origin link into the self-hosted Swagger UI (served by main.py).
     assert 'href="/docs"' in body
