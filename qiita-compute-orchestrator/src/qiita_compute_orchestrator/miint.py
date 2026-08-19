@@ -113,6 +113,27 @@ def duckdb_tmp_dir(workspace: Path) -> Iterator[Path]:
         shutil.rmtree(duckdb_tmp, ignore_errors=True)
 
 
+@contextmanager
+def mafft_scratch_cwd(base: Path) -> Iterator[Path]:
+    """run the body with CWD in `<base>/.mafft` so MAFFT's scratch (order/pre/trace)
+    lands there, not the launch dir — miint's linked MAFFT writes those to CWD and
+    ignores TMPDIR. removed on exit.
+
+    chdir is process-global, so the body must be synchronous miint work using only
+    absolute paths (a blocking conn.execute monopolizes the loop thread, so nothing
+    else runs while CWD is moved). TODO(duckdb-miint#NNN): push this into the MAFFT
+    fork so the scratch honors TMPDIR and this helper can go away."""
+    scratch = base / ".mafft"
+    scratch.mkdir(parents=True, exist_ok=True)
+    prev = Path.cwd()
+    os.chdir(scratch)
+    try:
+        yield scratch
+    finally:
+        os.chdir(prev)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def apply_duckdb_settings(
     conn: duckdb.DuckDBPyConnection,
     duckdb_tmp: Path,
