@@ -641,3 +641,109 @@ async def _resolve_qc_adapters(
             f"default adapter reference {default_adapter_reference_idx}: {exc}"
         ) from exc
     return {QC_ADAPTER_BINDING: adapter_parquet}
+
+
+# =============================================================================
+# SortMeRNA reference resolution (amplicon denoise)
+# =============================================================================
+#
+# The amplicon workflow's `denoise` step 16S-pre-filters with SortMeRNA, which
+# needs a FASTA of the reference. Rather than a fixed operator path, the workflow
+# names a loaded `sequence_reference` by `sortmerna_reference_idx` (also part of
+# the run's processing identity); the runner materializes its sequences to a FASTA
+# on shared scratch and binds it as `sortmerna_ref`.
+
+SORTMERNA_REF_BINDING = "sortmerna_ref"
+# action_context key naming the reference to materialize (an integer reference_idx).
+SORTMERNA_REFERENCE_IDX_KEY = "sortmerna_reference_idx"
+
+
+def _write_reference_fasta(rows: list[tuple[int, int, str]], out_path: Path) -> int:
+    """Reassemble chunked sequences (group by feature_idx, order by chunk_index,
+    concat chunk_data — the same reassembly as `_write_adapter_parquet`) into a
+    plain FASTA at `out_path`, one record per feature: `>{feature_idx}\\n{seq}\\n`.
+    The header is the feature_idx — SortMeRNA only needs a unique id per reference
+    sequence (we consume `aligned`/`coverage`, never the header). Records are
+    ordered by feature_idx for determinism. Returns the sequence count; raises
+    ValueError on an empty set (a SortMeRNA reference with no sequences is a
+    misconfiguration). Same newline/uniqueness contract as the adapter writer:
+    chunk_data is newline-free and (feature_idx, chunk_index) is unique."""
+    by_feature: dict[int, list[tuple[int, str]]] = {}
+    for feature_idx, chunk_index, chunk_data in rows:
+        by_feature.setdefault(feature_idx, []).append((chunk_index, chunk_data))
+    if not by_feature:
+        raise ValueError("SortMeRNA reference returned no sequences")
+    with out_path.open("w") as fh:
+        for feature_idx in sorted(by_feature):
+            seq = "".join(chunk for _, chunk in sorted(by_feature[feature_idx]))
+            fh.write(f">{feature_idx}\n{seq}\n")
+    return len(by_feature)
+
+
+async def _resolve_sortmerna_ref(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    action_context: dict[str, Any],
+    *,
+    data_plane_url: str,
+    signing_key: bytes,
+    workspace: Path,
+) -> dict[str, Path]:
+    """Materialize the amplicon workflow's SortMeRNA `sequence_reference` to a
+    FASTA for the denoise step.
+
+    Run before the step loop when a step declares `sortmerna_ref`. Reads
+    `sortmerna_reference_idx` from action_context, checks the reference is an
+    ACTIVE `sequence_reference`, DoGets its sequence chunks, reassembles them, and
+    writes `<workspace>/sortmerna_ref.fasta` (the shared-FS ticket root every
+    compute node sees). Re-run safe: a resume re-materializes the same file (DoGet
+    is read-only).
+
+    Every failure raises a SUBMISSION-attributed BAD_INPUT the outer handler turns
+    into a FAILED ticket (mirrors `_resolve_qc_adapters`): a missing
+    reference_idx, an unknown / wrong-kind / non-active reference, an unreachable
+    data plane, or an empty reference."""
+    reference_idx = action_context.get(SORTMERNA_REFERENCE_IDX_KEY)
+    if reference_idx is None:
+        raise _submission_bad_input(
+            "an amplicon workflow requires `sortmerna_reference_idx` in "
+            "action_context (the loaded SortMeRNA sequence_reference to 16S-filter with)"
+        )
+    row = await pool.fetchrow(
+        "SELECT kind, status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if row is None:
+        raise _submission_bad_input(f"SortMeRNA reference {reference_idx} does not exist")
+    if row["kind"] != "sequence_reference":
+        raise _submission_bad_input(
+            f"SortMeRNA reference {reference_idx} has kind {row['kind']!r}, "
+            "expected 'sequence_reference'"
+        )
+    if row["status"] != ReferenceStatus.ACTIVE.value:
+        raise _submission_bad_input(
+            f"SortMeRNA reference {reference_idx} status is {row['status']!r}, "
+            f"must be {ReferenceStatus.ACTIVE.value!r}"
+        )
+
+    ticket = sign_ticket(
+        table=_REFERENCE_CHUNKS_TABLE,
+        filter={"reference_idx": [reference_idx]},
+        secret=signing_key,
+    )
+    try:
+        rows = await asyncio.get_event_loop().run_in_executor(
+            None, _runner_pkg._do_get_reference_sequence_chunks, data_plane_url, ticket
+        )
+    except Exception as exc:
+        raise _submission_dp_fetch_failure(
+            f"could not fetch SortMeRNA reference {reference_idx} sequences from the "
+            f"data plane: {type(exc).__name__}: {exc}",
+            exc,
+        ) from exc
+    workspace.mkdir(parents=True, exist_ok=True)
+    fasta = workspace / "sortmerna_ref.fasta"
+    try:
+        _write_reference_fasta(rows, fasta)
+    except ValueError as exc:
+        fasta.unlink(missing_ok=True)
+        raise _submission_bad_input(f"SortMeRNA reference {reference_idx}: {exc}") from exc
+    return {SORTMERNA_REF_BINDING: fasta}

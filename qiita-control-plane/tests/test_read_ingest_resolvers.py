@@ -20,15 +20,21 @@ from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 from qiita_control_plane.runner import (
+    BARCODE_MAP_BINDING,
+    POOL_READS_BINDING,
     SAMPLE_MAP_BINDING,
     STAGED_MASKED_READS_BINDING,
     STAGED_READS_BINDING,
+    _concat_read_parts,
+    _resolve_barcode_map,
+    _resolve_pool_reads,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
+    _write_reference_fasta,
 )
 
 
@@ -381,3 +387,192 @@ def test_block_read_resolvers_are_gone():
         "_write_empty_reads_parquet",
     ):
         assert not hasattr(runner, name), f"{name} should have been removed"
+
+
+# --- barcode_map (golay-demux) ----------------------------------------------
+
+
+def test_resolve_barcode_map_writes_parquet(tmp_path):
+    """The action_context roster is written with the (prep_sample_idx, barcode,
+    barcodes_are_rc) columns the golay_demux step reads."""
+    action_context = {
+        BARCODE_MAP_BINDING: [
+            {"prep_sample_idx": 5, "barcode": "ACGT", "barcodes_are_rc": True},
+            {"prep_sample_idx": 6, "barcode": "TTGG", "barcodes_are_rc": False},
+        ]
+    }
+    bound = asyncio.run(_resolve_barcode_map(action_context, tmp_path / "ws"))
+    out = bound[BARCODE_MAP_BINDING]
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(
+            f"SELECT prep_sample_idx, barcode, barcodes_are_rc FROM read_parquet('{out}') "
+            "ORDER BY prep_sample_idx"
+        ).fetchall()
+    assert rows == [(5, "ACGT", True), (6, "TTGG", False)]
+
+
+def test_resolve_barcode_map_rejects_empty_roster(tmp_path):
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(_resolve_barcode_map({BARCODE_MAP_BINDING: []}, tmp_path / "ws"))
+    assert exc.value.kind == FailureKind.BAD_INPUT
+
+
+# --- SortMeRNA reference FASTA writer ----------------------------------------
+
+
+def test_write_reference_fasta_reassembles_chunks(tmp_path):
+    """Chunks are grouped by feature_idx, ordered by chunk_index, concatenated,
+    and written one FASTA record per feature (header = feature_idx)."""
+    rows = [
+        (2, 1, "CGA"),  # deliberately out of feature + chunk order
+        (1, 0, "ACG"),
+        (2, 0, "TT"),
+        (1, 1, "GGA"),
+    ]
+    out = tmp_path / "ref.fasta"
+    n = _write_reference_fasta(rows, out)
+    assert n == 2
+    assert out.read_text() == ">1\nACGGGA\n>2\nTTCGA\n"
+
+
+def test_write_reference_fasta_empty_raises(tmp_path):
+    with pytest.raises(ValueError, match="no sequences"):
+        _write_reference_fasta([], tmp_path / "ref.fasta")
+
+
+# --- pool_reads (amplicon) ---------------------------------------------------
+
+
+class _PrepFetchPool:
+    """Minimal asyncpg.Pool stand-in: `fetch` returns the canned prep_sample rows."""
+
+    def __init__(self, prep_sample_idxs):
+        self._rows = [{"prep_sample_idx": i} for i in prep_sample_idxs]
+
+    async def fetch(self, *_args):
+        return self._rows
+
+
+def _write_read_parquet(path, prep_sample_idx, n):
+    """Write a `read`-shaped parquet (the durable per-sample copy shape)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "COPY (SELECT ?::BIGINT AS prep_sample_idx, "
+            "  range::BIGINT AS sequence_idx, "
+            "  'r' || range AS read_id, 'ACGT' AS sequence1, "
+            "  NULL::UTINYINT[] AS qual1, NULL::VARCHAR AS sequence2, "
+            "  NULL::UTINYINT[] AS qual2 FROM range(?)) "
+            f"TO '{path}' (FORMAT PARQUET)",
+            [prep_sample_idx, n],
+        )
+
+
+def _pool_reads_kwargs(tmp_path):
+    return {
+        "data_plane_url": "grpc://unused",
+        "signing_key": b"x" * 32,
+        "workspace": tmp_path / "ticket" / "9",
+    }
+
+
+def test_resolve_pool_reads_durable_fastpath_concats(tmp_path, monkeypatch):
+    """Durable per-sample copies present → pool_reads is their concatenation and
+    the data plane is NOT called."""
+    staging_root = tmp_path / "staging"
+    for prep_sample_idx, n in [(11, 3), (12, 2)]:
+        durable = compute_reads_staging_path(staging_root, prep_sample_idx)
+        _write_read_parquet(durable, prep_sample_idx, n)
+
+    monkeypatch.setattr(
+        _EXPORT_READ,
+        lambda _u, _t: (_ for _ in ()).throw(AssertionError("export_read must not fire")),
+    )
+
+    bound = asyncio.run(
+        _resolve_pool_reads(
+            _PrepFetchPool([11, 12]),
+            {"kind": "sequenced_pool", "sequenced_pool_idx": 3},
+            staging_root,
+            **_pool_reads_kwargs(tmp_path),
+        )
+    )
+    out = bound[POOL_READS_BINDING]
+    with duckdb.connect(":memory:") as conn:
+        total, samples = conn.execute(
+            f"SELECT count(*), count(DISTINCT prep_sample_idx) FROM read_parquet('{out}')"
+        ).fetchone()
+    assert (total, samples) == (5, 2)
+
+
+def test_resolve_pool_reads_export_fallback_skips_empty(tmp_path, monkeypatch):
+    """Durable copies absent: reads come from export_read; a zero-read sample (a
+    blank / NTC) is skipped, not fatal, and the pool_reads holds only the rest."""
+    workspace = tmp_path / "ticket" / "9"
+
+    def _fake_export(_url, token):
+        # Decode is opaque here; route by call order via a mutable counter.
+        idx = _fake_export.calls.pop(0)
+        if idx == 0:  # sample with reads
+            dest = workspace / "reads_21.parquet"
+            _write_read_parquet(dest, 21, 4)
+            return {"count": 4, "dest": str(dest)}
+        return {"count": 0, "dest": "x"}  # empty blank
+
+    _fake_export.calls = [0, 1]
+    monkeypatch.setattr(_EXPORT_READ, _fake_export)
+
+    bound = asyncio.run(
+        _resolve_pool_reads(
+            _PrepFetchPool([21, 22]),
+            {"kind": "sequenced_pool", "sequenced_pool_idx": 3},
+            tmp_path / "staging",
+            **_pool_reads_kwargs(tmp_path),
+        )
+    )
+    out = bound[POOL_READS_BINDING]
+    with duckdb.connect(":memory:") as conn:
+        total, samples = conn.execute(
+            f"SELECT count(*), count(DISTINCT prep_sample_idx) FROM read_parquet('{out}')"
+        ).fetchone()
+    assert (total, samples) == (4, 1)
+
+
+def test_resolve_pool_reads_no_prep_samples_is_bad_input(tmp_path):
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_pool_reads(
+                _PrepFetchPool([]),
+                {"kind": "sequenced_pool", "sequenced_pool_idx": 3},
+                tmp_path / "staging",
+                **_pool_reads_kwargs(tmp_path),
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+
+
+def test_resolve_pool_reads_all_empty_is_no_data(tmp_path, monkeypatch):
+    """Every sample returns zero reads → terminal NO_DATA (the pool isn't ingested)."""
+    monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
+    with pytest.raises(StepNoData):
+        asyncio.run(
+            _resolve_pool_reads(
+                _PrepFetchPool([31, 32]),
+                {"kind": "sequenced_pool", "sequenced_pool_idx": 3},
+                tmp_path / "staging",
+                **_pool_reads_kwargs(tmp_path),
+            )
+        )
+
+
+def test_concat_read_parts_unions_by_name(tmp_path):
+    """`_concat_read_parts` unions per-sample parquets into one, preserving rows."""
+    a = tmp_path / "a.parquet"
+    b = tmp_path / "b.parquet"
+    _write_read_parquet(a, 1, 3)
+    _write_read_parquet(b, 2, 5)
+    out = tmp_path / "pool.parquet"
+    _concat_read_parts([str(a), str(b)], str(out))
+    with duckdb.connect(":memory:") as conn:
+        total = conn.execute(f"SELECT count(*) FROM read_parquet('{out}')").fetchone()[0]
+    assert total == 8

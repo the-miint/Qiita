@@ -82,10 +82,12 @@ from ._processing import (
 )
 from ._read_ingest import (
     BARCODE_MAP_BINDING,
+    POOL_READS_BINDING,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
     SAMPLE_MAP_BINDING,
     _resolve_barcode_map,
+    _resolve_pool_reads,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
@@ -103,9 +105,11 @@ from ._reconstruct import (
 )
 from ._reference import (
     QC_ADAPTER_BINDING,
+    SORTMERNA_REF_BINDING,
     _resolve_host_filter_indexes,
     _resolve_qc_adapters,
     _resolve_sharded_align_index_bindings,
+    _resolve_sortmerna_ref,
     _resolve_syndna_index,
     _workflow_needs_adapters,
     _workflow_needs_sharded_align_indexes,
@@ -329,6 +333,40 @@ async def run_workflow(
             bound.update(await _resolve_barcode_map(bound, workspace))
         if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
+
+        # SortMeRNA reference materialization (amplicon `denoise` step): resolve the
+        # `sortmerna_reference_idx` sequence_reference to a FASTA the step reads.
+        # Like the reference resolvers above, off fixed operator paths.
+        if _workflow_declares_input(action.steps, SORTMERNA_REF_BINDING):
+            bound.update(
+                await _resolve_sortmerna_ref(
+                    pool,
+                    bound,
+                    data_plane_url=data_plane_url,
+                    signing_key=signing_key,
+                    workspace=workspace,
+                )
+            )
+
+        # Pool-reads binding (amplicon workflow): `pool_reads` is consumed by the
+        # denoise step but produced by none, so bind it from the sequenced_pool's
+        # stored raw reads (16S is not masked). sequenced_pool-scoped only.
+        if _workflow_declares_input(action.steps, POOL_READS_BINDING):
+            if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
+                raise _submission_bad_input(
+                    "a workflow that consumes `pool_reads` must be sequenced_pool-scoped; "
+                    f"got {scope_target['kind']!r}"
+                )
+            bound.update(
+                await _resolve_pool_reads(
+                    pool,
+                    scope_target,
+                    upload_staging_root,
+                    data_plane_url=data_plane_url,
+                    signing_key=signing_key,
+                    workspace=workspace,
+                )
+            )
 
         # Staged-read binding (read-mask workflows): `reads` is consumed by qc /
         # host_filter but produced by no step, so bind it from stored reads.
