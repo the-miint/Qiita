@@ -2062,16 +2062,34 @@ impl ReplaceKey {
 ///
 /// The `IN` operand is a subquery, not a literal list: DuckDB plans it as a SEMI
 /// hash join and pushes the incoming keys' min/max into the lake scan as a
-/// dynamic filter. Measured on DuckDB 1.5.4 against a DuckLake catalog holding
-/// 1.0M rows over 57 files per table, with 16k incoming keys over 4 files — the
-/// composite `(prep_sample_idx, processing_idx)` delete scans 17,544 rows of
-/// 1,000,008 and opens 1 of the 57 files. A content-hashed `feature_idx` set is
-/// the case that does not prune: its min/max spans the whole identity space, so
-/// the derived range excludes nothing and the scan reads the table. That is the
-/// key distribution rather than the statement — a `WITH … DELETE … USING`
-/// rewrite plans the same apart from INNER vs SEMI, with identical filters and
-/// identical scan cardinality in every case, and no measurable time difference
-/// (25 alternating pairs, paired permutation p = 0.90).
+/// dynamic filter. What the delete reads therefore follows the SPREAD of the
+/// incoming key set against the per-file key ranges the catalog holds — not the
+/// key's arity, and not the table's size.
+///
+/// Measured on DuckDB 1.5.4 / ducklake d318a545. Against a catalog holding 1.0M
+/// rows over 57 files per table, 16k incoming keys over 4 files:
+///
+/// * composite `(prep_sample_idx, processing_idx)`, one pair per load: scans
+///   17,544 rows of 1,000,008 and opens 1 of the 57 files.
+/// * `feature_idx` spread over the identity space: scans 1,003,121 of 1,003,200
+///   and opens 57 of 57 — the derived range covers every file, so the scan reads
+///   the table.
+/// * `feature_idx` confined to one narrow window: scans 17,602 of 1,003,200 and
+///   still opens 57 of 57 — all 57 files hold a `feature_idx` below the window's
+///   maximum, so the range prunes row groups and no file.
+///
+/// Against a second catalog, single-column `feature_idx`, 2k incoming keys in
+/// one file, table size varied: one contiguous incoming block scans 2,000 rows
+/// and opens 1 file at both 40k rows over 20 files and 400k over 200; the same
+/// count of keys spread over the identity space scans 39,982 of 40,000 and
+/// 399,819 of 400,000, opening every file at both sizes.
+///
+/// A `WITH … DELETE … USING` rewrite plans the same apart from INNER vs SEMI —
+/// same dynamic filters, same scan cardinality, same files read — on each of the
+/// four key sets measured on the first catalog (the three above plus one
+/// matching no lake row). Over 25 alternating pairs per key set the mean paired
+/// difference (this statement minus the rewrite) ran from -0.8 ms to +1.0 ms on
+/// statements of 3-37 ms, the widest 95% CI being [-3.2, +2.9] ms.
 ///
 /// `table` / `keys` are interpolated because they are `REPLACE_KEY_TABLES`
 /// literals (the caller looks them up there, never using the payload's own
@@ -2097,15 +2115,16 @@ fn replace_key_delete_sql(table: &str, keys: &[&str], n_files: usize) -> String 
 ///
 /// A budget rather than an attempt count, because the retries a writer needs is
 /// the number of writers ahead of it, which nothing here knows. It is a livelock
-/// backstop. Measured against a DuckLake catalog: a whole
-/// registration transaction (lock UPDATE + replace-by-key DELETE + one
-/// `ducklake_add_data_files`) takes ~14 ms against a lake that already holds the
-/// incoming keys, ~7 ms when it does not, and the DELETE's cost does not grow
-/// with the table — 12 ms at both 40k rows over 20 files and 400k over 200, so it
-/// prunes rather than scanning. Since every writer queues behind one row, that
-/// per-transaction cost IS the queue rate, and this budget covers a queue far
-/// longer than a deploy produces. Exceeding it means something other than
-/// contention is wrong, and the error says so.
+/// backstop. Measured against a DuckLake catalog holding 40k rows over 20 files,
+/// with a contiguous incoming key set: a whole registration transaction (lock
+/// UPDATE + replace-by-key DELETE + one `ducklake_add_data_files`) takes ~14 ms
+/// against a lake that already holds the incoming keys, ~7 ms when it does not.
+/// Since every writer queues behind one row, that per-transaction cost IS the
+/// queue rate, and this budget covers a queue far longer than a deploy produces.
+/// The DELETE's share of it is set by the spread of the incoming key set rather
+/// than by the table's size — `replace_key_delete_sql` carries what each key set
+/// scans, including the sets where it reads the whole table. Exceeding the
+/// budget means something other than contention is wrong, and the error says so.
 ///
 /// A registration cannot be retried from the top — its staging files were already
 /// moved — so an exhausted budget loses the load.

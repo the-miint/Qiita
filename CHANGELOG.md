@@ -953,6 +953,22 @@ duplicates further down are historical strata; leave them where they are.
   `bin_quality`'s delete now reads the keys `assembly_membership` names in the same
   registration, which carries the run's key on every row and is never empty where the load
   runs at all (`assembly_hash` raises `StepNoData` at zero contigs of any kind).
+  The file stated the delete's cost twice and the two disagreed: `LAKE_COMMIT_BUDGET` read a
+  40k/400k timing as "the DELETE's cost does not grow with the table … so it prunes rather
+  than scanning", while `replace_key_delete_sql` 25 lines above said a `feature_idx` set does
+  not prune. That timing was taken on a contiguous incoming key set, which neither comment
+  said. `replace_key_delete_sql` is now the only site that states it, and the budget points
+  there: what the delete reads follows the SPREAD of the incoming key set against the
+  per-file key ranges, not the key's arity and not the table's size. Measured on DuckDB
+  1.5.4 / ducklake d318a545 — a composite `(prep_sample_idx, processing_idx)` pair scans
+  17,544 rows of 1,000,008 and opens 1 of 57 files; a `feature_idx` set spread over the
+  identity space scans 1,003,121 of 1,003,200 and opens all 57; a `feature_idx` set confined
+  to one narrow window scans 17,602 of 1,003,200 and still opens all 57; a contiguous
+  `feature_idx` block scans 2,000 rows and opens 1 file at both 40k rows over 20 files and
+  400k over 200, where the same key count spread over the identity space scans 39,982 of
+  40,000 and 399,819 of 400,000. The `WITH … DELETE … USING` comparison now reports the mean
+  paired difference and its interval (-0.8 to +1.0 ms across four key sets on statements of
+  3-37 ms, widest 95% CI [-3.2, +2.9] ms) rather than a bare non-significant p-value.
 
 - **`test_assembly_hash`'s canonical-hash oracle mis-complemented a soft-masked contig
   (#460).** Its hand-rolled reverse complement translated through an upper-case-only table
@@ -965,6 +981,15 @@ duplicates further down are historical strata; leave them where they are.
   case. The `LEAST`-over-hashes composition is still re-derived in Python, so a change to
   how the two hashes combine still fails the oracle. A soft-masked fixture covers it; every
   sequence the file hashed before was either upper-case or a palindrome.
+  `read_fastx` preserves input case (probed: an all-upper control record comes back
+  unchanged, its lowercase twin comes back lowercase), so the soft-masked fixture reaches
+  `canonical_sequence_hash_expr` still lowercase and the test pins the `upper()` inside that
+  expression rather than a transformation the reader already did. That test now also pins
+  which record's bytes reach the chunks: the fold keeps one representative per hash
+  (`DISTINCT ON (sequence_hash) … ORDER BY sequence_hash, read_id`) and chunks it as read, so
+  a different tie-break stores a different strand and casing with every hash assertion
+  unmoved. One happy-path fixture is no longer a reverse-complement palindrome, so its
+  `_hash` comparison exercises the fold instead of the identity.
 
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
   (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
