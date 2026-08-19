@@ -943,9 +943,10 @@ duplicates further down are historical strata; leave them where they are.
   false, and the minted `QF<idx>` the generated column produces from that pairing. Written
   as an allowlist rather than `<> 'qiita'` so a further internal source mints a handle
   until it is listed, instead of publishing. `_INSERT_FEATURE` is untouched: it already
-  reads a nullable `reference_membership.accession`. Latent — nothing writes a
-  `source='qiita'` genome row yet — and a new unit test fails if a `GenomeSource` member is
-  left unclassified by the predicate.
+  reads a nullable `reference_membership.accession`. The one writer of such a genome row is
+  a `qiita reference load` genome map declaring `genome_source='qiita'` with a
+  `prep_sample_idx`; a new unit test fails if a `GenomeSource` member is left unclassified
+  by the predicate.
 
 - **Re-running `long-read-assembly` over a sample doubled its `assembly_membership` and
   `bin_quality` rows (#460).** `processing_idx` hashes `{workflow, version, mask_idx,

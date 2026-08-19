@@ -1,16 +1,11 @@
 """The genome kind's source predicate: whose `qiita.genome.source_id` gets published.
 
-`source_id` is NOT NULL on every genome and is an accession only where the source
-is an external repository. A `source='qiita'` genome was assembled from one of our
-own prep_samples, so its source_id is a name we composed; the mint offers it no
-accession and Postgres generates a `QF<idx>` handle instead.
+`_SOURCE_ID_IS_EXTERNAL_ACCESSION` in `repositories/exported_feature.py` is the
+single copy of why the predicate is written the way it is. Two things are covered
+here:
 
-Two things are covered:
-
-* every `GenomeSource` member is classified external or not. The mint reads the
-  external half as an allowlist, so an unclassified member takes the handle rather
-  than publishing — and no other test in the suite reports that it was never
-  classified. This one needs no database, so it runs in the pure-unit tier.
+* every `GenomeSource` member is classified external or not. Needs no database, so
+  it runs in the pure-unit tier.
 * the behaviour that follows, per member: an external source publishes its
   source_id as `export_feature_id`, an internal one gets `QF<idx>`, a NULL
   `accession` and `accession_published` false.
@@ -36,9 +31,10 @@ from qiita_control_plane.testing.db_seeds import (
 
 
 def test_every_genome_source_is_classified_external_or_not():
-    """A member added to `GenomeSource` without a decision here would be non-external
-    by omission — correct for an internal source, wrong for the next external one,
-    and invisible either way until an artifact carries the label."""
+    """Nothing else in the suite reports a member left unclassified, and the cost is
+    asymmetric: the omission is right for an internal source and wrong for the next
+    external one, either way visible only once a published artifact carries the
+    label."""
     classified = set(_SOURCE_ID_IS_EXTERNAL_ACCESSION)
     members = set(GenomeSource)
     assert classified == members, (
@@ -50,8 +46,8 @@ def test_every_genome_source_is_classified_external_or_not():
 @pytest.mark.db
 @pytest.mark.parametrize("source", list(GenomeSource), ids=lambda s: s.value)
 async def test_the_source_decides_whether_source_id_is_published(postgres_pool, source):
-    """Parametrized over the whole vocabulary rather than the two cases the fix
-    names, so a new member has to be given a behaviour along with its
+    """Parametrized over the whole vocabulary rather than over one external source
+    and one internal one, so a new member has to be given a behaviour along with its
     classification — `_SOURCE_ID_IS_EXTERNAL_ACCESSION[source]` raises otherwise.
 
     The seeded source_id spells `GCF_…` for every source, so an internal genome that
@@ -92,7 +88,6 @@ async def test_the_source_decides_whether_source_id_is_published(postgres_pool, 
             assert row["accession_published"] is False
             assert row["export_feature_id"].startswith("QF")
             assert row["export_feature_id"][2:].isdigit()
-            assert source_id not in row["export_feature_id"]
     finally:
         await postgres_pool.execute(
             "DELETE FROM qiita.exported_feature WHERE genome_idx = $1", genome_idx
