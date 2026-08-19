@@ -2509,8 +2509,7 @@ async def test_get_sequenced_sample_carries_missing_reason_marker(ctx):
 async def test_get_sequenced_sample_carries_terminology_term(ctx):
     """Tests the case where a globally-linked metadata row is a terminology
     term (value_terminology_term_idx populated): the GET response surfaces
-    the row's value as a TerminologyTermRef on the wire (idx + term_id +
-    label).
+    the row's value as a TerminologyTermRef on the wire.
     """
     # Reuse the seeded NCBI Taxonomy + metagenome term.
     term_row = await fetch_seeded_metagenome_term(ctx["pool"])
@@ -2553,6 +2552,7 @@ async def test_get_sequenced_sample_carries_terminology_term(ctx):
                 "idx": term_row["idx"],
                 "term_id": term_row["term_id"],
                 "label": term_row["label"],
+                "alternate_label": None,
             },
         },
     }
