@@ -1,15 +1,16 @@
-"""DB tests for `mint-features` over an ASSEMBLY genome map — the source='qiita' half.
+"""DB test for `mint-features` over an ASSEMBLY genome map.
 
-The reference workflows' maps name external repositories, and the integration tier
-covers that shape. `long-read-assembly` opens the other branch of the same code: a
-map whose every row is `genome_source='qiita'` and therefore must carry the origin
-`prep_sample_idx` the `genome_qiita_origin_check` biconditional requires. What is
-covered here is the join between the two components — that the Parquet
-`assembly_hash` writes is one `_validate_genome_map` accepts and `_associate_genomes`
-resolves into `qiita.genome` + `qiita.feature_genome`.
+`tests/integration/test_action_library.py` covers the primitive's genome-map
+behaviour one property at a time, on external-source maps. This covers the one
+combination `long-read-assembly` produces and none of those tests do: three
+`genome_source='qiita'` genomes in a single batch, one of them shared by two
+features, every row carrying the origin `prep_sample_idx` that
+`genome_qiita_origin_check` requires of that source.
 
-The genome-map SCHEMA is restated below rather than imported, so a producer-side
-column rename fails here instead of at runtime on the deploy host.
+The genome-map columns are spelled out here rather than imported: the producer is
+`qiita_compute_orchestrator`, which is not a control-plane dependency. What each
+side requires is named by `_validate_genome_map` here and by the job's own tests
+there; nothing pins the two spellings to each other.
 """
 
 from __future__ import annotations
@@ -49,9 +50,9 @@ async def test_an_assembly_genome_map_lands_one_genome_per_kind_and_bin(postgres
     """One LCG contig, a two-contig MAG, and one unbinned contig: three genomes, four
     feature_genome rows, each genome carrying the origin prep_sample.
 
-    The MAG's two contigs share a `genome_source_id`, which is the case
-    `_write_genome_associations` dedupes before its upsert — Postgres rejects an
-    `ON CONFLICT DO UPDATE` that touches one conflict target twice.
+    The MAG's two contigs share a `genome_source_id` — the repeated conflict target
+    `_write_genome_associations` dedupes before its upsert — while carrying a
+    non-NULL prep_sample_idx.
     """
     principal_idx = await seed_user_principal(
         postgres_pool, prefix="asm-genome", suffix=str(uuid.uuid4())[:8]
@@ -121,22 +122,3 @@ async def test_an_assembly_genome_map_lands_one_genome_per_kind_and_bin(postgres
             "DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx
         )
         await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
-
-
-async def test_a_qiita_genome_map_without_the_origin_sample_is_rejected(postgres_pool, tmp_path):
-    """The map assembly_hash writes always sets prep_sample_idx; a producer that
-    stopped fails before any DB write rather than at the `genome_qiita_origin_check`
-    biconditional, which would leave the features already minted."""
-    sequence_hash = uuid.uuid4()
-    manifest = _write_parquet(
-        tmp_path / "manifest.parquet",
-        _MANIFEST_SCHEMA,
-        [("LCG:c1:c1", str(sequence_hash), 16)],
-    )
-    genome_map = _write_parquet(
-        tmp_path / "genome_map.parquet",
-        _GENOME_MAP_SCHEMA,
-        [("LCG:c1:c1", GenomeSource.QIITA.value, "no-origin", None)],
-    )
-    with pytest.raises(ValueError, match="qiita-origin rule"):
-        await mint_features(postgres_pool, manifest, tmp_path / "out", genome_map_path=genome_map)

@@ -29,11 +29,10 @@ first token come back as two rows with the same `read_id` (probed), so their
 synthetic ids collide too. Pass 2 joins `winner` on that id over a fresh scan of
 every record, so one colliding pair puts BOTH contigs' chunks under EACH of their
 two `sequence_hash` values — the stored bytes for a feature then hold a sequence
-that is not that feature's. The same collision maps two contigs onto one
-`genome_source_id` for LCG and UNBINNED, whose `bin_id` is the contig id. The
-uniqueness check below runs over the full scan rather than the surviving rows,
-because pass 2 re-derives the id from every record the DELETE would have removed
-too.
+that is not that feature's. The same collision maps two LCG or UNBINNED contigs
+onto one `genome_source_id`. The uniqueness check below runs over the full scan
+rather than the surviving rows, because pass 2 re-derives the id from every
+record the DELETE would have removed too.
 
 **Shared canonical identity.** `sequence_hash` is
 `qiita_common.chunking.canonical_sequence_hash_expr` — the SAME expression
@@ -84,7 +83,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-import duckdb
+import pyarrow as pa
 from pydantic import BaseModel
 from qiita_common.assembly_constants import KIND_LCG, KIND_MAG, KIND_UNBINNED
 from qiita_common.backend_failure import StepNoData
@@ -119,9 +118,6 @@ _DUCKDB_THREADS = 4
 # Byte budget for each `read_fastx` batch — caps the read-side vector so a run of
 # multi-MB contig records can't materialise a giant chunk before the chunker runs.
 _READ_FASTX_MAX_BATCH_BYTES = "128MB"
-
-# Rows per batch when the distinct genome keys stream through Python to be hashed.
-_GENOME_KEY_BATCH_ROWS = 10_000
 
 # How many colliding synthetic read_ids the uniqueness failure names.
 _DUPLICATE_ID_SAMPLE = 5
@@ -291,17 +287,19 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # docstring: what a collision does to the stored chunks and to the
             # genome identity). read_id is `kind:bin_id:contig_id` composed, so this
             # covers a repeated triple and a separator ambiguity alike.
+            # `count(*) OVER ()` is evaluated over the whole grouped result before
+            # LIMIT clips it, so the total collision count rides the sample rather
+            # than costing a second aggregation over `contig`.
             dupes = conn.execute(
-                "SELECT read_id, count(*) AS n FROM contig GROUP BY read_id "
-                "HAVING count(*) > 1 ORDER BY read_id LIMIT ?",
+                "SELECT read_id, n, count(*) OVER () AS colliding FROM ("
+                "  SELECT read_id, count(*) AS n FROM contig "
+                "  GROUP BY read_id HAVING count(*) > 1) "
+                "ORDER BY read_id LIMIT ?",
                 [_DUPLICATE_ID_SAMPLE],
             ).fetchall()
             if dupes:
-                colliding = conn.execute(
-                    "SELECT count(*) FROM ("
-                    "  SELECT read_id FROM contig GROUP BY read_id HAVING count(*) > 1)"
-                ).fetchone()[0]
-                shown = ", ".join(f"{read_id!r} x{n}" for read_id, n in dupes)
+                colliding = dupes[0][2]
+                shown = ", ".join(f"{read_id!r} x{n}" for read_id, n, _ in dupes)
                 raise ValueError(
                     f"contig ids are not unique for prep_sample_idx={inputs.prep_sample_idx}: "
                     f"{colliding} synthetic read_id(s) `kind:bin_id:contig_id` repeat across "
@@ -339,47 +337,33 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"TO '{bin_map_out}' ({PARQUET_OPTS})"
             )
 
-            # One genome per distinct (kind, bin_id): every LCG contig, every refined
-            # bin, every unbinned contig. `_genome_source_id` is Python (the canonical
-            # JSON has one implementation, in qiita_common.hashing), so the keys stream
-            # through it in batches.
+            # One genome per distinct (kind, bin_id) (module docstring:
+            # `genome_map.parquet`). `_genome_source_id` is Python — the canonical JSON
+            # has one implementation, in qiita_common.hashing — so the distinct keys are
+            # hashed here and joined back as ONE registered Arrow table.
             #
-            # The reader runs on a SECOND connection. An `executemany` on the reader's
-            # OWN connection invalidates the open reader and the loop ENDS EARLY with no
-            # error — measured at duckdb 1.5.4: 5 rows read in batches of 2 land 2 rows,
-            # against 5 with the reader on its own connection. Every key past the first
-            # batch would be missing, and the INNER JOIN below drops those contigs from
-            # the genome map silently. The keys come from the bin_map just written rather
-            # than from `contig` because a TEMP TABLE is not visible across connections
-            # and the rows are the same.
-            conn.execute(
-                "CREATE TEMP TABLE genome_key (kind VARCHAR, bin_id VARCHAR, source_id VARCHAR)"
+            # `to_arrow_table` materialises those keys. A LAZY reader over the same
+            # query (`.arrow()` returns one) is invalidated by the next write on this
+            # connection and stops early with no error — at duckdb 1.5.4, 5 rows read
+            # in batches of 2 deliver 2 — which would drop keys from the join below
+            # and silently leave those contigs out of the map.
+            keys = conn.execute("SELECT DISTINCT kind, bin_id FROM contig").to_arrow_table()
+            source_ids = [
+                _genome_source_id(
+                    prep_sample_idx=inputs.prep_sample_idx,
+                    processing_idx=inputs.processing_idx,
+                    kind=kind,
+                    bin_id=bin_id,
+                )
+                for kind, bin_id in zip(
+                    keys.column("kind").to_pylist(),
+                    keys.column("bin_id").to_pylist(),
+                    strict=True,
+                )
+            ]
+            conn.register(
+                "genome_key", keys.append_column("source_id", pa.array(source_ids, pa.string()))
             )
-            with duckdb.connect(":memory:") as key_conn:
-                key_reader = key_conn.execute(
-                    "SELECT DISTINCT kind, bin_id FROM read_parquet(?)", [str(bin_map_out)]
-                ).to_arrow_reader(_GENOME_KEY_BATCH_ROWS)
-                for batch in key_reader:
-                    conn.executemany(
-                        "INSERT INTO genome_key VALUES (?, ?, ?)",
-                        [
-                            (
-                                kind,
-                                bin_id,
-                                _genome_source_id(
-                                    prep_sample_idx=inputs.prep_sample_idx,
-                                    processing_idx=inputs.processing_idx,
-                                    kind=kind,
-                                    bin_id=bin_id,
-                                ),
-                            )
-                            for kind, bin_id in zip(
-                                batch.column("kind").to_pylist(),
-                                batch.column("bin_id").to_pylist(),
-                                strict=True,
-                            )
-                        ],
-                    )
             conn.execute(
                 "COPY (SELECT c.read_id, "
                 "  CAST(? AS VARCHAR) AS genome_source, "
@@ -389,6 +373,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"TO '{genome_map_out}' ({PARQUET_OPTS})",
                 [GenomeSource.QIITA.value, inputs.prep_sample_idx],
             )
+            conn.unregister("genome_key")
 
             # winner — the ONE surviving contig per canonical sequence_hash, chosen
             # as a NARROW `DISTINCT ON (sequence_hash)` over the in-memory `contig`

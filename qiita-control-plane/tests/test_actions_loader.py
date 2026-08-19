@@ -199,8 +199,7 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
         assembly_load thread `processing_idx` via params (a container step can't
         take a scalar param — the runner treats it as a bind path);
       * assembly_hash emits the genome map and mint-features takes it as a second
-        input, so each LCG contig / refined bin / unbinned contig reaches
-        qiita.genome.
+        declared input.
     """
     from pathlib import Path
 
@@ -251,10 +250,9 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
     # assembly_load threads processing_idx via params so the runner mints the run
     # identity before the step loop; write-assembly-membership then reads it.
     assert load_step.params == {"processing_idx": "processing_idx"}
-    # assembly_hash threads it too, because the genome source_id it mints is scoped
-    # to the run; and it produces the genome map mint-features consumes as its
-    # second input (the assembly workflow's map is a step output, not an uploaded
-    # companion, so it is wired in the YAML rather than through action_context).
+    # assembly_hash threads it too (`_genome_source_id` scopes the genome identity
+    # to the run), and it produces the genome map mint-features takes as a second
+    # declared input.
     assert hash_step.params == {"processing_idx": "processing_idx"}
     assert "genome_map" in hash_step.outputs
     mint_step = next(s for s in assembly.steps if s.name == "mint-features")

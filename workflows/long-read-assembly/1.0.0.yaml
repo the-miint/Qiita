@@ -185,8 +185,8 @@ steps:
   # canonical sequence_hash), hash-keyed assembly_chunks/, bin_map
   # (read_id → kind, bin_id), and genome_map (read_id → the qiita genome each
   # contig belongs to). Zero contigs of any kind is StepNoData. Threads
-  # processing_idx via params: because it enters the genome identity, so a re-run
-  # under different params mints its own genomes rather than reusing a prior run's.
+  # processing_idx via params: because it enters the genome identity
+  # (`_genome_source_id` in the job module).
   - step: assembly_hash
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.assembly_hash
@@ -200,10 +200,9 @@ steps:
 
   # Mint feature_idx for every contig hash against the SHARED qiita.feature (same
   # primitive reference-add uses) — identical bytes collapse to one feature_idx.
-  # `genome_map` additionally puts each LCG contig, refined bin, and unbinned
-  # contig in qiita.genome / qiita.feature_genome under source='qiita' — the same
-  # relations reference MAGs already occupy. The reference workflows leave it out
-  # and pass their map through action_context instead.
+  # `genome_map` additionally lands each contig's genome in qiita.genome /
+  # qiita.feature_genome under source='qiita'. It is optional for this primitive;
+  # the runner's mint-features dispatch carries the rule.
   - action: mint-features
     inputs: [manifest, genome_map]
     outputs: [feature_map]

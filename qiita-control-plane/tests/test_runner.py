@@ -5465,8 +5465,7 @@ async def test_dispatch_mint_features_takes_the_genome_map_as_a_declared_input(
     postgres_pool, library_spy, tmp_path
 ):
     """mint-features resolves `genome_map` from `entry.inputs` when the workflow
-    declares it — the long-read-assembly shape, where the map is a step output
-    rather than an uploaded companion.
+    declares it — the long-read-assembly shape.
 
     The two inputs are resolved by NAME: the entry below lists them in the
     non-obvious order, and the manifest must still arrive as the manifest.

@@ -89,8 +89,7 @@ def _source_id(*, prep_sample_idx: int, processing_idx: int, kind: str, bin_id: 
     Only the canonical-JSON digest comes from the shared helper (`qiita_common.hashing`,
     which production also calls); the tuple and the hex rendering around it are
     re-derived, so dropping a member or changing the rendering still fails. Same split
-    as `_hash` below, which takes the reverse complement from miint and re-derives the
-    composition."""
+    as `_hash` above."""
     return canonical_params_hash(
         {
             "bin_id": bin_id,
@@ -172,15 +171,8 @@ def test_happy_path_manifest_bin_map_and_chunks(tmp_path):
             c[0]: c[1]
             for c in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [glob]).fetchall()
         }
-        assert cols == {"sequence_hash": "UUID", "chunk_index": "INTEGER", "chunk_data": "VARCHAR"}
-        reassembled = dict(
-            con.execute(
-                "SELECT CAST(sequence_hash AS VARCHAR), "
-                "string_agg(chunk_data, '' ORDER BY chunk_index) "
-                "FROM read_parquet(?) GROUP BY sequence_hash",
-                [glob],
-            ).fetchall()
-        )
+    assert cols == {"sequence_hash": "UUID", "chunk_index": "INTEGER", "chunk_data": "VARCHAR"}
+    reassembled = _reassembled(chunks_dir)
     assert reassembled[str(_hash("AAAACCCCGGGGTTTT"))] == "AAAACCCCGGGGTTTT"
     assert reassembled[str(_hash("ACGTACGTACGTACGT"))] == "ACGTACGTACGTACGT"
 
@@ -580,11 +572,8 @@ def test_genome_map_is_one_genome_per_kind_and_bin(tmp_path):
 
 def test_genome_source_id_is_scoped_to_the_sample_and_the_run(tmp_path):
     """The same bin under a different prep_sample or processing_idx is a different
-    genome; under the same pair it is the same one.
-
-    `genome.prep_sample_idx` is a scalar FK, so two samples' identical single-contig
-    genomes must not resolve to one row that can record only one of them.
-    """
+    genome; under the same pair it is the same one (`_genome_source_id`: why the
+    identity is minted from the run rather than from the bin's contents)."""
     genomes, refined = _layout(tmp_path)
     _fasta(refined / "bin.1.fa", {"x1": "ACGTACGTACGTACGT"})
 
@@ -610,12 +599,11 @@ def test_genome_source_id_is_scoped_to_the_sample_and_the_run(tmp_path):
 def test_repeated_contig_id_fails_instead_of_collapsing(tmp_path):
     """Two records whose headers share a first token fail the step.
 
-    `read_fastx` returns both records under one `read_id`, so their synthetic ids
-    collide. The control below is the byte-identical fixture with only the second
-    header's first token changed: it succeeds, and each sequence_hash carries its
-    OWN bytes. Without the guard the colliding pair stores both sequences under each
-    hash (pass 2 joins `winner` on the synthetic id over a fresh scan), and both
-    contigs mint one `genome_source_id`.
+    What an uncaught collision does to the stored bytes and to the genome identity
+    is the job module's uniqueness paragraph. The control here is the byte-identical
+    fixture with only the second header's first token changed: it succeeds, each
+    sequence_hash carries its OWN bytes, and the two contigs mint two
+    `genome_source_id`s.
 
     Neither sequence equals its own reverse complement, and one is soft-masked, so
     the stored-bytes assertion discriminates on both axes the canonical hash folds.
@@ -660,8 +648,7 @@ def test_repeated_contig_id_fails_even_when_the_residue_delete_would_drop_one(tm
 
     Both noLCG records are named `ctg1`; a refined bin claims the bytes of one, so
     the residue DELETE removes that row and leaves a single UNBINNED survivor with a
-    unique id. Pass 2 re-derives the id from every scanned record, so the survivor's
-    `winner` row would still match the deleted record too.
+    unique id.
     """
     genomes, refined = _layout(tmp_path)
     binned, residue = "AAAAAAAACCCCGGGG", "TTTTAAAACCCCGGGG"
@@ -679,33 +666,3 @@ def test_repeated_contig_id_fails_even_when_the_residue_delete_would_drop_one(tm
             ),
             tmp_path / "ws",
         )
-
-
-def test_every_genome_key_survives_a_multi_batch_read(tmp_path, monkeypatch):
-    """More distinct genomes than one key batch still map every contig.
-
-    The keys are hashed in Python between reads of an Arrow reader; if that reader
-    ever shared the connection the INSERTs run on, it would end after the first
-    batch with no error and the INNER JOIN that builds the map would drop the rest.
-    The batch size is shrunk here so a handful of contigs spans several batches.
-    """
-    import qiita_compute_orchestrator.jobs.assembly_hash as ahmod
-
-    monkeypatch.setattr(ahmod, "_GENOME_KEY_BATCH_ROWS", 2)
-    genomes, refined = _layout(tmp_path)
-    contigs = {f"c{i}": f"ACGTTGCAAGGGTTCA{'ACGT'[i % 4]}{'A' * i}" for i in range(7)}
-    _fasta(genomes / "circular.fa", contigs)
-
-    out = _run(
-        Inputs(
-            genomes_dir=genomes,
-            refined_bins_dir=refined,
-            processing_idx=77,
-            prep_sample_idx=42,
-            work_ticket_idx=3,
-        ),
-        tmp_path / "ws",
-    )
-    mapped = _rows(out["genome_map"], "read_id, genome_source_id", "read_id")
-    assert [r[0] for r in mapped] == sorted(f"LCG:{cid}:{cid}" for cid in contigs)
-    assert len({r[1] for r in mapped}) == len(contigs)

@@ -1,9 +1,6 @@
 -- migrate:up
 
--- Comment only; no schema change. qiita.genome has carried no comment, and the
--- long-read-assembly tail now writes source='qiita' rows for three kinds of
--- subject, one of which is a single unbinned contig. Record what a row does and
--- does not assert, at the table the rows land in.
+-- Comment only; no schema change.
 
 COMMENT ON TABLE qiita.genome IS
     'A genome-level subject features are grouped under (qiita.feature_genome). A '
