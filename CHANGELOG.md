@@ -22,6 +22,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Unbinned assembly contigs are stored, as a third `assembly_membership` kind (#460).**
+  `assembly_hash` hashes the `noLCG.fa` residue — the contigs no DAS_Tool-refined bin
+  claimed — alongside the circular genomes and the refined MAGs, so they are minted a
+  `feature_idx` against the shared `qiita.feature` and recorded under `kind = 'UNBINNED'`
+  with the contig id as `bin_id` (the `(kind, bin_id)` shape `LCG` already uses). Unbinned
+  contigs can be valid sequence, DNA viruses in particular; previously they died with the
+  workspace.
+  **It is the residue, not all of `noLCG.fa`.** The refined MAGs are drawn from those same
+  contigs, so hashing the file whole would give every binned contig a second membership row
+  for one `feature_idx` — the bytes dedup, the membership does not. The exclusion is keyed
+  on the canonical sequence hash, not the contig id. Id preservation through binning and
+  refinement is measured for `hifiasm_meta` only: 198,747/198,747 refined-bin records across
+  57 assembly workspaces on the deploy host carried a first-token contig id identical to
+  their `noLCG.fa` record (whole-header on a 6-ticket subset, 5,660/5,660). It is
+  unmeasured for `myloasm` — no myloasm assembly exists on the host, and its header
+  grammar differs — so an id key would rest on an unmeasured assembler; the same match
+  measured there is what would make one viable. Two consequences of keying on content —
+  a bin holding a contig on the opposite strand still excludes its noLCG record (the
+  canonical hash folds both strands), and noLCG records sharing a canonical sequence
+  leave the residue together.
+  `StepNoData` narrows to match: only an assembler that produced no contig at all is
+  no-data, so a sample whose contigs all went unbinned now stores them. The `kind` value set
+  moves to `qiita_common.assembly_constants`, the contract layer both Python services
+  depend on, and the Postgres and DuckLake `assembly_membership` comments name it instead of
+  enumerating members (a comment-only migration).
+
 - **A getting-started runbook for bringing a run in (#461).** `docs/runbooks/getting-started.md`
   walks the path the bundled ingest gestures actually require: create the study with a
   `bioproject_accession`, create its biosamples with `biosample_accession`s, build the
@@ -917,6 +943,114 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **xdist workers shared one miint extension directory, so they installed on top of
+  each other (#462).** `setup_miint_test_env` named the directory per *component*
+  (`qiita-control-plane-duckdb-ext` under the system temp), and the control-plane suite
+  is the one that runs `-n auto --dist worksteal` — so N worker processes pointed
+  `extension_directory` at one path and each ran its own `INSTALL miint`. A cold INSTALL
+  downloads into a `tmp-<uuid>` file and renames that over `miint.duckdb_extension` and
+  its `.info`, which makes N workers N concurrent writers to those two paths; CI saw it as
+  `IO Error: Could not set lock on file …miint.duckdb_extension.tmp-<uuid>.duckdb_extension.info`
+  surfacing through an unrelated `_handle_feature_table_build` assertion, because the
+  install that failed is the one the code under test performs (`connect_with_miint()`),
+  not a conftest fixture — which is also why a fixture-level lock could not have covered
+  it. The directory now carries the worker id when `PYTEST_XDIST_WORKER` is set
+  (`qiita-control-plane-gw0-duckdb-ext`) and is unchanged for the single-process suites
+  (qiita-common, the orchestrator, the integration tier). The worker also has to *replace*
+  the directory it inherits rather than `setdefault` past it: a worker gets its environment
+  from the controller, which ran the same helper first and had already exported the shared
+  path, so the split alone left every worker pointing back at it — measured, the per-worker
+  directories came out 0 bytes and the shared one held the only install. Only that one
+  value is replaced, so a directory pinned from outside still reaches the suite as given.
+  It costs no extra downloads on a cold cache — each worker already downloaded its own
+  copy, only the rename target changes — each directory still caches across runs (24.5s
+  cold, 4.9s warm for the tier), and the name still matches the documented
+  `rm -rf "$TMPDIR"/qiita-*-duckdb-ext`, which a new unit test pins along with the split
+  and the inheritance. It does multiply the cached bytes: 67 MB per worker under the system
+  temp, 670 MB across the 10 workers `-n auto` picks on a 10-core machine. The race itself
+  was not reproduced locally — 5×8 concurrent cold installs on linux/amd64 and 3×8 on
+  macOS, both at DuckDB 1.5.4, produced no lock error — so the shared directory is the
+  established defect and the lock error is a reasoned, not demonstrated, consequence of it.
+
+- **`POST /exported-feature` would have published a qiita-derived genome's composed
+  `source_id` verbatim (#462).** `_INSERT_GENOME` offered `qiita.genome.source_id` as the
+  accession candidate for every genome, on the premise that `source_id` is NOT NULL and so
+  the genome kind always has an accession to offer. NOT NULL holds; "is an accession" does
+  not, for `source='qiita'` — a genome assembled from one of our own prep_samples has no
+  external authority behind its source_id, and `export_feature_id` labels rows in a feature
+  table, its taxonomy sidecar and its sheared tree. The statement now offers the accession
+  only for a source on an allowlist of external repositories (`genbank`, `refseq`), so an
+  internal source gets the hybrid's other half — a NULL accession, `accession_published`
+  false, and the minted `QF<idx>` the generated column produces from that pairing. Written
+  as an allowlist rather than `<> 'qiita'` so a further internal source mints a handle
+  until it is listed, instead of publishing. `_INSERT_FEATURE` is untouched: it already
+  reads a nullable `reference_membership.accession`. The one writer of such a genome row is
+  a `qiita reference load` genome map declaring `genome_source='qiita'` with a
+  `prep_sample_idx`; two new unit tests fail if a `GenomeSource` member is left
+  unclassified by the predicate, or if `qiita` is classified external — the latter pinned
+  as a literal, since every other assertion reads its expectation out of the predicate and
+  so agrees with whatever it says. The route's OpenAPI description names the new case.
+
+- **Re-running `long-read-assembly` over a sample doubled its `assembly_membership` and
+  `bin_quality` rows (#460).** `processing_idx` hashes `{workflow, version, mask_idx,
+  assembler}`, so a second run resolves to the SAME identity whenever those four hold — an
+  edited workflow file included — and the submit path admits it: the prep_sample arm of
+  `_check_disallow_without_delete` binds only the non-terminal states, so a COMPLETED ticket
+  does not block a fresh one, and no assembly result carries a DELETE gate. Both tables were
+  appended rather than replaced, leaving both runs' rows under one `(prep_sample_idx,
+  processing_idx)` with nothing on the row to tell them apart. Measured across two
+  registrations of the same rows: `assembly_membership` 0 → 2 → 4, `bin_quality` 0 → 1 → 2.
+  `register_files` now replaces both on the composite `(prep_sample_idx, processing_idx)`, so
+  a re-run supersedes that sample's rows for that run — a row agreeing on one half of the key
+  (another sample of the same run, the same sample under a different run) is untouched. The
+  replace-by-key statement widened from one key column to a row constructor to carry it; the
+  file paths stay bound parameters.
+  A re-run that yields no refined MAG is the case the key alone does not cover: CheckM
+  covers refined bins only, so `assembly_load` writes `bin_quality` empty-with-schema, the
+  file names no key, and a delete reading it removed nothing — measured, the previous run's
+  MAG rows survived a re-run whose `assembly_membership` was replaced out from under them
+  (`replaced` empty, 1 row before and after; the same load carrying one MAG row replaced it).
+  `bin_quality`'s delete now reads the keys `assembly_membership` names in the same
+  registration, which carries the run's key on every row and is never empty where the load
+  runs at all (`assembly_hash` raises `StepNoData` at zero contigs of any kind).
+  The file stated the delete's cost twice and the two disagreed: `LAKE_COMMIT_BUDGET` read a
+  40k/400k timing as "the DELETE's cost does not grow with the table … so it prunes rather
+  than scanning", while `replace_key_delete_sql` 25 lines above said a `feature_idx` set does
+  not prune. That timing was taken on a contiguous incoming key set, which neither comment
+  said. `replace_key_delete_sql` is now the only site that states it, and the budget points
+  there: what the delete reads follows the SPREAD of the incoming key set against the
+  per-file key ranges, not the key's arity and not the table's size. Measured on DuckDB
+  1.5.4 / ducklake d318a545 — a composite `(prep_sample_idx, processing_idx)` pair scans
+  17,544 rows of 1,000,008 and opens 1 of 57 files; a `feature_idx` set spread over the
+  identity space scans 1,003,121 of 1,003,200 and opens all 57; a `feature_idx` set confined
+  to one narrow window scans 17,602 of 1,003,200 and still opens all 57; a contiguous
+  `feature_idx` block scans 2,000 rows and opens 1 file at both 40k rows over 20 files and
+  400k over 200, where the same key count spread over the identity space scans 39,982 of
+  40,000 and 399,819 of 400,000. The `WITH … DELETE … USING` comparison now reports the mean
+  paired difference and its interval (-0.8 to +1.0 ms across four key sets on statements of
+  3-37 ms, widest 95% CI [-3.2, +2.9] ms) rather than a bare non-significant p-value.
+
+- **`test_assembly_hash`'s canonical-hash oracle mis-complemented a soft-masked contig
+  (#460).** Its hand-rolled reverse complement translated through an upper-case-only table
+  and upper-cased the result afterwards, so a lowercase base passed through uncomplemented
+  and the "reverse strand" it hashed was the plain reverse. Over 2,000 random 16 bp
+  lowercase sequences the oracle disagreed with `canonical_sequence_hash_expr` on 1,362
+  (68.1%); over the same sequences upper-cased, on 0. The oracle now takes its reverse
+  complement from miint's `sequence_dna_reverse_complement` — the scalar the production
+  expression calls — applied to the upper-cased sequence, since that function preserves
+  case. The `LEAST`-over-hashes composition is still re-derived in Python, so a change to
+  how the two hashes combine still fails the oracle. A soft-masked fixture covers it; every
+  sequence the file hashed before was either upper-case or a palindrome.
+  `read_fastx` preserves input case (probed: an all-upper control record comes back
+  unchanged, its lowercase twin comes back lowercase), so the soft-masked fixture reaches
+  `canonical_sequence_hash_expr` still lowercase and the test pins the `upper()` inside that
+  expression rather than a transformation the reader already did. That test now also pins
+  which record's bytes reach the chunks: the fold keeps one representative per hash
+  (`DISTINCT ON (sequence_hash) … ORDER BY sequence_hash, read_id`) and chunks it as read, so
+  a different tie-break stores a different strand and casing with every hash assertion
+  unmoved. One happy-path fixture is no longer a reverse-complement palindrome, so its
+  `_hash` comparison exercises the fold instead of the identity.
 
 - **`submit-bcl-convert --help` named a pre-flight column that does not exist (#461).** The
   `--prep-protocol-idx` help told operators the per-row `study_idx` "comes out of the file"

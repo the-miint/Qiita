@@ -4,7 +4,8 @@ The assembly analogue of the reference_membership INSERT that
 `qiita_control_plane.actions.library.write_membership` performs inline: a bulk,
 idempotent link of a prep_sample's assembly RUN (processing_idx) contigs — each a
 qiita.feature minted via the SHARED mint-features path — to the bin they belong to
-(kind = 'LCG' | 'MAG', bin_id). The DuckDB-side JOIN (bin_map x manifest x
+(kind, bin_id; the kind value set is enumerated in
+`qiita_common.assembly_constants`). The DuckDB-side JOIN (bin_map x manifest x
 feature_map -> (kind, bin_id, feature_idx)) and the batch streaming live in the
 library primitive; this module owns only the raw bulk-insert SQL, mirroring
 repositories.processing owning qiita.mint_processing's call.

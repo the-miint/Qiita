@@ -874,6 +874,55 @@ async def test_submit_prep_sample_disallow_without_delete(
     assert "in flight" in second.text.lower()
 
 
+async def test_submit_prep_sample_completed_does_not_block(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    prep_sample_action,
+    prep_sample_idx,
+):
+    """A COMPLETED prep_sample ticket does NOT block a fresh submission of the
+    same (action, sample) triple — no force, no admin role needed.
+
+    The prep_sample arm of `_check_disallow_without_delete` binds only
+    `NON_TERMINAL_WORK_TICKET_STATES`; the COMPLETED gate is sequenced_pool-only.
+    For actions whose result is a minted row (a mask), a downstream
+    DELETE-gated check refuses the re-run. `long-read-assembly` has no such
+    gate, so this 202 is what a re-run of an already-assembled sample gets.
+    """
+    token, admin_idx = admin_token
+    action_id, version = prep_sample_action
+
+    completed_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, state)"
+        " VALUES ($1, $2, $3, 'prep_sample', $4, $5::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        prep_sample_idx,
+        WorkTicketState.COMPLETED.value,
+    )
+    wt_client._created_tickets.append(completed_idx)
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    new_idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(new_idx)
+    assert new_idx != completed_idx
+
+
 async def test_submit_prep_sample_kind_match_passes(
     wt_client,
     postgres_pool,

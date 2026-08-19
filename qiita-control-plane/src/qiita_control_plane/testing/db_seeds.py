@@ -28,7 +28,7 @@ from qiita_common.hashing import canonical_params_hash
 # seed helpers, so they stay reachable from here.
 from qiita_common.models import NCBI_TAXONOMY_HUMAN_TERM_ID as NCBI_TAXONOMY_HUMAN_TERM_ID
 from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
-from qiita_common.models import FieldDataType, ReferenceStatus
+from qiita_common.models import FieldDataType, GenomeSource, ReferenceStatus
 
 from qiita_control_plane.miint import connect_with_miint
 from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
@@ -876,18 +876,30 @@ async def seed_bare_feature(pool: asyncpg.Pool) -> int:
     )
 
 
-async def seed_genome(pool: asyncpg.Pool, *, source: str = "refseq") -> tuple[int, str]:
+async def seed_genome(
+    pool: asyncpg.Pool,
+    *,
+    source: GenomeSource = GenomeSource.REFSEQ,
+    prep_sample_idx: int | None = None,
+) -> tuple[int, str]:
     """Insert a `qiita.genome`; return `(genome_idx, source_id)`.
 
     The source_id is returned because `qiita.genome`'s uniqueness is the
     composite `(source, source_id)` — a caller asserting on provenance needs the
     generated accession, and generating it here is what keeps it unique.
+
+    `prep_sample_idx` is required for `GenomeSource.QIITA` and refused for any
+    other source: `genome_qiita_origin_check` is a biconditional. A test that wants
+    a source outside the vocabulary — `genome_source_check` rejecting it — writes
+    the INSERT itself; this helper only produces rows the CHECKs accept.
     """
     source_id = f"GCF_{uuid.uuid4().hex[:12]}"
     genome_idx = await pool.fetchval(
-        "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2) RETURNING genome_idx",
-        source,
+        "INSERT INTO qiita.genome (source, source_id, prep_sample_idx)"
+        " VALUES ($1, $2, $3) RETURNING genome_idx",
+        str(source),
         source_id,
+        prep_sample_idx,
     )
     return genome_idx, source_id
 

@@ -2,9 +2,9 @@
 same manifest + hash-keyed-chunks shape `hash_sequences` produces, plus a bin_map.
 
 Head of the assembly-storage tail. The heavy tools ran in containers; this native
-step reads their circular-genome (LCG) and refined-MAG FASTA outputs and produces
-the inputs the SHARED reference-load machinery consumes downstream
-(mint-features -> write-assembly-membership -> assembly_load):
+step reads their circular-genome (LCG), refined-MAG, and unbinned-residue FASTA
+outputs and produces the inputs the SHARED reference-load machinery consumes
+downstream (mint-features -> write-assembly-membership -> assembly_load):
 
   - `manifest.parquet` — `(read_id, sequence_hash, sequence_length_bp)`, one row
     per contig. `read_id` is a SYNTHETIC globally-unique id
@@ -31,14 +31,36 @@ first token) and split into 64 KB chunks with miint's native `sequence_split`
 as passed, so a small in-memory `file_meta(filepath, kind, bin_id)` table (built
 from the input paths) JOINs the scan back to each contig's kind + bin without
 fragile filename regex. A MAG's bin_id is its file (one FASTA per bin groups many
-contigs); the LCG contigs arrive as a single `circular.fa` multi-FASTA and each is
-its own genome, so an LCG's bin_id is the contig id itself — carried as a NULL
+contigs); the LCG contigs arrive as a single `circular.fa` multi-FASTA and the
+unbinned residue as a single `noLCG.fa` one, and each of those records is its own
+subject, so their bin_id is the contig id itself — carried as a NULL
 `file_meta.bin_id` and COALESCE'd from the read_fastx record in the scan. (That
 also means the container needs no per-contig FASTA split: `read_fastx` reads the
 whole multi-FASTA and the id column IS the bin_id.)
 
-0 contigs (no LCG, no MAG under either dir) is a terminal no-data outcome
-(`StepNoData`), not a failure.
+**The unbinned subject set is the RESIDUE of `noLCG.fa`, not all of it.** The
+refined MAGs are drawn from the noLCG contigs, so hashing that file whole would
+give every binned contig a second bin_map row (one MAG, one UNBINNED) and so a
+second `assembly_membership` row for the same feature_idx. `file_meta` maps a
+FILE to a (kind, bin_id), so the subset is taken per RECORD instead: the `contig`
+scan below reads both files whole, and the DELETE that follows it removes every
+UNBINNED row whose `sequence_hash` also appears under KIND_MAG.
+
+The match key is `canonical_sequence_hash_expr`'s hash, not the contig id. That a
+bin FASTA carries the assembler's contig ids through is measured for hifiasm_meta
+and unmeasured for myloasm, so the match keys on the bytes that are actually
+stored. The hash's strand folding carries into the exclusion: a bin holding a
+contig on the opposite strand still excludes its noLCG record. An id still labels
+the row, as the UNBINNED bin_id below — never something matched on.
+
+Two consequences of keying on content. Hash-equal noLCG records share a fate: a
+bin claiming either drops both. And the exclusion set is the KIND_MAG rows alone —
+`assemble.sh` partitions the assembler's contigs between circular.fa and noLCG.fa,
+so a hash shared with an LCG record is two contigs carrying one sequence rather
+than one contig read twice, and both keep their bin_map row.
+
+0 contigs of any kind is a terminal no-data outcome (`StepNoData`, raised in
+`execute`), not a failure.
 """
 
 from __future__ import annotations
@@ -47,6 +69,7 @@ import shutil
 from pathlib import Path
 
 from pydantic import BaseModel
+from qiita_common.assembly_constants import KIND_LCG, KIND_MAG, KIND_UNBINNED
 from qiita_common.backend_failure import StepNoData
 from qiita_common.chunking import canonical_sequence_hash_expr, sequence_split_expr
 from qiita_common.duckdb_miint import is_empty_sequence_file
@@ -60,17 +83,12 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
-from ._assembly import KIND_LCG, KIND_MAG
+from ._assembly import LCG_FILE, NOLCG_FILE
 
 YAML_STEP_NAME = "assembly_hash"
 
 # FASTA extensions accepted for contig files (both plain and gzip-compressed).
 _FASTA_GLOBS = ("*.fna", "*.fna.gz", "*.fa", "*.fa.gz", "*.fasta", "*.fasta.gz")
-
-# The `assemble` container emits every circular contig into a single multi-FASTA
-# under genomes_dir (not one file per contig — no split step needed): each record
-# is one circular genome whose bin_id is the contig id itself.
-_LCG_FILE = "circular.fa"
 
 # DuckDB resource caps. `_DUCKDB_MEMORY_GB` is the OFF-SLURM fallback (local
 # backend / tests); under SLURM the limit tracks the real cgroup via
@@ -87,8 +105,8 @@ _READ_FASTX_MAX_BATCH_BYTES = "128MB"
 class Inputs(BaseModel):
     """Typed input contract for assembly_hash.
 
-    `genomes_dir` (holds `circular.fa`) and `refined_bins_dir` (MAG bins) are the upstream
-    container steps' outputs. `prep_sample_idx` / `work_ticket_idx` are
+    `genomes_dir` (holds `circular.fa` + `noLCG.fa`) and `refined_bins_dir` (MAG bins)
+    are the upstream container steps' outputs. `prep_sample_idx` / `work_ticket_idx` are
     framework-injected scope scalars (declared for an explicit contract even though
     this step doesn't read them — sequences are run-agnostic, so no processing_idx
     is needed here).
@@ -127,15 +145,19 @@ def _file_meta(genomes_dir: Path, refined_bins_dir: Path) -> list[tuple[str, str
       `bin_id` is NULL — an LCG contig is its own genome, so its bin_id is the
       contig id itself (the read_fastx record id), COALESCE'd in the scan rather
       than carried here.
+    - UNBINNED: the single `<genomes_dir>/noLCG.fa` multi-FASTA, same NULL-bin_id
+      shape as LCG. This row covers the WHOLE file; the residue subset is taken
+      per record in `execute` (see the module docstring).
     - MAG: each refined-bin FASTA under `<refined_bins_dir>`; `bin_id` = the
       filename stem (a bin groups many contigs under one file).
 
     Empty files are dropped (`read_fastx` raises on a 0-record input, and one empty
     path aborts the whole `VARCHAR[]` scan)."""
     meta: list[tuple[str, str, str | None]] = []
-    lcg = genomes_dir / _LCG_FILE
-    if lcg.is_file() and not is_empty_sequence_file(lcg):
-        meta.append((str(lcg), KIND_LCG, None))
+    for name, kind in ((LCG_FILE, KIND_LCG), (NOLCG_FILE, KIND_UNBINNED)):
+        path = genomes_dir / name
+        if path.is_file() and not is_empty_sequence_file(path):
+            meta.append((str(path), kind, None))
     for path in _fasta_files(refined_bins_dir):
         if is_empty_sequence_file(path):
             continue
@@ -146,14 +168,15 @@ def _file_meta(genomes_dir: Path, refined_bins_dir: Path) -> list[tuple[str, str
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     meta = _file_meta(inputs.genomes_dir, inputs.refined_bins_dir)
 
-    # A sample that assembled nothing binnable AND has no circular genome is a
-    # terminal no-data outcome — no contigs to hash, not a failure.
+    # A sample whose assembler produced no contig at all is a terminal no-data
+    # outcome — nothing to hash, not a failure.
     if not meta:
         raise StepNoData(
             step_name=YAML_STEP_NAME,
             reason=(
                 f"no contigs to hash for prep_sample_idx={inputs.prep_sample_idx} "
-                f"(no LCG at {inputs.genomes_dir}/{_LCG_FILE}, no MAG under "
+                f"(no LCG at {inputs.genomes_dir}/{LCG_FILE}, no contigs at "
+                f"{inputs.genomes_dir}/{NOLCG_FILE}, no MAG under "
                 f"{inputs.refined_bins_dir})"
             ),
         )
@@ -207,6 +230,27 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "  include_filepath:=true) rf "
                 "JOIN file_meta fm ON rf.filepath = fm.filepath",
                 [paths],
+            )
+
+            # Reduce the UNBINNED rows to the RESIDUE: drop the noLCG contigs a
+            # refined bin already claims, matched on the canonical sequence_hash
+            # (module docstring: why the residue and not the whole file, and why
+            # that key and not the contig id). The MAG hash set is materialised
+            # first so the DELETE never reads the table it writes; it is narrow
+            # (one UUID per distinct binned sequence, no bytes).
+            #
+            # This runs before the manifest/bin_map COPYs and before `winner`, so
+            # pass 2 inherits the exclusion through its `winner` join — a dropped
+            # contig has no winner row under its synthetic read_id.
+            conn.execute(
+                "CREATE TEMP TABLE binned_hash AS "
+                "SELECT DISTINCT sequence_hash FROM contig WHERE kind = ?",
+                [KIND_MAG],
+            )
+            conn.execute(
+                "DELETE FROM contig WHERE kind = ? "
+                "AND sequence_hash IN (SELECT sequence_hash FROM binned_hash)",
+                [KIND_UNBINNED],
             )
 
             conn.execute(

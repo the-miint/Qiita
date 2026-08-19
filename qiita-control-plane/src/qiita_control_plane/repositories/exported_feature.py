@@ -13,13 +13,19 @@ the ORDER BY on each INSERT. That rule is arbitrary; what matters is that it is
 fixed, because without it the winner is whatever row order the planner happened
 to produce and it could change under a stats refresh alone.
 
-The migration `db/migrations/20260813000000_exported_feature.sql` is the single
-copy of *why* the namespace works this way. Nothing here restates it.
+The migration `db/migrations/20260813000000_exported_feature.sql` owns *why* the
+namespace works this way — the snapshot, the two-pass fallback, the asymmetric
+published-namespace index, what a new entity kind must update — and none of that
+is restated here. What is decided here instead is which entities have an accession
+to offer at all: `_SOURCE_ID_IS_EXTERNAL_ACCESSION` below is the authority for the
+genome kind, over the migration's prose, which reads a genome as always carrying
+one.
 """
 
 from collections.abc import Sequence
 
 import asyncpg
+from qiita_common.models import GenomeSource
 
 # Every caller-visible column. `accession` rides along even when it lost, so a
 # caller who gets a QF handle for an entity that plainly has an accession can tell
@@ -52,11 +58,37 @@ _SELECT_LIVE = (
 # be caught.
 _ON_CONFLICT = " ON CONFLICT DO NOTHING"
 
+# Whether a genome's `source_id` is an accession outside Qiita, per source.
+# `source = 'qiita'` marks a genome assembled from one of our own prep_samples (the
+# `genome_qiita_origin_check` biconditional on qiita.genome); its source_id arrives
+# verbatim from the loader's genome map, with no external authority behind it, and
+# nothing outside this system resolves it. `export_feature_id` is published, which
+# is what the opaque-identifier rule in CLAUDE.md governs. The true half is a
+# DECLARED source, not a verified one: `actions.library._validate_genome_map` checks
+# `genome_source` against the vocabulary and the qiita-origin biconditional, never
+# the id.
+#
+# `_INSERT_GENOME` reads the true half as an allowlist rather than testing
+# `<> 'qiita'`, so a source absent from this map is offered no accession and takes
+# the minted handle instead of publishing whatever its source_id holds. Every
+# GenomeSource member must appear here; `tests/test_exported_feature_mint.py` fails
+# on one that does not.
+_SOURCE_ID_IS_EXTERNAL_ACCESSION: dict[GenomeSource, bool] = {
+    GenomeSource.GENBANK: True,
+    GenomeSource.REFSEQ: True,
+    GenomeSource.QIITA: False,
+}
+
+_EXTERNAL_GENOME_SOURCES: list[str] = [
+    source.value for source, external in _SOURCE_ID_IS_EXTERNAL_ACCESSION.items() if external
+]
+
 # The genome kind. The JOIN is not decoration: it both resolves the accession and
 # proves the genome exists, so an unknown genome_idx drops out here and is reported
 # by the caller's completeness check rather than raising a foreign-key error whose
-# message names our schema. source_id is NOT NULL on qiita.genome, so the genome
-# kind always has an accession to offer.
+# message names our schema. Which sources are offered their source_id is
+# `_SOURCE_ID_IS_EXTERNAL_ACCESSION` above; the rest are named 'QF<idx>' in this same
+# pass and so never come back unnamed for pass two.
 #
 # ORDER BY: when one request names two entities whose accessions collide with each
 # other, the lower idx keeps the accession. `_INSERT_FEATURE` orders for the same
@@ -64,10 +96,12 @@ _ON_CONFLICT = " ON CONFLICT DO NOTHING"
 _INSERT_GENOME = (
     "INSERT INTO qiita.exported_feature"
     "       (entity_kind, genome_idx, accession, accession_published, created_by_idx)"
-    " SELECT 'genome', g.genome_idx, gn.source_id, $3, $2"
-    "   FROM unnest($1::bigint[]) AS g(genome_idx)"
-    "   JOIN qiita.genome gn ON gn.genome_idx = g.genome_idx"
-    "  ORDER BY g.genome_idx" + _ON_CONFLICT
+    " SELECT 'genome', c.genome_idx, c.accession, $3 AND c.accession IS NOT NULL, $2"
+    "   FROM (SELECT g.genome_idx,"
+    "                CASE WHEN gn.source = ANY($4::text[]) THEN gn.source_id END AS accession"
+    "           FROM unnest($1::bigint[]) AS g(genome_idx)"
+    "           JOIN qiita.genome gn ON gn.genome_idx = g.genome_idx) AS c"
+    "  ORDER BY c.genome_idx" + _ON_CONFLICT
 )
 
 # The feature kind. The JOIN against reference_membership resolves the accession
@@ -114,7 +148,13 @@ async def _offer(
 ) -> None:
     """Insert an identifier for each named entity, offering it its accession or not."""
     if genome_idx:
-        await conn.execute(_INSERT_GENOME, list(genome_idx), created_by_idx, accession)
+        await conn.execute(
+            _INSERT_GENOME,
+            list(genome_idx),
+            created_by_idx,
+            accession,
+            _EXTERNAL_GENOME_SOURCES,
+        )
     if feature_idx and reference_idx is not None:
         await conn.execute(
             _INSERT_FEATURE, reference_idx, list(feature_idx), created_by_idx, accession
