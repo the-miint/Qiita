@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ducklake::ensure_read_tables(&setup_conn)?;
     ducklake::ensure_alignment_tables(&setup_conn)?;
     ducklake::ensure_assembly_tables(&setup_conn)?;
+    ducklake::ensure_amplicon_tables(&setup_conn)?;
     // The row concurrent registrations into the content-addressed tables contend
     // for. Seeded here so no request path has to create it.
     ducklake::ensure_registration_lock(&setup_conn)?;
