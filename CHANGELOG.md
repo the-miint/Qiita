@@ -22,6 +22,34 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Assembly completion is first-class state: `qiita.assembly_sample` (#464).**
+  The per-`(processing_idx, prep_sample)` gate `long-read-assembly` was missing, alongside
+  `qiita.mask_sample` and `qiita.alignment_sample`. Completion existed only as work-ticket
+  state, so a consumer asking "is this sample's assembly done?" had to infer it from row
+  presence — which does not hold here: `write-assembly-membership` writes
+  `qiita.assembly_membership` several entries before `register-files` lands the DuckLake
+  tables, so a ticket that dies in between leaves a partial footprint that looks finished.
+  The runner materializes the row `'pending'` when it mints the run's `processing_idx` (the
+  earliest point the key exists — the identity is a params hash, so there is nothing to key
+  on at HTTP submit), and a new terminal `finalize-assembly-sample` library action writes
+  `'completed'` after `register-files`.
+  **Three states, because assembly has two terminal outcomes.** A sample that assembled
+  nothing is not an error: `assembly_hash` raises `StepNoData`, the ticket lands in NO_DATA,
+  and the step loop is abandoned — so the terminal action never runs. The runner's
+  `StepNoData` handler writes `'no_data'` instead. Left `'pending'` the row would read
+  "still running" for a run that has ended and can never move again; written `'completed'`
+  it would contradict the ticket, which reads NO_DATA over the same unit (the workflow is
+  prep_sample-scoped). `{'completed', 'no_data'}` is the terminal set — a consumer asking
+  whether the run is over reads both, one that needs contigs reads `'completed'` alone. The
+  `'no_data'` writer is guarded against overwriting `'completed'`: an earlier run under the
+  same identity left contigs in DuckLake, and a later one finding none does not remove them.
+  `state` is TEXT + CHECK with no Postgres ENUM and no Pydantic twin (the gate has no wire
+  surface), so it stays out of the enum-parity discipline. The FK to `qiita.processing` is
+  `ON DELETE RESTRICT` where `alignment_sample` CASCADEs: one `processing` row is shared by
+  every sample assembled under the same params, and the DuckLake rows stamped with it are
+  beyond any FK's reach, so a cascade would drop the gate for all of them and leave data
+  with no completion state.
+
 - **Unbinned assembly contigs are stored, as a third `assembly_membership` kind (#460).**
   `assembly_hash` hashes the `noLCG.fa` residue — the contigs no DAS_Tool-refined bin
   claimed — alongside the circular genomes and the refined MAGs, so they are minted a

@@ -2297,6 +2297,63 @@ async def test_run_action_primitive_finalize_mask_sample_rejects_non_prep_sample
         )
 
 
+async def test_run_action_primitive_finalize_assembly_sample_dispatches(monkeypatch, tmp_path):
+    """The finalize-assembly-sample arm calls the FINALIZE_ASSEMBLY_SAMPLE primitive
+    with processing_idx from the runner-bound `bound` (the run identity minted before
+    the step loop) and prep_sample_idx from the scope target. No file inputs, no
+    data-plane hop."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_finalize(pool, *, processing_idx, prep_sample_idx):
+        recorded.update(processing_idx=processing_idx, prep_sample_idx=prep_sample_idx)
+        return {"processing_idx": processing_idx, "prep_sample_idx": prep_sample_idx}
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE, fake_finalize)
+
+    entry = WorkflowAction(kind="action", name="finalize-assembly-sample", inputs=[], outputs=[])
+    out = await _run_action_primitive(
+        None,  # pool — the fake ignores it
+        entry,
+        {"processing_idx": 31},
+        tmp_path,
+        {"kind": "prep_sample", "prep_sample_idx": 5},
+        work_ticket_idx=9,
+        signing_key=b"sekret",
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {}
+    assert recorded == {"processing_idx": 31, "prep_sample_idx": 5}
+
+
+async def test_run_action_primitive_finalize_assembly_sample_rejects_non_prep_sample_scope(
+    tmp_path,
+):
+    """finalize-assembly-sample is only meaningful for a prep_sample-scoped ticket;
+    any other scope is a contract error, surfaced loudly."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(kind="action", name="finalize-assembly-sample", inputs=[], outputs=[])
+    with pytest.raises(RuntimeError, match="prep_sample-scoped"):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"processing_idx": 1},
+            tmp_path,
+            {"kind": "block", "block_idx": 42},
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
+
+
 async def test_run_action_primitive_delete_block_mask_dispatches(monkeypatch, tmp_path):
     """The delete-block-mask arm calls the DELETE_READ_MASK_BLOCK primitive with
     block_idx from the scope target and mask_idx from the runner-bound `bound`,
@@ -5718,6 +5775,213 @@ async def test_masked_reads_workflow_persists_the_consumed_mask_onto_the_ticket(
         )
         assert row["state"] == expected_state
         assert row["mask_idx"] == mask_idx
+    finally:
+        await teardown()
+
+
+async def _seed_assembly_gate_ticket(pool):
+    """A prep_sample-scoped ticket shaped like long-read-assembly: one step that
+    consumes `masked_reads_fastq` (so the pre-loop masked-reads resolver runs) and
+    threads `processing_idx` (so the runner mints the run identity), followed by the
+    terminal `finalize-assembly-sample` action (so it writes the
+    qiita.assembly_sample gate). Returns the ids plus a teardown."""
+    from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
+
+    from qiita_control_plane.testing.db_seeds import (
+        seed_biosample_with_sequenced_prep_sample,
+        seed_user_principal,
+    )
+
+    principal_idx = await seed_user_principal(pool, prefix="asm-gate", suffix=uuid.uuid4().hex[:8])
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=principal_idx
+    )
+    mask_idx = await pool.fetchval(
+        "INSERT INTO qiita.mask_definition"
+        " (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+        " VALUES ($1, 'read-mask', '1.0.0', '{}'::jsonb, $2) RETURNING mask_idx",
+        uuid.uuid4().bytes + uuid.uuid4().bytes,  # 32-byte params_hash
+        principal_idx,
+    )
+    action_id = LONG_READ_ASSEMBLY_ACTION_ID
+    version = f"runner-test-{uuid.uuid4()}"
+    steps = [
+        {
+            "kind": "step",
+            "name": "assembly_load",
+            "step_type": "singleton",
+            "module": "qiita_compute_orchestrator.jobs.assembly_load",
+            "params": {"processing_idx": "processing_idx"},
+            "inputs": ["masked_reads_fastq"],
+            "outputs": ["staging_dir"],
+            "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+        },
+        {"kind": "action", "name": "finalize-assembly-sample", "inputs": [], "outputs": []},
+    ]
+    await pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps,"
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
+        ") VALUES ($1, $2, 'prep_sample', $3::text[], $4::jsonb,"
+        "  $5::jsonb, $6::jsonb, 1, 1, '1 minute')",
+        action_id,
+        version,
+        [],
+        json.dumps({"service": False, "human_roles": ["user"]}),
+        json.dumps({}),
+        json.dumps(steps),
+    )
+    work_ticket_idx = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, action_context"
+        ") VALUES ($1, $2, $3, 'prep_sample', $4, $5::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        principal_idx,
+        prep_sample_idx,
+        json.dumps({"mask_idx": mask_idx, "assembler": "hifiasm_meta"}),
+    )
+
+    async def _teardown():
+        await pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+        )
+        await pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+        )
+        await pool.execute(
+            "DELETE FROM qiita.assembly_sample WHERE prep_sample_idx = $1", prep_sample_idx
+        )
+        await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+        await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
+        await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
+        await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
+        await pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+
+    return work_ticket_idx, prep_sample_idx, _teardown
+
+
+def _stub_masked_reads(monkeypatch, tmp_path, *, empty: bool = False):
+    """Stand in for the pre-loop masked-reads resolver: either hand the workflow a
+    FASTQ, or raise the StepNoData an empty pass-set produces."""
+    from qiita_control_plane.runner import _workflow
+
+    fastq = tmp_path / "masked_reads.fastq.gz"
+    fastq.parent.mkdir(parents=True, exist_ok=True)
+    fastq.touch()
+
+    async def _fake_resolve(pool, scope_target, mask, **kwargs):
+        if empty:
+            raise StepNoData(reason=f"no reads pass mask_idx {mask} — nothing to assemble")
+        return {"masked_reads_fastq": fastq}
+
+    monkeypatch.setattr(_workflow, "_resolve_staged_masked_reads", _fake_resolve)
+
+
+async def test_assembly_gate_is_pending_at_mint_then_completed_at_the_terminal_action(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """The gate row exists from the moment the run identity does — so a consumer
+    polling mid-run reads 'pending', not absence — and the terminal action closes
+    it at 'completed'."""
+    work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
+    _stub_masked_reads(monkeypatch, tmp_path)
+    backend = FakeBackendClient()
+    backend.outputs_for["assembly_load"] = {"staging_dir": tmp_path / "staging"}
+    seen: list[str | None] = []
+    run_step = backend.run_step
+
+    async def _record_gate(**kwargs):
+        seen.append(
+            await postgres_pool.fetchval(
+                "SELECT state FROM qiita.assembly_sample WHERE prep_sample_idx = $1",
+                prep_sample_idx,
+            )
+        )
+        return await run_step(**kwargs)
+
+    monkeypatch.setattr(backend, "run_step", _record_gate)
+    try:
+        await _run(work_ticket_idx, postgres_pool, backend, tmp_path / "ws")
+        assert seen == ["pending"]
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+            )
+            == "completed"
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT state FROM qiita.assembly_sample WHERE prep_sample_idx = $1",
+                prep_sample_idx,
+            )
+            == "completed"
+        )
+    finally:
+        await teardown()
+
+
+async def test_assembly_gate_closes_at_no_data_when_a_step_produced_none(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """StepNoData abandons the remaining entries, so `finalize-assembly-sample` never
+    runs. Without the runner's own write the row would sit at 'pending' forever,
+    reading "still running" for a ticket that is terminal — a consumer could not
+    tell "assembled, nothing to show" from "not assembled yet"."""
+    work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
+    _stub_masked_reads(monkeypatch, tmp_path)
+    backend = FakeBackendClient()
+
+    async def _no_data(*_args, **_kwargs):
+        raise StepNoData(step_name="assembly_load", reason="no contigs to hash")
+
+    monkeypatch.setattr(backend, "run_step", _no_data)
+    try:
+        await _run(work_ticket_idx, postgres_pool, backend, tmp_path / "ws")
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+            )
+            == "no_data"
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT state FROM qiita.assembly_sample WHERE prep_sample_idx = $1",
+                prep_sample_idx,
+            )
+            == "no_data"
+        )
+    finally:
+        await teardown()
+
+
+async def test_assembly_gate_is_absent_when_no_data_precedes_the_mint(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """The OTHER StepNoData: an empty masked pass-set raises in the pre-loop input
+    resolver, which runs BEFORE the processing_idx mint, so there is no key to write
+    a gate row under and none is written. The ticket carries that outcome; the gate
+    does not. Pinned so the asymmetry with the no-contigs case above stays a
+    decision — see repositories.assembly.fetch_assembly_sample_state."""
+    work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
+    _stub_masked_reads(monkeypatch, tmp_path, empty=True)
+    try:
+        await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+            )
+            == "no_data"
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT count(*) FROM qiita.assembly_sample WHERE prep_sample_idx = $1",
+                prep_sample_idx,
+            )
+            == 0
+        )
     finally:
         await teardown()
 

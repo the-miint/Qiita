@@ -47,7 +47,10 @@ from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_s
 
 from ..auth.tickets import sign_action, sign_ticket
 from ..miint import duckdb_connect
-from ..repositories.assembly import insert_assembly_membership_rows
+from ..repositories.assembly import (
+    insert_assembly_membership_rows,
+    upsert_assembly_sample_completed,
+)
 from ..repositories.block import (
     MaskSampleInvalidated,
     fetch_block_members,
@@ -2323,6 +2326,29 @@ async def finalize_mask_sample_gate(
     return {"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx}
 
 
+async def finalize_assembly_sample_gate(
+    pool: asyncpg.Pool,
+    *,
+    processing_idx: int,
+    prep_sample_idx: int,
+) -> dict[str, int]:
+    """Terminal step of the long-read-assembly workflow: record this sample's
+    assembly as completed in the qiita.assembly_sample gate.
+
+    Runs AFTER register-files, so the gate never reads 'completed' before the
+    contigs are in DuckLake. The row is already 'pending' — the runner
+    materialized it when it minted this run's processing_idx — and the write is an
+    idempotent upsert, so a workflow retried from the start re-affirms
+    'completed'. The gate's state contract lives on
+    `repositories.assembly.fetch_assembly_sample_state`.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        await upsert_assembly_sample_completed(
+            conn, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
+        )
+    return {"processing_idx": processing_idx, "prep_sample_idx": prep_sample_idx}
+
+
 async def delete_alignment_block(
     pool: asyncpg.Pool,
     *,
@@ -2465,6 +2491,7 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
     LibraryPrimitive.FINALIZE_MASK_SAMPLE: finalize_mask_sample_gate,
+    LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE: finalize_assembly_sample_gate,
     LibraryPrimitive.DELETE_ALIGNMENT_BLOCK: delete_alignment_block,
     LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,
     LibraryPrimitive.SYNC_REFERENCE_EXCLUSION: sync_reference_exclusion,

@@ -38,6 +38,17 @@ _None yet._
   (`qiita-common/src/qiita_common/assembly_constants.py`) instead of listing its members,
   which went stale when unbinned contigs became a third kind. (#460)
 
+- `20260819000000_assembly_sample.sql` — plain `make migrate`, no out-of-band setup. One
+  empty table, `qiita.assembly_sample`: the per-`(processing_idx, prep_sample)` completion
+  gate for `long-read-assembly`, alongside the existing `qiita.mask_sample` and
+  `qiita.alignment_sample`. **No backfill**, deliberately: assemblies already completed on
+  this host get no gate row, so they read as not-assembled. Nothing consumes the gate yet,
+  so that costs nothing today; whether to backfill them is a separate decision. The
+  migrate→restart window has the same shape — an assembly ticket completing between bucket 3
+  and the bucket-4 restart runs under old code that writes no gate row. Re-submitting such a
+  sample after the restart is admitted and re-writes it (no disallow-without-delete site
+  applies to `long-read-assembly`). (#464)
+
 ### 4. Deploy
 
 _None yet._
@@ -59,10 +70,17 @@ _None yet._
 
 - **`long-read-assembly` 1.0.0 is edited in place, not versioned** — `activate.sh`'s
   `qiita-admin actions sync` re-syncs it, so the `qiita.action` list check `make
-  verify-deploy` already runs is the confirmation it landed. It gained no step and no
-  declared input: the `assembly_hash` step reads one more file (`noLCG.fa`) out of the
-  `genomes_dir` it already binds, so there is no new bind mount, resource, or env var.
-  (#460)
+  verify-deploy` already runs is the confirmation it landed. Two edits ride this deploy,
+  neither adding a bind mount, resource, or env var: the `assembly_hash` step reads one more
+  file (`noLCG.fa`) out of the `genomes_dir` it already binds (#460), and a terminal
+  `finalize-assembly-sample` entry was appended after `register-files` — an in-process
+  control-plane primitive writing the `qiita.assembly_sample` gate, not a SLURM step (#464).
+  The second is the one worth confirming landed, since a stale synced copy would leave every
+  new assembly's gate row stuck at `pending`. Expect `t`. (#464)
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -Atc "SELECT steps::text LIKE '\''%finalize-assembly-sample%'\'' FROM qiita.action WHERE action_id = '\''long-read-assembly'\'' AND version = '\''1.0.0'\'';"'
+  ```
 
 ### 6. After the deploy verifies green
 

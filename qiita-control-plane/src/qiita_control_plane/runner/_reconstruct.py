@@ -608,6 +608,24 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE:
+        # Terminal step of the long-read-assembly workflow: write 'completed' into
+        # the assembly_sample gate. Runs AFTER register-files so the gate never
+        # reads 'completed' before the contigs are in DuckLake. No file inputs:
+        # prep_sample_idx from the scope target, processing_idx from the run
+        # identity the runner minted before the loop.
+        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+            raise RuntimeError(
+                "finalize-assembly-sample requires a prep_sample-scoped ticket; "
+                f"got {scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE](
+            pool,
+            processing_idx=bound[PROCESSING_IDX_BINDING],
+            prep_sample_idx=scope_target["prep_sample_idx"],
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.PERSIST_QC_REPORT:
         # Persist the two fastqc-equivalent QC reports onto this prep_sample's
         # 1:1 sequenced_sample. Each declared input is a Path to a qc_report.json

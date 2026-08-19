@@ -46,6 +46,7 @@ def test_library_re_exports_match_module_callables():
     assert LIBRARY[LibraryPrimitive.DELETE_READ_MASK_BLOCK] is lib.delete_read_mask_block
     assert LIBRARY[LibraryPrimitive.RECONCILE_BLOCK] is lib.reconcile_block
     assert LIBRARY[LibraryPrimitive.FINALIZE_MASK_SAMPLE] is lib.finalize_mask_sample_gate
+    assert LIBRARY[LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE] is lib.finalize_assembly_sample_gate
     assert LIBRARY[LibraryPrimitive.DELETE_ALIGNMENT_BLOCK] is lib.delete_alignment_block
     assert LIBRARY[LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK] is lib.reconcile_alignment_block
     assert LIBRARY[LibraryPrimitive.SYNC_REFERENCE_EXCLUSION] is lib.sync_reference_exclusion

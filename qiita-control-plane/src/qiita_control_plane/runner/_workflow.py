@@ -14,6 +14,7 @@ from qiita_common.actions import (
     WorkflowAction,
     WorkflowStep,
 )
+from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import (
@@ -77,8 +78,12 @@ from ._mask import (
 )
 from ._processing import (
     ASSEMBLER_BINDING,
+    PROCESSING_IDX_BINDING,
+    _create_assembly_gate_pending,
     _mint_processing_idx,
+    _record_assembly_gate_no_data,
     _workflow_needs_processing,
+    _workflow_writes_assembly_gate,
 )
 from ._read_ingest import (
     READS_STAGING_ROOT_BINDING,
@@ -531,6 +536,26 @@ async def run_workflow(
                 )
             )
 
+        # Completion gate: a workflow declaring the terminal
+        # `finalize-assembly-sample` action gets its qiita.assembly_sample row
+        # materialized 'pending' here — the first point the (processing_idx,
+        # prep_sample) key exists, since processing_idx is a hash of the run's
+        # params rather than anything the submission carries. The gate is what a
+        # consumer reads instead of inferring completion from row presence; see
+        # repositories.assembly.fetch_assembly_sample_state.
+        if _workflow_writes_assembly_gate(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+                raise _submission_bad_input(
+                    "a workflow that gates assembly completion (declares "
+                    f"{LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE}) must be "
+                    f"prep_sample-scoped; got {scope_target['kind']!r}"
+                )
+            await _create_assembly_gate_pending(
+                pool,
+                processing_idx=bound[PROCESSING_IDX_BINDING],
+                prep_sample_idx=scope_target["prep_sample_idx"],
+            )
+
         # Default-OFF anchor for the whole-reference rype_router build gate. The
         # `when: router_pending` router entries (sharded reference-add) must NOT
         # run unless the plan-shards arm sets router_pending True (N > 0). Because
@@ -718,6 +743,25 @@ async def run_workflow(
         # state — no data was produced). Clear any in-place-retry marker so the
         # now-terminal ticket shows no stale "stuck retrying" reason.
         _log.info("workflow %d ended with no data: %s", work_ticket_idx, exc)
+        # Close the assembly_sample gate first, then transition. A workflow that
+        # gates assembly completion never reaches its terminal
+        # `finalize-assembly-sample` on this path — the step loop is abandoned
+        # here — so the row would otherwise stay 'pending', reading "still
+        # running" for a run that has ended. Ordered before the transition
+        # because a gate write that raises leaves the ticket non-terminal, which
+        # a `/run` redrive re-attempts (assembly_hash re-raises StepNoData
+        # deterministically); transitioning first would strand a NO_DATA ticket
+        # behind a 'pending' gate with nothing left to move it.
+        if (
+            action is not None
+            and _workflow_writes_assembly_gate(action.steps)
+            and PROCESSING_IDX_BINDING in bound
+        ):
+            await _record_assembly_gate_no_data(
+                pool,
+                processing_idx=bound[PROCESSING_IDX_BINDING],
+                prep_sample_idx=scope_target["prep_sample_idx"],
+            )
         await _transition_to_no_data(pool, work_ticket_idx)
         return
     except BackendFailure as exc:

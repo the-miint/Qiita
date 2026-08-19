@@ -14,7 +14,12 @@ from __future__ import annotations
 from typing import Any
 
 import asyncpg
+from qiita_common.api_paths import LibraryPrimitive
 
+from ..repositories.assembly import (
+    create_assembly_sample_pending,
+    upsert_assembly_sample_no_data,
+)
 from ..repositories.processing import mint_processing
 from ._mask import MASK_IDX_BINDING
 
@@ -102,3 +107,58 @@ async def _mint_processing_idx(
     if params["assembler"] is not None:
         bindings[ASSEMBLER_BINDING] = params["assembler"]
     return bindings
+
+
+def _workflow_writes_assembly_gate(steps: list[Any]) -> bool:
+    """True iff some entry is the `finalize-assembly-sample` action.
+
+    The signal for both of the runner's own qiita.assembly_sample writes: the
+    'pending' row after the processing_idx mint, and the 'no_data' row in the
+    StepNoData handler. Keying on the terminal action's presence rather than on
+    the action_id means the workflow that declares the gate is the workflow that
+    gets it, and the three writes cannot drift apart.
+    """
+    for entry in steps:
+        if getattr(entry, "kind", None) == "action" and (
+            entry.name == LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE
+        ):
+            return True
+    return False
+
+
+async def _create_assembly_gate_pending(
+    pool: asyncpg.Pool,
+    *,
+    processing_idx: int,
+    prep_sample_idx: int,
+) -> None:
+    """Materialize this run's assembly_sample gate row at 'pending'.
+
+    Run immediately after the processing_idx mint, which is the earliest point
+    the gate's key exists: the identity is a hash of the run's params, so there
+    is nothing to key on at HTTP submit. Idempotent, so a resume re-runs it
+    without disturbing a row a prior attempt already closed.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        await create_assembly_sample_pending(
+            conn, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
+        )
+
+
+async def _record_assembly_gate_no_data(
+    pool: asyncpg.Pool,
+    *,
+    processing_idx: int,
+    prep_sample_idx: int,
+) -> None:
+    """Close this run's assembly_sample gate at 'no_data'.
+
+    Run from the StepNoData handler. assembly_hash raises StepNoData when the
+    sample produced no contig of any kind, which abandons the remaining entries —
+    including `finalize-assembly-sample` — so without this write the row would sit
+    at 'pending' for a run that has ended and will never move again.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        await upsert_assembly_sample_no_data(
+            conn, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
+        )

@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from qiita_common.actions import WorkflowAction
+
 from qiita_control_plane.runner._processing import (
     _build_processing_params,
     _workflow_needs_processing,
+    _workflow_writes_assembly_gate,
 )
 
 
@@ -72,3 +75,25 @@ def test_mask_idx_is_part_of_the_identity():
     )
     assert mask_a != mask_b
     assert mask_a["mask_idx"] == 1 and mask_b["mask_idx"] == 2
+
+
+def test_workflow_writes_assembly_gate_keys_on_the_terminal_action():
+    """Declaring the `finalize-assembly-sample` action is the single signal for all
+    three assembly_sample writes (pending at mint, completed at the action, no_data
+    on the StepNoData path). A workflow that mints a processing_idx but declares no
+    gate action gets no gate row — the two signals are independent."""
+    gated = [WorkflowAction(kind="action", name="finalize-assembly-sample")]
+    assert _workflow_writes_assembly_gate(gated) is True
+
+    other_action = [WorkflowAction(kind="action", name="register-files")]
+    assert _workflow_writes_assembly_gate(other_action) is False
+
+    # A `step:` entry, which carries no `kind="action"`, never triggers the gate
+    # even if its name collides with the primitive's.
+    assert _workflow_writes_assembly_gate([_step()]) is False
+    assert (
+        _workflow_writes_assembly_gate(
+            [SimpleNamespace(kind="step", name="finalize-assembly-sample")]
+        )
+        is False
+    )

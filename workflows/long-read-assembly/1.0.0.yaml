@@ -230,6 +230,17 @@ steps:
     inputs: [staging_dir]
     outputs: []
 
+  # Terminal: write 'completed' into the qiita.assembly_sample gate for this
+  # ticket's (processing_idx, prep_sample). Declaring this entry is also what
+  # makes the runner materialize the row 'pending' at mint time and write
+  # 'no_data' when assembly_hash finds no contig. No file inputs: prep_sample_idx
+  # from the scope target, processing_idx from the run identity. MUST run last —
+  # after register-files makes the contigs durable — so 'completed' never
+  # advertises sequences that aren't in DuckLake.
+  - action: finalize-assembly-sample
+    inputs: []
+    outputs: []
+
 # Per-step cap (the runner enforces resolved <= ceiling on every axis at
 # dispatch). The two ESCALATING axes — mem_gb (on OOM) and walltime (on
 # TIMEOUT) — must sit strictly ABOVE the heaviest step's baseline, or retry is
