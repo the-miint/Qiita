@@ -8,27 +8,28 @@ from typing import Annotated
 from pydantic import AfterValidator, AwareDatetime, BaseModel, Field
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH
+from qiita_common.models.upload import SHA256_HEX_PATTERN
 
 # Mirrors qiita.terminology.version VARCHAR(50); note that column's own
 # comment mistakenly offers an ontology version IRI as an example, which
 # does not fit in 50, but seems not worth a db migration to correct.
 MAX_TERMINOLOGY_VERSION_LENGTH = 50
 
-# The two strings that identify a release, named so one set of bounds governs
-# every point a name or version is accepted rather than only the manifest.
+# The two strings identifying a release, named so one set of bounds governs
+# every point accepting a name or version, not just the manifest.
 TerminologyName = Annotated[str, Field(min_length=1, max_length=MAX_NAME_LENGTH)]
 TerminologyVersion = Annotated[str, Field(min_length=1, max_length=MAX_TERMINOLOGY_VERSION_LENGTH)]
 
 
 # The two relative-directory spellings, which name a directory rather than a
-# file in it and so are not filenames even though they carry no separator.
+# file in it and so are not filenames despite carrying no separator.
 _DIRECTORY_SPELLINGS = frozenset({".", ".."})
 
 
 def _check_bare_filename(value: str) -> str:
     """Return `value` if it names a file with no directory part, else raise."""
-    # PurePosixPath, not Path: a manifest is portable JSON, so what counts as a
-    # directory separator cannot depend on the host that reads it.
+    # PurePosixPath, not Path: a manifest is portable JSON, so the reading host
+    # must not decide what counts as a directory separator.
     if value in _DIRECTORY_SPELLINGS or PurePosixPath(value).name != value:
         raise ValueError(
             f"{value!r} is not a bare filename; a release is read from a single flat directory"
@@ -36,9 +37,9 @@ def _check_bare_filename(value: str) -> str:
     return value
 
 
-# How a release names one of its files. Bare because the name is both where the
-# file is read from and the name a staged copy is given, so one carrying a
-# directory or a `..` would reach outside the directory holding the manifest.
+# How a release names one of its files. Bare because the name both locates the
+# file and names its staged copy, so one carrying a directory or a `..` would
+# reach outside the directory holding the manifest.
 TerminologyFilename = Annotated[str, Field(min_length=1), AfterValidator(_check_bare_filename)]
 
 
@@ -69,8 +70,8 @@ class TerminologyTermObsoletionKind(StrEnum):
     recent load.
 
     Mirrors the Postgres `qiita.terminology_term_obsoletion_kind` enum.
-    `source_deprecated` when the source vocabulary deprecates the term;
-    `source_merged` when the source merges this term into another;
+    `source_deprecated` when the source vocabulary deprecates or deletes the
+    term; `source_merged` when the source merges this term into another;
     `silently_dropped` when the term disappears from a reload without a
     recorded replacement.
     """
@@ -89,7 +90,7 @@ class TerminologyManifestFile(BaseModel):
     """
 
     path: TerminologyFilename
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sha256: str = Field(pattern=SHA256_HEX_PATTERN)
 
 
 class TerminologyManifest(BaseModel):
@@ -116,11 +117,11 @@ class TerminologyResponse(BaseModel):
     loaded_at: AwareDatetime
 
 
-# A terminology's `active` state is not terminal: a reload of the same
-# terminology drops the row back to `loading` for the duration of the new
-# load, and `failed` -> `loading` retries a failed load in place without
-# deleting term rows that may already be referenced. The `failed` edges are
-# unreachable while a load is one transaction — see TerminologyStatus.
+# A terminology's `active` state is not terminal: reloading the same
+# terminology drops the row back to `loading` for the duration of the new load,
+# and `failed` -> `loading` retries a failed load in place without deleting term
+# rows something may already reference. Nothing reaches the `failed` edges while
+# a load is one transaction — see TerminologyStatus.
 VALID_TERMINOLOGY_STATUS_TRANSITIONS: dict[TerminologyStatus, set[TerminologyStatus]] = {
     TerminologyStatus.LOADING: {TerminologyStatus.ACTIVE, TerminologyStatus.FAILED},
     TerminologyStatus.ACTIVE: {TerminologyStatus.LOADING},

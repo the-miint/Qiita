@@ -1,198 +1,190 @@
-"""The NCBI taxdump's own dialect: the members of a taxdump archive a
-release is read from, and the term rows that reading yields.
+"""The NCBI taxdump's own dialect: what the members of a taxdump archive
+record about a taxon, and the term rows that reading them yields.
 
-Everything specific to the taxdump is confined here — which members it
-carries, the delimiters between its rows and fields, and which of its name
-classes feed which name column. The rows handed back carry no trace of it.
+This module confines everything specific to the taxdump — which members a
+release reads, which of its name classes feed which name column, and what its
+records say about a taxon's fate. The rows handed back carry no trace of it.
 """
 
 from __future__ import annotations
 
-import io
 import logging
-import zipfile
-from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
+import duckdb
+from qiita_common.duckdb_miint import MIINT_EXTENSION_DIRECTORY_VAR
 from qiita_common.models import TerminologyTermObsoletionKind
 
+from .miint import connect_with_miint
 from .repositories.terminology import ParsedTerm, format_offenders
 
 _log = logging.getLogger(__name__)
 
-# The archive members a release is read from.
-NAMES_DMP_MEMBER = "names.dmp"
-MERGED_DMP_MEMBER = "merged.dmp"
-DELNODES_DMP_MEMBER = "delnodes.dmp"
+# The archive members a release is read from, named in errors about them.
+_NAMES_DMP_MEMBER = "names.dmp"
+_MERGED_DMP_MEMBER = "merged.dmp"
+_DELNODES_DMP_MEMBER = "delnodes.dmp"
 
-# How a member delimits its rows and the fields within them: a row ends with
-# the leading half of the field separator, which is stripped before the row
-# is split.
-_DMP_FIELD_SEPARATOR = "\t|\t"
-_DMP_ROW_SUFFIX = "\t|"
-# Declared rather than left to the platform default, which varies by host.
-_DMP_ENCODING = "utf-8"
-
-# The documented column order of each member. A row is zipped against the
-# tuple for its member, so every field is read by name and a member whose
-# layout changed fails loudly instead of silently shifting fields.
-_COLUMN_TAX_ID = "tax_id"
-_COLUMN_NAME_TXT = "name_txt"
-_COLUMN_NAME_CLASS = "name_class"
-_COLUMN_OLD_TAX_ID = "old_tax_id"
-_COLUMN_NEW_TAX_ID = "new_tax_id"
-_NAMES_COLUMNS = (_COLUMN_TAX_ID, _COLUMN_NAME_TXT, "unique_name", _COLUMN_NAME_CLASS)
-_MERGED_COLUMNS = (_COLUMN_OLD_TAX_ID, _COLUMN_NEW_TAX_ID)
-_DELNODES_COLUMNS = (_COLUMN_TAX_ID,)
-
-# The two name classes a term's two name columns are taken from. The
-# taxdump's remaining classes are citations, set relations, or multi-valued
-# where the column holding them is not, so they are read past.
+# The two name classes feeding a term's two name columns. The taxdump's
+# remaining classes are citations, set relations, or multi-valued where the
+# column is not, so the read skips them.
 _NAME_CLASS_SCIENTIFIC = "scientific name"
 _NAME_CLASS_GENBANK_COMMON = "genbank common name"
-_CONSUMED_NAME_CLASSES = (_NAME_CLASS_SCIENTIFIC, _NAME_CLASS_GENBANK_COMMON)
+
+# One statement per member, ordered by taxon id so term rows land in a fixed
+# order: the manifest digests that file, and an unordered read would change it
+# per run. Each name class is counted so a taxon named twice can be reported.
+# Names come from the per-member reader rather than from the joined
+# read_ncbi_taxdump, which hands back the scientific name alone and so leaves
+# the second name column nothing to draw on.
+_TAXON_NAMES_SQL = f"""
+    SELECT
+        taxid,
+        min(CASE WHEN name_class = '{_NAME_CLASS_SCIENTIFIC}' THEN name END),
+        count(CASE WHEN name_class = '{_NAME_CLASS_SCIENTIFIC}' THEN 1 END),
+        min(CASE WHEN name_class = '{_NAME_CLASS_GENBANK_COMMON}' THEN name END),
+        count(CASE WHEN name_class = '{_NAME_CLASS_GENBANK_COMMON}' THEN 1 END)
+    FROM read_ncbi_taxdump_names(?)
+    GROUP BY taxid
+    ORDER BY taxid
+"""
+_MERGES_SQL = "SELECT old_taxid, new_taxid FROM read_ncbi_taxdump_merged(?) ORDER BY old_taxid"
+_DELETED_SQL = "SELECT taxid FROM read_ncbi_taxdump_deleted(?) ORDER BY taxid"
+
+# A full release reads long enough for DuckDB to draw its progress bar, which
+# it writes to stdout; stdout must stay free of it.
+_SILENCE_PROGRESS_SQL = "SET enable_progress_bar = false"
 
 
-def build_terms_from_taxdump(taxdump_zip: Path) -> list[ParsedTerm]:
+@dataclass(frozen=True)
+class _TaxonNames:
+    """The names one taxon carries in the two classes feeding a term's name
+    columns, each None when the archive names it in no such class."""
+
+    scientific: str | None
+    genbank_common: str | None
+
+
+def build_terms_from_taxdump(taxdump_tar_gz: Path) -> list[ParsedTerm]:
     """Read the term rows of a release from the taxdump archive at
-    `taxdump_zip`.
+    `taxdump_tar_gz`, a gzipped tar holding its members at the top level.
 
-    Raises FileNotFoundError when the archive or a member it must carry is
-    absent, zipfile.BadZipFile when the file is not an archive, and
-    ValueError when a member's layout or content contradicts what the
-    taxdump documents.
+    Raises FileNotFoundError when the archive is absent, duckdb.Error when
+    DuckDB cannot read it, when it carries no member a release needs, or when a
+    row's field count contradicts what the taxdump documents, and ValueError
+    when the path is not a file or the archive contradicts itself.
     """
-    if not taxdump_zip.exists():
-        raise FileNotFoundError(f"No taxdump archive at {taxdump_zip}")
+    if not taxdump_tar_gz.exists():
+        raise FileNotFoundError(f"No taxdump archive at {taxdump_tar_gz}")
 
-    with zipfile.ZipFile(taxdump_zip) as archive:
-        taxon_names = _read_taxon_names(archive)
-        merges = _read_merges(archive)
-        deleted_tax_ids = _read_deleted_tax_ids(archive)
+    # A directory of extracted members also reads, which is not the shape a
+    # release takes; refusing it keeps the accepted form the documented one
+    # rather than one that happens to work.
+    if not taxdump_tar_gz.is_file():
+        raise ValueError(f"Not a taxdump archive file: {taxdump_tar_gz}")
+
+    # Every member is read through one connection, and the whole archive is
+    # read before anything is assembled, so a member that cannot be read
+    # refuses the release rather than yielding a partial one.
+    #
+    # The members are read relationally and handed back as objects, so a release
+    # is bounded by the memory that its rows occupy rather than by what DuckDB
+    # can stream. Copying the rows straight into the release table would lift
+    # that bound, at the cost of a release-writing path that no longer serves a
+    # source whose rows are decided per-class in Python.
+    source = str(taxdump_tar_gz)
+    conn = connect_with_miint()
+    try:
+        conn.execute(_SILENCE_PROGRESS_SQL)
+        taxon_names = _read_taxon_names(conn, source)
+        merge_cursor = conn.execute(_MERGES_SQL, [source])
+        merge_rows = merge_cursor.fetchall()
+        merges = {str(retired): str(survivor) for retired, survivor in merge_rows}
+        deleted_cursor = conn.execute(_DELETED_SQL, [source])
+        deleted_rows = deleted_cursor.fetchall()
+        deleted_tax_ids = [str(row[0]) for row in deleted_rows]
+    except duckdb.CatalogException as exc:
+        # A cached extension predating these readers reports only the missing
+        # name, pointing at this code rather than at the cache holding it.
+        raise duckdb.CatalogException(
+            f"{exc} A cached miint build older than this reader would report"
+            f" exactly this; check {MIINT_EXTENSION_DIRECTORY_VAR} or clear the"
+            " extension cache and retry."
+        ) from exc
+    finally:
+        conn.close()
 
     terms = _assemble_terms(taxon_names, merges, deleted_tax_ids)
     return terms
 
 
-def _read_dmp_rows(
-    archive: zipfile.ZipFile,
-    member: str,
-    columns: tuple[str, ...],
-) -> Iterator[dict[str, str]]:
-    """Yield one `columns`-keyed dict per row of `member`.
+def _read_taxon_names(
+    conn: duckdb.DuckDBPyConnection,
+    source: str,
+) -> dict[str, _TaxonNames]:
+    """Map each taxon id the archive names to the names it carries in the
+    classes feeding a term's two name columns.
 
-    Raises FileNotFoundError when the archive carries no such member, and
-    ValueError naming the member and line number when a row does not end
-    with the row terminator or its field count does not match `columns`.
+    A taxon carrying two names of one class keeps one and warns about the
+    surplus, since each column holds a single name.
     """
-    if member not in archive.namelist():
-        raise FileNotFoundError(f"taxdump archive {archive.filename} carries no {member}")
+    cursor = conn.execute(_TAXON_NAMES_SQL, [source])
+    named_rows = cursor.fetchall()
 
-    with archive.open(member) as raw:
-        # newline="\n" leaves the bytes untranslated, so a stray carriage
-        # return survives into the row and trips the terminator check below
-        # instead of being silently absorbed.
-        text = io.TextIOWrapper(raw, encoding=_DMP_ENCODING, newline="\n")
-        for line_number, line in enumerate(text, start=1):
-            row = line.rstrip("\n")
-            if not row.endswith(_DMP_ROW_SUFFIX):
-                raise ValueError(
-                    f"{member} line {line_number} does not end with the row"
-                    f" terminator {_DMP_ROW_SUFFIX!r}"
+    names: dict[str, _TaxonNames] = {}
+    for taxid, scientific, scientific_count, genbank_common, genbank_common_count in named_rows:
+        # One name of the class stands, so warn about a taxon named twice
+        # rather than absorbing the surplus silently.
+        tax_id = str(taxid)
+        by_class = (
+            (_NAME_CLASS_SCIENTIFIC, scientific, scientific_count),
+            (_NAME_CLASS_GENBANK_COMMON, genbank_common, genbank_common_count),
+        )
+        for name_class, kept, carried_count in by_class:
+            if carried_count > 1:
+                _log.warning(
+                    "tax_id %s carries %d %r names; keeping %r",
+                    tax_id,
+                    carried_count,
+                    name_class,
+                    kept,
                 )
-
-            # Zipping strictly asserts the field count as it names the fields,
-            # so a member whose layout changed cannot read as a shifted row.
-            fields = row.removesuffix(_DMP_ROW_SUFFIX).split(_DMP_FIELD_SEPARATOR)
-            try:
-                named_fields = dict(zip(columns, fields, strict=True))
-            except ValueError as exc:
-                raise ValueError(
-                    f"{member} line {line_number} carries {len(fields)} field(s);"
-                    f" expected {len(columns)} ({list(columns)})"
-                ) from exc
-            yield named_fields
-
-
-def _read_taxon_names(archive: zipfile.ZipFile) -> dict[str, dict[str, str]]:
-    """Map each taxon id to the names it carries in the classes a term's two
-    name columns are taken from, keyed by class.
-
-    A taxon carrying a second name of a class it already has keeps the first
-    and the extra is warned about, since each column holds one name.
-    """
-    names: dict[str, dict[str, str]] = {}
-    for row in _read_dmp_rows(archive, NAMES_DMP_MEMBER, _NAMES_COLUMNS):
-        name_class = row[_COLUMN_NAME_CLASS]
-        if name_class not in _CONSUMED_NAME_CLASSES:
-            continue
-
-        # The first name of a class stands, so a taxon named twice in one
-        # class is reported rather than having its stored name overwritten.
-        tax_id = row[_COLUMN_TAX_ID]
-        for_taxon = names.get(tax_id, {})
-        kept = for_taxon.get(name_class)
-        if kept is not None:
-            _log.warning(
-                "tax_id %s carries more than one %r (%r and %r); keeping %r",
-                tax_id,
-                name_class,
-                kept,
-                row[_COLUMN_NAME_TXT],
-                kept,
-            )
-            continue
-        for_taxon[name_class] = row[_COLUMN_NAME_TXT]
-        names[tax_id] = for_taxon
+        names[tax_id] = _TaxonNames(scientific=scientific, genbank_common=genbank_common)
     return names
 
 
-def _read_merges(archive: zipfile.ZipFile) -> dict[str, str]:
-    """Map each merged-away taxon id to the id of the taxon it merged into."""
-    merges: dict[str, str] = {}
-    for row in _read_dmp_rows(archive, MERGED_DMP_MEMBER, _MERGED_COLUMNS):
-        merges[row[_COLUMN_OLD_TAX_ID]] = row[_COLUMN_NEW_TAX_ID]
-    return merges
-
-
-def _read_deleted_tax_ids(archive: zipfile.ZipFile) -> list[str]:
-    """Return the taxon ids the archive records as deleted, in member order."""
-    rows = _read_dmp_rows(archive, DELNODES_DMP_MEMBER, _DELNODES_COLUMNS)
-    deleted_tax_ids = [row[_COLUMN_TAX_ID] for row in rows]
-    return deleted_tax_ids
-
-
 def _check_taxon_records(
-    taxon_names: dict[str, dict[str, str]],
+    taxon_names: dict[str, _TaxonNames],
     merges: dict[str, str],
     deleted_tax_ids: list[str],
 ) -> None:
-    """Enforce that every taxon the archive names carries the name a label is
-    taken from, and that no taxon id is recorded in more than one of the
-    three ways.
+    """Enforce that every taxon the archive names carries the name a label
+    comes from, and that no taxon id appears in more than one of the three
+    sources.
 
     Raises ValueError naming the offending ids: a taxon named in no class a
-    label can come from leaves that column nothing to hold, and an id
-    recorded two ways is a taxdump contradicting itself.
+    label can come from leaves that column nothing to hold, and an id recorded
+    two ways is a taxdump contradicting itself.
     """
     unnamed_tax_ids = sorted(
-        tax_id for tax_id, by_class in taxon_names.items() if _NAME_CLASS_SCIENTIFIC not in by_class
+        tax_id for tax_id, names in taxon_names.items() if names.scientific is None
     )
     if unnamed_tax_ids:
         raise ValueError(
-            f"{NAMES_DMP_MEMBER} carries no {_NAME_CLASS_SCIENTIFIC!r} for"
+            f"{_NAMES_DMP_MEMBER} carries no {_NAME_CLASS_SCIENTIFIC!r} for"
             f" tax_id(s) {format_offenders(unnamed_tax_ids)}"
         )
 
-    # Every pair of id sets is checked before anything raises, so one read of
-    # the error names every pair that disagrees rather than only the first.
+    # Check every pair of id sets before raising, so one error names every
+    # disagreeing pair rather than only the first.
     live_ids = set(taxon_names)
     merged_ids = set(merges)
     deleted_ids = set(deleted_tax_ids)
     member_id_sets = (
-        (NAMES_DMP_MEMBER, live_ids),
-        (MERGED_DMP_MEMBER, merged_ids),
-        (DELNODES_DMP_MEMBER, deleted_ids),
+        (_NAMES_DMP_MEMBER, live_ids),
+        (_MERGED_DMP_MEMBER, merged_ids),
+        (_DELNODES_DMP_MEMBER, deleted_ids),
     )
     overlap_reports: list[str] = []
     for position, (member, ids) in enumerate(member_id_sets):
@@ -208,7 +200,7 @@ def _check_taxon_records(
 
 
 def _assemble_terms(
-    taxon_names: dict[str, dict[str, str]],
+    taxon_names: dict[str, _TaxonNames],
     merges: dict[str, str],
     deleted_tax_ids: list[str],
 ) -> list[ParsedTerm]:
@@ -216,22 +208,22 @@ def _assemble_terms(
     taxon named by its two name classes, a merged-away id replaced by the
     taxon it merged into, and a deleted id retired with no replacement.
 
-    A merged-away or deleted id is left unnamed, because the taxdump names
-    neither and what to store in its place depends on whether the term is
-    already known, which is not visible from here.
+    A merged-away or deleted id stays unnamed: the taxdump names neither, and
+    what to store in its place depends on whether the term is already known,
+    which this module cannot see.
     """
     _check_taxon_records(taxon_names, merges, deleted_tax_ids)
 
     terms = [
         ParsedTerm(
             term_id=tax_id,
-            label=by_class[_NAME_CLASS_SCIENTIFIC],
-            alternate_label=by_class.get(_NAME_CLASS_GENBANK_COMMON),
+            label=names.scientific,
+            alternate_label=names.genbank_common,
             is_obsolete=False,
             replaced_by_term_id=None,
             obsoletion_kind=None,
         )
-        for tax_id, by_class in taxon_names.items()
+        for tax_id, names in taxon_names.items()
     ]
 
     # A merge and a deletion differ only in whether a replacement is named
@@ -246,11 +238,8 @@ def _assemble_terms(
     )
     for retired_pairs, obsoletion_kind in retirements:
         terms += [
-            ParsedTerm(
-                term_id=retired_tax_id,
-                label=None,
-                alternate_label=None,
-                is_obsolete=True,
+            ParsedTerm.retired(
+                retired_tax_id,
                 replaced_by_term_id=replacement_tax_id,
                 obsoletion_kind=obsoletion_kind,
             )

@@ -47,7 +47,7 @@ NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
 
 # Pinned loaded_at for seeded terminology rows, so a seeded row is fully
 # determined rather than stamped at insert time. UTC-aware and
-# microsecond-stable for a Postgres TIMESTAMPTZ round trip.
+# microsecond-stable so it survives a Postgres TIMESTAMPTZ round trip.
 SEEDED_TERMINOLOGY_LOADED_AT = datetime(2026, 1, 15, 12, 30, 0, tzinfo=UTC)
 
 
@@ -90,7 +90,7 @@ async def seed_terminology(
 ) -> int:
     """Insert a qiita.terminology row and return its idx.
 
-    The initial status is settable so a caller can start from 'active' or
+    The initial status is settable, so a seed can start from 'active' or
     'failed' rather than only from the column's 'loading' default.
     """
     return await pool.fetchval(
@@ -106,9 +106,9 @@ async def seed_terminology(
 async def delete_terminology_cascade(pool: asyncpg.Pool, terminology_idx: int) -> None:
     """Delete a terminology along with its closure and term rows.
 
-    replaced_by is nulled before the term delete: that self-referential FK
-    is ON DELETE RESTRICT, so a term another term points at cannot be
-    removed while the pointer stands.
+    NULLs replaced_by before deleting the terms: that self-referential FK is
+    ON DELETE RESTRICT, so a term another term points at survives the delete
+    while the pointer stands.
     """
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(

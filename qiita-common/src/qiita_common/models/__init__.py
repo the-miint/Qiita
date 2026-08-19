@@ -251,6 +251,7 @@ from qiita_common.models.terminology import (
     TerminologyVersion,
 )
 from qiita_common.models.upload import (
+    SHA256_HEX_PATTERN,
     EmailReceiptStatus,
     UploadCreateRequest,
     UploadCreateResponse,
@@ -430,6 +431,7 @@ __all__ = [
     "StepSubmitRequest",
     # Upload.
     "EmailReceiptStatus",
+    "SHA256_HEX_PATTERN",
     "UploadCreateRequest",
     "UploadCreateResponse",
     "UploadDoneRequest",

@@ -31,6 +31,18 @@ _TERMINOLOGY_COLUMNS = "idx AS terminology_idx, name, version, loaded_at, status
 MAX_REPORTED_OFFENDERS = 20
 
 
+def capped_offenders(values: Sequence[object]) -> tuple[int, list[object]]:
+    """Return how many values offended and the at-most-MAX_REPORTED_OFFENDERS
+    sample a report names.
+
+    Which offenders a report names is decided here alone, so a prose error and
+    a structured one describe the same subset of the same failure.
+    """
+    total = len(values)
+    sample = list(values[:MAX_REPORTED_OFFENDERS])
+    return total, sample
+
+
 def format_offenders(values: Sequence[object]) -> str:
     """Render offending values for an error, naming at most
     MAX_REPORTED_OFFENDERS of them and stating the total when any go unnamed.
@@ -38,16 +50,16 @@ def format_offenders(values: Sequence[object]) -> str:
     A collection within the cap renders as its own repr, so an error about a
     handful of rows reads exactly as it would with no cap in place.
     """
-    named = list(values[:MAX_REPORTED_OFFENDERS])
-    if len(values) <= MAX_REPORTED_OFFENDERS:
-        return repr(named)
-    return f"{len(values)} total, first {MAX_REPORTED_OFFENDERS}: {named!r}"
+    total, sample = capped_offenders(values)
+    if total <= MAX_REPORTED_OFFENDERS:
+        return repr(sample)
+    return f"{total} total, first {MAX_REPORTED_OFFENDERS}: {sample!r}"
 
 
 class TerminologyImportAnomaly(Exception):
     """Raised when the staged release violates a structural invariant
-    the import cannot silently resolve. At least one attribute is
-    populated; each is a list of offending rows.
+    the import cannot silently resolve. Each attribute holds a list of
+    offending rows, and at least one is non-empty.
 
     `silently_dropped_term_ids`: in the DB but absent from the batch.
     `unresolved_replaced_by`: (term_id, target) — target absent from batch.
@@ -68,7 +80,7 @@ class TerminologyImportAnomaly(Exception):
         self.misaligned_replaced_by = misaligned_replaced_by or []
         self.unresolved_closure_endpoints = unresolved_closure_endpoints or []
 
-        # Only a populated kind is named, so the message says nothing about a
+        # The message names only populated kinds, so it says nothing about a
         # kind the release did not violate.
         parts = [
             f"{attribute}={format_offenders(rows)}"
@@ -79,7 +91,7 @@ class TerminologyImportAnomaly(Exception):
 
     def reported_anomalies(self) -> tuple[tuple[str, Sequence[object]], ...]:
         """Return (attribute name, offending rows) per anomaly kind, populated
-        or not, in one fixed order that a kind added later joins."""
+        or not, in one fixed order; a kind added later joins the end."""
         return (
             ("silently_dropped_term_ids", self.silently_dropped_term_ids),
             ("unresolved_replaced_by", self.unresolved_replaced_by),
@@ -93,13 +105,16 @@ class ParsedTerm:
     """One term in an incoming release batch.
 
     A `label` of None says the source supplies no name for the term, which
-    a source can do for a term id it retired without ever naming. What gets
-    stored in its place is decided against the pre-import snapshot, not
-    here.
+    a source can do for a term id it retired without ever naming. The import
+    decides what to store in its place against the pre-import snapshot.
 
     `alternate_label` is the second name the source supplies for the term,
     None when it supplies none. A source that names its terms only one way
     leaves it None throughout.
+
+    Every text value arrives stripped, and one carrying nothing arrives as
+    None rather than as the empty string. An empty term_id is not rejected
+    here.
     """
 
     term_id: str
@@ -108,6 +123,38 @@ class ParsedTerm:
     is_obsolete: bool
     replaced_by_term_id: str | None
     obsoletion_kind: TerminologyTermObsoletionKind | None
+
+    def __post_init__(self) -> None:
+        # Frozen forbids plain assignment, so normalization writes through
+        # object.__setattr__.
+        object.__setattr__(self, "term_id", self.term_id.strip())
+        for optional_field in ("label", "alternate_label", "replaced_by_term_id"):
+            raw_value = getattr(self, optional_field)
+            settled = raw_value.strip() or None if raw_value is not None else None
+            object.__setattr__(self, optional_field, settled)
+
+    @classmethod
+    def retired(
+        cls,
+        term_id: str,
+        *,
+        replaced_by_term_id: str | None,
+        obsoletion_kind: TerminologyTermObsoletionKind,
+    ) -> ParsedTerm:
+        """Build the row for a term id the release retires without naming it.
+
+        Leaves both names unset, which says the release asserts nothing about
+        them rather than that the term has none. A retirement that does carry
+        a name is an ordinary construction, not this.
+        """
+        return cls(
+            term_id=term_id,
+            label=None,
+            alternate_label=None,
+            is_obsolete=True,
+            replaced_by_term_id=replaced_by_term_id,
+            obsoletion_kind=obsoletion_kind,
+        )
 
 
 @dataclass(frozen=True)
@@ -192,11 +239,11 @@ async def update_terminology_status(
 
     Returns the post-UPDATE row on success, None when no row matched —
     either the idx does not exist or the row is in a state that cannot
-    reach `target`. The conditional UPDATE is what makes the transition
-    TOCTOU-safe against concurrent writers.
+    reach `target`. The conditional UPDATE makes the transition TOCTOU-safe
+    against concurrent writers.
     """
     # Derive the source states that can reach `target` rather than taking
-    # them from the caller, so the transition table is stated in one place.
+    # them from the caller, so the transition table lives in one place.
     valid_sources = [
         str(src)
         for src, targets in VALID_TERMINOLOGY_STATUS_TRANSITIONS.items()
@@ -253,8 +300,8 @@ async def import_terminology_release(
     silent_drop_synthetics = _handle_silent_drops(
         parsed_terms, prior_state, tolerate_anomalies=tolerate_anomalies
     )
-    # Settle what an unnamed term is stored under before anything reads a
-    # name, so the upsert and the counters see the same values.
+    # Settle what an unnamed term stores before anything reads a name, so the
+    # upsert and the counters see the same values.
     effective_terms = _resolve_missing_names(parsed_terms + silent_drop_synthetics, prior_state)
 
     # Pass 1: upsert every incoming term with replaced_by=NULL.
@@ -275,10 +322,9 @@ async def import_terminology_release(
     # Pass 2: populate replaced_by from the in-batch term_id → idx mapping.
     # Two row versions per replaced row per load: pass 1 wipes the pointer and
     # this restores it, changed or not, so a reload leaves twice the merge count
-    # in dead tuples. The wipe is what lets a release withdraw a replacement,
-    # and skipping it would need the term_id -> idx map that does not exist
-    # until pass 1 has run.  This is for all replacements, each time, not just
-    # the ones specific to the new release.
+    # in dead tuples. The wipe lets a release withdraw a replacement, and
+    # skipping it would need the term_id -> idx map that pass 1 produces. This
+    # covers all replacements, each time, not just the new release's own.
     await _resolve_replaced_by(conn, terminology_idx=terminology_idx, parsed_terms=effective_terms)
 
     # Tolerate mode: stamp the attempted-but-unresolvable CURIE on each
@@ -398,10 +444,10 @@ def _handle_silent_drops(
     marker. Already-obsolete terms absent from the batch are benign.
 
     Fail mode raises TerminologyImportAnomaly. Tolerate mode returns
-    synthetic ParsedTerm rows for the dropped term_ids — unnamed, so both
-    names already stored are what they keep, with is_obsolete=True,
-    replaced_by_term_id None, and obsoletion_kind=SILENTLY_DROPPED.
-    Returns the empty list when no silent drops are present."""
+    synthetic ParsedTerm rows for the dropped term_ids — unnamed, so they keep
+    both stored names, with is_obsolete=True, replaced_by_term_id None, and
+    obsoletion_kind=SILENTLY_DROPPED. Returns the empty list when the release
+    drops nothing silently."""
     incoming_term_ids = {term.term_id for term in parsed_terms}
     silently_dropped = sorted(
         term_id
@@ -413,11 +459,8 @@ def _handle_silent_drops(
     if not tolerate_anomalies:
         raise TerminologyImportAnomaly(silently_dropped_term_ids=silently_dropped)
     return [
-        ParsedTerm(
-            term_id=term_id,
-            label=None,
-            alternate_label=None,
-            is_obsolete=True,
+        ParsedTerm.retired(
+            term_id,
             replaced_by_term_id=None,
             obsoletion_kind=TerminologyTermObsoletionKind.SILENTLY_DROPPED,
         )
@@ -429,26 +472,26 @@ def _resolve_missing_names(
     parsed_terms: list[ParsedTerm],
     prior_state: dict[str, PriorTermState],
 ) -> list[ParsedTerm]:
-    """Settle both names of every term the source left unnamed: the ones
-    already held for it, or its own term_id and no second name when nothing
-    is held.
+    """Settle both names of every term the source left unnamed: the names
+    already stored for it, or its own term_id and no second name when the
+    database holds nothing.
 
     An absent label is the source saying nothing about the term rather than
-    asserting it has no names, so neither name is that release's to clear —
-    which is why both are settled together here. A term the source does name
-    is left alone, and the release stays authoritative for its second name.
+    asserting it has no names, so that release may clear neither name — hence
+    settling both together. A term the source does name passes through, and
+    the release stays authoritative for its second name.
 
-    The label column cannot be empty and the extractor that built the batch
-    cannot see what is stored, so falling back to the term_id keeps the row
-    honest: it asserts only what the source actually said, and a later
-    release naming the term overwrites it like any other label."""
+    The label column cannot be empty, and whatever built the batch cannot see
+    what the database holds, so falling back to the term_id keeps the row
+    honest: it asserts only what the source said, and a later release naming
+    the term overwrites it like any other label."""
     resolved: list[ParsedTerm] = []
     for term in parsed_terms:
         if term.label is not None:
             resolved.append(term)
             continue
-        # "No label" makes the record names malformed, so neither name it carries is
-        # wanted: any alternate_label it supplied is discarded along with the label.
+        # No label makes the record's names malformed, so discard any
+        # alternate_label it supplied along with the label.
         prior = prior_state.get(term.term_id)
         stored_label = prior.label if prior is not None else term.term_id
         stored_alternate_label = prior.alternate_label if prior is not None else None
@@ -465,10 +508,10 @@ async def _upsert_terms_without_replaced_by(
 ) -> None:
     """Insert-or-update every incoming term, setting replaced_by=NULL.
 
-    obsoleted_in_version is set once, by the version that first obsoletes a
-    term, and cleared when the term stops being obsolete. A term whose stored
-    values already match the incoming ones is left alone rather than
-    rewritten, so a reload costs row versions only for what actually moved."""
+    The version that first obsoletes a term stamps obsoleted_in_version, and
+    un-obsoleting clears it. A term whose stored values already match the
+    incoming ones passes through unwritten, so a reload costs row versions
+    only for what actually moved."""
     if not parsed_terms:
         return
     term_ids = [term.term_id for term in parsed_terms]
@@ -486,16 +529,15 @@ async def _upsert_terms_without_replaced_by(
     # ($2 term_ids, $3 labels, $4 alternate_labels, $5 is_obsoletes,
     # $6 obsoletion_kinds) zips into one tuple per incoming term.
     # The INSERT side stamps obsoleted_in_version with loading_version ($7)
-    # iff the row arrives obsolete, else NULL; NB: replaced_by is always
-    # NULL because the in-batch term_id -> idx map is not yet known.
+    # iff the row arrives obsolete, else NULL; NB: replaced_by is always NULL
+    # because pass 1 has not yet produced the term_id -> idx map.
     # The ON CONFLICT side overwrites label, alternate_label, is_obsolete,
     # and obsoletion_kind unconditionally, so the release is authoritative
     # for each of them and one supplying no second name clears a stored one;
     # obsoleted_in_version uses COALESCE(existing, EXCLUDED) when still
     # obsolete so the first version that obsoleted the term sticks across
-    # reloads, and clears to NULL on un-obsoletion; NB: replaced_by is wiped
-    # on every update so the later replaced_by-setting step starts from a
-    # clean slate.
+    # reloads, and clears to NULL on un-obsoletion; NB: every update wipes
+    # replaced_by so the later replaced_by-setting step starts clean.
     # The WHERE on the update branch skips a row in which nothing would
     # move, because Postgres stores a new row version per UPDATE without
     # comparing values and a reload would otherwise leave one dead tuple
@@ -503,8 +545,8 @@ async def _upsert_terms_without_replaced_by(
     # obsoleted_in_version needs no clause of its own: the alignment CHECK
     # ties its nullness to is_obsolete, so it can only move when is_obsolete
     # does. A row carrying a replaced_by must be rewritten whatever else
-    # matches, since the wipe above is what lets the next step drop a pointer
-    # the new release no longer asserts.
+    # matches, since the wipe above lets the next step drop a pointer the new
+    # release no longer asserts.
     await conn.execute(
         "INSERT INTO qiita.terminology_term"
         "   (terminology_idx, term_id, label, alternate_label, is_obsolete,"
@@ -552,16 +594,15 @@ async def _resolve_replaced_by(
     terminology_idx: int,
     parsed_terms: list[ParsedTerm],
 ) -> None:
-    """With all term rows currently present at known idxs, populate replaced_by
-    for obsolete rows whose incoming entry names within this terminology
-    show they have been replaced. Precondition: every term in the
-    batch is already present in terminology_term.
+    """Populate replaced_by for every obsolete row whose incoming entry names a
+    replacement within this terminology. Precondition: terminology_term
+    already holds every term in the batch.
 
-    For now, resolution is scoped to this terminology. A pointer naming another
-    vocabulary's term — which sources can emit — is removed upstream rather
-    than arriving here, so every pointer in a batch resolves in-terminology
-    by construction. The db itself could accept a cross-terminology
-    target; if we do start supporting that, we should revisit this."""
+    Resolution stays scoped to this terminology: a pointer naming another
+    vocabulary's term — which sources can emit — drops out before reaching
+    here, so every pointer in a batch resolves in-terminology by construction.
+    The db itself could accept a cross-terminology target; supporting that
+    would mean revisiting this."""
     pairs = [
         (term.term_id, term.replaced_by_term_id)
         for term in parsed_terms
@@ -593,12 +634,12 @@ async def _append_unresolved_replaced_by_notes(
 ) -> None:
     """Append a per-event audit line to qiita.terminology_term.notes for
     each (obsolete_term_id, attempted_curie) pair, scoped to this
-    terminology. Existing notes content is preserved; the new line is
-    newline-separated when prior content exists.
+    terminology. Preserves existing notes content, separating the new line
+    with a newline when prior content exists.
 
-    The notes column is shared between the loader and operator content,
-    so entries accumulate across reloads; the version stamp in each line
-    is what distinguishes one tolerate run from another."""
+    The notes column carries both loader and operator content, so entries
+    accumulate across reloads; the version stamp in each line distinguishes
+    one tolerate run from another."""
     if not unresolved_pairs:
         return
     obsolete_term_ids = [p[0] for p in unresolved_pairs]
@@ -626,11 +667,11 @@ async def _rebuild_closure(
     terminology_idx: int,
     parsed_closure: list[tuple[str, str, int]],
 ) -> int:
-    """Replace every closure row scoped to this terminology and return
-    the DB-side inserted count. A tuple naming a term_id not present in
-    terminology_term is dropped by the inner JOINs, so the returned count
-    may be less than len(parsed_closure); whether such a tuple is
-    acceptable at all is settled before this runs."""
+    """Replace every closure row scoped to this terminology and return the
+    DB-side inserted count. The inner JOINs drop a tuple naming a term_id
+    terminology_term does not hold, so the returned count may be less than
+    len(parsed_closure); an earlier check settles whether such a tuple is
+    acceptable at all."""
     await conn.execute(
         "DELETE FROM qiita.terminology_closure WHERE terminology_idx = $1",
         terminology_idx,

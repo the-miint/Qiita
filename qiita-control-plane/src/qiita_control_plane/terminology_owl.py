@@ -1,10 +1,9 @@
 """The OBO annotation conventions that decide which terms of an OWL
 release are obsolete and what replaced them.
 
-Holds no knowledge of any particular OWL toolchain: the input is already
-normalized into ExportedClass rows, and the identifiers of the three
-annotation properties those rows carry are defined here for whichever
-extractor asks the source for them.
+Holds no knowledge of any particular OWL toolchain: the input arrives already
+normalized into ExportedClass rows, and this module defines the identifiers of
+the three annotation properties those rows carry.
 """
 
 from __future__ import annotations
@@ -29,18 +28,17 @@ OBO_ALTERNATIVE_ID_PROPERTY = "oboInOwl:hasAlternativeId"
 @dataclass(frozen=True)
 class ExportedClass:
     """What an ontology release asserts about one of its classes, before any
-    obsoletion decision is taken from those assertions.
+    obsoletion decision draws on those assertions.
 
     The field names mark the assertions as the source's own, because they can
-    differ from the decisions derived from them: a class
-    the source never deprecated is obsoleted anyway if another class
-    absorbs it, and the replacement finally recorded may differ from the
-    one asserted here.
+    differ from the decisions that follow: another class absorbing a class
+    obsoletes it even when the source never deprecated it, and the replacement
+    finally recorded may differ from the one asserted here.
 
     These records do not map one-to-one onto term rows. Every term id in
-    `alternative_term_ids` earns a row of its own whether or not the
-    release also carries a class for it, so a set of these yields at least
-    as many term rows, and usually more.
+    `alternative_term_ids` earns a row of its own whether or not the release
+    also carries a class for it, so a set of these yields at least as many term
+    rows, and usually more.
     """
 
     term_id: str
@@ -58,8 +56,7 @@ def build_terms(
     """Turn `exported_classes` into the term rows of a release.
 
     A `term_id_prefix` of None takes the classes whole; otherwise classes
-    outside the prefix are dropped, along with any pointer reaching out of
-    it.
+    outside the prefix drop out, along with any pointer reaching past it.
     """
     in_scope_classes = (
         exported_classes
@@ -74,16 +71,16 @@ def _filter_classes_to_prefix(
     term_id_prefix: str,
 ) -> list[ExportedClass]:
     """Keep only the classes whose term id carries `term_id_prefix`, so
-    classes a release imports from other vocabularies stay out of it. A
-    replacement pointer or absorbed term id reaching outside the prefix is
-    dropped from the class that carries it."""
+    classes a release imports from other vocabularies stay out of it. A class
+    loses any replacement pointer or absorbed term id reaching past the
+    prefix."""
     kept: list[ExportedClass] = []
     for exported_class in exported_classes:
         if not exported_class.term_id.startswith(term_id_prefix):
             continue
 
-        # Only a same-vocabulary replacement is recorded here, so a pointer at
-        # another vocab is dropped, but the db can permit that, if we later decide to.
+        # Record only a same-vocabulary replacement, dropping a pointer at
+        # another vocab; the db could permit one if we later decide to.
         asserted_replacement = exported_class.asserted_replacement_term_id
         if asserted_replacement is not None and not asserted_replacement.startswith(term_id_prefix):
             _log.warning(
@@ -111,25 +108,22 @@ def _filter_classes_to_prefix(
 
 def _assemble_terms(exported_classes: list[ExportedClass]) -> list[ParsedTerm]:
     """Apply the OBO obsoletion conventions to `exported_classes`: a
-    deprecated class is obsolete, a class another one absorbed is obsolete
-    and replaced by that other class, and a class encoded both ways is
-    recorded only as absorbed."""
+    deprecated class is obsolete, a class another one absorbed is obsolete and
+    points at that other class, and a class encoded both ways records only the
+    absorption."""
     merge_survivors = _collect_merge_survivors(exported_classes)
     terms = [
         _term_for_class(exported_class, merge_survivors) for exported_class in exported_classes
     ]
 
-    # An absorbed term id with no class of its own is left unnamed: the
-    # release carries no class to take a label from, and what to store in its
-    # place depends on whether the term is already known, which is not visible
-    # from here.
+    # An absorbed term id with no class of its own stays unnamed: the release
+    # carries no class to take a label from, and what to store in its place
+    # depends on whether the term is already known, which this module cannot
+    # see.
     exported_term_ids = {exported_class.term_id for exported_class in exported_classes}
     terms += [
-        ParsedTerm(
-            term_id=merged_term_id,
-            label=None,
-            alternate_label=None,
-            is_obsolete=True,
+        ParsedTerm.retired(
+            merged_term_id,
             replaced_by_term_id=survivor_term_id,
             obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
         )
@@ -145,8 +139,8 @@ def _collect_merge_survivors(exported_classes: list[ExportedClass]) -> dict[str,
     survivors: dict[str, str] = {}
     for exported_class in exported_classes:
         for merged_term_id in exported_class.alternative_term_ids:
-            # A class listing its own term id records no absorption; taking
-            # it would obsolete the class and point it at itself.
+            # A class listing its own term id records no absorption; taking it
+            # would obsolete the class and point it at itself.
             if merged_term_id == exported_class.term_id:
                 continue
 
@@ -168,9 +162,8 @@ def _term_for_class(
     exported_class: ExportedClass,
     merge_survivors: dict[str, str],
 ) -> ParsedTerm:
-    """Build the term row for one exported class. Having been absorbed takes
-    precedence over the class's own deprecation, which is then recorded only
-    as the absorption."""
+    """Build the term row for one exported class. Absorption outranks the
+    class's own deprecation, so the row records only the absorption."""
     survivor_term_id = merge_survivors.get(exported_class.term_id)
     if survivor_term_id is None:
         return ParsedTerm(

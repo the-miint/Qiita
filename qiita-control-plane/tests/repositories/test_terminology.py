@@ -4,12 +4,14 @@ atomic row operations, and the import_terminology_release composer.
 Most of the scope is the connection-level contract — the transaction guard, a
 conditional UPDATE that matches nothing returning None instead of raising, and
 the closure rebuild's tolerance of tuples naming a term the batch never
-supplied. The status-transition rules those primitives back are exercised
-against the action-layer entry point instead.
+supplied. The status-transition rules those primitives back get their coverage
+at the action-layer entry point instead.
 
 The `db` marker is per test rather than module-wide, so the reporting tests,
 which need no database, stay in the pure-unit tier.
 """
+
+from dataclasses import replace
 
 import asyncpg
 import pytest
@@ -46,8 +48,8 @@ async def _insert_term(
     label: str,
     alternate_label: str | None,
 ) -> None:
-    """Insert one term row directly, bypassing the load path, so a value can
-    be placed on a row without a release having supplied it."""
+    """Insert one term row directly, bypassing the load path, so a value lands
+    on a row without a release supplying it."""
     await pool.execute(
         "INSERT INTO qiita.terminology_term (terminology_idx, term_id, label, alternate_label)"
         " VALUES ($1, $2, $3, $4)",
@@ -75,14 +77,46 @@ async def _load_release(
 
 async def _read_row_versions(pool: asyncpg.Pool, terminology_idx: int) -> dict[str, str]:
     """Return term_id -> the row's transaction stamp, which changes only when
-    the row is physically rewritten. Comparing two of these detects a write
-    that stored the value a row already held."""
+    Postgres physically rewrites the row. Comparing two of these detects a
+    write that stored the value a row already held."""
     rows = await pool.fetch(
         "SELECT term_id, xmin::text AS row_version FROM qiita.terminology_term"
         " WHERE terminology_idx = $1",
         terminology_idx,
     )
     return {row["term_id"]: row["row_version"] for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# ParsedTerm
+# ---------------------------------------------------------------------------
+
+
+def test_ParsedTerm_settles_padded_and_empty_values():
+    """Tests the case where a term is built from cells carrying padding or
+    nothing at all: every text value arrives stripped, and one holding nothing
+    arrives as None, so no reader has to spell that rule itself."""
+    result = parsed_term(
+        "  UBERON:0001  ",
+        "  mouth  ",
+        alternate_label="   ",
+        replaced_by_term_id="",
+    )
+
+    expected = parsed_term("UBERON:0001", "mouth")
+    assert result == expected
+
+
+def test_ParsedTerm_settles_values_on_replace():
+    """Tests the case where replace derives a row from another: it settles the
+    new values like any others, since replace rebuilds the row through the
+    constructor."""
+    term = parsed_term("UBERON:0001", "mouth")
+
+    result = replace(term, label="  molar  ", replaced_by_term_id="   ")
+
+    expected = parsed_term("UBERON:0001", "molar")
+    assert result == expected
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +136,8 @@ def test_format_offenders_within_cap():
 
 
 def test_format_offenders_at_cap():
-    """Tests the case where the offending values exactly fill the cap: nothing
-    is summarized, because no value went unnamed."""
+    """Tests the case where the offending values exactly fill the cap: the
+    message summarizes nothing, because no value went unnamed."""
     values = [f"UBERON:{i:04d}" for i in range(MAX_REPORTED_OFFENDERS)]
 
     result = format_offenders(values)
@@ -113,7 +147,7 @@ def test_format_offenders_at_cap():
 
 def test_format_offenders_over_cap():
     """Tests the case where more offending values arrive than the cap allows:
-    the total is stated and only the capped sample is named."""
+    the message states the total and names only the capped sample."""
     over_cap_count = MAX_REPORTED_OFFENDERS + 5
     values = [f"UBERON:{i:04d}" for i in range(over_cap_count)]
 
@@ -134,8 +168,8 @@ def test_format_offenders_pairs():
 
 
 def test_TerminologyImportAnomaly_every_kind():
-    """Tests the case where every anomaly kind is populated: each is named in one
-    message, in the order the anomaly declares them."""
+    """Tests the case where every anomaly kind is populated: one message names
+    each, in the order the anomaly declares them."""
     exc = TerminologyImportAnomaly(
         silently_dropped_term_ids=["UBERON:0003"],
         unresolved_replaced_by=[("UBERON:0001", "UBERON:9999")],
@@ -259,8 +293,8 @@ async def test_import_terminology_release_closure_tuple_with_unknown_term_id(
 @pytest.mark.db
 async def test_import_terminology_release_analyzes_terms(postgres_pool, created_terminologies):
     """Tests the case where a release has just been applied: the planner's row
-    estimate for the term table matches what it holds, so the statements that
-    filter on terminology_idx are not planned at a default selectivity.
+    estimate for the term table matches what it holds, so the planner does not
+    size statements filtering on terminology_idx at a default selectivity.
 
     The estimate is exact at this size because ANALYZE reads every page of a
     small table; a table never analyzed reports -1 instead of a count.
@@ -279,7 +313,7 @@ async def test_import_terminology_release_analyzes_terms(postgres_pool, created_
     created_terminologies.append(result.terminology_idx)
 
     # Table-wide, not scoped to this terminology: reltuples describes the whole
-    # table, so the row count it is compared against has to as well.
+    # table, so the row count compared against it must too.
     estimate = await postgres_pool.fetchval(
         "SELECT c.reltuples FROM pg_class c"
         "  JOIN pg_namespace n ON n.oid = c.relnamespace"
@@ -408,7 +442,7 @@ async def test_update_terminology_status_invalid_source(postgres_pool, created_t
 async def test_update_terminology_status_derives_sources(postgres_pool, created_terminologies):
     """Tests the case where the target is reachable from some state but not
     from this row's: FAILED is a source for LOADING only, so a FAILED row
-    cannot be promoted straight to ACTIVE."""
+    cannot go straight to ACTIVE."""
     terminology_idx = await seed_terminology(
         postgres_pool, name="tr_derived_sources", status=TerminologyStatus.FAILED
     )
@@ -461,9 +495,9 @@ async def test_fetch_terminology_idx_by_name_not_found(postgres_pool):
 
 @pytest.mark.db
 async def test_terminology_term_alternate_label_column(postgres_pool):
-    """Tests the case where the column's declared shape is read back from the
-    catalog: a nullable VARCHAR(500), the same width as label because it holds
-    a name rather than a definition."""
+    """Tests the case where the catalog reports the column's declared shape: a
+    nullable VARCHAR(500), the same width as label because it holds a name
+    rather than a definition."""
     row = await postgres_pool.fetchrow(
         "SELECT format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull"
         "  FROM pg_attribute a"
@@ -494,7 +528,7 @@ async def test_terminology_term_alternate_label_null_and_value(
     postgres_pool, created_terminologies
 ):
     """Tests the case where one term carries a second name and another does
-    not: both rows are accepted, and each reads back as written."""
+    not: the database accepts both rows, and each reads back as written."""
     terminology_idx = await seed_terminology(postgres_pool, name="tr_alt_roundtrip")
     created_terminologies.append(terminology_idx)
 
@@ -517,12 +551,12 @@ async def test_terminology_term_alternate_label_null_and_value(
 async def test_import_terminology_release_clears_unsupplied_alternate_label(
     postgres_pool, created_terminologies
 ):
-    """Tests the case where a second name was written onto a row outside any
-    load and the next release supplies none: the value is cleared.
+    """Tests the case where a second name reached a row outside any load and
+    the next release supplies none: the load clears the value.
 
     The release is authoritative for alternate_label, so the column is not a
-    place to keep content the source does not carry — a value put there by
-    hand survives only until the terminology is next loaded.
+    place to keep content the source does not carry — a value put there by hand
+    survives only until the next load.
     """
     async with postgres_pool.acquire() as conn, conn.transaction():
         first = await import_terminology_release(
@@ -571,7 +605,7 @@ async def test_import_terminology_release_unchanged_rows_are_not_rewritten(
     postgres_pool, created_terminologies
 ):
     """Tests the case where a release is applied twice with identical content:
-    no row is physically rewritten the second time.
+    the second load rewrites no row.
 
     Postgres stores a new row version on every UPDATE without comparing the
     incoming values to the stored ones, so an upsert that assigns
@@ -599,8 +633,8 @@ async def test_import_terminology_release_changed_row_is_rewritten(
     postgres_pool, created_terminologies
 ):
     """Tests the case where a reload changes one term's label and leaves
-    another untouched: only the changed row is rewritten, and it carries the
-    new value."""
+    another untouched: the load rewrites only the changed row, and it carries
+    the new value."""
     load = await _load_release(
         postgres_pool,
         name="tr_partial_reload",
@@ -641,10 +675,10 @@ async def test_import_terminology_release_withdrawn_replaced_by_is_cleared(
     """Tests the case where a reload keeps a term obsolete but withdraws its
     replacement pointer: replaced_by returns to NULL.
 
-    Every other column on the row is unchanged between the two releases, so
-    this is the case a change-detecting upsert would skip. The pointer is
-    populated after the upsert rather than by it, which is why the row has to
-    be rewritten on the strength of its stored pointer alone.
+    Every other column on the row is unchanged between the two releases, so a
+    change-detecting upsert would skip this case. A later step populates the
+    pointer rather than the upsert itself, so the row must be rewritten on the
+    strength of its stored pointer alone.
     """
     merged_term = parsed_term(
         "TR:1",
@@ -696,15 +730,15 @@ async def test_import_terminology_release_withdrawn_replaced_by_is_cleared(
 async def test_import_terminology_release_unnamed_term_keeps_stored_names(
     postgres_pool, created_terminologies
 ):
-    """Tests the case where a term the database already holds is merged away
-    by a release that supplies no name for it: both stored names survive.
+    """Tests the case where a release merges away a term the database already
+    holds and supplies no name for it: both stored names survive.
 
     A source that retires a term id often stops naming it, so the release
     carries nothing for either name column. An absent label is the source
     saying nothing about the term at all rather than asserting it has no
-    second name, so neither stored name is the release's to clear. The merge
-    is already recorded by is_obsolete, obsoletion_kind, and the replaced_by
-    pointer — the names are the only part a reader cannot reconstruct.
+    second name, so neither stored name is the release's to clear. is_obsolete,
+    obsoletion_kind, and the replaced_by pointer already record the merge — the
+    names are the only part a reader cannot reconstruct.
     """
     load = await _load_release(
         postgres_pool,
@@ -758,9 +792,9 @@ async def test_import_terminology_release_unnamed_term_keeps_stored_names(
 async def test_import_terminology_release_unnamed_new_term_falls_back_to_term_id(
     postgres_pool, created_terminologies
 ):
-    """Tests the case where a term the source does not name has never been
-    loaded before: its own term id becomes its label, since that is the only
-    thing anyone knows about it and the column cannot be empty."""
+    """Tests the case where no prior load holds a term the source does not
+    name: its own term id becomes its label, since that is the only thing
+    anyone knows about it and the column cannot be empty."""
     load = await _load_release(
         postgres_pool,
         name="tr_unnamed_new_term",

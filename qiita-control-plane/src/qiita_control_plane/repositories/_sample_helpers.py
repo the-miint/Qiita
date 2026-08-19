@@ -72,9 +72,9 @@ METADATA_VALUE_COLUMNS_SELECT = ", ".join(
 )
 
 # The display payload for a row whose value is a missing-reason or a terminology
-# term (the reason name; the term's term_id, label, and alternate label), and
-# the two LEFT JOINs that supply it. Split because the two halves sit in
-# different clauses of the statement, and neither is usable without the other.
+# term (the reason name; the term's term_id, label, and alternate label), and the
+# two LEFT JOINs supplying it. Split because the two halves sit in different
+# clauses of the statement, and neither works without the other.
 METADATA_REF_PAYLOAD_SELECT = (
     "mvr.name AS missing_reason_name,"
     " tt.term_id AS terminology_term_id,"
@@ -733,11 +733,11 @@ async def fetch_terminology_term_idxs_by_term_ids(
     supplies no second name for.
 
     Term ids absent from the table are absent from the returned dict. Empty
-    input short-circuits with no DB call. No is_obsolete filter — any row in
-    the table scoped to this terminology is treated as a valid marker; the
-    obsoletion lifecycle is not yet exercised. Scoped to one terminology_idx
-    because (terminology_idx, term_id) is the table's unique key — the same
-    term_id can recur across different terminologies.
+    input short-circuits with no DB call. No is_obsolete filter — any row
+    scoped to this terminology counts as a valid marker; nothing exercises the
+    obsoletion lifecycle yet. Scoped to one terminology_idx because
+    (terminology_idx, term_id) is the table's unique key — the same term_id can
+    recur across different terminologies.
     """
     # Materialize so emptiness is detectable and the param can be passed as ANY.
     candidate_term_ids = list(term_ids)

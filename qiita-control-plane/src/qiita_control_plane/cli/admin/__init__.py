@@ -298,10 +298,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # robot-command told the operator to create, while the archive is NCBI's
     # and sits wherever they downloaded it.
     p_prepare_taxdump.add_argument(
-        "--taxdump-zip",
+        "--taxdump",
         required=True,
         type=Path,
-        help="path to NCBI's new_taxdump archive",
+        help="path to NCBI's taxdump.tar.gz or new_taxdump.tar.gz",
     )
     p_prepare_taxdump.add_argument("--name", required=True, help="terminology name to load under")
     p_prepare_taxdump.add_argument("--version", required=True, help="release version to load under")
@@ -337,7 +337,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "absorb structural anomalies instead of refusing the load:"
             " auto-obsolete terms the release dropped without deprecating them,"
-            " and record an unresolvable replacement pointer as a note"
+            " record an unresolvable replacement pointer as a note, and drop a"
+            " closure row naming an endpoint the release does not define, which"
+            " lowers the closure count the load reports"
         ),
     )
     p_terminology_load.set_defaults(handler=_handle_terminology_load)

@@ -1,11 +1,15 @@
 """Unit tests for qiita_control_plane.terminology — manifest
-parser/verifier, and the staging-dir import workflow."""
+parser/verifier, and the staging-dir import workflow.
 
-import csv
+A test that pins the position an error names writes its offending row after
+a well-formed one, so a position counted off the wrong origin cannot pass.
+"""
+
 import hashlib
 import json
 from datetime import datetime
 
+import duckdb
 import pytest
 from pydantic import ValidationError
 from qiita_common.models import (
@@ -27,6 +31,8 @@ from qiita_control_plane.terminology import (
     CLOSURE_TSV_COLUMNS,
     CLOSURE_TSV_FILENAME,
     MANIFEST_FILENAME,
+    MAX_TERM_ID_LENGTH,
+    MAX_TERM_NAME_LENGTH,
     TERMS_TSV_COLUMNS,
     TERMS_TSV_FILENAME,
     _parse_closure_tsv,
@@ -38,6 +44,7 @@ from qiita_control_plane.terminology import (
     write_closure_tsv_stub,
     write_manifest,
     write_terms_tsv,
+    write_tsv,
 )
 from qiita_control_plane.testing.terminology import parsed_term
 
@@ -116,7 +123,7 @@ def test_load_manifest_version_at_max_length(tmp_path):
 
 def test_load_manifest_version_over_max_length(tmp_path):
     """Tests the case where the version is one character longer than the column
-    that stores it allows: the manifest is refused up front, rather than passing
+    that stores it allows: the parse refuses it up front, rather than passing
     validation and failing against the column mid-load."""
     _write_manifest_json(tmp_path, _manifest_payload("v" * (MAX_TERMINOLOGY_VERSION_LENGTH + 1)))
 
@@ -199,7 +206,7 @@ def test_verify_manifest_checksums_mismatch(tmp_path):
 
 def test_verify_manifest_checksums_closure_mismatch(tmp_path):
     """Tests the case where the terms table verifies but the closure table
-    does not, so a mismatch in the second table is not skipped."""
+    does not, so the check does not skip a mismatch in the second table."""
     terms_content = b"term_id\tlabel\nUBERON:0001\tmouth\n"
     _write_release_tables(tmp_path, terms_content, b"actual content")
     manifest = _manifest_for(hashlib.sha256(terms_content).hexdigest(), "c" * 64)
@@ -217,13 +224,74 @@ def test_verify_manifest_checksums_missing_table(tmp_path):
 
 
 # =============================================================================
+# write_tsv
+# =============================================================================
+
+
+def test_write_tsv(tmp_path):
+    """Tests the case where a table with cells needing every escape is written:
+    the header leads the file, a None cell arrives empty, and a cell holding a
+    delimiter, a quote, a newline, or a hash survives it. The hash is quoted
+    though the format does not require it, since that decides the digest bytes."""
+    path = tmp_path / "table.tsv"
+
+    write_tsv(
+        path,
+        ("first", "second", "third"),
+        [
+            ("plain", None, "café"),
+            ("has\ttab", 'has "quote"', "has\nnewline"),
+            ("clone LGB#32", None, None),
+        ],
+    )
+
+    expected = (
+        'first\tsecond\tthird\nplain\t\tcafé\n"has\ttab"\t"has ""quote"""\t"has\nnewline"\n'
+        '"clone LGB#32"\t\t\n'
+    )
+    assert path.read_text() == expected
+
+
+def test_write_tsv_no_rows(tmp_path):
+    """Tests the case where a table is written with no rows: the file holds its
+    header and nothing else."""
+    path = tmp_path / "table.tsv"
+
+    write_tsv(path, ("first", "second"))
+
+    assert path.read_text() == "first\tsecond\n"
+
+
+@pytest.mark.parametrize("row", [("only", "two"), ("one", "two", "three", "four")])
+def test_write_tsv_row_of_wrong_width(tmp_path, row):
+    """Tests the case where a row does not carry one cell per column: the write
+    refuses it, since cells are positional and the surplus or shortfall would
+    otherwise land under the wrong column or drop one."""
+    path = tmp_path / "table.tsv"
+
+    with pytest.raises(ValueError):
+        write_tsv(path, ("first", "second", "third"), [row])
+
+    assert not path.exists()
+
+
+def test_write_tsv_unwritable_destination(tmp_path):
+    """Tests the case where the destination cannot be written: the writer
+    reports it rather than leaving the caller a partial file."""
+    path = tmp_path / "absent-directory" / "table.tsv"
+
+    with pytest.raises(duckdb.Error):
+        write_tsv(path, ("first", "second"), [("a", "b")])
+
+
+# =============================================================================
 # write_terms_tsv / write_closure_tsv_stub
 # =============================================================================
 
 
 def test_write_terms_tsv(tmp_path):
     """Tests the case where terms with and without obsoletion fields and
-    with and without a second name are written: the file is headed by the
+    with and without a second name are written: the file leads with the
     declared columns and reads back through the parser unchanged."""
     terms = [
         ParsedTerm(
@@ -250,6 +318,16 @@ def test_write_terms_tsv(tmp_path):
             replaced_by_term_id="UBERON:0001",
             obsoletion_kind=TerminologyTermObsoletionKind.SOURCE_MERGED,
         ),
+        # The writer quotes a hash, so a label carrying one proves the quoting
+        # round-trips rather than reaching the database with its quotes.
+        ParsedTerm(
+            term_id="NCBI:40846",
+            label="unidentified eubacterium clone LGB#32",
+            alternate_label=None,
+            is_obsolete=False,
+            replaced_by_term_id=None,
+            obsoletion_kind=None,
+        ),
     ]
     path = tmp_path / TERMS_TSV_FILENAME
 
@@ -261,9 +339,8 @@ def test_write_terms_tsv(tmp_path):
 
 def test__parse_terms_tsv_blank_label(tmp_path):
     """Tests the case where the label cell is blank: it parses to None rather
-    than an empty string, so a source that names no term is distinguishable
-    from one that names it the empty string, and the load can decide what to
-    store."""
+    than an empty string, so a source naming no term stays distinguishable from
+    one naming it the empty string, leaving the load to decide what to store."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
@@ -284,8 +361,8 @@ def test__parse_terms_tsv_blank_label(tmp_path):
 
 
 def test_write_terms_tsv_unnamed_term(tmp_path):
-    """Tests the case where a term carries no label: it is written as an empty
-    cell and reads back through the parser as None."""
+    """Tests the case where a term carries no label: the writer emits an empty
+    cell, and the parser reads it back as None."""
     terms = [
         parsed_term(
             "NCBI:12",
@@ -303,8 +380,8 @@ def test_write_terms_tsv_unnamed_term(tmp_path):
 
 def test__parse_terms_tsv_blank_alternate_label(tmp_path):
     """Tests the case where the alternate_label cell is blank or holds only
-    whitespace: both arrive as None, because an absent second name is
-    spelled NULL in the database rather than as an empty string."""
+    whitespace: both arrive as None, because the database spells an absent
+    second name NULL rather than as an empty string."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
@@ -323,9 +400,8 @@ def test__parse_terms_tsv_blank_alternate_label(tmp_path):
 
 def test__parse_terms_tsv_strips_key_and_names(tmp_path):
     """Tests the case where the term id and both names arrive padded with
-    whitespace: each is stripped, because the index over them is a plain btree
-    that would hold a padded variant as a value distinct from its unpadded
-    twin."""
+    whitespace: the parse strips each, because a plain btree index holds a
+    padded variant as a value distinct from its unpadded twin."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
@@ -340,8 +416,8 @@ def test__parse_terms_tsv_strips_key_and_names(tmp_path):
 
 def test__parse_terms_tsv_strips_every_cell(tmp_path):
     """Tests the case where every cell of a row arrives padded with whitespace:
-    each is stripped, so a padded replacement pointer resolves against the term
-    it names and a padded flag or kind reads as the value it spells."""
+    the parse strips each, so a padded replacement pointer resolves against the
+    term it names and a padded flag or kind reads as the value it spells."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
@@ -365,13 +441,13 @@ def test__parse_terms_tsv_strips_every_cell(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("row_text", "expected_column"),
+    ("row_text", "cells_found"),
     [
-        ("UBERON:0001\n", "label"),
-        ("UBERON:0001\tmouth\n", "alternate_label"),
-        ("UBERON:0001\tmouth\t\n", "is_obsolete"),
-        ("UBERON:0001\tmouth\t\tfalse\n", "replaced_by_term_id"),
-        ("UBERON:0001\tmouth\t\tfalse\t\n", "obsoletion_kind"),
+        ("UBERON:0001\n", 1),
+        ("UBERON:0001\tmouth\n", 2),
+        ("UBERON:0001\tmouth\t\n", 3),
+        ("UBERON:0001\tmouth\t\tfalse\n", 4),
+        ("UBERON:0001\tmouth\t\tfalse\t\n", 5),
     ],
     ids=[
         "stops_before_label",
@@ -381,12 +457,10 @@ def test__parse_terms_tsv_strips_every_cell(tmp_path):
         "stops_before_obsoletion_kind",
     ],
 )
-def test__parse_terms_tsv_short_row(tmp_path, row_text, expected_column):
-    """Tests the case where a terms row stops before a cell that is always read:
-    the parse is refused naming the absent column and the line it is on, rather
-    than failing on whatever the missing value was asked to do. The offending
-    row follows a well-formed one, so a line number counted off the wrong
-    origin cannot pass."""
+def test__parse_terms_tsv_short_row(tmp_path, row_text, cells_found):
+    """Tests the case where a terms row carries fewer cells than the table
+    declares columns: the parse refuses it, naming the row and both counts,
+    rather than reading its later values under the wrong columns."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
@@ -394,13 +468,117 @@ def test__parse_terms_tsv_short_row(tmp_path, row_text, expected_column):
         f"{row_text}"
     )
 
-    with pytest.raises(ValueError, match=f"line 3 carries no {expected_column}"):
+    expected_error = f"(?s)Line: 3.*Expected Number of Columns: 6 Found: {cells_found}"
+    with pytest.raises(duckdb.Error, match=expected_error):
         _parse_terms_tsv(path)
+
+
+def test__parse_terms_tsv_long_row(tmp_path):
+    """Tests the case where a terms row runs past the last column: the parse
+    refuses it, naming the row and both counts, since cells are positional and
+    a surplus means the values sit under the wrong columns."""
+    path = tmp_path / TERMS_TSV_FILENAME
+    path.write_text(
+        "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        "UBERON:0009\tnostril\t\tfalse\t\t\n"
+        "UBERON:0001\tmouth\t\tfalse\t\t\tEXTRA\n"
+    )
+
+    with pytest.raises(duckdb.Error, match="(?s)Line: 3.*Expected Number of Columns: 6 Found: 7"):
+        _parse_terms_tsv(path)
+
+
+@pytest.mark.parametrize(
+    ("column", "max_length"),
+    [
+        ("term_id", MAX_TERM_ID_LENGTH),
+        ("label", MAX_TERM_NAME_LENGTH),
+        ("alternate_label", MAX_TERM_NAME_LENGTH),
+        ("replaced_by_term_id", MAX_TERM_ID_LENGTH),
+    ],
+)
+def test__parse_terms_tsv_over_long_value(tmp_path, column, max_length):
+    """Tests the case where a cell holds more than its column can store: the
+    parse refuses it, naming the row, the length found, and the length allowed,
+    rather than reaching the database and failing there with nothing naming the
+    row."""
+    cells = {
+        "term_id": "UBERON:0001",
+        "label": "mouth",
+        "alternate_label": "",
+        "is_obsolete": "false",
+        "replaced_by_term_id": "",
+        "obsoletion_kind": "",
+    }
+    cells[column] = "x" * (max_length + 1)
+
+    # Only an obsolete row carries a replacement pointer, and it must also
+    # record why it is obsolete.
+    if column == "replaced_by_term_id":
+        cells["is_obsolete"] = "true"
+        cells["obsoletion_kind"] = "source_merged"
+
+    path = tmp_path / TERMS_TSV_FILENAME
+    offending_row = "\t".join(cells[c] for c in TERMS_TSV_COLUMNS)
+    path.write_text(
+        "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        "UBERON:0009\tnostril\t\tfalse\t\t\n"
+        f"{offending_row}\n"
+    )
+
+    expected_error = f"row 2 carries a {column} of {max_length + 1} characters"
+    with pytest.raises(ValueError, match=expected_error):
+        _parse_terms_tsv(path)
+
+
+def test__parse_terms_tsv_value_at_the_limit(tmp_path):
+    """Tests the case where a term id and both names are exactly as long as
+    their columns allow: the row parses, so the bound refuses only what the
+    database could not store."""
+    term_id = "x" * MAX_TERM_ID_LENGTH
+    label = "y" * MAX_TERM_NAME_LENGTH
+    alternate_label = "z" * MAX_TERM_NAME_LENGTH
+    path = tmp_path / TERMS_TSV_FILENAME
+    path.write_text(
+        "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        f"{term_id}\t{label}\t{alternate_label}\tfalse\t\t\n"
+    )
+
+    result = _parse_terms_tsv(path)
+
+    expected = [parsed_term(term_id, label, alternate_label=alternate_label)]
+    assert result == expected
+
+
+def test__parse_terms_tsv_round_trip_normalizes(tmp_path):
+    """Tests the case where terms carry an empty, whitespace-only, or padded
+    name: the rows read back out of the written table equal the rows written
+    into it, so a release assembled in memory and the same release read from
+    its files cannot disagree."""
+    path = tmp_path / TERMS_TSV_FILENAME
+    terms = [
+        parsed_term("UBERON:0001", "", alternate_label="   "),
+        parsed_term("UBERON:0002", "   ", alternate_label="  oral opening  "),
+        parsed_term("UBERON:0003", "  molar  ", replaced_by_term_id="  UBERON:0001  "),
+        parsed_term("UBERON:0004", "mouth"),
+    ]
+
+    write_terms_tsv(path, terms)
+    result = _parse_terms_tsv(path)
+
+    expected = [
+        parsed_term("UBERON:0001", None),
+        parsed_term("UBERON:0002", None, alternate_label="oral opening"),
+        parsed_term("UBERON:0003", "molar", replaced_by_term_id="UBERON:0001"),
+        parsed_term("UBERON:0004", "mouth"),
+    ]
+    assert result == expected
+    assert result == terms
 
 
 def test__parse_terms_tsv_empty_term_id(tmp_path):
     """Tests the case where a term id cell holds nothing but whitespace: the
-    parse is refused naming the line, since the database keys the row by that
+    parse refuses it, naming the row, since the database keys the row by that
     value and every row referencing the term spells it unpadded."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
@@ -409,13 +587,13 @@ def test__parse_terms_tsv_empty_term_id(tmp_path):
         "   \tmouth\t\tfalse\t\t\n"
     )
 
-    with pytest.raises(ValueError, match="line 3 carries an empty term_id"):
+    with pytest.raises(ValueError, match="row 2 carries an empty term_id"):
         _parse_terms_tsv(path)
 
 
 def test__parse_terms_tsv_invalid_is_obsolete(tmp_path):
     """Tests the case where an is_obsolete cell spells neither boolean value:
-    the parse is refused naming the line, the value, and the two spellings it
+    the parse refuses it, naming the row, the value, and the two spellings it
     accepts, rather than coercing the row to not-obsolete."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
@@ -423,13 +601,13 @@ def test__parse_terms_tsv_invalid_is_obsolete(tmp_path):
         "UBERON:0001\tmouth\t\tyes\t\t\n"
     )
 
-    with pytest.raises(ValueError, match="line 2.*is_obsolete.*'yes'"):
+    with pytest.raises(ValueError, match="row 1.*is_obsolete.*'yes'"):
         _parse_terms_tsv(path)
 
 
 def test__parse_terms_tsv_unrecognized_obsoletion_kind(tmp_path):
     """Tests the case where an obsoletion_kind cell names a kind the enum does
-    not carry: the parse is refused naming the line and the value, rather than
+    not carry: the parse refuses it, naming the row and the value, rather than
     leaving the enum cast to fail without saying which row it read."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
@@ -437,27 +615,52 @@ def test__parse_terms_tsv_unrecognized_obsoletion_kind(tmp_path):
         "UBERON:0002\ttooth\t\ttrue\t\tsource_vanished\n"
     )
 
-    with pytest.raises(ValueError, match="line 2.*obsoletion_kind 'source_vanished'"):
+    with pytest.raises(ValueError, match="row 1.*obsoletion_kind 'source_vanished'"):
         _parse_terms_tsv(path)
 
 
 def test__parse_terms_tsv_missing_column(tmp_path):
     """Tests the case where the terms table was written against an earlier
-    column set: the parse is refused up front naming the absent column,
-    rather than silently reading every row as having no second name."""
+    column set: the parse refuses it up front, rather than silently reading
+    every row as having no second name."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
         "UBERON:0001\tmouth\tfalse\t\t\n"
     )
 
-    with pytest.raises(ValueError, match="alternate_label"):
+    with pytest.raises(duckdb.Error, match="Expected Number of Columns: 6 Found: 5"):
+        _parse_terms_tsv(path)
+
+
+def test__parse_terms_tsv_reordered_header(tmp_path):
+    """Tests the case where the terms table names every declared column but in
+    another order: the parse refuses it, naming the order found and the order
+    expected, since the read maps columns positionally and each cell would
+    otherwise land under the wrong one."""
+    path = tmp_path / TERMS_TSV_FILENAME
+    path.write_text(
+        "label\tterm_id\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
+        "mouth\tUBERON:0001\t\tfalse\t\t\n"
+    )
+
+    with pytest.raises(ValueError, match="is headed by.*expected.*in that order"):
+        _parse_terms_tsv(path)
+
+
+def test__parse_terms_tsv_no_header(tmp_path):
+    """Tests the case where the terms table is wholly empty: the parse refuses
+    it for carrying no header, rather than reading it as a table of no rows."""
+    path = tmp_path / TERMS_TSV_FILENAME
+    path.write_text("")
+
+    with pytest.raises(ValueError, match="carries no header"):
         _parse_terms_tsv(path)
 
 
 def test__parse_terms_tsv_duplicate_term_id(tmp_path):
     """Tests the case where one term id occupies two rows of the terms table:
-    the parse is refused naming the id, because the release contradicts itself
+    the parse refuses it, naming the id, because the release contradicts itself
     about one term and no upsert can apply two rows to one key."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
@@ -471,9 +674,9 @@ def test__parse_terms_tsv_duplicate_term_id(tmp_path):
 
 
 def test__parse_terms_tsv_duplicate_term_id_reports_all(tmp_path):
-    """Tests the case where several term ids are duplicated: every offending id
-    is named in one sorted error, so a whole table is corrected in one pass
-    rather than one id per run."""
+    """Tests the case where several term ids are duplicated: one sorted error
+    names every offending id, so a whole table takes one correction pass rather
+    than one id per run."""
     path = tmp_path / TERMS_TSV_FILENAME
     header = "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
     body = "".join(
@@ -498,8 +701,8 @@ def test__parse_terms_tsv_duplicate_term_id_reports_all(tmp_path):
 
 def test__parse_terms_tsv_duplicate_term_id_over_cap(tmp_path):
     """Tests the case where more term ids are duplicated than the error names:
-    the total is stated and the tail is left unnamed, so a wholly corrupt table
-    yields a readable error rather than one line per offending id."""
+    the error states the total and leaves the tail unnamed, so a wholly corrupt
+    table yields a readable error rather than one line per offending id."""
     over_cap_count = MAX_REPORTED_OFFENDERS + 5
     term_ids = [f"UBERON:{i:04d}" for i in range(over_cap_count)]
     path = tmp_path / TERMS_TSV_FILENAME
@@ -528,7 +731,7 @@ def test_write_closure_tsv_stub(tmp_path):
 
 def test__parse_closure_tsv_duplicate_pair(tmp_path):
     """Tests the case where one ancestor/descendant pair occupies two rows of
-    the closure table: the parse is refused naming the pair, because the
+    the closure table: the parse refuses it, naming the pair, because the
     database holds that pair unique."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text(
@@ -543,7 +746,7 @@ def test__parse_closure_tsv_duplicate_pair(tmp_path):
 
 def test__parse_closure_tsv_duplicate_pair_differing_distance(tmp_path):
     """Tests the case where two closure rows name one pair at two distances:
-    the parse is refused just as for an exact repeat, because the database
+    the parse refuses it just as for an exact repeat, because the database
     holds the pair unique without regard to distance."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text(
@@ -558,35 +761,35 @@ def test__parse_closure_tsv_duplicate_pair_differing_distance(tmp_path):
 
 def test__parse_terms_tsv_obsolete_without_kind(tmp_path):
     """Tests the case where a row is obsolete but names no obsoletion kind: the
-    parse is refused naming the row and its line, because the database requires
-    an obsolete term to record why it is obsolete."""
+    parse refuses it, naming the row and its line, because the database
+    requires an obsolete term to record why it is obsolete."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
         "UBERON:0003\tobsolete molar\t\ttrue\t\t\n"
     )
 
-    with pytest.raises(ValueError, match="line 2.*UBERON:0003"):
+    with pytest.raises(ValueError, match="row 1.*UBERON:0003"):
         _parse_terms_tsv(path)
 
 
 def test__parse_terms_tsv_kind_on_live_row(tmp_path):
-    """Tests the case where a live row carries an obsoletion kind: the parse is
-    refused naming the row and its line, because the database allows a kind only
-    on a term that is obsolete."""
+    """Tests the case where a live row carries an obsoletion kind: the parse
+    refuses it, naming the row and its line, because the database allows a kind
+    only on an obsolete term."""
     path = tmp_path / TERMS_TSV_FILENAME
     path.write_text(
         "term_id\tlabel\talternate_label\tis_obsolete\treplaced_by_term_id\tobsoletion_kind\n"
         "UBERON:0001\tmouth\t\tfalse\t\tsource_merged\n"
     )
 
-    with pytest.raises(ValueError, match="line 2.*UBERON:0001"):
+    with pytest.raises(ValueError, match="row 1.*UBERON:0001"):
         _parse_terms_tsv(path)
 
 
 def test__parse_closure_tsv_missing_column(tmp_path):
     """Tests the case where the closure table was written against a different
-    column set: the parse is refused up front naming the absent column, rather
+    column set: the parse refuses it up front, naming the absent column, rather
     than failing per row on a key it cannot find."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text("ancestor\tdescendant\tdistance\nUBERON:0001\tUBERON:0002\t1\n")
@@ -597,8 +800,8 @@ def test__parse_closure_tsv_missing_column(tmp_path):
 
 def test__parse_closure_tsv_strips_every_cell(tmp_path):
     """Tests the case where every cell of a row arrives padded with whitespace:
-    each is stripped, so the pair matches the term rows it relates rather than
-    being dropped by the rebuild for naming a term id nothing spells that way,
+    the parse strips each, so the pair matches the term rows it relates rather
+    than the rebuild dropping it for naming a term id nothing spells that way,
     and the distance reads as the number it spells."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text(
@@ -622,10 +825,8 @@ def test__parse_closure_tsv_empty_endpoint(
     tmp_path, ancestor_cell, descendant_cell, expected_column
 ):
     """Tests the case where one endpoint cell holds nothing but whitespace: the
-    parse is refused naming that column and the line it is on, since a closure
-    row can only relate terms the release defines. The offending row follows a
-    well-formed one, so a line number counted off the wrong origin cannot
-    pass."""
+    parse refuses it, naming that column and the row it is on, since a closure
+    row can only relate terms the release defines."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text(
         "ancestor_term_id\tdescendant_term_id\tdistance\n"
@@ -633,15 +834,14 @@ def test__parse_closure_tsv_empty_endpoint(
         f"{ancestor_cell}\t{descendant_cell}\t1\n"
     )
 
-    with pytest.raises(ValueError, match=f"line 3 carries an empty {expected_column}"):
+    with pytest.raises(ValueError, match=f"row 2 carries an empty {expected_column}"):
         _parse_closure_tsv(path)
 
 
 def test__parse_closure_tsv_short_row(tmp_path):
     """Tests the case where a closure row stops before its distance: the parse
-    is refused naming the absent column and the line it is on, rather than
-    raising on an absent cell. The offending row follows a well-formed one, so a
-    line number counted off the wrong origin cannot pass."""
+    refuses it, naming the row and both counts, rather than raising on an
+    absent cell."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text(
         "ancestor_term_id\tdescendant_term_id\tdistance\n"
@@ -649,31 +849,46 @@ def test__parse_closure_tsv_short_row(tmp_path):
         "UBERON:0001\tUBERON:0002\n"
     )
 
-    with pytest.raises(ValueError, match="line 3 carries no distance"):
+    with pytest.raises(duckdb.Error, match="(?s)Line: 3.*Expected Number of Columns: 3 Found: 2"):
+        _parse_closure_tsv(path)
+
+
+def test__parse_closure_tsv_long_row(tmp_path):
+    """Tests the case where a closure row runs past its distance: the parse
+    refuses it, naming the row and both counts, rather than reading a row whose
+    endpoints and distance sit under the wrong columns."""
+    path = tmp_path / CLOSURE_TSV_FILENAME
+    path.write_text(
+        "ancestor_term_id\tdescendant_term_id\tdistance\n"
+        "UBERON:0008\tUBERON:0009\t1\n"
+        "UBERON:0001\tUBERON:0002\t1\t2\n"
+    )
+
+    with pytest.raises(duckdb.Error, match="(?s)Line: 3.*Expected Number of Columns: 3 Found: 4"):
         _parse_closure_tsv(path)
 
 
 def test__parse_closure_tsv_non_integer_distance(tmp_path):
-    """Tests the case where a distance cell is not a number: the parse is
-    refused naming the line and the pair it belongs to."""
+    """Tests the case where a distance cell is not a number: the parse refuses
+    it, naming the row and the pair it belongs to."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text(
         "ancestor_term_id\tdescendant_term_id\tdistance\nUBERON:0001\tUBERON:0002\tone\n"
     )
 
-    with pytest.raises(ValueError, match="line 2.*UBERON:0002"):
+    with pytest.raises(ValueError, match="row 1.*UBERON:0002"):
         _parse_closure_tsv(path)
 
 
 def test__parse_closure_tsv_negative_distance(tmp_path):
-    """Tests the case where a distance is negative: the parse is refused naming
+    """Tests the case where a distance is negative: the parse refuses it, naming
     the line and the pair, because the database holds distance non-negative."""
     path = tmp_path / CLOSURE_TSV_FILENAME
     path.write_text(
         "ancestor_term_id\tdescendant_term_id\tdistance\nUBERON:0001\tUBERON:0002\t-1\n"
     )
 
-    with pytest.raises(ValueError, match="line 2.*UBERON:0002"):
+    with pytest.raises(ValueError, match="row 1.*UBERON:0002"):
         _parse_closure_tsv(path)
 
 
@@ -698,44 +913,43 @@ def _write_staging(
     digests of the two tables actually written, so the checksum verification the
     import performs is real.
 
-    Both headers are spelled out here rather than taken from the constants
-    the writers use, so a rename of a declared column fails these tests
-    instead of passing tautologically.
+    Both headers appear here in full rather than coming from the writers' own
+    constants, so a rename of a declared column fails these tests instead of
+    passing tautologically.
     """
     staging_dir.mkdir(parents=True, exist_ok=True)
 
-    with (staging_dir / terms_filename).open("w", newline="") as fh:
-        writer = csv.writer(fh, delimiter="\t")
-        writer.writerow(
-            [
-                "term_id",
-                "label",
-                "alternate_label",
-                "is_obsolete",
-                "replaced_by_term_id",
-                "obsoletion_kind",
-            ]
-        )
-        for term in terms:
-            writer.writerow(
-                [
-                    term.term_id,
-                    term.label,
-                    term.alternate_label or "",
-                    "true" if term.is_obsolete else "false",
-                    term.replaced_by_term_id or "",
-                    str(term.obsoletion_kind) if term.obsoletion_kind is not None else "",
-                ]
+    write_tsv(
+        staging_dir / terms_filename,
+        (
+            "term_id",
+            "label",
+            "alternate_label",
+            "is_obsolete",
+            "replaced_by_term_id",
+            "obsoletion_kind",
+        ),
+        [
+            (
+                term.term_id,
+                term.label,
+                term.alternate_label,
+                "true" if term.is_obsolete else "false",
+                term.replaced_by_term_id,
+                str(term.obsoletion_kind) if term.obsoletion_kind is not None else None,
             )
+            for term in terms
+        ],
+    )
 
-    with (staging_dir / closure_filename).open("w", newline="") as fh:
-        writer = csv.writer(fh, delimiter="\t")
-        writer.writerow(["ancestor_term_id", "descendant_term_id", "distance"])
-        for ancestor, descendant, distance in closure:
-            writer.writerow([ancestor, descendant, str(distance)])
+    write_tsv(
+        staging_dir / closure_filename,
+        ("ancestor_term_id", "descendant_term_id", "distance"),
+        [(ancestor, descendant, str(distance)) for ancestor, descendant, distance in closure],
+    )
 
-    # Digest the tables after writing them, so the manifest describes what is
-    # actually on disk rather than what was intended.
+    # Digest the tables after writing them, so the manifest describes what
+    # landed on disk rather than what was intended.
     manifest = _manifest_for(
         sha256_of_file(staging_dir / terms_filename),
         sha256_of_file(staging_dir / closure_filename),
@@ -777,9 +991,9 @@ def _expected_term_state(
 ) -> dict:
     """One expected _read_term_state entry, for whole-dict comparison.
 
-    `idx` is auto-generated, so it is copied from `idx_source` — the actual
-    state whose idxs the comparison should match. Passing an earlier load's
-    state there is what folds idx preservation into the equality.
+    `idx` is auto-generated, so it comes from `idx_source` — the actual state
+    whose idxs the comparison should match. Passing an earlier load's state
+    there folds idx preservation into the equality.
     """
     return {
         "idx": idx_source[term_id]["idx"],
@@ -818,9 +1032,9 @@ def _expected_terminology_row(
 
 @pytest.mark.db
 async def test_import_terminology(postgres_pool, created_terminologies, tmp_path):
-    """Tests the case where a brand-new staging directory is loaded: every term
-    is inserted, every closure row is written, and the terminology row ends in
-    ACTIVE."""
+    """Tests the case where a brand-new staging directory is loaded: the load
+    inserts every term, writes every closure row, and leaves the terminology
+    row in ACTIVE."""
     _write_staging(
         tmp_path,
         name="ldt_brand_new",
@@ -871,8 +1085,8 @@ async def test_import_terminology_reload_preserves_idx(
     postgres_pool, created_terminologies, tmp_path
 ):
     """Tests the case where a terminology is reloaded at a new version:
-    terminology_idx and the per-term idxs are preserved, and a relabeled term
-    counts as terms_label_updated."""
+    terminology_idx and the per-term idxs survive, and a relabeled term counts
+    as terms_label_updated."""
     # First load establishes the terminology and term idxs.
     v1_dir = tmp_path / "v1"
     _write_staging(
@@ -889,7 +1103,7 @@ async def test_import_terminology_reload_preserves_idx(
     created_terminologies.append(v1_result.terminology_idx)
     v1_state = await _read_term_state(postgres_pool, v1_result.terminology_idx)
 
-    # Second load relabels one term; terminology_idx and per-term idxs must persist.
+    # Second load relabels one term; terminology_idx and per-term idxs persist.
     v2_dir = tmp_path / "v2"
     _write_staging(
         v2_dir,
@@ -916,7 +1130,7 @@ async def test_import_terminology_reload_preserves_idx(
     )
     assert v2_result == expected
 
-    # idxs are sourced from v1_state, so this equality also proves they persisted.
+    # The idxs come from v1_state, so this equality also proves they persisted.
     v2_state = await _read_term_state(postgres_pool, v2_result.terminology_idx)
     expected_v2_state = {
         "UBERON:0001": _expected_term_state(v1_state, "UBERON:0001", label="oral opening"),
@@ -971,12 +1185,12 @@ async def test_import_terminology_alternate_label_release_authoritative(
     postgres_pool, created_terminologies, tmp_path
 ):
     """Tests the case where a second release changes one term's second name
-    and supplies none for another that had one: the changed value is
-    overwritten and the omitted one is cleared to NULL.
+    and supplies none for another that had one: the load overwrites the changed
+    value and clears the omitted one to NULL.
 
     The release is authoritative for alternate_label exactly as it is for
-    label, so a source that stops offering a second name is able to say so.
-    A term the release leaves untouched keeps the value it already had.
+    label, so a source that stops offering a second name can say so. A term the
+    release leaves untouched keeps the value it already had.
     """
     v1_dir = tmp_path / "v1"
     _write_staging(
@@ -1023,8 +1237,8 @@ async def test_import_terminology_obsoleted_in_version_set_once(
     postgres_pool, created_terminologies, tmp_path
 ):
     """Tests the case where a term is active in v1, obsoleted in v2, and still
-    obsolete in v3: obsoleted_in_version is stamped at v2 and never advances on
-    subsequent reloads."""
+    obsolete in v3: v2 stamps obsoleted_in_version, and no subsequent reload
+    advances it."""
     for version, terms in [
         ("1.0.0", [parsed_term("UBERON:0001", "mouth")]),
         (
@@ -1080,8 +1294,8 @@ async def test_import_terminology_un_obsoletion_clears_columns(
     postgres_pool, created_terminologies, tmp_path
 ):
     """Tests the case where a term obsolete in v1 is reloaded as non-obsolete in
-    v2: is_obsolete, obsoletion_kind, obsoleted_in_version, and replaced_by are
-    all cleared."""
+    v2: the load clears is_obsolete, obsoletion_kind, obsoleted_in_version, and
+    replaced_by."""
     v1_dir = tmp_path / "v1"
     _write_staging(
         v1_dir,
@@ -1126,8 +1340,8 @@ async def test_import_terminology_re_obsoletion_stamps_new_version(
     The set-once rule holds within one obsoletion episode, not across the
     row's whole lifetime: un-obsoletion NULLs the column, so the COALESCE in
     the UPSERT finds nothing to preserve on the next obsoletion and takes the
-    version being loaded. The v2 state is asserted before v3 runs, so a v2
-    that failed to stamp cannot let the v4 expectation pass vacuously.
+    loading version. Asserting the v2 state before v3 runs keeps a v2 that
+    failed to stamp from letting the v4 expectation pass vacuously.
     """
     obsolete_term = parsed_term(
         "UBERON:0001",
@@ -1240,8 +1454,8 @@ async def test_import_terminology_kind_and_replaced_by_change(
     )
     v2_result = await import_terminology(postgres_pool, v2_dir)
 
-    # terms_newly_merged counts the kind flip on UBERON:0001 even though
-    # the row was already obsolete from v1, so terms_newly_obsoleted stays 0.
+    # terms_newly_merged counts the kind flip on UBERON:0001 even though the
+    # row was already obsolete from v1, so terms_newly_obsoleted stays 0.
     expected = TerminologyImportResult(
         terminology_idx=v1_result.terminology_idx,
         terms_inserted=1,
@@ -1276,7 +1490,7 @@ async def test_import_terminology_cross_terminology_closure_untouched(
     postgres_pool, created_terminologies, tmp_path
 ):
     """Tests the case where a second, unrelated terminology is loaded: the
-    closure rows of a previously loaded sentinel terminology are left
+    closure rows of a previously loaded sentinel terminology survive
     untouched."""
     sentinel_dir = tmp_path / "sentinel"
     _write_staging(
@@ -1319,9 +1533,9 @@ async def test_import_terminology_silent_drops_raise_and_preserve_state(
     postgres_pool, created_terminologies, tmp_path
 ):
     """Tests the case where a v2 staging directory omits a term present in v1
-    with no explicit deprecation marker: TerminologyImportAnomaly is raised
-    listing the silently-dropped term, and the v1 row and term set survive
-    intact because the v2 transaction rolls back."""
+    with no explicit deprecation marker: the load raises
+    TerminologyImportAnomaly listing the silently-dropped term, and the v1 row
+    and term set survive intact because the v2 transaction rolls back."""
     v1_dir = tmp_path / "v1"
     _write_staging(
         v1_dir,
@@ -1361,8 +1575,8 @@ async def test_import_terminology_silent_drops_raise_and_preserve_state(
         await import_terminology(postgres_pool, v2_dir)
     assert exc_info.value.silently_dropped_term_ids == ["UBERON:0003"]
 
-    # Transaction must have rolled back: status, version, loaded_at
-    # unchanged from v1, and UBERON:0003 still present and active.
+    # The transaction rolled back: status, version, and loaded_at stand as v1
+    # left them, and UBERON:0003 is still present and active.
     post_attempt_row = await fetch_terminology(postgres_pool, v1_result.terminology_idx)
     expected_row = _expected_terminology_row(
         v1_result.terminology_idx,
@@ -1388,7 +1602,7 @@ async def test_import_terminology_unresolved_replaced_by_raises(
 ):
     """Tests the case where a term names a replaced_by target declared nowhere
     in the TSV: TerminologyImportAnomaly carries the exact (obsolete_term_id,
-    attempted_replaced_by) pair, and nothing is written to the database."""
+    attempted_replaced_by) pair, and nothing reaches the database."""
     staging_dir = tmp_path / "stage"
     _write_staging(
         staging_dir,
@@ -1410,7 +1624,7 @@ async def test_import_terminology_unresolved_replaced_by_raises(
         await import_terminology(postgres_pool, staging_dir)
     assert exc_info.value.unresolved_replaced_by == [("UBERON:0001", "UBERON:9999")]
 
-    # Nothing was inserted — name lookup returns no row.
+    # Nothing landed — the name lookup returns no row.
     row = await postgres_pool.fetchrow(
         "SELECT idx FROM qiita.terminology WHERE name = $1", "ldt_unresolved"
     )
@@ -1420,7 +1634,7 @@ async def test_import_terminology_unresolved_replaced_by_raises(
 @pytest.mark.db
 async def test_import_terminology_unresolved_closure_endpoint_raises(postgres_pool, tmp_path):
     """Tests the case where a closure row names a term the release does not
-    define: the load is refused naming the pair and writes nothing, because a
+    define: the load refuses it, naming the pair, and writes nothing, because a
     closure can only relate terms of the terminology that carries it."""
     staging_dir = tmp_path / "stage"
     _write_staging(
@@ -1477,8 +1691,8 @@ async def test_import_terminology_declared_table_paths(
     postgres_pool, created_terminologies, tmp_path
 ):
     """Tests the case where the manifest declares filenames other than the
-    canonical ones: the tables are read from the declared paths, which are the
-    same paths their digests were checked against."""
+    canonical ones: the load reads the tables from the declared paths, the same
+    paths the digest check covered."""
     staging_dir = tmp_path / "stage"
     _write_staging(
         staging_dir,
@@ -1527,8 +1741,8 @@ async def test_import_terminology_misaligned_replaced_by_raises(
 ):
     """Tests the case where a term that is not obsolete names a replacement:
     TerminologyImportAnomaly carries the exact (term_id, attempted_target)
-    pair and nothing is written, because only an obsolete term may point at
-    a successor."""
+    pair and nothing reaches the database, because only an obsolete term may
+    point at a successor."""
     staging_dir = tmp_path / "stage"
     _misaligned_staging(staging_dir, name="ldt_misaligned")
 
@@ -1536,7 +1750,7 @@ async def test_import_terminology_misaligned_replaced_by_raises(
         await import_terminology(postgres_pool, staging_dir)
     assert exc_info.value.misaligned_replaced_by == [("UBERON:0001", "UBERON:0002")]
 
-    # Nothing was inserted — name lookup returns no row.
+    # Nothing landed — the name lookup returns no row.
     row = await postgres_pool.fetchrow(
         "SELECT idx FROM qiita.terminology WHERE name = $1", "ldt_misaligned"
     )
@@ -1572,11 +1786,11 @@ async def test_import_terminology_tolerate_silent_drops(
     auto-obsoletes it instead of refusing the load.
 
     The dropped row carries both of its prior names forward, picks up
-    obsoletion_kind=silently_dropped, and is stamped with the new
-    release as its obsoleted_in_version. The result's
-    terms_silently_dropped counter surfaces the count for the caller to
-    log; terms_newly_obsoleted also reflects the event because a silent
-    drop is a kind of obsoletion."""
+    obsoletion_kind=silently_dropped, and takes the new release as its
+    obsoleted_in_version. The result's terms_silently_dropped counter carries
+    the count, and terms_newly_obsoleted also reflects the event because a
+    silent drop is a kind of obsoletion.
+    """
     v1_dir = tmp_path / "v1"
     _write_staging(
         v1_dir,
@@ -1651,13 +1865,13 @@ async def test_import_terminology_tolerate_unresolved_replaced_by(
     mode records the attempted CURIE in the notes column rather than
     refusing the load.
 
-    Fail mode treats this as a structural anomaly because there is no
-    in-batch idx the loader can use to populate replaced_by. Tolerate
-    mode lands the row with replaced_by=NULL on the DB side so the
-    structural CHECKs hold, and writes a free-text audit line into
-    notes recording the exact CURIE that was attempted so an operator
-    later inspecting the row can recover the source's stated intent
-    without re-parsing the staging dir."""
+    Fail mode treats this as a structural anomaly because no in-batch idx can
+    populate replaced_by. Tolerate mode lands the row with replaced_by=NULL so
+    the structural CHECKs hold, and writes a free-text audit line into notes
+    recording the exact CURIE it attempted, so an operator inspecting the row
+    later recovers the source's stated intent without re-parsing the staging
+    dir.
+    """
     staging_dir = tmp_path / "stage"
     _write_staging(
         staging_dir,
@@ -1766,18 +1980,18 @@ async def test_import_terminology_tolerate_un_obsoletion_clears_silent_drop(
 async def test_import_terminology_tolerate_notes_accumulate(
     postgres_pool, created_terminologies, tmp_path
 ):
-    """Tests the case where two sequential tolerate-mode loads each
-    produce an unresolved-replaced_by audit line for the same row, and
-    both lines remain present in notes (the first preserved, the second
-    appended on a new line).
+    """Tests the case where two sequential tolerate-mode loads each produce an
+    unresolved-replaced_by audit line for the same row, and both lines remain
+    present in notes (the first preserved, the second appended on a new line).
 
     The notes column is shared between the loader's audit lines and
-    operator-added content, so the loader is not allowed to wipe it on
-    reload. The trade-off is that audit lines from prior loads stay
-    even after the row's structural state has moved on; in practice
-    tolerate-mode runs should be rare enough that the column does not
-    bloat. v1 carries an obsolete row pointing at an absent UBERON:9999;
-    v2 reloads the same row pointing at a different absent UBERON:8888."""
+    operator-added content, so the loader must not wipe it on reload. The
+    trade-off is that audit lines from prior loads stay even after the row's
+    structural state has moved on; in practice tolerate-mode runs should be rare
+    enough that the column does not bloat. v1 carries an obsolete row pointing
+    at an absent UBERON:9999; v2 reloads the same row pointing at a different
+    absent UBERON:8888.
+    """
     v1_dir = tmp_path / "v1"
     _write_staging(
         v1_dir,

@@ -1,18 +1,21 @@
 """ROBOT's export dialect: the command that produces an export of an OWL
 release, and the reading of what that command wrote.
 
-Everything specific to ROBOT is confined here — the column selection it
-accepts, the separators it writes, and the datatype suffix it leaves on a
-typed literal. The rows handed back carry no trace of it.
+This module confines everything specific to ROBOT — the column selection it
+accepts, the separators it writes, and the datatype suffix it leaves on a typed
+literal. The rows handed back carry no trace of it.
 """
 
 from __future__ import annotations
 
-import csv
 from collections.abc import Sequence
 from pathlib import Path
 
-from .terminology import check_tsv_columns
+from .terminology import (
+    read_tsv,
+    stripped_cell,
+    stripped_key,
+)
 from .terminology_owl import (
     OBO_ALTERNATIVE_ID_PROPERTY,
     OBO_REPLACED_BY_PROPERTY,
@@ -33,10 +36,12 @@ _ROBOT_EXPORT_COLUMNS = (
     OBO_ALTERNATIVE_ID_PROPERTY,
 )
 # ROBOT spells the column selection and the values within one cell with the
-# same character; only the cell form is configurable, and it is left alone.
+# same character; only the cell form is configurable, and this leaves it alone.
 _ROBOT_HEADER_SEPARATOR = "|"
 _ROBOT_MULTI_VALUE_SEPARATOR = "|"
 _ROBOT_EXPORT_ENTITY_TYPES = "classes"
+# How the export is named in an error about one of its rows.
+_EXPORT_SOURCE_NAME = "export"
 # A typed literal arrives with its datatype after this marker.
 _LITERAL_DATATYPE_SEPARATOR = "^^"
 
@@ -56,11 +61,10 @@ def robot_export_argv(
 ) -> list[str]:
     """Build the argv of a ROBOT export requesting _ROBOT_EXPORT_COLUMNS.
 
-    Naming both files without a directory keeps the command runnable with
-    the directory holding them as its working directory, so neither path
-    depends on where a container mounts it. `executable` ends with the
-    ROBOT executable itself, carrying whatever runs it (for example
-    ("apptainer", "exec", "<sif>", "robot")).
+    Naming both files without a directory keeps the command runnable from the
+    directory holding them, so neither path depends on where a container mounts
+    it. `executable` ends with the ROBOT executable itself, carrying whatever
+    runs it (for example ("apptainer", "exec", "<sif>", "robot")).
     """
     return [
         *executable,
@@ -82,9 +86,11 @@ def parse_robot_export(export_path: Path) -> list[ExportedClass]:
     Cells hold their values separated by a pipe, and a typed literal
     carries its datatype after a '^^' marker.
 
-    Raises FileNotFoundError when the export is absent, and ValueError when
-    the header lacks a requested column, a row carries no term id, or
-    owl:deprecated holds an uninterpretable value.
+    Raises FileNotFoundError when the export is absent, duckdb.Error when
+    DuckDB cannot read it or a row does not carry one cell per requested
+    column, and ValueError when the header does not spell the requested columns
+    in order, when a row carries no term id, or when owl:deprecated holds an
+    uninterpretable value.
     """
     if not export_path.exists():
         raise FileNotFoundError(
@@ -93,39 +99,39 @@ def parse_robot_export(export_path: Path) -> list[ExportedClass]:
         )
 
     exported_classes: list[ExportedClass] = []
-    with export_path.open(newline="") as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
+    read_rows = read_tsv(export_path, _ROBOT_EXPORT_COLUMNS, source_name=_EXPORT_SOURCE_NAME)
+    for row_number, row in enumerate(read_rows, start=1):
+        # What every error about this row names.
+        cell_kwargs = {
+            "path": export_path,
+            "source_name": _EXPORT_SOURCE_NAME,
+            "row_number": row_number,
+        }
 
-        check_tsv_columns(
-            reader.fieldnames,
-            _ROBOT_EXPORT_COLUMNS,
-            source_name="export",
-            path=export_path,
-        )
+        term_id = stripped_key(row, _ROBOT_COLUMN_TERM_ID, **cell_kwargs)
+        label = stripped_cell(row, _ROBOT_COLUMN_LABEL, **cell_kwargs)
+        deprecated_cell = stripped_cell(row, OWL_DEPRECATED_PROPERTY, **cell_kwargs)
+        replacement_cell = stripped_cell(row, OBO_REPLACED_BY_PROPERTY, **cell_kwargs)
+        alternative_cell = stripped_cell(row, OBO_ALTERNATIVE_ID_PROPERTY, **cell_kwargs)
 
-        for row in reader:
-            term_id = row[_ROBOT_COLUMN_TERM_ID].strip()
-            if not term_id:
-                raise ValueError(f"export at {export_path} carries a row with no term id")
-
-            # A class may have absorbed several term ids; a replacement
-            # pointer names a single class, so only the first is kept.
-            replacements = _split_cell(row[OBO_REPLACED_BY_PROPERTY])
-            exported_classes.append(
-                ExportedClass(
-                    term_id=term_id,
-                    label=row[_ROBOT_COLUMN_LABEL],
-                    source_deprecated=_parse_deprecated_cell(row[OWL_DEPRECATED_PROPERTY], term_id),
-                    asserted_replacement_term_id=replacements[0] if replacements else None,
-                    alternative_term_ids=tuple(_split_cell(row[OBO_ALTERNATIVE_ID_PROPERTY])),
-                )
+        # A class may have absorbed several term ids; a replacement pointer
+        # names a single class, so keep only the first.
+        replacements = _split_cell(replacement_cell)
+        exported_classes.append(
+            ExportedClass(
+                term_id=term_id,
+                label=label,
+                source_deprecated=_parse_deprecated_cell(deprecated_cell, term_id),
+                asserted_replacement_term_id=replacements[0] if replacements else None,
+                alternative_term_ids=tuple(_split_cell(alternative_cell)),
             )
+        )
     return exported_classes
 
 
 def _parse_deprecated_cell(cell: str, term_id: str) -> bool:
-    """Interpret an owl:deprecated cell, where an absent annotation arrives
-    as an empty cell. Raises ValueError naming `term_id` on a value that is
+    """Interpret an owl:deprecated cell, where an absent annotation arrives as
+    an empty cell. Raises ValueError naming `term_id` on a value that is
     neither true nor false."""
     values = _split_cell(cell)
     if not values:
@@ -140,8 +146,8 @@ def _parse_deprecated_cell(cell: str, term_id: str) -> bool:
 
 
 def _split_cell(cell: str) -> list[str]:
-    """Split a cell into its values, dropping the datatype of any typed
-    literal and discarding empties."""
+    """Split a cell into its values, dropping the datatype of any typed literal
+    and discarding empties."""
     values: list[str] = []
     for raw_value in cell.split(_ROBOT_MULTI_VALUE_SEPARATOR):
         value = raw_value.split(_LITERAL_DATATYPE_SEPARATOR, 1)[0].strip()

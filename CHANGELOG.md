@@ -23,19 +23,18 @@ duplicates further down are historical strata; leave them where they are.
 ### Added
 
 - **NCBI Taxonomy releases read from a taxdump archive (#439).**
-  `qiita-admin terminology prepare-taxdump` reads a `new_taxdump.zip` into the
-  term rows of a release, so taxa no longer arrive as hand-written seed
+  `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
+  into the term rows of a release, so taxa no longer arrive as hand-written seed
   migrations. A live taxon takes its scientific name as its label and its genbank
   common name as its second name; a taxon NCBI merged away becomes an obsolete
   term pointing at the taxon it merged into; and a taxon NCBI deleted outright
   becomes an obsolete term with no replacement, so a reload never mistakes
   routine NCBI deletion for a terminology that silently lost terms. The archive
-  is read in place, with nothing unpacked. Every field is read by name against
-  the column order the taxdump documents, so a member whose layout changed
-  refuses the read instead of shifting fields, as does an archive recording one
-  taxon as live, merged, and deleted at once. The existing OWL command is now
-  `prepare-owl`, so each names the source it reads, and both write a release
-  through one shared step.
+  is read in place, with nothing unpacked, through duckdb-miint's taxdump
+  readers, so a member whose row layout contradicts what the taxdump documents
+  refuses the read naming the line at fault — as does an archive recording one
+  taxon as live, merged, and deleted at once. Term rows land in taxon-id order,
+  so the same archive always yields the same release digest.
 
 - **`terminology_term.alternate_label` — a second name for a term (#439).** Holds the
   name a source vocabulary supplies alongside the one that becomes the term's
@@ -50,83 +49,37 @@ duplicates further down are historical strata; leave them where they are.
   metadata reads.
 
 - **`qiita-admin terminology` — prepare and load an ontology release (#439).**
-  `robot-command` prints the ROBOT export command to run against a staged OWL
-  file; nothing in the control plane executes ROBOT, on any host. `prepare-owl`
-  turns that export into the release's terms table, a header-only closure stub,
-  and a manifest declaring the digests of both, keeping only the term ids of a
-  chosen prefix so classes the source imports from other vocabularies stay out.
-  No prepare command computes subsumption, so a loaded terminology resolves terms
-  while subsumption queries have nothing to answer from. Both prepare commands
-  hold the release name and version to the bounds a manifest can carry before
-  they read the source or write anything, so an over-long one is refused rather
-  than leaving tables on disk with no manifest beside them. `load` applies a
-  prepared release to the database, verifying both tables against the manifest
-  first, and reporting how many terms were inserted, relabelled, obsoleted, or
-  merged. The three files are named individually and copied into a temporary
-  directory under the names the manifest declares, so no staging directory has to
-  exist on the host; a declared name carrying a directory, one that is the
-  manifest's own name, and one shared by both tables are each refused rather
-  than staged. A named path that cannot be opened — a directory, an unreadable
-  file, the empty string — is reported with the operating system's own reason
-  and exits 1, on both prepare commands and on `load`. Loading a release over one
-  already in the database writes only the terms whose stored values differ, so the
-  cost tracks what changed between the two releases rather than the size of the
-  vocabulary. A term the source does not name keeps the label already stored for
-  it, falling back to its own term id when the database holds nothing — so a
-  release that retires a term id without naming it cannot overwrite the name the
-  term was loaded under.
+  `robot-command` prints the ROBOT export command to run against a staged OWL file;
+  nothing in the control plane executes ROBOT, on any host. `prepare-owl` turns that
+  export into the three files `load` consumes — a terms table, a header-only closure
+  stub, and a manifest declaring the digests of both — recording a deprecated class
+  as obsolete and an absorbed one as merged into the class that absorbed it, and
+  keeping only the term ids of a chosen prefix so classes imported from other
+  vocabularies stay out. Neither prepare command computes subsumption, so a loaded
+  terminology resolves terms while subsumption queries have nothing to answer from.
+  `load` takes the three files individually, verifies both tables against the
+  manifest before parsing either, applies the release in one transaction, and reports
+  how many terms were inserted, relabelled, obsoleted, or merged.
+  `--tolerate-anomalies` absorbs three anomalies instead of refusing the load:
+  terms the release silently dropped are auto-obsoleted, an unresolvable replacement
+  pointer is recorded as a note, and a closure row naming an endpoint the release
+  does not define is dropped, which lowers the reported closure count. A live term
+  carrying a replacement pointer refuses the load either way.
 
-- **Terminology release extraction — read a staged OWL release into the term
-  records the load applies (#439).** Builds the argv of the ROBOT export that produces
-  the release's export file, reads that export back, and turns it into term
-  rows: a deprecated class is recorded as obsolete, and a class another one
-  absorbed as merged into it. ROBOT itself is run out of band, so nothing here
-  executes it. A manifest may declare a term id prefix to keep classes the
-  source imports from other vocabularies out of the release. ROBOT's export
-  dialect is confined to one module; the obsoletion conventions it feeds are
-  independent of any OWL toolchain.
-
-- **Terminology release load — apply a staged ontology release from a staging
-  directory (#439).** Reads the release manifest, verifies both tables against the
-  digests it declares before any of their content is read, reads each table from
-  the path the manifest declares for it, and applies the whole release in one
-  transaction, ending with the terminology row in `active`. A release may not
-  reference a term it does not define — an obsolete term's replacement pointer
-  and both endpoints of every closure row have to resolve within the release
-  itself. Every cell of either table arrives stripped of surrounding whitespace,
-  since the index over a term id would otherwise hold a padded variant as a
-  value distinct from its unpadded twin; a key cell left holding nothing is
-  refused rather than stored, as is a row that stops before a cell the parse
-  always reads. Structural anomalies in the
-  source fail the load by default and roll it back; `tolerate_anomalies=True`
-  instead auto-obsoletes the terms a release silently dropped, records an audit
-  line for a replacement pointer that resolves to nothing, and drops a closure
-  row naming an endpoint the release does not define, so the reported closure
-  count covers only the rows that resolved. Every check that rejects a release
-  states how many values offended and names a capped sample of them, so a
-  release violating one for millions of terms still reports readably.
-
-- **Terminology repository layer — apply a staged ontology release to the DB (#439).**
-  Owns every SQL string for `terminology`, `terminology_term`, and
-  `terminology_closure`: the atomic row reads and the TOCTOU-safe status UPDATE,
-  plus a composer that runs find-or-create, a pre-import snapshot, silent-drop
-  detection, the two-pass term upsert, and the per-terminology closure rebuild
-  inside one caller-supplied transaction. Term rows are upserted, never
-  replaced, so any term already referenced by biosample metadata stays
-  resolvable; obsoletion is recorded on the row instead. Each of a term's two
-  names has its own counter, so a reload that changes only second names reports
-  what moved instead of all zeros, and a row whose names both changed counts
-  once against each. The term table is analyzed as it is written, so the
-  statements that follow it plan the `terminology_idx` filter against real
-  selectivity rather than a default that is orders of magnitude off.
-
-- **`qiita_common.models.terminology` — the terminology model surface (#439).** Gathers
-  the release-load lifecycle status and its allowed transitions, the term
-  obsoletion kinds, the staging manifest contract, and the terminology row
-  projection into one submodule. The two lifecycle enums move here from
-  `models.reference`; every name stays importable from `qiita_common.models`.
-  A manifest may name its release tables only by bare filename, so no declared
-  path can reach outside the directory the manifest itself sits in.
+- **What a terminology release must be (#439).** A manifest may name its tables only
+  by bare filename, so no declared path can reach outside the directory the manifest
+  itself sits in. A release may not reference a term it does not define — an obsolete
+  term's replacement pointer and both endpoints of every closure row have to resolve
+  within the release itself. Term rows are upserted, never replaced, so any term
+  already referenced by biosample metadata stays resolvable; obsoletion is recorded
+  on the row instead. A term the source does not name keeps the label already stored
+  for it, falling back to its own term id when the database holds nothing, so a
+  release that retires a term id without naming it cannot overwrite the name the term
+  was loaded under. Each of a term's two names has its own counter, so a reload that
+  changes only second names reports what moved rather than all zeros.
+  `TerminologyStatus` and `TerminologyTermObsoletionKind` now live in
+  `qiita_common.models.terminology` rather than `models.reference`; both stay
+  importable from `qiita_common.models`.
 
 - **A client-side way to discover a `mask_idx` (#423, closes #345).** Continuing a masked pool into
   `long-read-assembly` requires a `mask_idx`, and nothing outside a psql shell could
@@ -1907,15 +1860,6 @@ duplicates further down are historical strata; leave them where they are.
 
 
 ### Removed
-
-- **The unreached terminology status-transition helper (#439).** A terminology load
-  applies as a single transaction, so only `active` is ever observable from
-  outside it and the validated transition helper the load was expected to call
-  never had a caller. The two status writes now derive their permitted source
-  states from the transition table itself instead of restating it, so the table
-  is stated in one place. `loading` and `failed` stay in both the Python enum
-  and the Postgres type, against a load design that can commit a partial state;
-  what they mean today is recorded on `TerminologyStatus`.
 
 - **The intake `human_filtering` policy flag (#303).** Host filtering no longer reads a
   per-project intent recorded at intake — a sample's host is a property of the sample, not

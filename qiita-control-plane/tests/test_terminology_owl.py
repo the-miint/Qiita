@@ -49,10 +49,28 @@ def test_build_terms():
     assert result == expected
 
 
+def test_build_terms_unnamed_class():
+    """Tests the case where a class carries no name at all: the term row says
+    the source supplied none — what the import stores a never-named term
+    against — rather than carrying an empty name of its own."""
+    exported_classes = [
+        exported_class("UBERON:0001", ""),
+        exported_class("UBERON:0002", "mouth"),
+    ]
+
+    result = build_terms(exported_classes, term_id_prefix=None)
+
+    expected = [
+        parsed_term("UBERON:0001", None),
+        parsed_term("UBERON:0002", "mouth"),
+    ]
+    assert result == expected
+
+
 def test_build_terms_prefix_filter():
     """Tests the case where a prefix is declared: classes imported from other
-    vocabularies are left out, and pointers reaching outside the prefix are
-    dropped from the classes carrying them."""
+    vocabularies stay out, and a class carrying a pointer past the prefix
+    loses it."""
     exported_classes = [
         exported_class("UBERON:0001", "mouth"),
         exported_class("CL:0000000", "cell"),
@@ -90,7 +108,7 @@ def test_build_terms_prefix_filter():
 def test__assemble_terms_merge_without_class():
     """Tests the case where an absorbed term id has no class of its own: it
     carries no label, because the release names no class to take one from and
-    what to store instead is not the extractor's to decide."""
+    this layer cannot decide what to store instead."""
     exported_classes = [
         exported_class("UBERON:0002", "tooth", alternative_term_ids=("UBERON:0900",))
     ]
@@ -112,7 +130,7 @@ def test__assemble_terms_merge_without_class():
 
 def test__assemble_terms_merge_with_class():
     """Tests the case where an absorbed term id also has a class of its own:
-    that class's own label is kept instead of a synthesized one."""
+    the row keeps that class's own label instead of a synthesized one."""
     exported_classes = [
         exported_class("UBERON:0002", "tooth", alternative_term_ids=("UBERON:0900",)),
         exported_class("UBERON:0900", "obsolete tooth bud", source_deprecated=True),
@@ -135,8 +153,8 @@ def test__assemble_terms_merge_with_class():
 
 def test__assemble_terms_deprecation_and_merge_collision(caplog):
     """Tests the case where a class is both deprecated with a replacement and
-    absorbed by a different class: only the absorption is recorded, and the
-    divergent replacement is warned about."""
+    absorbed by a different class: the row records only the absorption and
+    warns about the divergent replacement."""
     exported_classes = [
         exported_class("UBERON:0002", "tooth", alternative_term_ids=("UBERON:0900",)),
         exported_class(
@@ -168,7 +186,7 @@ def test__assemble_terms_deprecation_and_merge_collision(caplog):
 
 def test__assemble_terms_duplicate_survivor_claim(caplog):
     """Tests the case where two classes claim the same absorbed term id: the
-    first claim stands and the conflict is warned about."""
+    first claim stands and the collector warns about the conflict."""
     exported_classes = [
         exported_class("UBERON:0002", "tooth", alternative_term_ids=("UBERON:0900",)),
         exported_class("UBERON:0003", "molar", alternative_term_ids=("UBERON:0900",)),
@@ -195,8 +213,8 @@ def test__assemble_terms_duplicate_survivor_claim(caplog):
 
 def test__assemble_terms_replacement_without_deprecation():
     """Tests the case where a class carries a replacement pointer but is not
-    deprecated: the row is emitted as it stands, leaving the contradiction
-    for the import to reject."""
+    deprecated: the row passes through as it stands, leaving the import to
+    reject the contradiction."""
     exported_classes = [
         exported_class("UBERON:0002", "tooth", asserted_replacement_term_id="UBERON:0003")
     ]
@@ -208,8 +226,8 @@ def test__assemble_terms_replacement_without_deprecation():
 
 
 def test__collect_merge_survivors_self_reference():
-    """Tests the case where a class lists its own term id as absorbed: no
-    survivor mapping is recorded for it."""
+    """Tests the case where a class lists its own term id as absorbed: the map
+    records no survivor for it."""
     exported_classes = [
         exported_class("UBERON:0002", "tooth", alternative_term_ids=("UBERON:0002", "UBERON:0900"))
     ]

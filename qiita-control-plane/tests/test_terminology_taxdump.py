@@ -2,21 +2,21 @@
 taxdump archive's members and the term rows assembled from them."""
 
 import logging
-import zipfile
 
+import duckdb
 import pytest
 from qiita_common.models import TerminologyTermObsoletionKind
 
 from qiita_control_plane.repositories.terminology import MAX_REPORTED_OFFENDERS
-from qiita_control_plane.terminology_taxdump import _read_dmp_rows, build_terms_from_taxdump
+from qiita_control_plane.terminology_taxdump import build_terms_from_taxdump
 from qiita_control_plane.testing.terminology import (
-    DELNODES_DMP_MEMBER,
-    MERGED_DMP_MEMBER,
-    NAMES_DMP_MEMBER,
-    TAXDUMP_ARCHIVE_FILENAME,
+    FIXTURE_DELNODES_DMP_MEMBER,
+    FIXTURE_MERGED_DMP_MEMBER,
+    FIXTURE_NAMES_DMP_MEMBER,
+    FIXTURE_TAXDUMP_ARCHIVE_FILENAME,
     parsed_term,
     write_taxdump,
-    write_taxdump_zip,
+    write_taxdump_tar,
 )
 
 _MERGED = TerminologyTermObsoletionKind.SOURCE_MERGED
@@ -49,8 +49,8 @@ def test_build_terms_from_taxdump(tmp_path):
 
     expected = [
         parsed_term("2", "Bacteria", alternate_label="eubacteria"),
-        parsed_term("9606", "Homo sapiens", alternate_label="human"),
         parsed_term("1234", "Nonesuch bacterium"),
+        parsed_term("9606", "Homo sapiens", alternate_label="human"),
         parsed_term(
             "30",
             None,
@@ -64,9 +64,9 @@ def test_build_terms_from_taxdump(tmp_path):
 
 
 def test_build_terms_from_taxdump_unconsumed_name_classes(tmp_path):
-    """Tests the case where a taxon carries name classes neither name column
-    is taken from: they are read past, and only the two consumed classes
-    reach the term row."""
+    """Tests the case where a taxon carries name classes feeding neither name
+    column: the read skips them, and only the two consumed classes reach the
+    term row."""
     archive_path = write_taxdump(
         tmp_path,
         names=[
@@ -90,8 +90,8 @@ def test_build_terms_from_taxdump_unconsumed_name_classes(tmp_path):
 
 
 def test_build_terms_from_taxdump_duplicate_scientific_name(tmp_path, caplog):
-    """Tests the case where a taxon carries two scientific names: the first
-    stands and the extra is warned about, because the column holds one."""
+    """Tests the case where a taxon carries two scientific names: one stands
+    and the read warns about the surplus, because the column holds one."""
     archive_path = write_taxdump(
         tmp_path,
         names=[
@@ -105,12 +105,12 @@ def test_build_terms_from_taxdump_duplicate_scientific_name(tmp_path, caplog):
 
     assert result == [parsed_term("2", "Bacteria")]
     assert len(caplog.records) == 1
-    assert "Procaryotae" in caplog.text
+    assert "tax_id 2 carries 2 'scientific name' names; keeping 'Bacteria'" in caplog.text
 
 
 def test_build_terms_from_taxdump_duplicate_genbank_common_name(tmp_path, caplog):
-    """Tests the case where a taxon carries two genbank common names: the
-    first stands and the extra is warned about."""
+    """Tests the case where a taxon carries two genbank common names: one
+    stands and the read warns about the surplus."""
     archive_path = write_taxdump(
         tmp_path,
         names=[
@@ -125,12 +125,12 @@ def test_build_terms_from_taxdump_duplicate_genbank_common_name(tmp_path, caplog
 
     assert result == [parsed_term("2", "Bacteria", alternate_label="eubacteria")]
     assert len(caplog.records) == 1
-    assert "prokaryotes" in caplog.text
+    assert "tax_id 2 carries 2 'genbank common name' names; keeping 'eubacteria'" in caplog.text
 
 
 def test_build_terms_from_taxdump_tax_id_in_two_members(tmp_path):
-    """Tests the case where one taxon id is recorded both as live and as
-    deleted, which no taxdump can mean."""
+    """Tests the case where the archive records one taxon id both as live and
+    as deleted, which no taxdump can mean."""
     archive_path = write_taxdump(
         tmp_path,
         names=[("2", "Bacteria", "", "scientific name")],
@@ -142,8 +142,8 @@ def test_build_terms_from_taxdump_tax_id_in_two_members(tmp_path):
 
 
 def test_build_terms_from_taxdump_tax_id_in_every_member_pair(tmp_path):
-    """Tests the case where all three pairs of members disagree: every pair is
-    named in the one error, not just the first found."""
+    """Tests the case where all three pairs of members disagree: one error
+    names every pair, not just the first found."""
     archive_path = write_taxdump(
         tmp_path,
         names=[
@@ -158,14 +158,14 @@ def test_build_terms_from_taxdump_tax_id_in_every_member_pair(tmp_path):
         build_terms_from_taxdump(archive_path)
 
     message = str(raised.value)
-    assert f"{NAMES_DMP_MEMBER} and {MERGED_DMP_MEMBER}: ['2']" in message
-    assert f"{NAMES_DMP_MEMBER} and {DELNODES_DMP_MEMBER}: ['3']" in message
-    assert f"{MERGED_DMP_MEMBER} and {DELNODES_DMP_MEMBER}: ['4']" in message
+    assert f"{FIXTURE_NAMES_DMP_MEMBER} and {FIXTURE_MERGED_DMP_MEMBER}: ['2']" in message
+    assert f"{FIXTURE_NAMES_DMP_MEMBER} and {FIXTURE_DELNODES_DMP_MEMBER}: ['3']" in message
+    assert f"{FIXTURE_MERGED_DMP_MEMBER} and {FIXTURE_DELNODES_DMP_MEMBER}: ['4']" in message
 
 
 def test_build_terms_from_taxdump_member_overlap_over_cap(tmp_path):
-    """Tests the case where more taxon ids are recorded two ways than the error
-    names: the total is stated and the tail is left unnamed."""
+    """Tests the case where the archive records more taxon ids two ways than
+    the error names: the error states the total and leaves the tail unnamed."""
     over_cap_count = MAX_REPORTED_OFFENDERS + 5
     tax_ids = [str(tax_id) for tax_id in range(100, 100 + over_cap_count)]
     archive_path = write_taxdump(
@@ -183,8 +183,8 @@ def test_build_terms_from_taxdump_member_overlap_over_cap(tmp_path):
 
 
 def test_build_terms_from_taxdump_taxon_without_scientific_name(tmp_path):
-    """Tests the case where a taxon is named only in the class the second
-    name column is taken from, leaving the label column nothing to hold."""
+    """Tests the case where the archive names a taxon only in the class feeding
+    the second name column, leaving the label column nothing to hold."""
     archive_path = write_taxdump(
         tmp_path,
         names=[("2", "eubacteria", "", "genbank common name")],
@@ -195,8 +195,8 @@ def test_build_terms_from_taxdump_taxon_without_scientific_name(tmp_path):
 
 
 def test_build_terms_from_taxdump_unnamed_over_cap(tmp_path):
-    """Tests the case where more taxa lack the name the label is taken from than
-    the error names: the total is stated and the tail is left unnamed."""
+    """Tests the case where more taxa lack the name the label comes from than
+    the error names: the error states the total and leaves the tail unnamed."""
     over_cap_count = MAX_REPORTED_OFFENDERS + 5
     tax_ids = [str(tax_id) for tax_id in range(100, 100 + over_cap_count)]
     archive_path = write_taxdump(
@@ -215,49 +215,38 @@ def test_build_terms_from_taxdump_unnamed_over_cap(tmp_path):
 def test_build_terms_from_taxdump_missing_member(tmp_path):
     """Tests the case where the archive is readable but carries none of the
     deleted taxon ids."""
-    archive_path = tmp_path / TAXDUMP_ARCHIVE_FILENAME
-    write_taxdump_zip(
+    archive_path = tmp_path / FIXTURE_TAXDUMP_ARCHIVE_FILENAME
+    write_taxdump_tar(
         archive_path,
         {
-            NAMES_DMP_MEMBER: [("2", "Bacteria", "", "scientific name")],
-            MERGED_DMP_MEMBER: [],
+            FIXTURE_NAMES_DMP_MEMBER: [("2", "Bacteria", "", "scientific name")],
+            FIXTURE_MERGED_DMP_MEMBER: [],
         },
     )
 
-    with pytest.raises(FileNotFoundError, match=DELNODES_DMP_MEMBER):
+    with pytest.raises(duckdb.Error, match=FIXTURE_DELNODES_DMP_MEMBER):
         build_terms_from_taxdump(archive_path)
 
 
 def test_build_terms_from_taxdump_missing_archive(tmp_path):
     """Tests the case where the named archive does not exist."""
     with pytest.raises(FileNotFoundError, match="No taxdump archive"):
-        build_terms_from_taxdump(tmp_path / TAXDUMP_ARCHIVE_FILENAME)
+        build_terms_from_taxdump(tmp_path / FIXTURE_TAXDUMP_ARCHIVE_FILENAME)
 
 
-# =============================================================================
-# _read_dmp_rows
-# =============================================================================
+def test_build_terms_from_taxdump_not_an_archive(tmp_path):
+    """Tests the case where the named path exists but is not a gzipped tar."""
+    archive_path = tmp_path / FIXTURE_TAXDUMP_ARCHIVE_FILENAME
+    archive_path.write_text("2\t|\tBacteria\t|\n")
+
+    with pytest.raises(duckdb.Error, match="gzip inflate failed"):
+        build_terms_from_taxdump(archive_path)
 
 
-def test__read_dmp_rows_field_count_mismatch(tmp_path):
+def test_build_terms_from_taxdump_field_count_mismatch(tmp_path):
     """Tests the case where a row carries fewer fields than the member's
     documented column order declares."""
     archive_path = write_taxdump(tmp_path, names=[("2", "Bacteria", "")])
 
-    with zipfile.ZipFile(archive_path) as archive:
-        rows = _read_dmp_rows(archive, NAMES_DMP_MEMBER, ("a", "b", "c", "d"))
-        with pytest.raises(ValueError, match="expected 4"):
-            list(rows)
-
-
-def test__read_dmp_rows_missing_row_terminator(tmp_path):
-    """Tests the case where a row does not end with the terminator every
-    taxdump row carries."""
-    archive_path = tmp_path / TAXDUMP_ARCHIVE_FILENAME
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr(NAMES_DMP_MEMBER, "2\t|\tBacteria\n")
-
-    with zipfile.ZipFile(archive_path) as archive:
-        rows = _read_dmp_rows(archive, NAMES_DMP_MEMBER, ("a", "b"))
-        with pytest.raises(ValueError, match="row terminator"):
-            list(rows)
+    with pytest.raises(duckdb.Error, match="expected exactly 4"):
+        build_terms_from_taxdump(archive_path)
