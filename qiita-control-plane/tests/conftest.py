@@ -37,6 +37,35 @@ from qiita_control_plane.testing.sessions import (  # noqa: E402, F401
 from qiita_control_plane.testing.terminology import created_terminologies  # noqa: E402, F401
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _stage_miint_extension():
+    """Stage miint once into the per-component extension dir, so the LOAD-only
+    paths in this suite find it — the unit-tier mirror of what the deploy stages
+    and what the orchestrator's and integration conftests already do.
+
+    **Not optional, and not merely a speed-up.** `connect_with_miint_staged()` is
+    the service-side helper and is LOAD-only by design, so nothing it drives will
+    ever install. What made that work here was another module in the same session
+    happening to INSTALL first (the `reference load` CLI tests use the client
+    helper) into a directory that caches across runs — so a warm developer machine
+    passed while CI, which always starts cold, failed every real-miint test in the
+    tier. Order-dependent either way, since test order is randomized.
+
+    Plain INSTALL, not the deploy's FORCE, so the stable temp dir keeps caching:
+    the first run downloads from the mirror and later ones are instant.
+    """
+    import duckdb  # noqa: PLC0415
+    from qiita_common.duckdb_miint import (  # noqa: PLC0415
+        miint_connect_config,
+        miint_install_sql,
+        miint_load_sql,
+    )
+
+    with duckdb.connect(":memory:", config=miint_connect_config()) as conn:
+        conn.execute(miint_install_sql())
+        conn.execute(miint_load_sql())
+
+
 @pytest.fixture(scope="session")
 def migrations_dir() -> Path:
     """Path to qiita-control-plane/db/migrations from this conftest.

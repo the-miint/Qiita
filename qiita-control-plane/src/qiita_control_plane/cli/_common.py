@@ -5,7 +5,8 @@ Surface:
   defaults / env-var names that back them. `validate_base_url(args,
   parser)` is the post-parse companion that refuses plain http:// to
   a non-localhost host unless --insecure was passed.
-- PAT file I/O (`read_token`, `write_token`).
+- PAT file I/O (`read_token`, `write_token`), and `commit_partials`, the
+  all-or-nothing multi-file commit both CLIs' exports write through.
 - The authenticated HTTP call helper (`call`) plus `whoami` as a thin
   wrapper, and the generic token-read + invoke + JSON-print runner
   (`run_http_subcommand`).
@@ -38,6 +39,7 @@ prefix because within the package this module is the public surface.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.server
 import json
 import os
@@ -208,6 +210,48 @@ def write_token(path: Path, plaintext: str) -> None:
     tmp.write_text(plaintext)
     os.chmod(tmp, 0o600)
     tmp.replace(path)
+
+
+def commit_partials(
+    write_fn: Callable[[], None], pairs: list[tuple[Path, Path]], *, mode: int | None = None
+) -> None:
+    """Run `write_fn` — which writes each pair's `.partial` — then move every partial
+    into place. **All-or-nothing across the set.**
+
+    On any failure (the write raising, or a rename failing partway through a multi-file
+    commit) every partial AND every already-committed final is removed, so a retry
+    never finds a half-written set: no lone R1 without its R2, no table without the map
+    it must be read with. The partial paths are passed in rather than derived, so a
+    failure *inside* `write_fn` — which may already have created some of them — is
+    cleaned up too.
+
+    `mode`, when given, is applied to each partial BEFORE its rename, so the file is
+    never visible at its final name under a looser umask, even for an instant. Whether
+    that matters is the caller's to know, which is why it is a parameter and not a
+    default.
+
+    **The one gap, stated rather than implied:** a kill no Python code can catch —
+    SIGKILL, an OOM kill, power loss — between two renames leaves the finals that
+    already landed. Nothing here can close that, so a caller whose set must not be
+    read half-committed checks for a pre-existing final before it starts, and says
+    that a lone survivor means an interrupted run rather than a finished one.
+    """
+    committed: list[Path] = []
+    try:
+        write_fn()
+        for partial, final in pairs:
+            if mode is not None:
+                partial.chmod(mode)
+            os.replace(partial, final)
+            committed.append(final)
+    except BaseException:
+        for partial, _ in pairs:
+            with contextlib.suppress(FileNotFoundError):
+                partial.unlink()
+        for final in committed:
+            with contextlib.suppress(FileNotFoundError):
+                final.unlink()
+        raise
 
 
 # ---------------------------------------------------------------------------

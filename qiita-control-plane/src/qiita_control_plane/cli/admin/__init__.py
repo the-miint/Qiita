@@ -66,6 +66,7 @@ from .force_fail import (
     _validate_force_fail_args,
 )
 from .mask import (
+    _MASK_IDX_COVERAGE_ACTION_IDS,
     _PURGE_FAILED_ACTION_IDS,
     _READ_MASK_PARQUET_NOT_FOUND,
     _RESUBMITTABLE_SCOPE_KIND,
@@ -601,6 +602,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "is the direct/on-host form and is not reachable off-host."
         ),
     )
+    p_export.add_argument(
+        "--compress",
+        action="store_true",
+        help=(
+            "Ask the data plane to zstd-compress the DoGet stream. Off by"
+            " default because compression costs more time than it saves on a"
+            " fast link (break-even is around 4 Gbit/s), so it is a loss"
+            " on-host and a large win over the TLS edge from off-site. Output"
+            " files are identical either way."
+        ),
+    )
     p_export.set_defaults(handler=_handle_masked_read_export)
 
     p_readiness = sub.add_parser(
@@ -690,9 +702,12 @@ async def _purge_failed(
         # --execute can refuse on it before any destructive work). The shared-mask
         # guard is only sound once every NON-failed ticket carries its mask_idx;
         # a non-failed sharer with a NULL mask_idx is invisible to the guard, so
-        # the mask could be wrongly deleted out from under a live result.
+        # the mask could be wrongly deleted out from under a live result. Scoped to
+        # _MASK_IDX_COVERAGE_ACTION_IDS rather than this run's `action_ids`: the
+        # guard reads tickets of every action, so narrowing the candidate set with
+        # --action must not narrow what counts as a blind spot.
         non_failed_missing_mask_idx = await _count_non_failed_missing_mask_idx(
-            pool, action_ids=action_ids
+            pool, action_ids=_MASK_IDX_COVERAGE_ACTION_IDS
         )
 
         candidates = await _select_purge_failed_candidates(pool, action_ids=action_ids, limit=limit)
@@ -749,6 +764,10 @@ async def _purge_failed(
             "executed": execute,
             "with_tickets": with_tickets,
             "action_ids": list(action_ids),
+            # The coverage gate's own scope, reported separately because it is
+            # deliberately wider than the candidate `action_ids` above — a reader
+            # comparing the count to the wrong list looks in the wrong place.
+            "coverage_action_ids": list(_MASK_IDX_COVERAGE_ACTION_IDS),
             "non_failed_missing_mask_idx": non_failed_missing_mask_idx,
             "candidates": len(candidates),
             "eligible": [
@@ -772,13 +791,14 @@ async def _purge_failed(
         if non_failed_missing_mask_idx:
             raise RuntimeError(
                 f"mask-idx coverage incomplete: {non_failed_missing_mask_idx} non-failed"
-                f" work_ticket(s) for {list(action_ids)} have mask_idx IS NULL, so the"
-                " shared-mask guard cannot see them and a shared mask could be wrongly"
-                " deleted. A non-failed masking ticket should always carry its mask_idx"
-                " (minted at submit time); the one-time backfill that populated"
-                " pre-tracking tickets has been retired. Investigate why these are"
-                " unmasked (a submit-path regression, or a pre-tracking ticket that"
-                " backfill never reached) and set their mask_idx before re-running."
+                f" work_ticket(s) for {list(_MASK_IDX_COVERAGE_ACTION_IDS)} have mask_idx"
+                " IS NULL, so the shared-mask guard cannot see them and a shared mask"
+                " could be wrongly deleted. Note this list is WIDER than the --action"
+                " selection: the guard reads tickets of every action, so the blind spot"
+                " may be outside what this run would purge. A non-failed ticket that"
+                " mints or consumes a mask should always carry its mask_idx (the runner"
+                " writes it before the step loop). Investigate why these are unmasked and"
+                " set their mask_idx before re-running."
             )
 
         # --execute: process each eligible candidate in isolation. Mask deletes
@@ -910,15 +930,16 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
         print(
             f"  *** MASK-IDX COVERAGE INCOMPLETE:"
             f" {report['non_failed_missing_mask_idx']} non-failed work_ticket(s)"
-            f" for {report['action_ids']} have mask_idx IS NULL."
+            f" for {report['coverage_action_ids']} have mask_idx IS NULL."
         )
         print(
             "      The shared-mask guard cannot see them; a shared mask could be wrongly deleted."
         )
         print(
-            "      A non-failed masking ticket should always carry its mask_idx; the"
-            " one-time backfill has been retired. Investigate and set their mask_idx"
-            " before proceeding. --execute will REFUSE until this is 0."
+            "      That list is WIDER than --action: the guard reads tickets of every"
+            " action, so the blind spot may be outside what this run would purge."
+            " Investigate and set their mask_idx before proceeding."
+            " --execute will REFUSE until this is 0."
         )
     print(f"  candidates: {report['candidates']}")
     print(f"  eligible:   {len(report['eligible'])}")
@@ -1218,6 +1239,7 @@ __all__ = [
     "_FAILURE_STAGES_REQUIRING_STEP_NAME",
     "_FAILURE_STAGE_CHOICES",
     "_FORCE_FAIL_ELIGIBLE_STATES",
+    "_MASK_IDX_COVERAGE_ACTION_IDS",
     "_OWNER_ID_BASE_COLUMNS",
     "_OWNER_ID_POOL_COLUMNS",
     "_PURGE_FAILED_ACTION_IDS",

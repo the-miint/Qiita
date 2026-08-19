@@ -19,14 +19,17 @@ from uuid import UUID
 import duckdb
 import pytest
 
-# Three contigs across two bins + one circular genome. bin.1 has two contigs;
-# bin.2 shares bin.1:x1's bytes (same hash -> same feature_idx) to exercise the
-# distinct-membership / dedup path.
+# Three contigs across two bins, one circular genome, and one unbinned-residue
+# contig. bin.1 has two contigs; bin.2 shares bin.1:x1's bytes (same hash -> same
+# feature_idx) to exercise the distinct-membership / dedup path. The UNBINNED row
+# carries its own contig id as bin_id, the shape assembly_hash emits, and has no
+# CheckM counterpart — bin_quality holds MAG rows alone.
 _SEQUENCES = {
     "LCG:circ1:c1": ("AAAACCCCGGGGTTTT", 100),
     "MAG:bin.1:x1": ("ACGTACGTACGTACGT", 200),
     "MAG:bin.1:x2": ("TTTTGGGGCCCCAAAA", 300),
     "MAG:bin.2:y1": ("ACGTACGTACGTACGT", 200),  # identical bytes to x1
+    "UNBINNED:ctgU:ctgU": ("GGGGCCCCAAAATTTT", 400),
 }
 
 
@@ -181,6 +184,7 @@ def test_reused_writers_emit_feature_keyed_sequences_and_chunks(tmp_path, stagin
         (100, str(_hash("AAAACCCCGGGGTTTT")), 16),
         (200, str(_hash("ACGTACGTACGTACGT")), 16),
         (300, str(_hash("TTTTGGGGCCCCAAAA")), 16),
+        (400, str(_hash("GGGGCCCCAAAATTTT")), 16),
     ]
 
     # assembled_sequence_chunks/ — directory of part files, keyed by feature_idx.
@@ -204,6 +208,7 @@ def test_reused_writers_emit_feature_keyed_sequences_and_chunks(tmp_path, stagin
         100: "AAAACCCCGGGGTTTT",
         200: "ACGTACGTACGTACGT",
         300: "TTTTGGGGCCCCAAAA",
+        400: "GGGGCCCCAAAATTTT",
     }
 
 
@@ -225,17 +230,24 @@ def test_assembly_membership_parquet_lifts_bins_to_feature_idx(tmp_path, staging
     }
     rows = _rows(pq, "kind, bin_id, feature_idx", "kind, bin_id, feature_idx")
     # bin.2 shares x1's feature (200) but keeps its own distinct membership row.
+    # The unbinned contig lifts the same way, its own contig id as bin_id.
     assert rows == [
         ("LCG", "circ1", 100),
         ("MAG", "bin.1", 200),
         ("MAG", "bin.1", 300),
         ("MAG", "bin.2", 200),
+        ("UNBINNED", "ctgU", 400),
     ]
     stamps = _rows(pq, "DISTINCT prep_sample_idx, processing_idx", "1")
     assert stamps == [(42, 77)]
 
 
 def test_bin_quality_joins_checkm_and_das(tmp_path, staging_inputs):
+    """CheckM x DAS_Tool -> one row per refined bin, and per refined bin only.
+
+    The fixture's LCG and UNBINNED memberships have no CheckM row, so the
+    exact-equality assertion below pins that bin_quality holds MAG rows alone.
+    """
     inputs = _inputs(
         tmp_path,
         staging_inputs,
@@ -280,9 +292,10 @@ def test_bin_quality_without_das_scores_is_null(tmp_path, staging_inputs):
     assert rows == [("bin.1", 95.5, None, None)]
 
 
-def test_lcg_only_writes_empty_bin_quality(tmp_path, staging_inputs):
-    """No CheckM table (LCG-only, or CheckM DB absent) -> valid empty bin_quality
-    with the right schema; the sequences/membership still store."""
+def test_no_checkm_table_writes_empty_bin_quality(tmp_path, staging_inputs):
+    """No CheckM table (a sample with no MAG, or a CheckM DB that was absent) ->
+    valid empty bin_quality with the right schema; the sequences/membership still
+    store."""
     inputs = _inputs(tmp_path, staging_inputs, checkm_rows=None, das_rows=None)
     out = _run(inputs, tmp_path / "ws")
     pq = out["staging_dir"] / "bin_quality.parquet"

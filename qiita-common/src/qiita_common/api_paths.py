@@ -73,6 +73,12 @@ PATH_REFERENCE_EXCLUSION_BY_IDX = "/{reference_idx}/exclusion"
 # genome_idx) because the accession is per-(reference, feature) and a DoGet ticket
 # is per-reference. Param path, distinct 4-segment shape (no literal shadow).
 PATH_REFERENCE_GENOME_MEMBER = "/{reference_idx}/genome/{genome_idx}/member"
+# The whole reference's feature_idx → genome lookup, the inverse direction of
+# GENOME_MEMBER: one entry per (feature, genome) pair with the genome's
+# provenance. Named `genome-map` rather than `/genome` because it is not a
+# listing of genomes — it is the join table a client rolls alignment rows up
+# through. Param path, 2 segments, no literal shadow.
+PATH_REFERENCE_GENOME_MAP = "/{reference_idx}/genome-map"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -84,6 +90,7 @@ URL_REFERENCE_EXCLUSION = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION}"
 URL_REFERENCE_EXCLUSION_SYNC = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_SYNC}"
 URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_BY_IDX}"
 URL_REFERENCE_GENOME_MEMBER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MEMBER}"
+URL_REFERENCE_GENOME_MAP = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP}"
 
 # =============================================================================
 # /host-filter-profile/*
@@ -390,10 +397,22 @@ PATH_MASK_DEFINITION_PREFIX = "/mask-definition"
 PATH_MASK_DEFINITION_ROOT = ""  # POST (mint) / GET (list) against the prefix itself
 PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # GET one mask; DELETE (lake rows + Postgres row)
 PATH_MASK_DEFINITION_PREP_SAMPLE = "/{mask_idx}/prep-sample"  # GET the per-sample roster
+# PATCH the CONFIG's lifecycle (active <-> deprecated). Mirrors
+# PATH_REFERENCE_STATUS; a deprecated config cannot be minted against.
+PATH_MASK_DEFINITION_STATUS = "/{mask_idx}/status"
+# PATCH specific RUNS of the config (completed <-> invalidated), naming the
+# prep_samples in the body. Bulk because the judgement is made per cohort, not per
+# sample. Distinct from the route above: config lifecycle and run lifecycle are
+# different questions (see qiita_common.models.MaskDefinitionStatus).
+PATH_MASK_DEFINITION_SAMPLE_STATUS = "/{mask_idx}/sample-status"
 
 URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
 URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
 URL_MASK_DEFINITION_PREP_SAMPLE = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_PREP_SAMPLE}"
+URL_MASK_DEFINITION_STATUS = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_STATUS}"
+URL_MASK_DEFINITION_SAMPLE_STATUS = (
+    f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_SAMPLE_STATUS}"
+)
 
 # =============================================================================
 # /alignment-definition/* — control-plane sharded-alignment config identity
@@ -416,27 +435,42 @@ URL_ALIGNMENT_DEFINITION_BY_IDX = (
 # /alignment/* — Flight DoGet ticket for the alignment sink (feature-table OGU)
 # =============================================================================
 # Signs a DoGet ticket scoped to a single alignment run + its explicit
-# prep_sample_idx cohort on the data plane's `alignment` table. POST is
-# service-account-only (Scope.TICKET_DOGET) — the compute job mints it at
-# runtime. The body carries only work_ticket_idx; the route reads alignment_idx
-# and the cohort from that ticket's action_context (keeping the sample list
-# CP-side, off the wire). Distinct prefix from /alignment-definition (the
-# alignment identity CRUD).
+# prep_sample_idx cohort on the data plane's `alignment` table. Distinct prefix
+# from /alignment-definition (the alignment identity CRUD).
+#
+# TWO mint paths, differing in where the cohort comes from and therefore in how
+# it is authorized:
+#
+#   PATH_ALIGNMENT_DOGET         service-account-only (Scope.TICKET_DOGET). The
+#                                compute job mints it at runtime; the body
+#                                carries only work_ticket_idx and the route
+#                                reads alignment_idx + the cohort from that
+#                                ticket's action_context, already validated by
+#                                the runner resolver at submit (and kept CP-side,
+#                                off the wire).
+#   PATH_ALIGNMENT_COHORT_DOGET  human-callable (Scope.ALIGNMENT_DOGET). The
+#                                caller names the alignment in the path and the
+#                                cohort in the body, so the route authorizes
+#                                every sample per-study before signing. Both are
+#                                POSTs under /alignment but never ambiguous:
+#                                one has a path parameter, the other does not.
 
 PATH_ALIGNMENT_PREFIX = "/alignment"
 PATH_ALIGNMENT_DOGET = "/ticket/doget"
+PATH_ALIGNMENT_COHORT_DOGET = "/{alignment_idx}/ticket/doget"
 
 URL_ALIGNMENT_PREFIX = f"{API_PREFIX}{PATH_ALIGNMENT_PREFIX}"
 URL_ALIGNMENT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_DOGET}"
+URL_ALIGNMENT_COHORT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_COHORT_DOGET}"
 
 # =============================================================================
 # /read-masked/* — Flight DoGet ticket for the masked-read surface
 # =============================================================================
 # Signs an HMAC DoGet ticket scoped to a single (prep_sample_idx, mask_idx) on
-# the data plane's `read_masked` view. POST is service-account-only
+# the data plane's `read_masked` macro. POST is service-account-only
 # (Scope.READ_MASKED_DOGET). The route enforces the mandatory-filter invariant:
-# both identifiers are required, so an unfiltered read_masked ticket is never
-# signed.
+# both identifiers are required (they are the macro's arguments), so an
+# unfiltered read_masked ticket is never signed.
 
 PATH_READ_MASKED_PREFIX = "/read-masked"
 PATH_READ_MASKED_DOGET = "/ticket/doget"
@@ -506,7 +540,7 @@ PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS = "/principal/{principal_idx}/revoke-all-
 PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID = "/study/{study_idx}/owner-biosample-id"
 # Masked-read export (system_admin only): the manifest GET lists a
 # sequenced_pool's non-retired samples to export under ?mask_idx=; the ticket
-# POST mints a per-sample DoGet ticket on the data plane's read_masked view.
+# POST mints a per-sample DoGet ticket on the data plane's read_masked macro.
 PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
     "/sequenced-pool/{sequenced_pool_idx}/masked-read-export"
 )
@@ -618,6 +652,18 @@ PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
 PATH_SEQUENCED_POOL_ALIGN_PLAN = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/align-plan"
 )
+# GET the alignments over this pool's samples: per alignment_idx, its config
+# params and completed/total sample counts. Counts are scoped to the samples the
+# CALLER may read, so they agree with what the alignment DoGet mint will sign.
+PATH_SEQUENCED_POOL_ALIGNMENT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/alignment"
+)
+# GET the cohort to mint an alignment DoGet ticket for: the pool's prep_samples
+# that are BOTH readable by the caller and 'completed' for this alignment. The
+# list this returns is a valid mint body by construction.
+PATH_SEQUENCED_POOL_ALIGNMENT_COHORT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/alignment/{alignment_idx}/cohort"
+)
 # GET the pool's exception drill-down: only the anomalous non-retired
 # sequenced_samples — no usable reads (unprocessed or zero survived), missing any
 # of the four submission accessions, or a genuinely-failed read-mask ticket (failed
@@ -653,6 +699,10 @@ URL_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN}"
 )
 URL_SEQUENCED_POOL_ALIGN_PLAN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGN_PLAN}"
+URL_SEQUENCED_POOL_ALIGNMENT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGNMENT}"
+URL_SEQUENCED_POOL_ALIGNMENT_COHORT = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGNMENT_COHORT}"
+)
 URL_SEQUENCED_SAMPLE_EXCEPTIONS = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_EXCEPTIONS}"
 URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY}"
@@ -772,6 +822,49 @@ PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
 # Create a study-local prep_sample field definition (POST). The study-scoped
 # mint hangs off the /study router (the caller is authorized on the study).
 PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/prep-sample-field"
+
+# =============================================================================
+# /exported-identifier — the public handle a published table carries per sample
+# =============================================================================
+# POST, and not only because it writes: the cohort has to ride the body, like
+# /biosample/lookup-by-accession, because a feature table's cohort is a pool's or
+# a study's worth of samples and routinely spans pools, neither of which a query
+# string can carry.
+
+PATH_EXPORTED_IDENTIFIER_PREFIX = "/exported-identifier"
+PATH_EXPORTED_IDENTIFIER_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_IDENTIFIER_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_IDENTIFIER_PREFIX}"
+URL_EXPORTED_IDENTIFIER = f"{URL_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_ROOT}"
+
+
+# =============================================================================
+# /exported-feature — the public handle a published table carries per ROW
+# =============================================================================
+# The other axis of the same artifact: /exported-identifier names the columns
+# (processed samples), this names the rows (genomes and features). POST for the
+# same two reasons — it mints, and the entity set has to ride the body.
+
+PATH_EXPORTED_FEATURE_PREFIX = "/exported-feature"
+PATH_EXPORTED_FEATURE_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_FEATURE_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_FEATURE_PREFIX}"
+URL_EXPORTED_FEATURE = f"{URL_EXPORTED_FEATURE_PREFIX}{PATH_EXPORTED_FEATURE_ROOT}"
+
+
+# =============================================================================
+# /exported-processing — the public handle a published bundle's manifest cites
+# =============================================================================
+# The third axis: /exported-identifier names a table's columns, /exported-feature
+# its rows, and this names what was DONE to produce it. POST because it mints, and
+# against the prefix like its two siblings.
+
+PATH_EXPORTED_PROCESSING_PREFIX = "/exported-processing"
+PATH_EXPORTED_PROCESSING_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_PROCESSING_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_PROCESSING_PREFIX}"
+URL_EXPORTED_PROCESSING = f"{URL_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_ROOT}"
+
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"

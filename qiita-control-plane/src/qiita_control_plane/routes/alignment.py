@@ -2,11 +2,14 @@
 (`qiita.alignment_definition`).
 
 The `alignment_idx` that keys the DuckLake `alignment` rows is minted at plan time
-by the align-plan route (`POST .../sequenced-pool/{P}/align-plan`), so there is no
-public POST here. This module owns the destructive DELETE — the full purge of an
-alignment (its DuckLake rows + the Postgres `alignment_definition` row) — which is
-the escape hatch the align planner's disallow-without-delete rule requires: an
-operator must DELETE a completed alignment before re-aligning the same config.
+by the align-plan route (`POST .../sequenced-pool/{P}/align-plan`), so **no route
+here mints one** — the POSTs below sign Flight DoGet tickets against an alignment
+that already exists.
+
+This module owns the destructive DELETE — the full purge of an alignment (its
+DuckLake rows + the Postgres `alignment_definition` row) — which is the escape
+hatch the align planner's disallow-without-delete rule requires: an operator must
+DELETE a completed alignment before re-aligning the same config.
 
 Modelled on the mask-definition purge (`routes/read_masked.py`): lake-first,
 system_admin-only, idempotent/retriable.
@@ -21,6 +24,7 @@ import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
 from qiita_common.api_paths import (
+    PATH_ALIGNMENT_COHORT_DOGET,
     PATH_ALIGNMENT_DEFINITION_BY_IDX,
     PATH_ALIGNMENT_DEFINITION_PREFIX,
     PATH_ALIGNMENT_DOGET,
@@ -28,19 +32,23 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
+    AlignmentCohortDoGetTicketRequest,
     AlignmentDefinitionDeleteResponse,
     AlignmentDoGetTicketRequest,
     DoGetTicketResponse,
 )
 
 from ..actions.library import delete_alignment_data
-from ..auth.guards import require_scope, require_service_with_scope
-from ..auth.principal import Principal, ServiceAccount
+from ..auth.guards import (
+    require_complete_profile,
+    require_scope,
+    require_service_with_scope,
+)
+from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
 from ..feature_table import parse_feature_table_scope
-
-_MSG_ALIGNMENT_NOT_FOUND = "Alignment definition not found"
+from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort
 
 # The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
 # VIEW (`alignment` ANTI JOIN the resolved blocklist), never the raw base table —
@@ -103,7 +111,7 @@ async def delete_alignment_definition_route(
         "SELECT 1 FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
     )
     if exists is None:
-        raise HTTPException(status_code=404, detail=_MSG_ALIGNMENT_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
 
     # DuckLake alignment rows (idempotent, atomic delete-by-alignment_idx in the
     # data plane). Lake-first so a crash before the Postgres delete leaves a
@@ -194,6 +202,85 @@ async def create_alignment_doget_ticket(
         alignment_idx, prep_sample_idx = parse_feature_table_scope(ctx)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    filter_ = {"alignment_idx": [alignment_idx], "prep_sample_idx": prep_sample_idx}
-    ticket_bytes = sign_ticket(table=_ALIGNMENT_TABLE, filter=filter_, secret=signing_key)
+    return _sign_alignment_ticket(
+        alignment_idx=alignment_idx,
+        prep_sample_idx=prep_sample_idx,
+        columns=body.columns,
+        signing_key=signing_key,
+    )
+
+
+@alignment_router.post(PATH_ALIGNMENT_COHORT_DOGET, status_code=201)
+async def create_alignment_cohort_doget_ticket(
+    alignment_idx: Annotated[int, Field(gt=0)],
+    body: AlignmentCohortDoGetTicketRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    signing_key: bytes = Depends(get_flight_signing_key),
+    caller: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.ALIGNMENT_DOGET)),
+) -> DoGetTicketResponse:
+    """Sign a DoGet ticket for an alignment cohort the CALLER names — the
+    scientist-facing counterpart of the work-ticket mint above.
+
+    Human-callable (``alignment:doget``, on every role ceiling — see that scope
+    for why, including where the reasoning stops applying): the caller must hold
+    ``Tier.VIEWER`` on every study each requested prep_sample is still linked to.
+    Service accounts are deliberately excluded — a worker has the other route,
+    and one surface with two validation paths is what splitting the scopes
+    prevented.
+
+    **The signed cohort IS the authorization boundary.** The data plane serves
+    exactly the prep_sample_idx list this ticket carries and knows nothing about
+    studies or users, so there is no second line of defence behind this
+    function; every check below is the only one there is.
+
+    Validation is `authorize_completed_alignment_cohort`, whose docstring is the
+    single copy of why its three checks run in the order they do; the signing that
+    follows shares one helper with the work-ticket route so the two cannot drift.
+    Two things specific to this route and not to that gate: the cohort is never
+    narrowed because coverage filtering makes a feature table cohort-dependent, so
+    trimming the request would answer a different scientific question under the name
+    of the one asked; and the completeness check is the one the work-ticket route can
+    skip, its runner resolver having already run it at submit.
+    """
+    cohort = await authorize_completed_alignment_cohort(
+        pool,
+        caller=caller,
+        alignment_idx=alignment_idx,
+        prep_sample_idx=body.prep_sample_idx,
+        nothing_to="",
+    )
+
+    return _sign_alignment_ticket(
+        alignment_idx=alignment_idx,
+        prep_sample_idx=cohort,
+        columns=body.columns,
+        signing_key=signing_key,
+    )
+
+
+def _sign_alignment_ticket(
+    *,
+    alignment_idx: int,
+    prep_sample_idx: list[int],
+    columns: list[str] | None,
+    signing_key: bytes,
+) -> DoGetTicketResponse:
+    """Sign the alignment DoGet ticket both mint routes return.
+
+    Shared so the table name, the filter shape, and the 422-on-bad-projection
+    translation have one definition — two mint routes for one data-plane surface
+    is otherwise an invitation to drift. The projection allowlist itself lives
+    at the signing boundary (`auth/tickets.py`), not here, so no route can mint
+    an unvalidated one.
+    """
+    try:
+        ticket_bytes = sign_ticket(
+            table=_ALIGNMENT_TABLE,
+            filter={"alignment_idx": [alignment_idx], "prep_sample_idx": prep_sample_idx},
+            columns=columns,
+            secret=signing_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())

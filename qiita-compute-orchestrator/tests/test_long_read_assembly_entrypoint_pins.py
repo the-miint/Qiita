@@ -2,10 +2,11 @@
 
 Most of the file is about `binning.sh` and the coverage BAM (below), but it also
 pins `bin_refine.sh`'s `--write_bins` flag, `checkm.sh`'s TMPDIR shortening for the
-AF_UNIX socket, and the version constraints in `binning.def` / `bin_refine.def` that
-each entrypoint's behaviour depends on. All of it is the same kind of assertion:
-read the shipped file, check the command it pins is still there and still shaped
-correctly.
+AF_UNIX socket, the genomes_dir basenames the entrypoints write and read against
+their Python constants, and the version constraints in `binning.def` /
+`bin_refine.def` that each entrypoint's behaviour depends on. All of it is the same
+kind of assertion: read the shipped file, check the command it pins is still there
+and still shaped correctly.
 
 The coverage BAM: how `binning.sh` puts it where metaWRAP will read it.
 
@@ -45,8 +46,11 @@ from pathlib import Path
 
 import pytest
 
+from qiita_compute_orchestrator.jobs._assembly import LCG_FILE, NOLCG_FILE
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WORKFLOW_DIR = _REPO_ROOT / "workflows" / "long-read-assembly"
+_ASSEMBLE_SH = _WORKFLOW_DIR / "assemble.sh"
 _BINNING_SH = _WORKFLOW_DIR / "binning.sh"
 _BINNING_DEF = _WORKFLOW_DIR / "binning.def"
 _BINNING_VERIFY = _WORKFLOW_DIR / "binning-verify.sh"
@@ -57,14 +61,22 @@ _CHECKM_SH = _WORKFLOW_DIR / "checkm.sh"
 
 @pytest.mark.parametrize(
     "path",
-    [_BINNING_SH, _BINNING_DEF, _BINNING_VERIFY, _BIN_REFINE_SH, _BIN_REFINE_DEF, _CHECKM_SH],
+    [
+        _ASSEMBLE_SH,
+        _BINNING_SH,
+        _BINNING_DEF,
+        _BINNING_VERIFY,
+        _BIN_REFINE_SH,
+        _BIN_REFINE_DEF,
+        _CHECKM_SH,
+    ],
 )
 def test_source_file_is_present_and_parses(path: Path) -> None:
     """Anti-vacuity guard, matching the sibling static pins.
 
-    Every assertion below reads one of these files through `_code_lines` — all six,
-    which is why all six are listed here rather than the three `binning` ones. A
-    moved file or a `_REPO_ROOT` that stopped resolving would make the
+    Every assertion below reads one of these files through `_code_lines` — all
+    seven, which is why all seven are listed here rather than the three `binning`
+    ones. A moved file or a `_REPO_ROOT` that stopped resolving would make the
     absence-shaped pins pass for the wrong reason, so fail loudly here first.
     """
     assert path.is_file(), f"{path} is missing -- the pins below would be vacuous"
@@ -129,6 +141,43 @@ def _strip_comment(line: str) -> str:
         elif ch == "#" and (i == 0 or line[i - 1].isspace()):
             return line[:i]
     return line
+
+
+@pytest.mark.parametrize(
+    ("path", "dir_var", "expected"),
+    [
+        (_ASSEMBLE_SH, "OUT", {LCG_FILE, NOLCG_FILE}),
+        (_BINNING_SH, "GENOMES_DIR", {NOLCG_FILE}),
+        (_BIN_REFINE_SH, "GENOMES_DIR", {NOLCG_FILE}),
+    ],
+    ids=["assemble", "binning", "bin_refine"],
+)
+def test_genomes_dir_basenames_match_the_python_constants(
+    path: Path, dir_var: str, expected: set[str]
+) -> None:
+    """The genomes_dir basenames are spelled the same in the shell and in Python.
+
+    `assemble.sh` writes both files into its output genomes_dir; `binning.sh` and
+    `bin_refine.sh` read noLCG back out of the one they are handed. The native jobs
+    reach the same files through `_assembly.LCG_FILE` / `NOLCG_FILE`, and nothing
+    joins the two spellings at runtime. `assembly_hash._file_meta` looks genomes_dir
+    up by exact name, not by glob, so renaming one side alone drops the circular and
+    unbinned contigs from the run with no error; a sample with no refined bin either
+    becomes the terminal StepNoData "no contigs to hash", discarded with no retry.
+
+    Set equality, not membership: a new file under genomes_dir has to be added here
+    and given a constant, rather than reaching the native jobs unnamed. `dir_var` is
+    per script because `${OUT}` is genomes_dir only in `assemble.sh` -- in the other
+    two it is the bins output.
+    """
+    code = "\n".join(_code_lines(path))
+    found = set(re.findall(rf"\$\{{{dir_var}\}}/([^\s\"']+)", code))
+    assert found == expected, (
+        f"{path.name} reaches genomes_dir by ${{{dir_var}}}/{sorted(found)}, but the "
+        f"Python constants spell it {sorted(expected)}. The two are pinned together "
+        "here because nothing checks them at runtime -- a rename on one side leaves "
+        "assembly_hash scanning for a file the entrypoint no longer writes."
+    )
 
 
 def test_binning_stages_the_coverage_bam_unrewritten() -> None:

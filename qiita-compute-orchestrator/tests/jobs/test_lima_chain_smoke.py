@@ -306,7 +306,7 @@ def test_export_handles_an_empty_source(tmp_path):
 def test_mask_trims_are_relative_to_the_raw_read(tmp_path):
     """lima clipped _LEAD off the 5' end and _TRAIL off the 3'. The emitted trims
     must reconstruct the insert from the RAW read — `qc`, `host_filter`, and the
-    `read_masked` view all apply mask trims to `read.sequence1`."""
+    `read_masked` macro all apply mask trims to `read.sequence1`."""
     raw = _LEAD + _INSERT + _TRAIL
     rows = _mask_rows(_roundtrip(tmp_path, [(11, raw)], [(11, _INSERT)])["partial_mask"])
     assert rows == [(11, ReadMaskReason.PASS.value, len(_LEAD), len(_TRAIL), None, None)]

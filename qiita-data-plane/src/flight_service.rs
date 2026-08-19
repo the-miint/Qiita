@@ -4,9 +4,13 @@
 //! and streaming results as Arrow RecordBatches.
 //!
 //! Each request opens its own DuckDB connection and attaches DuckLake. This
-//! avoids shared mutable state and allows concurrent requests — DuckLake's
-//! snapshot isolation in the shared Postgres catalog handles concurrency.
+//! avoids shared mutable state and allows concurrent requests; DuckLake's
+//! snapshot isolation in the shared Postgres catalog keeps readers off each
+//! other. It is not sufficient for every writer, though — it detects a conflict
+//! only where two transactions touch the same existing row, so writers that must
+//! not both commit take an explicit lock (`take_registration_lock`).
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -21,6 +25,8 @@ use arrow_flight::{
     Action, ActionType, Criteria, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
     HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
+use arrow_ipc::writer::IpcWriteOptions;
+use arrow_ipc::CompressionType;
 use duckdb::Connection;
 use futures::stream::{self, Stream, StreamExt};
 use parquet::arrow::ArrowWriter;
@@ -32,6 +38,64 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth;
 use crate::ducklake;
+
+/// gRPC metadata key by which a DoGet client asks for a compressed IPC body.
+///
+/// Lowercase because HTTP/2 requires it of header names. **Python twin:**
+/// `qiita_common.flight_constants.IPC_COMPRESSION_HEADER` — the two are a wire
+/// contract and must change together.
+const IPC_COMPRESSION_HEADER: &str = "qiita-ipc-compression";
+
+/// The only codec this server will apply, and the value clients send to get it.
+const IPC_COMPRESSION_ZSTD: &str = "zstd";
+/// Explicitly asking for no compression — the same as sending no header, but
+/// lets a client be unambiguous.
+const IPC_COMPRESSION_NONE: &str = "none";
+
+/// The IPC body codec this DoGet should use, from the client's request metadata.
+///
+/// **The client chooses, not the server.** Whether compression pays depends on
+/// the client's bandwidth, which the server cannot know — behind nginx it cannot
+/// even see the client's address. So the default is off and the client opts in
+/// per call. The break-even arithmetic is in `docs/architecture.md`.
+///
+/// An unrecognised value is an **error, not a fallback**. A client that asked
+/// for compression, silently did not get it, and measured the result would draw
+/// the wrong conclusion about its own transfer. `lz4` is rejected along with
+/// everything else rather than served as a quietly worse stream.
+fn requested_ipc_codec(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<Option<CompressionType>, Status> {
+    // `get_all`, not `get`: HTTP/2 headers may repeat, and `get` returns only the
+    // FIRST value — so `zstd` followed by `lz4` would apply zstd and silently
+    // drop the value it does not support, which is exactly the quiet downgrade
+    // this function exists to prevent. A repeated header is ambiguous about what
+    // the client wanted, and ambiguity here is refused rather than resolved.
+    let mut values = metadata.get_all(IPC_COMPRESSION_HEADER).iter();
+    let Some(raw) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(Status::invalid_argument(format!(
+            "{IPC_COMPRESSION_HEADER} was sent more than once; send exactly one \
+             value ({IPC_COMPRESSION_ZSTD:?} or {IPC_COMPRESSION_NONE:?})"
+        )));
+    }
+    let value = raw.to_str().map_err(|_| {
+        Status::invalid_argument(format!(
+            "{IPC_COMPRESSION_HEADER} must be valid UTF-8; accepted values are \
+             {IPC_COMPRESSION_ZSTD:?} and {IPC_COMPRESSION_NONE:?}"
+        ))
+    })?;
+    match value {
+        IPC_COMPRESSION_ZSTD => Ok(Some(CompressionType::ZSTD)),
+        IPC_COMPRESSION_NONE => Ok(None),
+        other => Err(Status::invalid_argument(format!(
+            "unsupported {IPC_COMPRESSION_HEADER}: {other:?}; accepted values are \
+             {IPC_COMPRESSION_ZSTD:?} and {IPC_COMPRESSION_NONE:?}"
+        ))),
+    }
+}
 
 /// The qiita data plane Flight service.
 pub struct QiitaFlightService {
@@ -229,9 +293,11 @@ pub fn staging_path_for(root: &Path, upload_idx: i64) -> PathBuf {
 ///
 /// PRIVACY: the bare `read` and `read_mask` tables are deliberately absent, and
 /// must stay absent. A whole-table name here would make an unscoped raw-read
-/// SELECT representable; `read_masked` is the only *unrestricted* read surface,
-/// and it excludes host/human and QC-failed rows by construction (`WHERE
-/// m.reason = 'pass'`).
+/// SELECT representable. `read_masked` is the only broadly-reachable read
+/// surface, and it excludes host/human and QC-failed rows by construction (an
+/// unconditional `reason = 'pass'`). It is no longer unrestricted either: it is a
+/// table MACRO, not a relation, and what its required arguments foreclose is
+/// documented where they are declared (`ducklake.rs`).
 ///
 /// `read_block` is the one path to raw `read` rows over Flight, and it is
 /// admissible only because it CANNOT express an unscoped read: it is not a table
@@ -262,8 +328,9 @@ const ALLOWED_TABLES: &[&str] = &[
     // raw `alignment` is deliberately absent so a blocked feature can't reach an
     // OGU rollup. It holds host-depleted, derived per-read alignments (not raw
     // human reads), so — unlike read_masked — it is not the human-read privacy
-    // surface. Reads are projected to the coverage/OGU columns and always scoped
-    // by alignment_idx + prep_sample_idx (see build_query / ALIGNMENT_DOGET_PROJECTION).
+    // surface. Reads are projected to the ticket's signed column list — required
+    // here, unlike every other table — and always scoped by alignment_idx +
+    // prep_sample_idx (see build_query / ALIGNMENT_PROJECTION_COLUMNS).
     "alignment_visible",
 ];
 
@@ -282,20 +349,123 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
     "alignment_idx",
 ];
 
-/// Columns the `alignment` DoGet projects — exactly what the coverage +
-/// `woltka_ogu` feature-table computation needs, out of the ~20-column alignment
-/// row. Projection pushdown: the wide `tag_*` / `mate_*` columns never cross the
-/// wire. The OGU key (`genome_idx`) is derived compute-side from `feature_idx`
-/// via the reference's feature→genome map, so the raw `feature_idx` suffices here.
+/// Columns a signed ticket may ask the alignment DoGet to project: every column
+/// of `qiita_lake.alignment`, which `alignment_visible` mirrors (`SELECT a.*`,
+/// see `ducklake::ensure_exclusion_tables`). Keep in step with
+/// `ensure_alignment_tables`' DDL.
 ///
-/// Coverage is breadth via miint `genome_coverage(alignments, ...)`, whose
-/// `alignments` relation needs only `reference (=feature_idx), position,
-/// stop_position` — it merges alignment spans per contig, so `cigar` is NOT
-/// required (unlike `compute_coverage_depth`, which we do not use). `alignment_idx`
-/// is intentionally absent: the DoGet is enforced to a single alignment run
-/// (see build_query), so every streamed row shares it and the consumer carries it.
-const ALIGNMENT_DOGET_PROJECTION: &str =
-    "prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position";
+/// This is the Rust half of a CP-mirrored pair — the control plane validates the
+/// same set at mint time, so an unknown column is refused before it is ever
+/// signed. Both halves exist on purpose: the CP's copy turns a consumer's typo
+/// into a 422 with a useful message, and this one is the defense-in-depth that
+/// keeps a signed name out of interpolated SQL.
+///
+/// The allowlist is per-table (see `projection_allowlist`) and today only the
+/// alignment surface has one; every other DoGet table streams `SELECT *` and
+/// refuses a column list outright. Why the asymmetry: `docs/architecture.md`.
+const ALIGNMENT_PROJECTION_COLUMNS: &[&str] = &[
+    "alignment_idx",
+    "prep_sample_idx",
+    "sequence_idx",
+    "feature_idx",
+    "mate_feature_idx",
+    "flags",
+    "position",
+    "stop_position",
+    "mapq",
+    "cigar",
+    "mate_position",
+    "template_length",
+    "tag_as",
+    "tag_xs",
+    "tag_ys",
+    "tag_xn",
+    "tag_xm",
+    "tag_xo",
+    "tag_xg",
+    "tag_nm",
+    "tag_yt",
+    "tag_md",
+    "tag_sa",
+];
+
+/// Tables that resolve a `reference_idx` filter through a JOIN against
+/// `reference_membership` — they have no `reference_idx` column of their own.
+///
+/// Named rather than inlined at the one `if` that needs them because the JOIN and
+/// the projection do not compose (see `build_query`), and an invariant nothing can
+/// name is an invariant nothing can check —
+/// `no_membership_join_table_has_a_projection_allowlist` does.
+const MEMBERSHIP_JOIN_TABLES: &[&str] = &["reference_sequences", "reference_sequence_chunks"];
+
+/// The projection allowlist for `table`, or `None` when the table takes no
+/// column list at all (it streams `SELECT *`, and a list is a control-plane bug).
+fn projection_allowlist(table: &str) -> Option<&'static [&'static str]> {
+    is_alignment_doget_surface(table).then_some(ALIGNMENT_PROJECTION_COLUMNS)
+}
+
+/// The SQL select list for `table`, given the ticket's (possibly empty) column
+/// list: the signed columns in the ticket's own order, or `*` for a table that
+/// takes no projection.
+///
+/// **Having an allowlist and requiring a list are the same property.** A table
+/// only gets an allowlist because serving it unprojected is the wrong default,
+/// so the four cases below are total and there is no "projection is optional
+/// here" state to reason about. Splitting them is a one-line change if that ever
+/// becomes something we want.
+///
+/// Every rejection is a control-plane bug rather than client input — the CP
+/// validates the same set before signing — so failing loudly is the point: the
+/// alternative is quietly serving a different set of columns than was signed.
+fn select_list_for(table: &str, columns: &[String]) -> Result<String, Status> {
+    match (projection_allowlist(table), columns.is_empty()) {
+        (None, true) => Ok("*".to_string()),
+        // No server-side default to fall back to, deliberately: the consumer is
+        // the only component that knows which columns it binds, and a fallback
+        // here would be a second answer to that question, free to drift wider
+        // than what was asked for. A ticket minted before this shipped and
+        // redeemed after lands here — loudly, inside its 300 s TTL — rather than
+        // being silently widened.
+        (Some(_), true) => Err(Status::invalid_argument(format!(
+            "{table} requires an explicit projection column list"
+        ))),
+        // Ignoring the list would serve wider rows than the ticket asked for,
+        // which is the silent widening this whole mechanism exists to prevent.
+        (None, false) => Err(Status::invalid_argument(format!(
+            "table {table:?} does not accept a projection column list"
+        ))),
+        (Some(allowed), false) => {
+            check_projection_columns(allowed, columns)?;
+            Ok(columns.join(", "))
+        }
+    }
+}
+
+/// Reject a projection column that is not on `allowed`, or named twice.
+///
+/// Names are whitelisted even though the ticket is signature-verified, because
+/// they are interpolated into SQL — the same defense-in-depth argument
+/// `ALLOWED_FILTER_COLUMNS` makes. A repeated name is refused rather than
+/// deduped: it produces two identically-named Arrow fields, which consumers
+/// collapse or reject inconsistently, and picking a behaviour for them would be
+/// guessing.
+fn check_projection_columns(allowed: &[&str], columns: &[String]) -> Result<(), Status> {
+    let mut seen: Vec<&str> = Vec::with_capacity(columns.len());
+    for col in columns {
+        if !allowed.contains(&col.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "unknown projection column: {col:?}"
+            )));
+        }
+        if seen.contains(&col.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate projection column: {col:?}"
+            )));
+        }
+        seen.push(col);
+    }
+    Ok(())
+}
 
 /// The block-read DoGet selectors, mapped to the DuckLake relation each streams.
 ///
@@ -389,6 +559,8 @@ impl FlightService for QiitaFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        // Read the request metadata before `into_inner()` consumes it.
+        let codec = requested_ipc_codec(request.metadata())?;
         let ticket_bytes = &request.into_inner().ticket;
 
         // Verify Ed25519 signature, expiry, and parse payload
@@ -404,7 +576,12 @@ impl FlightService for QiitaFlightService {
         }
 
         // Build query from filter
-        let (sql, table) = build_query(&payload.table, &payload.filter, &payload.members)?;
+        let (sql, table) = build_query(
+            &payload.table,
+            &payload.filter,
+            &payload.members,
+            &payload.columns,
+        )?;
 
         // Stream the result incrementally. Each request gets its own DuckDB
         // connection + DuckLake snapshot, opened on a blocking task that feeds
@@ -419,7 +596,24 @@ impl FlightService for QiitaFlightService {
             sql,
             table,
         );
-        let flight_stream = FlightDataEncoderBuilder::new().build(batch_stream);
+        // With no codec these options are structurally the encoder default that
+        // preceded this change (pinned by
+        // `no_codec_write_options_match_the_encoder_default`), which is what keeps
+        // every existing client unaffected.
+        //
+        // `try_with_compression` is NOT the missing-feature check: its only error
+        // is `metadata_version < V5`, which `IpcWriteOptions::default()` cannot
+        // hit. A build without `arrow-ipc/zstd` fails instead inside arrow-ipc's
+        // `compress_zstd`, per batch, after the schema message has already
+        // shipped — so it arrives as a stream error, not from this call. The
+        // `map_err` stays because an error here is a build mistake either way and
+        // must not read as bad client input.
+        let write_options = IpcWriteOptions::default()
+            .try_with_compression(codec)
+            .map_err(|e| Status::internal(format!("IPC codec {codec:?} unavailable: {e}")))?;
+        let flight_stream = FlightDataEncoderBuilder::new()
+            .with_options(write_options)
+            .build(batch_stream);
         let mapped = flight_stream.map(|result| {
             result.map_err(|e| Status::internal(format!("data plane stream error: {e}")))
         });
@@ -522,14 +716,15 @@ impl FlightService for QiitaFlightService {
                 // crosses no await.
                 let catalog = self.catalog_connstr.clone();
                 let data_path = self.data_path.clone();
-                let registered = tokio::task::spawn_blocking(move || {
+                let registration = tokio::task::spawn_blocking(move || {
                     register_files(&catalog, &data_path, &payload)
                 })
                 .await
                 .map_err(|e| Status::internal(format!("register_files task join failed: {e}")))??;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
-                    "registered": registered,
+                    "registered": registration.registered,
+                    "replaced": registration.replaced,
                 }))
                 .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
 
@@ -821,6 +1016,18 @@ impl FlightService for QiitaFlightService {
                         "count_masked requires a read_masked ticket, got table {:?}",
                         payload.table
                     )));
+                }
+                // Refused, not ignored — the same rule the DoGet projection
+                // follows. Unreachable today (`read_masked` takes no projection,
+                // so the control plane cannot sign one) and harmless if it were
+                // reached, since this returns a count and no rows. It is here
+                // because "a signed field this arm silently disregards" is the one
+                // shape that turns a narrowed ticket into a wider answer, and this
+                // was the only place in the ticket surface still allowing it.
+                if !payload.columns.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "count_masked takes no projection column list",
+                    ));
                 }
                 let prep_sample_idx = single_i64_filter(&payload.filter, "prep_sample_idx")?;
                 let mask_idx = single_i64_filter(&payload.filter, "mask_idx")?;
@@ -1307,7 +1514,7 @@ const EXPORT_READ_PARQUET_OPTS: &str =
 /// The read projection, in `read` / `read_masked` table order. Shared by the
 /// per-sample `export_read` DoAction (from `qiita_lake.read`) and by BOTH
 /// block-read DoGet selectors (`read_block` from `qiita_lake.read`,
-/// `read_masked_block` from the `read_masked` VIEW), so every read payload the
+/// `read_masked_block` from the `read_masked` MACRO), so every read payload the
 /// data plane hands a compute job has the identical column shape — the shape
 /// `align_sharded.reads` / the read-mask jobs bind. `read_masked` exposes exactly
 /// these columns (plus `mask_idx`), already trimmed and `pass`-filtered.
@@ -1514,10 +1721,7 @@ fn export_read_to_parquet(
 /// so `coarse AND exact == exact`. `members` must be non-empty (caller guards);
 /// all integers are signature-verified i64s, safe to inline.
 fn block_read_where_clause(members: &[auth::BlockReadMember]) -> String {
-    let mut preps: Vec<i64> = members.iter().map(|m| m.prep_sample_idx).collect();
-    preps.sort_unstable();
-    preps.dedup();
-    let in_list = preps
+    let in_list = block_member_preps(members)
         .iter()
         .map(|v| v.to_string())
         .collect::<Vec<_>>()
@@ -1562,10 +1766,67 @@ fn single_i64_filter(filter: &auth::TicketFilter, col: &str) -> Result<i64, Stat
             ))
         }),
         _ => Err(Status::invalid_argument(format!(
-            "count_masked requires exactly one value for {col:?}, got {}",
+            "expected exactly one value for {col:?}, got {}",
             values.len()
         ))),
     }
+}
+
+/// A non-empty integer set from a ticket filter column.
+fn i64_list_filter(filter: &auth::TicketFilter, col: &str) -> Result<Vec<i64>, Status> {
+    let values = filter
+        .get(col)
+        .ok_or_else(|| Status::invalid_argument(format!("ticket missing filter column {col:?}")))?;
+    if values.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "filter column {col:?} has empty values list"
+        )));
+    }
+    values
+        .iter()
+        .map(|v| {
+            v.as_i64().ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "filter values for {col:?} must be integers, got {v}"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// The sorted, deduplicated sample set a block's members cover.
+fn block_member_preps(members: &[auth::BlockReadMember]) -> Vec<i64> {
+    let mut preps: Vec<i64> = members.iter().map(|m| m.prep_sample_idx).collect();
+    preps.sort_unstable();
+    preps.dedup();
+    preps
+}
+
+/// The `read_masked` table-macro call for one (mask, samples) scope.
+///
+/// `read_masked` is a MACRO, not a relation — it takes its scope as arguments;
+/// `ducklake.rs` carries why.
+///
+/// `preps` must be non-empty, and that is the CALLER's guarantee, not this
+/// function's: `build_read_masked_query` gets it from `i64_list_filter` (which
+/// rejects an empty list) and `build_block_read_query` refuses empty `members`
+/// first. Those two are the enforcement. An empty list here would emit
+/// `read_masked(m, [])`, which the macro reads as "match nothing" — safe, but a
+/// silent zero-row answer rather than a loud error. The `debug_assert` below is a
+/// development-time tripwire for a future caller that forgets to guard; it is
+/// compiled out of the release binary the deploy builds, so it protects the next
+/// edit rather than production.
+fn read_masked_relation(mask_idx: i64, preps: &[i64]) -> String {
+    debug_assert!(
+        !preps.is_empty(),
+        "read_masked scope must name at least one sample; callers guard this"
+    );
+    let csv = preps
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("qiita_lake.read_masked({mask_idx}, [{csv}])")
 }
 
 /// Count the masked reads a `read_masked` ticket selects, without streaming them.
@@ -1587,7 +1848,7 @@ fn count_masked_reads(
     let conn = open_ducklake(catalog_connstr, data_path)?;
     // `prep_sample_idx`/`mask_idx` are signature-verified i64s, safe to inline (same
     // rationale as build_query: parsed integers reach SQL, no string data); the
-    // 'pass' filter mirrors the read_masked view's privacy filter.
+    // 'pass' filter mirrors the read_masked macro's privacy filter.
     let sql = format!(
         "SELECT count(*) FROM qiita_lake.read_mask \
          WHERE mask_idx = {mask_idx} AND prep_sample_idx = {prep_sample_idx} \
@@ -1682,6 +1943,306 @@ fn mask_metrics_counts(
     }))
 }
 
+/// Lake tables a registration REPLACES by key rather than appends to, and the
+/// key each replaces on.
+///
+/// `feature_idx` is minted from the canonical sequence hash
+/// (`qiita_common.chunking.canonical_sequence_hash_expr`), so identical bytes
+/// carry one feature across every producer: two references that share a
+/// sequence, or two assemblies that produce the same contig, each emit that
+/// feature's rows in full. The producer cannot anti-join them away — the compute
+/// job writing the staging Parquet has no DuckLake access — and DuckLake enforces
+/// no PK/UNIQUE, so an append leaves N copies and
+/// `string_agg(chunk_data, '' ORDER BY chunk_index)` returns the sequence
+/// concatenated with itself while `sequence_length_bp` still describes one copy.
+/// Replacing on the key is what makes a second load converge instead of
+/// accumulate.
+///
+/// Two conditions admit a table:
+///
+/// 1. The incoming files carry the COMPLETE row set for every key they mention.
+///    True of the `_feature_load` writers, which bin-pack whole features into
+///    parts, so no part holds a fragment of a feature.
+/// 2. Every row set carrying one key is an acceptable substitute for any other.
+///    `sequence_hash` and `sequence_length_bp` are functions of the feature, so
+///    those are identical. `chunk_data` is NOT: the canonical hash is
+///    `LEAST(md5(seq), md5(revcomp(seq)))` over the upper-cased sequence, so a
+///    sequence, its reverse complement, and its case variants share one
+///    `feature_idx` while differing byte for byte. Replacing therefore lets the
+///    newest load's strand and casing win.
+///
+/// Without the replace both byte strings persist and a reader gets them
+/// concatenated — neither strand, and a length that matches nothing. With it a
+/// reader gets one coherent sequence that `sequence_length_bp` describes.
+/// Nothing records which chunk arrived in which load, so keeping the older
+/// strand instead is not expressible.
+///
+/// The incoming file is taken whole: it is a single load, self-consistent by
+/// construction, so no chunk of one strand lands beside a chunk of another. A
+/// rule that picked per `chunk_index` from rows already in the lake could,
+/// since nothing there records which load a chunk came from.
+///
+/// Writers of these tables also SERIALIZE against each other, on
+/// `registration_lock`. Why the replace alone does not suffice is at the site
+/// that takes it — `register_files`' transaction.
+///
+/// `assembly_membership` / `bin_quality` are keyed on `(prep_sample_idx,
+/// processing_idx)` instead. A second `long-read-assembly` run over a sample
+/// resolves to the same `processing_idx` whenever the inputs
+/// `runner/_processing.py` hashes are unchanged — an edited workflow file
+/// included — and `routes/work_ticket.py` admits the submission. Appending
+/// leaves both runs' rows under one identity with nothing on the row to tell
+/// them apart.
+///
+/// Condition 1 holds per run: `assembly_load` derives both files from the job's
+/// own workspace (`bin_map` ⋈ `id_map`, and the CheckM/DAS_Tool tables) and
+/// never reads the lake back, so each carries the run's whole row set for its
+/// one key. Condition 2 is the run identity itself — same hashed inputs, so the
+/// later rows stand in for the earlier.
+const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
+    ReplaceKey::own("reference_sequences", &["feature_idx"]),
+    ReplaceKey::own("reference_sequence_chunks", &["feature_idx"]),
+    ReplaceKey::own("assembled_sequence", &["feature_idx"]),
+    ReplaceKey::own("assembled_sequence_chunks", &["feature_idx"]),
+    ReplaceKey::own(
+        "assembly_membership",
+        &["prep_sample_idx", "processing_idx"],
+    ),
+    ReplaceKey {
+        table: "bin_quality",
+        key: &["prep_sample_idx", "processing_idx"],
+        key_source: "assembly_membership",
+    },
+];
+
+/// One `REPLACE_KEY_TABLES` entry.
+struct ReplaceKey {
+    /// Lake table whose rows a registration supersedes.
+    table: &'static str,
+    /// Columns compared together as one key.
+    key: &'static [&'static str],
+    /// Table in the same registration whose incoming files name the key set to
+    /// delete on, unioned with this table's own files.
+    ///
+    /// `bin_quality` borrows `assembly_membership`'s, because CheckM covers
+    /// refined bins only: a run with no MAG writes `bin_quality` with zero rows,
+    /// which names no key and so deletes nothing, leaving the previous run's
+    /// rows joined to a membership set that was replaced out from under them.
+    /// `assembly_membership` carries the run's key on every row and is never
+    /// empty where the load runs at all (`assembly_hash` raises `StepNoData` at
+    /// zero contigs of any kind). Every other entry is its own source.
+    key_source: &'static str,
+}
+
+impl ReplaceKey {
+    /// An entry whose delete keys come from its own incoming files.
+    const fn own(table: &'static str, key: &'static [&'static str]) -> Self {
+        Self {
+            table,
+            key,
+            key_source: table,
+        }
+    }
+}
+
+/// The replace-by-key DELETE for one `REPLACE_KEY_TABLES` entry: drop every lake
+/// row whose key appears in ANY of the `n_files` Parquets the caller passes.
+/// Takes one bound path parameter per file, in order. The files are the ones
+/// headed for the entry's table plus, where they differ, the ones headed for its
+/// `key_source`.
+///
+/// A multi-column entry matches on the whole key — the row constructor compares
+/// the columns together, so a lake row agreeing on one component and differing
+/// on another survives.
+///
+/// One statement for the whole table, not one per file. A multi-file table
+/// arrives as several parts, and deleting part-by-part would let a later part's
+/// delete drop rows an earlier part had just added whenever the two share a key;
+/// it would also re-scan the lake table once per part.
+///
+/// The `IN` operand is a subquery, not a literal list: DuckDB plans it as a SEMI
+/// hash join and pushes the incoming keys' min/max into the lake scan as a
+/// dynamic filter. What the delete reads therefore follows the SPREAD of the
+/// incoming key set against the per-file key ranges the catalog holds — not the
+/// key's arity, and not the table's size.
+///
+/// Measured on DuckDB 1.5.4 / ducklake d318a545. Against a catalog holding 1.0M
+/// rows over 57 files per table, 16k incoming keys over 4 files:
+///
+/// * composite `(prep_sample_idx, processing_idx)`, one pair per load: scans
+///   17,544 rows of 1,000,008 and opens 1 of the 57 files.
+/// * `feature_idx` spread over the identity space: scans 1,003,121 of 1,003,200
+///   and opens 57 of 57 — the derived range covers every file, so the scan reads
+///   the table.
+/// * `feature_idx` confined to one narrow window: scans 17,602 of 1,003,200 and
+///   still opens 57 of 57 — all 57 files hold a `feature_idx` below the window's
+///   maximum, so the range prunes row groups and no file.
+///
+/// Against a second catalog, single-column `feature_idx`, 2k incoming keys in
+/// one file, table size varied: one contiguous incoming block scans 2,000 rows
+/// and opens 1 file at both 40k rows over 20 files and 400k over 200; the same
+/// count of keys spread over the identity space scans 39,982 of 40,000 and
+/// 399,819 of 400,000, opening every file at both sizes.
+///
+/// A `WITH … DELETE … USING` rewrite plans the same apart from INNER vs SEMI —
+/// same dynamic filters, same scan cardinality, same files read — on each of the
+/// four key sets measured on the first catalog (the three above plus one
+/// matching no lake row). Over 25 alternating pairs per key set the mean paired
+/// difference (this statement minus the rewrite) ran from -0.8 ms to +1.0 ms on
+/// statements of 3-37 ms, the widest 95% CI being [-3.2, +2.9] ms.
+///
+/// `table` / `keys` are interpolated because they are `REPLACE_KEY_TABLES`
+/// literals (the caller looks them up there, never using the payload's own
+/// string); the file paths are bound parameters, so a basename carrying a quote
+/// cannot reach the SQL text.
+fn replace_key_delete_sql(table: &str, keys: &[&str], n_files: usize) -> String {
+    let key_list = keys.join(", ");
+    let incoming_keys = (0..n_files)
+        .map(|_| format!("SELECT {key_list} FROM read_parquet(?)"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    // DISTINCT because a chunk table repeats its key once per 64 KB chunk and a
+    // run-scoped table repeats its pair on every row, and that whole multiset
+    // would otherwise become the semi-join's build side.
+    format!(
+        "DELETE FROM qiita_lake.{table} WHERE ({key_list}) IN \
+         (SELECT DISTINCT {key_list} FROM ({incoming_keys}))"
+    )
+}
+
+/// How long a lake writer keeps re-running its transaction after a failed COMMIT
+/// before giving up.
+///
+/// A budget rather than an attempt count, because the retries a writer needs is
+/// the number of writers ahead of it, which nothing here knows. It is a livelock
+/// backstop. Measured against a DuckLake catalog holding 40k rows over 20 files,
+/// with a contiguous incoming key set: a whole registration transaction (lock
+/// UPDATE + replace-by-key DELETE + one `ducklake_add_data_files`) takes ~14 ms
+/// against a lake that already holds the incoming keys, ~7 ms when it does not.
+/// Since every writer queues behind one row, that per-transaction cost IS the
+/// queue rate, and this budget covers a queue far longer than a deploy produces.
+/// The DELETE's share of it is set by the spread of the incoming key set rather
+/// than by the table's size — `replace_key_delete_sql` carries what each key set
+/// scans, including the sets where it reads the whole table. Exceeding the
+/// budget means something other than contention is wrong, and the error says so.
+///
+/// A registration cannot be retried from the top — its staging files were already
+/// moved — so an exhausted budget loses the load.
+const LAKE_COMMIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Ceiling on the backoff between retries. Without a cap the doubling below would
+/// soon sleep away the whole budget in one wait.
+const LAKE_COMMIT_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Starting backoff, doubled per attempt up to `LAKE_COMMIT_BACKOFF_CAP`.
+const LAKE_COMMIT_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Backoff before re-running a conflicted lake transaction.
+///
+/// Doubles per attempt to a cap, offset by a caller-supplied `salt` so writers
+/// that conflicted together are less likely to wake together. The salt is an
+/// identifier already in hand (the work ticket, the reference) rather than an
+/// RNG, which keeps the data plane's write path deterministic; two callers whose
+/// salts happen to be congruent modulo the current spread still collide, which
+/// costs an attempt and not correctness.
+fn lake_commit_backoff(attempt: u32, salt: i64) -> std::time::Duration {
+    let base = LAKE_COMMIT_BACKOFF_BASE
+        .saturating_mul(1u32 << attempt.min(6))
+        .min(LAKE_COMMIT_BACKOFF_CAP);
+    let spread = base.as_millis() as u64;
+    let offset = if spread == 0 {
+        0
+    } else {
+        salt.unsigned_abs() % spread
+    };
+    base + std::time::Duration::from_millis(offset)
+}
+
+/// Take the lock that serializes writers of the replace-keyed tables. Call
+/// inside an open transaction; see `register_files` for why.
+fn take_registration_lock(conn: &duckdb::Connection) -> Result<(), Status> {
+    let locked = conn
+        .execute(
+            "UPDATE qiita_lake.registration_lock SET epoch = epoch + 1",
+            [],
+        )
+        .map_err(|e| Status::internal(format!("failed to take the registration lock: {e}")))?;
+    // An UPDATE matching no row succeeds and locks nothing, so the serialization
+    // would be silently absent and the symptom would be the duplication it exists
+    // to prevent. `ensure_registration_lock` seeds the row at boot.
+    if locked == 0 {
+        return Err(Status::internal(
+            "qiita_lake.registration_lock holds no row, so concurrent lake writers \
+             would not serialize",
+        ));
+    }
+    Ok(())
+}
+
+/// Run `body` inside a DuckLake transaction, re-running the whole thing when the
+/// COMMIT fails, until `LAKE_COMMIT_BUDGET` is spent.
+///
+/// Conflicts surface at COMMIT, not at the statement: measured with 16 concurrent
+/// writers contending on `registration_lock`, with the retry disabled, every
+/// failure was the COMMIT and none was the lock UPDATE or the replace-by-key
+/// DELETE. So an error out of `body` is not contention, will not resolve on a
+/// retry, and is surfaced immediately.
+///
+/// `body` must therefore be idempotent across attempts — each one re-reads a
+/// fresh snapshot after DuckLake rolled the last one back. `salt` only spreads
+/// the backoff (see `lake_commit_backoff`).
+fn transact_with_retry<T>(
+    conn: &duckdb::Connection,
+    what: &str,
+    salt: i64,
+    mut body: impl FnMut() -> Result<T, Status>,
+) -> Result<T, Status> {
+    let deadline = std::time::Instant::now() + LAKE_COMMIT_BUDGET;
+    let mut attempt: u32 = 0;
+    loop {
+        conn.execute_batch("BEGIN TRANSACTION")
+            .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+        let value = match body() {
+            Ok(value) => value,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        };
+
+        let commit_error = match conn.execute_batch("COMMIT") {
+            Ok(()) => return Ok(value),
+            Err(e) => e,
+        };
+
+        if std::time::Instant::now() >= deadline {
+            return Err(Status::internal(format!(
+                "failed to commit {what} within {}s ({} attempts): {commit_error}",
+                LAKE_COMMIT_BUDGET.as_secs(),
+                attempt.saturating_add(1),
+            )));
+        }
+        std::thread::sleep(lake_commit_backoff(attempt, salt));
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+/// What one `register_files` call did.
+#[derive(Debug)]
+struct Registration {
+    /// Permanent lake paths registered, in payload iteration order.
+    registered: Vec<String>,
+    /// Rows the replace-by-key pass removed, per table — non-zero entries only.
+    /// Empty when nothing this call registered was a `REPLACE_KEY_TABLES`
+    /// target, or when every key it carried was new to the lake.
+    ///
+    /// Rides back to the control plane in the DoAction body, which logs it: a
+    /// delete nothing recorded is the one thing an operator reconciling row
+    /// counts cannot reconstruct.
+    replaced: BTreeMap<&'static str, usize>,
+}
+
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
 ///
 /// Validates all requested files exist in staging, moves them to permanent
@@ -1691,6 +2252,9 @@ fn mask_metrics_counts(
 /// Uses `std::fs::rename` with a copy+delete fallback for cross-filesystem moves
 /// (e.g., SLURM local scratch → shared NFS).
 ///
+/// Some tables are REPLACED on their key rather than appended to — see
+/// `REPLACE_KEY_TABLES` for which, and why.
+///
 /// Note: the action token is scoped to staging_dir + files, not to a specific
 /// reference_idx. The control plane is responsible for issuing tokens only for
 /// valid references in the correct state.
@@ -1698,7 +2262,7 @@ fn register_files(
     catalog_connstr: &str,
     data_path: &str,
     payload: &auth::ActionPayload,
-) -> Result<Vec<String>, Status> {
+) -> Result<Registration, Status> {
     let staging = std::path::Path::new(&payload.staging_dir);
     let perm_root = std::path::Path::new(data_path);
 
@@ -1738,7 +2302,9 @@ fn register_files(
     }
 
     // Move all files to permanent storage.
-    let mut moved: Vec<(String, std::path::PathBuf)> = Vec::new();
+    // (DuckLake table, permanent path). The path is carried as a String because
+    // every consumer below binds it into SQL or reports it.
+    let mut moved: Vec<(String, String)> = Vec::new();
     for (filename, table) in &payload.files {
         let src = staging.join(filename);
         let dest_dir = perm_root.join(table);
@@ -1766,7 +2332,13 @@ fn register_files(
         // refuses to overwrite besides, as a hard safety net.
         let dest = dest_dir.join(lake_dest_filename(payload.work_ticket_idx, basename));
         move_file(&src, &dest)?;
-        moved.push((table.clone(), dest));
+        // Both SQL passes below name the destination as a string, so resolve it
+        // once here rather than re-deriving (and re-erroring on) it twice.
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?
+            .to_string();
+        moved.push((table.clone(), dest_str));
     }
 
     // Register in DuckLake. Tables are ensured at startup in main.rs.
@@ -1775,10 +2347,11 @@ fn register_files(
     ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
         .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
-    // Register every moved file in ONE DuckLake transaction so the catalog
-    // update is all-or-nothing (mirrors delete_reference / delete_mask /
-    // delete_pool_reads). A failure part-way through the loop rolls back every
-    // prior ducklake_add_data_files call rather than leaving the reference
+    // Replace-by-key the `REPLACE_KEY_TABLES` targets, then register every moved
+    // file, in ONE DuckLake transaction so the catalog update is all-or-nothing
+    // (mirrors delete_reference / delete_mask / delete_pool_reads). A failure
+    // part-way through rolls back every prior delete and
+    // ducklake_add_data_files call rather than leaving the reference
     // half-registered in the catalog.
     //
     // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above have
@@ -1789,45 +2362,106 @@ fn register_files(
     // and never a double-registration. This matches how DuckLake already
     // tolerates orphan Parquets (the delete_* actions reclaim nothing from disk
     // either); a future maintenance pass sweeps them.
-    conn.execute_batch("BEGIN TRANSACTION")
-        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
-
-    let registration = (|| -> Result<Vec<String>, Status> {
-        let mut registered = Vec::new();
-        for (table, dest) in &moved {
-            let dest_str = dest
-                .to_str()
-                .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?;
-            conn.execute(
-                "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
-                duckdb::params![table, dest_str],
-            )
-            .map_err(|e| {
-                Status::internal(format!(
-                    "ducklake_add_data_files failed for {table}/{}: {e}",
-                    dest.display()
-                ))
-            })?;
-            registered.push(dest_str.to_string());
+    //
+    // Registrations that touch a replace-keyed table SERIALIZE against each
+    // other, and retry when they lose. Both halves are needed:
+    //
+    // DuckLake detects a conflict only where two transactions touch the same
+    // EXISTING row, so the replace-by-key DELETE serializes writers of a feature
+    // the lake already holds — but NOT writers of a feature that is new, whose
+    // deletes match nothing. Measured with 4 concurrent writers of one feature:
+    // 1 row when it already existed, 4 when it did not, and 4 again for two bare
+    // `ducklake_add_data_files` with no delete at all. Bumping
+    // `registration_lock` gives every such registration a row to contend for, so
+    // the new-feature case conflicts too (measured: back to 1 row).
+    //
+    // The loser's work is fully re-runnable — its files are already at their
+    // ticket-unique lake paths and the delete+add is idempotent against whatever
+    // snapshot it re-reads — so it retries here rather than failing the ticket. A
+    // retry from the top would not work: the staging files were moved above, so
+    // the caller's next attempt gets `not_found`.
+    //
+    // Registrations touching none of those tables (read_mask, alignment) skip the
+    // lock and so never contend.
+    // Which tables this registration replaces by key, and the files whose keys
+    // each delete reads — its own, plus its `key_source`'s where the two differ
+    // and that table is in this registration too. Loop-invariant, so it is built
+    // once outside the retry.
+    let mut files_for: BTreeMap<&'static str, Vec<&str>> = BTreeMap::new();
+    for (table, dest) in &moved {
+        if let Some(entry) = REPLACE_KEY_TABLES
+            .iter()
+            .find(|candidate| candidate.table == table.as_str())
+        {
+            files_for
+                .entry(entry.table)
+                .or_default()
+                .push(dest.as_str());
         }
-        Ok(registered)
-    })();
+    }
+    let incoming: Vec<(&'static ReplaceKey, Vec<&str>)> = REPLACE_KEY_TABLES
+        .iter()
+        .filter_map(|entry| {
+            let mut dests = files_for.get(entry.table)?.clone();
+            if entry.key_source != entry.table {
+                if let Some(source_dests) = files_for.get(entry.key_source) {
+                    dests.extend(source_dests.iter().copied());
+                }
+            }
+            Some((entry, dests))
+        })
+        .collect();
+    let takes_lock = !incoming.is_empty();
 
-    let registered = match registration {
-        Ok(registered) => registered,
-        Err(e) => {
-            // Best-effort rollback; the catalog is left untouched so the control
-            // plane can retry from a clean slate. The moved files stay on disk
-            // as ticket-unique orphans (see above) — inert until a successful
-            // registration references them.
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
-        }
-    };
-    conn.execute_batch("COMMIT")
-        .map_err(|e| Status::internal(format!("failed to commit registration transaction: {e}")))?;
+    let registration = transact_with_retry(
+        &conn,
+        "the registration transaction",
+        payload.work_ticket_idx,
+        || {
+            if takes_lock {
+                take_registration_lock(&conn)?;
+            }
 
-    Ok(registered)
+            // Replace-by-key runs as its OWN pass, ahead of every add: one statement
+            // per target table over all the files headed for it, so no delete can
+            // touch a row this same registration already added.
+            let mut replaced: BTreeMap<&'static str, usize> = BTreeMap::new();
+            for (entry, dests) in &incoming {
+                let sql = replace_key_delete_sql(entry.table, entry.key, dests.len());
+                let params: Vec<&dyn duckdb::ToSql> =
+                    dests.iter().map(|d| d as &dyn duckdb::ToSql).collect();
+                let deleted = conn.execute(&sql, params.as_slice()).map_err(|e| {
+                    let table = entry.table;
+                    Status::internal(format!("replace-by-key delete failed for {table}: {e}"))
+                })?;
+                // Zero is the ordinary case (a first load, or a run whose features
+                // are all new) and says nothing; only a real supersede earns an entry.
+                if deleted > 0 {
+                    replaced.insert(entry.table, deleted);
+                }
+            }
+
+            let mut registered = Vec::new();
+            for (table, dest) in &moved {
+                conn.execute(
+                    "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
+                    duckdb::params![table, dest],
+                )
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "ducklake_add_data_files failed for {table}/{dest}: {e}"
+                    ))
+                })?;
+                registered.push(dest.clone());
+            }
+            Ok(Registration {
+                registered,
+                replaced,
+            })
+        },
+    )?;
+
+    Ok(registration)
 }
 
 /// Delete every DuckLake row belonging to a reference.
@@ -1870,9 +2504,15 @@ fn delete_reference(
     // leaving a half-purged reference. That atomicity is what lets the control
     // plane safely retry — a failed call leaves DuckLake membership fully
     // intact, so the orphan recomputation on the next attempt is unchanged.
-    conn.execute_batch("BEGIN TRANSACTION")
-        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
-
+    //
+    // It runs under the same lock and retry as `register_files`, because it
+    // writes two of the same content-addressed tables. Without the lock a
+    // registration could add a feature between this transaction's snapshot and
+    // its commit, and the orphan filter — which reads `reference_membership` —
+    // would not see the claim; with it, the two serialize. Without the retry a
+    // registration's DELETE would newly conflict this one out, which the bare
+    // COMMIT here predates.
+    //
     // Orphan features: this reference's features minus every other reference's.
     //
     // A reference claims a feature in TWO ways and both count: as a MEMBER (a whole
@@ -1882,10 +2522,12 @@ fn delete_reference(
     // features; omitting it on the right would delete a sequence another reference
     // still annotates.
     //
-    // This set MUST match the Postgres-side orphan computation in
+    // These two claim sets MUST match the Postgres-side orphan computation in
     // qiita_control_plane.actions.reference.delete_reference_cascade — the two
     // stores GC the same features independently, so a change to one query must
-    // change the other or sequences/features desync across stores.
+    // change the other or sequences/features desync across stores. That query
+    // carries one further term this filter omits (`qiita.assembly_membership`);
+    // its comment holds the rationale for the asymmetry.
     let orphan_filter = "feature_idx IN (
             (SELECT feature_idx FROM qiita_lake.reference_membership WHERE reference_idx = ?
              UNION
@@ -1899,7 +2541,8 @@ fn delete_reference(
     // Sequence/chunk deletes run BEFORE the membership AND annotation deletes: the
     // orphan subquery reads both of this reference's claim tables, so both must
     // still be present.
-    let deletes = (|| -> Result<serde_json::Value, Status> {
+    let counts = transact_with_retry(&conn, "the reference delete", reference_idx, || {
+        take_registration_lock(&conn)?;
         let sequences_deleted = exec(
             &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
             &[reference_idx, reference_idx, reference_idx, reference_idx],
@@ -1942,18 +2585,7 @@ fn delete_reference(
             "placements_deleted": placements_deleted,
             "annotations_deleted": annotations_deleted,
         }))
-    })();
-
-    let counts = match deletes {
-        Ok(counts) => counts,
-        Err(e) => {
-            // Best-effort rollback; surface the original delete error.
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
-        }
-    };
-    conn.execute_batch("COMMIT")
-        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+    })?;
 
     let mut out = counts;
     out["reference_idx"] = serde_json::json!(reference_idx);
@@ -2487,7 +3119,7 @@ fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status
 /// The alignment DoGet surface: the exclusion-aware view `alignment_visible`, and
 /// ONLY that — never the raw `alignment` base table (which is out of
 /// `ALLOWED_TABLES`, so unreachable via `do_get`). `build_query` gives this name
-/// the `ALIGNMENT_DOGET_PROJECTION` and the mandatory (non-empty, single
+/// the mandatory projection column list and the mandatory (non-empty, single
 /// `alignment_idx`) scoping. Deliberately NOT recognizing the raw name: if
 /// `"alignment"` were ever re-added to `ALLOWED_TABLES` by mistake, it would fall
 /// through to a bare `SELECT *`, producing an obviously-malformed, unscoped result
@@ -2512,7 +3144,14 @@ fn build_query(
     table: &str,
     filter: &auth::TicketFilter,
     members: &[auth::BlockReadMember],
+    columns: &[String],
 ) -> Result<(String, String), Status> {
+    // Resolve the projection FIRST, before any early return below can build SQL
+    // on its own path — otherwise the block-read and `read_masked` selectors
+    // would silently ignore a column list rather than refuse it, which is the
+    // silent-widening failure this mechanism exists to prevent.
+    let select_list = select_list_for(table, columns)?;
+
     // Block-read selectors resolve to a different relation than their ticket name
     // and are scoped by `members`, not by a column filter — handle them first, and
     // reject `members` on any other table so a stray selector can never silently
@@ -2528,36 +3167,42 @@ fn build_query(
 
     let full_table = format!("qiita_lake.{table}");
 
+    // `read_masked` is a table macro whose (mask, samples) scope IS its argument
+    // list, so it cannot be assembled by the generic WHERE-clause path below.
+    if table == "read_masked" {
+        return build_read_masked_query(filter);
+    }
+
     if filter.is_empty() {
-        // Defense-in-depth against a full-table read leak. `read_masked`
-        // exposes per-sample human read data; the control plane scopes each
-        // ticket to an explicit (prep_sample_idx, mask_idx) before signing, so
-        // an empty filter should never reach here. If the CP ever mis-signed,
-        // an empty filter would `SELECT *` every sample's pass-reads across all
-        // studies — refuse it. This rejects only the *empty* case, not every
-        // under-scoped one: a non-empty but non-scoping filter (e.g. feature_idx
-        // alone) still passes today. Making an unfiltered read opt-in via an
-        // allowlist, and requiring prep_sample_idx for read_masked, is a tracked
-        // durability follow-up.
+        // Defense-in-depth against a full-table read leak. The human-read surface
+        // no longer reaches here at all — `read_masked` is a macro that cannot be
+        // called without a scope (above), which retires the "requiring
+        // prep_sample_idx for read_masked" half of the follow-up this comment used
+        // to track. `alignment_visible` is still guarded here: the CP always
+        // scopes it to (alignment_idx, prep_sample_idx), and an empty filter would
+        // dump the whole sink (and bypass the projection). This rejects only the
+        // *empty* case, not every under-scoped one: a non-empty but non-scoping
+        // filter (e.g. feature_idx alone) still passes today. Making an unfiltered
+        // read opt-in via an allowlist is still a tracked durability follow-up.
         // The reference_* tables are broadly readable by design (this mirrors
         // the anonymous REST `GET /reference/{idx}`), so an unfiltered SELECT is
-        // legitimate there — reject empty filters only for the read surface.
-        // `alignment_visible` is likewise never read unscoped — the CP always
-        // scopes it to (alignment_idx, prep_sample_idx). An empty filter would
-        // dump the whole sink (and bypass the projection), so refuse it here too.
-        if table == "read_masked" || is_alignment_doget_surface(table) {
+        // legitimate there — reject empty filters only for the alignment surface.
+        if is_alignment_doget_surface(table) {
             return Err(Status::invalid_argument(format!(
                 "{table} requires a non-empty filter (refusing full-table read)"
             )));
         }
-        return Ok((format!("SELECT * FROM {full_table}"), full_table));
+        return Ok((
+            format!("SELECT {select_list} FROM {full_table}"),
+            full_table,
+        ));
     }
 
-    // A feature-table DoGet builds a table for exactly ONE alignment run, and
-    // alignment_idx is dropped from the projection (ALIGNMENT_DOGET_PROJECTION),
-    // so require it present and single-valued. Otherwise a ticket could omit the
-    // scope or pass several alignment_idx values and blend rows from
-    // heterogeneous runs into one indistinguishable stream. Fail loud.
+    // A feature-table DoGet builds a table for exactly ONE alignment run, and a
+    // consumer typically leaves alignment_idx out of its projection (every row
+    // shares it), so require it present and single-valued. Otherwise a ticket
+    // could omit the scope, or pass several alignment_idx values and blend rows
+    // from heterogeneous runs into one indistinguishable stream. Fail loud.
     if is_alignment_doget_surface(table) {
         match filter.get("alignment_idx") {
             Some(values) if values.len() == 1 => {}
@@ -2569,12 +3214,11 @@ fn build_query(
         }
     }
 
-    // reference_sequences and reference_sequence_chunks have no reference_idx
-    // column. When the filter includes reference_idx, resolve via a JOIN with
-    // the membership table.
-    let needs_membership_join = (table == "reference_sequences"
-        || table == "reference_sequence_chunks")
-        && filter.contains_key("reference_idx");
+    // The MEMBERSHIP_JOIN_TABLES have no reference_idx column of their own. When
+    // the filter includes reference_idx, resolve it via a JOIN with the membership
+    // table.
+    let needs_membership_join =
+        MEMBERSHIP_JOIN_TABLES.contains(&table) && filter.contains_key("reference_idx");
 
     let mut where_clauses = Vec::new();
     for (col, values) in filter {
@@ -2625,22 +3269,58 @@ fn build_query(
 
     let where_str = where_clauses.join(" AND ");
     let sql = if needs_membership_join {
+        // This arm hardcodes `SELECT t.*` and does NOT use `select_list`, so a
+        // projection reaching it would be silently dropped and the stream would
+        // carry wider rows than the ticket signed. That is the one failure the
+        // projection mechanism exists to prevent, so refuse instead.
+        //
+        // Unreachable twice over today: no MEMBERSHIP_JOIN_TABLES entry has a
+        // projection allowlist (pinned by
+        // `no_membership_join_table_has_a_projection_allowlist`), and
+        // `select_list_for` at the top of this function already rejects a list for
+        // an allowlist-less table. The day one of them gains an allowlist, this is
+        // what stands between that and a silently widened stream — the two
+        // features compose badly (under the JOIN a bare column name is ambiguous,
+        // since both sides carry feature_idx, so a projection here would need
+        // `t.`-qualifying), so it must be a decision, not a default.
+        if !columns.is_empty() {
+            return Err(Status::internal(format!(
+                "projection column list is not supported on {table:?} (membership JOIN)"
+            )));
+        }
         format!(
             "SELECT t.* FROM {full_table} t \
              JOIN qiita_lake.reference_membership m ON t.feature_idx = m.feature_idx \
              WHERE {where_str}"
         )
     } else {
-        // Most tables stream every column; the alignment surface is projected to
-        // just the feature-table columns (projection pushdown — see ALIGNMENT_DOGET_PROJECTION).
-        let projection = if is_alignment_doget_surface(table) {
-            ALIGNMENT_DOGET_PROJECTION
-        } else {
-            "*"
-        };
-        format!("SELECT {projection} FROM {full_table} WHERE {where_str}")
+        format!("SELECT {select_list} FROM {full_table} WHERE {where_str}")
     };
     Ok((sql, full_table))
+}
+
+/// Build the `read_masked` DoGet: a call to the table macro, not a filtered SELECT.
+///
+/// The ticket must name exactly the macro's scope — one `mask_idx` and a non-empty
+/// `prep_sample_idx` set — which is what every control-plane signing site produces
+/// (deliberately not enumerated: the list drifts, and `grep 'read_masked'` on the
+/// control plane is exact). Any other column is refused rather than appended as an
+/// outer filter: on the human-read surface an unrecognised scope column is a
+/// control-plane bug, and quietly reading "the macro's scope, plus whatever else"
+/// is how an under-scoped read would pass.
+fn build_read_masked_query(filter: &auth::TicketFilter) -> Result<(String, String), Status> {
+    let mask_idx = single_i64_filter(filter, "mask_idx")?;
+    let preps = i64_list_filter(filter, "prep_sample_idx")?;
+    if filter.len() != 2 {
+        return Err(Status::invalid_argument(format!(
+            "read_masked accepts only mask_idx and prep_sample_idx, got {} columns",
+            filter.len()
+        )));
+    }
+    Ok((
+        format!("SELECT * FROM {}", read_masked_relation(mask_idx, &preps)),
+        "qiita_lake.read_masked".to_string(),
+    ))
 }
 
 /// Build the SELECT for a block-read DoGet (`read_block` / `read_masked_block`).
@@ -2674,7 +3354,12 @@ fn build_block_read_query(
     let full_table = format!("qiita_lake.{source}");
     let member_clause = block_read_where_clause(members);
 
-    let where_str = if table == "read_masked_block" {
+    // `read_masked` is a macro (scope-as-arguments); `read` is a plain relation.
+    // The member clause stays an outer filter either way — it carries the
+    // per-sample sequence sub-ranges the macro's sample scope does not express,
+    // and it is the SAME selector the block DELETE path uses, so a block's read
+    // footprint and its delete footprint cannot drift.
+    let (relation, where_str) = if table == "read_masked_block" {
         let mask_idx = single_i64_filter(filter, "mask_idx")?;
         if filter.len() != 1 {
             return Err(Status::invalid_argument(format!(
@@ -2682,7 +3367,11 @@ fn build_block_read_query(
                 filter.len()
             )));
         }
-        format!("mask_idx = {mask_idx} AND ({member_clause})")
+        // `mask_idx` moves into the macro call; the members' samples scope its
+        // `read`/`read_mask` inputs so DuckLake prunes to their files rather than
+        // scanning the lake (see the measurements on the macro in ducklake.rs).
+        let relation = read_masked_relation(mask_idx, &block_member_preps(members));
+        (relation, member_clause)
     } else {
         if !filter.is_empty() {
             return Err(Status::invalid_argument(format!(
@@ -2690,11 +3379,11 @@ fn build_block_read_query(
                 filter.len()
             )));
         }
-        member_clause
+        (full_table.clone(), member_clause)
     };
 
     Ok((
-        format!("SELECT {EXPORT_READ_COLUMNS} FROM {full_table} WHERE {where_str}"),
+        format!("SELECT {EXPORT_READ_COLUMNS} FROM {relation} WHERE {where_str}"),
         full_table,
     ))
 }
@@ -2737,6 +3426,117 @@ mod tests {
         // The dest is inlined into a DuckDB `COPY ... TO '<dest>'` literal.
         let root = Path::new("/scratch");
         assert!(validate_export_dest("/scratch/ti'ck/reads.parquet", root).is_err());
+    }
+
+    // --- requested_ipc_codec (pure; no DuckDB) ---
+
+    fn metadata_with(value: &[u8]) -> tonic::metadata::MetadataMap {
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert(
+            IPC_COMPRESSION_HEADER,
+            tonic::metadata::MetadataValue::try_from(value).expect("valid metadata value"),
+        );
+        map
+    }
+
+    #[test]
+    fn absent_compression_header_means_no_codec() {
+        let map = tonic::metadata::MetadataMap::new();
+        assert_eq!(requested_ipc_codec(&map).expect("absent is valid"), None);
+    }
+
+    #[test]
+    fn zstd_compression_header_selects_zstd() {
+        let map = metadata_with(b"zstd");
+        assert_eq!(
+            requested_ipc_codec(&map).expect("zstd is accepted"),
+            Some(CompressionType::ZSTD)
+        );
+    }
+
+    #[test]
+    fn explicit_none_compression_header_means_no_codec() {
+        let map = metadata_with(b"none");
+        assert_eq!(requested_ipc_codec(&map).expect("none is accepted"), None);
+    }
+
+    /// `lz4` is in this list on purpose: it is rejected by decision, not by
+    /// omission, so a future reader does not "fix" the gap by accepting it.
+    #[test]
+    fn unknown_compression_header_is_rejected() {
+        for value in [b"lz4".as_slice(), b"gzip", b"ZSTD", b"", b"zstd,none"] {
+            let err = requested_ipc_codec(&metadata_with(value))
+                .expect_err("unknown codec must be rejected, not ignored");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(
+                err.message().contains("zstd") && err.message().contains("none"),
+                "error should name the accepted values, got: {}",
+                err.message()
+            );
+        }
+    }
+
+    /// A repeated header must be refused, not resolved to its first value.
+    ///
+    /// `MetadataMap::get` returns only the first value of a repeated key, so
+    /// reading with it would apply `zstd` and silently ignore the `lz4` the client
+    /// also asked for — a client that requested an unsupported codec and got a
+    /// working stream anyway learns nothing. Both orders are exercised because
+    /// only one of them looks wrong under `get`.
+    #[test]
+    fn repeated_compression_header_is_rejected() {
+        for pair in [["zstd", "lz4"], ["lz4", "zstd"], ["zstd", "zstd"]] {
+            let mut map = tonic::metadata::MetadataMap::new();
+            for value in pair {
+                map.append(
+                    IPC_COMPRESSION_HEADER,
+                    tonic::metadata::MetadataValue::try_from(value).expect("valid value"),
+                );
+            }
+            let err = requested_ipc_codec(&map)
+                .expect_err("a repeated codec header is ambiguous and must be rejected");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(
+                err.message().contains("more than once"),
+                "error should say the header repeated, got: {}",
+                err.message()
+            );
+        }
+    }
+
+    /// No codec must leave the encoder options structurally identical to the
+    /// default the uncompressed encoder used before this existed.
+    ///
+    /// This is the mechanism behind "no header means today's behaviour byte for
+    /// byte": `do_get` always routes through `try_with_compression`, so the claim
+    /// rests on that call being a no-op when the codec is `None`. Compared through
+    /// `Debug` because `IpcWriteOptions` implements neither `PartialEq` nor field
+    /// accessors — the derived formatting covers every field, which is the
+    /// property being pinned.
+    #[test]
+    fn no_codec_write_options_match_the_encoder_default() {
+        let with_none = IpcWriteOptions::default()
+            .try_with_compression(None)
+            .expect("None is always a valid codec");
+        assert_eq!(
+            format!("{with_none:?}"),
+            format!("{:?}", IpcWriteOptions::default()),
+            "an unrequested codec changed the write options"
+        );
+    }
+
+    /// A value the transport accepts but that is not UTF-8 must be an error
+    /// rather than a panic or a silent fall-through to uncompressed.
+    #[test]
+    fn non_utf8_compression_header_is_rejected() {
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert(
+            IPC_COMPRESSION_HEADER,
+            tonic::metadata::MetadataValue::try_from(b"\xff\xfe".as_slice())
+                .expect("bytes are valid as an ASCII metadata value"),
+        );
+        let err = requested_ipc_codec(&map).expect_err("non-UTF-8 must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     // --- single_i64_filter (pure; no DuckDB) ---
@@ -3419,7 +4219,7 @@ mod tests {
 
         // Helper that mirrors do_get's query body for read_masked.
         let run = |filter: &auth::TicketFilter| -> Vec<arrow_array::RecordBatch> {
-            let (sql, _) = build_query("read_masked", filter, &[]).unwrap();
+            let (sql, _) = build_query("read_masked", filter, &[], &[]).unwrap();
             let mut stmt = conn.prepare(&sql).unwrap();
             let arrow_result = stmt.query_arrow([]).unwrap();
             let schema = arrow_result.get_schema();
@@ -3525,7 +4325,7 @@ mod tests {
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(prep)],
         );
-        let (sql, table) = build_query("read_masked", &filter, &[]).unwrap();
+        let (sql, table) = build_query("read_masked", &filter, &[], &[]).unwrap();
         let batches: Vec<arrow_array::RecordBatch> =
             stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
                 .collect::<Vec<_>>()
@@ -3563,7 +4363,7 @@ mod tests {
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(prep)],
         );
-        let (esql, etable) = build_query("read_masked", &empty_filter, &[]).unwrap();
+        let (esql, etable) = build_query("read_masked", &empty_filter, &[], &[]).unwrap();
         let empty: Vec<arrow_array::RecordBatch> =
             stream_ducklake_batches(connstr.clone(), data_path.clone(), esql, etable)
                 .collect::<Vec<_>>()
@@ -3707,6 +4507,187 @@ mod tests {
         }
     }
 
+    // --- replace-by-key (in-memory DuckDB; no DuckLake catalog) ---
+
+    /// Every `REPLACE_KEY_TABLES` table appears once, under a non-empty key that
+    /// names no column twice. A repeated table would build two delete statements
+    /// for it, and the second would mask a wrong key column in the first by
+    /// deleting the same rows again. An empty key list would produce
+    /// `WHERE () IN (SELECT DISTINCT FROM …)`; a repeated column would compare
+    /// one component of the row constructor against itself.
+    #[test]
+    fn replace_key_tables_names_each_table_once() {
+        let mut seen = std::collections::HashSet::new();
+        for entry in REPLACE_KEY_TABLES {
+            let table = entry.table;
+            assert!(seen.insert(table), "{table} listed twice");
+            assert!(!entry.key.is_empty(), "{table} has no key column");
+            let mut seen_keys = std::collections::HashSet::new();
+            for key in entry.key {
+                assert!(seen_keys.insert(*key), "{table} names {key} twice");
+            }
+        }
+    }
+
+    /// Every `key_source` is itself a registered table carrying the same key.
+    /// The borrowing delete SELECTs this entry's key columns out of the source's
+    /// Parquet, so a source keyed on anything else would name a column that file
+    /// does not have and fail the whole registration.
+    #[test]
+    fn replace_key_tables_borrow_from_a_table_with_the_same_key() {
+        for entry in REPLACE_KEY_TABLES {
+            let (table, source) = (entry.table, entry.key_source);
+            let found = REPLACE_KEY_TABLES
+                .iter()
+                .find(|candidate| candidate.table == source)
+                .unwrap_or_else(|| panic!("{table} borrows keys from unregistered {source}"));
+            assert_eq!(
+                found.key, entry.key,
+                "{table} borrows keys from {source}, which is keyed differently"
+            );
+        }
+    }
+
+    /// Write a `(feature_idx, chunk_index, chunk_data)` Parquet at `path`. The
+    /// COPY has no bound-parameter form, so it doubles any quote in the path to
+    /// escape it — precisely what the delete under test must NOT have to do.
+    #[cfg(test)]
+    fn seed_chunk_parquet(conn: &Connection, path: &std::path::Path, rows: &[(i64, i32, &str)]) {
+        let values = rows
+            .iter()
+            .map(|(feature_idx, chunk_index, data)| {
+                format!("({feature_idx}::BIGINT, {chunk_index}::INTEGER, '{data}')")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let literal = path.to_str().unwrap().replace('\'', "''");
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES {values}) t(feature_idx, chunk_index, chunk_data)) \
+             TO '{literal}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+    }
+
+    /// The replace-by-key DELETE removes exactly the rows whose key appears in
+    /// the incoming Parquets — the union across a multi-part table, not one part
+    /// — leaves every other key alone, and reads each file through a BOUND
+    /// parameter, so a lake path carrying a single quote is data, not SQL. Runs
+    /// against a plain in-memory DuckDB with a `qiita_lake` schema: the
+    /// statement's semantics are the thing under test, not DuckLake.
+    #[test]
+    fn replace_key_delete_removes_only_the_incoming_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE SCHEMA qiita_lake;
+             CREATE TABLE qiita_lake.assembled_sequence_chunks (
+                 feature_idx BIGINT NOT NULL,
+                 chunk_index INTEGER NOT NULL,
+                 chunk_data VARCHAR NOT NULL
+             );
+             -- Features 1 and 3 are contigs a second run also produces (1 has 2
+             -- chunks); feature 2 belongs to an earlier run only and must survive.
+             INSERT INTO qiita_lake.assembled_sequence_chunks VALUES
+                 (1, 0, 'AAAA'), (1, 1, 'CCCC'), (2, 0, 'GGGG'), (3, 0, 'TTTT');",
+        )
+        .unwrap();
+
+        // Two parts, and a single quote in one of the names — register_files
+        // mints each basename from the (signed, but CP-authored) staging
+        // filename, so a path must never be interpolated into the SQL text.
+        let dir = tempfile::tempdir().unwrap();
+        let part_a = dir.path().join("part'00000.parquet");
+        let part_b = dir.path().join("part_00001.parquet");
+        seed_chunk_parquet(&conn, &part_a, &[(1, 0, "AAAA"), (1, 1, "CCCC")]);
+        seed_chunk_parquet(&conn, &part_b, &[(3, 0, "TTTT")]);
+
+        let sql = replace_key_delete_sql("assembled_sequence_chunks", &["feature_idx"], 2);
+        let deleted = conn
+            .execute(
+                &sql,
+                duckdb::params![part_a.to_str().unwrap(), part_b.to_str().unwrap()],
+            )
+            .expect("read_parquet(?) must accept each path as a bound parameter");
+        assert_eq!(
+            deleted, 3,
+            "both of feature 1's chunk rows plus feature 3's"
+        );
+
+        let survivor_feature: i64 = conn
+            .query_row(
+                "SELECT feature_idx FROM qiita_lake.assembled_sequence_chunks",
+                [],
+                |r| r.get(0),
+            )
+            .expect("exactly one row must remain");
+        assert_eq!(survivor_feature, 2, "the other run's feature is untouched");
+    }
+
+    /// The composite form matches on the WHOLE key: a lake row agreeing on one
+    /// component and differing on the other survives. Same in-memory DuckDB as
+    /// the single-key sibling above — this is the SQL text's semantics, not
+    /// DuckLake's.
+    #[test]
+    fn replace_key_delete_matches_the_whole_composite_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE SCHEMA qiita_lake;
+             CREATE TABLE qiita_lake.assembly_membership (
+                 prep_sample_idx BIGINT NOT NULL,
+                 processing_idx BIGINT NOT NULL,
+                 kind VARCHAR NOT NULL,
+                 bin_id VARCHAR NOT NULL,
+                 feature_idx BIGINT NOT NULL
+             );
+             -- Sample 10 run 20 is the run being re-registered. Sample 11 run 20
+             -- shares its processing_idx, sample 10 run 21 shares its
+             -- prep_sample_idx; each agrees on one half and must survive.
+             INSERT INTO qiita_lake.assembly_membership VALUES
+                 (10, 20, 'LCG', 'circular_1', 700),
+                 (10, 20, 'MAG', 'bin.1', 701),
+                 (11, 20, 'MAG', 'bin.1', 702),
+                 (10, 21, 'MAG', 'bin.1', 703);",
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let incoming = dir.path().join("assembly_membership.parquet");
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES \
+                 (10::BIGINT, 20::BIGINT, 'UNBINNED', 'contig_9', 704::BIGINT)) \
+                 t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx)) \
+             TO '{}' (FORMAT PARQUET)",
+            incoming.to_str().unwrap()
+        ))
+        .unwrap();
+
+        let sql = replace_key_delete_sql(
+            "assembly_membership",
+            &["prep_sample_idx", "processing_idx"],
+            1,
+        );
+        let deleted = conn
+            .execute(&sql, duckdb::params![incoming.to_str().unwrap()])
+            .unwrap();
+        assert_eq!(deleted, 2, "both of sample 10 / run 20's rows");
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT prep_sample_idx, processing_idx FROM qiita_lake.assembly_membership \
+                 ORDER BY prep_sample_idx, processing_idx",
+            )
+            .unwrap();
+        let survivors: Vec<(i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            survivors,
+            vec![(10, 21), (11, 20)],
+            "a row agreeing on only one component of the key is not the same run"
+        );
+    }
+
     // --- do_action dispatch trust checks (pure; no DuckDB) ---
 
     /// An action whose `Action.type` header disagrees with the signed
@@ -3828,6 +4809,7 @@ mod tests {
             let conn = Connection::open_in_memory().unwrap();
             ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
             ducklake::ensure_reference_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
             conn.execute_batch(&format!(
                 "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
             ))
@@ -3865,11 +4847,15 @@ mod tests {
             work_ticket_idx: ticket,
         };
 
-        let registered =
+        let outcome =
             register_files(&connstr, &data_path, &payload).expect("register_files failed");
-        assert_eq!(registered.len(), 1, "one file registered");
+        assert_eq!(outcome.registered.len(), 1, "one file registered");
+        assert!(
+            outcome.replaced.is_empty(),
+            "reference_membership is not a REPLACE_KEY_TABLES target, so nothing is replaced"
+        );
         // The dest carries the ticket-unique minted name under the per-table dir.
-        let dest = std::path::Path::new(&registered[0]);
+        let dest = std::path::Path::new(&outcome.registered[0]);
         assert_eq!(
             dest.file_name().and_then(|f| f.to_str()).unwrap(),
             lake_dest_filename(ticket, "reference_membership.parquet")
@@ -3902,6 +4888,978 @@ mod tests {
         // delete_reference orphan subquery) with a missing-file IO error.
         let _ = reader.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
+        ));
+    }
+
+    // --- replace-by-key against a real DuckLake catalog ---
+
+    /// Seed one assembly run's staging dir in the shapes `ensure_assembly_tables`
+    /// declares: `assembled_sequence.parquet`, plus an
+    /// `assembled_sequence_chunks/` dir holding ONE PART PER CONTIG — the
+    /// multi-file form `write_feature_sequence_chunks` emits, so the registration
+    /// under test takes the grouped replace-by-key path rather than a
+    /// single-file shortcut.
+    ///
+    /// `contigs` is `(feature_idx, uuid, [chunk_data...])` — chunk_index is the
+    /// position, and `sequence_length_bp` is the summed chunk length, so a
+    /// reassembly check against it is meaningful rather than tautological.
+    #[cfg(feature = "integration")]
+    fn seed_assembly_staging(contigs: &[(i64, &str, &[&str])]) -> tempfile::TempDir {
+        let staging = tempfile::tempdir().unwrap();
+        let chunks_dir = staging.path().join("assembled_sequence_chunks");
+        std::fs::create_dir_all(&chunks_dir).unwrap();
+        let writer = Connection::open_in_memory().unwrap();
+
+        let sequence_rows: Vec<String> = contigs
+            .iter()
+            .map(|(feature_idx, uuid, chunks)| {
+                let length: usize = chunks.iter().map(|c| c.len()).sum();
+                format!("({feature_idx}::BIGINT, '{uuid}'::UUID, {length}::BIGINT)")
+            })
+            .collect();
+        let sequences = staging.path().join("assembled_sequence.parquet");
+        writer
+            .execute_batch(&format!(
+                "COPY (SELECT * FROM (VALUES {}) \
+                     t(feature_idx, sequence_hash, sequence_length_bp)) \
+                 TO '{}' (FORMAT PARQUET)",
+                sequence_rows.join(", "),
+                sequences.to_str().unwrap()
+            ))
+            .unwrap();
+
+        for (part_index, (feature_idx, _uuid, chunks)) in contigs.iter().enumerate() {
+            let rows: Vec<(i64, i32, &str)> = chunks
+                .iter()
+                .enumerate()
+                .map(|(i, data)| (*feature_idx, i as i32, *data))
+                .collect();
+            seed_chunk_parquet(
+                &writer,
+                &chunks_dir.join(format!("part_{part_index:05}.parquet")),
+                &rows,
+            );
+        }
+
+        staging
+    }
+
+    #[cfg(feature = "integration")]
+    fn assembly_register_payload(
+        staging: &tempfile::TempDir,
+        n_parts: usize,
+        ticket: i64,
+    ) -> auth::ActionPayload {
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "assembled_sequence.parquet".to_string(),
+            "assembled_sequence".to_string(),
+        );
+        for part_index in 0..n_parts {
+            files.insert(
+                format!("assembled_sequence_chunks/part_{part_index:05}.parquet"),
+                "assembled_sequence_chunks".to_string(),
+            );
+        }
+        auth::ActionPayload {
+            action: "register_files".to_string(),
+            staging_dir: staging.path().to_str().unwrap().to_string(),
+            files,
+            work_ticket_idx: ticket,
+        }
+    }
+
+    /// One row per feature, whatever the lake already held: a contig two
+    /// assembly runs both produce collapses to ONE `feature_idx` (shared
+    /// canonical hash), and each run writes that feature's sequence + chunks in
+    /// full. Without replace-by-key the second load leaves two copies and
+    /// `string_agg(chunk_data, '' ORDER BY chunk_index)` returns the contig
+    /// concatenated with itself while `sequence_length_bp` still describes one.
+    ///
+    /// Asserts the run-A-only feature survives run B untouched — the replace is
+    /// scoped to the keys the incoming file carries, not to "this run's rows".
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn register_files_replaces_shared_contigs_across_assembly_runs() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let a_only: i64 = 971_010;
+        let shared: i64 = 971_011;
+        let b_only: i64 = 971_012;
+        let ticket_a: i64 = 971_000_000 + std::process::id() as i64;
+        let ticket_b: i64 = ticket_a + 1;
+
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_assembly_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.assembled_sequence \
+                   WHERE feature_idx IN ({a_only}, {shared}, {b_only});
+                 DELETE FROM qiita_lake.assembled_sequence_chunks \
+                   WHERE feature_idx IN ({a_only}, {shared}, {b_only});"
+            ))
+            .unwrap();
+        }
+
+        // Run A: its own contig plus the one run B will also assemble.
+        let staging_a = seed_assembly_staging(&[
+            (
+                a_only,
+                "00000000-0000-0000-0000-000000971010",
+                &["ACGTACGT"],
+            ),
+            (
+                shared,
+                "00000000-0000-0000-0000-000000971011",
+                &["ACGTACGT", "ACGT"],
+            ),
+        ]);
+        let outcome_a = register_files(
+            &connstr,
+            &data_path,
+            &assembly_register_payload(&staging_a, 2, ticket_a),
+        )
+        .expect("run A register_files failed");
+        assert!(
+            outcome_a.replaced.is_empty(),
+            "a fresh feature set replaces nothing, got {:?}",
+            outcome_a.replaced
+        );
+
+        // Run B: the SAME contig (same feature_idx, same bytes) plus its own.
+        let staging_b = seed_assembly_staging(&[
+            (
+                shared,
+                "00000000-0000-0000-0000-000000971011",
+                &["ACGTACGT", "ACGT"],
+            ),
+            (b_only, "00000000-0000-0000-0000-000000971012", &["ACGT"]),
+        ]);
+        let outcome_b = register_files(
+            &connstr,
+            &data_path,
+            &assembly_register_payload(&staging_b, 2, ticket_b),
+        )
+        .expect("run B register_files failed");
+        assert_eq!(
+            outcome_b.replaced.get("assembled_sequence").copied(),
+            Some(1),
+            "run A's copy of the shared contig's sequence row is superseded"
+        );
+        assert_eq!(
+            outcome_b.replaced.get("assembled_sequence_chunks").copied(),
+            Some(2),
+            "and both of its chunk rows"
+        );
+
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        for (feature_idx, expected_length) in [(a_only, 8_i64), (shared, 12), (b_only, 4)] {
+            let rows: i64 = reader
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM qiita_lake.assembled_sequence \
+                         WHERE feature_idx = {feature_idx}"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 1, "exactly one sequence row for {feature_idx}");
+
+            // The acceptance check: the reassembled bytes are as long as the row
+            // that describes them.
+            let (declared, reassembled): (i64, i64) = reader
+                .query_row(
+                    &format!(
+                        "SELECT s.sequence_length_bp, \
+                                length(string_agg(c.chunk_data, '' ORDER BY c.chunk_index)) \
+                         FROM qiita_lake.assembled_sequence s \
+                         JOIN qiita_lake.assembled_sequence_chunks c USING (feature_idx) \
+                         WHERE s.feature_idx = {feature_idx} \
+                         GROUP BY s.sequence_length_bp"
+                    ),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(declared, expected_length, "declared length {feature_idx}");
+            assert_eq!(
+                reassembled, declared,
+                "reassembled bytes for {feature_idx} must match sequence_length_bp"
+            );
+        }
+
+        // Tombstone the catalog rows only — the physical lake files stay
+        // registered until compaction (see the sibling register test).
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.assembled_sequence \
+               WHERE feature_idx IN ({a_only}, {shared}, {b_only});
+             DELETE FROM qiita_lake.assembled_sequence_chunks \
+               WHERE feature_idx IN ({a_only}, {shared}, {b_only});"
+        ));
+    }
+
+    /// Registering the same contigs again converges instead of accumulating —
+    /// the DoAction's own idempotency, under a fresh work ticket each time (so
+    /// the lake gets a distinct file carrying the same keys, which is what makes
+    /// it a real second registration rather than a no-op).
+    ///
+    /// This is the primitive's property, not a workflow scenario: within one
+    /// ticket the runner fast-forwards a COMPLETED `register-files` on resume
+    /// rather than re-running it. Across tickets it is reachable — a fresh
+    /// submission over a COMPLETED prep_sample is admitted (`REPLACE_KEY_TABLES`
+    /// carries the submit path) — as is one contig produced by two DIFFERENT
+    /// runs, the sibling test above.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn register_files_re_registering_the_same_contigs_does_not_accumulate() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let feature: i64 = 971_020;
+        let base_ticket: i64 = 971_100_000 + std::process::id() as i64;
+
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_assembly_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {feature};
+                 DELETE FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {feature};"
+            ))
+            .unwrap();
+        }
+
+        let contigs: &[(i64, &str, &[&str])] = &[(
+            feature,
+            "00000000-0000-0000-0000-000000971020",
+            &["ACGTACGT", "TTTT"],
+        )];
+        for attempt in 0..3 {
+            let staging = seed_assembly_staging(contigs);
+            register_files(
+                &connstr,
+                &data_path,
+                &assembly_register_payload(&staging, 1, base_ticket + attempt),
+            )
+            .unwrap_or_else(|e| panic!("attempt {attempt} register_files failed: {e}"));
+        }
+
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        let sequence_rows: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.assembled_sequence \
+                     WHERE feature_idx = {feature}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sequence_rows, 1, "three loads, one sequence row");
+        let chunk_rows: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.assembled_sequence_chunks \
+                     WHERE feature_idx = {feature}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_rows, 2, "one chunk row per chunk_index, not six");
+        let reassembled: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT length(string_agg(chunk_data, '' ORDER BY chunk_index)) \
+                     FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {feature}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reassembled, 12, "the contig, not the contig three times");
+
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {feature};
+             DELETE FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {feature};"
+        ));
+    }
+
+    /// Register one staging Parquet per `(table, SELECT list)` the caller
+    /// supplies, as ONE registration under a caller-chosen ticket. Returns the
+    /// `Registration` so a test can read the replaced-row counts.
+    #[cfg(feature = "integration")]
+    fn register_parquets(
+        connstr: &str,
+        data_path: &str,
+        tables: &[(&str, &str)],
+        ticket: i64,
+    ) -> Registration {
+        let staging = tempfile::tempdir().unwrap();
+        let writer = Connection::open_in_memory().unwrap();
+        let mut files = std::collections::HashMap::new();
+        for (table, values_sql) in tables {
+            let src = staging.path().join(format!("{table}.parquet"));
+            writer
+                .execute_batch(&format!(
+                    "COPY ({values_sql}) TO '{}' (FORMAT PARQUET)",
+                    src.to_str().unwrap()
+                ))
+                .unwrap();
+            files.insert(format!("{table}.parquet"), (*table).to_string());
+        }
+
+        let payload = auth::ActionPayload {
+            action: "register_files".to_string(),
+            staging_dir: staging.path().to_str().unwrap().to_string(),
+            files,
+            work_ticket_idx: ticket,
+        };
+        register_files(connstr, data_path, &payload).unwrap_or_else(|e| {
+            let names: Vec<&str> = tables.iter().map(|(table, _)| *table).collect();
+            panic!("register_files({names:?}) failed: {e}")
+        })
+    }
+
+    #[cfg(feature = "integration")]
+    fn register_one_parquet(
+        connstr: &str,
+        data_path: &str,
+        table: &str,
+        values_sql: &str,
+        ticket: i64,
+    ) -> Registration {
+        register_parquets(connstr, data_path, &[(table, values_sql)], ticket)
+    }
+
+    #[cfg(feature = "integration")]
+    fn lake_count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// A second registration of one `(prep_sample_idx, processing_idx)`
+    /// SUPERSEDES that run's `assembly_membership` / `bin_quality` rows, and
+    /// reaches no other key: neither another sample's rows under the same
+    /// `processing_idx`, nor the same sample's rows under a different one. Both
+    /// halves of the composite key have to be compared for that to hold.
+    ///
+    /// `reference_sequences` is the control — same two-registration sequence,
+    /// same `register_files` entry point, replace-keyed on a single column. It
+    /// isolates the key as the one variable: a converging count on the
+    /// run-scoped tables alone would not distinguish the key from
+    /// `register_files` collapsing everything it registers.
+    ///
+    /// What this pins is what a re-run of `long-read-assembly` over an
+    /// already-COMPLETED prep_sample does to the lake — `REPLACE_KEY_TABLES`
+    /// carries why such a re-run resolves to the same `processing_idx` and why
+    /// the submit path admits it.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        // Sample A run P is the re-run under test. Sample B run P shares its
+        // processing_idx, sample A run Q shares its prep_sample_idx; each agrees
+        // on one half of the key and must survive.
+        let sample_a: i64 = 972_010;
+        let sample_b: i64 = 972_011;
+        let run_p: i64 = 972_020;
+        let run_q: i64 = 972_021;
+        let feature_a: i64 = 972_030;
+        let feature_b: i64 = 972_031;
+        let control_feature: i64 = 972_040;
+        let base_ticket: i64 = 972_000_000 + std::process::id() as i64;
+
+        let scope = |sample: i64, run: i64| {
+            format!("prep_sample_idx = {sample} AND processing_idx = {run}")
+        };
+        let a_p = scope(sample_a, run_p);
+        let b_p = scope(sample_b, run_p);
+        let a_q = scope(sample_a, run_q);
+        let control_where = format!("feature_idx = {control_feature}");
+
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_assembly_tables(&conn).unwrap();
+            ducklake::ensure_reference_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
+            for where_clause in [&a_p, &b_p, &a_q] {
+                conn.execute_batch(&format!(
+                    "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
+                     DELETE FROM qiita_lake.bin_quality WHERE {where_clause};"
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.reference_sequences WHERE {control_where};"
+            ))
+            .unwrap();
+        }
+
+        // One run's rows, byte-identical across both of its registrations —
+        // exactly what a re-run under the same processing_idx re-derives.
+        let membership_values = |sample: i64, run: i64| {
+            format!(
+                "SELECT * FROM (VALUES \
+                     ({sample}::BIGINT, {run}::BIGINT, 'LCG', 'circular_1', {feature_a}::BIGINT), \
+                     ({sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', {feature_b}::BIGINT)) \
+                     t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
+            )
+        };
+        let quality_values = |sample: i64, run: i64| {
+            format!(
+                "SELECT * FROM (VALUES \
+                     ({sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
+                      'k__Bacteria'::VARCHAR, 91.5::DOUBLE, 1.25::DOUBLE, 0.0::DOUBLE, \
+                      4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR)) \
+                     t(prep_sample_idx, processing_idx, kind, bin_id, marker_lineage, \
+                       completeness, contamination, strain_heterogeneity, genome_size, \
+                       n_contigs, das_tool_score, source_binner)"
+            )
+        };
+        let control_values = format!(
+            "SELECT * FROM (VALUES \
+                 ({control_feature}::BIGINT, \
+                  '00000000-0000-0000-0000-000000972040'::UUID, 8::BIGINT)) \
+                 t(feature_idx, sequence_hash, sequence_length_bp)"
+        );
+
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        let control_count =
+            format!("SELECT count(*) FROM qiita_lake.reference_sequences WHERE {control_where}");
+        let assert_run_rows = |where_clause: &str, membership: i64, quality: i64, label: &str| {
+            assert_eq!(
+                lake_count(
+                    &reader,
+                    &format!(
+                        "SELECT count(*) FROM qiita_lake.assembly_membership WHERE {where_clause}"
+                    )
+                ),
+                membership,
+                "assembly_membership {label}"
+            );
+            assert_eq!(
+                lake_count(
+                    &reader,
+                    &format!("SELECT count(*) FROM qiita_lake.bin_quality WHERE {where_clause}")
+                ),
+                quality,
+                "bin_quality {label}"
+            );
+        };
+
+        assert_run_rows(&a_p, 0, 0, "before any load (A/P)");
+        assert_run_rows(&b_p, 0, 0, "before any load (B/P)");
+        assert_run_rows(&a_q, 0, 0, "before any load (A/Q)");
+        assert_eq!(lake_count(&reader, &control_count), 0, "control empty");
+
+        // A fresh ticket per registration: the lake gets a distinct file
+        // carrying the same keys, which is what makes the second load a real
+        // re-registration rather than a no-op.
+        let mut ticket = base_ticket;
+        let mut register = |table: &str, values: &str| {
+            ticket += 1;
+            register_one_parquet(&connstr, &data_path, table, values, ticket)
+        };
+
+        let m1 = register("assembly_membership", &membership_values(sample_a, run_p));
+        let q1 = register("bin_quality", &quality_values(sample_a, run_p));
+        let c1 = register("reference_sequences", &control_values);
+        register("assembly_membership", &membership_values(sample_b, run_p));
+        register("bin_quality", &quality_values(sample_b, run_p));
+        register("assembly_membership", &membership_values(sample_a, run_q));
+        register("bin_quality", &quality_values(sample_a, run_q));
+
+        assert!(
+            m1.replaced.is_empty() && q1.replaced.is_empty() && c1.replaced.is_empty(),
+            "a key the lake does not hold replaces nothing: membership={:?} \
+             bin_quality={:?} control={:?}",
+            m1.replaced,
+            q1.replaced,
+            c1.replaced,
+        );
+        assert_run_rows(&a_p, 2, 1, "after the first load");
+        assert_run_rows(&b_p, 2, 1, "after the first load");
+        assert_run_rows(&a_q, 2, 1, "after the first load");
+        assert_eq!(
+            lake_count(&reader, &control_count),
+            1,
+            "control loaded once"
+        );
+
+        let m2 = register("assembly_membership", &membership_values(sample_a, run_p));
+        let q2 = register("bin_quality", &quality_values(sample_a, run_p));
+        let c2 = register("reference_sequences", &control_values);
+
+        assert_eq!(
+            m2.replaced.get("assembly_membership").copied(),
+            Some(2),
+            "the re-run supersedes A/P's two membership rows, and only those",
+        );
+        assert_eq!(
+            q2.replaced.get("bin_quality").copied(),
+            Some(1),
+            "the re-run supersedes A/P's one bin_quality row, and only that",
+        );
+        assert_eq!(
+            c2.replaced.get("reference_sequences").copied(),
+            Some(1),
+            "control: the second registration supersedes the first's row",
+        );
+
+        assert_run_rows(&a_p, 2, 1, "after the re-run (superseded, not appended)");
+        assert_run_rows(&b_p, 2, 1, "after the re-run (same run, other sample)");
+        assert_run_rows(&a_q, 2, 1, "after the re-run (same sample, other run)");
+        assert_eq!(
+            lake_count(&reader, &control_count),
+            1,
+            "control: one row per feature_idx after both registrations",
+        );
+
+        // Tombstone the catalog rows only — the physical lake files stay
+        // registered until compaction (see the sibling register tests).
+        for where_clause in [&a_p, &b_p, &a_q] {
+            let _ = reader.execute_batch(&format!(
+                "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
+                 DELETE FROM qiita_lake.bin_quality WHERE {where_clause};"
+            ));
+        }
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_sequences WHERE {control_where};"
+        ));
+    }
+
+    /// A re-run that yields NO MAG still clears the previous run's `bin_quality`
+    /// rows, because `bin_quality`'s delete reads the keys `assembly_membership`
+    /// names in the same registration. `bin_quality` alone names none — CheckM
+    /// covers refined bins only, so `assembly_load` writes it empty-with-schema —
+    /// and a delete keyed on the incoming file alone removes nothing, leaving MAG
+    /// rows behind a membership set that was replaced out from under them.
+    ///
+    /// The control is the second registration's membership rows: they are
+    /// superseded in the same call, which is what makes the surviving-or-not
+    /// `bin_quality` rows the one variable.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let sample: i64 = 974_010;
+        let run: i64 = 974_020;
+        let feature: i64 = 974_030;
+        let base_ticket: i64 = 974_000_000 + std::process::id() as i64;
+        let where_clause = format!("prep_sample_idx = {sample} AND processing_idx = {run}");
+
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_assembly_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
+                 DELETE FROM qiita_lake.bin_quality WHERE {where_clause};"
+            ))
+            .unwrap();
+        }
+
+        let membership_values = |kind: &str, bin_id: &str| {
+            format!(
+                "SELECT * FROM (VALUES \
+                     ({sample}::BIGINT, {run}::BIGINT, '{kind}', '{bin_id}', {feature}::BIGINT)) \
+                     t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
+            )
+        };
+        let quality_values = |suffix: &str| {
+            format!(
+                "SELECT * FROM (VALUES \
+                     ({sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
+                      'k__Bacteria'::VARCHAR, 91.5::DOUBLE, 1.25::DOUBLE, 0.0::DOUBLE, \
+                      4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR)) \
+                     t(prep_sample_idx, processing_idx, kind, bin_id, marker_lineage, \
+                       completeness, contamination, strain_heterogeneity, genome_size, \
+                       n_contigs, das_tool_score, source_binner){suffix}"
+            )
+        };
+
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        let membership_count =
+            format!("SELECT count(*) FROM qiita_lake.assembly_membership WHERE {where_clause}");
+        let quality_count =
+            format!("SELECT count(*) FROM qiita_lake.bin_quality WHERE {where_clause}");
+
+        // The first run: one refined MAG, so both files carry a row.
+        register_parquets(
+            &connstr,
+            &data_path,
+            &[
+                ("assembly_membership", &membership_values("MAG", "bin.1")),
+                ("bin_quality", &quality_values("")),
+            ],
+            base_ticket,
+        );
+        assert_eq!(
+            lake_count(&reader, &membership_count),
+            1,
+            "first run loaded"
+        );
+        assert_eq!(lake_count(&reader, &quality_count), 1, "first run loaded");
+
+        // The re-run: contigs, but no refined bin. `assembly_load` writes
+        // bin_quality empty-with-schema and register-files registers it anyway.
+        let replaced = register_parquets(
+            &connstr,
+            &data_path,
+            &[
+                (
+                    "assembly_membership",
+                    &membership_values("UNBINNED", "contig_1"),
+                ),
+                ("bin_quality", &quality_values(" WHERE FALSE")),
+            ],
+            base_ticket + 1,
+        )
+        .replaced;
+
+        assert_eq!(
+            replaced.get("assembly_membership").copied(),
+            Some(1),
+            "control: the re-run supersedes the first run's membership row",
+        );
+        assert_eq!(
+            replaced.get("bin_quality").copied(),
+            Some(1),
+            "the empty bin_quality supersedes the first run's MAG row",
+        );
+        assert_eq!(lake_count(&reader, &membership_count), 1, "one run's rows");
+        assert_eq!(
+            lake_count(&reader, &quality_count),
+            0,
+            "a run with no MAG leaves no bin_quality row behind",
+        );
+
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
+             DELETE FROM qiita_lake.bin_quality WHERE {where_clause};"
+        ));
+    }
+
+    /// Every `REPLACE_KEY_TABLES` entry names a real lake table with that key
+    /// column. The delete interpolates both names into SQL, so a typo or a
+    /// renamed column would otherwise surface as a failed load in production
+    /// rather than here.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn replace_key_tables_match_the_lake_schema() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_reference_tables(&conn).unwrap();
+        ducklake::ensure_assembly_tables(&conn).unwrap();
+
+        for entry in REPLACE_KEY_TABLES {
+            let table = entry.table;
+            for key in entry.key {
+                let found: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM duckdb_columns() \
+                         WHERE database_name = 'qiita_lake' AND table_name = ? AND column_name = ?",
+                        duckdb::params![table, key],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|e| panic!("column lookup for {table}.{key} failed: {e}"));
+                assert_eq!(found, 1, "qiita_lake.{table} has no {key} column");
+            }
+        }
+    }
+
+    /// The inverse direction: every lake table shaped like a content-addressed
+    /// sequence store IS registered. `replace_key_tables_match_the_lake_schema`
+    /// only catches a wrong column in an existing entry; this catches a fifth table
+    /// added later with the same shape and no entry, which would duplicate
+    /// silently.
+    ///
+    /// The shape is the column set, not the name: `(feature_idx, sequence_hash,
+    /// sequence_length_bp)` or `(feature_idx, chunk_index, chunk_data)`. A table
+    /// carrying a run-scoping column has a different set and is not matched.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn every_content_addressed_lake_table_is_registered() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_reference_tables(&conn).unwrap();
+        ducklake::ensure_assembly_tables(&conn).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+        ducklake::ensure_alignment_tables(&conn).unwrap();
+
+        // Content-addressed shape: keyed by feature_idx, carrying sequence bytes or
+        // their hash, and scoped by nothing else. Matching the shape rather than an
+        // exact column set means a fifth table with one extra column is still
+        // caught; the scope-column exclusion is what keeps reference_taxonomy and
+        // the alignment tables out.
+        let mut stmt = conn
+            .prepare(
+                "SELECT table_name, list(column_name) AS cols \
+                 FROM duckdb_columns() WHERE database_name = 'qiita_lake' \
+                 GROUP BY table_name \
+                 HAVING list_contains(cols, 'feature_idx') \
+                    AND (list_contains(cols, 'chunk_data') \
+                         OR list_contains(cols, 'sequence_hash')) \
+                    AND NOT list_has_any(cols, ['reference_idx', 'prep_sample_idx', \
+                                                'processing_idx', 'mask_idx', \
+                                                'alignment_idx']) \
+                 ORDER BY table_name",
+            )
+            .unwrap();
+        let shaped: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert!(
+            !shaped.is_empty(),
+            "the shape query matched nothing — it can no longer catch an omission"
+        );
+        for table in &shaped {
+            assert!(
+                REPLACE_KEY_TABLES.iter().any(|entry| entry.table == table),
+                "qiita_lake.{table} is content-addressed but absent from REPLACE_KEY_TABLES, \
+                 so a second load carrying its keys would duplicate them; found shaped tables: \
+                 {shaped:?}"
+            );
+        }
+    }
+
+    /// Concurrent registrations of one feature leave ONE row, and every writer
+    /// succeeds.
+    ///
+    /// This is the case the replace-by-key DELETE alone does not cover — see
+    /// `register_files`' transaction for why — and so the test that `registration_lock`
+    /// answers for.
+    ///
+    /// Runs against a lake that does NOT already hold the feature, because
+    /// pre-seeding it would make the DELETE conflict and the test would green with
+    /// the lock removed.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn concurrent_registrations_of_one_feature_leave_one_row() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let shared: i64 = 973_010;
+        let base_ticket: i64 = 973_000_000 + std::process::id() as i64;
+        const WRITERS: i64 = 4;
+
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_assembly_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {shared};
+                 DELETE FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {shared};"
+            ))
+            .unwrap();
+        }
+
+        // Stage every writer's Parquet BEFORE spawning, and release them from a
+        // barrier, so the only work between the threads starting and their
+        // transactions is `register_files` itself. Seeding inside the threads
+        // staggers them past each other, and the test then greens with the lock
+        // removed.
+        let payloads: Vec<(tempfile::TempDir, auth::ActionPayload)> = (0..WRITERS)
+            .map(|i| {
+                let staging = seed_assembly_staging(&[(
+                    shared,
+                    "00000000-0000-0000-0000-000000973010",
+                    &["ACGTACGT", "ACGT"],
+                )]);
+                let payload = assembly_register_payload(&staging, 1, base_ticket + i);
+                (staging, payload)
+            })
+            .collect();
+
+        let start = std::sync::Barrier::new(WRITERS as usize);
+        let outcomes: Vec<Result<Registration, Status>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = payloads
+                .iter()
+                .map(|(_staging, payload)| {
+                    let connstr = &connstr;
+                    let data_path = &data_path;
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        register_files(connstr, data_path, payload)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (i, outcome) in outcomes.iter().enumerate() {
+            assert!(
+                outcome.is_ok(),
+                "writer {i} failed instead of retrying its conflicted commit: {:?}",
+                outcome.as_ref().err()
+            );
+        }
+
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        let (sequences, chunks): (i64, i64) = reader
+            .query_row(
+                &format!(
+                    "SELECT (SELECT count(*) FROM qiita_lake.assembled_sequence \
+                              WHERE feature_idx = {shared}), \
+                            (SELECT count(*) FROM qiita_lake.assembled_sequence_chunks \
+                              WHERE feature_idx = {shared})"
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sequences, 1, "{WRITERS} concurrent loads, one sequence row");
+        assert_eq!(chunks, 2, "one chunk row per chunk_index, not {WRITERS}x");
+
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {shared};
+             DELETE FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {shared};"
+        ));
+    }
+
+    /// The reference pair takes the same path as the assembly pair, and unlike it
+    /// is Flight-readable (`ALLOWED_TABLES`), so a duplicate there reaches a
+    /// consumer. Two references sharing a sequence each ship that feature's rows;
+    /// after both loads there is one of each.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn register_files_replaces_sequences_shared_across_references() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let shared: i64 = 972_010;
+        let b_only: i64 = 972_011;
+        let ticket_a: i64 = 972_000_000 + std::process::id() as i64;
+
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_reference_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.reference_sequences \
+                   WHERE feature_idx IN ({shared}, {b_only});
+                 DELETE FROM qiita_lake.reference_sequence_chunks \
+                   WHERE feature_idx IN ({shared}, {b_only});"
+            ))
+            .unwrap();
+        }
+
+        let seed = |contigs: &[(i64, &str, &[&str])], ticket: i64| {
+            let staging = seed_assembly_staging(contigs);
+            // Same two shapes, registered into the reference tables.
+            std::fs::rename(
+                staging.path().join("assembled_sequence.parquet"),
+                staging.path().join("reference_sequences.parquet"),
+            )
+            .unwrap();
+            std::fs::rename(
+                staging.path().join("assembled_sequence_chunks"),
+                staging.path().join("reference_sequence_chunks"),
+            )
+            .unwrap();
+            let mut files = std::collections::HashMap::new();
+            files.insert(
+                "reference_sequences.parquet".to_string(),
+                "reference_sequences".to_string(),
+            );
+            for part_index in 0..contigs.len() {
+                files.insert(
+                    format!("reference_sequence_chunks/part_{part_index:05}.parquet"),
+                    "reference_sequence_chunks".to_string(),
+                );
+            }
+            let payload = auth::ActionPayload {
+                action: "register_files".to_string(),
+                staging_dir: staging.path().to_str().unwrap().to_string(),
+                files,
+                work_ticket_idx: ticket,
+            };
+            let outcome = register_files(&connstr, &data_path, &payload)
+                .unwrap_or_else(|e| panic!("register_files failed: {e}"));
+            // Keep `staging` alive until after the call.
+            drop(staging);
+            outcome
+        };
+
+        // Reference A: one sequence, which reference B also carries.
+        seed(
+            &[(shared, "00000000-0000-0000-0000-000000972010", &["ACGT"])],
+            ticket_a,
+        );
+        let outcome_b = seed(
+            &[
+                (shared, "00000000-0000-0000-0000-000000972010", &["ACGT"]),
+                (b_only, "00000000-0000-0000-0000-000000972011", &["TTTT"]),
+            ],
+            ticket_a + 1,
+        );
+        assert_eq!(
+            outcome_b.replaced.get("reference_sequences").copied(),
+            Some(1),
+            "reference A's copy of the shared sequence is superseded"
+        );
+        assert_eq!(
+            outcome_b.replaced.get("reference_sequence_chunks").copied(),
+            Some(1)
+        );
+
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        for feature_idx in [shared, b_only] {
+            let (sequences, chunks): (i64, i64) = reader
+                .query_row(
+                    &format!(
+                        "SELECT (SELECT count(*) FROM qiita_lake.reference_sequences \
+                                  WHERE feature_idx = {feature_idx}), \
+                                (SELECT count(*) FROM qiita_lake.reference_sequence_chunks \
+                                  WHERE feature_idx = {feature_idx})"
+                    ),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(sequences, 1, "one sequence row for {feature_idx}");
+            assert_eq!(chunks, 1, "one chunk row for {feature_idx}");
+        }
+
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_sequences WHERE feature_idx IN ({shared}, {b_only});
+             DELETE FROM qiita_lake.reference_sequence_chunks \
+               WHERE feature_idx IN ({shared}, {b_only});"
         ));
     }
 
@@ -4222,7 +6180,7 @@ mod tests {
         members: &[auth::BlockReadMember],
         view_name: &str,
     ) -> i64 {
-        let (sql, _) = build_query(table, filter, members).expect("build_query failed");
+        let (sql, _) = build_query(table, filter, members, &[]).expect("build_query failed");
         conn.execute_batch(&format!("CREATE OR REPLACE TEMP VIEW {view_name} AS {sql}"))
             .expect("block-read DoGet SQL failed");
         conn.query_row(&format!("SELECT count(*) FROM ({sql})"), [], |r| r.get(0))
@@ -4334,7 +6292,7 @@ mod tests {
         // unscoped raw read must not be representable), where the retired export
         // wrote no file and returned 0.
         assert!(
-            build_query("read_block", &auth::TicketFilter::new(), &[]).is_err(),
+            build_query("read_block", &auth::TicketFilter::new(), &[], &[]).is_err(),
             "an empty members selector must be rejected, not treated as zero rows"
         );
 
@@ -4344,8 +6302,8 @@ mod tests {
     }
 
     /// The `read_masked_block` DoGet selector streams the block's members from the
-    /// `read_masked` VIEW scoped to `mask_idx`: it excludes non-`pass` reads (the
-    /// view's privacy filter), a different mask's rows, and non-member samples —
+    /// `read_masked` MACRO scoped to `mask_idx`: it excludes non-`pass` reads (the
+    /// macro's privacy filter), a different mask's rows, and non-member samples —
     /// in the same `EXPORT_READ_COLUMNS` shape the raw `read_block` selector
     /// yields. Because masked-out reads drop, a masked block can be a proper
     /// subset of the raw range.
@@ -4375,7 +6333,7 @@ mod tests {
                  ({prep_a}, 102, 'a2', 'GGGGG', [30,30,30,30,30]::UTINYINT[], NULL, NULL), \
                  ({prep_b}, 200, 'b0', 'TTTTT', [30,30,30,30,30]::UTINYINT[], NULL, NULL);
              -- mask_a: seq 100 & 102 pass, seq 101 is a host hit (excluded by the
-             -- read_masked view). prep_b's 200 passes but is not a block member.
+             -- read_masked macro). prep_b's 200 passes but is not a block member.
              -- Trims 0 so bytes pass through unchanged.
              INSERT INTO qiita_lake.read_mask \
                  (mask_idx, prep_sample_idx, sequence_idx, reason) VALUES \
@@ -4456,7 +6414,7 @@ mod tests {
         // stricter than the retired export, which wrote no file and returned 0.
         // An unscoped read must not be representable at all (see ALLOWED_TABLES).
         assert!(
-            build_query("read_masked_block", &mask_filter, &[]).is_err(),
+            build_query("read_masked_block", &mask_filter, &[], &[]).is_err(),
             "an empty members selector must be rejected, not treated as zero rows"
         );
 
@@ -4544,7 +6502,8 @@ mod tests {
 
     #[test]
     fn build_query_no_filter() {
-        let (sql, _) = build_query("reference_sequences", &auth::TicketFilter::new(), &[]).unwrap();
+        let (sql, _) =
+            build_query("reference_sequences", &auth::TicketFilter::new(), &[], &[]).unwrap();
         assert_eq!(sql, "SELECT * FROM qiita_lake.reference_sequences");
     }
 
@@ -4559,7 +6518,7 @@ mod tests {
                 serde_json::Value::from(3),
             ],
         );
-        let (sql, _) = build_query("reference_sequences", &filter, &[]).unwrap();
+        let (sql, _) = build_query("reference_sequences", &filter, &[], &[]).unwrap();
         assert!(sql.contains("feature_idx IN (1,2,3)"));
     }
 
@@ -4570,7 +6529,7 @@ mod tests {
             "'; DROP TABLE".to_string(),
             vec![serde_json::Value::from(1)],
         );
-        let result = build_query("reference_sequences", &filter, &[]);
+        let result = build_query("reference_sequences", &filter, &[], &[]);
         assert!(result.is_err());
     }
 
@@ -4581,7 +6540,7 @@ mod tests {
             "feature_idx".to_string(),
             vec![serde_json::Value::from("not_an_int")],
         );
-        let result = build_query("reference_sequences", &filter, &[]);
+        let result = build_query("reference_sequences", &filter, &[], &[]);
         assert!(result.is_err());
     }
 
@@ -4589,7 +6548,7 @@ mod tests {
     fn build_query_rejects_empty_values() {
         let mut filter = auth::TicketFilter::new();
         filter.insert("feature_idx".to_string(), vec![]);
-        let result = build_query("reference_sequences", &filter, &[]);
+        let result = build_query("reference_sequences", &filter, &[], &[]);
         assert!(result.is_err());
     }
 
@@ -4600,7 +6559,7 @@ mod tests {
             "reference_idx".to_string(),
             vec![serde_json::Value::from(42)],
         );
-        let (sql, _) = build_query("reference_sequences", &filter, &[]).unwrap();
+        let (sql, _) = build_query("reference_sequences", &filter, &[], &[]).unwrap();
         assert!(
             sql.contains("JOIN qiita_lake.reference_membership m ON t.feature_idx = m.feature_idx"),
             "expected JOIN for reference_sequences + reference_idx, got: {sql}"
@@ -4627,7 +6586,7 @@ mod tests {
                 serde_json::Value::from(800002),
             ],
         );
-        let (sql, _) = build_query("reference_sequence_chunks", &filter, &[]).unwrap();
+        let (sql, _) = build_query("reference_sequence_chunks", &filter, &[], &[]).unwrap();
         assert!(
             sql.contains("JOIN qiita_lake.reference_membership m ON t.feature_idx = m.feature_idx"),
             "expected membership JOIN, got: {sql}"
@@ -4651,7 +6610,7 @@ mod tests {
             "reference_idx".to_string(),
             vec![serde_json::Value::from(42)],
         );
-        let (sql, _) = build_query("reference_taxonomy", &filter, &[]).unwrap();
+        let (sql, _) = build_query("reference_taxonomy", &filter, &[], &[]).unwrap();
         assert!(
             sql.contains("reference_idx IN (42)"),
             "expected direct filter, got: {sql}"
@@ -4662,53 +6621,82 @@ mod tests {
         );
     }
 
+    /// THE pruning regression guard. `read_masked` must be reached as a scoped
+    /// MACRO CALL, never as a relation with a `WHERE`: a filtered select puts the
+    /// sample scope on only one side of the macro's internal join, DuckLake prunes
+    /// nothing, and the DoGet reads every file in the lake (see the measurements on
+    /// the macro in ducklake.rs). That failure is invisible in results — the rows
+    /// are correct, only the cost explodes — so nothing but this shape assertion
+    /// catches a regression to it.
     #[test]
-    fn build_query_read_masked_both_filters() {
-        // read_masked is a plain view: both mask_idx and prep_sample_idx are
-        // integer columns filtered directly via IN clauses (no membership join).
+    fn build_query_read_masked_calls_the_scoped_macro() {
         let mut filter = auth::TicketFilter::new();
         filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
         filter.insert(
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(11), serde_json::Value::from(12)],
         );
-        let (sql, table) = build_query("read_masked", &filter, &[]).unwrap();
+        let (sql, table) = build_query("read_masked", &filter, &[], &[]).unwrap();
         assert_eq!(table, "qiita_lake.read_masked");
+        assert_eq!(sql, "SELECT * FROM qiita_lake.read_masked(7, [11,12])");
         assert!(
-            sql.starts_with("SELECT * FROM qiita_lake.read_masked WHERE"),
-            "expected a plain view select, got: {sql}"
-        );
-        assert!(sql.contains("mask_idx IN (7)"), "got: {sql}");
-        assert!(sql.contains("prep_sample_idx IN (11,12)"), "got: {sql}");
-        assert!(
-            !sql.contains("JOIN"),
-            "read_masked is a plain view, no membership JOIN, got: {sql}"
+            !sql.contains("WHERE"),
+            "the scope must be macro arguments, not a WHERE — a WHERE reaches only \
+             one side of the join and defeats file pruning. got: {sql}"
         );
     }
 
     #[test]
-    fn build_query_read_masked_rejects_bad_column() {
-        // sequence_idx is a column of the view but is NOT an allowed filter
-        // column, so a ticket filtering on it must be rejected.
-        let mut filter = auth::TicketFilter::new();
-        filter.insert("sequence_idx".to_string(), vec![serde_json::Value::from(1)]);
-        let result = build_query("read_masked", &filter, &[]);
+    fn build_query_read_masked_requires_its_full_scope() {
+        let mask_only = filter_of(&[("mask_idx", vec![serde_json::json!(7)])]);
         assert!(
-            result.is_err(),
+            build_query("read_masked", &mask_only, &[], &[]).is_err(),
+            "a mask with no samples has no macro call — refuse it"
+        );
+
+        let preps_only = filter_of(&[("prep_sample_idx", vec![serde_json::json!(11)])]);
+        assert!(
+            build_query("read_masked", &preps_only, &[], &[]).is_err(),
+            "samples with no mask would blend pass-sets from different masks"
+        );
+
+        // An empty filter on the human-read surface must never degrade to a
+        // fleet-wide read.
+        assert!(
+            build_query("read_masked", &auth::TicketFilter::new(), &[], &[]).is_err(),
+            "empty filter on read_masked must be rejected"
+        );
+
+        // Extra columns are refused rather than silently appended as an outer
+        // filter: on this surface an unrecognised scope column is a CP bug.
+        let extra = filter_of(&[
+            ("mask_idx", vec![serde_json::json!(7)]),
+            ("prep_sample_idx", vec![serde_json::json!(11)]),
+            ("feature_idx", vec![serde_json::json!(1)]),
+        ]);
+        assert!(
+            build_query("read_masked", &extra, &[], &[]).is_err(),
+            "read_masked takes exactly its scope, nothing else"
+        );
+
+        // sequence_idx is a column of the result but not an allowed scope.
+        let bad = filter_of(&[("sequence_idx", vec![serde_json::json!(1)])]);
+        assert!(
+            build_query("read_masked", &bad, &[], &[]).is_err(),
             "sequence_idx is not an allowed filter column"
         );
-    }
 
-    #[test]
-    fn build_query_read_masked_rejects_empty_filter() {
-        // An empty filter on the human-read surface would SELECT * every
-        // sample's pass-reads across all studies — refuse it (the CP always
-        // scopes read_masked tickets, this is defense-in-depth).
-        let empty = auth::TicketFilter::new();
-        let result = build_query("read_masked", &empty, &[]);
+        // An explicitly EMPTY sample list. This is the one shape that would
+        // otherwise reach `read_masked_relation` and emit `read_masked(7, [])` —
+        // which the macro reads as "match nothing", so it would answer zero rows
+        // instead of failing. Reject it at the boundary, loudly.
+        let empty_preps = filter_of(&[
+            ("mask_idx", vec![serde_json::json!(7)]),
+            ("prep_sample_idx", vec![]),
+        ]);
         assert!(
-            result.is_err(),
-            "empty filter on read_masked must be rejected"
+            build_query("read_masked", &empty_preps, &[], &[]).is_err(),
+            "an empty prep_sample_idx list must be refused, not answered with zero rows"
         );
     }
 
@@ -4734,7 +6722,8 @@ mod tests {
         // Resolves to the raw read table, projects the shared EXPORT_READ_COLUMNS,
         // and scopes with the selector the block DELETE path also uses.
         let members = block_members();
-        let (sql, table) = build_query("read_block", &auth::TicketFilter::new(), &members).unwrap();
+        let (sql, table) =
+            build_query("read_block", &auth::TicketFilter::new(), &members, &[]).unwrap();
         assert_eq!(
             table, "qiita_lake.read",
             "read_block is a selector name; it must resolve to the raw read table"
@@ -4758,16 +6747,41 @@ mod tests {
         let members = block_members();
         let mut filter = auth::TicketFilter::new();
         filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
-        let (sql, table) = build_query("read_masked_block", &filter, &members).unwrap();
+        let (sql, table) = build_query("read_masked_block", &filter, &members, &[]).unwrap();
         assert_eq!(table, "qiita_lake.read_masked");
+        // The mask AND the block's samples move into the macro call, so both of
+        // the macro's inputs are pruned; the member clause stays outside because
+        // it carries the per-sample sequence sub-ranges the scope cannot express.
+        let preps = block_member_preps(&members);
         assert!(
-            sql.contains("mask_idx = 7 AND ("),
-            "the mask scope must conjoin the member selector, got: {sql}"
+            sql.starts_with(&format!(
+                "SELECT {EXPORT_READ_COLUMNS} FROM {} WHERE ",
+                read_masked_relation(7, &preps)
+            )),
+            "expected a scoped macro call carrying the block's samples, got: {sql}"
         );
         assert!(
             sql.contains(&block_read_where_clause(&members)),
             "got: {sql}"
         );
+    }
+
+    /// The block path must not regress to scanning the lake either: every member's
+    /// sample has to reach the macro's argument list, not just the outer clause.
+    #[test]
+    fn build_query_read_masked_block_passes_every_block_sample_into_the_macro() {
+        let members = block_members();
+        let filter = filter_of(&[("mask_idx", vec![serde_json::json!(7)])]);
+        let (sql, _) = build_query("read_masked_block", &filter, &members, &[]).unwrap();
+        let scope = read_masked_relation(7, &block_member_preps(&members));
+        assert!(sql.contains(&scope), "expected {scope} in: {sql}");
+        for m in &members {
+            assert!(
+                scope.contains(&m.prep_sample_idx.to_string()),
+                "member {} missing from the macro scope {scope}",
+                m.prep_sample_idx
+            );
+        }
     }
 
     #[test]
@@ -4776,13 +6790,13 @@ mod tests {
         // reads". This is what makes exposing raw `read` via read_block
         // admissible at all (see the PRIVACY note on ALLOWED_TABLES).
         assert!(
-            build_query("read_block", &auth::TicketFilter::new(), &[]).is_err(),
+            build_query("read_block", &auth::TicketFilter::new(), &[], &[]).is_err(),
             "read_block with no members must be rejected"
         );
         let mut filter = auth::TicketFilter::new();
         filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
         assert!(
-            build_query("read_masked_block", &filter, &[]).is_err(),
+            build_query("read_masked_block", &filter, &[], &[]).is_err(),
             "read_masked_block with no members must be rejected"
         );
     }
@@ -4792,7 +6806,13 @@ mod tests {
         let members = block_members();
         // Absent: would blend every mask's pass-set for those ranges.
         assert!(
-            build_query("read_masked_block", &auth::TicketFilter::new(), &members).is_err(),
+            build_query(
+                "read_masked_block",
+                &auth::TicketFilter::new(),
+                &members,
+                &[]
+            )
+            .is_err(),
             "a masked block without its mask scope must be rejected"
         );
         // Multi-valued: same blending, just spelled differently.
@@ -4802,7 +6822,7 @@ mod tests {
             vec![serde_json::Value::from(7), serde_json::Value::from(8)],
         );
         assert!(
-            build_query("read_masked_block", &multi, &members).is_err(),
+            build_query("read_masked_block", &multi, &members, &[]).is_err(),
             "a multi-valued mask_idx must be rejected"
         );
         // Extra columns: the ticket shape is pinned, not merely sufficient.
@@ -4813,7 +6833,7 @@ mod tests {
             vec![serde_json::Value::from(11)],
         );
         assert!(
-            build_query("read_masked_block", &extra, &members).is_err(),
+            build_query("read_masked_block", &extra, &members, &[]).is_err(),
             "an unexpected extra filter column must be rejected"
         );
     }
@@ -4828,7 +6848,7 @@ mod tests {
             vec![serde_json::Value::from(11)],
         );
         assert!(
-            build_query("read_block", &filter, &block_members()).is_err(),
+            build_query("read_block", &filter, &block_members(), &[]).is_err(),
             "read_block must reject filter columns"
         );
     }
@@ -4844,14 +6864,15 @@ mod tests {
             vec![serde_json::Value::from(11)],
         );
         assert!(
-            build_query("read_masked", &filter, &block_members()).is_err(),
+            build_query("read_masked", &filter, &block_members(), &[]).is_err(),
             "read_masked must reject a block members selector"
         );
         assert!(
             build_query(
                 "reference_sequences",
                 &auth::TicketFilter::new(),
-                &block_members()
+                &block_members(),
+                &[]
             )
             .is_err(),
             "a reference table must reject a block members selector"
@@ -4919,7 +6940,7 @@ mod tests {
             "alignment_idx".to_string(),
             vec![serde_json::Value::from(7)],
         );
-        let (sql, table) = build_query("alignment", &filter, &[]).unwrap();
+        let (sql, table) = build_query("alignment", &filter, &[], &[]).unwrap();
         assert_eq!(table, "qiita_lake.alignment");
         assert!(
             sql.starts_with("SELECT * FROM qiita_lake.alignment WHERE"),
@@ -4929,7 +6950,7 @@ mod tests {
         // view), further proof it is not the special surface.
         let empty = auth::TicketFilter::new();
         assert!(
-            build_query("alignment", &empty, &[]).is_ok(),
+            build_query("alignment", &empty, &[], &[]).is_ok(),
             "raw alignment gets no alignment_idx requirement (it is not the surface)"
         );
     }
@@ -4949,14 +6970,15 @@ mod tests {
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(3), serde_json::Value::from(4)],
         );
-        let (sql, table) = build_query("alignment_visible", &filter, &[]).unwrap();
+        let cols = columns(&["prep_sample_idx", "feature_idx", "position"]);
+        let (sql, table) = build_query("alignment_visible", &filter, &[], &cols).unwrap();
         assert_eq!(table, "qiita_lake.alignment_visible");
         assert!(
             sql.starts_with(
-                "SELECT prep_sample_idx, sequence_idx, feature_idx, flags, position, \
-                 stop_position FROM qiita_lake.alignment_visible WHERE"
+                "SELECT prep_sample_idx, feature_idx, position \
+                 FROM qiita_lake.alignment_visible WHERE"
             ),
-            "the view must get the projected coverage/OGU columns, got: {sql}"
+            "the view must get the ticket's signed columns, got: {sql}"
         );
         assert!(sql.contains("alignment_idx IN (7)"), "got: {sql}");
         assert!(sql.contains("prep_sample_idx IN (3,4)"), "got: {sql}");
@@ -4977,13 +6999,222 @@ mod tests {
             vec![serde_json::Value::from(3)],
         );
         assert!(
-            build_query("alignment_visible", &filter, &[]).is_err(),
+            build_query("alignment_visible", &filter, &[], &[]).is_err(),
             "alignment_visible without alignment_idx must be rejected"
         );
         let empty = auth::TicketFilter::new();
         assert!(
-            build_query("alignment_visible", &empty, &[]).is_err(),
+            build_query("alignment_visible", &empty, &[], &[]).is_err(),
             "empty filter on alignment_visible must be rejected"
+        );
+    }
+
+    /// A minimally-scoped alignment ticket filter. The scoping guards have their
+    /// own tests above; the projection tests below care only about `columns`.
+    fn alignment_scope() -> auth::TicketFilter {
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "alignment_idx".to_string(),
+            vec![serde_json::Value::from(7)],
+        );
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(3)],
+        );
+        filter
+    }
+
+    fn columns(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn signed_columns_are_projected_in_order() {
+        // The whole point of the signed list: a consumer that wants `cigar` asks
+        // for it, and one that doesn't never pays for it. Order is the caller's,
+        // verbatim — it keeps the SQL a pure function of the ticket, and the
+        // consumer's Arrow schema predictable rather than a function of our
+        // allowlist's ordering.
+        let cols = columns(&["feature_idx", "cigar", "position"]);
+        let (sql, table) =
+            build_query("alignment_visible", &alignment_scope(), &[], &cols).unwrap();
+        assert_eq!(table, "qiita_lake.alignment_visible");
+        assert!(
+            sql.starts_with(
+                "SELECT feature_idx, cigar, position FROM qiita_lake.alignment_visible WHERE"
+            ),
+            "expected exactly the signed columns, in the signed order, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn unknown_projection_column_is_rejected() {
+        // Defense-in-depth. The list is signature-verified — the control plane
+        // set it, not the client — but column names are interpolated into SQL,
+        // so it is whitelisted anyway, exactly as ALLOWED_FILTER_COLUMNS is.
+        for bad in ["no_such_column", "feature_idx; DROP TABLE alignment", "*"] {
+            let cols = columns(&["feature_idx", bad]);
+            let err = build_query("alignment_visible", &alignment_scope(), &[], &cols)
+                .expect_err("unknown projection column must be rejected");
+            assert!(
+                err.message().contains(bad),
+                "the error should name the offending column, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_projection_columns_are_rejected() {
+        // A repeated name produces two identically-named Arrow fields, which
+        // consumers collapse or reject inconsistently. Refuse to emit the
+        // ambiguous schema rather than pick a behaviour on their behalf.
+        let cols = columns(&["feature_idx", "position", "feature_idx"]);
+        assert!(
+            build_query("alignment_visible", &alignment_scope(), &[], &cols).is_err(),
+            "a duplicated projection column must be rejected"
+        );
+    }
+
+    #[test]
+    fn projection_columns_are_rejected_on_a_table_with_no_allowlist() {
+        // Only the alignment surface takes a column list; every other table
+        // streams SELECT * by decision. A list elsewhere is a control-plane bug,
+        // and *ignoring* it would serve wider rows than the ticket asked for —
+        // the exact silent widening this whole mechanism exists to prevent.
+        let cols = columns(&["feature_idx"]);
+
+        let mut reference = auth::TicketFilter::new();
+        reference.insert(
+            "reference_idx".to_string(),
+            vec![serde_json::Value::from(42)],
+        );
+        assert!(
+            build_query("reference_taxonomy", &reference, &[], &cols).is_err(),
+            "a reference table must refuse a projection column list"
+        );
+
+        // The block-read and read_masked selectors build their SQL on their own
+        // early-return paths, so they are the cases that would silently skip a
+        // gate placed further down build_query. Pin them explicitly.
+        assert!(
+            build_query(
+                "read_block",
+                &auth::TicketFilter::new(),
+                &block_members(),
+                &cols
+            )
+            .is_err(),
+            "a block-read selector must refuse a projection column list"
+        );
+        let mut masked = auth::TicketFilter::new();
+        masked.insert("mask_idx".to_string(), vec![serde_json::Value::from(1)]);
+        masked.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(3)],
+        );
+        assert!(
+            build_query("read_masked", &masked, &[], &cols).is_err(),
+            "the read_masked macro must refuse a projection column list"
+        );
+    }
+
+    /// The allowlist must equal the `alignment` DDL's column list — checked here
+    /// without a catalog, so `make test` catches a drift.
+    ///
+    /// `projection_allowlist_matches_the_alignment_schema_exactly` checks the same
+    /// property against a LIVE catalog, which needs Postgres and therefore only
+    /// runs in the integration tier: a column added to the DDL without an
+    /// allowlist entry would stay green through every pure-unit run until then.
+    /// This closes that window by reading the DDL out of the source at compile
+    /// time. `alignment_visible` is `SELECT a.*` over this table, so the view's
+    /// column set is this one — which is why the cheap check is worth having even
+    /// though the live one is stricter.
+    #[test]
+    fn projection_allowlist_matches_the_alignment_ddl() {
+        const DUCKLAKE_SRC: &str = include_str!("ducklake.rs");
+
+        let start = DUCKLAKE_SRC
+            .find("CREATE TABLE IF NOT EXISTS qiita_lake.alignment (")
+            .expect("the alignment DDL moved; this test reads it out of ducklake.rs");
+        let tail = &DUCKLAKE_SRC[start..];
+        let body = &tail[..tail
+            .find(");")
+            .expect("unterminated alignment CREATE TABLE")];
+
+        let mut ddl_columns: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for line in body.lines().skip(1) {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("--") {
+                continue;
+            }
+            ddl_columns.insert(line.split_whitespace().next().expect("non-empty line"));
+        }
+        assert!(
+            ddl_columns.len() > 5,
+            "parsed only {ddl_columns:?} out of the alignment DDL — the shape changed \
+             and this test is no longer reading it"
+        );
+
+        let allowed: std::collections::BTreeSet<&str> =
+            ALIGNMENT_PROJECTION_COLUMNS.iter().copied().collect();
+        assert_eq!(
+            ddl_columns,
+            allowed,
+            "the projection allowlist and the alignment DDL have drifted; \
+             only in the DDL: {:?}; only in the allowlist: {:?}",
+            ddl_columns.difference(&allowed).collect::<Vec<_>>(),
+            allowed.difference(&ddl_columns).collect::<Vec<_>>()
+        );
+    }
+
+    /// The membership-JOIN arm of `build_query` hardcodes `SELECT t.*`, so a
+    /// projection reaching it would be silently dropped and the stream would carry
+    /// wider rows than the ticket signed.
+    ///
+    /// Today nothing can: no joined table has an allowlist. That is an invariant,
+    /// not a coincidence, and this is where it is enforced — adding an allowlist to
+    /// a joined table fails here, at unit time, instead of at runtime behind a
+    /// guard someone may have decided was dead code.
+    #[test]
+    fn no_membership_join_table_has_a_projection_allowlist() {
+        for table in MEMBERSHIP_JOIN_TABLES {
+            assert!(
+                projection_allowlist(table).is_none(),
+                "{table} takes the membership JOIN, whose SELECT t.* would silently \
+                 drop a projection — teach build_query to qualify the columns with \
+                 the base alias before giving it an allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn alignment_doget_without_columns_is_rejected() {
+        // The alignment surface has no default projection any more: the consumer
+        // names its columns or gets nothing. Falling back to a server-side list
+        // would put the wrong component in charge of the answer — only the job
+        // knows what it binds — and a fallback that drifted wider would ship
+        // `cigar` to callers that never asked.
+        //
+        // Empty and absent are one case, not two, and cannot be told apart here:
+        // `#[serde(default)]` renders an omitted field as an empty Vec, exactly
+        // as it does for `members`. Both are refused. An explicitly-empty list
+        // is additionally refused at mint, which is the one layer where the
+        // distinction still exists.
+        let err = build_query("alignment_visible", &alignment_scope(), &[], &[])
+            .expect_err("an alignment ticket with no column list must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "got: {err}");
+
+        // The guard is specific to the projected surface: every other table
+        // still streams SELECT * with no column list, which is what keeps this
+        // change scoped to the one surface that needed it.
+        let mut reference = auth::TicketFilter::new();
+        reference.insert(
+            "reference_idx".to_string(),
+            vec![serde_json::Value::from(42)],
+        );
+        assert!(
+            build_query("reference_taxonomy", &reference, &[], &[]).is_ok(),
+            "an unprojected table must not have acquired a column requirement"
         );
     }
 
@@ -4998,7 +7229,7 @@ mod tests {
             "reference_idx".to_string(),
             vec![serde_json::Value::from(42)],
         );
-        let (sql, table) = build_query("reference_taxonomy_visible", &filter, &[]).unwrap();
+        let (sql, table) = build_query("reference_taxonomy_visible", &filter, &[], &[]).unwrap();
         assert_eq!(table, "qiita_lake.reference_taxonomy_visible");
         assert_eq!(
             sql,
@@ -5027,7 +7258,7 @@ mod tests {
             vec![serde_json::Value::from(3)],
         );
         assert!(
-            build_query("alignment_visible", &filter, &[]).is_err(),
+            build_query("alignment_visible", &filter, &[], &[]).is_err(),
             "alignment_visible DoGet with multi-valued alignment_idx must be rejected"
         );
     }
@@ -5080,7 +7311,13 @@ mod tests {
                 serde_json::Value::from(prep_b),
             ],
         );
-        let (sql, table) = build_query("alignment_visible", &filter, &[]).unwrap();
+        let (sql, table) = build_query(
+            "alignment_visible",
+            &filter,
+            &[],
+            &columns(FEATURE_TABLE_COLUMNS),
+        )
+        .unwrap();
         let batches: Vec<arrow_array::RecordBatch> =
             stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
                 .collect::<Vec<_>>()
@@ -5166,7 +7403,13 @@ mod tests {
             "prep_sample_idx".to_string(),
             vec![serde_json::Value::from(prep)],
         );
-        let (sql, table) = build_query("alignment_visible", &filter, &[]).unwrap();
+        let (sql, table) = build_query(
+            "alignment_visible",
+            &filter,
+            &[],
+            &columns(FEATURE_TABLE_COLUMNS),
+        )
+        .unwrap();
         let batches: Vec<arrow_array::RecordBatch> =
             stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
                 .collect::<Vec<_>>()
@@ -5207,7 +7450,7 @@ mod tests {
         // Reference tables are broadly readable by design (mirrors the
         // anonymous REST reference GET), so an unfiltered SELECT is legitimate.
         let empty = auth::TicketFilter::new();
-        let (sql, table) = build_query("reference_sequences", &empty, &[])
+        let (sql, table) = build_query("reference_sequences", &empty, &[], &[])
             .expect("empty filter on a reference table is allowed");
         assert_eq!(table, "qiita_lake.reference_sequences");
         assert_eq!(sql, "SELECT * FROM qiita_lake.reference_sequences");
@@ -5311,6 +7554,331 @@ mod tests {
             staging_root,
             scratch_root,
         )
+    }
+
+    // ------------------------------------------------------------------
+    // DoGet IPC compression — the parser being right does not prove the encoder
+    // honoured it, so these drive the real `do_get` end to end and assert on
+    // what the encoder stamped into each record-batch message.
+    // ------------------------------------------------------------------
+
+    /// Seed alignment rows and return a signed `alignment_visible` ticket for
+    /// them projecting `cols`, plus a service wired to the same catalog.
+    ///
+    /// Every row carries a `cigar` — the wide column the projection exists to
+    /// keep off the wire — so a test can prove both that asking for it delivers
+    /// it and that not asking for it costs nothing.
+    ///
+    /// The returned `TempDir` owns the service's staging and scratch roots and
+    /// must stay bound for the test's lifetime — dropping it removes the
+    /// directory. `do_get` reaches neither root today (staging belongs to DoPut,
+    /// scratch to the export DoActions), but they are real, TMPDIR-resident and
+    /// self-cleaning rather than `/tmp` literals, so a DoGet that later does
+    /// write cannot litter a shared directory.
+    #[cfg(feature = "integration")]
+    fn doget_fixture(
+        align: i64,
+        prep: i64,
+        cols: &[&str],
+    ) -> (QiitaFlightService, Vec<u8>, tempfile::TempDir) {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_reference_tables(&conn).unwrap();
+            ducklake::ensure_alignment_tables(&conn).unwrap();
+            ducklake::ensure_exclusion_tables(&conn).unwrap();
+            // Enough rows that a compressed body is unambiguously smaller than a
+            // raw one; a handful would be dominated by framing.
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align};
+                 INSERT INTO qiita_lake.alignment \
+                     (alignment_idx, prep_sample_idx, sequence_idx, feature_idx, \
+                      flags, position, stop_position, cigar) \
+                 SELECT {align}, {prep}, i, 1, 0, 100, 200, '100M' FROM range(20000) t(i);"
+            ))
+            .unwrap();
+        }
+        let quoted = cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let payload = format!(
+            r#"{{"table":"alignment_visible","filter":{{"alignment_idx":[{align}],"prep_sample_idx":[{prep}]}},"columns":[{quoted}]}}"#
+        );
+        let ticket = sign_raw(payload.as_bytes(), &TEST_SEED, future_expiry_secs(300));
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let service = QiitaFlightService::new(
+            test_vk(),
+            connstr,
+            data_path,
+            staging,
+            tmp.path().to_path_buf(),
+        );
+        (service, ticket, tmp)
+    }
+
+    /// The projection the feature-table consumer signs. Mirrors
+    /// `_ALIGNMENT_COLUMNS` in `estimate_feature_table.py`; used by the
+    /// compression tests, which care about the stream, not the column set.
+    #[cfg(feature = "integration")]
+    const FEATURE_TABLE_COLUMNS: &[&str] = &[
+        "prep_sample_idx",
+        "sequence_idx",
+        "feature_idx",
+        "flags",
+        "position",
+        "stop_position",
+    ];
+
+    /// Collect a DoGet response, returning the codec stamped into each
+    /// record-batch message and the total payload size.
+    ///
+    /// Reads the codec back out of each message's IPC header rather than
+    /// trusting that the request was honoured — a codec the encoder silently
+    /// declined to apply would otherwise pass every test below.
+    /// Returns the per-message codec stamps, the total body size, and every
+    /// message's bytes (header ‖ body, concatenated) so a caller can compare two
+    /// streams for real byte-identity rather than for matching stamps.
+    #[cfg(feature = "integration")]
+    async fn doget_codecs(
+        service: &QiitaFlightService,
+        ticket: Vec<u8>,
+        header: Option<&str>,
+    ) -> Result<(Vec<Option<CompressionType>>, usize, Vec<u8>), Status> {
+        let mut request = Request::new(Ticket {
+            ticket: ticket.into(),
+        });
+        if let Some(value) = header {
+            request.metadata_mut().insert(
+                IPC_COMPRESSION_HEADER,
+                tonic::metadata::MetadataValue::try_from(value).unwrap(),
+            );
+        }
+        let response = service.do_get(request).await?;
+        let messages: Vec<FlightData> = response
+            .into_inner()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, Status>>()?;
+        let bytes = messages.iter().map(|m| m.data_body.len()).sum();
+        let codecs = messages
+            .iter()
+            .filter_map(|m| {
+                Some(
+                    arrow_ipc::root_as_message(&m.data_header)
+                        .ok()?
+                        .header_as_record_batch()?
+                        .compression()
+                        .map(|c| c.codec()),
+                )
+            })
+            .collect();
+        let raw = messages
+            .iter()
+            .flat_map(|m| m.data_header.iter().chain(m.data_body.iter()).copied())
+            .collect();
+        Ok((codecs, bytes, raw))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn doget_with_zstd_header_stamps_the_codec_into_every_batch_message() {
+        let (service, ticket, _tmp) = doget_fixture(977_000, 977_010, FEATURE_TABLE_COLUMNS);
+        let (codecs, compressed, _) = doget_codecs(&service, ticket.clone(), Some("zstd"))
+            .await
+            .expect("zstd DoGet should succeed");
+
+        assert!(!codecs.is_empty(), "no record-batch messages in the stream");
+        assert!(
+            codecs.iter().all(|c| *c == Some(CompressionType::ZSTD)),
+            "a batch message shipped uncompressed despite the header: {codecs:?}"
+        );
+
+        // The codec stamp alone would be satisfied by a codec that ran and
+        // achieved nothing; these rows are highly repetitive, so real
+        // compression must show up in the body.
+        let (_, raw, _) = doget_codecs(&service, ticket, None)
+            .await
+            .expect("uncompressed DoGet should succeed");
+        assert!(
+            compressed * 2 < raw,
+            "expected zstd to at least halve the body, got {compressed} vs {raw} bytes"
+        );
+    }
+
+    /// The regression guard for every existing client: neither way of asking for
+    /// no compression may change the stream.
+    ///
+    /// Asserts two things the codec stamp alone does not. Every message comes back
+    /// unstamped, AND the two streams are byte-for-byte equal — an absent header
+    /// and an explicit `none` are the same stream, not merely two streams that
+    /// both claim to be uncompressed. What neither can observe is equality with
+    /// the encoder that preceded this change, which is not reachable from here;
+    /// `no_codec_write_options_match_the_encoder_default` pins that instead.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn doget_without_the_header_streams_exactly_what_an_explicit_none_does() {
+        let (service, ticket, _tmp) = doget_fixture(977_100, 977_110, FEATURE_TABLE_COLUMNS);
+        let mut streams = Vec::new();
+        for header in [None, Some("none")] {
+            let (codecs, _, raw) = doget_codecs(&service, ticket.clone(), header)
+                .await
+                .unwrap_or_else(|e| panic!("DoGet with header {header:?} failed: {e}"));
+            assert!(!codecs.is_empty(), "{header:?}: no record-batch messages");
+            assert!(
+                codecs.iter().all(Option::is_none),
+                "{header:?} must leave the body uncompressed, got {codecs:?}"
+            );
+            streams.push(raw);
+        }
+        assert_eq!(
+            streams[0], streams[1],
+            "an absent header and an explicit `none` produced different bytes"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn doget_with_an_unsupported_codec_is_rejected_before_streaming() {
+        let (service, ticket, _tmp) = doget_fixture(977_200, 977_210, FEATURE_TABLE_COLUMNS);
+        let err = doget_codecs(&service, ticket, Some("lz4"))
+            .await
+            .expect_err("lz4 must be rejected, not silently ignored");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ------------------------------------------------------------------
+    // Signed projection — end to end, over a real Arrow stream. The unit
+    // tests prove build_query emits the right SQL; only these prove the ticket
+    // the control plane signs turns into the schema the consumer receives.
+    // ------------------------------------------------------------------
+
+    /// Drive a real `do_get` and return the streamed schema's field names.
+    #[cfg(feature = "integration")]
+    async fn doget_schema(service: &QiitaFlightService, ticket: Vec<u8>) -> Vec<String> {
+        let response = service
+            .do_get(Request::new(Ticket {
+                ticket: ticket.into(),
+            }))
+            .await
+            .expect("DoGet should succeed");
+        let messages: Vec<FlightData> = response
+            .into_inner()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, Status>>()
+            .expect("stream should not error");
+        messages
+            .iter()
+            .find_map(|m| arrow_schema::Schema::try_from(m).ok())
+            .expect("no schema message in the stream")
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn doget_streams_cigar_only_when_the_ticket_signed_it() {
+        // The whole point of the signed projection, proven end to end. Two
+        // tickets over identical rows; the only difference is what was signed.
+        let (service, with, _tmp) = doget_fixture(
+            977_300,
+            977_310,
+            &["prep_sample_idx", "feature_idx", "cigar"],
+        );
+        assert_eq!(
+            doget_schema(&service, with).await,
+            vec!["prep_sample_idx", "feature_idx", "cigar"],
+            "the stream must carry exactly the signed columns, in the signed order"
+        );
+
+        let (service, without, _tmp) = doget_fixture(977_400, 977_410, FEATURE_TABLE_COLUMNS);
+        let fields = doget_schema(&service, without).await;
+        assert_eq!(fields, FEATURE_TABLE_COLUMNS);
+        assert!(
+            !fields.iter().any(|f| f == "cigar"),
+            "cigar reached a consumer that never asked for it: {fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn alignment_doget_without_a_signed_projection_is_rejected() {
+        // The retired fallback, pinned end to end. A ticket minted before this
+        // shipped and redeemed inside its 300 s TTL after it lands here.
+        let (service, _, _tmp) = doget_fixture(977_500, 977_510, FEATURE_TABLE_COLUMNS);
+        let payload = r#"{"table":"alignment_visible","filter":{"alignment_idx":[977500],"prep_sample_idx":[977510]}}"#;
+        let ticket = sign_raw(payload.as_bytes(), &TEST_SEED, future_expiry_secs(300));
+        let err = service
+            .do_get(Request::new(Ticket {
+                ticket: ticket.into(),
+            }))
+            .await
+            .err()
+            .expect("a columnless alignment ticket must be refused");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "got: {err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn projection_allowlist_matches_the_alignment_schema_exactly() {
+        // ALIGNMENT_PROJECTION_COLUMNS is hand-copied from the DDL two files
+        // over, and nothing else checks it. Drift is quiet in both directions:
+        // a column added to the table but not the allowlist simply cannot be
+        // requested (the feature silently does not exist), and one removed from
+        // the table but left in the allowlist mints tickets that fail at bind
+        // time, on the cluster, rather than here.
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(
+            &conn,
+            &delete_test_catalog_connstr(),
+            &delete_test_data_path(),
+        )
+        .unwrap();
+        ducklake::ensure_reference_tables(&conn).unwrap();
+        ducklake::ensure_alignment_tables(&conn).unwrap();
+        ducklake::ensure_exclusion_tables(&conn).unwrap();
+
+        // The VIEW, not the base table: `alignment_visible` is what a ticket can
+        // name, and its `SELECT a.*` is what makes the two column sets equal.
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name FROM duckdb_columns() WHERE table_name = 'alignment_visible'",
+            )
+            .unwrap();
+        let actual: std::collections::BTreeSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let allowed: std::collections::BTreeSet<String> = ALIGNMENT_PROJECTION_COLUMNS
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+
+        assert_eq!(
+            actual,
+            allowed,
+            "the projection allowlist and alignment_visible's columns have drifted; \
+             only in the view: {:?}; only in the allowlist: {:?}",
+            actual.difference(&allowed).collect::<Vec<_>>(),
+            allowed.difference(&actual).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

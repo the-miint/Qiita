@@ -219,3 +219,40 @@ def test_reject_scopes_outside_ceiling():
     assert set(rejected) == {Scope.ADMIN_USER, Scope.REFERENCE_WRITE}
     # Sorted, so the API can echo them deterministically.
     assert rejected == sorted(rejected)
+
+
+def test_alignment_doget_is_on_every_role_ceiling_and_not_the_worker_one():
+    """alignment:doget is the HUMAN-callable alignment mint.
+
+    The inverse of `test_sequence_range_mint_is_workers_only`. It exists as a
+    separate scope precisely because `ticket:doget` is workers-only: that scope
+    signs a cohort the control plane read out of a work ticket's action_context,
+    which a worker's runner already validated. A human request has no work
+    ticket, so the new route resolves and authorizes the cohort per-study at
+    mint time instead — a different trust model, and reusing `ticket:doget`
+    would have put a human PAT on the worker path.
+
+    On every role ceiling because the per-study `Tier.VIEWER` check is the real
+    boundary; a plain user with access to a study may pull its alignments.
+    Absent from the service-account ceiling because workers keep using
+    `ticket:doget` — a worker holding both would be two ways in with two
+    different validation paths.
+    """
+    from qiita_control_plane.auth.scopes import (
+        ROLE_IMPLIED_SCOPES,
+        SERVICE_ACCOUNT_SCOPE_CEILING,
+    )
+
+    for role, ceiling in ROLE_IMPLIED_SCOPES.items():
+        assert Scope.ALIGNMENT_DOGET in ceiling, (
+            f"alignment:doget must be on role {role!r}'s ceiling — the per-study "
+            "tier check is the boundary, not the role"
+        )
+    assert Scope.ALIGNMENT_DOGET not in SERVICE_ACCOUNT_SCOPE_CEILING
+    # And the worker scope stays workers-only, which is the whole reason the
+    # new scope exists rather than widening this one.
+    assert Scope.TICKET_DOGET in SERVICE_ACCOUNT_SCOPE_CEILING
+    for role, ceiling in ROLE_IMPLIED_SCOPES.items():
+        assert Scope.TICKET_DOGET not in ceiling, (
+            f"ticket:doget must stay off role {role!r}'s ceiling"
+        )
