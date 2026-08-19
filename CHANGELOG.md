@@ -22,35 +22,6 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **An assembled genome now sits in `qiita.genome`, beside the reference MAGs it will be
-  compared against (#463).** `long-read-assembly` mints a `genome_idx` for each circular
-  contig (`LCG`), each DAS_Tool-refined bin (`MAG`), and each unbinned contig: one genome per
-  `(kind, bin_id)`, carrying one feature for the two single-contig kinds and many for a bin.
-  Reference data already loaded includes MAGs — just not ones we assembled — so putting ours
-  in the same `qiita.genome` / `qiita.feature_genome` relations is what lets one query reach
-  both. `assembly_hash` emits a fourth output, `genome_map.parquet`
-  (`read_id, genome_source, genome_source_id, prep_sample_idx`), and the workflow wires it as
-  `mint-features`'s second input. The writing machinery is the one reference-add already uses,
-  unchanged: `_associate_genomes` upserts `qiita.genome` and writes `feature_genome`, whose
-  many-to-many key means a contig byte-identical across two samples is one `feature_idx` under
-  two `genome_idx`.
-  **`genome.source_id` is the hash of `{prep_sample_idx, processing_idx, kind, bin_id}`** —
-  canonical JSON, SHA-256, hex — the discipline `processing_idx` and
-  `mask_definition.params_hash` already follow: unique within `source='qiita'`, idempotent on
-  a re-run under the same `processing_idx`, non-invertible. A content hash of the bin's member
-  set was rejected because `genome.prep_sample_idx` is a scalar FK: two samples assembling a
-  byte-identical single-contig genome would collapse onto one row that can record only one
-  origin sample. `bin_id` is already the contig id for `LCG` and `UNBINNED`, so the tuple is
-  the same shape for all three kinds. `assembly_hash` therefore threads `processing_idx` via
-  `params:`, which it did not previously need — sequences are run-agnostic, this identity is
-  not. The assembly tail becomes the second writer of `source='qiita'` rows, and (#462)'s
-  predicate already covers them: `qiita` is classified non-external, so `POST
-  /exported-feature` offers such a genome a minted `QF<n>` and never the params hash.
-  A comment-only migration records at `qiita.genome` what a row does not assert: minting a
-  genome for an unbinned contig is not a completeness claim, and it is consistent with a MAG
-  precisely because a MAG's completeness is unknown too — `bin_quality` measures it rather
-  than the genome row presuming it.
-
 - **Unbinned assembly contigs are stored, as a third `assembly_membership` kind (#460).**
   `assembly_hash` hashes the `noLCG.fa` residue — the contigs no DAS_Tool-refined bin
   claimed — alongside the circular genomes and the refined MAGs, so they are minted a
@@ -960,28 +931,35 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **Two assembled contigs whose FASTA headers shared a first token stored each other's
-  bytes (#463).** `read_fastx` returns one row per record and never deduplicates, so two
-  such records come back under one `read_id` and `assembly_hash`'s synthetic
-  `kind:bin_id:contig_id` collided. Pass 2 joins the per-hash `winner` on that id over a
-  fresh scan of every record, so each of the pair's two `sequence_hash` values received BOTH
-  contigs' chunks — the bytes stored for a feature then included a sequence that was not that
-  feature's, at the same `chunk_index`. Measured on a two-record fixture of 16 bp contigs:
-  2 chunk rows and 32 bytes under each of the two hashes, against 1 row and 16 bytes for the
-  byte-identical fixture whose second header's first token differs. `assembly_hash` now fails
-  the step, naming the repeated ids, when the synthetic id is not unique. The check reads the
-  whole scan rather than the surviving rows, because pass 2 re-derives the id from every
-  record — including one the unbinned-residue DELETE removed, whose bytes would still reach a
-  survivor's hash.
-  This also decides the identity question the genome minting above raises: a collision would
-  otherwise put two contigs under one `genome_source_id`, since `bin_id` for `LCG` and
-  `UNBINNED` is the assembler's contig id. Failing is the choice rather than making the id
-  positional, because a positional id would make a minted genome identity depend on a
-  record's ordinal in a file, and because a collision that reaches the data leaves the
-  manifest, bin_map and chunks all well-formed — there is nothing downstream to notice it.
-  Nothing established it does not happen: the host survey (#460) measured id PRESERVATION
-  through binning for `hifiasm_meta`, not within-file uniqueness, and `myloasm` — whose header
-  grammar differs — is unmeasured either way.
+- **Two assembled contigs in one FASTA whose headers shared a first token stored each
+  other's bytes (#463).** `read_fastx` returns one row per record, so two such records come
+  back under one `read_id`; sharing a file they also share `kind` and `bin_id`, so
+  `assembly_hash`'s whole synthetic `kind:bin_id:contig_id` repeated. Pass 2 joins the
+  per-hash `winner` on that id over a fresh scan of every record, so each of the pair's two
+  `sequence_hash` values received both contigs' chunks — the bytes stored for a feature then
+  included a sequence that was not that feature's, at the same `chunk_index`. Measured on a
+  two-record fixture of 16 bp contigs: 2 chunk rows and 32 bytes under each of the two
+  hashes, against 1 row and 16 bytes for the byte-identical fixture whose second header's
+  first token differs. `assembly_hash` now fails the step, naming the repeated ids, when the
+  synthetic id is not unique. The check reads the whole scan rather than the surviving rows,
+  because pass 2 re-derives the id from every record — including one the unbinned-residue
+  DELETE removed, whose bytes would still reach a survivor's hash. A colliding run leaves
+  the manifest, bin_map and chunks all well-formed, so nothing downstream can notice it.
+  Whether an assembler emits such a pair is unmeasured: the host survey (#460) measured id
+  preservation through binning for `hifiasm_meta`, not within-file uniqueness, and
+  `myloasm` — whose header grammar differs — is unmeasured either way. The same check also
+  catches the other route to a repeated id, a `:` inside a bin_id or contig id: `:` is a
+  separator and is not escaped, so bins `a:b.fa`/contig `c` and `a.fa`/contig `b:c` both
+  compose `MAG:a:b:c`.
+
+- **Two refined-bin FASTAs stemming to one `bin_id` merged into one bin (#463).**
+  `_FASTA_GLOBS` accepts `.fa` / `.fna` / `.fasta`, and `_local_id` strips the suffix, so
+  `bin.1.fa` and `bin.1.fna` both became `bin.1` — one bin where there were two, in
+  `bin_map` and so in `qiita.assembly_membership` and the `bin_quality` join it feeds, both
+  of which key a bin on `(prep_sample_idx, processing_idx, kind, bin_id)`. Measured as 1
+  distinct `bin_id` in `bin_map` against 2 for the same pair renamed. The read_id check
+  above does not reach it: with distinct contig ids every synthetic `MAG:bin.1:<contig>`
+  stays unique. `_file_meta` now raises, naming both filenames.
 
 - **xdist workers shared one miint extension directory, so they installed on top of
   each other (#462).** `setup_miint_test_env` named the directory per *component*
@@ -2089,6 +2067,25 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **`mint-features` pins its declared `inputs:` list (#463).** The runner's dispatch resolved
+  the manifest as `entry.inputs[0]`, so a workflow naming any other binding minted features out
+  of whatever path sat there. It now requires `inputs: [manifest]` and reads `bound["manifest"]`
+  by name, failing the entry otherwise — the shape `mint-annotation-features`,
+  `write-membership` and `write-assembly-membership` already use. The optional genome map is
+  unchanged: it stays an `action_context` binding (`genome_map_path`), not a declared input.
+
+- **`qiita.assembly_membership` documents its key prefix and its `bin_id` column (#463).**
+  A comment-only migration. The table comment: `(prep_sample_idx, processing_idx, kind,
+  bin_id)` is the subject identity — one circular genome, one refined bin, or one unbinned
+  contig — with `feature_idx` completing the row per member contig, and `kind` is what tells
+  the three apart (value set still enumerated only in `qiita_common.assembly_constants`,
+  which the comment points at). A subject records grouping and nothing about completeness,
+  for any kind; the `bin_quality` lake table measures that, per refined bin, from CheckM.
+  `bin_id` gains its first column comment: what it holds depends on `kind` — a refined
+  bin's FASTA filename stem, or, for a circular or unbinned contig, that contig's own
+  assembler-given id — which is the fact that makes the three-way subject claim hold, and
+  is not recoverable from the bare `TEXT` column.
 
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that

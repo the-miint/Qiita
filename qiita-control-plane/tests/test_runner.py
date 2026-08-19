@@ -5461,48 +5461,9 @@ async def test_runner_local_passthrough_threads_paths(
     ]
 
 
-async def test_dispatch_mint_features_takes_the_genome_map_as_a_declared_input(
-    postgres_pool, library_spy, tmp_path
-):
-    """mint-features resolves `genome_map` from `entry.inputs` when the workflow
-    declares it — the long-read-assembly shape.
-
-    The two inputs are resolved by NAME: the entry below lists them in the
-    non-obvious order, and the manifest must still arrive as the manifest.
-    """
-    from qiita_common.actions import WorkflowAction
-
-    from qiita_control_plane.runner import _run_action_primitive
-
-    manifest = tmp_path / "manifest.parquet"
-    genome_map = tmp_path / "genome_map.parquet"
-    manifest.touch()
-    genome_map.touch()
-    entry = WorkflowAction(
-        kind="action",
-        name="mint-features",
-        inputs=["genome_map", "manifest"],
-        outputs=["feature_map"],
-    )
-
-    await _run_action_primitive(
-        postgres_pool,
-        entry,
-        {"manifest": str(manifest), "genome_map": str(genome_map)},
-        tmp_path / "ws",
-        {"kind": "prep_sample", "prep_sample_idx": 1},
-        work_ticket_idx=1,
-        signing_key=b"\x00" * 32,
-        data_plane_url="grpc://unused:50051",
-    )
-    call = next(c for c in library_spy.calls if c[0] == "mint-features")
-    assert call[1] == manifest
-    assert call[3] == genome_map
-
-
 async def test_dispatch_mint_features_rejects_unknown_inputs(postgres_pool, library_spy, tmp_path):
     """An `inputs:` list mint-features cannot resolve fails the entry rather than
-    silently minting from whichever binding sat first."""
+    minting features out of whichever binding sat first."""
     from qiita_common.actions import WorkflowAction
 
     from qiita_control_plane.runner import _run_action_primitive

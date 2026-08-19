@@ -38,11 +38,10 @@ _None yet._
   (`qiita-common/src/qiita_common/assembly_constants.py`) instead of listing its members,
   which went stale when unbinned contigs became a third kind. (#460)
 
-- `20260819000000_genome_completeness_comment.sql` — plain `make migrate`, no out-of-band
-  setup. Comment only, no schema change: `qiita.genome` gains a table comment saying a row
-  asserts that its features were grouped as one subject, not that the genome is complete —
-  the assembly tail now mints one per circular contig, refined bin, and unbinned contig.
-  (#463)
+- `20260819000000_assembly_membership_subject_comment.sql` — plain `make migrate`, no
+  out-of-band setup. Comment only, no schema change: it supersedes the
+  `qiita.assembly_membership` table comment `20260818000000` above sets, and adds the first
+  comment on the `bin_id` column. (#463)
 
 ### 4. Deploy
 
@@ -65,11 +64,10 @@ _None yet._
 
 - **`long-read-assembly` 1.0.0 is edited in place, not versioned** — `activate.sh`'s
   `qiita-admin actions sync` re-syncs it, so the `qiita.action` list check `make
-  verify-deploy` already runs is the confirmation it landed. It gained no step: the
-  `assembly_hash` step reads one more file (`noLCG.fa`) out of the `genomes_dir` it already
-  binds (#460), and emits one more output (`genome_map`) that `mint-features` consumes as a
-  second input, plus a `processing_idx` param the runner already mints for `assembly_load`
-  (#463). Both are control-plane-side bindings — no new bind mount, resource, or env var.
+  verify-deploy` already runs is the confirmation it landed. It gained no step and no
+  declared input: the `assembly_hash` step reads one more file (`noLCG.fa`) out of the
+  `genomes_dir` it already binds, so there is no new bind mount, resource, or env var.
+  (#460)
 
 ### 6. After the deploy verifies green
 
