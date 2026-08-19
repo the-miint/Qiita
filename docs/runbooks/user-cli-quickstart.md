@@ -9,9 +9,6 @@ system. To bring in a whole sequencing run instead, one command does the
 run, the pool and every sample for you from the run's pre-flight file:
 [`getting-started.md`](getting-started.md).
 
-This doubles as the post-deploy smoke test an operator runs
-([`first-deploy.md`](first-deploy.md) Step 11 links here).
-
 ## Before you start
 
 You need the `qiita` command, a token, a filled-in profile, and a study
@@ -129,12 +126,3 @@ past the time the step should take is worth raising with your operator.
 - **Machine accounts.** The tokens the compute side uses to call back into
   Qiita are provisioned separately; see
   [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md).
-
-## Smoke-testing this flow
-
-The integration test `tests/integration/test_user_authoring_smoke.py`
-walks this flow end-to-end, starting from the study and biosample its
-prerequisites name: it stands up a real control-plane server and shells
-out to the actual `qiita` CLI for every command, so the flag names in
-this runbook are mechanically pinned against argparse drift. Run it via
-`make test-integration`.

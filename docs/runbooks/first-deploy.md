@@ -1110,7 +1110,11 @@ carries it from there to a `COMPLETED` ticket.
 
 Together the two drive the smoke from a fresh user PAT through to a
 `COMPLETED` ticket and a `reads.parquet` artifact, with verification
-commands at each layer. Compute service-account provisioning per
+commands at each layer. The same walk runs unattended as
+`tests/integration/test_user_authoring_smoke.py` (`make test-integration`),
+which stands up a control plane and shells out to the real `qiita` CLI for
+every command — so the flags both runbooks document are pinned against
+argparse drift. Compute service-account provisioning per
 [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md)
 is the one prerequisite that remains operator-side after step 10 —
 `qiita-admin actions sync` is now run automatically by
