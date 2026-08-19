@@ -8,10 +8,13 @@
 //! with DATA_PATH as a separate option specifying Parquet storage location.
 //! Requires both `ducklake` and `postgres` extensions.
 //!
-//! DuckLake does not support UNIQUE or FK constraints. Data integrity
-//! (no duplicate feature_idx, valid reference_idx) must be enforced
-//! programmatically before insertion — the control plane owns dedup,
-//! the orchestrator verifies before loading.
+//! DuckLake does not support UNIQUE or FK constraints, so data integrity
+//! (no duplicate feature_idx, valid reference_idx) is enforced programmatically.
+//! Mostly before insertion — the control plane owns dedup, the orchestrator
+//! verifies before loading — but not entirely: a feature is shared across
+//! producers, so no producer can know whether the lake already holds it. That
+//! part is enforced AT insertion, by the data plane
+//! (`flight_service::REPLACE_KEY_TABLES`).
 
 use duckdb::Connection;
 
@@ -26,6 +29,13 @@ fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Parquet row-group size (rows) DuckLake should use when it rewrites the chunked
+/// sequence tables. Must equal `qiita_common.chunking.CHUNK_ROW_GROUP_SIZE`: the
+/// orchestrator writes those chunk Parquets at this row count
+/// (`PARQUET_OPTS_CHUNKED` `ROW_GROUP_SIZE`), and the per-table `set_option` calls
+/// below pin DuckLake's own rewrites to the same layout.
+const CHUNK_ROW_GROUP_SIZE: u64 = 16384;
 
 /// Connect to DuckLake backed by a Postgres catalog.
 ///
@@ -46,13 +56,37 @@ pub fn connect_ducklake(
     Ok(())
 }
 
+/// Set the catalog-global Parquet options DuckLake uses for its OWN writes
+/// (compaction, merge, any future direct insert), aligning them with how
+/// register_files writes our files: `qiita_common.parquet.PARQUET_OPTS` is
+/// zstd + Parquet v2, whereas DuckLake defaults to snappy + v1. Without this,
+/// DuckLake's maintenance rewrites would drift from the register-time format.
+///
+/// These options are PERSISTED in `ducklake_metadata` (catalog-global), so they
+/// only need to be set ONCE per catalog. Call this on the PROCESS-START
+/// connection only — NEVER on a per-request attach. Setting it on every attach
+/// made each concurrent Flight request UPDATE the same `ducklake_metadata` row,
+/// which serialized and failed under load with Postgres SQLSTATE 40001
+/// (`could not serialize access due to concurrent update`). Keep the values in
+/// sync with PARQUET_OPTS.
+pub fn set_catalog_options(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CALL qiita_lake.set_option('parquet_compression', 'zstd');
+         CALL qiita_lake.set_option('parquet_version', 2);",
+    )?;
+    Ok(())
+}
+
 /// Create the reference data tables in DuckLake if they don't already exist.
 ///
 /// Note on DuckLake constraints: DuckLake does not support UNIQUE, PK, or FK
-/// constraints. Data integrity is enforced upstream:
+/// constraints. Data integrity is enforced upstream, plus one rule at register
+/// time that no upstream producer is in a position to enforce:
 /// - The control plane deduplicates features by sequence_hash before minting feature_idx
 /// - The orchestrator verifies data before loading
 /// - The data plane validates identifier sets programmatically on DoAction
+/// - `reference_sequences` / `reference_sequence_chunks` are additionally
+///   REPLACED on `feature_idx` at register time — `flight_service::REPLACE_KEY_TABLES`
 ///
 /// Per-table storage tuning (compression, row group size) is deferred to a
 /// separate configuration pass — see DuckLake configuration docs.
@@ -118,12 +152,69 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             like_weight_ratio DOUBLE,
             distal_length DOUBLE,
             pendant_length DOUBLE
+        );
+
+        -- Annotations: a feature that is a REGION OF another feature — a SynDNA
+        -- insert on its plasmid, a gene on a chromosome. Every other reference table
+        -- treats feature_idx as a WHOLE sequence; this is the one place it is a
+        -- sub-interval, which is what lets a quantification be keyed by the thing
+        -- measured (the insert) while reads align to the thing sequenced (the plasmid).
+        --
+        --   annotation_idx     -- the OCCURRENCE's identity, minted by the control
+        --                        plane. This is the join back to the Postgres claim
+        --                        (qiita.reference_annotation) and to the semantic terms
+        --                        (qiita.annotation_term via qiita.annotation_to_term).
+        --   feature_idx        -- the annotated interval's BYTES (minted from the
+        --                        canonical hash of the EXTRACTED sub-sequence).
+        --   parent_feature_idx -- the sequence it sits on, and what reads align to.
+        --   annotation_id      -- the GFF3 `ID`. PROVENANCE ONLY — nullable, and NOT
+        --                        unique: GFF3 lets a discontinuous feature repeat one ID
+        --                        across N lines (NCBI's E. coli RefSeq has 20 such).
+        --
+        -- feature_idx is NOT the occurrence's identity either: identical bases share one
+        -- feature_idx (a bacterial 16S occurs in 5-7 byte-identical copies), so a feature
+        -- is a SEQUENCE and an annotation is an OCCURRENCE of it at a place. A consumer
+        -- aggregating coverage over a feature sums across its occurrences.
+        --
+        -- Annotated features are deliberately absent from reference_membership (which
+        -- is what gets INDEXED and aligned against) and from reference_sequences /
+        -- _chunks (the bytes are recoverable from parent + interval). Rationale in
+        -- full: qiita-control-plane/db/migrations/20260713020000_reference_annotation.sql
+        --
+        -- Coordinates are 1-based HALF-OPEN [position, stop_position) — matching
+        -- read_alignments / alignment_slice / qiita_lake.alignment, NOT the closed
+        -- convention GFF3 arrives in. Converted once, at ingest, in hash_sequences.
+        --
+        -- `attributes` is kept RAW and lossless (it is what the GFF3 said). The
+        -- normalized cross-references parsed out of it live in Postgres as
+        -- qiita.annotation_term — the MAP stays so that a system we do not yet parse is
+        -- still recoverable without a re-ingest.
+        CREATE TABLE IF NOT EXISTS qiita_lake.reference_annotation (
+            annotation_idx BIGINT NOT NULL,
+            reference_idx BIGINT NOT NULL,
+            feature_idx BIGINT NOT NULL,
+            parent_feature_idx BIGINT NOT NULL,
+            annotation_id VARCHAR,
+            source VARCHAR,
+            annotation_type VARCHAR NOT NULL,
+            position BIGINT NOT NULL,
+            stop_position BIGINT NOT NULL,
+            strand VARCHAR NOT NULL,
+            score DOUBLE,
+            phase SMALLINT,
+            attributes MAP(VARCHAR, VARCHAR)
         );",
     )?;
+    // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk
+    // writer uses (see CHUNK_ROW_GROUP_SIZE).
+    conn.execute_batch(&format!(
+        "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
+         table_name => 'reference_sequence_chunks');"
+    ))?;
     Ok(())
 }
 
-/// Create the read + read_mask tables and the read_masked view in DuckLake.
+/// Create the read + read_mask tables and the read_masked macro in DuckLake.
 ///
 /// These hold per-sample sequencing reads and the downstream masks that record,
 /// per read, whether it survives QC/host filtering and how it should be trimmed.
@@ -137,10 +228,12 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 ///
 /// PRIVACY: `read` and `read_mask` are deliberately NOT exposed via Flight
 /// (they are absent from `flight_service::ALLOWED_TABLES`). The only
-/// Flight-reachable read surface is the `read_masked` view, which joins read to
+/// Flight-reachable read surface is the `read_masked` MACRO, which joins read to
 /// read_mask, applies the recorded trims, and excludes every non-`pass` row
-/// (host/human hits + QC failures) via `WHERE m.reason = 'pass'`. Human reads
-/// are therefore unreachable by construction, not by a scope check.
+/// (host/human hits + QC failures) via an unconditional `reason = 'pass'`. Human
+/// reads are therefore unreachable by construction, not by a scope check. What
+/// its required (mask, samples) parameters foreclose is on the macro itself,
+/// below.
 pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "-- Full reads, written ONCE per sequenced sample. Independent of any mask.
@@ -180,26 +273,101 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 
         -- The masking + access boundary: join read to read_mask, apply trims,
         -- and exclude every non-'pass' row. This is the ONLY Flight-reachable
-        -- read surface. substr() takes a 1-based start and a LENGTH; list slicing
-        -- is 1-based and inclusive on both ends. The qual arrays are guarded for
-        -- NULL (FASTA / single-end) symmetrically with their sequence columns.
+        -- read surface.
+        --
+        -- A MACRO, not a view, and the parameters are the point. DuckDB derives a
+        -- transitive predicate across a join equality for `col = const` but NOT for
+        -- `col IN (list)`, so a view can only ever receive a multi-sample scope on
+        -- ONE side of this join: the `read` scan got no filter at all, DuckLake
+        -- pruned nothing, and every file in the lake was read. Taking the scope as
+        -- a parameter puts it on BOTH inputs explicitly instead of hoping the
+        -- optimizer propagates it.
+        --
+        -- Upstream cause, traced 2026-08-03 and NOT reported as of that date (no
+        -- issue number to cite yet — file it against duckdb/duckdb, not ducklake:
+        -- the reproducer needs no DuckLake). DuckDB's filter pull-up
+        -- (`src/optimizer/filter_combiner.cpp`) mirrors only comparison
+        -- expressions: `FilterCombiner::AddFilter` returns UNSUPPORTED for
+        -- anything that is not a comparison/BETWEEN, and `SupportedFilterComparison`
+        -- omits COMPARE_IN, so an IN or an OR-of-equalities lands in
+        -- `remaining_filters` and is emitted verbatim, never entering the
+        -- equivalence-set maps that do the mirroring. Still present on main after
+        -- the join-filter-mirroring work (duckdb PR #23009), so this is not a
+        -- version we can wait out. Note a CONTIGUOUS integer IN list is rewritten
+        -- to a range and DOES mirror — any reproducer must use a SPARSE list.
+        --
+        -- Measured on DuckDB 1.5.4 against a local DuckLake of 1,000,000 `read`
+        -- rows over 200 samples, one file per sample (the layout fastq_to_parquet
+        -- writes), 10% of rows non-'pass'. Query is a realistic block — one partial
+        -- head sample, 18 complete, one partial tail — selecting 84,600 rows.
+        -- Figures are rows the scans actually produced (EXPLAIN ANALYZE):
+        --
+        --     view    948,999 read +  84,600 read_mask = 1,033,599
+        --     macro    93,999 read +  84,600 read_mask =   178,599
+        --     floor    84,600 read +  84,600 read_mask =   169,200
+        --
+        -- The macro's `read` figure is 84,600/0.9 to the row, i.e. its entire
+        -- residual is the non-'pass' rate and the two partial end samples cost
+        -- nothing. In production this shape fully scanned a ~20.7-billion-row
+        -- `read`; a single-sample equality scoped the same query to 5,356 rows in
+        -- 0.147 s — which is why this went unnoticed. A one-element IN is rewritten
+        -- to `=`, so single-sample blocks (every long-read tile) were always fine.
+        --
+        -- Two rejected alternatives, both measured, so they are not re-proposed:
+        -- passing the block's sequence_idx range as further parameters is identical
+        -- to the row (once the sample scope prunes to the right per-sample files the
+        -- block's global range spans them anyway), and pushing per-member
+        -- (sample, range) pairs down as an EXISTS is far WORSE than the view —
+        -- 1,900,000 rows, because it defeats file pruning entirely. Hence ONE macro,
+        -- with `read_masked_block` reusing it and leaving its member terms an outer
+        -- filter.
+        --
+        -- Required parameters also make an unscoped fleet-wide masked read
+        -- UNREPRESENTABLE rather than merely refused — there is no argument list
+        -- that means `every sample`, so the macro has no whole-table form to
+        -- construct. THIS IS THE ONE SITE THAT ENFORCES THAT, and every other
+        -- comment on the subject points here. The control plane's mandatory-filter
+        -- invariant (routes/read_masked.py) stays as defence in depth but is no
+        -- longer the only thing between a mis-signed ticket and every study's reads.
+        --
+        -- Needs DuckDB >= 1.5 (we pin libduckdb 1.5.4): on 1.4 this CREATE fails
+        -- outright with `DuckLake does not support functions`, so the parameterized
+        -- form is not available on an older engine at all.
+        --
+        -- substr() takes a 1-based start and a LENGTH; list slicing is 1-based and
+        -- inclusive on both ends. The qual arrays are guarded for NULL (FASTA /
+        -- single-end) symmetrically with their sequence columns.
         --
         -- Trim arithmetic: length() is signed BIGINT, so `length - left - right`
         -- promotes the UINTEGER trims to signed — no unsigned underflow even when
         -- the result is negative. At the exact full-trim boundary
         -- (left+right == length) substr length is 0 -> '' and the slice end < start
-        -- -> [], consistently. The view ASSUMES the upstream invariant
+        -- -> [], consistently. This ASSUMES the upstream invariant
         -- left_trim+right_trim <= length (enforced upstream at mask-emit time: a
         -- read trimmed below min_length is reason='qc_too_short', never 'pass').
         -- An out-of-contract over-trim row would yield inconsistent bytes; it is
         -- a producer bug, not handled here.
         --
-        -- CREATE OR REPLACE (not IF NOT EXISTS): the view is pure metadata, so a
+        -- CREATE OR REPLACE (not IF NOT EXISTS): the macro is pure metadata, so a
         -- definition change here is reconciled on every DP startup. IF NOT EXISTS
         -- would silently keep a stale definition on an already-attached catalog —
-        -- a privacy-surface footgun (the WHERE reason='pass' predicate lives
-        -- here). Tables stay IF NOT EXISTS — they hold data.
-        CREATE OR REPLACE VIEW qiita_lake.read_masked AS
+        -- a privacy-surface footgun (the reason='pass' predicate lives here).
+        -- Tables stay IF NOT EXISTS — they hold data.
+        --
+        -- The DROP VIEW migrates an already-deployed catalog off the view this
+        -- macro replaces, and it is NOT what keeps the CREATE below working:
+        -- DuckLake keeps views and macros in separate catalog tables, so the two
+        -- coexist under one name and BOTH call forms resolve (probed on 1.5.4
+        -- against a real DuckLake catalog, either creation order; a table-vs-view
+        -- collision does error, so the probe could have failed). That coexistence
+        -- is precisely the problem: without the DROP, the old unparameterized view
+        -- survives the upgrade and `SELECT * FROM qiita_lake.read_masked` keeps
+        -- working unscoped on every catalog that already has one — the exact form
+        -- the arguments exist to remove. With it, that call is a Catalog Error and
+        -- only the parameterized form remains.
+        DROP VIEW IF EXISTS qiita_lake.read_masked;
+
+        CREATE OR REPLACE MACRO qiita_lake.read_masked(p_mask_idx, p_preps) AS TABLE
         SELECT
             m.mask_idx,
             m.prep_sample_idx,
@@ -214,23 +382,255 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
                        length(r.sequence2) - m.left_trim2 - m.right_trim2) END AS sequence2,
             CASE WHEN r.qual2 IS NULL THEN NULL ELSE
                 r.qual2[m.left_trim2 + 1 : len(r.qual2) - m.right_trim2] END AS qual2
-        FROM qiita_lake.read r
-        JOIN qiita_lake.read_mask m
+        FROM (SELECT * FROM qiita_lake.read
+              WHERE prep_sample_idx IN (SELECT unnest(p_preps))) r
+        JOIN (SELECT * FROM qiita_lake.read_mask
+              WHERE mask_idx = p_mask_idx
+                AND reason = 'pass'
+                AND prep_sample_idx IN (SELECT unnest(p_preps))) m
           ON r.prep_sample_idx = m.prep_sample_idx
-         AND r.sequence_idx = m.sequence_idx
-        WHERE m.reason = 'pass';
+         AND r.sequence_idx = m.sequence_idx;",
+    )?;
+    Ok(())
+}
 
-        -- sparse feature table: one row per (sample, processing, feature). feature_idx is
-        -- the CP-minted hash-deduped feature identity (never an md5 string — see CLAUDE.md).
-        -- carries no sequence bytes, so unlike `read` it is Flight-reachable. the producer
-        -- writes it sorted by the canonical result order for DuckLake + row-group pruning.
-        CREATE TABLE IF NOT EXISTS qiita_lake.feature_counts (
+/// Create the DuckLake `alignment` table — the sink for the sharded-alignment
+/// consumer.
+///
+/// One row per emitted alignment: the `align_sharded` native job aligns a block
+/// of a sample's HOST-DEPLETED reads against a sharded reference and register-files
+/// lands its `alignment.parquet` here. The table is keyed by the CP-minted
+/// `alignment_idx` (the align config's params-hash identity: reference, aligner,
+/// mask, and shard-set), NOT by the deferred processing_idx / processed_prep_sample
+/// hierarchy. It carries `feature_idx` (the aligned subject) but NOT
+/// `reference_idx`: reference scoping is a query-time join against
+/// `reference_membership`, and a feature's shard is likewise derivable via
+/// `reference_membership.shard_id`, so there is no per-row `shard_id` column either
+/// (the identifier-ownership design in CLAUDE.md).
+///
+/// Column order = the exact order `align_sharded`'s COPY writes (so register-files'
+/// `ducklake_add_data_files` schema-matches for free): the five CP identity columns
+/// (`alignment_idx`, `prep_sample_idx`, `sequence_idx`, `feature_idx`,
+/// `mate_feature_idx`) followed by the miint aligner output
+/// `a.* EXCLUDE (read_id, reference, mate_reference)` — the SAM columns MINUS the raw
+/// VARCHAR subject ids, which are dropped because `feature_idx` / `mate_feature_idx`
+/// (cast from them) already carry that identity. That miint output was qiita-verified
+/// against the team-mirror v1.5.4 build for BOTH `align_minimap2_sharded` and
+/// `align_bowtie2_sharded` (identical schema; see docs/duckdb-miint.md). The types
+/// match miint exactly (`flags` USMALLINT, `mapq` UTINYINT, positions/lengths BIGINT)
+/// so the parquet registers without a cast; a miint SAM-schema change would need a
+/// matching migration here (coupled to the pinned DuckDB/miint version, per the
+/// version-lockstep discipline).
+///
+/// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
+/// (integrity is enforced upstream — the CP mints alignment_idx; align_sharded
+/// stamps feature_idx). Exposed via Flight DoGet (in flight_service::ALLOWED_TABLES)
+/// for the feature-table (OGU) consumer: reads are always scoped to a single
+/// alignment_idx + an explicit prep_sample_idx set, and projected to the columns
+/// the ticket signed — required on this surface, and drawn from the allowlist
+/// `flight_service::ALIGNMENT_PROJECTION_COLUMNS`, which mirrors the column list
+/// below. An unscoped or unprojected read is refused. This is host-depleted
+/// derived data, not raw human reads.
+pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.alignment (
+            -- CP identity columns (align_sharded prepends these to the aligner output).
+            alignment_idx    BIGINT NOT NULL,
+            prep_sample_idx  BIGINT NOT NULL,
+            sequence_idx     BIGINT NOT NULL,
+            feature_idx      BIGINT NOT NULL,
+            mate_feature_idx BIGINT,
+            -- miint aligner output minus the raw VARCHAR subject ids
+            -- (reference / mate_reference): their identity is already carried by
+            -- feature_idx / mate_feature_idx (cast from them in align_sharded), so
+            -- persisting the strings too would be redundant.
+            flags            USMALLINT,
+            position         BIGINT,
+            stop_position    BIGINT,
+            mapq             UTINYINT,
+            cigar            VARCHAR,
+            mate_position    BIGINT,
+            template_length  BIGINT,
+            tag_as           BIGINT,
+            tag_xs           BIGINT,
+            tag_ys           BIGINT,
+            tag_xn           BIGINT,
+            tag_xm           BIGINT,
+            tag_xo           BIGINT,
+            tag_xg           BIGINT,
+            tag_nm           BIGINT,
+            tag_yt           VARCHAR,
+            tag_md           VARCHAR,
+            tag_sa           VARCHAR
+        );",
+    )?;
+    Ok(())
+}
+
+/// Create the reference-exclusion table and the exclusion-aware `_visible` views.
+///
+/// `reference_exclusion` is the data-plane mirror of the control-plane blocklist
+/// (`qiita.reference_exclusion`): the RESOLVED set of `feature_idx` to exclude
+/// (direct feature blocks plus every feature of a blocked genome). The control
+/// plane recomputes and ships it WHOLESALE via the `sync_reference_exclusion`
+/// DoAction; here it is just a one-column table the views anti-join against.
+///
+/// `alignment_visible` / `reference_taxonomy_visible` are the ONLY
+/// exclusion-aware read surfaces: each is its base table minus every row whose
+/// `feature_idx` is blocked (an `ANTI JOIN` — cheap in DuckDB; the build side is
+/// a tiny curated list). A blocked genome/feature therefore never reaches an OGU
+/// feature table or a taxonomy lineage, even though it stays in the base table:
+/// exclusion is read-time only, so no aligner index is rebuilt. Phylogeny is
+/// deliberately NOT viewed here — `reference_phylogeny` is not row-independent
+/// (a node carries parent/child structure; `feature_idx` is on tips only), so a
+/// row-wise anti-join would orphan internal parents and malform the tree. The
+/// contract instead is that a tree consumer shears the tree to the keep-set
+/// (`tips WHERE feature_idx NOT IN reference_exclusion`) with miint's
+/// `shear_tree`, so no phylogeny view is built. The consumer today is the
+/// client-side `qiita feature-table build --tree`, which honours that keep-set by
+/// reading the blocklist over REST — this being the one read surface that cannot
+/// hand it an exclusion-aware view — and intersects it with the genomes its table
+/// publishes. Neither set implies the other: a curator can block one contig of a
+/// genome that still publishes on a sibling's alignments.
+///
+/// `CREATE OR REPLACE VIEW` (not `IF NOT EXISTS`), for the same reason the
+/// `read_masked` macro is `CREATE OR REPLACE`: the
+/// anti-join predicate IS the enforcement surface, so a definition change must
+/// reconcile on every DP startup rather than silently keep a stale view on an
+/// already-attached catalog. Must run AFTER `ensure_reference_tables` +
+/// `ensure_alignment_tables` (the views reference `reference_taxonomy` +
+/// `alignment`).
+pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "-- Resolved excluded feature_idx set, mirrored wholesale from the CP
+        -- blocklist. Same DuckLake constraint story as the sibling tables: no
+        -- PK/UNIQUE/FK (the CP owns integrity; a replayed sync is a full replace).
+        CREATE TABLE IF NOT EXISTS qiita_lake.reference_exclusion (
+            feature_idx BIGINT NOT NULL
+        );
+
+        CREATE OR REPLACE VIEW qiita_lake.alignment_visible AS
+        SELECT a.*
+        FROM qiita_lake.alignment a
+        ANTI JOIN qiita_lake.reference_exclusion x USING (feature_idx);
+
+        CREATE OR REPLACE VIEW qiita_lake.reference_taxonomy_visible AS
+        SELECT t.*
+        FROM qiita_lake.reference_taxonomy t
+        ANTI JOIN qiita_lake.reference_exclusion x USING (feature_idx);",
+    )?;
+    Ok(())
+}
+
+/// Create the assembly-result tables in DuckLake — the assembly analogue of the
+/// reference-sequence tables, following the SAME chunked + content-hashed model.
+///
+/// A contig is stored ONCE, deduped by content hash and keyed by the CP-minted
+/// `feature_idx` (the shared `qiita.feature` space, minted via `mint-features`),
+/// exactly like a reference sequence. The bytes are 64 KB chunks (reassemble via
+/// `string_agg(chunk_data, '' ORDER BY chunk_index)`), never a bulk VARCHAR cell.
+/// `assembly_membership` records which features a prep_sample's assembly contains
+/// and in which bin (a circular LCG genome or a refined MAG) — the DuckLake copy
+/// of `qiita.assembly_membership`, for bulk joins against the sequences.
+/// `bin_quality` is per-MAG CheckM, joined to its contigs via assembly_membership
+/// on (prep_sample_idx, kind, bin_id).
+///
+/// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
+/// (the CP mints feature_idx/dedups on sequence_hash, the orchestrator verifies
+/// before load, and the data plane replaces on the key at register time).
+/// `assembled_sequence` /
+/// `assembled_sequence_chunks` are additionally REPLACED on `feature_idx` at
+/// register time — `flight_service::REPLACE_KEY_TABLES`, which also says why
+/// `assembly_membership` / `bin_quality` are not.
+///
+/// NOTE: not yet exposed via Flight (absent from `flight_service::ALLOWED_TABLES`).
+/// register_files loads them and they are SQL-queryable in the catalog; they are
+/// intentionally not on the external Flight read-back path (`ALLOWED_TABLES`).
+pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "-- One row per UNIQUE contig (content-hash deduped), keyed by the minted
+        -- feature_idx. Mirrors reference_sequences: sequence_length_bp lives here
+        -- (kept for coverage), the bytes live in the chunks table.
+        CREATE TABLE IF NOT EXISTS qiita_lake.assembled_sequence (
+            feature_idx BIGINT NOT NULL,
+            sequence_hash UUID NOT NULL,
+            sequence_length_bp BIGINT NOT NULL
+        );
+
+        -- The contig bytes in 64 KB chunks (reassemble with
+        -- string_agg(chunk_data, '' ORDER BY chunk_index)). Mirrors
+        -- reference_sequence_chunks; loaded multi-file (a <table>/ subdir of parts)
+        -- so a large assembly never OOMs a single-file sort+write.
+        CREATE TABLE IF NOT EXISTS qiita_lake.assembled_sequence_chunks (
+            feature_idx BIGINT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            chunk_data VARCHAR NOT NULL
+        );
+
+        -- Which features a (prep_sample, processing) assembly run contains, and in
+        -- which bin. processing_idx disambiguates runs (bin_id reused across
+        -- samples AND runs); kind is 'LCG' | 'MAG' (value set owned by the
+        -- producer). The DuckLake copy of qiita.assembly_membership for bulk joins
+        -- with the sequences.
+        CREATE TABLE IF NOT EXISTS qiita_lake.assembly_membership (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,
-            processed_prep_sample_idx BIGINT NOT NULL,
-            feature_idx BIGINT NOT NULL,
-            value DOUBLE NOT NULL
+            kind VARCHAR NOT NULL,
+            bin_id VARCHAR NOT NULL,
+            feature_idx BIGINT NOT NULL
+        );
+
+        -- Per-MAG CheckM quality. Joins to its contigs via assembly_membership on
+        -- (prep_sample_idx, processing_idx, kind, bin_id). completeness /
+        -- contamination / strain_heterogeneity + marker_lineage from `checkm
+        -- lineage_wf --tab_table`; genome_size / n_contigs from `checkm qa -o 2`;
+        -- das_tool_score / source_binner are DAS_Tool provenance. The assembler is
+        -- captured in qiita.processing (processing_idx), not repeated here.
+        CREATE TABLE IF NOT EXISTS qiita_lake.bin_quality (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            kind VARCHAR NOT NULL,
+            bin_id VARCHAR NOT NULL,
+            marker_lineage VARCHAR,
+            completeness DOUBLE,
+            contamination DOUBLE,
+            strain_heterogeneity DOUBLE,
+            genome_size BIGINT,
+            n_contigs BIGINT,
+            das_tool_score DOUBLE,
+            source_binner VARCHAR
         );",
+    )?;
+    // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk
+    // writer uses (see CHUNK_ROW_GROUP_SIZE).
+    conn.execute_batch(&format!(
+        "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
+         table_name => 'assembled_sequence_chunks');"
+    ))?;
+    Ok(())
+}
+
+/// Create the one row that registrations into the content-addressed tables
+/// serialize on, and seed it.
+///
+/// Why a lock is needed at all, and what it buys, lives at the one site that
+/// takes it — `flight_service::register_files`. What matters here is the shape:
+/// EXACTLY ONE row, holding a value nothing reads. `register_files` fails loudly
+/// if its UPDATE matches no row, because a lock that silently stopped locking
+/// reintroduces the duplication this table exists to prevent.
+///
+/// The seeding INSERT is guarded so a restart does not add a second row. Two data
+/// planes booting together could still both insert; that degrades nothing — an
+/// extra row is one more thing every writer updates, so they still contend.
+pub fn ensure_registration_lock(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "-- One row, ever. `epoch` is a bump counter, not a timestamp: it is never
+        -- read, and it is a counter rather than a constant only so the UPDATE that
+        -- takes the lock is a real mutation.
+        CREATE TABLE IF NOT EXISTS qiita_lake.registration_lock (epoch BIGINT NOT NULL);
+
+        INSERT INTO qiita_lake.registration_lock (epoch)
+        SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM qiita_lake.registration_lock);",
     )?;
     Ok(())
 }
@@ -238,6 +638,7 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::DataType;
     use serial_test::serial;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -271,6 +672,12 @@ mod tests {
         std::fs::create_dir_all(&data_path).unwrap();
         connect_ducklake(&conn, &connstr, &data_path)
             .expect("failed to connect DuckLake — check DUCKLAKE_CATALOG_CONNSTR");
+        // This helper mirrors the production BOOT connection (main.rs): it creates
+        // the tables AND sets the catalog-global Parquet options once. connect_ducklake
+        // no longer does. The options persist in the shared Postgres catalog, so
+        // per-request connections (flight_service, in tests as in production) inherit
+        // them and correctly do NOT re-set them.
+        set_catalog_options(&conn).expect("failed to set catalog options");
         conn
     }
 
@@ -326,6 +733,89 @@ mod tests {
             cols.contains(&"sequence_length_bp".to_string()),
             "missing sequence_length_bp column, got: {cols:?}"
         );
+    }
+
+    /// `reference_annotation` is the first `qiita_lake` table with a MAP column, and
+    /// the only one a producer writes as a ZERO-ROW file on the common path (every
+    /// reference ingested without a GFF3 emits one). Both properties are load-bearing
+    /// and neither is exercised anywhere else, so pin them here — against the real
+    /// DDL rather than a copy of it.
+    ///
+    /// The zero-row half is not a formality: `register-files` moves EVERY staging
+    /// `*.parquet` into the lake, so a no-GFF reference-add registers an empty file on
+    /// every single run. If DuckLake rejected that, the annotation work would break
+    /// reference ingest for references that have nothing to do with annotations.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn reference_annotation_accepts_a_map_column_and_a_zero_row_file() {
+        let conn = setup_conn();
+        ensure_reference_tables(&conn).unwrap();
+        let id = next_test_id();
+        let _cleanup = Cleanup {
+            conn: &conn,
+            table: "reference_annotation",
+            column: "reference_idx",
+            id,
+        };
+
+        // A populated row: the MAP round-trips, and the per-insert mass the cell-count
+        // model needs is reachable by key. Columns are named rather than positional —
+        // the row carries a minted annotation_idx now, and a positional VALUES list
+        // silently shifts every column when one is added.
+        conn.execute_batch(&format!(
+            "INSERT INTO qiita_lake.reference_annotation \
+             (annotation_idx, reference_idx, feature_idx, parent_feature_idx, annotation_id, \
+              source, annotation_type, position, stop_position, strand, score, phase, attributes) \
+             VALUES \
+             (9001, {id}, 7, 42, 'insert_01', 'syndna', 'insert', 2001, 3001, '+', NULL, NULL, \
+              MAP{{'ID': 'insert_01', 'mass_ng': '0.5'}});"
+        ))
+        .unwrap();
+
+        // A zero-row insert, the no-GFF shape: must be a clean no-op, not an error.
+        conn.execute_batch(&format!(
+            "INSERT INTO qiita_lake.reference_annotation \
+             SELECT * FROM qiita_lake.reference_annotation WHERE reference_idx = {id} AND false;"
+        ))
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT annotation_idx, feature_idx, parent_feature_idx, position, stop_position, \
+                        attributes['mass_ng'] \
+                 FROM qiita_lake.reference_annotation WHERE reference_idx = {id}"
+            ))
+            .unwrap();
+        let (annotation_idx, feature_idx, parent, position, stop, mass): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+        ) = stmt
+            .query_row([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap();
+        // The lake row's join back to its Postgres claim, and to the annotation's
+        // semantic terms. Minted by the control plane; the data plane never derives it.
+        assert_eq!(annotation_idx, 9001);
+        assert_eq!(feature_idx, 7);
+        assert_eq!(parent, 42);
+        // Half-open: a 1000 bp insert starting at 2001 stops at 3001, not 3000.
+        assert_eq!(position, 2001);
+        assert_eq!(stop, 3001);
+        assert_eq!(stop - position, 1000);
+        assert_eq!(mass, "0.5");
     }
 
     #[test]
@@ -436,89 +926,306 @@ mod tests {
         ensure_read_tables(&conn).expect("first ensure_read_tables");
         ensure_read_tables(&conn).expect("second ensure_read_tables (idempotent)");
 
-        // The view exists and is queryable.
-        let mut stmt = conn
-            .prepare(
+        // The macro exists, and — the migration half — no view of that name is
+        // left behind. A catalog that still carried the view would mean the DROP
+        // silently no-op'd, and the next boot would fail on the name collision.
+        let macros: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_functions() \
+                 WHERE function_name = 'read_masked' AND function_type = 'table_macro'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            macros, 1,
+            "read_masked table macro should exist exactly once"
+        );
+        let views: i64 = conn
+            .query_row(
                 "SELECT count(*) FROM information_schema.tables \
                  WHERE table_name = 'read_masked'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
-        let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
-        assert_eq!(n, 1, "read_masked view should exist exactly once");
-
-        // feature_counts is created by the same call and survives re-ensuring.
-        let mut stmt = conn
-            .prepare(
-                "SELECT count(*) FROM information_schema.tables \
-                 WHERE table_name = 'feature_counts'",
-            )
-            .unwrap();
-        let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
-        assert_eq!(n, 1, "feature_counts table should exist exactly once");
+        assert_eq!(
+            views, 0,
+            "the superseded read_masked VIEW must be dropped — it can coexist with \
+             the macro, and while it exists the unscoped call form still resolves"
+        );
     }
 
-    /// feature_counts holds the canonical six-tuple result rows (minus the two
-    /// vestigial idx columns that don't exist yet): a feature_idx count per
-    /// (sample, processing). Round-trip a row and confirm the column shape.
+    /// ensure_alignment_tables is idempotent (CREATE TABLE IF NOT EXISTS, run on
+    /// every DP restart) and lays down the alignment sink in the EXACT column
+    /// order + types align_sharded's COPY writes, so register-files'
+    /// ducklake_add_data_files schema-matches. The full column list is pinned
+    /// here so a drift from the align_sharded output or the miint SAM
+    /// schema is caught at unit time rather than at register-files runtime.
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
-    fn insert_and_read_feature_counts() {
+    fn ensure_alignment_tables_is_idempotent_and_matches_align_output() {
         let conn = setup_conn();
-        ensure_read_tables(&conn).unwrap();
-        let prep = next_test_id();
-        let _cleanup = Cleanup {
-            conn: &conn,
-            table: "feature_counts",
-            column: "prep_sample_idx",
-            id: prep,
-        };
+        ensure_alignment_tables(&conn).expect("first ensure_alignment_tables");
+        ensure_alignment_tables(&conn).expect("second ensure_alignment_tables (idempotent)");
 
-        let processing = next_test_id();
-        let processed = next_test_id();
-        let feature = next_test_id();
-        conn.execute_batch(&format!(
-            "INSERT INTO qiita_lake.feature_counts VALUES \
-             ({prep}, {processing}, {processed}, {feature}, 42.0);"
-        ))
-        .unwrap();
-
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT processing_idx, feature_idx, value \
-                 FROM qiita_lake.feature_counts WHERE prep_sample_idx = {prep}"
-            ))
-            .unwrap();
-        let (proc_idx, feat_idx, value): (i64, i64, f64) = stmt
-            .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .unwrap();
-        assert_eq!(proc_idx, processing);
-        assert_eq!(feat_idx, feature);
-        assert_eq!(value, 42.0);
-
-        // Schema assertion: the exact five identifier+value columns, no md5 string.
         let mut stmt = conn
             .prepare(
-                "SELECT column_name FROM information_schema.columns \
-                 WHERE table_name = 'feature_counts' ORDER BY ordinal_position",
+                "SELECT column_name, data_type FROM information_schema.columns \
+                 WHERE table_name = 'alignment' ORDER BY ordinal_position",
             )
             .unwrap();
-        let cols: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
+        let cols: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
+        // 5 CP identity columns + the miint SAM columns MINUS the raw subject ids
+        // (a.* EXCLUDE (read_id, reference, mate_reference)), in align_sharded COPY
+        // order.
+        let expected: &[(&str, &str)] = &[
+            ("alignment_idx", "BIGINT"),
+            ("prep_sample_idx", "BIGINT"),
+            ("sequence_idx", "BIGINT"),
+            ("feature_idx", "BIGINT"),
+            ("mate_feature_idx", "BIGINT"),
+            ("flags", "USMALLINT"),
+            ("position", "BIGINT"),
+            ("stop_position", "BIGINT"),
+            ("mapq", "UTINYINT"),
+            ("cigar", "VARCHAR"),
+            ("mate_position", "BIGINT"),
+            ("template_length", "BIGINT"),
+            ("tag_as", "BIGINT"),
+            ("tag_xs", "BIGINT"),
+            ("tag_ys", "BIGINT"),
+            ("tag_xn", "BIGINT"),
+            ("tag_xm", "BIGINT"),
+            ("tag_xo", "BIGINT"),
+            ("tag_xg", "BIGINT"),
+            ("tag_nm", "BIGINT"),
+            ("tag_yt", "VARCHAR"),
+            ("tag_md", "VARCHAR"),
+            ("tag_sa", "VARCHAR"),
+        ];
+        let got: Vec<(&str, &str)> = cols.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+        assert_eq!(got, expected, "alignment table schema/order drift");
+    }
+
+    /// ensure_exclusion_tables is idempotent (run on every DP restart) and lays
+    /// down the blocklist mirror table plus both `_visible` anti-join views.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_exclusion_tables_is_idempotent() {
+        let conn = setup_conn();
+        ensure_reference_tables(&conn).unwrap();
+        ensure_alignment_tables(&conn).unwrap();
+        ensure_exclusion_tables(&conn).expect("first ensure_exclusion_tables");
+        ensure_exclusion_tables(&conn).expect("second ensure_exclusion_tables (idempotent)");
+
+        for name in [
+            "reference_exclusion",
+            "alignment_visible",
+            "reference_taxonomy_visible",
+        ] {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_name = '{name}'"
+                ))
+                .unwrap();
+            let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(n, 1, "{name} should exist exactly once");
+        }
+    }
+
+    /// The `_visible` views anti-join the blocklist: a blocked feature_idx is
+    /// absent from alignment_visible / reference_taxonomy_visible while the base
+    /// tables retain it (read-time exclusion), and an unblocked feature passes
+    /// through. Scoped to this test's own alignment_idx / reference_idx so it is
+    /// robust against rows other #[serial] tests leave in the shared catalog.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn visible_views_anti_join_the_blocklist() {
+        let conn = setup_conn();
+        ensure_reference_tables(&conn).unwrap();
+        ensure_alignment_tables(&conn).unwrap();
+        ensure_exclusion_tables(&conn).unwrap();
+
+        let alignment_idx = next_test_id();
+        let reference_idx = next_test_id();
+        let feat_kept = next_test_id();
+        let feat_blocked = next_test_id();
+
+        let _c_align = Cleanup {
+            conn: &conn,
+            table: "alignment",
+            column: "alignment_idx",
+            id: alignment_idx,
+        };
+        let _c_tax = Cleanup {
+            conn: &conn,
+            table: "reference_taxonomy",
+            column: "reference_idx",
+            id: reference_idx,
+        };
+        let _c_excl = Cleanup {
+            conn: &conn,
+            table: "reference_exclusion",
+            column: "feature_idx",
+            id: feat_blocked,
+        };
+
+        conn.execute_batch(&format!(
+            "INSERT INTO qiita_lake.alignment
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx)
+               VALUES ({alignment_idx}, 1, 1, {feat_kept}),
+                      ({alignment_idx}, 1, 2, {feat_blocked});
+             INSERT INTO qiita_lake.reference_taxonomy (reference_idx, feature_idx)
+               VALUES ({reference_idx}, {feat_kept}), ({reference_idx}, {feat_blocked});
+             INSERT INTO qiita_lake.reference_exclusion (feature_idx)
+               VALUES ({feat_blocked});"
+        ))
+        .unwrap();
+
+        // Base table keeps both rows — exclusion is read-time, not a delete.
+        let base_align: i64 = conn
+            .prepare(&format!(
+                "SELECT count(*) FROM qiita_lake.alignment WHERE alignment_idx = {alignment_idx}"
+            ))
+            .unwrap()
+            .query_row([], |r| r.get(0))
+            .unwrap();
+        assert_eq!(base_align, 2, "base alignment retains the blocked row");
+
+        let vis_align: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT feature_idx FROM qiita_lake.alignment_visible \
+                     WHERE alignment_idx = {alignment_idx} ORDER BY feature_idx"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
         assert_eq!(
-            cols,
-            vec![
-                "prep_sample_idx",
-                "processing_idx",
-                "processed_prep_sample_idx",
-                "feature_idx",
-                "value",
-            ],
-            "feature_counts column shape drifted, got: {cols:?}"
+            vis_align,
+            vec![feat_kept],
+            "alignment_visible excludes the blocked feature"
         );
+
+        let vis_tax: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT feature_idx FROM qiita_lake.reference_taxonomy_visible \
+                     WHERE reference_idx = {reference_idx} ORDER BY feature_idx"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            vis_tax,
+            vec![feat_kept],
+            "reference_taxonomy_visible excludes the blocked feature"
+        );
+    }
+
+    /// The `_visible` views are catalog-stored, not session-local: a fresh ATTACH
+    /// (a real DP restart) sees them WITHOUT re-running ensure_exclusion_tables and
+    /// they still anti-join the mirror. Parity with
+    /// read_masked_macro_persists_across_reattach.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn visible_views_persist_across_reattach() {
+        let alignment_idx = next_test_id();
+        let feat_kept = next_test_id();
+        let feat_blocked = next_test_id();
+
+        // Connection 1: ensure tables + views, insert a base + blocklist row.
+        {
+            let conn1 = setup_conn();
+            ensure_reference_tables(&conn1).unwrap();
+            ensure_alignment_tables(&conn1).unwrap();
+            ensure_exclusion_tables(&conn1).unwrap();
+            conn1
+                .execute_batch(&format!(
+                    "INSERT INTO qiita_lake.alignment
+                         (alignment_idx, prep_sample_idx, sequence_idx, feature_idx)
+                       VALUES ({alignment_idx}, 1, 1, {feat_kept}),
+                              ({alignment_idx}, 1, 2, {feat_blocked});
+                     INSERT INTO qiita_lake.reference_exclusion (feature_idx)
+                       VALUES ({feat_blocked});"
+                ))
+                .unwrap();
+        }
+
+        // Connection 2: fresh ATTACH, NO ensure_* — the catalog-stored view must
+        // already exist and still exclude the blocked feature.
+        let conn2 = setup_conn();
+        let _c_align = Cleanup {
+            conn: &conn2,
+            table: "alignment",
+            column: "alignment_idx",
+            id: alignment_idx,
+        };
+        let _c_excl = Cleanup {
+            conn: &conn2,
+            table: "reference_exclusion",
+            column: "feature_idx",
+            id: feat_blocked,
+        };
+        let vis: Vec<i64> = {
+            let mut stmt = conn2
+                .prepare(&format!(
+                    "SELECT feature_idx FROM qiita_lake.alignment_visible \
+                     WHERE alignment_idx = {alignment_idx} ORDER BY feature_idx"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            vis,
+            vec![feat_kept],
+            "alignment_visible persists + anti-joins after reattach"
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_assembly_tables_is_idempotent() {
+        // Re-running on every DP restart must be a no-op (CREATE TABLE IF NOT
+        // EXISTS), and every table must exist and be queryable afterwards.
+        let conn = setup_conn();
+        ensure_assembly_tables(&conn).expect("first ensure_assembly_tables");
+        ensure_assembly_tables(&conn).expect("second ensure_assembly_tables (idempotent)");
+
+        for table in [
+            "assembled_sequence",
+            "assembled_sequence_chunks",
+            "assembly_membership",
+            "bin_quality",
+        ] {
+            // table is a &'static str literal, so the format! is injection-safe
+            // (test-only pattern; see Cleanup above).
+            let sql = format!(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = '{table}'"
+            );
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(n, 1, "{table} table should exist exactly once");
+        }
     }
 
     /// read_masked applies the recorded trims (substr on the sequence, list
@@ -590,10 +1297,7 @@ mod tests {
         // (b) non-'pass' rows excluded: exactly 2 rows for this (mask, prep).
         let total: i64 = conn
             .query_row(
-                &format!(
-                    "SELECT count(*) FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND prep_sample_idx = {prep}"
-                ),
+                &format!("SELECT count(*) FROM qiita_lake.read_masked({mask}, [{prep}])"),
                 [],
                 |r| r.get(0),
             )
@@ -614,8 +1318,8 @@ mod tests {
             .prepare(&format!(
                 "SELECT sequence1, array_to_string(qual1, ','), sequence2, \
                         array_to_string(qual2, ',') \
-                 FROM qiita_lake.read_masked \
-                 WHERE mask_idx = {mask} AND sequence_idx = {seq_se}"
+                 FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                 WHERE sequence_idx = {seq_se}"
             ))
             .unwrap();
         let (seq1, qual1, seq2, qual2): (String, String, Option<String>, Option<String>) = stmt
@@ -636,8 +1340,8 @@ mod tests {
             .prepare(&format!(
                 "SELECT sequence1, array_to_string(qual1, ','), sequence2, \
                         array_to_string(qual2, ',') \
-                 FROM qiita_lake.read_masked \
-                 WHERE mask_idx = {mask} AND sequence_idx = {seq_pe}"
+                 FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                 WHERE sequence_idx = {seq_pe}"
             ))
             .unwrap();
         let (pseq1, pqual1, pseq2, pqual2): (String, String, Option<String>, Option<String>) =
@@ -717,8 +1421,8 @@ mod tests {
         let (s_full, qlen_full): (String, i64) = conn
             .query_row(
                 &format!(
-                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq_full}"
+                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq_full}"
                 ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -735,8 +1439,8 @@ mod tests {
             .query_row(
                 &format!(
                     "SELECT sequence1, len(qual1), sequence2, len(qual2) \
-                     FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq_full_pe}"
+                     FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq_full_pe}"
                 ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -751,8 +1455,8 @@ mod tests {
         let (s_zero, qlen_zero): (String, i64) = conn
             .query_row(
                 &format!(
-                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq_zero}"
+                    "SELECT sequence1, len(qual1) FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq_zero}"
                 ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -762,14 +1466,15 @@ mod tests {
         assert_eq!(qlen_zero, 4, "zero-trim keeps all quals");
     }
 
-    /// The read_masked view is stored in the Postgres catalog, not the session: a
+    /// The read_masked MACRO is stored in the Postgres catalog, not the session: a
     /// fresh ATTACH (a real DP restart) sees it WITHOUT re-running
-    /// ensure_read_tables. Asserts that catalog-stored view persistence holds on
+    /// ensure_read_tables. That is what makes a macro a drop-in for the view it
+    /// replaced — same lifecycle, created once at boot — so it is worth pinning on
     /// the Postgres catalog the data plane actually uses.
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
-    fn read_masked_view_persists_across_reattach() {
+    fn read_masked_macro_persists_across_reattach() {
         let prep = next_test_id();
         let mask = next_test_id();
         let seq = next_test_id();
@@ -808,8 +1513,8 @@ mod tests {
         let s: String = conn2
             .query_row(
                 &format!(
-                    "SELECT sequence1 FROM qiita_lake.read_masked \
-                     WHERE mask_idx = {mask} AND sequence_idx = {seq}"
+                    "SELECT sequence1 FROM qiita_lake.read_masked({mask}, [{prep}]) \
+                     WHERE sequence_idx = {seq}"
                 ),
                 [],
                 |r| r.get(0),
@@ -817,7 +1522,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             s, "ACGT",
-            "view persisted across re-attach (zero-trim identity)"
+            "macro persisted across re-attach (zero-trim identity)"
         );
     }
 
@@ -837,5 +1542,194 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         let result = connect_ducklake(&conn, "dbname=test", "/tmp/it's bad");
         assert!(result.is_err());
+    }
+
+    // --- What DuckDB hands the Flight encoder ---------------------------
+    //
+    // Structural facts, not measurements: they need a live DuckLake but no
+    // production fixtures, and the export path's encoding choices rest on them.
+
+    /// Everything about dictionary encoding follows from this: if the export
+    /// never emits one, `DictionaryHandling` is dead config for us and any
+    /// dictionary must be built data-plane-side.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ducklake_arrow_export_never_emits_dictionary_for_varchar() {
+        let conn = setup_conn();
+        let id = next_test_id();
+        let table = format!("qiita_lake.dict_probe_{id}");
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {table} AS
+             SELECT i AS k, ['Bacteria', 'Archaea'][(i % 2) + 1] AS domain
+             FROM range(50000) t(i);"
+        ))
+        .expect("create probe table");
+
+        let schema = {
+            let mut stmt = conn
+                .prepare(&format!("SELECT k, domain FROM {table}"))
+                .expect("prepare");
+            stmt.query_arrow([]).expect("query_arrow").get_schema()
+        };
+        let _ = conn.execute_batch(&format!("DROP TABLE {table};"));
+
+        let domain = schema.field_with_name("domain").expect("domain column");
+        assert!(
+            !matches!(domain.data_type(), DataType::Dictionary(..)),
+            "DuckDB emitted a dictionary for a 2-distinct VARCHAR: {:?} — \
+             dictionary encoding would need re-measuring",
+            domain.data_type()
+        );
+    }
+
+    /// The other half. DuckDB's ENUM is the one type that *should* map to an
+    /// Arrow dictionary. If even ENUM does not, the question is closed for good
+    /// and nothing we can store will ever arrive dictionary-encoded.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ducklake_arrow_export_emits_dictionary_for_enum() {
+        let conn = setup_conn();
+        let id = next_test_id();
+        let enum_type = format!("enum_rank_{id}");
+        conn.execute_batch(&format!(
+            "CREATE TYPE {enum_type} AS ENUM ('Bacteria', 'Archaea');"
+        ))
+        .expect("create enum");
+
+        let schema = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT 'Bacteria'::{enum_type} AS domain FROM range(10) t(i)"
+                ))
+                .expect("prepare");
+            stmt.query_arrow([]).expect("query_arrow").get_schema()
+        };
+        let _ = conn.execute_batch(&format!("DROP TYPE {enum_type};"));
+
+        // Recorded either way: this is a fact about DuckDB we are pinning, not a
+        // behaviour we require. A change here is a signal to re-measure, which is
+        // why the failure message says so rather than just asserting.
+        let domain = schema.field_with_name("domain").expect("domain column");
+        assert!(
+            matches!(domain.data_type(), DataType::Dictionary(..)),
+            "DuckDB ENUM no longer maps to an Arrow dictionary (got {:?}) — \
+             it did when this was measured; re-measure",
+            domain.data_type()
+        );
+    }
+
+    /// Run-end encoding and delta-style wins depend on rows arriving in the
+    /// identifier order the files are written in, and the DoGet applies no
+    /// `ORDER BY` — so a parallel scan over several files may interleave.
+    ///
+    /// Both DoGet shapes are covered because they answer differently: a plain
+    /// scan is ordered by `preserve_insertion_order`, but `read_masked` is a
+    /// JOIN, and a hash join carries no such guarantee. Production fixtures came
+    /// through the join and showed 1-4 inversions; that is the distinction.
+    ///
+    /// Uses `stream_arrow`, the streaming form `stream_ducklake_batches` uses in
+    /// production — the materialising `query_arrow` is a different execution mode
+    /// and could order differently.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ducklake_parallel_scan_preserves_file_sort_order() {
+        let conn = setup_conn();
+        let id = next_test_id();
+        let table = format!("qiita_lake.order_probe_{id}");
+        let side = format!("qiita_lake.order_join_{id}");
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {table} (grp BIGINT, seq BIGINT);
+             CREATE OR REPLACE TABLE {side} (grp BIGINT, seq BIGINT);"
+        ))
+        .expect("create probe tables");
+        // One INSERT per group, so each lands in its own DuckLake file — the
+        // layout a partitioned writer produces, and the one a parallel scan can
+        // interleave. Large enough that DuckDB actually parallelises.
+        const GROUPS: i64 = 16;
+        const PER_GROUP: i64 = 100_000;
+        for group in 0..GROUPS {
+            conn.execute_batch(&format!(
+                "INSERT INTO {table} SELECT {group}, i FROM range({}, {}) t(i);
+                 INSERT INTO {side} SELECT {group}, i FROM range({}, {}) t(i);",
+                group * PER_GROUP,
+                (group + 1) * PER_GROUP,
+                group * PER_GROUP,
+                (group + 1) * PER_GROUP,
+            ))
+            .expect("insert group");
+        }
+
+        let ordered = |sql: &str| -> (usize, usize, usize) {
+            let schema = {
+                let mut probe = conn
+                    .prepare(&format!("SELECT * FROM ({sql}) AS _p LIMIT 0"))
+                    .expect("prepare probe");
+                probe.query_arrow([]).expect("probe").get_schema()
+            };
+            let mut stmt = conn.prepare(sql).expect("prepare");
+            let stream = stmt.stream_arrow([], schema).expect("stream_arrow");
+            let mut seen = Vec::new();
+            let mut batches = 0usize;
+            for batch in stream {
+                batches += 1;
+                let grp = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("grp is Int64");
+                let seq = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("seq is Int64");
+                for row in 0..batch.num_rows() {
+                    seen.push((grp.value(row), seq.value(row)));
+                }
+            }
+            let inversions = seen.windows(2).filter(|w| w[1] < w[0]).count();
+            (seen.len(), inversions, batches)
+        };
+
+        let scan = ordered(&format!("SELECT grp, seq FROM {table}"));
+        let join = ordered(&format!(
+            "SELECT l.grp, l.seq FROM {table} l JOIN {side} r
+               ON l.grp = r.grp AND l.seq = r.seq"
+        ));
+        let _ = conn.execute_batch(&format!("DROP TABLE {table}; DROP TABLE {side};"));
+
+        let expected = (GROUPS * PER_GROUP) as usize;
+        assert_eq!(scan.0, expected, "scan lost rows");
+        assert_eq!(join.0, expected, "join lost rows");
+        println!(
+            "scan order: scan {} rows / {} inversions / {} batches; \
+             join {} rows / {} inversions / {} batches",
+            scan.0, scan.1, scan.2, join.0, join.1, join.2
+        );
+
+        // Assert on *average run length*, not inversion count: the count scales
+        // with row count (1 inversion at 160k rows became 1 at 1.6M for the scan
+        // and 323 for the join), whereas run length is scale-free and is the
+        // property run-end and delta encodings actually consume. Anything in the
+        // thousands is coarse interleaving; row-level scatter would be single
+        // digits.
+        let run_len = |(rows, inversions, _): (usize, usize, usize)| rows / (inversions + 1);
+        assert!(
+            run_len(scan) >= 100_000,
+            "a plain DuckLake scan is no longer near-ordered ({} rows/run) — check \
+             preserve_insertion_order; the order-sensitive encodings depend on it",
+            run_len(scan)
+        );
+        // The join carries no ordering guarantee at all — this is not a promise
+        // DuckDB makes, so the bound is deliberately loose and exists to catch a
+        // collapse to row-level scatter.
+        assert!(
+            run_len(join) >= 1_000,
+            "the join produced {} rows/run — that is row-level interleaving, not \
+             the coarse runs measured against production fixtures",
+            run_len(join)
+        );
     }
 }

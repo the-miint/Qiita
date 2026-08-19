@@ -1,4 +1,4 @@
-.PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate sync-actions clean verify-health verify-deploy preflight redeploy dev-setup install-hooks
+.PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate sync-actions clean verify-health verify-deploy preflight redeploy lake-shell dev-setup install-hooks
 .PHONY: build-common build-control-plane build-data-plane build-data-plane-debug build-compute-orchestrator build-integration build-workflows
 .PHONY: test-common test-control-plane-without-db test-control-plane-with-db test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
@@ -106,14 +106,19 @@ test-common: build-common
 # `pytestmark = pytest.mark.db`) and are excluded here; run them via
 # `make test-control-plane-with-db`.
 test-control-plane-without-db: build-control-plane
-	cd qiita-control-plane && uv run pytest -m 'not db'
+	cd qiita-control-plane && uv run pytest -n auto --dist worksteal -m 'not db'
 
 # Run the full control-plane suite, including DB-bound tests. Brings up
 # Postgres + applies dbmate migrations; tears down on exit. Set
 # QIITA_USE_HOST_POSTGRES=1 to skip Docker bring-up and use a host Postgres.
+# `-n auto` fans the suite across xdist workers; each worker provisions its own
+# `qiita_test_<worker>` database (see testing/postgres.py) so they don't share
+# catalog state. `--dist worksteal` lets an idle worker pull queued tests from a
+# busy one, avoiding an end-of-run straggler where the default `load` scheduler
+# strands a block of slow DB tests on a single worker.
 test-control-plane-with-db: build-control-plane $(DBMATE_BIN)
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
-	  ((cd qiita-control-plane && uv run pytest); PY_EC=$$?; \
+	  ((cd qiita-control-plane && uv run pytest -n auto --dist worksteal); PY_EC=$$?; \
 	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
 	   exit $$PY_EC)
 
@@ -286,6 +291,15 @@ verify-deploy:
 # local-deploy.sh -> stage -> verify); migrations stay out-of-band.
 redeploy:
 	QIITA_HOSTNAME="$(QIITA_HOSTNAME)" bash deploy/redeploy.sh
+
+# ADMIN DEBUGGING ONLY. Read-only DuckDB shell over the lake (qiita_lake) and the
+# control-plane database (qiita_cp), for an operator diagnosing the live system.
+# It bypasses every authorization check the API enforces — it sees all studies —
+# so read-only is not permission: handle what you see as confidential. Not an
+# export path and not a user-facing query interface. Needs no root, only the
+# group-reads the operator already grants. `bash scripts/lake-shell.sh --help`.
+lake-shell:
+	@bash scripts/lake-shell.sh
 
 # Check developer tool prerequisites and print install instructions only for missing ones
 dev-setup:

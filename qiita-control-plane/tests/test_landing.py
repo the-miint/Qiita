@@ -25,7 +25,7 @@ def _build_minimal_settings(
 
     return Settings(
         database_url="unused",
-        hmac_secret_key=b"\x00" * 32,
+        flight_signing_key=b"\x00" * 32,
         data_plane_url="unused",
         contact_email=contact_email,
         build_sha=build_sha,

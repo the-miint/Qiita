@@ -218,8 +218,12 @@ restart_if_env_present qiita-data-plane@50051      /etc/qiita/data-plane.env
 # If you scale out the data plane (additional qiita-data-plane@NNNN instances),
 # add a restart_if_env_present line for each here.
 
-# Skip reload when TLS files are absent (nginx -t would fail and refuse reload).
+# Validate the rendered config before reloading. Skip both when TLS files are
+# absent (nginx -t would fail on the missing cert/key and refuse reload). With
+# set -e, a bad config fails the deploy here loudly instead of a silently-failed
+# reload leaving the old config live.
 if [ -r /etc/ssl/certs/qiita.crt ] && [ -r /etc/ssl/private/qiita.key ]; then
+    nginx -t
     systemctl reload nginx
 else
     echo "skipping nginx reload — TLS files at /etc/ssl/{certs,private}/qiita.{crt,key} not present" >&2

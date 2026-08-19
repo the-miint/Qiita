@@ -14,6 +14,7 @@ import json
 import logging
 import uuid
 
+import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
@@ -25,8 +26,10 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
     ComputeTarget,
     ReferenceStatus,
+    ScopeTargetKind,
     StepProgressState,
     WorkTicketState,
 )
@@ -70,7 +73,7 @@ async def wt_client(postgres_pool, stub_compute_backend_client):
     app.state.oidc_verifier = None
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=b"\x00" * 32,
+        flight_signing_key=b"\x00" * 32,
         data_plane_url="unused",
     )
     app.state.compute_backend_client = stub_compute_backend_client
@@ -271,6 +274,7 @@ _TEST_STEPS = [
         "name": "noop",
         "step_type": "singleton",
         "container": "qiita/noop:1.0.0",
+        "entrypoint": "/opt/qiita/noop.sh",
         "inputs": [],
         "outputs": [],
         "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
@@ -283,6 +287,7 @@ async def _seed_action(
     *,
     context_schema: dict,
     target_kind: str = "reference",
+    action_id: str = "wt-test-action",
     scopes: list[str] | None = None,
     target_processing_kinds: list[str] | None = None,
     human_roles: list[str] | None = None,
@@ -299,8 +304,10 @@ async def _seed_action(
     DB CHECK action_processing_kinds_only_for_prep_sample enforces
     that pairing). `human_roles` overrides the default audience
     ([system_admin]) — pass [user, wet_lab_admin, system_admin] to
-    exercise the wider audience the fastq-to-parquet YAML declares."""
-    action_id = "wt-test-action"
+    exercise the wider audience the fastq-to-parquet YAML declares.
+
+    Every action here shares one `action_id` and varies only by `version`;
+    `action_id` overrides that for a test that needs two distinct ids."""
     version = f"v-{uuid.uuid4()}"
     await postgres_pool.execute(
         "INSERT INTO qiita.action ("
@@ -488,6 +495,37 @@ async def sequenced_pool_action(postgres_pool):
     )
     yield action_id, version
     await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def block_action(postgres_pool):
+    """An enabled, block-targeting action — the read-mask-block shape. Empty
+    scopes and any-object context, default audience ([system_admin]) matching
+    the admin_token fixture."""
+    action_id, version = await _seed_action(
+        postgres_pool,
+        context_schema={},
+        target_kind="block",
+        scopes=[],
+    )
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def block_for_wt(postgres_pool):
+    """A bare qiita.block row with no back-filled work_ticket_idx yet — the
+    scope target a block-scoped submission aims at. Returns block_idx.
+
+    Teardown is FK-reverse: drop dependent work_tickets (work_ticket.block_idx
+    is a deferred NO ACTION, so the tickets must go first), then the block
+    (its block_member rows cascade)."""
+    block_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.block (state) VALUES ('pending') RETURNING block_idx"
+    )
+    yield block_idx
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE block_idx = $1", block_idx)
+    await postgres_pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", block_idx)
 
 
 @pytest.fixture
@@ -1364,6 +1402,150 @@ async def test_submit_sequenced_pool_unique_index_catches_select_race(
     assert "in flight" in second.json()["detail"]["reason"]
 
 
+# ---------------------------------------------------------------------------
+# block scope target (bulk-block read-mask)
+# ---------------------------------------------------------------------------
+
+
+def _block_body(action_id, version, block_idx, **overrides):
+    base = {
+        "action_id": action_id,
+        "action_version": version,
+        "scope_target": {"kind": "block", "block_idx": block_idx},
+        "action_context": {},
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_submit_block_scope_round_trips(
+    wt_client, postgres_pool, admin_token, block_action, block_for_wt
+):
+    """A block-scoped submission persists block_idx with every other scope arm
+    NULL (per work_ticket_scope_target_consistent), and a GET round-trips the
+    block scope_target."""
+    token, _ = admin_token
+    action_id, version = block_action
+    block_idx = block_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_block_body(action_id, version, block_idx),
+        headers=headers,
+    )
+    assert resp.status_code == 202, resp.text
+    idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(idx)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT scope_target_kind, study_idx, prep_idx, reference_idx,"
+        "       prep_sample_idx, sequenced_pool_idx, block_idx, state"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
+    )
+    assert row["scope_target_kind"] == "block"
+    assert row["block_idx"] == block_idx
+    assert row["study_idx"] is None
+    assert row["prep_idx"] is None
+    assert row["reference_idx"] is None
+    assert row["prep_sample_idx"] is None
+    assert row["sequenced_pool_idx"] is None
+    assert row["state"] == WorkTicketState.PENDING.value
+
+    got = await wt_client.get(URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx), headers=headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["scope_target"] == {"kind": "block", "block_idx": block_idx}
+
+
+async def test_submit_block_disallow_without_delete(
+    wt_client, admin_token, block_action, block_for_wt
+):
+    """A second block submission against the same (action, block) while the
+    first is non-terminal must 409 via the SELECT-side disallow-without-delete
+    check, naming the blocking ticket idx."""
+    token, _ = admin_token
+    action_id, version = block_action
+    block_idx = block_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+    body = _block_body(action_id, version, block_idx)
+
+    first = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert first.status_code == 202, first.text
+    first_idx = first.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(first_idx)
+
+    second = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert second.status_code == 409, second.text
+    assert second.json()["detail"]["blocking_work_ticket_idx"] == first_idx
+
+
+async def test_submit_block_distinct_blocks_allowed(
+    wt_client, postgres_pool, admin_token, block_action, block_for_wt
+):
+    """The in-flight gate is per-block: a second, distinct block submits
+    cleanly alongside a non-terminal ticket for the first block."""
+    token, _ = admin_token
+    action_id, version = block_action
+    first_block = block_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_block_body(action_id, version, first_block),
+        headers=headers,
+    )
+    assert first.status_code == 202, first.text
+    wt_client._created_tickets.append(first.json()["work_ticket_idx"])
+
+    second_block = await postgres_pool.fetchval(
+        "INSERT INTO qiita.block (state) VALUES ('pending') RETURNING block_idx"
+    )
+    try:
+        second = await wt_client.post(
+            URL_WORK_TICKET_PREFIX,
+            json=_block_body(action_id, version, second_block),
+            headers=headers,
+        )
+        assert second.status_code == 202, second.text
+        wt_client._created_tickets.append(second.json()["work_ticket_idx"])
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE block_idx = $1", second_block
+        )
+        await postgres_pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", second_block)
+
+
+async def test_submit_block_unique_index_catches_select_race(
+    wt_client, admin_token, block_action, block_for_wt, monkeypatch
+):
+    """The atomic gate for a block double-submit is the partial unique index
+    work_ticket_one_in_flight_per_block. Short-circuit the SELECT-side check so
+    both submissions reach INSERT; the second must trip the constraint and
+    surface as the same 409 the SELECT path returns."""
+    token, _ = admin_token
+    action_id, version = block_action
+    block_idx = block_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+    body = _block_body(action_id, version, block_idx)
+
+    first = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert first.status_code == 202, first.text
+    wt_client._created_tickets.append(first.json()["work_ticket_idx"])
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.work_ticket._check_disallow_without_delete",
+        _noop,
+    )
+
+    second = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert second.status_code == 409, second.text
+    assert "in flight" in second.json()["detail"]["reason"]
+
+
 async def test_submit_valid_context_against_schema(
     wt_client,
     postgres_pool,
@@ -1908,6 +2090,40 @@ async def test_run_on_failed_resets_to_pending(
     assert row["failure_reason"] is None
 
 
+async def test_run_on_cancelled_resets_to_pending(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """CANCELLED → /run redrives just like FAILED: state → PENDING with a clean
+    retry budget, so an operator can restart a cancelled ticket once the blocker
+    is fixed. A cancelled ticket already carries NULL failure_*."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state, retry_count)"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state, 3)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.CANCELLED.value,
+    )
+    wt_client._created_tickets.append(idx)
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+    )
+    assert row["state"] == WorkTicketState.PENDING.value
+    assert row["retry_count"] == 0
+
+
 async def test_run_on_failed_resets_reference_scope_target_to_pending(
     wt_client, postgres_pool, admin_token, reference_action, reference_idx
 ):
@@ -1965,9 +2181,12 @@ async def test_run_on_failed_drops_dead_step_rows_keeps_completed(
     Re-using that attempt would collide — the step_progress writers reject
     any transition out of 'failed' (and record_failed refuses
     failed->failed), so the redrive would die re-adjudicating the dead row.
-    /run drops every non-'completed' step row so the redrive's
-    attempt-0 writes land on a clean slate, while KEEPING 'completed' rows
-    so the runner still fast-forwards already-finished steps."""
+    /run drops the terminal 'failed' step rows so the redrive's attempt-0
+    writes land on a clean slate, while KEEPING 'completed' rows so the
+    runner still fast-forwards already-finished steps. (Whether an in-flight
+    row survives depends on the state redriven from — see
+    `test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptable`
+    and `test_run_after_cancel_drops_inflight_rows_whose_jobs_were_reaped`.)"""
     token, admin_idx = admin_token
     action_id, version = reference_action
     idx = await postgres_pool.fetchval(
@@ -2020,6 +2239,311 @@ async def test_run_on_failed_drops_dead_step_rows_keeps_completed(
     )
     surviving = [(r["step_index"], r["attempt"], r["state"]) for r in rows]
     assert surviving == [(0, 0, StepProgressState.COMPLETED.value)]
+
+
+async def test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptable(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A FAILED ticket CAN still have a live SLURM job, and /run must not
+    strand it.
+
+    When a step OOM-kills, the runner escalates and submits attempt N+1; if the
+    ticket then fails for any reason, that attempt's row is left live
+    ('submitted') carrying a real slurm_job_id. Deleting it on redrive would
+    orphan the job outright — the CP would forget the id, nothing would poll it,
+    and `_adopt_or_submit` (which re-attaches by exactly that persisted id)
+    could never reclaim it. So the redrive keeps live rows and drops only the
+    terminal 'failed' one, letting the runner adopt the job already paid for
+    instead of resubmitting the work."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state,"
+        "  failure_type, failure_stage, failure_step_name, failure_reason)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 'permanent'::qiita.failure_type,"
+        "  'step_run'::qiita.work_ticket_failure_stage, 'load', 'test seed')"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.FAILED.value,
+    )
+    wt_client._created_tickets.append(idx)
+    # attempt 0 died (OOM); attempt 1 is the escalated retry, still live.
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
+        " VALUES ($1, 0, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0',"
+        "  'oom_killed', 'OUT_OF_MEMORY')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.FAILED.value,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, slurm_job_id, job_name)"
+        " VALUES ($1, 0, 1, 'load', $2, $3, 605029, 'qiita-wt-load-a1')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.SUBMITTED.value,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    rows = await postgres_pool.fetch(
+        "SELECT step_index, attempt, state, slurm_job_id FROM qiita.work_ticket_step"
+        " WHERE work_ticket_idx = $1 ORDER BY step_index, attempt",
+        idx,
+    )
+    surviving = [(r["step_index"], r["attempt"], r["state"]) for r in rows]
+    # The dead attempt is gone; the live one survives WITH its job id intact,
+    # which is the whole point — that id is the only handle on the running job.
+    assert surviving == [(0, 1, StepProgressState.SUBMITTED.value)]
+    assert rows[0]["slurm_job_id"] == 605029
+
+
+async def test_run_preserves_the_escalated_resource_floor(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A redrive must NOT reset the ladder a ticket already climbed.
+
+    The redrive drops the `failed` step rows, so the escalation history they
+    carry is gone by the time the runner re-enters — which is exactly why the
+    learned floor lives on the work_ticket row instead of being reconstructed
+    from that history. Nothing in the reset UPDATE touches it today; this pins
+    that, because adding the column to that reset (or "clearing the ticket
+    cleanly") would silently reintroduce the re-climb: the ticket would come
+    back at its YAML baseline and burn a failing attempt getting back to a size
+    it had already reached."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state,"
+        "  failure_type, failure_stage, failure_step_name, failure_reason,"
+        "  escalated_resource_floor)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 'retriable'::qiita.failure_type,"
+        "  'step_run'::qiita.work_ticket_failure_stage, 'load', 'OOM',"
+        "  $6::jsonb)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.FAILED.value,
+        json.dumps({"load": {"mem_gb": 384, "walltime_seconds": 115200}}),
+    )
+    wt_client._created_tickets.append(idx)
+    # The attempt that taught the ticket it needs 384 GB. The redrive deletes
+    # this row — the floor must outlive it.
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
+        " VALUES ($1, 0, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0',"
+        "  'oom_killed', 'OUT_OF_MEMORY')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.FAILED.value,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count, escalated_resource_floor"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
+    )
+    # The redrive did its usual reset...
+    assert row["state"] == WorkTicketState.PENDING.value
+    assert row["retry_count"] == 0
+    # ... and the escalation history it drops is indeed gone ...
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.work_ticket_step WHERE work_ticket_idx = $1", idx
+        )
+        == 0
+    )
+    # ... but the learned floor survived, so the next run resumes the ladder.
+    # asyncpg hands JSONB back as a string — no codec is registered on this pool.
+    floor = row["escalated_resource_floor"]
+    decoded = json.loads(floor) if isinstance(floor, str) else floor
+    assert decoded == {"load": {"mem_gb": 384, "walltime_seconds": 115200}}
+
+
+async def test_escalated_resource_floor_rejects_a_jsonb_null(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """The read side can't distinguish jsonb `null` from SQL NULL — both decode
+    to Python None, which the runner reads as "nothing escalated yet". Clearing
+    this column by hand is a documented operator step, so the CHECK makes the
+    near-miss (`'null'::jsonb` instead of NULL) fail loudly at the DB instead of
+    silently resetting a ticket's ladder. The write path needs no such guard:
+    `jsonb_set` errors on a non-object target."""
+    _token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx)"
+        " VALUES ($1, $2, $3, 'reference', $4) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+    )
+    wt_client._created_tickets.append(idx)
+
+    for bad in ("null", "[]", "42"):
+        with pytest.raises(asyncpg.exceptions.CheckViolationError):
+            await postgres_pool.execute(
+                "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+                " WHERE work_ticket_idx = $1",
+                idx,
+                bad,
+            )
+    # The control: SQL NULL (the documented way to clear it) and a real object
+    # both pass, so the CHECK isn't just rejecting everything.
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = NULL WHERE work_ticket_idx = $1",
+        idx,
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+        " WHERE work_ticket_idx = $1",
+        idx,
+        json.dumps({"load": {"mem_gb": 384}}),
+    )
+
+
+async def test_run_after_cancel_drops_inflight_rows_whose_jobs_were_reaped(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """The CANCELLED carve-out: a post-cancel redrive drops in-flight rows.
+
+    Cancel is terminal-flip-then-scancel, and the runner's abort path stops
+    without recording the step row terminal — so a cancelled ticket keeps a
+    'submitted'/'running' row naming a job the reap ALREADY KILLED. Keeping it
+    (correct for FAILED, where the job may still be live) would make the redrive
+    adopt a dead job: slurmrestd purges it, the poll loop's filesystem
+    tiebreaker synthesizes COMPLETED, and verification fails on a workspace with
+    no manifest — the same failure this commit fixes, reached through a live row
+    instead of a dead one. So after a cancel, every non-completed row goes."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state)"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.CANCELLED.value,
+    )
+    wt_client._created_tickets.append(idx)
+    # A finished step (must survive) and an in-flight row whose job the cancel
+    # already scancelled (must NOT survive).
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target, state)"
+        " VALUES ($1, 0, 0, 'hash', $2, $3)",
+        idx,
+        ComputeTarget.LOCAL.value,
+        StepProgressState.COMPLETED.value,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, slurm_job_id, job_name)"
+        " VALUES ($1, 1, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.RUNNING.value,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    rows = await postgres_pool.fetch(
+        "SELECT step_index, attempt, state FROM qiita.work_ticket_step"
+        " WHERE work_ticket_idx = $1 ORDER BY step_index, attempt",
+        idx,
+    )
+    surviving = [(r["step_index"], r["attempt"], r["state"]) for r in rows]
+    assert surviving == [(0, 0, StepProgressState.COMPLETED.value)]
+
+
+async def test_run_on_failed_drops_submitting_row_with_no_job_id(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A write-ahead 'submitting' row with no persisted job id is dropped even
+    when redriving a FAILED ticket.
+
+    Its only handle is the deterministic job_name, and the find-by-name orphan
+    closer that would use it runs solely under `resume=True`; /run dispatches
+    with resume=False. A kept row would therefore fall through to a fresh submit
+    writing into the SAME attempt dir a possibly-live orphan job is already
+    using. Dropping it restores the advance-to-a-fresh-dir guard."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state,"
+        "  failure_type, failure_stage, failure_step_name, failure_reason)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 'permanent'::qiita.failure_type,"
+        "  'step_run'::qiita.work_ticket_failure_stage, 'load', 'test seed')"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.FAILED.value,
+    )
+    wt_client._created_tickets.append(idx)
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, job_name)"
+        " VALUES ($1, 0, 0, 'load', $2, $3, 'qiita-wt-load-a0')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.SUBMITTING.value,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    remaining = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.work_ticket_step WHERE work_ticket_idx = $1", idx
+    )
+    assert remaining == 0
 
 
 async def test_run_on_failed_with_non_failed_reference_does_not_abort_redrive(
@@ -2166,9 +2690,13 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
         return idx
 
     try:
-        for s in ("pending", "queued", "processing"):
+        # Drive the loops off the shared constant rather than a hand-written tuple:
+        # a new WorkTicketState joins the derived non-terminal set automatically,
+        # and this test must move with it instead of quietly ignoring it.
+        for s in NON_TERMINAL_WORK_TICKET_STATES:
             seeded[s] = await _seed(s)
         completed_idx = await _seed("completed")
+        no_data_idx = await _seed("no_data")
         failed_idx = await _seed("failed", failed=True)
 
         scheduled: list[tuple[int, dict]] = []
@@ -2183,15 +2711,16 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
         count = await dispatch.reconcile_inflight_tickets(app)
 
         scheduled_idxs = {idx for idx, _ in scheduled}
-        # All three non-terminal tickets scheduled for resume.
-        for s in ("pending", "queued", "processing"):
+        # Every non-terminal ticket scheduled for resume.
+        for s in NON_TERMINAL_WORK_TICKET_STATES:
             assert seeded[s] in scheduled_idxs
         assert all(kw == {"resume": True} for idx, kw in scheduled if idx in seeded.values())
-        # Terminal tickets are never scheduled.
+        # No terminal ticket is scheduled — all THREE of them, no_data included.
         assert completed_idx not in scheduled_idxs
+        assert no_data_idx not in scheduled_idxs
         assert failed_idx not in scheduled_idxs
-        # Count covers at least our three (earlier tests may leave orphans).
-        assert count >= 3
+        # Count covers at least ours (earlier tests may leave orphans).
+        assert count >= len(NON_TERMINAL_WORK_TICKET_STATES)
     finally:
         if created_idxs:
             await postgres_pool.execute(
@@ -2206,7 +2735,7 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
 
 
 # ---------------------------------------------------------------------------
-# GET /api/v1/work-ticket  (list / summary, Phase 6)
+# GET /api/v1/work-ticket  (list / summary)
 # ---------------------------------------------------------------------------
 
 
@@ -2312,9 +2841,9 @@ async def ticket_seeder(postgres_pool):
         )
 
 
-def _summary_by_idx(payload: list[dict], idx: int) -> dict | None:
-    """Find the summary dict for `idx` in a list response, or None."""
-    return next((row for row in payload if row["work_ticket_idx"] == idx), None)
+def _summary_by_idx(body: dict, idx: int) -> dict | None:
+    """Find the summary dict for `idx` in a WorkTicketListResponse body, or None."""
+    return next((row for row in body["tickets"] if row["work_ticket_idx"] == idx), None)
 
 
 async def test_list_work_ticket_401_on_anonymous(wt_client):
@@ -2431,6 +2960,52 @@ async def test_list_work_ticket_reports_current_slurm_entry(
     assert summary["compute_target"] == ComputeTarget.SLURM.value
     assert summary["slurm_job_id"] == 4242
     assert summary["step_state"] == StepProgressState.RUNNING.value
+    # A reference-scoped ticket has no prep_sample, so no read outcome.
+    assert summary["read_outcome"] is None
+
+
+async def test_list_work_ticket_reports_prep_sample_read_outcome(
+    wt_client, postgres_pool, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """A prep_sample-scoped ticket's summary nests read_outcome from the ticket's
+    sequenced_sample — the per-stage read counts plus the recomputed passing
+    fraction — so a read-mask ticket is assessable without a separate lookup."""
+    admin_tok, admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    action_id, version = prep_sample_action
+    await postgres_pool.execute(
+        "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2=1000,"
+        " biological_read_count_r1r2=900, quality_filtered_read_count_r1r2=800,"
+        " spikein_read_count_r1r2=10 WHERE prep_sample_idx=$1",
+        prep_sample_idx,
+    )
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx, scope_target_kind,"
+        "  prep_sample_idx, state)"
+        " VALUES ($1, $2, $3, 'prep_sample', $4, 'processing'::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        prep_sample_idx,
+    )
+    try:
+        resp = await wt_client.get(
+            URL_WORK_TICKET_LIST, headers={"Authorization": f"Bearer {admin_tok}"}
+        )
+        assert resp.status_code == 200, resp.text
+        summary = _summary_by_idx(resp.json(), idx)
+        assert summary is not None
+        ro = summary["read_outcome"]
+        assert ro is not None
+        assert ro["raw_read_count_r1r2"] == 1000
+        assert ro["biological_read_count_r1r2"] == 900
+        assert ro["quality_filtered_read_count_r1r2"] == 800
+        assert ro["spikein_read_count_r1r2"] == 10
+        assert ro["fraction_passing_quality_filter"] == pytest.approx(0.8)
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx=$1", idx)
 
 
 async def test_list_work_ticket_reports_control_plane_entry_without_job_id(
@@ -2501,7 +3076,7 @@ async def test_list_work_ticket_state_filter(
         headers={"Authorization": f"Bearer {admin_tok}"},
     )
     assert resp.status_code == 200, resp.text
-    returned = {row["work_ticket_idx"] for row in resp.json()}
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
     assert processing_idx in returned
     assert pending_idx not in returned
     assert completed_idx not in returned
@@ -2532,7 +3107,7 @@ async def test_list_work_ticket_active_filter(
         headers={"Authorization": f"Bearer {admin_tok}"},
     )
     assert resp.status_code == 200, resp.text
-    returned = {row["work_ticket_idx"] for row in resp.json()}
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
     assert {pending_idx, processing_idx} <= returned
     assert completed_idx not in returned
     assert failed_idx not in returned
@@ -2573,14 +3148,17 @@ async def test_list_work_ticket_orders_newest_first(
         URL_WORK_TICKET_LIST, headers={"Authorization": f"Bearer {admin_tok}"}
     )
     assert resp.status_code == 200, resp.text
-    returned = [row["work_ticket_idx"] for row in resp.json()]
+    returned = [row["work_ticket_idx"] for row in resp.json()["tickets"]]
     assert returned == sorted(seeded, reverse=True)
 
 
 async def test_list_work_ticket_limit_caps_results(
     wt_client, admin_token, reference_action, ticket_seeder
 ):
-    """`?limit=N` caps the page size (own-scoped, so the count is exact)."""
+    """`?limit=N` caps the page size and says so: a capped page reports
+    `truncated` true with `count` at the cap, an uncapped one false — the
+    caller never has to infer a cut from the row count. Own-scoped, so both
+    counts are exact."""
     admin_tok, admin_idx = admin_token
     for _ in range(3):
         await ticket_seeder.ticket(
@@ -2592,7 +3170,379 @@ async def test_list_work_ticket_limit_caps_results(
         headers={"Authorization": f"Bearer {admin_tok}"},
     )
     assert resp.status_code == 200, resp.text
-    assert len(resp.json()) == 2
+    body = resp.json()
+    assert len(body["tickets"]) == 2
+    assert body["count"] == 2
+    assert body["truncated"] is True
+
+    # limit == the exact row count: the limit+1 fetch finds no extra row, so
+    # this is a complete page, not a truncated one.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"limit": "3"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 3
+    assert body["truncated"] is False
+
+
+# The tagged-union idx column each scope kind fills in (mirrors the DB CHECK on
+# qiita.work_ticket). Keyed on the enum, so the column name interpolated into
+# the INSERT is always one of these three literals.
+_SCOPE_IDX_COLUMN = {
+    ScopeTargetKind.PREP_SAMPLE: "prep_sample_idx",
+    ScopeTargetKind.SEQUENCED_POOL: "sequenced_pool_idx",
+    ScopeTargetKind.BLOCK: "block_idx",
+}
+
+
+async def _seed_scoped_ticket(
+    wt_client,
+    postgres_pool,
+    *,
+    action,
+    originator_idx,
+    kind: ScopeTargetKind,
+    idx,
+    state: WorkTicketState = WorkTicketState.PROCESSING,
+):
+    """Insert one work_ticket of `kind` pointing at `idx` (the tagged-union
+    column that kind uses), register it for wt_client teardown, and return its
+    work_ticket_idx. Only the column NAME is interpolated — both closed-set
+    labels bind through their enum twin."""
+    action_id, version = action
+    column = _SCOPE_IDX_COLUMN[kind]
+    work_ticket_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        f"  scope_target_kind, {column}, state)"
+        " VALUES ($1, $2, $3, $4::qiita.scope_target_kind, $5,"
+        "         $6::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        originator_idx,
+        kind.value,
+        idx,
+        state.value,
+    )
+    wt_client._created_tickets.append(work_ticket_idx)
+    return work_ticket_idx
+
+
+@pytest.fixture
+async def pool_of_prep_sample(postgres_pool, prep_sample_with_pool_item):
+    """The sequenced_pool_idx behind `prep_sample_with_pool_item` — the pool a
+    `?sequenced_pool_idx=` filter names when the ticket is sample-scoped."""
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    return await postgres_pool.fetchval(
+        "SELECT sequenced_pool_idx FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
+        prep_sample_idx,
+    )
+
+
+async def test_list_work_ticket_pool_filter_matches_all_three_scope_kinds(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    reference_action,
+    ticket_seeder,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+    pool_of_prep_sample,
+    sequenced_pool_action,
+    block_action,
+    block_for_wt,
+):
+    """`?sequenced_pool_idx=P` returns every ticket that touches P by any of the
+    three routes a ticket reaches a pool — the pool itself, one of its samples,
+    or a block covering one of its samples — and nothing else."""
+    admin_tok, admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    await postgres_pool.execute(
+        "INSERT INTO qiita.block_member"
+        " (block_idx, prep_sample_idx, min_sequence_idx, max_sequence_idx)"
+        " VALUES ($1, $2, 1, 10)",
+        block_for_wt,
+        prep_sample_idx,
+    )
+    sample_scoped = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+    pool_scoped = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=sequenced_pool_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.SEQUENCED_POOL,
+        idx=pool_of_prep_sample,
+    )
+    block_scoped = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=block_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.BLOCK,
+        idx=block_for_wt,
+    )
+    # Control: same originator, touches no pool at all.
+    unrelated = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="processing"
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = [row["work_ticket_idx"] for row in resp.json()["tickets"]]
+    assert set(returned) == {sample_scoped, pool_scoped, block_scoped}
+    assert unrelated not in returned
+    # One row per ticket: the block arm covers many samples and the sample arm
+    # rides a UNIQUE join, so neither can fan a ticket into duplicate rows.
+    assert len(returned) == len(set(returned))
+    # The sample-scoped ticket carries read_outcome; the block ticket spans many
+    # samples and carries none.
+    assert _summary_by_idx(resp.json(), sample_scoped)["read_outcome"] is not None
+    assert _summary_by_idx(resp.json(), block_scoped)["read_outcome"] is None
+
+    # AND-composes with the state filters: all three are PROCESSING, so
+    # ?state=completed intersects to empty and ?active=true keeps all three.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={
+            "sequenced_pool_idx": str(pool_of_prep_sample),
+            "state": WorkTicketState.COMPLETED.value,
+        },
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["tickets"] == []
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample), "active": "true"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert {row["work_ticket_idx"] for row in resp.json()["tickets"]} == {
+        sample_scoped,
+        pool_scoped,
+        block_scoped,
+    }
+
+
+async def test_list_work_ticket_pool_filter_excludes_other_pools(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+    pool_of_prep_sample,
+    sequenced_pool_action,
+    sequenced_pool_for_wt,
+):
+    """A ticket on a DIFFERENT pool is excluded — the filter narrows to the
+    named pool rather than to "has a pool"."""
+    admin_tok, admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    _run_idx, other_pool_idx = sequenced_pool_for_wt
+    mine = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+    theirs = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=sequenced_pool_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.SEQUENCED_POOL,
+        idx=other_pool_idx,
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
+    assert mine in returned
+    assert theirs not in returned
+
+
+async def test_list_work_ticket_pool_filter_keeps_originator_scoping(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    regular_token,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+    pool_of_prep_sample,
+):
+    """The pool filter composes with the originator scoping instead of
+    replacing it: another principal's ticket on the pool stays invisible
+    without `?all=true`."""
+    user_tok, user_idx = regular_token
+    admin_tok, _admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    theirs = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=user_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), theirs) is None
+
+    # The originator sees it under the same filter.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {user_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), theirs) is not None
+
+    # ...and so does the operator view: ?all=true widens across originators
+    # with the pool filter still applied, rather than the two cancelling out.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample), "all": "true"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), theirs) is not None
+
+
+@pytest.fixture
+async def other_id_reference_action(postgres_pool):
+    """A reference-targeting action under a DIFFERENT action_id. The module's
+    other action fixtures all share `wt-test-action`, so an action_id filter
+    needs this one to have anything to exclude."""
+    action_id, version = await _seed_action(
+        postgres_pool, context_schema={}, action_id="wt-test-other-action"
+    )
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+async def test_list_work_ticket_prep_sample_and_action_id_filters(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    other_id_reference_action,
+    ticket_seeder,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+):
+    """`?prep_sample_idx=` narrows to one sample's tickets and `?action_id=`
+    to one action; both AND-compose with the rest of the filters."""
+    admin_tok, admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    sample_ticket = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+    other_action_ticket = await ticket_seeder.ticket(
+        action=other_id_reference_action, originator_idx=admin_idx, state="processing"
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"prep_sample_idx": str(prep_sample_idx)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert {row["work_ticket_idx"] for row in resp.json()["tickets"]} == {sample_ticket}
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"action_id": other_id_reference_action[0]},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
+    assert other_action_ticket in returned
+    assert sample_ticket not in returned
+
+    # The other direction: the sample's own action_id excludes the other action.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"action_id": prep_sample_action[0]},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
+    assert sample_ticket in returned
+    assert other_action_ticket not in returned
+
+    # AND-composed: this sample has no ticket for the other action.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={
+            "prep_sample_idx": str(prep_sample_idx),
+            "action_id": other_id_reference_action[0],
+        },
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["tickets"] == []
+
+
+async def test_list_work_ticket_unknown_filter_idx_is_empty_not_404(wt_client, admin_token):
+    """An idx that matches nothing returns an empty list — these are filters on
+    a list, and the route does not confirm which pools or samples exist."""
+    admin_tok, _ = admin_token
+    for params in (
+        {"sequenced_pool_idx": "999999999"},
+        {"prep_sample_idx": "999999999"},
+        {"action_id": "no-such-action"},
+    ):
+        resp = await wt_client.get(
+            URL_WORK_TICKET_LIST,
+            params=params,
+            headers={"Authorization": f"Bearer {admin_tok}"},
+        )
+        assert resp.status_code == 200, (params, resp.text)
+        assert resp.json()["tickets"] == []
+
+
+async def test_list_work_ticket_filter_idx_out_of_range_422(wt_client, admin_token):
+    """The two idx filters are positive integers (gt=0), like every other idx
+    on this surface."""
+    admin_tok, _ = admin_token
+    for params in ({"sequenced_pool_idx": "0"}, {"prep_sample_idx": "0"}, {"action_id": ""}):
+        resp = await wt_client.get(
+            URL_WORK_TICKET_LIST,
+            params=params,
+            headers={"Authorization": f"Bearer {admin_tok}"},
+        )
+        assert resp.status_code == 422, (params, resp.text)
 
 
 async def test_list_work_ticket_limit_out_of_range_422(wt_client, admin_token):

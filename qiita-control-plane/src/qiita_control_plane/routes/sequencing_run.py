@@ -22,28 +22,37 @@ clients should be aware of.
 The preflight GET is SA-only via Scope.SEQUENCED_POOL_PREFLIGHT_READ,
 matching the existing CO→CP precedent (routes/sequence_range.py).
 
-Every handler delegates its DB work to the repositories.sequencing_run
-module. The per-item sequenced-sample import composer, the run-scoped
-sequenced_sample bulk-id read, and the single-sequenced-sample
-read/PATCH live in the sibling sequenced_sample route module.
+Handlers delegate their DB work to the repositories layer — mostly
+repositories.sequencing_run, and repositories.alignment_definition for the two
+pool-alignment discovery reads, which query the alignment tables rather than the
+run's own. The per-item sequenced-sample import composer, the run-scoped
+sequenced_sample bulk-id read, and the single-sequenced-sample read/PATCH live in
+the sibling sequenced_sample route module.
 """
 
 import base64
 import json
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any
 
 import asyncpg
 import pyarrow.flight as _flight
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import Field
 from qiita_common.api_paths import (
+    PATH_SEQUENCED_POOL_ALIGN_PLAN,
+    PATH_SEQUENCED_POOL_ALIGNMENT,
+    PATH_SEQUENCED_POOL_ALIGNMENT_COHORT,
+    PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN,
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_COMPLETION,
     PATH_SEQUENCED_POOL_PREFLIGHT,
     PATH_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE,
     PATH_SEQUENCED_POOL_QC_REPORT,
+    PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY,
+    PATH_SEQUENCED_SAMPLE_EXCEPTIONS,
     PATH_SEQUENCING_RUN_BY_IDX,
     PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
     PATH_SEQUENCING_RUN_PREFIX,
@@ -51,10 +60,21 @@ from qiita_common.api_paths import (
     PATH_SEQUENCING_RUN_SEQUENCED_POOL,
 )
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.host_filter_plan import PoolPlanRefusal
 from qiita_common.models import (
+    AlignPlanRequest,
+    AlignPlanResponse,
+    BlockMaskPlanRequest,
+    BlockMaskPlanResponse,
+    PoolAlignmentCohort,
+    PoolAlignmentList,
+    PoolAlignmentSummary,
     PoolCompletionStatus,
+    PoolExceptionsResponse,
     PoolQCReport,
+    PoolReadMaskCoverage,
     PoolReadMetrics,
+    PoolWorkTicketSummary,
     SampleQCReport,
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
@@ -63,14 +83,17 @@ from qiita_common.models import (
     SequencedPoolPreflightUpdateLaneRequest,
     SequencedPoolPreflightUpdateLaneResponse,
     SequencedPoolResponse,
+    SequencedSampleException,
     SequencingRunCreateRequest,
     SequencingRunCreateResponse,
     SequencingRunLookupByInstrumentRunIdRequest,
     SequencingRunLookupByInstrumentRunIdResponse,
     SequencingRunResponse,
+    WorkTicketState,
     merge_qc_reports,
 )
 
+from .. import align_planner, block_planner
 from ..actions.library import delete_pool_reads_data
 from ..actions.sequenced_pool import (
     PreflightNotEditable,
@@ -83,6 +106,8 @@ from ..actions.sequenced_pool import (
     reap_staged_reads,
 )
 from ..auth.guards import (
+    COHORT_MIN_TIER,
+    filter_prep_samples_caller_can_read,
     require_caller_owns_run,
     require_complete_profile,
     require_human,
@@ -97,19 +122,28 @@ from ..deps import (
     TxConnFactory,
     get_data_plane_url,
     get_db_pool,
-    get_hmac_secret,
+    get_flight_signing_key,
     get_scratch_staging,
     get_tx_conn_factory,
 )
+from ..repositories.alignment_definition import (
+    list_alignments_over_prep_samples,
+    list_completed_alignment_samples,
+    list_pool_prep_sample_idxs,
+)
+from ..repositories.mask_definition import MaskDefinitionDeprecated
 from ..repositories.sequencing_run import (
     PayloadMismatch,
     fetch_sequenced_pool_completion,
     fetch_sequenced_pool_demux_state,
     fetch_sequenced_pool_preflight,
+    fetch_sequenced_pool_read_mask_ticket_state_counts,
     fetch_sequenced_pool_read_metrics,
+    fetch_sequenced_pool_sample_exceptions,
     fetch_sequenced_pool_sample_qc_reports,
     fetch_sequencing_run,
     fetch_sequencing_run_idxs_by_instrument_run_id,
+    fetch_sequencing_run_read_metrics,
     insert_sequenced_pool,
     insert_sequencing_run,
     update_sequenced_pool_preflight_blob,
@@ -117,6 +151,32 @@ from ..repositories.sequencing_run import (
 from ._helpers import GENERIC_FK_VIOLATION, resolve_idxs_by_natural_key
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequencing-run"])
+
+
+def _host_filter_refusal_http(exc: block_planner.PoolHostFilterRefusal) -> HTTPException:
+    """Turn a per-sample host-filter refusal into a 422 that NAMES the offending
+    prep_samples — the same fail-closed abort the CLI submit path prints, now on the
+    server surface both the block-mask and align plans share. UNRESOLVED lists the
+    samples and the resolver's reason for the first few; MULTI_HOST names the
+    prep_samples that established the competing hosts."""
+    if exc.refusal is PoolPlanRefusal.UNRESOLVED_SAMPLES:
+        reasons = "; ".join(f"{idx}: {why}" for idx, why in exc.reasons.items())
+        detail = (
+            f"{len(exc.offending)} sample(s) have no resolvable host"
+            f" (e.g. {list(exc.offending[:5])}); refusing to submit — a sample whose"
+            " host we cannot determine would be masked against the wrong thing, or"
+            f" against nothing. {reasons}. Fix the samples' host_taxon_id metadata"
+            " (qiita-admin backfill host-taxon-id), or force an explicit reference."
+        )
+    else:  # MULTI_HOST
+        detail = (
+            f"pool spans more than one host (established by e.g."
+            f" {list(exc.offending[:5])}); its blanks have no single reference to be"
+            " depleted against, and filtering against the union of the pool's hosts"
+            " is not supported yet. Submit a single-host subset, or force an explicit"
+            " reference."
+        )
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail)
 
 
 @router.post(PATH_SEQUENCING_RUN_ROOT, status_code=201)
@@ -180,10 +240,11 @@ async def get_sequencing_run(
 
     Returns the run's caller-visible columns (see `fetch_sequencing_run`),
     notably `instrument_model` — the field `qiita submit-host-filter-pool` reads
-    to forward QC's polyG gate per sample. Same read gate as the pool roster
-    route (`list_sequenced_samples_in_pool`): a HumanUser with
-    `Scope.PREP_SAMPLE_READ` and system_role at least wet_lab_admin. 404 when the
-    run does not exist.
+    to forward QC's polyG gate per sample — plus `read_metrics`, the run-level
+    twin of the pool rollup (the identical PoolReadMetrics shape summed across the
+    run's pools, compute-on-read). Same read gate as the pool roster route
+    (`list_sequenced_samples_in_pool`): a HumanUser with `Scope.PREP_SAMPLE_READ`
+    and system_role at least wet_lab_admin. 404 when the run does not exist.
     """
     row = await fetch_sequencing_run(pool, sequencing_run_idx)
     if row is None:
@@ -196,6 +257,12 @@ async def get_sequencing_run(
     # carries an object, matching the study GET route's handling.
     if isinstance(data["extra_metadata"], str):
         data["extra_metadata"] = json.loads(data["extra_metadata"])
+    # Run-level read-metric twin: same PoolReadMetrics shape as the pool rollup,
+    # summed across the run's pools. The run existence is already established by the
+    # metadata fetch above; the aggregate row is always present (a run with no
+    # samples reads as NULL sums / 0 counts).
+    metrics_row = await fetch_sequencing_run_read_metrics(pool, sequencing_run_idx)
+    data["read_metrics"] = _pool_read_metrics(metrics_row)
     return SequencingRunResponse.model_validate(data)
 
 
@@ -446,6 +513,24 @@ async def update_sequenced_pool_preflight_lane(
     )
 
 
+# The rollup columns `PoolReadMetrics` is built from — derived from the model, not
+# re-listed, so adding a metric cannot silently miss a construction site. (The model's
+# `fraction_passing_quality_filter` is a computed_field, so it is not in `model_fields`
+# and is correctly absent here: it is recomputed from the summed counts, never read.)
+_POOL_READ_METRIC_FIELDS: tuple[str, ...] = tuple(PoolReadMetrics.model_fields)
+
+
+def _pool_read_metrics(row: Mapping[str, Any]) -> PoolReadMetrics:
+    """The pool read-metric rollup, from any mapping carrying its columns.
+
+    ONE construction site, on purpose. This was hand-built field-by-field in two places
+    (the pool GET and the QC-report GET) from the same `fetch_sequenced_pool_read_metrics`
+    row, so every new metric had to be added twice — and a missed one is not a crash but a
+    silently-null metric on one endpoint only.
+    """
+    return PoolReadMetrics.model_validate({f: row[f] for f in _POOL_READ_METRIC_FIELDS})
+
+
 @router.get(PATH_SEQUENCED_POOL_BY_IDX)
 async def get_sequenced_pool(
     sequencing_run_idx: Annotated[int, Field(gt=0)],
@@ -486,13 +571,11 @@ async def get_sequenced_pool(
     data["sequenced_pool_idx"] = data.pop("idx")
     if isinstance(data["extra_metadata"], str):
         data["extra_metadata"] = json.loads(data["extra_metadata"])
-    data["read_metrics"] = PoolReadMetrics(
-        raw_read_count_r1r2=data.pop("raw_read_count_r1r2"),
-        biological_read_count_r1r2=data.pop("biological_read_count_r1r2"),
-        quality_filtered_read_count_r1r2=data.pop("quality_filtered_read_count_r1r2"),
-        sample_count=data.pop("sample_count"),
-        samples_with_metrics=data.pop("samples_with_metrics"),
-    )
+    # Build BEFORE popping: the metric columns are the source, and popping them is what
+    # leaves `data` holding exactly SequencedPoolResponse's top-level fields.
+    data["read_metrics"] = _pool_read_metrics(data)
+    for field in _POOL_READ_METRIC_FIELDS:
+        data.pop(field)
     return SequencedPoolResponse.model_validate(data)
 
 
@@ -550,15 +633,115 @@ async def get_sequenced_pool_qc_report(
         sequencing_run_idx=rollup["sequencing_run_idx"],
         sample_count=rollup["sample_count"],
         samples_with_qc_report=sum(1 for s in samples if s.raw_qc_report is not None),
-        read_metrics=PoolReadMetrics(
-            raw_read_count_r1r2=rollup["raw_read_count_r1r2"],
-            biological_read_count_r1r2=rollup["biological_read_count_r1r2"],
-            quality_filtered_read_count_r1r2=rollup["quality_filtered_read_count_r1r2"],
-            sample_count=rollup["sample_count"],
-            samples_with_metrics=rollup["samples_with_metrics"],
-        ),
+        read_metrics=_pool_read_metrics(rollup),
         merged=merge_qc_reports(samples),
         samples=samples,
+    )
+
+
+async def _readable_pool_prep_samples(
+    pool: asyncpg.Pool, *, sequenced_pool_idx: int, caller: Principal
+) -> list[int]:
+    """The pool's non-retired prep_samples that `caller` may read.
+
+    Pool membership, then the shared per-study read gate
+    (`filter_prep_samples_caller_can_read`) — the same one the all-or-nothing
+    alignment mint raises on, so a cohort discovered here is one the mint
+    accepts. Everything about what "may read" means, including the orphan drop
+    and the wet_lab_admin bypass, lives in that guard rather than here.
+    """
+    prep_sample_idxs = await list_pool_prep_sample_idxs(pool, sequenced_pool_idx)
+    access = await filter_prep_samples_caller_can_read(
+        pool, caller=caller, prep_sample_idxs=prep_sample_idxs, min_tier=COHORT_MIN_TIER
+    )
+    return access.readable
+
+
+@router.get(PATH_SEQUENCED_POOL_ALIGNMENT)
+async def list_sequenced_pool_alignments(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolAlignmentList:
+    """List the alignments over this pool's samples — the answer to "what has
+    been aligned here, against which reference, and is it finished".
+
+    **Narrowed to the caller's readable slice**, not gated on the whole pool. A
+    pool spans studies, so 403ing it would make it undiscoverable to someone who
+    legitimately owns part of it; narrowing is safe on a listing because no
+    scientific result depends on it. The per-study `Tier.VIEWER` check is the
+    boundary, which is why this is open to role `user` where the sibling
+    completion rollup is wet_lab_admin-gated.
+
+    Both counts are over the caller's own samples (see `PoolAlignmentSummary`),
+    so they agree with what the alignment DoGet mint will accept — that mint is
+    all-or-nothing, and showing the pool's real counts here would set the caller
+    up for a 403. An alignment the caller can read no sample of is absent
+    entirely rather than reported with zero counts.
+    """
+    prep_sample_idxs = await _readable_pool_prep_samples(
+        pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
+    )
+    rows = await list_alignments_over_prep_samples(pool, prep_sample_idxs)
+    return PoolAlignmentList(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+        alignments=[
+            PoolAlignmentSummary(
+                alignment_idx=row["alignment_idx"],
+                # asyncpg hands JSONB back as str under the default codec.
+                params=json.loads(row["params"])
+                if isinstance(row["params"], str)
+                else row["params"],
+                # Hex, not raw bytes: this is a string a client compares against its
+                # own `canonical_params_hash(params).hex()` and a manifest publishes.
+                params_hash=row["params_hash"].hex(),
+                samples_completed=row["samples_completed"],
+                samples_total=row["samples_total"],
+            )
+            for row in rows
+        ],
+    )
+
+
+@router.get(PATH_SEQUENCED_POOL_ALIGNMENT_COHORT)
+async def get_sequenced_pool_alignment_cohort(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    alignment_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolAlignmentCohort:
+    """Resolve the cohort to mint an alignment DoGet ticket for: this pool's
+    prep_samples that are both readable by the caller and `'completed'` for this
+    alignment.
+
+    Two filters, and both are load-bearing. Readability makes the result a valid
+    mint body by construction — the mint is all-or-nothing, so a cohort this
+    route hands back can never 403 there. Completion is a first-class state:
+    alignment rows are NOT 1:1 with reads (cross-shard routing and paired-end
+    mates both multiply rows per read), so the presence of rows says nothing
+    about whether a sample is done.
+
+    An empty cohort is a legitimate answer, not a 404 or a 403 — it means
+    "nothing here you may mint", and unlike a rejection it does not confirm
+    which of the pool's alignments touch data the caller lacks.
+    """
+    prep_sample_idxs = await _readable_pool_prep_samples(
+        pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
+    )
+    return PoolAlignmentCohort(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+        alignment_idx=alignment_idx,
+        prep_sample_idx=await list_completed_alignment_samples(
+            pool, alignment_idx, prep_sample_idxs
+        ),
     )
 
 
@@ -571,6 +754,15 @@ async def get_sequenced_pool_completion(
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
     _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+    reference_idx: int | None = Query(
+        default=None,
+        ge=1,
+        description=(
+            "Optional host reference to scope host-masking completion to: the"
+            " buckets then count only masks that used this reference, so"
+            " samples_not_submitted means 'not masked against THIS reference'."
+        ),
+    ),
 ) -> PoolCompletionStatus:
     """Read the pool's end-to-end processing rollup: the demux (bcl-convert)
     stage state plus the host-masking stage. `demux_state` is the pool-scoped
@@ -589,11 +781,14 @@ async def get_sequenced_pool_completion(
     and system_role at least wet_lab_admin. `require_sequenced_pool_in_run` fronts
     404 (no such pool) / 422 (pool not under this run); a pool with no non-retired
     samples reads as all-zero counts and `complete=False`."""
-    row = await fetch_sequenced_pool_completion(pool, sequenced_pool_idx)
+    row = await fetch_sequenced_pool_completion(
+        pool, sequenced_pool_idx, reference_idx=reference_idx
+    )
     demux_state = await fetch_sequenced_pool_demux_state(pool, sequenced_pool_idx)
     return PoolCompletionStatus(
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=sequencing_run_idx,
+        reference_idx=reference_idx,
         demux_state=demux_state,
         sample_count=row["sample_count"],
         samples_completed=row["samples_completed"],
@@ -604,6 +799,362 @@ async def get_sequenced_pool_completion(
     )
 
 
+def _sequenced_sample_exception_flags(row: Mapping[str, Any]) -> list[str]:
+    """Derive the ordered exception flags for one anomalous sample row. Mirrors the
+    SQL WHERE in `fetch_sequenced_pool_sample_exceptions`, so every row that query
+    returns yields at least one flag. `unprocessed` (no metrics) and `no_reads`
+    (processed, 0 survived) are mutually exclusive; `failed_ticket` is a FAILED
+    read-mask ticket with no COMPLETED one (same precedence as the completion
+    rollup)."""
+    flags: list[str] = []
+    if row["raw_read_count_r1r2"] is None:
+        flags.append("unprocessed")
+    elif (row["quality_filtered_read_count_r1r2"] or 0) == 0:
+        flags.append("no_reads")
+    if row["biosample_accession"] is None:
+        flags.append("missing_biosample_accession")
+    if row["ena_sample_accession"] is None:
+        flags.append("missing_ena_sample_accession")
+    if row["ena_experiment_accession"] is None:
+        flags.append("missing_ena_experiment_accession")
+    if row["ena_run_accession"] is None:
+        flags.append("missing_ena_run_accession")
+    if row["has_failed"] and not row["has_completed"]:
+        flags.append("failed_ticket")
+    return flags
+
+
+@router.get(PATH_SEQUENCED_SAMPLE_EXCEPTIONS)
+async def get_sequenced_pool_exceptions(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolExceptionsResponse:
+    """Read the pool's exception drill-down: only the anomalous non-retired
+    sequenced_samples — no usable reads (unprocessed or zero survived), missing any
+    of the four submission accessions, or a genuinely-failed read-mask ticket —
+    each with the `flags` naming why. The actionable subset of the roster, so an
+    operator sees what needs attention without scanning every sample.
+
+    Compute-on-read; `count` is `len(samples)` and a clean pool returns
+    `count=0, samples=[]`. Same read gate and 404/422 fronting as the pool
+    metadata / completion endpoints."""
+    rows = await fetch_sequenced_pool_sample_exceptions(pool, sequenced_pool_idx)
+    samples = [
+        SequencedSampleException(
+            sequenced_sample_idx=r["sequenced_sample_idx"],
+            prep_sample_idx=r["prep_sample_idx"],
+            biosample_accession=r["biosample_accession"],
+            quality_filtered_read_count_r1r2=r["quality_filtered_read_count_r1r2"],
+            flags=_sequenced_sample_exception_flags(r),
+        )
+        for r in rows
+    ]
+    return PoolExceptionsResponse(
+        sequenced_pool_idx=sequenced_pool_idx,
+        sequencing_run_idx=sequencing_run_idx,
+        count=len(samples),
+        samples=samples,
+    )
+
+
+@router.get(PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY)
+async def get_sequenced_pool_work_ticket_summary(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolWorkTicketSummary:
+    """Read the pool's read-mask work-ticket rollup: coverage (samples with vs.
+    without a read-mask ticket) plus per-STATE ticket counts (tickets as the
+    denominator — no per-sample precedence collapse, unlike the completion
+    rollup's buckets).
+
+    Coverage is taken from the completion rollup so the two reconcile by
+    construction (`samples_with_read_mask_ticket` == `sample_count -
+    samples_not_submitted`). `ticket_state_counts` carries every WorkTicketState
+    (states with no tickets read 0). Compute-on-read; same read gate and 404/422
+    fronting as the pool completion endpoint."""
+    completion = await fetch_sequenced_pool_completion(pool, sequenced_pool_idx)
+    state_counts = await fetch_sequenced_pool_read_mask_ticket_state_counts(
+        pool, sequenced_pool_idx
+    )
+    sample_count = completion["sample_count"]
+    without = completion["samples_not_submitted"]
+    return PoolWorkTicketSummary(
+        sequenced_pool_idx=sequenced_pool_idx,
+        sequencing_run_idx=sequencing_run_idx,
+        sample_count=sample_count,
+        read_mask=PoolReadMaskCoverage(
+            samples_with_read_mask_ticket=sample_count - without,
+            samples_without_read_mask_ticket=without,
+        ),
+        # Fill every state so the map is complete regardless of which appear in the DB.
+        ticket_state_counts={s.value: state_counts.get(s.value, 0) for s in WorkTicketState},
+    )
+
+
+@router.post(PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN, status_code=status.HTTP_202_ACCEPTED)
+async def submit_block_mask_plan(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    body: BlockMaskPlanRequest,
+    request: Request,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _run_exists: None = Depends(require_sequencing_run_exists),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+    signing_key: bytes = Depends(get_flight_signing_key),
+    data_plane_url: str = Depends(get_data_plane_url),
+    staging_root: Path | None = Depends(get_scratch_staging),
+) -> BlockMaskPlanResponse:
+    """Plan + submit the pool's bulk-block read masking in ONE call — the
+    block-compute analog of the per-sample submit-host-filter-pool fan-out.
+
+    Resolves each sample's `mask_idx` (shared identity with per-sample read-mask),
+    partitions by mask, tiles each partition into fixed ~10M-read blocks, persists
+    the `block`/`block_member` cover-map + a PENDING `mask_sample` gate per sample,
+    creates one block work_ticket per block, and dispatches each. Returns the plan
+    (blocks + tickets + partition/sample counts) with HTTP 202; a pool with
+    nothing to do returns 202 with zero counts.
+
+    Same gate as the pool read/QC endpoints — a HumanUser with
+    `Scope.PREP_SAMPLE_WRITE` at system_role ≥ wet_lab_admin (host filtering / QC
+    is a privileged lab operation; matches the read-mask audience).
+    `require_sequenced_pool_in_run` fronts 404 (no such pool) / 422 (pool not
+    under this run). Host-ref coherence (minimap2⇒rype) is validated on the model.
+    """
+    # Dispatch is fire-and-forget in-process; refuse if the orchestrator hop is
+    # unconfigured rather than minting blocks whose tickets can never run.
+    if request.app.state.compute_backend_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="compute orchestrator not configured (COMPUTE_ORCHESTRATOR_URL unset)",
+        )
+
+    # The block workflow ships out-of-tree (qiita-admin actions sync). If it is
+    # not yet registered the ticket INSERT would FK-violate mid-plan; front it
+    # with a clear 503 so the operator syncs actions rather than seeing a 500.
+    action_enabled = await pool.fetchval(
+        "SELECT enabled FROM qiita.action WHERE action_id = $1 AND version = $2",
+        block_planner.BLOCK_MASK_ACTION_ID,
+        block_planner.BLOCK_MASK_ACTION_VERSION,
+    )
+    if action_enabled is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"block-mask workflow "
+                f"({block_planner.BLOCK_MASK_ACTION_ID}/{block_planner.BLOCK_MASK_ACTION_VERSION})"
+                " is not registered; run `qiita-admin actions sync`"
+            ),
+        )
+    if not action_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=(
+                f"block-mask workflow "
+                f"({block_planner.BLOCK_MASK_ACTION_ID}/{block_planner.BLOCK_MASK_ACTION_VERSION})"
+                " is deprecated"
+            ),
+        )
+
+    # The mask identity folds in a hash of the canonical adapter set to exactly
+    # match the per-sample read-mask mint (so the two collapse to one mask_idx).
+    # The planner helper decides inclusion the same way the runner does — gated on
+    # the read-mask workflow declaring adapter_parquet AND a default reference
+    # being configured — and materializes it once (a data-plane hop) only then.
+    try:
+        adapter_set_hashes = await block_planner.resolve_block_mask_adapter_hash(
+            pool,
+            default_adapter_reference_idx=request.app.state.settings.default_adapter_reference_idx,
+            data_plane_url=data_plane_url,
+            signing_key=signing_key,
+            staging_root=staging_root,
+            sequencing_run_idx=sequencing_run_idx,
+            sequenced_pool_idx=sequenced_pool_idx,
+        )
+    except block_planner.AdapterMaterializationUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+
+    try:
+        summary = await block_planner.plan_and_submit_blocks(
+            pool,
+            app=request.app,
+            sequencing_run_idx=sequencing_run_idx,
+            sequenced_pool_idx=sequenced_pool_idx,
+            force_decision=block_planner.force_decision_from(
+                force=body.force,
+                host_rype_reference_idx=body.host_rype_reference_idx,
+                host_minimap2_reference_idx=body.host_minimap2_reference_idx,
+            ),
+            only_missing=body.only_missing,
+            adapter_set_hashes=adapter_set_hashes,
+            originator_principal_idx=user.principal_idx,
+            block_action_id=block_planner.BLOCK_MASK_ACTION_ID,
+            block_action_version=block_planner.BLOCK_MASK_ACTION_VERSION,
+        )
+    except block_planner.PoolHostFilterRefusal as exc:
+        raise _host_filter_refusal_http(exc) from exc
+    except block_planner.HostReferenceNotReady as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    except MaskDefinitionDeprecated as exc:
+        # The config this plan would mint against is void. 409, not the
+        # unmapped 500 an unhandled raise gives: the request is well-formed
+        # and would have succeeded before the deprecation.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.detail) from exc
+    except block_planner.BlockMaskResubmitError as exc:
+        # A sample already gated for the resolved mask would be re-masked
+        # (completed → read_mask double-write) or wedged (pending → duplicate
+        # covering block). Mirror the pool resubmit 409: DELETE the mask or pass
+        # only_missing.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "reason": str(exc),
+                "conflicting_prep_sample_idxs": exc.conflicting_prep_sample_idxs,
+            },
+        ) from exc
+    return BlockMaskPlanResponse(**summary)
+
+
+@router.post(PATH_SEQUENCED_POOL_ALIGN_PLAN, status_code=status.HTTP_202_ACCEPTED)
+async def submit_align_plan(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    body: AlignPlanRequest,
+    request: Request,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _run_exists: None = Depends(require_sequencing_run_exists),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> AlignPlanResponse:
+    """Plan + submit the pool's bulk-block sharded alignment in ONE call — the
+    align analog of block-mask-plan.
+
+    Selects the pool's samples masked-complete under the caller-supplied `mask_idx`
+    (alignment does NOT re-derive the mask config — the caller names the mask its
+    reads were produced under), mints one `alignment_idx` over the sharded reference
+    + aligner + shard-set + mask, tiles them into fixed ~10M-read blocks, persists
+    the `block`/`block_member` cover-map + a PENDING `alignment_sample` gate per
+    sample, creates one block work_ticket per block, and dispatches each. Returns the
+    plan (blocks + tickets + partition/sample counts) with HTTP 202; a pool with
+    nothing to align (all samples still masking, or none masked under this mask)
+    returns 202 with zero counts.
+
+    Same gate as block-mask-plan — a HumanUser with `Scope.PREP_SAMPLE_WRITE` at
+    system_role ≥ wet_lab_admin (alignment re-materializes host-depleted,
+    human-derived reads, a privileged lab operation).
+    `require_sequenced_pool_in_run` fronts 404 (no such pool) / 422 (pool not under
+    this run). A nonexistent `mask_idx` is 404; a mask under which no pool sample is
+    masked-complete is 422.
+    """
+    # Dispatch is fire-and-forget in-process; refuse if the orchestrator hop is
+    # unconfigured rather than minting blocks whose tickets can never run.
+    if request.app.state.compute_backend_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="compute orchestrator not configured (COMPUTE_ORCHESTRATOR_URL unset)",
+        )
+
+    # The align workflow ships out-of-tree (qiita-admin actions sync). If it is not
+    # yet registered the ticket INSERT would FK-violate mid-plan; front it with a
+    # clear 503 so the operator syncs actions rather than seeing a 500.
+    action_enabled = await pool.fetchval(
+        "SELECT enabled FROM qiita.action WHERE action_id = $1 AND version = $2",
+        align_planner.ALIGN_ACTION_ID,
+        align_planner.ALIGN_ACTION_VERSION,
+    )
+    if action_enabled is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"align workflow "
+                f"({align_planner.ALIGN_ACTION_ID}/{align_planner.ALIGN_ACTION_VERSION})"
+                " is not registered; run `qiita-admin actions sync`"
+            ),
+        )
+    if not action_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=(
+                f"align workflow "
+                f"({align_planner.ALIGN_ACTION_ID}/{align_planner.ALIGN_ACTION_VERSION})"
+                " is deprecated"
+            ),
+        )
+
+    # The caller names the mask_idx to align under; the planner selects the pool's
+    # samples whose mask_sample gate is 'completed' under it. Alignment does not
+    # re-derive the mask config, so there is no adapter-set / host resolution here.
+    try:
+        summary = await align_planner.plan_and_submit_alignments(
+            pool,
+            app=request.app,
+            sequencing_run_idx=sequencing_run_idx,
+            sequenced_pool_idx=sequenced_pool_idx,
+            reference_idx=body.reference_idx,
+            mask_idx=body.mask_idx,
+            only_missing=body.only_missing,
+            originator_principal_idx=user.principal_idx,
+            align_action_id=align_planner.ALIGN_ACTION_ID,
+            align_action_version=align_planner.ALIGN_ACTION_VERSION,
+        )
+    except align_planner.AlignNoMasksFound as exc:
+        # No pool sample is masked under the named mask_idx — loud 422, not a silent
+        # 202/0 (the caller named a mask this pool was not masked under).
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    except align_planner.AlignMaskNotFound as exc:
+        # The named mask_idx does not exist (a client-supplied identifier).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except align_planner.AlignMaskDeprecated as exc:
+        # The mask exists but its config is void, so new results must not be built
+        # on it. 409, not 404: the request is well-formed and would have succeeded
+        # before the deprecation.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except align_planner.AlignReferenceNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except align_planner.AlignUnsupportedPlatform as exc:
+        # The run's platform has no defined sharded aligner (only Illumina / PacBio
+        # HiFi / Nanopore are alignable) — a request the server can't process.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    except align_planner.AlignReferenceNotReady as exc:
+        # Reference exists but is not ACTIVE + sharded — the operator must build /
+        # shard it (or wait for it to go active) before aligning against it.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except align_planner.AlignResubmitError as exc:
+        # A sample already gated for the resolved alignment would be re-aligned
+        # (completed → alignment double-write) or wedged (pending → duplicate
+        # covering block). DELETE the alignment or pass only_missing.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "reason": str(exc),
+                "conflicting_prep_sample_idxs": exc.conflicting_prep_sample_idxs,
+            },
+        ) from exc
+    return AlignPlanResponse(**summary)
+
+
 @router.delete(PATH_SEQUENCED_POOL_BY_IDX)
 async def delete_sequenced_pool(
     sequencing_run_idx: Annotated[int, Field(gt=0)],
@@ -611,7 +1162,7 @@ async def delete_sequenced_pool(
     force: bool = False,
     pool: asyncpg.Pool = Depends(get_db_pool),
     tx: TxConnFactory = Depends(get_tx_conn_factory),
-    hmac_secret: bytes = Depends(get_hmac_secret),
+    signing_key: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
     staging_root: Path | None = Depends(get_scratch_staging),
     _scope: Principal = Depends(require_scope(Scope.SEQUENCED_POOL_DELETE)),
@@ -634,8 +1185,9 @@ async def delete_sequenced_pool(
     study link they hold — not only the run/pool the operator is thinking of.
 
     Gating: in-flight work tickets (pending/queued/processing) block the delete
-    unconditionally (409). Completed/failed work tickets, prep_samples published
-    into a study, and samples carrying an ENA accession each block it unless
+    unconditionally (409). Terminal work tickets (completed/no_data/failed),
+    prep_samples published into a study, and samples carrying an ENA accession
+    each block it unless
     `force=true`.
 
     The DuckLake purge (the `read`/`read_mask` rows the pool's bcl-convert run
@@ -687,7 +1239,7 @@ async def delete_sequenced_pool(
     try:
         purge = await delete_pool_reads_data(
             prep_sample_idxs=prep_sample_idxs,
-            hmac_secret=hmac_secret,
+            signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
     except _flight.FlightError as exc:

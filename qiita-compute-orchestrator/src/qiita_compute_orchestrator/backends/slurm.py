@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -30,15 +31,16 @@ from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.duckdb_miint import miint_job_env
 from qiita_common.log_tail import contains_oom_signature, read_text_tail
 from qiita_common.models import (
-    ComputeTarget,
     StepBaselineResources,
     StepStatus,
     WorkTicketFailureStage,
+    check_derived_inputs,
 )
 
 from ..backend import (
     ComputeBackend,
     FoundJob,
+    SlurmStepHandle,
     StepHandle,
     StepStatusInfo,
     assert_container_scope_supported,
@@ -49,6 +51,7 @@ from ..slurm import (
     SlurmrestdError,
     TerminalSlurmState,
     build_job_submit_payload,
+    job_name_prefix,
     parse_launcher_failure,
     parse_launcher_no_data,
     parse_outputs_map,
@@ -118,8 +121,6 @@ class SlurmBackend(ComputeBackend):
         client: SlurmrestdClient,
         partition: str,
         account: str,
-        poll_interval_seconds: int,
-        job_timeout_seconds: int,
         native_python: str = "python",
         co_to_cp_token: str = "",
         cp_url: str = "",
@@ -127,20 +128,11 @@ class SlurmBackend(ComputeBackend):
         path_derived_images: Path | None = None,
         path_scratch: str = "",
         path_derived: str = "",
+        data_plane_url: str = "",
     ) -> None:
         self._client = client
         self._partition = partition
         self._account = account
-        # TODO(decouple-compute follow-up): remove these two fields + the
-        # SlurmSettings entries + the SLURM_POLL_INTERVAL_SECONDS /
-        # SLURM_JOB_TIMEOUT_SECONDS env vars in a dedicated config-cleanup PR.
-        # Retained-but-unread since the CP runner took over the poll loop (it
-        # drives status_step at its own interval and relies on SLURM's walltime
-        # to terminate a stuck job), so the orchestrator no longer polls or
-        # enforces a watch-timeout. Kept now only to keep this change off the
-        # deploy surface (the env vars still parse harmlessly).
-        self._poll_interval = poll_interval_seconds
-        self._job_timeout = job_timeout_seconds
         self._native_python = native_python
         # Shared-FS dir where built SIFs live (PATH_DERIVED/images). When
         # set, bare `container:` filenames in workflow YAML resolve as
@@ -182,6 +174,13 @@ class SlurmBackend(ComputeBackend):
         # the launcher's get_settings() on the compute node needs the real
         # value, not the $TMPDIR/qiita/derived dev fallback.
         self._path_derived = path_derived
+        # Data-plane gRPC origin, propagated for the same reason as PATH_DERIVED:
+        # a native job that streams reference chunks (Flight DoGet) resolves it
+        # via the launcher's get_settings() on the compute node, so it needs the
+        # real nginx-fronted origin, not the localhost dev fallback. Empty in unit
+        # tests that don't exercise streaming; production wires it in
+        # main._build_backend().
+        self._data_plane_url = data_plane_url
         # Optional SLURM QOS to set on submit; empty string means "let
         # SLURM apply the submitting user's default QOS" (the orchestrator
         # doesn't override).
@@ -283,6 +282,75 @@ class SlurmBackend(ComputeBackend):
         # Sorted output makes payload tests deterministic.
         return sorted(bind_dirs)
 
+    def _resolve_derived_inputs(
+        self, derived_inputs: dict[str, str], *, step_name: str
+    ) -> dict[str, Path]:
+        """Join each YAML-declared `derived_inputs` value against this
+        orchestrator's ``PATH_DERIVED``, yielding env_var_name -> absolute
+        host path. The caller binds each path into the container (read-only)
+        and forwards it under its env var name.
+
+        This is the LAST gate before a YAML-authored string becomes a host path
+        bind-mounted into a container, and a direct caller (a test, programmatic
+        submission) skips the wire — so it re-runs the full shared
+        `check_derived_inputs` contract rather than a subset of it, then adds
+        the two checks that need the resolved root:
+
+          * the joined path stays under PATH_DERIVED, and
+          * it is not PATH_DERIVED itself (a bare `.` would bind the whole
+            derived root — every SIF under images/ — into the container).
+
+        Existence is NOT checked, for the same reason as `_resolve_input_binds`:
+        the orchestrator's filesystem view can differ from the compute nodes'.
+        A genuinely missing derived artifact fails loudly inside apptainer when
+        ``--bind`` evaluates against a non-existent host directory.
+        """
+        if not derived_inputs:
+            return {}
+        if not self._path_derived:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=(
+                    "step declares 'derived_inputs' but PATH_DERIVED is not set"
+                    " — the orchestrator cannot resolve the derived-artifact root"
+                ),
+            )
+        try:
+            check_derived_inputs(derived_inputs, container="present", owner="submit_step")
+        except ValueError as exc:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=str(exc),
+            ) from exc
+
+        root = Path(self._path_derived)
+        resolved: dict[str, Path] = {}
+        for env_name, rel in derived_inputs.items():
+            # normpath() COLLAPSES `..` lexically. Without it the containment
+            # check below is worthless: `is_relative_to` compares path parts
+            # verbatim, so `<root>/../../etc` "starts with" <root> and passes.
+            # Deliberately not Path.resolve() — that also follows symlinks, and
+            # (like _resolve_input_binds) we bind the path as written rather
+            # than chasing a link to somewhere the author didn't name.
+            path = Path(os.path.normpath(root / rel))
+            if not path.is_relative_to(root) or path == root:
+                raise BackendFailure(
+                    kind=FailureKind.CONTRACT_VIOLATION,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=step_name,
+                    reason=(
+                        f"derived_inputs[{env_name!r}]={rel!r} must name a path"
+                        f" strictly under PATH_DERIVED ({root}); it resolves to"
+                        f" {path}"
+                    ),
+                )
+            resolved[env_name] = path
+        return resolved
+
     async def submit_step(
         self,
         name: str,
@@ -296,6 +364,7 @@ class SlurmBackend(ComputeBackend):
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
+        derived_inputs: dict[str, str] | None = None,
     ) -> StepHandle:
         """Lay out the workspace tree + params.json, submit the SLURM job,
         and return a StepHandle — without polling. Submission errors are
@@ -338,10 +407,26 @@ class SlurmBackend(ComputeBackend):
         #   <workspace>/input/   contains params.json (mounted as $QIITA_INPUT_PATH)
         #   <workspace>/output/  receives manifest.json + outputs (mounted as $QIITA_OUTPUT_PATH)
         #   <workspace>/logs/    SLURM stdout / stderr land here
+        #   <workspace>/tmp/     the container's TMPDIR (see below)
         input_path = workspace / "input"
         output_path = workspace / "output"
         logs_path = workspace / "logs"
-        for d in (input_path, output_path, logs_path):
+        # `apptainer exec --containall` gives the container a *tmpfs* /tmp sized by
+        # the host's `sessiondir max size` — 64 MiB on the live deploy — and scrubs
+        # the environment, so TMPDIR is unset and a bare `mktemp -d` lands there.
+        # An entrypoint that stages real work through mktemp (an assembly, a
+        # decompressed FASTQ) then dies on a 64 MiB in-memory disk, and what it does
+        # write counts against the job's cgroup memory, silently eating the
+        # allocation its own resource sizing assumed it had. Point TMPDIR at the
+        # per-job workspace instead: it is real disk on the shared filesystem, it is
+        # already bound into the container (via --home), and it is cleaned up with
+        # the rest of the workspace.
+        #
+        # Container steps only. A native step runs on the compute node with no
+        # container, where /tmp is ordinary node-local disk — deliberately left
+        # alone (DuckDB's spill dir resolves against it).
+        tmp_path = workspace / "tmp"
+        for d in (input_path, output_path, logs_path, tmp_path):
             d.mkdir(parents=True, exist_ok=True)
         # params.json is the channel for workflow-specific data — never the
         # slurmrestd submit body, which is visible in `scontrol show job`
@@ -398,10 +483,14 @@ class SlurmBackend(ComputeBackend):
             extra_env["PATH_SCRATCH"] = self._path_scratch
         if self._path_derived:
             extra_env["PATH_DERIVED"] = self._path_derived
+        if self._data_plane_url:
+            extra_env["DATA_PLANE_URL"] = self._data_plane_url
         # Native jobs LOAD miint from the deploy-staged MIINT_EXTENSION_DIRECTORY
-        # (open_miint_conn); the compute node sees it only if we propagate it.
-        # Single-sourced with the compute-readiness probe via miint_job_env() so
-        # the diagnostic and the real jobs can't drift.
+        # and reach the GPL-boundary host via MIINT_GPL_BOUNDARY_PATH; the compute
+        # node sees these only if we propagate them (the slurmrestd environment is
+        # an allowlist, not inherited). miint is a core dependency, so miint_job_env()
+        # RAISES if either is unset — a doomed job is never submitted. Single-sourced
+        # with the compute-readiness probe so the diagnostic and real jobs can't drift.
         extra_env.update(miint_job_env())
 
         # For container steps, expose the parent directory of every
@@ -409,8 +498,22 @@ class SlurmBackend(ComputeBackend):
         # apptainer's host-mounted view. Native steps don't need extra
         # binds — the launcher runs outside any container.
         extra_bind_dirs: list[Path] | None = None
+        ro_bind_dirs: list[Path] | None = None
+        container_env: dict[str, str] | None = None
         if container is not None:
             extra_bind_dirs = self._resolve_input_binds(inputs, step_name=name)
+            # Operator-provisioned artifacts under PATH_DERIVED (e.g. CheckM's
+            # reference DB, too large to bake into the SIF). Bind each one
+            # read-only and forward its absolute path under the declared env var
+            # — apptainer runs `--containall`, so an unforwarded host env var is
+            # invisible inside the container.
+            derived = self._resolve_derived_inputs(derived_inputs or {}, step_name=name)
+            if derived:
+                # Same directory-granularity rule as _resolve_input_binds: bind a
+                # directory itself, but a FILE's parent (apptainer's --bind is
+                # directory-granular). The env var still names the file.
+                ro_bind_dirs = sorted({p if p.is_dir() else p.parent for p in derived.values()})
+                container_env = {k: str(v) for k, v in derived.items()}
 
         payload = build_job_submit_payload(
             step_name=name,
@@ -430,6 +533,8 @@ class SlurmBackend(ComputeBackend):
             attempt=attempt,
             extra_env=extra_env or None,
             extra_bind_dirs=extra_bind_dirs,
+            ro_bind_dirs=ro_bind_dirs,
+            container_env=container_env,
             qos=self._qos,
         )
 
@@ -438,8 +543,7 @@ class SlurmBackend(ComputeBackend):
         except SlurmrestdError as exc:
             raise self._classify_submit_error(exc, name) from exc
 
-        return StepHandle(
-            compute_target=ComputeTarget.SLURM,
+        return SlurmStepHandle(
             step_name=name,
             slurm_job_id=job_id,
             job_name=payload["job"]["name"],
@@ -591,14 +695,38 @@ class SlurmBackend(ComputeBackend):
             if info.job_id is not None
         ]
 
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        """scancel every live job of a work_ticket — all attempts, by the
+        `qiita-wt{idx}-` name prefix. Returns the ids actually cancelled. slurmrestd
+        errors classify like `find_jobs_by_name` (transport / 5xx / 401 => retriable
+        SLURMRESTD_UNREACHABLE). Idempotent: a job already gone between the list and
+        the cancel (a 404) is swallowed by the client and simply not reported."""
+        prefix = job_name_prefix(work_ticket_idx)
+        try:
+            infos = await self._client.find_jobs_by_name_prefix(prefix)
+        except SlurmrestdError as exc:
+            raise self._classify_status_error(exc, prefix) from exc
+        cancelled: list[int] = []
+        for info in infos:
+            if info.job_id is None:
+                continue
+            try:
+                await self._client.cancel_job(info.job_id)
+            except SlurmrestdError as exc:
+                raise self._classify_status_error(exc, prefix) from exc
+            cancelled.append(info.job_id)
+        return cancelled
+
     @staticmethod
     def _require_slurm_handle(handle: StepHandle) -> None:
         """Guard: status_step / result_step operate only on a SLURM handle
         (one carrying a job id and the workspace paths). A handle from a
         different backend reaching here is a caller bug — fail loudly with
-        a typed BackendFailure rather than dereferencing a None path into
-        an opaque AttributeError."""
-        if handle.slurm_job_id is None or handle.output_path is None or handle.logs_path is None:
+        a typed BackendFailure rather than dereferencing a missing field into
+        an opaque AttributeError. `SlurmStepHandle`'s required job-id / paths
+        make the fields non-None once this passes, so the callers below can
+        dereference them directly."""
+        if not isinstance(handle, SlurmStepHandle):
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,

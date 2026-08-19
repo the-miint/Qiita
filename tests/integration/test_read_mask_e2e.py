@@ -34,7 +34,7 @@ parsed in their shipped order from the real workflow YAML — exercising the rea
 LIBRARY primitives, the real data-plane `register_files`/`delete_mask`
 DoActions, and the real DuckLake catalog.
 
-Shared fixtures (`data_plane`, `hmac_secret`, `postgres_pool`,
+Shared fixtures (`data_plane`, `signing_key`, `postgres_pool`,
 `human_admin_session`, `ducklake_connect`) live in conftest.py.
 """
 
@@ -204,7 +204,7 @@ async def _run_persist_read_metrics(
         Path(read_mask_path).parent,  # workspace (unused by this primitive)
         {"prep_sample_idx": prep_sample_idx},
         work_ticket_idx=0,
-        hmac_secret=data_plane["secret"],
+        signing_key=data_plane["secret"],
         data_plane_url=_data_plane_url(data_plane),
     )
 
@@ -224,7 +224,7 @@ async def _run_register_files(
         staging_dir,
         {},
         work_ticket_idx=work_ticket_idx,
-        hmac_secret=data_plane["secret"],
+        signing_key=data_plane["secret"],
         data_plane_url=_data_plane_url(data_plane),
     )
 
@@ -408,7 +408,7 @@ async def test_purge_before_resubmit_leaves_no_duplicate_rows(
     # --- Recovery: purge via delete_mask, then re-register → one logical copy. ---
     deleted = await delete_mask_data(
         mask_idx=mask_idx,
-        hmac_secret=data_plane["secret"],
+        signing_key=data_plane["secret"],
         data_plane_url=_data_plane_url(data_plane),
     )
     # Purge removed every row currently registered for the mask (both copies).
@@ -430,7 +430,7 @@ async def test_purge_before_resubmit_leaves_no_duplicate_rows(
     # the data plane's catalog.
     await delete_mask_data(
         mask_idx=mask_idx,
-        hmac_secret=data_plane["secret"],
+        signing_key=data_plane["secret"],
         data_plane_url=_data_plane_url(data_plane),
     )
     assert _count_read_mask_rows(data_plane, mask_idx) == 0
@@ -443,7 +443,7 @@ async def test_delete_mask_is_idempotent_on_absent_mask(postgres_pool, data_plan
 
     deleted = await delete_mask_data(
         mask_idx=66001,
-        hmac_secret=data_plane["secret"],
+        signing_key=data_plane["secret"],
         data_plane_url=_data_plane_url(data_plane),
     )
     assert deleted == 0

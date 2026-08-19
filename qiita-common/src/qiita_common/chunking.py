@@ -45,3 +45,44 @@ def sequence_split_expr(seq: str) -> str:
     has miint loaded.
     """
     return f"sequence_split({seq}, {CHUNK_SIZE})"
+
+
+def reassemble_chunks_expr(prefix: str = "") -> str:
+    """SQL aggregate that reassembles a sequence from its chunk rows — the
+    inverse of `sequence_split_expr`. Concatenates `chunk_data` in `chunk_index`
+    order; use it under a GROUP BY on the chunk table's key column, e.g.
+    ``SELECT feature_idx, {reassemble_chunks_expr()} AS sequence FROM ... GROUP BY
+    feature_idx``.
+
+    `prefix` qualifies the columns with a table alias when the query needs it
+    (e.g. ``"c."`` → ``string_agg(c.chunk_data, '' ORDER BY c.chunk_index)``).
+    Single-sourcing this next to `sequence_split_expr` pins the chunk contract —
+    the `chunk_data` / `chunk_index` column names and the concatenation order —
+    to one place for both directions. Plain SQL text; the caller executes it on a
+    connection that has miint loaded.
+    """
+    return f"string_agg({prefix}chunk_data, '' ORDER BY {prefix}chunk_index)"
+
+
+def canonical_sequence_hash_expr(seq: str) -> str:
+    """SQL expression computing the canonical content hash of the sequence
+    column/expression `seq` as a 16-byte DuckDB UUID — the SINGLE source of truth
+    for how a sequence maps to its `sequence_hash` (and thus its shared
+    `feature_idx`).
+
+    A sequence and its reverse complement are the same molecular entity, so we
+    md5 BOTH strands (upper-cased) and keep the lex-smaller:
+
+        LEAST(md5(upper(seq)), md5(revcomp(upper(seq))))::uuid
+
+    Every producer that mints/dedups features against `qiita.feature` MUST use
+    this exact expression — reference ingest (`hash_sequences`) and assembly
+    ingest alike — or identical bytes would split into two feature_idx. Never
+    write the VARCHAR md5 hexstring (project hash-storage rule); the `::uuid` cast
+    keeps it 16 bytes to match the wire-side `sequence_hash`/`feature_idx` types.
+    Plain SQL text; the caller executes it on a miint-loaded connection
+    (`sequence_dna_reverse_complement` is a miint scalar honoring IUPAC).
+    """
+    return (
+        f"LEAST(md5(upper({seq}))::uuid, md5(sequence_dna_reverse_complement(upper({seq})))::uuid)"
+    )

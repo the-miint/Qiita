@@ -22,6 +22,7 @@ steps:
   - step: hash
     step_type: singleton
     container: qiita/reference-hash:1.0.0
+    entrypoint: /opt/qiita/entrypoint.sh
     baseline_resources: {cpu: 4, mem_gb: 8, walltime: PT1H}
   - action: mint-features
     inputs: [hash.manifest]
@@ -40,6 +41,7 @@ steps:
   - step: denoise
     step_type: map
     container: qiita/deblur:0.1.0
+    entrypoint: /opt/qiita/entrypoint.sh
     baseline_resources: {cpu: 8, mem_gb: 16, walltime: PT2H}
 action_ceiling: {cpu: 32, mem_gb: 128, walltime: PT8H}
 """
@@ -178,6 +180,88 @@ def test_load_actions_loads_on_disk_reference_add_yaml():
     assert _REFERENCE_ADD_ACTION_VERSION == ref_add.version == "1.0.0"
 
 
+def test_load_actions_loads_on_disk_long_read_assembly_yaml():
+    """The on-disk `workflows/long-read-assembly/1.0.0.yaml` loads as a valid
+    ActionDefinition with the per-sample assembly→MAG shape:
+
+      * target_kind prep_sample; context_schema REQUIRES mask_idx (the selector
+        for the masked read_masked pass-set to assemble);
+      * the step chain is assembly_run_config (module) → assemble →
+        assembly_coverage (module; the miint minimap2 pre-map whose BAM lets
+        metaWRAP skip its own bwa self-alignment) → binning →
+        bin_refine → checkm (four container steps) → assembly_hash (module) →
+        mint-features → write-assembly-membership → assembly_load (module) →
+        register-files, in that order — the storage tail reuses the reference-add
+        primitives;
+      * each of the four heavy tools has its OWN per-tool SIF + entrypoint — the
+        packaging the multi-SIF-per-workflow-dir build tooling supports;
+      * assembly_run_config threads the `assembler` scalar and assembly_load
+        threads `processing_idx` via params (a container step can't take a scalar
+        param — the runner treats it as a bind path).
+    """
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "long-read-assembly" in by_id, "workflows/long-read-assembly/1.0.0.yaml must load"
+    assembly = by_id["long-read-assembly"]
+
+    assert assembly.target_kind == ScopeTargetKind.PREP_SAMPLE
+    assert assembly.version == "1.0.0"
+    assert assembly.context_schema["required"] == ["mask_idx"]
+
+    assert [s.name for s in assembly.steps] == [
+        "assembly_run_config",
+        "assemble",
+        "assembly_coverage",
+        "binning",
+        "bin_refine",
+        "checkm",
+        "assembly_hash",
+        "mint-features",
+        "write-assembly-membership",
+        "assembly_load",
+        "register-files",
+    ]
+
+    export_step = next(s for s in assembly.steps if s.name == "assembly_run_config")
+    assert export_step.module == "qiita_compute_orchestrator.jobs.assembly_run_config"
+    assert export_step.params == {"assembler": "assembler"}
+    hash_step = next(s for s in assembly.steps if s.name == "assembly_hash")
+    assert hash_step.module == "qiita_compute_orchestrator.jobs.assembly_hash"
+    load_step = next(s for s in assembly.steps if s.name == "assembly_load")
+    assert load_step.module == "qiita_compute_orchestrator.jobs.assembly_load"
+    # The coverage pre-map must sit BEFORE binning and feed it: binning stages
+    # `coverage_bam` into metaWRAP's work_files/ so it skips its own bwa mem.
+    # Reversed or unwired, metaWRAP silently self-aligns HiFi reads with a
+    # short-read aligner instead of failing.
+    coverage_step = next(s for s in assembly.steps if s.name == "assembly_coverage")
+    assert coverage_step.module == "qiita_compute_orchestrator.jobs.assembly_coverage"
+    assert "coverage_bam" in coverage_step.outputs
+    binning_step = next(s for s in assembly.steps if s.name == "binning")
+    assert "coverage_bam" in binning_step.inputs
+    # assembly_load threads processing_idx via params so the runner mints the run
+    # identity before the step loop; write-assembly-membership then reads it.
+    assert load_step.params == {"processing_idx": "processing_idx"}
+
+    # One per-tool image per container step (assemble / binning / bin_refine /
+    # checkm), each with its own SIF + entrypoint — the multi-SIF packaging.
+    container_steps = [s for s in assembly.steps if getattr(s, "container", None)]
+    assert len(container_steps) == 4
+    assert {s.container for s in container_steps} == {
+        "long-read-assembly-assemble-1.0.0.sif",
+        "long-read-assembly-binning-1.0.0.sif",
+        "long-read-assembly-dastool-1.0.0.sif",
+        "long-read-assembly-checkm-1.0.0.sif",
+    }
+    assert len({s.entrypoint for s in container_steps}) == 4
+
+
 def test_load_actions_loads_on_disk_host_reference_add_yaml():
     """The actual on-disk `workflows/host-reference-add/1.0.0.yaml` loads as a
     valid ActionDefinition with the host-indexing shape:
@@ -215,10 +299,15 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
 
     step_names = [s.name for s in host.steps]
     # Shares the reference-add prefix, then adds the host-indexing tail: two
-    # index builders (rype + minimap2) and a register-index per build.
+    # index builders (rype + minimap2) and a register-index per build. The
+    # post-load `sync-reference-exclusion` step is DEAD LAST — after both
+    # register-index — so a transient sync FlightError can't strand an
+    # already-built index unregistered (a host reference writes the
+    # reference_taxonomy anti-join surface, so the sync must still fire here).
     assert step_names == [
         "hash_sequences",
         "mint-features",
+        "mint-annotation-features",
         "write-membership",
         "load",
         "build_rype_index",
@@ -226,6 +315,7 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
         "register-files",
         "register-index",
         "register-index",
+        "sync-reference-exclusion",
     ]
     # build_rype_index must precede register-files (move-on-register); the
     # minimap2 builder reads the RAW upload fasta, so it has no such ordering dep
@@ -420,6 +510,7 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
         "stage_local_fasta",
         "hash_sequences",
         "mint-features",
+        "mint-annotation-features",
         "write-membership",
         "load",
         "build_rype_index",
@@ -427,6 +518,7 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
         "register-files",
         "register-index",
         "register-index",
+        "sync-reference-exclusion",
     ]
 
     stage = next(s for s in local_host.steps if s.name == "stage_local_fasta")
@@ -487,6 +579,155 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
 
     assert _LOCAL_HOST_REFERENCE_ADD_ACTION_ID == local_host.action_id == "local-host-reference-add"
     assert _REFERENCE_ADD_ACTION_VERSION == local_host.version == "1.0.0"
+
+
+def test_every_write_membership_step_declares_the_runner_contract_inputs():
+    """Every on-disk `write-membership` action must declare `inputs:` exactly
+    {manifest, feature_map} — the runner's `_run_action_primitive` dispatch arm
+    hard-asserts that set and raises (failing the whole ticket) on any other
+    shape. This guards against the drift that a per-workflow-shape unit test can't
+    see: when `write-membership` gained its second input (`manifest`, for the
+    persisted accession), a workflow left on the old single-input form crashes at
+    runtime, not at load. Enumerating the real YAML here catches it at build time.
+    Same guard-by-enumeration applies to any future primitive-contract change."""
+    from pathlib import Path
+
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    offenders = {
+        f"{a.action_id}:{s.name}": s.inputs
+        for a in actions
+        for s in a.steps
+        if s.name == LibraryPrimitive.WRITE_MEMBERSHIP
+        and set(s.inputs) != {"manifest", "feature_map"}
+    }
+    assert not offenders, (
+        "these write-membership steps don't match the runner's required "
+        f"[manifest, feature_map] contract and will crash at dispatch: {offenders}"
+    )
+
+
+# Steps pinned at their ceiling on an escalating axis, keyed `action_id:version`
+# → {step label: pinned axes}. Being listed either way means the FIRST OOM (or
+# TIMEOUT) of that step fails its ticket permanently at retry_count=0.
+#
+# TWO dicts, not one with a comment, because the difference is intent and a
+# future author has to make that choice deliberately: an entry is either a
+# decision we stand behind or a defect we owe a fix. The checker unions them, so
+# they behave identically — the split exists to keep the two from being confused
+# for one another, and to let the pending one empty to `{}` mechanically.
+#
+# Neither covers a baseline that EXCEEDS its ceiling. That is a different and
+# worse defect, rejected unconditionally by the second test below, and nothing
+# here can absolve it.
+
+# Deliberate: the step's YAML carries the reasoning at `baseline_resources`, and
+# a new entry belongs here only with the same. `align_sharded` sizes miint's
+# shard concurrency off cpu, which is pinned to the ceiling by design, and its
+# memory is sized to the same budget. Only the memory arm is given up — walltime
+# keeps headroom (PT4H under PT8H), so a TIMEOUT still escalates, which is why
+# the entry names one axis and not both.
+_ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
+    "align:1.0.0": {"align_sharded": ("mem_gb",)},
+}
+
+# NOT accepts — a defect being tracked rather than fixed right now, listed so the
+# guard can land ahead of the re-sizing (which needs measured peak-RSS data per
+# workflow rather than a blanket multiplier). Empty today: the six entries this
+# started with, across four workflow directories, were re-sized and so deleted.
+#
+# Raising a ceiling above its step baseline DELETES that entry from here — the
+# exact-equality check below then fails until it is gone, so a re-size cannot
+# silently leave its suppression behind. Nothing is added here except alongside
+# the work to remove it.
+_ESCALATION_PENDING_RESIZE: dict[str, dict[str, tuple[str, ...]]] = {}
+
+
+def test_every_shipped_step_can_escalate_on_both_retry_axes():
+    """No shipped workflow may pin a step's `mem_gb`/`walltime` at its
+    `action_ceiling` unless it is listed above.
+
+    A pinned axis silently disables retry: the runner grows the escalation floor
+    by a fixed factor and clamps it to the ceiling, so an equal pair leaves the
+    grown value unchanged, which the retry loop reads as saturation and fails the
+    ticket PERMANENTLY on attempt 0. That is invisible at author time, in the
+    per-workflow unit tests above, and at `qiita-admin actions sync` — it
+    surfaces only in production, as a work ticket dead at retry_count=0 with
+    RESOURCE_CEILING_EXHAUSTED.
+
+    Compared for EXACT equality against the union of the two lists, in both
+    directions: a newly-pinned step fails as an unexpected offender, and a listed
+    step whose workflow has since been re-sized fails as stale. The second half
+    is the point — a suppression that outlives its reason is how this defect
+    would quietly come back.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    expected = _ESCALATION_ACCEPTS | _ESCALATION_PENDING_RESIZE
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    observed = {
+        f"{a.action_id}:{a.version}": pinned
+        for a in actions
+        if (pinned := a.steps_without_escalation_headroom())
+    }
+
+    # Bucketed by which fix each drift needs, so a partial mismatch (a listed
+    # action that gained a SECOND pinned axis) is reported once, as the
+    # disagreement it is, rather than in two buckets with opposite advice.
+    newly_pinned = {k: v for k, v in observed.items() if k not in expected}
+    stale = {k: v for k, v in expected.items() if k not in observed}
+    changed = {
+        k: f"listed as {expected[k]}, YAML now declares {v}"
+        for k, v in observed.items()
+        if k in expected and v != expected[k]
+    }
+    assert observed == expected, (
+        "escalation headroom drift.\n"
+        f"  pinned at the ceiling and listed nowhere — raise the action's "
+        f"mem_gb/walltime ceiling above the step baseline, leaving the baseline "
+        f"alone so ordinary tickets schedule unchanged. If instead this is a "
+        f"defect you are tracking rather than fixing now, it goes in "
+        f"_ESCALATION_PENDING_RESIZE, not _ESCALATION_ACCEPTS: {newly_pinned}\n"
+        f"  listed but no longer pinned — delete the stale entry from whichever "
+        f"list holds it: {stale}\n"
+        f"  listed with different axes — re-decide the entry: {changed}"
+    )
+
+
+def test_no_shipped_step_declares_a_baseline_above_its_ceiling():
+    """No shipped workflow may declare a `baseline_resources` axis ABOVE its
+    `action_ceiling`. Unconditional — there is no accept list, because there is
+    no version of this that is ever intended.
+
+    The runner rejects an over-ceiling baseline per ticket, which makes such a
+    workflow one that cannot run at all: every ticket it accepts fails. Nothing
+    catches it when the YAML is loaded, so it ships.
+
+    Deliberately separate from the escalation-headroom guard above. That one
+    reports an over-ceiling axis too (it is `not (baseline < ceiling)`), but its
+    accept list would absolve it — an accept written to mean "this step knowingly
+    forgoes retry" would silently also cover "this step can never run" if the
+    accepted baseline later drifted past the ceiling.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    over = {
+        f"{a.action_id}:{a.version}": exceeded
+        for a in actions
+        if (exceeded := a.steps_over_ceiling())
+    }
+    assert not over, (
+        "these steps declare a baseline above their action_ceiling; the runner "
+        f"fails every such ticket at dispatch, so the workflow cannot run: {over}"
+    )
 
 
 def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
@@ -622,7 +863,8 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     step is a container with the SIF filename Settings.path_derived_images
     resolves against; baseline_resources for bcl_convert uses the lookup
     population (from_step_output + profiles with the three supported
-    Illumina families); and action_ceiling matches the largest profile.
+    Illumina families); and action_ceiling leaves escalation headroom
+    above the largest profile.
 
     Locks the YAML shape so the runner's A4 resolution branch (the
     lookup vs flat split in qiita_control_plane.runner._dispatch_step)
@@ -685,13 +927,21 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     # Flat-side fields are unset when the lookup population is used.
     assert br.cpu is None and br.mem_gb is None and br.walltime is None
 
-    # action_ceiling matches the largest profile (NovaSeq X). A future
-    # profile bump that exceeds this must update both axes in the same PR
-    # because the runner enforces resolved <= ceiling at dispatch.
+    # The largest profile (NovaSeq X) sits UNDER action_ceiling on both
+    # escalating axes. Equality here — which is what this asserted before —
+    # is the dead-ladder shape: escalation clamps to the ceiling, so an
+    # OOM/TIMEOUT on the NovaSeq X profile failed the ticket permanently at
+    # retry_count=0 instead of retrying larger. cpu is exempt (nothing
+    # escalates it) and stays equal. A future profile bump that exceeds the
+    # ceiling must raise it in the same PR, because the runner enforces
+    # resolved <= ceiling at dispatch; the escalating axes must clear it.
     novaseqx = br.profiles["Illumina NovaSeq X"]
-    assert bcl.action_ceiling.cpu == novaseqx.cpu == 16
-    assert bcl.action_ceiling.mem_gb == novaseqx.mem_gb == 480
-    assert bcl.action_ceiling.walltime == novaseqx.walltime == timedelta(hours=12)
+    assert novaseqx.cpu == 16
+    assert novaseqx.mem_gb == 480
+    assert novaseqx.walltime == timedelta(hours=12)
+    assert bcl.action_ceiling.cpu == novaseqx.cpu
+    assert bcl.action_ceiling.mem_gb > novaseqx.mem_gb
+    assert bcl.action_ceiling.walltime > novaseqx.walltime
 
     # context_schema gates on the operator-supplied BCL folder path; the
     # absolute-path pattern keeps the launcher from resolving against a
@@ -701,6 +951,144 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     # The pool roster the ingest_reads step keys off (prep_sample_idx ↔
     # pool_item_id), embedded by submit-bcl-convert.
     assert bcl.context_schema["properties"]["sample_map"]["type"] == "array"
+
+
+def test_load_actions_loads_on_disk_read_mask_block_yaml():
+    """The on-disk `workflows/read-mask-block/1.0.0.yaml` loads as a valid
+    ActionDefinition with the block-compute shape:
+
+      * target_kind block, and NO target_processing_kinds (the loader/DB CHECK
+        reject that field for a non-prep_sample target_kind);
+      * steps qc → host_filter → delete-block-mask → register-files →
+        reconcile-block — delete-block-mask clears this block's read_mask
+        footprint before register-files re-writes it (idempotent block replace),
+        and reconcile runs AFTER register-files (it reads the PERSISTED DuckLake
+        aggregate across all a sample's blocks, unlike read-mask's
+        persist-read-metrics which reads the local parquet BEFORE register-files);
+      * host_filter threads mask_idx via params (signals the runner to bind the
+        ticket's plan-time mask_idx); delete-block-mask and reconcile-block have
+        no file inputs/outputs;
+      * admin-only audience + prep_sample:write, same as read-mask;
+      * the action_id/version match the planner's BLOCK_MASK_ACTION_* constants
+        (the planner mints block tickets against these literals — a drift would
+        submit tickets against a non-existent action)."""
+    from pathlib import Path
+
+    from qiita_common.auth_constants import SystemRole
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+    from qiita_control_plane.block_planner import (
+        BLOCK_MASK_ACTION_ID,
+        BLOCK_MASK_ACTION_VERSION,
+    )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
+    assert "read-mask-block" in by_id, "workflows/read-mask-block/1.0.0.yaml must load"
+    rmb = by_id["read-mask-block"]
+
+    assert rmb.target_kind == ScopeTargetKind.BLOCK
+    assert rmb.target_processing_kinds == []
+    assert rmb.scopes == ["prep_sample:write"]
+    assert rmb.audience.service is False
+    assert set(rmb.audience.human_roles) == {SystemRole.WET_LAB_ADMIN, SystemRole.SYSTEM_ADMIN}
+
+    assert [s.name for s in rmb.steps] == [
+        "qc",
+        "host_filter",
+        "delete-block-mask",
+        "register-files",
+        "reconcile-block",
+    ]
+    step_names = [s.name for s in rmb.steps]
+    # delete-block-mask (idempotent block replace) must run BEFORE register-files,
+    # so a re-run clears the prior footprint before the fresh rows land.
+    assert step_names.index("delete-block-mask") < step_names.index("register-files")
+    # reconcile-block must run AFTER register-files (reads DuckLake, not the local
+    # parquet) — the inverse of read-mask's persist-read-metrics ordering.
+    assert step_names.index("register-files") < step_names.index("reconcile-block")
+
+    host_filter = next(s for s in rmb.steps if s.name == "host_filter")
+    assert host_filter.module == "qiita_compute_orchestrator.jobs.host_filter"
+    # No `reads` input: a block's steps STREAM their reads from the data plane at
+    # runtime, so the control plane stages nothing at submit time. qc likewise
+    # declares only its optional adapter_parquet.
+    assert host_filter.inputs == ["qc_mask"]
+    qc_step = next(s for s in rmb.steps if s.name == "qc")
+    assert qc_step.inputs == []
+    assert qc_step.optional_inputs == ["adapter_parquet"]
+    assert host_filter.optional_inputs == ["host_rype_path", "host_minimap2_path"]
+    assert host_filter.params == {"mask_idx": "mask_idx"}
+
+    delete_block = next(s for s in rmb.steps if s.name == "delete-block-mask")
+    assert delete_block.inputs == []
+    assert delete_block.outputs == []
+
+    reconcile = next(s for s in rmb.steps if s.name == "reconcile-block")
+    assert reconcile.inputs == []
+    assert reconcile.outputs == []
+
+    # The planner mints block tickets against these literals; a YAML id/version
+    # drift without the planner following would submit against a missing action.
+    assert BLOCK_MASK_ACTION_ID == rmb.action_id == "read-mask-block"
+    assert BLOCK_MASK_ACTION_VERSION == rmb.version == "1.0.0"
+
+
+def test_load_actions_loads_on_disk_estimate_feature_table_yaml():
+    """The on-disk `workflows/estimate-feature-table/1.0.0.yaml` loads as a valid
+    ActionDefinition with the compute-on-demand OGU shape:
+
+      * target_kind reference (so the framework injects `reference_idx` as a scope
+        scalar), NO target_processing_kinds;
+      * a single native step `estimate_feature_table`, `inputs: [genome_map_path]`
+        (the resolver-staged map — this is also the input the runner's resolver
+        gate keys on), `params: {coverage_threshold: coverage_threshold}`,
+        `outputs: [ogu_table]`;
+      * `reference_idx` is NOT in `params` — it is the framework-injected scope
+        scalar, and binding it via params would collide at flatten_native_inputs;
+      * no success_status / failure_status (compute-on-demand mints no identity and
+        flips no reference/sample state), so no register/status step;
+      * admin-only audience + `reference:read` (read-only reference/alignment
+        compute — both audience roles already hold it);
+      * context_schema requires the three action_context scalars the mint route +
+        resolver read (alignment_idx, prep_sample_idx, coverage_threshold)."""
+    from pathlib import Path
+
+    from qiita_common.auth_constants import SystemRole
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
+    assert "estimate-feature-table" in by_id, (
+        "workflows/estimate-feature-table/1.0.0.yaml must load"
+    )
+    eft = by_id["estimate-feature-table"]
+
+    assert eft.version == "1.0.0"
+    assert eft.target_kind == ScopeTargetKind.REFERENCE
+    assert eft.target_processing_kinds == []
+    assert eft.scopes == ["reference:read"]
+    assert eft.audience.service is False
+    assert set(eft.audience.human_roles) == {SystemRole.WET_LAB_ADMIN, SystemRole.SYSTEM_ADMIN}
+    # No identity/state to flip — the table is computed on demand.
+    assert eft.success_status is None
+    assert eft.failure_status is None
+
+    assert [s.name for s in eft.steps] == ["estimate_feature_table"]
+    step = eft.steps[0]
+    assert step.module == "qiita_compute_orchestrator.jobs.estimate_feature_table"
+    assert step.inputs == ["genome_map_path"]
+    assert step.params == {"coverage_threshold": "coverage_threshold"}
+    assert step.outputs == ["ogu_table"]
+    # reference_idx is framework-injected (REFERENCE scope scalar); binding it via
+    # params would collide with that injection at flatten_native_inputs.
+    assert "reference_idx" not in step.params
+
+    required = set(eft.context_schema.get("required", []))
+    assert {"alignment_idx", "prep_sample_idx", "coverage_threshold"} <= required
 
 
 def test_load_actions_handles_two_versions_of_same_action(tmp_path):
@@ -742,3 +1130,44 @@ def test_load_actions_read_mask_audience_is_admin_only():
         SystemRole.WET_LAB_ADMIN,
         SystemRole.SYSTEM_ADMIN,
     }
+
+
+def test_load_actions_read_mask_finalizes_gate_after_register_files():
+    """`finalize-mask-sample` (the per-sample mask_sample completion writer) must be
+    the LAST step and run strictly AFTER `register-files`: the gate must not read
+    'completed' until the masked reads are durable in DuckLake. Pins the terminal
+    ordering so a reorder that flips the gate before register-files surfaces here."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
+    names = [s.name for s in by_id["read-mask"].steps]
+
+    assert names[-1] == "finalize-mask-sample"
+    assert names.index("register-files") < names.index("finalize-mask-sample")
+    # persist-read-metrics still reads the local parquet before register-files moves it.
+    assert names.index("persist-read-metrics") < names.index("register-files")
+
+
+def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
+    """The mask-model fastq-to-parquet (1.3.0) mints a mask_idx and writes read_mask
+    exactly like read-mask, so it owes the SAME first-class completion gate: its last
+    step is `finalize-mask-sample`, after the read_mask `register-files`. The
+    pre-mask-model versions (1.0.0–1.2.0) never mint a mask_idx and carry no such
+    step; they are not checked here. Keyed by (action_id, version) because several
+    fastq-to-parquet versions coexist on disk."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    ftp_130 = next(
+        a
+        for a in load_actions(repo_root / "workflows")
+        if a.action_id == "fastq-to-parquet" and a.version == "1.3.0"
+    )
+    names = [s.name for s in ftp_130.steps]
+    assert names[-1] == "finalize-mask-sample"
+    assert names[-2] == "register-files"  # register-files immediately precedes the gate flip

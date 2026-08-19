@@ -1,19 +1,33 @@
-"""DuckDB + miint connection helper for the control-plane CLI.
+"""DuckDB + miint connection helpers for the control plane.
 
-`qiita reference load` parses FASTA with miint's `read_fastx` and chunks in
-DuckDB (no Python parser), so it needs a DuckDB connection with the miint
-extension installed and loaded. The connect-config + install/load statements are
-shared with the orchestrator via `qiita_common.duckdb_miint` (single source for
-the `MIINT_EXTENSION_REPO` / `MIINT_EXTENSION_DIRECTORY` env contract).
+Two connect paths, because the control plane runs miint in two very different
+places and they have opposite requirements:
 
-Unlike the cluster paths (CO service, native jobs, the probe), this CLI runs
-from **arbitrary client hosts** that have no deploy-staged extension_directory,
-so it can't be LOAD-only. It installs into its own cache — but a plain
-`INSTALL` (a no-op once the cache is warm), once per process (thread-safe),
-then LOADs. The retired `FORCE INSTALL` re-downloaded on every invocation; this
-downloads at most once per host. The concurrency model is **synchronous** (the
-CLI runs the upload stream inside `asyncio.to_thread`, with a `threading.Lock`
-guarding the one-time install) where the orchestrator's is async.
+* `connect_with_miint()` — CLIENT side (`qiita reference load`). Runs from
+  **arbitrary client hosts** that have no deploy-staged extension_directory, so
+  it can't be LOAD-only: it INSTALLs into its own cache (a plain `INSTALL`, a
+  no-op once the cache is warm, once per process, thread-safe) then LOADs.
+* `connect_with_miint_staged()` — SERVICE side (the CP runner, in-process under
+  systemd). LOAD-only from the deploy-staged `MIINT_EXTENSION_DIRECTORY`,
+  exactly like the cluster paths (CO service, native jobs, the probe).
+
+The distinction is load-bearing, not stylistic. `INSTALL` resolves DuckDB's
+extension directory, which defaults to `$HOME/.duckdb/extensions` when
+`MIINT_EXTENSION_DIRECTORY` is unset — and the service accounts have no usable
+`$HOME` (`qiita-api` / `qiita-orch` are `/dev/null`), so a service-side INSTALL
+dies with `IO Error: Can't find the home directory at '/dev/null'`. Service-side
+code must therefore never reach the INSTALL path. Note this is a property of
+where the code RUNS, not of which CLI it belongs to: `qiita-admin` subcommands
+are run as `qiita-api` on the deploy host (see `deploy/verify.sh`), so an
+admin-CLI path that INSTALLs is only safe while it stays off the service
+accounts. This mirrors the reasoning
+already spelled out in `qiita_common.duckdb_miint.miint_load_sql`: cluster
+runtime LOADs from a pre-staged directory so no node "depends on mirror
+reachability, or needs a writable `$HOME`". The control plane is no different.
+
+The connect-config + install/load statements are shared with the orchestrator
+via `qiita_common.duckdb_miint` (single source for the `MIINT_EXTENSION_REPO` /
+`MIINT_EXTENSION_DIRECTORY` env contract).
 """
 
 from __future__ import annotations
@@ -25,16 +39,31 @@ from qiita_common.duckdb_miint import (
     miint_connect_config,
     miint_install_sql,
     miint_load_sql,
+    require_staged_extension_directory,
 )
 
 _install_lock = threading.Lock()
 _installed = False
 
 
-def _connect() -> duckdb.DuckDBPyConnection:
-    # miint_connect_config() is always non-empty (allow_unsigned is always set,
-    # since miint installs from a mirror), so always pass it.
+def duckdb_connect() -> duckdb.DuckDBPyConnection:
+    """Bare in-memory DuckDB connection with miint-safe config.
+
+    For CP-service code that does not need miint loaded but must remain safe
+    if a future change adds INSTALL/LOAD (extension_directory is set when
+    MIINT_EXTENSION_DIRECTORY is present, so $HOME never gets resolved).
+
+    Note: we do not set `home_directory` here. Prod sets
+    MIINT_EXTENSION_DIRECTORY (deploy bucket 1), and `make preflight` +
+    `verify-deploy`'s cp-miint check enforce it, so the only unset
+    environments are dev/CI, which have a writable $HOME and no /dev/null
+    failure."""
     return duckdb.connect(":memory:", config=miint_connect_config())
+
+
+def _connect() -> duckdb.DuckDBPyConnection:
+    # Private alias of duckdb_connect() for the miint-loaded helpers above.
+    return duckdb_connect()
 
 
 def connect_with_miint() -> duckdb.DuckDBPyConnection:
@@ -50,5 +79,27 @@ def connect_with_miint() -> duckdb.DuckDBPyConnection:
             if not _installed:
                 conn.execute(miint_install_sql())
                 _installed = True
+    conn.execute(miint_load_sql())
+    return conn
+
+
+def connect_with_miint_staged() -> duckdb.DuckDBPyConnection:
+    """Open an in-memory DuckDB connection with miint LOADed from the
+    deploy-staged extension directory. The SERVICE-side counterpart to
+    `connect_with_miint()` — use this from anything running inside the CP
+    service (the runner), never the INSTALL-based client helper.
+
+    LOAD-only by design: no mirror round-trip on a request path, and no
+    dependence on a writable `$HOME` the service account does not have (see the
+    module docstring). Requires `MIINT_EXTENSION_DIRECTORY`, which must be the
+    same staged directory the compute orchestrator and data plane use.
+
+    The requirement check is shared with the orchestrator's `open_miint_conn()`
+    (`require_staged_extension_directory`) so the rule and its wording live in
+    one place; the alternative it replaces is DuckDB's `Can't find the home
+    directory at '/dev/null'`, which names neither the variable nor the service.
+    The caller owns the connection and must close it."""
+    require_staged_extension_directory(service="control-plane service")
+    conn = _connect()
     conn.execute(miint_load_sql())
     return conn

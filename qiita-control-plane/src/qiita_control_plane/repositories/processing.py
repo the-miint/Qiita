@@ -1,8 +1,13 @@
-"""Repository for the qiita.processing_method and processed_prep_sample tables.
+"""Repository functions for the qiita.processing identity table.
 
-A processing method's identity is its config; minting upserts on params_hash so the
-same config always resolves to the same processing_idx fleet-wide. params_hash is a
-SHA-256 of the canonical config JSON computed CP-side, so there is no pgcrypto dependency.
+A processing_idx is the identity of a per-sample processing RUN — its canonical
+parameters (workflow + version + result-affecting knobs like the assembler). The
+mint path wraps the qiita.mint_processing plpgsql function, which upserts on
+params_hash so the same params always resolve to the same processing_idx
+fleet-wide (idempotent re-run) and different params get a distinct id (run
+disambiguation). The params_hash is computed control-plane-side via
+qiita_common.hashing.canonical_params_hash (SHA-256 of the canonical params
+JSON) — no pgcrypto dependency on the database. Mirrors repositories.mask_definition.
 """
 
 import json
@@ -11,60 +16,30 @@ import asyncpg
 from qiita_common.hashing import canonical_params_hash
 
 
-async def mint_processing_method(
+async def mint_processing(
     conn: asyncpg.Connection,
     *,
-    workflow_name: str,
-    workflow_version: str,
+    workflow: str,
+    version: str,
     params: dict,
-    principal_idx: int,
 ) -> asyncpg.Record:
-    """Mint or return the existing processing_method row for a config.
+    """Mint (or return the existing) qiita.processing row for a params set.
 
-    Deduplicates on the canonical-JSON SHA-256 of `params` alone, so two callers passing the
-    same `params` collapse to one row; `workflow_name` and `workflow_version` are descriptive.
+    Deduplicates on the canonical-JSON SHA-256 of `params` — the dedup key is the
+    full params blob, so the same params resolve to the same `processing_idx`.
+    `workflow` / `version` are stored as descriptive columns; they are expected to
+    also appear inside `params` so the hash covers them.
+
+    Returns the qiita.processing row as an asyncpg.Record. No
+    `require_transaction(conn)` guard: the plpgsql SELECT/INSERT upsert loop runs
+    as a single statement, so Postgres wraps it in one transaction either way.
     """
     params_hash = canonical_params_hash(params)
-    # pass the serialized JSON explicitly so behaviour is independent of whether a JSON
-    # codec is registered on the connection.
     return await conn.fetchrow(
-        "SELECT processing_idx, params_hash, workflow_name, workflow_version,"
-        "       params, created_by_idx, created_at"
-        "  FROM qiita.mint_processing_method($1, $2, $3, $4::jsonb, $5)",
+        "SELECT processing_idx, params_hash, workflow, version, params, created_at"
+        "  FROM qiita.mint_processing($1, $2, $3, $4::jsonb)",
         params_hash,
-        workflow_name,
-        workflow_version,
+        workflow,
+        version,
         json.dumps(params),
-        principal_idx,
-    )
-
-
-async def mint_processed_prep_samples(
-    conn: asyncpg.Connection,
-    *,
-    processing_idx: int,
-    prep_sample_idxs: list[int],
-) -> dict[int, int]:
-    """Mint or return processed_prep_sample rows for a cohort, keyed by prep_sample_idx.
-
-    Idempotent over (processing_idx, prep_sample_idx): a re-run returns the same values.
-    """
-    rows = await conn.fetch(
-        "SELECT prep_sample_idx, processed_prep_sample_idx"
-        "  FROM qiita.mint_processed_prep_samples($1, $2::bigint[])",
-        processing_idx,
-        prep_sample_idxs,
-    )
-    return {r["prep_sample_idx"]: r["processed_prep_sample_idx"] for r in rows}
-
-
-async def lookup_processing_idx_by_params(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    params: dict,
-) -> int | None:
-    """Return the processing_idx whose params_hash matches ``params``, or None; never mints."""
-    params_hash = canonical_params_hash(params)
-    return await pool_or_conn.fetchval(
-        "SELECT processing_idx FROM qiita.processing_method WHERE params_hash = $1",
-        params_hash,
     )

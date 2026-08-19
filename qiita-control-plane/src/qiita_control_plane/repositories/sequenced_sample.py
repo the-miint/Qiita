@@ -28,11 +28,9 @@ from qiita_common.actions import READ_MASK_ACTION_ID
 
 from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
-    fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
-    preflight_global_metadata,
     validate_primary_secondary_studies,
-    write_global_metadata_entries,
+    write_sample_metadata,
 )
 from .prep_sample import insert_prep_sample
 from .prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
@@ -43,6 +41,24 @@ from .prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 # supertype row. The subtype table pins its own processing_kind column
 # via GENERATED ALWAYS AS so no caller passes it there.
 _PROCESSING_KIND_SEQUENCED = "sequenced"
+
+# The SequencedSampleListItem projection, shared verbatim by the pool- and
+# run-scoped roster reads (they differ only in their join and WHERE). Every
+# column is named exactly as the model field it fills — ss.idx is aliased —
+# so a row maps straight onto the model via model_validate(dict(row)) with no
+# renaming. `$3` is the read-mask action_id the has_read_mask_ticket EXISTS
+# matches on; both callers bind it in that position.
+_LIST_ITEM_COLUMNS = (
+    "ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
+    " ps.biosample_idx, ss.sequenced_pool_item_id,"
+    " ss.ena_experiment_accession, ss.ena_run_accession,"
+    " bs.biosample_accession, bs.ena_sample_accession,"
+    " ss.raw_read_count_r1r2, ss.biological_read_count_r1r2,"
+    " ss.quality_filtered_read_count_r1r2, ss.spikein_read_count_r1r2,"
+    " EXISTS (SELECT 1 FROM qiita.work_ticket wt"
+    "          WHERE wt.prep_sample_idx = ss.prep_sample_idx"
+    "            AND wt.action_id = $3) AS has_read_mask_ticket"
+)
 
 
 async def fetch_sequenced_sample_with_prep_sample(
@@ -81,7 +97,7 @@ async def fetch_sequenced_sample_with_prep_sample(
         " ss.sequenced_pool_item_id, ss.ena_experiment_accession,"
         " ss.ena_run_accession, ss.last_submission_at, ss.submission_error,"
         " ss.raw_read_count_r1r2, ss.biological_read_count_r1r2,"
-        " ss.quality_filtered_read_count_r1r2,"
+        " ss.quality_filtered_read_count_r1r2, ss.spikein_read_count_r1r2,"
         " ps.biosample_idx, ps.owner_idx, ps.prep_protocol_idx,"
         " ps.metadata_checklist_idx,"
         " (SELECT name FROM qiita.metadata_checklist mc"
@@ -247,6 +263,7 @@ async def import_sequenced_prep_sample(
     metadata_checklist_idx: int | None = None,
     ena_experiment_accession: str | None = None,
     ena_run_accession: str | None = None,
+    global_internal_names: bool = False,
 ) -> SequencedPrepSampleImportResult:
     """Create one sequenced prep sample with its study links and metadata.
 
@@ -254,15 +271,7 @@ async def import_sequenced_prep_sample(
     interactions):
 
       1. Require an open transaction (fail-fast at the function boundary).
-      2. Pre-flight metadata validation: resolve every metadata key
-         against prep_sample_global_field in one SELECT, then parse every
-         text value into its typed Python value (or, when the text matches
-         a missing_value_reason name, into a MissingReasonRef that lands
-         as value_missing_reason_idx; or, on a TERMINOLOGY-typed field,
-         into a TerminologyTermRef that lands as
-         value_terminology_term_idx). No DB writes yet; unknown-name,
-         parse-failure, and unresolved-terminology cases raise typed
-         exceptions before any row is touched.
+      2. Reject primary_study_idx also appearing in secondary_study_idxs.
       3. INSERT qiita.prep_sample with processing_kind='sequenced'
          supplied explicitly (the supertype column is plain NOT NULL,
          not GENERATED ALWAYS).
@@ -275,16 +284,23 @@ async def import_sequenced_prep_sample(
          reject_without_biosample_link trigger fires on every INSERT
          and raises asyncpg.RaiseError if any requested study lacks a
          non-retired biosample_to_study link.
-      6. For each metadata entry: call write_global_metadata_or_diagnose
-         with PREP_SAMPLE_METADATA_SPEC against primary_study_idx (the
-         field-owning study). That upserts a globally-linked
-         prep_sample_study_field bound to the global field, then INSERTs
-         one prep_sample_metadata row. The reject_if_link_retired trigger
-         fires here, which is why step 5 must precede step 6.
+      6. Validate and write the supplied metadata against primary_study_idx
+         (the field-owning study): resolve every key against
+         prep_sample_global_field — on display_name, or on internal_name when
+         global_internal_names is set — or against the study's existing
+         study-local fields, parse each value into its typed Python value (or a
+         MissingReasonRef / TerminologyTermRef marker), then INSERT one
+         prep_sample_metadata row per entry, through a globally-linked
+         prep_sample_study_field for a global field and through the existing
+         local field row otherwise. A name matching neither raises. This must
+         follow step 5 because the reject_if_link_retired trigger fires on each
+         metadata insert.
 
-    The caller must wrap the call in `async with conn.transaction():`; the
-    guard at entry raises RuntimeError otherwise so partial failure cannot
-    leave orphan rows.
+    Unknown-name, parse-failure, and unresolved-terminology cases raise
+    typed exceptions. The caller must wrap the call in `async with
+    conn.transaction():`; the guard at entry raises RuntimeError otherwise,
+    and the whole call is atomic, so any such raise rolls back the rows
+    written above it and partial failure cannot leave orphan rows.
 
     primary_study_idx owns the per-display_name prep_sample_study_field
     rows written for metadata; secondary studies share the value through
@@ -301,23 +317,6 @@ async def import_sequenced_prep_sample(
     # Reject primary appearing in the secondary list at the composer boundary;
     # defense-in-depth against callers bypassing the wire-level guard.
     validate_primary_secondary_studies(primary_study_idx, secondary_study_idxs)
-
-    # Pre-flight: resolve every text value that could plausibly be a
-    # missing-reason marker in one DB round trip; the prep-sample composer
-    # has no owner-id field so the candidate set is just the metadata values.
-    # Values are stripped so a padded marker (e.g. " not collected ") resolves.
-    candidate_texts = {v.strip() for v in metadata.values()}
-    known_missing_reasons = await fetch_missing_value_reason_idxs_by_names(conn, candidate_texts)
-
-    # Pre-flight: type-resolve every metadata entry against
-    # prep_sample_global_field; unknown-name, parse-failure, and
-    # unresolved-terminology cases raise before any DB write.
-    parsed_metadata = await preflight_global_metadata(
-        conn,
-        spec=PREP_SAMPLE_METADATA_SPEC,
-        metadata=metadata,
-        known_missing_reasons=known_missing_reasons,
-    )
 
     # Step a: create the supertype prep_sample with processing_kind pinned.
     ps_idx = await insert_prep_sample(
@@ -355,15 +354,19 @@ async def import_sequenced_prep_sample(
         caller_idx=caller_idx,
     )
 
-    # Step d: write each globally-linked metadata entry against
-    # primary_study_idx, the field-owning study.
-    await write_global_metadata_entries(
+    # Step d: validate and write the supplied metadata against
+    # primary_study_idx, the field-owning study: a global field writes through
+    # its slot, an existing study-local field writes locally. Must follow the
+    # link above — reject_if_link_retired fires on each insert.
+    await write_sample_metadata(
         conn,
         spec=PREP_SAMPLE_METADATA_SPEC,
         entity_idx=ps_idx,
         study_idx=primary_study_idx,
+        metadata=metadata,
         caller_idx=caller_idx,
-        parsed_metadata=parsed_metadata,
+        allow_local=True,
+        global_internal_names=global_internal_names,
     )
 
     return SequencedPrepSampleImportResult(
@@ -412,8 +415,8 @@ async def fetch_sequenced_pool_samples(
 ) -> list[asyncpg.Record]:
     """Return up to `limit` active sequenced_samples in one pool, each with
     the SequencedSampleListItem column set (prep_sample_idx, biosample_idx,
-    sequenced_pool_item_id, and the ENA experiment/run + biosample/ena-sample
-    accessions).
+    sequenced_pool_item_id, the ENA experiment/run + biosample/ena-sample
+    accessions, and the four per-stage read counts).
 
     Pool-scoped sibling of fetch_sequenced_sample_idxs_for_run: that one
     spans every pool in a run and returns bare idxs; this one is scoped to a
@@ -431,15 +434,7 @@ async def fetch_sequenced_pool_samples(
     # retired = false predicate and the join filters down to one pool. The
     # has_read_mask_ticket EXISTS rides the work_ticket_prep_sample_idx index.
     rows = await pool_or_conn.fetch(
-        # Alias ss.idx so a row maps straight onto SequencedSampleListItem via
-        # model_validate(dict(row)) — the route does no field renaming.
-        "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
-        " ps.biosample_idx, ss.sequenced_pool_item_id,"
-        " ss.ena_experiment_accession, ss.ena_run_accession,"
-        " bs.biosample_accession, bs.ena_sample_accession,"
-        " EXISTS (SELECT 1 FROM qiita.work_ticket wt"
-        "          WHERE wt.prep_sample_idx = ss.prep_sample_idx"
-        "            AND wt.action_id = $3) AS has_read_mask_ticket"
+        f"SELECT {_LIST_ITEM_COLUMNS}"
         " FROM qiita.sequenced_sample ss"
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
@@ -464,8 +459,8 @@ async def fetch_sequenced_samples_for_run(
 ) -> list[asyncpg.Record]:
     """Return up to `limit` active sequenced_samples across every pool in one
     run, each with the SequencedSampleListItem column set (prep_sample_idx,
-    biosample_idx, sequenced_pool_item_id, and the ENA experiment/run +
-    biosample/ena-sample accessions).
+    biosample_idx, sequenced_pool_item_id, the ENA experiment/run +
+    biosample/ena-sample accessions, and the four per-stage read counts).
 
     Run-scoped sibling of fetch_sequenced_pool_samples (pool-scoped): walks
     run -> sequenced_pool -> sequenced_sample -> prep_sample -> biosample and
@@ -475,15 +470,7 @@ async def fetch_sequenced_samples_for_run(
     the underlying set exceeded the cap.
     """
     rows = await pool_or_conn.fetch(
-        # Alias ss.idx so a row maps straight onto SequencedSampleListItem via
-        # model_validate(dict(row)) — the route does no field renaming.
-        "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
-        " ps.biosample_idx, ss.sequenced_pool_item_id,"
-        " ss.ena_experiment_accession, ss.ena_run_accession,"
-        " bs.biosample_accession, bs.ena_sample_accession,"
-        " EXISTS (SELECT 1 FROM qiita.work_ticket wt"
-        "          WHERE wt.prep_sample_idx = ss.prep_sample_idx"
-        "            AND wt.action_id = $3) AS has_read_mask_ticket"
+        f"SELECT {_LIST_ITEM_COLUMNS}"
         " FROM qiita.sequenced_sample ss"
         " JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"

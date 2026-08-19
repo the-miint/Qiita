@@ -75,6 +75,17 @@ async def test_list_excludes_retired_by_default(client, retired_protocol):
     assert retired_protocol not in idxs
 
 
+async def test_list_respects_limit(client):
+    """The anonymous listing is bounded — ?limit=1 returns at most one row, and
+    an out-of-range limit is rejected by the query-param validator (422)."""
+    resp = await client.get(f"{URL_PREP_PROTOCOL_PREFIX}?limit=1")
+    assert resp.status_code == 200
+    assert len(resp.json()) <= 1
+
+    too_big = await client.get(f"{URL_PREP_PROTOCOL_PREFIX}?limit=1000000")
+    assert too_big.status_code == 422
+
+
 async def test_list_includes_retired_when_requested(client, retired_protocol):
     """`?include_retired=true` surfaces the retired protocol."""
     resp = await client.get(URL_PREP_PROTOCOL_PREFIX, params={"include_retired": "true"})

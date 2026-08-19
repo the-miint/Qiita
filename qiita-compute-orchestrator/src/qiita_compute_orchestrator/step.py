@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.api_paths import (
+    PATH_STEP_CANCEL,
     PATH_STEP_FIND_BY_NAME,
     PATH_STEP_PLAN,
     PATH_STEP_PREFIX,
@@ -52,7 +53,10 @@ from qiita_common.backend_failure import (
     StepNoDataBody,
 )
 from qiita_common.models import (
+    ComputeTarget,
     FoundJobWire,
+    StepCancelRequest,
+    StepCancelResponse,
     StepFindByNameRequest,
     StepFindByNameResponse,
     StepHandleWire,
@@ -65,7 +69,7 @@ from qiita_common.models import (
     StepSubmitRequest,
 )
 
-from .backend import ComputeBackend, StepHandle, StepStatusInfo
+from .backend import ComputeBackend, LocalStepHandle, SlurmStepHandle, StepHandle, StepStatusInfo
 from .jobs import flatten_native_inputs, run_native_job_plan
 
 _log = logging.getLogger(__name__)
@@ -127,33 +131,45 @@ def _step_no_data_response(exc: StepNoData) -> JSONResponse:
 
 
 def _handle_to_wire(handle: StepHandle) -> StepHandleWire:
+    if isinstance(handle, SlurmStepHandle):
+        return StepHandleWire(
+            compute_target=handle.compute_target,
+            step_name=handle.step_name,
+            slurm_job_id=handle.slurm_job_id,
+            job_name=handle.job_name,
+            output_path=str(handle.output_path),
+            logs_path=str(handle.logs_path),
+            terminal_outputs=None,
+        )
     return StepHandleWire(
         compute_target=handle.compute_target,
         step_name=handle.step_name,
-        slurm_job_id=handle.slurm_job_id,
-        job_name=handle.job_name,
-        output_path=str(handle.output_path) if handle.output_path is not None else None,
-        logs_path=str(handle.logs_path) if handle.logs_path is not None else None,
-        terminal_outputs=(
-            {k: str(v) for k, v in handle.terminal_outputs.items()}
-            if handle.terminal_outputs is not None
-            else None
-        ),
+        terminal_outputs={k: str(v) for k, v in handle.terminal_outputs.items()},
     )
 
 
 def _handle_from_wire(wire: StepHandleWire) -> StepHandle:
-    return StepHandle(
-        compute_target=wire.compute_target,
+    # SLURM handles require the job id + workspace paths (mirrors the old
+    # _require_slurm_handle contract); job_name rides along optionally. Anything
+    # else reconstructs as a local (synchronous, terminal-outputs) handle.
+    if wire.compute_target == ComputeTarget.SLURM:
+        if wire.slurm_job_id is None or wire.output_path is None or wire.logs_path is None:
+            raise ValueError(
+                f"malformed SLURM step handle (missing job id / workspace paths): {wire!r}"
+            )
+        return SlurmStepHandle(
+            step_name=wire.step_name,
+            slurm_job_id=wire.slurm_job_id,
+            job_name=wire.job_name,
+            output_path=Path(wire.output_path),
+            logs_path=Path(wire.logs_path),
+        )
+    return LocalStepHandle(
         step_name=wire.step_name,
-        slurm_job_id=wire.slurm_job_id,
-        job_name=wire.job_name,
-        output_path=Path(wire.output_path) if wire.output_path is not None else None,
-        logs_path=Path(wire.logs_path) if wire.logs_path is not None else None,
         terminal_outputs=(
             {k: Path(v) for k, v in wire.terminal_outputs.items()}
             if wire.terminal_outputs is not None
-            else None
+            else {}
         ),
     )
 
@@ -196,6 +212,7 @@ async def submit_step(
             module=body.module,
             entrypoint=body.entrypoint,
             baseline_resources=body.baseline_resources,
+            derived_inputs=body.derived_inputs,
         )
     except StepNoData as exc:
         # LocalBackend runs the native job to completion at submit time, so an
@@ -283,6 +300,11 @@ async def status_step(
         info = await backend.status_step(_handle_from_wire(body.handle))
     except BackendFailure as exc:
         return _backend_failure_response(exc)
+    except ValueError as exc:
+        # A malformed handle (e.g. a SLURM wire missing its job id / paths) can't
+        # round-trip from a real submit; treat it as a bad request like /submit
+        # does, not a raw 500 that a CP client would read as transient.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _status_to_wire(info)
 
 
@@ -304,6 +326,11 @@ async def result_step(
         return _step_no_data_response(exc)
     except BackendFailure as exc:
         return _backend_failure_response(exc)
+    except ValueError as exc:
+        # A malformed handle (e.g. a SLURM wire missing its job id / paths) can't
+        # round-trip from a real submit; treat it as a bad request like /submit
+        # does, not a raw 500 that a CP client would read as transient.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return StepResultResponse(outputs={k: str(v) for k, v in outputs.items()})
 
 
@@ -332,3 +359,22 @@ async def find_jobs_by_name(
             for f in found
         ]
     )
+
+
+@router.post(PATH_STEP_CANCEL)
+async def cancel_step(
+    body: StepCancelRequest,
+    backend: Annotated[ComputeBackend, Depends(_get_backend)],
+    _: Annotated[None, Depends(_require_cp_to_co_token)],
+) -> StepCancelResponse:
+    """scancel every live SLURM job of a work_ticket (all attempts, by the
+    `qiita-wt{idx}-` name prefix). The control plane calls this AFTER flipping the
+    ticket terminal, so no new attempt can spawn between the find and the scancel.
+    Idempotent — returns the ids actually cancelled (empty when none are live).
+    Serializes a classified BackendFailure (e.g. slurmrestd unreachable) so the CP
+    retries rather than treating a transient reap failure as permanent."""
+    try:
+        cancelled = await backend.cancel(body.work_ticket_idx)
+    except BackendFailure as exc:
+        return _backend_failure_response(exc)
+    return StepCancelResponse(cancelled_job_ids=cancelled)

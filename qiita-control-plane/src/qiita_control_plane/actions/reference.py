@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncpg
 from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
+    TERMINAL_WORK_TICKET_STATES,
     VALID_STATUS_TRANSITIONS,
     ReferenceResponse,
     ReferenceStatus,
@@ -30,20 +32,48 @@ class ReferenceNotFound(Exception):
 # unconditionally (a running job is reading/writing the reference's data);
 # terminal states block only without `force` (a completed test run is exactly
 # what an admin purging a test reference wants gone).
-_WORK_TICKET_IN_FLIGHT_STATES = ("pending", "queued", "processing")
-_WORK_TICKET_TERMINAL_STATES = ("completed", "failed")
+#
+# Between them these cover EVERY state, which is the point: a state in neither
+# arm is invisible to the gate, and since the cascade below is state-blind, the
+# delete would proceed unforced and purge its tickets anyway.
+_WORK_TICKET_IN_FLIGHT_STATES = NON_TERMINAL_WORK_TICKET_STATES
+_WORK_TICKET_TERMINAL_STATES = TERMINAL_WORK_TICKET_STATES
 
 
 class ReferenceDeleteBlocked(Exception):
-    """Raised when a reference cannot be deleted because work tickets
-    reference it. `in_flight` always blocks; `terminal` blocks only when the
-    caller did not pass force=True."""
+    """Raised when a reference cannot be deleted. `alignment_definitions` blocks
+    UNCONDITIONALLY (even with force); `in_flight` work tickets always block;
+    `terminal` work tickets block only when the caller did not pass force=True."""
 
-    def __init__(self, *, reference_idx: int, in_flight: int, terminal: int) -> None:
+    def __init__(
+        self,
+        *,
+        reference_idx: int,
+        in_flight: int,
+        terminal: int,
+        alignment_definitions: int = 0,
+    ) -> None:
         self.reference_idx = reference_idx
         self.in_flight = in_flight
         self.terminal = terminal
-        if in_flight:
+        self.alignment_definitions = alignment_definitions
+        # Alignment definitions are the force-proof reason and the one the operator
+        # most needs to act on, so it is reported first when present. A reference
+        # delete cascades neither `alignment_definition` nor the DuckLake `alignment`
+        # rows it owns (those are keyed on `feature_idx`, which this delete would
+        # orphan-GC in both stores), and the data plane's delete_reference does not
+        # touch `alignment` — so force cannot make this delete safe. The
+        # DELETE /alignment-definition/{idx} route DOES purge the lake rows and
+        # cascade its gates, so send the operator there first.
+        if alignment_definitions:
+            reason = (
+                f"{alignment_definitions} alignment definition(s) align against it; "
+                "force cannot be used because it cannot clean the DuckLake "
+                "`alignment` rows they own (keyed on feature_idx this delete would "
+                "orphan). Delete each via DELETE /alignment-definition/{idx} first "
+                "(that route purges the lake rows and cascades its gates), then retry"
+            )
+        elif in_flight:
             reason = (
                 f"{in_flight} in-flight work ticket(s) "
                 f"({'/'.join(_WORK_TICKET_IN_FLIGHT_STATES)}) reference it; "
@@ -51,7 +81,8 @@ class ReferenceDeleteBlocked(Exception):
             )
         else:
             reason = (
-                f"{terminal} completed/failed work ticket(s) reference it; "
+                f"{terminal} terminal work ticket(s) "
+                f"({'/'.join(_WORK_TICKET_TERMINAL_STATES)}) reference it; "
                 "re-issue with force=true to delete them too"
             )
         super().__init__(f"Reference {reference_idx} cannot be deleted: {reason}")
@@ -77,7 +108,8 @@ async def assert_reference_deletable(
 
     Returns the reference's current status on success. Raises
     ReferenceNotFound if it doesn't exist, or ReferenceDeleteBlocked if work
-    tickets reference it (in-flight always; terminal unless force). Run this
+    tickets reference it (in-flight always; terminal unless force) or if any
+    alignment definition aligns against it (always, even with force). Run this
     *before* any destructive step so a blocked delete touches nothing."""
     status = await conn.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
@@ -92,11 +124,27 @@ async def assert_reference_deletable(
     counts = {r["state"]: r["n"] for r in rows}
     in_flight = sum(counts.get(s, 0) for s in _WORK_TICKET_IN_FLIGHT_STATES)
     terminal = sum(counts.get(s, 0) for s in _WORK_TICKET_TERMINAL_STATES)
-    if in_flight or (terminal and not force):
+    # Align-block work tickets are block-scoped and leave work_ticket.reference_idx
+    # NULL, so the gate above cannot see them — the reference↔alignment link lives
+    # only in alignment_definition.params (JSON `reference_idx`, an int; there is no
+    # FK). Gate on that row directly: it is the durable record that an alignment was
+    # built against this reference, and it outlives the (transient) work tickets.
+    # This blocks EVEN WITH force, because neither the Postgres cascade nor the data
+    # plane's delete_reference touches the DuckLake `alignment` rows those
+    # definitions own (keyed on feature_idx this delete would orphan-GC in both
+    # stores) — so no force can make the delete safe. DELETE /alignment-definition
+    # first purges the lake rows and cascades the gates.
+    alignment_definitions = await conn.fetchval(
+        "SELECT count(*) FROM qiita.alignment_definition"
+        " WHERE (params->>'reference_idx')::bigint = $1",
+        reference_idx,
+    )
+    if alignment_definitions or in_flight or (terminal and not force):
         raise ReferenceDeleteBlocked(
             reference_idx=reference_idx,
             in_flight=in_flight,
             terminal=terminal,
+            alignment_definitions=alignment_definitions,
         )
     return status
 
@@ -112,23 +160,72 @@ async def delete_reference_cascade(
 
     The schema uses ON DELETE RESTRICT throughout (no cascades), so order is
     explicit: work_ticket (→ work_ticket_step CASCADEs) → reference_index →
-    reference_membership → orphan feature_genome/feature → orphan genome →
-    reference. Features and genomes are deleted only when *orphaned* — claimed
-    by no other reference — so a shared feature survives.
+    reference_membership → annotation_to_term → reference_annotation → orphan
+    annotation_term → orphan feature_genome/feature → orphan genome → reference.
+    Features, genomes and terms are deleted only when *orphaned* — claimed by
+    nothing that outlives this delete — so a shared one survives. A feature has one
+    claim from outside the reference graph: `qiita.assembly_membership`, which keeps
+    an assembled contig's feature whatever happens to the reference.
 
     Returns the per-table delete counts for the caller's response."""
-    # Orphan features: this reference's features that no other reference claims.
-    # Computed before the membership DELETE below (the EXCEPT needs this
-    # reference's rows present). This set MUST match the data-plane orphan
-    # computation in qiita-data-plane's flight_service.rs::delete_reference —
-    # the two stores GC the same features independently, so a change to either
-    # query must change the other or sequences/features desync across stores.
+    # Orphan features: this reference's features that nothing else claims.
+    #
+    # A reference claims a feature in TWO ways, and both count: as a member
+    # (reference_membership — a whole sequence, indexed and aligned against) or as
+    # an annotated interval (reference_annotation — a SynDNA insert on its plasmid,
+    # minted its own feature_idx but deliberately kept OUT of membership). Reading
+    # only membership here would leave every annotated feature_idx behind forever,
+    # referenced by nothing; reading only membership on the *right* side of the
+    # EXCEPT would delete a feature another reference still annotates.
+    #
+    # reference_annotation.parent_feature_idx is a third FK on qiita.feature and is on
+    # neither side, resting on an ingest invariant rather than a constraint: the parent
+    # is resolved from the same reference's own feature map (mint_annotation_features),
+    # so a parent always carries that reference's membership row and the right side
+    # covers it there.
+    #
+    # assembly_membership is a claim from OUTSIDE the reference graph, and appears on
+    # the RIGHT side only. An assembled contig is minted through the same mint-features
+    # path and the same canonical hash as a reference sequence, so a contig whose bytes
+    # match a reference sequence collapses to one feature_idx. The FK declares no
+    # ON DELETE action, so deleting a feature an assembly still claims raises
+    # ForeignKeyViolationError and aborts the whole cascade. It is absent from the LEFT
+    # side because an assembly claim carries no reference_idx — this reference does not
+    # own it and deleting this reference does not release it.
+    #
+    # Computed before the DELETEs below (the EXCEPT needs this reference's rows
+    # present). The two reference-claim terms MUST match the data-plane orphan
+    # computation in qiita-data-plane's flight_service.rs::delete_reference — the two
+    # stores GC the same features independently, so a change to either query must
+    # change the other or sequences/features desync across stores. The assembly term is
+    # deliberately Postgres-only: an assembly's contig bytes land in
+    # qiita_lake.assembled_sequence(_chunks) once its assembly_load step has run, so
+    # dropping the qiita_lake.reference_sequences copy of a feature no reference claims
+    # leaves the assembly's own copy resolvable, keyed by the qiita.feature row this
+    # query retains.
+    #
+    # The assembly term is scoped to `claimed` rather than reading the table whole:
+    # unlike the other two it has no reference_idx to filter on, and assembly_membership
+    # grows per (prep_sample x run x contig). The IN keeps it on an index-only scan of
+    # assembly_membership(feature_idx), so the cost tracks the size of THIS reference,
+    # not of every assembly ever loaded. Measured on Postgres 17.10, 1M
+    # assembly_membership rows and 50k members in the deleted reference: 158 ms scoped
+    # against 844 ms reading the table whole.
     orphan_features = [
         r["feature_idx"]
         for r in await conn.fetch(
-            "SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx = $1"
+            "WITH claimed AS ("
+            "  SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx = $1"
+            "  UNION"
+            "  SELECT feature_idx FROM qiita.reference_annotation WHERE reference_idx = $1)"
+            "  SELECT feature_idx FROM claimed"
             " EXCEPT"
-            " SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx <> $1",
+            " ( SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx <> $1"
+            "  UNION"
+            "  SELECT feature_idx FROM qiita.reference_annotation WHERE reference_idx <> $1"
+            "  UNION"
+            "  SELECT am.feature_idx FROM qiita.assembly_membership am"
+            "   WHERE am.feature_idx IN (SELECT feature_idx FROM claimed))",
             reference_idx,
         )
     ]
@@ -144,6 +241,55 @@ async def delete_reference_cascade(
     membership_deleted = _rowcount(
         await conn.execute(
             "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+    )
+    # The terms THIS reference cites. Captured BEFORE the junction rows go, because the
+    # junction is the only thing that records the citation — after the delete below there
+    # is no way back from a reference to the terms it used to name.
+    cited_terms = [
+        r["annotation_term_idx"]
+        for r in await conn.fetch(
+            "SELECT DISTINCT l.annotation_term_idx FROM qiita.annotation_to_term l"
+            " JOIN qiita.reference_annotation ra ON ra.annotation_idx = l.annotation_idx"
+            " WHERE ra.reference_idx = $1",
+            reference_idx,
+        )
+    ]
+
+    # Must precede the reference_annotation delete: annotation_to_term FKs
+    # annotation_idx with ON DELETE RESTRICT.
+    annotation_term_link_deleted = _rowcount(
+        await conn.execute(
+            "DELETE FROM qiita.annotation_to_term l"
+            " USING qiita.reference_annotation ra"
+            " WHERE l.annotation_idx = ra.annotation_idx AND ra.reference_idx = $1",
+            reference_idx,
+        )
+    )
+    # Must precede the qiita.feature delete below: reference_annotation FKs BOTH
+    # feature_idx and parent_feature_idx with ON DELETE RESTRICT, so an orphan
+    # feature that is still claimed by one of these rows cannot be removed.
+    annotation_deleted = _rowcount(
+        await conn.execute(
+            "DELETE FROM qiita.reference_annotation WHERE reference_idx = $1", reference_idx
+        )
+    )
+    # Orphan terms: a term is GLOBAL (deduplicated on (system, system_id) across every
+    # reference), so it goes only once NO annotation anywhere still cites it — the same
+    # orphan rule qiita.feature and qiita.genome get.
+    #
+    # Scoped to the terms THIS reference cited (captured before the junction delete
+    # above), not a whole-table sweep: an unscoped DELETE would make the returned count
+    # unattributable to this reference, and would quietly become this endpoint's
+    # responsibility to GC terms leaked by some other path.
+    annotation_term_deleted = _rowcount(
+        await conn.execute(
+            "DELETE FROM qiita.annotation_term t"
+            " WHERE t.annotation_term_idx = ANY($1::bigint[])"
+            "   AND NOT EXISTS ("
+            "     SELECT 1 FROM qiita.annotation_to_term l"
+            "     WHERE l.annotation_term_idx = t.annotation_term_idx)",
+            cited_terms,
         )
     )
 
@@ -179,6 +325,9 @@ async def delete_reference_cascade(
 
     return {
         "membership_deleted": membership_deleted,
+        "annotation_deleted": annotation_deleted,
+        "annotation_term_link_deleted": annotation_term_link_deleted,
+        "annotation_term_deleted": annotation_term_deleted,
         "index_deleted": index_deleted,
         "work_ticket_deleted": work_ticket_deleted,
         "orphan_feature_count": len(orphan_features),

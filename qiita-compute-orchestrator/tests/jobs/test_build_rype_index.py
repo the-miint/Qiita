@@ -303,6 +303,29 @@ def _run_memory_split(tmp_path, monkeypatch, alloc_gb):
     return captured
 
 
+def test_build_rype_index_meta_has_no_shard_id(tmp_path, monkeypatch):
+    """A build records NO shard_id in the meta JSON — the register-index arm's
+    `meta.get('shard_id')` yields None, giving a whole-reference row (host rype is
+    never sharded; the sharded ROUTER is a separate job)."""
+    from qiita_compute_orchestrator.jobs import build_rype_index
+
+    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
+    chunks_dir = _write_chunks_dir(tmp_path / "reference_sequence_chunks", [(1, 0, "ACGT")])
+
+    def fake_build(conn, chunk_table, output_path, mapping_table, *, k, w, max_memory):
+        Path(output_path).mkdir(parents=True, exist_ok=True)
+        return "ok"
+
+    monkeypatch.setattr(build_rype_index, "_run_rype_index_create", fake_build)
+
+    inputs = build_rype_index.Inputs(
+        reference_sequence_chunks=chunks_dir, reference_idx=1, work_ticket_idx=1
+    )
+    out = asyncio.run(build_rype_index.execute(inputs, tmp_path / "ws"))
+    meta = json.loads(Path(out["rype_index_meta"]).read_text())
+    assert meta.get("shard_id") is None
+
+
 def test_build_rype_index_memory_split_under_slurm(tmp_path, monkeypatch):
     """Under SLURM the cgroup is split DuckDB(bounded) / rype(elastic). DuckDB is
     hard-capped at `_DUCKDB_MEMORY_CAP_GB` (small because `rype_index_create`

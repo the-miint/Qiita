@@ -85,6 +85,7 @@ async def test_mint_sequence_range_returns_row_with_expected_shape(parent_chain)
             prep_sample_idx=parent_chain["prep_sample_idx"],
             count=10,
             principal_idx=parent_chain["principal_idx"],
+            work_ticket_idx=None,
         )
     assert row["prep_sample_idx"] == parent_chain["prep_sample_idx"]
     assert row["sequence_idx_stop"] - row["sequence_idx_start"] + 1 == 10
@@ -108,6 +109,7 @@ async def test_mint_sequence_range_count_of_one_is_single_idx(parent_chain):
             prep_sample_idx=parent_chain["prep_sample_idx"],
             count=1,
             principal_idx=parent_chain["principal_idx"],
+            work_ticket_idx=None,
         )
     assert row["sequence_idx_start"] == row["sequence_idx_stop"]
 
@@ -128,12 +130,14 @@ async def test_mint_sequence_range_sequential_disjoint(parent_chain):
             prep_sample_idx=parent_chain["prep_sample_idx"],
             count=100,
             principal_idx=parent_chain["principal_idx"],
+            work_ticket_idx=None,
         )
         second = await mint_sequence_range(
             conn,
             prep_sample_idx=ps2,
             count=50,
             principal_idx=parent_chain["principal_idx"],
+            work_ticket_idx=None,
         )
 
     assert first["sequence_idx_stop"] < second["sequence_idx_start"]
@@ -160,6 +164,7 @@ async def test_mint_sequence_range_concurrent_disjoint(parent_chain):
                 prep_sample_idx=ps_idx,
                 count=1000,
                 principal_idx=parent_chain["principal_idx"],
+                work_ticket_idx=None,
             )
 
     row_a, row_b = await asyncio.gather(
@@ -195,6 +200,7 @@ async def test_mint_sequence_range_rejects_nonpositive_count(parent_chain, bad_c
                 prep_sample_idx=parent_chain["prep_sample_idx"],
                 count=bad_count,
                 principal_idx=parent_chain["principal_idx"],
+                work_ticket_idx=None,
             )
     assert exc_info.value.sqlstate == "22023"
 
@@ -207,6 +213,7 @@ async def test_mint_sequence_range_rejects_duplicate_prep_sample(parent_chain):
             prep_sample_idx=parent_chain["prep_sample_idx"],
             count=10,
             principal_idx=parent_chain["principal_idx"],
+            work_ticket_idx=None,
         )
         with pytest.raises(asyncpg.UniqueViolationError):
             await mint_sequence_range(
@@ -214,6 +221,7 @@ async def test_mint_sequence_range_rejects_duplicate_prep_sample(parent_chain):
                 prep_sample_idx=parent_chain["prep_sample_idx"],
                 count=10,
                 principal_idx=parent_chain["principal_idx"],
+                work_ticket_idx=None,
             )
 
 
@@ -229,6 +237,7 @@ async def test_mint_sequence_range_rejects_unknown_prep_sample(parent_chain):
                 prep_sample_idx=bogus_idx,
                 count=10,
                 principal_idx=parent_chain["principal_idx"],
+                work_ticket_idx=None,
             )
 
 
@@ -245,6 +254,7 @@ async def test_fetch_returns_row_after_mint(parent_chain):
             prep_sample_idx=parent_chain["prep_sample_idx"],
             count=7,
             principal_idx=parent_chain["principal_idx"],
+            work_ticket_idx=None,
         )
     fetched = await fetch_sequence_range_by_prep_sample_idx(pool, parent_chain["prep_sample_idx"])
     assert fetched is not None
@@ -279,6 +289,7 @@ async def test_sequence_range_cascade_on_prep_sample_delete(parent_chain):
             prep_sample_idx=parent_chain["prep_sample_idx"],
             count=10,
             principal_idx=parent_chain["principal_idx"],
+            work_ticket_idx=None,
         )
     # Direct delete of the parent prep_sample should cascade.
     await pool.execute(
@@ -302,6 +313,7 @@ async def test_sequence_idx_not_reused_after_cascade_delete(parent_chain):
             prep_sample_idx=parent_chain["prep_sample_idx"],
             count=10,
             principal_idx=parent_chain["principal_idx"],
+            work_ticket_idx=None,
         )
 
     # Cascade-delete the parent, then mint against a fresh prep_sample
@@ -323,5 +335,49 @@ async def test_sequence_idx_not_reused_after_cascade_delete(parent_chain):
             prep_sample_idx=ps2,
             count=5,
             principal_idx=parent_chain["principal_idx"],
+            work_ticket_idx=None,
         )
     assert second["sequence_idx_start"] > first["sequence_idx_stop"]
+
+
+async def test_mint_persists_the_minting_work_ticket(parent_chain):
+    """The mint RECORDS which ticket minted the range — the single fact the whole
+    reuse guard rests on.
+
+    If the function ever stopped writing p_work_ticket_idx, every range would come
+    back with a NULL minter, every reads-job retry would read that as "not mine",
+    and the retry path would fail closed on EVERYTHING — silently, because no other
+    test asserts the value round-trips.
+    """
+    pool = parent_chain["pool"]
+    async with pool.acquire() as conn:
+        row = await mint_sequence_range(
+            conn,
+            prep_sample_idx=parent_chain["prep_sample_idx"],
+            count=5,
+            principal_idx=parent_chain["principal_idx"],
+            work_ticket_idx=4242,
+        )
+    assert row["minted_by_work_ticket_idx"] == 4242
+    durable = await pool.fetchval(
+        "SELECT minted_by_work_ticket_idx FROM qiita.sequence_range WHERE prep_sample_idx = $1",
+        parent_chain["prep_sample_idx"],
+    )
+    assert durable == 4242, "the minting ticket must be persisted, not just returned"
+
+
+async def test_mint_tolerates_an_unattributed_range(parent_chain):
+    """The column is nullable at the DB layer: fixtures and non-ingest callers may
+    mint without a ticket. Such a range reads as "not mine" on the reuse path and
+    fails closed — the HTTP surface requires the ticket, so nothing minted through
+    the API is ever unattributed."""
+    pool = parent_chain["pool"]
+    async with pool.acquire() as conn:
+        row = await mint_sequence_range(
+            conn,
+            prep_sample_idx=parent_chain["prep_sample_idx"],
+            count=3,
+            principal_idx=parent_chain["principal_idx"],
+            work_ticket_idx=None,
+        )
+    assert row["minted_by_work_ticket_idx"] is None

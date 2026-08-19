@@ -7,7 +7,7 @@ and the read_masked table allowlist membership), plus the mandatory-filter
 rejection at the request layer.
 
 The DoGet round-trip against a live data plane is NOT exercised here — the
-read_masked DuckLake view does not exist until PR 2, so these tests assert the
+read_masked DuckLake macro does not exist until PR 2, so these tests assert the
 signing/validation/rejection logic only.
 """
 
@@ -27,20 +27,58 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 
 from qiita_control_plane.auth.token import mint_api_token
-from qiita_control_plane.testing.db_seeds import seed_user_principal
+from qiita_control_plane.repositories.mask_definition import mint_mask_definition
+from qiita_control_plane.testing.db_seeds import (
+    seed_biosample_with_sequenced_prep_sample,
+    seed_user_principal,
+)
 
 pytestmark = pytest.mark.db
 
 
-# HMAC secret the test app signs tickets with; the test decodes the payload
-# (not the MAC) so any 32-byte value works.
-_HMAC_SECRET = b"\x00" * 32
+async def _seed_gate(pool, principal_idx, *, state):
+    """Seed a real (prep_sample, mask_definition) pair, plus a mask_sample gate row
+    in `state` when `state` is not None (no row otherwise). Returns
+    `(prep_sample_idx, mask_idx, biosample_idx)`; caller cleans up via
+    `_cleanup_gate` (FK-reverse)."""
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=principal_idx
+    )
+    async with pool.acquire() as conn:
+        mask = await mint_mask_definition(
+            conn,
+            filter_workflow="read-mask",
+            filter_version="1.0.0",
+            params={"workflow": "read-mask", "s": secrets.token_hex(4)},
+            principal_idx=principal_idx,
+        )
+    mask_idx = mask["mask_idx"]
+    if state is not None:
+        await pool.execute(
+            "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state) VALUES ($1, $2, $3)",
+            mask_idx,
+            prep_sample_idx,
+            state,
+        )
+    return prep_sample_idx, mask_idx, biosample_idx
+
+
+async def _cleanup_gate(pool, prep_sample_idx, mask_idx, biosample_idx):
+    await pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
+    await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+    await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
+    await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
+
+
+# Ed25519 signing seed the test app signs tickets with; the test decodes the
+# payload (not the signature) so any 32-byte value works.
+_TEST_SEED = b"\x00" * 32
 
 
 def _decode_ticket_payload(ticket_b64: str) -> dict:
     """Parse the JSON payload out of a base64 signed Flight ticket.
 
-    Wire format: <1B version><4B payload_len><payload><32B HMAC><8B expiry>.
+    Wire format: <1B version><4B payload_len><payload><64B Ed25519 signature><8B expiry>.
     """
     raw = base64.b64decode(ticket_b64)
     payload_len = struct.unpack(">I", raw[1:5])[0]
@@ -57,7 +95,7 @@ async def ctx(postgres_pool, regular_user_session, compute_worker_service_accoun
     app.state.pool = postgres_pool
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=_HMAC_SECRET,
+        flight_signing_key=_TEST_SEED,
         data_plane_url="unused",
     )
     transport = ASGITransport(app=app)
@@ -247,12 +285,42 @@ async def test_doget_sa_without_scope_403(ctx, sa_no_scope_client):
 
 
 async def test_doget_signs_mandatory_filter(ctx):
-    resp = await ctx["sa"].post(URL_READ_MASKED_DOGET, json={"prep_sample_idx": 11, "mask_idx": 4})
-    assert resp.status_code == 201, resp.text
-    payload = _decode_ticket_payload(resp.json()["ticket"])
-    # read_masked table + BOTH identifiers present and non-empty.
-    assert payload["table"] == "read_masked"
-    assert payload["filter"] == {"prep_sample_idx": [11], "mask_idx": [4]}
+    """A 'completed' gate under the mask → a signed ticket carrying BOTH
+    identifiers as a non-empty filter."""
+    pool = ctx["pool"]
+    prep, mask, bs = await _seed_gate(pool, ctx["principal_idx"], state="completed")
+    try:
+        resp = await ctx["sa"].post(
+            URL_READ_MASKED_DOGET, json={"prep_sample_idx": prep, "mask_idx": mask}
+        )
+        assert resp.status_code == 201, resp.text
+        payload = _decode_ticket_payload(resp.json()["ticket"])
+        # read_masked table + BOTH identifiers present and non-empty.
+        assert payload["table"] == "read_masked"
+        assert payload["filter"] == {"prep_sample_idx": [prep], "mask_idx": [mask]}
+    finally:
+        await _cleanup_gate(pool, prep, mask, bs)
+
+
+@pytest.mark.parametrize("state", [None, "pending"])
+async def test_doget_refuses_when_not_masked_complete(ctx, state):
+    """The completion gate: a 'pending' gate (a covering block still in flight) or
+    NO gate row (absence is not exempt) both 409 — an in-flight/absent pass-set
+    would silently truncate. This is the third read_masked-ticket door; it must be
+    gated exactly like the human export ticket route, so the invariant is uniform:
+    every path that mints a read_masked ticket requires 'completed'."""
+    pool = ctx["pool"]
+    prep, mask, bs = await _seed_gate(pool, ctx["principal_idx"], state=state)
+    try:
+        resp = await ctx["sa"].post(
+            URL_READ_MASKED_DOGET, json={"prep_sample_idx": prep, "mask_idx": mask}
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["mask_state"] == state
+        assert detail["prep_sample_idx"] == prep and detail["mask_idx"] == mask
+    finally:
+        await _cleanup_gate(pool, prep, mask, bs)
 
 
 async def test_doget_table_is_in_cp_allowlist(ctx):
@@ -261,6 +329,41 @@ async def test_doget_table_is_in_cp_allowlist(ctx):
     from qiita_control_plane.routes.reference import _DOGET_ALLOWED_TABLES
 
     assert "read_masked" in _DOGET_ALLOWED_TABLES
+
+
+def test_cp_doget_allowlist_matches_the_rust_one_exactly():
+    """`_DOGET_ALLOWED_TABLES` is a hand-copy of the data plane's `ALLOWED_TABLES`
+    (flight_service.rs). The CP signs tickets; the DP serves them. The two lists must
+    be IDENTICAL, and the failure when they aren't is asymmetric and silent:
+
+    * a table in the DP list but not the CP one is UNREACHABLE — the DP would serve
+      it happily, but nobody can sign a ticket for it, so the feature simply does not
+      work and no test notices (this is exactly what happened when
+      `reference_annotation` was added to the DP list alone);
+    * a table in the CP list but not the DP one mints tickets the DP then rejects.
+
+    The comment above `_DOGET_ALLOWED_TABLES` has always said "must stay in sync with
+    it" — this is what makes that true. Rust cannot import the Python set and vice
+    versa, so the const is parsed out of the source, exactly as
+    `test_read_mask_counts` does for the mask-reason lists.
+    """
+    import re
+    from pathlib import Path
+
+    from qiita_control_plane.routes.reference import _DOGET_ALLOWED_TABLES
+
+    src = (
+        Path(__file__).resolve().parents[3] / "qiita-data-plane" / "src" / "flight_service.rs"
+    ).read_text()
+    m = re.search(r"const ALLOWED_TABLES: &\[&str\] = &\[(.*?)\];", src, flags=re.DOTALL)
+    assert m, "ALLOWED_TABLES not found in flight_service.rs"
+    rust_tables = set(re.findall(r'"([^"]+)"', m.group(1)))
+
+    assert rust_tables == set(_DOGET_ALLOWED_TABLES), (
+        "the CP DoGet allowlist and the data plane's ALLOWED_TABLES have drifted; "
+        f"only in Rust: {sorted(rust_tables - set(_DOGET_ALLOWED_TABLES))}; "
+        f"only in Python: {sorted(set(_DOGET_ALLOWED_TABLES) - rust_tables)}"
+    )
 
 
 async def test_doget_read_masked_not_signable_via_reference_route(ctx):

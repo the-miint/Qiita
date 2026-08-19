@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import types
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from qiita_common.api_paths import (
@@ -18,7 +19,9 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_LIST_BY_STUDY,
+    URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_PROTOCOL_PREFIX,
+    URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_SAMPLE_STUDY_LIST,
     URL_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE,
     URL_SEQUENCED_SAMPLE_BY_IDX,
@@ -546,6 +549,7 @@ def _stub_post(
     response_json: dict,
     status: int = 201,
     whoami_idx: int | None = None,
+    response_headers: dict | None = None,
 ):
     """Patch `_common.httpx.request` to capture every call and return canned
     responses. Each call appends to `captured['requests']` (full list); the
@@ -585,7 +589,12 @@ def _stub_post(
                 json={"kind": "human", "principal_idx": whoami_idx},
                 request=_httpx.Request(method, url),
             )
-        return _httpx.Response(status, json=response_json, request=_httpx.Request(method, url))
+        return _httpx.Response(
+            status,
+            json=response_json,
+            headers=response_headers,
+            request=_httpx.Request(method, url),
+        )
 
     monkeypatch.setattr(_common.httpx, "request", fake_request)
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
@@ -645,6 +654,40 @@ def test_biosample_create_defaults_owner_idx_to_caller(monkeypatch):
         "owner_idx": 42,
         "owner_biosample_id_field_name": "owner_sample_id",
         "owner_biosample_id_value": "SMK-001",
+    }
+
+
+def test_biosample_create_global_internal_names_sent_only_when_passed(monkeypatch):
+    """--global-internal-names is three-state: passing it puts
+    global_internal_names=true on the POST body, and omitting it leaves the
+    field off the wire (the server model default fills in False)."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_CREATE_RESPONSE)
+
+    rc = main(
+        [
+            "biosample",
+            "create",
+            "--study-idx",
+            "7",
+            "--owner-idx",
+            "11",
+            "--owner-biosample-id-field-name",
+            "owner_sample_id",
+            "--owner-biosample-id-value",
+            "SMK-001",
+            "--global-internal-names",
+        ]
+    )
+    assert rc == 0
+    post_req = next(r for r in captured["requests"] if r["method"] == "POST")
+    assert post_req["json"] == {
+        "owner_idx": 11,
+        "owner_biosample_id_field_name": "owner_sample_id",
+        "owner_biosample_id_value": "SMK-001",
+        "global_internal_names": True,
     }
 
 
@@ -1939,30 +1982,34 @@ def test_ticket_logs_requires_step_index(capsys):
 # ---------------------------------------------------------------------------
 
 
-_TICKET_LIST_RESPONSE = [
-    {
-        "work_ticket_idx": 12,
-        "action_id": "fastq-to-parquet",
-        "action_version": "1.0.0",
-        "originator_principal_idx": 7,
-        "scope_target": {"kind": "prep_sample", "prep_sample_idx": 55},
-        "action_context": {},
-        "state": "processing",
-        "retry_count": 0,
-        "max_retries": 3,
-        "failure_type": None,
-        "failure_stage": None,
-        "failure_step_name": None,
-        "failure_reason": None,
-        "created_at": "2026-05-20T00:00:00+00:00",
-        "updated_at": "2026-05-20T00:00:01+00:00",
-        "current_step_index": 0,
-        "current_step_name": "convert",
-        "compute_target": "slurm",
-        "slurm_job_id": 4242,
-        "step_state": "running",
-    }
-]
+_TICKET_LIST_RESPONSE = {
+    "tickets": [
+        {
+            "work_ticket_idx": 12,
+            "action_id": "fastq-to-parquet",
+            "action_version": "1.0.0",
+            "originator_principal_idx": 7,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 55},
+            "action_context": {},
+            "state": "processing",
+            "retry_count": 0,
+            "max_retries": 3,
+            "failure_type": None,
+            "failure_stage": None,
+            "failure_step_name": None,
+            "failure_reason": None,
+            "created_at": "2026-05-20T00:00:00+00:00",
+            "updated_at": "2026-05-20T00:00:01+00:00",
+            "current_step_index": 0,
+            "current_step_name": "convert",
+            "compute_target": "slurm",
+            "slurm_job_id": 4242,
+            "step_state": "running",
+        }
+    ],
+    "count": 1,
+    "truncated": False,
+}
 
 
 def test_ticket_list_issues_get_with_no_filter_params(monkeypatch):
@@ -2012,6 +2059,36 @@ def test_ticket_list_passes_filter_params(monkeypatch):
     }
 
 
+def test_ticket_list_passes_scope_filter_params(monkeypatch):
+    """--sequenced-pool-idx / --prep-sample-idx / --action-id map onto the
+    query params the route reads, under their snake_case names."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_TICKET_LIST_RESPONSE, status=200)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "list",
+            "--sequenced-pool-idx",
+            "9",
+            "--prep-sample-idx",
+            "55",
+            "--action-id",
+            "read-mask",
+        ]
+    )
+    assert rc == 0
+    assert captured["params"] == {
+        "sequenced_pool_idx": "9",
+        "prep_sample_idx": "55",
+        "action_id": "read-mask",
+    }
+
+
 def test_ticket_list_rejects_unknown_state(capsys):
     """--state is constrained to the WorkTicketState values (argparse
     choices), so a bogus value exits 2 before any HTTP call."""
@@ -2048,6 +2125,78 @@ def test_http_error_response_prints_to_stderr_and_exits_1(monkeypatch, capsys):
     assert "http error 403" in err
     # The server's response body is echoed so the user sees the reason.
     assert "requires study access" in err
+
+
+def test_stale_scope_403_prints_clean_relogin_prompt(monkeypatch, capsys):
+    """A 403 the server flags with the stale-token-scope marker header —
+    the token predates a scope the caller's role now grants — surfaces a
+    clean, actionable `qiita login` prompt instead of the raw JSON envelope."""
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"detail": "missing required scope 'sequenced_pool:delete' (...)"},
+        status=403,
+        response_headers={STALE_TOKEN_SCOPE_HEADER: "1"},
+    )
+
+    rc = main(["study", "create", "--title", "denied-study"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "qiita login" in err
+    # The clean prompt replaces the raw JSON dump — no braces/quotes leak.
+    assert "{" not in err
+    assert '"detail"' not in err
+
+
+def test_plain_403_without_marker_still_echoes_body(monkeypatch, capsys):
+    """A 403 that is *not* a stale-scope case (no marker header) keeps the
+    generic body echo — the clean prompt is reserved for the stale case so an
+    ordinary authorization denial isn't misdescribed as a re-login fix."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"detail": "requires study access at tier 'admin' or higher"},
+        status=403,
+    )
+
+    rc = main(["study", "create", "--title", "denied-study"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "http error 403" in err
+    assert "requires study access" in err
+    assert "qiita login" not in err
+
+
+def test_marker_header_on_non_403_still_echoes_body(monkeypatch, capsys):
+    """The clean prompt is gated on `status_code == 403`, not the header alone:
+    a non-403 response that happens to carry the marker keeps the generic body
+    echo. Pins that the status half of the guard is load-bearing."""
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"detail": "conflict"},
+        status=409,
+        response_headers={STALE_TOKEN_SCOPE_HEADER: "1"},
+    )
+
+    rc = main(["study", "create", "--title", "denied-study"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "http error 409" in err
+    assert "qiita login" not in err
 
 
 def test_connection_error_prints_friendly_message_and_exits_1(monkeypatch, capsys):
@@ -2213,61 +2362,29 @@ def _seed_bcl_folder(tmp_path: Path, name: str, *, with_runinfo: bool = True) ->
 def preflight_stub(monkeypatch, tmp_path):
     """Install a fake `run_preflight` module + return a blob-path builder.
 
-    The handler imports `open_db_file`, `get_illumina_sample_info`, and
-    `get_illumina_sample_rows` from `run_preflight` at call time, and reads
-    `project.human_filtering` off the opened connection; the fixture patches
-    `sys.modules["run_preflight"]` and returns a connection whose `.execute`
-    serves canned project rows, so the test controls every per-sample input
-    without depending on the upstream library or a real SQLite schema.
+    The reader imports `open_db_file` and `get_illumina_sample_info` from
+    `run_preflight` at call time; the fixture patches `sys.modules["run_preflight"]`
+    so the test controls every per-sample input without a real SQLite schema.
 
-    Returns a callable
-    `_install(rows=None, raises=None, project_by_idx=None,
-    filtering_by_project=None) -> Path` that writes a non-empty marker blob at
-    `tmp_path/preflight.db` and yields its path. `rows` is a list of 4-tuples
-    matching `get_illumina_sample_info`; `raises` is an exception the stub raises
-    when invoked. `project_by_idx` maps illumina_sample_idx -> project_name
-    (default: every row -> 'STUB_PROJECT'); `filtering_by_project` maps
-    project_name -> human_filtering bool (default: every project -> False, so
-    existing tests need no host reference args). The stub builds
-    get_illumina_sample_rows 6-tuples from `project_by_idx` and serves the
-    `SELECT project_name, human_filtering FROM project` rows from
-    `filtering_by_project`.
+    Returns `_install(rows=None, raises=None) -> Path`, writing a marker blob at
+    `tmp_path/preflight.db`. `rows` is a list of 4-tuples matching
+    `get_illumina_sample_info`; `raises` is an exception the accessor raises.
+
+    (It used to also mock `project.human_filtering` and `get_illumina_sample_rows`
+    — the reader read the project's host-filter flag off the blob. That flag is
+    gone: host filtering resolves from sample metadata, not from the pre-flight, so
+    the reader no longer touches either.)
     """
 
     def _install(
         rows: list[tuple[int, str, str, list[str]]] | None = None,
         raises: Exception | None = None,
-        project_by_idx: dict[int, str] | None = None,
-        filtering_by_project: dict[str, bool] | None = None,
     ) -> Path:
         blob = tmp_path / "preflight.db"
         blob.write_bytes(b"\x00stub-preflight-marker")
         captured_rows = list(rows or [])
-        # Default project wiring: every row -> one project, not human-filtered.
-        idx_to_project = dict(project_by_idx or {})
-        for row in captured_rows:
-            idx_to_project.setdefault(row[0], "STUB_PROJECT")
-        project_filtering = dict(filtering_by_project or {})
-        for name in idx_to_project.values():
-            project_filtering.setdefault(name, False)
-
-        class _StubCursor:
-            def __init__(self, result):
-                self._result = result
-
-            def fetchall(self):
-                return self._result
 
         class _StubConn:
-            # The handler runs exactly one raw query:
-            # SELECT project_name, human_filtering FROM project. SQLite returns
-            # the boolean as 0/1, so serve ints to mirror it (the handler bool()s).
-            # Assert the shape so a future second raw query can't be silently fed
-            # project rows.
-            def execute(self, sql):
-                assert "FROM project" in sql, f"unexpected preflight query: {sql!r}"
-                return _StubCursor([(n, int(f)) for n, f in project_filtering.items()])
-
             def close(self):
                 pass
 
@@ -2282,15 +2399,6 @@ def preflight_stub(monkeypatch, tmp_path):
             stub_module.get_illumina_sample_info = _get
         else:
             stub_module.get_illumina_sample_info = lambda _conn: list(captured_rows)
-        # get_illumina_sample_rows lives in run_preflight.db (NOT top-level), so
-        # mirror that layout — the handler reaches it via `from run_preflight
-        # import db`. Tuple is (idx, lane, i7, i5, project_name, sample_name); the
-        # handler reads only idx ([0]) and project_name ([4]).
-        stub_module.db = types.SimpleNamespace(
-            get_illumina_sample_rows=lambda _conn: [
-                (idx, 1, "", "", idx_to_project[idx], f"s{idx}") for idx in idx_to_project
-            ]
-        )
         monkeypatch.setitem(sys.modules, "run_preflight", stub_module)
         return blob
 
@@ -2357,6 +2465,8 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
             # sequencing-run, sequenced-pool
             (201, {"sequencing_run_idx": 12}),
             (201, {"sequenced_pool_idx": 34}),
+            # pool roster GET (create-missing: fresh pool -> empty, all created)
+            (200, {"samples": []}),
             # sequenced-sample x3
             (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
             (201, {"sequenced_sample_idx": 72, "prep_sample_idx": 82}),
@@ -2381,8 +2491,9 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     )
     assert rc == 0
     requests = captured["requests"]
-    # whoami + biosample-lookup + study-lookup + run + pool + 3 samples + ticket = 9 calls.
-    assert len(requests) == 9
+    # whoami + biosample-lookup + study-lookup + run + pool + roster-GET + 3 samples
+    # + ticket = 10 calls.
+    assert len(requests) == 10
 
     # Leg 1: whoami.
     assert requests[0]["method"] == "GET"
@@ -2427,7 +2538,12 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     assert pool_body["run_preflight_filename"] == "preflight.db"
     assert _b64.b64decode(pool_body["run_preflight_blob"]) == blob.read_bytes()
 
-    # Legs 6..8: one sequenced-sample composer POST per preflight row.
+    # Leg 6: GET the pool roster (create-missing) — empty here, so all 3 samples
+    # are created next.
+    assert requests[5]["method"] == "GET"
+    assert requests[5]["url"].endswith("/sequencing-run/12/sequenced-pool/34/sequenced-sample/list")
+
+    # Legs 7..9: one sequenced-sample composer POST per preflight row.
     # secondary_study_idxs preserves the row's secondary order (after
     # the model's dedup; here no row has duplicates).
     expected_per_sample = [
@@ -2438,7 +2554,7 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     for offset, (illumina, biosample_idx, primary_study, secondary_studies) in enumerate(
         expected_per_sample
     ):
-        req = requests[5 + offset]
+        req = requests[6 + offset]
         assert req["method"] == "POST"
         assert req["url"].endswith("/sequencing-run/12/sequenced-pool/34/sequenced-sample")
         assert req["json"] == {
@@ -2450,10 +2566,10 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
             "secondary_study_idxs": secondary_studies,
         }
 
-    # Leg 9: POST /work-ticket.
-    assert requests[8]["method"] == "POST"
-    assert requests[8]["url"] == f"https://q.example.test{URL_WORK_TICKET_PREFIX}"
-    ticket_body = requests[8]["json"]
+    # Leg 10: POST /work-ticket.
+    assert requests[9]["method"] == "POST"
+    assert requests[9]["url"] == f"https://q.example.test{URL_WORK_TICKET_PREFIX}"
+    ticket_body = requests[9]["json"]
     assert ticket_body["action_id"] == "bcl-convert"
     assert ticket_body["action_version"] == "1.0.0"
     assert ticket_body["scope_target"] == {
@@ -2692,6 +2808,7 @@ def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
             (200, {"resolved": {"PRJ001": 7}, "missing": []}),
             (201, {"sequencing_run_idx": 12}),
             (201, {"sequenced_pool_idx": 34}),
+            (200, {"samples": []}),  # pool roster GET (create-missing)
             (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
             (201, {"sequenced_sample_idx": 72, "prep_sample_idx": 82}),
             (202, {"work_ticket_idx": 56, "state": "pending"}),
@@ -2720,8 +2837,8 @@ def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
         "accession_field": "bioproject_accession",
     }
     # Both rows still produce a sequenced-sample composer POST with the
-    # row's distinct illumina_sample_idx.
-    sample_bodies = [r["json"] for r in captured["requests"][5:7]]
+    # row's distinct illumina_sample_idx (after the run/pool/roster-GET legs).
+    sample_bodies = [r["json"] for r in captured["requests"][6:8]]
     assert sample_bodies[0]["sequenced_pool_item_id"] == "1"
     assert sample_bodies[1]["sequenced_pool_item_id"] == "2"
     # Both rows resolve to the same biosample_idx (replicate convention).
@@ -2754,6 +2871,7 @@ def test_submit_bcl_convert_reports_reused_when_run_post_returns_200(
             (200, {"resolved": {"PRJ001": 7}, "missing": []}),
             (200, {"sequencing_run_idx": 12}),
             (200, {"sequenced_pool_idx": 34}),
+            (200, {"samples": []}),  # pool roster GET (create-missing)
             (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
             (202, {"work_ticket_idx": 56, "state": "pending"}),
         ],
@@ -2774,6 +2892,73 @@ def test_submit_bcl_convert_reports_reused_when_run_post_returns_200(
     summary = _json.loads(capsys.readouterr().out)
     assert summary["sequencing_run"]["status"] == "reused"
     assert summary["sequenced_pool"]["status"] == "reused"
+
+
+def test_submit_bcl_convert_reuses_existing_roster_samples(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """Convergent re-run: when the pool roster already holds a sample, bcl-convert
+    creates NO sequenced-sample (create-missing) and reuses its prep_sample_idx in
+    the work-ticket sample_map. Pins the CHANGELOG 'convergent re-run' claim."""
+    import json as _json
+
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = preflight_stub(rows=[(1, "SAMN001", "PRJ001", [])])
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, {"kind": "human", "principal_idx": 99}),
+            (200, {"resolved": {"SAMN001": 41}, "missing": []}),
+            (200, {"resolved": {"PRJ001": 7}, "missing": []}),
+            (200, {"sequencing_run_idx": 12}),
+            (200, {"sequenced_pool_idx": 34}),
+            # roster already has item "1" (biosample_idx matches the resolved 41).
+            (
+                200,
+                {
+                    "samples": [
+                        {
+                            "sequenced_pool_item_id": "1",
+                            "prep_sample_idx": 81,
+                            "sequenced_sample_idx": 71,
+                            "biosample_idx": 41,
+                        }
+                    ]
+                },
+            ),
+            (202, {"work_ticket_idx": 56, "state": "pending"}),
+        ],
+    )
+
+    rc = main(
+        [
+            "submit-bcl-convert",
+            "--bcl-input-dir",
+            str(folder),
+            "--preflight-blob",
+            str(blob),
+            "--prep-protocol-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    # No sequenced-sample was CREATED (POST) — the existing one is reused.
+    assert not [
+        r
+        for r in captured["requests"]
+        if r["method"] == "POST" and r["url"].endswith("/sequenced-sample")
+    ]
+    # The work-ticket sample_map carries the reused prep_sample_idx.
+    ticket = next(r for r in captured["requests"] if r["url"].endswith("/work-ticket"))
+    assert ticket["json"]["action_context"]["sample_map"] == [
+        {"prep_sample_idx": 81, "pool_item_id": "1"}
+    ]
+    summary = _json.loads(capsys.readouterr().out)
+    assert summary["sequenced_samples"][0]["prep_sample_idx"] == 81
 
 
 def test_submit_bcl_convert_rejects_relative_bcl_input_dir(capsys, preflight_stub):
@@ -2929,11 +3114,7 @@ def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
     from qiita_control_plane.cli.user import _PreflightRow, _read_preflight_rows
 
     library_secondaries = ["PRJ002", "PRJ003"]
-    blob = preflight_stub(
-        rows=[(7, "SAMN001", "PRJ001", library_secondaries)],
-        project_by_idx={7: "PROJ_A"},
-        filtering_by_project={"PROJ_A": True},
-    )
+    blob = preflight_stub(rows=[(7, "SAMN001", "PRJ001", library_secondaries)])
     parser = argparse.ArgumentParser()
     rows = _read_preflight_rows(blob, parser)
     assert rows == [
@@ -2942,7 +3123,6 @@ def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
             biosample_accession="SAMN001",
             primary_project_accession="PRJ001",
             secondary_project_accessions=["PRJ002", "PRJ003"],
-            human_filtering=True,
         )
     ]
     # NamedTuple field carries a fresh list, not an alias to the
@@ -2953,19 +3133,15 @@ def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
 
 def test_submit_bcl_convert_records_no_host_refs(monkeypatch, tmp_path, capsys, preflight_stub):
     """bcl-convert only demultiplexes the run: no sequenced-sample composer POST
-    carries a host reference (host filtering is chosen later at
-    submit-host-filter-pool). The preflight's per-project human_filtering flag is
-    still echoed per sample for operator reference."""
+    carries a host reference, and the summary carries no host-filter intent either.
+    Host filtering is decided later at submit-host-filter-pool, from each sample's
+    own metadata — bcl-convert has nothing to say about it."""
     import json as _json
 
     from qiita_control_plane.cli.user import main
 
     folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
-    blob = preflight_stub(
-        rows=[(1, "SAMN001", "PRJ001", []), (2, "SAMN002", "PRJ001", [])],
-        project_by_idx={1: "HUMAN", 2: "NOFILT"},
-        filtering_by_project={"HUMAN": True, "NOFILT": False},
-    )
+    blob = preflight_stub(rows=[(1, "SAMN001", "PRJ001", []), (2, "SAMN002", "PRJ001", [])])
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
@@ -2976,6 +3152,7 @@ def test_submit_bcl_convert_records_no_host_refs(monkeypatch, tmp_path, capsys, 
             (200, {"resolved": {"PRJ001": 70}, "missing": []}),  # study
             (201, {"sequencing_run_idx": 12}),
             (201, {"sequenced_pool_idx": 34}),
+            (200, {"samples": []}),  # pool roster GET (create-missing)
             (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
             (201, {"sequenced_sample_idx": 72, "prep_sample_idx": 82}),
             (202, {"work_ticket_idx": 56, "state": "pending"}),
@@ -3007,8 +3184,8 @@ def test_submit_bcl_convert_records_no_host_refs(monkeypatch, tmp_path, capsys, 
     # Summary still echoes the per-project human_filtering flag for reference.
     summary = _json.loads(capsys.readouterr().out)
     by_illumina = {s["illumina_sample_idx"]: s for s in summary["sequenced_samples"]}
-    assert by_illumina[1]["human_filtering"] is True
-    assert by_illumina[2]["human_filtering"] is False
+    # No host-filter intent is carried anywhere — not a reference, not a flag.
+    assert "human_filtering" not in by_illumina[1]
     assert "host_rype_reference_idx" not in by_illumina[1]
 
 
@@ -3018,11 +3195,7 @@ def test_submit_bcl_convert_rejects_host_ref_args(monkeypatch, tmp_path, capsys,
     from qiita_control_plane.cli.user import main
 
     folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
-    blob = preflight_stub(
-        rows=[(1, "SAMN001", "PRJ001", [])],
-        project_by_idx={1: "HUMAN"},
-        filtering_by_project={"HUMAN": True},
-    )
+    blob = preflight_stub(rows=[(1, "SAMN001", "PRJ001", [])])
     with pytest.raises(SystemExit) as exc_info:
         main(
             [
@@ -3088,16 +3261,62 @@ def _both_indexes_body(reference_idx=7):
     ]
 
 
+def _hf(outcome, *, rype=None, minimap2=None, host=9606):
+    """A roster `host_filter` block — what the server resolved for one sample.
+
+    The CLI no longer decides host filtering; it reads this. So the tests below
+    drive the submit path by choosing what the SAMPLE resolves to, not by choosing
+    a flag — which is the whole point of the change.
+    """
+    return {
+        "outcome": outcome,
+        "host_term_idx": host if outcome == "filter" else None,
+        "rype_reference_idx": rype,
+        "minimap2_reference_idx": minimap2,
+        "reason": f"test: {outcome}",
+    }
+
+
+def _hf_filter(rype=7, minimap2=None, host=9606):
+    return _hf("filter", rype=rype, minimap2=minimap2, host=host)
+
+
+_HF_PASS_THROUGH = _hf("pass_through")
+_HF_CONTROL = _hf("control")
+_HF_UNRESOLVED = _hf("unresolved")
+
+
 def _pool_samples_body(samples):
     """samples: list of (sequenced_sample_idx, prep_sample_idx, pool_item_id[,
-    human_filtering]).
+    host_filter][, has_read_mask_ticket]).
 
-    Host references are no longer a sample property — they are chosen at
-    submit-host-filter-pool time, so the sample-list rows carry none. The roster
-    DOES carry each sample's intake `human_filtering` intent, which the route
-    derives server-side from the pool's stored preflight; supply it as the 4th
-    tuple entry. A 3-tuple leaves `human_filtering` None (the route's "no stored
-    intent for this item" case), which the host-filter-pool guard rejects."""
+    Host references are not a sample property and are no longer chosen at submit
+    time either: each roster row carries the RESOLVED host filtering the server
+    derived from that sample's own `host_taxon_id` metadata. Supply it as the 4th
+    tuple entry (see `_hf_filter` / `_HF_PASS_THROUGH` / `_HF_CONTROL` /
+    `_HF_UNRESOLVED`); it defaults to a plain human FILTER against rype 7, which is
+    what the overwhelming majority of these tests want.
+
+    A 4th entry of None means the roster carried NO resolution — an older server —
+    which the submit path refuses rather than guessing what to deplete.
+    """
+
+    def _resolve(entry):
+        # 4th tuple entry: the sample's resolved host_filter block. Three shapes:
+        #   absent      -> a plain human FILTER against rype 7 (the common case).
+        #   True/False  -> shorthand for FILTER-against-7 / PASS_THROUGH. This is
+        #                  the OLD `human_filtering` intent bool; the same tuples
+        #                  now mean "resolves to filter / pass-through", so the
+        #                  legacy tests read as before but exercise resolution.
+        #   a dict      -> an explicit _hf(...) block (control, unresolved, etc.).
+        if len(entry) <= 3:
+            return _hf_filter()
+        val = entry[3]
+        if val is True:
+            return _hf_filter()
+        if val is False:
+            return _HF_PASS_THROUGH
+        return val  # explicit block (or None, for the older-server case)
 
     def _row(entry):
         ss, ps, item = entry[0], entry[1], entry[2]
@@ -3105,7 +3324,7 @@ def _pool_samples_body(samples):
             "sequenced_sample_idx": ss,
             "prep_sample_idx": ps,
             "sequenced_pool_item_id": item,
-            "human_filtering": entry[3] if len(entry) > 3 else None,
+            "host_filter": _resolve(entry),
             # 5th tuple entry → has_read_mask_ticket (default False = no ticket).
             "has_read_mask_ticket": entry[4] if len(entry) > 4 else False,
         }
@@ -3139,7 +3358,15 @@ def _seq_run_body(*, sequencing_run_idx=3, instrument_model="NextSeq 550"):
 
 
 def _run_submit_host_filter_pool(
-    *, run=3, pool=5, rype=None, minimap2=None, force=False, only_missing=False
+    *,
+    run=3,
+    pool=5,
+    rype=None,
+    minimap2=None,
+    syndna=None,
+    force=False,
+    only_missing=False,
+    dry_run=False,
 ):
     from qiita_control_plane.cli.user import main
 
@@ -3154,11 +3381,105 @@ def _run_submit_host_filter_pool(
         argv += ["--host-rype-reference-idx", str(rype)]
     if minimap2 is not None:
         argv += ["--host-minimap2-reference-idx", str(minimap2)]
+    if syndna is not None:
+        argv += ["--syndna-reference-idx", str(syndna)]
     if force:
         argv += ["--force"]
     if only_missing:
         argv += ["--only-missing"]
+    if dry_run:
+        argv += ["--dry-run"]
     return main(argv)
+
+
+def test_submit_host_filter_pool_pacbio_run_with_no_protocol_facts_aborts(monkeypatch, capsys):
+    """REGRESSION. A PacBio run whose roster carries no `sheet_type` means the server
+    could not parse the pool's stored pre-flight — NOT that the pool is Illumina.
+
+    Without this guard the submit infers "not PacBio" from the ABSENCE of sheet_type,
+    takes the Illumina branch, and writes `lima_enabled: false, syndna_enabled: false`
+    onto every ticket: a case-5 pool masked with no lima and no syndna, whose spike-in
+    count is then structurally zero. It is caught today only incidentally (the same bad
+    blob nulls human_filtering), and that backstop is --force-bypassable and disappears
+    when human_filtering moves to sample metadata. So this keys on the run's `platform`,
+    and NO ticket may be posted."""
+    captured: dict = {}
+    run_body = _seq_run_body(instrument_model="Revio")
+    run_body["platform"] = "pacbio_smrt"
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            # roster: samples carry human_filtering but NO sheet_type (blob unparseable)
+            (200, _pool_samples_body([(100, 1000, "1", False), (101, 1001, "2", False)])),
+            (200, run_body),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        _run_submit_host_filter_pool(run=3, pool=5)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "is PacBio" in err
+    assert "could not be parsed" in err
+    # and nothing was submitted
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_pacbio_no_facts_not_bypassable_by_force(monkeypatch, capsys):
+    """--force turns host filtering off deliberately; it must NOT also let a PacBio pool
+    be masked with lima and syndna silently off."""
+    captured: dict = {}
+    run_body = _seq_run_body(instrument_model="Revio")
+    run_body["platform"] = "pacbio_smrt"
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "1", False)])),
+            (200, run_body),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        _run_submit_host_filter_pool(run=3, pool=5, force=True)
+    assert exc.value.code == 1
+    assert "--force does not bypass this" in capsys.readouterr().err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_pacbio_sets_qc_adapter_enabled_false(monkeypatch):
+    """A PacBio absquant pool: each read-mask ticket carries qc_adapter_enabled=False
+    — HiFi carries no Illumina adapters, so QC skips the adapter trim (SMRTbell +
+    Twist are handled by the instrument and lima). syndna_enabled is True (absquant),
+    lima_enabled False (no twist adaptor). The Illumina case (qc_adapter_enabled=True)
+    is covered by the fan-out test below."""
+    captured: dict = {}
+    run_body = _seq_run_body(instrument_model="Revio")
+    run_body["platform"] = "pacbio_smrt"
+    # Seawater pass-through host; absquant sheet_type; no twist adaptor (lima off).
+    roster = _pool_samples_body([(100, 1000, "1", False)])
+    for row in roster["samples"]:
+        row["sheet_type"] = "pacbio_absquant"
+        row["twist_adaptor_id"] = None
+        row["syndna_is_twisted"] = None
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, roster),
+            (200, run_body),
+            (200, _ref_active_body(reference_idx=14)),  # syndna reference (readiness check)
+            (200, [_both_indexes_body(reference_idx=14)[1]]),  # its minimap2 index
+            (202, {"work_ticket_idx": 900}),
+        ],
+    )
+    rc = _run_submit_host_filter_pool(syndna=14)
+    assert rc == 0
+    post = next(r for r in captured["requests"] if r["method"] == "POST")
+    ctx = post["json"]["action_context"]
+    assert ctx["qc_adapter_enabled"] is False  # PacBio: QC does not trim adapters
+    assert ctx["syndna_enabled"] is True  # absquant
+    assert ctx["lima_enabled"] is False  # no twist adaptor
+    assert ctx["host_filter_enabled"] is False  # seawater pass-through
 
 
 def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, capsys):
@@ -3174,15 +3495,15 @@ def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, cap
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10", True), (101, 1001, "11", True)])),
+            (200, _seq_run_body(instrument_model="NextSeq 550")),  # run metadata
             (200, _ref_active_body()),  # rype reference 7 (pre-flighted once)
             (200, _both_indexes_body()),  # its index list (carries rype)
-            (200, _seq_run_body(instrument_model="NextSeq 550")),  # run metadata
             (202, {"work_ticket_idx": 900}),
             (202, {"work_ticket_idx": 901}),
         ],
     )
 
-    rc = _run_submit_host_filter_pool(rype=7)
+    rc = _run_submit_host_filter_pool()
     assert rc == 0
 
     # The shared rype reference is GET-pre-flighted once, not once per sample.
@@ -3202,6 +3523,8 @@ def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, cap
         assert body["scope_target"] == {"kind": "prep_sample", "prep_sample_idx": prep_idx}
         ctx = body["action_context"]
         assert ctx["host_filter_enabled"] is True
+        # Illumina (short-read): QC trims adapters against the default set.
+        assert ctx["qc_adapter_enabled"] is True
         assert ctx["host_rype_reference_idx"] == 7
         # minimap2 not recorded → its key is omitted (rype-only host filter).
         assert "host_minimap2_reference_idx" not in ctx
@@ -3231,9 +3554,9 @@ def test_submit_host_filter_pool_one_failure_does_not_strand_the_rest(monkeypatc
                     ]
                 ),
             ),
+            (200, _seq_run_body()),  # run metadata (read before the ref preflight)
             (200, _ref_active_body()),  # rype reference 7 (pre-flighted once)
             (200, _both_indexes_body()),  # its index list
-            (200, _seq_run_body()),  # run metadata
             (202, {"work_ticket_idx": 900}),  # sample 1000 → ok
             (502, {"detail": "bad gateway"}),  # sample 1001 → transient 5xx
             (202, {"work_ticket_idx": 902}),  # sample 1002 → ok (NOT stranded)
@@ -3241,7 +3564,7 @@ def test_submit_host_filter_pool_one_failure_does_not_strand_the_rest(monkeypatc
     )
 
     with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(rype=7)
+        _run_submit_host_filter_pool()
     assert exc_info.value.code == 1
 
     # All three samples were attempted — the 1001 failure did not abort 1002.
@@ -3275,14 +3598,14 @@ def test_submit_host_filter_pool_only_missing_skips_ticketed_samples(monkeypatch
                     ]
                 ),
             ),
+            (200, _seq_run_body()),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
-            (200, _seq_run_body()),
             (202, {"work_ticket_idx": 900}),  # only the one missing sample
         ],
     )
 
-    rc = _run_submit_host_filter_pool(rype=7, only_missing=True)
+    rc = _run_submit_host_filter_pool(only_missing=True)
     assert rc == 0
 
     posts = [r for r in captured["requests"] if r["method"] == "POST"]
@@ -3308,7 +3631,7 @@ def test_submit_host_filter_pool_only_missing_all_present_no_posts(monkeypatch, 
         ],
     )
 
-    rc = _run_submit_host_filter_pool(rype=7, only_missing=True)
+    rc = _run_submit_host_filter_pool(only_missing=True)
     assert rc == 0
     assert [r for r in captured["requests"] if r["method"] == "POST"] == []
     summary = json.loads(capsys.readouterr().out)
@@ -3317,29 +3640,31 @@ def test_submit_host_filter_pool_only_missing_all_present_no_posts(monkeypatch, 
 
 
 def test_submit_host_filter_pool_two_reference_forwards_both(monkeypatch):
-    """A submission giving both a rype (7) and a minimap2 (8) reference →
-    each is pre-flighted (reference + its index) and both flow into the
-    per-sample action_context."""
+    """A sample that resolves to a two-stage profile (rype 7 + minimap2 8) →
+    each reference is pre-flighted (reference + its index) and both flow into the
+    per-sample action_context. The references come from the resolution, not a
+    flag."""
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", True)])),
+            (200, _pool_samples_body([(100, 1000, "10", _hf_filter(rype=7, minimap2=8))])),
+            (200, _seq_run_body(instrument_model="NovaSeq 6000")),
             (200, _ref_active_body(reference_idx=7)),  # rype reference
             (200, [_both_indexes_body()[0]]),  # rype-only index list
             (200, _ref_active_body(reference_idx=8)),  # minimap2 reference
             (200, [_both_indexes_body(reference_idx=8)[1]]),  # minimap2-only index list
-            (200, _seq_run_body(instrument_model="NovaSeq 6000")),
             (202, {"work_ticket_idx": 900}),
         ],
     )
 
-    rc = _run_submit_host_filter_pool(rype=7, minimap2=8)
+    rc = _run_submit_host_filter_pool()
     assert rc == 0
     post = next(r for r in captured["requests"] if r["method"] == "POST")
     ctx = post["json"]["action_context"]
     assert ctx["host_filter_enabled"] is True
+    assert ctx["qc_adapter_enabled"] is True  # Illumina short-read: QC adapter trim on
     assert ctx["host_rype_reference_idx"] == 7
     assert ctx["host_minimap2_reference_idx"] == 8
     assert ctx["instrument_model"] == "NovaSeq 6000"
@@ -3382,15 +3707,15 @@ def test_submit_host_filter_pool_applies_ref_to_every_sample(monkeypatch):
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10", True), (101, 1001, "11", True)])),
+            (200, _seq_run_body(instrument_model="NextSeq 550")),
             (200, _ref_active_body()),  # rype reference 7
             (200, _both_indexes_body()),
-            (200, _seq_run_body(instrument_model="NextSeq 550")),
             (202, {"work_ticket_idx": 900}),
             (202, {"work_ticket_idx": 901}),
         ],
     )
 
-    rc = _run_submit_host_filter_pool(rype=7)
+    rc = _run_submit_host_filter_pool()
     assert rc == 0
     posts = [r for r in captured["requests"] if r["method"] == "POST"]
     by_prep = {
@@ -3415,14 +3740,14 @@ def test_submit_host_filter_pool_instrument_model_absent_omitted(monkeypatch):
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10", True)])),
+            (200, _seq_run_body(instrument_model=None)),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
-            (200, _seq_run_body(instrument_model=None)),
             (202, {"work_ticket_idx": 900}),
         ],
     )
 
-    rc = _run_submit_host_filter_pool(rype=7)
+    rc = _run_submit_host_filter_pool()
     assert rc == 0
     post = next(r for r in captured["requests"] if r["method"] == "POST")
     assert "instrument_model" not in post["json"]["action_context"]
@@ -3447,11 +3772,15 @@ def test_submit_host_filter_pool_reference_not_active_no_posts(monkeypatch, caps
     _stub_multi_response(
         monkeypatch,
         captured,
-        responses=[(200, _pool_samples_body([(100, 1000, "10", True)])), (200, inactive)],
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "10", True)])),
+            (200, _seq_run_body()),
+            (200, inactive),
+        ],
     )
 
     with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(rype=7)
+        _run_submit_host_filter_pool()
     assert exc_info.value.code == 1
     assert "not active" in capsys.readouterr().err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
@@ -3467,29 +3796,34 @@ def test_submit_host_filter_pool_rype_ref_missing_rype_index_no_posts(monkeypatc
         captured,
         responses=[
             (200, _pool_samples_body([(100, 1000, "10", True)])),
+            (200, _seq_run_body()),
             (200, _ref_active_body()),
             (200, minimap2_only),
         ],
     )
 
     with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(rype=7)
+        _run_submit_host_filter_pool()
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
     assert "rype" in err
-    assert "--host-rype-reference-idx" in err
+    # The reference came from the resolved profile, not a flag, so the message
+    # points there — telling the operator to check a flag they never passed would
+    # be a wrong lead.
+    assert "host_filter_profile" in err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
 def test_submit_host_filter_pool_minimap2_ref_missing_minimap2_index_no_posts(monkeypatch, capsys):
-    """The given minimap2 reference is active but carries no minimap2 index →
-    abort before any ticket (the rype reference passed first)."""
+    """A two-stage profile whose minimap2 reference is active but carries no
+    minimap2 index → abort before any ticket (the rype reference passed first)."""
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", True)])),
+            (200, _pool_samples_body([(100, 1000, "10", _hf_filter(rype=7, minimap2=8))])),
+            (200, _seq_run_body()),  # run GET (read before the ref preflight)
             (200, _ref_active_body(reference_idx=7)),  # rype reference OK
             (200, [_both_indexes_body()[0]]),  # rype index present
             (200, _ref_active_body(reference_idx=8)),  # minimap2 reference active
@@ -3498,152 +3832,241 @@ def test_submit_host_filter_pool_minimap2_ref_missing_minimap2_index_no_posts(mo
     )
 
     with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(rype=7, minimap2=8)
+        _run_submit_host_filter_pool()
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
     assert "minimap2" in err
-    assert "--host-minimap2-reference-idx" in err
+    assert "host_filter_profile" in err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
 # ---------------------------------------------------------------------------
-# submit-host-filter-pool: intent-mismatch guard (+ --force override)
+# submit-host-filter-pool: the fail-closed refusals (+ --force override)
 # ---------------------------------------------------------------------------
+# Host filtering is resolved per sample now, not chosen on the command line, so
+# the guard is no longer "does the operator's flag match intent" — it is "can
+# every sample be placed, and does the pool have a single host for its blanks".
 
 
-def test_submit_host_filter_pool_all_human_no_ref_errors_no_posts(monkeypatch, capsys):
-    """Every sample's intake intent is human_filtering=True, but the submission
-    gives NO host reference (a pass-through) → the dangerous case: human reads
-    would not be depleted. Abort with zero POSTs before any host-ref preflight."""
+def test_submit_host_filter_pool_unresolved_sample_aborts_no_posts(monkeypatch, capsys):
+    """One sample the server could not resolve (no host_taxon_id) aborts the whole
+    submission with zero POSTs, and the message names the sample and points at the
+    backfill. Refusing beats masking it against the wrong thing — or nothing."""
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
-        responses=[(200, _pool_samples_body([(100, 1000, "10", True), (101, 1001, "11", True)]))],
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11", _HF_UNRESOLVED)])),
+        ],
     )
 
     with pytest.raises(SystemExit) as exc_info:
         _run_submit_host_filter_pool()
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
-    assert "intake" in err and "human_filtering" in err
-    # Both mismatched samples named.
-    assert "sequenced_pool_item_id 10" in err
-    assert "sequenced_pool_item_id 11" in err
-    assert not [r for r in captured["requests"] if r["method"] == "POST"]
-
-
-def test_submit_host_filter_pool_all_nonhuman_with_ref_errors_no_posts(monkeypatch, capsys):
-    """Every sample's intake intent is human_filtering=False, but the submission
-    gives a host reference → samples would be filtered against their intent.
-    Abort with zero POSTs."""
-    captured: dict = {}
-    _stub_multi_response(
-        monkeypatch,
-        captured,
-        responses=[(200, _pool_samples_body([(100, 1000, "10", False)]))],
-    )
-
-    with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(rype=7)
-    assert exc_info.value.code == 1
-    err = capsys.readouterr().err
-    assert "sequenced_pool_item_id 10" in err
-    assert "apply host reference 7" in err
-    # No host-ref preflight GET happened — the guard aborts first.
-    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
-    assert not [r for r in captured["requests"] if r["method"] == "POST"]
-
-
-def test_submit_host_filter_pool_roster_item_missing_intent_errors_no_posts(monkeypatch, capsys):
-    """A pool roster item the route resolved no human_filtering intent for (a
-    broken bcl-convert/preflight coupling, surfaced as a null roster field)
-    aborts fail-fast before any POST. Every pool member is checked, so a single
-    null intent fails the submission."""
-    # Roster carries 10 (intent True) and 11 (no stored intent → null).
-    captured: dict = {}
-    _stub_multi_response(
-        monkeypatch,
-        captured,
-        responses=[(200, _pool_samples_body([(100, 1000, "10", True), (101, 1001, "11")]))],
-    )
-
-    with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(rype=7)
-    assert exc_info.value.code == 1
-    err = capsys.readouterr().err
-    assert "no stored preflight intent" in err
+    assert "no resolvable host" in err
     assert "11" in err
+    assert "backfill host-taxon-id" in err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
-def test_submit_host_filter_pool_mismatch_force_warns_and_proceeds(monkeypatch, capsys):
-    """--force downgrades the mismatch to a warning and proceeds with the
-    pool-wide host-ref choice (POSTs happen)."""
-    # Intake intent says not-human-filtered, but the submission applies rype 7.
+def test_submit_host_filter_pool_multi_host_aborts_no_posts(monkeypatch, capsys):
+    """A pool whose samples resolve to two different hosts has no single answer for
+    its blanks, so it aborts before any ticket and points at the single-host-subset
+    escape. Names the samples that established the competing hosts."""
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", False)])),
-            (200, _ref_active_body()),
-            (200, _both_indexes_body()),
-            (200, _seq_run_body()),
-            (202, {"work_ticket_idx": 900}),
+            (
+                200,
+                _pool_samples_body(
+                    [
+                        (100, 1000, "10", _hf_filter(rype=7, host=9606)),
+                        (101, 1001, "11", _hf_filter(rype=9, host=10090)),
+                    ]
+                ),
+            ),
         ],
     )
 
-    rc = _run_submit_host_filter_pool(rype=7, force=True)
-    assert rc == 0
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool()
+    assert exc_info.value.code == 1
     err = capsys.readouterr().err
-    assert "WARNING (--force)" in err
-    assert "sequenced_pool_item_id 10" in err
-    posts = [r for r in captured["requests"] if r["method"] == "POST"]
-    assert len(posts) == 1
-    assert posts[0]["json"]["action_context"]["host_filter_enabled"] is True
+    assert "more than one host" in err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
-def test_submit_host_filter_pool_mixed_pool_errors_then_force_proceeds(monkeypatch, capsys):
-    """A mixed pool (one human, one not) with a host reference → without --force
-    it errors naming only the disagreeing sample (the not-human one) and POSTs
-    nothing; with --force it warns and submits every sample."""
-    mixed_roster = [(100, 1000, "10", True), (101, 1001, "11", False)]
+def test_submit_host_filter_pool_host_ref_without_force_is_an_error(monkeypatch, capsys):
+    """A --host-rype-reference-idx with NO --force is rejected up front: the
+    references are resolved from metadata now, so a bare flag would either be a
+    silent no-op or a surprise override. Neither is acceptable, so it errors."""
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(rype=7)
+    assert exc_info.value.code == 2
+    assert "overrides" in capsys.readouterr().err
 
-    # Without --force: error, zero POSTs.
+
+def test_submit_host_filter_pool_force_overrides_resolution_pool_wide(monkeypatch, capsys):
+    """--force ignores what the samples resolve to and applies the given reference
+    to EVERY sample, blanks included. The escape hatch for wrong or absent
+    metadata. Here the roster says pass-through, but --force filters anyway."""
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
-        responses=[(200, _pool_samples_body(mixed_roster))],
-    )
-    with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(rype=7)
-    assert exc_info.value.code == 1
-    err = capsys.readouterr().err
-    # Only the disagreeing sample (item 11, not-human) is flagged.
-    assert "sequenced_pool_item_id 11" in err
-    assert "sequenced_pool_item_id 10" not in err
-    assert not [r for r in captured["requests"] if r["method"] == "POST"]
-
-    # With --force: warns, submits all samples.
-    captured2: dict = {}
-    _stub_multi_response(
-        monkeypatch,
-        captured2,
         responses=[
-            (200, _pool_samples_body(mixed_roster)),
+            (200, _pool_samples_body([(100, 1000, "10", False), (101, 1001, "11", _HF_CONTROL)])),
+            (200, _seq_run_body()),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
-            (200, _seq_run_body()),
             (202, {"work_ticket_idx": 900}),
             (202, {"work_ticket_idx": 901}),
         ],
     )
+
     rc = _run_submit_host_filter_pool(rype=7, force=True)
     assert rc == 0
-    assert "WARNING (--force)" in capsys.readouterr().err
-    assert len([r for r in captured2["requests"] if r["method"] == "POST"]) == 2
+    assert "--force" in capsys.readouterr().err
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 2
+    for post in posts:
+        ctx = post["json"]["action_context"]
+        assert ctx["host_filter_enabled"] is True
+        assert ctx["host_rype_reference_idx"] == 7
+
+
+def test_submit_host_filter_pool_dry_run_resolves_but_posts_nothing(monkeypatch, capsys):
+    """--dry-run resolves the pool and prints the plan, then exits before any
+    write — the roster GET and the run GET happen (both reads, needed to resolve and
+    to run the PacBio no-facts refusal), but NO host-ref pre-flight GET and NO POST.
+    The way to look before leaping."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11", _HF_CONTROL)])),
+            (200, _seq_run_body()),  # the run GET, now read before the dry-run return
+        ],
+    )
+
+    rc = _run_submit_host_filter_pool(dry_run=True)
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "DRY RUN" in err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+    # Reads only — no reference readiness GET (that is a write-path preflight).
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
+
+
+# ---------------------------------------------------------------------------
+# submit-block-mask-pool
+# ---------------------------------------------------------------------------
+# A THIN client: host filtering is resolved PER SAMPLE server-side, so the CLI does
+# NO roster GET, no client-side resolution, no uniformity refusal, and no host-ref
+# readiness preflight. It validates host-ref argument coherence (minimap2⇒rype; a
+# host ref requires --force) and POSTs ONE BlockMaskPlanRequest to block-mask-plan.
+
+
+def _run_submit_block_mask_pool(
+    *, run=3, pool=5, rype=None, minimap2=None, force=False, only_missing=False
+):
+    from qiita_control_plane.cli.user import main
+
+    argv = [
+        "submit-block-mask-pool",
+        "--sequencing-run-idx",
+        str(run),
+        "--sequenced-pool-idx",
+        str(pool),
+    ]
+    if rype is not None:
+        argv += ["--host-rype-reference-idx", str(rype)]
+    if minimap2 is not None:
+        argv += ["--host-minimap2-reference-idx", str(minimap2)]
+    if force:
+        argv += ["--force"]
+    if only_missing:
+        argv += ["--only-missing"]
+    return main(argv)
+
+
+def test_submit_block_mask_pool_single_plan_call_passthrough(monkeypatch, capsys):
+    """No host reference: exactly ONE POST to the block-mask-plan endpoint (no
+    roster GET, no per-sample fan-out, no host-ref preflight), carrying the null
+    host refs + force=False + only_missing. The server resolves per sample."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (202, {"blocks_created": 1, "samples_planned": 2, "partitions": [], "blocks": []}),
+        ],
+    )
+    rc = _run_submit_block_mask_pool()
+    assert rc == 0
+
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["url"].endswith("/sequenced-pool/5/block-mask-plan")
+    assert posts[0]["json"] == {
+        "host_rype_reference_idx": None,
+        "host_minimap2_reference_idx": None,
+        "force": False,
+        "only_missing": False,
+    }
+    # Thin client: no roster GET, no host-ref preflight GETs at all.
+    assert [r["method"] for r in captured["requests"]] == ["POST"]
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
+
+
+def test_submit_block_mask_pool_force_posts_override(monkeypatch, capsys):
+    """--force with a host reference: ONE POST carrying the override host ref +
+    force=True. The server (not the CLI) checks reference readiness, so there is
+    still no client-side reference preflight GET."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (202, {"blocks_created": 2, "samples_planned": 2, "partitions": [], "blocks": []}),
+        ],
+    )
+    rc = _run_submit_block_mask_pool(rype=7, force=True, only_missing=True)
+    assert rc == 0
+
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["json"] == {
+        "host_rype_reference_idx": 7,
+        "host_minimap2_reference_idx": None,
+        "force": True,
+        "only_missing": True,
+    }
+    assert [r["method"] for r in captured["requests"]] == ["POST"]
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
+
+
+def test_submit_block_mask_pool_host_ref_without_force_errors(monkeypatch, capsys):
+    """A host reference without --force is a rejected override (parser.error → exit
+    2), before any network call — resolution is per-sample server-side now, so a
+    bare reference override that would silently do nothing is refused."""
+    captured: dict = {}
+    _stub_multi_response(monkeypatch, captured, responses=[])
+    with pytest.raises(SystemExit):
+        _run_submit_block_mask_pool(rype=7)
+    assert not captured["requests"]
+
+
+def test_submit_block_mask_pool_minimap2_without_rype_errors(capsys):
+    """argparse-time coherence: minimap2 requires rype (exit 2), before any call."""
+    with pytest.raises(SystemExit):
+        _run_submit_block_mask_pool(minimap2=9)
 
 
 # ---------------------------------------------------------------------------
@@ -3697,6 +4120,95 @@ def test_pool_completion_requires_both_idxs(capsys):
         main(["pool-completion", "--sequencing-run-idx", "3"])
     assert exc_info.value.code == 2
     assert "--sequenced-pool-idx" in capsys.readouterr().err
+
+
+def test_pool_completion_help_uses_current_labels(capsys):
+    """The --help text describes the command in demux (bcl-convert) + host-masking
+    (read-mask) terms, not the retired fastq-to-parquet / prep-generation /
+    GenPrepFileJob labels the read-storage/masking split obsoleted."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(["pool-completion", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "bcl-convert" in out
+    assert "read-mask" in out
+    for stale in ("fastq-to-parquet", "prep-generation", "GenPrepFileJob"):
+        assert stale not in out
+
+
+def test_render_pool_completion_summarizes_fully_processed(capsys):
+    """The render prints the full JSON to stdout AND a human verdict line to
+    stderr surfacing fully_processed / demux_state / never-submitted, so the
+    'is this pool done and clean?' answer is legible at a glance."""
+    from qiita_control_plane.cli.user.pool import _render_pool_completion
+
+    body = {
+        "sequenced_pool_idx": 5,
+        "sequencing_run_idx": 3,
+        "demux_state": "completed",
+        "sample_count": 4,
+        "samples_completed": 4,
+        "samples_in_flight": 0,
+        "samples_no_data": 0,
+        "samples_failed": 0,
+        "samples_not_submitted": 0,
+        "complete": True,
+        "fully_processed": True,
+    }
+    _render_pool_completion(body)
+    cap = capsys.readouterr()
+    # Full machine-readable body still on stdout.
+    assert '"fully_processed": true' in cap.out
+    # Human summary on stderr surfaces the three operator questions.
+    assert "DONE and clean" in cap.err
+    assert "demux completed" in cap.err
+    assert "0 never-submitted" in cap.err
+
+
+def test_render_pool_completion_flags_incomplete_and_stranded(capsys):
+    """A pool with stranded (never-submitted) samples reads NOT fully processed
+    with the never-submitted count front-and-centre, instead of the operator
+    having to spot it in the raw JSON (the stranded-samples incident that
+    motivated this surface was originally found only by hand-written SQL)."""
+    from qiita_control_plane.cli.user.pool import _render_pool_completion
+
+    body = {
+        "sequenced_pool_idx": 9,
+        "sequencing_run_idx": 3,
+        "demux_state": "completed",
+        "sample_count": 200,
+        "samples_completed": 5,
+        "samples_in_flight": 0,
+        "samples_no_data": 0,
+        "samples_failed": 0,
+        "samples_not_submitted": 195,
+        "complete": False,
+        "fully_processed": False,
+    }
+    _render_pool_completion(body)
+    err = capsys.readouterr().err
+    assert "NOT fully processed" in err
+    assert "195 never-submitted" in err
+
+
+def test_render_pool_completion_stays_quiet_on_unrecognized_body(capsys):
+    """The render only summarizes a recognized PoolCompletionStatus body: an
+    unexpected shape (a list, or a dict missing the discriminating
+    `fully_processed` field) still gets its JSON on stdout but no verdict line on
+    stderr, and never raises."""
+    from qiita_control_plane.cli.user.pool import _render_pool_completion
+
+    _render_pool_completion(["not", "a", "completion", "body"])
+    cap = capsys.readouterr()
+    assert "not" in cap.out  # JSON is still printed
+    assert cap.err == ""  # no verdict on an unrecognized shape
+
+    _render_pool_completion({"unexpected": "shape"})
+    cap = capsys.readouterr()
+    assert "unexpected" in cap.out
+    assert cap.err == ""
 
 
 # ---------------------------------------------------------------------------
@@ -4243,3 +4755,479 @@ def test_reference_list_index_type_no_match_returns_empty(monkeypatch, capsys):
     )
     assert rc == 0
     assert json.loads(capsys.readouterr().out) == []
+
+
+# --- PacBio read-mask gate derivation ----------------------------------------
+#
+# The roster carries the raw pre-flight facts; the POLICY that turns them into
+# `when:` gates lives in the submit. `when:` is DEFAULT-ON, so both keys must be
+# written on EVERY ticket — an Illumina ticket that merely omitted lima_enabled
+# would run the long-read lima chain.
+
+
+def _sample(**kw):
+    base = {"sequenced_pool_item_id": "bc01", "prep_sample_idx": 1, "human_filtering": False}
+    base.update(kw)
+    return base
+
+
+def test_pacbio_gates_none_for_an_illumina_roster():
+    """An Illumina roster carries no sheet_type; the submit must not invent one."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    assert _pacbio_gates(_sample()) is None
+
+
+def test_pacbio_gates_case5_signature():
+    """absquant + twist filled + syndna_is_twisted False -> both gates on."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=False)
+    )
+    assert g == {"syndna_enabled": True, "lima_enabled": True}
+
+
+def test_pacbio_gates_absquant_without_twist_is_syndna_only():
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id=None, syndna_is_twisted=None)
+    )
+    assert g == {"syndna_enabled": True, "lima_enabled": False}
+
+
+def test_pacbio_gates_twisted_syndna_disables_lima():
+    """syndna_is_twisted True means the spike-in already carries the adaptor, so
+    lima must NOT run even though twist_adaptor_id is filled."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=True)
+    )
+    assert g["lima_enabled"] is False
+
+
+def test_pacbio_gates_null_syndna_is_twisted_does_not_enable_lima():
+    """NULL means the pre-flight never answered — not the same as 'no'. `not None`
+    would be True and would silently enable lima."""
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=None)
+    )
+    assert g["lima_enabled"] is False
+
+
+def test_pacbio_gates_non_absquant_sheet_has_no_syndna():
+    from qiita_control_plane.cli.user.pool import _pacbio_gates
+
+    g = _pacbio_gates(
+        _sample(sheet_type="pacbio_metag", twist_adaptor_id="T1", syndna_is_twisted=False)
+    )
+    assert g == {"syndna_enabled": False, "lima_enabled": True}
+
+
+def _case5(**kw):
+    return _sample(
+        sheet_type="pacbio_absquant", twist_adaptor_id="T1", syndna_is_twisted=False, **kw
+    )
+
+
+def _decisions(*enabled_minimap2):
+    """A decisions dict for `_assert_pacbio_submission_coherent`: one entry per
+    (enabled, minimap2_reference_idx) pair, keyed on a positional item id."""
+    from qiita_common.host_filter_plan import SampleHostFilter
+
+    return {
+        str(i): SampleHostFilter(
+            enabled=enabled, rype_reference_idx=3 if enabled else None, minimap2_reference_idx=mm2
+        )
+        for i, (enabled, mm2) in enumerate(enabled_minimap2)
+    }
+
+
+def test_pacbio_submission_requires_syndna_reference(capsys):
+    """An absquant pool carries SynDNA spike-ins, so --syndna-reference-idx is
+    required — unchanged by the host-filter swap."""
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit) as exc:
+        _assert_pacbio_submission_coherent(
+            [_case5()],
+            decisions=_decisions((True, None)),
+            sequenced_pool_idx=1,
+            syndna_reference_idx=None,
+        )
+    assert exc.value.code == 1
+    assert "--syndna-reference-idx is required" in capsys.readouterr().err
+
+
+def test_pacbio_submission_rejects_a_resolved_minimap2_stage(capsys):
+    """Long reads are rype-only: the chain binds no minimap2 index, so a resolution
+    that carries a minimap2 stage on a PacBio pool cannot be honoured. Silently
+    dropping it would mask against less than the profile declares, so it aborts and
+    points at the profile to fix."""
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit) as exc:
+        _assert_pacbio_submission_coherent(
+            [_case5()],
+            decisions=_decisions((True, 4)),  # a minimap2 stage on a PacBio sample
+            sequenced_pool_idx=1,
+            syndna_reference_idx=7,
+        )
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "rype-only" in err
+    assert "minimap2" in err
+
+
+def test_pacbio_submission_allows_a_mixed_filtered_unfiltered_pool(capsys):
+    """Host filtering is per sample: a PacBio pool may legitimately mix a filtered
+    sample and a pass-through one. Neither carries a minimap2 stage, so the
+    coherence check passes."""
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    _assert_pacbio_submission_coherent(
+        [_case5(), _case5()],
+        decisions=_decisions((True, None), (False, None)),
+        sequenced_pool_idx=1,
+        syndna_reference_idx=7,
+    )
+
+
+def test_pacbio_submission_rejects_syndna_ref_on_a_non_absquant_pool(capsys):
+    """--syndna-reference-idx given but no sample carries SynDNA (not an absquant
+    sheet) → abort. Unchanged by the host-filter swap."""
+    from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent
+
+    with pytest.raises(SystemExit) as exc:
+        _assert_pacbio_submission_coherent(
+            [_sample(sheet_type="pacbio_metag", twist_adaptor_id=None, syndna_is_twisted=None)],
+            decisions=_decisions((False, None)),
+            sequenced_pool_idx=1,
+            syndna_reference_idx=7,
+        )
+    assert exc.value.code == 1
+    assert "no sample in this pool carries SynDNA" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# biosample create-field
+# ---------------------------------------------------------------------------
+
+
+class _FieldCliSurface(NamedTuple):
+    """One entity's create-field CLI bindings: subcommand, its global-link flag,
+    the URL the POST must reach, and the request model argparse validates
+    against (its name appears in the exit-2 stderr line)."""
+
+    subcommand: str
+    global_fk_flag: str
+    url_template: str
+    model_name: str
+
+
+_FIELD_CLI_SURFACES = [
+    pytest.param(
+        _FieldCliSurface(
+            "biosample",
+            "--biosample-global-field-idx",
+            URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+            "BiosampleStudyFieldCreateRequest",
+        ),
+        id="biosample",
+    ),
+    pytest.param(
+        _FieldCliSurface(
+            "prep-sample",
+            "--prep-sample-global-field-idx",
+            URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
+            "PrepSampleStudyFieldCreateRequest",
+        ),
+        id="prep_sample",
+    ),
+]
+
+
+@pytest.mark.parametrize("surface", _FIELD_CLI_SURFACES)
+def test_create_field_local_sends_expected_body(surface, monkeypatch):
+    """`<entity> create-field` for a purely-local field POSTs display_name +
+    data_type to that entity's field route, omitting unset optionals."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        captured["json"] = json
+        return _httpx.Response(201, json={}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            surface.subcommand,
+            "create-field",
+            "--study-idx",
+            "5",
+            "--display-name",
+            "pH",
+            "--data-type",
+            "numeric",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == (f"https://q.example.test{surface.url_template.format(study_idx=5)}")
+    assert captured["json"] == {"display_name": "pH", "data_type": "numeric"}
+
+
+@pytest.mark.parametrize("surface", _FIELD_CLI_SURFACES)
+def test_create_field_linked_omits_type_columns(surface, monkeypatch):
+    """Linked mode sends only display_name + the entity-qualified global-field
+    link; the inherited type columns stay absent from the body."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(201, json={}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            surface.subcommand,
+            "create-field",
+            "--study-idx",
+            "5",
+            "--display-name",
+            "Sample pH",
+            surface.global_fk_flag,
+            "7",
+        ]
+    )
+    assert rc == 0
+    assert captured["json"] == {
+        "display_name": "Sample pH",
+        surface.global_fk_flag.removeprefix("--").replace("-", "_"): 7,
+    }
+
+
+@pytest.mark.parametrize("surface", _FIELD_CLI_SURFACES)
+def test_create_field_linked_with_data_type_exits_2(surface, capsys, monkeypatch):
+    """A linked create that also passes an inherited attribute fails the
+    model's mode-coupling validator and exits 2 without a POST."""
+    from qiita_control_plane.cli.user import main
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                surface.subcommand,
+                "create-field",
+                "--study-idx",
+                "5",
+                "--display-name",
+                "X",
+                surface.global_fk_flag,
+                "7",
+                "--data-type",
+                "text",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert surface.model_name in capsys.readouterr().err
+
+
+def test_create_field_required_boolean_optional(monkeypatch):
+    """--required sends True, --no-required sends False, neither omits the
+    field entirely (three-state, so a local field defaults required
+    server-side). The flag is entity-agnostic, so one entity covers it."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    bodies: list[dict] = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        bodies.append(json)
+        return _httpx.Response(201, json={}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    base = [
+        "biosample",
+        "create-field",
+        "--study-idx",
+        "5",
+        "--display-name",
+        "pH",
+        "--data-type",
+        "text",
+    ]
+    main(base + ["--required"])
+    main(base + ["--no-required"])
+    main(base)
+
+    assert bodies == [
+        {"display_name": "pH", "data_type": "text", "required": True},
+        {"display_name": "pH", "data_type": "text", "required": False},
+        {"display_name": "pH", "data_type": "text"},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# submit-align-pool
+# ---------------------------------------------------------------------------
+# A THIN client, like submit-block-mask-pool: sample selection, aligner choice,
+# reference readiness and block size are ALL resolved server-side, so the CLI does
+# no roster GET, no reference preflight, and no client-side validation beyond
+# argparse. It POSTs one AlignPlanRequest and renders the plan.
+
+
+def _run_submit_align_pool(*, run=3, pool=5, reference=16, mask=10, only_missing=False):
+    from qiita_control_plane.cli.user import main
+
+    argv = [
+        "submit-align-pool",
+        "--sequencing-run-idx",
+        str(run),
+        "--sequenced-pool-idx",
+        str(pool),
+        "--reference-idx",
+        str(reference),
+        "--mask-idx",
+        str(mask),
+    ]
+    if only_missing:
+        argv += ["--only-missing"]
+    return main(argv)
+
+
+def _align_plan_body(**overrides):
+    body = {
+        "sequencing_run_idx": 3,
+        "sequenced_pool_idx": 5,
+        "reference_idx": 16,
+        "aligner": "minimap2",
+        "samples_planned": 26,
+        "samples_skipped_existing": 0,
+        "samples_skipped_no_mask": 0,
+        "samples_skipped_mask_incomplete": 0,
+        "samples_skipped_no_reads": 0,
+        "partitions": [],
+        "blocks": [
+            {"block_idx": 1, "work_ticket_idx": 10, "read_count": 1000000},
+            {"block_idx": 2, "work_ticket_idx": 11, "read_count": 451794},
+        ],
+        "blocks_created": 2,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_submit_align_pool_single_plan_call_passthrough(monkeypatch, capsys):
+    """Exactly ONE POST to the align-plan endpoint, carrying the reference + mask +
+    only_missing. No roster GET and no reference-readiness preflight: the server
+    owns both."""
+    captured: dict = {}
+    _stub_multi_response(monkeypatch, captured, responses=[(202, _align_plan_body())])
+    rc = _run_submit_align_pool()
+    assert rc == 0
+
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["url"].endswith("/sequencing-run/3/sequenced-pool/5/align-plan")
+    assert posts[0]["json"] == {"reference_idx": 16, "mask_idx": 10, "only_missing": False}
+    assert [r["method"] for r in captured["requests"]] == ["POST"]
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
+
+
+def test_submit_align_pool_only_missing_is_passed_through(monkeypatch, capsys):
+    """--only-missing rides the body (applied server-side), still one POST."""
+    captured: dict = {}
+    _stub_multi_response(monkeypatch, captured, responses=[(202, _align_plan_body())])
+    assert _run_submit_align_pool(only_missing=True) == 0
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["json"] == {"reference_idx": 16, "mask_idx": 10, "only_missing": True}
+
+
+def test_submit_align_pool_summary_reports_the_block_read_count(monkeypatch, capsys):
+    """The stderr summary names the per-block read count.
+
+    This is the line that makes a mis-tiled plan visible at SUBMIT time: block size
+    is resolved server-side from the platform, so the response is the first place it
+    is observable. A short tail block renders as a min-max range, not a per-block
+    list, so a 46-block plan stays one readable line. JSON still goes to stdout.
+    """
+    captured: dict = {}
+    _stub_multi_response(monkeypatch, captured, responses=[(202, _align_plan_body())])
+    assert _run_submit_align_pool() == 0
+    out = capsys.readouterr()
+    assert json.loads(out.out)["blocks_created"] == 2
+    assert "451794-1000000 reads" in out.err
+    assert "planned 26 sample(s) into 2 block(s)" in out.err
+    assert "minimap2" in out.err
+
+
+def test_submit_align_pool_summary_reports_skipped_samples(monkeypatch, capsys):
+    """Every skip reason reaches the summary — four separate counts in the body that
+    are easy to miss in raw JSON, and the difference between 'nothing to do' and
+    'named the wrong mask'."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (
+                202,
+                _align_plan_body(
+                    samples_planned=0,
+                    samples_skipped_mask_incomplete=4,
+                    samples_skipped_no_reads=1,
+                    blocks=[],
+                    blocks_created=0,
+                ),
+            )
+        ],
+    )
+    assert _run_submit_align_pool() == 0
+    err = capsys.readouterr().err
+    assert "4 masking-incomplete" in err
+    assert "1 no-reads" in err
+    # No blocks: the size is genuinely unknown rather than a misleading 0.
+    assert "unknown reads" in err
+
+
+def test_submit_align_pool_server_refusal_is_surfaced(monkeypatch, capsys):
+    """A 409 (already-gated pool / unsharded reference) is the server's to raise;
+    the CLI surfaces it as a non-zero exit rather than pre-empting it."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[(409, {"detail": "samples already have an alignment gate"})],
+    )
+    assert _run_submit_align_pool() != 0

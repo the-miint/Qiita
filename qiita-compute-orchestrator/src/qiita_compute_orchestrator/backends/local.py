@@ -16,9 +16,9 @@ fabricating a job id it doesn't have.
 from pathlib import Path
 
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import ComputeTarget, StepStatus, WorkTicketFailureStage
+from qiita_common.models import StepStatus, WorkTicketFailureStage
 
-from ..backend import ComputeBackend, FoundJob, StepHandle, StepStatusInfo
+from ..backend import ComputeBackend, FoundJob, LocalStepHandle, StepHandle, StepStatusInfo
 from ..jobs import flatten_native_inputs, run_native_job
 
 
@@ -46,6 +46,9 @@ class LocalBackend(ComputeBackend):
         module: str | None = None,
         entrypoint: str | None = None,  # noqa: ARG002 — LocalBackend ignores entrypoint
         baseline_resources=None,  # noqa: ARG002 — accepted for protocol parity
+        # Container-only (bind + env into apptainer), and LocalBackend rejects
+        # container steps below — so it can only ever arrive empty here.
+        derived_inputs: dict[str, str] | None = None,  # noqa: ARG002 — protocol parity
     ) -> StepHandle:
         """Run the native module in-process to completion and return a
         terminal StepHandle (compute_target=local, no SLURM job id, the
@@ -91,11 +94,7 @@ class LocalBackend(ComputeBackend):
             work_ticket_idx=work_ticket_idx,
         )
         outputs = await run_native_job(module, raw_inputs, workspace, step_name=name)
-        return StepHandle(
-            compute_target=ComputeTarget.LOCAL,
-            step_name=name,
-            terminal_outputs=outputs,
-        )
+        return LocalStepHandle(step_name=name, terminal_outputs=outputs)
 
     async def status_step(self, handle: StepHandle) -> StepStatusInfo:
         """Local steps run to completion at submit time, so status is
@@ -118,7 +117,7 @@ class LocalBackend(ComputeBackend):
                 reason=f"LocalBackend.result_step called with non-COMPLETED status "
                 f"{status.status.value!r}",
             )
-        return handle.terminal_outputs or {}
+        return handle.terminal_outputs
 
     async def find_jobs_by_name(self, job_name: str) -> list[FoundJob]:
         """LocalBackend runs steps in-process and never submits to SLURM, so
@@ -126,4 +125,11 @@ class LocalBackend(ComputeBackend):
         interface parity so the CP→CO find-by-name route works against either
         backend without an isinstance check."""
         del job_name
+        return []
+
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        """LocalBackend runs steps in-process, so there is never a live SLURM job
+        to scancel. Always empty — interface parity so the CP→CO cancel route works
+        against either backend without an isinstance check."""
+        del work_ticket_idx
         return []

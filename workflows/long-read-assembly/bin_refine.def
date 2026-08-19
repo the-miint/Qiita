@@ -1,0 +1,93 @@
+Bootstrap: docker
+From: mambaorg/micromamba:1.5.8
+
+# Per-tool image for the long-read-assembly `bin_refine` step (DAS_Tool + diamond).
+# One of four single-tool images the workflow ships; see assemble.def for the
+# split rationale. Invoked as `apptainer exec <sif> /opt/qiita/bin_refine.sh`
+# (per-step entrypoint), so the %runscript is unused.
+#
+# Pinned invariant: bin_refine.sh + assembly_load depend on DAS_Tool 1.1.x's
+# `*_DASTool_summary.tsv` summary columns — `bin`, `bin_score`, `bin_set` —
+# consumed downstream by assembly_load with DuckDB.
+
+%labels
+    workflow long-read-assembly
+    tool bin_refine
+    version 1.0.0
+
+%files
+    # Workflow-agnostic output-dir → manifest.json walker, copied from _shared
+    # (build-sif.sh mirrors the repo layout so this relative path resolves).
+    ../_shared/manifest_writer.py /opt/qiita/manifest_writer.py
+    # Shared entrypoint helpers (params.json parsing, manifest + mode contract).
+    ../_shared/_lib.sh /opt/qiita/_lib.sh
+    # This image's per-step entrypoint.
+    bin_refine.sh /opt/qiita/bin_refine.sh
+
+%environment
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export PATH=/opt/conda/bin:${PATH}
+
+%post
+    set -e
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    # jq (params.json), gawk, pigz (fast (de)compress), procps, findutils — the
+    # base utilities the entrypoint relies on outside the tool env.
+    # `python` is REQUIRED, not a nicety: _lib.sh's qiita_finish runs
+    # `python3 /opt/qiita/manifest_writer.py` to emit manifest.json, and EVERY
+    # step must write one (the backend verifies it before registering outputs).
+    # The micromamba base image ships no Python, so without this every step of
+    # this workflow dies at its final line — after doing all its real work.
+    # PINNED, like bcl-convert's python3.11: unpinned, a later rebuild silently
+    # moves the interpreter major version under manifest_writer.py.
+    micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils python=3.11
+
+    # One env for this tool. Channels bioconda + conda-forge.
+    #  - bin_refine: DAS_Tool + diamond (DAS_Tool bundles its SCG db).
+    # das_tool PINNED to 1.1.7: the create line was unpinned, so a rebuild's solve
+    # was free to drift off the "1.1.x summary-columns" invariant above. The
+    # `--write_bins 1` crash bin_refine.sh hit was an ARG bug, not a version one
+    # (das_tool 1.1.7 / r-docopt 0.7.2 parse the corrected bare `--write_bins`
+    # fine — probed), but this image rebuilds whenever bin_refine.sh changes, so
+    # lock the version rather than re-roll the solve each time.
+    micromamba create -y -n dastool -c bioconda -c conda-forge das_tool=1.1.7 diamond
+
+    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/bin_refine.sh
+    chmod 0644 /opt/qiita/manifest_writer.py
+
+    micromamba clean -a -y
+
+%test
+    set -e
+    # `apptainer build` runs %test inside the FINISHED image — a read-only
+    # filesystem — with HOME=/root, a path that lives in that image. libmamba
+    # creates a cache dir under $HOME and hard-aborts when it cannot, which failed
+    # the very first build of these images. At RUN time this never bites: the SLURM
+    # payload passes `--home <workspace>`, a writable dir. So give the test a
+    # writable HOME too — and ONLY that, because HOME is the only thing production
+    # sets. (Setting XDG_CACHE_HOME as well would be a config no job ever runs
+    # under, and would hide it if HOME alone ever stopped being sufficient.) A
+    # fresh mktemp dir rather than bare /tmp: private, and it does not leave
+    # root-owned litter on the build host.
+    export HOME="$(mktemp -d)"
+    micromamba env list | grep -q dastool
+    micromamba run -n dastool DAS_Tool --version
+    # Base utilities the entrypoints actually invoke — assert each one, since the
+    # whole point of this %test is to fail the BUILD on a missing runtime dep
+    # rather than at the end of a long job.
+    jq --version
+    gawk --version >/dev/null
+    find --version >/dev/null
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('mw','/opt/qiita/manifest_writer.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    # Lockstep guard (mirrors bcl-convert): if _lib.sh's manifest line ever stops
+    # matching what %post installs, fail the BUILD. This bug class — an entrypoint
+    # reaching for an interpreter the image lacks — is what killed every step of
+    # this workflow at its final line.
+    grep -q 'python3 /opt/qiita/manifest_writer\.py' /opt/qiita/_lib.sh
+    # Guard the entrypoint stays wired to its env.
+    grep -q 'micromamba run -n dastool DAS_Tool' /opt/qiita/bin_refine.sh
+
+%runscript
+    echo "long-read-assembly-dastool image: invoke the step entrypoint, e.g." >&2
+    echo "  apptainer exec <sif> /opt/qiita/bin_refine.sh" >&2
+    exit 64

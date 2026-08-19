@@ -132,6 +132,7 @@ async def test_submit_step_posts_to_submit_endpoint_and_returns_handle():
         work_ticket_idx=99,
         attempt=2,
         container=REFERENCE_HASH_CONTAINER,
+        entrypoint="/opt/qiita/hash.sh",
     )
     assert len(captured) == 1
     assert captured[0].url.path == URL_STEP_SUBMIT
@@ -308,6 +309,7 @@ async def test_submit_step_reconstructs_backend_failure():
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             container=REFERENCE_HASH_CONTAINER,
+            entrypoint="/opt/qiita/hash.sh",
         )
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
     assert ComputeTarget  # imported to keep parity with the handle-shaped tests
@@ -372,6 +374,7 @@ async def test_submit_step_transport_error_becomes_orchestrator_unreachable():
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             container=REFERENCE_HASH_CONTAINER,
+            entrypoint="/opt/qiita/hash.sh",
         )
     assert ei.value.kind is FailureKind.ORCHESTRATOR_UNREACHABLE
     assert ei.value.transient is True
@@ -427,3 +430,37 @@ async def test_status_step_4xx_without_header_stays_http_error(status_code):
         await _client_with(_status_transport(status_code)).status_step(
             StepHandleWire(compute_target=ComputeTarget.SLURM, step_name="hash", slurm_job_id=1)
         )
+
+
+# ============================================================================
+# cancel — scancel every SLURM job of a work_ticket
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_cancel_posts_ticket_idx_and_returns_cancelled_ids():
+    """cancel() POSTs the work_ticket_idx to /step/cancel and returns the ids the
+    orchestrator reports scancelled."""
+    from qiita_common.api_paths import URL_STEP_CANCEL
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"cancelled_job_ids": [518235, 518236]})
+
+    cancelled = await _client_with(httpx.MockTransport(handler)).cancel(4837)
+    assert cancelled == [518235, 518236]
+    assert seen["path"] == URL_STEP_CANCEL
+    assert seen["body"] == {"work_ticket_idx": 4837}
+
+
+@pytest.mark.asyncio
+async def test_cancel_reraises_classified_backend_failure():
+    """A classified BackendFailure from the orchestrator (e.g. slurmrestd
+    unreachable) is reconstructed and raised, so the CP can retry the reap."""
+    from qiita_common.backend_failure import BackendFailure
+
+    with pytest.raises(BackendFailure):
+        await _client_with(_failure_transport("slurmrestd_unreachable")).cancel(4837)

@@ -1,46 +1,27 @@
 """Sequenced-sample routes.
 
-Three routers live here. The run-scoped router (prefix=/sequencing-run)
-carries the per-item import composer (POST
-/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample) and
-the sequenced-sample list reads scoped to a run or one of its pools —
-bare idxs (GET /sequencing-run/{run_idx}/sequenced-sample/list-idxs) and
-the richer per-sample rows (GET
-/sequencing-run/{run_idx}/sequenced-sample/list and the pool-scoped
-.../sequenced-pool/{pool_idx}/sequenced-sample/list). The study-scoped
-router (prefix=/study) carries the study-scoped bulk-id read (GET
-/study/{study_idx}/sequenced-sample/list-idxs). The
-sequenced-sample-scoped router (prefix=/sequenced-sample) carries the
-single-resource read (GET /{sequenced_sample_idx}) that surfaces the
-combined sequenced_sample + supertype prep_sample row plus its
-globally-linked metadata, and the single-resource PATCH (PATCH
-/{sequenced_sample_idx}) that edits the subtype-table columns (ENA
-accessions and submission tracking).
+Three routers live here: a run-scoped one (prefix=/sequencing-run) for the
+per-item import composer and the list reads scoped to a run or one of its
+pools, a study-scoped one (prefix=/study) for operations authorized on a
+study, and a sequenced-sample-scoped one (prefix=/sequenced-sample) for
+single-resource access to the combined sequenced_sample + supertype
+prep_sample row.
 
 Every write handler gates on caller scope (Scope.PREP_SAMPLE_WRITE) plus
-require_complete_profile (humans-only). The POST composer additionally
-gates on caller-creator semantics on the path's `sequenced_pool` (via
-`require_caller_owns_pool()`, wet_lab_admin+ bypass) and on per-study
-ADMIN access across every listed study in the body (via
-`require_caller_has_admin_on_all_studies`, same bypass). The PATCH
-still composes `require_role_at_least(WET_LAB_ADMIN)` because its
-editable column set (ENA accessions + submission tracking) is operated
-by the submission subsystem, not by sample owners. The run-scoped and
-single-resource reads gate on Scope.PREP_SAMPLE_READ + wet_lab_admin
-role unconditionally; the study-scoped roster read instead gates on
-Scope.STUDY_READ + study existence + study access (viewer tier,
-wet_lab_admin and system_admin bypass tier), mirroring the biosample
-study-roster read. All handlers delegate their DB work to the sibling
-repository modules. Service accounts are still rejected by the PATCH's
-role gate today; a wider auth-model change (so ServiceAccount carries a
-system_role) is required before submission-subsystem service accounts
-can satisfy require_role_at_least.
+require_complete_profile (humans-only); the import composer adds
+caller-creator semantics on the path's `sequenced_pool` (via
+`require_caller_owns_pool()`) and per-study ADMIN access across every study
+listed in the body (via `require_caller_has_admin_on_all_studies`), both with
+a wet_lab_admin+ bypass. The run-scoped and single-resource reads gate on
+Scope.PREP_SAMPLE_READ + wet_lab_admin role unconditionally; the study-scoped
+reads gate on study existence plus a study-access tier — viewer for the roster
+read, an interim ADMIN clamp for the single read — with wet_lab_admin and
+system_admin bypassing, mirroring the biosample reads. All handlers delegate
+their DB work to the sibling repository modules.
 """
 
 import logging
 import sqlite3
-import tempfile
-from pathlib import Path
 from typing import Annotated
 
 import asyncpg
@@ -48,26 +29,31 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_SEQUENCED_SAMPLE_BY_IDX,
+    PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX,
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
     PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
     PATH_SEQUENCED_SAMPLE_LIST_BY_RUN,
     PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
     PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY,
+    PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY,
     PATH_SEQUENCED_SAMPLE_PREFIX,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
-    GlobalMetadataEntry,
     IdxsListResponse,
     MetadataChecklistRef,
+    MetadataEntry,
+    SampleMetadataWriteRequest,
+    SampleMetadataWriteResponse,
     SequencedSampleCreateRequest,
     SequencedSampleCreateResponse,
     SequencedSampleListItem,
     SequencedSampleListResponse,
     SequencedSamplePatchRequest,
     SequencedSampleResponse,
+    StudyScopedSequencedSampleResponse,
     Tier,
 )
 
@@ -86,14 +72,13 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
-from ..repositories._sample_helpers import (
-    MetadataParseError,
-    MetadataUnknownFieldsError,
-    SlotOccupiedError,
-    StudyFieldConflictError,
-    TransientWriteRaceError,
-    fetch_global_metadata,
+from ..host_filter_resolver import resolve_host_filter_many
+from ..preflight import (
+    PacbioProtocol,
+    open_blob,
+    pacbio_protocol_by_sample_idx,
 )
+from ..repositories._sample_helpers import fetch_global_metadata
 from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from ..repositories.sequenced_sample import (
     fetch_sequenced_pool_samples,
@@ -104,16 +89,27 @@ from ..repositories.sequenced_sample import (
     import_sequenced_prep_sample,
     update_sequenced_sample,
 )
-from ..repositories.sequencing_run import fetch_sequenced_pool_preflight
+from ..repositories.sequencing_run import (
+    fetch_sequenced_pool_preflight,
+    fetch_sequencing_run_platform,
+)
 from ._helpers import (
+    ETAG_HEADER,
     GENERIC_FK_VIOLATION,
+    IF_MATCH_HEADER,
+    SAMPLE_METADATA_WRITE_ERRORS,
     build_idxs_list_response,
+    cap_rows,
     detail_for_biosample_link_rejection,
-    detail_for_slot_collision,
+    detail_for_unlinked_entity,
     etag_for_updated_at,
+    metadata_entries_from_rows,
     parse_kv_detail,
-    raise_for_transient_write_race,
+    raise_http_for_sample_metadata_write_error,
+    read_study_scoped_entity,
+    resolve_linked_study_entity,
     resolve_metadata_checklist_idx,
+    write_and_map_sample_metadata,
 )
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequenced-sample"])
@@ -137,10 +133,15 @@ _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own prep samples"
 # means updating both sites in lockstep.
 _BIOSAMPLE_LINK_TRIGGER_NAME = "prep_sample_to_study_reject_without_biosample_link"
 
+# The two ENA-accession unique indexes, named because both the create and the
+# PATCH constraint maps below key on them.
+_ENA_EXPERIMENT_ACCESSION_UNIQUE = "sequenced_sample_ena_experiment_accession_unique"
+_ENA_RUN_ACCESSION_UNIQUE = "sequenced_sample_ena_run_accession_unique"
+
 _SEQUENCED_SAMPLE_UNIQUE_MESSAGES: dict[str, str] = {
     "sequenced_sample_pool_item_id_unique": ("sequenced_pool_item_id already in use for this pool"),
-    "sequenced_sample_ena_experiment_accession_unique": ("ena_experiment_accession already in use"),
-    "sequenced_sample_ena_run_accession_unique": "ena_run_accession already in use",
+    _ENA_EXPERIMENT_ACCESSION_UNIQUE: "ena_experiment_accession already in use",
+    _ENA_RUN_ACCESSION_UNIQUE: "ena_run_accession already in use",
     "prep_sample_metadata_unique_per_field": (
         "duplicate metadata entry for the same prep_sample_study_field"
     ),
@@ -159,6 +160,16 @@ _SEQUENCED_SAMPLE_FK_MESSAGES: dict[str, str] = {
     "prep_sample_to_study_study_idx_fkey": ("study_idx does not reference an existing study"),
 }
 _GENERIC_SEQ_UNIQUE_VIOLATION = "conflicts with an existing prep_sample / sequenced_sample"
+
+# Constraint names update_sequenced_sample can trip. Only the two ENA-accession
+# unique indexes appear because the subtype-only PATCH writes no FK column;
+# their wording is selected from the create map so the two cannot drift.
+# Unknown names fall back to the generic string on the matching exception path.
+_SEQUENCED_SAMPLE_PATCH_UNIQUE_MESSAGES: dict[str, str] = {
+    name: _SEQUENCED_SAMPLE_UNIQUE_MESSAGES[name]
+    for name in (_ENA_EXPERIMENT_ACCESSION_UNIQUE, _ENA_RUN_ACCESSION_UNIQUE)
+}
+_SEQUENCED_SAMPLE_GENERIC_UNIQUE_VIOLATION = "conflicts with an existing sequenced_sample"
 
 
 @router.post(
@@ -222,55 +233,16 @@ async def import_sequenced_sample_from_run(
                 metadata_checklist_idx=metadata_checklist_idx,
                 ena_experiment_accession=body.ena_experiment_accession,
                 ena_run_accession=body.ena_run_accession,
+                global_internal_names=body.global_internal_names,
             )
-        except MetadataUnknownFieldsError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=f"unknown metadata fields: {', '.join(exc.unknown_display_names)}",
-            )
-        except MetadataParseError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"could not parse metadata field {exc.display_name!r}"
-                    f" value {exc.text_value!r} as {exc.data_type}: {exc.reason}"
-                ),
-            )
-        except StudyFieldConflictError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"study {exc.study_idx} has an existing field at"
-                    f" display_name {exc.display_name!r} bound to a different"
-                    " global field"
-                ),
-            )
-        except SlotOccupiedError as exc:
-            # SlotOccupiedError is its own exception family (not an
-            # asyncpg.UniqueViolationError subclass), so this catch and
-            # the generic UniqueViolationError catch below are independent;
-            # both return 409, but this one's detail discriminates the
-            # six sub-cases rather than collapsing to the generic message.
-            #
-            # NOT DEAD CODE — do not prune. Currently unreachable
-            # through this POST because the route creates a fresh
-            # prep_sample per call, so neither the global-field slot nor
-            # the per-field local slot for that prep_sample can be pre-
-            # occupied and the unique constraint cannot fire. Kept for
-            # the planned PATCH-style write-metadata-on-existing-
-            # prep_sample endpoint, which will share this composer path;
-            # that endpoint can hit either constraint whenever a caller
-            # writes a value into a prep_sample whose slot was already
-            # claimed (by another study on the global path, or by an
-            # earlier write on the same study on the local path).
-            detail = await detail_for_slot_collision(conn, exc)
-            raise HTTPException(status_code=409, detail=detail)
-        except TransientWriteRaceError as exc:
-            # The diagnostic read found the colliding occupant already
-            # gone — a concurrent delete won the race and the slot is
-            # free again. Independent of the asyncpg catches; maps to a
-            # 503 + Retry-After so the client resubmits the same request.
-            raise_for_transient_write_race(exc)
+        except SAMPLE_METADATA_WRITE_ERRORS as exc:
+            # Shared metadata-write arms (parse / unknown / conflict /
+            # duplicate-global-target / slot-collision / transient-race) map
+            # through one place. The asyncpg arms below stay route-specific.
+            # SlotOccupiedError is unreachable through this POST (a fresh
+            # prep_sample per call cannot pre-occupy a slot) but is handled for
+            # the shared PATCH path that reuses this composer.
+            await raise_http_for_sample_metadata_write_error(conn, exc)
         except asyncpg.UniqueViolationError as exc:
             detail = _SEQUENCED_SAMPLE_UNIQUE_MESSAGES.get(
                 exc.constraint_name, _GENERIC_SEQ_UNIQUE_VIOLATION
@@ -339,68 +311,34 @@ async def list_sequenced_sample_idxs_in_run(
     )
 
 
-def _human_filtering_by_item_id(blob: bytes) -> dict[str, bool]:
-    """Map each illumina_sample's ``sequenced_pool_item_id`` to its intake
-    human_filtering intent, read from a run-preflight SQLite blob.
-
-    The intent is the sample's effective project's per-project ``human_filtering``
-    flag (the preflight exposes no per-sample accessor), keyed by
-    ``str(illumina_sample_idx)`` — which equals the ``sequenced_pool_item_id`` the
-    bcl-convert composer assigns. Mirrors the CLI's ``_read_preflight_rows`` join
-    but returns only the boolean map the pool roster needs.
-
-    The blob is materialized to a private temp file because run_preflight operates
-    on a file-backed sqlite3 connection (matching
-    ``routes/sequencing_run.py::_apply_preflight_lane_update``); the run_preflight
-    import is lazy and local so the git-pinned dependency only loads on this path.
-
-    Raises ``sqlite3.DatabaseError`` (blob is not a readable SQLite) or
-    ``ValueError`` (not a single-run kl-run-preflight, or a run_preflight
-    schema-version skew) — the caller degrades those to "intent unknown" rather
-    than failing the listing (see ``_pool_human_filtering_by_item_id``).
+def _pacbio_facts_by_item_id(blob: bytes) -> dict[str, PacbioProtocol]:
+    """Return the PacBio protocol facts for a blob, keyed on ``str(pacbio_sample_idx)``
+    — which IS the ``sequenced_pool_item_id`` the PacBio composer assigns (the barcode
+    is only the BAM-locating key). ``{}`` for a non-PacBio blob, so the caller can
+    probe without branching on platform.
     """
-    from run_preflight import db as run_preflight_db  # noqa: PLC0415
-    from run_preflight import open_db_file  # noqa: PLC0415
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "preflight.db"
-        db_path.write_bytes(blob)
-        conn = open_db_file(str(db_path))
-        try:
-            project_by_idx = {
-                row[0]: row[4] for row in run_preflight_db.get_illumina_sample_rows(conn)
-            }
-            filtering_by_project = {
-                name: bool(flag)
-                for name, flag in conn.execute(
-                    "SELECT project_name, human_filtering FROM project"
-                ).fetchall()
-            }
-        finally:
-            conn.close()
-    return {
-        str(idx): filtering_by_project[project_name]
-        for idx, project_name in project_by_idx.items()
-        if project_name in filtering_by_project
-    }
+    with open_blob(blob) as conn:
+        return pacbio_protocol_by_sample_idx(conn)
 
 
-async def _pool_human_filtering_by_item_id(
+async def _pool_sample_facts_by_item_id(
     pool: asyncpg.Pool,
     *,
     sequencing_run_idx: int,
     sequenced_pool_idx: int,
-) -> dict[str, bool]:
-    """Return the pool's per-item intake human_filtering map, or ``{}`` when the
-    pool has no preflight populated or its stored blob cannot be parsed into
-    intents. Reads the stored run-preflight blob (the single source of truth) and
-    parses it via ``_human_filtering_by_item_id``.
+) -> dict[str, PacbioProtocol]:
+    """Return the pool's PacBio protocol facts, keyed on ``sequenced_pool_item_id``.
 
-    An unparseable stored blob (corrupt, a non-bcl pool, or a run_preflight
-    schema-version skew) degrades to ``{}`` — None per sample — rather than
-    failing this passive listing. The host-filter-pool guard turns a null intent
-    into an actionable abort at submit time, which is the right place to be loud;
-    a corrupt preflight must not take down an unrelated sample listing."""
+    The single seam where the roster sources its per-sample PRE-FLIGHT facts. The
+    blob is asked only for what it is genuinely the source of — library prep — which
+    is PacBio-only, so an Illumina pool simply gets ``{}``. (Host filtering is a
+    separate matter: it resolves from the sample's own ``host_taxon_id`` metadata.)
+
+    Degrades to ``{}`` on an unparseable blob: the roster must not 500 because a pool's
+    pre-flight is corrupt. The submit path refuses separately when a PacBio pool's facts
+    are missing (it keys on the run's ``platform`` column, not on this), so a blob that
+    will not parse cannot silently mask a PacBio pool with its long-read chain off.
+    """
     row = await fetch_sequenced_pool_preflight(
         pool,
         sequencing_run_idx=sequencing_run_idx,
@@ -409,16 +347,11 @@ async def _pool_human_filtering_by_item_id(
     if row is None or row["run_preflight_blob"] is None:
         return {}
     try:
-        return _human_filtering_by_item_id(bytes(row["run_preflight_blob"]))
+        return _pacbio_facts_by_item_id(bytes(row["run_preflight_blob"]))
     except (sqlite3.DatabaseError, ValueError) as exc:
-        # Degrade to "intent unknown" but log loudly: a stored preflight that the
-        # server can't parse (corrupt, non-bcl, or a run_preflight schema-version
-        # skew that would silently null EVERY pool's intents deploy-wide) is a
-        # real problem the operator-facing guard's message can't diagnose on its
-        # own. Parentheses are required with `as` even under PEP 758.
         _log.warning(
             "could not parse stored run-preflight for sequenced_pool %s (run %s);"
-            " human_filtering will be null for its samples: %s",
+            " its PacBio protocol facts will be absent: %s",
             sequenced_pool_idx,
             sequencing_run_idx,
             exc,
@@ -452,34 +385,60 @@ async def list_sequenced_samples_in_pool(
     `truncated` flag indicates the underlying set exceeded the hard cap;
     callers hitting it should narrow their scope.
 
-    Each sample also carries `human_filtering` — its intake host-filter intent,
-    derived here from the pool's stored run-preflight blob (the single source of
-    truth) — so `submit-host-filter-pool` can run its pool-wide host-filter guard
-    without an operator-supplied preflight file. It is None when the pool has no
-    preflight populated or the blob carries no row for that pool item.
+    Each sample carries `host_filter` — what host filtering it WOULD get, resolved
+    from its own `host_taxon_id` metadata plus the run's platform. This is what the
+    submit path reads (there is no intake host-filter flag any more).
+
+    Each sample also carries its four per-stage read counts and the fraction
+    surviving quality filtering, making one call the pool's per-sample read
+    table; `SequencedSampleListItem` records which samples that covers and the
+    work-ticket list does not.
     """
-    # Fetch cap+1 rows so a count strictly greater than the cap signals
-    # truncation; the route slices back to the cap before returning.
+    # Over-fetch by one so cap_rows can tell a full page from a cut one.
     rows = await fetch_sequenced_pool_samples(
         pool,
         sequenced_pool_idx=sequenced_pool_idx,
         limit=_SEQUENCED_SAMPLE_HARD_CAP + 1,
     )
-    truncated = len(rows) > _SEQUENCED_SAMPLE_HARD_CAP
-    if truncated:
-        rows = rows[:_SEQUENCED_SAMPLE_HARD_CAP]
-    # Derive each sample's intake human_filtering intent from the pool's stored
-    # preflight blob and attach it by sequenced_pool_item_id; None per sample
-    # when the pool has no preflight or the blob omits its row.
-    human_filtering_by_item_id = await _pool_human_filtering_by_item_id(
+    rows, truncated = cap_rows(rows, _SEQUENCED_SAMPLE_HARD_CAP)
+    # PacBio protocol facts from the pool's stored pre-flight, keyed by
+    # sequenced_pool_item_id. Empty for an Illumina pool (it has none) and for a
+    # pool whose blob cannot be parsed.
+    pacbio_by_item_id = await _pool_sample_facts_by_item_id(
         pool,
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,
     )
+    # Resolve host filtering for the whole roster in two queries — NOT one call
+    # per sample; see resolve_host_filter_many.
+    #
+    # The run's platform is the resolution's second input (the same host is
+    # depleted with different stages depending on how it was sequenced) and is
+    # constant across the pool, so it is read once here rather than per sample.
+    # Not-None: require_sequenced_pool_in_run has already established that the
+    # path's pool belongs to this run, so the run exists.
+    platform = await fetch_sequencing_run_platform(pool, sequencing_run_idx)
+    host_filter_by_biosample = await resolve_host_filter_many(
+        pool,
+        biosample_idxs=[r["biosample_idx"] for r in rows],
+        platform=platform,
+    )
     samples = []
     for r in rows:
         item = dict(r)
-        item["human_filtering"] = human_filtering_by_item_id.get(item["sequenced_pool_item_id"])
+        item_id = item["sequenced_pool_item_id"]
+        # PacBio protocol facts; absent (None) for an Illumina pool. The read-mask
+        # submit derives lima_enabled / syndna_enabled from these.
+        facts = pacbio_by_item_id.get(item_id)
+        if facts is not None:
+            item["sheet_type"] = facts.sheet_type
+            item["twist_adaptor_id"] = facts.twist_adaptor_id
+            item["syndna_is_twisted"] = facts.syndna_is_twisted
+        # Every roster row gets a resolution — a sample with no host metadata
+        # comes back UNRESOLVED rather than absent, so "we don't know" is
+        # visible instead of silent. The resolver already returns the wire type,
+        # so there is nothing to map.
+        item["host_filter"] = host_filter_by_biosample[item["biosample_idx"]]
         samples.append(SequencedSampleListItem.model_validate(item))
     return SequencedSampleListResponse(
         samples=samples,
@@ -507,17 +466,17 @@ async def list_sequenced_samples_in_run(
     run instead of one pool. require_sequencing_run_exists fires a 404 for an
     unknown run. Excludes rows whose supertype prep_sample is retired; the
     `truncated` flag indicates the underlying set exceeded the hard cap.
+
+    Carries the same per-sample read counts as the pool-scoped list; `host_filter`
+    stays None here (it needs the run's platform and is resolved per pool).
     """
-    # Fetch cap+1 rows so a count strictly greater than the cap signals
-    # truncation; the route slices back to the cap before returning.
+    # Over-fetch by one so cap_rows can tell a full page from a cut one.
     rows = await fetch_sequenced_samples_for_run(
         pool,
         sequencing_run_idx=sequencing_run_idx,
         limit=_SEQUENCED_SAMPLE_HARD_CAP + 1,
     )
-    truncated = len(rows) > _SEQUENCED_SAMPLE_HARD_CAP
-    if truncated:
-        rows = rows[:_SEQUENCED_SAMPLE_HARD_CAP]
+    rows, truncated = cap_rows(rows, _SEQUENCED_SAMPLE_HARD_CAP)
     # same-pattern-ok: run-scoped twin of list_sequenced_samples_in_pool's
     # envelope; the scope variants are kept as separate routes, not
     # parameterized into one shared pool/run handler
@@ -565,51 +524,228 @@ async def list_sequenced_sample_idxs_in_study(
     )
 
 
+def _sequenced_sample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
+    """Map a JOIN(sequenced_sample, prep_sample) row's columns to
+    SequencedSampleResponse field names.
+
+    Centralises the column -> field mapping (ss.idx -> sequenced_sample_idx,
+    GREATEST(...) -> effective_updated_at). Excludes the metadata dicts and
+    caller_system_role. Runs no DB queries.
+    """
+    return {
+        "sequenced_sample_idx": row["idx"],
+        "prep_sample_idx": row["prep_sample_idx"],
+        "biosample_idx": row["biosample_idx"],
+        "owner_idx": row["owner_idx"],
+        "prep_protocol_idx": row["prep_protocol_idx"],
+        "metadata_checklist": MetadataChecklistRef.from_row(
+            row["metadata_checklist_idx"], row["metadata_checklist_name"]
+        ),
+        "sequenced_pool_idx": row["sequenced_pool_idx"],
+        "sequenced_pool_item_id": row["sequenced_pool_item_id"],
+        "ena_experiment_accession": row["ena_experiment_accession"],
+        "ena_run_accession": row["ena_run_accession"],
+        "last_submission_at": row["last_submission_at"],
+        "submission_error": row["submission_error"],
+        "raw_read_count_r1r2": row["raw_read_count_r1r2"],
+        "biological_read_count_r1r2": row["biological_read_count_r1r2"],
+        "quality_filtered_read_count_r1r2": row["quality_filtered_read_count_r1r2"],
+        "spikein_read_count_r1r2": row["spikein_read_count_r1r2"],
+        "last_metadata_change_at": row["last_metadata_change_at"],
+        "created_by_idx": row["created_by_idx"],
+        "created_at": row["created_at"],
+        "effective_updated_at": row["effective_updated_at"],
+        "retired": row["retired"],
+        "retired_by_idx": row["retired_by_idx"],
+        "retired_at": row["retired_at"],
+        "retire_reason": row["retire_reason"],
+    }
+
+
 def _sequenced_sample_response_from_row(
     row: asyncpg.Record,
     *,
-    global_metadata: dict[str, GlobalMetadataEntry],
+    global_metadata: dict[str, MetadataEntry],
     caller_system_role: SystemRole,
 ) -> SequencedSampleResponse:
     """Shape a JOIN(sequenced_sample, prep_sample) row + decoded global
     metadata into SequencedSampleResponse.
 
-    Centralises the column -> field mapping (ss.idx -> sequenced_sample_idx,
-    GREATEST(...) -> effective_updated_at) so the GET (and a future PATCH)
-    share one source of truth. The global_metadata dict is supplied by
-    the caller — this helper runs no DB queries.
+    Reuses the shared core-column mapping; the global_metadata dict is supplied
+    by the caller — this helper runs no DB queries.
     """
-    return SequencedSampleResponse.model_validate(
-        {
-            "sequenced_sample_idx": row["idx"],
-            "prep_sample_idx": row["prep_sample_idx"],
-            "biosample_idx": row["biosample_idx"],
-            "owner_idx": row["owner_idx"],
-            "prep_protocol_idx": row["prep_protocol_idx"],
-            "metadata_checklist": MetadataChecklistRef.from_row(
-                row["metadata_checklist_idx"], row["metadata_checklist_name"]
-            ),
-            "sequenced_pool_idx": row["sequenced_pool_idx"],
-            "sequenced_pool_item_id": row["sequenced_pool_item_id"],
-            "ena_experiment_accession": row["ena_experiment_accession"],
-            "ena_run_accession": row["ena_run_accession"],
-            "last_submission_at": row["last_submission_at"],
-            "submission_error": row["submission_error"],
-            "raw_read_count_r1r2": row["raw_read_count_r1r2"],
-            "biological_read_count_r1r2": row["biological_read_count_r1r2"],
-            "quality_filtered_read_count_r1r2": row["quality_filtered_read_count_r1r2"],
-            "last_metadata_change_at": row["last_metadata_change_at"],
-            "created_by_idx": row["created_by_idx"],
-            "created_at": row["created_at"],
-            "effective_updated_at": row["effective_updated_at"],
-            "retired": row["retired"],
-            "retired_by_idx": row["retired_by_idx"],
-            "retired_at": row["retired_at"],
-            "retire_reason": row["retire_reason"],
-            "global_metadata": global_metadata,
-            "caller_system_role": caller_system_role,
-        }
+    payload = _sequenced_sample_core_row_dict(row) | {
+        "global_metadata": global_metadata,
+        "caller_system_role": caller_system_role,
+    }
+    return SequencedSampleResponse.model_validate(payload)
+
+
+def _study_scoped_sequenced_sample_response_from_row(
+    row: asyncpg.Record,
+    *,
+    global_metadata: dict[str, MetadataEntry],
+    local_metadata: dict[str, MetadataEntry],
+    caller_system_role: SystemRole,
+) -> StudyScopedSequencedSampleResponse:
+    """Shape a JOIN(sequenced_sample, prep_sample) row + its global and
+    study-local prep_sample metadata into StudyScopedSequencedSampleResponse.
+
+    Reuses the shared core-column mapping and adds this study's purely-local
+    metadata (keyed by display_name) alongside the global map. Both metadata
+    dicts are supplied by the caller — this helper runs no DB queries.
+    """
+    payload = _sequenced_sample_core_row_dict(row) | {
+        "global_metadata": global_metadata,
+        "local_metadata": local_metadata,
+        "caller_system_role": caller_system_role,
+    }
+    return StudyScopedSequencedSampleResponse.model_validate(payload)
+
+
+@study_scoped_router.get(PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX)
+async def get_sequenced_sample_in_study(
+    study_idx: Annotated[int, Field(gt=0)],
+    sequenced_sample_idx: Annotated[int, Field(gt=0)],
+    response: Response,
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> StudyScopedSequencedSampleResponse:
+    """Return one study's view of a sequenced_sample: the joined
+    sequenced_sample + supertype prep_sample row, its globally-linked
+    prep_sample metadata, and this study's purely-local prep_sample metadata.
+
+    Access policy is interim: gated at Tier.ADMIN study access with a
+    wet_lab_admin+ role bypass -- a coarse stand-in until per-field
+    visibility-tier enforcement lands, at which point this relaxes. 401 on
+    Anonymous, 403 on missing scope or sub-ADMIN tier, 404 on a study that does
+    not exist. require_study_exists composes alongside require_study_access so
+    an admin-bypass caller still gets 404 on a non-existent study.
+
+    The prep_sample must be linked to this study: a sequenced_sample whose
+    supertype prep_sample has no non-retired prep_sample_to_study link to
+    study_idx is 404, with the same wording as a nonexistent sequenced_sample so
+    a caller never learns whether one exists outside their study. A retired
+    sequenced_sample is likewise 404, checked only after the link passes
+    (mirroring the sequenced-sample-level read's retired carve-out).
+
+    The response carries an `ETag` header derived from `effective_updated_at`
+    (GREATEST of the prep_sample and sequenced_sample timestamps); the value is
+    a quoted ISO 8601 timestamp and is opaque by contract.
+    """
+    # One REPEATABLE READ snapshot so the row read, the link check, and both
+    # metadata reads cannot disagree about a concurrent writer's commit. The
+    # shared helper fetches the joined row and keys the link + metadata on the
+    # supertype prep_sample_idx (nonexistent and unlinked share one 404).
+    async with snapshot() as conn:
+        row, global_metadata, local_metadata = await read_study_scoped_entity(
+            conn,
+            spec=PREP_SAMPLE_METADATA_SPEC,
+            fetch_row=fetch_sequenced_sample_with_prep_sample,
+            entity_idx=sequenced_sample_idx,
+            metadata_idx_column="prep_sample_idx",
+            study_idx=study_idx,
+            noun="sequenced_sample",
+        )
+
+    # ETag from the GREATEST-of-both timestamp; opaque-by-contract to clients.
+    response.headers[ETAG_HEADER] = etag_for_updated_at(row["effective_updated_at"])
+
+    return _study_scoped_sequenced_sample_response_from_row(
+        row,
+        global_metadata=global_metadata,
+        local_metadata=local_metadata,
+        caller_system_role=user.system_role,
     )
+
+
+@study_scoped_router.patch(PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY)
+async def patch_sequenced_sample_metadata(
+    study_idx: Annotated[int, Field(gt=0)],
+    sequenced_sample_idx: Annotated[int, Field(gt=0)],
+    body: SampleMetadataWriteRequest,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> SampleMetadataWriteResponse:
+    """Upsert this study's metadata values on a sequenced_sample's supertype
+    prep_sample.
+
+    Access policy is interim: gated at Tier.ADMIN study access with a
+    wet_lab_admin+ role bypass -- a coarse stand-in until per-field
+    visibility-tier enforcement lands. 401 on Anonymous, 403 on missing scope,
+    an incomplete profile, or sub-ADMIN tier, 404 on a study that does not
+    exist. require_study_exists composes alongside require_study_access so an
+    admin-bypass caller still gets 404 on a non-existent study.
+
+    The prep_sample must be linked to this study: a nonexistent
+    sequenced_sample_idx and one whose prep_sample has no non-retired
+    prep_sample_to_study link to study_idx share the same 404 so a caller never
+    learns the state of a sample outside their study; a retired sequenced_sample
+    is a 409 (its metadata cannot be written), checked only after the link
+    passes. A link retired between that check and the write is refused by the
+    database and answers the same 404, so the status does not depend on which of
+    the two noticed.
+
+    The body maps field display_name -> text value -- or global internal_name ->
+    text value when it sets global_internal_names, which leaves study-local
+    fields display-name-keyed. Each key resolves against the study's existing
+    global or study-local prep_sample fields and is upserted (unknown fields
+    -> 422, an empty body -> 422 at the wire boundary, a cross-study global slot
+    collision -> 409). The response reports per field, in input order, whether it
+    resolved global or local, the write outcome (inserted / updated / unchanged),
+    the value now in the slot, and the internal_name a globally linked value
+    reads back under.
+
+    There is NO If-Match on this route: a concurrent same-study, same-field
+    write is last-writer-wins (a silent lost update). The per-slot upsert is
+    race-safe against cross-study collisions (409) but does not serialize
+    same-study rewrites; callers needing lost-update protection coordinate out
+    of band.
+    """
+    async with tx() as conn:
+        # Gate on the study link (nonexistent + unlinked share one 404) and
+        # retirement (409 for a write); metadata keys on the supertype
+        # prep_sample_idx the join carries.
+        _row, prep_sample_idx = await resolve_linked_study_entity(
+            conn,
+            spec=PREP_SAMPLE_METADATA_SPEC,
+            fetch_row=fetch_sequenced_sample_with_prep_sample,
+            entity_idx=sequenced_sample_idx,
+            metadata_idx_column="prep_sample_idx",
+            study_idx=study_idx,
+            noun="sequenced_sample",
+            retired_status=409,
+            retired_detail=f"sequenced_sample {sequenced_sample_idx} is retired",
+        )
+        # Upsert and shape via the shared write body (the no-If-Match
+        # lost-update caveat lives at its call site).
+        response = await write_and_map_sample_metadata(
+            conn,
+            spec=PREP_SAMPLE_METADATA_SPEC,
+            entity_idx=prep_sample_idx,
+            study_idx=study_idx,
+            metadata=body.metadata,
+            caller_idx=user.principal_idx,
+            # The write keys on the supertype prep_sample_idx; a link the
+            # database refuses still answers under the requested idx.
+            unlinked_detail=detail_for_unlinked_entity(
+                noun="sequenced_sample",
+                entity_idx=sequenced_sample_idx,
+                study_idx=study_idx,
+            ),
+            global_internal_names=body.global_internal_names,
+        )
+    return response
 
 
 @sequenced_sample_router.get(PATH_SEQUENCED_SAMPLE_BY_IDX)
@@ -665,18 +801,10 @@ async def get_sequenced_sample(
             conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=row["prep_sample_idx"]
         )
 
-    global_metadata = {
-        internal_name: GlobalMetadataEntry(
-            display_name=entry.display_name,
-            description=entry.description,
-            data_type=entry.data_type,
-            value=entry.value,
-        )
-        for internal_name, entry in metadata_rows.items()
-    }
+    global_metadata = metadata_entries_from_rows(metadata_rows)
 
     # ETag from the GREATEST-of-both timestamp; opaque-by-contract to clients.
-    response.headers["ETag"] = etag_for_updated_at(row["effective_updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(row["effective_updated_at"])
 
     return _sequenced_sample_response_from_row(
         row,
@@ -685,23 +813,12 @@ async def get_sequenced_sample(
     )
 
 
-# Map of constraint names update_sequenced_sample can trip. Only the two
-# ENA-accession unique indexes appear here because the subtype-only PATCH
-# does not write any FK column; unknown names fall back to the generic
-# string on the matching exception path.
-_SEQUENCED_SAMPLE_PATCH_UNIQUE_MESSAGES: dict[str, str] = {
-    "sequenced_sample_ena_experiment_accession_unique": ("ena_experiment_accession already in use"),
-    "sequenced_sample_ena_run_accession_unique": "ena_run_accession already in use",
-}
-_SEQUENCED_SAMPLE_GENERIC_UNIQUE_VIOLATION = "conflicts with an existing sequenced_sample"
-
-
 @sequenced_sample_router.patch(PATH_SEQUENCED_SAMPLE_BY_IDX)
 async def patch_sequenced_sample(
     sequenced_sample_idx: Annotated[int, Field(gt=0)],
     body: SequencedSamplePatchRequest,
     response: Response,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    if_match: Annotated[str | None, Header(alias=IF_MATCH_HEADER)] = None,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     caller: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
@@ -806,19 +923,11 @@ async def patch_sequenced_sample(
             raise HTTPException(status_code=409, detail=detail)
 
     # Set the new ETag from the updated row's bumped effective_updated_at.
-    response.headers["ETag"] = etag_for_updated_at(updated_row["effective_updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(updated_row["effective_updated_at"])
 
     # Reuse the GET route's row -> response shaper so PATCH and GET share
     # one source of truth for the response shape.
-    global_metadata = {
-        internal_name: GlobalMetadataEntry(
-            display_name=entry.display_name,
-            description=entry.description,
-            data_type=entry.data_type,
-            value=entry.value,
-        )
-        for internal_name, entry in metadata_rows.items()
-    }
+    global_metadata = metadata_entries_from_rows(metadata_rows)
     return _sequenced_sample_response_from_row(
         updated_row,
         global_metadata=global_metadata,

@@ -5,7 +5,8 @@ Surface:
   defaults / env-var names that back them. `validate_base_url(args,
   parser)` is the post-parse companion that refuses plain http:// to
   a non-localhost host unless --insecure was passed.
-- PAT file I/O (`read_token`, `write_token`).
+- PAT file I/O (`read_token`, `write_token`), and `commit_partials`, the
+  all-or-nothing multi-file commit both CLIs' exports write through.
 - The authenticated HTTP call helper (`call`) plus `whoami` as a thin
   wrapper, and the generic token-read + invoke + JSON-print runner
   (`run_http_subcommand`).
@@ -38,6 +39,7 @@ prefix because within the package this module is the public surface.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.server
 import json
 import os
@@ -50,7 +52,11 @@ from pathlib import Path
 
 import httpx
 from qiita_common.api_paths import LOOPBACK_HOST
-from qiita_common.auth_constants import API_PREFIX, BEARER_PREFIX
+from qiita_common.auth_constants import (
+    API_PREFIX,
+    BEARER_PREFIX,
+    STALE_TOKEN_SCOPE_HEADER,
+)
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
 # the wire protocol — those live in qiita_common.auth_constants). Keep them
@@ -204,6 +210,48 @@ def write_token(path: Path, plaintext: str) -> None:
     tmp.write_text(plaintext)
     os.chmod(tmp, 0o600)
     tmp.replace(path)
+
+
+def commit_partials(
+    write_fn: Callable[[], None], pairs: list[tuple[Path, Path]], *, mode: int | None = None
+) -> None:
+    """Run `write_fn` — which writes each pair's `.partial` — then move every partial
+    into place. **All-or-nothing across the set.**
+
+    On any failure (the write raising, or a rename failing partway through a multi-file
+    commit) every partial AND every already-committed final is removed, so a retry
+    never finds a half-written set: no lone R1 without its R2, no table without the map
+    it must be read with. The partial paths are passed in rather than derived, so a
+    failure *inside* `write_fn` — which may already have created some of them — is
+    cleaned up too.
+
+    `mode`, when given, is applied to each partial BEFORE its rename, so the file is
+    never visible at its final name under a looser umask, even for an instant. Whether
+    that matters is the caller's to know, which is why it is a parameter and not a
+    default.
+
+    **The one gap, stated rather than implied:** a kill no Python code can catch —
+    SIGKILL, an OOM kill, power loss — between two renames leaves the finals that
+    already landed. Nothing here can close that, so a caller whose set must not be
+    read half-committed checks for a pre-existing final before it starts, and says
+    that a lone survivor means an interrupted run rather than a finished one.
+    """
+    committed: list[Path] = []
+    try:
+        write_fn()
+        for partial, final in pairs:
+            if mode is not None:
+                partial.chmod(mode)
+            os.replace(partial, final)
+            committed.append(final)
+    except BaseException:
+        for partial, _ in pairs:
+            with contextlib.suppress(FileNotFoundError):
+                partial.unlink()
+        for final in committed:
+            with contextlib.suppress(FileNotFoundError):
+                final.unlink()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +449,19 @@ def run_http_subcommand(
     try:
         body = fn(token)
     except httpx.HTTPStatusError as exc:
+        # A stale-scope 403 — the token predates a scope the caller's role now
+        # grants (or was deliberately minted below the ceiling) — is flagged by
+        # the server with a machine-readable header. Recognize it and surface a
+        # clean, actionable re-login prompt instead of dumping the raw JSON
+        # envelope. Every other HTTP error keeps the generic body echo.
+        if exc.response.status_code == 403 and exc.response.headers.get(STALE_TOKEN_SCOPE_HEADER):
+            print(
+                "error: your access token predates a scope your role now grants.\n"
+                "Run `qiita login` to mint a fresh token with your full role scopes,"
+                " then retry.",
+                file=sys.stderr,
+            )
+            return 1
         print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
         return 1
     except httpx.RequestError as exc:

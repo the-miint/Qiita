@@ -1,0 +1,255 @@
+action_id: long-read-assembly
+version: 1.0.0
+target_kind: prep_sample
+# target_processing_kinds is intentionally omitted (empty = any kind): there is
+# no "masked" ProcessingKind, and the real input selector is `mask_idx` (which
+# host-filter/mask identity to assemble from), which the runner STREAMS into the
+# masked-reads FASTQ the pipeline consumes (no intermediate Parquet).
+
+description: >
+  Per-sample metagenome assembly → MAG recovery for masked, ready-for-consumption
+  PacBio HiFi long reads. The runner STREAMS the
+  prep_sample's masked reads (the read_masked pass-set for `mask_idx`:
+  host/human/QC-failing reads excluded, recorded trims applied) from the data
+  plane straight to a gzip FASTQ (`masked_reads_fastq`) via miint's native
+  COPY FORMAT FASTQ — no intermediate Parquet; the native `assembly_run_config`
+  step only records the chosen assembler. Four container steps then run the heavy
+  tools —
+  `assemble` (hifiasm_meta or myloasm → circular LCG genomes + noLCG contigs), `binning`
+  (metawrap: metabat2/maxbin2/concoct), `bin_refine` (DAS_Tool consensus bins),
+  and `checkm` (per-MAG completeness/contamination). The storage tail REUSES the
+  reference-add machinery: `assembly_hash` hashes the LCG + MAG contigs (shared
+  canonical sequence hash), `mint-features` mints the contig features against the
+  shared `qiita.feature`, `write-assembly-membership` links them to
+  `qiita.assembly_membership` (tagged by kind/bin_id, stamped with the run's
+  processing_idx), `assembly_load` re-keys them + reads the CheckM/DAS_Tool metrics
+  into the DuckLake-shape Parquets, and register-files loads the `assembled_sequence`,
+  `assembled_sequence_chunks`, `assembly_membership`, and `bin_quality` tables.
+
+  Everything here is per-sample. Cross-sample dereplication / taxonomy / abundance
+  (galah/gtdbtk/GToTree/coverm) is a separate downstream stage that reads these
+  stored per-sample results across many preps.
+
+scopes: []
+
+audience:
+  # A processing workflow over a sample's already-stored masked reads. Available
+  # to end users and above; no service-account (LIMS) submission today.
+  service: false
+  human_roles: [user, wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [mask_idx]
+  properties:
+    # The CP-minted filtering-config identity whose pass-set to assemble. The
+    # runner signs a read_masked DoGet ticket scoped to (prep_sample_idx, mask_idx)
+    # and STREAMS that pass-set into a FASTQ (the same capability the admin
+    # masked-read export uses). Without it there is no way to select WHICH mask's
+    # reads to use.
+    mask_idx:
+      type: integer
+      minimum: 1
+    # Step-1 assembler. Threaded (as a scalar param) through the native
+    # assembly_run_config step into run_config.json, which the `assemble`
+    # container reads — a scalar can't ride a container step's inputs (the runner
+    # would treat it as a bind-mount path). Both values are implemented; they
+    # differ in HOW circularity is read back (hifiasm_meta: GFA segment name;
+    # myloasm: assembly_primary.fa header), which assemble.sh branches on. The
+    # default stays hifiasm_meta — switching it is an assay decision, not a
+    # mechanical one.
+    assembler:
+      type: string
+      enum: [hifiasm_meta, myloasm]
+      default: hifiasm_meta
+
+steps:
+  # Emit run_config.json (the chosen assembler). The masked reads are STREAMED to
+  # `masked_reads_fastq` by the runner (the read_masked DoGet + miint COPY FORMAT
+  # FASTQ, keyed off the action_context `mask_idx`) — a runner-produced binding, so
+  # no step reads them here. This native step only carries the `assembler` scalar
+  # (native-only) into a file the assemble container reads with jq.
+  - step: assembly_run_config
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.assembly_run_config
+    params: {assembler: assembler}
+    outputs: [run_config]
+    baseline_resources:
+      cpu: 1
+      mem_gb: 2
+      walltime: PT10M
+
+  # hifiasm_meta / myloasm assembly + circular-genome extraction. Reads run_config.json to
+  # pick the assembler; emits genomes_dir/{circular.fa, noLCG.fa}. 0 contigs is a
+  # terminal no-data outcome inside the container.
+  - step: assemble
+    step_type: singleton
+    container: long-read-assembly-assemble-1.0.0.sif
+    entrypoint: /opt/qiita/assemble.sh
+    inputs: [masked_reads_fastq, run_config]
+    # The deploy-staged miint extension, bind-mounted read-only. The myloasm
+    # branch's circular/linear split reads with miint's read_fastx and writes with
+    # COPY (FORMAT FASTA), and it LOADs the SAME build the CP/CO/DP run rather
+    # than a copy baked into the image — a fourth miint would be one `make
+    # preflight`'s byte-identity check does not compare, free to drift. Resolved
+    # against PATH_DERIVED, matching where the deploy stages it
+    # (PATH_DERIVED/duckdb-ext).
+    #
+    # The bind is UNCONDITIONAL — the backend emits it for every derived_inputs
+    # entry regardless of which assembler the entrypoint then runs — so a missing
+    # or mislocated PATH_DERIVED/duckdb-ext fails apptainer for BOTH branches,
+    # hifiasm_meta included. Only the miint LOAD is myloasm-specific; the mount is
+    # not. That is why the deploy checklist verifies the path exists rather than
+    # treating it as a myloasm-only concern.
+    derived_inputs:
+      MIINT_EXTENSION_DIRECTORY: duckdb-ext
+    outputs: [genomes_dir]
+    baseline_resources:
+      cpu: 32
+      mem_gb: 192
+      walltime: PT16H
+
+  # Align the masked HiFi reads back to the noLCG contigs with miint's embedded
+  # minimap2 (`map-hifi`), emitting the coordinate-sorted BAM the binning step
+  # injects into metaWRAP's alignment cache. Its own step because the minimap2
+  # pre-map is a distinct command from metawrap's binners (qp-pacbio splits them
+  # the same way); native (`module:`) because minimap2 ships in miint, an
+  # orchestrator-native dep — like assembly_hash/assembly_load. Without it
+  # metaWRAP self-aligns HiFi reads with bwa, a short-read aligner, and offers no
+  # flag to choose. See the module docstring.
+  - step: assembly_coverage
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.assembly_coverage
+    inputs: [genomes_dir, masked_reads_fastq]
+    outputs: [coverage_bam]
+    baseline_resources:
+      cpu: 16
+      mem_gb: 64
+      walltime: PT4H
+
+  # metawrap binning (metabat2 + maxbin2 + concoct) over the noLCG contigs +
+  # reads. 0 bins → empty bins_dir (exit 0); downstream steps skip cleanly.
+  # `coverage_bam` is staged into work_files/ so metaWRAP skips its own bwa mem and
+  # derives depth from the minimap2 alignment instead. It must arrive coordinate
+  # sorted — metaWRAP's own `samtools sort` sits inside the same "is there already
+  # a BAM?" guard as its `bwa mem`, so pre-placing the file skips both, and
+  # jgi_summarize_bam_contig_depths rejects an unsorted BAM. The assembly_coverage
+  # step writes it sorted; the entrypoint only places it.
+  - step: binning
+    step_type: singleton
+    container: long-read-assembly-binning-1.0.0.sif
+    entrypoint: /opt/qiita/binning.sh
+    inputs: [genomes_dir, masked_reads_fastq, coverage_bam]
+    outputs: [bins_dir]
+    baseline_resources:
+      cpu: 16
+      mem_gb: 100
+      walltime: PT8H
+
+  # DAS_Tool consensus refinement over the three binners' output. "No bins >0.5"
+  # → empty refined_bins_dir (exit 0); a real DAS_Tool crash fails the step.
+  - step: bin_refine
+    step_type: singleton
+    container: long-read-assembly-dastool-1.0.0.sif
+    entrypoint: /opt/qiita/bin_refine.sh
+    inputs: [genomes_dir, bins_dir]
+    outputs: [refined_bins_dir]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 32
+      walltime: PT4H
+
+  # CheckM lineage_wf + qa -o 2 over the refined MAGs → raw lineage.tsv + qa.tsv
+  # (assembly_load joins them in DuckDB). Empty input → empty checkm_dir (exit 0).
+  - step: checkm
+    step_type: singleton
+    container: long-read-assembly-checkm-1.0.0.sif
+    entrypoint: /opt/qiita/checkm.sh
+    inputs: [refined_bins_dir]
+    # CheckM's ~1.4 GB reference DB is operator-provisioned under PATH_DERIVED,
+    # deliberately NOT baked into the SIF. Bind it in and point checkm.sh at it:
+    # the entrypoint reads QIITA_CHECKM_DB (falling back to an /opt/checkm_data
+    # that does not exist in the image, so an unbound DB exits 78).
+    derived_inputs:
+      QIITA_CHECKM_DB: checkm_data
+    outputs: [checkm_dir]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 40
+      walltime: PT4H
+
+  # Hash the LCG + MAG contigs into the reference-load shape: manifest
+  # (synthetic globally-unique read_id, SHARED canonical sequence_hash),
+  # hash-keyed assembly_chunks/, and bin_map (read_id → kind, bin_id). Zero
+  # contigs (no LCG, no MAG) is StepNoData. Sequences are run-agnostic, so this
+  # step carries no processing_idx.
+  - step: assembly_hash
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.assembly_hash
+    inputs: [genomes_dir, refined_bins_dir]
+    outputs: [manifest, assembly_chunks, bin_map]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 8
+      walltime: PT1H
+
+  # Mint feature_idx for every contig hash against the SHARED qiita.feature (same
+  # primitive reference-add uses) — identical bytes collapse to one feature_idx.
+  - action: mint-features
+    inputs: [manifest]
+    outputs: [feature_map]
+
+  # Link this run's contigs to qiita.assembly_membership, tagged by (kind, bin_id)
+  # and stamped with the run's processing_idx (minted before the loop because
+  # assembly_load threads it via params). Idempotent (ON CONFLICT DO NOTHING).
+  - action: write-assembly-membership
+    inputs: [bin_map, manifest, feature_map]
+    outputs: []
+
+  # Re-key the contigs to feature_idx (REUSED reference_load writers) and read the
+  # CheckM/DAS_Tool metrics → the four DuckLake-shape staging Parquets. Threads
+  # processing_idx via params: (signals the runner to mint the run identity before
+  # the step loop). LCG-only samples write bin_quality empty (a success).
+  - step: assembly_load
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.assembly_load
+    inputs: [manifest, feature_map, assembly_chunks, bin_map, checkm_dir, refined_bins_dir]
+    params: {processing_idx: processing_idx}
+    outputs: [staging_dir]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 16
+      walltime: PT2H
+
+  # Load the staging Parquets → the `assembled_sequence`, `assembled_sequence_chunks`,
+  # `assembly_membership`, and `bin_quality` DuckLake tables (top-level
+  # <stem>.parquet → table; a subdir of parts → the table named after the dir).
+  - action: register-files
+    inputs: [staging_dir]
+    outputs: []
+
+# Per-step cap (the runner enforces resolved <= ceiling on every axis at
+# dispatch). The two ESCALATING axes — mem_gb (on OOM) and walltime (on
+# TIMEOUT) — must sit strictly ABOVE the heaviest step's baseline, or retry is
+# silently dead: the runner grows the floor by a fixed factor and clamps to the
+# ceiling, so an equal pair leaves the grown value unchanged, which reads as
+# saturation and fails the ticket permanently on attempt 0 rather than ever
+# retrying. `cpu` is deliberately left equal to assemble's baseline — nothing
+# escalates it. See the runner's escalation helpers for the mechanism.
+#
+# Sizing is measured, not guessed. `assemble` is the binding step, and its peak
+# scales with THREAD COUNT, so our 32-thread runs cost materially more than the
+# 16-thread reference the assay was validated on: that reference peaked at
+# 164.8 GiB across 26 samples, while our smallest input peaked at 182.3 GiB and
+# a mid-sized one blew past 192 GiB during minimizer counting. The reference's
+# slowest sample also ran 28h16m, which a PT16H cap cannot express. 500 GB fits
+# a qiita-partition node (RealMemory 514000 MB, no MemSpecLimit) with little to
+# spare, so an escalated retry effectively reserves a whole node.
+#
+# Both assemblers run on this step (hifiasm_meta and myloasm); the numbers above
+# are hifiasm_meta's. Note the retry budget is TICKET-wide, not per-step, so a
+# ticket that already spent retries earlier cannot count on reaching the top rung.
+action_ceiling:
+  cpu: 32
+  mem_gb: 500
+  walltime: P2D

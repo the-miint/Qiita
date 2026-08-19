@@ -16,6 +16,7 @@ import secrets
 import signal
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -29,15 +30,16 @@ os.environ.setdefault("CP_TO_CO_TOKEN", "test-cp-to-co-token")
 os.environ.setdefault("CO_TO_CP_TOKEN", "test-co-to-cp-token")
 
 import asyncpg  # noqa: E402
+import httpx  # noqa: E402
 import pytest  # noqa: E402
-from qiita_common.api_paths import LOOPBACK_HOST
-from qiita_common.duckdb_miint import setup_miint_test_env  # noqa: E402
-
 from _pg_env import (
     LIB_PATH_ENV,
     ducklake_catalog_connstr,
     find_duckdb_lib_dir,
 )
+from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_common.duckdb_miint import setup_miint_test_env  # noqa: E402
+
 from qiita_control_plane.testing.jwks import jwks_harness  # noqa: F401
 from qiita_control_plane.testing.postgres import (  # noqa: F401
     _run_db_migrations,
@@ -67,8 +69,12 @@ def _stage_miint_extension():
     """Stage miint once into the per-suite extension dir so the LOAD-only job
     paths (`open_miint_conn`) work — the integration mirror of the deploy stage.
     Plain INSTALL (not the deploy's FORCE) so the stable temp dir caches across
-    runs. Kept in step with qiita-compute-orchestrator/tests/conftest.py's
-    identical fixture."""
+    runs. Also installs the GPL-boundary tool host once, mirroring the deploy's
+    `stage_miint_extension` (bowtie2 alignment runs behind it), so the sharded-
+    alignment smoke finds it pre-installed as a native job does. Kept in step with
+    qiita-compute-orchestrator/tests/conftest.py's identical fixture."""
+    import os
+
     import duckdb
     from qiita_common.duckdb_miint import (
         miint_connect_config,
@@ -79,6 +85,17 @@ def _stage_miint_extension():
     with duckdb.connect(":memory:", config=miint_connect_config()) as conn:
         conn.execute(miint_install_sql())
         conn.execute(miint_load_sql())
+        row = conn.execute("SELECT install_gpl_boundary()").fetchone()
+
+    # miint is a CORE dependency: miint_job_env() now REQUIRES MIINT_GPL_BOUNDARY_PATH
+    # (native jobs get an ephemeral HOME, so the boundary must be pointed at
+    # explicitly). install_gpl_boundary() reports where it installed the binary;
+    # point the var there so the sharded-alignment / bowtie2 smokes and any submit
+    # path resolve the same boundary a real job would. setdefault → an explicit
+    # override still wins. Kept in step with the CO conftest's identical fixture.
+    boundary_path = row[0].get("path") if row and row[0] else None
+    if boundary_path:
+        os.environ.setdefault("MIINT_GPL_BOUNDARY_PATH", boundary_path)
 
 
 POSTGRES_URL = resolve_postgres_url()
@@ -202,13 +219,15 @@ def ducklake_connect(data_path: str):
 
 
 @pytest.fixture(scope="module")
-def hmac_secret() -> bytes:
-    """HMAC secret shared between the data plane under test and its clients."""
+def signing_key() -> bytes:
+    """Ed25519 PRIVATE seed (32 bytes) the signing clients / control plane use to
+    sign Flight tickets. The data plane under test gets the matching PUBLIC key
+    (see the `data_plane` fixture)."""
     return secrets.token_bytes(32)
 
 
 @pytest.fixture(scope="module")
-def data_plane(hmac_secret, tmp_path_factory):
+def data_plane(signing_key, tmp_path_factory):
     """Start the qiita-data-plane binary for the duration of a test module.
 
     Yields a dict with: process, secret, port, data_path, ducklake_connstr.
@@ -224,6 +243,8 @@ def data_plane(hmac_secret, tmp_path_factory):
             f"Run 'make build-data-plane-debug' (or 'make test-integration', "
             f"which builds it first)."
         )
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     _reset_ducklake_catalog()
 
@@ -248,7 +269,12 @@ def data_plane(hmac_secret, tmp_path_factory):
     env = {
         **os.environ,
         "LISTEN_ADDR": f"{LOOPBACK_HOST}:{port}",
-        "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
+        # The data plane verifies with the PUBLIC key derived from the signing seed.
+        "FLIGHT_TICKET_PUBLIC_KEY": base64.b64encode(
+            Ed25519PrivateKey.from_private_bytes(signing_key)
+            .public_key()
+            .public_bytes_raw()
+        ).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "PATH_PERSISTENT": str(persistent_base),
         "PATH_SCRATCH": str(scratch_base),
@@ -297,7 +323,7 @@ def data_plane(hmac_secret, tmp_path_factory):
 
     yield {
         "process": proc,
-        "secret": hmac_secret,
+        "secret": signing_key,
         "port": port,
         "data_path": data_path,
         "ducklake_connstr": DUCKLAKE_CATALOG_CONNSTR,
@@ -306,6 +332,104 @@ def data_plane(hmac_secret, tmp_path_factory):
     }
 
     proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.fixture
+def cp_server(tmp_path, signing_key):
+    """Spawn the control-plane app under uvicorn against the test
+    Postgres; yield its base URL.
+
+    `COMPUTE_ORCHESTRATOR_URL` points at a dead port so the
+    work-ticket POST's compute-backend guard passes (it only checks the
+    client is non-None) while the background dispatch simply fails —
+    irrelevant to what this test pins. The CP→CO token file must exist
+    on disk because `ComputeBackendClient.__init__` reads it eagerly,
+    so the fixture writes a dummy one.
+    """
+    port = _alloc_free_port()
+    token_file = tmp_path / "cp-to-co.token"
+    token_file.write_text("unused-dispatch-token")
+    # Settings.from_env() requires PATH_SCRATCH, CONTACT_EMAIL, and (since the
+    # cookie split) LOGIN_COOKIE_SECRET_KEY — the CP would fail to boot without
+    # them. PATH_SCRATCH/ticket and PATH_SCRATCH/staging are derived but don't
+    # need to exist for this smoke (the dispatch points at a dead orchestrator
+    # port, so the runner never reaches mkdir); the value just needs to be an
+    # absolute path so the boot-time validation passes.
+    env = {
+        **os.environ,
+        "DATABASE_URL": resolve_postgres_url(),
+        # CP signs Flight tickets with the Ed25519 private seed; the cookie key
+        # is a distinct required secret (from_env fails without it).
+        "FLIGHT_TICKET_SIGNING_KEY": base64.b64encode(signing_key).decode(),
+        "LOGIN_COOKIE_SECRET_KEY": base64.b64encode(b"\x02" * 32).decode(),
+        "COMPUTE_ORCHESTRATOR_URL": "http://127.0.0.1:1",
+        "CP_TO_CO_TOKEN_PATH": str(token_file),
+        "PATH_SCRATCH": str(tmp_path / "scratch"),
+        "CONTACT_EMAIL": "qiita-test@example.org",
+    }
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "qiita_control_plane.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--log-level",
+            "warning",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    base_url = f"http://127.0.0.1:{port}"
+
+    def _fail(reason: str) -> None:
+        proc.terminate()
+        out, err = proc.communicate(timeout=5)
+        pytest.fail(
+            f"{reason}\nstdout: {out.decode()[:2000]}\nstderr: {err.decode()[:2000]}"
+        )
+
+    deadline = time.monotonic() + 20.0
+    healthy = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            _fail(f"cp server exited during startup (rc={proc.returncode})")
+        try:
+            resp = httpx.get(f"{base_url}/health", timeout=1.0)
+            if resp.status_code == 200:
+                # The CP's aggregated /health probes the CO and DP
+                # too, but this fixture intentionally configures a
+                # dead CO (see COMPUTE_ORCHESTRATOR_URL above) and
+                # doesn't spawn a DP — so the aggregate top-level
+                # status will be `degraded`. Check the cp sub-
+                # service instead, since that's the only piece this
+                # test cares about being up. Fall back to top-level
+                # status for legacy /health responses that omit the
+                # services dict.
+                body = resp.json()
+                services = body.get("services") or {}
+                cp_status = services.get("cp", body.get("status"))
+                if cp_status == "ok":
+                    healthy = True
+                    break
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.25)
+    if not healthy:
+        _fail("cp server did not become healthy within 20s")
+
+    yield base_url
+
+    proc.terminate()
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:

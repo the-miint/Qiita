@@ -88,13 +88,20 @@ git -C ~/qiita-miint fetch origin
 sed -n '/^## Pending deploy/,/^## Deployed history/p' ~/qiita-miint/DEPLOY_CHECKLIST.md
 ```
 
-That section is your deploy, in five ordered buckets: **1. Env vars**,
+That section is your deploy, in six ordered buckets: **1. Env vars**,
 **2. One-time host setup**, **3. Migrations**, **4. Deploy**,
-**5. Verify**, plus **Notes** (no host action). The bucket order *is*
-the dependency order — buckets 1–3 must complete before the bucket-4
-restart. Steps 2–6 below are those buckets with the surrounding
-mechanics; if the checklist and this runbook ever disagree on order,
-the runbook's order wins (it encodes the invariants).
+**5. Verify**, **6. After the deploy verifies green**, plus **Notes**
+(no host action). The bucket order *is* the dependency order — buckets
+1–3 must complete before the bucket-4 restart, and bucket 6 must not run
+until bucket 5 is green. Steps 2–6 below are those buckets with the
+surrounding mechanics; if the checklist and this runbook ever disagree on
+order, the runbook's order wins (it encodes the invariants).
+
+Bucket 6 is for the irreversible cleanup a deploy earns only by
+succeeding — today, retiring the now-unread `HMAC_SECRET_KEY`. Anything
+that destroys your ability to roll back belongs here, never in bucket 1:
+until verification passes, the *old* build's secrets are the rollback
+path, and the new build ignores what it doesn't read.
 
 ## 2. Pull source onto the host
 
@@ -117,8 +124,8 @@ checklist — copy/paste from there.
 
 Then confirm the config/secret files are mutually consistent **before** the
 restart — this catches the silent runtime failures (`PATH_SCRATCH` drift across
-the three env files, `HMAC_SECRET_KEY` mismatch between CP and DP, a missing or
-mis-permed token file) up front rather than at first request:
+the three env files, a Flight signing keypair mismatch between CP and DP, a
+missing or mis-permed token file) up front rather than at first request:
 
 ```bash
 # [admin] read-only; prints non-secret fingerprints, never the values
@@ -325,8 +332,9 @@ deployed commit from step 7.
 A maintainer then, in a local checkout, runs `/deploy-archive <sha>`
 (passing the operator-reported commit — not the maintainer's local
 `HEAD`, which may have moved on). It moves the just-deployed `## Pending
-deploy` block into `## Deployed history` stamped with the date + that
-commit, resets Pending to empty, and the maintainer commits + pushes.
-No Claude? Do the same move by hand following the shape in
-`DEPLOY_CHECKLIST.md`. Either way, also record the deployed commit somewhere
+deploy` block out of `DEPLOY_CHECKLIST.md` into its own file under
+[`docs/deploy-archive/`](../deploy-archive/), empties Pending for the next
+cycle, and the maintainer commits + pushes.
+No Claude? Do the same move by hand, copying the shape of the newest file in
+`docs/deploy-archive/`. Either way, also record the deployed commit somewhere
 durable (deploy log, ops channel).

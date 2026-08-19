@@ -60,7 +60,14 @@ GG2_GENOME_MAP = DATA_DIR / "2024.09.backbone.feature-to-genome.parquet"
 # is either real data corruption upstream or a regression in our
 # pipeline; either way it should fail loudly.
 _EXPECTED_FEATURES = 331269
-_EXPECTED_TAXONOMY = 331240
+# reference_taxonomy is 1-1 with features: every feature gets exactly one
+# row. On the 2024.09 backbone the supplied taxonomy classifies 331240
+# features and 29 have no taxonomy row; those 29 are now recorded as
+# all-NULL-rank ("unclassified") rows rather than dropped, so the count is
+# 331240 + 29 = 331269 == _EXPECTED_FEATURES (was 331240 under the old
+# INNER-JOIN drop-on-mismatch behavior). The backbone taxonomy carries no
+# stray feature_ids (all 331240 match a read_id), so no stray warning fires.
+_EXPECTED_TAXONOMY = 331269
 _EXPECTED_PHYLOGENY = 662537
 
 # feature-to-genome.parquet has 72,765 non-null-genome_id rows but the
@@ -89,16 +96,21 @@ def gg2_genome_map(tmp_path):
     schema `(read_id, genome_source, genome_source_id)` that
     `mint_features` JOINs against the manifest's read_id.
 
-    GG2 doesn't carry a genome_source column (every entry is implicitly
-    sourced from GG2 itself), so we hardcode it here. Other corpora that
-    write a self-describing genome_source column won't need this fixture.
+    GG2 doesn't carry a genome_source column, so we hardcode one. GG2's
+    genomes are NCBI-derived (GTDB-style `G`-prefixed accessions with no
+    per-row source signal), and the value only has to be a member of the
+    `GenomeSource` vocabulary (`genbank`/`refseq`/`qiita`) so the map
+    passes `_validate_genome_map` — `genbank` is the defensible single
+    value (non-`qiita`, so no `prep_sample_idx` is required). Other
+    corpora that write a self-describing genome_source column won't need
+    this fixture.
     """
     out = tmp_path / "gg2_genome_map.parquet"
     with duckdb.connect(":memory:") as conn:
         conn.execute(
             "COPY ("
             "  SELECT feature_id AS read_id,"
-            "         'gg2' AS genome_source,"
+            "         'genbank' AS genome_source,"
             "         genome_id AS genome_source_id"
             "  FROM read_parquet(?) WHERE genome_id IS NOT NULL"
             f") TO '{out}' (FORMAT PARQUET)",
@@ -171,7 +183,7 @@ async def gg2_reference(postgres_pool, human_admin_session):
 
 
 @pytest.fixture
-async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_plane):
+async def cli_cp_client(postgres_pool, signing_key, human_admin_session, data_plane):
     """Same shape as the e2e test's cli_cp_client — wires cp_app.state so
     POST /work-ticket can fire schedule_dispatch against a real backend."""
     from qiita_common.api_paths import LOOPBACK_HOST
@@ -181,7 +193,7 @@ async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_pl
     cp_app.state.pool = postgres_pool
     cp_app.state.settings = CPSettings(
         database_url="unused-in-test",
-        hmac_secret_key=hmac_secret,
+        flight_signing_key=signing_key,
         data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
         path_scratch_staging=Path(data_plane["upload_staging_root"]),
         path_scratch_ticket=Path(data_plane["workspace_root"]),
@@ -208,7 +220,7 @@ async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_pl
 async def test_gg2_backbone_full_pipeline(
     postgres_pool,
     data_plane,
-    hmac_secret,
+    signing_key,
     flight_client,
     synced_reference_add_action,
     gg2_reference,
@@ -273,7 +285,7 @@ async def test_gg2_backbone_full_pipeline(
         "SELECT count(*) FROM qiita.feature_genome fg"
         " JOIN qiita.genome g USING (genome_idx)"
         " JOIN qiita.reference_membership m ON m.feature_idx = fg.feature_idx"
-        " WHERE m.reference_idx = $1 AND g.source = 'gg2'",
+        " WHERE m.reference_idx = $1 AND g.source = 'genbank'",
         gg2_reference,
     )
     assert actual_genome_count == _EXPECTED_GENOME_ASSOCIATIONS
@@ -283,7 +295,7 @@ async def test_gg2_backbone_full_pipeline(
         ticket_bytes = sign_ticket(
             table=table,
             filter={"reference_idx": [gg2_reference]},
-            secret=hmac_secret,
+            secret=signing_key,
         )
         return flight_client.do_get(flight.Ticket(ticket_bytes)).read_all()
 
@@ -294,8 +306,10 @@ async def test_gg2_backbone_full_pipeline(
         set(seq_table.column_names)
     )
 
-    # reference_taxonomy — locked count for the 2024.09 snapshot.
-    tax_table = _doget("reference_taxonomy")
+    # reference_taxonomy — locked count for the 2024.09 snapshot. Read through the
+    # exclusion-aware view (raw reference_taxonomy is not Flight-readable); no
+    # exclusions are seeded for this snapshot, so the count is unchanged.
+    tax_table = _doget("reference_taxonomy_visible")
     assert tax_table.num_rows == _EXPECTED_TAXONOMY
     assert "domain" in tax_table.column_names
 

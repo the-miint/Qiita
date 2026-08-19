@@ -34,6 +34,9 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            Scope.ALIGNMENT_DOGET,
         }
     ),
     SystemRole.WET_LAB_ADMIN: frozenset(
@@ -48,6 +51,9 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            Scope.ALIGNMENT_DOGET,
             # Upload slots — needed to drive reference data ingest via the
             # qiita-admin CLI, whose reference-add audience includes
             # wet_lab_admin.
@@ -64,6 +70,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # wet_lab_admin (who can create/load references via REFERENCE_WRITE
             # but not destroy them). Service accounts never get it.
             Scope.REFERENCE_DELETE,
+            # Curate the reference exclusion blocklist — system_admin-only, same
+            # rationale as REFERENCE_DELETE (masking a bad genome/feature is a
+            # curatorial act above wet_lab_admin's create/load capability).
+            Scope.REFERENCE_EXCLUSION_WRITE,
             Scope.BIOSAMPLE_READ,
             Scope.BIOSAMPLE_WRITE,
             Scope.PREP_SAMPLE_READ,
@@ -77,18 +87,45 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # deleting a mask drops its mask_definition row and DuckLake
             # read_mask data. Service accounts never get it.
             Scope.MASK_DEFINITION_DELETE,
+            # Deprecating a mask / withdrawing its runs is system_admin-only for
+            # the same reason: it decides that published results were produced by
+            # a filter we no longer stand behind. Non-destructive, but not a
+            # judgement a service account or wet_lab_admin makes.
+            Scope.MASK_DEFINITION_LIFECYCLE,
+            # Full alignment purge is system_admin-only, same as
+            # MASK_DEFINITION_DELETE: deleting an alignment drops its
+            # alignment_definition row (cascading the alignment_sample gate) and
+            # its DuckLake alignment data. The disallow-without-delete escape
+            # hatch. Service accounts never get it.
+            Scope.ALIGNMENT_DEFINITION_DELETE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
+            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            Scope.ALIGNMENT_DOGET,
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,
-            # Owner-id re-identification export is system_admin-only — the
-            # owner-submitted names are PII-pinned and masked elsewhere.
+            # Owner-id re-identification export is system_admin-only —
+            # owner-submitted names can carry incautiously-entered PII. The
+            # field is pinned to member tier, but nothing enforces that pin
+            # yet, and wet_lab_admin and system_admin reach owner-ids
+            # regardless of tier.
             Scope.ADMIN_BIOSAMPLE_OWNER_ID_READ,
             # Per-pool masked-read export is system_admin-only — the first human
             # masked-read pull, admin-gated until there's a model for picking the
             # right mask. Service accounts use READ_MASKED_DOGET, not this.
             Scope.ADMIN_MASKED_READ_EXPORT,
+            # Operator-cancel of in-flight compute (flip terminal + scancel) is
+            # system_admin-only — it stops running work and reaps SLURM jobs on the
+            # operator's behalf, same privilege tier as the destructive deletes.
+            # It ALSO gates the fan-out throttle surface (read cohorts, retune a
+            # cohort's in-flight cap, pump one) rather than that getting a scope of
+            # its own: both are incident-time operator control over in-flight compute
+            # at the same privilege tier. The cost of the reuse is that it cannot be
+            # split later — granting "cancel a stuck ticket" necessarily grants
+            # "retune the global throttle and pump any cohort".
+            Scope.WORK_TICKET_CANCEL,
             Scope.TICKET_DOPUT,
         }
     ),
@@ -111,6 +148,10 @@ SERVICE_ACCOUNT_SCOPE_CEILING: frozenset[Scope] = frozenset(
         # only — the masked-read consumer path is service-driven; no human role
         # carries it (privacy-sensitive read surface, see Scope.READ_MASKED_DOGET).
         Scope.READ_MASKED_DOGET,
+        # Sign block-read DoGet tickets so a block-scoped compute job can stream
+        # its reads. Workers only, and the most privacy-sensitive of the three
+        # doget scopes — `read_block` streams RAW reads (see Scope.READ_DOGET).
+        Scope.READ_DOGET,
     }
 )
 

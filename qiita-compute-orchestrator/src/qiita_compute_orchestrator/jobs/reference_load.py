@@ -1,9 +1,9 @@
 """Native job: re-key hash_sequences' outputs to feature_idx, write the
-six DuckLake-shape staging Parquets the data plane registers.
+DuckLake-shape staging Parquets the data plane registers.
 
 Reads the upstream Parquets (manifest from hash_sequences, feature_map
 from mint-features) and emits the files `register-files` then hands to
-the data plane's DoAction. The six staging outputs are:
+the data plane's DoAction. The staging outputs are:
 
   - `reference_sequences.parquet`        (feature_idx, sequence_hash, sequence_length_bp)
   - `reference_sequence_chunks/part_*.parquet` (feature_idx, chunk_index, chunk_data)
@@ -11,6 +11,7 @@ the data plane's DoAction. The six staging outputs are:
   - `reference_taxonomy.parquet`         (if taxonomy_path is set)
   - `reference_phylogeny.parquet`        (if tree_path is set)
   - `reference_placements.parquet`       (if jplace_path is set)
+  - `reference_annotation.parquet`       (if annotation_manifest is set)
 
 `reference_sequence_chunks` is a DIRECTORY of `part_*.parquet` files
 rather than a single file — the chunks output is bin-pack-batched by
@@ -38,25 +39,44 @@ write only when the corresponding `*_path` flows through `bound` from
 the work_ticket's `action_context`. The runner injects them under
 `taxonomy_path` / `tree_path` / `jplace_path` after upload-handle
 resolution; absent uploads → absent paths → absent outputs.
+
+`annotation_manifest` / `annotation_map` are the odd pair: they are not
+uploads but STEP OUTPUTS (hash_sequences + mint-annotation-features), so
+they arrive already bound, and every reference-add workflow binds BOTH
+unconditionally — a reference with no GFF3 simply carries zero annotation
+rows through them. They are typed optional here only so a caller
+constructing `Inputs` directly (a test, a future workflow) can omit them;
+supplying one without the other is a mis-wired workflow whose only symptom
+would be a silently EMPTY `reference_annotation` table, so `execute` refuses
+it up front.
 """
 
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
 from qiita_common.parquet import validate_parquet_path
+from qiita_common.taxonomy import RANK_COLUMNS, RANK_PREFIXES, quote_rank
 
 from ..miint import (
     PARQUET_OPTS,
-    PARQUET_OPTS_CHUNKED,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ._blob_input import resolve_blob_input
+from ._feature_load import (
+    build_feature_id_map,
+    write_feature_sequence_chunks,
+    write_feature_sequences,
+)
+
+_LOG = logging.getLogger(__name__)
 
 YAML_STEP_NAME = "load"
 
@@ -69,15 +89,6 @@ YAML_STEP_NAME = "load"
 # co-consumer), so it gets the allocation minus headroom.
 _DUCKDB_MEMORY_GB = 31
 _DUCKDB_THREADS = 8
-
-# Per-batch chunk budget for `_write_reference_sequence_chunks`. Same
-# rationale as hash_sequences: each batch's in-memory sort is bounded
-# by `_CHUNK_BUDGET_PER_BATCH × chunk_size` (~3.2 GB at 64 KB chunks).
-# Bin-packing by chunk-count (not feature-count) is load-bearing on
-# GG2 backbone where feature sizes span 3+ orders of magnitude;
-# feature-count batching would concentrate the genome tail into the
-# first batch and OOM even the 31 GB cap.
-_CHUNK_BUDGET_PER_BATCH = 50_000
 
 
 class Inputs(BaseModel):
@@ -104,6 +115,8 @@ class Inputs(BaseModel):
     taxonomy_path: Path | None = None
     tree_path: Path | None = None
     jplace_path: Path | None = None
+    annotation_manifest: Path | None = None
+    annotation_map: Path | None = None
     reference_idx: int
     work_ticket_idx: int
 
@@ -120,9 +133,23 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         ("taxonomy", inputs.taxonomy_path),
         ("tree", inputs.tree_path),
         ("jplace", inputs.jplace_path),
+        ("annotation_manifest", inputs.annotation_manifest),
+        ("annotation_map", inputs.annotation_map),
     ]:
         if opt is not None and not opt.exists():
             raise FileNotFoundError(f"{label} not found: {opt}")
+
+    # hash_sequences produces the manifest and mint-annotation-features the
+    # feature-map; every workflow binds both. One without the other means the
+    # workflow is mis-wired, and the failure it would otherwise produce is a
+    # silently EMPTY reference_annotation table — so refuse up front rather than
+    # emit a well-formed, wrong result.
+    if (inputs.annotation_manifest is None) != (inputs.annotation_map is None):
+        raise ValueError(
+            "annotation_manifest and annotation_map must be supplied together; got "
+            f"annotation_manifest={inputs.annotation_manifest!r}, "
+            f"annotation_map={inputs.annotation_map!r}"
+        )
 
     workspace.mkdir(parents=True, exist_ok=True)
     sequences_path = workspace / "reference_sequences.parquet"
@@ -134,12 +161,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     taxonomy_out_path = workspace / "reference_taxonomy.parquet"
     phylogeny_out_path = workspace / "reference_phylogeny.parquet"
     placements_out_path = workspace / "reference_placements.parquet"
+    annotation_out_path = workspace / "reference_annotation.parquet"
 
     sequences_out = validate_parquet_path(sequences_path)
     membership_out = validate_parquet_path(membership_path)
     taxonomy_out = validate_parquet_path(taxonomy_out_path)
     phylogeny_out = validate_parquet_path(phylogeny_out_path)
     placements_out = validate_parquet_path(placements_out_path)
+    annotation_out = validate_parquet_path(annotation_out_path)
 
     # miint is needed for `read_newick` and `read_jplace` when the
     # optional tree / jplace inputs are present. LOAD unconditionally even
@@ -158,7 +187,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             # Pull feature_map into a TEMP TABLE once — every downstream
             # write JOINs against it (sequences, chunks, membership) and
-            # _build_id_map needs it too. Without this each helper would
+            # build_feature_id_map needs it too. Without this each helper would
             # re-scan the file.
             conn.execute(
                 "CREATE TEMP TABLE feature_map AS SELECT * FROM read_parquet(?)",
@@ -169,12 +198,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # taxonomy / phylogeny / placements writes all key off
             # read_id, so this single JOIN is the bridge to feature_idx.
             # Counts also drive the unmapped-hash check below.
-            _build_id_map(conn, inputs.manifest)
+            build_feature_id_map(conn, inputs.manifest)
 
-            _write_reference_sequences(conn, sequences_out)
+            write_feature_sequences(conn, sequences_out)
             written.append(sequences_path)
 
-            _write_reference_sequence_chunks(
+            write_feature_sequence_chunks(
                 conn,
                 inputs.reference_sequence_chunks,
                 chunks_dir,
@@ -189,28 +218,44 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 written.append(taxonomy_out_path)
 
             if inputs.tree_path is not None:
-                # The CLI's DoPut writes Newick / jplace as a chunked
-                # `(chunk_index, chunk_data BLOB)` Parquet so the data
-                # plane stays schema-agnostic and large blobs stream
-                # under bounded memory. miint's `read_newick` /
-                # `read_jplace` parse on-disk text/JSON files, so we
-                # stitch chunks back into a temp file here.
-                newick_path = _unwrap_chunks_to_temp_file(
+                # On the REMOTE path the CLI DoPuts Newick / jplace as a chunked
+                # `(chunk_index, chunk_data BLOB)` Parquet, so the data plane
+                # stays schema-agnostic and large blobs stream under bounded
+                # memory; miint's `read_newick` / `read_jplace` parse on-disk
+                # text/JSON, so the chunks are stitched back into a temp file.
+                # On the LOCAL path no bytes cross the wire and this is already
+                # the raw file. `resolve_blob_input` sniffs which one it got —
+                # unconditionally unwrapping would `read_parquet()` a raw `.nwk`
+                # and raise, which is what a local reference-add carrying a tree
+                # used to do.
+                newick_path = resolve_blob_input(
                     conn,
-                    parquet_path=inputs.tree_path,
+                    path=inputs.tree_path,
                     out_path=duckdb_tmp / "tree.nwk",
                 )
                 _write_phylogeny(conn, newick_path, inputs.reference_idx, phylogeny_out)
                 written.append(phylogeny_out_path)
 
             if inputs.jplace_path is not None:
-                jplace_path = _unwrap_chunks_to_temp_file(
+                jplace_path = resolve_blob_input(
                     conn,
-                    parquet_path=inputs.jplace_path,
+                    path=inputs.jplace_path,
                     out_path=duckdb_tmp / "placement.jplace",
                 )
                 _write_placements(conn, jplace_path, inputs.reference_idx, placements_out)
                 written.append(placements_out_path)
+
+            if inputs.annotation_manifest is not None and inputs.annotation_map is not None:
+                # Returns False (and writes nothing) for a reference with no
+                # annotations — the common case; see _write_annotation.
+                if _write_annotation(
+                    conn,
+                    annotation_manifest=inputs.annotation_manifest,
+                    annotation_map=inputs.annotation_map,
+                    reference_idx=inputs.reference_idx,
+                    out=annotation_out,
+                ):
+                    written.append(annotation_out_path)
 
             conn.execute("DROP TABLE id_map")
             conn.execute("DROP TABLE feature_map")
@@ -223,6 +268,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 taxonomy_out_path,
                 phylogeny_out_path,
                 placements_out_path,
+                annotation_out_path,
             ):
                 partial.unlink(missing_ok=True)
             shutil.rmtree(chunks_dir, ignore_errors=True)
@@ -233,7 +279,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # top-level subdirs of `part_*.parquet` (multi-file tables).
     #
     # `reference_sequence_chunks` re-exposes the feature-keyed chunks dir
-    # (written by `_write_reference_sequence_chunks` above) as its own binding.
+    # (written by `write_feature_sequence_chunks` above) as its own binding.
     # The hash_sequences step's same-named binding is sequence_hash-keyed
     # (pre-minting); this is the feature_idx-keyed re-key, which is what rype
     # needs. host-reference-add's build_rype_index step consumes it — and must
@@ -242,249 +288,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # `staging_dir` as an output, so this extra key is inert there (the runner
     # binds only a step's declared outputs).
     return {"staging_dir": workspace, "reference_sequence_chunks": chunks_dir}
-
-
-def _unwrap_chunks_to_temp_file(
-    conn: duckdb.DuckDBPyConnection,
-    *,
-    parquet_path: Path,
-    out_path: Path,
-) -> Path:
-    """Stitch a chunked-BLOB upload Parquet back into a temp file.
-
-    Upload shape: `(chunk_index INTEGER, chunk_data BLOB)`. Writes
-    `chunk_data` to `out_path` in `chunk_index` order, fetching rows in
-    batches so we never materialise the whole BLOB in memory — important
-    for jplace inputs that can run into the GB range."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cursor = conn.execute(
-        "SELECT chunk_data FROM read_parquet(?) ORDER BY chunk_index",
-        [str(parquet_path)],
-    )
-    with out_path.open("wb") as f:
-        while True:
-            rows = cursor.fetchmany(1024)
-            if not rows:
-                break
-            for (chunk_data,) in rows:
-                if chunk_data is None:
-                    raise ValueError(f"{parquet_path} contains a NULL chunk_data")
-                f.write(bytes(chunk_data))
-    if out_path.stat().st_size == 0:
-        raise ValueError(f"{parquet_path} produced an empty file — upload was malformed")
-    return out_path
-
-
-def _build_id_map(
-    conn: duckdb.DuckDBPyConnection,
-    manifest_path: Path,
-) -> None:
-    """Join manifest + feature_map (TEMP TABLE pre-loaded by execute) on
-    sequence_hash. Raises ValueError if any manifest row lacks a matching
-    feature_map row — mint-features is supposed to mint a feature_idx for
-    every distinct hash, so a gap means upstream produced inconsistent
-    inputs (permanent error)."""
-    manifest_count = conn.execute(
-        "SELECT count(*) FROM read_parquet(?)",
-        [str(manifest_path)],
-    ).fetchone()[0]
-
-    conn.execute(
-        "CREATE TEMP TABLE id_map AS "
-        "SELECT m.read_id, fm.feature_idx,"
-        "  m.sequence_hash,"
-        "  m.sequence_length_bp "
-        "FROM read_parquet(?) m "
-        "JOIN feature_map fm "
-        "  ON m.sequence_hash = fm.sequence_hash",
-        [str(manifest_path)],
-    )
-
-    id_map_count = conn.execute("SELECT count(*) FROM id_map").fetchone()[0]
-    if id_map_count != manifest_count:
-        n_unmapped = manifest_count - id_map_count
-        unmapped = conn.execute(
-            "SELECT m.sequence_hash FROM read_parquet(?) m "
-            "ANTI JOIN id_map x ON m.sequence_hash = x.sequence_hash "
-            "LIMIT 10",
-            [str(manifest_path)],
-        ).fetchall()
-        hashes = [str(r[0]) for r in unmapped]
-        raise ValueError(f"{n_unmapped} unmapped sequence hash(es) in feature_map: {hashes}")
-
-
-def _write_reference_sequences(
-    conn: duckdb.DuckDBPyConnection,
-    out: str,
-) -> None:
-    """Emit DuckLake's `reference_sequences` shape — one row per unique
-    feature_idx with `(feature_idx, sequence_hash, sequence_length_bp)`.
-    Pulls everything from id_map (which already carries the per-read
-    triple from the manifest × feature_map JOIN); reads sharing a
-    canonical hash all carry the same length, so DISTINCT ON
-    feature_idx collapses them deterministically."""
-    conn.execute(
-        "COPY ("
-        "  SELECT DISTINCT ON (feature_idx)"
-        "    feature_idx, sequence_hash, sequence_length_bp"
-        "  FROM id_map"
-        "  ORDER BY feature_idx"
-        f") TO '{out}' ({PARQUET_OPTS})"
-    )
-
-
-def _write_reference_sequence_chunks(
-    conn: duckdb.DuckDBPyConnection,
-    reference_sequence_chunks_path: Path,
-    out_dir: Path,
-) -> None:
-    """Re-key hash_sequences' chunks (hash-keyed) to DuckLake's
-    `reference_sequence_chunks` schema (feature_idx-keyed), as a
-    DIRECTORY of `part_*.parquet` files.
-
-    `reference_sequence_chunks_path` (input) is a DIRECTORY of
-    `part_*.parquet` files written by hash_sequences. Read via glob.
-
-    `out_dir` (output) likewise becomes a directory of part files.
-    The runner's register-files convention picks up this directory as
-    a multi-file DuckLake table (table name = `reference_sequence_chunks`).
-
-    **Why batched, not a single sort+write.** The original single-file
-    pipeline (parallel readers feeding one writer with a global
-    `ORDER BY feature_idx, chunk_index`) OOMs at GG2 scale: ~30+ GB of
-    chunk_data piles up in the reader→writer back-pressure queue
-    because zstd-decode is 5-10× faster than zstd-encode. `threads=1`
-    workarounds bring memory below the queue limit but the sort itself
-    needs ~22 GiB peak on GG2 backbone, exceeding what a 30 GiB host
-    can offer with Postgres + Python + OS overhead. See
-    miint-localdocs/sequence-chunking-assessment.md for the benchmark.
-
-    **Batched shape.** Bin-pack features by chunk count into batches
-    of ≤ `_CHUNK_BUDGET_PER_BATCH` chunks (~3.2 GB raw per batch),
-    write each batch as its own `part_NNNNN.parquet` with an internal
-    `ORDER BY (feature_idx, chunk_index)`. Batches walk feature_idx
-    in ascending order, so the parts collectively form one globally-
-    sorted dataset readable via `read_parquet(dir/part_*.parquet)`.
-    Per-batch peak memory is bounded by the in-memory sort over one
-    batch (~3.2 GB), well under `_DUCKDB_MEMORY_GB`.
-
-    **Memory safety.** The per-batch COPY joins a `feature_map` subset
-    pre-filtered to the batch's hashes (the `fmb` CTE), not the full
-    `feature_map`, so the join is bounded by one batch by construction —
-    the optimizer cannot reorder a full-table join ahead of the batch
-    filter and materialize the whole glob's chunk_data (the OOM that the
-    hash_sequences output side hit; see that job for the same fix).
-
-    **Cost tradeoff.** Each batch re-scans the full input glob, filtered
-    by `WHERE rc.sequence_hash = ANY(?)` (applied during the Parquet scan
-    via late materialisation). Scan dominates per-batch wall time, so the
-    number of batches matters more than per-batch size — the bin-pack
-    keeps it to one batch per ~`_CHUNK_BUDGET_PER_BATCH` chunks."""
-    parts_glob = str(reference_sequence_chunks_path / "part_*.parquet")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Metadata scan: (feature_idx, sequence_hash, n_chunks) ordered by
-    # feature_idx. Only sequence_hash is read from the input Parquet —
-    # columnar storage makes the count(*) cheap (~1-2 sec) even though
-    # the input is ~30 GB total. JOIN with the small feature_map TEMP
-    # TABLE attaches feature_idx; defensive against any hash without a
-    # mint (every input hash should have one via _build_id_map's gap
-    # check, but this keeps the count semantically correct).
-    rows = conn.execute(
-        "SELECT fm.feature_idx, rc.sequence_hash, count(*) AS n_chunks "
-        "FROM read_parquet(?) rc "
-        "JOIN feature_map fm ON rc.sequence_hash = fm.sequence_hash "
-        "GROUP BY rc.sequence_hash, fm.feature_idx "
-        "ORDER BY fm.feature_idx",
-        [parts_glob],
-    ).fetchall()
-
-    # Each batch is a list of sequence_hash strings to filter on.
-    # Bin-pack in feature_idx order so output parts collectively form
-    # a feature_idx-sorted dataset (each part is internally sorted by
-    # feature_idx; batches walk feature_idx ascending).
-    batches: list[list[str]] = []
-    current_batch: list[str] = []
-    current_chunks = 0
-    for _feature_idx, sequence_hash, n_chunks in rows:
-        if current_batch and current_chunks + n_chunks > _CHUNK_BUDGET_PER_BATCH:
-            batches.append(current_batch)
-            current_batch = []
-            current_chunks = 0
-        current_batch.append(str(sequence_hash))
-        current_chunks += n_chunks
-    if current_batch:
-        batches.append(current_batch)
-
-    if batches:
-        for i, batch_hashes in enumerate(batches):
-            part_path = out_dir / f"part_{i:05d}.parquet"
-            part_out = validate_parquet_path(part_path)
-            # Two phases per part so the full-glob scan and the feature_idx
-            # sort never co-peak in memory. A single COPY doing
-            # scan + join + ORDER BY(chunk_data) + write at once OOMed at
-            # genome scale: the sort is a pipeline breaker, so it buffers the
-            # batch's wide ~64 KB rows while the 30 GB scan and the 8-thread
-            # write buffers are all still live. Splitting the scan from the
-            # sort means at most one of them is resident at a time.
-            #
-            # Phase 1 — STREAM this batch's chunks into a temp table, re-keyed
-            # hash → feature_idx, with NO sort. The `fmb` CTE bounds the build
-            # side to one batch of hashes (so it's the hash-join build and
-            # chunk_data streams through the probe, never into the build); the
-            # `WHERE ... = ANY(...)` on the input column keeps the filter on the
-            # Parquet scan so late materialisation skips chunk_data for
-            # non-matching rows. The insert is bounded by the batch and spills
-            # to temp_directory under pressure.
-            conn.execute(
-                "CREATE OR REPLACE TEMP TABLE part_chunks AS "
-                "  WITH fmb AS ("
-                "    SELECT feature_idx, sequence_hash"
-                "    FROM feature_map"
-                "    WHERE sequence_hash = ANY(CAST(? AS UUID[]))"
-                "  )"
-                "  SELECT fmb.feature_idx, rc.chunk_index, rc.chunk_data"
-                "  FROM read_parquet(?) rc"
-                "  JOIN fmb ON rc.sequence_hash = fmb.sequence_hash"
-                "  WHERE rc.sequence_hash = ANY(CAST(? AS UUID[]))",
-                [batch_hashes, parts_glob, batch_hashes],
-            )
-            # Phase 2 — sort THIS part in isolation and write it. The sort sees
-            # only the materialised batch (≤ _CHUNK_BUDGET_PER_BATCH chunks),
-            # never the 30 GB glob, so it fits the cap (spilling if needed). The
-            # per-part `ORDER BY feature_idx` clusters row groups so a
-            # `WHERE feature_idx IN (...)` DoGet prunes row groups WITHIN a part;
-            # feature_idx-ascending batches keep the parts a globally
-            # disjoint-range dataset for catalog-level FILE pruning. Keeping both
-            # levels is the point of sorting here — input order is
-            # parallel-scrambled upstream (preserve_insertion_order=false), so
-            # without this sort a point query would scan a whole part. The
-            # secondary `chunk_index` orders a feature's chunks for cheap
-            # reassembly.
-            conn.execute(
-                "COPY ("
-                "  SELECT feature_idx, chunk_index, chunk_data"
-                "  FROM part_chunks"
-                "  ORDER BY feature_idx, chunk_index"
-                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})"
-            )
-        conn.execute("DROP TABLE IF EXISTS part_chunks")
-    else:
-        # No minted features → emit one empty part so the directory is
-        # non-empty and the runner's `dir.glob('*.parquet')` discovers
-        # the multi-file table. register-files would otherwise error
-        # on a zero-file directory.
-        empty_part = out_dir / "part_00000.parquet"
-        empty_out = validate_parquet_path(empty_part)
-        conn.execute(
-            "COPY ("
-            "  SELECT"
-            "    CAST(NULL AS BIGINT) AS feature_idx,"
-            "    CAST(NULL AS INTEGER) AS chunk_index,"
-            "    CAST(NULL AS VARCHAR) AS chunk_data"
-            "  WHERE FALSE"
-            f") TO '{empty_out}' ({PARQUET_OPTS_CHUNKED})"
-        )
 
 
 def _write_reference_membership(
@@ -506,6 +309,142 @@ def _write_reference_membership(
     )
 
 
+def _write_annotation(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    annotation_manifest: Path,
+    annotation_map: Path,
+    reference_idx: int,
+    out: str,
+) -> bool:
+    """Emit DuckLake's `reference_annotation` shape — one row per annotated interval.
+
+    Every identifier on the row is MINTED by the control plane and arrives via
+    `annotation_map` (the output of `mint-annotation-features`); this job resolves none
+    of them itself:
+
+      * `annotation_idx`     — the OCCURRENCE's identity, and the join back to the
+                               Postgres claim and to the annotation's semantic terms.
+      * `feature_idx`        — the interval itself (the SynDNA insert, the gene).
+      * `parent_feature_idx` — the sequence the interval sits on and that reads actually
+                               align to (the plasmid, the chromosome).
+
+    The map is joined on the annotation's NATURAL key — parent + window + type + strand —
+    reached from the manifest through `id_map` (GFF `seqid` → FASTA `read_id` →
+    feature_idx), the same bridge `_write_taxonomy` and `_write_phylogeny` use. Not on the
+    GFF3 `ID`: the spec lets a discontinuous feature repeat one ID across N lines, so it
+    is carried as provenance and joined on by nothing.
+
+    Coordinates pass through VERBATIM. They were converted from GFF3's closed
+    `[start, end]` to half-open `[position, stop_position)` exactly once, at ingest, in
+    `hash_sequences._write_annotation_manifest`. Re-deriving or "correcting" them here
+    would be a second conversion.
+
+    Unlike taxonomy's coverage checks (which warn), an unresolved row here is fatal: it
+    would emit a lake row whose `annotation_idx` or `feature_idx` is NULL, and a feature
+    table keyed on a NULL feature is not a degraded result, it is a wrong one.
+    """
+    # The zero-annotation case is the COMMON one — almost no reference carries a
+    # GFF3, but every reference-add reaches here (the manifest is bound
+    # unconditionally so the step's output binding always resolves). Emitting the
+    # file anyway would have `register-files` move a zero-row Parquet into permanent
+    # lake storage and add a DuckLake snapshot for it, on every single reference-add,
+    # forever. So write NOTHING and tell the caller: the table already exists
+    # (ensure_reference_tables creates it at data-plane boot), so a reference with no
+    # annotations is correctly represented by having no rows, not by an empty file.
+    if (
+        conn.execute("SELECT count(*) FROM read_parquet(?)", [str(annotation_manifest)]).fetchone()[
+            0
+        ]
+        == 0
+    ):
+        return False
+
+    conn.execute(
+        "CREATE TEMP TABLE annotation_map AS SELECT * FROM read_parquet(?)",
+        [str(annotation_map)],
+    )
+    conn.execute(
+        "CREATE TEMP TABLE annotation_manifest AS SELECT * FROM read_parquet(?)",
+        [str(annotation_manifest)],
+    )
+
+    # The natural-key join, single-sourced so the check below and the COPY cannot drift
+    # apart — an unresolved row must be REJECTED here, not silently dropped by the COPY's
+    # inner join.
+    natural_key_join = (
+        "JOIN id_map im ON im.read_id = am.parent_read_id "
+        "{kind} JOIN annotation_map map "
+        "  ON map.parent_feature_idx = im.feature_idx "
+        " AND map.position = am.position "
+        " AND map.stop_position = am.stop_position "
+        " AND map.annotation_type = am.annotation_type "
+        " AND map.strand = am.strand "
+    )
+
+    unresolved = conn.execute(
+        "SELECT am.parent_read_id, am.annotation_type, am.position, am.stop_position "
+        "FROM annotation_manifest am "
+        "LEFT " + natural_key_join.format(kind="LEFT") + "WHERE map.annotation_idx IS NULL "
+        "ORDER BY am.parent_read_id, am.position LIMIT 5"
+    ).fetchall()
+    if unresolved:
+        raise ValueError(
+            "annotation rows with no minted annotation_idx (the annotation map is "
+            "incomplete — mint-annotation-features and this load disagree about the "
+            "natural key): "
+            + ", ".join(f"{t} on {p!r} [{pos}, {stop})" for p, t, pos, stop in unresolved)
+        )
+
+    conn.execute(
+        "COPY ("
+        "  SELECT map.annotation_idx, "
+        f"         CAST({reference_idx} AS BIGINT) AS reference_idx, "
+        "         map.feature_idx, "
+        "         map.parent_feature_idx, "
+        "         am.annotation_id, "
+        "         am.source, "
+        "         am.annotation_type, "
+        "         am.position, "
+        "         am.stop_position, "
+        "         am.strand, "
+        "         am.score, "
+        "         am.phase, "
+        "         am.attributes "
+        "  FROM annotation_manifest am "
+        + natural_key_join.format(kind="")
+        + "  ORDER BY map.parent_feature_idx, am.position, am.stop_position"
+        f") TO '{out}' ({PARQUET_OPTS})"
+    )
+    conn.execute("DROP TABLE annotation_manifest")
+    conn.execute("DROP TABLE annotation_map")
+    return True
+
+
+def _warn_taxonomy_anomaly(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    count_sql: str,
+    sample_sql: str,
+    params: list,
+    describe: str,
+) -> None:
+    """Emit a loud WARNING (never a raise) with a LIMIT-5 sample when a
+    taxonomy-coverage anomaly is present.
+
+    Coverage gaps and namespace mismatches are expected on real corpora —
+    GG2's 2024.09 backbone has ~29 features with no taxonomy row, and a
+    supplied taxonomy keyed in a different ID namespace than the FASTA is
+    the exact class that already bit the genome map — so they must NOT
+    fail the ingest. They must be visible, though: an unconfigured WARNING
+    reaches stderr via Python's last-resort handler and lands in the SLURM
+    job log, the loudest channel this architecture offers today."""
+    n = conn.execute(count_sql, params).fetchone()[0]
+    if n:
+        sample = [r[0] for r in conn.execute(sample_sql, params).fetchall()]
+        _LOG.warning("%d %s (sample: %s)", n, describe, sample)
+
+
 def _write_taxonomy(
     conn: duckdb.DuckDBPyConnection,
     taxonomy_path: Path,
@@ -514,8 +453,15 @@ def _write_taxonomy(
 ) -> None:
     """Parse semicolon-delimited rank string from the input Parquet's
     `(feature_id, taxonomy)` rows, JOIN against id_map on read_id, and
-    emit one DuckLake row per matched feature. Validation: ≤8 ranks, no
-    blank fields, prefix order."""
+    emit exactly one DuckLake row per reference feature — including
+    features with no supplied taxonomy, which are recorded at rest as
+    all-NULL-rank ("unclassified") rows. So `reference_taxonomy` is 1-1
+    with the reference's features.
+
+    Format checks on *supplied* content stay hard ValueErrors (≤8 ranks,
+    no blank fields, prefix order). Coverage anomalies (missing / stray /
+    duplicate) are warned loudly, not raised: real data isn't strictly
+    1-1 and a hard check would reject GG2."""
     conn.execute(
         "CREATE TEMP TABLE parsed_taxonomy AS "
         "SELECT "
@@ -540,38 +486,96 @@ def _write_taxonomy(
         ids = [r[0] for r in bad]
         raise ValueError(f"Taxonomy contains blank fields for feature_idx: {ids}")
 
+    # Built from RANK_PREFIXES rather than spelled out, because the published
+    # taxonomy sidecar RESTORES these prefixes by position from that same tuple —
+    # so a drift between the two would silently relabel ranks in a file people
+    # join. See qiita_common.taxonomy.
+    prefix_order = " OR ".join(
+        f"(nranks >= {i} AND NOT starts_with(ranks[{i}], '{prefix}'))"
+        for i, prefix in enumerate(RANK_PREFIXES, start=1)
+    )
     bad = conn.execute(
-        "SELECT feature_idx FROM parsed_taxonomy WHERE "
-        "(nranks >= 1 AND NOT starts_with(ranks[1], 'd__')) OR "
-        "(nranks >= 2 AND NOT starts_with(ranks[2], 'p__')) OR "
-        "(nranks >= 3 AND NOT starts_with(ranks[3], 'c__')) OR "
-        "(nranks >= 4 AND NOT starts_with(ranks[4], 'o__')) OR "
-        "(nranks >= 5 AND NOT starts_with(ranks[5], 'f__')) OR "
-        "(nranks >= 6 AND NOT starts_with(ranks[6], 'g__')) OR "
-        "(nranks >= 7 AND NOT starts_with(ranks[7], 's__')) OR "
-        "(nranks >= 8 AND NOT starts_with(ranks[8], 't__')) "
-        "LIMIT 5"
+        f"SELECT feature_idx FROM parsed_taxonomy WHERE {prefix_order} LIMIT 5"
     ).fetchall()
     if bad:
         ids = [r[0] for r in bad]
         raise ValueError(f"Taxonomy has wrong rank prefix order for feature_idx: {ids}")
 
+    # Warn (don't raise) on coverage anomalies. Distinct-feature counts so
+    # a canonical-hash collision (two read_ids → one feature) isn't
+    # double-counted.
+    _warn_taxonomy_anomaly(
+        conn,
+        count_sql=(
+            "SELECT count(*) FROM (SELECT DISTINCT feature_idx FROM id_map) x "
+            "ANTI JOIN parsed_taxonomy p ON x.feature_idx = p.feature_idx"
+        ),
+        sample_sql=(
+            "SELECT DISTINCT x.read_id FROM id_map x "
+            "ANTI JOIN parsed_taxonomy p ON x.feature_idx = p.feature_idx LIMIT 5"
+        ),
+        params=[],
+        describe="feature(s) have no supplied taxonomy; recording as unclassified (NULL ranks)",
+    )
+    _warn_taxonomy_anomaly(
+        conn,
+        count_sql=(
+            "SELECT count(*) FROM read_parquet(?) t ANTI JOIN id_map m ON t.feature_id = m.read_id"
+        ),
+        sample_sql=(
+            "SELECT t.feature_id FROM read_parquet(?) t "
+            "ANTI JOIN id_map m ON t.feature_id = m.read_id LIMIT 5"
+        ),
+        params=[str(taxonomy_path)],
+        describe=(
+            "supplied taxonomy row(s) reference a feature_id that is not a sequence read_id "
+            "(stray / unmatched — ID-namespace mismatch); dropping them"
+        ),
+    )
+    _warn_taxonomy_anomaly(
+        conn,
+        count_sql=(
+            "SELECT count(*) FROM "
+            "(SELECT feature_id FROM read_parquet(?) GROUP BY feature_id HAVING count(*) > 1)"
+        ),
+        sample_sql=(
+            "SELECT feature_id FROM read_parquet(?) GROUP BY feature_id HAVING count(*) > 1 LIMIT 5"
+        ),
+        params=[str(taxonomy_path)],
+        describe=(
+            "feature_id(s) have duplicate supplied taxonomy rows; collapsing to one per feature"
+        ),
+    )
+
+    # LEFT JOIN off the distinct reference feature set (same features
+    # reference_sequences / reference_membership emit) so every feature
+    # gets exactly one row; features with no supplied taxonomy get NULL
+    # ranks (the existing NULLIF(substr(ranks[i], 4), '') yields NULL for
+    # a NULL `ranks`). Dedupe supplied taxonomy to one row per feature_idx
+    # first so a duplicate read_id can't multiply the LEFT JOIN.
     conn.execute(
         "COPY ("
         "  SELECT "
         f"    CAST({reference_idx} AS BIGINT) AS reference_idx,"
-        "    feature_idx,"
-        "    NULLIF(substr(ranks[1], 4), '') AS domain,"
-        "    NULLIF(substr(ranks[2], 4), '') AS phylum,"
-        "    NULLIF(substr(ranks[3], 4), '') AS class,"
-        "    NULLIF(substr(ranks[4], 4), '') AS \"order\","
-        "    NULLIF(substr(ranks[5], 4), '') AS family,"
-        "    NULLIF(substr(ranks[6], 4), '') AS genus,"
-        "    NULLIF(substr(ranks[7], 4), '') AS species,"
-        "    NULLIF(substr(ranks[8], 4), '') AS strain,"
-        "    NULL::BIGINT AS ncbi_taxon_id"
-        "  FROM parsed_taxonomy"
-        "  ORDER BY feature_idx"
+        "    m.feature_idx,"
+        # Strips the prefix the check above REQUIRED, per rank, so the column a rank
+        # lands in and the prefix it was required to carry cannot come apart. The cut
+        # length comes from the prefix itself rather than a literal 3: every prefix is
+        # three characters today, so a four-character one would otherwise leave a
+        # stray character in a published sidecar and nothing here would notice.
+        + "".join(
+            f"    NULLIF(substr(p.ranks[{i}], {len(prefix) + 1}), '') AS {quote_rank(column)},"
+            for i, (column, prefix) in enumerate(
+                zip(RANK_COLUMNS, RANK_PREFIXES, strict=True), start=1
+            )
+        )
+        + "    NULL::BIGINT AS ncbi_taxon_id"
+        "  FROM (SELECT DISTINCT feature_idx FROM id_map) m"
+        "  LEFT JOIN ("
+        "    SELECT feature_idx, any_value(ranks) AS ranks"
+        "    FROM parsed_taxonomy GROUP BY feature_idx"
+        "  ) p ON m.feature_idx = p.feature_idx"
+        "  ORDER BY m.feature_idx"
         f") TO '{out}' ({PARQUET_OPTS})"
     )
     conn.execute("DROP TABLE parsed_taxonomy")

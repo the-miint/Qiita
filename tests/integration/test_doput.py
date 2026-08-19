@@ -34,14 +34,14 @@ from qiita_control_plane.main import app as cp_app
 
 
 @pytest.fixture
-async def cp_client(postgres_pool, hmac_secret, human_admin_session):
+async def cp_client(postgres_pool, signing_key, human_admin_session):
     """ASGITransport-driven AsyncClient onto the CP with the integration
-    pool + hmac_secret wired up. Uses the human_admin_session PAT (which
+    pool + signing_key wired up. Uses the human_admin_session PAT (which
     carries TICKET_DOPUT per the session fixture)."""
     cp_app.state.pool = postgres_pool
     cp_app.state.settings = CPSettings(
         database_url="unused-in-test",
-        hmac_secret_key=hmac_secret,
+        flight_signing_key=signing_key,
         data_plane_url="grpc://unused:0",
     )
     async with AsyncClient(

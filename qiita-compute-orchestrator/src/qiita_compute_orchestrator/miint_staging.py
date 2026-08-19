@@ -33,7 +33,7 @@ import urllib.request
 from pathlib import Path
 
 import duckdb
-from qiita_common.duckdb_miint import miint_repo
+from qiita_common.duckdb_miint import MIINT_EXTENSION_DIRECTORY_VAR, miint_repo
 
 log = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ def staging_fingerprint() -> dict[str, str]:
 def marker_path() -> Path | None:
     """Path to the staging marker, or ``None`` when ``MIINT_EXTENSION_DIRECTORY``
     is unset (dev/test stage into the DuckDB default dir — no gate, always stage)."""
-    ext_dir = os.environ.get("MIINT_EXTENSION_DIRECTORY")
+    ext_dir = os.environ.get(MIINT_EXTENSION_DIRECTORY_VAR)
     return Path(ext_dir) / MARKER_NAME if ext_dir else None
 
 

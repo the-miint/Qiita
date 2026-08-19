@@ -22,6 +22,8 @@ from pathlib import Path
 
 import duckdb
 import httpx
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from qiita_common.api_paths import (
     URL_REFERENCE_BY_IDX,
@@ -352,6 +354,215 @@ async def test_do_reference_load_host_requires_taxonomy(fasta_file, tmp_path, cp
             )
 
     # Fail-fast: nothing hit the wire.
+    assert calls == []
+
+
+async def test_do_reference_load_shard_index_writes_context_and_keeps_reference_add(
+    fasta_file, taxonomy_file, tmp_path, cp_transport, upload_state
+):
+    """`--shard-index` keeps the plain `reference-add` action (sharding is a
+    context flag, not a new action) and writes shard_index + the two per-shard
+    build gates into action_context; the reference is a plain (non-host)
+    reference. Per-shard rype no longer exists — routing is the auto-built
+    whole-reference router — so build_rype / rype_w are NOT written."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    flight_client = FakeFlightClient()
+    flight_client.queue_response(100)  # FASTA
+    flight_client.queue_response(101)  # taxonomy
+    flight_client.queue_response(102)  # genome_map
+    genome_map = tmp_path / "gmap.parquet"
+    pq.write_table(pa.table({"feature_idx": pa.array([1], type=pa.int64())}), genome_map)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        result = await do_reference_load(
+            http=http,
+            token="t",
+            flight_client=flight_client,
+            fasta_path=fasta_file,
+            taxonomy_path=taxonomy_file,
+            genome_map_path=genome_map,
+            name="shard-ref",
+            version="1.0",
+            shard_index=True,
+            watch=False,
+        )
+
+    assert result["reference_idx"] == 999
+    create_call = next(c for c in calls if c[1] == URL_REFERENCE_PREFIX and c[0] == "POST")
+    assert create_call[2]["is_host"] is False  # sharding does not make it a host
+    submit_call = next(c for c in calls if c[1] == URL_WORK_TICKET_PREFIX and c[0] == "POST")
+    assert submit_call[2]["action_id"] == "reference-add"
+    # A sharded reference's per-shard .mmi is always built with the fixed map-hifi
+    # preset (not submitter-tunable on load), so the context carries it unconditionally.
+    assert submit_call[2]["action_context"] == {
+        "fasta_upload_idx": 100,
+        "taxonomy_upload_idx": 101,
+        "genome_map_upload_idx": 102,
+        "shard_index": True,
+        "build_minimap2": True,
+        "build_bowtie2": True,
+        "minimap2_preset": "map-hifi",
+    }
+
+
+async def test_do_reference_load_shard_index_requires_taxonomy(fasta_file, tmp_path, cp_transport):
+    """`--shard-index` without `--taxonomy` is rejected before any network call —
+    sharding sorts by lineage, so taxonomy is the sort key."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="taxonomy"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                name="shard-ref",
+                version="1.0",
+                shard_index=True,
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_shard_index_requires_genome_map(
+    fasta_file, taxonomy_file, tmp_path, cp_transport
+):
+    """`--shard-index` without `--genome-map` is rejected before any network call —
+    plan-shards derives the per-shard feature set from qiita.feature_genome, which
+    mint-features populates only when a genome map is supplied."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="genome-map"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                taxonomy_path=taxonomy_file,
+                name="shard-ref",
+                version="1.0",
+                shard_index=True,
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_shard_index_and_host_mutually_exclusive(
+    fasta_file, taxonomy_file, tmp_path, cp_transport
+):
+    """`--host --shard-index` is rejected — host-filter vs per-shard analysis
+    indexes are distinct actions."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                taxonomy_path=taxonomy_file,
+                name="shard-ref",
+                version="1.0",
+                host=True,
+                shard_index=True,
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_shard_index_all_off_rejected(
+    fasta_file, taxonomy_file, tmp_path, cp_transport
+):
+    """`--shard-index` with both per-shard builders disabled is rejected
+    (fail-fast) — a sharded reference must carry at least one per-shard index
+    (the whole-reference router is always built regardless)."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="at least one per-shard index"):
+            genome_map = tmp_path / "gmap.parquet"
+            genome_map.write_text("x")
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                taxonomy_path=taxonomy_file,
+                genome_map_path=genome_map,
+                name="shard-ref",
+                version="1.0",
+                shard_index=True,
+                build_minimap2=False,
+                build_bowtie2=False,
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_shard_index_rejects_rype_knobs(
+    fasta_file, taxonomy_file, tmp_path, cp_transport
+):
+    """`--no-rype-index` / `--rype-w` do NOT apply to `--shard-index` — a sharded
+    reference builds no per-shard rype (its routing is the auto-built
+    whole-reference router). Rejected before any network call."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match=r"--no-rype-index / --rype-w apply only with --host"):
+            genome_map = tmp_path / "gmap.parquet"
+            genome_map.write_text("x")
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                taxonomy_path=taxonomy_file,
+                genome_map_path=genome_map,
+                name="shard-ref",
+                version="1.0",
+                shard_index=True,
+                build_rype=False,
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_shard_index_rejects_minimap2_preset(
+    fasta_file, taxonomy_file, tmp_path, cp_transport
+):
+    """`--minimap2-preset` does NOT apply to `--shard-index` — a sharded reference's
+    per-shard `.mmi` is always built with the fixed map-hifi preset. Rejected before
+    any network call."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match=r"--minimap2-preset applies only with --host"):
+            genome_map = tmp_path / "gmap.parquet"
+            genome_map.write_text("x")
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                taxonomy_path=taxonomy_file,
+                genome_map_path=genome_map,
+                name="shard-ref",
+                version="1.0",
+                shard_index=True,
+                minimap2_preset="map-ont",
+                watch=False,
+            )
     assert calls == []
 
 
@@ -1271,3 +1482,61 @@ def test_handler_returns_nonzero_on_bad_args(monkeypatch, tmp_path, capsys):
     assert rc == 1
     captured = capsys.readouterr()
     assert "exactly one of" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("final_state", "expected_rc"),
+    [
+        ("completed", 0),
+        ("failed", 1),
+        # no_data is TERMINAL and builds no reference. The watch loop now returns
+        # on it (it used to poll to the 24 h ceiling), so the exit code must call
+        # it a failure — a positive list of bad states would exit 0 here and a CI
+        # step would treat "produced nothing" as a successful build.
+        ("no_data", 1),
+        # --no-watch: we returned before the ticket reached an outcome, so there
+        # is no state to judge. Not a failure — the caller polls it themselves.
+        (None, 0),
+    ],
+)
+def test_reference_load_exit_code_is_zero_only_for_completed(
+    monkeypatch, tmp_path, final_state, expected_rc
+):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import reference_load as _ref
+    from qiita_control_plane.cli import user as _user
+
+    monkeypatch.setattr(_common, "read_token", lambda: "test-pat")
+
+    async def fake_do_reference_load(**kwargs):
+        result = {"reference_idx": 1, "work_ticket_idx": 2, "upload_idxs": {}}
+        if final_state is not None:
+            result["work_ticket"] = {"work_ticket_idx": 2, "state": final_state}
+        return result
+
+    monkeypatch.setattr(_ref, "do_reference_load", fake_do_reference_load)
+    fasta = tmp_path / "x.fasta"
+    fasta.write_text(">a\nACGT\n")
+    tax = tmp_path / "t.parquet"
+    tax.write_text("x")
+
+    rc = _user.main(
+        [
+            "--base-url",
+            "http://localhost:8080",
+            "reference",
+            "load",
+            "--name",
+            "r",
+            "--version",
+            "1.0",
+            "--fasta",
+            str(fasta),
+            "--taxonomy",
+            str(tax),
+            "--data-plane-url",
+            "grpc://localhost:0",
+            "--no-watch",
+        ]
+    )
+    assert rc == expected_rc

@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from qiita_common.duckdb_miint import MIINT_REQUIRED_JOB_VARS
+
 from .slurm import DEFAULT_SLURMRESTD_API_VERSION
 
 # Default install location for the shared CP↔CO bearer token in
@@ -73,18 +75,12 @@ CORRECT_COMPUTE_READINESS_INVOCATION = (
 BACKEND_LOCAL = "local"
 BACKEND_SLURM = "slurm"
 
-# SLURM polling defaults. The interval is the gap between
-# `GET /slurm/.../job/{id}` calls when waiting for a non-terminal
-# job; 10s is a reasonable trade-off between latency and slurmrestd
-# load. The total timeout caps a single step's wall time at 48h — it
-# must stay >= the largest step walltime any workflow declares (the
-# reference-add steps now run up to PT24H under a PT48H action_ceiling)
-# so SLURM's own --time kill fires before the CP poll loop gives up. A
-# step that exceeds this is either misconfigured (declare it longer in
-# YAML *and* raise this) or stuck (kill from outside). Override per-host
-# via SLURM_JOB_TIMEOUT_SECONDS.
-DEFAULT_SLURM_POLL_INTERVAL_SECONDS = 10
-DEFAULT_SLURM_JOB_TIMEOUT_SECONDS = 48 * 60 * 60
+# Default data-plane gRPC origin for outbound Flight DoGet from native jobs
+# (reference-chunk streaming). Mirrors the control plane's own DATA_PLANE_URL
+# default. Overridden in production via DATA_PLANE_URL so the compute node
+# DoGets against the nginx-fronted gRPC origin. Not fail-fast (has a default),
+# unlike the SLURM-only required vars.
+DEFAULT_DATA_PLANE_URL = "grpc://localhost:50051"
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,8 +95,6 @@ class SlurmSettings:
     partition: str  # SLURM partition (e.g. "qiita")
     account: str  # SLURM account for usage reporting
     api_version: str  # default v0.0.40
-    poll_interval_seconds: int
-    job_timeout_seconds: int
     # Python executable the native-step SBATCH script invokes via
     # `srun <native_python> -m qiita_compute_orchestrator.jobs ...`.
     # Default "python" assumes compute nodes already have a Python on
@@ -155,6 +149,12 @@ class Settings:
     # name; `compute` on the live deploy), presented as Bearer auth on
     # outbound CO→CP calls. Same file-or-env resolution pattern as cp_to_co_token.
     co_to_cp_token: str
+    # Data-plane gRPC origin native jobs DoGet reference chunks from. Propagated
+    # into the SLURM job env like PATH_DERIVED so the launcher's get_settings()
+    # resolves the real origin on the compute node (see SlurmBackend). Has a
+    # default (DEFAULT_DATA_PLANE_URL) so it is NOT fail-fast — a deploy that
+    # forgets it falls back to localhost rather than keeping the unit down.
+    data_plane_url: str = DEFAULT_DATA_PLANE_URL
     # SLURM config — non-None only when backend_type=slurm.
     slurm: SlurmSettings | None = None
     # Shared-FS dir where built SIFs land, derived as PATH_DERIVED/images.
@@ -205,6 +205,7 @@ class Settings:
             cp_to_co_token=_resolve_token("cp_to_co") if require_cp_to_co_token else "",
             cp_url=_resolve_cp_url(),
             co_to_cp_token=_resolve_token("co_to_cp"),
+            data_plane_url=os.environ.get("DATA_PLANE_URL", DEFAULT_DATA_PLANE_URL),
             slurm=slurm,
             path_derived_images=path_derived_images,
         )
@@ -221,6 +222,16 @@ def _resolve_slurm_settings() -> SlurmSettings:
             raise RuntimeError(f"orchestrator: COMPUTE_BACKEND=slurm requires {name} to be set")
         return v
 
+    # miint is a CORE, non-optional dependency (see CLAUDE.md "miint is a core
+    # dependency"): a SLURM deploy MUST have every miint job var configured, or
+    # native jobs die at `LOAD miint` / the first GPL-boundary call. Fail the boot
+    # (keep the unit DOWN) rather than submit doomed jobs. Driven off the SAME
+    # MIINT_REQUIRED_JOB_VARS that miint_job_env() enforces at submit (the runtime
+    # backstop) so the boot check can't drift from it; the values themselves are
+    # read from os.environ by miint_job_env(), here we only assert presence.
+    for _miint_var in MIINT_REQUIRED_JOB_VARS:
+        _required(_miint_var)
+
     return SlurmSettings(
         base_url=_required("SLURMRESTD_URL"),
         jwt_path=Path(_required("SLURMRESTD_JWT_PATH")),
@@ -228,12 +239,6 @@ def _resolve_slurm_settings() -> SlurmSettings:
         partition=_required("SLURM_PARTITION"),
         account=_required("SLURM_ACCOUNT"),
         api_version=os.environ.get("SLURMRESTD_API_VERSION", DEFAULT_SLURMRESTD_API_VERSION),
-        poll_interval_seconds=int(
-            os.environ.get("SLURM_POLL_INTERVAL_SECONDS", str(DEFAULT_SLURM_POLL_INTERVAL_SECONDS))
-        ),
-        job_timeout_seconds=int(
-            os.environ.get("SLURM_JOB_TIMEOUT_SECONDS", str(DEFAULT_SLURM_JOB_TIMEOUT_SECONDS))
-        ),
         native_python=os.environ.get("SLURM_NATIVE_PYTHON", "python"),
         qos=os.environ.get("SLURM_QOS", ""),
     )

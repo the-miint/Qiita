@@ -42,28 +42,48 @@ from qiita_common.models import (
 
 
 @dataclass(frozen=True, slots=True)
-class StepHandle:
-    """What `submit_step` hands back, threaded into `status_step` /
-    `result_step`. Because the orchestrator holds no state between those
-    calls, the handle must carry everything they need — the SLURM job id
-    and the workspace paths — so a later poll / result can proceed from
-    the handle alone. The control plane persists these fields and, after a
-    restart, reconstructs an equivalent handle from them to re-attach
-    (it does not reuse this object).
+class LocalStepHandle:
+    """Handle for a step a synchronous backend ran to completion in-process at
+    submit time (LocalBackend runs the module in-process). It carries the
+    outputs captured then, so the runner skips polling and reads them directly.
+    `compute_target` is fixed to LOCAL."""
 
-    A synchronous backend (LocalBackend runs the module in-process at
-    submit time) sets `terminal_outputs`; the caller then skips polling
-    and uses the outputs directly. `slurm_job_id` / `job_name` /
-    `output_path` / `logs_path` are populated only for the SLURM path.
-    """
-
-    compute_target: ComputeTarget
     step_name: str
-    slurm_job_id: int | None = None
+    terminal_outputs: dict[str, Path]
+    compute_target: ComputeTarget = ComputeTarget.LOCAL
+
+
+@dataclass(frozen=True, slots=True)
+class SlurmStepHandle:
+    """Handle for a step submitted to SLURM. The orchestrator holds no state
+    between submit / status / result, so the handle carries everything the
+    later calls need: the job id and the workspace paths — a later poll /
+    result proceeds from the handle alone. The control plane persists these
+    fields and, after a restart, reconstructs an equivalent handle from them to
+    re-attach (it does not reuse this object).
+
+    `slurm_job_id` / `output_path` / `logs_path` are required — a SLURM handle
+    without them is malformed, which the previous single all-nullable StepHandle
+    could only catch with a runtime None-guard. `job_name` stays optional: it
+    rides along for the wire / persistence but status / result never dereference
+    it, so a reconstructed handle may lack it. `compute_target` is fixed to
+    SLURM."""
+
+    step_name: str
+    slurm_job_id: int
+    output_path: Path
+    logs_path: Path
     job_name: str | None = None
-    output_path: Path | None = None
-    logs_path: Path | None = None
-    terminal_outputs: dict[str, Path] | None = None
+    compute_target: ComputeTarget = ComputeTarget.SLURM
+
+
+# The two shapes a backend hands back, discriminated by `compute_target`. The
+# wire form (`StepHandleWire`, in qiita_common) stays a single flat model with
+# every field nullable — this split is purely the orchestrator's in-memory
+# representation, so CP persistence and the CP<->CO contract are unchanged.
+# `StepHandle` is a union, so annotate/`isinstance` with it but construct the
+# specific subtype.
+StepHandle = LocalStepHandle | SlurmStepHandle
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +117,11 @@ class FoundJob:
 
 
 _CONTAINER_SUPPORTED_SCOPES: frozenset[str] = frozenset(
-    {ScopeTargetKind.REFERENCE.value, ScopeTargetKind.SEQUENCED_POOL.value}
+    {
+        ScopeTargetKind.REFERENCE.value,
+        ScopeTargetKind.SEQUENCED_POOL.value,
+        ScopeTargetKind.PREP_SAMPLE.value,
+    }
 )
 
 
@@ -105,17 +129,24 @@ def assert_container_scope_supported(*, step_name: str, scope_target: dict[str, 
     """Reject a container step whose work_ticket's scope_target isn't one
     the backends know how to dispatch.
 
-    Container steps today are referenced by two scope_target.kinds:
-
-      * REFERENCE — every reference-add container step (hash, load).
-      * SEQUENCED_POOL — the bcl-convert workflow's container step.
-
-    Submitting a container step against any other kind is a
+    Submitting a container step against an unlisted kind is a
     workflow-authoring error, not a data error — surface it as
-    CONTRACT_VIOLATION so the runner doesn't quietly fall through to a
-    downstream path that would extract the wrong scalar. Shared between
-    LocalBackend and SlurmBackend so the two implementations cannot
-    drift in either the predicate or the error wording.
+    CONTRACT_VIOLATION rather than dispatching a step no backend is known
+    to handle.
+
+    This is an allowlist, so a workflow that introduces a container step
+    under a NEW scope kind is rejected at submit until the kind is added
+    here — the failure is loud and names the kind, but it is a failure, and
+    it surfaces only on the compute path against a live ticket. That is how
+    long-read-assembly shipped unrunnable: every one of its container steps
+    is prep_sample-scoped, which this list did not admit.
+    `test_workflow_container_scope_pin` now pins each workflow's container
+    steps against this set at `make test` so the next such gap fails in CI
+    instead of at someone's first submit.
+
+    The dispatch path itself treats `scope_target` opaquely (it rides into
+    params.json verbatim; nothing here reads a kind-specific scalar), so
+    admitting a kind costs nothing beyond this list.
 
     Raises BackendFailure(CONTRACT_VIOLATION) on an unsupported kind.
     Returns None otherwise; callers consume the kind-appropriate
@@ -163,6 +194,7 @@ class ComputeBackend(ABC):
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
+        derived_inputs: dict[str, str] | None = None,
     ) -> StepHandle:
         """Submit the step and return immediately with a `StepHandle` —
         do NOT block until completion. For SLURM this `sbatch`es the job
@@ -209,3 +241,16 @@ class ComputeBackend(ABC):
         instead of re-submitting a duplicate. Raises a classified
         `BackendFailure` on a backend read error (e.g. SLURMRESTD_UNREACHABLE,
         which the runner's recovery treats as transient)."""
+
+    @abstractmethod
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        """Cancel (scancel) EVERY live SLURM job of a work_ticket — all attempts,
+        matched by the deterministic name prefix `qiita-wt{idx}-`. Returns the job
+        ids actually cancelled (empty when none are live: already finished/purged,
+        or an in-process backend that never submits to SLURM).
+
+        Idempotent: cancelling an already-gone job is a no-op. The control plane
+        calls this AFTER flipping the ticket terminal (so no new attempt spawns
+        between the find and the scancel — the terminal-first ordering the cancel
+        command relies on). Raises a classified `BackendFailure` on a backend
+        error the caller can retry."""

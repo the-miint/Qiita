@@ -21,9 +21,11 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories._sample_helpers import (
+    DuplicateGlobalFieldTargetError,
     LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
     MetadataUnknownFieldsError,
+    StudyFieldConflictError,
     insert_entity_to_study,
 )
 from qiita_control_plane.repositories.biosample import (
@@ -45,6 +47,9 @@ from qiita_control_plane.testing.db_seeds import (
     retire_biosample,
     retire_biosample_to_study_link,
     seed_biosample_global_field,
+    seed_globally_linked_study_field,
+    seed_local_study_field,
+    track_biosample_metadata_outputs,
 )
 from qiita_control_plane.testing.unique_names import (
     unique_accession,
@@ -141,6 +146,12 @@ async def test_insert_biosample_full_columns(ctx):
 # ---------------------------------------------------------------------------
 
 
+# host_taxon_id is now a required field the composer enforces. A missing-value
+# marker counts as supplied and needs no seeded NCBI term, so it is the cheapest
+# way to satisfy the gate; tests that mean to exercise the gate omit it explicitly.
+_REQUIRED_METADATA = {"host taxon id": "not applicable"}
+
+
 async def _track_composer_outputs(ctx, bs_idx, study_idx, field_name):
     """Look up the rows the composer created on top of bs_idx and track them.
 
@@ -171,6 +182,23 @@ async def _track_composer_outputs(ctx, bs_idx, study_idx, field_name):
     if meta_idx is not None:
         ctx["created"]["biosample_metadata"].append(meta_idx)
 
+    # The composer also auto-creates the globally-linked host_taxon_id study field
+    # and its metadata row (the enforced required field). Track both, or the
+    # untracked metadata row blocks the biosample delete in FK-reverse cleanup.
+    host_meta = await ctx["pool"].fetch(
+        "SELECT bm.idx AS meta_idx, bm.biosample_study_field_idx AS field_idx"
+        "  FROM qiita.biosample_metadata bm"
+        "  JOIN qiita.biosample_global_field bgf"
+        "    ON bgf.idx = bm.global_field_idx AND bgf.internal_name = 'host_taxon_id'"
+        " WHERE bm.biosample_idx = $1",
+        bs_idx,
+    )
+    for r in host_meta:
+        if r["meta_idx"] not in ctx["created"]["biosample_metadata"]:
+            ctx["created"]["biosample_metadata"].append(r["meta_idx"])
+        if r["field_idx"] not in ctx["created"]["biosample_study_field"]:
+            ctx["created"]["biosample_study_field"].append(r["field_idx"])
+
 
 async def test_import_biosample_from_owner_biosample_id_creates_full_chain(ctx):
     field_name = unique_field_name()
@@ -188,7 +216,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_full_chain(ctx):
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-XYZ-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={},
+                metadata=dict(_REQUIRED_METADATA),
             )
     bs_idx = result.biosample_idx
     await _track_composer_outputs(ctx, bs_idx, ctx["study_idx"], field_name)
@@ -281,7 +309,7 @@ async def test_import_biosample_from_owner_biosample_id_with_explicit_checklist(
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-CL-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={},
+                metadata=dict(_REQUIRED_METADATA),
                 metadata_checklist_idx=ctx["checklist_idx"],
                 biosample_accession=bs_acc,
             )
@@ -314,7 +342,7 @@ async def test_import_biosample_from_owner_biosample_id_reuses_local_field_for_s
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="A",
                 caller_idx=ctx["principal_idx"],
-                metadata={},
+                metadata=dict(_REQUIRED_METADATA),
             )
             result2 = await import_biosample_from_owner_biosample_id(
                 conn,
@@ -323,7 +351,7 @@ async def test_import_biosample_from_owner_biosample_id_reuses_local_field_for_s
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="B",
                 caller_idx=ctx["principal_idx"],
-                metadata={},
+                metadata=dict(_REQUIRED_METADATA),
             )
     bs1 = result1.biosample_idx
     bs2 = result2.biosample_idx
@@ -376,7 +404,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_distinct_fields_
                 owner_biosample_id_field_name=name_a,
                 owner_biosample_id_value="A",
                 caller_idx=ctx["principal_idx"],
-                metadata={},
+                metadata=dict(_REQUIRED_METADATA),
             )
             result2 = await import_biosample_from_owner_biosample_id(
                 conn,
@@ -385,7 +413,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_distinct_fields_
                 owner_biosample_id_field_name=name_b,
                 owner_biosample_id_value="B",
                 caller_idx=ctx["principal_idx"],
-                metadata={},
+                metadata=dict(_REQUIRED_METADATA),
             )
     bs1 = result1.biosample_idx
     bs2 = result2.biosample_idx
@@ -424,7 +452,7 @@ async def test_import_biosample_from_owner_biosample_id_rolls_back_on_failed_ste
                     owner_biosample_id_field_name=unique_field_name(),
                     owner_biosample_id_value="DOOMED",
                     caller_idx=ctx["principal_idx"],
-                    metadata={},
+                    metadata=dict(_REQUIRED_METADATA),
                     biosample_accession=bs_acc,
                 )
 
@@ -456,7 +484,7 @@ async def test_import_biosample_from_owner_biosample_id_uses_independent_field_p
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="STUDY1-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={},
+                metadata=dict(_REQUIRED_METADATA),
             )
             result2 = await import_biosample_from_owner_biosample_id(
                 conn,
@@ -465,7 +493,7 @@ async def test_import_biosample_from_owner_biosample_id_uses_independent_field_p
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="STUDY2-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={},
+                metadata=dict(_REQUIRED_METADATA),
             )
     bs1 = result1.biosample_idx
     bs2 = result2.biosample_idx
@@ -504,38 +532,8 @@ async def test_import_biosample_from_owner_biosample_id_rejects_non_transactiona
                 owner_biosample_id_field_name=unique_field_name(),
                 owner_biosample_id_value="GUARD-CHECK",
                 caller_idx=ctx["principal_idx"],
-                metadata={},
+                metadata=dict(_REQUIRED_METADATA),
             )
-
-
-async def _track_global_metadata_outputs(ctx, bs_idx, study_idx, global_idxs):
-    """Track globally-linked study fields (by global field idx) and every
-    non-owner-id metadata row written for this biosample. Use after
-    `_track_composer_outputs` in tests that exercised the metadata dict
-    path so the FK-reverse cleanup picks the new rows up.
-    """
-    # Pick up every globally-linked study field row at this study tied to
-    # one of the supplied global fields.
-    rows = await ctx["pool"].fetch(
-        "SELECT idx FROM qiita.biosample_study_field"
-        " WHERE study_idx = $1 AND biosample_global_field_idx = ANY($2::bigint[])",
-        study_idx,
-        list(global_idxs),
-    )
-    for r in rows:
-        if r["idx"] not in ctx["created"]["biosample_study_field"]:
-            ctx["created"]["biosample_study_field"].append(r["idx"])
-
-    # Pick up every non-owner-id metadata row for this biosample. The
-    # owner-id row is already tracked by _track_composer_outputs.
-    meta_rows = await ctx["pool"].fetch(
-        "SELECT idx FROM qiita.biosample_metadata"
-        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
-        bs_idx,
-    )
-    for r in meta_rows:
-        if r["idx"] not in ctx["created"]["biosample_metadata"]:
-            ctx["created"]["biosample_metadata"].append(r["idx"])
 
 
 async def test_import_biosample_from_owner_biosample_id_writes_global_metadata(ctx):
@@ -560,6 +558,7 @@ async def test_import_biosample_from_owner_biosample_id_writes_global_metadata(c
 
     field_name = unique_field_name()
     metadata_payload = {
+        **_REQUIRED_METADATA,
         f"Collection Date {suffix}": "2026-05-06",
         f"Latitude {suffix}": "32.7",
     }
@@ -578,7 +577,9 @@ async def test_import_biosample_from_owner_biosample_id_writes_global_metadata(c
             )
     bs_idx = result.biosample_idx
     await _track_composer_outputs(ctx, bs_idx, ctx["study_idx"], field_name)
-    await _track_global_metadata_outputs(ctx, bs_idx, ctx["study_idx"], [date_global, num_global])
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, ctx["study_idx"], [date_global, num_global]
+    )
 
     # Verify two globally-linked study field rows landed under the seeded globals.
     field_rows = await ctx["pool"].fetch(
@@ -605,12 +606,15 @@ async def test_import_biosample_from_owner_biosample_id_writes_global_metadata(c
     assert [dict(r) for r in field_rows] == expected_fields
 
     # Verify the typed values landed in the matching value_* columns.
+    # Scoped to the two fields under test — the injected required host_taxon_id
+    # writes its own non-owner-id row that this assertion is not about.
     meta_rows = await ctx["pool"].fetch(
         "SELECT global_field_idx, value_text, value_numeric, value_date"
         " FROM qiita.biosample_metadata"
-        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false"
+        " WHERE biosample_idx = $1 AND global_field_idx = ANY($2::bigint[])"
         " ORDER BY global_field_idx",
         bs_idx,
+        sorted([date_global, num_global]),
     )
     expected_meta = sorted(
         [
@@ -658,13 +662,13 @@ async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_
                 owner_biosample_id_field_name=seed_owner_field,
                 owner_biosample_id_value="SEED-OWNER",
                 caller_idx=ctx["principal_idx"],
-                metadata={linked_name: "seed-value"},
+                metadata={**_REQUIRED_METADATA, linked_name: "seed-value"},
             )
     await _track_composer_outputs(
         ctx, seed_result.biosample_idx, ctx["study_idx"], seed_owner_field
     )
-    await _track_global_metadata_outputs(
-        ctx, seed_result.biosample_idx, ctx["study_idx"], [global_idx]
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], seed_result.biosample_idx, ctx["study_idx"], [global_idx]
     )
 
     # Reuse the globally-linked display_name AS the owner-id field. The
@@ -683,7 +687,7 @@ async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_
                     owner_biosample_id_field_name=linked_name,
                     owner_biosample_id_value="DOOMED",
                     caller_idx=ctx["principal_idx"],
-                    metadata={},
+                    metadata=dict(_REQUIRED_METADATA),
                     biosample_accession=bs_acc,
                 )
 
@@ -696,11 +700,15 @@ async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_
     assert found is None
 
 
-async def test_import_biosample_from_owner_biosample_id_with_empty_metadata(ctx):
+async def test_import_biosample_from_owner_biosample_id_minimal_metadata(ctx):
+    """The smallest legal import: only the enforced required field(s). The composer
+    writes the owner-id row plus one row per required field, and nothing else.
+
+    (This used to test truly-empty metadata skipping the global block; empty is no
+    longer legal — host_taxon_id is required — so the minimal case is now
+    'exactly the required set'.)"""
     field_name = unique_field_name()
 
-    # Empty metadata dict — composer must skip the global-metadata block
-    # entirely and write only the owner-biosample-id metadata row.
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
             result = await import_biosample_from_owner_biosample_id(
@@ -710,17 +718,25 @@ async def test_import_biosample_from_owner_biosample_id_with_empty_metadata(ctx)
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-EM-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={},
+                metadata=dict(_REQUIRED_METADATA),
             )
     bs_idx = result.biosample_idx
     await _track_composer_outputs(ctx, bs_idx, ctx["study_idx"], field_name)
 
-    # Exactly one biosample_metadata row exists; it is the owner-id row.
+    # Two metadata rows: the owner-id row, and the required host_taxon_id row
+    # (written as a missing-value marker). Nothing else.
     rows = await ctx["pool"].fetch(
-        "SELECT is_owner_biosample_id FROM qiita.biosample_metadata WHERE biosample_idx = $1",
+        "SELECT bm.is_owner_biosample_id, bgf.internal_name"
+        "  FROM qiita.biosample_metadata bm"
+        "  LEFT JOIN qiita.biosample_global_field bgf ON bgf.idx = bm.global_field_idx"
+        " WHERE bm.biosample_idx = $1"
+        " ORDER BY bm.is_owner_biosample_id DESC",
         bs_idx,
     )
-    assert [dict(r) for r in rows] == [{"is_owner_biosample_id": True}]
+    assert [dict(r) for r in rows] == [
+        {"is_owner_biosample_id": True, "internal_name": None},
+        {"is_owner_biosample_id": False, "internal_name": "host_taxon_id"},
+    ]
 
 
 async def test_import_biosample_from_owner_biosample_id_raises_on_unknown_metadata_field(ctx):
@@ -742,9 +758,9 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_unknown_metada
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="UNKNOWN",
                     caller_idx=ctx["principal_idx"],
-                    metadata={unknown_a: "x", unknown_b: "y"},
+                    metadata={**_REQUIRED_METADATA, unknown_a: "x", unknown_b: "y"},
                 )
-    assert sorted(excinfo.value.unknown_display_names) == sorted([unknown_a, unknown_b])
+    assert sorted(excinfo.value.field_keys) == sorted([unknown_a, unknown_b])
 
 
 async def test_import_biosample_from_owner_biosample_id_raises_on_metadata_parse_failure(ctx):
@@ -772,9 +788,9 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_metadata_parse
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="PARSE-FAIL",
                     caller_idx=ctx["principal_idx"],
-                    metadata={numeric_field_name: "not-a-number"},
+                    metadata={**_REQUIRED_METADATA, numeric_field_name: "not-a-number"},
                 )
-    assert excinfo.value.display_name == numeric_field_name
+    assert excinfo.value.field_key == numeric_field_name
     assert excinfo.value.data_type == FieldDataType.NUMERIC
 
 
@@ -824,7 +840,7 @@ async def test_import_biosample_from_owner_biosample_id_owner_id_missing_value_r
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value=reason_name,
                     caller_idx=ctx["principal_idx"],
-                    metadata={},
+                    metadata=dict(_REQUIRED_METADATA),
                 )
     assert excinfo.value.owner_biosample_id_value == reason_name
     assert excinfo.value.reason_idx == reason_idx
@@ -863,7 +879,7 @@ async def test_import_biosample_from_owner_biosample_id_owner_id_padded_marker_r
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value=padded_value,
                     caller_idx=ctx["principal_idx"],
-                    metadata={},
+                    metadata=dict(_REQUIRED_METADATA),
                 )
     # The raw padded value is preserved on the error so the user sees what they sent.
     assert excinfo.value.owner_biosample_id_value == padded_value
@@ -913,11 +929,13 @@ async def test_import_biosample_from_owner_biosample_id_metadata_missing_value_p
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-MV-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={f"Latitude {suffix}": reason_name},
+                metadata={**_REQUIRED_METADATA, f"Latitude {suffix}": reason_name},
             )
     bs_idx = result.biosample_idx
     await _track_composer_outputs(ctx, bs_idx, ctx["study_idx"], field_name)
-    await _track_global_metadata_outputs(ctx, bs_idx, ctx["study_idx"], [global_idx])
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, ctx["study_idx"], [global_idx]
+    )
 
     # Assert one non-owner-id metadata row exists, with
     # value_missing_reason_idx populated and every typed column NULL.
@@ -925,8 +943,9 @@ async def test_import_biosample_from_owner_biosample_id_metadata_missing_value_p
         "SELECT global_field_idx, value_text, value_numeric, value_date,"
         " value_missing_reason_idx"
         " FROM qiita.biosample_metadata"
-        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
+        " WHERE biosample_idx = $1 AND global_field_idx = $2",
         bs_idx,
+        global_idx,
     )
     assert [dict(r) for r in rows] == [
         {
@@ -937,6 +956,208 @@ async def test_import_biosample_from_owner_biosample_id_metadata_missing_value_p
             "value_missing_reason_idx": reason_idx,
         }
     ]
+
+
+async def test_import_biosample_from_owner_biosample_id_writes_existing_local_field(ctx):
+    """Tests the case where a metadata key names an existing purely-local study
+    field: the value is written against that field, producing a metadata row
+    with global_field_idx NULL.
+    """
+    local_name = unique_field_name("local")
+    local_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=ctx["study_idx"],
+        display_name=local_name,
+        created_by_idx=ctx["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(local_idx)
+
+    field_name = unique_field_name("owner")
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            result = await import_biosample_from_owner_biosample_id(
+                conn,
+                primary_study_idx=ctx["study_idx"],
+                owner_idx=ctx["biosample_owner_idx"],
+                owner_biosample_id_field_name=field_name,
+                owner_biosample_id_value="OWNER-LOCAL-1",
+                caller_idx=ctx["principal_idx"],
+                metadata={**_REQUIRED_METADATA, local_name: "local-value"},
+            )
+    bs_idx = result.biosample_idx
+    await _track_composer_outputs(ctx, bs_idx, ctx["study_idx"], field_name)
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, ctx["study_idx"], []
+    )
+
+    # The value lands against the purely-local field, so the row's
+    # denormalized global_field_idx is NULL. Scoped to the field under test so
+    # the separately-supplied required host_taxon_id row is not in view.
+    rows = await ctx["pool"].fetch(
+        "SELECT biosample_study_field_idx, global_field_idx,"
+        " value_text, value_numeric, value_date"
+        " FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false"
+        "   AND biosample_study_field_idx = $2",
+        bs_idx,
+        local_idx,
+    )
+    assert [dict(r) for r in rows] == [
+        {
+            "biosample_study_field_idx": local_idx,
+            "global_field_idx": None,
+            "value_text": "local-value",
+            "value_numeric": None,
+            "value_date": None,
+        }
+    ]
+
+
+async def test_import_biosample_from_owner_biosample_id_writes_alias_through_to_global(ctx):
+    """Tests the case where a metadata key names a study-local alias of a
+    global field: the value is written through to the global field's slot,
+    producing a metadata row carrying that global_field_idx.
+    """
+    suffix = secrets.token_hex(4)
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"alias_glob_{suffix}",
+        display_name=f"Global Label {suffix}",
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+    alias_name = f"Alias Label {suffix}"
+    alias_idx = await seed_globally_linked_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=ctx["study_idx"],
+        global_field_idx=global_idx,
+        display_name=alias_name,
+        created_by_idx=ctx["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(alias_idx)
+
+    field_name = unique_field_name("owner")
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            result = await import_biosample_from_owner_biosample_id(
+                conn,
+                primary_study_idx=ctx["study_idx"],
+                owner_idx=ctx["biosample_owner_idx"],
+                owner_biosample_id_field_name=field_name,
+                owner_biosample_id_value="OWNER-ALIAS-1",
+                caller_idx=ctx["principal_idx"],
+                metadata={**_REQUIRED_METADATA, alias_name: "alias-value"},
+            )
+    bs_idx = result.biosample_idx
+    await _track_composer_outputs(ctx, bs_idx, ctx["study_idx"], field_name)
+    await track_biosample_metadata_outputs(
+        ctx["pool"], ctx["created"], bs_idx, ctx["study_idx"], [global_idx]
+    )
+
+    # The value attaches to the alias study field but occupies the global slot.
+    # Scoped to the field under test so the separately-supplied required
+    # host_taxon_id row is not in view.
+    rows = await ctx["pool"].fetch(
+        "SELECT biosample_study_field_idx, global_field_idx, value_text"
+        " FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false"
+        "   AND biosample_study_field_idx = $2",
+        bs_idx,
+        alias_idx,
+    )
+    assert [dict(r) for r in rows] == [
+        {
+            "biosample_study_field_idx": alias_idx,
+            "global_field_idx": global_idx,
+            "value_text": "alias-value",
+        }
+    ]
+
+
+async def test_import_biosample_from_owner_biosample_id_raises_on_cross_field_conflict(ctx):
+    """Tests the case where a metadata key names a global field but the study
+    already has a purely-local field at that same display_name: the composer
+    raises StudyFieldConflictError before any write.
+    """
+    suffix = secrets.token_hex(4)
+    shared_name = f"Shared Label {suffix}"
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"conflict_glob_{suffix}",
+        display_name=shared_name,
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+    # A purely-local field shadows the global's display_name.
+    shadow_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=ctx["study_idx"],
+        display_name=shared_name,
+        created_by_idx=ctx["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(shadow_idx)
+
+    field_name = unique_field_name("owner")
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(StudyFieldConflictError) as excinfo:
+            async with conn.transaction():
+                await import_biosample_from_owner_biosample_id(
+                    conn,
+                    primary_study_idx=ctx["study_idx"],
+                    owner_idx=ctx["biosample_owner_idx"],
+                    owner_biosample_id_field_name=field_name,
+                    owner_biosample_id_value="OWNER-CONFLICT-1",
+                    caller_idx=ctx["principal_idx"],
+                    metadata={**_REQUIRED_METADATA, shared_name: "x"},
+                )
+    assert excinfo.value.display_name == shared_name
+
+
+async def test_import_biosample_from_owner_biosample_id_raises_on_duplicate_global_target(ctx):
+    """Tests the case where two metadata keys — a global field's own label and
+    a study-local alias of it — resolve to the same global field: the composer
+    raises DuplicateGlobalFieldTargetError before any write.
+    """
+    suffix = secrets.token_hex(4)
+    global_label = f"Global Label {suffix}"
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"dup_glob_{suffix}",
+        display_name=global_label,
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+    alias_name = f"Alias Label {suffix}"
+    alias_idx = await seed_globally_linked_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=ctx["study_idx"],
+        global_field_idx=global_idx,
+        display_name=alias_name,
+        created_by_idx=ctx["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(alias_idx)
+
+    field_name = unique_field_name("owner")
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(DuplicateGlobalFieldTargetError) as excinfo:
+            async with conn.transaction():
+                await import_biosample_from_owner_biosample_id(
+                    conn,
+                    primary_study_idx=ctx["study_idx"],
+                    owner_idx=ctx["biosample_owner_idx"],
+                    owner_biosample_id_field_name=field_name,
+                    owner_biosample_id_value="OWNER-DUP-1",
+                    caller_idx=ctx["principal_idx"],
+                    metadata={**_REQUIRED_METADATA, global_label: "a", alias_name: "b"},
+                )
+    assert excinfo.value.global_field_idx == global_idx
 
 
 # ---------------------------------------------------------------------------

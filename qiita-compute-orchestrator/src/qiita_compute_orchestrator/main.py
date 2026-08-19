@@ -1,8 +1,9 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from qiita_common.auth_constants import API_PREFIX
-from qiita_common.log import install_authorization_scrub
+from qiita_common.log import configure_logging, install_authorization_scrub
 from qiita_common.models import HealthResponse, HealthStatus
 
 from .backend import ComputeBackend
@@ -13,6 +14,8 @@ from .jobs import scan_native_jobs
 from .reference_artifact import router as reference_artifact_router
 from .slurm import SlurmrestdClient
 from .step import router as step_router
+
+_log = logging.getLogger(__name__)
 
 
 def _build_backend(settings: Settings) -> ComputeBackend:
@@ -34,8 +37,6 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             client=client,
             partition=settings.slurm.partition,
             account=settings.slurm.account,
-            poll_interval_seconds=settings.slurm.poll_interval_seconds,
-            job_timeout_seconds=settings.slurm.job_timeout_seconds,
             native_python=settings.slurm.native_python,
             # Forward the outbound CO→CP token + CP URL so SLURM jobs
             # can re-resolve Settings.from_env(require_cp_to_co_token=False)
@@ -53,6 +54,10 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             # Propagated into the job env for the same reason as path_scratch:
             # native index builders derive {path_derived}/references/{idx}/...
             path_derived=settings.path_derived,
+            # Propagated into the job env so a native job that streams reference
+            # chunks (Flight DoGet) resolves the real data-plane origin on the
+            # compute node instead of the localhost default.
+            data_plane_url=settings.data_plane_url,
             qos=settings.slurm.qos,
             # PATH_DERIVED/images is validated in Settings.from_env when
             # backend_type=slurm — non-None here on the production path.
@@ -63,8 +68,24 @@ def _build_backend(settings: Settings) -> ComputeBackend:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Must precede the scrubber, which attaches to root's handlers: uvicorn puts its
+    # handlers on its own loggers, so without this root has none and the scrubber is
+    # inert — bearer tokens in httpx logs would go out unscrubbed.
+    log_level = configure_logging()
     install_authorization_scrub()
     settings = Settings.from_env()
+    # The one unconditional INFO this service emits at boot, and the only proof from
+    # outside the process that app logging came up at all: every other `.info()` here
+    # is work-triggered (a JWT nearing expiry, a miint re-stage), so an idle CO used to
+    # narrate nothing and a journal with no app lines was indistinguishable from a CO
+    # whose root logger was never configured — which is exactly the bug that shipped.
+    # The resolved backend and level are worth having in the journal on their own: they
+    # are what a "why is nothing dispatching" question starts from.
+    _log.info(
+        "compute-orchestrator up: backend=%s log_level=%s",
+        settings.backend_type,
+        log_level,
+    )
     # Install once so make_cp_client / get_settings hit the cached
     # instance for every subsequent step. Misconfig already crashed on
     # the Settings.from_env() line above; install_settings just makes

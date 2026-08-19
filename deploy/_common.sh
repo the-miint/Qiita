@@ -184,6 +184,36 @@ qiita_sif_build_inputs_hash() {
     )
 }
 
+# Scoped variant of the hash above for a MULTI-IMAGE workflow (one that ships
+# several per-tool images from a `sif-build.d/` — see build-sif.sh). Instead of
+# hashing the whole workflow dir (which would make a change to ANY tool's
+# def/entrypoint rebuild EVERY image), this hashes only the EXPLICIT files an
+# image declares (its own def + entrypoint(s), via the spec's HASH_INPUTS) plus
+# _shared/. That is what lets, e.g., an edit to the checkm image's def rebuild
+# only long-read-assembly-checkm and leave long-read-assembly-assemble alone — the granularity the
+# per-tool split exists to deliver. Same digest shape as the whole-dir hash
+# (repo-relative path + sha256 per file, sorted, re-hashed) so a legacy single
+# image and a scoped image are computed identically; only the input SET differs.
+#
+# $1 = repo root, $2 = shared dir, then N absolute file paths (the image's
+# declared build inputs, each already validated to exist by the caller). Echoes
+# the hex digest. The same cd-to-/ safety note as qiita_sif_build_inputs_hash
+# applies (find restoring an unreadable cwd), so the work runs in a subshell.
+qiita_sif_build_inputs_hash_scoped() {
+    local repo_root="$1" shared_dir="$2"
+    shift 2
+    (
+        cd / || exit 1
+        {
+            printf '%s\n' "$@"
+            find "$shared_dir" -type f ! -path '*/__pycache__/*'
+        } | LC_ALL=C sort | while IFS= read -r f; do
+            printf '%s ' "${f#"$repo_root"/}"   # repo-relative path → location-independent
+            _qiita_sha256 < "$f"
+        done | _qiita_sha256
+    )
+}
+
 # Which of a workflow's vendored SOURCES are NOT staged under the images/sources
 # dir? build-sifs.sh uses this to SKIP (not fail) an image whose licensed artifact
 # the operator hasn't placed out of band. $1 = sources dir, $2 = space-separated
@@ -207,6 +237,57 @@ read_env_var() {
     local env_file="$1" var="$2"
     # shellcheck disable=SC1090,SC1091
     ( set +eu; set -a; source "$env_file" >/dev/null 2>&1; set +a; printf '%s' "${!var:-}" )
+}
+
+# Split the password out of a libpq connection string — key=value form
+# ("host=… user=… password=…") or postgres:// URI form — so a caller can hand it
+# to libpq through PGPASSFILE instead of leaving it in a SQL file or, worse, on a
+# command line (argv is world-readable via /proc).
+#
+# $1 = the connection string. Echoes three TAB-separated fields, newline-terminated:
+#   <connstr with the password removed>\t<username>\t<password>
+#
+# The password field comes back EMPTY, with the connstr unchanged, when it cannot
+# be lifted out safely: no username to key a pgpass entry on, or a percent-encoded
+# URI password that would have to be decoded first. The caller must then use the
+# string as-is rather than authenticate with a wrong value — silently sending the
+# still-encoded password would fail as an auth error far from its cause.
+#
+# Pure (echo + return only) so scripts/lake-shell.sh and the unit tests in
+# test_deploy_scripts.py can both call it.
+qiita_split_conn_password() {
+    local connstr="$1" sanitized="$1" user="" password=""
+    if [[ "$connstr" =~ ^postgres(ql)?:// ]]; then
+        # postgres[ql]://user[:password]@host…  — a literal ':' '@' or '/' inside
+        # either credential has to be percent-encoded, so the character classes
+        # below cannot run past the credential they are matching.
+        if [[ "$connstr" =~ ^(postgres(ql)?://)([^:@/]+):([^@/]+)@(.*)$ ]]; then
+            user="${BASH_REMATCH[3]}"
+            password="${BASH_REMATCH[4]}"
+            sanitized="${BASH_REMATCH[1]}${user}@${BASH_REMATCH[5]}"
+        elif [[ "$connstr" =~ ^(postgres(ql)?://)([^:@/]+)@ ]]; then
+            user="${BASH_REMATCH[3]}"
+        fi
+        if [[ "$password" == *%* ]]; then
+            sanitized="$connstr"
+            password=""
+        fi
+    else
+        if [[ "$connstr" =~ (^|[[:space:]])user=([^[:space:]]+) ]]; then
+            user="${BASH_REMATCH[2]}"
+        fi
+        if [[ "$connstr" =~ (^|[[:space:]])password=([^[:space:]]+) ]]; then
+            password="${BASH_REMATCH[2]}"
+            sanitized="$(printf '%s' "$connstr" \
+                | sed -E 's/(^|[[:space:]])password=[^[:space:]]+/\1/g' \
+                | tr -s '[:space:]' ' ' | sed -E 's/^ +| +$//g')"
+        fi
+    fi
+    if [[ -n "$password" && -z "$user" ]]; then
+        sanitized="$connstr"
+        password=""
+    fi
+    printf '%s\t%s\t%s\n' "$sanitized" "$user" "$password"
 }
 
 # Extract the Env-vars + one-time-host-setup buckets (buckets 1 & 2) from a

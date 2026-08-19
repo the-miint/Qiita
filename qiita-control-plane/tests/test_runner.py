@@ -18,9 +18,11 @@ Coverage strategy:
 
 import json
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
     ComputeTarget,
@@ -73,6 +75,10 @@ class _LocalLikeBackendMixin:
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
+        # Container-only (bind + env-forward into apptainer). Accepted for
+        # ComputeBackendClient parity and dropped: these fakes never dispatch a
+        # real container, and `run_step` is the single customization point.
+        derived_inputs: dict[str, str] | None = None,  # noqa: ARG002
     ) -> StepHandleWire:
         outputs = await self.run_step(
             step_name=step_name,
@@ -160,13 +166,13 @@ def library_spy(monkeypatch):
         feature_map.touch(exist_ok=True)
         return feature_map, 0, 0
 
-    async def write_membership(pool, reference_idx, feature_map_path):
-        calls.append(("write-membership", reference_idx, feature_map_path))
+    async def write_membership(pool, reference_idx, manifest_path, feature_map_path):
+        calls.append(("write-membership", reference_idx, manifest_path, feature_map_path))
         if state["fail_on"] == LibraryPrimitive.WRITE_MEMBERSHIP:
             raise RuntimeError("simulated write-membership failure")
         return 0, 0
 
-    async def register_files(*, staging_dir, files, work_ticket_idx, hmac_secret, data_plane_url):
+    async def register_files(*, staging_dir, files, work_ticket_idx, signing_key, data_plane_url):
         # work_ticket_idx is keyword-required: if the runner stops threading it
         # (it rides in the signed payload so the data plane can mint unique,
         # ticket-traceable lake filenames), this stub raises TypeError and the
@@ -194,6 +200,7 @@ _REFERENCE_ADD_STEPS = [
         "name": "hash",
         "step_type": "singleton",
         "container": REFERENCE_HASH_CONTAINER,
+        "entrypoint": "/opt/qiita/hash.sh",
         "target_status": "hashing",
         "inputs": ["fasta_path"],
         "outputs": ["manifest"],
@@ -209,7 +216,7 @@ _REFERENCE_ADD_STEPS = [
     {
         "kind": "action",
         "name": "write-membership",
-        "inputs": ["feature_map"],
+        "inputs": ["manifest", "feature_map"],
         "outputs": [],
     },
     {
@@ -217,6 +224,7 @@ _REFERENCE_ADD_STEPS = [
         "name": "load",
         "step_type": "singleton",
         "container": REFERENCE_LOAD_CONTAINER,
+        "entrypoint": "/opt/qiita/load.sh",
         "target_status": "loading",
         "inputs": ["fasta_path", "manifest", "feature_map"],
         "outputs": ["staging_dir"],
@@ -398,7 +406,7 @@ async def _run(
         work_ticket_idx,
         pool,
         backend,  # type: ignore[arg-type]  # protocol-shaped duck
-        hmac_secret=b"unused",
+        signing_key=b"\x00" * 32,
         data_plane_url="grpc://unused:0",
         work_ticket_workspace_root=workspace_root,
         upload_staging_root=effective_upload_root,
@@ -583,6 +591,10 @@ async def test_refuses_non_pending_ticket(postgres_pool, pending_work_ticket, tm
 
 
 async def test_refuses_disabled_action(postgres_pool, pending_work_ticket, tmp_path):
+    """An action disabled between submit and dispatch must FAIL the ticket
+    (SUBMISSION stage, NULL step name) and re-raise. Previously the action
+    pre-fetch ran ABOVE the try, so the raise stranded the ticket in PENDING
+    with no failure recorded (and a misleading "marked FAILED" dispatch log)."""
     action_id, version = pending_work_ticket["action"]
     await postgres_pool.execute(
         "UPDATE qiita.action SET enabled = false, disabled_at = now(), disabled_by_idx = 1"
@@ -597,11 +609,15 @@ async def test_refuses_disabled_action(postgres_pool, pending_work_ticket, tmp_p
             FakeBackendClient(),
             tmp_path,
         )
-    state = await postgres_pool.fetchval(
-        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_stage, failure_step_name, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
         pending_work_ticket["work_ticket_idx"],
     )
-    assert state == "pending"
+    assert row["state"] == "failed"
+    assert row["failure_stage"] == "submission"
+    assert row["failure_step_name"] is None
+    assert "disabled" in row["failure_reason"]
 
 
 async def test_refuses_unknown_ticket(postgres_pool, tmp_path):
@@ -1092,6 +1108,356 @@ async def test_timeout_at_walltime_ceiling_fails_without_retry(
     assert backend.attempts["hash"] == 1
 
 
+# =============================================================================
+# Persisted escalated resource floor — the ladder survives restart / redrive
+# =============================================================================
+#
+# The escalated floor used to live only in a local variable, so a CP restart or
+# a `/run` redrive discarded it and the ticket re-burned a failing attempt
+# climbing back to a size it had already reached. It is now written to
+# `qiita.work_ticket.escalated_resource_floor` per step as it grows, and seeded
+# from there on every run.
+#
+# `reference_add_action` deliberately pins its ceilings AT the hash step's
+# baseline (mem 1 GB, walltime 1 min) so the at-ceiling fail-fast tests above
+# work, which leaves escalation no headroom. These tests need a ladder, so they
+# use their own action with room above the same baselines:
+#
+#     memory   1 → 2 → 4 → 8 (ceiling)
+#     walltime 1m → 2m → 4m → 8m (ceiling)
+
+
+class _RecordingBackendClient(_RetryingBackendClient):
+    """`_RetryingBackendClient` that also records the resources each attempt was
+    dispatched at. The parent drops `baseline_resources`; the escalation tests
+    assert on exactly that, since the size a step is submitted at is the whole
+    observable behaviour of the floor."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        # (step_name, mem_gb, walltime_seconds) per submit, in dispatch order.
+        self.dispatched: list[tuple[str, int, int]] = []
+
+    async def run_step(self, *, step_name, inputs, workspace, scope_target, work_ticket_idx, **kw):
+        baseline = kw.get("baseline_resources")
+        if baseline is not None:
+            self.dispatched.append((step_name, baseline.mem_gb, baseline.walltime_seconds))
+        # `load` is not under test here — hand it the staging dir register-files
+        # expects so the workflow can reach COMPLETED, and count it ourselves
+        # since we don't delegate. `hash` drives the ladder and goes through the
+        # parent, which does its own counting alongside the fail-N-times logic.
+        if step_name == "load":
+            self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
+            (workspace / "staging").mkdir(parents=True, exist_ok=True)
+            (workspace / "staging" / "reference_sequences.parquet").touch()
+            return {"staging_dir": workspace / "staging"}
+        return await super().run_step(
+            step_name=step_name,
+            inputs=inputs,
+            workspace=workspace,
+            scope_target=scope_target,
+            work_ticket_idx=work_ticket_idx,
+            **kw,
+        )
+
+    def sizes_for(self, step_name: str) -> list[tuple[int, int]]:
+        return [(mem, wall) for name, mem, wall in self.dispatched if name == step_name]
+
+
+@pytest.fixture
+async def escalating_action(postgres_pool):
+    """`reference-add` with ceilings ABOVE the hash step's baseline, so the
+    OOM / TIMEOUT ladders actually have rungs to climb."""
+    action_id = "reference-add"
+    version = f"runner-escalation-{uuid.uuid4()}"
+    await postgres_pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience, "
+        "  context_schema, steps, "
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, "
+        "  success_status, failure_status"
+        ") VALUES ($1, $2, 'reference', $3::text[], $4::jsonb,"
+        "  $5::jsonb, $6::jsonb, 1, 8, '8 minutes', $7, $8)",
+        action_id,
+        version,
+        ["feature:mint", "reference:write", "reference:register_files"],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps({}),
+        json.dumps(_REFERENCE_ADD_STEPS),
+        "active",
+        "failed",
+    )
+    yield action_id, version
+    await postgres_pool.execute(
+        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
+        action_id,
+        version,
+    )
+
+
+@pytest.fixture
+async def escalating_work_ticket(postgres_pool, escalating_action, reference_idx, tmp_path):
+    action_id, version = escalating_action
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">seq1\nACGT\n")
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        reference_idx,
+        json.dumps({"fasta_path": str(fasta)}),
+    )
+    yield {"work_ticket_idx": idx, "reference_idx": reference_idx, "fasta_path": fasta}
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx)
+
+
+async def _escalated_floor(pool, work_ticket_idx: int):
+    raw = await pool.fetchval(
+        "SELECT escalated_resource_floor FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+async def test_oom_escalation_persists_the_memory_floor(
+    postgres_pool, escalating_work_ticket, library_spy, tmp_path
+):
+    """Each OOM retry writes the grown memory floor to the ticket before
+    re-queuing, so the ladder's position is durable the moment it is learned.
+    Two OOMs climb 1 → 2 → 4 GB; the third attempt succeeds at 4."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+
+    backend = _RecordingBackendClient(
+        fail_step="hash",
+        fail_n_times=2,
+        kind=FailureKind.OOM_KILLED,
+        outputs_on_success={"manifest": workspace_root / str(work_ticket_idx) / "manifest.parquet"},
+    )
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    # The observable behaviour: each retry was submitted at the grown size.
+    assert [mem for mem, _wall in backend.sizes_for("hash")] == [1, 2, 4]
+    # ... and the last floor learned is on the ticket, not just in memory.
+    assert await _escalated_floor(postgres_pool, work_ticket_idx) == {"hash": {"mem_gb": 4}}
+
+
+async def test_run_seeds_memory_floor_from_the_persisted_value(
+    postgres_pool, escalating_work_ticket, library_spy, tmp_path
+):
+    """The regression this column exists for. A ticket that already escalated
+    `hash` to 4 GB dispatches its NEXT run at 4 GB — not back at the 1 GB YAML
+    baseline. Before this, a CP restart or a `/run` redrive re-burned a failing
+    attempt climbing back to a size the ticket had already reached."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        json.dumps({"hash": {"mem_gb": 4, "walltime_seconds": 240}}),
+    )
+
+    backend = _RecordingBackendClient(
+        fail_step="none",
+        fail_n_times=0,
+        kind=FailureKind.OOM_KILLED,
+        outputs_on_success={"manifest": workspace_root / str(work_ticket_idx) / "manifest.parquet"},
+    )
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    # One dispatch, at the persisted floor on BOTH axes (baseline is 1 GB / 60s).
+    assert backend.sizes_for("hash") == [(4, 240)]
+    # A step with no persisted floor is untouched — the floor is per step, which
+    # is why it is not folded into the ticket-wide `resource_override`.
+    assert backend.sizes_for("load") == [(1, 60)]
+
+
+async def test_walltime_escalation_merges_without_clobbering_memory(
+    postgres_pool, escalating_work_ticket, library_spy, tmp_path
+):
+    """The two axes escalate from separate arms of the retry loop, so writing
+    one must merge into the step's existing object rather than replace it. A
+    ticket carrying a memory floor that then TIMES OUT keeps both."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        json.dumps({"hash": {"mem_gb": 4}}),
+    )
+
+    backend = _RecordingBackendClient(
+        fail_step="hash",
+        fail_n_times=1,
+        kind=FailureKind.TIMEOUT_BEFORE_START,
+        outputs_on_success={"manifest": workspace_root / str(work_ticket_idx) / "manifest.parquet"},
+    )
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    # Attempt 0 runs at the persisted memory floor with the BASELINE walltime
+    # (nothing has timed out yet); attempt 1 keeps the memory floor and doubles
+    # walltime 60s → 120s.
+    assert backend.sizes_for("hash") == [(4, 60), (4, 120)]
+    assert await _escalated_floor(postgres_pool, work_ticket_idx) == {
+        "hash": {"mem_gb": 4, "walltime_seconds": 120}
+    }
+
+
+async def test_seeded_floor_at_the_ceiling_fails_fast_without_climbing(
+    postgres_pool, escalating_work_ticket, library_spy, tmp_path
+):
+    """The flip side of resuming the ladder, and the most visible new behaviour:
+    a ticket whose persisted floor is already AT the action ceiling no longer
+    re-climbs to it before failing. It runs once at the ceiling, the escalation
+    returns the floor unchanged (saturation), and the OOM is reclassified
+    permanent. Before the floor was persisted this ticket would have restarted
+    at the 1 GB baseline and burned three attempts getting back to 8."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        json.dumps({"hash": {"mem_gb": 8}}),  # == the action's mem ceiling
+    )
+
+    backend = _RecordingBackendClient(
+        fail_step="hash",
+        fail_n_times=999,
+        kind=FailureKind.OOM_KILLED,
+        outputs_on_success={"manifest": workspace_root / str(work_ticket_idx) / "manifest.parquet"},
+    )
+    with pytest.raises(BackendFailure) as exc_info:
+        await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+    assert exc_info.value.kind is FailureKind.RESOURCE_CEILING_EXHAUSTED
+
+    # Exactly one attempt, at the ceiling — no climb, no retry budget spent.
+    assert backend.sizes_for("hash") == [(8, 60)]
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "failed"
+    assert row["retry_count"] == 0
+    # Saturated: the floor is unchanged, not grown past the ceiling.
+    assert await _escalated_floor(postgres_pool, work_ticket_idx) == {"hash": {"mem_gb": 8}}
+
+
+@pytest.mark.parametrize(
+    ("override_mem_gb", "persisted_mem_gb", "expected"),
+    [
+        (2, 4, 4),  # the learned floor is higher — it wins
+        (4, 2, 4),  # the static override is higher — it wins
+    ],
+)
+async def test_memory_floor_composes_static_override_with_persisted(
+    postgres_pool,
+    escalating_work_ticket,
+    library_spy,
+    tmp_path,
+    override_mem_gb,
+    persisted_mem_gb,
+    expected,
+):
+    """Both are raise-only floors, so the seed is their max in either direction.
+    The learned floor normally dominates (it grew from a resolution that already
+    included the override), but the composition must not depend on that."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket"
+        "   SET resource_override = $2::jsonb, escalated_resource_floor = $3::jsonb"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        json.dumps({"mem_gb": override_mem_gb}),
+        json.dumps({"hash": {"mem_gb": persisted_mem_gb}}),
+    )
+
+    backend = _RecordingBackendClient(
+        fail_step="none",
+        fail_n_times=0,
+        kind=FailureKind.OOM_KILLED,
+        outputs_on_success={"manifest": workspace_root / str(work_ticket_idx) / "manifest.parquet"},
+    )
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    assert backend.sizes_for("hash") == [(expected, 60)]
+    # `load` has no persisted floor, so it sees the ticket-wide override alone —
+    # which is the difference between the two columns, in one assertion.
+    assert backend.sizes_for("load") == [(override_mem_gb, 60)]
+
+
+async def test_persist_escalated_floor_raises_when_ticket_is_gone(postgres_pool):
+    """Not best-effort: a lost write silently reintroduces the re-climb this
+    column exists to prevent, so a missing row raises rather than no-ops."""
+    from qiita_control_plane.runner import _persist_escalated_floor
+
+    with pytest.raises(RuntimeError, match="row not found"):
+        await _persist_escalated_floor(postgres_pool, 2**62, step_name="assemble", mem_gb=384)
+
+
+async def test_persist_escalated_floor_rounds_walltime_up(postgres_pool, escalating_work_ticket):
+    """Whole seconds on the wire, rounded UP. A fractional walltime (ISO 8601
+    admits one) truncated DOWN would leave the stored floor below the ceiling it
+    was clamped to, so the ceiling-exhaustion fail-fast would miss once and burn
+    an attempt at a size that just failed."""
+    from qiita_control_plane.runner import _persist_escalated_floor
+
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+    await _persist_escalated_floor(
+        postgres_pool,
+        work_ticket_idx,
+        step_name="hash",
+        walltime=timedelta(seconds=119.4),
+    )
+    assert await _escalated_floor(postgres_pool, work_ticket_idx) == {
+        "hash": {"walltime_seconds": 120}
+    }
+
+
+async def test_persist_escalated_floor_requires_an_axis(postgres_pool, escalating_work_ticket):
+    """A call recording nothing is a programming bug in the retry loop, not a
+    no-op to swallow."""
+    from qiita_control_plane.runner import _persist_escalated_floor
+
+    with pytest.raises(ValueError, match="no axis to record"):
+        await _persist_escalated_floor(
+            postgres_pool,
+            escalating_work_ticket["work_ticket_idx"],
+            step_name="hash",
+        )
+
+
+async def test_fetch_work_ticket_decodes_escalated_resource_floor(
+    postgres_pool, escalating_work_ticket
+):
+    """Same JSONB-decode seam as `resource_override`: asyncpg returns JSONB as a
+    *string* with no codec registered, and `run_workflow` indexes the decoded
+    object. NULL (never escalated) must stay None."""
+    from qiita_control_plane.runner import _fetch_work_ticket
+
+    work_ticket_idx = escalating_work_ticket["work_ticket_idx"]
+
+    fresh = await _fetch_work_ticket(postgres_pool, work_ticket_idx)
+    assert fresh["escalated_resource_floor"] is None
+
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET escalated_resource_floor = $2::jsonb"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        json.dumps({"assemble": {"mem_gb": 384, "walltime_seconds": 115200}}),
+    )
+    escalated = await _fetch_work_ticket(postgres_pool, work_ticket_idx)
+    assert escalated["escalated_resource_floor"] == {
+        "assemble": {"mem_gb": 384, "walltime_seconds": 115200}
+    }
+
+
 async def test_unwrapped_exception_marks_failed_as_permanent(
     postgres_pool, pending_work_ticket, library_spy, tmp_path
 ):
@@ -1577,7 +1943,7 @@ async def test_dispatch_register_index_writes_row(postgres_pool, reference_idx, 
         tmp_path,
         {"kind": "reference", "reference_idx": reference_idx},
         work_ticket_idx=1,  # register-index ignores it; required by the signature
-        hmac_secret=b"unused",
+        signing_key=b"\x00" * 32,
         data_plane_url="grpc://unused:50051",
     )
     assert out == {}
@@ -1631,7 +1997,7 @@ async def test_dispatch_register_index_minimap2_meta(postgres_pool, reference_id
         tmp_path,
         {"kind": "reference", "reference_idx": reference_idx},
         work_ticket_idx=1,  # register-index ignores it; required by the signature
-        hmac_secret=b"unused",
+        signing_key=b"\x00" * 32,
         data_plane_url="grpc://unused:50051",
     )
     assert out == {}
@@ -1647,6 +2013,352 @@ async def test_dispatch_register_index_minimap2_meta(postgres_pool, reference_id
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
     )
+
+
+async def test_dispatch_register_index_threads_shard_id(postgres_pool, reference_idx, tmp_path):
+    """A sharded analysis index's meta JSON carries `shard_id`; the arm threads
+    it (via `meta.get`) into register_index so the row records it. A host meta
+    JSON that omits the key registers `shard_id IS NULL` (backward-compatible)."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    async def _dispatch(meta: dict, binding: str) -> None:
+        meta_path = tmp_path / f"{binding}.json"
+        meta_path.write_text(json.dumps(meta))
+        entry = WorkflowAction(kind="action", name="register-index", inputs=[binding], outputs=[])
+        out = await _run_action_primitive(
+            postgres_pool,
+            entry,
+            {binding: str(meta_path)},
+            tmp_path,
+            {"kind": "reference", "reference_idx": reference_idx},
+            work_ticket_idx=1,
+            signing_key=b"unused",
+            data_plane_url="grpc://unused:50051",
+        )
+        assert out == {}
+
+    try:
+        await _dispatch(
+            {
+                "index_type": "minimap2",
+                "fs_path": f"/srv/qiita/references/{reference_idx}/minimap2-shards/1.mmi",
+                "params": {"preset": "sr"},
+                "shard_id": 1,
+            },
+            "shard_index_meta",
+        )
+        await _dispatch(
+            {
+                "index_type": "rype",
+                "fs_path": f"/srv/qiita/references/{reference_idx}/rype/index.ryxdi",
+                "params": {"k": 64},
+            },
+            "rype_index_meta",
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT shard_id FROM qiita.reference_index"
+                " WHERE reference_idx = $1 AND fs_path LIKE '%minimap2-shards/1.mmi'",
+                reference_idx,
+            )
+            == 1
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT shard_id FROM qiita.reference_index"
+                " WHERE reference_idx = $1 AND fs_path LIKE '%/rype/index.ryxdi'",
+                reference_idx,
+            )
+            is None
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_run_action_primitive_plan_shards_is_opt_in(postgres_pool, tmp_path):
+    """plan-shards is OPT-IN: the arm no-ops when `shard_index` is absent or
+    falsy in `bound`, so a plain reference-add never fans out — this is the guard
+    that keeps a genome-bearing reference nobody asked to shard from being
+    sharded, and it fires BEFORE the dispatch_cb requirement, so a no-op needs no
+    dispatch_cb. A no-op still returns `router_pending: False` so the downstream
+    router-build entries (`when: router_pending`) stay OFF. When `shard_index` IS
+    set the dispatch_cb requirement still bites (fanning out with no dispatch
+    mechanism would strand tickets)."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(kind="action", name="plan-shards", inputs=[], outputs=[])
+    ref_scope = {"kind": "reference", "reference_idx": 1}
+
+    async def _call(bound, *, dispatch_cb):
+        return await _run_action_primitive(
+            postgres_pool,
+            entry,
+            bound,
+            tmp_path,
+            ref_scope,
+            work_ticket_idx=1,
+            signing_key=b"unused",
+            data_plane_url="grpc://unused:50051",
+            dispatch_cb=dispatch_cb,
+        )
+
+    # Absent key => no-op, even without a dispatch_cb (the failing-smoke case).
+    # The no-op returns router_pending False so the router build stays gated off.
+    assert await _call({}, dispatch_cb=None) == {"router_pending": False}
+    # Explicit false => no-op too.
+    assert await _call({"shard_index": False}, dispatch_cb=None) == {"router_pending": False}
+    # Opt-in true + no dispatch_cb => the fan-out precondition still fails loud.
+    with pytest.raises(RuntimeError, match="requires a dispatch_cb"):
+        await _call({"shard_index": True}, dispatch_cb=None)
+
+
+async def test_run_action_primitive_sync_reference_exclusion_stages_under_workspace(
+    tmp_path, monkeypatch
+):
+    """The sync-reference-exclusion arm re-materializes the GLOBAL blocklist onto
+    the lake mirror after a reference load. It has no file inputs; the arm derives
+    the dest Parquet in the per-attempt workspace (under the shared PATH_SCRATCH
+    tree the data plane re-validates under its scratch_root) and threads
+    pool / signing_key / data_plane_url straight through. The arm returns `{}`
+    (no bound outputs) even though the primitive reports a feature_count."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library as _lib
+    from qiita_control_plane.runner import _run_action_primitive
+
+    captured: dict = {}
+
+    async def _spy(pool, *, dest, signing_key, data_plane_url):
+        captured.update(
+            pool=pool, dest=dest, signing_key=signing_key, data_plane_url=data_plane_url
+        )
+        return {"synced_feature_count": 7}
+
+    monkeypatch.setitem(_lib.LIBRARY, LibraryPrimitive.SYNC_REFERENCE_EXCLUSION, _spy)
+
+    pool = object()  # the arm forwards it unchanged; the DB read lives in the primitive
+    entry = WorkflowAction(kind="action", name="sync-reference-exclusion", inputs=[], outputs=[])
+    out = await _run_action_primitive(
+        pool,
+        entry,
+        {},
+        tmp_path,
+        {"kind": "reference", "reference_idx": 1},
+        work_ticket_idx=1,
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://dp:50051",
+    )
+
+    assert out == {}
+    assert captured["pool"] is pool
+    assert captured["dest"] == tmp_path / "reference_exclusion.parquet"
+    assert captured["signing_key"] == b"\x00" * 32
+    assert captured["data_plane_url"] == "grpc://dp:50051"
+
+
+# =============================================================================
+# Block-scope wiring (bulk-block read-mask): scope target + reconcile-block arm
+# =============================================================================
+
+
+def test_build_scope_target_block():
+    """A block-scoped work_ticket row maps to the {kind: block, block_idx} shape
+    the pre-loop / dispatch code reads (matching BlockScopeTarget)."""
+    from qiita_control_plane.runner import _build_scope_target
+
+    assert _build_scope_target({"scope_target_kind": "block", "block_idx": 42}) == {
+        "kind": "block",
+        "block_idx": 42,
+    }
+
+
+async def test_run_action_primitive_reconcile_block_dispatches(monkeypatch, tmp_path):
+    """The reconcile-block arm calls the RECONCILE_BLOCK primitive with block_idx
+    from the scope target and mask_idx from the runner-bound `bound` (the ticket's
+    mask_idx), plus the signing_key / data_plane_url for the mask_metrics read."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_reconcile(pool, *, block_idx, mask_idx, signing_key, data_plane_url):
+        recorded.update(
+            block_idx=block_idx,
+            mask_idx=mask_idx,
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
+        )
+        return {"block_idx": block_idx, "finalized_samples": []}
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.RECONCILE_BLOCK, fake_reconcile)
+
+    entry = WorkflowAction(kind="action", name="reconcile-block", inputs=[], outputs=[])
+    out = await _run_action_primitive(
+        None,  # pool — the fake ignores it
+        entry,
+        {"mask_idx": 77},
+        tmp_path,
+        {"kind": "block", "block_idx": 42},
+        work_ticket_idx=9,
+        signing_key=b"sekret",
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {}
+    assert recorded == {
+        "block_idx": 42,
+        "mask_idx": 77,
+        "signing_key": b"sekret",
+        "data_plane_url": "grpc://dp:50051",
+    }
+
+
+async def test_run_action_primitive_reconcile_block_rejects_non_block_scope(tmp_path):
+    """reconcile-block is only meaningful for a block-scoped ticket; a mis-scoped
+    workflow YAML is a contract error, surfaced loudly."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(kind="action", name="reconcile-block", inputs=[], outputs=[])
+    with pytest.raises(RuntimeError, match="block-scoped"):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"mask_idx": 1},
+            tmp_path,
+            {"kind": "prep_sample", "prep_sample_idx": 5},
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
+
+
+async def test_run_action_primitive_finalize_mask_sample_dispatches(monkeypatch, tmp_path):
+    """The finalize-mask-sample arm calls the FINALIZE_MASK_SAMPLE primitive with
+    mask_idx from the runner-bound `bound` (the ticket's mask_idx) and prep_sample_idx
+    from the scope target. No file inputs, no data-plane hop."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_finalize(pool, *, mask_idx, prep_sample_idx):
+        recorded.update(mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+        return {"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx}
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.FINALIZE_MASK_SAMPLE, fake_finalize)
+
+    entry = WorkflowAction(kind="action", name="finalize-mask-sample", inputs=[], outputs=[])
+    out = await _run_action_primitive(
+        None,  # pool — the fake ignores it
+        entry,
+        {"mask_idx": 77},
+        tmp_path,
+        {"kind": "prep_sample", "prep_sample_idx": 5},
+        work_ticket_idx=9,
+        signing_key=b"sekret",
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {}
+    assert recorded == {"mask_idx": 77, "prep_sample_idx": 5}
+
+
+async def test_run_action_primitive_finalize_mask_sample_rejects_non_prep_sample_scope(tmp_path):
+    """finalize-mask-sample is only meaningful for a prep_sample-scoped ticket; a
+    block- or otherwise-scoped ticket is a contract error, surfaced loudly."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(kind="action", name="finalize-mask-sample", inputs=[], outputs=[])
+    with pytest.raises(RuntimeError, match="prep_sample-scoped"):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"mask_idx": 1},
+            tmp_path,
+            {"kind": "block", "block_idx": 42},
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
+
+
+async def test_run_action_primitive_delete_block_mask_dispatches(monkeypatch, tmp_path):
+    """The delete-block-mask arm calls the DELETE_READ_MASK_BLOCK primitive with
+    block_idx from the scope target and mask_idx from the runner-bound `bound`,
+    plus the signing_key / data_plane_url for the footprint delete DoAction."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_delete(pool, *, block_idx, mask_idx, signing_key, data_plane_url):
+        recorded.update(
+            block_idx=block_idx,
+            mask_idx=mask_idx,
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
+        )
+        return {"block_idx": block_idx, "rows_deleted": 0}
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.DELETE_READ_MASK_BLOCK, fake_delete)
+
+    entry = WorkflowAction(kind="action", name="delete-block-mask", inputs=[], outputs=[])
+    out = await _run_action_primitive(
+        None,  # pool — the fake ignores it
+        entry,
+        {"mask_idx": 77},
+        tmp_path,
+        {"kind": "block", "block_idx": 42},
+        work_ticket_idx=9,
+        signing_key=b"sekret",
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {}
+    assert recorded == {
+        "block_idx": 42,
+        "mask_idx": 77,
+        "signing_key": b"sekret",
+        "data_plane_url": "grpc://dp:50051",
+    }
+
+
+async def test_run_action_primitive_delete_block_mask_rejects_non_block_scope(tmp_path):
+    """delete-block-mask is only meaningful for a block-scoped ticket; a mis-scoped
+    workflow YAML is a contract error, surfaced loudly."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(kind="action", name="delete-block-mask", inputs=[], outputs=[])
+    with pytest.raises(RuntimeError, match="block-scoped"):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"mask_idx": 1},
+            tmp_path,
+            {"kind": "prep_sample", "prep_sample_idx": 5},
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
 
 
 # =============================================================================
@@ -1738,7 +2450,7 @@ def register_index_spy(monkeypatch):
 
     calls: list[tuple[str, dict]] = []
 
-    async def register_index(pool, *, reference_idx, index_type, fs_path, params):
+    async def register_index(pool, *, reference_idx, index_type, fs_path, params, shard_id=None):
         calls.append((index_type, params))
 
     monkeypatch.setitem(_lib.LIBRARY, LibraryPrimitive.REGISTER_INDEX, register_index)
@@ -1846,14 +2558,17 @@ async def test_when_gate_runs_both_when_flags_absent(
 # populates.
 
 
-async def _insert_reference_index(pool, reference_idx, fs_path, *, index_type="rype"):
+async def _insert_reference_index(
+    pool, reference_idx, fs_path, *, index_type="rype", shard_id=None
+):
     return await pool.fetchval(
-        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
-        " VALUES ($1, $2, $3, $4::jsonb) RETURNING reference_index_idx",
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params, shard_id)"
+        " VALUES ($1, $2, $3, $4::jsonb, $5) RETURNING reference_index_idx",
         reference_idx,
         index_type,
         fs_path,
         json.dumps({"k": 64, "w": 25}),
+        shard_id,
     )
 
 
@@ -1873,6 +2588,31 @@ async def test_resolve_reference_index_path_returns_latest(postgres_pool, refere
     try:
         resolved = await _resolve_reference_index_path(postgres_pool, reference_idx, "rype")
         assert resolved == newest
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_reference_index_path_ignores_shard_rows(postgres_pool, reference_idx):
+    """The whole-reference (unsharded) resolver must never return a shard row's
+    path, even when a shard row sorts first (newer / higher idx). It selects the
+    newest row with `shard_id IS NULL`."""
+    from qiita_control_plane.runner import _resolve_reference_index_path
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+    unsharded = "/srv/qiita/whole.ryxdi"
+    await _insert_reference_index(postgres_pool, reference_idx, unsharded)
+    # Inserted last (higher reference_index_idx) so it would win newest-wins if
+    # the resolver didn't filter shard rows out.
+    await _insert_reference_index(
+        postgres_pool, reference_idx, "/srv/qiita/shards/0/index.ryxdi", shard_id=0
+    )
+    try:
+        resolved = await _resolve_reference_index_path(postgres_pool, reference_idx, "rype")
+        assert resolved == unsharded
     finally:
         await postgres_pool.execute(
             "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
@@ -1914,6 +2654,186 @@ async def test_resolve_reference_index_path_raises_when_no_index(postgres_pool, 
     )
     with pytest.raises(ValueError, match="no 'rype' index"):
         await _resolve_reference_index_path(postgres_pool, reference_idx, "rype")
+
+
+# =============================================================================
+# _resolve_sharded_align_indexes  (router + per-aligner shard dir)
+# =============================================================================
+#
+# Resolves (router_index_paths, shard_directory) for align_sharded against an
+# ACTIVE sharded reference. Built + tested now, UNWIRED — like the align job it
+# ships tested but with no consumer yet.
+
+
+async def _activate(pool, reference_idx):
+    await pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+
+
+async def _seed_sharded_reference(pool, reference_idx, *, n_shards=3, router=True):
+    """Seed an active sharded reference's reference_index rows: one rype_router
+    (shard_id NULL) when `router`, plus per-shard minimap2 + bowtie2 rows at the
+    exact derived-store fs_path shapes the resolver derives the shard-root from."""
+    await _activate(pool, reference_idx)
+    if router:
+        await _insert_reference_index(
+            pool,
+            reference_idx,
+            f"/derived/references/{reference_idx}/rype-router.ryxdi",
+            index_type="rype_router",
+        )
+    for shard_id in range(n_shards):
+        await _insert_reference_index(
+            pool,
+            reference_idx,
+            f"/derived/references/{reference_idx}/minimap2-shards/{shard_id}.mmi",
+            index_type="minimap2",
+            shard_id=shard_id,
+        )
+        await _insert_reference_index(
+            pool,
+            reference_idx,
+            f"/derived/references/{reference_idx}/bowtie2-shards/{shard_id}/index",
+            index_type="bowtie2",
+            shard_id=shard_id,
+        )
+
+
+async def test_resolve_sharded_align_indexes_minimap2(postgres_pool, reference_idx):
+    """minimap2's shard-root is the fs_path PARENT (`.../minimap2-shards`); the
+    router path list carries the one whole-reference rype_router."""
+    from pathlib import Path
+
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx)
+    try:
+        routers, shard_dir = await _resolve_sharded_align_indexes(
+            postgres_pool, reference_idx, "minimap2"
+        )
+        assert routers == [Path(f"/derived/references/{reference_idx}/rype-router.ryxdi")]
+        assert shard_dir == Path(f"/derived/references/{reference_idx}/minimap2-shards")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_bowtie2(postgres_pool, reference_idx):
+    """bowtie2's shard-root is the fs_path PARENT-OF-PARENT (`.../bowtie2-shards`)
+    — the prefix sits inside a per-shard `{shard_id}` subdir."""
+    from pathlib import Path
+
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx)
+    try:
+        routers, shard_dir = await _resolve_sharded_align_indexes(
+            postgres_pool, reference_idx, "bowtie2"
+        )
+        assert routers == [Path(f"/derived/references/{reference_idx}/rype-router.ryxdi")]
+        assert shard_dir == Path(f"/derived/references/{reference_idx}/bowtie2-shards")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_returns_all_routers_newest_first(
+    postgres_pool, reference_idx
+):
+    """Multiple routers (the forward growable-reference case) resolve to the SET,
+    newest-first (highest reference_index_idx wins the ordering)."""
+    from pathlib import Path
+
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx)
+    # A second router generation (higher idx → sorts first).
+    await _insert_reference_index(
+        postgres_pool,
+        reference_idx,
+        f"/derived/references/{reference_idx}/rype-router-2.ryxdi",
+        index_type="rype_router",
+    )
+    try:
+        routers, _ = await _resolve_sharded_align_indexes(postgres_pool, reference_idx, "minimap2")
+        assert routers == [
+            Path(f"/derived/references/{reference_idx}/rype-router-2.ryxdi"),
+            Path(f"/derived/references/{reference_idx}/rype-router.ryxdi"),
+        ]
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_missing_router_fails(postgres_pool, reference_idx):
+    """No router row → ReferenceIndexNotBuilt (a sharded ref isn't routable
+    without it)."""
+    from qiita_control_plane.runner import ReferenceIndexNotBuilt, _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx, router=False)
+    try:
+        with pytest.raises(ReferenceIndexNotBuilt, match="rype_router"):
+            await _resolve_sharded_align_indexes(postgres_pool, reference_idx, "minimap2")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_missing_shard_fails(postgres_pool, reference_idx):
+    """Router present but no per-shard index of the requested aligner →
+    ReferenceIndexNotBuilt."""
+    from qiita_control_plane.runner import ReferenceIndexNotBuilt, _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx, n_shards=0)  # router only
+    try:
+        with pytest.raises(ReferenceIndexNotBuilt, match="per-shard 'minimap2'"):
+            await _resolve_sharded_align_indexes(postgres_pool, reference_idx, "minimap2")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_non_active_fails(postgres_pool, reference_idx):
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx)
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'indexing' WHERE reference_idx = $1", reference_idx
+    )
+    try:
+        with pytest.raises(ValueError, match="active"):
+            await _resolve_sharded_align_indexes(postgres_pool, reference_idx, "minimap2")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_sharded_align_indexes_unknown_reference(postgres_pool):
+    from qiita_control_plane.actions.reference import ReferenceNotFound
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    with pytest.raises(ReferenceNotFound):
+        await _resolve_sharded_align_indexes(postgres_pool, 999_999_999, "minimap2")
+
+
+async def test_resolve_sharded_align_indexes_unknown_aligner(postgres_pool, reference_idx):
+    from qiita_control_plane.runner import _resolve_sharded_align_indexes
+
+    await _seed_sharded_reference(postgres_pool, reference_idx)
+    try:
+        with pytest.raises(ValueError, match="unknown sharded aligner"):
+            await _resolve_sharded_align_indexes(postgres_pool, reference_idx, "bwa")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
 
 
 # =============================================================================
@@ -2401,7 +3321,7 @@ async def test_resolve_qc_adapters_writes_parquet(
         postgres_pool,
         default_adapter_reference_idx=reference_idx,
         data_plane_url="grpc://unused",
-        hmac_secret=b"x" * 16,
+        signing_key=b"x" * 32,
         workspace=tmp_path,
     )
     adapter_parquet = tmp_path / "adapters.parquet"
@@ -2423,7 +3343,7 @@ async def test_resolve_qc_adapters_unconfigured(postgres_pool, tmp_path):
             postgres_pool,
             default_adapter_reference_idx=None,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2439,7 +3359,7 @@ async def test_resolve_qc_adapters_unknown_reference(postgres_pool, tmp_path):
             postgres_pool,
             default_adapter_reference_idx=999_999_999,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2458,7 +3378,7 @@ async def test_resolve_qc_adapters_wrong_kind(postgres_pool, reference_idx, tmp_
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2478,7 +3398,7 @@ async def test_resolve_qc_adapters_non_active(postgres_pool, reference_idx, tmp_
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2497,7 +3417,7 @@ async def test_resolve_qc_adapters_empty_set(postgres_pool, reference_idx, tmp_p
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
@@ -2524,13 +3444,50 @@ async def test_resolve_qc_adapters_dataplane_failure_is_submission_failure(
             postgres_pool,
             default_adapter_reference_idx=reference_idx,
             data_plane_url="grpc://unused",
-            hmac_secret=b"x" * 16,
+            signing_key=b"x" * 32,
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
     assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
     assert ei.value.step_name is None
     assert "data plane" in ei.value.reason
+
+
+async def test_shard_fanout_owns_finalize_matrix(postgres_pool, reference_idx):
+    """The conditional-finalize predicate: the parent reference-add finalize skips
+    its success_status patch iff this ticket kicked off a sharded fan-out —
+    shard_index set AND the reference `indexing` (N>0 fanned out) OR already
+    `active` (the parent's own router-tail finalize-shard flipped it — the common
+    case, since the router build is the long pole). Every other case (no
+    shard_index, sharded-but-still-loading = N=0, non-reference scope) returns
+    False → the parent patches `active` inline."""
+    from qiita_control_plane import runner
+
+    ref_scope = {"kind": "reference", "reference_idx": reference_idx}
+
+    async def owns(bound, *, status):
+        await postgres_pool.execute(
+            "UPDATE qiita.reference SET status = $1 WHERE reference_idx = $2", status, reference_idx
+        )
+        async with postgres_pool.acquire() as conn:
+            return await runner._shard_fanout_owns_finalize(conn, ref_scope, bound)
+
+    # shard_index + indexing (fan-out happened, N>0) → skip the parent patch.
+    assert await owns({"shard_index": True}, status="indexing") is True
+    # shard_index + already active (the parent's own finalize-shard won the race)
+    # → STILL skip the inline patch, else the parent re-patches active→active
+    # (illegal) and fails a fully-successful ticket.
+    assert await owns({"shard_index": True}, status="active") is True
+    # shard_index + still loading (N=0, no fan-out) → parent patches active.
+    assert await owns({"shard_index": True}, status="loading") is False
+    # No shard_index (unsharded ref-add) → parent patches active, even if indexing.
+    assert await owns({}, status="indexing") is False
+    assert await owns({"shard_index": False}, status="indexing") is False
+    # Non-reference scope → never owned by a shard fan-out.
+    block_scope = {"kind": "block", "block_idx": 1}
+    async with postgres_pool.acquire() as conn:
+        owned = await runner._shard_fanout_owns_finalize(conn, block_scope, {"shard_index": True})
+    assert owned is False
 
 
 async def test_workflow_needs_adapters_detects_adapter_input():
@@ -2543,6 +3500,331 @@ async def test_workflow_needs_adapters_detects_adapter_input():
     with_qc = [SimpleNamespace(inputs=["reads", "adapter_parquet"], optional_inputs=[])]
     assert _workflow_needs_adapters(no_qc) is False
     assert _workflow_needs_adapters(with_qc) is True
+
+
+# =============================================================================
+# _stage_shard_roster (sharded-index build roster pre-step)
+# =============================================================================
+
+
+async def _add_shard_members(pool, reference_idx, members):
+    """Mint features + reference_membership rows carrying shard_id. `members` is
+    a list of (shard_id | None) — one feature per entry. Returns the feature_idxs."""
+    feats = []
+    for shard_id in members:
+        f = await pool.fetchval(
+            "INSERT INTO qiita.feature (sequence_hash) VALUES (gen_random_uuid())"
+            " RETURNING feature_idx"
+        )
+        await pool.execute(
+            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx, shard_id)"
+            " VALUES ($1, $2, $3)",
+            reference_idx,
+            f,
+            shard_id,
+        )
+        feats.append(f)
+    return feats
+
+
+async def test_stage_shard_roster_scopes_ticket_to_shard(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """The roster DoGet is scoped to EXACTLY this shard's member features
+    (reference_membership.shard_id), and the returned bindings carry the roster
+    path + shard_id for the build steps' Inputs."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from qiita_control_plane import runner
+
+    # shard 0 -> {fA, fB}; shard 1 -> {fC}; one unassigned (shard_id NULL).
+    fA, fB, fC, _f_null = await _add_shard_members(postgres_pool, reference_idx, [0, 0, 1, None])
+
+    captured: dict = {}
+
+    def fake_sign(*, table, filter, secret):
+        captured["table"] = table
+        captured["filter"] = filter
+        return b"ticket-bytes"
+
+    def fake_doget(_url, _ticket, out_path):
+        fids = captured["filter"]["feature_idx"]
+        pq.write_table(
+            pa.table(
+                {
+                    "feature_idx": pa.array(fids, pa.int64()),
+                    "sequence_length_bp": pa.array([100] * len(fids), pa.int64()),
+                }
+            ),
+            str(out_path),
+        )
+        return len(fids)
+
+    monkeypatch.setattr("qiita_control_plane.runner._read_ingest.sign_ticket", fake_sign)
+    monkeypatch.setattr(runner, "_do_get_reference_sequences_roster", fake_doget)
+
+    try:
+        out = await runner._stage_shard_roster(
+            postgres_pool,
+            reference_idx,
+            0,
+            data_plane_url="grpc://unused",
+            signing_key=b"x" * 16,
+            workspace=tmp_path,
+        )
+        assert captured["table"] == "reference_sequences"
+        assert captured["filter"]["reference_idx"] == [reference_idx]
+        # Exactly shard 0's features — not shard 1's, not the NULL-shard one.
+        assert sorted(captured["filter"]["feature_idx"]) == sorted([fA, fB])
+        assert out == {
+            "shard_features": tmp_path / "shard_roster.parquet",
+            "shard_id": 0,
+        }
+        assert (tmp_path / "shard_roster.parquet").exists()
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", [fA, fB, fC, _f_null]
+        )
+
+
+async def test_stage_shard_roster_empty_shard_fails(postgres_pool, reference_idx, tmp_path):
+    """A shard with no member features (nothing assigned to it) is a
+    misconfiguration — SUBMISSION BAD_INPUT, not an empty build."""
+    from qiita_control_plane import runner
+
+    with pytest.raises(BackendFailure) as ei:
+        await runner._stage_shard_roster(
+            postgres_pool,
+            reference_idx,
+            99,
+            data_plane_url="grpc://unused",
+            signing_key=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+
+
+async def test_stage_shard_roster_dataplane_failure_is_submission(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """A Flight DoGet failure while staging the roster is wrapped as a SUBMISSION
+    BackendFailure (never an untyped escape — same contract as the other
+    pre-loop resolvers)."""
+    from qiita_control_plane import runner
+
+    feats = await _add_shard_members(postgres_pool, reference_idx, [0])
+
+    def _boom(_url, _ticket, _out):
+        raise RuntimeError("Flight: connection refused")
+
+    monkeypatch.setattr(runner, "_do_get_reference_sequences_roster", _boom)
+    try:
+        with pytest.raises(BackendFailure) as ei:
+            await runner._stage_shard_roster(
+                postgres_pool,
+                reference_idx,
+                0,
+                data_plane_url="grpc://unused",
+                signing_key=b"x" * 32,
+                workspace=tmp_path,
+            )
+        assert ei.value.kind == FailureKind.BAD_INPUT
+        assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+        assert ei.value.step_name is None
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", feats
+        )
+
+
+# =============================================================================
+# _stage_shard_mapping + plan-shards router gate
+# =============================================================================
+#
+# _stage_shard_mapping exports reference_membership.shard_id (Postgres — the
+# authoritative store) to the (feature_idx, bucket_name) Parquet build_routing_index
+# consumes. The plan-shards arm stages it + flips router_pending only on a real
+# fan-out (N > 0); the reconstruct helper re-derives both on resume.
+
+
+async def test_stage_shard_mapping_exports_shard_id_as_bucket(
+    postgres_pool, reference_idx, tmp_path
+):
+    """Exports only the shard-assigned features (shard_id NOT NULL), with
+    bucket_name = str(shard_id). A no-genome (NULL shard_id) member is excluded."""
+    import duckdb
+
+    from qiita_control_plane import runner
+
+    feats = await _add_shard_members(postgres_pool, reference_idx, [0, 1, 1, None])
+    try:
+        out = await runner._stage_shard_mapping(
+            postgres_pool, reference_idx, tmp_path / "shard_mapping.parquet"
+        )
+        with duckdb.connect(":memory:") as con:
+            rows = con.execute(
+                f"SELECT feature_idx, bucket_name FROM read_parquet('{out}') ORDER BY feature_idx"
+            ).fetchall()
+        # The three shard-assigned features (bucket = str(shard_id)); the NULL one dropped.
+        assert rows == [(feats[0], "0"), (feats[1], "1"), (feats[2], "1")]
+        # Column types: feature_idx BIGINT, bucket_name VARCHAR (the router build's contract).
+        with duckdb.connect(":memory:") as con:
+            types = {
+                r[0]: r[1]
+                for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{out}')").fetchall()
+            }
+        assert types["feature_idx"] == "BIGINT"
+        assert types["bucket_name"] == "VARCHAR"
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", feats
+        )
+
+
+async def test_stage_shard_mapping_raises_when_no_assignment(
+    postgres_pool, reference_idx, tmp_path
+):
+    """No shard-assigned membership → fail-loud (the arm only calls this after a
+    reported fan-out, so an empty result is a bug)."""
+    from qiita_control_plane import runner
+
+    with pytest.raises(RuntimeError, match="no reference_membership.shard_id"):
+        await runner._stage_shard_mapping(
+            postgres_pool, reference_idx, tmp_path / "shard_mapping.parquet"
+        )
+
+
+async def test_plan_shards_arm_stages_router_on_fanout(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """On a real fan-out (N > 0) the plan-shards arm returns router_pending True
+    and a staged shard_mapping Parquet built from the shard assignment. The
+    fan-out itself (plan_and_submit_shards) is stubbed — this pins the arm's
+    router-gate + mapping-staging behavior, not the fan-out."""
+    import duckdb
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane import runner
+
+    entry = WorkflowAction(kind="action", name="plan-shards", inputs=[], outputs=[])
+    ref_scope = {"kind": "reference", "reference_idx": reference_idx}
+    # Seed the assignment the fan-out would have written; the arm stages the
+    # mapping from it. (plan_and_submit_shards is stubbed, so no work_ticket /
+    # status transition is needed.)
+    feats = await _add_shard_members(postgres_pool, reference_idx, [0, 1])
+
+    async def fake_fanout(pool, ref, **kwargs):
+        return {"reference_idx": ref, "shards": 2, "tickets": [10, 11]}
+
+    monkeypatch.setattr(
+        "qiita_control_plane.runner._reconstruct.plan_and_submit_shards", fake_fanout
+    )
+
+    try:
+        out = await runner._run_action_primitive(
+            postgres_pool,
+            entry,
+            {"shard_index": True},
+            tmp_path,
+            ref_scope,
+            work_ticket_idx=1,
+            signing_key=b"x" * 32,
+            data_plane_url="grpc://unused:1",
+            dispatch_cb=lambda _idx: None,
+        )
+        assert out["router_pending"] is True
+        with duckdb.connect(":memory:") as con:
+            rows = con.execute(
+                f"SELECT bucket_name FROM read_parquet('{out['shard_mapping']}')"
+                " ORDER BY feature_idx"
+            ).fetchall()
+        assert [r[0] for r in rows] == ["0", "1"]
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", feats
+        )
+
+
+async def test_plan_shards_arm_raises_on_zero_shards_when_requested(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """An EXPLICIT shard_index=true request that yields N == 0 shardable features
+    (no genomes / no genome map) FAILS the ticket rather than finalizing an
+    unroutable, terminal `active` reference with no router. The `when: shard_index`
+    gate + the opt-in guard mean this branch is only ever reached for a caller who
+    explicitly asked to shard, so the request is an error, not a silent no-op — the
+    operator supplies genomes and redrives (`failed → pending`)."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane import runner, shard_orchestration
+
+    entry = WorkflowAction(kind="action", name="plan-shards", inputs=[], outputs=[])
+    ref_scope = {"kind": "reference", "reference_idx": reference_idx}
+
+    async def fake_noop(pool, reference_idx, **kwargs):
+        return 0
+
+    monkeypatch.setattr(shard_orchestration, "plan_shards", fake_noop)
+    with pytest.raises(RuntimeError, match="no genome-bearing features to shard"):
+        await runner._run_action_primitive(
+            postgres_pool,
+            entry,
+            {"shard_index": True},
+            tmp_path,
+            ref_scope,
+            work_ticket_idx=1,
+            signing_key=b"x" * 32,
+            data_plane_url="grpc://unused:1",
+            dispatch_cb=lambda _idx: None,
+        )
+
+
+async def test_reconstruct_plan_shards_outputs_rederives_from_db(
+    postgres_pool, reference_idx, tmp_path
+):
+    """On resume the reconstruct helper re-derives router_pending from the durable
+    shard assignment and RE-STAGES the shard_mapping (not trusting a scratch file
+    to survive). No assignment → router_pending False, no mapping."""
+    import duckdb
+
+    from qiita_control_plane import runner
+
+    ref_scope = {"kind": "reference", "reference_idx": reference_idx}
+
+    # No assignment yet → False, no mapping.
+    out = await runner._reconstruct_plan_shards_outputs(postgres_pool, ref_scope, tmp_path)
+    assert out == {"router_pending": False}
+
+    feats = await _add_shard_members(postgres_pool, reference_idx, [0, 1, 1])
+    try:
+        out = await runner._reconstruct_plan_shards_outputs(postgres_pool, ref_scope, tmp_path)
+        assert out["router_pending"] is True
+        with duckdb.connect(":memory:") as con:
+            n = con.execute(
+                f"SELECT count(*) FROM read_parquet('{out['shard_mapping']}')"
+            ).fetchone()[0]
+        assert n == 3
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", feats
+        )
 
 
 # =============================================================================
@@ -2800,6 +4082,12 @@ class FakeSlurmBackendClient:
         self.submit_calls = 0
         self.status_calls = 0
         self.result_calls = 0
+        # Handles the runner actually polled / verified. Which ATTEMPT a resume
+        # re-attached to is only observable here: the job id and output_path
+        # carried by the handle say whether recovery landed on the live attempt
+        # or on a dead one.
+        self.status_handles: list = []
+        self.result_handles: list = []
 
     async def submit_step(
         self,
@@ -2814,6 +4102,7 @@ class FakeSlurmBackendClient:
         module=None,
         entrypoint=None,
         baseline_resources=None,
+        derived_inputs=None,  # noqa: ARG002 — container-only; this fake dispatches none
     ):
         self.submit_calls += 1
         if self.submit_calls <= self._submit_unreachable_times:
@@ -2834,6 +4123,7 @@ class FakeSlurmBackendClient:
 
     async def status_step(self, handle):
         self.status_calls += 1
+        self.status_handles.append(handle)
         item = self.status_script.pop(0) if self.status_script else StepStatus.COMPLETED
         if isinstance(item, BackendFailure):
             raise item
@@ -2841,6 +4131,7 @@ class FakeSlurmBackendClient:
 
     async def result_step(self, handle, status):
         self.result_calls += 1
+        self.result_handles.append(handle)
         item = self.result_script.pop(0) if self.result_script else {}
         if isinstance(item, BackendFailure):
             raise item
@@ -2866,6 +4157,7 @@ _SINGLE_STEP_WORKFLOW = [
         "name": "compute",
         "step_type": "singleton",
         "container": REFERENCE_HASH_CONTAINER,
+        "entrypoint": "/opt/qiita/hash.sh",
         "inputs": ["fasta_path"],
         "outputs": ["result"],
         "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
@@ -3229,6 +4521,81 @@ async def test_resume_purged_job_without_output_fails(postgres_pool, slurm_ticke
     assert row["failure_type"] == "permanent"
 
 
+async def _seed_failed_then_escalated_step(
+    pool, work_ticket_idx, *, step_name, dead_job_id, live_job_id, step_index=0
+):
+    """Seed the shape an OOM escalation leaves behind: attempt 0 terminal
+    (`failed`, OOM-killed) and attempt 1 live (`submitted`) with its own job id.
+
+    Unreachable before the action ceiling was raised above the step baseline —
+    an OOM-killed step used to fail permanently at attempt 0, so no step ever
+    had a second attempt."""
+    for attempt, job_id in ((0, dead_job_id), (1, live_job_id)):
+        await step_progress.record_submitting(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            step_name=step_name,
+            compute_target=ComputeTarget.SLURM,
+            job_name=f"qiita-wt{work_ticket_idx}-{step_name}-a{attempt}",
+        )
+        await step_progress.record_submitted(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            slurm_job_id=job_id,
+        )
+    await step_progress.record_failed(
+        pool,
+        work_ticket_idx=work_ticket_idx,
+        step_index=step_index,
+        attempt=0,
+        failure_kind=FailureKind.OOM_KILLED.value,
+        failure_reason="OUT_OF_MEMORY (simulated)",
+    )
+
+
+async def test_resume_skips_terminal_attempt_and_adopts_the_live_one(
+    postgres_pool, slurm_ticket, tmp_path
+):
+    """Restart recovery must resume at the LIVE attempt, not a dead one.
+
+    Regression test for the incident: `assemble` OOM-killed at attempt 0, the
+    runner escalated and submitted attempt 1, and a control-plane restart then
+    re-entered at attempt 0 (the per-invocation counter starts there). Its
+    `failed` row read as "owned", so the runner re-attached to the ENDED job;
+    slurmrestd had purged it, the poll loop's filesystem tiebreaker synthesized
+    COMPLETED, and result_step verified attempt-0's workspace — which has no
+    manifest precisely because that attempt failed. The ticket died with a
+    CONTRACT_VIOLATION while its live attempt-1 job sat queued, never adopted.
+
+    Pins the outcome by the job id and workspace the runner actually touched:
+    against the pre-fix code these assert attempt 0's job and dir."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_failed_then_escalated_step(
+        postgres_pool, slurm_ticket, step_name="compute", dead_job_id=903, live_job_id=904
+    )
+
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    # Adopted, not resubmitted — the escalated job is the one already paid for.
+    assert backend.submit_calls == 0
+    # ...and it is attempt 1's job, not the dead attempt 0's.
+    assert [h.slurm_job_id for h in backend.status_handles] == [904]
+    # The workspace verified is attempt-1's; verifying attempt-0's is the bug.
+    assert backend.result_handles[0].output_path.endswith("attempt-1/output")
+
+
 async def test_resume_never_started_runs_from_scratch(postgres_pool, slurm_ticket, tmp_path):
     """A ticket orphaned right after PENDING → PROCESSING with no progress rows
     runs from step 0 — resume degrades to a normal dispatch."""
@@ -3514,6 +4881,7 @@ _MULTI_STEP_WORKFLOW = [
         "name": "compute",
         "step_type": "singleton",
         "container": REFERENCE_HASH_CONTAINER,
+        "entrypoint": "/opt/qiita/hash.sh",
         "inputs": ["fasta_path"],
         "outputs": ["manifest"],
         "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
@@ -3529,6 +4897,7 @@ _MULTI_STEP_WORKFLOW = [
         "name": "finish",
         "step_type": "singleton",
         "container": REFERENCE_LOAD_CONTAINER,
+        "entrypoint": "/opt/qiita/load.sh",
         "inputs": ["feature_map"],
         "outputs": ["result"],
         "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
@@ -3634,6 +5003,7 @@ _TARGET_STATUS_WORKFLOW = [
         "name": "s0",
         "step_type": "singleton",
         "container": REFERENCE_HASH_CONTAINER,
+        "entrypoint": "/opt/qiita/hash.sh",
         "target_status": "hashing",
         "inputs": ["fasta_path"],
         "outputs": ["manifest"],
@@ -3644,6 +5014,7 @@ _TARGET_STATUS_WORKFLOW = [
         "name": "s1",
         "step_type": "singleton",
         "container": REFERENCE_LOAD_CONTAINER,
+        "entrypoint": "/opt/qiita/load.sh",
         "target_status": "minting",
         "inputs": ["manifest"],
         "outputs": ["result"],
@@ -3732,6 +5103,7 @@ _REDRIVE_REWALK_WORKFLOW = [
         "name": "s0",
         "step_type": "singleton",
         "container": REFERENCE_HASH_CONTAINER,
+        "entrypoint": "/opt/qiita/hash.sh",
         "target_status": "hashing",
         "inputs": ["fasta_path"],
         "outputs": ["manifest"],
@@ -3742,6 +5114,7 @@ _REDRIVE_REWALK_WORKFLOW = [
         "name": "s1",
         "step_type": "singleton",
         "container": REFERENCE_LOAD_CONTAINER,
+        "entrypoint": "/opt/qiita/load.sh",
         "target_status": "minting",
         "inputs": ["manifest"],
         "outputs": ["feature_map"],
@@ -3752,6 +5125,7 @@ _REDRIVE_REWALK_WORKFLOW = [
         "name": "s2",
         "step_type": "singleton",
         "container": REFERENCE_LOAD_CONTAINER,
+        "entrypoint": "/opt/qiita/load.sh",
         "target_status": "loading",
         "inputs": ["feature_map"],
         "outputs": ["result"],
@@ -3897,7 +5271,7 @@ _LOCAL_REFERENCE_ADD_STEPS = [
     {
         "kind": "action",
         "name": "write-membership",
-        "inputs": ["feature_map"],
+        "inputs": ["manifest", "feature_map"],
         "outputs": [],
     },
     {
@@ -4085,3 +5459,302 @@ async def test_runner_local_passthrough_threads_paths(
         "write-membership",
         "register-files",
     ]
+
+
+# --- deliberate output shadowing (read-mask: lima_mask self-shadows partial_mask) ---
+#
+# The read-mask chain threads a `partial_mask` binding through syndna -> lima -> qc.
+# `lima_mask` (when lima_enabled) both CONSUMES `partial_mask` (syndna's) and
+# PRODUCES it, so its output overwrites the incoming binding (bound.update is
+# last-writer-wins) and qc reads whichever ran latest; when lima is skipped,
+# syndna's binding stands. This self-shadow is safe because _bind_step_inputs reads
+# `bound` BEFORE bound.update(outputs).
+#
+# The shape below exercises that mechanism generically, without read-mask's reads /
+# adapters / rype machinery: `first` always runs, `second` is `when:`-gated and both
+# reads and overwrites the binding, `consumer` reads whichever value stands. A
+# regression in the read/update ordering would otherwise miscount silently.
+
+_SHADOW_STEPS = [
+    {
+        "kind": "step",
+        "name": "first",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.build_rype_index",
+        "inputs": [],
+        "outputs": ["shared_out"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "second",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.build_minimap2_index",
+        # Reads the binding it also writes — the self-shadow lima_mask relies on.
+        "inputs": ["shared_out"],
+        "when": "second_enabled",
+        "outputs": ["shared_out"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "consumer",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.build_rype_index",
+        "inputs": ["shared_out"],
+        "outputs": [],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+]
+
+
+async def _make_shadow_ticket(pool, reference_idx, action_context: dict) -> tuple[int, str]:
+    version = f"shadow-{uuid.uuid4()}"
+    await pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps, cpu_ceiling, mem_ceiling_gb, walltime_ceiling,"
+        "  success_status, failure_status"
+        ") VALUES ('host-reference-add', $1, 'reference', $2::text[], $3::jsonb,"
+        "  '{}'::jsonb, $4::jsonb, 4, 32, '1 hour', NULL, 'failed')",
+        version,
+        ["reference:write"],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps(_SHADOW_STEPS),
+    )
+    wt_idx = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ('host-reference-add', $1, 1, 'reference', $2, $3::jsonb)"
+        " RETURNING work_ticket_idx",
+        version,
+        reference_idx,
+        json.dumps(action_context),
+    )
+    return wt_idx, version
+
+
+async def _run_shadow(postgres_pool, reference_idx, tmp_path, *, second_enabled: bool):
+    backend = FakeBackendClient()
+    first_out = tmp_path / "first" / "out.parquet"
+    second_out = tmp_path / "second" / "out.parquet"
+    for p in (first_out, second_out):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+    backend.outputs_for["first"] = {"shared_out": first_out}
+    backend.outputs_for["second"] = {"shared_out": second_out}
+
+    wt_idx, version = await _make_shadow_ticket(
+        postgres_pool, reference_idx, {"second_enabled": second_enabled}
+    )
+    try:
+        await _run(wt_idx, postgres_pool, backend, tmp_path)
+        by_name = {name: inputs for name, inputs, *_ in backend.calls}
+        return [name for name, *_ in backend.calls], by_name, first_out, second_out
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = 'host-reference-add' AND version = $1",
+            version,
+        )
+
+
+async def test_gated_step_shadows_the_earlier_steps_output_binding(
+    postgres_pool, reference_idx, tmp_path
+):
+    """Gate ON: the consumer sees the SECOND step's output, not the first's. This
+    is what makes register-files persist syndna's extended mask rather than
+    host_filter's pre-syndna one."""
+    calls, by_name, first_out, second_out = await _run_shadow(
+        postgres_pool, reference_idx, tmp_path, second_enabled=True
+    )
+    assert calls == ["first", "second", "consumer"]
+    # The self-shadow: `second` reads the binding it also writes, and reads the
+    # value bound BEFORE its own outputs land.
+    assert by_name["second"]["shared_out"] == first_out
+    assert by_name["consumer"]["shared_out"] == second_out
+
+
+async def test_skipped_gated_step_leaves_the_earlier_binding_standing(
+    postgres_pool, reference_idx, tmp_path
+):
+    """Gate OFF: the consumer sees the FIRST step's output. Distinct output names
+    would break exactly this case — the consumer takes one input binding."""
+    calls, by_name, first_out, _second_out = await _run_shadow(
+        postgres_pool, reference_idx, tmp_path, second_enabled=False
+    )
+    assert calls == ["first", "consumer"]
+    assert by_name["consumer"]["shared_out"] == first_out
+
+
+# =============================================================================
+# Consumed-mask traceability: a workflow that ASSEMBLES a mask's pass-set
+# =============================================================================
+
+
+async def _seed_assembly_ticket(pool, tmp_path):
+    """A prep_sample-scoped ticket for a one-step action consuming
+    `masked_reads_fastq` — the binding `_workflow_needs_staged_masked_reads` keys
+    on, which is all the pre-loop path needs. Returns the ids plus a teardown."""
+    from qiita_control_plane.testing.db_seeds import (
+        seed_biosample_with_sequenced_prep_sample,
+        seed_user_principal,
+    )
+
+    principal_idx = await seed_user_principal(
+        pool, prefix="mask-consume", suffix=uuid.uuid4().hex[:8]
+    )
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=principal_idx
+    )
+    mask_idx = await pool.fetchval(
+        "INSERT INTO qiita.mask_definition"
+        " (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+        " VALUES ($1, 'read-mask', '1.0.0', '{}'::jsonb, $2) RETURNING mask_idx",
+        uuid.uuid4().bytes + uuid.uuid4().bytes,  # 32-byte params_hash
+        principal_idx,
+    )
+    action_id = LONG_READ_ASSEMBLY_ACTION_ID
+    version = f"runner-test-{uuid.uuid4()}"
+    steps = [
+        {
+            "kind": "step",
+            "name": "assemble",
+            "step_type": "singleton",
+            "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/assemble.sh",
+            "inputs": ["masked_reads_fastq"],
+            "outputs": ["contigs"],
+            "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+        }
+    ]
+    await pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps,"
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
+        ") VALUES ($1, $2, 'prep_sample', $3::text[], $4::jsonb,"
+        "  $5::jsonb, $6::jsonb, 1, 1, '1 minute')",
+        action_id,
+        version,
+        [],
+        json.dumps({"service": False, "human_roles": ["user"]}),
+        json.dumps({}),
+        json.dumps(steps),
+    )
+    work_ticket_idx = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, action_context"
+        ") VALUES ($1, $2, $3, 'prep_sample', $4, $5::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        principal_idx,
+        prep_sample_idx,
+        json.dumps({"mask_idx": mask_idx}),
+    )
+
+    async def _teardown():
+        await pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+        )
+        await pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+        )
+        await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+        await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
+        await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
+        await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
+        await pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+
+    return work_ticket_idx, mask_idx, _teardown
+
+
+@pytest.mark.parametrize(
+    ("resolver_outcome", "expected_state"),
+    [("reads", "completed"), ("no_data", "no_data")],
+    ids=["completed", "no_data"],
+)
+async def test_masked_reads_workflow_persists_the_consumed_mask_onto_the_ticket(
+    postgres_pool, monkeypatch, tmp_path, resolver_outcome, expected_state
+):
+    """A workflow that CONSUMES a mask records it on `work_ticket.mask_idx` — see
+    the shared-mask guard in `qiita_control_plane.cli.admin.mask` for what reads it.
+
+    Both terminal outcomes of the staging resolver are covered, because only one of
+    them is at risk: an empty pass-set is a NO_DATA, which is TERMINAL and NOT
+    failed, so a ticket that ends there is one the guard still protects. Persisting
+    after the resolver would leave exactly those tickets NULL forever — and NO_DATA
+    is a routine outcome for an aggressively filtered sample, not a corner.
+    """
+    from qiita_control_plane.runner import _workflow
+
+    work_ticket_idx, mask_idx, teardown = await _seed_assembly_ticket(postgres_pool, tmp_path)
+
+    fastq = tmp_path / "masked_reads.fastq.gz"
+    fastq.parent.mkdir(parents=True, exist_ok=True)
+    fastq.touch()
+
+    async def _fake_resolve(pool, scope_target, mask, **kwargs):
+        assert mask == mask_idx
+        if resolver_outcome == "no_data":
+            raise StepNoData(reason=f"no reads pass mask_idx {mask} — nothing to assemble")
+        return {"masked_reads_fastq": fastq}
+
+    monkeypatch.setattr(_workflow, "_resolve_staged_masked_reads", _fake_resolve)
+
+    backend = FakeBackendClient()
+    backend.outputs_for["assemble"] = {"contigs": tmp_path / "contigs.fasta"}
+
+    try:
+        await _run(work_ticket_idx, postgres_pool, backend, tmp_path / "ws")
+
+        row = await postgres_pool.fetchrow(
+            "SELECT state, mask_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        assert row["state"] == expected_state
+        assert row["mask_idx"] == mask_idx
+    finally:
+        await teardown()
+
+
+async def test_masked_reads_workflow_rejects_a_mask_that_does_not_exist(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """A context naming no mask fails with that as the reason, not with the
+    ForeignKeyViolationError the persist would otherwise raise."""
+    from qiita_control_plane.runner import _workflow
+
+    work_ticket_idx, mask_idx, teardown = await _seed_assembly_ticket(postgres_pool, tmp_path)
+    try:
+        gone = mask_idx + 10_000
+        await postgres_pool.execute(
+            "UPDATE qiita.work_ticket SET action_context = $2::jsonb WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+            json.dumps({"mask_idx": gone}),
+        )
+
+        async def _unreached(*a, **k):
+            raise AssertionError("resolver must not run for a mask that does not exist")
+
+        monkeypatch.setattr(_workflow, "_resolve_staged_masked_reads", _unreached)
+
+        with pytest.raises(BackendFailure) as ei:
+            await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        assert f"mask_idx {gone}" in str(ei.value)
+
+        row = await postgres_pool.fetchrow(
+            "SELECT state, mask_idx, failure_reason FROM qiita.work_ticket"
+            " WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        assert row["state"] == "failed"
+        assert row["mask_idx"] is None
+        assert f"mask_idx {gone}" in row["failure_reason"]
+        assert "does not exist" in row["failure_reason"]
+    finally:
+        await teardown()

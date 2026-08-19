@@ -29,6 +29,9 @@ def _stage_miint_extension():
     temp extension dir (`setup_miint_test_env` above) so LOAD-only callers find
     it. Plain INSTALL (not the deploy's FORCE) so the stable temp dir caches
     across runs — first run downloads from the mirror, later runs are instant.
+    Also installs the GPL-boundary tool host once, mirroring what the deploy's
+    `stage_miint_extension` does (bowtie2 alignment and friends run behind it), so
+    real-miint smokes find it pre-installed exactly as a native job does at runtime.
     Kept in step with the integration conftest's identical fixture."""
     import duckdb
     from qiita_common.duckdb_miint import (
@@ -40,6 +43,18 @@ def _stage_miint_extension():
     with duckdb.connect(":memory:", config=miint_connect_config()) as conn:
         conn.execute(miint_install_sql())
         conn.execute(miint_load_sql())
+        row = conn.execute("SELECT install_gpl_boundary()").fetchone()
+
+    # miint is a CORE dependency (see CLAUDE.md): miint_job_env() — used by the
+    # SlurmBackend and the compute-readiness probe — now REQUIRES
+    # MIINT_GPL_BOUNDARY_PATH, mirroring the deploy (native jobs get an ephemeral
+    # HOME, so the boundary must be pointed at explicitly). install_gpl_boundary()
+    # reports where it installed the binary; point the var there so submit/probe
+    # tests resolve exactly the boundary a real job would. setdefault → an explicit
+    # override (e.g. a real deploy env) still wins.
+    boundary_path = row[0].get("path") if row and row[0] else None
+    if boundary_path:
+        os.environ.setdefault("MIINT_GPL_BOUNDARY_PATH", boundary_path)
 
 
 @pytest.fixture

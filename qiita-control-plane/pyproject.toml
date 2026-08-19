@@ -9,6 +9,10 @@ dependencies = [
     "asyncpg>=0.31",
     "pyarrow>=19",
     "pyjwt[crypto]>=2.9",
+    # Ed25519 Flight-ticket signing (`auth/tickets.py`) imports `cryptography`
+    # directly. It also arrives transitively via `pyjwt[crypto]`, but a
+    # trust-boundary module must not rely on a transitive dep — pin it explicitly.
+    "cryptography>=44",
     "httpx>=0.28",
     "pyyaml>=6",
     "duckdb>=1.5.4",
@@ -29,7 +33,7 @@ dependencies = [
     # pin matches the orchestrator (which calls `save_bclconvert_v1_csv`
     # from the same release) so a re-vendor is a coordinated bump;
     # an integration parity test enforces parity.
-    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@dcce1f37c0c940478063389ef00394816bda0a2c",
+    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@366e381a72b9b7ef8b9842735cf5d7d80906194c",
 ]
 
 [project.scripts]
@@ -45,6 +49,7 @@ qiita = "qiita_control_plane.cli._bootstrap:qiita"
 dev = [
     "pytest>=9",
     "pytest-asyncio>=0.25",
+    "pytest-xdist>=3",
     "httpx>=0.28",
     "ruff>=0.15",
 ]

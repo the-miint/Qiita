@@ -55,13 +55,52 @@ PATH_REFERENCE_ROOT = ""  # POST/list against the prefix itself
 PATH_REFERENCE_BY_IDX = "/{reference_idx}"
 PATH_REFERENCE_STATUS = "/{reference_idx}/status"
 PATH_REFERENCE_INDEX = "/{reference_idx}/index"
+PATH_REFERENCE_SHARD_INDEX_STATUS = "/{reference_idx}/shard-index-status"
 PATH_REFERENCE_DOGET = "/{reference_idx}/ticket/doget"
+# Global exclusion-blocklist curation (POST/DELETE) — keyed on genome_idx /
+# feature_idx alone, NOT scoped to a reference. Literal segment, so it must be
+# registered before the `/{reference_idx}` routes (see routes/reference.py).
+PATH_REFERENCE_EXCLUSION = "/exclusion"
+# Operator force-resync: re-materialize the data-plane exclusion mirror from the
+# current Postgres blocklist with no Postgres change (recovery after a failed
+# sync / rebuilt catalog / fresh data plane). A longer literal than /exclusion, so
+# unambiguous; still a literal, registered before the `/{reference_idx}` routes.
+PATH_REFERENCE_EXCLUSION_SYNC = "/exclusion/sync"
+# Reference-scoped read of what the blocklist filters from one reference.
+PATH_REFERENCE_EXCLUSION_BY_IDX = "/{reference_idx}/exclusion"
+# Resolve a genome to its member features (feature_idx + accession) within one
+# reference — the inverse of export_member_genome, keyed on (reference_idx,
+# genome_idx) because the accession is per-(reference, feature) and a DoGet ticket
+# is per-reference. Param path, distinct 4-segment shape (no literal shadow).
+PATH_REFERENCE_GENOME_MEMBER = "/{reference_idx}/genome/{genome_idx}/member"
+# The whole reference's feature_idx → genome lookup, the inverse direction of
+# GENOME_MEMBER: one entry per (feature, genome) pair with the genome's
+# provenance. Named `genome-map` rather than `/genome` because it is not a
+# listing of genomes — it is the join table a client rolls alignment rows up
+# through. Param path, 2 segments, no literal shadow.
+PATH_REFERENCE_GENOME_MAP = "/{reference_idx}/genome-map"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
 URL_REFERENCE_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_STATUS}"
 URL_REFERENCE_INDEX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_INDEX}"
+URL_REFERENCE_SHARD_INDEX_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_SHARD_INDEX_STATUS}"
 URL_REFERENCE_DOGET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET}"
+URL_REFERENCE_EXCLUSION = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION}"
+URL_REFERENCE_EXCLUSION_SYNC = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_SYNC}"
+URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_BY_IDX}"
+URL_REFERENCE_GENOME_MEMBER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MEMBER}"
+URL_REFERENCE_GENOME_MAP = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP}"
+
+# =============================================================================
+# /host-filter-profile/*
+# =============================================================================
+
+PATH_HOST_FILTER_PROFILE_PREFIX = "/host-filter-profile"
+PATH_HOST_FILTER_PROFILE_ROOT = ""  # list against the prefix itself
+
+URL_HOST_FILTER_PROFILE_PREFIX = f"{API_PREFIX}{PATH_HOST_FILTER_PROFILE_PREFIX}"
+URL_HOST_FILTER_PROFILE_LIST = f"{URL_HOST_FILTER_PROFILE_PREFIX}{PATH_HOST_FILTER_PROFILE_ROOT}"
 
 # =============================================================================
 # /prep-protocol/*
@@ -91,11 +130,74 @@ class LibraryPrimitive(StrEnum):
     """
 
     MINT_FEATURES = "mint-features"
+    # Mint a feature_idx for each ANNOTATED INTERVAL (a SynDNA insert on its plasmid)
+    # and record the reference's claim on it. Deliberately NOT followed by
+    # write-membership. See qiita_control_plane.actions.library.mint_annotation_features.
+    MINT_ANNOTATION_FEATURES = "mint-annotation-features"
     WRITE_MEMBERSHIP = "write-membership"
+    # Assembly analogue of write-membership: link a prep_sample's assembly RUN
+    # (processing_idx) contigs — already minted against the shared qiita.feature —
+    # to qiita.assembly_membership, tagged by (kind, bin_id). See
+    # qiita_control_plane.actions.library.write_assembly_membership.
+    WRITE_ASSEMBLY_MEMBERSHIP = "write-assembly-membership"
     REGISTER_FILES = "register-files"
     REGISTER_INDEX = "register-index"
+    # Reference sharding: assign a reference's genome-bearing features to N
+    # lineage-sorted shards (reference_membership.shard_id). A CP-side primitive
+    # (its inputs — feature_genome, reference_membership, taxonomy — are
+    # Postgres/DuckLake, and it writes shard_id back), not a native compute job.
+    # See qiita_control_plane.actions.library.plan_shards.
+    PLAN_SHARDS = "plan-shards"
+    # Reference sharding: the terminal step of each shard's build ticket.
+    # Count-based, fail-closed completion — when every expected index_type has a
+    # registered row for all N shards, does the guarded `indexing -> active`.
+    # See qiita_control_plane.actions.library.finalize_shard.
+    FINALIZE_SHARD = "finalize-shard"
     PERSIST_READ_METRICS = "persist-read-metrics"
     PERSIST_QC_REPORT = "persist-qc-report"
+    # Block-compute: idempotent block replace. Runs immediately BEFORE
+    # register-files in the bulk-block read-mask workflow — deletes this block's
+    # exact read_mask footprint (its member sub-ranges under the ticket's
+    # mask_idx) so a re-run deletes-then-re-registers without double-counting. On
+    # a fresh block it deletes 0 rows. See
+    # qiita_control_plane.actions.library.delete_read_mask_block_data.
+    DELETE_READ_MASK_BLOCK = "delete-block-mask"
+    # Block-compute: the bulk-block read-mask workflow's terminal step. Marks the
+    # block completed, then finalizes each covered sample once ALL its covering
+    # blocks are done (the per-sample rollup the per-sample path did via
+    # persist-read-metrics, gated on block completion so a partially-masked sample
+    # never finalizes). See qiita_control_plane.actions.library.reconcile_block.
+    RECONCILE_BLOCK = "reconcile-block"
+    # Block-compute (align): idempotent block replace, the alignment twin of
+    # delete-block-mask. Runs immediately BEFORE register-files in the `align`
+    # workflow — deletes this block's exact alignment footprint (its member
+    # sub-ranges under the ticket's alignment_idx) from the DuckLake `alignment`
+    # table so a re-run deletes-then-re-registers without double-counting. On a
+    # fresh block it deletes 0 rows. See
+    # qiita_control_plane.actions.library.delete_alignment_block.
+    DELETE_ALIGNMENT_BLOCK = "delete-alignment-block"
+    # Block-compute (align): the `align` workflow's terminal step, the alignment
+    # twin of reconcile-block. Marks the block completed, then finalizes each
+    # covered sample's alignment_sample gate once ALL its covering blocks are done.
+    # No count-assertion (alignment rows are not 1:1 with reads — cross-shard + PE
+    # multiplicity). See qiita_control_plane.actions.library.reconcile_alignment_block.
+    RECONCILE_ALIGNMENT_BLOCK = "reconcile-alignment-block"
+    # Reference exclusion: re-materialize the GLOBAL curated blocklist onto the
+    # data plane's DuckLake `reference_exclusion` mirror (a wholesale, idempotent,
+    # replay-safe REPLACE). Runs as the post-load tail step of every reference-load
+    # workflow (reference-add, local-reference-add, host-reference-add,
+    # local-host-reference-add) so a fresh assembly of an already-blocked genome —
+    # whose newly-minted feature_idx the standing mirror can't know about — is
+    # caught by the re-resolve. Also fired on every blocklist mutation by the admin
+    # route. See qiita_control_plane.actions.library.sync_reference_exclusion.
+    SYNC_REFERENCE_EXCLUSION = "sync-reference-exclusion"
+    # Per-sample read-mask completion: the terminal step of the per-sample read-mask
+    # workflow. Records this sample's masking as 'completed' in the qiita.mask_sample
+    # gate — the per-sample twin of reconcile-block's gate flip. Per-sample masking is
+    # atomic per ticket (no PENDING phase), so it upserts straight to 'completed'.
+    # Runs AFTER register-files so the gate never reads 'completed' before the masked
+    # reads are in DuckLake. See qiita_control_plane.actions.library.finalize_mask_sample_gate.
+    FINALIZE_MASK_SAMPLE = "finalize-mask-sample"
 
 
 # =============================================================================
@@ -120,6 +222,10 @@ PATH_STEP_PLAN = "/plan"
 # Recovery / idempotency: look up live SLURM jobs by their deterministic
 # name so the CP can adopt a job it submitted but never recorded the id for.
 PATH_STEP_FIND_BY_NAME = "/find-by-name"
+# Cancel: scancel every live SLURM job of a work_ticket (all attempts, by the
+# `qiita-wt{idx}-` name prefix). The CP calls this AFTER flipping the ticket
+# terminal, so no new attempt spawns between the find and the scancel.
+PATH_STEP_CANCEL = "/cancel"
 
 URL_STEP_PREFIX = f"{API_PREFIX}{PATH_STEP_PREFIX}"
 URL_STEP_SUBMIT = f"{URL_STEP_PREFIX}{PATH_STEP_SUBMIT}"
@@ -127,6 +233,7 @@ URL_STEP_STATUS = f"{URL_STEP_PREFIX}{PATH_STEP_STATUS}"
 URL_STEP_RESULT = f"{URL_STEP_PREFIX}{PATH_STEP_RESULT}"
 URL_STEP_PLAN = f"{URL_STEP_PREFIX}{PATH_STEP_PLAN}"
 URL_STEP_FIND_BY_NAME = f"{URL_STEP_PREFIX}{PATH_STEP_FIND_BY_NAME}"
+URL_STEP_CANCEL = f"{URL_STEP_PREFIX}{PATH_STEP_CANCEL}"
 
 
 # =============================================================================
@@ -159,9 +266,24 @@ PATH_WORK_TICKET_PREFIX = "/work-ticket"
 PATH_WORK_TICKET_ROOT = ""  # POST (submit) and GET (list) against the prefix itself
 PATH_WORK_TICKET_BY_IDX = "/{work_ticket_idx}"
 PATH_WORK_TICKET_RUN = "/{work_ticket_idx}/run"
+# Operator-cancel (system_admin, work_ticket:cancel): flip the selected tickets
+# terminal (`cancelled`) so the CP stops driving them AND scancel their SLURM
+# job(s). Selects by an explicit idx list AND/OR an action_id (+ run/pool) filter —
+# one collection-level verb path serves both single and bulk, so it hangs off the
+# prefix, not `/{idx}`.
+PATH_WORK_TICKET_CANCEL = "/cancel"
 # Read a single step attempt's stdout/stderr tail (operator diagnosis without
 # a host shell — the logs live under PATH_SCRATCH/ticket, served by the CP).
 PATH_WORK_TICKET_STEP_LOGS = "/{work_ticket_idx}/step/{step_index}/logs"
+# Fan-out throttle control (system_admin, work_ticket:cancel). GET the collection
+# lists every cohort with held or in-flight children; PATCH one cohort retunes its
+# in-flight cap AND pumps it in the same call; POST .../pump re-triggers a pump
+# without touching the cap. A cohort is addressed by (kind, key) — the kinds are
+# `FanoutCohortKind`, the key is the reference_idx / mask_idx / alignment_idx the
+# fan-out hangs off. `pump` is a verb segment, the naming carve-out.
+PATH_WORK_TICKET_FANOUT = "/fanout"
+PATH_WORK_TICKET_FANOUT_COHORT = "/fanout/{kind}/{key}"
+PATH_WORK_TICKET_FANOUT_COHORT_PUMP = "/fanout/{kind}/{key}/pump"
 
 URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
 # GET-list URL — same path as the POST root, named distinctly so clients
@@ -169,7 +291,13 @@ URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
 URL_WORK_TICKET_LIST = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_ROOT}"
 URL_WORK_TICKET_BY_IDX = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_BY_IDX}"
 URL_WORK_TICKET_RUN = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_RUN}"
+URL_WORK_TICKET_CANCEL = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_CANCEL}"
 URL_WORK_TICKET_STEP_LOGS = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_STEP_LOGS}"
+URL_WORK_TICKET_FANOUT = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_FANOUT}"
+URL_WORK_TICKET_FANOUT_COHORT = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_FANOUT_COHORT}"
+URL_WORK_TICKET_FANOUT_COHORT_PUMP = (
+    f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_FANOUT_COHORT_PUMP}"
+)
 
 
 # =============================================================================
@@ -257,28 +385,120 @@ URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
 # Mints (idempotently, deduped on a canonical-config hash) the mask_idx that
 # tags the data plane's read_mask / read_masked rows. POST is service-account-
 # only (Scope.READ_MASKED_DOGET).
+#
+# The three GETs are the human read surface: which masks exist, what config a
+# mask encodes, and which samples are masked-complete under it. They carry no
+# read data — only filter metadata and per-sample completion state — so they sit
+# at Scope.PREP_SAMPLE_READ (every human role holds it), narrowed per study for a
+# plain user. The privacy-sensitive pulls (read_masked:doget,
+# admin:masked_read_export) are unchanged.
 
 PATH_MASK_DEFINITION_PREFIX = "/mask-definition"
-PATH_MASK_DEFINITION_ROOT = ""  # POST against the prefix itself
-PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # DELETE a mask (lake rows + Postgres row)
+PATH_MASK_DEFINITION_ROOT = ""  # POST (mint) / GET (list) against the prefix itself
+PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # GET one mask; DELETE (lake rows + Postgres row)
+PATH_MASK_DEFINITION_PREP_SAMPLE = "/{mask_idx}/prep-sample"  # GET the per-sample roster
+# PATCH the CONFIG's lifecycle (active <-> deprecated). Mirrors
+# PATH_REFERENCE_STATUS; a deprecated config cannot be minted against.
+PATH_MASK_DEFINITION_STATUS = "/{mask_idx}/status"
+# PATCH specific RUNS of the config (completed <-> invalidated), naming the
+# prep_samples in the body. Bulk because the judgement is made per cohort, not per
+# sample. Distinct from the route above: config lifecycle and run lifecycle are
+# different questions (see qiita_common.models.MaskDefinitionStatus).
+PATH_MASK_DEFINITION_SAMPLE_STATUS = "/{mask_idx}/sample-status"
 
 URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
 URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
+URL_MASK_DEFINITION_PREP_SAMPLE = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_PREP_SAMPLE}"
+URL_MASK_DEFINITION_STATUS = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_STATUS}"
+URL_MASK_DEFINITION_SAMPLE_STATUS = (
+    f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_SAMPLE_STATUS}"
+)
+
+# =============================================================================
+# /alignment-definition/* — control-plane sharded-alignment config identity
+# =============================================================================
+# The alignment_idx that keys the data plane's DuckLake `alignment` rows is minted
+# at plan time by the align-plan route (not a public POST here). This surface is
+# the destructive DELETE: full purge of an alignment (its DuckLake rows + the
+# Postgres alignment_definition row, cascading the alignment_sample gate) — the
+# disallow-without-delete escape hatch, system_admin-only.
+
+PATH_ALIGNMENT_DEFINITION_PREFIX = "/alignment-definition"
+PATH_ALIGNMENT_DEFINITION_BY_IDX = "/{alignment_idx}"  # DELETE an alignment (lake + Postgres)
+
+URL_ALIGNMENT_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_ALIGNMENT_DEFINITION_PREFIX}"
+URL_ALIGNMENT_DEFINITION_BY_IDX = (
+    f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_BY_IDX}"
+)
+
+# =============================================================================
+# /alignment/* — Flight DoGet ticket for the alignment sink (feature-table OGU)
+# =============================================================================
+# Signs a DoGet ticket scoped to a single alignment run + its explicit
+# prep_sample_idx cohort on the data plane's `alignment` table. Distinct prefix
+# from /alignment-definition (the alignment identity CRUD).
+#
+# TWO mint paths, differing in where the cohort comes from and therefore in how
+# it is authorized:
+#
+#   PATH_ALIGNMENT_DOGET         service-account-only (Scope.TICKET_DOGET). The
+#                                compute job mints it at runtime; the body
+#                                carries only work_ticket_idx and the route
+#                                reads alignment_idx + the cohort from that
+#                                ticket's action_context, already validated by
+#                                the runner resolver at submit (and kept CP-side,
+#                                off the wire).
+#   PATH_ALIGNMENT_COHORT_DOGET  human-callable (Scope.ALIGNMENT_DOGET). The
+#                                caller names the alignment in the path and the
+#                                cohort in the body, so the route authorizes
+#                                every sample per-study before signing. Both are
+#                                POSTs under /alignment but never ambiguous:
+#                                one has a path parameter, the other does not.
+
+PATH_ALIGNMENT_PREFIX = "/alignment"
+PATH_ALIGNMENT_DOGET = "/ticket/doget"
+PATH_ALIGNMENT_COHORT_DOGET = "/{alignment_idx}/ticket/doget"
+
+URL_ALIGNMENT_PREFIX = f"{API_PREFIX}{PATH_ALIGNMENT_PREFIX}"
+URL_ALIGNMENT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_DOGET}"
+URL_ALIGNMENT_COHORT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_COHORT_DOGET}"
 
 # =============================================================================
 # /read-masked/* — Flight DoGet ticket for the masked-read surface
 # =============================================================================
 # Signs an HMAC DoGet ticket scoped to a single (prep_sample_idx, mask_idx) on
-# the data plane's `read_masked` view. POST is service-account-only
+# the data plane's `read_masked` macro. POST is service-account-only
 # (Scope.READ_MASKED_DOGET). The route enforces the mandatory-filter invariant:
-# both identifiers are required, so an unfiltered read_masked ticket is never
-# signed.
+# both identifiers are required (they are the macro's arguments), so an
+# unfiltered read_masked ticket is never signed.
 
 PATH_READ_MASKED_PREFIX = "/read-masked"
 PATH_READ_MASKED_DOGET = "/ticket/doget"
 
 URL_READ_MASKED_PREFIX = f"{API_PREFIX}{PATH_READ_MASKED_PREFIX}"
 URL_READ_MASKED_DOGET = f"{URL_READ_MASKED_PREFIX}{PATH_READ_MASKED_DOGET}"
+
+# =============================================================================
+# /read/* — Flight DoGet ticket for a block's reads (block-compute streaming)
+# =============================================================================
+# Signs a DoGet ticket scoped to ONE block's `(prep_sample_idx, sequence_idx
+# sub-range)` members, so a block-scoped compute job streams its reads from the
+# data plane instead of reading a Parquet the control plane materialized onto
+# shared scratch. POST is service-account-only (Scope.TICKET_DOGET) — the job
+# mints it at runtime (short TTL; a SLURM queue can outlive a submit-time
+# ticket), the same shape as /alignment/ticket/doget.
+#
+# The body carries only work_ticket_idx. The route reads the block's members
+# from qiita.block_member (keeping a large member list CP-side, off the wire)
+# and picks the selector — raw `read_block` for a read-mask block, mask-scoped
+# `read_masked_block` for an align block — from the ticket's action_context (see
+# block_read.resolve_block_read_scope).
+
+PATH_READ_PREFIX = "/read"
+PATH_READ_DOGET = "/ticket/doget"
+
+URL_READ_PREFIX = f"{API_PREFIX}{PATH_READ_PREFIX}"
+URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
 
 
 # =============================================================================
@@ -320,7 +540,7 @@ PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS = "/principal/{principal_idx}/revoke-all-
 PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID = "/study/{study_idx}/owner-biosample-id"
 # Masked-read export (system_admin only): the manifest GET lists a
 # sequenced_pool's non-retired samples to export under ?mask_idx=; the ticket
-# POST mints a per-sample DoGet ticket on the data plane's read_masked view.
+# POST mints a per-sample DoGet ticket on the data plane's read_masked macro.
 PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
     "/sequenced-pool/{sequenced_pool_idx}/masked-read-export"
 )
@@ -414,6 +634,51 @@ PATH_SEQUENCED_POOL_QC_REPORT = (
 PATH_SEQUENCED_POOL_COMPLETION = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/completion"
 )
+# POST action: plan + submit the pool's bulk-block read masking. One call tiles
+# the pool's samples into fixed ~10M-read blocks (partitioned by mask identity),
+# persists the block cover-map + per-sample completion gate, and dispatches one
+# block work ticket per block. A verb sub-path (not a resource) — it is a
+# server-side command (resolve masks -> tile -> persist -> dispatch), replacing
+# the per-sample fan-out of the CLI's submit-host-filter-pool.
+PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/block-mask-plan"
+)
+# POST action: plan + submit the pool's bulk-block ALIGNMENT against a sharded
+# reference. The align analog of block-mask-plan — one call resolves each sample's
+# already-minted mask, mints an alignment_idx per mask partition, tiles the pool's
+# masked reads into fixed ~10M-read blocks, persists the block cover-map +
+# per-sample alignment gate, and dispatches one block work ticket per block. A verb
+# sub-path (a server-side command), not a resource.
+PATH_SEQUENCED_POOL_ALIGN_PLAN = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/align-plan"
+)
+# GET the alignments over this pool's samples: per alignment_idx, its config
+# params and completed/total sample counts. Counts are scoped to the samples the
+# CALLER may read, so they agree with what the alignment DoGet mint will sign.
+PATH_SEQUENCED_POOL_ALIGNMENT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/alignment"
+)
+# GET the cohort to mint an alignment DoGet ticket for: the pool's prep_samples
+# that are BOTH readable by the caller and 'completed' for this alignment. The
+# list this returns is a valid mint body by construction.
+PATH_SEQUENCED_POOL_ALIGNMENT_COHORT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/alignment/{alignment_idx}/cohort"
+)
+# GET the pool's exception drill-down: only the anomalous non-retired
+# sequenced_samples — no usable reads (unprocessed or zero survived), missing any
+# of the four submission accessions, or a genuinely-failed read-mask ticket (failed
+# with no completed) — each with the flags naming why. The actionable subset of the
+# roster, so an operator sees what needs attention without scanning every sample.
+PATH_SEQUENCED_SAMPLE_EXCEPTIONS = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/sequenced-sample/exceptions"
+)
+# GET the pool's work-ticket state rollup: read-mask ticket coverage
+# (samples with / without a ticket) plus per-STATE ticket counts (tickets as the
+# denominator, no per-sample precedence collapse — distinct from the completion
+# rollup's per-sample buckets).
+PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/work-ticket/summary"
+)
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
@@ -430,6 +695,18 @@ URL_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE = (
 URL_SEQUENCED_POOL_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BY_IDX}"
 URL_SEQUENCED_POOL_QC_REPORT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_QC_REPORT}"
 URL_SEQUENCED_POOL_COMPLETION = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_COMPLETION}"
+URL_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN}"
+)
+URL_SEQUENCED_POOL_ALIGN_PLAN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGN_PLAN}"
+URL_SEQUENCED_POOL_ALIGNMENT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGNMENT}"
+URL_SEQUENCED_POOL_ALIGNMENT_COHORT = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGNMENT_COHORT}"
+)
+URL_SEQUENCED_SAMPLE_EXCEPTIONS = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_EXCEPTIONS}"
+URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY}"
+)
 
 
 # =============================================================================
@@ -441,6 +718,14 @@ URL_SEQUENCED_POOL_COMPLETION = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POO
 
 PATH_BIOSAMPLE_BY_STUDY = "/{study_idx}/biosample"
 PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
+# Study-scoped single biosample: a GET view carrying this study's local
+# metadata alongside the global metadata, and a metadata upsert PATCH. Both
+# anchor on the /study router (the caller is authorized on the study).
+PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
+PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
+# Create a study-local biosample field definition (POST). The study-scoped
+# mint hangs off the /study router (the caller is authorized on the study).
+PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/biosample-field"
 
 PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
@@ -458,6 +743,9 @@ PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
+URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
+URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
+URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
@@ -484,6 +772,10 @@ PATH_SEQUENCED_SAMPLE_LIST_BY_RUN = "/{sequencing_run_idx}/sequenced-sample/list
 # rather than `list-idxs`, paralleling LIST_BY_POOL.
 PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = "/{sequencing_run_idx}/sequenced-sample/list"
 PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY = "/{study_idx}/sequenced-sample/list-idxs"
+PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/sequenced-sample/{sequenced_sample_idx}"
+PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
+    "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata"
+)
 # Pool-scoped sibling of LIST_BY_RUN. Returns richer per-sample rows
 # (prep_sample_idx + sequenced_pool_item_id), hence the `list` segment rather
 # than `list-idxs`. Anchored on /sequencing-run so require_sequenced_pool_in_run
@@ -501,6 +793,12 @@ URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL}"
 )
 URL_SEQUENCED_SAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY}"
+URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = (
+    f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX}"
+)
+URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
+    f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY}"
+)
 URL_SEQUENCED_SAMPLE_LIST_BY_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_POOL}"
 )
@@ -521,7 +819,54 @@ PATH_PREP_SAMPLE_STUDY_LIST = "/{prep_sample_idx}/study/list"
 # without a raw production UPDATE. Reversible by design (a misclassified well
 # must be recoverable), unlike the terminal principal retire.
 PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
+# Create a study-local prep_sample field definition (POST). The study-scoped
+# mint hangs off the /study router (the caller is authorized on the study).
+PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/prep-sample-field"
+
+# =============================================================================
+# /exported-identifier — the public handle a published table carries per sample
+# =============================================================================
+# POST, and not only because it writes: the cohort has to ride the body, like
+# /biosample/lookup-by-accession, because a feature table's cohort is a pool's or
+# a study's worth of samples and routinely spans pools, neither of which a query
+# string can carry.
+
+PATH_EXPORTED_IDENTIFIER_PREFIX = "/exported-identifier"
+PATH_EXPORTED_IDENTIFIER_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_IDENTIFIER_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_IDENTIFIER_PREFIX}"
+URL_EXPORTED_IDENTIFIER = f"{URL_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_ROOT}"
+
+
+# =============================================================================
+# /exported-feature — the public handle a published table carries per ROW
+# =============================================================================
+# The other axis of the same artifact: /exported-identifier names the columns
+# (processed samples), this names the rows (genomes and features). POST for the
+# same two reasons — it mints, and the entity set has to ride the body.
+
+PATH_EXPORTED_FEATURE_PREFIX = "/exported-feature"
+PATH_EXPORTED_FEATURE_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_FEATURE_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_FEATURE_PREFIX}"
+URL_EXPORTED_FEATURE = f"{URL_EXPORTED_FEATURE_PREFIX}{PATH_EXPORTED_FEATURE_ROOT}"
+
+
+# =============================================================================
+# /exported-processing — the public handle a published bundle's manifest cites
+# =============================================================================
+# The third axis: /exported-identifier names a table's columns, /exported-feature
+# its rows, and this names what was DONE to produce it. POST because it mints, and
+# against the prefix like its two siblings.
+
+PATH_EXPORTED_PROCESSING_PREFIX = "/exported-processing"
+PATH_EXPORTED_PROCESSING_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_PROCESSING_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_PROCESSING_PREFIX}"
+URL_EXPORTED_PROCESSING = f"{URL_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_ROOT}"
+
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
 URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"
+URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"

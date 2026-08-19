@@ -4,6 +4,14 @@ description: Fold the current branch's operator-impacting changes into the Pendi
 
 You are folding this branch's operator-facing deploy steps into the **single consolidated `## Pending deploy` checklist** in `DEPLOY_CHECKLIST.md`. Read `DEPLOY_CHECKLIST.md`'s preamble and the "Operator-facing changes" + "Deployments" sections of `CLAUDE.md` first — they define the model. Do **not** create a standalone per-PR entry; this repo replaced that format with the living checklist.
 
+**Read only the live section — never the whole file.** `## Pending deploy` is the only part you edit. Print it with the same recipe the operator uses on the deploy host (`docs/runbooks/redeploy.md` §1):
+
+```
+sed -n '/^## Pending deploy/,/^## Deployed history/p' DEPLOY_CHECKLIST.md
+```
+
+Everything below `## Deployed history` is archive — past deploys, pointing at `docs/deploy-archive/`. It is never the target of a fold. Don't grep the file for a bucket heading either: use the line range this recipe gives you and `Read` that span.
+
 ## 1. Detect what this branch changes that the operator must act on
 
 Diff the branch against `main` and look for each category below. `$ARGUMENTS` may name a PR number to tag with; if absent, use the branch name (e.g. `#feat/foo`) as the tag and tell the user to retag once the PR number exists.
@@ -31,7 +39,7 @@ Edit `## Pending deploy` in `DEPLOY_CHECKLIST.md`. Place each item in its bucket
 - **Merge into the existing lines, don't duplicate them.** If bucket 1 already appends to `compute-orchestrator.env` (one idempotent `sudo bash -c 'grep -q … || echo "KEY=value" >> …'` per var), add your var as another such line next to them — do not start a second CO group. Same for the migration list and verify checks.
 - **Tag every line you add with `(#N)`** (the PR/branch ref) so the archive step and the operator can trace provenance.
 - **Keep it concise** — a copy-pasteable command and a half-line of why, matching the surrounding style. No prose narration of the change; the git log covers that.
-- Respect ordering: anything `from_env()` requires goes in bucket 1 (must precede the restart); migrations in bucket 3; verification in bucket 5.
+- Respect ordering: anything `from_env()` requires goes in bucket 1 (must precede the restart); migrations in bucket 3; verification in bucket 5. Irreversible cleanup that burns the rollback path (retiring a superseded secret, deleting an old data dir) goes in bucket 6 — it must not run until bucket 5 is green, because until then the OLD build's config is the way back.
 - Don't maintain any parallel PR roll-call list — the per-line `(#N)` tags are the only provenance record.
 
 ## 3. Report

@@ -101,6 +101,82 @@ def _inputs(host_filter, **kw):
     return host_filter.Inputs(**base)
 
 
+@pytest.mark.parametrize(
+    ("mates", "rype_cols"),
+    [
+        ([None, None], ["read_id", "sequence1"]),
+        (["ACGTACGTAC", "ACGTACGTAC"], ["read_id", "sequence1", "sequence2"]),
+        ([None, "ACGTACGTAC"], ["read_id", "sequence1", "sequence2"]),
+    ],
+    ids=["single-end", "paired-end", "mixed-keeps-the-mate-column"],
+)
+def test_host_filter_rype_query_drops_an_all_null_mate(
+    tmp_path, monkeypatch, write_reads, mates, rype_cols
+):
+    """rype is handed `sequence1` ALONE when NO read in the block carries a mate; minimap2
+    keeps both mates in every case.
+
+    A batch-SIZING property with no effect on the mask, so only the COLUMN LIST can pin it.
+    miint reads rype's `is_paired` off the presence of a `sequence2` column and never off
+    its values (duckdb-miint#199), and rype then assumes a query twice as long and halves
+    its Arrow batch — and it reloads the whole index per batch, so an all-NULL mate column
+    doubles the host-index reloads.
+
+    Narrowing minimap2's query instead would be a correctness bug (it aligns pairs
+    natively), hence the second assertion.
+
+    The MIXED arm is the one that pins the deliberate divergence from `align_sharded`:
+    this job gates on `paired > 0`, not all-or-none, so one mate-carrying read keeps the
+    column for the whole batch (conservative sizing rather than dropped mates). Nothing
+    else in the suite constrains that — `test_host_filter_marks_rype_union_minimap2` has a
+    mixed fixture but asserts read ids, reasons, threshold and preset, never a column
+    list, so it passes either way and the `> 0` could be flipped to all-or-none with the
+    suite green."""
+    from qiita_compute_orchestrator.jobs import host_filter
+
+    reads = write_reads(
+        tmp_path / "reads.parquet",
+        [(10 * (i + 1), f"r{i}", "ACGTACGTAC", mate) for i, mate in enumerate(mates)],
+    )
+    qc_mask = _qc_mask(
+        tmp_path / "qc_mask.parquet",
+        [
+            (10 * (i + 1), ReadMaskReason.PASS.value, mate is not None)
+            for i, mate in enumerate(mates)
+        ],
+    )
+
+    seen: dict = {}
+
+    def _cols(conn, relation):
+        return [d[0] for d in conn.execute(f"SELECT * FROM {relation} LIMIT 0").description]
+
+    def fake_rype(conn, index_path, sequence_table, dest_table, *, threshold):
+        seen["rype_cols"] = _cols(conn, sequence_table)
+
+    def fake_mm2(conn, index_path, query_table, dest_table, *, preset):
+        seen["mm2_cols"] = _cols(conn, query_table)
+
+    monkeypatch.setattr(host_filter, "_run_rype_classify", fake_rype)
+    monkeypatch.setattr(host_filter, "_run_align_minimap2", fake_mm2)
+
+    asyncio.run(
+        host_filter.execute(
+            _inputs(
+                host_filter,
+                reads=reads,
+                qc_mask=qc_mask,
+                host_rype_path=_ryxdi(tmp_path),
+                host_minimap2_path=_mmi(tmp_path),
+            ),
+            tmp_path / "ws",
+        )
+    )
+
+    assert seen["rype_cols"] == rype_cols
+    assert seen["mm2_cols"] == ["read_id", "sequence1", "sequence2"]
+
+
 def test_host_filter_marks_rype_union_minimap2(tmp_path, monkeypatch, write_reads):
     """host set = rype ∪ minimap2; minimap2 sees ONLY rype's survivors; host
     overrides pass; the mask schema + mask_idx/prep_sample_idx are stamped."""
@@ -175,6 +251,63 @@ def test_host_filter_marks_rype_union_minimap2(tmp_path, monkeypatch, write_read
             f"SELECT DISTINCT mask_idx, prep_sample_idx FROM read_parquet('{out['read_mask']}')"
         ).fetchall()
     assert consts == [(_MASK_IDX, _PREP_SAMPLE_IDX)]
+
+
+def test_host_filter_multi_sample_block_stamps_per_row_prep_sample(
+    tmp_path, monkeypatch, write_reads
+):
+    """A BLOCK's reads span several prep_samples, so the mask must stamp each
+    row's OWN prep_sample_idx (read per-row from the reads parquet), not a single
+    per-run constant. sequence_idx is globally unique, so a host hit still marks
+    exactly the right read regardless of which sample it belongs to."""
+    from qiita_compute_orchestrator.jobs import host_filter
+
+    # Two samples in one block: sample 5 owns seq 10,20; sample 7 owns seq 30,40.
+    reads = write_reads(
+        tmp_path / "reads.parquet",
+        [
+            (10, "a", "ACGTACGTAC", "ACGTACGTAC"),
+            (20, "b", "ACGTACGTAC", "ACGTACGTAC"),
+            (30, "c", "ACGTACGTAC", "ACGTACGTAC"),
+            (40, "d", "ACGTACGTAC", None),
+        ],
+        prep_sample_idx=[5, 5, 7, 7],
+    )
+    qc_mask = _qc_mask(
+        tmp_path / "qc_mask.parquet",
+        [
+            (10, ReadMaskReason.PASS.value, True),
+            (20, ReadMaskReason.PASS.value, True),
+            (30, ReadMaskReason.PASS.value, True),
+            (40, ReadMaskReason.PASS.value, False),
+        ],
+    )
+
+    def fake_rype(conn, index_path, sequence_table, dest_table, *, threshold):
+        # Flag one read from EACH sample (seq 20 -> sample 5, seq 30 -> sample 7).
+        conn.execute(f"INSERT INTO {dest_table} VALUES (20), (30)")
+
+    monkeypatch.setattr(host_filter, "_run_rype_classify", fake_rype)
+
+    out = asyncio.run(
+        host_filter.execute(
+            _inputs(host_filter, reads=reads, qc_mask=qc_mask, host_rype_path=_ryxdi(tmp_path)),
+            tmp_path / "ws",
+        )
+    )
+
+    # Each row carries its OWN owner, and both samples appear in one output.
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(
+            f"SELECT sequence_idx, prep_sample_idx, reason "
+            f"FROM read_parquet('{out['read_mask']}') ORDER BY sequence_idx"
+        ).fetchall()
+    assert rows == [
+        (10, 5, ReadMaskReason.PASS.value),
+        (20, 5, ReadMaskReason.HOST_RYPE.value),
+        (30, 7, ReadMaskReason.HOST_RYPE.value),
+        (40, 7, ReadMaskReason.PASS.value),
+    ]
 
 
 def test_host_filter_classifies_only_pass_reads(tmp_path, monkeypatch, write_reads):

@@ -1,22 +1,14 @@
 """Biosample routes.
 
-Two routers live here. The study-scoped router (prefix=/study) carries the
-single-biosample import (POST) and the study-scoped bulk-id read
-(GET .../list-idxs). The biosample-scoped router (prefix=/biosample)
-carries the single-resource read (GET /{biosample_idx}) and the
-single-resource PATCH (PATCH /{biosample_idx}). Bulk-import,
-retirement, search, and admin metadata-schema endpoints are deferred.
-The write handler gates on caller scope, study existence, and
-per-study ADMIN access (wet_lab_admin+ bypass) and delegates the
-multi-table write to the repositories.biosample composer inside one
-connection-scoped transaction; the study-scoped read gates
-on caller scope and study access (with admin role bypass); the
-single-biosample read gates on caller scope, then 404s on missing or
-retired biosamples and gates non-admin callers on
-owner-or-linked-study-access via the repository predicate; the PATCH
-gates on caller scope and wet_lab_admin (or higher) role and applies
-its mutation inside one connection-scoped transaction with required
-If-Match optimistic-concurrency control.
+Two routers live here: a study-scoped one (prefix=/study) for operations
+authorized on a study, and a biosample-scoped one (prefix=/biosample) for
+operations authorized on the biosample itself. Study-scoped handlers gate on
+caller scope, study existence, and per-study access tier (wet_lab_admin+
+bypass); biosample-scoped handlers gate on caller scope, then on
+owner-or-linked-study access via the repository predicate. Writes apply their
+mutation inside one connection-scoped transaction, delegating multi-table work
+to the repositories.biosample composer. Bulk import, retirement, search, and
+admin metadata-schema endpoints are deferred.
 """
 
 from collections.abc import Awaitable, Callable
@@ -28,10 +20,13 @@ from pydantic import Field
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_BY_STUDY,
+    PATH_BIOSAMPLE_BY_STUDY_AND_IDX,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
+    PATH_BIOSAMPLE_METADATA_BY_STUDY,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import Scope, SystemRole
@@ -44,9 +39,14 @@ from qiita_common.models import (
     BiosampleLookupByMatrixTubeIdResponse,
     BiosamplePatchRequest,
     BiosampleResponse,
-    GlobalMetadataEntry,
+    BiosampleStudyFieldCreateRequest,
+    BiosampleStudyFieldResponse,
     IdxsListResponse,
     MetadataChecklistRef,
+    MetadataEntry,
+    SampleMetadataWriteRequest,
+    SampleMetadataWriteResponse,
+    StudyScopedBiosampleResponse,
     Tier,
 )
 
@@ -63,11 +63,7 @@ from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
 from ..repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
-    MetadataParseError,
-    MetadataUnknownFieldsError,
-    SlotOccupiedError,
-    StudyFieldConflictError,
-    TransientWriteRaceError,
+    MetadataMissingRequiredFieldsError,
     fetch_global_metadata,
 )
 from ..repositories.biosample import (
@@ -85,16 +81,24 @@ from ..repositories.biosample_metadata import (
     BiosampleOwnerIdMissingValueError,
 )
 from ._helpers import (
+    ETAG_HEADER,
     GENERIC_FK_VIOLATION,
+    IF_MATCH_HEADER,
+    SAMPLE_METADATA_WRITE_ERRORS,
     build_idxs_list_response,
-    detail_for_slot_collision,
+    create_and_map_study_field,
+    detail_for_unlinked_entity,
     etag_for_updated_at,
-    raise_for_transient_write_race,
+    metadata_entries_from_rows,
     raise_for_unique_violation,
+    raise_http_for_sample_metadata_write_error,
+    read_study_scoped_entity,
     require_etag_match,
     require_if_match,
     resolve_idxs_by_natural_key,
+    resolve_linked_study_entity,
     resolve_metadata_checklist_idx,
+    write_and_map_sample_metadata,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["biosample"])
@@ -181,6 +185,7 @@ async def import_biosample(
                 biosample_accession=body.biosample_accession,
                 ena_sample_accession=body.ena_sample_accession,
                 matrix_tube_id=body.matrix_tube_id,
+                global_internal_names=body.global_internal_names,
             )
         except BiosampleOwnerIdFieldCollisionError as exc:
             raise HTTPException(
@@ -200,53 +205,25 @@ async def import_biosample(
                     " cannot be a missing-value marker"
                 ),
             )
-        except MetadataUnknownFieldsError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=f"unknown metadata fields: {', '.join(exc.unknown_display_names)}",
-            )
-        except MetadataParseError as exc:
+        except MetadataMissingRequiredFieldsError as exc:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"could not parse metadata field {exc.display_name!r}"
-                    f" value {exc.text_value!r} as {exc.data_type}: {exc.reason}"
+                    "missing required metadata field(s):"
+                    f" {', '.join(exc.missing_display_names)}."
+                    " A field may be given a missing-value marker (e.g."
+                    " 'not applicable') — declining to answer is allowed, silence"
+                    " is not."
                 ),
             )
-        except StudyFieldConflictError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"study has an existing field at display_name {exc.display_name!r}"
-                    " bound to a different global field"
-                ),
-            )
-        except SlotOccupiedError as exc:
-            # SlotOccupiedError is its own exception family (not an
-            # asyncpg.UniqueViolationError subclass), so this catch and
-            # the generic UniqueViolationError catch below are independent;
-            # both return 409, but this one's detail discriminates the
-            # six sub-cases rather than collapsing to the generic message.
-            #
-            # NOT DEAD CODE — do not prune. Currently unreachable
-            # through this POST because the route creates a fresh
-            # biosample per call, so neither the global-field slot nor
-            # the per-field local slot for that biosample can be pre-
-            # occupied and the unique constraint cannot fire. Kept for
-            # the planned PATCH-style write-metadata-on-existing-
-            # biosample endpoint, which will share this composer path;
-            # that endpoint can hit either constraint whenever a caller
-            # writes a value into a biosample whose slot was already
-            # claimed (by another study on the global path, or by an
-            # earlier write on the same study on the local path).
-            detail = await detail_for_slot_collision(conn, exc)
-            raise HTTPException(status_code=409, detail=detail)
-        except TransientWriteRaceError as exc:
-            # The diagnostic read found the colliding occupant already
-            # gone — a concurrent delete won the race and the slot is
-            # free again. Independent of the asyncpg catches; maps to a
-            # 503 + Retry-After so the client resubmits the same request.
-            raise_for_transient_write_race(exc)
+        except SAMPLE_METADATA_WRITE_ERRORS as exc:
+            # Shared metadata-write arms (parse / unknown / conflict /
+            # duplicate-global-target / slot-collision / transient-race) map
+            # through one place. The owner-id and asyncpg arms below stay
+            # route-specific. SlotOccupiedError is unreachable through this POST
+            # (a fresh biosample per call cannot pre-occupy a slot) but is
+            # handled for the shared PATCH path that reuses this composer.
+            await raise_http_for_sample_metadata_write_error(conn, exc)
         except LocalWriteOnGloballyLinkedFieldError as exc:
             # The requested owner-biosample-id field name resolves to a
             # field already globally linked on this study. The owner-id
@@ -279,6 +256,54 @@ async def import_biosample(
         owner_id_biosample_study_field_idx=result.owner_id_biosample_study_field_idx,
         owner_id_biosample_study_field_created=result.owner_id_biosample_study_field_created,
     )
+
+
+@router.post(PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY, status_code=201)
+async def create_biosample_field(
+    study_idx: Annotated[int, Field(gt=0)],
+    body: BiosampleStudyFieldCreateRequest,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> BiosampleStudyFieldResponse:
+    """Create a study-local biosample field definition (no metadata value).
+
+    The caller must be a HumanUser with profile_complete=True, hold the
+    biosample:write scope, and have `Tier.ADMIN` access (or higher) to the
+    path's study — study owner, an ADMIN study_access row, or wet_lab_admin /
+    system_admin (role bypass). `require_study_exists` composes alongside
+    `require_study_access` so role-bypass callers still get 404 on a
+    non-existent study_idx. A field of that name already on the study is a 409;
+    the response body is the created field.
+
+    Access policy is interim: the ADMIN gate is a coarse stand-in matching the
+    study-scoped biosample metadata routes, held until per-field
+    visibility-tier enforcement lands. When that clamp comes off, this route
+    goes back to `Tier.MEMBER` — minting a study-local field is work a study
+    member is meant to do.
+
+    biosample_global_field_idx discriminates two mutually-exclusive modes.
+    Purely-local (omitted): data_type is required, plus optional required /
+    terminology_idx / tier_override. Globally-linked (set): only display_name
+    (+ optional description); data_type / required / terminology_idx /
+    tier_override are inherited from the global field and must be omitted here,
+    and come back on the response resolved to the global field's values.
+    """
+    async with tx() as conn:
+        response = await create_and_map_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            body=body,
+            caller_idx=user.principal_idx,
+            response_model=BiosampleStudyFieldResponse,
+        )
+
+    return response
 
 
 # Hard cap on the bulk-id read. Sized to comfortably cover any single
@@ -322,6 +347,150 @@ async def list_biosample_idxs_in_study(
     )
 
 
+@router.get(PATH_BIOSAMPLE_BY_STUDY_AND_IDX)
+async def get_biosample_in_study(
+    study_idx: Annotated[int, Field(gt=0)],
+    biosample_idx: Annotated[int, Field(gt=0)],
+    response: Response,
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> StudyScopedBiosampleResponse:
+    """Return one study's view of a biosample: the core row, its globally-linked
+    metadata, and this study's purely-local metadata.
+
+    Access policy is interim: gated at Tier.ADMIN study access with a
+    wet_lab_admin+ role bypass -- a coarse stand-in until per-field
+    visibility-tier enforcement lands. 401 on Anonymous, 403 on missing scope or
+    sub-ADMIN tier, 404 on a study that does not exist. require_study_exists
+    composes alongside require_study_access so an admin-bypass caller still gets
+    404 on a non-existent study.
+
+    The biosample must be linked to this study: a nonexistent biosample_idx and
+    one with no non-retired biosample_to_study link to study_idx share the same
+    404 so a caller never learns the state of a biosample outside their study;
+    retirement is evaluated only after the link passes, and a retired biosample
+    is likewise 404 (mirroring the biosample-level read's retired carve-out).
+
+    local_metadata includes the owner-biosample-id row, and every caller the
+    gate above admits sees it: an ADMIN-tier study_access row, the study's
+    owner, or a wet_lab_admin+ role, which returns before the tier check runs.
+    The field is pinned to member tier in the schema, but nothing enforces that
+    pin yet, so the gate is what restricts the value. This route does not write it.
+
+    The response carries an `ETag` header derived from the row's `updated_at`
+    column; the value is a quoted ISO 8601 timestamp and is opaque by contract.
+    """
+    # One REPEATABLE READ snapshot so the row read, the link check, and both
+    # metadata reads cannot disagree about a concurrent writer's commit. The
+    # shared helper fetches the row, gates on the study link (nonexistent and
+    # unlinked share one 404) and retirement, and reads both metadata scopes.
+    async with snapshot() as conn:
+        row, global_metadata, local_metadata = await read_study_scoped_entity(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            fetch_row=fetch_biosample,
+            entity_idx=biosample_idx,
+            metadata_idx_column="idx",
+            study_idx=study_idx,
+            noun="biosample",
+        )
+
+    # Set the ETag header so callers can use it as the If-Match value on a
+    # subsequent PATCH; the value is opaque-by-contract.
+    response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
+
+    return _study_scoped_response_from_row(
+        row,
+        global_metadata=global_metadata,
+        local_metadata=local_metadata,
+        caller_system_role=user.system_role,
+    )
+
+
+@router.patch(PATH_BIOSAMPLE_METADATA_BY_STUDY)
+async def patch_biosample_metadata(
+    study_idx: Annotated[int, Field(gt=0)],
+    biosample_idx: Annotated[int, Field(gt=0)],
+    body: SampleMetadataWriteRequest,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> SampleMetadataWriteResponse:
+    """Upsert this study's metadata values on a biosample.
+
+    Access policy is interim: gated at Tier.ADMIN study access with a
+    wet_lab_admin+ role bypass -- a coarse stand-in until per-field
+    visibility-tier enforcement lands. 401 on Anonymous, 403 on missing scope,
+    an incomplete profile, or sub-ADMIN tier, 404 on a study that does not
+    exist. require_study_exists composes alongside require_study_access so an
+    admin-bypass caller still gets 404 on a non-existent study.
+
+    The biosample must be linked to this study: a nonexistent biosample_idx and
+    one with no non-retired biosample_to_study link to study_idx share the same
+    404 so a caller never learns the state of a biosample outside their study; a
+    retired biosample is a 409 (its metadata cannot be written), checked only
+    after the link passes. A link retired between that check and the write is
+    refused by the database and answers the same 404, so the status does not
+    depend on which of the two noticed.
+
+    The body maps field display_name -> text value -- or global internal_name ->
+    text value when it sets global_internal_names, which leaves study-local
+    fields display-name-keyed. Each key resolves against the study's existing
+    global or study-local fields and is upserted (unknown fields -> 422, an empty
+    body -> 422 at the wire boundary, the owner-biosample-id field -> 422 since
+    it is changed only through its own surface, a cross-study global slot
+    collision -> 409). The response reports per field, in input order, whether it
+    resolved global or local, the write outcome (inserted / updated /
+    unchanged), the value now in the slot, and the internal_name a globally
+    linked value reads back under.
+
+    There is NO If-Match on this route: a concurrent same-study, same-field
+    write is last-writer-wins (a silent lost update). The per-slot upsert is
+    race-safe against cross-study collisions (409) but does not serialize
+    same-study rewrites; callers needing lost-update protection coordinate out
+    of band.
+    """
+    async with tx() as conn:
+        # Gate on the study link (nonexistent + unlinked share one 404) and
+        # retirement (409 for a write); metadata_entity_idx is the biosample's
+        # own idx here (a subtype entity would key metadata on a supertype idx).
+        _row, metadata_entity_idx = await resolve_linked_study_entity(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            fetch_row=fetch_biosample,
+            entity_idx=biosample_idx,
+            metadata_idx_column="idx",
+            study_idx=study_idx,
+            noun="biosample",
+            retired_status=409,
+            retired_detail=f"biosample {biosample_idx} is retired",
+        )
+        # Upsert and shape via the shared write body (owner-id write refused
+        # -> 422; the no-If-Match lost-update caveat lives at its call site).
+        response = await write_and_map_sample_metadata(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            entity_idx=metadata_entity_idx,
+            study_idx=study_idx,
+            metadata=body.metadata,
+            caller_idx=user.principal_idx,
+            unlinked_detail=detail_for_unlinked_entity(
+                noun="biosample", entity_idx=biosample_idx, study_idx=study_idx
+            ),
+            global_internal_names=body.global_internal_names,
+        )
+    return response
+
+
 # Roles that may bypass the per-biosample owner / linked-study-access check.
 # A bypass-role caller still gets the standard 404 on a missing or retired
 # biosample (see the docstring on get_biosample for the retired-row
@@ -329,42 +498,73 @@ async def list_biosample_idxs_in_study(
 _BIOSAMPLE_GET_BYPASS_ROLE: SystemRole = SystemRole.WET_LAB_ADMIN
 
 
+def _biosample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
+    """Map a qiita.biosample row's columns to BiosampleResponse field names.
+
+    Centralises the column -> field mapping (the idx -> biosample_idx rename
+    aside, every key matches its column). Excludes the metadata dicts and
+    caller_system_role. Runs no DB queries.
+    """
+    return {
+        "biosample_idx": row["idx"],
+        "owner_idx": row["owner_idx"],
+        "metadata_checklist": MetadataChecklistRef.from_row(
+            row["metadata_checklist_idx"], row["metadata_checklist_name"]
+        ),
+        "biosample_accession": row["biosample_accession"],
+        "ena_sample_accession": row["ena_sample_accession"],
+        "matrix_tube_id": row["matrix_tube_id"],
+        "last_submission_at": row["last_submission_at"],
+        "submission_error": row["submission_error"],
+        "last_metadata_change_at": row["last_metadata_change_at"],
+        "created_by_idx": row["created_by_idx"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "retired": row["retired"],
+        "retired_by_idx": row["retired_by_idx"],
+        "retired_at": row["retired_at"],
+        "retire_reason": row["retire_reason"],
+    }
+
+
 def _biosample_response_from_row(
     row: asyncpg.Record,
     *,
-    global_metadata: dict[str, GlobalMetadataEntry],
+    global_metadata: dict[str, MetadataEntry],
     caller_system_role: SystemRole,
 ) -> BiosampleResponse:
     """Shape a qiita.biosample row + decoded global metadata into BiosampleResponse.
 
-    Centralises the column -> field mapping (idx -> biosample_idx) so a future
-    GET / PATCH route can reuse it. The global_metadata dict is supplied by
-    the caller -- this helper does not run any DB queries.
+    Reuses the shared core-column mapping; the global_metadata dict is supplied
+    by the caller -- this helper runs no DB queries.
     """
-    return BiosampleResponse.model_validate(
-        {
-            "biosample_idx": row["idx"],
-            "owner_idx": row["owner_idx"],
-            "metadata_checklist": MetadataChecklistRef.from_row(
-                row["metadata_checklist_idx"], row["metadata_checklist_name"]
-            ),
-            "biosample_accession": row["biosample_accession"],
-            "ena_sample_accession": row["ena_sample_accession"],
-            "matrix_tube_id": row["matrix_tube_id"],
-            "last_submission_at": row["last_submission_at"],
-            "submission_error": row["submission_error"],
-            "last_metadata_change_at": row["last_metadata_change_at"],
-            "created_by_idx": row["created_by_idx"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-            "retired": row["retired"],
-            "retired_by_idx": row["retired_by_idx"],
-            "retired_at": row["retired_at"],
-            "retire_reason": row["retire_reason"],
-            "global_metadata": global_metadata,
-            "caller_system_role": caller_system_role,
-        }
-    )
+    payload = _biosample_core_row_dict(row) | {
+        "global_metadata": global_metadata,
+        "caller_system_role": caller_system_role,
+    }
+    return BiosampleResponse.model_validate(payload)
+
+
+def _study_scoped_response_from_row(
+    row: asyncpg.Record,
+    *,
+    global_metadata: dict[str, MetadataEntry],
+    local_metadata: dict[str, MetadataEntry],
+    caller_system_role: SystemRole,
+) -> StudyScopedBiosampleResponse:
+    """Shape a biosample row + its global and study-local metadata into
+    StudyScopedBiosampleResponse.
+
+    Reuses the shared core-column mapping and adds this study's purely-local
+    metadata (keyed by display_name) alongside the global map. Both metadata
+    dicts are supplied by the caller -- this helper runs no DB queries.
+    """
+    payload = _biosample_core_row_dict(row) | {
+        "global_metadata": global_metadata,
+        "local_metadata": local_metadata,
+        "caller_system_role": caller_system_role,
+    }
+    return StudyScopedBiosampleResponse.model_validate(payload)
 
 
 @biosample_router.get(PATH_BIOSAMPLE_BY_IDX)
@@ -432,19 +632,11 @@ async def get_biosample(
             conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx
         )
 
-    global_metadata = {
-        internal_name: GlobalMetadataEntry(
-            display_name=entry.display_name,
-            description=entry.description,
-            data_type=entry.data_type,
-            value=entry.value,
-        )
-        for internal_name, entry in metadata_rows.items()
-    }
+    global_metadata = metadata_entries_from_rows(metadata_rows)
 
     # Set the ETag header so callers can use it as the If-Match value on a
     # subsequent PATCH; the value is opaque-by-contract.
-    response.headers["ETag"] = etag_for_updated_at(row["updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
 
     return _biosample_response_from_row(
         row,
@@ -538,7 +730,7 @@ async def patch_biosample(
     biosample_idx: Annotated[int, Field(gt=0)],
     body: BiosamplePatchRequest,
     response: Response,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    if_match: Annotated[str | None, Header(alias=IF_MATCH_HEADER)] = None,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     caller: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
@@ -662,19 +854,11 @@ async def patch_biosample(
             raise
 
     # Set the new ETag from the updated row's bumped updated_at.
-    response.headers["ETag"] = etag_for_updated_at(updated_row["updated_at"])
+    response.headers[ETAG_HEADER] = etag_for_updated_at(updated_row["updated_at"])
 
     # Reuse the GET route's row -> response shaper so the PATCH and GET
     # surfaces share one source of truth for the response shape.
-    global_metadata = {
-        internal_name: GlobalMetadataEntry(
-            display_name=entry.display_name,
-            description=entry.description,
-            data_type=entry.data_type,
-            value=entry.value,
-        )
-        for internal_name, entry in metadata_rows.items()
-    }
+    global_metadata = metadata_entries_from_rows(metadata_rows)
     return _biosample_response_from_row(
         updated_row,
         global_metadata=global_metadata,

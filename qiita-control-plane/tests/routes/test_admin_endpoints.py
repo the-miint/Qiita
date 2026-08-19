@@ -33,7 +33,7 @@ async def admin_client(postgres_pool, jwks_harness):
     app.state.oidc_verifier = None
     app.state.settings = Settings(
         database_url="unused",
-        hmac_secret_key=b"\x00" * 32,
+        flight_signing_key=b"\x00" * 32,
         data_plane_url="unused",
     )
     created: list[int] = []

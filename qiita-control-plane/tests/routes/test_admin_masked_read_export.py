@@ -4,7 +4,7 @@
     — the roster manifest (one row per non-retired sample, with filename parts).
   * POST /admin/masked-read-export/ticket
     — a per-sample DoGet ticket scoped to (prep_sample_idx, mask_idx) on the
-      data plane's read_masked view.
+      data plane's read_masked macro.
 
 Both are dual-gated: system_admin role PLUS admin:masked_read_export scope. The
 ticket is the human counterpart to the service-account POST
@@ -40,20 +40,20 @@ from qiita_control_plane.testing.db_seeds import (
 
 pytestmark = pytest.mark.db
 
-# Any 32-byte value: the tests decode the ticket payload + expiry, not the MAC.
-_HMAC_SECRET = b"\x00" * 32
+# Any 32-byte value: the tests decode the ticket payload + expiry, not the signature.
+_TEST_SEED = b"\x00" * 32
 _TICKET_BODY = {"prep_sample_idx": 11, "mask_idx": 4}
 
 
 @pytest.fixture
 def ctx(role_keyed_clients):
-    """Shared role-keyed clients, plus a known hmac secret on app.state so the
-    ticket route's get_hmac_secret resolves (role_keyed_clients sets only the
+    """Shared role-keyed clients, plus a known signing key on app.state so the
+    ticket route's get_flight_signing_key resolves (role_keyed_clients sets only the
     pool)."""
     from qiita_control_plane.config import Settings
 
     app.state.settings = Settings(
-        database_url="unused", hmac_secret_key=_HMAC_SECRET, data_plane_url="unused"
+        database_url="unused", flight_signing_key=_TEST_SEED, data_plane_url="unused"
     )
     return role_keyed_clients
 
@@ -64,7 +64,7 @@ def _manifest_url(sequenced_pool_idx: int) -> str:
 
 def _decode_ticket_payload(ticket_b64: str) -> dict:
     """Parse the JSON payload from a base64 signed Flight ticket.
-    Wire: <1B version><4B payload_len><payload><32B HMAC><8B expiry>."""
+    Wire: <1B version><4B payload_len><payload><64B Ed25519 signature><8B expiry>."""
     raw = base64.b64decode(ticket_b64)
     payload_len = struct.unpack(">I", raw[1:5])[0]
     return json.loads(raw[5 : 5 + payload_len])
@@ -73,7 +73,7 @@ def _decode_ticket_payload(ticket_b64: str) -> dict:
 def _decode_ticket_expiry(ticket_b64: str) -> int:
     raw = base64.b64decode(ticket_b64)
     payload_len = struct.unpack(">I", raw[1:5])[0]
-    expiry_start = 1 + 4 + payload_len + 32
+    expiry_start = 1 + 4 + payload_len + 64
     return struct.unpack(">Q", raw[expiry_start : expiry_start + 8])[0]
 
 
@@ -156,6 +156,9 @@ async def seeded(ctx):
         "ps_c": ps_c,
     }
 
+    # mask_sample rows (a test may insert them to exercise the completion gate)
+    # FK into BOTH prep_sample and mask_definition, so drop them first.
+    await pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
     await pool.execute(
         "DELETE FROM qiita.sequenced_sample WHERE idx = ANY($1::bigint[])", [ss_a, ss_b, ss_c]
     )
@@ -239,6 +242,28 @@ async def test_manifest_happy_path(ctx, seeded):
     assert by_prep[seeded["ps_b"]]["biosample_accession"] is None
 
 
+async def test_manifest_surfaces_mask_sample_state(ctx, seeded):
+    """The manifest surfaces each sample's per-(mask, prep_sample) completion so
+    the CLI can report skips: a sample carries its mask_sample state
+    ('pending'/'completed'); a sample with no gate row carries null — under the
+    first-class completion contract that means "not masked-complete under this
+    mask" (the ticket route 409s it), but the manifest still reports it rather than
+    dropping it silently."""
+    pool, mask_idx = seeded["pool"], seeded["mask_idx"]
+    # A carries a still-pending gate; B has no gate row (not masked under this mask).
+    await pool.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'pending')",
+        mask_idx,
+        seeded["ps_a"],
+    )
+    resp = await ctx["admin"].get(_manifest_url(seeded["pool_idx"]), params={"mask_idx": mask_idx})
+    assert resp.status_code == 200, resp.text
+    by_prep = {s["prep_sample_idx"]: s for s in resp.json()["samples"]}
+    assert by_prep[seeded["ps_a"]]["mask_state"] == "pending"
+    assert by_prep[seeded["ps_b"]]["mask_state"] is None
+
+
 async def test_manifest_unknown_pool_404(ctx, seeded):
     resp = await ctx["admin"].get(
         _manifest_url(999_999_999), params={"mask_idx": seeded["mask_idx"]}
@@ -297,22 +322,39 @@ async def test_ticket_admin_missing_scope_403(ctx):
 # ---------------------------------------------------------------------------
 
 
-async def test_ticket_signs_mandatory_filter(ctx):
+async def _seed_completed_gate(pool, mask_idx, prep_sample_idx):
+    """Mark the (mask_idx, prep_sample) gate 'completed' so the tightened ticket
+    route reaches the signing path (a masked-complete sample is exportable)."""
+    await pool.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        mask_idx,
+        prep_sample_idx,
+    )
+
+
+async def test_ticket_signs_mandatory_filter(ctx, seeded):
+    pool, mask_idx, ps = seeded["pool"], seeded["mask_idx"], seeded["ps_a"]
+    await _seed_completed_gate(pool, mask_idx, ps)
     resp = await ctx["admin"].post(
-        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": 11, "mask_idx": 4}
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
     )
     assert resp.status_code == 201, resp.text
     payload = _decode_ticket_payload(resp.json()["ticket"])
     assert payload["table"] == "read_masked"
-    assert payload["filter"] == {"prep_sample_idx": [11], "mask_idx": [4]}
+    assert payload["filter"] == {"prep_sample_idx": [ps], "mask_idx": [mask_idx]}
 
 
-async def test_ticket_ttl_is_one_hour(ctx):
+async def test_ticket_ttl_is_one_hour(ctx, seeded):
     """Export tickets mint at the 3600 s max (the data plane's ceiling); expiry
     is checked only at DoGet initiation, so this bounds mint->stream-start, not
     the download."""
+    pool, mask_idx, ps = seeded["pool"], seeded["mask_idx"], seeded["ps_a"]
+    await _seed_completed_gate(pool, mask_idx, ps)
     before = int(time.time())
-    resp = await ctx["admin"].post(URL_ADMIN_MASKED_READ_EXPORT_TICKET, json=_TICKET_BODY)
+    resp = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
+    )
     assert resp.status_code == 201, resp.text
     expiry = _decode_ticket_expiry(resp.json()["ticket"])
     assert before + 3600 - 5 <= expiry <= before + 3600 + 5
@@ -332,3 +374,53 @@ async def test_ticket_ttl_is_one_hour(ctx):
 async def test_ticket_rejects_bad_body_422(ctx, bad_body):
     resp = await ctx["admin"].post(URL_ADMIN_MASKED_READ_EXPORT_TICKET, json=bad_body)
     assert resp.status_code == 422, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Ticket — mask_sample completion gate (block-masked samples)
+# ---------------------------------------------------------------------------
+
+
+async def test_ticket_refuses_pending_mask_sample_409(ctx, seeded):
+    """A block-masked sample whose mask_sample gate is still PENDING (a covering
+    block unfinished) must NOT get an export ticket — its read_mask is partial, so
+    a pull would silently truncate. Fail loud (409), never mint the ticket."""
+    pool, mask_idx, ps = seeded["pool"], seeded["mask_idx"], seeded["ps_a"]
+    await pool.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'pending')",
+        mask_idx,
+        ps,
+    )
+    resp = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
+    )
+    assert resp.status_code == 409, resp.text
+
+
+async def test_ticket_allows_completed_mask_sample_201(ctx, seeded):
+    """A block-masked sample whose gate is COMPLETED (all covering blocks done) is
+    fully masked — the ticket is minted."""
+    pool, mask_idx, ps = seeded["pool"], seeded["mask_idx"], seeded["ps_a"]
+    await pool.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        mask_idx,
+        ps,
+    )
+    resp = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_ticket_refuses_no_mask_sample_row_409(ctx, seeded):
+    """A sample with NO mask_sample row is NOT masked-complete under this mask_idx
+    — no read-mask has completed for the pair. Under the first-class completion
+    contract, absence is refused (409), never minted (both masking paths now write
+    the gate, so absence is 'not masked here', not 'exempt')."""
+    mask_idx, ps = seeded["mask_idx"], seeded["ps_b"]
+    resp = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
+    )
+    assert resp.status_code == 409, resp.text

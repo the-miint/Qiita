@@ -157,20 +157,43 @@ def test_scan_native_jobs_succeeds_on_real_tree():
 
 
 def test_scan_native_jobs_rejects_stray_non_dunder_file(fake_jobs_pkg):
-    """A non-dunder file in the jobs tree that doesn't export Inputs +
-    execute must fail the scan. The error message must mention where
-    shared helpers belong so the operator knows what to do."""
+    """A non-dunder, non-underscore file in the jobs tree that doesn't
+    export Inputs + execute must fail the scan. The error message must
+    mention where shared helpers belong so the operator knows what to do."""
     pkg_path, prefix, add_module = fake_jobs_pkg
-    add_module("_stray", "# not a valid native job module — no Inputs, no execute\n")
+    add_module("stray", "# not a valid native job module — no Inputs, no execute\n")
 
     with pytest.raises(RuntimeError) as ei:
         scan_native_jobs(package_path=pkg_path, prefix=prefix)
     msg = str(ei.value)
-    assert "_stray" in msg
+    assert "stray" in msg
     assert "missing `Inputs`" in msg
     assert "missing `execute`" in msg
-    # The error message must tell the operator where helpers go.
-    assert "job_helpers" in msg
+    # The error message must tell the operator where helpers go — a
+    # leading-underscore private module inside jobs/.
+    assert "_feature_load" in msg
+
+
+def test_scan_native_jobs_skips_leading_underscore_helper(fake_jobs_pkg):
+    """A leading-underscore module (a private shared helper like
+    `_feature_load.py`) is exempt from the Inputs+execute contract: the
+    scan skips it entirely rather than rejecting it, and it never appears
+    in the validated list."""
+    pkg_path, prefix, add_module = fake_jobs_pkg
+    full = add_module("_helper", "# private shared helper — no Inputs, no execute\n")
+    # A valid sibling job so the scan has something to validate and return.
+    ok = add_module(
+        "real_job",
+        "from pydantic import BaseModel\n"
+        "class Inputs(BaseModel):\n"
+        "    x: int\n"
+        "async def execute(inputs, workspace):\n"
+        "    return {}\n",
+    )
+
+    validated = scan_native_jobs(package_path=pkg_path, prefix=prefix)
+    assert ok in validated
+    assert full not in validated
 
 
 def test_scan_native_jobs_rejects_module_with_missing_execute(fake_jobs_pkg):

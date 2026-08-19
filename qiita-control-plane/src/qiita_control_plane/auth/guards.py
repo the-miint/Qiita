@@ -12,15 +12,19 @@ Each guard depends on `get_current_principal`, so FastAPI dedupes the
 underlying resolution per-request even when many guards compose.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from typing import NamedTuple
 
 import asyncpg
 from fastapi import Depends, HTTPException
-from qiita_common.auth_constants import SystemRole
+from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER, SystemRole
 from qiita_common.models import Tier
 
 from ..deps import get_db_pool
-from ..repositories.prep_sample import fetch_prep_sample_exists
+from ..repositories.prep_sample import (
+    fetch_active_study_idxs_for_prep_samples,
+    fetch_prep_sample_exists,
+)
 from ..repositories.sequencing_run import (
     fetch_sequenced_pool,
     fetch_sequenced_pool_created_by,
@@ -28,7 +32,11 @@ from ..repositories.sequencing_run import (
     fetch_sequencing_run_exists,
 )
 from ..repositories.study import fetch_study_exists
-from ..repositories.study_access import fetch_caller_study_access
+from ..repositories.study_access import (
+    CallerStudyAccessRow,
+    fetch_caller_study_access,
+    fetch_caller_study_access_batch,
+)
 from ..repositories.user_eligibility import fetch_user_eligibility
 from .principal import (
     Anonymous,
@@ -37,6 +45,7 @@ from .principal import (
     ServiceAccount,
     get_current_principal,
 )
+from .scopes import role_ceiling
 
 _MSG_AUTH_REQUIRED = "authentication required"
 
@@ -142,12 +151,64 @@ def require_human_with_role(role: str) -> Callable[..., HumanUser]:
     return _dep
 
 
+_STALE_TOKEN_HINT = (
+    " (your role grants this scope, but your current token doesn't include it — "
+    "run `qiita login` to mint a fresh token with your full role scopes)"
+)
+
+
+def _is_stale_token_scope(p: Principal, scopes: tuple[str, ...]) -> bool:
+    """True when a scope 403's real cause is a stale token, not a genuine lack
+    of entitlement.
+
+    A human's PAT scopes are fixed at mint time, so a scope that's in the
+    caller's live `role_ceiling` but absent from the token yields a confusing
+    "missing required scope" 403 even though the role grants it. Two states land
+    here — a scope added to the ceiling *after* the token was minted (the token
+    predates the grant), or a PAT deliberately minted below the ceiling — and the
+    condition can't tell them apart; either way re-login is the fix. True when
+    any of the checked `scopes` is in the caller's live ceiling but absent from
+    the token. Non-human principals (service accounts, anonymous) don't use the
+    role ceiling, so they never qualify.
+    """
+    if not isinstance(p, HumanUser):
+        return False
+    try:
+        ceiling = role_ceiling(p.system_role)
+    except ValueError:
+        return False
+    return any(s in ceiling and not p.has_scope(s) for s in scopes)
+
+
+def _stale_token_hint(p: Principal, scopes: tuple[str, ...]) -> str:
+    """Actionable detail suffix for a stale-scope 403 (see `_is_stale_token_scope`
+    for the condition), or '' when the 403 is a genuine lack of entitlement that
+    re-login wouldn't fix.
+    """
+    return _STALE_TOKEN_HINT if _is_stale_token_scope(p, scopes) else ""
+
+
+def _stale_token_headers(p: Principal, scopes: tuple[str, ...]) -> dict[str, str] | None:
+    """Machine-readable marker header for a stale-scope 403, or None otherwise.
+
+    Twin of `_stale_token_hint`: the hint carries the human-readable prose in the
+    detail, this carries the structured signal the CLI keys off so it doesn't have
+    to string-match the prose (or keep its own copy of the role ceiling). Returned
+    as an `HTTPException(headers=...)` kwarg value.
+    """
+    if _is_stale_token_scope(p, scopes):
+        return {STALE_TOKEN_SCOPE_HEADER: "1"}
+    return None
+
+
 def require_scope(scope: str) -> Callable[..., Principal]:
     """Factory: returns a dep that 401s on Anonymous, 403s if the principal's
     token scope set does not include `scope`.
 
     Accepts a Scope member or bare string; normalised so the 403 detail
-    renders `'self:token'` not `<Scope.SELF_TOKEN: 'self:token'>`.
+    renders `'self:token'` not `<Scope.SELF_TOKEN: 'self:token'>`. When the
+    caller's live role grants the scope but their token doesn't carry it, the
+    detail carries an actionable re-login hint (see `_stale_token_hint`).
     """
     scope_str = str(scope)
 
@@ -157,7 +218,8 @@ def require_scope(scope: str) -> Callable[..., Principal]:
         if not p.has_scope(scope_str):
             raise HTTPException(
                 status_code=403,
-                detail=f"missing required scope {scope_str!r}",
+                detail=f"missing required scope {scope_str!r}" + _stale_token_hint(p, (scope_str,)),
+                headers=_stale_token_headers(p, (scope_str,)),
             )
         return p
 
@@ -184,7 +246,9 @@ def require_any_scope(*scopes: str) -> Callable[..., Principal]:
         if not any(p.has_scope(s) for s in scope_strs):
             raise HTTPException(
                 status_code=403,
-                detail=f"missing one of required scopes {list(scope_strs)!r}",
+                detail=f"missing one of required scopes {list(scope_strs)!r}"
+                + _stale_token_hint(p, scope_strs),
+                headers=_stale_token_headers(p, scope_strs),
             )
         return p
 
@@ -261,15 +325,26 @@ def require_complete_profile(
 
 # Strict ordering by privilege; mirrors the qiita.tier enum order. The
 # integer ranks let the guard compare tiers with a plain >= rather than
-# relying on enum-string ordering. Lives next to its sole consumer
-# (require_study_access). Unlike Roles, Tiers are not a property of
-# principals.
+# relying on enum-string ordering. Read only through `_access_row_allows`,
+# which is the single definition of the comparison. Unlike Roles, Tiers are
+# not a property of principals.
 _TIER_ORDER = {
     Tier.PUBLIC: 0,
     Tier.VIEWER: 1,
     Tier.MEMBER: 2,
     Tier.ADMIN: 3,
 }
+
+# The read tier a prep_sample cohort requires on every study its samples link to.
+#
+# ONE definition, shared by the routes that discover a cohort and the one that
+# mints a ticket for it, because the contract between them is that a cohort
+# discovery returns is a cohort the mint accepts. Two literals would let that
+# drift silently in the one direction that matters: raise it at the mint alone and
+# discovery starts advertising cohorts the mint 403s, which is precisely the
+# failure a named constant is supposed to prevent — and a per-route constant
+# cannot, since nothing compares them.
+COHORT_MIN_TIER = Tier.VIEWER
 
 
 async def require_eligible_owner(
@@ -357,6 +432,239 @@ async def require_prep_sample_exists(
         )
 
 
+def _access_row_allows(
+    row: CallerStudyAccessRow | None, *, caller: Principal, min_tier: Tier
+) -> bool:
+    """Does this study permit `caller` at `min_tier`? (`None` row = no such study.)
+
+    **The one definition of the study-access comparison**, split from the fetch
+    so every path decides identically no matter how it read the row — the
+    narrowing filter and the raising gate both read many rows in one query, and
+    `require_study_access` reads one. A second copy of this ladder is how they
+    would come to disagree about who may read what, which shows up as a
+    discovery route advertising something the mint then 403s.
+
+    A non-existent study returns True: it is not this predicate's job to 404.
+    The authoring gates' composers surface a missing study as one 422 from their
+    own FK violation, and `require_study_access` 404s on the `None` row itself
+    before calling here, so neither loses the error — they just own it.
+
+    **That fail-open branch is only safe while every caller sources its
+    `study_idx` from an FK-backed column.** Today's all do — the study_idxs
+    reaching the narrowing filter come from `qiita.prep_sample_to_study`, whose
+    `REFERENCES qiita.study(idx) ON DELETE RESTRICT` makes a phantom study
+    unreachable. A future caller that passes user-supplied study_idxs would
+    inherit fail-open silently, which is the wrong default for a read gate; give
+    it an existence check of its own, or make the branch configurable.
+
+    Comparison goes through `_TIER_ORDER`, never the enum members: `Tier` is a
+    `StrEnum` and compares LEXICALLY, where 'admin' < 'member' < 'public' <
+    'viewer'. A bare `>=` would admit a PUBLIC caller at a VIEWER minimum and
+    reject an ADMIN one.
+    """
+    if row is None:
+        return True
+    if row.owner_idx == caller.principal_idx:
+        return True
+    # Public-by-absence when the caller holds no study_access row, matching
+    # require_study_access.
+    effective_tier = row.access_tier if row.access_tier is not None else Tier.PUBLIC
+    return _TIER_ORDER[effective_tier] >= _TIER_ORDER[min_tier]
+
+
+async def filter_studies_caller_can_read(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    caller: Principal,
+    study_idxs: Iterable[int],
+    min_tier: Tier,
+    bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
+) -> set[int]:
+    """The subset of `study_idxs` the caller may read at `min_tier`.
+
+    The narrowing counterpart of `require_caller_has_tier_on_all_studies`: the
+    discovery reads use this to show a caller their own slice of a pool that
+    spans studies, where 403ing the whole pool would make it undiscoverable to
+    someone who legitimately owns part of it. The mint uses the raising form,
+    because there a silently narrowed cohort would change the scientific answer.
+
+    Anonymous returns the empty set rather than raising — a listing route fronts
+    its own 401 via `require_human`, and a filter that raises would be a
+    surprising shape for one. A caller at or above `bypass_role` gets everything
+    back with no DB lookup, matching every other resource gate.
+
+    ONE query for the whole set, like the raising gate below. That matters more
+    here than there: the mint route feeding this one takes its identifier list
+    from the CALLER, so a per-study round trip would put the request count under
+    the caller's control.
+    """
+    # Dedup below the early returns, not above: both discard the result, and the
+    # cohort reaching here can be thousands of ids.
+    if isinstance(caller, Anonymous):
+        return set()
+    if caller.has_role_at_least(bypass_role):
+        return set(study_idxs)
+    study_idxs = list(dict.fromkeys(study_idxs))
+    rows = await fetch_caller_study_access_batch(
+        pool_or_conn, principal_idx=caller.principal_idx, study_idxs=study_idxs
+    )
+    return {
+        study_idx
+        for study_idx in study_idxs
+        # rows.get() is None for a study that does not exist, which
+        # _access_row_allows reads as "not this predicate's job to 404" — the
+        # same fail-open the single-study path documents, and safe for the same
+        # FK-backed reason.
+        if _access_row_allows(rows.get(study_idx), caller=caller, min_tier=min_tier)
+    }
+
+
+class PrepSampleReadAccess(NamedTuple):
+    """Which prep_samples of a cohort the caller may read, and why not for the rest.
+
+    Three disjoint outcomes rather than a bare readable/denied split, because the
+    two ways a sample can be denied need different words in the 403: `unlinked`
+    is a data-integrity anomaly the caller can do nothing about, while
+    `blocked_by` names studies they can go ask for access to.
+
+    **Input order is a contract, which is why the dedup below is `dict.fromkeys`
+    and not `set`.** `readable` is returned to the caller verbatim by the pool
+    discovery read, whose roster arrives `ORDER BY prep_sample_idx`; dropping
+    through a set would trade a sorted API response for an arbitrary one. Sort
+    explicitly if the ordering ever needs to change.
+    """
+
+    readable: list[int]  # deduped, input order
+    unlinked: list[int]  # no active prep_sample_to_study link at all
+    blocked_by: dict[int, list[int]]  # prep_sample_idx → the studies that denied it
+
+
+async def filter_prep_samples_caller_can_read(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    caller: Principal,
+    prep_sample_idxs: Iterable[int],
+    min_tier: Tier,
+    bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
+) -> PrepSampleReadAccess:
+    """Resolve a prep_sample cohort against the caller's per-study access.
+
+    A sample is readable only if the caller holds `min_tier` on EVERY study it
+    is still linked to — a sample shared into a study you cannot see is not
+    yours to read through the back door of one you can.
+
+    **A sample with no active study link is NOT readable.** It has no study to
+    authorize against, and failing open on a data-integrity anomaly is the wrong
+    default for a read. This diverges from the prep_sample-scoped *submission*
+    gate (`_check_prep_sample_study_access` in routes/work_ticket.py), which
+    lets an orphan pass; that gate guards a write whose downstream lookups fail
+    anyway, this one answers "may this person see this".
+
+    A caller at or above `bypass_role` gets the whole cohort back with no
+    lookups — including the orphans, deliberately, so an admin can still see and
+    act on the anomaly. That is why the bypass cannot simply be delegated to
+    `filter_studies_caller_can_read`, and why it comes first: the link
+    resolution below would otherwise be computed and discarded.
+
+    The one definition of "may this caller read this sample" **for this surface**
+    — shared by the narrowing discovery reads and the all-or-nothing alignment
+    mint, where two copies would be exactly the drift that ends with discovery
+    advertising a cohort the mint then 403s. It is not the only such predicate in
+    the repo: `repositories/mask_definition.py`'s `_CALLER_MAY_SEE_SAMPLE` answers
+    a similar-sounding question for the admin mask surface, at a different tier,
+    and reaches the OPPOSITE verdict on an orphan. Do not assume a sample's
+    readability has one answer everywhere; assume it has one answer here.
+    """
+    prep_sample_idxs = list(dict.fromkeys(prep_sample_idxs))
+    if not prep_sample_idxs or caller.has_role_at_least(bypass_role):
+        return PrepSampleReadAccess(readable=prep_sample_idxs, unlinked=[], blocked_by={})
+
+    links = await fetch_active_study_idxs_for_prep_samples(pool_or_conn, prep_sample_idxs)
+    readable_studies = await filter_studies_caller_can_read(
+        pool_or_conn,
+        caller=caller,
+        study_idxs={study_idx for studies in links.values() for study_idx in studies},
+        min_tier=min_tier,
+        bypass_role=bypass_role,
+    )
+
+    readable: list[int] = []
+    unlinked: list[int] = []
+    blocked_by: dict[int, list[int]] = {}
+    for prep_sample_idx in prep_sample_idxs:
+        # Absent from the mapping means every link is retired — see
+        # fetch_active_study_idxs_for_prep_samples, which deliberately does not
+        # encode what that means so each gate has to say.
+        studies = links.get(prep_sample_idx)
+        if not studies:
+            unlinked.append(prep_sample_idx)
+        elif denied := sorted(set(studies) - readable_studies):
+            blocked_by[prep_sample_idx] = denied
+        else:
+            readable.append(prep_sample_idx)
+    return PrepSampleReadAccess(readable=readable, unlinked=unlinked, blocked_by=blocked_by)
+
+
+async def require_caller_has_tier_on_all_studies(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    caller: Principal,
+    study_idxs: list[int],
+    min_tier: Tier,
+    bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
+) -> None:
+    """Require the caller to hold `min_tier` or higher on every study_idx
+    in the list, deduplicated.
+
+    Per study, in input order: role-bypass at or above `bypass_role`
+    short-circuits with no DB lookup; 401 on Anonymous (defense in depth);
+    owner bypass or a sufficient tier passes; anything below 403s naming
+    the offending study. A non-existent study row is silently skipped —
+    the composer's FK violation surfaces as 422 from one source.
+    Precedence: when the body has both a missing study and a no-access
+    study, the 403 fires on whichever appears first in the input, not
+    422. Iteration is deduped because secondary_study_idxs may repeat
+    the primary on misuse paths the composer rejects later.
+
+    This policy has a second implementation: the mask-definition reads
+    restate it as a SQL predicate
+    (`repositories.mask_definition._CALLER_MAY_SEE_SAMPLE`), because
+    narrowing a list one sample at a time in Python would be a query per
+    row. A change to any arm above — the bypass role, the required tier,
+    the treatment of a missing study, the orphan case — has to land there
+    in the same PR, or mask discovery and ticket submission disagree about
+    the same sample.
+
+    ONE query for the whole set, then the decision per study in input order.
+    Short-circuiting on the first refusal saved nothing on the path that
+    matters — a request where every study passes is the common one, and it
+    used to cost one round trip per study.
+
+    Comparison goes through `_TIER_ORDER`, never the enum members: `Tier`
+    is a `StrEnum` and compares LEXICALLY, where 'admin' < 'member' <
+    'public' < 'viewer'. A bare `>=` would admit a PUBLIC caller at a
+    VIEWER minimum and reject an ADMIN one.
+    """
+    if isinstance(caller, Anonymous):
+        raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
+    if caller.has_role_at_least(bypass_role):
+        return
+
+    study_idxs = list(dict.fromkeys(study_idxs))
+    rows = await fetch_caller_study_access_batch(
+        pool_or_conn, principal_idx=caller.principal_idx, study_idxs=study_idxs
+    )
+    for study_idx in study_idxs:
+        if _access_row_allows(rows.get(study_idx), caller=caller, min_tier=min_tier):
+            continue
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"requires study access at tier {str(min_tier)!r} or higher on study {study_idx}"
+            ),
+        )
+
+
 async def require_caller_has_admin_on_all_studies(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
@@ -364,42 +672,20 @@ async def require_caller_has_admin_on_all_studies(
     study_idxs: list[int],
     bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
 ) -> None:
-    """Require the caller to have `Tier.ADMIN` access to every study_idx
-    in the list, deduplicated.
+    """`Tier.ADMIN` form of `require_caller_has_tier_on_all_studies`.
 
-    Per study, in input order: role-bypass at or above `bypass_role`
-    short-circuits with no DB lookup; 401 on Anonymous (defense in depth);
-    owner bypass or `Tier.ADMIN` passes; anything below 403s naming the
-    offending study. A non-existent study row is silently skipped — the
-    composer's FK violation surfaces as 422 from one source. Precedence:
-    when the body has both a missing study and a no-access study, the
-    403 fires on whichever appears first in the input, not 422.
-    Iteration is deduped because secondary_study_idxs may repeat the
-    primary on misuse paths the composer rejects later.
+    The authoring routes' gate (sequenced-sample compose, prep_sample-scoped
+    work-ticket submit). Kept as a named entry point rather than folded into
+    its callers so the ADMIN policy stays greppable and its call sites read
+    as a policy, not a parameter.
     """
-    if isinstance(caller, Anonymous):
-        raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
-    if caller.has_role_at_least(bypass_role):
-        return
-
-    for study_idx in dict.fromkeys(study_idxs):
-        row = await fetch_caller_study_access(
-            pool_or_conn, principal_idx=caller.principal_idx, study_idx=study_idx
-        )
-        if row is None:
-            # Study does not exist — not this gate's job to 404. The
-            # composer's INSERT trips the FK and surfaces one 422.
-            continue
-        if row.owner_idx == caller.principal_idx:
-            continue
-        if row.access_tier == Tier.ADMIN:
-            continue
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"requires study access at tier {str(Tier.ADMIN)!r} or higher on study {study_idx}"
-            ),
-        )
+    await require_caller_has_tier_on_all_studies(
+        pool_or_conn,
+        caller=caller,
+        study_idxs=study_idxs,
+        min_tier=Tier.ADMIN,
+        bypass_role=bypass_role,
+    )
 
 
 async def _check_caller_owns_resource(
@@ -578,17 +864,13 @@ def require_study_access(
                 detail=f"study {study_idx} not found",
             )
 
-        # Owner bypass — study owner authorized at every tier.
-        if row.owner_idx == p.principal_idx:
-            return
-
         # Resolve the minimum tier per call: explicit factory arg wins,
-        # otherwise fall back to the study's own default_tier.
+        # otherwise fall back to the study's own default_tier. This is the only
+        # part of the decision that is this guard's own — owner bypass and the
+        # tier ladder go through the shared predicate, so the route gate and the
+        # body-time gates cannot drift apart.
         resolved_min_tier = min_tier if min_tier is not None else row.default_tier
-
-        # Tier comparison — public-by-absence when no study_access row.
-        effective_tier = row.access_tier if row.access_tier is not None else Tier.PUBLIC
-        if _TIER_ORDER[effective_tier] >= _TIER_ORDER[resolved_min_tier]:
+        if _access_row_allows(row, caller=p, min_tier=resolved_min_tier):
             return
         raise HTTPException(
             status_code=403,

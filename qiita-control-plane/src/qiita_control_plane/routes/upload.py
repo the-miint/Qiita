@@ -35,7 +35,7 @@ from qiita_common.models import (
 from ..auth.guards import require_scope
 from ..auth.principal import Principal
 from ..auth.tickets import sign_doput
-from ..deps import get_db_pool, get_hmac_secret
+from ..deps import get_db_pool, get_flight_signing_key
 
 router = APIRouter(prefix=PATH_UPLOAD_PREFIX, tags=["upload"])
 
@@ -66,7 +66,7 @@ def _record_to_response(row: asyncpg.Record) -> UploadResponse:
 async def create_upload(
     body: UploadCreateRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    hmac_secret: bytes = Depends(get_hmac_secret),
+    signing_key: bytes = Depends(get_flight_signing_key),
     principal: Principal = Depends(require_scope(Scope.TICKET_DOPUT)),
 ) -> UploadCreateResponse:
     """Mint an upload slot and return a signed DoPut ticket.
@@ -94,7 +94,7 @@ async def create_upload(
     except asyncpg.PostgresError as exc:
         raise HTTPException(status_code=500, detail="database error") from exc
 
-    ticket = sign_doput(upload_idx=row["upload_idx"], secret=hmac_secret)
+    ticket = sign_doput(upload_idx=row["upload_idx"], secret=signing_key)
     return UploadCreateResponse(
         upload_idx=row["upload_idx"],
         doput_ticket=base64.b64encode(ticket).decode(),

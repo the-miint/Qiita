@@ -474,6 +474,41 @@ class SlurmrestdClient:
             if isinstance(job, dict) and job.get("name") == name
         ]
 
+    async def find_jobs_by_name_prefix(self, prefix: str) -> list[SlurmJobInfo]:
+        """Like `find_jobs_by_name` but matches names STARTING WITH `prefix`.
+        Used to reap EVERY attempt of a work_ticket in one pass — all its jobs
+        share the `qiita-wt{idx}-` prefix (the trailing `-` disambiguates ticket
+        5 from 50). Same client-side filter (slurmrestd's job-list route takes no
+        name filter); only matching entries are parsed."""
+        url = f"/slurm/{self._api_version}/jobs"
+        body = await self._request_with_jwt_retry("GET", url)
+        jobs = body.get("jobs")
+        if not isinstance(jobs, list):
+            raise SlurmrestdError(
+                f"slurmrestd jobs response missing 'jobs' array: {body!r}",
+                url=url,
+            )
+        return [
+            self._parse_job(job, url=url)
+            for job in jobs
+            if isinstance(job, dict)
+            and isinstance(job.get("name"), str)
+            and job["name"].startswith(prefix)
+        ]
+
+    async def cancel_job(self, job_id: int) -> None:
+        """scancel a job: DELETE /slurm/{api_version}/job/{job_id}. Idempotent —
+        a 404 (the job already finished or was purged from slurmrestd's view) is a
+        no-op, not an error, so cancelling the same ticket twice is safe. Any other
+        non-2xx raises SlurmrestdError, which the backend classifies."""
+        url = f"/slurm/{self._api_version}/job/{job_id}"
+        try:
+            await self._request_with_jwt_retry("DELETE", url)
+        except SlurmrestdError as exc:
+            if exc.status_code == 404:
+                return
+            raise
+
     def _parse_job(self, job: dict[str, Any], *, url: str) -> SlurmJobInfo:
         """Parse one slurmrestd job object into a SlurmJobInfo. Shared by
         get_job (single) and find_jobs_by_name (filtered list)."""
@@ -494,7 +529,12 @@ class SlurmrestdClient:
         # exit_code shape varies by SLURM version; v0.0.40+ wraps
         # return_code in the typed-numeric envelope (number/set/infinite).
         exit_code: int | None = None
-        rc = job.get("exit_code", {}).get("return_code")
+        # exit_code may be absent, JSON null (key present, value None), or the
+        # typed envelope dict. `.get("exit_code", {})` only defaults on absence,
+        # so a null value would make `.get("return_code")` raise AttributeError
+        # and escape the SlurmrestdError contract — guard the type explicitly.
+        exit_code_obj = job.get("exit_code")
+        rc = exit_code_obj.get("return_code") if isinstance(exit_code_obj, dict) else None
         if isinstance(rc, dict) and rc.get("set"):
             exit_code = rc.get("number")
         elif isinstance(rc, int):

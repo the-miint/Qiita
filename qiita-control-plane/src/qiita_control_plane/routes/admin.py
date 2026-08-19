@@ -58,7 +58,7 @@ from ..auth.scopes import (
 )
 from ..auth.tickets import sign_ticket
 from ..auth.token import mint_api_token
-from ..deps import TxConnFactory, get_db_pool, get_hmac_secret, get_tx_conn_factory
+from ..deps import TxConnFactory, get_db_pool, get_flight_signing_key, get_tx_conn_factory
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["admin"])
 
@@ -203,9 +203,13 @@ async def set_principal_disabled(
                     body.reason,
                 )
             except asyncpg.CheckViolationError as exc:
-                # principal_not_both_disabled_and_retired (race with retire) or
-                # principal_system_principal_always_active.
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+                # Map the constraint to a stable client message rather than
+                # leaking the raw constraint identifier (schema internal).
+                if exc.constraint_name == "principal_system_principal_always_active":
+                    detail = "system principals cannot be disabled"
+                else:  # principal_not_both_disabled_and_retired (race with concurrent retire)
+                    detail = "principal cannot be disabled: it is retired"
+                raise HTTPException(status_code=409, detail=detail) from exc
         else:
             result = await conn.execute(
                 "UPDATE qiita.principal SET"
@@ -277,7 +281,13 @@ async def retire_principal(
                 body.reason,
             )
         except asyncpg.CheckViolationError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            # Map the constraint to a stable client message rather than leaking
+            # the raw constraint identifier (schema internal).
+            if exc.constraint_name == "principal_system_principal_always_active":
+                detail = "system principals cannot be retired"
+            else:  # principal_not_both_disabled_and_retired (race with a concurrent disable)
+                detail = "principal cannot be retired: it is disabled or was disabled concurrently"
+            raise HTTPException(status_code=409, detail=detail) from exc
 
         if rows_affected(result) == 0:
             row = await conn.fetchrow(
@@ -529,9 +539,11 @@ async def export_owner_biosample_id(
     a study, keyed by minted biosample_idx + public accession.
 
     The owner name (biosample_metadata.value_text where
-    is_owner_biosample_id=true) is PII-pinned and masked on the normal read
-    path; this route is the only way to recover it, so it is gated by
-    system_admin PLUS admin:biosample_owner_id_read.
+    is_owner_biosample_id=true) is the owner's own name for their sample.
+    It is restricted to authorized study members rather than shown on the
+    general read path — submitters sometimes put PII in sample names — so
+    recovering it across a whole study is gated by system_admin PLUS
+    admin:biosample_owner_id_read.
 
     Without sequenced_pool_idx, returns one row per active biosample link in
     the study. With it, returns the study's sequenced_samples in that pool,
@@ -598,7 +610,7 @@ async def export_owner_biosample_id(
 # Masked-read export (system_admin + admin:masked_read_export)
 # ---------------------------------------------------------------------------
 
-# The masked-read view table the export ticket is signed for. Must match the
+# The masked-read macro the export ticket is signed for. Must match the
 # data plane's ALLOWED_TABLES and the CP-side _DOGET_ALLOWED_TABLES
 # (routes/reference.py) and the service-account read_masked route's own constant.
 _READ_MASKED_TABLE = "read_masked"
@@ -612,12 +624,18 @@ _EXPORT_TICKET_TTL_SECONDS = 3600
 # Roster of a sequenced_pool's non-retired samples to export: the prep_sample_idx
 # (the read_masked join key) + biosample_accession (the filename's leading part;
 # NULL until NCBI submission, surfaced so the export fails loudly rather than
-# silently dropping the sample). The pool-wide run/pool idxs live on the manifest.
+# silently dropping the sample) + the per-(mask_idx, prep_sample) completion gate
+# state (LEFT JOIN mask_sample — NULL when no gate row exists for this
+# (mask_idx, prep_sample); NULL means "not masked-complete under this mask", NOT an
+# exempt sample — gate contract in `fetch_mask_sample_state`). The pool-wide
+# run/pool idxs live on the manifest. `$2` is the mask_idx the manifest is scoped to.
 _MASKED_EXPORT_ROSTER_SQL = (
-    "SELECT ss.prep_sample_idx, bs.biosample_accession"
+    "SELECT ss.prep_sample_idx, bs.biosample_accession, msamp.state AS mask_state"
     "  FROM qiita.sequenced_sample ss"
     "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
     "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+    "  LEFT JOIN qiita.mask_sample msamp"
+    "    ON msamp.prep_sample_idx = ss.prep_sample_idx AND msamp.mask_idx = $2"
     " WHERE ss.sequenced_pool_idx = $1 AND ps.retired = false"
     " ORDER BY ss.prep_sample_idx"
 )
@@ -658,30 +676,25 @@ async def export_masked_read_manifest(
     if mask_exists is None:
         raise HTTPException(status_code=404, detail=f"no mask_definition with mask_idx={mask_idx}")
 
-    db_rows = await pool.fetch(_MASKED_EXPORT_ROSTER_SQL, sequenced_pool_idx)
+    db_rows = await pool.fetch(_MASKED_EXPORT_ROSTER_SQL, sequenced_pool_idx, mask_idx)
     return MaskedReadExportManifest(
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=run_idx,
         mask_idx=mask_idx,
-        samples=[
-            MaskedReadExportSample(
-                prep_sample_idx=r["prep_sample_idx"],
-                biosample_accession=r["biosample_accession"],
-            )
-            for r in db_rows
-        ],
+        samples=[MaskedReadExportSample.model_validate(dict(r)) for r in db_rows],
     )
 
 
 @router.post(PATH_ADMIN_MASKED_READ_EXPORT_TICKET, status_code=201)
 async def create_masked_read_export_ticket(
     body: MaskedReadExportTicketRequest,
-    hmac_secret: bytes = Depends(get_hmac_secret),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    signing_key: bytes = Depends(get_flight_signing_key),
     _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_MASKED_READ_EXPORT)),
 ) -> DoGetTicketResponse:
     """Mint a Flight DoGet ticket scoped to one (prep_sample_idx, mask_idx) on
-    the data plane's read_masked view — the human (system_admin) counterpart to
+    the data plane's read_masked macro — the human (system_admin) counterpart to
     the service-account POST /read-masked/ticket/doget. The export CLI mints one
     just-in-time per sample.
 
@@ -691,6 +704,11 @@ async def create_masked_read_export_ticket(
     empty-filter path would otherwise dump every sample's pass reads. Minted at
     the 3600 s max (the data plane's ceiling; expiry is checked only at DoGet
     initiation, so it never bounds the download).
+
+    Completion gate (contract: see `fetch_mask_sample_state`): the sample must be
+    'completed' under this `mask_idx`, else 409 — a 'pending' row (a covering block
+    still in flight) or NO row (absence is not exempt) both mean the read_masked
+    pass-set would be absent or partial, and a pull would silently truncate.
     """
     filter_ = {
         "prep_sample_idx": [body.prep_sample_idx],
@@ -702,10 +720,34 @@ async def create_masked_read_export_ticket(
             detail="masked-read export ticket requires a non-empty prep_sample_idx and mask_idx",
         )
 
+    mask_state = await pool.fetchval(
+        "SELECT state FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        body.mask_idx,
+        body.prep_sample_idx,
+    )
+    if mask_state != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": (
+                    "the sample is not masked-complete under this mask_idx "
+                    f"(mask_sample.state={mask_state!r}). Either no read-mask has "
+                    "completed for this (prep_sample, mask_idx), a covering block is "
+                    "still in flight, or the run was withdrawn as untrustworthy "
+                    "('invalidated'). The read_masked pass-set would be absent, "
+                    "partial, or unfit. Refusing to export; a withdrawn run is not "
+                    "retryable — re-mask under a corrected config."
+                ),
+                "prep_sample_idx": body.prep_sample_idx,
+                "mask_idx": body.mask_idx,
+                "mask_state": mask_state,
+            },
+        )
+
     ticket_bytes = sign_ticket(
         table=_READ_MASKED_TABLE,
         filter=filter_,
-        secret=hmac_secret,
+        secret=signing_key,
         ttl_seconds=_EXPORT_TICKET_TTL_SECONDS,
     )
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())

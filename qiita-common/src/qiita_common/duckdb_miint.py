@@ -31,7 +31,15 @@ Install vs. load — the two halves of the contract:
 
 Cross-language note: the Rust data plane can't import this module, so it honors
 the same env contract (`MIINT_EXTENSION_REPO` / `MIINT_EXTENSION_DIRECTORY`)
-independently — keep the two sides in sync (see `qiita-data-plane/src/main.rs`).
+independently — keep the sides in sync (see `qiita-data-plane/src/main.rs`).
+
+There is a THIRD copy for the same reason: `workflows/long-read-assembly/`'s
+myloasm splitter runs inside a container SIF, which installs `python-duckdb` but
+not `qiita-common` (a path dep of the two Python services only). It reaches the
+deploy-staged extension through the step's `derived_inputs` bind and mirrors
+`miint_connect_config()` inline. A change to the connect config or the
+LOAD-vs-INSTALL rule has to reach all three — the container one fails at LOAD on
+the cluster, after the assembler has already done its work.
 """
 
 from __future__ import annotations
@@ -56,12 +64,19 @@ def miint_repo() -> str:
     return os.environ.get("MIINT_EXTENSION_REPO") or MIINT_MIRROR_URL
 
 
+# The env var naming the deploy-staged extension directory. Public because the
+# orchestrator reads it directly too (its staging gate and the resolved-dir
+# report), so the literal is spelled once across both packages rather than in
+# each of the five places that reach for it.
+MIINT_EXTENSION_DIRECTORY_VAR = "MIINT_EXTENSION_DIRECTORY"
+
+
 def miint_connect_config() -> dict[str, str]:
     """DuckDB `connect()` config for loading miint. miint always installs from
     a mirror (the team's signing chain, not DuckDB's), so unsigned extensions
     are always allowed; the extension directory is isolated when configured."""
     config: dict[str, str] = {"allow_unsigned_extensions": "true"}
-    ext_dir = os.environ.get("MIINT_EXTENSION_DIRECTORY")
+    ext_dir = os.environ.get(MIINT_EXTENSION_DIRECTORY_VAR)
     if ext_dir:
         config["extension_directory"] = ext_dir
     return config
@@ -93,18 +108,97 @@ def miint_load_sql() -> str:
     return "LOAD miint;"
 
 
-def miint_job_env() -> dict[str, str]:
-    """The miint env vars a remote (SLURM) job must carry to LOAD the
-    deploy-staged extension. Both the orchestrator's SlurmBackend (real jobs)
-    and the compute-readiness probe inject exactly this into the job's slurmrestd
-    `environment` — single-sourced here so the two can't drift.
+# miint is a CORE, non-optional dependency (see CLAUDE.md "miint is a core
+# dependency"). Every native SLURM job needs BOTH of these to function:
+#   * MIINT_EXTENSION_DIRECTORY — the deploy-staged extension the job LOADs;
+#   * MIINT_GPL_BOUNDARY_PATH   — the GPL-boundary host binary (bowtie2 index/
+#                                 align, vsearch, MAFFT, … run inside it; miint
+#                                 streams sequences to it as Arrow over shm).
+# The compute node receives ONLY what we explicitly forward (the slurmrestd
+# `environment` is an allowlist, not an inherited copy — see SlurmBackend and
+# payload.build_job_submit_payload), so an unforwarded var is simply absent at
+# job runtime.
+MIINT_REQUIRED_JOB_VARS = (MIINT_EXTENSION_DIRECTORY_VAR, "MIINT_GPL_BOUNDARY_PATH")
 
-    Only `MIINT_EXTENSION_DIRECTORY` is propagated: the cluster path is LOAD-only
-    (it reads the pre-staged dir), so `MIINT_EXTENSION_REPO` — which only selects
-    where an *install* downloads from — is irrelevant on a compute node. Returns
-    empty when unset (dev/test runs that rely on the DuckDB default dir)."""
-    ext_dir = os.environ.get("MIINT_EXTENSION_DIRECTORY")
-    return {"MIINT_EXTENSION_DIRECTORY": ext_dir} if ext_dir else {}
+
+def require_staged_extension_directory(*, service: str) -> str:
+    """Raise unless `MIINT_EXTENSION_DIRECTORY` is set and is a readable
+    directory; return it for callers that want the value.
+
+    Used by LOAD-only paths that have NO usable `$HOME` to fall back on — today
+    that is the control plane's `connect_with_miint_staged()` (the `qiita-api`
+    service account's home is `/dev/null`). It is deliberately NOT called by the
+    orchestrator's `open_miint_conn()`: a slurm CO already requires the var at
+    boot, its native jobs get a writable per-ticket HOME, and a local-backend dev
+    run legitimately has neither. Adding callers is a judgement about whether
+    that caller can EVER run without the var, not a blanket rule.
+
+    `service` names the caller in the message ("control-plane service",
+    "compute orchestrator") so an operator learns which env file to edit.
+
+    Why this exists as a guard rather than letting DuckDB fail: with the
+    variable unset DuckDB resolves extensions under `$HOME/.duckdb/extensions`,
+    and the service accounts' home is `/dev/null`, so the raw failure is
+    `IO Error: Can't find the home directory at '/dev/null'` — which names
+    neither the variable nor the service. LOAD-only paths cannot fall back to
+    INSTALL (that is what needs the writable `$HOME` in the first place), so an
+    unset directory is always a misconfiguration, never a soft default.
+
+    Scoped to LOAD-only callers on purpose: the client `qiita reference load`
+    CLI legitimately runs with this unset and INSTALLs into its own cache, so it
+    uses `miint_connect_config()` directly — same carve-out `miint_job_env()`
+    documents."""
+    ext_dir = os.environ.get(MIINT_EXTENSION_DIRECTORY_VAR)
+    if not ext_dir:
+        raise RuntimeError(
+            f"{MIINT_EXTENSION_DIRECTORY_VAR} is not set for the {service}. "
+            "Service-side miint is LOAD-only from the deploy-staged extension "
+            "directory (the service account has no writable $HOME, so INSTALL "
+            "cannot resolve one). Set it in that service's env file to the same "
+            "path the other components use."
+        )
+    if not Path(ext_dir).is_dir():
+        # is_dir() is also False when the path exists but this account cannot
+        # traverse it — the likeliest failure on a fresh deploy, where the staged
+        # dir is owned by another service account. Say so rather than insisting
+        # it is not a directory.
+        raise RuntimeError(
+            f"{MIINT_EXTENSION_DIRECTORY_VAR}={ext_dir!r} (read by the {service}) "
+            "is not a readable directory — it does not exist, is not a directory, "
+            "or this account cannot traverse it. It must point at the "
+            "deploy-staged miint extension directory, byte-identical across "
+            "components, readable by this service account."
+        )
+    return ext_dir
+
+
+def miint_job_env() -> dict[str, str]:
+    """The miint env vars a remote (SLURM) job MUST carry to LOAD the
+    deploy-staged extension AND reach the GPL-boundary host. Both the
+    orchestrator's SlurmBackend (real jobs) and the compute-readiness probe
+    inject exactly this into the job's slurmrestd `environment` — single-sourced
+    here so the two can't drift.
+
+    miint is a CORE dependency, not optional: this RAISES if either
+    `MIINT_EXTENSION_DIRECTORY` or `MIINT_GPL_BOUNDARY_PATH` is unset. A silent
+    empty dict was the bug — it let a job submit that then died at `LOAD miint`
+    or the first GPL-boundary call (the bowtie2-shard `gpl-boundary not
+    installed` incident), and it hid a broken boundary through a green deploy.
+    Fail loud instead. `MIINT_EXTENSION_REPO` is deliberately NOT propagated: the
+    cluster path is LOAD-only, so the install repo is irrelevant on a node.
+
+    This is the CLUSTER/JOB path. The client-side `qiita reference load` CLI
+    legitimately runs with these unset (it INSTALLs into its own cache) and uses
+    `miint_connect_config()`, which stays optional — this requirement is scoped
+    to job submission on purpose."""
+    missing = [v for v in MIINT_REQUIRED_JOB_VARS if not os.environ.get(v)]
+    if missing:
+        raise RuntimeError(
+            "miint is a core dependency; these required env var(s) are unset and "
+            "must be set in compute-orchestrator.env for any SLURM job: "
+            f"{', '.join(missing)}. See CLAUDE.md 'miint is a core dependency'."
+        )
+    return {v: os.environ[v] for v in MIINT_REQUIRED_JOB_VARS}
 
 
 def is_empty_sequence_file(path: Path) -> bool:
@@ -136,7 +230,18 @@ def setup_miint_test_env(component: str) -> None:
     the env is already set). Call at conftest top. `component` names the
     private dir (`qiita-<component>-duckdb-ext` under the system temp), kept
     distinct per component so a mirror build in one suite doesn't collide with
-    another's cached extension."""
+    another's cached extension.
+
+    The conftest fixtures INSTALL (not FORCE INSTALL) into that dir, so it caches
+    across runs and NEVER refreshes. After the mirror rebuilds — e.g. a new miint
+    function lands — a warm cache still holds the old build, and the symptom is a
+    bare `Catalog Error: ... does not exist` from the new function, which points at
+    the code rather than at the cache. Clear it:
+
+        rm -rf "$TMPDIR"/qiita-*-duckdb-ext        # NOT /tmp on macOS
+
+    CI is unaffected (it always starts cold), and the deploy is covered by
+    compute-readiness's miint probes."""
     os.environ.setdefault("MIINT_EXTENSION_REPO", MIINT_MIRROR_URL)
     ext_dir = os.path.join(tempfile.gettempdir(), f"qiita-{component}-duckdb-ext")
     os.makedirs(ext_dir, exist_ok=True)

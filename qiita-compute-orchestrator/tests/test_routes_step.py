@@ -13,12 +13,13 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from qiita_common.models import ComputeTarget, StepStatus
+from qiita_common.models import StepStatus
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 
 from qiita_compute_orchestrator.backend import (
     ComputeBackend,
     FoundJob,
+    LocalStepHandle,
     StepHandle,
     StepStatusInfo,
 )
@@ -40,6 +41,7 @@ class _RecordedCall:
     module: str | None
     entrypoint: str | None
     baseline_resources: Any
+    derived_inputs: dict[str, str]
 
 
 class _RecordingBackend(ComputeBackend):
@@ -49,6 +51,10 @@ class _RecordingBackend(ComputeBackend):
         # and read `find_by_name_calls` to assert what was looked up.
         self.found_jobs: list[FoundJob] = []
         self.find_by_name_calls: list[str] = []
+        # cancel: tests set `cancel_ids` to script the response and read
+        # `cancel_calls` to assert which ticket was reaped.
+        self.cancel_ids: list[int] = []
+        self.cancel_calls: list[int] = []
 
     # Stubbed as a synchronous backend: submit_step records the forwarded
     # call and returns a terminal handle (no SLURM hop), so the route tests
@@ -66,6 +72,7 @@ class _RecordingBackend(ComputeBackend):
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
+        derived_inputs: dict[str, str] | None = None,
     ) -> StepHandle:
         self.calls.append(
             _RecordedCall(
@@ -78,10 +85,10 @@ class _RecordingBackend(ComputeBackend):
                 module=module,
                 entrypoint=entrypoint,
                 baseline_resources=baseline_resources,
+                derived_inputs=dict(derived_inputs or {}),
             )
         )
-        return StepHandle(
-            compute_target=ComputeTarget.LOCAL,
+        return LocalStepHandle(
             step_name=name,
             terminal_outputs={"manifest": workspace / "manifest.parquet"},
         )
@@ -95,6 +102,10 @@ class _RecordingBackend(ComputeBackend):
     async def find_jobs_by_name(self, job_name: str) -> list[FoundJob]:
         self.find_by_name_calls.append(job_name)
         return list(self.found_jobs)
+
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        self.cancel_calls.append(work_ticket_idx)
+        return list(self.cancel_ids)
 
 
 @pytest.fixture
@@ -134,6 +145,7 @@ def test_step_submit_requires_bearer_token(http_client):
             "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
             "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/hash.sh",
         },
     )
     assert resp.status_code == 401
@@ -156,6 +168,7 @@ def test_step_submit_dispatches_and_returns_handle(http_client, cp_to_co_token, 
             "work_ticket_idx": 99,
             "attempt": 2,
             "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/hash.sh",
         },
     )
     assert resp.status_code == 200, resp.text
@@ -242,6 +255,7 @@ def test_step_submit_serializes_backend_failure(http_client, cp_to_co_token, tmp
             "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
             "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/hash.sh",
         },
     )
     assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS
@@ -291,7 +305,13 @@ def test_step_result_serializes_backend_failure(http_client, cp_to_co_token):
         URL_STEP_RESULT,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
         json={
-            "handle": {"compute_target": "slurm", "step_name": "hash", "slurm_job_id": 1},
+            "handle": {
+                "compute_target": "slurm",
+                "step_name": "hash",
+                "slurm_job_id": 1,
+                "output_path": "/scratch/ws/output",
+                "logs_path": "/scratch/ws/logs",
+            },
             "status": {"status": "completed", "raw_state": "COMPLETED", "exit_code": 0},
         },
     )
@@ -358,7 +378,13 @@ def test_step_result_serializes_step_no_data(http_client, cp_to_co_token):
         URL_STEP_RESULT,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
         json={
-            "handle": {"compute_target": "slurm", "step_name": "fastq", "slurm_job_id": 1},
+            "handle": {
+                "compute_target": "slurm",
+                "step_name": "fastq",
+                "slurm_job_id": 1,
+                "output_path": "/scratch/ws/output",
+                "logs_path": "/scratch/ws/logs",
+            },
             "status": {"status": "failed", "raw_state": "FAILED", "exit_code": 1},
         },
     )
@@ -646,3 +672,79 @@ def test_step_plan_degenerate_hint_degrades_not_500(http_client, cp_to_co_token,
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"cpu": None, "mem_gb": None, "walltime_seconds": None}
+
+
+def test_step_submit_forwards_derived_inputs(http_client, cp_to_co_token, tmp_path):
+    """`derived_inputs` survives the CP->CO wire hop and reaches the backend.
+    It rides as a RELATIVE path — the CP never names a compute-node absolute
+    path; the orchestrator joins it against its own PATH_DERIVED at submit."""
+    from qiita_common.api_paths import URL_STEP_SUBMIT
+
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_SUBMIT,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "checkm",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 7},
+            "work_ticket_idx": 99,
+            "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/hash.sh",
+            "derived_inputs": {"QIITA_CHECKM_DB": "checkm_data"},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert backend.calls[-1].derived_inputs == {"QIITA_CHECKM_DB": "checkm_data"}
+
+
+def test_step_submit_rejects_absolute_derived_input(http_client, cp_to_co_token, tmp_path):
+    """The wire validator refuses an absolute derived_inputs path — otherwise a
+    workflow could name any host directory for the orchestrator to bind into a
+    container. 422 at the boundary, never reaching the backend."""
+    from qiita_common.api_paths import URL_STEP_SUBMIT
+
+    client, backend = http_client
+    before = len(backend.calls)
+    resp = client.post(
+        URL_STEP_SUBMIT,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "checkm",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 7},
+            "work_ticket_idx": 99,
+            "container": REFERENCE_HASH_CONTAINER,
+            "entrypoint": "/opt/qiita/hash.sh",
+            "derived_inputs": {"QIITA_CHECKM_DB": "/etc"},
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert len(backend.calls) == before
+
+
+def test_step_cancel_requires_bearer_token(http_client):
+    from qiita_common.api_paths import URL_STEP_CANCEL
+
+    client, _ = http_client
+    resp = client.post(URL_STEP_CANCEL, json={"work_ticket_idx": 1})
+    assert resp.status_code == 401
+
+
+def test_step_cancel_dispatches_and_returns_ids(http_client, cp_to_co_token):
+    """POST /step/cancel forwards the ticket idx to backend.cancel and serializes
+    the scancelled job ids."""
+    from qiita_common.api_paths import URL_STEP_CANCEL
+
+    client, backend = http_client
+    backend.cancel_ids = [518235, 518236]
+    resp = client.post(
+        URL_STEP_CANCEL,
+        json={"work_ticket_idx": 4837},
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["cancelled_job_ids"] == [518235, 518236]
+    assert backend.cancel_calls == [4837]

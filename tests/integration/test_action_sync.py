@@ -39,16 +39,20 @@ async def workflows_dir(tmp_path):
 async def clean_action_table(postgres_pool):
     """Truncate qiita.action before and after each test in this module so
     runs don't bleed into each other. work_ticket_step → work_ticket → action
-    is an FK chain, and TRUNCATE does not honor ON DELETE CASCADE, so every
-    referencing table must be named in the same statement."""
+    is an FK chain, and block ⇄ work_ticket mutually reference each other
+    (block.work_ticket_idx / work_ticket.block_idx) with block_member → block;
+    TRUNCATE does not honor ON DELETE CASCADE, so every referencing table must
+    be named in the same statement."""
     async with postgres_pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE qiita.work_ticket_step, qiita.work_ticket, qiita.action"
+            "TRUNCATE qiita.work_ticket_step, qiita.block_member, qiita.work_ticket,"
+            " qiita.block, qiita.action"
         )
     yield
     async with postgres_pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE qiita.work_ticket_step, qiita.work_ticket, qiita.action"
+            "TRUNCATE qiita.work_ticket_step, qiita.block_member, qiita.work_ticket,"
+            " qiita.block, qiita.action"
         )
 
 
@@ -236,6 +240,7 @@ async def test_sync_transaction_rolls_back_on_failure(
                     "step": "x",
                     "step_type": "singleton",
                     "container": "img:1",
+                    "entrypoint": "/opt/qiita/x.sh",
                     "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
                 }
             ],
@@ -288,6 +293,7 @@ steps:
   - step: hash
     step_type: singleton
     container: qiita/reference-hash:2.0.0
+    entrypoint: /opt/qiita/hash.sh
     target_status: hashing
     baseline_resources: {cpu: 4, mem_gb: 8, walltime: PT1H}
   - action: mint-features

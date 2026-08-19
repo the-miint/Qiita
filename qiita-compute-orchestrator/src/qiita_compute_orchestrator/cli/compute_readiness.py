@@ -82,9 +82,9 @@ _PROBE_JOB_NAME = "qiita-compute-readiness-probe"
 _PROBE_CPU = 1
 _PROBE_MEM_MB = 256
 _PROBE_TIME_LIMIT_MINUTES = 5
-# The poll interval is intentionally tighter than the regular
-# SlurmBackend's `DEFAULT_SLURM_POLL_INTERVAL_SECONDS` (config.py).
-# Compute-readiness is an interactive operator command (someone is
+# The poll interval is intentionally tight (tighter than a background
+# poll loop would use). Compute-readiness is an interactive operator
+# command (someone is
 # watching the terminal); faster feedback beats slurmrestd-load
 # concerns, especially because the probe job's wall-time is capped at
 # 5 minutes so there are ~60 polls maximum.
@@ -375,6 +375,85 @@ else
     echo "{_PROBE_LINE_PREFIX} miint-host-filter-fns=fail err=$MIINT_ERR"
 fi
 rm -f "$MIINT_HOSTFILTER_PROBE"
+
+# `infer_trim` (the read-mask lima chain's trim reconciler) is a table MACRO, not a
+# scalar, so registration alone proves little — INVOKE it. It is cheap: two
+# two-row relations. It is also the newest miint dependency, and the failure mode
+# it guards is nasty: a stale extension_directory (a plain INSTALL never refreshes
+# a warm cache) yields a build with every OTHER function present, so the lima_mask
+# step fails at the first real submit with a bare catalog error. Assert the whole
+# contract here, at deploy: one row per ORIGINAL read, NULL/NULL for a read the
+# tool omitted.
+MIINT_INFERTRIM_PROBE="$(mktemp)"
+cat > "$MIINT_INFERTRIM_PROBE" <<'PYEOF'
+import sys
+try:
+    import duckdb
+    from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+    conn = duckdb.connect(":memory:", config=miint_connect_config())
+    conn.execute(miint_load_sql())
+    conn.execute(
+        "CREATE TABLE orig AS SELECT 1::BIGINT AS sequence_index, 'AAACCCGGGTTT' AS sequence "
+        "UNION ALL SELECT 2::BIGINT, 'TTTTGGGGCCCC'"
+    )
+    conn.execute("CREATE TABLE qcd AS SELECT 1::BIGINT AS sequence_index, 'CCCGGG' AS sequence")
+    rows = conn.execute(
+        "SELECT sequence_index, trimmed_5p, trimmed_3p FROM infer_trim(orig, qcd) "
+        "ORDER BY sequence_index"
+    ).fetchall()
+    assert rows == [(1, 3, 3), (2, None, None)], "infer_trim contract drift: " + str(rows)
+except Exception as exc:
+    msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
+    print(msg[:500])
+    sys.exit(1)
+PYEOF
+if MIINT_ERR="$("$PYTHON" "$MIINT_INFERTRIM_PROBE" 2>/dev/null)"; then
+    echo "{_PROBE_LINE_PREFIX} miint-infer-trim=ok"
+else
+    echo "{_PROBE_LINE_PREFIX} miint-infer-trim=fail err=$MIINT_ERR"
+fi
+rm -f "$MIINT_INFERTRIM_PROBE"
+
+# GPL boundary. miint is a CORE dependency, and the GPL-boundary host (a runtime
+# binary behind which bowtie2/vsearch/MAFFT/SortMeRNA run) is the ONE miint
+# surface no prior probe exercised — which is exactly why a whole WOL3 sharded
+# build got to the compute nodes with the boundary unreachable and every
+# `build_bowtie2_index` step died `gpl-boundary not installed`, silently, through
+# a green deploy. Registration alone proves nothing (the boundary is out-of-process),
+# so INVOKE it: build a tiny bowtie2 index via `save_bowtie2_index`, which shells to
+# the boundary. This runs IN THE JOB ENV — so it also verifies the fix that made
+# it fail before: native jobs get an ephemeral HOME, so the boundary is reachable
+# ONLY when MIINT_GPL_BOUNDARY_PATH is forwarded into the job (miint_job_env);
+# unset/wrong → this fails here, at deploy, not at the first real shard build.
+MIINT_BOUNDARY_PROBE="$(mktemp)"
+cat > "$MIINT_BOUNDARY_PROBE" <<'PYEOF'
+import sys
+try:
+    import os, tempfile, duckdb
+    from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+    conn = duckdb.connect(":memory:", config=miint_connect_config())
+    conn.execute(miint_load_sql())
+    conn.execute(
+        "CREATE TABLE bt2_subject AS SELECT 1::BIGINT AS read_id, "
+        "'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT' AS sequence1"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "index")
+        row = conn.execute(
+            "SELECT success FROM save_bowtie2_index('bt2_subject', ?)", [out]
+        ).fetchone()
+        assert row is not None and row[0], "save_bowtie2_index did not report success"
+except Exception as exc:
+    msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
+    print(msg[:500])
+    sys.exit(1)
+PYEOF
+if MIINT_ERR="$("$PYTHON" "$MIINT_BOUNDARY_PROBE" 2>/dev/null)"; then
+    echo "{_PROBE_LINE_PREFIX} miint-gpl-boundary=ok"
+else
+    echo "{_PROBE_LINE_PREFIX} miint-gpl-boundary=fail err=$MIINT_ERR"
+fi
+rm -f "$MIINT_BOUNDARY_PROBE"
 
 # The `/ticket` leaf must match the control plane's PATH_SCRATCH/ticket
 # derivation (qiita_control_plane.config.Settings.from_env) — that's the

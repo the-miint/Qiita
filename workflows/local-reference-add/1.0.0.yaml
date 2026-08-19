@@ -41,6 +41,47 @@ context_schema:
     tree_path: {type: string, pattern: "^/"}
     jplace_path: {type: string, pattern: "^/"}
     genome_map_path: {type: string, pattern: "^/"}
+    # Analysis sharding (opt-in, default OFF) — identical semantics to
+    # reference-add's shard_index: after register-files, `plan-shards` assigns
+    # reference_membership.shard_id and fans out one build-shard-index ticket per
+    # shard (loading → indexing → active). Sharding is an indexing choice on the
+    # same reference data. Default OFF → today's loading → active, byte-identical.
+    shard_index: {type: boolean}
+    # Which per-shard analysis indexes to build (default-ON; only meaningful when
+    # shard_index is true). Per-shard rype no longer exists — routing is the ONE
+    # whole-reference rype_router the sharded path builds automatically, so a
+    # shard builds only minimap2 + bowtie2.
+    build_minimap2: {type: boolean}
+    build_bowtie2: {type: boolean}
+    # Build params forwarded to the shard builders (minimap2_preset ->
+    # build_minimap2_index.preset).
+    minimap2_preset:
+      type: string
+      enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
+    # Optional GFF3 of per-interval ANNOTATIONS on the sequences above (a plasmid map
+    # naming each SynDNA insert's window; a genome's gene coordinates). Each interval
+    # is minted its OWN feature_idx so it can key a feature table while reads align to
+    # its parent. Contract + the closed->half-open coordinate conversion:
+    # qiita_compute_orchestrator.jobs.hash_sequences.
+    gff_path: {type: string, pattern: "^/"}
+  # A sharded reference must build at least one per-shard index type.
+  # The `required` list means this `not:` only fires when all three keys are
+  # present — an omitted `build_*` defaults ON via the build-shard-index steps'
+  # `when:`, so a partial selection (e.g. `build_minimap2: false` alone) is valid.
+  not:
+    required: [shard_index, build_minimap2, build_bowtie2]
+    properties:
+      shard_index: {const: true}
+      build_minimap2: {const: false}
+      build_bowtie2: {const: false}
+  # A sharded reference requires a genome map — plan-shards derives the per-shard
+  # feature set from qiita.feature_genome, which mint-features populates only when
+  # a genome map is supplied.
+  if:
+    required: [shard_index]
+    properties: {shard_index: {const: true}}
+  then:
+    required: [genome_map_path]
 
 success_status: active
 failure_status: failed
@@ -69,7 +110,11 @@ steps:
     module: qiita_compute_orchestrator.jobs.hash_sequences
     target_status: hashing
     inputs: [fasta_path]
-    outputs: [manifest, reference_sequence_chunks]
+    # Optional GFF3 of annotated intervals. Absent → a ZERO-ROW annotation_manifest
+    # rather than an absent output; see the hash_sequences module docstring for why
+    # that beats a `when:` gate (short version: `when:` is default-ON).
+    optional_inputs: [gff_path]
+    outputs: [manifest, reference_sequence_chunks, annotation_manifest]
     baseline_resources:
       cpu: 8
       mem_gb: 32
@@ -80,15 +125,29 @@ steps:
     inputs: [manifest]
     outputs: [feature_map]
 
+  # Mint a feature_idx for each ANNOTATED INTERVAL, and record the reference's claim
+  # on it in qiita.reference_annotation. Deliberately NOT followed by
+  # write-membership — membership is what gets INDEXED, and an interval is
+  # quantified, not aligned against. `manifest` + `feature_map` are the SEQUENCE
+  # side's, read only to resolve each interval's parent_feature_idx.
+  # See qiita_control_plane.actions.library.mint_annotation_features.
+  - action: mint-annotation-features
+    inputs: [annotation_manifest, feature_map]
+    outputs: [annotation_map]
+
   - action: write-membership
-    inputs: [feature_map]
+    # `manifest` supplies the representative source accession (FASTA-header
+    # read_id) per feature_idx; `feature_map` supplies feature_idx. Resolved by
+    # binding name in the runner, so order here is not load-bearing.
+    inputs: [manifest, feature_map]
     outputs: []
 
   - step: load
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.reference_load
     target_status: loading
-    inputs: [manifest, feature_map, reference_sequence_chunks]
+    inputs: [manifest, feature_map, reference_sequence_chunks,
+             annotation_manifest, annotation_map]
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
     baseline_resources:
@@ -100,7 +159,62 @@ steps:
     inputs: [staging_dir]
     outputs: []
 
+  # Sharded-index fan-out (opt-in) — identical to reference-add's plan-shards
+  # tail. Runs only when shard_index: true; MUST follow register-files (shard
+  # builds stream chunks from DuckLake). See reference-add/1.0.0.yaml for the
+  # full rationale (loading → indexing → active, conditional finalize).
+  - action: plan-shards
+    when: shard_index
+    inputs: []
+    outputs: []
+
+  # Whole-reference routing index — identical to reference-add's router tail (see
+  # that file for the full rationale). Gated on `router_pending` (plan-shards sets
+  # it true + stages `shard_mapping` only on a real fan-out, N > 0). Runs in the
+  # PARENT ticket after plan-shards; build_routing_index builds the whole-reference
+  # rype ROUTER, register-index records the `rype_router` row, and finalize-shard
+  # converges with the per-shard children on the guarded indexing → active.
+  - step: build_routing_index
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.build_routing_index
+    when: router_pending
+    inputs: [shard_mapping]
+    outputs: [routing_index_meta]
+    # Whole-reference rype build (sized like local-host-reference-add's
+    # build_rype_index — the local path allows a long walltime for genome-scale
+    # references); an OOM retry doubles mem to the 128 GB action ceiling.
+    baseline_resources:
+      cpu: 4
+      mem_gb: 64
+      walltime: PT24H
+
+  - action: register-index
+    when: router_pending
+    inputs: [routing_index_meta]
+    outputs: []
+
+  - action: finalize-shard
+    when: router_pending
+    inputs: []
+    outputs: []
+
+  # Post-load exclusion sync — the LAST step, identical to reference-add's tail
+  # sync (see that file for the full rationale). Re-resolves the GLOBAL curated
+  # blocklist and REPLACES the data plane's DuckLake `reference_exclusion` mirror
+  # wholesale (idempotent, replay-safe), so a fresh assembly of an already-blocked
+  # genome is caught by the re-resolve. Unconditional; MUST follow register-files
+  # and is placed DEAD LAST — after the sharded fan-out and its register-index —
+  # so a transient sync FlightError can never strand an already-built index
+  # unregistered. On the unsharded path every step above is skipped
+  # (when: router_pending), so sync still effectively runs right after
+  # register-files. See qiita_control_plane.actions.library.sync_reference_exclusion.
+  - action: sync-reference-exclusion
+    inputs: []
+    outputs: []
+
 action_ceiling:
   cpu: 16
-  mem_gb: 64
+  # 128 (not 64): build_routing_index starts at 64 GB and an OOM retry doubles it,
+  # matching local-host-reference-add's build_rype_index ceiling rationale.
+  mem_gb: 128
   walltime: PT48H

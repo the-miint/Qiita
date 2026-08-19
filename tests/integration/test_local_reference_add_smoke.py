@@ -152,7 +152,7 @@ async def test_local_reference_add_workflow_end_to_end(
     register_calls: list[tuple] = []
 
     async def _stub_register_files(
-        *, staging_dir, files, work_ticket_idx, hmac_secret, data_plane_url
+        *, staging_dir, files, work_ticket_idx, signing_key, data_plane_url
     ):
         # work_ticket_idx is keyword-required: the runner must thread it so the
         # data plane can mint unique, ticket-traceable lake filenames.
@@ -163,6 +163,19 @@ async def test_local_reference_add_workflow_end_to_end(
         _lib.LIBRARY, LibraryPrimitive.REGISTER_FILES, _stub_register_files
     )
 
+    # Stub the post-load exclusion sync too (real path signs a DoAction to a
+    # running data plane). Capturing the call proves the hook fires on the local
+    # path exactly as on the remote one.
+    sync_calls: list[dict] = []
+
+    async def _stub_sync_exclusion(pool, *, dest, signing_key, data_plane_url):
+        sync_calls.append({"dest": dest})
+        return {"synced_feature_count": 0}
+
+    monkeypatch.setitem(
+        _lib.LIBRARY, LibraryPrimitive.SYNC_REFERENCE_EXCLUSION, _stub_sync_exclusion
+    )
+
     workspace_root = tmp_path / "workspace"
     backend_client = LocalComputeBackendClient()
 
@@ -170,7 +183,7 @@ async def test_local_reference_add_workflow_end_to_end(
         work_ticket_idx,
         postgres_pool,
         backend_client,  # type: ignore[arg-type]  # protocol-shaped duck
-        hmac_secret=b"unused-in-smoke",
+        signing_key=b"unused-in-smoke",
         data_plane_url="grpc://unused:0",
         work_ticket_workspace_root=workspace_root,
         # No uploads on the local path, but the kwarg is required; an empty
@@ -203,6 +216,10 @@ async def test_local_reference_add_workflow_end_to_end(
     # register-files invoked once with the staging-dir Parquet files mapped by
     # the runner's convention — identical to the remote path's load output.
     assert len(register_calls) == 1
+    # The post-load exclusion sync fired exactly once (local path), staging its
+    # Parquet into this ticket's workspace.
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["dest"].name == "reference_exclusion.parquet"
     _staging_dir, files = register_calls[0]
     assert files.get("reference_sequences.parquet") == "reference_sequences"
     assert "reference_membership.parquet" in files

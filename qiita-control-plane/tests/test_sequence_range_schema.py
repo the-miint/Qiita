@@ -10,8 +10,10 @@ the loop does not see:
   - the table's composite FK is ON DELETE CASCADE (so a prep_sample
     delete drops the range row), not the default RESTRICT
   - the CHECK constraints on the range bounds exist
-  - the qiita.mint_sequence_range(bigint, bigint, bigint) function
+  - the qiita.mint_sequence_range(bigint, bigint, bigint, bigint) function
     exists with the expected return type
+  - minted_by_work_ticket_idx exists, is nullable, and carries NO foreign key
+    (it is an identity token compared for equality, not a navigable relationship)
 
 These tests fail with a clear "does not exist" message until the
 migration in this PR lands.
@@ -133,8 +135,46 @@ async def test_mint_sequence_range_function_exists(postgres_pool):
     # Signature: (bigint, bigint, bigint) -> qiita.sequence_range. The
     # types-only check avoids depending on the in_parameter names which
     # are intentional in the migration but not part of the contract.
-    assert row["pronargs"] == 3, row["pronargs"]
-    assert list(row["argtypes"]) == ["bigint", "bigint", "bigint"], row["argtypes"]
+    # 4 args: prep_sample_idx, count, principal_idx, work_ticket_idx. The ticket is
+    # what lets a reads job prove an orphaned range is its OWN before reusing it.
+    assert row["pronargs"] == 4, row["pronargs"]
+    assert list(row["argtypes"]) == ["bigint", "bigint", "bigint", "bigint"], row["argtypes"]
     # pg_get_function_result drops the schema qualifier when 'qiita' is
     # on the search path; same idiom as the format_type case above.
     assert row["result"] == "sequence_range", row["result"]
+
+
+async def test_minted_by_work_ticket_idx_column(postgres_pool):
+    """The range records WHICH ticket minted it, and the column is NULLABLE.
+
+    Nullable is load-bearing: rows that predate this column (every Illumina sample
+    ingested so far) have no provenance, and callers read NULL as "not mine" —
+    fail closed, which is exactly disallow-without-delete."""
+    row = await postgres_pool.fetchrow(
+        "SELECT data_type, is_nullable"
+        "  FROM information_schema.columns"
+        " WHERE table_schema = 'qiita' AND table_name = 'sequence_range'"
+        "   AND column_name = 'minted_by_work_ticket_idx'"
+    )
+    assert row is not None, "qiita.sequence_range.minted_by_work_ticket_idx is missing"
+    assert row["data_type"] == "bigint", row["data_type"]
+    assert row["is_nullable"] == "YES", "minted_by_work_ticket_idx must be nullable"
+
+
+async def test_minted_by_work_ticket_has_no_fk(postgres_pool):
+    """No FK, on purpose. The column is an identity token compared for equality, not
+    a relationship we navigate. A FK would make a mint whose ticket row is absent
+    raise ForeignKeyViolationError — which the route maps to a misleading 404
+    ("prep_sample not found") — and would force a delete rule on work_ticket that
+    must never cascade (the range's sequence_idx values are already in the lake).
+    A dangling value already reads as "not mine" and fails closed."""
+    fks = await postgres_pool.fetchval(
+        "SELECT count(*)"
+        "  FROM pg_constraint c"
+        "  JOIN pg_class t ON t.oid = c.conrelid"
+        "  JOIN pg_namespace n ON n.oid = t.relnamespace"
+        "  JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (c.conkey)"
+        " WHERE n.nspname = 'qiita' AND t.relname = 'sequence_range'"
+        "   AND c.contype = 'f' AND a.attname = 'minted_by_work_ticket_idx'"
+    )
+    assert fks == 0, "minted_by_work_ticket_idx must carry no FK (see the migration)"

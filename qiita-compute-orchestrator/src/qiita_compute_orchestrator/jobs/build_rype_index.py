@@ -16,6 +16,11 @@ rather than omitting the optional mapping table: it keeps the index
 self-describing and exercises the same mapping path future multi-bucket
 (microbial) uses will reuse.
 
+This job is WHOLE-REFERENCE / host-only. The multi-bucket sharded ROUTER (one
+bucket per shard) is a separate job (`build_routing_index`); per-shard rype
+`.ryxdi` builds no longer exist — the whole-reference router replaced them for
+routing.
+
 rype build parameters default to k=64, w=20 (the function's own w default is
 50, so we pass 20 explicitly); `w` is overridable per build via the `rype_w`
 action_context key. The authoritative build manifest lives inside
@@ -121,11 +126,15 @@ _MAPPING_TABLE = "rype_bucket_map"
 class Inputs(BaseModel):
     """Typed input contract for build_rype_index.
 
-    `reference_sequence_chunks` is the feature-keyed chunk output of the
-    `load` step (a DIRECTORY of `part_*.parquet`, or a single Parquet file).
-    `reference_idx` and `work_ticket_idx` are framework-injected scope scalars.
-    `k` / `w` are the rype build parameters (host-filter defaults); `bucket_name`
-    overrides the default single-bucket name.
+    `reference_sequence_chunks` is the feature-keyed chunk output of the `load`
+    step (a DIRECTORY of `part_*.parquet`, or a single Parquet file) — the
+    whole reference's sequences. `reference_idx` and `work_ticket_idx` are
+    framework-injected scope scalars. `k` / `w` are the rype build parameters
+    (host-filter defaults); `bucket_name` overrides the default single-bucket
+    name.
+
+    Whole-reference / host mode only — the sharded ROUTER is a separate job
+    (`build_routing_index`).
     """
 
     reference_sequence_chunks: Path
@@ -177,8 +186,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # reference_load emits chunks as a directory of part_*.parquet; accept a
     # single file too (tests / future producers).
     read_target = chunks / "part_*.parquet" if chunks.is_dir() else chunks
-
-    bucket = inputs.bucket_name or f"reference_{inputs.reference_idx}"
+    bucket = (
+        inputs.bucket_name
+        if inputs.bucket_name is not None
+        else f"reference_{inputs.reference_idx}"
+    )
 
     # Persistent index location under the derived-artifact root (PATH_DERIVED),
     # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
@@ -186,7 +198,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # here instead of the $TMPDIR/qiita/derived default. The layout is owned by
     # `derived_store` (the orchestrator's derived-storage convention, shared with
     # build_minimap2_index and the reference-artifact purge endpoint).
-    index_dir = rype_index_path(get_settings().path_derived, inputs.reference_idx)
+    path_derived = get_settings().path_derived
+    index_dir = rype_index_path(path_derived, inputs.reference_idx)
     index_dir.parent.mkdir(parents=True, exist_ok=True)
     # On a workflow retry the build re-runs against the same persistent path;
     # clear any prior (possibly partial) `.ryxdi` so the rebuild is
@@ -217,14 +230,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=duckdb_memory_gb, threads=_DUCKDB_THREADS)
-        # Non-temp view/table so rype's separate bind/execute connection can
-        # resolve them by name. DuckDB rejects prepared parameters inside
-        # CREATE VIEW, so the path is inlined; validate_parquet_path rejects
-        # quote/backslash/control chars (the repo's fail-fast escaping contract).
+        # Non-temp view (`_CHUNK_VIEW`) so rype's separate bind/execute connection
+        # can resolve it by name and windows over the on-disk staging Parquet
+        # lazily (never materialised into an in-memory table). DuckDB rejects
+        # prepared parameters inside CREATE VIEW, so the path is inlined;
+        # validate_parquet_path rejects quote/backslash/control chars (the repo's
+        # fail-fast escaping contract).
         read_target_sql = validate_parquet_path(read_target)
         conn.execute(
             f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
-            f"SELECT feature_idx, chunk_index, chunk_data FROM read_parquet('{read_target_sql}')"
+            "SELECT feature_idx, chunk_index, chunk_data "
+            f"FROM read_parquet('{read_target_sql}')"
         )
         # Single-bucket mapping over every distinct feature. bucket is a
         # controlled string; escape quotes for the inlined literal.
@@ -251,11 +267,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     params = {"k": inputs.k, "w": inputs.w, "bucket_name": bucket}
     meta_path = workspace / "rype_index_meta.json"
-    meta_path.write_text(
-        json.dumps(
-            {"index_type": HOST_FILTER_INDEX_TYPE_RYPE, "fs_path": str(index_dir), "params": params}
-        )
-    )
+    # The runner's register-index arm reads meta.get("shard_id") -> None -> a
+    # whole-reference row (host rype is never sharded).
+    meta = {
+        "index_type": HOST_FILTER_INDEX_TYPE_RYPE,
+        "fs_path": str(index_dir),
+        "params": params,
+    }
+    meta_path.write_text(json.dumps(meta))
     # Only the in-tree meta JSON is a step output. The `.ryxdi` itself lives
     # under PATH_DERIVED (outside the per-attempt workspace) on purpose — it
     # outlives the work ticket — so it CANNOT be a declared output: the launcher

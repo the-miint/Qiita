@@ -1,0 +1,7 @@
+{
+  "env": {
+    "PYTEST_ADDOPTS": "-q --no-header --tb=short",
+    "CARGO_TERM_QUIET": "true",
+    "UV_NO_PROGRESS": "1"
+  }
+}

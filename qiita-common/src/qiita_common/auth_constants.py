@@ -43,22 +43,85 @@ class Scope(StrEnum):
     # destructive and admin-only, granted solely to system_admin in
     # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts.
     REFERENCE_DELETE = "reference:delete"
+    # Curate the global reference exclusion blocklist (block/unblock a bad
+    # genome_idx / feature_idx so it stops contributing to downstream products).
+    # Destructive-adjacent and admin-only: granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts. Mirrors
+    # REFERENCE_DELETE (the read-only GET /reference/{idx}/exclusion rides
+    # REFERENCE_READ instead).
+    REFERENCE_EXCLUSION_WRITE = "reference:exclusion:write"
     REFERENCE_REGISTER_FILES = "reference:register_files"
     FEATURE_MINT = "feature:mint"
+    # Sign DoGet tickets for the data plane's reference-data surfaces AND the
+    # per-sample `alignment` slice (host-depleted derived data, the feature-table
+    # OGU job's input — see routes/alignment.py). Deliberately NOT split out the way
+    # READ_MASKED_DOGET is below: alignment is not raw human/host reads, so it rides
+    # the generic scope rather than a privacy-sensitive one.
     TICKET_DOGET = "ticket:doget"
+    # Mint an alignment DoGet ticket as a HUMAN, naming the cohort directly.
+    #
+    # Split from TICKET_DOGET because the two carry different trust models, not
+    # different data. TICKET_DOGET signs a cohort the control plane read out of a
+    # work ticket's action_context, which the runner resolver already validated
+    # at submit; there is no such upstream for a client-driven request, so this
+    # scope's route resolves the cohort and authorizes it per-study (Tier.VIEWER
+    # on every study each sample links to) before signing. Reusing TICKET_DOGET
+    # would have put a human PAT on the worker path — and it is deliberately
+    # absent from every role ceiling precisely so that cannot happen.
+    #
+    # On every role ceiling, unlike its neighbours: for a plain user the
+    # per-study tier check is the real boundary, so the role does not need to be.
+    # That argument is honest only for `user`. `wet_lab_admin` and `system_admin`
+    # are at or above the cohort gate's `bypass_role`
+    # (`filter_prep_samples_caller_can_read`), so for them the whole cohort comes
+    # back readable with no per-study lookup at all and the 403 cannot fire — the
+    # ROLE is the boundary, which is the inverse of the reason above. Both are
+    # deliberate; they are just not the same reason, and a reader who assumes the
+    # per-study check protects every caller is wrong about the two roles that
+    # matter most. Correspondingly NOT on SERVICE_ACCOUNT_SCOPE_CEILING — a
+    # worker holding both would be two ways into one surface with two different
+    # validation paths.
+    ALIGNMENT_DOGET = "alignment:doget"
     # DoGet against the data plane's masked-read surface (`read_masked`).
-    # Deliberately distinct from the generic TICKET_DOGET (which signs
-    # reference-data tickets): masked reads are privacy-sensitive (the lake
-    # retains human/host reads, excluded only by the read_masked view), so the
+    # Deliberately distinct from the generic TICKET_DOGET (which signs reference-data
+    # and alignment tickets): masked reads are privacy-sensitive (the lake
+    # retains human/host reads, excluded only by the read_masked macro), so the
     # capability to pull them is granted separately — to service accounts that
     # drive the masked-read consumer path, never piggybacking on reference reads.
     READ_MASKED_DOGET = "read_masked:doget"
+    # DoGet against the data plane's BLOCK-read selectors (`read_block` /
+    # `read_masked_block`) — one block's `(prep_sample_idx, sequence_idx
+    # sub-range)` members, streamed to a block-scoped compute job.
+    #
+    # Distinct from BOTH neighbours, and strictly the most privileged of the
+    # three. `read_block` streams RAW `read` rows: host/human sequence that the
+    # `read_masked` macro exists to exclude, so it is a strict superset of what
+    # READ_MASKED_DOGET covers. Riding TICKET_DOGET (reference data + the derived
+    # `alignment` slice) would let any service account minting reference tickets
+    # pull raw reads — an inversion of the model the two scopes above establish.
+    # Granted only to the service account that drives block compute.
+    READ_DOGET = "read:doget"
     # Full purge of a mask (the mask_definition row + its DuckLake read_mask
     # rows). Deliberately distinct from the mask-minting capability: deletion
     # is destructive and admin-only, granted solely to system_admin in
     # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts.
     # Mirrors REFERENCE_DELETE.
     MASK_DEFINITION_DELETE = "mask_definition:delete"
+    # Mask LIFECYCLE: deprecate a config so it can no longer be minted against, and
+    # withdraw individual runs of a sound config. Separate from
+    # MASK_DEFINITION_DELETE because the two are opposites — deletion destroys the
+    # record of what filtered published data, deprecation preserves it and adds the
+    # judgement. Separate from the minting capability (READ_MASKED_DOGET) because a
+    # service account that mints masks must not be able to void them. system_admin
+    # only, in ROLE_IMPLIED_SCOPES.
+    MASK_DEFINITION_LIFECYCLE = "mask_definition:lifecycle"
+    # Full purge of an alignment (the alignment_definition row + its DuckLake
+    # alignment rows; the alignment_sample gate cascade-deletes). Deliberately
+    # distinct from the align-submitting capability (PREP_SAMPLE_WRITE): deletion
+    # is destructive and admin-only, granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts. Mirrors
+    # MASK_DEFINITION_DELETE; it is the disallow-without-delete escape hatch.
+    ALIGNMENT_DEFINITION_DELETE = "alignment_definition:delete"
     # Generic upload domain. Gates the slot-minting + DoPut path; not
     # reference-specific. Carried by admins (humans uploading via qiita-admin)
     # and service accounts (workers driving import flows).
@@ -96,20 +159,30 @@ class Scope(StrEnum):
     ADMIN_AUDIT_READ = "admin:audit_read"
     # Re-identification read: dump the owner-submitted original sample names
     # (biosample_metadata where is_owner_biosample_id=true) keyed by minted
-    # idx + public accession. That value is PII-pinned and masked on the
-    # normal biosample:read path, so exporting it gets its own system_admin-only
-    # scope rather than overloading biosample:read. Granted solely to
+    # idx + public accession. That value is the owner's own name for their
+    # sample, restricted to study members rather than shown on the normal
+    # biosample:read path (submitters sometimes put PII in sample names), so
+    # exporting it gets its own system_admin-only scope rather than
+    # overloading biosample:read. Granted solely to
     # system_admin in ROLE_IMPLIED_SCOPES; never wet_lab_admin or service
     # accounts.
     ADMIN_BIOSAMPLE_OWNER_ID_READ = "admin:biosample_owner_id_read"
     # Admin per-pool masked-read export: list a sequenced_pool's samples and mint
-    # per-sample DoGet tickets on the data plane's read_masked view, so an admin
+    # per-sample DoGet tickets on the data plane's read_masked macro, so an admin
     # can download masked sequence data locally. This is the first *human*
     # masked-read pull — distinct from the service-account READ_MASKED_DOGET path
     # (which is untouched). Admin-gated until there's a model for auto-selecting
     # the correct mask; granted solely to system_admin in ROLE_IMPLIED_SCOPES,
     # never wet_lab_admin or service accounts.
     ADMIN_MASKED_READ_EXPORT = "admin:masked_read_export"
+
+    # Operator-cancel of in-flight compute: flip a work_ticket terminal
+    # (cancelled) so the CP stops driving it AND scancel its SLURM job(s). Privileged
+    # — it stops running work and crosses into the compute account's reap on the
+    # operator's behalf — so it is granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES, never to wet_lab_admin or service accounts. Mirrors the
+    # destructive-delete scopes (REFERENCE_DELETE / SEQUENCED_POOL_DELETE).
+    WORK_TICKET_CANCEL = "work_ticket:cancel"
 
     # Self-service (humans only)
     SELF_PROFILE = "self:profile"
@@ -161,13 +234,27 @@ API_PREFIX = "/api/v1"
 BEARER_PREFIX = "Bearer "
 
 
+# Machine-readable marker the scope guards set on a *stale-scope* 403 — one
+# whose real cause is a PAT minted before the missing scope entered the
+# caller's live role ceiling (or a PAT deliberately narrowed below it). The
+# server is the authoritative place to decide this (it holds the live
+# `role_ceiling`), so it flags the condition here as a response header rather
+# than in the detail prose. The CLI's single HTTP-error chokepoint keys off
+# this header to surface a clean "run `qiita login`" prompt, without the CLI
+# needing its own (drift-prone) copy of the role ceiling. Presence is the
+# signal; the value is unspecified beyond being truthy.
+STALE_TOKEN_SCOPE_HEADER = "X-Qiita-Stale-Token-Scope"
+
+
 # Pydantic Field max_length policy values. 255 is the historical "name-ish"
 # default that lines up with VARCHAR(255) in DB columns; 100 covers reference
 # version strings; 64 caps DuckLake / DB table names per Postgres identifier
-# limits.
+# limits; 50 tracks the VARCHAR(50) accession columns, so an over-long
+# accession fails at the wire rather than in the database.
 MAX_NAME_LENGTH = 255
 MAX_VERSION_LENGTH = 100
 MAX_TABLE_NAME_LENGTH = 64
+MAX_ACCESSION_LENGTH = 50
 
 
 # TTL maxima enforced at the API boundary. Human PATs cap at 1 year so a

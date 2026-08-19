@@ -45,6 +45,12 @@ context_schema:
     tree_upload_idx: {type: integer, minimum: 1}
     jplace_upload_idx: {type: integer, minimum: 1}
     genome_map_upload_idx: {type: integer, minimum: 1}
+    # Optional GFF3 of per-interval ANNOTATIONS on the sequences above (a plasmid map
+    # naming each SynDNA insert's window; a genome's gene coordinates). Each interval
+    # is minted its OWN feature_idx so it can key a feature table while reads align to
+    # its parent. Contract + the closed->half-open coordinate conversion:
+    # qiita_compute_orchestrator.jobs.hash_sequences.
+    gff_upload_idx: {type: integer, minimum: 1}
     # Index selection (default-ON via the steps' `when:`; omitting a key builds
     # that index). The runner reads these to gate build_rype_index /
     # build_minimap2_index and their register-index siblings.
@@ -74,7 +80,11 @@ steps:
     module: qiita_compute_orchestrator.jobs.hash_sequences
     target_status: hashing
     inputs: [fasta_path]
-    outputs: [manifest, reference_sequence_chunks]
+    # Optional GFF3 of annotated intervals. Absent → a ZERO-ROW annotation_manifest
+    # rather than an absent output; see the hash_sequences module docstring for why
+    # that beats a `when:` gate (short version: `when:` is default-ON).
+    optional_inputs: [gff_path]
+    outputs: [manifest, reference_sequence_chunks, annotation_manifest]
     baseline_resources:
       cpu: 4
       mem_gb: 8
@@ -85,15 +95,29 @@ steps:
     inputs: [manifest]
     outputs: [feature_map]
 
+  # Mint a feature_idx for each ANNOTATED INTERVAL, and record the reference's claim
+  # on it in qiita.reference_annotation. Deliberately NOT followed by
+  # write-membership — membership is what gets INDEXED, and an interval is
+  # quantified, not aligned against. `manifest` + `feature_map` are the SEQUENCE
+  # side's, read only to resolve each interval's parent_feature_idx.
+  # See qiita_control_plane.actions.library.mint_annotation_features.
+  - action: mint-annotation-features
+    inputs: [annotation_manifest, feature_map]
+    outputs: [annotation_map]
+
   - action: write-membership
-    inputs: [feature_map]
+    # `manifest` supplies the representative source accession (FASTA-header
+    # read_id) per feature_idx; `feature_map` supplies feature_idx. Resolved by
+    # binding name in the runner, so order here is not load-bearing.
+    inputs: [manifest, feature_map]
     outputs: []
 
   - step: load
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.reference_load
     target_status: loading
-    inputs: [manifest, feature_map, reference_sequence_chunks]
+    inputs: [manifest, feature_map, reference_sequence_chunks,
+             annotation_manifest, annotation_map]
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     # `reference_sequence_chunks` is re-emitted feature-keyed here (the
     # hash_sequences binding was sequence_hash-keyed); build_rype_index below
@@ -182,6 +206,23 @@ steps:
   - action: register-index
     inputs: [minimap2_index_meta]
     when: build_minimap2
+    outputs: []
+
+  # Post-load exclusion sync — the LAST step (see reference-add/1.0.0.yaml for the
+  # full rationale). A host reference loads taxonomy into `reference_taxonomy`
+  # (hence the `reference_taxonomy_visible` anti-join view) and can carry a
+  # genome_map, so a fresh assembly of an already-blocked genome must
+  # re-materialize the DuckLake `reference_exclusion` mirror here too — otherwise
+  # the "future references inherit the block" guarantee would not hold on the
+  # host-ref load path. Unconditional; MUST follow register-files, and placed DEAD
+  # LAST — after both register-index — so a transient sync FlightError can never
+  # strand an already-built rype/minimap2 index unregistered: the expensive builds
+  # and their registration complete and persist before this best-effort side step
+  # (its primitive swallows a transient failure rather than failing the ticket —
+  # see reference-add/1.0.0.yaml and the primitive docstring).
+  # See qiita_control_plane.actions.library.sync_reference_exclusion.
+  - action: sync-reference-exclusion
+    inputs: []
     outputs: []
 
 action_ceiling:

@@ -58,15 +58,16 @@ for svc in control-plane data-plane compute-orchestrator; do
     cp ".env.$svc.example" ".env.$svc"
 done
 
-# 5. Generate the shared HMAC secret once and sed-substitute it into both
-#    .env.control-plane and .env.data-plane (CP and DP must agree byte-for-byte;
-#    doing it here avoids the failure mode where you edit one file by hand,
-#    forget the other, and the second-sourced placeholder silently wins).
-HMAC_SECRET_KEY=$(openssl rand -base64 32)
-for f in .env.control-plane .env.data-plane; do
-    sed -i.bak "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" "$f"
-    rm "$f.bak"
-done
+# 5. Generate the Flight-ticket signing keypair (Ed25519) + the login-cookie
+#    secret, and sed-substitute them in. The control plane signs tickets with the
+#    PRIVATE seed; the data plane verifies with the matching PUBLIC key (asymmetric
+#    — the DP can never forge a ticket). The login cookie uses its own distinct
+#    HMAC key. Doing it here avoids editing one file and forgetting the other.
+eval "$(python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; import base64; k=K.generate(); print('SIGNING=' + base64.b64encode(k.private_bytes_raw()).decode()); print('PUBLIC=' + base64.b64encode(k.public_key().public_bytes_raw()).decode())")"
+COOKIE=$(openssl rand -base64 32)
+sed -i.bak -e "s|^FLIGHT_TICKET_SIGNING_KEY=.*|FLIGHT_TICKET_SIGNING_KEY=$SIGNING|" \
+    -e "s|^LOGIN_COOKIE_SECRET_KEY=.*|LOGIN_COOKIE_SECRET_KEY=$COOKIE|" .env.control-plane && rm .env.control-plane.bak
+sed -i.bak "s|^FLIGHT_TICKET_PUBLIC_KEY=.*|FLIGHT_TICKET_PUBLIC_KEY=$PUBLIC|" .env.data-plane && rm .env.data-plane.bak
 
 # 6. Edit each .env.<svc> to fill in the remaining placeholders:
 #       .env.control-plane            DATABASE_URL <username>

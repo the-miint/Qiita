@@ -41,11 +41,28 @@ reading `$QIITA_INPUT_PATH/params.json`, writing outputs and
 
 from __future__ import annotations
 
+import shlex
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 from qiita_common.actions import NATIVE_MODULE_PREFIX, BaselineResources
+
+
+def job_name_prefix(work_ticket_idx: int) -> str:
+    """The deterministic SLURM job-name prefix shared by ALL of a work_ticket's
+    attempts: `qiita-wt{idx}-`. Cancel/reap matches every attempt against this
+    prefix — the trailing `-` disambiguates `qiita-wt5-` from `qiita-wt50-...`.
+    Kept next to `job_name` so the prefix and the full name can't drift."""
+    return f"qiita-wt{work_ticket_idx}-"
+
+
+def job_name(work_ticket_idx: int, step_name: str, attempt: int) -> str:
+    """The deterministic, recovery-findable SLURM job name:
+    `qiita-wt{idx}-{step}-a{attempt}`. `find_jobs_by_name` re-adopts a job by this
+    exact shape (the write-ahead gap); the attempt suffix keeps a retry's job from
+    colliding with the terminal previous attempt's."""
+    return f"{job_name_prefix(work_ticket_idx)}{step_name}-a{attempt}"
 
 
 def number_envelope(value: int) -> dict[str, Any]:
@@ -79,13 +96,29 @@ def _build_script(
     /opt/qiita or arbitrary host paths beyond what the bind mounts
     expose. Bind mounts for QIITA_INPUT_PATH and QIITA_OUTPUT_PATH are
     set up by the caller via apptainer_extra_args; this function just
-    formats the script."""
-    extra = " ".join(apptainer_extra_args or [])
+    formats the script.
+
+    Every arg is shell-quoted: they are interpolated into a bash script, and
+    several carry values that originate in workflow YAML (a `--bind` path, an
+    `--env NAME=<path>` from a step's `derived_inputs`). Unquoted, a `;` or a
+    space in any of them would terminate the `apptainer exec` and run whatever
+    followed. Quoting here covers every arg at the one place they become shell
+    text, rather than trusting each producer to sanitize its own.
+    """
+    # `apptainer exec <image>` with no command is rejected by apptainer ("exec
+    # requires at least 2 arg(s)"). A container step must carry an entrypoint;
+    # the wire validator enforces this, but re-check here — the one place the
+    # command is actually assembled — so a hand-built payload can't emit a broken
+    # `apptainer exec`.
+    if not entrypoint:
+        raise ValueError(
+            "container step requires an entrypoint: `apptainer exec` has no command "
+            "without one and does not fall back to the image's runscript"
+        )
+    extra = " ".join(shlex.quote(a) for a in (apptainer_extra_args or []))
     if extra:
         extra = f" {extra}"
-    cmd = f"apptainer exec --containall{extra} {container}"
-    if entrypoint:
-        cmd = f"{cmd} {entrypoint}"
+    cmd = f"apptainer exec --containall{extra} {shlex.quote(container)} {shlex.quote(entrypoint)}"
     return f"#!/bin/bash\nset -euo pipefail\n{cmd}\n"
 
 
@@ -143,6 +176,8 @@ def build_job_submit_payload(
     attempt: int = 0,
     extra_env: dict[str, str] | None = None,
     extra_bind_dirs: list[Path] | None = None,
+    ro_bind_dirs: list[Path] | None = None,
+    container_env: dict[str, str] | None = None,
     native_python: str = "python",
     qos: str = "",
 ) -> dict[str, Any]:
@@ -173,9 +208,12 @@ def build_job_submit_payload(
             script invokes the shared `python -m` launcher instead of
             `apptainer exec`; bind mounts are not emitted because
             there's no container to bind into.
-        entrypoint: optional binary inside the container. None means
-            the container's own ENTRYPOINT runs. Meaningful only when
-            `container` is set.
+        entrypoint: the in-container launcher path, run as
+            `apptainer exec <image> <entrypoint>`. REQUIRED whenever
+            `container` is set — exec has no command without it and does
+            NOT fall back to the image's runscript (the wire validator
+            `check_exactly_one_runtime` enforces this upstream; `_build_script`
+            re-checks defensively). Meaningful only when `container` is set.
         baseline_resources: CPU / memory / walltime from the YAML step.
             Used as-is — there is no originator-profile multiplier
             applied here. Caller is responsible for clamping against
@@ -198,6 +236,18 @@ def build_job_submit_payload(
             future per-step overrides; kept as a flat name => value map
             (slurmrestd's `environment` field is a list of "KEY=VAL"
             strings, which we serialize from this dict).
+        extra_bind_dirs: additional host directories to bind into the
+            container (identity-mapped, `host:host`). Container steps only.
+        ro_bind_dirs: same, but mounted `:ro` — the derived-artifact dirs a
+            step's `derived_inputs` names. Read-only because these are shared,
+            operator-provisioned reference data the step only reads.
+        container_env: env vars forwarded INTO the container via
+            `--env`, distinct from `extra_env` (which sets the SLURM job's
+            environment). `--containall` means the job env does not cross
+            into the container, so a var the entrypoint must read belongs
+            here. Carries a step's resolved `derived_inputs`; the paths it
+            names must also appear in `ro_bind_dirs` or they won't
+            resolve inside the container. Container steps only.
 
     Returns:
         A dict ready to pass directly to slurmrestd's job/submit
@@ -214,6 +264,15 @@ def build_job_submit_payload(
         raise ValueError("partition must be set on the orchestrator config")
     if not account:
         raise ValueError("account must be set on the orchestrator config")
+    if baseline_resources.gpu:
+        # BaselineResources carries a validated gpu field, but the payload emits
+        # no gres/tres, so a gpu>0 step would be submitted with no GPU and no
+        # error. Reject at submit (fail loud) until GRES support is implemented.
+        raise ValueError(
+            f"gpu={baseline_resources.gpu} requested but the SLURM payload emits no "
+            "GRES — GPU steps are not yet supported; reject rather than silently "
+            "run without a GPU"
+        )
 
     # QIITA_WORK_TICKET_IDX is mirrored from params.json so producers
     # that want to stamp output filenames or logs with the originating
@@ -265,6 +324,30 @@ def build_job_submit_payload(
         # `$QIITA_OUTPUT_PATH`, so without this it exits 64 ("QIITA_INPUT_PATH
         # not set"). Only the contract vars are forwarded; native-only env
         # (CO→CP token, miint dirs) is deliberately not exposed to containers.
+        #
+        # TMPDIR is forwarded for a related reason: `--containall` also mounts a
+        # *tmpfs* /tmp, sized by the host's `sessiondir max size` (64 MiB on the
+        # live deploy). With the env scrubbed, TMPDIR is unset, so an entrypoint's
+        # bare `mktemp -d` lands on that tiny in-memory disk — and a step that
+        # stages real work through it (an assembly, a decompressed FASTQ) dies
+        # partway through, having also charged those bytes to the job's cgroup
+        # memory. Point it at the workspace: real disk, already bound via --home.
+        #
+        # QIITA_CPUS / QIITA_MEM_MB are the resolved allocation, forwarded for the
+        # same reason: `--containall` scrubs the SLURM_* vars too, so an entrypoint
+        # inside the container sees NEITHER SLURM_CPUS_PER_TASK NOR
+        # SLURM_MEM_PER_NODE (measured: zero SLURM_* vars survive). Without these,
+        # a tool sized "per the allocation" is really sized off `nproc` and off
+        # nothing at all — and `nproc` only happens to equal the allocation because
+        # SLURM cpuset-binds the step; a site with cpuset binding off would hand a
+        # 16-cpu step the node's full core count. Memory has no such accident:
+        # nothing inside the container reveals the cgroup ceiling (the enforcing
+        # cgroup is a PARENT of the one /proc/self/cgroup names), while the ceiling
+        # is real and fatal — the SLURM cgroup carries memory.max = the step's
+        # --mem, and a per-thread tool budget that overshoots it is an OOM kill.
+        # These are the only channel; treat them as part of the container contract
+        # (`workflows/_shared/_lib.sh` resolves both, with fallbacks for off-SLURM
+        # local runs).
         apptainer_args = [
             "--home",
             f"{workspace}:{workspace}",
@@ -274,6 +357,12 @@ def build_job_submit_payload(
             f"QIITA_OUTPUT_PATH={output_path}",
             "--env",
             f"QIITA_WORK_TICKET_IDX={work_ticket_idx}",
+            "--env",
+            f"QIITA_CPUS={baseline_resources.cpu}",
+            "--env",
+            f"QIITA_MEM_MB={baseline_resources.mem_gb * 1024}",
+            "--env",
+            f"TMPDIR={workspace}/tmp",
             "--bind",
             f"{input_path}:{input_path}",
             "--bind",
@@ -281,6 +370,19 @@ def build_job_submit_payload(
         ]
         for bind_dir in extra_bind_dirs or ():
             apptainer_args.extend(("--bind", f"{bind_dir}:{bind_dir}"))
+        # Derived artifacts are operator-provisioned reference data the step only
+        # READS, and one copy is shared by every concurrent job (CheckM's single
+        # 1.4 GB DB). `:ro` is what makes that safe — a writable mount would let
+        # one misbehaving container corrupt the copy every other job depends on.
+        for bind_dir in ro_bind_dirs or ():
+            apptainer_args.extend(("--bind", f"{bind_dir}:{bind_dir}:ro"))
+        # `container_env` carries the step's resolved `derived_inputs`
+        # (env_var_name -> absolute host path under PATH_DERIVED). The paths are
+        # already bound above, so they resolve identically inside the container;
+        # this forwards the names the entrypoint reads (e.g. QIITA_CHECKM_DB).
+        # Sorted for deterministic payloads.
+        for env_name, value in sorted((container_env or {}).items()):
+            apptainer_args.extend(("--env", f"{env_name}={value}"))
         script = _build_script(
             container=container,
             entrypoint=entrypoint,
@@ -293,7 +395,7 @@ def build_job_submit_payload(
         # shape to re-adopt a job the control plane submitted but may not
         # have persisted the id for. The attempt suffix keeps a retry's
         # job from colliding with the terminal previous attempt's job.
-        "name": f"qiita-wt{work_ticket_idx}-{step_name}-a{attempt}",
+        "name": job_name(work_ticket_idx, step_name, attempt),
         "account": account,
         "partition": partition,
         "current_working_directory": str(workspace),

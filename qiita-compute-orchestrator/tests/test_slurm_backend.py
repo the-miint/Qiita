@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shlex
 from pathlib import Path
 
 import httpx
@@ -29,7 +30,12 @@ from qiita_common.models import (
 )
 from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
-from qiita_compute_orchestrator.backend import StepHandle, StepStatusInfo
+from qiita_compute_orchestrator.backend import (
+    LocalStepHandle,
+    SlurmStepHandle,
+    StepHandle,
+    StepStatusInfo,
+)
 from qiita_compute_orchestrator.backends.slurm import SlurmBackend
 from qiita_compute_orchestrator.slurm import SlurmrestdClient
 
@@ -68,6 +74,7 @@ def _make_backend(
     cp_url: str = "",
     path_scratch: str = "",
     path_derived: str = "",
+    data_plane_url: str = "",
 ) -> SlurmBackend:
     client = SlurmrestdClient(
         base_url="http://slurm-test:6820",
@@ -83,12 +90,11 @@ def _make_backend(
         client=client,
         partition="qiita",
         account="qiita-prod",
-        poll_interval_seconds=0,  # 0 so tests don't sleep
-        job_timeout_seconds=60,
         co_to_cp_token=co_to_cp_token,
         cp_url=cp_url,
         path_scratch=path_scratch,
         path_derived=path_derived,
+        data_plane_url=data_plane_url,
     )
 
 
@@ -227,7 +233,7 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=None,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
@@ -236,12 +242,16 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
 
 @pytest.mark.asyncio
 async def test_run_step_container_rejects_unsupported_scope(jwt_path, baseline, tmp_path):
-    """Mirror of LocalBackend's container-path scope gate (S4):
-    SlurmBackend container steps are gated on a closed set of supported
-    scope kinds (today: reference + sequenced_pool). A prep_sample-scoped
-    or study_prep-scoped ticket dispatched to a container step would
-    silently produce wrong params.json; the gate 422s at submit time
-    instead."""
+    """Container steps are gated on a closed set of scope kinds (reference,
+    sequenced_pool, prep_sample). A kind outside that set is a workflow-authoring
+    error, and the gate fails it at submit rather than dispatching a step no
+    backend is known to handle.
+
+    `block` stands in for "some kind not on the list" — no workflow runs a
+    container under a block-scoped ticket today. If one ever does, admit the kind
+    in the allowlist (the dispatch path treats scope_target opaquely) and repoint
+    this test; the workflow-scope pin test catches the mismatch statically either
+    way."""
     handler = httpx.MockTransport(lambda req: httpx.Response(500))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
@@ -250,17 +260,15 @@ async def test_run_step_container_rejects_unsupported_scope(jwt_path, baseline, 
             "hash",
             {},
             tmp_path,
-            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            scope_target={"kind": "block", "block_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
     assert "requires a scope_target with kind in" in ei.value.reason
-    assert "reference" in ei.value.reason
-    assert "sequenced_pool" in ei.value.reason
-    assert "prep_sample" in ei.value.reason
+    assert "block" in ei.value.reason
 
 
 @pytest.mark.asyncio
@@ -412,9 +420,11 @@ async def test_run_step_omits_token_env_when_backend_has_no_tokens(jwt_path, bas
     assert "CO_TO_CP_TOKEN" not in env
     assert "QIITA_ALLOW_TOKEN_ENV" not in env
     assert "QIITA_CP_URL" not in env
-    # Likewise PATH_SCRATCH / PATH_DERIVED — only propagated when wired (below).
+    # Likewise PATH_SCRATCH / PATH_DERIVED / DATA_PLANE_URL — only propagated
+    # when wired (below).
     assert "PATH_SCRATCH" not in env
     assert "PATH_DERIVED" not in env
+    assert "DATA_PLANE_URL" not in env
 
 
 @pytest.mark.asyncio
@@ -501,6 +511,46 @@ async def test_run_step_propagates_path_derived_into_job_env(jwt_path, baseline,
 
 
 @pytest.mark.asyncio
+async def test_run_step_propagates_data_plane_url_into_job_env(jwt_path, baseline, tmp_path):
+    """A native job that streams reference chunks (Flight DoGet) resolves the
+    data-plane origin via the launcher's get_settings() on the compute node.
+    Like PATH_DERIVED, /etc/qiita is invisible from compute nodes, so the backend
+    must propagate the resolved DATA_PLANE_URL into the SLURM job env or the
+    launcher falls back to the grpc://localhost:50051 DEFAULT and DoGets against
+    the wrong origin."""
+    captured: dict[str, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/job/submit"):
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"job_id": 1})
+        return httpx.Response(
+            200,
+            json={"jobs": [{"job_id": 1, "job_state": ["COMPLETED"], "exit_code": {}}]},
+        )
+
+    backend = _make_backend(
+        httpx.MockTransport(handler),
+        jwt_path,
+        data_plane_url="grpc://qiita-miint.ucsd.edu:50051",
+    )
+    _write_completed_output(tmp_path)
+
+    await _run_step_via_trio(
+        backend,
+        "fastq",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        module=FASTQ_TO_PARQUET_MODULE,
+        baseline_resources=baseline,
+    )
+    env = dict(item.split("=", 1) for item in captured["payload"]["job"]["environment"])
+    assert env["DATA_PLANE_URL"] == "grpc://qiita-miint.ucsd.edu:50051"
+
+
+@pytest.mark.asyncio
 async def test_run_step_writes_params_json(jwt_path, baseline, tmp_path):
     """params.json must end up at <workspace>/input/params.json so the
     container can read it via $QIITA_INPUT_PATH."""
@@ -516,7 +566,7 @@ async def test_run_step_writes_params_json(jwt_path, baseline, tmp_path):
         scope_target={"kind": "reference", "reference_idx": 42},
         work_ticket_idx=99,
         container="docker://qiita/hash:1.0.0",
-        entrypoint=None,
+        entrypoint="/opt/qiita/hash.sh",
         baseline_resources=baseline,
     )
     params_text = (tmp_path / "input" / "params.json").read_text()
@@ -568,7 +618,7 @@ async def test_run_step_terminal_states_map_to_kinds(
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == expected_kind
@@ -699,7 +749,7 @@ async def test_run_step_falls_back_to_state_based_kind_when_no_launcher_line(
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     # State-based classification stands.
@@ -737,7 +787,7 @@ async def test_run_step_completed_but_missing_manifest_is_contract_violation(
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
@@ -764,7 +814,7 @@ async def test_run_step_submit_5xx_is_unreachable(jwt_path, baseline, tmp_path):
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
@@ -786,7 +836,7 @@ async def test_run_step_submit_4xx_is_contract_violation(jwt_path, baseline, tmp
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
@@ -824,7 +874,7 @@ async def test_run_step_submit_200_with_error_code_is_contract_violation(
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
@@ -848,7 +898,7 @@ async def test_run_step_submit_persistent_401_is_unreachable(jwt_path, baseline,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
@@ -872,7 +922,7 @@ async def test_run_step_submit_transport_error_is_unreachable(jwt_path, baseline
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
@@ -886,8 +936,7 @@ async def test_run_step_submit_transport_error_is_unreachable(jwt_path, baseline
 def _slurm_handle(tmp_path, *, job_id: int = 1) -> StepHandle:
     """A SLURM StepHandle pointing at the workspace tree, for driving
     status_step / result_step in isolation."""
-    return StepHandle(
-        compute_target=ComputeTarget.SLURM,
+    return SlurmStepHandle(
         step_name="hash",
         slurm_job_id=job_id,
         job_name="qiita-wt99-hash-a0",
@@ -922,12 +971,12 @@ async def test_submit_step_returns_slurm_handle_without_polling(jwt_path, baseli
         entrypoint="/usr/local/bin/hash",
         baseline_resources=baseline,
     )
+    assert isinstance(handle, SlurmStepHandle)
     assert handle.compute_target == ComputeTarget.SLURM
     assert handle.slurm_job_id == 4242
     assert handle.job_name == "qiita-wt99-hash-a3"
     assert handle.output_path == tmp_path / "output"
     assert handle.logs_path == tmp_path / "logs"
-    assert handle.terminal_outputs is None
     # The deterministic name also went onto the submit payload.
     assert captured["payload"]["job"]["name"] == "qiita-wt99-hash-a3"
     # params.json was written so a later status/result (or a re-attach)
@@ -948,7 +997,7 @@ async def test_submit_step_classifies_submit_error(jwt_path, baseline, tmp_path)
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="docker://qiita/hash:1.0.0",
-            entrypoint=None,
+            entrypoint="/opt/qiita/hash.sh",
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
@@ -1068,7 +1117,7 @@ async def test_result_step_rejects_non_slurm_handle(jwt_path, tmp_path):
     fail loudly with a typed BackendFailure, not an opaque AttributeError
     from dereferencing a None path."""
     backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
-    local_handle = StepHandle(compute_target=ComputeTarget.LOCAL, step_name="hash")
+    local_handle = LocalStepHandle(step_name="hash", terminal_outputs={})
     with pytest.raises(BackendFailure) as ei:
         await backend.result_step(
             local_handle,
@@ -1205,3 +1254,347 @@ async def test_find_jobs_by_name_classifies_slurmrestd_error(jwt_path):
         await backend.find_jobs_by_name("qiita-wt1-hash-a0")
     assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
     assert ei.value.transient is True
+
+
+# ============================================================================
+# derived_inputs — operator-provisioned PATH_DERIVED artifacts into containers
+# ============================================================================
+
+
+def _capture_submit() -> tuple[httpx.MockTransport, dict]:
+    """MockTransport that records the /job/submit payload and then reports the
+    job COMPLETED, so a full trio run can assert on what was submitted."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/job/submit"):
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"job_id": 1})
+        return httpx.Response(
+            200,
+            json={"jobs": [{"job_id": 1, "job_state": ["COMPLETED"], "exit_code": {}}]},
+        )
+
+    return httpx.MockTransport(handler), captured
+
+
+@pytest.mark.asyncio
+async def test_derived_inputs_bind_and_forward_env_into_container(jwt_path, baseline, tmp_path):
+    """A container step's `derived_inputs` is joined against PATH_DERIVED, bound
+    into the container, and forwarded as `--env NAME=<abs>`. This is what makes
+    an operator-staged artifact (CheckM's DB) visible inside the SIF at all:
+    apptainer runs `--containall`, so an unforwarded host env var is invisible.
+    """
+    transport, captured = _capture_submit()
+    derived = tmp_path / "derived"
+    (derived / "checkm_data").mkdir(parents=True)
+    backend = _make_backend(transport, jwt_path, path_derived=str(derived))
+    _write_completed_output(tmp_path)
+
+    await _run_step_via_trio(
+        backend,
+        "checkm",
+        {"refined_bins_dir": tmp_path / "bins"},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        container="docker://qiita/checkm:1.0.0",
+        entrypoint="/opt/qiita/checkm.sh",
+        baseline_resources=baseline,
+        derived_inputs={"QIITA_CHECKM_DB": "checkm_data"},
+    )
+
+    script = captured["payload"]["script"]
+    db = derived / "checkm_data"
+    # Read-only: one shared DB copy, many concurrent jobs.
+    assert f"{db}:{db}:ro" in shlex.split(script)
+    assert f"QIITA_CHECKM_DB={db}" in shlex.split(script)
+
+
+@pytest.mark.asyncio
+async def test_derived_inputs_without_path_derived_is_contract_violation(
+    jwt_path, baseline, tmp_path
+):
+    """PATH_DERIVED unset + a step that declares derived_inputs = a
+    misconfigured orchestrator. Fail loudly at submit rather than binding a
+    path rooted at "" and letting apptainer produce a cryptic error."""
+    transport, _ = _capture_submit()
+    backend = _make_backend(transport, jwt_path, path_derived="")
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.submit_step(
+            "checkm",
+            {},
+            tmp_path,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=99,
+            container="docker://qiita/checkm:1.0.0",
+            baseline_resources=baseline,
+            derived_inputs={"QIITA_CHECKM_DB": "checkm_data"},
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "PATH_DERIVED" in (ei.value.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_derived_inputs_escaping_path_derived_is_contract_violation(
+    jwt_path, baseline, tmp_path
+):
+    """A `..` that slipped past the wire validator must not reach apptainer: the
+    backend is the last gate before a host path is bind-mounted into a container,
+    so it re-runs the full shared contract itself rather than trusting the
+    wire."""
+    transport, _ = _capture_submit()
+    backend = _make_backend(transport, jwt_path, path_derived=str(tmp_path / "derived"))
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.submit_step(
+            "checkm",
+            {},
+            tmp_path,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=99,
+            container="docker://qiita/checkm:1.0.0",
+            baseline_resources=baseline,
+            derived_inputs={"QIITA_CHECKM_DB": "../../etc"},
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "traverse above PATH_DERIVED" in (ei.value.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_derived_inputs_naming_the_derived_root_is_contract_violation(
+    jwt_path, baseline, tmp_path
+):
+    """A bare "." passes the relative/no-`..` checks but resolves to PATH_DERIVED
+    itself — binding the WHOLE derived root (every SIF under images/) into the
+    container. Least privilege: a derived input must name something strictly
+    under the root."""
+    transport, _ = _capture_submit()
+    backend = _make_backend(transport, jwt_path, path_derived=str(tmp_path / "derived"))
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.submit_step(
+            "checkm",
+            {},
+            tmp_path,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=99,
+            container="docker://qiita/checkm:1.0.0",
+            baseline_resources=baseline,
+            derived_inputs={"QIITA_CHECKM_DB": "."},
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "strictly under PATH_DERIVED" in (ei.value.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_derived_input_value_cannot_inject_shell(jwt_path, baseline, tmp_path):
+    """The apptainer args are interpolated into a bash script. A derived_inputs
+    VALUE carrying shell metacharacters must not be able to terminate the
+    `apptainer exec` and run something else — every arg is shlex-quoted, so the
+    `;` survives as literal text inside a quoted argument."""
+    transport, captured = _capture_submit()
+    derived = tmp_path / "derived"
+    (derived / "evil; touch pwned").mkdir(parents=True)
+    backend = _make_backend(transport, jwt_path, path_derived=str(derived))
+    _write_completed_output(tmp_path)
+
+    await _run_step_via_trio(
+        backend,
+        "checkm",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        container="docker://qiita/checkm:1.0.0",
+        entrypoint="/opt/qiita/checkm.sh",
+        baseline_resources=baseline,
+        derived_inputs={"QIITA_CHECKM_DB": "evil; touch pwned"},
+    )
+
+    script = captured["payload"]["script"]
+    cmd_line = next(ln for ln in script.splitlines() if ln.startswith("apptainer "))
+
+    # Parse the line the way the shell would. If the `;` were unquoted it would
+    # be a command separator and `touch`/`pwned` would surface as their own
+    # tokens; quoted, the whole bind stays a single argv entry.
+    tokens = shlex.split(cmd_line)
+    assert "touch" not in tokens
+    db = derived / "evil; touch pwned"
+    assert f"{db}:{db}:ro" in tokens
+    assert f"QIITA_CHECKM_DB={db}" in tokens
+
+
+@pytest.mark.asyncio
+async def test_container_tmpdir_points_at_the_workspace_not_the_tmpfs(jwt_path, baseline, tmp_path):
+    """`apptainer exec --containall` mounts a tmpfs /tmp — 64 MiB on the live
+    deploy, per the host's `sessiondir max size` — and scrubs the environment, so
+    an entrypoint's bare `mktemp -d` lands on a tiny in-memory disk. A step that
+    stages real work through it (an assembly, a decompressed FASTQ) dies partway
+    through, and the bytes it does write are charged to the job's cgroup memory.
+
+    Forward TMPDIR to the per-job workspace: real disk, already bound via --home.
+    The directory must exist before submit, since nothing inside the container can
+    create it under the read-only image root."""
+    transport, captured = _capture_submit()
+    backend = _make_backend(transport, jwt_path)
+    _write_completed_output(tmp_path)
+
+    await _run_step_via_trio(
+        backend,
+        "assemble",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        container="docker://qiita/assemble:1.0.0",
+        entrypoint="/opt/qiita/assemble.sh",
+        baseline_resources=baseline,
+    )
+
+    assert f"TMPDIR={tmp_path}/tmp" in shlex.split(captured["payload"]["script"])
+    assert (tmp_path / "tmp").is_dir(), "workspace tmp/ must exist before the job starts"
+
+
+@pytest.mark.asyncio
+async def test_container_is_told_its_own_allocation(jwt_path, tmp_path):
+    """`QIITA_CPUS` / `QIITA_MEM_MB` reach the container, carrying the step's
+    resolved baseline_resources.
+
+    `--containall` scrubs the environment, so NO `SLURM_*` var survives into a
+    container step — measured on the deploy host: zero of them. Without these two
+    an entrypoint has no way to learn its allocation: cpu degrades to `nproc`
+    (which equals the allocation only because SLURM cpuset-binds the step, an
+    accident of site config), and memory has nothing at all, while the cgroup
+    ceiling is real and fatal. `workflows/_shared/_lib.sh` resolves THREADS/MEM_MB
+    from these, and the assemble step's `myloasm_split.py` sizes its DuckDB
+    `memory_limit` off MEM_MB so it stays under the cgroup ceiling.
+
+    The values must be the STEP's, not the node's, which is why this asserts a
+    distinctive cpu/mem rather than the shared `baseline` fixture's 1/1."""
+    transport, captured = _capture_submit()
+    backend = _make_backend(transport, jwt_path)
+    _write_completed_output(tmp_path)
+
+    await _run_step_via_trio(
+        backend,
+        "binning",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        container="docker://qiita/binning:1.0.0",
+        entrypoint="/opt/qiita/binning.sh",
+        baseline_resources=StepBaselineResources(cpu=16, mem_gb=100, walltime_seconds=60),
+    )
+
+    tokens = shlex.split(captured["payload"]["script"])
+    assert "QIITA_CPUS=16" in tokens
+    assert "QIITA_MEM_MB=102400" in tokens
+
+
+# ============================================================================
+# cancel — scancel every attempt of a ticket by name prefix
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_cancel_scancels_all_attempts_by_prefix_and_ignores_other_tickets(jwt_path):
+    """cancel(42) lists jobs, keeps only those whose name starts with
+    `qiita-wt42-` (all attempts), DELETEs each, and returns their ids — a job for
+    a DIFFERENT ticket (wt5, which `qiita-wt42-` must not prefix-match) is left
+    untouched."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.method == "GET" and request.url.path.endswith("/jobs"):
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [
+                        {"job_id": 100, "job_state": ["RUNNING"], "name": "qiita-wt42-fastq-a0"},
+                        {"job_id": 101, "job_state": ["PENDING"], "name": "qiita-wt42-fastq-a1"},
+                        {"job_id": 200, "job_state": ["RUNNING"], "name": "qiita-wt5-fastq-a0"},
+                    ]
+                },
+            )
+        if request.method == "DELETE" and "/job/" in request.url.path:
+            return httpx.Response(200, json={})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    cancelled = await backend.cancel(42)
+
+    assert cancelled == [100, 101]
+    deletes = [c for c in seen if c.startswith("DELETE")]
+    assert any(c.endswith("/job/100") for c in deletes)
+    assert any(c.endswith("/job/101") for c in deletes)
+    assert not any(c.endswith("/job/200") for c in deletes)  # other ticket untouched
+
+
+@pytest.mark.asyncio
+async def test_cancel_no_live_jobs_returns_empty(jwt_path):
+    """A ticket with no live jobs (all finished/purged) cancels to []."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/jobs"):
+            return httpx.Response(200, json={"jobs": []})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    assert await backend.cancel(42) == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_swallows_404_on_a_job_that_finished_mid_reap(jwt_path):
+    """A job listed as live but gone (404) by the time we DELETE it is a no-op,
+    not an error — cancel stays idempotent."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/jobs"):
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [{"job_id": 100, "job_state": ["RUNNING"], "name": "qiita-wt42-x-a0"}]
+                },
+            )
+        if request.method == "DELETE" and request.url.path.endswith("/job/100"):
+            return httpx.Response(404, json={"errors": [{"error": "unknown job"}]})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    # No exception; the id is still reported (we targeted it).
+    assert await backend.cancel(42) == [100]
+
+
+@pytest.mark.asyncio
+async def test_cancel_prefix_does_not_match_a_numerically_larger_ticket(jwt_path):
+    """The trailing `-` in `qiita-wt{idx}-` is load-bearing: cancel(5) must NOT
+    reap ticket 50's jobs (`qiita-wt50-...`), whose name shares the `qiita-wt5`
+    stem. This pins that boundary the wt42-vs-wt5 case can't."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.method == "GET" and request.url.path.endswith("/jobs"):
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [
+                        {"job_id": 5, "job_state": ["RUNNING"], "name": "qiita-wt5-fastq-a0"},
+                        {"job_id": 50, "job_state": ["RUNNING"], "name": "qiita-wt50-fastq-a0"},
+                    ]
+                },
+            )
+        if request.method == "DELETE" and "/job/" in request.url.path:
+            return httpx.Response(200, json={})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    cancelled = await backend.cancel(5)
+    assert cancelled == [5]  # only ticket 5, NOT 50
+    deletes = [c for c in seen if c.startswith("DELETE")]
+    assert any(c.endswith("/job/5") for c in deletes)
+    assert not any(c.endswith("/job/50") for c in deletes)

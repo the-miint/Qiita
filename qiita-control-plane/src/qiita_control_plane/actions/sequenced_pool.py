@@ -21,6 +21,11 @@ from pathlib import Path
 
 import asyncpg
 from qiita_common.api_paths import compute_reads_staging_path
+from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
+    TERMINAL_WORK_TICKET_STATES,
+    WorkTicketState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +33,22 @@ logger = logging.getLogger(__name__)
 # unconditionally (a running job is reading/writing the pool's data); terminal
 # states block only without `force` (a completed test run is exactly what an
 # admin purging a mis-pooled preparation wants gone).
-_WORK_TICKET_IN_FLIGHT_STATES = ("pending", "queued", "processing")
-_WORK_TICKET_TERMINAL_STATES = ("completed", "failed")
+#
+# Between them these cover EVERY state, which is the point: a state in neither
+# arm is invisible to the gate, and since the cascade below is state-blind, the
+# delete would proceed unforced and purge its tickets anyway.
+#
+# NO_DATA belongs on the terminal side even though it mints no result. What the
+# force gate protects is the ticket row — the record that this pool WAS processed
+# and came back empty — not an artifact. FAILED mints no result either and has
+# always blocked, so "has a result to lose" was never the criterion; "is terminal"
+# is. The consequence is deliberate: an all-blank plate (no_data is the expected
+# outcome for an empty well) needs an explicit `force` to delete.
+#
+# Not to be confused with _PREFLIGHT_EDIT_BLOCKING_STATES below, where excluding
+# no_data IS deliberate.
+_WORK_TICKET_IN_FLIGHT_STATES = NON_TERMINAL_WORK_TICKET_STATES
+_WORK_TICKET_TERMINAL_STATES = TERMINAL_WORK_TICKET_STATES
 
 # Work-ticket states that block a run-preflight EDIT (distinct from the delete
 # gating above). The preflight — notably its lane assignment — feeds bcl-convert
@@ -41,7 +60,13 @@ _WORK_TICKET_TERMINAL_STATES = ("completed", "failed")
 # case the edit exists to serve (a stale preflight may be why it failed), so
 # edit-then-retry must be allowed. Note this differs from delete gating, where
 # 'failed' blocks unless forced.
-_PREFLIGHT_EDIT_BLOCKING_STATES = ("pending", "queued", "processing", "completed")
+#
+# Derived (in-flight + COMPLETED) rather than spelled out, so it tracks the enum;
+# the deliberate exclusions are the other two terminal states, no_data and failed.
+_PREFLIGHT_EDIT_BLOCKING_STATES = (
+    *NON_TERMINAL_WORK_TICKET_STATES,
+    WorkTicketState.COMPLETED.value,
+)
 
 
 class SequencedPoolNotFound(Exception):
@@ -99,7 +124,10 @@ class SequencedPoolDeleteBlocked(Exception):
         else:
             parts: list[str] = []
             if terminal:
-                parts.append(f"{terminal} completed/failed work ticket(s) reference it")
+                parts.append(
+                    f"{terminal} terminal work ticket(s) "
+                    f"({'/'.join(_WORK_TICKET_TERMINAL_STATES)}) reference it"
+                )
             if published:
                 parts.append(f"{published} prep_sample(s) are published into a study")
             if ena:
@@ -282,15 +310,30 @@ async def delete_sequenced_pool_cascade(
     the caller's transaction; the caller must have already gated via
     `assert_sequenced_pool_deletable`.
 
-    The subtree is ON DELETE RESTRICT throughout (with two exceptions that
-    CASCADE: work_ticket_step off work_ticket, and sequence_range off
-    prep_sample), so order is explicit:
+    Every prep_sample-referencing FK in the subtree is ON DELETE RESTRICT (with
+    two exceptions that CASCADE: work_ticket_step off work_ticket, and
+    sequence_range off prep_sample), so each must be cleared before prep_sample.
+    Order:
       work_ticket (pool- and sample-scoped; → work_ticket_step CASCADEs) →
       prep_sample_metadata → prep_sample_field_exception → prep_sample_to_study →
       sequenced_sample (breaks the composite FK to prep_sample) →
+      block cover-map: the block-scoped work_tickets (block tickets carry NULL
+        pool/sample idxs — a CHECK — so the pool-/sample-scoped work_ticket delete
+        above cannot reach them) then the blocks themselves (→ block_member
+        CASCADEs; a block is planned per (pool, mask/alignment), so every block
+        covering one of this pool's samples is this pool's) →
+      mask_sample + alignment_sample (per-(mask/alignment, prep_sample) completion
+        gates) →
       prep_sample (→ sequence_range CASCADEs) → sequenced_pool.
 
-    Returns the per-table delete counts for the caller's response."""
+    NOT cleared here: `qiita.genome.prep_sample_idx` (a qiita-origin genome's
+    source sample, also ON DELETE RESTRICT) — a narrower, separately-tracked gap,
+    so a pool with a derived-genome source sample still cannot be deleted until
+    that is handled.
+
+    Returns the per-table delete counts for the caller's response (the derived
+    gate-row and block-cover-map deletes are not surfaced — internal cleanup, not
+    primary counts)."""
     prep_sample_idxs = await _pool_prep_sample_idxs(conn, sequenced_pool_idx)
 
     work_ticket_deleted = _rowcount(
@@ -325,6 +368,43 @@ async def delete_sequenced_pool_cascade(
             "DELETE FROM qiita.sequenced_sample WHERE sequenced_pool_idx = $1",
             sequenced_pool_idx,
         )
+    )
+    # Bulk-block cover-map. block_member.prep_sample_idx is ON DELETE RESTRICT, and
+    # the block-scoped work_tickets that own the blocks carry NULL pool/sample idxs
+    # (work_ticket_scope_target_consistent CHECK), so the pool-/sample-scoped
+    # work_ticket delete above cannot reach them. Tear the blocks down here: their
+    # work_tickets first (work_ticket.block_idx is NO ACTION, so it must precede the
+    # block delete; this CASCADEs work_ticket_step), then the blocks (→ block_member
+    # CASCADEs; block.work_ticket_idx is SET NULL). A block is planned per
+    # (pool, mask/alignment), so every block covering one of this pool's samples is
+    # this pool's — deleting them whole is correct.
+    block_idxs = [
+        r["block_idx"]
+        for r in await conn.fetch(
+            "SELECT DISTINCT block_idx FROM qiita.block_member"
+            " WHERE prep_sample_idx = ANY($1::bigint[])",
+            prep_sample_idxs,
+        )
+    ]
+    if block_idxs:
+        await conn.execute(
+            "DELETE FROM qiita.work_ticket WHERE block_idx = ANY($1::bigint[])",
+            block_idxs,
+        )
+        await conn.execute(
+            "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])",
+            block_idxs,
+        )
+    # Per-(mask/alignment, prep_sample) completion gates. Both prep_sample_idx FKs
+    # are ON DELETE RESTRICT, so any live gate row would block the prep_sample
+    # delete below. Clear them here (after sequenced_sample, before prep_sample).
+    await conn.execute(
+        "DELETE FROM qiita.mask_sample WHERE prep_sample_idx = ANY($1::bigint[])",
+        prep_sample_idxs,
+    )
+    await conn.execute(
+        "DELETE FROM qiita.alignment_sample WHERE prep_sample_idx = ANY($1::bigint[])",
+        prep_sample_idxs,
     )
     prep_sample_deleted = _rowcount(
         await conn.execute(

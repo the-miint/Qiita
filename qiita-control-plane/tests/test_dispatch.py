@@ -9,6 +9,7 @@ is exercised by the route tests in tests/routes/test_work_ticket.py.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,16 @@ from qiita_control_plane.dispatch import (
     drain_running_dispatches,
     schedule_dispatch,
 )
+from qiita_control_plane.fanout_dispatch import shard_cohort
+
+
+def _async_return(value):
+    """An async stub returning `value`, for monkeypatching awaited collaborators."""
+
+    async def _stub(*_args, **_kwargs):
+        return value
+
+    return _stub
 
 
 def _fake_app(*, compute_backend_client=object(), pool=object()) -> SimpleNamespace:
@@ -32,8 +43,9 @@ def _fake_app(*, compute_backend_client=object(), pool=object()) -> SimpleNamesp
         running_dispatches=set(),
         pool=pool,
         settings=SimpleNamespace(
-            hmac_secret_key=b"x" * 16,
+            flight_signing_key=b"x" * 32,
             data_plane_url="grpc://unused",
+            fanout_max_inflight=8,
             # _run_and_log reads both before dispatching to run_workflow.
             # Real Paths keep the defensive None-check happy without
             # making the test reach any filesystem operation (run_workflow
@@ -162,3 +174,71 @@ async def test_run_and_log_swallows_runner_exception(monkeypatch, caplog):
     app = _fake_app()
     # Should NOT raise — the wrapper logs and swallows.
     await _run_and_log(app, 17)
+
+
+# ---------------------------------------------------------------------------
+# _pump_ticket_cohort — a pump failure must not strand the cohort silently
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pump_ticket_cohort_retries_once_after_a_transient_failure(monkeypatch):
+    """A transient pump failure at the tail of a fan-out would otherwise strand it.
+
+    The completion hook is the only thing that re-triggers a pump, so if it throws
+    while the failing child was the LAST in flight, every remaining ticket stays
+    held with no future terminal transition to retry it — until a CP restart.
+    """
+    from qiita_control_plane import dispatch as dispatch_mod
+
+    app = _fake_app()
+    monkeypatch.setattr(
+        dispatch_mod, "cohort_for_work_ticket", _async_return(shard_cohort(7)), raising=True
+    )
+    calls: list[int] = []
+
+    async def flaky(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("transient")
+        return []
+
+    monkeypatch.setattr(dispatch_mod, "top_up_dispatch", flaky, raising=True)
+    await dispatch_mod._pump_ticket_cohort(app, 42)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_pump_ticket_cohort_logs_error_naming_the_cohort_when_the_retry_fails(
+    monkeypatch, caplog
+):
+    from qiita_control_plane import dispatch as dispatch_mod
+
+    app = _fake_app()
+    monkeypatch.setattr(
+        dispatch_mod, "cohort_for_work_ticket", _async_return(shard_cohort(7)), raising=True
+    )
+
+    async def always_fails(*_args, **_kwargs):
+        raise RuntimeError("still broken")
+
+    monkeypatch.setattr(dispatch_mod, "top_up_dispatch", always_fails, raising=True)
+    with caplog.at_level(logging.ERROR):
+        await dispatch_mod._pump_ticket_cohort(app, 42)
+    # Naming the cohort is the point: it is what an operator needs to re-pump.
+    assert shard_cohort(7).label in caplog.text
+    # Still swallowed — a pump failure must not fail the dispatch task.
+
+
+@pytest.mark.asyncio
+async def test_pump_ticket_cohort_is_a_no_op_for_a_non_fanout_ticket(monkeypatch):
+    from qiita_control_plane import dispatch as dispatch_mod
+
+    app = _fake_app()
+    monkeypatch.setattr(dispatch_mod, "cohort_for_work_ticket", _async_return(None), raising=True)
+
+    async def must_not_run(*_args, **_kwargs):
+        raise AssertionError("top_up_dispatch called for a non-fan-out ticket")
+
+    monkeypatch.setattr(dispatch_mod, "top_up_dispatch", must_not_run, raising=True)
+    await dispatch_mod._pump_ticket_cohort(app, 42)

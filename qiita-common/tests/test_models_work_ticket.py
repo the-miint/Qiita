@@ -53,8 +53,10 @@ def test_work_ticket_create_request_optional_resource_override():
 def test_scope_target_dispatches_on_kind():
     """The discriminated union must select StudyPrepScopeTarget for kind='study_prep',
     ReferenceScopeTarget for kind='reference', PrepSampleScopeTarget for
-    kind='prep_sample', and SequencedPoolScopeTarget for kind='sequenced_pool'."""
+    kind='prep_sample', SequencedPoolScopeTarget for kind='sequenced_pool', and
+    BlockScopeTarget for kind='block'."""
     from qiita_common.models import (
+        BlockScopeTarget,
         PrepSampleScopeTarget,
         ReferenceScopeTarget,
         ScopeTarget,
@@ -83,6 +85,25 @@ def test_scope_target_dispatches_on_kind():
     assert isinstance(pool, SequencedPoolScopeTarget)
     assert pool.sequenced_pool_idx == 42
     assert pool.sequencing_run_idx == 7
+
+    block = adapter.validate_python({"kind": "block", "block_idx": 99})
+    assert isinstance(block, BlockScopeTarget)
+    assert block.block_idx == 99
+
+
+def test_block_scope_target_requires_positive_block_idx():
+    """BlockScopeTarget carries a single block_idx (gt=0). A missing idx or a
+    non-positive one must raise, mirroring the other single-idx arms."""
+    from qiita_common.models import ScopeTarget
+
+    adapter = TypeAdapter(ScopeTarget)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "block"})
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "block", "block_idx": 0})
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "block", "block_idx": -1})
 
 
 def test_sequenced_pool_scope_target_requires_both_idxs():
@@ -234,3 +255,70 @@ def test_work_ticket_rejects_non_positive_originator():
             created_at=now,
             updated_at=now,
         )
+
+
+def test_terminal_and_non_terminal_partition_the_enum():
+    """The two sets are exact complements over WorkTicketState.
+
+    The invariant every consumer leans on: a state in neither set is invisible to
+    every gate, poll loop, and rollup that reasons about terminal-ness.
+    """
+    from qiita_common.models import (
+        NON_TERMINAL_WORK_TICKET_STATES,
+        TERMINAL_WORK_TICKET_STATES,
+        WorkTicketState,
+    )
+
+    terminal = set(TERMINAL_WORK_TICKET_STATES)
+    non_terminal = set(NON_TERMINAL_WORK_TICKET_STATES)
+    assert terminal.isdisjoint(non_terminal)
+    assert terminal | non_terminal == {s.value for s in WorkTicketState}
+
+
+def test_terminal_set_carries_all_terminal_states():
+    """NO_DATA is terminal (an empty-well outcome, not pending); CANCELLED is
+    terminal (an operator stop). Both are outcomes, not in-flight states."""
+    from qiita_common.models import TERMINAL_WORK_TICKET_STATES
+
+    assert TERMINAL_WORK_TICKET_STATES == ("completed", "no_data", "failed", "cancelled")
+
+
+def test_non_terminal_states_are_in_lifecycle_order():
+    """Derived from the enum's declaration order, so a caller can render it."""
+    from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
+
+    assert NON_TERMINAL_WORK_TICKET_STATES == ("pending", "queued", "processing")
+
+
+def test_membership_works_for_plain_strings():
+    """asyncpg and JSON both hand the state back as a plain str, not the enum."""
+    from qiita_common.models import (
+        NON_TERMINAL_WORK_TICKET_STATES,
+        TERMINAL_WORK_TICKET_STATES,
+    )
+
+    assert "no_data" in TERMINAL_WORK_TICKET_STATES
+    assert "processing" not in TERMINAL_WORK_TICKET_STATES
+    assert "processing" in NON_TERMINAL_WORK_TICKET_STATES
+    assert "no_data" not in NON_TERMINAL_WORK_TICKET_STATES
+
+
+def test_work_ticket_cancel_request_selector_and_cap():
+    """WorkTicketCancelRequest requires a selector, ties run/pool narrowing to
+    action_id, and caps the explicit idx list."""
+    from qiita_common.models import WorkTicketCancelRequest
+
+    # At least one selector required.
+    with pytest.raises(ValidationError):
+        WorkTicketCancelRequest()
+    # run/pool narrowing without action_id is rejected.
+    with pytest.raises(ValidationError):
+        WorkTicketCancelRequest(sequencing_run_idx=3)
+    # The explicit idx list is capped.
+    with pytest.raises(ValidationError):
+        WorkTicketCancelRequest(work_ticket_idxs=list(range(1, 1002)))
+    # Valid shapes.
+    assert WorkTicketCancelRequest(work_ticket_idxs=[1, 2]).action_id is None
+    filtered = WorkTicketCancelRequest(action_id="read-mask", sequenced_pool_idx=9)
+    assert filtered.action_id == "read-mask"
+    assert filtered.sequenced_pool_idx == 9

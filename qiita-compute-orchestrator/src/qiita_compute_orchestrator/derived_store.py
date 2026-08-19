@@ -42,9 +42,15 @@ from __future__ import annotations
 from pathlib import Path
 
 __all__ = [
+    "bowtie2_index_path",
     "minimap2_index_path",
     "reference_derived_dir",
     "rype_index_path",
+    "rype_router_index_path",
+    "shard_bowtie2_dir",
+    "shard_bowtie2_index_prefix",
+    "shard_minimap2_dir",
+    "shard_minimap2_index_path",
 ]
 
 
@@ -65,7 +71,80 @@ def rype_index_path(derived_root: Path | str, reference_idx: int) -> Path:
     return reference_derived_dir(derived_root, reference_idx) / "rype" / "index.ryxdi"
 
 
+def rype_router_index_path(derived_root: Path | str, reference_idx: int) -> Path:
+    """The whole-reference rype ROUTER ``.ryxdi`` index directory:
+    ``{PATH_DERIVED}/references/{reference_idx}/rype-router.ryxdi``.
+
+    A single multi-bucket router over the ENTIRE reference — one bucket per shard
+    (``bucket_name = str(shard_id)``) — written by ``build_routing_index``. One
+    ``rype_classify`` pass against it yields the ``read_to_shard`` table
+    ``align_*_sharded`` need. Distinct from the per-reference host-filter
+    ``rype_index_path`` (a single POSITIVE bucket). Sits directly under the
+    per-reference subtree so the ``DELETE /reference-artifact/{idx}`` rmtree purges
+    it; ``shard_id`` is NULL on its ``reference_index`` row (whole-reference, not
+    per-shard). It replaced the per-shard routing ``.ryxdi``."""
+    return reference_derived_dir(derived_root, reference_idx) / "rype-router.ryxdi"
+
+
 def minimap2_index_path(derived_root: Path | str, reference_idx: int) -> Path:
     """The minimap2 ``.mmi`` index file for a reference (a single FILE),
-    written by ``build_minimap2_index``."""
+    written by ``build_minimap2_index`` in host/whole-reference mode."""
     return reference_derived_dir(derived_root, reference_idx) / "minimap2" / "index.mmi"
+
+
+def shard_minimap2_dir(derived_root: Path | str, reference_idx: int) -> Path:
+    """The per-reference minimap2 SHARD-DIRECTORY root:
+    ``{PATH_DERIVED}/references/{reference_idx}/minimap2-shards``.
+
+    This is the ``shard_directory`` ``align_minimap2_sharded`` is pointed at: a
+    FLAT directory holding one ``{shard_id}.mmi`` per shard (see
+    ``shard_minimap2_index_path``). miint resolves each shard by
+    ``{shard_directory}/{shard_name}.mmi`` where ``shard_name = str(shard_id)``, so
+    the directory must contain nothing but those files. Sits under the
+    per-reference subtree the ``DELETE /reference-artifact/{idx}`` rmtree purges."""
+    return reference_derived_dir(derived_root, reference_idx) / "minimap2-shards"
+
+
+def shard_minimap2_index_path(derived_root: Path | str, reference_idx: int, shard_id: int) -> Path:
+    """The per-shard minimap2 ``.mmi`` index FILE of a sharded *analysis*
+    reference: ``{PATH_DERIVED}/references/{reference_idx}/minimap2-shards/{shard_id}.mmi``.
+
+    A flat ``{shard_id}.mmi`` inside ``shard_minimap2_dir`` — the exact shape
+    ``align_minimap2_sharded`` binds (``{shard_directory}/{shard_name}.mmi``,
+    ``shard_name = str(shard_id)``). Written by ``build_minimap2_index`` in shard
+    mode (one ``.mmi`` per shard, over just that shard's features)."""
+    return shard_minimap2_dir(derived_root, reference_idx) / f"{shard_id}.mmi"
+
+
+def bowtie2_index_path(derived_root: Path | str, reference_idx: int) -> Path:
+    """The bowtie2 index PREFIX for a reference (host/whole-reference mode):
+    ``{PATH_DERIVED}/references/{reference_idx}/bowtie2/index``. bowtie2 writes
+    MULTIPLE files under this shared prefix (``index.1.bt2`` … ``index.rev.2.bt2``),
+    so this is a prefix, not a single file — ``reference_index.fs_path`` for a
+    bowtie2 row is this prefix. Written by ``build_bowtie2_index``."""
+    return reference_derived_dir(derived_root, reference_idx) / "bowtie2" / "index"
+
+
+def shard_bowtie2_dir(derived_root: Path | str, reference_idx: int) -> Path:
+    """The per-reference bowtie2 SHARD-DIRECTORY root:
+    ``{PATH_DERIVED}/references/{reference_idx}/bowtie2-shards``.
+
+    This is the ``shard_directory`` ``align_bowtie2_sharded`` is pointed at: it
+    holds one SUBDIR per shard, named ``{shard_id}``, each carrying the
+    ``index.*.bt2`` set (see ``shard_bowtie2_index_prefix``). miint resolves each
+    shard by ``{shard_directory}/{shard_name}/index.*`` where
+    ``shard_name = str(shard_id)``. Sits under the per-reference subtree the
+    ``DELETE /reference-artifact/{idx}`` rmtree purges."""
+    return reference_derived_dir(derived_root, reference_idx) / "bowtie2-shards"
+
+
+def shard_bowtie2_index_prefix(derived_root: Path | str, reference_idx: int, shard_id: int) -> Path:
+    """The per-shard bowtie2 index PREFIX of a sharded *analysis* reference:
+    ``{PATH_DERIVED}/references/{reference_idx}/bowtie2-shards/{shard_id}/index``.
+    Like ``bowtie2_index_path`` this is a PREFIX (bowtie2 writes multiple ``.bt2``
+    files under it) — the per-shard SUBDIR is ``{shard_id}`` under
+    ``shard_bowtie2_dir`` and the prefix inside it is ``index``, the exact shape
+    ``align_bowtie2_sharded`` binds (``{shard_directory}/{shard_name}/index.*``,
+    ``shard_name = str(shard_id)``). Written by ``build_bowtie2_index`` in shard
+    mode."""
+    return shard_bowtie2_dir(derived_root, reference_idx) / str(shard_id) / "index"

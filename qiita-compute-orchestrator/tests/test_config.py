@@ -16,6 +16,7 @@ import pytest
 
 from qiita_compute_orchestrator.config import (
     Settings,
+    _resolve_slurm_settings,
     _resolve_token,
     _settings_ctx,
     get_settings,
@@ -122,6 +123,27 @@ def test_from_env_path_derived_dev_fallback(monkeypatch):
     assert settings.path_derived == "/tmp/xyz/qiita/derived"
 
 
+def test_from_env_data_plane_url_explicit(monkeypatch):
+    """DATA_PLANE_URL is the gRPC origin native jobs DoGet reference chunks from.
+    Resolved on every backend; when set, it is used verbatim."""
+    monkeypatch.setenv("DATA_PLANE_URL", "grpc://qiita-miint.ucsd.edu:50051")
+    monkeypatch.setenv("QIITA_ALLOW_TOKEN_ENV", "true")
+    monkeypatch.setenv("CO_TO_CP_TOKEN", "t")
+    settings = Settings.from_env(require_cp_to_co_token=False)
+    assert settings.data_plane_url == "grpc://qiita-miint.ucsd.edu:50051"
+
+
+def test_from_env_data_plane_url_dev_default(monkeypatch):
+    """With no DATA_PLANE_URL, it falls back to the localhost default — NOT
+    fail-fast (unlike the SLURM-only required vars), so a deploy that forgets it
+    keeps the unit up rather than down."""
+    monkeypatch.delenv("DATA_PLANE_URL", raising=False)
+    monkeypatch.setenv("QIITA_ALLOW_TOKEN_ENV", "true")
+    monkeypatch.setenv("CO_TO_CP_TOKEN", "t")
+    settings = Settings.from_env(require_cp_to_co_token=False)
+    assert settings.data_plane_url == "grpc://localhost:50051"
+
+
 def test_resolve_co_to_cp_token_permission_denied_is_actionable(monkeypatch, tmp_path):
     """A present-but-unreadable CO→CP token file — the compute-readiness-as-the-
     wrong-user case (the token is 0400 qiita-orch, qiita-api can't read it) —
@@ -188,3 +210,24 @@ def test_resolve_cp_to_co_token_permission_denied_does_not_misdirect_to_qiita_or
     assert "qiita-services" in msg
     assert "qiita-orch" not in msg
     assert "sudo -u qiita-orch" not in msg
+
+
+def test_resolve_slurm_settings_requires_miint_extension_directory(monkeypatch):
+    """miint is a CORE dependency: COMPUTE_BACKEND=slurm must fail at boot without
+    MIINT_EXTENSION_DIRECTORY. The miint presence checks run BEFORE the SLURM vars,
+    so no SLURM env is needed to reach the raise. (conftest sets both miint vars
+    globally, so the test explicitly clears the one under test.)"""
+    monkeypatch.delenv("MIINT_EXTENSION_DIRECTORY", raising=False)
+    monkeypatch.setenv("MIINT_GPL_BOUNDARY_PATH", "/scratch/derived/gpl-boundary")
+    with pytest.raises(RuntimeError, match="MIINT_EXTENSION_DIRECTORY"):
+        _resolve_slurm_settings()
+
+
+def test_resolve_slurm_settings_requires_miint_gpl_boundary_path(monkeypatch):
+    """miint is a CORE dependency: COMPUTE_BACKEND=slurm must fail at boot without
+    MIINT_GPL_BOUNDARY_PATH — the exact var whose absence stranded the bowtie2
+    shard builds. Regression guard for the boot-time enforcement."""
+    monkeypatch.setenv("MIINT_EXTENSION_DIRECTORY", "/scratch/derived/duckdb-ext")
+    monkeypatch.delenv("MIINT_GPL_BOUNDARY_PATH", raising=False)
+    with pytest.raises(RuntimeError, match="MIINT_GPL_BOUNDARY_PATH"):
+        _resolve_slurm_settings()

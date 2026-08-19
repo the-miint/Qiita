@@ -31,6 +31,7 @@ def _minimal_action_kwargs() -> dict:
                 "step": "hash",
                 "step_type": StepType.SINGLETON,
                 "container": REFERENCE_HASH_CONTAINER,
+                "entrypoint": "/opt/qiita/entrypoint.sh",
                 "baseline_resources": {
                     "cpu": 4,
                     "mem_gb": 8,
@@ -75,6 +76,7 @@ def test_step_and_action_shorthand_normalize():
             "step": "hash",
             "step_type": StepType.SINGLETON,
             "container": "img:1",
+            "entrypoint": "/opt/qiita/x.sh",
             "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
         },
         {"action": "mint-features", "inputs": ["hash.manifest"]},
@@ -108,6 +110,7 @@ def test_duplicate_step_names_rejected():
     step = {
         "step_type": StepType.SINGLETON,
         "container": "img:1",
+        "entrypoint": "/opt/qiita/x.sh",
         "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
     }
     kwargs["steps"] = [
@@ -131,6 +134,7 @@ def test_duplicate_action_names_allowed():
             "step": "build",
             "step_type": StepType.SINGLETON,
             "container": "img:1",
+            "entrypoint": "/opt/qiita/x.sh",
             "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
         },
         {"action": "register-index", "inputs": ["rype_index_meta"]},
@@ -543,6 +547,25 @@ def test_workflow_step_rejects_neither_container_nor_module():
     assert "exactly one" in str(exc_info.value)
 
 
+def test_workflow_step_container_requires_entrypoint():
+    """A `container:` step with no `entrypoint:` is rejected at YAML-author /
+    actions-sync time. Every container step is run as `apptainer exec <image>
+    <entrypoint>`, and exec has no command without one (it does NOT fall back to
+    the image's runscript), so apptainer would fail the SLURM job with "exec
+    requires at least 2 arg(s)". Rejecting it here surfaces the mistake before any
+    ticket runs — the gap that let the read-mask `lima` step ship without an
+    entrypoint."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    del kwargs["steps"][0]["entrypoint"]
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    msg = str(exc_info.value)
+    assert "'container' without 'entrypoint'" in msg
+    assert "apptainer exec" in msg
+
+
 def test_workflow_step_rejects_entrypoint_without_container():
     """`entrypoint` overrides a container's ENTRYPOINT — it's meaningless
     for native steps, which dispatch via `python -m`."""
@@ -578,3 +601,276 @@ def test_native_module_prefix_constant_value():
     from qiita_common.actions import NATIVE_MODULE_PREFIX
 
     assert NATIVE_MODULE_PREFIX == "qiita_compute_orchestrator.jobs."
+
+
+# ---------------------------------------------------------------------------
+# derived_inputs (container-only PATH_DERIVED artifacts)
+# ---------------------------------------------------------------------------
+
+
+def test_workflow_step_derived_inputs_on_container_ok():
+    """The happy path: a container step names an operator-provisioned artifact
+    under PATH_DERIVED, keyed by the env var its entrypoint reads."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["derived_inputs"] = {"QIITA_CHECKM_DB": "checkm_data"}
+    a = ActionDefinition(**kwargs)
+    assert a.steps[0].derived_inputs == {"QIITA_CHECKM_DB": "checkm_data"}
+
+
+def test_workflow_step_rejects_derived_inputs_on_native_step():
+    """`derived_inputs` is a bind + env-forward into a container. A native step
+    runs in the orchestrator's own env and reads PATH_DERIVED from its settings,
+    so declaring it there is a contract error, not a no-op."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0] = {
+        "step": "fastq",
+        "step_type": StepType.SINGLETON,
+        "module": FASTQ_TO_PARQUET_MODULE,
+        "derived_inputs": {"QIITA_CHECKM_DB": "checkm_data"},
+        "baseline_resources": {"cpu": 4, "mem_gb": 8, "walltime": "PT1H"},
+    }
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "derived_inputs" in str(exc_info.value)
+
+
+def test_workflow_step_rejects_absolute_derived_input():
+    """Values are relative to the orchestrator's PATH_DERIVED. An absolute path
+    would let a workflow name any host directory for the orchestrator to bind
+    into a container."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["derived_inputs"] = {"QIITA_CHECKM_DB": "/etc"}
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "relative" in str(exc_info.value)
+
+
+def test_workflow_step_rejects_traversing_derived_input():
+    """Same containment rule, via `..` rather than a leading slash."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["derived_inputs"] = {"QIITA_CHECKM_DB": "../../etc"}
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "traverse" in str(exc_info.value)
+
+
+def test_workflow_step_rejects_non_env_name_derived_input_key():
+    """The key is interpolated into an `--env K=V` apptainer argument, so a
+    stray `=` or space would corrupt the argument rather than fail."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["derived_inputs"] = {"not a var": "checkm_data"}
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "env var name" in str(exc_info.value)
+
+
+def test_escalating_axes_are_exactly_mem_and_walltime():
+    """Pins the axis list to the two the runner actually grows. `cpu`/`gpu` must
+    stay out: nothing escalates them, so a step at the cpu ceiling forgoes
+    nothing (long-read-assembly pins `cpu: 32` deliberately). A third axis added
+    here without its escalation helper would make the guard flag workflows for a
+    retry path that does not exist."""
+    from qiita_common.actions import ESCALATING_RESOURCE_AXES
+
+    assert ESCALATING_RESOURCE_AXES == ("mem_gb", "walltime")
+
+
+def test_ceiling_axes_are_derived_from_the_model_and_contain_the_escalating_ones():
+    """`CEILING_RESOURCE_AXES` must stay derived from `FlatBaselineResources`, so
+    a resource field added to the model is covered by the over-ceiling check
+    without anyone remembering to widen a list. The escalating axes must be a
+    subset: an axis that escalates but that no ceiling bounds would make the
+    headroom comparison read a ceiling attribute that does not exist."""
+    from qiita_common.actions import (
+        CEILING_RESOURCE_AXES,
+        ESCALATING_RESOURCE_AXES,
+        FlatBaselineResources,
+    )
+
+    assert CEILING_RESOURCE_AXES == tuple(FlatBaselineResources.model_fields)
+    assert set(ESCALATING_RESOURCE_AXES) <= set(CEILING_RESOURCE_AXES)
+
+
+def test_headroom_empty_when_every_axis_is_below_the_ceiling():
+    """The baseline case: 8 GB / PT1H under a 64 GB / PT4H ceiling escalates on
+    both axes, so nothing is reported."""
+    from qiita_common.actions import ActionDefinition
+
+    assert ActionDefinition(**_minimal_action_kwargs()).steps_without_escalation_headroom() == {}
+
+
+def test_headroom_flags_a_step_pinned_at_the_memory_ceiling():
+    """`mem_gb` equal to the ceiling is the long-read-assembly defect: the OOM
+    escalator's grown value never exceeds the resolved one, so the first OOM is
+    permanent. Walltime keeps its headroom here and must not be reported."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["baseline_resources"]["mem_gb"] = 64  # == action_ceiling.mem_gb
+    assert ActionDefinition(**kwargs).steps_without_escalation_headroom() == {"hash": ("mem_gb",)}
+
+
+def test_headroom_flags_a_step_pinned_at_the_walltime_ceiling():
+    """The TIMEOUT arm has the identical shape, and is reported on its own."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["baseline_resources"]["walltime"] = "PT4H"  # == ceiling
+    assert ActionDefinition(**kwargs).steps_without_escalation_headroom() == {"hash": ("walltime",)}
+
+
+def test_headroom_flags_both_axes_and_reports_them_in_axis_order():
+    """A step dead on both axes reports both, ordered as
+    ESCALATING_RESOURCE_AXES declares them, so the message is stable."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["baseline_resources"]["mem_gb"] = 64
+    kwargs["steps"][0]["baseline_resources"]["walltime"] = "PT4H"
+    assert ActionDefinition(**kwargs).steps_without_escalation_headroom() == {
+        "hash": ("mem_gb", "walltime")
+    }
+
+
+def test_headroom_ignores_cpu_pinned_at_the_ceiling():
+    """`cpu` at the ceiling is legal and deliberate — nothing escalates it. This
+    is the false positive the guard must never produce, since long-read-assembly
+    ships exactly this shape."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["baseline_resources"]["cpu"] = 16  # == action_ceiling.cpu
+    assert ActionDefinition(**kwargs).steps_without_escalation_headroom() == {}
+
+
+def test_headroom_flags_a_baseline_above_the_ceiling():
+    """`baseline > ceiling` is folded into the same report. The runner rejects it
+    at dispatch, but nothing catches it at load — so without this it would ship
+    as a workflow that cannot run at all. `steps_over_ceiling` is what reports it
+    as the distinct, worse defect it is."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["baseline_resources"]["mem_gb"] = 128  # > ceiling's 64
+    assert ActionDefinition(**kwargs).steps_without_escalation_headroom() == {"hash": ("mem_gb",)}
+
+
+def test_headroom_checks_every_lookup_profile_independently():
+    """bcl-convert's shape: one step, one profile per instrument. A profile at
+    the ceiling is dead even when its siblings have headroom, so each is
+    reported under its own `name[profile]` label."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["baseline_resources"] = {
+        "from_step_output": "instrument_model",
+        "profiles": {
+            # Pinned on both axes — the NovaSeq X case.
+            "big": {"cpu": 16, "mem_gb": 64, "walltime": "PT4H"},
+            # Comfortably under the ceiling on both.
+            "small": {"cpu": 16, "mem_gb": 16, "walltime": "PT1H"},
+        },
+    }
+    assert ActionDefinition(**kwargs).steps_without_escalation_headroom() == {
+        "hash[big]": ("mem_gb", "walltime")
+    }
+
+
+def test_headroom_ignores_action_entries():
+    """`action:` entries run in-process in the control plane and declare no
+    resources at all — they must not trip the guard or raise looking for a
+    `baseline_resources` they do not have."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"].append({"action": "mint-features", "inputs": [], "outputs": []})
+    assert ActionDefinition(**kwargs).steps_without_escalation_headroom() == {}
+
+
+def test_over_ceiling_empty_when_every_axis_fits():
+    """The two queries are independent: a step pinned exactly AT the ceiling has
+    no escalation headroom but does not exceed it, so only the headroom query
+    reports it. This is the distinction the shipped-workflow accept list depends
+    on — an accept covers forgone escalation, never an unrunnable workflow."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["baseline_resources"]["mem_gb"] = 64  # == ceiling
+    action = ActionDefinition(**kwargs)
+    assert action.steps_without_escalation_headroom() == {"hash": ("mem_gb",)}
+    assert action.steps_over_ceiling() == {}
+
+
+def test_over_ceiling_reports_each_exceeded_axis():
+    """Unlike the headroom query, this one covers all four axes — it mirrors what
+    the runner rejects at dispatch, and the runner rejects cpu and gpu too."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["baseline_resources"].update(
+        {"cpu": 32, "mem_gb": 128, "walltime": "PT8H", "gpu": 1}
+    )  # ceiling is 16 / 64 / PT4H / 0
+    assert ActionDefinition(**kwargs).steps_over_ceiling() == {
+        "hash": ("cpu", "mem_gb", "walltime", "gpu")
+    }
+
+
+def test_over_ceiling_checks_lookup_profiles_too():
+    """A lookup step is only ever as safe as its worst profile, and the runner
+    resolves one profile per run — so an over-ceiling profile is reported under
+    its own label even when its siblings fit."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["baseline_resources"] = {
+        "from_step_output": "instrument_model",
+        "profiles": {
+            "over": {"cpu": 16, "mem_gb": 128, "walltime": "PT1H"},
+            "fits": {"cpu": 16, "mem_gb": 16, "walltime": "PT1H"},
+        },
+    }
+    assert ActionDefinition(**kwargs).steps_over_ceiling() == {"hash[over]": ("mem_gb",)}
+
+
+def test_as_flat_returns_the_declared_flat_values():
+    """`as_flat` is the single narrowing of the Optional flat fields the
+    exactly-one-population validator has already guaranteed; the runner's
+    dispatch path and the headroom queries both resolve through it, so a drift
+    here would desync what runs from what the guard checks."""
+    from qiita_common.actions import BaselineResources
+
+    br = BaselineResources(cpu=4, mem_gb=8, walltime=timedelta(hours=1), gpu=2)
+    flat = br.as_flat()
+    assert (flat.cpu, flat.mem_gb, flat.walltime, flat.gpu) == (4, 8, timedelta(hours=1), 2)
+
+
+def test_as_flat_defaults_gpu_to_zero():
+    """Every shipped YAML omits `gpu:`, so the default must survive the round
+    trip rather than becoming None and tripping the ceiling comparison."""
+    from qiita_common.actions import BaselineResources
+
+    assert BaselineResources(cpu=4, mem_gb=8, walltime=timedelta(hours=1)).as_flat().gpu == 0
+
+
+def test_as_flat_rejects_the_lookup_population():
+    """The lookup population resolves to a different profile per run, so there is
+    no single flat answer — asking for one is a caller bug, not a value to
+    invent."""
+    from qiita_common.actions import BaselineResources, FlatBaselineResources
+
+    br = BaselineResources(
+        from_step_output="instrument_model",
+        profiles={"x": FlatBaselineResources(cpu=1, mem_gb=1, walltime=timedelta(hours=1))},
+    )
+    with pytest.raises(AssertionError, match="lookup population"):
+        br.as_flat()
