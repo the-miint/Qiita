@@ -1,0 +1,108 @@
+action_id: amplicon
+version: 1.0.0
+target_kind: sequenced_pool
+# No target_processing_kinds: like long-read-assembly there is no "denoised"
+# ProcessingKind, and the run identity is the amplicon knobs (trim / primer /
+# orient_primer / sortmerna_reference_idx), which the runner hashes into a
+# processing_idx before the step loop.
+
+description: >
+  Rapid 16S amplicon denoising for a sequenced pool's already-ingested reads
+  (golay-demux or bcl-convert stored them in the DuckLake `read` table). Runs the
+  deblur pipeline REFERENCE-AGNOSTICALLY: 16S reads are not host/human sequence,
+  so they are NOT masked — the runner STREAMS the pool's raw reads (`pool_reads`)
+  from the `read` table and materializes the SortMeRNA 16S pre-filter reference
+  (`sortmerna_ref`) from a loaded sequence_reference (by reference_idx, off fixed
+  operator paths).
+
+  The `denoise` step (native, miint) trims → per-sample dereplicates → SortMeRNA
+  16S pre-filters → UCHIME chimera-filters → MAFFT-aligns → deblur-denoises into
+  ASVs, emitting each ASV's canonical sequence_hash + per-sample abundance.
+  `mint-features` mints a feature_idx per ASV against the shared `qiita.feature`
+  space; `amplicon_load` joins the counts to the feature map and writes the
+  DuckLake `amplicon_membership` (prep_sample_idx, processing_idx, feature_idx,
+  count); register-files loads it. The closed-reference (e.g. GG2) feature table
+  is DERIVED on demand by intersecting feature_idx with a reference's membership —
+  never stored here.
+
+scopes: []
+
+audience:
+  # A processing workflow over a pool's stored reads. Available to end users and
+  # above; no service-account (LIMS) submission today.
+  service: false
+  human_roles: [user, wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [sortmerna_reference_idx, trim]
+  properties:
+    # The loaded SortMeRNA 16S reference (a sequence_reference). The runner
+    # materializes its sequences to a FASTA (`sortmerna_ref`) via the data plane —
+    # a STABLE reference identity, not a fixed operator path. Part of the run
+    # identity (a different pre-filter reference is a different result).
+    sortmerna_reference_idx:
+      type: integer
+      minimum: 1
+    # bp truncation length (150 for the GG2 V4 catalog). Result-affecting.
+    trim:
+      type: integer
+      minimum: 1
+    # Forward primer; only consulted when orient_primer. Rapid 16S reads arrive
+    # primer-stripped, so orient defaults off and the primer is otherwise unused.
+    primer:
+      type: string
+      minLength: 1
+      default: GTGYCAGCMGCCGCGGTAA
+    # Run the primer search/orient/extract step (default off — see above).
+    orient_primer:
+      type: boolean
+      default: false
+
+steps:
+  # Denoise the pool's reads into ASVs. `pool_reads` (raw reads streamed from the
+  # `read` table) and `sortmerna_ref` (the materialized reference FASTA) are
+  # runner-resolved; the scalar knobs ride `params:`. Emits the mint-features
+  # manifest + per-sample counts.
+  - step: denoise
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.amplicon_deblur
+    inputs: [pool_reads, sortmerna_ref]
+    params: {primer: primer, trim: trim, orient_primer: orient_primer}
+    outputs: [asv_counts, asv_manifest]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 64
+      walltime: PT8H
+
+  # Mint a feature_idx per distinct ASV sequence_hash against the shared feature
+  # space. Consumes the manifest, produces the (sequence_hash, feature_idx) map.
+  - action: mint-features
+    inputs: [asv_manifest]
+    outputs: [feature_map]
+
+  # Join the per-sample counts to the feature map and write the DuckLake
+  # amplicon_membership staging Parquet. processing_idx (minted pre-loop from the
+  # amplicon knobs) rides params — its presence also signals the runner to mint it.
+  - step: amplicon_load
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.amplicon_load
+    inputs: [asv_counts, feature_map]
+    params: {processing_idx: processing_idx}
+    outputs: [staging_dir]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 8
+      walltime: PT1H
+
+  # Load amplicon_membership.parquet into the DuckLake `amplicon_membership` table
+  # (pure append — a re-run reuses the same processing_idx, gated by
+  # disallow-without-delete).
+  - action: register-files
+    inputs: [staging_dir]
+    outputs: []
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 64
+  walltime: PT12H
