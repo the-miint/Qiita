@@ -406,7 +406,7 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
     # `ticket run` would send the operator to a 409.
     if terminal_state == WorkTicketState.FAILED.value:
         assert f"qiita ticket run {1}" in ei.value.reason
-        assert "DELETE the prep_sample" not in ei.value.reason
+        assert "delete the sample" not in ei.value.reason
     else:
         assert "delete the sample" in ei.value.reason
         assert "ticket run" not in ei.value.reason

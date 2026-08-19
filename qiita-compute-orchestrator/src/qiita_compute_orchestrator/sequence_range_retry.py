@@ -236,8 +236,9 @@ async def mint_or_reuse_sequence_range(
                 step_name=step_name,
                 reason=(
                     f"prep_sample {prep_sample_idx}'s read numbering was deleted while "
-                    "this step was retrying, so the step could not finish against it. "
-                    "Submit the sample again"
+                    "this step was retrying, so the step could not finish against it — "
+                    "the mint said it already existed (409), then the read-back did not "
+                    "find it (404). Submit the sample again"
                 ),
             ) from exc
         if existing.minted_by_work_ticket_idx != work_ticket_idx:
@@ -312,11 +313,12 @@ async def mint_or_reuse_sequence_range(
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
-                    f"prep_sample {prep_sample_idx} has an existing sequence_range covering "
-                    f"{recovered_count} indices "
-                    f"({existing.sequence_idx_start}..{existing.sequence_idx_stop}) but its "
-                    f"input now has {count} reads — the range must match the prior mint "
-                    "count exactly; delete the prep_sample to re-mint"
+                    f"prep_sample {prep_sample_idx} already has read numbering for "
+                    f"{recovered_count} reads "
+                    f"({existing.sequence_idx_start}..{existing.sequence_idx_stop}), but "
+                    f"the input now has {count} — the range must match the prior mint "
+                    "count exactly, so the input is not the one that was numbered. "
+                    "Delete the sample and submit again"
                 ),
             ) from exc
         return existing.sequence_idx_start

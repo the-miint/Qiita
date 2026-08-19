@@ -1,9 +1,9 @@
 # Getting started (runbook)
 
 **For:** anyone bringing a sequencing run into Qiita for the first time. It ends
-with the run's reads stored in Qiita and one job per sample you can watch.
-Host-filtering, alignment and feature tables come after this and are covered
-elsewhere.
+with the run's reads stored in Qiita and a job you can watch — one for the whole
+run on Illumina, one per sample on PacBio. Read masking (host-filtering and the
+rest), alignment and feature tables come after this and are covered elsewhere.
 
 Everything up to the submit you can do yourself. The Illumina submit in step 5
 needs a `wet_lab_admin` account; the PacBio one does not.
@@ -97,9 +97,10 @@ STUDY_IDX=$(qiita study create \
 give it one now. A study without an accession cannot be named by a pre-flight
 row at all, and no two studies may share the same one.
 
-Qiita does not check the shape of the accession, only that it is not empty — so
-if your BioProject is not registered yet, any agreed string works, as long as the
-*identical* string goes into the pre-flight file.
+Qiita does not check the shape of the accession, only that it is not empty and no
+longer than 50 characters — so if your BioProject is not registered yet, any
+agreed string works, as long as the *identical* string goes into the pre-flight
+file.
 
 The study is yours: you can do everything below on it without anyone granting you
 access.
@@ -168,7 +169,8 @@ plate's main project.
 Qiita refuses the file outright — before creating anything — if:
 
 - A normal sample has no project, or a control has one. Controls take their
-  project from the plate, so this pairing has to be the right way round.
+  project from the plate, so this pairing has to be the right way round. This is
+  checked before the accessions, so it is the only error you see until it is fixed.
 - Any `biosample_accession` or `bioproject_accession` it needs is still empty.
   The pre-flight format allows them to be empty, so a file that is perfectly
   valid otherwise can still be unusable here. This is the common one.
@@ -206,8 +208,9 @@ one row.
 Opening a pre-flight file modifies it: the library upgrades it in place. Two
 things follow.
 
-A file owned by someone else, on a shared filesystem, cannot be opened at all —
-you get `attempt to write a readonly database`. Copy it somewhere you own.
+A file you cannot write — the usual `644` copy owned by someone else on a shared
+filesystem — cannot be opened at all: you get `attempt to write a readonly
+database`. Copy it somewhere you own.
 
 More important: Qiita identifies a pool by the exact bytes of the file you hand
 it, and the submit reads those bytes *before* opening it. Submit a file that has
@@ -267,9 +270,10 @@ no flags for them. One command creates the run, the pool and one entry per
 pre-flight sample, then queues the demultiplexing job. Re-running is safe: it
 reuses what it already made and adds only what is missing.
 
-Each sample is labelled with its row number from the pre-flight file, which is
-also the prefix `bcl-convert` puts on that sample's FASTQ files — so you can tell
-from a filename which sample it belongs to.
+Each sample is labelled with the identifier the pre-flight file gives its row,
+which is also the prefix `bcl-convert` puts on that sample's FASTQ files — so you
+can tell from a filename which sample it belongs to. It is not the row's position
+in the sheet, so read it off the file rather than counting.
 
 ### PacBio
 
@@ -301,7 +305,7 @@ again, delete the pool with `qiita delete-sequenced-pool` and submit again.
 qiita ticket list --active
 qiita ticket status <idx>
 qiita ticket logs <idx> --step-index 0
-qiita ticket run <idx>        # retry a failed job where it left off
+qiita ticket run <idx>        # start a failed job over from the beginning
 qiita pool-completion --sequencing-run-idx <run> --sequenced-pool-idx <pool>
 ```
 
@@ -319,8 +323,8 @@ read-loading failures is in
 - **One sample at a time, with no pre-flight file** — registering a run, pool and
   sample by hand and processing FASTQs you already hold:
   [`user-cli-quickstart.md`](user-cli-quickstart.md).
-- **What happens to the reads next** — host-filtering, alignment and feature
-  tables: `qiita submit-host-filter-pool`, `submit-block-mask-pool`,
+- **What happens to the reads next** — read masking (host-filtering among it),
+  alignment and feature tables: `qiita submit-host-filter-pool`, `submit-block-mask-pool`,
   `submit-align-pool`, `feature-table build`.
 - **Loading reference databases** — reserved for `wet_lab_admin` and above;
   everybody else uses the references already loaded.

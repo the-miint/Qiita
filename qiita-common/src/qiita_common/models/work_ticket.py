@@ -314,9 +314,10 @@ class WorkTicketCreateRequest(BaseModel):
 
     `force` re-submits a sequenced_pool action even when a COMPLETED ticket
     already exists for the same `(pool, action, version)`. Default-refused
-    because a re-run re-registers the pool's reads into the lake (DuckLake has
-    no uniqueness — duplicate rows result); the intended recovery for a stored
-    result is `delete-sequenced-pool` then resubmit. It is privileged regardless
+    because the pool's reads are already stored; forcing waives that refusal
+    only — the re-run still stops at the read-loading step, which will not
+    number the same reads twice — so the recovery for a stored result is
+    `delete-sequenced-pool` then resubmit. It is privileged regardless
     of scope: setting `force=true` requires wet_lab_admin / system_admin (403
     otherwise) for ANY action. It only *changes submission behavior* for the
     sequenced_pool COMPLETED gate, though — for other scopes, or when no

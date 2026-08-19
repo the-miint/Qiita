@@ -23,8 +23,8 @@ it; you own the study, so you may attach the sample to it.
 
 ## 1. Register the sequencing run
 
-The run stands for the instrument's output as a whole. Anyone may create
-one.
+The run stands for the instrument's output as a whole. Any user account may
+create one.
 
 ```bash
 qiita sequencing-run create \
@@ -81,15 +81,19 @@ The reply gives you two numbers. `prep_sample_idx` is the one step 4 wants.
 ```bash
 qiita ticket submit \
     --action-id fastq-to-parquet \
-    --action-version 1.0.0 \
+    --action-version 1.3.0 \
     --prep-sample-idx $PREP_SAMPLE_IDX \
     --context-json '{"fastq_path": "/scratch/filename_prefix_R1.fastq", "reverse_fastq_path": "/scratch/filename_prefix_R2.fastq"}'
 ```
 
 The paths must be absolute, and must be readable from the cluster — not
-just from your laptop. Several versions of `fastq-to-parquet` ship and you
-have to name one exactly; ask your operator which is current if `1.0.0` is
-not.
+just from your laptop.
+
+`--action-version` has to name the version your site is currently running,
+exactly. Several versions of `fastq-to-parquet` exist, but a deploy enables
+only the newest one it syncs and retires the rest, so naming an older one is
+refused. `1.3.0` is the newest at the time of writing — ask your operator if
+that is not what your site has.
 
 You get back a job number and a starting state of `pending`.
 

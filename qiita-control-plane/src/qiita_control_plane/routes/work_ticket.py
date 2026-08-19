@@ -429,9 +429,10 @@ async def _check_disallow_without_delete(
                         "a ticket for this pool and action has already COMPLETED, so "
                         "the pool's reads are already stored. To start over, delete "
                         "the pool (`qiita delete-sequenced-pool`) and submit again. "
-                        "To re-run deliberately, pass --force (wet_lab_admin or "
-                        "system_admin) — note the run will stop at the read-loading "
-                        "step, which refuses to number the same reads twice."
+                        "To re-run deliberately, pass force=true (--force in the "
+                        "CLI; wet_lab_admin or system_admin) — note the run will stop "
+                        "at the read-loading step, which refuses to number the same "
+                        "reads twice."
                     ),
                     "blocking_work_ticket_idx": completed,
                 },

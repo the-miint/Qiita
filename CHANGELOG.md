@@ -22,22 +22,6 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **The messages a user hits at the terminal say what happened, not how we store it (#461).**
-  The 409 for re-submitting a finished pool, the `--force` help on both submit commands, and the
-  read-loading failures a `qiita ticket status` reports asked the reader to know about the lake,
-  DuckLake's lack of uniqueness, and `ON DELETE CASCADE` in order to act. They now name what
-  happened to the reader's data and which command to run, keeping every identifier, role and
-  recovery command they carried. They also stop implying that forcing a re-run duplicates
-  reads: the read-numbering step refuses a range another ticket reserved, before anything is
-  written, so a forced re-run stops there instead — which is what the messages now say.
-
-- **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`,
-  `user-cli-quickstart.md` and `pacbio-ingest.md` are what a person with samples reads, so they
-  no longer explain themselves in route paths, guard-function names, column constraints and HTTP
-  status codes. What a reader has to *do* differently is unchanged and every mechanism that
-  changes an outcome is still stated — in terms of what they will see. Identifiers they type or
-  read back (CLI flags, ticket states, pre-flight column names, `skipped`) stay verbatim.
-
 - **A getting-started runbook for bringing a run in (#461).** `docs/runbooks/getting-started.md`
   walks the path the bundled ingest gestures actually require: create the study with a
   `bioproject_accession`, create its biosamples with `biosample_accession`s, build the
@@ -1963,6 +1947,23 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **The messages a user hits at the terminal say what happened, not how we store it (#461).**
+  The 409 for re-submitting a finished pool, the `--force` help on both submit commands, and the
+  read-loading failures a `qiita ticket status` reports asked the reader to know about the lake,
+  DuckLake's lack of uniqueness, and `ON DELETE CASCADE` in order to act. They now name what
+  happened to the reader's data and which command to run, keeping the identifiers, roles,
+  recovery commands and — since `failure_reason` is an ops-triage surface as much as a user
+  one — the detail that says which call failed. They also stop implying that forcing a re-run duplicates
+  reads: the read-numbering step refuses a range another ticket reserved, before anything is
+  written, so a forced re-run stops there instead — which is what the messages now say.
+
+- **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`,
+  `user-cli-quickstart.md` and `pacbio-ingest.md` are what a person with samples reads, so they
+  no longer explain themselves in route paths, guard-function names, column constraints and HTTP
+  status codes. What a reader has to *do* differently is unchanged and every mechanism that
+  changes an outcome is still stated — in terms of what they will see. Identifiers they type or
+  read back (CLI flags, ticket states, pre-flight column names, `skipped`) stay verbatim.
 
 - **`user-cli-quickstart.md` is now the by-hand path only, and the landing page points at the
   new runbook (#461).** It kept a full copy of login, profile, study and biosample creation,
