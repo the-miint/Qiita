@@ -35,12 +35,9 @@
 -- which reads NO_DATA over the same unit — this workflow is prep_sample-scoped,
 -- so ticket and gate row describe the same (run, sample).
 --
--- THE CONTRACT: {'completed', 'no_data'} is the terminal set. A consumer asking
--- whether the run is over reads both; 'pending' and absence both mean "not
--- over", and absence is never "assembled". A consumer that needs contigs
--- proceeds on 'completed' alone — under 'no_data' there are, by construction,
--- none. Stated in full at repositories/assembly.py::fetch_assembly_sample_state,
--- which consumers point to rather than restate.
+-- The read contract (which states are terminal, what a consumer may conclude
+-- from each) is stated at repositories/assembly.py::fetch_assembly_sample_state;
+-- consumers point there rather than restate it.
 --
 -- `state` is a deliberate TEXT + CHECK (no Postgres ENUM, no Pydantic twin) —
 -- the gate has no wire surface, so it stays out of the enum-parity discipline
@@ -53,11 +50,11 @@ CREATE TABLE qiita.assembly_sample (
     -- qiita.processing row is SHARED by every sample assembled under the same
     -- params, so a cascade would drop the gate for all of them at once, while
     -- the DuckLake rows stamped with that processing_idx stay — no FK reaches
-    -- them, the catalog being a separate database. That leaves data with no
-    -- completion state, which is what this table exists to remove. There is no
-    -- assembly DELETE path today; RESTRICT makes whoever builds one clear these
-    -- rows explicitly. Matches qiita.assembly_membership's own FK to
-    -- qiita.processing (declared with no ON DELETE, i.e. NO ACTION).
+    -- them, the catalog being a separate database — leaving assembled data with
+    -- no completion state. There is no assembly DELETE path today; RESTRICT
+    -- makes whoever builds one clear these rows explicitly. Matches
+    -- qiita.assembly_membership's own FK to qiita.processing (declared with no
+    -- ON DELETE, i.e. NO ACTION).
     processing_idx   BIGINT NOT NULL
         REFERENCES qiita.processing(processing_idx) ON DELETE RESTRICT,
 
@@ -82,17 +79,9 @@ COMMENT ON TABLE qiita.assembly_sample IS
     'written ''completed'' by the terminal finalize-assembly-sample action or '
     '''no_data'' by the runner when assembly_hash found no contig of any kind. '
     'Consumers read completion from this state, NEVER from the presence of '
-    'qiita.assembly_membership or DuckLake rows -- the assembly tail writes '
-    'those across several entries, so a partial footprint looks like a finished '
-    'one. Twin of qiita.mask_sample / qiita.alignment_sample.';
-
-COMMENT ON COLUMN qiita.assembly_sample.state IS
-    'Gate state: ''pending'' | ''completed'' | ''no_data'' (TEXT + CHECK, not a '
-    'Postgres ENUM). The terminal set is {completed, no_data}: a consumer asking '
-    'whether the run is over reads both, one that needs contigs reads '
-    '''completed'' alone. ''no_data'' means the assembler produced nothing for '
-    'this (run, sample) -- an outcome, not an error -- and matches the '
-    'work_ticket''s own NO_DATA over the same unit.';
+    'qiita.assembly_membership or DuckLake rows. Read contract: '
+    'repositories/assembly.py::fetch_assembly_sample_state. Twin of '
+    'qiita.mask_sample / qiita.alignment_sample.';
 
 CREATE TRIGGER assembly_sample_set_updated_at
     BEFORE UPDATE ON qiita.assembly_sample

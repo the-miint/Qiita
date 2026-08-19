@@ -41,13 +41,12 @@ _None yet._
 - `20260819000000_assembly_sample.sql` — plain `make migrate`, no out-of-band setup. One
   empty table, `qiita.assembly_sample`: the per-`(processing_idx, prep_sample)` completion
   gate for `long-read-assembly`, alongside the existing `qiita.mask_sample` and
-  `qiita.alignment_sample`. **No backfill**, deliberately: assemblies already completed on
-  this host get no gate row, so they read as not-assembled. Nothing consumes the gate yet,
-  so that costs nothing today; whether to backfill them is a separate decision. The
-  migrate→restart window has the same shape — an assembly ticket completing between bucket 3
-  and the bucket-4 restart runs under old code that writes no gate row. Re-submitting such a
-  sample after the restart is admitted and re-writes it (no disallow-without-delete site
-  applies to `long-read-assembly`). (#464)
+  `qiita.alignment_sample`. **No backfill**: assemblies already completed on this host get
+  no gate row, so they read as not-assembled. No code reads the gate yet; whether to
+  backfill them is a separate decision. The migrate→restart window has the same shape — an
+  assembly ticket completing between bucket 3 and the bucket-4 restart runs under old code
+  that writes no gate row. Re-submitting such a sample after the restart is admitted and
+  re-writes it (no disallow-without-delete site applies to `long-read-assembly`). (#464)
 
 ### 4. Deploy
 
@@ -75,12 +74,13 @@ _None yet._
   file (`noLCG.fa`) out of the `genomes_dir` it already binds (#460), and a terminal
   `finalize-assembly-sample` entry was appended after `register-files` — an in-process
   control-plane primitive writing the `qiita.assembly_sample` gate, not a SLURM step (#464).
-  The second is the one worth confirming landed, since a stale synced copy would leave every
-  new assembly's gate row stuck at `pending`. Expect `t`. (#464)
+  Confirm the second landed: under a stale synced copy every new assembly's gate row stays
+  at `pending`.
   ```bash
   sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
   psql "$DATABASE_URL" -Atc "SELECT steps::text LIKE '\''%finalize-assembly-sample%'\'' FROM qiita.action WHERE action_id = '\''long-read-assembly'\'' AND version = '\''1.0.0'\'';"'
   ```
+  Expect `t`. (#464)
 
 ### 6. After the deploy verifies green
 

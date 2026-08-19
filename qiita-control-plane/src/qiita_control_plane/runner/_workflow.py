@@ -538,11 +538,9 @@ async def run_workflow(
 
         # Completion gate: a workflow declaring the terminal
         # `finalize-assembly-sample` action gets its qiita.assembly_sample row
-        # materialized 'pending' here — the first point the (processing_idx,
-        # prep_sample) key exists, since processing_idx is a hash of the run's
-        # params rather than anything the submission carries. The gate is what a
-        # consumer reads instead of inferring completion from row presence; see
-        # repositories.assembly.fetch_assembly_sample_state.
+        # materialized 'pending' here, right after the mint that gives the row its
+        # key (see `_create_assembly_gate_pending`). The gate row is keyed on
+        # (processing_idx, prep_sample), so the ticket must be prep_sample-scoped.
         if _workflow_writes_assembly_gate(action.steps):
             if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
                 raise _submission_bad_input(
@@ -743,15 +741,12 @@ async def run_workflow(
         # state — no data was produced). Clear any in-place-retry marker so the
         # now-terminal ticket shows no stale "stuck retrying" reason.
         _log.info("workflow %d ended with no data: %s", work_ticket_idx, exc)
-        # Close the assembly_sample gate first, then transition. A workflow that
-        # gates assembly completion never reaches its terminal
-        # `finalize-assembly-sample` on this path — the step loop is abandoned
-        # here — so the row would otherwise stay 'pending', reading "still
-        # running" for a run that has ended. Ordered before the transition
-        # because a gate write that raises leaves the ticket non-terminal, which
-        # a `/run` redrive re-attempts (assembly_hash re-raises StepNoData
-        # deterministically); transitioning first would strand a NO_DATA ticket
-        # behind a 'pending' gate with nothing left to move it.
+        # Close the assembly_sample gate (see `_record_assembly_gate_no_data`)
+        # before the transition, not after: a gate write that raises leaves the
+        # ticket non-terminal, which a `/run` redrive re-attempts (assembly_hash
+        # re-raises StepNoData deterministically). Transitioning first would
+        # strand a NO_DATA ticket behind a 'pending' gate with nothing left to
+        # move it.
         if (
             action is not None
             and _workflow_writes_assembly_gate(action.steps)

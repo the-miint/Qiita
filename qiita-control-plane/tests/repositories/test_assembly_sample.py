@@ -12,6 +12,7 @@ postgres_pool fixture.
 
 import secrets
 
+import asyncpg
 import pytest
 import pytest_asyncio
 
@@ -161,9 +162,13 @@ async def test_no_data_upsert_closes_the_gate(gate):
 
 
 @pytest.mark.parametrize(
-    "writer", [upsert_assembly_sample_completed, upsert_assembly_sample_no_data]
+    ("writer", "expected"),
+    [
+        (upsert_assembly_sample_completed, "completed"),
+        (upsert_assembly_sample_no_data, "no_data"),
+    ],
 )
-async def test_terminal_writers_stand_alone_without_a_pending_row(gate, writer):
+async def test_terminal_writers_stand_alone_without_a_pending_row(gate, writer, expected):
     """Both write the row outright, so neither depends on the pre-loop
     materialization having run."""
     async with gate["pool"].acquire() as conn, conn.transaction():
@@ -172,13 +177,12 @@ async def test_terminal_writers_stand_alone_without_a_pending_row(gate, writer):
             processing_idx=gate["processing_idx"],
             prep_sample_idx=gate["prep_sample_idx"],
         )
-    assert await _state(gate) in {"completed", "no_data"}
+    assert await _state(gate) == expected
 
 
 async def test_no_data_does_not_overwrite_completed(gate):
-    """A prior run under this identity left contigs in DuckLake; a later run of the
-    same identity finding none does not remove them, so 'no_data' must not deny
-    rows that are there. The asymmetry with the completed writer below."""
+    """'no_data' never walks a 'completed' row back — the guard on the DO UPDATE
+    in `upsert_assembly_sample_no_data`, which carries the reasoning."""
     async with gate["pool"].acquire() as conn, conn.transaction():
         await upsert_assembly_sample_completed(
             conn,
@@ -217,8 +221,6 @@ async def test_completed_overwrites_no_data(gate):
 
 
 async def test_state_check_rejects_an_unknown_value(gate):
-    import asyncpg
-
     await _write_pending(gate)
     with pytest.raises(asyncpg.CheckViolationError):
         await gate["pool"].execute(
@@ -254,11 +256,8 @@ async def test_updated_at_trigger_bumps_on_the_terminal_flip(gate):
 
 
 async def test_processing_delete_is_restricted_while_a_gate_row_lives(gate):
-    """RESTRICT, not CASCADE: a qiita.processing row is shared by every sample
-    assembled under the same params, and the DuckLake rows stamped with it are
-    beyond any FK's reach, so dropping the gate silently is what this refuses."""
-    import asyncpg
-
+    """Deleting a qiita.processing row with a live gate row is refused, not
+    cascaded — see the FK's column comment in the assembly_sample migration."""
     await _write_pending(gate)
     with pytest.raises(asyncpg.ForeignKeyViolationError):
         await gate["pool"].execute(

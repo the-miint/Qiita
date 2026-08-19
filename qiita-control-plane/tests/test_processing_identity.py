@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from qiita_common.actions import WorkflowAction
+from qiita_common.actions import WorkflowAction, WorkflowStep
 
 from qiita_control_plane.runner._processing import (
     _build_processing_params,
@@ -81,19 +81,22 @@ def test_workflow_writes_assembly_gate_keys_on_the_terminal_action():
     """Declaring the `finalize-assembly-sample` action is the single signal for all
     three assembly_sample writes (pending at mint, completed at the action, no_data
     on the StepNoData path). A workflow that mints a processing_idx but declares no
-    gate action gets no gate row — the two signals are independent."""
+    gate action gets no gate row."""
     gated = [WorkflowAction(kind="action", name="finalize-assembly-sample")]
     assert _workflow_writes_assembly_gate(gated) is True
 
     other_action = [WorkflowAction(kind="action", name="register-files")]
     assert _workflow_writes_assembly_gate(other_action) is False
 
-    # A `step:` entry, which carries no `kind="action"`, never triggers the gate
-    # even if its name collides with the primitive's.
-    assert _workflow_writes_assembly_gate([_step()]) is False
-    assert (
-        _workflow_writes_assembly_gate(
-            [SimpleNamespace(kind="step", name="finalize-assembly-sample")]
+    # A `step:` entry never triggers the gate even when its name collides with
+    # the primitive's — only an `action:` entry declares it.
+    colliding_step = [
+        WorkflowStep(
+            kind="step",
+            name="finalize-assembly-sample",
+            step_type="singleton",
+            module="qiita_compute_orchestrator.jobs.assembly_load",
+            baseline_resources={"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
         )
-        is False
-    )
+    ]
+    assert _workflow_writes_assembly_gate(colliding_step) is False

@@ -1,4 +1,7 @@
-"""Runner processing identity (processing_idx) minting.
+"""Runner processing identity (processing_idx) minting, and the two
+qiita.assembly_sample gate writes the runner owns (the gate is keyed on the
+processing_idx minted here; the third write is the terminal
+`finalize-assembly-sample` library action).
 
 A processing_idx is minted before the step loop (like mask_idx) from the run's
 canonical params — the workflow + version + the inputs and knobs that change the
@@ -14,6 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 import asyncpg
+from qiita_common.actions import WorkflowAction
 from qiita_common.api_paths import LibraryPrimitive
 
 from ..repositories.assembly import (
@@ -118,12 +122,8 @@ def _workflow_writes_assembly_gate(steps: list[Any]) -> bool:
     the action_id means the workflow that declares the gate is the workflow that
     gets it, and the three writes cannot drift apart.
     """
-    for entry in steps:
-        if getattr(entry, "kind", None) == "action" and (
-            entry.name == LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE
-        ):
-            return True
-    return False
+    gate = LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE
+    return any(isinstance(entry, WorkflowAction) and entry.name == gate for entry in steps)
 
 
 async def _create_assembly_gate_pending(

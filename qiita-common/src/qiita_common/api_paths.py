@@ -201,9 +201,7 @@ class LibraryPrimitive(StrEnum):
     # Per-sample assembly completion: the terminal step of the long-read-assembly
     # workflow. Writes 'completed' into the qiita.assembly_sample gate for this
     # ticket's (processing_idx, prep_sample). Runs AFTER register-files so the gate
-    # never reads 'completed' before the contigs are in DuckLake. Declaring this
-    # entry is also what tells the runner to materialize the row 'pending' at mint
-    # time and to write 'no_data' when assembly_hash finds no contig. See
+    # never reads 'completed' before the contigs are in DuckLake. See
     # qiita_control_plane.actions.library.finalize_assembly_sample_gate.
     FINALIZE_ASSEMBLY_SAMPLE = "finalize-assembly-sample"
 

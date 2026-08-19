@@ -70,7 +70,7 @@ async def insert_assembly_membership_rows(
 # =============================================================================
 # One row per (run, sample). The runner materializes it 'pending' when it mints
 # the run's processing_idx, and exactly one of the two terminal writers below
-# closes it. See qiita.assembly_sample for the state contract.
+# closes it. Read contract: `fetch_assembly_sample_state`.
 
 
 async def create_assembly_sample_pending(

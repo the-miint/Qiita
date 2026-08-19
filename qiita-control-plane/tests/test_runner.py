@@ -5652,18 +5652,49 @@ async def test_skipped_gated_step_leaves_the_earlier_binding_standing(
 # =============================================================================
 
 
-async def _seed_assembly_ticket(pool, tmp_path):
-    """A prep_sample-scoped ticket for a one-step action consuming
-    `masked_reads_fastq` — the binding `_workflow_needs_staged_masked_reads` keys
-    on, which is all the pre-loop path needs. Returns the ids plus a teardown."""
+_ASSEMBLE_STEPS = [
+    {
+        "kind": "step",
+        "name": "assemble",
+        "step_type": "singleton",
+        "container": REFERENCE_HASH_CONTAINER,
+        "entrypoint": "/opt/qiita/assemble.sh",
+        "inputs": ["masked_reads_fastq"],
+        "outputs": ["contigs"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    }
+]
+
+# What the qiita.assembly_sample gate needs on top of consuming masked reads: a step
+# threading `processing_idx` (so the runner mints the run identity the gate row is
+# keyed on) and the terminal `finalize-assembly-sample` action.
+_ASSEMBLY_GATE_STEPS = [
+    {
+        "kind": "step",
+        "name": "assembly_load",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.assembly_load",
+        "params": {"processing_idx": "processing_idx"},
+        "inputs": ["masked_reads_fastq"],
+        "outputs": ["staging_dir"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {"kind": "action", "name": "finalize-assembly-sample", "inputs": [], "outputs": []},
+]
+
+
+async def _seed_assembly_ticket(pool, *, prefix="mask-consume", steps=None, extra_context=None):
+    """A prep_sample-scoped ticket for an action consuming `masked_reads_fastq` —
+    the binding `_workflow_needs_staged_masked_reads` keys on, which is all the
+    pre-loop path needs. `steps` defaults to a single container `assemble` entry;
+    `extra_context` merges onto the `{mask_idx}` action_context. Returns the ids
+    plus a teardown."""
     from qiita_control_plane.testing.db_seeds import (
         seed_biosample_with_sequenced_prep_sample,
         seed_user_principal,
     )
 
-    principal_idx = await seed_user_principal(
-        pool, prefix="mask-consume", suffix=uuid.uuid4().hex[:8]
-    )
+    principal_idx = await seed_user_principal(pool, prefix=prefix, suffix=uuid.uuid4().hex[:8])
     biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
         pool, owner_idx=principal_idx
     )
@@ -5676,18 +5707,7 @@ async def _seed_assembly_ticket(pool, tmp_path):
     )
     action_id = LONG_READ_ASSEMBLY_ACTION_ID
     version = f"runner-test-{uuid.uuid4()}"
-    steps = [
-        {
-            "kind": "step",
-            "name": "assemble",
-            "step_type": "singleton",
-            "container": REFERENCE_HASH_CONTAINER,
-            "entrypoint": "/opt/qiita/assemble.sh",
-            "inputs": ["masked_reads_fastq"],
-            "outputs": ["contigs"],
-            "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
-        }
-    ]
+    steps = _ASSEMBLE_STEPS if steps is None else steps
     await pool.execute(
         "INSERT INTO qiita.action ("
         "  action_id, version, target_kind, scopes, audience,"
@@ -5711,7 +5731,7 @@ async def _seed_assembly_ticket(pool, tmp_path):
         version,
         principal_idx,
         prep_sample_idx,
-        json.dumps({"mask_idx": mask_idx}),
+        json.dumps({"mask_idx": mask_idx, **(extra_context or {})}),
     )
 
     async def _teardown():
@@ -5721,13 +5741,18 @@ async def _seed_assembly_ticket(pool, tmp_path):
         await pool.execute(
             "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
         )
+        # No-op unless `steps` declared the gate; keeps the RESTRICT FK from
+        # blocking the prep_sample delete below.
+        await pool.execute(
+            "DELETE FROM qiita.assembly_sample WHERE prep_sample_idx = $1", prep_sample_idx
+        )
         await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
         await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
         await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
         await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
         await pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
 
-    return work_ticket_idx, mask_idx, _teardown
+    return work_ticket_idx, mask_idx, prep_sample_idx, _teardown
 
 
 @pytest.mark.parametrize(
@@ -5749,7 +5774,7 @@ async def test_masked_reads_workflow_persists_the_consumed_mask_onto_the_ticket(
     """
     from qiita_control_plane.runner import _workflow
 
-    work_ticket_idx, mask_idx, teardown = await _seed_assembly_ticket(postgres_pool, tmp_path)
+    work_ticket_idx, mask_idx, _ps_idx, teardown = await _seed_assembly_ticket(postgres_pool)
 
     fastq = tmp_path / "masked_reads.fastq.gz"
     fastq.parent.mkdir(parents=True, exist_ok=True)
@@ -5780,87 +5805,17 @@ async def test_masked_reads_workflow_persists_the_consumed_mask_onto_the_ticket(
 
 
 async def _seed_assembly_gate_ticket(pool):
-    """A prep_sample-scoped ticket shaped like long-read-assembly: one step that
-    consumes `masked_reads_fastq` (so the pre-loop masked-reads resolver runs) and
-    threads `processing_idx` (so the runner mints the run identity), followed by the
-    terminal `finalize-assembly-sample` action (so it writes the
-    qiita.assembly_sample gate). Returns the ids plus a teardown."""
-    from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
-
-    from qiita_control_plane.testing.db_seeds import (
-        seed_biosample_with_sequenced_prep_sample,
-        seed_user_principal,
+    """`_seed_assembly_ticket` shaped like long-read-assembly's gated form: the
+    steps thread `processing_idx` and declare the terminal
+    `finalize-assembly-sample` action, so the runner writes qiita.assembly_sample.
+    Returns the prep_sample the gate row is keyed on, plus a teardown."""
+    work_ticket_idx, _mask_idx, prep_sample_idx, teardown = await _seed_assembly_ticket(
+        pool,
+        prefix="asm-gate",
+        steps=_ASSEMBLY_GATE_STEPS,
+        extra_context={"assembler": "hifiasm_meta"},
     )
-
-    principal_idx = await seed_user_principal(pool, prefix="asm-gate", suffix=uuid.uuid4().hex[:8])
-    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
-        pool, owner_idx=principal_idx
-    )
-    mask_idx = await pool.fetchval(
-        "INSERT INTO qiita.mask_definition"
-        " (params_hash, filter_workflow, filter_version, params, created_by_idx)"
-        " VALUES ($1, 'read-mask', '1.0.0', '{}'::jsonb, $2) RETURNING mask_idx",
-        uuid.uuid4().bytes + uuid.uuid4().bytes,  # 32-byte params_hash
-        principal_idx,
-    )
-    action_id = LONG_READ_ASSEMBLY_ACTION_ID
-    version = f"runner-test-{uuid.uuid4()}"
-    steps = [
-        {
-            "kind": "step",
-            "name": "assembly_load",
-            "step_type": "singleton",
-            "module": "qiita_compute_orchestrator.jobs.assembly_load",
-            "params": {"processing_idx": "processing_idx"},
-            "inputs": ["masked_reads_fastq"],
-            "outputs": ["staging_dir"],
-            "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
-        },
-        {"kind": "action", "name": "finalize-assembly-sample", "inputs": [], "outputs": []},
-    ]
-    await pool.execute(
-        "INSERT INTO qiita.action ("
-        "  action_id, version, target_kind, scopes, audience,"
-        "  context_schema, steps,"
-        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
-        ") VALUES ($1, $2, 'prep_sample', $3::text[], $4::jsonb,"
-        "  $5::jsonb, $6::jsonb, 1, 1, '1 minute')",
-        action_id,
-        version,
-        [],
-        json.dumps({"service": False, "human_roles": ["user"]}),
-        json.dumps({}),
-        json.dumps(steps),
-    )
-    work_ticket_idx = await pool.fetchval(
-        "INSERT INTO qiita.work_ticket ("
-        "  action_id, action_version, originator_principal_idx,"
-        "  scope_target_kind, prep_sample_idx, action_context"
-        ") VALUES ($1, $2, $3, 'prep_sample', $4, $5::jsonb) RETURNING work_ticket_idx",
-        action_id,
-        version,
-        principal_idx,
-        prep_sample_idx,
-        json.dumps({"mask_idx": mask_idx, "assembler": "hifiasm_meta"}),
-    )
-
-    async def _teardown():
-        await pool.execute(
-            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
-        )
-        await pool.execute(
-            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
-        )
-        await pool.execute(
-            "DELETE FROM qiita.assembly_sample WHERE prep_sample_idx = $1", prep_sample_idx
-        )
-        await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-        await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-        await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-        await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-        await pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
-
-    return work_ticket_idx, prep_sample_idx, _teardown
+    return work_ticket_idx, prep_sample_idx, teardown
 
 
 def _stub_masked_reads(monkeypatch, tmp_path, *, empty: bool = False):
@@ -5993,7 +5948,7 @@ async def test_masked_reads_workflow_rejects_a_mask_that_does_not_exist(
     ForeignKeyViolationError the persist would otherwise raise."""
     from qiita_control_plane.runner import _workflow
 
-    work_ticket_idx, mask_idx, teardown = await _seed_assembly_ticket(postgres_pool, tmp_path)
+    work_ticket_idx, mask_idx, _ps_idx, teardown = await _seed_assembly_ticket(postgres_pool)
     try:
         gone = mask_idx + 10_000
         await postgres_pool.execute(
