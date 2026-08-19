@@ -103,6 +103,9 @@ steps:
     outputs: []
 
 action_ceiling:
+  # mem_gb above the denoise baseline (64) so a memory retry has headroom to
+  # escalate — MAFFT/deblur over a large pool can spike (see the escalation-
+  # headroom guard in test_actions_loader.py).
   cpu: 8
-  mem_gb: 64
+  mem_gb: 128
   walltime: PT12H
