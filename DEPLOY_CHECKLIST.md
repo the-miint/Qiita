@@ -446,13 +446,17 @@ sys.exit(1 if bad else 0)'
 - **`POST /exported-feature` labels a `source='qiita'` genome `QF<idx>`, not its
   `source_id`.** A genome whose `source` is an external repository (`genbank`, `refseq`)
   still publishes its `source_id` as `export_feature_id`, unchanged. Only a genome derived
-  from one of our own prep_samples is affected — its `source_id` is a name we composed, so
-  it now comes back with `accession: null` and `accession_published: false`. Such a genome
-  is reachable today only through a `qiita reference load` genome map declaring
-  `genome_source='qiita'` with a `prep_sample_idx`; where that has already been done and a
-  handle minted, the existing handle is unchanged (the mint is idempotent and never
-  re-labels a live row), so only genomes minted after this deploy see the new answer.
-  (#461)
+  from one of our own prep_samples is affected — its `source_id` has no external authority
+  behind it, so it now comes back with `accession: null` and `accession_published: false`.
+  Such a genome is reachable today only through a `qiita reference load` genome map
+  declaring `genome_source='qiita'` with a `prep_sample_idx`. No handle predates this
+  behaviour: `qiita.exported_feature` is created by `20260813000000_exported_feature.sql`
+  in bucket 3 of this same wave. That migration must not go out in a wave without this fix
+  — `accession` and `accession_published` are immutable (the
+  `exported_feature_retire_on_detach` trigger rejects any UPDATE touching either), so a
+  handle minted in the interim cannot be corrected in place; the only remediation is
+  deleting the genome, whose `ON DELETE SET NULL` detaches and retires the identifier.
+  (#462)
 
 ---
 

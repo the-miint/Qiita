@@ -13,8 +13,13 @@ the ORDER BY on each INSERT. That rule is arbitrary; what matters is that it is
 fixed, because without it the winner is whatever row order the planner happened
 to produce and it could change under a stats refresh alone.
 
-The migration `db/migrations/20260813000000_exported_feature.sql` is the single
-copy of *why* the namespace works this way. Nothing here restates it.
+The migration `db/migrations/20260813000000_exported_feature.sql` owns *why* the
+namespace works this way — the snapshot, the two-pass fallback, the asymmetric
+published-namespace index, what a new entity kind must update — and none of that
+is restated here. What is decided here instead is which entities have an accession
+to offer at all: `_SOURCE_ID_IS_EXTERNAL_ACCESSION` below is the authority for the
+genome kind, over the migration's prose, which reads a genome as always carrying
+one.
 """
 
 from collections.abc import Sequence
@@ -55,9 +60,13 @@ _ON_CONFLICT = " ON CONFLICT DO NOTHING"
 
 # Whether a genome's `source_id` is an accession outside Qiita, per source.
 # `source = 'qiita'` marks a genome assembled from one of our own prep_samples (the
-# `genome_qiita_origin_check` biconditional on qiita.genome), so its source_id is a
-# name we composed and nothing outside this system resolves it. `export_feature_id`
-# is published, which is what the opaque-identifier rule in CLAUDE.md governs.
+# `genome_qiita_origin_check` biconditional on qiita.genome); its source_id arrives
+# verbatim from the loader's genome map, with no external authority behind it, and
+# nothing outside this system resolves it. `export_feature_id` is published, which
+# is what the opaque-identifier rule in CLAUDE.md governs. The true half is a
+# DECLARED source, not a verified one: `actions.library._validate_genome_map` checks
+# `genome_source` against the vocabulary and the qiita-origin biconditional, never
+# the id.
 #
 # `_INSERT_GENOME` reads the true half as an allowlist rather than testing
 # `<> 'qiita'`, so a source absent from this map is offered no accession and takes
@@ -70,7 +79,7 @@ _SOURCE_ID_IS_EXTERNAL_ACCESSION: dict[GenomeSource, bool] = {
     GenomeSource.QIITA: False,
 }
 
-_EXTERNAL_GENOME_SOURCE: list[str] = [
+_EXTERNAL_GENOME_SOURCES: list[str] = [
     source.value for source, external in _SOURCE_ID_IS_EXTERNAL_ACCESSION.items() if external
 ]
 
@@ -144,7 +153,7 @@ async def _offer(
             list(genome_idx),
             created_by_idx,
             accession,
-            _EXTERNAL_GENOME_SOURCE,
+            _EXTERNAL_GENOME_SOURCES,
         )
     if feature_idx and reference_idx is not None:
         await conn.execute(

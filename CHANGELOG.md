@@ -932,7 +932,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Fixed
 
 - **`POST /exported-feature` would have published a qiita-derived genome's composed
-  `source_id` verbatim (#461).** `_INSERT_GENOME` offered `qiita.genome.source_id` as the
+  `source_id` verbatim (#462).** `_INSERT_GENOME` offered `qiita.genome.source_id` as the
   accession candidate for every genome, on the premise that `source_id` is NOT NULL and so
   the genome kind always has an accession to offer. NOT NULL holds; "is an accession" does
   not, for `source='qiita'` — a genome assembled from one of our own prep_samples has no
@@ -945,8 +945,10 @@ duplicates further down are historical strata; leave them where they are.
   until it is listed, instead of publishing. `_INSERT_FEATURE` is untouched: it already
   reads a nullable `reference_membership.accession`. The one writer of such a genome row is
   a `qiita reference load` genome map declaring `genome_source='qiita'` with a
-  `prep_sample_idx`; a new unit test fails if a `GenomeSource` member is left unclassified
-  by the predicate.
+  `prep_sample_idx`; two new unit tests fail if a `GenomeSource` member is left
+  unclassified by the predicate, or if `qiita` is classified external — the latter pinned
+  as a literal, since every other assertion reads its expectation out of the predicate and
+  so agrees with whatever it says. The route's OpenAPI description names the new case.
 
 - **Re-running `long-read-assembly` over a sample doubled its `assembly_membership` and
   `bin_quality` rows (#460).** `processing_idx` hashes `{workflow, version, mask_idx,
