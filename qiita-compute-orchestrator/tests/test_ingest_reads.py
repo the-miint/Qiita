@@ -327,7 +327,7 @@ def test_reuse_missing_range_fails_permanent(monkeypatch, tmp_path):
     with pytest.raises(BackendFailure) as exc:
         _run(inputs, tmp_path / "ws")
     assert exc.value.kind == FailureKind.UNKNOWN_PERMANENT
-    assert "concurrent deletion" in str(exc.value)
+    assert "deleted while this step was retrying" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

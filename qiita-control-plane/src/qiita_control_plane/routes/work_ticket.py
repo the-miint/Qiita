@@ -426,10 +426,12 @@ async def _check_disallow_without_delete(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
                     "reason": (
-                        "a COMPLETED ticket already exists for this (sequenced_pool, "
-                        "action); re-running re-registers the pool's reads into the "
-                        "lake. Delete the pool (delete-sequenced-pool) and resubmit, "
-                        "or pass force=true (wet_lab_admin+) to intentionally re-run."
+                        "a ticket for this pool and action has already COMPLETED, so "
+                        "the pool's reads are already stored. To start over, delete "
+                        "the pool (`qiita delete-sequenced-pool`) and submit again. "
+                        "To re-run deliberately, pass --force (wet_lab_admin or "
+                        "system_admin) — note the run will stop at the read-loading "
+                        "step, which refuses to number the same reads twice."
                     ),
                     "blocking_work_ticket_idx": completed,
                 },

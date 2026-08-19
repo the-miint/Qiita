@@ -317,7 +317,7 @@ def test_execute_refuses_a_range_minted_by_a_different_ticket(monkeypatch, tmp_p
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert ei.value.step_name == YAML_STEP_NAME
-    assert "work_ticket 999" in ei.value.reason
+    assert "ticket 999" in ei.value.reason
     assert "already loaded" in ei.value.reason
     # Nothing was written: the refusal happens before the durable rewrite.
     assert not (tmp_path / "ws" / "read").exists()
@@ -349,7 +349,7 @@ def test_execute_refuses_a_range_with_unknown_provenance(monkeypatch, tmp_path):
         _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert "unknown work_ticket" in ei.value.reason
+    assert "cannot identify" in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()
 
 
@@ -396,7 +396,7 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
         _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert "no longer in flight" in ei.value.reason
+    assert "no longer running" in ei.value.reason
     assert terminal_state in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()
 
@@ -408,7 +408,7 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
         assert f"qiita ticket run {1}" in ei.value.reason
         assert "DELETE the prep_sample" not in ei.value.reason
     else:
-        assert "DELETE the prep_sample" in ei.value.reason
+        assert "delete the sample" in ei.value.reason
         assert "ticket run" not in ei.value.reason
 
 
@@ -493,8 +493,8 @@ def test_execute_refuses_when_the_minter_state_is_unknown(monkeypatch, tmp_path)
         _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert "no longer in flight" in ei.value.reason
+    assert "no longer running" in ei.value.reason
     # No ticket row to redrive — `/run` would 404. Delete-first is the only recovery.
-    assert "DELETE the prep_sample" in ei.value.reason
+    assert "delete the sample" in ei.value.reason
     assert "ticket run" not in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()

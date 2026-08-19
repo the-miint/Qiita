@@ -1302,12 +1302,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help=(
-            "Re-submit even when a COMPLETED bcl-convert ticket already exists"
-            " for this pool. Without it the submission is refused, because a"
-            " re-run re-registers the pool's reads into the lake (duplicate"
-            " rows — DuckLake has no uniqueness). Requires wet_lab_admin or"
-            " system_admin. The non-force recovery is delete-sequenced-pool"
-            " then resubmit."
+            "Submit again even though a bcl-convert ticket for this pool has"
+            " already COMPLETED. Without it the submission is refused, because"
+            " the pool's reads are already stored. This waives the refusal"
+            " only: the re-run still stops at the read-loading step, which"
+            " will not number the same reads twice. To genuinely load the run"
+            " again, delete-sequenced-pool first, then resubmit. Requires"
+            " wet_lab_admin or system_admin."
         ),
     )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
@@ -1391,9 +1392,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help=(
-            "Re-submit each sample's bam-to-parquet ticket even when a COMPLETED"
-            " one already exists (a re-run re-registers reads into the lake —"
-            " DuckLake has no uniqueness). Requires wet_lab_admin or system_admin."
+            "Submit each sample's bam-to-parquet ticket again even when one has"
+            " already COMPLETED. Those samples' reads are already stored, and the"
+            " re-run stops at the read-loading step rather than number them twice"
+            " — to genuinely load them again, delete the pool first. Requires"
+            " wet_lab_admin or system_admin."
         ),
     )
     p_submit_pacbio.set_defaults(handler=_handle_submit_pacbio_ingest)

@@ -235,8 +235,9 @@ async def mint_or_reuse_sequence_range(
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
-                    f"prep_sample {prep_sample_idx} sequence_range 409'd on mint but "
-                    "404'd on read-back — concurrent deletion during retry; resubmit"
+                    f"prep_sample {prep_sample_idx}'s read numbering was deleted while "
+                    "this step was retrying, so the step could not finish against it. "
+                    "Submit the sample again"
                 ),
             ) from exc
         if existing.minted_by_work_ticket_idx != work_ticket_idx:
@@ -246,18 +247,21 @@ async def mint_or_reuse_sequence_range(
             # them a second time. DuckLake has no uniqueness: the duplication would
             # be silent. Refuse, and tell the operator the one thing that fixes it.
             owner = existing.minted_by_work_ticket_idx
-            owner_detail = f"work_ticket {owner}" if owner is not None else "an unknown work_ticket"
+            owner_detail = (
+                f"ticket {owner}" if owner is not None else "a ticket Qiita cannot identify"
+            )
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
-                    f"prep_sample {prep_sample_idx} already has a sequence_range minted "
-                    f"by {owner_detail}, not by this one (work_ticket {work_ticket_idx}) — "
-                    "its reads are already loaded, and re-ingesting would duplicate them "
-                    "(DuckLake has no uniqueness). To re-ingest deliberately, DELETE the "
-                    "prep_sample (its sequence_range goes with it via ON DELETE CASCADE; "
-                    "for a whole pool, `qiita delete-sequenced-pool`) and resubmit"
+                    f"prep_sample {prep_sample_idx}'s reads were already loaded by "
+                    f"{owner_detail}, not by this one (ticket {work_ticket_idx}). "
+                    "Loading them again would store every read twice, so this step "
+                    "stopped without writing anything. To load them again on purpose, "
+                    "delete the sample first — its read numbering goes with it — or "
+                    "delete the whole pool with `qiita delete-sequenced-pool`, then "
+                    "submit again"
                 ),
             ) from exc
         if existing.minted_by_work_ticket_state not in _REUSABLE_MINTER_STATES:
@@ -281,19 +285,19 @@ async def mint_or_reuse_sequence_range(
             else:
                 # COMPLETED (reads registered), or a state with no in-place redrive.
                 recovery = (
-                    "there is no in-place recovery from this state — to re-ingest, "
-                    "DELETE the prep_sample (its sequence_range goes with it) and "
-                    "resubmit"
+                    "there is no way to resume from this state — delete the sample "
+                    "(its read numbering goes with it) and submit again"
                 )
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
-                    f"prep_sample {prep_sample_idx}'s sequence_range was minted by "
-                    f"work_ticket {work_ticket_idx}, which is no longer in flight "
-                    f"(state={state!r}) — this attempt is stale. Refusing to re-write "
-                    f"the range, which could duplicate the sample's reads. {recovery}"
+                    f"prep_sample {prep_sample_idx}'s read numbering was reserved by "
+                    f"ticket {work_ticket_idx}, which is no longer running "
+                    f"(state={state!r}), so this attempt is out of date. Renumbering "
+                    f"now could store the sample's reads twice, so it stopped. "
+                    f"{recovery}"
                 ),
             ) from exc
         recovered_count = existing.sequence_idx_stop - existing.sequence_idx_start + 1
