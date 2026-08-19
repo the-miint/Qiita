@@ -931,13 +931,13 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **Two assembled contigs in one FASTA whose headers shared a first token stored each
-  other's bytes (#463).** `read_fastx` returns one row per record, so two such records come
+- **Two assembled contigs in one FASTA whose headers share a first token store each
+  other's bytes (#464).** `read_fastx` returns one row per record, so two such records come
   back under one `read_id`; sharing a file they also share `kind` and `bin_id`, so
-  `assembly_hash`'s whole synthetic `kind:bin_id:contig_id` repeated. Pass 2 joins the
+  `assembly_hash`'s whole synthetic `kind:bin_id:contig_id` repeats. Pass 2 joins the
   per-hash `winner` on that id over a fresh scan of every record, so each of the pair's two
-  `sequence_hash` values received both contigs' chunks — the bytes stored for a feature then
-  included a sequence that was not that feature's, at the same `chunk_index`. Measured on a
+  `sequence_hash` values receives both contigs' chunks — the bytes stored for a feature then
+  include a sequence that is not that feature's, at the same `chunk_index`. Measured on a
   two-record fixture of 16 bp contigs: 2 chunk rows and 32 bytes under each of the two
   hashes, against 1 row and 16 bytes for the byte-identical fixture whose second header's
   first token differs. `assembly_hash` now fails the step, naming the repeated ids, when the
@@ -952,7 +952,7 @@ duplicates further down are historical strata; leave them where they are.
   separator and is not escaped, so bins `a:b.fa`/contig `c` and `a.fa`/contig `b:c` both
   compose `MAG:a:b:c`.
 
-- **Two refined-bin FASTAs stemming to one `bin_id` merged into one bin (#463).**
+- **Two refined-bin FASTAs stemming to one `bin_id` merged into one bin (#464).**
   `_FASTA_GLOBS` accepts `.fa` / `.fna` / `.fasta`, and `_local_id` strips the suffix, so
   `bin.1.fa` and `bin.1.fna` both became `bin.1` — one bin where there were two, in
   `bin_map` and so in `qiita.assembly_membership` and the `bin_quality` join it feeds, both
@@ -2068,14 +2068,14 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
-- **`mint-features` pins its declared `inputs:` list (#463).** The runner's dispatch resolved
+- **`mint-features` pins its declared `inputs:` list (#464).** The runner's dispatch resolved
   the manifest as `entry.inputs[0]`, so a workflow naming any other binding minted features out
   of whatever path sat there. It now requires `inputs: [manifest]` and reads `bound["manifest"]`
   by name, failing the entry otherwise — the shape `mint-annotation-features`,
   `write-membership` and `write-assembly-membership` already use. The optional genome map is
   unchanged: it stays an `action_context` binding (`genome_map_path`), not a declared input.
 
-- **`qiita.assembly_membership` documents its key prefix and its `bin_id` column (#463).**
+- **`qiita.assembly_membership` documents its key prefix and its `bin_id` column (#464).**
   A comment-only migration. The table comment: `(prep_sample_idx, processing_idx, kind,
   bin_id)` is the subject identity — one circular genome, one refined bin, or one unbinned
   contig — with `feature_idx` completing the row per member contig, and `kind` is what tells
