@@ -124,12 +124,14 @@ the study: it is the only thing the pre-flight file can match on. Same rules —
 unique, and unchecked as to shape. Leave it out and the sample exists but no
 pre-flight row can reach it.
 
-`--metadata "host taxon id=…"` is **required**. It takes an NCBI taxonomy id, but
-only from the list your site has loaded — `9606` for human and `10090` for mouse
-are there, along with a handful of metagenome taxa. Anything else is rejected, and
-adding a term is an operator job, so ask if the host you need is missing. For a
-sample with no host of its own — a blank, a control, an environmental sample —
-use `not applicable`.
+`--metadata "host taxon id=…"` is **required**. It takes an NCBI taxonomy id — the
+number, not the name — matched against the NCBI Taxonomy your site has loaded. How
+much that covers is a per-site choice: a deploy starts with a small seeded set
+(`9606` human, `10090` mouse, a few metagenome taxa), and an operator can load a
+full NCBI release, after which the whole taxonomy is accepted. An id your site does
+not have is refused, and there is no self-service way to list or add one — ask your
+operator. For a sample with no host of its own — a blank, a control, an
+environmental sample — use `not applicable`.
 
 `--owner-biosample-id-value` is your own name for the sample, stored under the
 field named by `--owner-biosample-id-field-name` (the field is created the first
