@@ -1,34 +1,33 @@
 # User CLI quickstart
 
-> Authoring one sequenced sample **by hand** — no pre-flight file — and
-> processing it with a `fastq-to-parquet` work-ticket. The whole flow is
-> `user`-role: no `wet_lab_admin` or `system_admin` in the loop.
+> Registering **one sample by hand** — no pre-flight file — and processing
+> FASTQs you already hold. Everything here you can do with an ordinary
+> account; no admin is involved at any point.
 
-Use this when you already hold the FASTQs and want one sample in the
-system. Bringing in a whole sequencing run instead goes through a
-pre-flight file and one bundled command, which creates the run, the pool,
-and every sample for you: [`getting-started.md`](getting-started.md).
+Use this when you have the FASTQs in hand and want a single sample in the
+system. To bring in a whole sequencing run instead, one command does the
+run, the pool and every sample for you from the run's pre-flight file:
+[`getting-started.md`](getting-started.md).
 
-Two audiences: an operator runs these steps as a post-deploy smoke
-([`first-deploy.md`](first-deploy.md) Step 11 links here), and a user
-follows them as the reference for the authoring CLI. Every authoring
-route gates on a per-resource auth predicate — study owner, run/pool
-creator, or per-study `ADMIN` tier — rather than a blanket
-`wet_lab_admin` role check; each step below names the gate it clears.
+This doubles as the post-deploy smoke test an operator runs
+([`first-deploy.md`](first-deploy.md) Step 11 links here).
 
-## Prerequisites
+## Before you start
 
-- A working deploy (see [`first-deploy.md`](first-deploy.md)).
-- The `qiita` CLI installed, a PAT in hand, a complete profile, and a
-  study plus a biosample you own — steps 0 through 3 of
-  [`getting-started.md`](getting-started.md). They leave you with the
-  `$STUDY_IDX` and `$BIOSAMPLE_IDX` this flow starts from.
+You need the `qiita` command, a token, a filled-in profile, and a study
+with a sample in it that you own — steps 0 through 3 of
+[`getting-started.md`](getting-started.md). They leave you with the
+`$STUDY_IDX` and `$BIOSAMPLE_IDX` used below.
 
-## 1. Create a sequencing run
+Nothing here needs an admin to grant you anything. Each step is allowed
+because of something you did in the step before: you created the run, so
+you may put a pool on it; you created the pool, so you may put a sample in
+it; you own the study, so you may attach the sample to it.
 
-The instrument-level container. No role / tier gate — any user with
-`prep_sample:write`, which every `user`-role PAT carries (the per-role scope
-ceilings are in [`auth.md`](../auth.md)), can stand one up.
+## 1. Register the sequencing run
+
+The run stands for the instrument's output as a whole. Anyone may create
+one.
 
 ```bash
 qiita sequencing-run create \
@@ -36,23 +35,23 @@ qiita sequencing-run create \
     --platform illumina
 ```
 
-The route records you as `created_by_idx`; this is the key the next
-two steps' caller-creator guards check.
+Qiita records you as its creator, which is what lets you do the next two
+steps.
 
-## 2. Create a sequenced pool on the run
+## 2. Add a pool to the run
 
 ```bash
 qiita sequenced-pool create --run-idx $RUN_IDX
 ```
 
-Auth path: `require_caller_owns_run()` admits you because you created
-the run in step 1. Wet-lab admins bypass the creator check.
+A pool is what was sequenced together. You may add one because you created
+the run in step 1 (wet-lab admins may add one to anybody's run).
 
-`--run-preflight-blob` attaches a pre-flight file to the pool. Hand-authoring
-does not need one; the bundled ingest gestures pass it themselves
-([`getting-started.md`](getting-started.md)).
+There is a `--run-preflight-blob` flag for attaching a run's pre-flight
+file, which you do not need here — the whole-run commands in
+[`getting-started.md`](getting-started.md) pass it themselves.
 
-## 3. Create a sequenced sample (the prep_sample)
+## 3. Add your sample to the pool
 
 ```bash
 qiita sequenced-sample create \
@@ -64,33 +63,23 @@ qiita sequenced-sample create \
     --primary-study-idx $STUDY_IDX
 ```
 
-`--pool-item-id` is a per-pool unique label for this item (a well
-position or library barcode). **It must also be the filename prefix
-of every fastq this sample's work-ticket processes** — see step 4.
-The value used here, `filename_prefix`, is a placeholder; substitute
-the actual prefix of your fastq files (for paired-end input,
-`filename_prefix` implies `filename_prefix_R1.fastq` /
-`filename_prefix_R2.fastq`). The control plane rejects a
-`fastq-to-parquet` submission whose `fastq_path` basename does not
-start with this value.
+`--pool-item-id` labels this sample within the pool — a well position or a
+library barcode. **It must also be the start of your FASTQ filenames**, and
+Qiita checks that when you submit in step 4, so the filenames alone say
+which sample the reads belong to. `filename_prefix` above is a placeholder:
+put in the actual prefix, so that paired-end reads are
+`filename_prefix_R1.fastq` and `filename_prefix_R2.fastq`.
 
-Auth paths:
+`--prep-protocol-idx` says how the library was prepared; `qiita
+prep-protocol list` shows the numbers your site has, and
+`short_read_metagenomics` is the one that ships by default.
 
-- `require_caller_owns_pool()` — you created the pool in step 2.
-- `require_caller_has_admin_on_all_studies` over the primary study
-  plus every secondary — you own the primary study by owner-bypass.
-  Add a secondary study you also have ADMIN on with
-  `--secondary-study-idx STUDY_IDX` (repeat the flag for several).
+To attach the sample to further studies, repeat `--secondary-study-idx` —
+you need admin access on each one, which you have on studies you own.
 
-The response carries both `prep_sample_idx` (the supertype) and
-`sequenced_sample_idx` (the subtype); the work-ticket step uses
-`prep_sample_idx`.
+The reply gives you two numbers. `prep_sample_idx` is the one step 4 wants.
 
-`--prep-protocol-idx` resolves to the `qiita.prep_protocol` row
-seeded by the migrations (`short_read_metagenomics` is the default
-that ships).
-
-## 4. Submit fastq-to-parquet
+## 4. Submit the FASTQs
 
 ```bash
 qiita ticket submit \
@@ -100,56 +89,46 @@ qiita ticket submit \
     --context-json '{"fastq_path": "/scratch/filename_prefix_R1.fastq", "reverse_fastq_path": "/scratch/filename_prefix_R2.fastq"}'
 ```
 
-The `fastq-to-parquet` action's audience admits `user`; the route
-applies a per-study ADMIN check over every non-retired
-`prep_sample_to_study` link (your primary study passes via
-owner-bypass). Response: 202 with `work_ticket_idx` and the initial
-`state` (`pending`).
+The paths must be absolute, and must be readable from the cluster — not
+just from your laptop. Several versions of `fastq-to-parquet` ship and you
+have to name one exactly; ask your operator which is current if `1.0.0` is
+not.
 
-`fastq_path` (and, for paired-end input, `reverse_fastq_path`) must be
-absolute paths the orchestrator can read (validated by the action's
-`context_schema`).
+You get back a job number and a starting state of `pending`.
 
-**Filename-prefix rule.** Every fastq basename must start with the
-`--pool-item-id` you chose in step 3 — here `filename_prefix`. The
-control plane resolves the prep_sample's `sequenced_pool_item_id` and
-rejects the submission (422) when a basename does not carry that
-prefix, so the filenames alone identify which DB row a fastq belongs
-to. The rule applies to every path you pass:
-- **Paired-end** — `fastq_path` and `reverse_fastq_path`, e.g.
-  `filename_prefix_R1.fastq` and `filename_prefix_R2.fastq`; both
-  basenames are checked.
-- **Single-end** — pass only `fastq_path` (e.g. `filename_prefix.fastq`);
-  the lone forward read is checked against the same prefix.
-  Forward-only submission is fully supported.
+**The filename rule.** Every FASTQ filename you pass must start with the
+`--pool-item-id` from step 3 — here `filename_prefix`. A name that does not
+is refused outright, before the job is queued.
 
-## 5. Poll for status
+- **Paired-end** — pass `fastq_path` and `reverse_fastq_path`; both names
+  are checked.
+- **Single-end** — pass `fastq_path` only. Forward-only is fully
+  supported.
+
+## 5. Watch it
 
 ```bash
 qiita ticket status $WORK_TICKET_IDX
 ```
 
-Returns the full `WorkTicket` record: `state`, `action_id /
-action_version`, `scope_target`, `action_context`, `retry_count /
-max_retries`, the `failure_*` surface, and timestamps. Auth: the
-originator (you) passes; wet_lab_admin+ can read any ticket.
+This shows the job's state, what it was asked to do, how many times it has
+been retried, and — if it failed — why and at which step. You can read your
+own jobs; wet-lab admins can read anyone's.
 
-The state progression and the failure surface are the same for every
-action; [`getting-started.md`](getting-started.md) lists them. `completed`
-here means the Parquet is under the ticket's workspace and the sample's
-`sequence_range` is populated. A `processing` state that stalls past the
-action's `walltime_ceiling` is the operator's signal to look at the
-orchestrator logs.
+The states are the same for every kind of job and are listed in
+[`getting-started.md`](getting-started.md). Here, `completed` means the
+sample's reads are stored and numbered. A job stuck in `processing` well
+past the time the step should take is worth raising with your operator.
 
-## What this flow does NOT cover
+## What this does not cover
 
-- **Cross-study access grants** and **reference-data authoring** — see
-  [`getting-started.md`](getting-started.md) under *Not covered here*.
-- **Service-account flows.** End-user PATs do not carry
-  `sequence_range:mint` or `reference:register_files`; those scopes
-  are on the service-account ceiling for the orchestrator's CO→CP
-  callbacks (see
-  [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md)).
+- **Putting a sample into a study you do not own** — that needs access only
+  an operator can grant, see [`auth.md`](../auth.md) under *User
+  self-service*.
+- **Loading reference databases** — reserved for wet-lab admins and above.
+- **Machine accounts.** The tokens the compute side uses to call back into
+  Qiita are provisioned separately; see
+  [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md).
 
 ## Smoke-testing this flow
 

@@ -1,18 +1,18 @@
 # PacBio ingest (runbook)
 
-**For:** whoever is ingesting a PacBio run (`qiita submit-pacbio-ingest`). Read it
-before the first ingest on a new deploy — three of the things below surprise people.
+**For:** whoever is loading a PacBio run (`qiita submit-pacbio-ingest`). Read it
+before the first PacBio run at your site — the things below catch people out.
 Not needed for Illumina.
 
-This covers only what is specific to PacBio. Everything shared with the Illumina
-path — where to run the CLI, carrying a PAT to a headless host, the study and
-biosample rows the pre-flight rows resolve against, building the pre-flight file
-and pre-patching it, retrying, and the `--force` rule — is in
-[`getting-started.md`](getting-started.md), whose examples this one continues.
+This covers only what is different about PacBio. Everything the two platforms
+share — where to run the command, working from a remote machine, the studies and
+samples the pre-flight file has to match, building that file and opening it once
+first, how to retry, and why not to use `--force` — is in
+[`getting-started.md`](getting-started.md), which these examples carry on from.
 
 ## Submit
 
-`$PF` is the writable, pre-patched copy of the pre-flight file
+`$PF` is your own writable copy of the pre-flight file, already opened once
 ([`getting-started.md`](getting-started.md), step 4).
 
 ```bash
@@ -24,22 +24,24 @@ qiita submit-pacbio-ingest \
     --prep-protocol-idx 3
 ```
 
-- **`--instrument-run-id` is free-form.** PacBio has no `RunInfo.xml` to read it from,
-  so nothing derives or validates it; the run-folder basename is the natural value.
-- **The protocol is always `long_read_metagenomics`.** The command only accepts
-  `pacbio_absquant` / `pacbio_metag` sheets and both are metagenomics, so it is never
-  `long_read_amplicon`, no matter what the sheet filename suggests. Look the idx up on
-  your deploy rather than copying a number (`qiita prep-protocol list`); on
-  `qiita-miint` it is **3**, and the amplicon protocol you must *not* pick is 5.
-  Nothing validates this for you — see the protocol note in
-  [`getting-started.md`](getting-started.md), step 5.
-- **A re-run reports already-ingested samples as `skipped`.**
+- **You have to supply `--instrument-run-id` yourself.** Illumina run folders
+  carry the run's name in a file Qiita reads; PacBio's do not. Nothing checks
+  what you type, so use the run folder's own name.
+- **The protocol is always `long_read_metagenomics`.** This command only takes
+  the two PacBio sheet types and both are metagenomics, so it is never
+  `long_read_amplicon`, whatever the sheet is called. Look the number up on your
+  own site with `qiita prep-protocol list` rather than copying one — on
+  `qiita-miint` it is **3**, and **5** is the amplicon protocol you must not
+  pick. Nothing will catch a wrong number for you.
+- **Re-running reports samples that are already loaded as `skipped`.**
 
-## `pool-completion` does not report on ingest
+## `pool-completion` will not tell you the load finished
 
-Its per-sample buckets key on the **`read-mask`** action, and `demux_state` keys on
-**`bcl-convert`**. So a freshly-ingested PacBio pool reads `samples_not_submitted: N`
-and `demux_state: not_submitted` — that means *"not masked yet,"* not a failure.
+That command reports on host-filtering, and on Illumina demultiplexing — neither
+of which a freshly loaded PacBio run has done yet. So it reads
+`samples_not_submitted: N` and `demux_state: not_submitted`, which here means
+"not filtered yet", not "something went wrong".
 
-PacBio never mints a `bcl-convert` ticket, so **`fully_processed` is permanently
-`false` for a PacBio pool.** Use `complete` as the done signal instead.
+PacBio runs are never demultiplexed by Qiita, so **`fully_processed` stays
+`false` for a PacBio pool forever.** Use `complete` as the signal that the
+samples are done instead.

@@ -22,6 +22,13 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`,
+  `user-cli-quickstart.md` and `pacbio-ingest.md` are what a person with samples reads, so they
+  no longer explain themselves in route paths, guard-function names, column constraints and HTTP
+  status codes. What a reader has to *do* differently is unchanged and every mechanism that
+  changes an outcome is still stated — in terms of what they will see. Identifiers they type or
+  read back (CLI flags, ticket states, pre-flight column names, `skipped`) stay verbatim.
+
 - **A getting-started runbook for bringing a run in (#461).** `docs/runbooks/getting-started.md`
   walks the path the bundled ingest gestures actually require: create the study with a
   `bioproject_accession`, create its biosamples with `biosample_accession`s, build the
@@ -1954,8 +1961,8 @@ duplicates further down are historical strata; leave them where they are.
   run, pool and sequenced-sample yourself and submitting `fastq-to-parquet` against FASTQs you
   already hold. `pacbio-ingest.md` likewise drops where-to-run-the-CLI, the pre-flight
   writability trap and the `--force` rule, keeping only what has no Illumina counterpart. The
-  `study_access` grant mechanism moves to `docs/auth.md`, which owns the auth surface; both
-  runbooks now point at it rather than spelling out the INSERT.
+  `study_access` grant mechanism moves to `docs/auth.md`, which owns the auth surface, and both
+  runbooks point at it rather than spelling out the INSERT.
 
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that
