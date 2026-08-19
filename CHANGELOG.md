@@ -931,6 +931,54 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **xdist workers shared one miint extension directory, so they installed on top of
+  each other (#462).** `setup_miint_test_env` named the directory per *component*
+  (`qiita-control-plane-duckdb-ext` under the system temp), and the control-plane suite
+  is the one that runs `-n auto --dist worksteal` — so N worker processes pointed
+  `extension_directory` at one path and each ran its own `INSTALL miint`. A cold INSTALL
+  downloads into a `tmp-<uuid>` file and renames that over `miint.duckdb_extension` and
+  its `.info`, which makes N workers N concurrent writers to those two paths; CI saw it as
+  `IO Error: Could not set lock on file …miint.duckdb_extension.tmp-<uuid>.duckdb_extension.info`
+  surfacing through an unrelated `_handle_feature_table_build` assertion, because the
+  install that failed is the one the code under test performs (`connect_with_miint()`),
+  not a conftest fixture — which is also why a fixture-level lock could not have covered
+  it. The directory now carries the worker id when `PYTEST_XDIST_WORKER` is set
+  (`qiita-control-plane-gw0-duckdb-ext`) and is unchanged for the single-process suites
+  (qiita-common, the orchestrator, the integration tier). The worker also has to *replace*
+  the directory it inherits rather than `setdefault` past it: a worker gets its environment
+  from the controller, which ran the same helper first and had already exported the shared
+  path, so the split alone left every worker pointing back at it — measured, the per-worker
+  directories came out 0 bytes and the shared one held the only install. Only that one
+  value is replaced, so a directory pinned from outside still reaches the suite as given.
+  It costs no extra downloads on a cold cache — each worker already downloaded its own
+  copy, only the rename target changes — each directory still caches across runs (24.5s
+  cold, 4.9s warm for the tier), and the name still matches the documented
+  `rm -rf "$TMPDIR"/qiita-*-duckdb-ext`, which a new unit test pins along with the split
+  and the inheritance. It does multiply the cached bytes: 67 MB per worker under the system
+  temp, 670 MB across the 10 workers `-n auto` picks on a 10-core machine. The race itself
+  was not reproduced locally — 5×8 concurrent cold installs on linux/amd64 and 3×8 on
+  macOS, both at DuckDB 1.5.4, produced no lock error — so the shared directory is the
+  established defect and the lock error is a reasoned, not demonstrated, consequence of it.
+
+- **`POST /exported-feature` would have published a qiita-derived genome's composed
+  `source_id` verbatim (#462).** `_INSERT_GENOME` offered `qiita.genome.source_id` as the
+  accession candidate for every genome, on the premise that `source_id` is NOT NULL and so
+  the genome kind always has an accession to offer. NOT NULL holds; "is an accession" does
+  not, for `source='qiita'` — a genome assembled from one of our own prep_samples has no
+  external authority behind its source_id, and `export_feature_id` labels rows in a feature
+  table, its taxonomy sidecar and its sheared tree. The statement now offers the accession
+  only for a source on an allowlist of external repositories (`genbank`, `refseq`), so an
+  internal source gets the hybrid's other half — a NULL accession, `accession_published`
+  false, and the minted `QF<idx>` the generated column produces from that pairing. Written
+  as an allowlist rather than `<> 'qiita'` so a further internal source mints a handle
+  until it is listed, instead of publishing. `_INSERT_FEATURE` is untouched: it already
+  reads a nullable `reference_membership.accession`. The one writer of such a genome row is
+  a `qiita reference load` genome map declaring `genome_source='qiita'` with a
+  `prep_sample_idx`; two new unit tests fail if a `GenomeSource` member is left
+  unclassified by the predicate, or if `qiita` is classified external — the latter pinned
+  as a literal, since every other assertion reads its expectation out of the predicate and
+  so agrees with whatever it says. The route's OpenAPI description names the new case.
+
 - **Re-running `long-read-assembly` over a sample doubled its `assembly_membership` and
   `bin_quality` rows (#460).** `processing_idx` hashes `{workflow, version, mask_idx,
   assembler}`, so a second run resolves to the SAME identity whenever those four hold — an
