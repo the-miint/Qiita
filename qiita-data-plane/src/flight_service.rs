@@ -2060,6 +2060,19 @@ impl ReplaceKey {
 /// delete drop rows an earlier part had just added whenever the two share a key;
 /// it would also re-scan the lake table once per part.
 ///
+/// The `IN` operand is a subquery, not a literal list: DuckDB plans it as a SEMI
+/// hash join and pushes the incoming keys' min/max into the lake scan as a
+/// dynamic filter. Measured on DuckDB 1.5.4 against a DuckLake catalog holding
+/// 1.0M rows over 57 files per table, with 16k incoming keys over 4 files — the
+/// composite `(prep_sample_idx, processing_idx)` delete scans 17,544 rows of
+/// 1,000,008 and opens 1 of the 57 files. A content-hashed `feature_idx` set is
+/// the case that does not prune: its min/max spans the whole identity space, so
+/// the derived range excludes nothing and the scan reads the table. That is the
+/// key distribution rather than the statement — a `WITH … DELETE … USING`
+/// rewrite plans the same apart from INNER vs SEMI, with identical filters and
+/// identical scan cardinality in every case, and no measurable time difference
+/// (25 alternating pairs, paired permutation p = 0.90).
+///
 /// `table` / `keys` are interpolated because they are `REPLACE_KEY_TABLES`
 /// literals (the caller looks them up there, never using the payload's own
 /// string); the file paths are bound parameters, so a basename carrying a quote

@@ -973,6 +973,18 @@ duplicates further down are historical strata; leave them where they are.
   registration, which carries the run's key on every row and is never empty where the load
   runs at all (`assembly_hash` raises `StepNoData` at zero contigs of any kind).
 
+- **`test_assembly_hash`'s canonical-hash oracle mis-complemented a soft-masked contig
+  (#460).** Its hand-rolled reverse complement translated through an upper-case-only table
+  and upper-cased the result afterwards, so a lowercase base passed through uncomplemented
+  and the "reverse strand" it hashed was the plain reverse. Over 2,000 random 16 bp
+  lowercase sequences the oracle disagreed with `canonical_sequence_hash_expr` on 1,362
+  (68.1%); over the same sequences upper-cased, on 0. The oracle now takes its reverse
+  complement from miint's `sequence_dna_reverse_complement` — the scalar the production
+  expression calls — applied to the upper-cased sequence, since that function preserves
+  case. The `LEAST`-over-hashes composition is still re-derived in Python, so a change to
+  how the two hashes combine still fails the oracle. A soft-masked fixture covers it; every
+  sequence the file hashed before was either upper-case or a palindrome.
+
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
   (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
   carry ONE feature across every producer — but each load still wrote that feature's rows in
