@@ -431,6 +431,12 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 /// `flight_service::ALIGNMENT_PROJECTION_COLUMNS`, which mirrors the column list
 /// below. An unscoped or unprojected read is refused. This is host-depleted
 /// derived data, not raw human reads.
+///
+/// The second table, `alignment_circular`, records which `alignment` rows are one
+/// origin-spanning read; its contract is on its DDL below. It is created here
+/// rather than by its own `ensure_*` because `delete_alignment` /
+/// `delete_alignment_block` drop from both, so a catalog holding one without the
+/// other fails those deletes.
 pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qiita_lake.alignment (
@@ -462,6 +468,64 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             tag_yt           VARCHAR,
             tag_md           VARCHAR,
             tag_sa           VARCHAR
+        );
+
+        -- Evidence that a set of `alignment` rows is ONE read spanning the origin
+        -- of a circular contig. minimap2 aligns a circular contig as a linear one,
+        -- so a read crossing the origin emits one SAM record per side of it.
+        -- Identity and mapq do not separate those records from any other good
+        -- alignment; query coverage does, because each covers only its own share of
+        -- the read. The fragment rows stay in `alignment` unchanged, one per SAM
+        -- record with its CIGAR; only the merged read is recorded here, and only
+        -- where the evidence exists.
+        --
+        -- CONTRACT: a consumer applying a query-coverage predicate to `alignment`
+        -- MUST LEFT JOIN alignment_circular on (alignment_idx, prep_sample_idx,
+        -- sequence_idx) and judge a matched read on `pooled_coverage` instead.
+        -- `alignment` alone shows an origin-spanning read as two rows of partial
+        -- query coverage, so a per-row floor drops it.
+        --
+        -- Superseded by delete-then-register, like `alignment` itself, NOT by
+        -- `flight_service::REPLACE_KEY_TABLES`: a replace-by-key delete reads the
+        -- keys out of the incoming file, and a re-run that no longer finds a read
+        -- origin-spanning writes no row for it, so it would name no key and the
+        -- stale row would survive its own fragments. `delete_alignment_block`
+        -- deletes by footprint instead and so covers reads the new run omits.
+        --
+        -- No producer writes this table yet.
+        CREATE TABLE IF NOT EXISTS qiita_lake.alignment_circular (
+            -- Key order mirrors `alignment`'s leading columns, so this table
+            -- prunes on the same DuckLake statistics and the block delete's
+            -- per-member (prep_sample_idx, sequence_idx) predicate applies to it
+            -- unchanged. NOT NULL because these four are what every delete
+            -- predicate names: a NULL is a row no delete can reach.
+            alignment_idx   BIGINT NOT NULL,
+            prep_sample_idx BIGINT NOT NULL,
+            sequence_idx    BIGINT NOT NULL,
+            feature_idx     BIGINT NOT NULL,
+            -- The merged QUERY interval. A read that wraps the origin still covers
+            -- the query contiguously, so one pair describes it.
+            query_start     BIGINT,
+            query_stop      BIGINT,
+            -- The circular REFERENCE interval, on `alignment.position` /
+            -- `stop_position`'s axis. feature_start > feature_stop means the
+            -- interval WRAPS the origin. Resolving a wrapped interval to bases
+            -- needs the contig length, which is NOT duplicated here — join
+            -- `assembled_sequence.sequence_length_bp` on feature_idx.
+            feature_start   BIGINT,
+            feature_stop    BIGINT,
+            -- Strand of the read relative to the contig — miint's
+            -- `alignment_is_reverse` over the fragments' `flags`. Derivable from a
+            -- join back to those rows; carried here so this table stands alone,
+            -- since reverse is where the interval interpretation flips.
+            is_reverse      BOOLEAN,
+            -- The pooled scores that admitted the read. Recorded nowhere else.
+            pooled_identity DOUBLE,
+            pooled_coverage DOUBLE,
+            -- SAM records merged into this row: 2 for an origin-spanning read,
+            -- more when the read is longer than the contig. BIGINT so a producer's
+            -- count(*) registers without a cast.
+            fragment_count  BIGINT
         );",
     )?;
     Ok(())
@@ -1011,6 +1075,48 @@ mod tests {
         ];
         let got: Vec<(&str, &str)> = cols.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
         assert_eq!(got, expected, "alignment table schema/order drift");
+    }
+
+    /// `ensure_alignment_tables` also lays down the `alignment_circular` side
+    /// table, idempotently (it runs on every DP restart), with the column order
+    /// and types a producer's Parquet must carry to register without a cast. The
+    /// identity columns' types are `alignment`'s; the interval columns are on
+    /// `alignment.position` / `stop_position`'s axis and share their BIGINT.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_alignment_tables_lays_down_alignment_circular() {
+        let conn = setup_conn();
+        ensure_alignment_tables(&conn).expect("first ensure_alignment_tables");
+        ensure_alignment_tables(&conn).expect("second ensure_alignment_tables (idempotent)");
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name, data_type FROM information_schema.columns \
+                 WHERE table_name = 'alignment_circular' ORDER BY ordinal_position",
+            )
+            .unwrap();
+        let cols: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let expected: &[(&str, &str)] = &[
+            ("alignment_idx", "BIGINT"),
+            ("prep_sample_idx", "BIGINT"),
+            ("sequence_idx", "BIGINT"),
+            ("feature_idx", "BIGINT"),
+            ("query_start", "BIGINT"),
+            ("query_stop", "BIGINT"),
+            ("feature_start", "BIGINT"),
+            ("feature_stop", "BIGINT"),
+            ("is_reverse", "BOOLEAN"),
+            ("pooled_identity", "DOUBLE"),
+            ("pooled_coverage", "DOUBLE"),
+            ("fragment_count", "BIGINT"),
+        ];
+        let got: Vec<(&str, &str)> = cols.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+        assert_eq!(got, expected, "alignment_circular schema/order drift");
     }
 
     /// ensure_exclusion_tables is idempotent (run on every DP restart) and lays

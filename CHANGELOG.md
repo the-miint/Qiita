@@ -22,6 +22,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`qiita_lake.alignment_circular`, the side table for origin-spanning long reads (#465).**
+  minimap2 aligns a circular contig as a linear one, so a read crossing the origin emits
+  one SAM record per side of it: each scores a full identity at a confident mapq while
+  covering only its own share of the query, so a per-row query-coverage floor drops the
+  read. The loss is localised at the origin and falls on the elements most often recovered
+  as complete circles — small plasmids and phages. The fragment rows stay in `alignment`
+  unchanged, one per SAM record with its CIGAR; the new table records the merged read —
+  its query interval, its reference interval (`feature_start > feature_stop` means the
+  interval wraps the origin), strand, pooled identity and coverage, and fragment count —
+  and only where that evidence exists. Contig length is deliberately not duplicated:
+  resolving a wrapped interval to bases joins `assembled_sequence.sequence_length_bp`.
+  The table comment carries the resulting contract — a consumer applying a query-coverage
+  predicate to `alignment` MUST `LEFT JOIN alignment_circular` on `(alignment_idx,
+  prep_sample_idx, sequence_idx)` and judge a matched read on `pooled_coverage`.
+  `delete_alignment` and `delete_alignment_block` drop from both tables in one
+  transaction, and each reports the side table's count under
+  `alignment_circular_rows_deleted`; the block delete's per-member `(prep_sample_idx,
+  sequence_idx)` predicate applies to the side table unchanged, which is why its key order
+  mirrors `alignment`'s. The table is **not** in `REPLACE_KEY_TABLES` — a re-run that no
+  longer finds a read origin-spanning writes no row for it, so a key-set delete would name
+  no key and leave the stale row behind, while the footprint delete covers it — and **not**
+  in `ALLOWED_TABLES`: exposing it over Flight would first need the `reference_exclusion`
+  anti-join `alignment_visible` has, or a blocked genome reaches a consumer through the
+  side table. Storage and delete plumbing only; no producer writes the table yet, and
+  `register-files` needs no change because it derives its filename→table map from the
+  staging dir by stem.
 - **Unbinned assembly contigs are stored, as a third `assembly_membership` kind (#460).**
   `assembly_hash` hashes the `noLCG.fa` residue — the contigs no DAS_Tool-refined bin
   claimed — alongside the circular genomes and the refined MAGs, so they are minted a
