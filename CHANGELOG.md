@@ -945,6 +945,14 @@ duplicates further down are historical strata; leave them where they are.
   (another sample of the same run, the same sample under a different run) is untouched. The
   replace-by-key statement widened from one key column to a row constructor to carry it; the
   file paths stay bound parameters.
+  A re-run that yields no refined MAG is the case the key alone does not cover: CheckM
+  covers refined bins only, so `assembly_load` writes `bin_quality` empty-with-schema, the
+  file names no key, and a delete reading it removed nothing — measured, the previous run's
+  MAG rows survived a re-run whose `assembly_membership` was replaced out from under them
+  (`replaced` empty, 1 row before and after; the same load carrying one MAG row replaced it).
+  `bin_quality`'s delete now reads the keys `assembly_membership` names in the same
+  registration, which carries the run's key on every row and is never empty where the load
+  runs at all (`assembly_hash` raises `StepNoData` at zero contigs of any kind).
 
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
   (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes

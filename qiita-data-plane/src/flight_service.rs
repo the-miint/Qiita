@@ -1944,7 +1944,7 @@ fn mask_metrics_counts(
 }
 
 /// Lake tables a registration REPLACES by key rather than appends to, and the
-/// key column it replaces on.
+/// key each replaces on.
 ///
 /// `feature_idx` is minted from the canonical sequence hash
 /// (`qiita_common.chunking.canonical_sequence_hash_expr`), so identical bytes
@@ -1987,36 +1987,69 @@ fn mask_metrics_counts(
 /// that takes it — `register_files`' transaction.
 ///
 /// `assembly_membership` / `bin_quality` are keyed on `(prep_sample_idx,
-/// processing_idx)` instead. `processing_idx` hashes `{workflow, version,
-/// mask_idx, assembler}` (`runner/_processing.py`), so a second
-/// `long-read-assembly` run over a sample resolves to the SAME identity while
-/// those four hold — an edited workflow file included — and the submit path
-/// admits it: the prep_sample arm of `_check_disallow_without_delete`
-/// (`routes/work_ticket.py`) binds only the non-terminal states, so a COMPLETED
-/// ticket does not block a fresh one. Appending leaves both runs' rows under one
-/// identity with nothing on the row to tell them apart.
+/// processing_idx)` instead. A second `long-read-assembly` run over a sample
+/// resolves to the same `processing_idx` whenever the inputs
+/// `runner/_processing.py` hashes are unchanged — an edited workflow file
+/// included — and `routes/work_ticket.py` admits the submission. Appending
+/// leaves both runs' rows under one identity with nothing on the row to tell
+/// them apart.
 ///
 /// Condition 1 holds per run: `assembly_load` derives both files from the job's
 /// own workspace (`bin_map` ⋈ `id_map`, and the CheckM/DAS_Tool tables) and
 /// never reads the lake back, so each carries the run's whole row set for its
-/// one key. Condition 2 is the run identity itself — same four inputs, so the
-/// later rows stand in for the earlier. A load naming no key replaces nothing,
-/// which is what an empty `bin_quality` (a sample with no MAG) does.
-const REPLACE_KEY_TABLES: &[(&str, &[&str])] = &[
-    ("reference_sequences", &["feature_idx"]),
-    ("reference_sequence_chunks", &["feature_idx"]),
-    ("assembled_sequence", &["feature_idx"]),
-    ("assembled_sequence_chunks", &["feature_idx"]),
-    (
+/// one key. Condition 2 is the run identity itself — same hashed inputs, so the
+/// later rows stand in for the earlier.
+const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
+    ReplaceKey::own("reference_sequences", &["feature_idx"]),
+    ReplaceKey::own("reference_sequence_chunks", &["feature_idx"]),
+    ReplaceKey::own("assembled_sequence", &["feature_idx"]),
+    ReplaceKey::own("assembled_sequence_chunks", &["feature_idx"]),
+    ReplaceKey::own(
         "assembly_membership",
         &["prep_sample_idx", "processing_idx"],
     ),
-    ("bin_quality", &["prep_sample_idx", "processing_idx"]),
+    ReplaceKey {
+        table: "bin_quality",
+        key: &["prep_sample_idx", "processing_idx"],
+        key_source: "assembly_membership",
+    },
 ];
 
+/// One `REPLACE_KEY_TABLES` entry.
+struct ReplaceKey {
+    /// Lake table whose rows a registration supersedes.
+    table: &'static str,
+    /// Columns compared together as one key.
+    key: &'static [&'static str],
+    /// Table in the same registration whose incoming files name the key set to
+    /// delete on, unioned with this table's own files.
+    ///
+    /// `bin_quality` borrows `assembly_membership`'s, because CheckM covers
+    /// refined bins only: a run with no MAG writes `bin_quality` with zero rows,
+    /// which names no key and so deletes nothing, leaving the previous run's
+    /// rows joined to a membership set that was replaced out from under them.
+    /// `assembly_membership` carries the run's key on every row and is never
+    /// empty where the load runs at all (`assembly_hash` raises `StepNoData` at
+    /// zero contigs of any kind). Every other entry is its own source.
+    key_source: &'static str,
+}
+
+impl ReplaceKey {
+    /// An entry whose delete keys come from its own incoming files.
+    const fn own(table: &'static str, key: &'static [&'static str]) -> Self {
+        Self {
+            table,
+            key,
+            key_source: table,
+        }
+    }
+}
+
 /// The replace-by-key DELETE for one `REPLACE_KEY_TABLES` entry: drop every lake
-/// row whose key appears in ANY of the `n_files` Parquets about to be registered
-/// into that table. Takes one bound path parameter per file, in order.
+/// row whose key appears in ANY of the `n_files` Parquets the caller passes.
+/// Takes one bound path parameter per file, in order. The files are the ones
+/// headed for the entry's table plus, where they differ, the ones headed for its
+/// `key_source`.
 ///
 /// A multi-column entry matches on the whole key — the row constructor compares
 /// the columns together, so a lake row agreeing on one component and differing
@@ -2093,8 +2126,8 @@ fn lake_commit_backoff(attempt: u32, salt: i64) -> std::time::Duration {
     base + std::time::Duration::from_millis(offset)
 }
 
-/// Take the lock that serializes writers of the content-addressed sequence
-/// tables. Call inside an open transaction; see `register_files` for why.
+/// Take the lock that serializes writers of the replace-keyed tables. Call
+/// inside an open transaction; see `register_files` for why.
 fn take_registration_lock(conn: &duckdb::Connection) -> Result<(), Status> {
     let locked = conn
         .execute(
@@ -2187,8 +2220,8 @@ struct Registration {
 /// Uses `std::fs::rename` with a copy+delete fallback for cross-filesystem moves
 /// (e.g., SLURM local scratch → shared NFS).
 ///
-/// Content-addressed tables are REPLACED on their key rather than appended to —
-/// see `REPLACE_KEY_TABLES` for which, and why.
+/// Some tables are REPLACED on their key rather than appended to — see
+/// `REPLACE_KEY_TABLES` for which, and why.
 ///
 /// Note: the action token is scoped to staging_dir + files, not to a specific
 /// reference_idx. The control plane is responsible for issuing tokens only for
@@ -2282,7 +2315,7 @@ fn register_files(
     ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
         .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
-    // Replace-by-key the content-addressed tables, then register every moved
+    // Replace-by-key the `REPLACE_KEY_TABLES` targets, then register every moved
     // file, in ONE DuckLake transaction so the catalog update is all-or-nothing
     // (mirrors delete_reference / delete_mask / delete_pool_reads). A failure
     // part-way through rolls back every prior delete and
@@ -2298,7 +2331,7 @@ fn register_files(
     // tolerates orphan Parquets (the delete_* actions reclaim nothing from disk
     // either); a future maintenance pass sweeps them.
     //
-    // Registrations that touch a content-addressed table SERIALIZE against each
+    // Registrations that touch a replace-keyed table SERIALIZE against each
     // other, and retry when they lose. Both halves are needed:
     //
     // DuckLake detects a conflict only where two transactions touch the same
@@ -2318,21 +2351,34 @@ fn register_files(
     //
     // Registrations touching none of those tables (read_mask, alignment) skip the
     // lock and so never contend.
-    // Which tables this registration replaces by key, and the files headed for
-    // each. Loop-invariant, so it is built once outside the retry.
-    let mut incoming: BTreeMap<(&'static str, &'static [&'static str]), Vec<&str>> =
-        BTreeMap::new();
+    // Which tables this registration replaces by key, and the files whose keys
+    // each delete reads — its own, plus its `key_source`'s where the two differ
+    // and that table is in this registration too. Loop-invariant, so it is built
+    // once outside the retry.
+    let mut files_for: BTreeMap<&'static str, Vec<&str>> = BTreeMap::new();
     for (table, dest) in &moved {
-        if let Some((lake_table, keys)) = REPLACE_KEY_TABLES
+        if let Some(entry) = REPLACE_KEY_TABLES
             .iter()
-            .find(|(candidate, _)| candidate == table)
+            .find(|candidate| candidate.table == table.as_str())
         {
-            incoming
-                .entry((*lake_table, *keys))
+            files_for
+                .entry(entry.table)
                 .or_default()
                 .push(dest.as_str());
         }
     }
+    let incoming: Vec<(&'static ReplaceKey, Vec<&str>)> = REPLACE_KEY_TABLES
+        .iter()
+        .filter_map(|entry| {
+            let mut dests = files_for.get(entry.table)?.clone();
+            if entry.key_source != entry.table {
+                if let Some(source_dests) = files_for.get(entry.key_source) {
+                    dests.extend(source_dests.iter().copied());
+                }
+            }
+            Some((entry, dests))
+        })
+        .collect();
     let takes_lock = !incoming.is_empty();
 
     let registration = transact_with_retry(
@@ -2348,19 +2394,18 @@ fn register_files(
             // per target table over all the files headed for it, so no delete can
             // touch a row this same registration already added.
             let mut replaced: BTreeMap<&'static str, usize> = BTreeMap::new();
-            for ((lake_table, keys), dests) in &incoming {
-                let sql = replace_key_delete_sql(lake_table, keys, dests.len());
+            for (entry, dests) in &incoming {
+                let sql = replace_key_delete_sql(entry.table, entry.key, dests.len());
                 let params: Vec<&dyn duckdb::ToSql> =
                     dests.iter().map(|d| d as &dyn duckdb::ToSql).collect();
                 let deleted = conn.execute(&sql, params.as_slice()).map_err(|e| {
-                    Status::internal(format!(
-                        "replace-by-key delete failed for {lake_table}: {e}"
-                    ))
+                    let table = entry.table;
+                    Status::internal(format!("replace-by-key delete failed for {table}: {e}"))
                 })?;
                 // Zero is the ordinary case (a first load, or a run whose features
                 // are all new) and says nothing; only a real supersede earns an entry.
                 if deleted > 0 {
-                    replaced.insert(lake_table, deleted);
+                    replaced.insert(entry.table, deleted);
                 }
             }
 
@@ -4441,13 +4486,33 @@ mod tests {
     #[test]
     fn replace_key_tables_names_each_table_once() {
         let mut seen = std::collections::HashSet::new();
-        for (table, keys) in REPLACE_KEY_TABLES {
-            assert!(seen.insert(*table), "{table} listed twice");
-            assert!(!keys.is_empty(), "{table} has no key column");
+        for entry in REPLACE_KEY_TABLES {
+            let table = entry.table;
+            assert!(seen.insert(table), "{table} listed twice");
+            assert!(!entry.key.is_empty(), "{table} has no key column");
             let mut seen_keys = std::collections::HashSet::new();
-            for key in *keys {
+            for key in entry.key {
                 assert!(seen_keys.insert(*key), "{table} names {key} twice");
             }
+        }
+    }
+
+    /// Every `key_source` is itself a registered table carrying the same key.
+    /// The borrowing delete SELECTs this entry's key columns out of the source's
+    /// Parquet, so a source keyed on anything else would name a column that file
+    /// does not have and fail the whole registration.
+    #[test]
+    fn replace_key_tables_borrow_from_a_table_with_the_same_key() {
+        for entry in REPLACE_KEY_TABLES {
+            let (table, source) = (entry.table, entry.key_source);
+            let found = REPLACE_KEY_TABLES
+                .iter()
+                .find(|candidate| candidate.table == source)
+                .unwrap_or_else(|| panic!("{table} borrows keys from unregistered {source}"));
+            assert_eq!(
+                found.key, entry.key,
+                "{table} borrows keys from {source}, which is keyed differently"
+            );
         }
     }
 
@@ -4523,6 +4588,72 @@ mod tests {
             )
             .expect("exactly one row must remain");
         assert_eq!(survivor_feature, 2, "the other run's feature is untouched");
+    }
+
+    /// The composite form matches on the WHOLE key: a lake row agreeing on one
+    /// component and differing on the other survives. Same in-memory DuckDB as
+    /// the single-key sibling above — this is the SQL text's semantics, not
+    /// DuckLake's.
+    #[test]
+    fn replace_key_delete_matches_the_whole_composite_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE SCHEMA qiita_lake;
+             CREATE TABLE qiita_lake.assembly_membership (
+                 prep_sample_idx BIGINT NOT NULL,
+                 processing_idx BIGINT NOT NULL,
+                 kind VARCHAR NOT NULL,
+                 bin_id VARCHAR NOT NULL,
+                 feature_idx BIGINT NOT NULL
+             );
+             -- Sample 10 run 20 is the run being re-registered. Sample 11 run 20
+             -- shares its processing_idx, sample 10 run 21 shares its
+             -- prep_sample_idx; each agrees on one half and must survive.
+             INSERT INTO qiita_lake.assembly_membership VALUES
+                 (10, 20, 'LCG', 'circular_1', 700),
+                 (10, 20, 'MAG', 'bin.1', 701),
+                 (11, 20, 'MAG', 'bin.1', 702),
+                 (10, 21, 'MAG', 'bin.1', 703);",
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let incoming = dir.path().join("assembly_membership.parquet");
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES \
+                 (10::BIGINT, 20::BIGINT, 'UNBINNED', 'contig_9', 704::BIGINT)) \
+                 t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx)) \
+             TO '{}' (FORMAT PARQUET)",
+            incoming.to_str().unwrap()
+        ))
+        .unwrap();
+
+        let sql = replace_key_delete_sql(
+            "assembly_membership",
+            &["prep_sample_idx", "processing_idx"],
+            1,
+        );
+        let deleted = conn
+            .execute(&sql, duckdb::params![incoming.to_str().unwrap()])
+            .unwrap();
+        assert_eq!(deleted, 2, "both of sample 10 / run 20's rows");
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT prep_sample_idx, processing_idx FROM qiita_lake.assembly_membership \
+                 ORDER BY prep_sample_idx, processing_idx",
+            )
+            .unwrap();
+        let survivors: Vec<(i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            survivors,
+            vec![(10, 21), (11, 20)],
+            "a row agreeing on only one component of the key is not the same run"
+        );
     }
 
     // --- do_action dispatch trust checks (pure; no DuckDB) ---
@@ -5031,9 +5162,42 @@ mod tests {
         ));
     }
 
-    /// Register one staging Parquet, whose SELECT list and target table the
-    /// caller supplies, under a caller-chosen ticket. Returns the `Registration`
-    /// so a test can read the replaced-row counts.
+    /// Register one staging Parquet per `(table, SELECT list)` the caller
+    /// supplies, as ONE registration under a caller-chosen ticket. Returns the
+    /// `Registration` so a test can read the replaced-row counts.
+    #[cfg(feature = "integration")]
+    fn register_parquets(
+        connstr: &str,
+        data_path: &str,
+        tables: &[(&str, &str)],
+        ticket: i64,
+    ) -> Registration {
+        let staging = tempfile::tempdir().unwrap();
+        let writer = Connection::open_in_memory().unwrap();
+        let mut files = std::collections::HashMap::new();
+        for (table, values_sql) in tables {
+            let src = staging.path().join(format!("{table}.parquet"));
+            writer
+                .execute_batch(&format!(
+                    "COPY ({values_sql}) TO '{}' (FORMAT PARQUET)",
+                    src.to_str().unwrap()
+                ))
+                .unwrap();
+            files.insert(format!("{table}.parquet"), (*table).to_string());
+        }
+
+        let payload = auth::ActionPayload {
+            action: "register_files".to_string(),
+            staging_dir: staging.path().to_str().unwrap().to_string(),
+            files,
+            work_ticket_idx: ticket,
+        };
+        register_files(connstr, data_path, &payload).unwrap_or_else(|e| {
+            let names: Vec<&str> = tables.iter().map(|(table, _)| *table).collect();
+            panic!("register_files({names:?}) failed: {e}")
+        })
+    }
+
     #[cfg(feature = "integration")]
     fn register_one_parquet(
         connstr: &str,
@@ -5042,26 +5206,7 @@ mod tests {
         values_sql: &str,
         ticket: i64,
     ) -> Registration {
-        let staging = tempfile::tempdir().unwrap();
-        let src = staging.path().join(format!("{table}.parquet"));
-        let writer = Connection::open_in_memory().unwrap();
-        writer
-            .execute_batch(&format!(
-                "COPY ({values_sql}) TO '{}' (FORMAT PARQUET)",
-                src.to_str().unwrap()
-            ))
-            .unwrap();
-
-        let mut files = std::collections::HashMap::new();
-        files.insert(format!("{table}.parquet"), table.to_string());
-        let payload = auth::ActionPayload {
-            action: "register_files".to_string(),
-            staging_dir: staging.path().to_str().unwrap().to_string(),
-            files,
-            work_ticket_idx: ticket,
-        };
-        register_files(connstr, data_path, &payload)
-            .unwrap_or_else(|e| panic!("register_files({table}) failed: {e}"))
+        register_parquets(connstr, data_path, &[(table, values_sql)], ticket)
     }
 
     #[cfg(feature = "integration")]
@@ -5136,15 +5281,15 @@ mod tests {
         let membership_values = |sample: i64, run: i64| {
             format!(
                 "SELECT * FROM (VALUES \
-                     ({sample}::BIGINT, {run}::BIGINT, 'lcg', 'circular_1', {feature_a}::BIGINT), \
-                     ({sample}::BIGINT, {run}::BIGINT, 'mag', 'bin.1', {feature_b}::BIGINT)) \
+                     ({sample}::BIGINT, {run}::BIGINT, 'LCG', 'circular_1', {feature_a}::BIGINT), \
+                     ({sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', {feature_b}::BIGINT)) \
                      t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
             )
         };
         let quality_values = |sample: i64, run: i64| {
             format!(
                 "SELECT * FROM (VALUES \
-                     ({sample}::BIGINT, {run}::BIGINT, 'mag', 'bin.1', \
+                     ({sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
                       'k__Bacteria'::VARCHAR, 91.5::DOUBLE, 1.25::DOUBLE, 0.0::DOUBLE, \
                       4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR)) \
                      t(prep_sample_idx, processing_idx, kind, bin_id, marker_lineage, \
@@ -5265,6 +5410,123 @@ mod tests {
         ));
     }
 
+    /// A re-run that yields NO MAG still clears the previous run's `bin_quality`
+    /// rows, because `bin_quality`'s delete reads the keys `assembly_membership`
+    /// names in the same registration. `bin_quality` alone names none — CheckM
+    /// covers refined bins only, so `assembly_load` writes it empty-with-schema —
+    /// and a delete keyed on the incoming file alone removes nothing, leaving MAG
+    /// rows behind a membership set that was replaced out from under them.
+    ///
+    /// The control is the second registration's membership rows: they are
+    /// superseded in the same call, which is what makes the surviving-or-not
+    /// `bin_quality` rows the one variable.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let sample: i64 = 974_010;
+        let run: i64 = 974_020;
+        let feature: i64 = 974_030;
+        let base_ticket: i64 = 974_000_000 + std::process::id() as i64;
+        let where_clause = format!("prep_sample_idx = {sample} AND processing_idx = {run}");
+
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_assembly_tables(&conn).unwrap();
+            ducklake::ensure_registration_lock(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
+                 DELETE FROM qiita_lake.bin_quality WHERE {where_clause};"
+            ))
+            .unwrap();
+        }
+
+        let membership_values = |kind: &str, bin_id: &str| {
+            format!(
+                "SELECT * FROM (VALUES \
+                     ({sample}::BIGINT, {run}::BIGINT, '{kind}', '{bin_id}', {feature}::BIGINT)) \
+                     t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
+            )
+        };
+        let quality_values = |suffix: &str| {
+            format!(
+                "SELECT * FROM (VALUES \
+                     ({sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
+                      'k__Bacteria'::VARCHAR, 91.5::DOUBLE, 1.25::DOUBLE, 0.0::DOUBLE, \
+                      4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR)) \
+                     t(prep_sample_idx, processing_idx, kind, bin_id, marker_lineage, \
+                       completeness, contamination, strain_heterogeneity, genome_size, \
+                       n_contigs, das_tool_score, source_binner){suffix}"
+            )
+        };
+
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        let membership_count =
+            format!("SELECT count(*) FROM qiita_lake.assembly_membership WHERE {where_clause}");
+        let quality_count =
+            format!("SELECT count(*) FROM qiita_lake.bin_quality WHERE {where_clause}");
+
+        // The first run: one refined MAG, so both files carry a row.
+        register_parquets(
+            &connstr,
+            &data_path,
+            &[
+                ("assembly_membership", &membership_values("MAG", "bin.1")),
+                ("bin_quality", &quality_values("")),
+            ],
+            base_ticket,
+        );
+        assert_eq!(
+            lake_count(&reader, &membership_count),
+            1,
+            "first run loaded"
+        );
+        assert_eq!(lake_count(&reader, &quality_count), 1, "first run loaded");
+
+        // The re-run: contigs, but no refined bin. `assembly_load` writes
+        // bin_quality empty-with-schema and register-files registers it anyway.
+        let replaced = register_parquets(
+            &connstr,
+            &data_path,
+            &[
+                (
+                    "assembly_membership",
+                    &membership_values("UNBINNED", "contig_1"),
+                ),
+                ("bin_quality", &quality_values(" WHERE FALSE")),
+            ],
+            base_ticket + 1,
+        )
+        .replaced;
+
+        assert_eq!(
+            replaced.get("assembly_membership").copied(),
+            Some(1),
+            "control: the re-run supersedes the first run's membership row",
+        );
+        assert_eq!(
+            replaced.get("bin_quality").copied(),
+            Some(1),
+            "the empty bin_quality supersedes the first run's MAG row",
+        );
+        assert_eq!(lake_count(&reader, &membership_count), 1, "one run's rows");
+        assert_eq!(
+            lake_count(&reader, &quality_count),
+            0,
+            "a run with no MAG leaves no bin_quality row behind",
+        );
+
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
+             DELETE FROM qiita_lake.bin_quality WHERE {where_clause};"
+        ));
+    }
+
     /// Every `REPLACE_KEY_TABLES` entry names a real lake table with that key
     /// column. The delete interpolates both names into SQL, so a typo or a
     /// renamed column would otherwise surface as a failed load in production
@@ -5280,8 +5542,9 @@ mod tests {
         ducklake::ensure_reference_tables(&conn).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
 
-        for (table, keys) in REPLACE_KEY_TABLES {
-            for key in *keys {
+        for entry in REPLACE_KEY_TABLES {
+            let table = entry.table;
+            for key in entry.key {
                 let found: i64 = conn
                     .query_row(
                         "SELECT count(*) FROM duckdb_columns() \
@@ -5348,7 +5611,7 @@ mod tests {
         );
         for table in &shaped {
             assert!(
-                REPLACE_KEY_TABLES.iter().any(|(t, _)| t == table),
+                REPLACE_KEY_TABLES.iter().any(|entry| entry.table == table),
                 "qiita_lake.{table} is content-addressed but absent from REPLACE_KEY_TABLES, \
                  so a second load carrying its keys would duplicate them; found shaped tables: \
                  {shaped:?}"

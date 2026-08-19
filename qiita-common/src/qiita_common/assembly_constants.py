@@ -1,12 +1,10 @@
 """The `kind` value set for `assembly_membership` / `bin_quality`.
 
-Single-sourced here, in the contract layer, because the set is referenced across
-components: the compute orchestrator's native jobs produce it (`assembly_hash`
-writes `bin_map.kind`, `assembly_load` writes `assembly_membership.kind` and
-`bin_quality.kind`), while the control-plane repository, the DuckLake DDL, and the
-Postgres table comment point here rather than enumerating members. `bin_quality`
-joins `assembly_membership` on `kind`, so a drift between the two producers would
-silently break that join.
+Single-sourced here, in the contract layer, because the set crosses components:
+the compute orchestrator's native jobs write it, and the control plane, the
+DuckLake DDL, and the Postgres table comment point here rather than enumerating
+members. `bin_quality` joins `assembly_membership` on `kind`, so a drift between
+producers would silently break that join.
 
 Plain module constants, not a `StrEnum` with a Postgres twin: `kind` is a TEXT
 column with no `CREATE TYPE` twin (the set is extensible — a future

@@ -9,7 +9,7 @@ COMMENT ON TABLE qiita.assembly_membership IS
     'processing_idx, kind, bin_id, feature_idx) — the assembly analogue of '
     'qiita.reference_membership. processing_idx disambiguates re-runs so a reused '
     'bin_id never collides; kind is a TEXT set enumerated in '
-    'qiita-common/src/qiita_common/assembly_constants.py.';
+    'qiita_common.assembly_constants.';
 
 
 -- migrate:down

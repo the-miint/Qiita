@@ -570,8 +570,8 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
         -- Which features a (prep_sample, processing) assembly run contains, and in
         -- which bin. processing_idx disambiguates runs (bin_id reused across
         -- samples AND runs); the `kind` value set is enumerated in
-        -- qiita-common/src/qiita_common/assembly_constants.py. The DuckLake
-        -- copy of qiita.assembly_membership for bulk joins with the sequences.
+        -- qiita_common.assembly_constants. The DuckLake copy of
+        -- qiita.assembly_membership for bulk joins with the sequences.
         CREATE TABLE IF NOT EXISTS qiita_lake.assembly_membership (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,
@@ -610,7 +610,7 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Create the one row that registrations into the content-addressed tables
+/// Create the one row that registrations into the replace-keyed tables
 /// serialize on, and seed it.
 ///
 /// Why a lock is needed at all, and what it buys, lives at the one site that
