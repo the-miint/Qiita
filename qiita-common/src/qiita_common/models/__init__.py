@@ -165,8 +165,6 @@ from qiita_common.models.reference import (
     ReferenceShardIndexStatus,
     ReferenceStatus,
     ReferenceStatusUpdate,
-    TerminologyStatus,
-    TerminologyTermObsoletionKind,
     Tier,
     read_mask_reason_sql_list,
 )
@@ -259,7 +257,20 @@ from qiita_common.models.step import (
     StepSubmitRequest,
 )
 from qiita_common.models.study import StudyCreate, StudyPatchRequest, StudyResponse
+from qiita_common.models.terminology import (
+    MAX_TERMINOLOGY_VERSION_LENGTH,
+    VALID_TERMINOLOGY_STATUS_TRANSITIONS,
+    TerminologyFilename,
+    TerminologyManifest,
+    TerminologyManifestFile,
+    TerminologyName,
+    TerminologyResponse,
+    TerminologyStatus,
+    TerminologyTermObsoletionKind,
+    TerminologyVersion,
+)
 from qiita_common.models.upload import (
+    SHA256_HEX_PATTERN,
     EmailReceiptStatus,
     UploadCreateRequest,
     UploadCreateResponse,
@@ -357,6 +368,7 @@ __all__ = [
     "STUDY_FIELD_IDX_ATTR",
     "TERMINOLOGY_TERM_VALUE_COLUMN",
     "VALID_STATUS_TRANSITIONS",
+    "VALID_TERMINOLOGY_STATUS_TRANSITIONS",
     # Shared base types.
     "AccessionText",
     "BlockScopeTarget",
@@ -412,9 +424,17 @@ __all__ = [
     "ReferenceShardIndexStatus",
     "ReferenceStatus",
     "ReferenceStatusUpdate",
+    "Tier",
+    # Terminology.
+    "MAX_TERMINOLOGY_VERSION_LENGTH",
+    "TerminologyFilename",
+    "TerminologyManifest",
+    "TerminologyManifestFile",
+    "TerminologyName",
+    "TerminologyResponse",
     "TerminologyStatus",
     "TerminologyTermObsoletionKind",
-    "Tier",
+    "TerminologyVersion",
     # Step wire contract.
     "AlignmentCohortDoGetTicketRequest",
     "AlignmentDoGetTicketRequest",
@@ -437,6 +457,7 @@ __all__ = [
     "StepSubmitRequest",
     # Upload.
     "EmailReceiptStatus",
+    "SHA256_HEX_PATTERN",
     "UploadCreateRequest",
     "UploadCreateResponse",
     "UploadDoneRequest",

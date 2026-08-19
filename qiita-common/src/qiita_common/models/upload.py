@@ -58,7 +58,7 @@ class UploadCreateRequest(BaseModel):
 
 # sha256 wire shape: 64 lowercase hex characters. Pinned at the model
 # layer so a misbehaving client surfaces as a 422 before the DB write.
-_SHA256_HEX_PATTERN = r"^[0-9a-f]{64}$"
+SHA256_HEX_PATTERN = r"^[0-9a-f]{64}$"
 
 
 class UploadCreateResponse(BaseModel):
@@ -83,7 +83,7 @@ class UploadDoneRequest(BaseModel):
     claim with a server-verified signature.
     """
 
-    sha256: Annotated[str, Field(pattern=_SHA256_HEX_PATTERN)]
+    sha256: Annotated[str, Field(pattern=SHA256_HEX_PATTERN)]
     row_count: Annotated[int, Field(ge=0)]
     bytes_received: Annotated[int, Field(ge=0)]
 

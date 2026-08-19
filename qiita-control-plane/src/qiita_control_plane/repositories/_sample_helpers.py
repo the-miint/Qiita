@@ -72,14 +72,14 @@ METADATA_VALUE_COLUMNS_SELECT = ", ".join(
 )
 
 # The display payload for a row whose value is a missing-reason or a terminology
-# term (the reason name; the term's term_id and label), and the two LEFT JOINs
-# that supply it. Split because the two halves sit in different clauses of the
-# statement; both are consumed together by every read that decodes values for a
-# caller.
+# term (the reason name; the term's term_id, label, and alternate label), and the
+# two LEFT JOINs supplying it. Split because the two halves sit in different
+# clauses of the statement, and neither works without the other.
 METADATA_REF_PAYLOAD_SELECT = (
     "mvr.name AS missing_reason_name,"
     " tt.term_id AS terminology_term_id,"
-    " tt.label AS terminology_term_label"
+    " tt.label AS terminology_term_label,"
+    " tt.alternate_label AS terminology_term_alternate_label"
 )
 METADATA_REF_JOIN_CLAUSES = (
     f" LEFT JOIN qiita.missing_value_reason mvr"
@@ -195,8 +195,8 @@ class MetadataRow:
     cosmetic display_name and description, its data_type, and the value
     extracted from the row — either the typed Python value from the matching
     value_* column, a MissingReasonRef carrying an intentionally-missing
-    reason's idx + name, or a TerminologyTermRef carrying a terminology-term's
-    idx + term_id + label.
+    reason's idx + name, or a TerminologyTermRef carrying the resolved
+    terminology term.
     """
 
     display_name: str
@@ -726,16 +726,18 @@ async def fetch_terminology_term_idxs_by_term_ids(
     *,
     terminology_idx: int,
     term_ids: Iterable[str],
-) -> dict[str, tuple[int, str]]:
-    """Return a dict of term_id -> (idx, label) for every qiita.terminology_term
-    row whose term_id appears in `term_ids` AND whose terminology_idx matches.
+) -> dict[str, tuple[int, str, str | None]]:
+    """Return a dict of term_id -> (idx, label, alternate_label) for every
+    qiita.terminology_term row whose term_id appears in `term_ids` AND whose
+    terminology_idx matches. alternate_label is None for a term the source
+    supplies no second name for.
 
     Term ids absent from the table are absent from the returned dict. Empty
-    input short-circuits with no DB call. No is_obsolete filter — any row in
-    the table scoped to this terminology is treated as a valid marker; the
-    obsoletion lifecycle is not yet exercised. Scoped to one terminology_idx
-    because (terminology_idx, term_id) is the table's unique key — the same
-    term_id can recur across different terminologies.
+    input short-circuits with no DB call. No is_obsolete filter — any row
+    scoped to this terminology counts as a valid marker; nothing exercises the
+    obsoletion lifecycle yet. Scoped to one terminology_idx because
+    (terminology_idx, term_id) is the table's unique key — the same term_id can
+    recur across different terminologies.
     """
     # Materialize so emptiness is detectable and the param can be passed as ANY.
     candidate_term_ids = list(term_ids)
@@ -746,12 +748,12 @@ async def fetch_terminology_term_idxs_by_term_ids(
     # The (terminology_idx, term_id) UNIQUE constraint bounds the row count
     # by len(candidate_term_ids).
     rows = await pool_or_conn.fetch(
-        "SELECT idx, term_id, label FROM qiita.terminology_term"
+        "SELECT idx, term_id, label, alternate_label FROM qiita.terminology_term"
         " WHERE terminology_idx = $1 AND term_id = ANY($2::text[])",
         terminology_idx,
         candidate_term_ids,
     )
-    return {r["term_id"]: (r["idx"], r["label"]) for r in rows}
+    return {r["term_id"]: (r["idx"], r["label"], r["alternate_label"]) for r in rows}
 
 
 async def fetch_metadata_checklist_idx_by_name(
@@ -799,6 +801,7 @@ def _decode_metadata_value(
             idx=terminology_term_idx,
             term_id=row["terminology_term_id"],
             label=row["terminology_term_label"],
+            alternate_label=row["terminology_term_alternate_label"],
         )
     column = GLOBAL_METADATA_VALUE_COLUMN.get(data_type)
     if column is None:
@@ -2126,13 +2129,13 @@ async def _resolve_and_parse_metadata_values(
 
     # One round trip per distinct terminology_idx; the helper short-circuits
     # on empty inputs so a no-terminology import pays nothing.
-    terminology_lookup: dict[tuple[int, str], tuple[int, str]] = {}
+    terminology_lookup: dict[tuple[int, str], tuple[int, str, str | None]] = {}
     for terminology_idx, term_ids in terminology_candidates.items():
         resolved = await fetch_terminology_term_idxs_by_term_ids(
             conn, terminology_idx=terminology_idx, term_ids=term_ids
         )
-        for term_id, idx_label in resolved.items():
-            terminology_lookup[(terminology_idx, term_id)] = idx_label
+        for term_id, resolved_term in resolved.items():
+            terminology_lookup[(terminology_idx, term_id)] = resolved_term
 
     # Parse each text value: missing-reason markers route to MissingReasonRef
     # first; TERMINOLOGY-typed fields then route to TerminologyTermRef on hit
@@ -2150,17 +2153,20 @@ async def _resolve_and_parse_metadata_values(
             # *_global_field CHECK; assert rather than guard so a CHECK violation
             # surfaces loudly instead of silently dropping the row.
             assert resolved_field.terminology_idx is not None
-            resolved_idx_label = terminology_lookup.get((resolved_field.terminology_idx, stripped))
-            if resolved_idx_label is None:
+            resolved_term = terminology_lookup.get((resolved_field.terminology_idx, stripped))
+            if resolved_term is None:
                 raise MetadataParseError(
                     field_key=caller_key,
                     data_type=resolved_field.data_type,
                     text_value=text_value,
                     reason="no matching terminology term",
                 )
-            term_idx, term_label = resolved_idx_label
+            term_idx, term_label, term_alternate_label = resolved_term
             parsed[caller_key] = TerminologyTermRef(
-                idx=term_idx, term_id=stripped, label=term_label
+                idx=term_idx,
+                term_id=stripped,
+                label=term_label,
+                alternate_label=term_alternate_label,
             )
             continue
         parsed[caller_key] = parse_text_for_data_type(
