@@ -182,14 +182,17 @@ steps:
 
   # Hash the LCG contigs, the MAG contigs, and the unbinned noLCG residue into the
   # reference-load shape: manifest (synthetic globally-unique read_id, SHARED
-  # canonical sequence_hash), hash-keyed assembly_chunks/, and bin_map
-  # (read_id → kind, bin_id). Zero contigs of any kind is StepNoData. Sequences
-  # are run-agnostic, so this step carries no processing_idx.
+  # canonical sequence_hash), hash-keyed assembly_chunks/, bin_map
+  # (read_id → kind, bin_id), and genome_map (read_id → the qiita genome each
+  # contig belongs to). Zero contigs of any kind is StepNoData. Threads
+  # processing_idx via params: because it enters the genome identity, so a re-run
+  # under different params mints its own genomes rather than reusing a prior run's.
   - step: assembly_hash
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.assembly_hash
     inputs: [genomes_dir, refined_bins_dir]
-    outputs: [manifest, assembly_chunks, bin_map]
+    params: {processing_idx: processing_idx}
+    outputs: [manifest, assembly_chunks, bin_map, genome_map]
     baseline_resources:
       cpu: 2
       mem_gb: 8
@@ -197,8 +200,12 @@ steps:
 
   # Mint feature_idx for every contig hash against the SHARED qiita.feature (same
   # primitive reference-add uses) — identical bytes collapse to one feature_idx.
+  # `genome_map` additionally puts each LCG contig, refined bin, and unbinned
+  # contig in qiita.genome / qiita.feature_genome under source='qiita' — the same
+  # relations reference MAGs already occupy. The reference workflows leave it out
+  # and pass their map through action_context instead.
   - action: mint-features
-    inputs: [manifest]
+    inputs: [manifest, genome_map]
     outputs: [feature_map]
 
   # Link this run's contigs to qiita.assembly_membership, tagged by (kind, bin_id)

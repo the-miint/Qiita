@@ -343,12 +343,23 @@ async def _run_action_primitive(
     input/output shape — a generic dispatcher would just push the same
     `if name == ...` ladder somewhere else."""
     if entry.name == LibraryPrimitive.MINT_FEATURES:
-        manifest_path = Path(bound[entry.inputs[0]])
-        # `genome_map_path` is a workflow-context optional, not an entry
-        # input — the YAML's mint-features `inputs:` stays single-valued.
-        # Pulled directly from `bound` so a ticket whose action_context
-        # carries it picks up genome-association writes for free.
-        genome_map = bound.get("genome_map_path")
+        # Inputs resolved by fixed binding NAME, not positionally — both are
+        # Parquet paths, and a reorder would hand the manifest the genome map.
+        # `genome_map` is optional: the reference workflows declare
+        # `inputs: [manifest]` and carry their map through action_context
+        # (`genome_map_path`), which is a submitter-supplied file rather than an
+        # upstream step's output; long-read-assembly declares it as an input
+        # because assembly_hash produces it.
+        if set(entry.inputs) not in ({"manifest"}, {"manifest", "genome_map"}):
+            raise RuntimeError(
+                "mint-features expects inputs [manifest] or [manifest, genome_map]; "
+                f"got {entry.inputs!r}"
+            )
+        manifest_path = Path(bound["manifest"])
+        if "genome_map" in entry.inputs:
+            genome_map = bound["genome_map"]
+        else:
+            genome_map = bound.get("genome_map_path")
         feature_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
             pool,
             manifest_path,

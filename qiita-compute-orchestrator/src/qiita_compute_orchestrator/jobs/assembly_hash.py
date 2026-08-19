@@ -18,6 +18,22 @@ downstream (mint-features -> write-assembly-membership -> assembly_load):
     exactly like `hash_sequences`.
   - `bin_map.parquet` — `(read_id, kind, bin_id)`, the per-contig bin membership
     `write-assembly-membership` / `assembly_load` join against.
+  - `genome_map.parquet` — `(read_id, genome_source, genome_source_id,
+    prep_sample_idx)`, the shape `mint-features` consumes to write `qiita.genome`
+    + `qiita.feature_genome`. Each LCG contig, each refined bin, and each unbinned
+    contig is one genome; `genome_source_id` is `_genome_source_id` below.
+
+**The synthetic read_id must be unique across the whole scan.** `read_fastx` returns
+one row per record and never deduplicates: two FASTA records whose headers share a
+first token come back as two rows with the same `read_id` (probed), so their
+synthetic ids collide too. Pass 2 joins `winner` on that id over a fresh scan of
+every record, so one colliding pair puts BOTH contigs' chunks under EACH of their
+two `sequence_hash` values — the stored bytes for a feature then hold a sequence
+that is not that feature's. The same collision maps two contigs onto one
+`genome_source_id` for LCG and UNBINNED, whose `bin_id` is the contig id. The
+uniqueness check below runs over the full scan rather than the surviving rows,
+because pass 2 re-derives the id from every record the DELETE would have removed
+too.
 
 **Shared canonical identity.** `sequence_hash` is
 `qiita_common.chunking.canonical_sequence_hash_expr` — the SAME expression
@@ -68,11 +84,14 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import duckdb
 from pydantic import BaseModel
 from qiita_common.assembly_constants import KIND_LCG, KIND_MAG, KIND_UNBINNED
 from qiita_common.backend_failure import StepNoData
 from qiita_common.chunking import canonical_sequence_hash_expr, sequence_split_expr
 from qiita_common.duckdb_miint import is_empty_sequence_file
+from qiita_common.hashing import canonical_params_hash
+from qiita_common.models import GenomeSource
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -101,21 +120,55 @@ _DUCKDB_THREADS = 4
 # multi-MB contig records can't materialise a giant chunk before the chunker runs.
 _READ_FASTX_MAX_BATCH_BYTES = "128MB"
 
+# Rows per batch when the distinct genome keys stream through Python to be hashed.
+_GENOME_KEY_BATCH_ROWS = 10_000
+
+# How many colliding synthetic read_ids the uniqueness failure names.
+_DUPLICATE_ID_SAMPLE = 5
+
 
 class Inputs(BaseModel):
     """Typed input contract for assembly_hash.
 
     `genomes_dir` (holds `circular.fa` + `noLCG.fa`) and `refined_bins_dir` (MAG bins)
-    are the upstream container steps' outputs. `prep_sample_idx` / `work_ticket_idx` are
-    framework-injected scope scalars (declared for an explicit contract even though
-    this step doesn't read them — sequences are run-agnostic, so no processing_idx
-    is needed here).
+    are the upstream container steps' outputs. `processing_idx` is threaded via the
+    step's `params:` and enters the genome identity (`_genome_source_id`).
+    `prep_sample_idx` / `work_ticket_idx` are framework-injected scope scalars;
+    `prep_sample_idx` enters that identity too, and rides the genome map as the
+    origin sample `qiita.genome.prep_sample_idx` requires for source='qiita'.
     """
 
     genomes_dir: Path
     refined_bins_dir: Path
+    processing_idx: int
     prep_sample_idx: int
     work_ticket_idx: int
+
+
+def _genome_source_id(*, prep_sample_idx: int, processing_idx: int, kind: str, bin_id: str) -> str:
+    """The `qiita.genome.source_id` of one assembled genome, under source='qiita'.
+
+    Hex SHA-256 of the canonical JSON of the four values that identify it, the
+    content-addressed discipline `qiita.processing.params_hash` and
+    `qiita.mask_definition.params_hash` use (`qiita_common.hashing`). `bin_id` alone
+    is a string the assembler or the binner chose — 'bin.1' recurs across samples and
+    runs — so the sample and the run scope it, and `kind` separates an LCG contig
+    from an UNBINNED one carrying the same id. Re-running under the same
+    processing_idx resolves to the row already there.
+
+    `qiita.genome (source, source_id)` is UNIQUE, so this value is what makes two
+    samples' bins two genomes; `genome.prep_sample_idx` is a scalar FK and can record
+    only one origin sample, which is why the identity is minted from the run rather
+    than from the bin's contents.
+    """
+    return canonical_params_hash(
+        {
+            "prep_sample_idx": prep_sample_idx,
+            "processing_idx": processing_idx,
+            "kind": kind,
+            "bin_id": bin_id,
+        }
+    ).hex()
 
 
 def _local_id(path: Path) -> str:
@@ -185,6 +238,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     workspace.mkdir(parents=True, exist_ok=True)
     manifest_path = workspace / "manifest.parquet"
     bin_map_path = workspace / "bin_map.parquet"
+    genome_map_path = workspace / "genome_map.parquet"
     # assembly_chunks is a DIRECTORY of part_*.parquet (the shape
     # write_feature_sequence_chunks re-keys); one part here, kept a directory so
     # register-files / the re-key treat it as a multi-file DuckLake table.
@@ -192,6 +246,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     chunks_dir.mkdir(parents=True, exist_ok=True)
     manifest_out = validate_parquet_path(manifest_path)
     bin_map_out = validate_parquet_path(bin_map_path)
+    genome_map_out = validate_parquet_path(genome_map_path)
     chunks_part_out = validate_parquet_path(chunks_dir / "part_00000.parquet")
 
     success = False
@@ -232,6 +287,28 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 [paths],
             )
 
+            # Uniqueness of the synthetic read_id across the whole scan (module
+            # docstring: what a collision does to the stored chunks and to the
+            # genome identity). read_id is `kind:bin_id:contig_id` composed, so this
+            # covers a repeated triple and a separator ambiguity alike.
+            dupes = conn.execute(
+                "SELECT read_id, count(*) AS n FROM contig GROUP BY read_id "
+                "HAVING count(*) > 1 ORDER BY read_id LIMIT ?",
+                [_DUPLICATE_ID_SAMPLE],
+            ).fetchall()
+            if dupes:
+                colliding = conn.execute(
+                    "SELECT count(*) FROM ("
+                    "  SELECT read_id FROM contig GROUP BY read_id HAVING count(*) > 1)"
+                ).fetchone()[0]
+                shown = ", ".join(f"{read_id!r} x{n}" for read_id, n in dupes)
+                raise ValueError(
+                    f"contig ids are not unique for prep_sample_idx={inputs.prep_sample_idx}: "
+                    f"{colliding} synthetic read_id(s) `kind:bin_id:contig_id` repeat across "
+                    f"{inputs.genomes_dir} and {inputs.refined_bins_dir}; first {len(dupes)}: "
+                    f"{shown}. Two FASTA records sharing a header first token produce one id."
+                )
+
             # Reduce the UNBINNED rows to the RESIDUE: drop the noLCG contigs a
             # refined bin already claims, matched on the canonical sequence_hash
             # (module docstring: why the residue and not the whole file, and why
@@ -260,6 +337,57 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             conn.execute(
                 "COPY (SELECT read_id, kind, bin_id FROM contig) "
                 f"TO '{bin_map_out}' ({PARQUET_OPTS})"
+            )
+
+            # One genome per distinct (kind, bin_id): every LCG contig, every refined
+            # bin, every unbinned contig. `_genome_source_id` is Python (the canonical
+            # JSON has one implementation, in qiita_common.hashing), so the keys stream
+            # through it in batches.
+            #
+            # The reader runs on a SECOND connection. An `executemany` on the reader's
+            # OWN connection invalidates the open reader and the loop ENDS EARLY with no
+            # error — measured at duckdb 1.5.4: 5 rows read in batches of 2 land 2 rows,
+            # against 5 with the reader on its own connection. Every key past the first
+            # batch would be missing, and the INNER JOIN below drops those contigs from
+            # the genome map silently. The keys come from the bin_map just written rather
+            # than from `contig` because a TEMP TABLE is not visible across connections
+            # and the rows are the same.
+            conn.execute(
+                "CREATE TEMP TABLE genome_key (kind VARCHAR, bin_id VARCHAR, source_id VARCHAR)"
+            )
+            with duckdb.connect(":memory:") as key_conn:
+                key_reader = key_conn.execute(
+                    "SELECT DISTINCT kind, bin_id FROM read_parquet(?)", [str(bin_map_out)]
+                ).to_arrow_reader(_GENOME_KEY_BATCH_ROWS)
+                for batch in key_reader:
+                    conn.executemany(
+                        "INSERT INTO genome_key VALUES (?, ?, ?)",
+                        [
+                            (
+                                kind,
+                                bin_id,
+                                _genome_source_id(
+                                    prep_sample_idx=inputs.prep_sample_idx,
+                                    processing_idx=inputs.processing_idx,
+                                    kind=kind,
+                                    bin_id=bin_id,
+                                ),
+                            )
+                            for kind, bin_id in zip(
+                                batch.column("kind").to_pylist(),
+                                batch.column("bin_id").to_pylist(),
+                                strict=True,
+                            )
+                        ],
+                    )
+            conn.execute(
+                "COPY (SELECT c.read_id, "
+                "  CAST(? AS VARCHAR) AS genome_source, "
+                "  k.source_id AS genome_source_id, "
+                "  CAST(? AS BIGINT) AS prep_sample_idx "
+                "  FROM contig c JOIN genome_key k USING (kind, bin_id)) "
+                f"TO '{genome_map_out}' ({PARQUET_OPTS})",
+                [GenomeSource.QIITA.value, inputs.prep_sample_idx],
             )
 
             # winner — the ONE surviving contig per canonical sequence_hash, chosen
@@ -309,6 +437,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if not success:
             manifest_path.unlink(missing_ok=True)
             bin_map_path.unlink(missing_ok=True)
+            genome_map_path.unlink(missing_ok=True)
             shutil.rmtree(chunks_dir, ignore_errors=True)
 
-    return {"manifest": manifest_path, "assembly_chunks": chunks_dir, "bin_map": bin_map_path}
+    return {
+        "manifest": manifest_path,
+        "assembly_chunks": chunks_dir,
+        "bin_map": bin_map_path,
+        "genome_map": genome_map_path,
+    }
