@@ -83,16 +83,12 @@ async def create_assembly_sample_pending(
 
     Idempotent, which is what makes a resumed or redriven ticket safe: the same
     params re-resolve to the same processing_idx, so this runs again over whatever
-    the last run left. The two terminal states are treated differently, and the
-    asymmetry is the same one `upsert_assembly_sample_completed` rests on —
-    'no_data' is not a final answer about the identity, 'completed' is:
-
-      - 'completed' is left alone. Contigs for this identity are in DuckLake, and
-        a run in flight does not unsay that.
-      - 'no_data' is reopened. It says the run that wrote it assembled nothing;
-        a new run of the same identity has not finished, so leaving it would have
-        the gate answer for a run that is still going — and answer 'no_data' about
-        a run that may go on to FAIL.
+    the last run left. It reopens 'no_data' and leaves 'completed' — the same
+    asymmetry `upsert_assembly_sample_no_data` is guarded on, for the reason
+    stated there. 'no_data' says the run that wrote it assembled nothing; a new
+    run of the same identity has not finished, so leaving it would have the gate
+    answer for a run that is still going — and answer 'no_data' about a run that
+    may go on to FAIL.
 
     Twin of `repositories.block.create_mask_sample_pending`, one sample at a time
     — assembly is per-sample-ticket, not a block fan-out. Those twins have no
@@ -187,10 +183,10 @@ async def fetch_assembly_sample_state(
     that needs contigs proceeds on 'completed' alone (under 'no_data' there are
     none). 'pending' and None both mean "not over"; None is never "assembled".
 
-    Terminal is per-run, not per-key: a re-run of the same identity walks a
-    'no_data' row back to 'pending' and leaves a 'completed' one, so a consumer
-    holding an earlier 'no_data' can read 'pending' on the next call. The
-    asymmetry is stated on `create_assembly_sample_pending`.
+    Terminal is per-run, not per-key: a re-run of the same identity can reopen a
+    row this read reported terminal, so a consumer holding an earlier 'no_data'
+    can read 'pending' on the next call. Which state reopens, and why, is on
+    `create_assembly_sample_pending`.
 
     None also covers a sample the run never reached: a ticket whose masked
     pass-set is empty raises StepNoData in the runner's pre-loop input resolver,

@@ -192,12 +192,12 @@ async def run_workflow(
     action: ActionDefinition | None = None
     index: int | None = None
     uploads_to_consume: list[int] = []
-    # The processing_idx this run MINTED, and the only value either
-    # qiita.assembly_sample write below is keyed on. `bound` is seeded from
-    # action_context, which is stored verbatim and passes `validate_context` with
-    # unknown keys intact, so a submitter can put a `processing_idx` there; before
-    # the mint overwrites it that value is another run's identity, or none at all.
-    # None means the mint has not run, which is what the gate writes read.
+    # The processing_idx this run MINTED — the only value either
+    # qiita.assembly_sample write below is keyed on, and None until the mint runs.
+    # `bound` is seeded from action_context, which is stored verbatim and passes
+    # `validate_context` with unknown keys intact, so a submitter can put a
+    # `processing_idx` there; before the mint overwrites it that value is another
+    # run's identity, or none at all.
     minted_processing_idx: int | None = None
 
     try:

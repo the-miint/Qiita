@@ -5804,16 +5804,17 @@ async def test_masked_reads_workflow_persists_the_consumed_mask_onto_the_ticket(
         await teardown()
 
 
-async def _seed_assembly_gate_ticket(pool):
+async def _seed_assembly_gate_ticket(pool, *, extra_context=None):
     """`_seed_assembly_ticket` shaped like long-read-assembly's gated form: the
     steps thread `processing_idx` and declare the terminal
     `finalize-assembly-sample` action, so the runner writes qiita.assembly_sample.
-    Returns the prep_sample the gate row is keyed on, plus a teardown."""
+    `extra_context` merges onto the action_context. Returns the prep_sample the
+    gate row is keyed on, plus a teardown."""
     work_ticket_idx, _mask_idx, prep_sample_idx, teardown = await _seed_assembly_ticket(
         pool,
         prefix="asm-gate",
         steps=_ASSEMBLY_GATE_STEPS,
-        extra_context={"assembler": "hifiasm_meta"},
+        extra_context={"assembler": "hifiasm_meta", **(extra_context or {})},
     )
     return work_ticket_idx, prep_sample_idx, teardown
 
@@ -5942,7 +5943,7 @@ async def test_assembly_gate_is_absent_when_no_data_precedes_the_mint(
 
 
 async def _mint_unrelated_processing(pool) -> int:
-    """A processing_idx belonging to some other run, for the injected-context tests."""
+    """A processing_idx belonging to some other run, for the test below."""
     from qiita_control_plane.repositories.processing import mint_processing
 
     version = uuid.uuid4().hex
@@ -5956,39 +5957,22 @@ async def _mint_unrelated_processing(pool) -> int:
     return row["processing_idx"]
 
 
-async def _inject_action_context(pool, work_ticket_idx: int, **keys) -> None:
-    """Merge keys into a ticket's persisted action_context, the way a submitter's
-    extra keys arrive: action_context is stored verbatim and no shipped
-    context_schema sets `additionalProperties: false`, so `validate_context` passes
-    them through into the runner's `bound`."""
-    context = json.loads(
-        await pool.fetchval(
-            "SELECT action_context::text FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-            work_ticket_idx,
-        )
-    )
-    context.update(keys)
-    await pool.execute(
-        "UPDATE qiita.work_ticket SET action_context = $2::jsonb WHERE work_ticket_idx = $1",
-        work_ticket_idx,
-        json.dumps(context),
-    )
-
-
 async def test_assembly_gate_ignores_a_processing_idx_from_action_context(
     postgres_pool, monkeypatch, tmp_path
 ):
     """Both gate writes key on the processing_idx the runner MINTED, never on a
-    `processing_idx` in action_context.
+    `processing_idx` a submitter put in action_context — which reaches the
+    runner's bindings intact, see `minted_processing_idx` in `runner/_workflow.py`.
 
     The pre-mint StepNoData above is where the two differ: the mint never runs, so
     `bound` still carries whatever the submitter sent. Keyed off `bound`, this
     ticket closes a gate row belonging to another run of another identity for this
     sample — a row its submitter does not own."""
-    work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
     other = await _mint_unrelated_processing(postgres_pool)
-    await _inject_action_context(postgres_pool, work_ticket_idx, processing_idx=other)
-    # A live 'pending' row under the injected key, as a concurrent run of that
+    work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(
+        postgres_pool, extra_context={"processing_idx": other}
+    )
+    # A live 'pending' row under the submitted key, as a concurrent run of that
     # identity over this sample would have left.
     await postgres_pool.execute(
         "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
@@ -6025,20 +6009,21 @@ async def test_assembly_gate_ignores_a_processing_idx_from_action_context(
 async def test_assembly_gate_ignores_an_action_context_processing_idx_that_does_not_exist(
     postgres_pool, monkeypatch, tmp_path
 ):
-    """The same injection pointing at no qiita.processing row at all.
+    """The same submitted key pointing at no qiita.processing row at all.
 
     Keyed off action_context, the gate write raises ForeignKeyViolationError from
     inside the StepNoData handler, before the NO_DATA transition — leaving the
     ticket PROCESSING with NULL failure_* and reproducing on every `/run` redrive,
     because the resolver raises StepNoData deterministically. Keyed off the mint
     there is no key, so nothing is written and the ticket reaches NO_DATA."""
-    work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
     gone = (
         await postgres_pool.fetchval(
             "SELECT coalesce(max(processing_idx), 0) FROM qiita.processing"
         )
     ) + 10_000
-    await _inject_action_context(postgres_pool, work_ticket_idx, processing_idx=gone)
+    work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(
+        postgres_pool, extra_context={"processing_idx": gone}
+    )
     _stub_masked_reads(monkeypatch, tmp_path, empty=True)
     try:
         await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
@@ -6067,11 +6052,10 @@ async def test_assembly_gate_ignores_an_action_context_processing_idx_that_does_
 async def test_assembly_gate_declared_without_a_threaded_processing_idx_fails_at_submission(
     postgres_pool, monkeypatch, tmp_path
 ):
-    """`_workflow_needs_processing` and `_workflow_writes_assembly_gate` are
-    independent reads of `action.steps`. A workflow that declares the terminal
-    action without threading `processing_idx` has no key to write the gate row
-    under, so the run would produce contigs behind a gate that never materializes.
-    Refuse the ticket at submission instead."""
+    """A workflow that declares the terminal action without threading
+    `processing_idx` has no key to write the gate row under, and is refused at
+    the SUBMISSION stage rather than run — the guard in `runner/_workflow.py`
+    carries why the two declarations can come apart."""
     ungated_step = {k: v for k, v in _ASSEMBLY_GATE_STEPS[0].items() if k != "params"}
     work_ticket_idx, _mask_idx, prep_sample_idx, teardown = await _seed_assembly_ticket(
         postgres_pool,
@@ -6107,11 +6091,11 @@ async def test_assembly_gate_reopens_a_no_data_row_for_a_re_run_of_the_same_iden
     postgres_pool, monkeypatch, tmp_path
 ):
     """A re-run under the same params re-resolves the same processing_idx, so the
-    pre-loop pending write lands on the row the previous run closed at 'no_data'.
-    It has to reopen: 'no_data' says the run assembled nothing, and while the new
-    run is in flight that is a claim about a run that has not finished. The row
-    stays 'pending' when this run FAILs — the gate contract's stale-'pending' case
-    — rather than going on asserting the earlier run's outcome."""
+    pre-loop pending write lands on the row the previous run closed at 'no_data'
+    and reopens it — the rule and its reasoning are on
+    `repositories.assembly.create_assembly_sample_pending`. Pinned here end to
+    end: the same key, 'pending' while the second run is in flight, and still
+    'pending' after it FAILs (the gate contract's stale-'pending' case)."""
     first_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
     _stub_masked_reads(monkeypatch, tmp_path)
 
