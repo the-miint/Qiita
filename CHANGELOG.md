@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **A per-`prep_sample` alignment delete (#TBD).** The alignment delete surface had two
+- **A per-`prep_sample` alignment delete (#469).** The alignment delete surface had two
   scopes: `delete_alignment` (a whole `alignment_idx`) and `delete_alignment_block` (a
   block's member sub-ranges). A workflow that aligns one prep_sample per ticket fits
   neither — the whole-idx purge destroys every other sample's rows, and there is no block
@@ -1055,7 +1055,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **The replay registry's `delete_*` claim (#TBD).** `REPLAY_SAFE_ACTIONS`' comment said
+- **The replay registry's `delete_*` claim (#469).** `REPLAY_SAFE_ACTIONS`' comment said
   re-running a delete "deletes zero rows". That holds only for a replay with no write in
   between: `delete_read_mask_block` (in `read-mask-block`) and `delete_alignment_block`
   (in `align`) run as a pre-`register-files` replace, so a token replayed after that
@@ -1067,7 +1067,7 @@ duplicates further down are historical strata; leave them where they are.
   is corrected with it.
 
 - **`alignment_delete_covers_every_alignment_scoped_lake_table` now checks columns too
-  (#TBD).** It pinned that every `alignment_idx`-scoped lake table is in
+  (#469).** It pinned that every `alignment_idx`-scoped lake table is in
   `ALIGNMENT_DELETE_TABLES`, but not that a listed table carries the columns the delete
   clauses key on. `delete_lake_rows` applies one clause to every listed table, so a table
   joining the list without `prep_sample_idx` or `sequence_idx` makes the narrower deletes
