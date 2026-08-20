@@ -1001,17 +1001,10 @@ duplicates further down are historical strata; leave them where they are.
   hashes, against 1 row and 16 bytes for the byte-identical fixture whose second header's
   first token differs. A colliding run leaves the manifest, bin_map and chunks all
   well-formed, so nothing downstream can notice it. The id's last component is now
-  `read_fastx`'s `sequence_index` rather than the contig id — a 1-based ordinal over the
-  records of one file, restarting at 1 in the next — which makes
-  `kind:bin_id:sequence_index` unique by construction: `(kind, bin_id)` names exactly one
-  file (LCG and UNBINNED are a single file each, and `_file_meta` refuses two refined-bin
-  FASTAs that stem to one bin_id), and the ordinal is unique inside a file. That also
-  closes the other route to a repeated id: `:` is still not escaped, but a digits-only last
-  component fixes where the separators are, so bins `a:b.fa`/contig `c` and `a.fa`/contig
-  `b:c` compose `MAG:a:b:1` and `MAG:a:1` instead of `MAG:a:b:c` twice. Both passes derive
-  the id from their own scan of the same files, so the join between them rests on
-  `sequence_index` being the record's position rather than an artifact of one scan; that is
-  pinned against the real miint build in
+  `read_fastx`'s per-file ordinal `sequence_index` rather than the contig id, which makes
+  `kind:bin_id:sequence_index` unique by construction and also closes the other route to a
+  repeated id, an unescaped `:` inside a bin_id — the job module carries the argument, and
+  the two `sequence_index` facts it rests on are pinned against the real miint build in
   `qiita-compute-orchestrator/tests/jobs/test_read_fastx_miint_contract.py`. The contig id
   leaves the key and rides `bin_map` as its own `contig_id` column; nothing joins on it.
 
@@ -1021,9 +1014,7 @@ duplicates further down are historical strata; leave them where they are.
   `bin_map` and so in `qiita.assembly_membership` and the `bin_quality` join it feeds, both
   of which key a bin on `(prep_sample_idx, processing_idx, kind, bin_id)`. Measured as 1
   distinct `bin_id` in `bin_map` against 2 for the same pair renamed. `_file_meta` now
-  raises, naming both filenames — and that raise is what makes `(kind, bin_id)` name one
-  file for MAG, which the synthetic read_id above rests on: both files' ordinals start at 1,
-  so a shared bin_id would compose `MAG:bin.1:1` twice.
+  raises, naming both filenames; the synthetic read_id above rests on that raise too.
 
 - **xdist workers shared one miint extension directory, so they installed on top of
   each other (#462).** `setup_miint_test_env` named the directory per *component*

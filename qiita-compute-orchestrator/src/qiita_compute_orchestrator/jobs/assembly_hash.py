@@ -18,8 +18,7 @@ downstream (mint-features -> write-assembly-membership -> assembly_load):
     exactly like `hash_sequences`.
   - `bin_map.parquet` — `(read_id, kind, bin_id, contig_id)`, the per-contig bin
     membership `write-assembly-membership` / `assembly_load` join against.
-    `contig_id` is the assembler's own id for the record, carried beside the key
-    rather than inside it; nothing joins on it.
+    `contig_id` is the assembler's own id for the record; nothing joins on it.
 
 **The synthetic read_id is unique across the scan by construction.** Its last
 component is `read_fastx`'s `sequence_index`, a 1-based ordinal over the records of
@@ -118,6 +117,13 @@ _DUCKDB_THREADS = 4
 # multi-MB contig records can't materialise a giant chunk before the chunker runs.
 _READ_FASTX_MAX_BATCH_BYTES = "128MB"
 
+# The synthetic read_id (module docstring), over a `read_fastx rf` x `file_meta fm`
+# join. Both passes compose it and pass 2 joins `winner` on the string pass 1
+# composed, so a divergence between the two leaves a contig with no chunks.
+_READ_ID_EXPR = (
+    "fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) || ':' || CAST(rf.sequence_index AS VARCHAR)"
+)
+
 
 class Inputs(BaseModel):
     """Typed input contract for assembly_hash.
@@ -161,18 +167,15 @@ def _file_meta(genomes_dir: Path, refined_bins_dir: Path) -> list[tuple[str, str
     - LCG: the single `<genomes_dir>/circular.fa` multi-FASTA of circular contigs.
       `bin_id` is NULL — an LCG contig is its own genome, so its bin_id is the
       contig id itself (the read_fastx record id), COALESCE'd in the scan rather
-      than carried here. Two records of that one file whose headers share a first
-      token therefore land under one `(kind, bin_id)`, each keeping its own
-      read_id, feature and chunks.
+      than carried here.
     - UNBINNED: the single `<genomes_dir>/noLCG.fa` multi-FASTA, same NULL-bin_id
       shape as LCG. This row covers the WHOLE file; the residue subset is taken
       per record in `execute` (see the module docstring).
     - MAG: each refined-bin FASTA under `<refined_bins_dir>`; `bin_id` = the
-      filename stem (a bin groups many contigs under one file). Two files stemming
-      to one bin_id raise, which is what makes `(kind, bin_id)` name a single file
-      for this kind — the property the synthetic read_id's uniqueness rests on
-      (module docstring). `_FASTA_GLOBS` accepts several suffixes, so `bin.1.fa`
-      and `bin.1.fna` would otherwise be two bins the rest of the tail keys as one.
+      filename stem (a bin groups many contigs under one file). `_FASTA_GLOBS`
+      accepts several suffixes, so `bin.1.fa` and `bin.1.fna` stem to one bin_id;
+      that raises. The rest of the tail would key them as one bin, and the
+      synthetic read_id needs `(kind, bin_id)` to name one file (module docstring).
 
     Empty files are dropped (`read_fastx` raises on a 0-record input, and one empty
     path aborts the whole `VARCHAR[]` scan)."""
@@ -254,8 +257,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "  fm.kind AS kind, "
                 "  COALESCE(fm.bin_id, rf.read_id) AS bin_id, "
                 "  rf.read_id AS contig_id, "
-                "  fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) "
-                "|| ':' || CAST(rf.sequence_index AS VARCHAR) AS read_id, "
+                f"  {_READ_ID_EXPR} AS read_id, "
                 f"  {canonical_sequence_hash_expr('rf.sequence1')} AS sequence_hash, "
                 "  CAST(length(rf.sequence1) AS BIGINT) AS sequence_length_bp "
                 f"FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
@@ -328,9 +330,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"    FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
                 "      include_filepath:=true) rf "
                 "    JOIN file_meta fm ON rf.filepath = fm.filepath "
-                "    JOIN winner w ON w.read_id = "
-                "      (fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) || ':' "
-                "       || CAST(rf.sequence_index AS VARCHAR))"
+                f"    JOIN winner w ON w.read_id = ({_READ_ID_EXPR})"
                 "  )"
                 f") TO '{chunks_part_out}' ({PARQUET_OPTS_CHUNKED})",
                 [paths],

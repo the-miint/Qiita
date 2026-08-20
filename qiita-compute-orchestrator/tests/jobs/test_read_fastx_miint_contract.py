@@ -1,20 +1,11 @@
 """Real-miint contract pins for the `sequence_index` `read_fastx` assigns, which
 `assembly_hash` composes into its synthetic per-contig `read_id`.
 
-Upstream states the column as "1-based sequential index per file (resets to 1 for
-each file when reading multiple files)"
-(https://the-miint.github.io/duckdb-miint/reading/). Two halves of that are what
-`assembly_hash` rests on:
-
-  * Dense 1..N over ONE file, restarting at 1 in the next file of a multi-path
-    scan. The synthetic id is `kind:bin_id:sequence_index` and `(kind, bin_id)`
-    names one file, so a per-file ordinal makes the id unique; an ordinal that
-    restarted per BATCH would repeat inside a file.
-  * The same record takes the same ordinal in a second scan of the same bytes,
-    including one that batches the file differently. `assembly_hash` scans the
-    FASTAs twice — metadata first, then the chunk bytes — and joins the second
-    scan to the first on the composed id, so a scan-dependent ordinal would file
-    one contig's bytes under another contig's sequence_hash.
+Two halves of the column's upstream contract
+(https://the-miint.github.io/duckdb-miint/reading/) are what the id rests on, and
+what each test here pins: dense 1..N over ONE file, restarting at 1 in the next
+file of a multi-path scan; and the same record taking the same ordinal in a second
+scan of the same bytes. Why the id needs each is in the job module.
 
 Runs against the team-mirror miint build staged by the session-autouse fixture in
 tests/conftest.py (`open_miint_conn` is LOAD-only).

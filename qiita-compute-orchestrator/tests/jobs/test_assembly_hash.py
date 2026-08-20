@@ -127,9 +127,9 @@ def test_happy_path_manifest_bin_map_and_chunks(tmp_path):
         ]
     )
 
-    # bin_map: kind + bin_id per synthetic read_id, and the contig id the id itself
-    # no longer carries. Each LCG contig is its own bin (bin_id == contig id); the
-    # MAG's contigs share the file's bin_id, so `x1`/`x2` survive only here.
+    # bin_map: kind + bin_id per synthetic read_id, plus the contig id. Each LCG
+    # contig is its own bin (bin_id == contig id); the MAG's contigs share the
+    # file's bin_id, so `x1`/`x2` appear only under contig_id.
     bin_map = _rows(out["bin_map"], "read_id, kind, bin_id, contig_id", "read_id")
     assert bin_map == sorted(
         [
@@ -524,10 +524,9 @@ def test_the_residue_delete_leaves_the_survivors_ordinal_where_it_was(tmp_path):
 def test_a_colon_in_a_bin_id_composes_no_other_bins_id(tmp_path):
     """A bin_id holding the id's own separator still composes a distinct read_id.
 
-    `:` is not escaped. With a contig id as the last component, bin `a:b` / contig
-    `c` and bin `a` / contig `b:c` both compose `MAG:a:b:c`; with `sequence_index`
-    there the last `:` is always the one before the digits, so these two bins get
-    `MAG:a:b:1` and `MAG:a:1` and each keeps its own bytes.
+    `:` is not escaped; the composition is injective anyway (job module). Bin `a:b`
+    / contig `c` and bin `a` / contig `b:c` compose `MAG:a:b:1` and `MAG:a:1`, and
+    each keeps its own bytes.
     """
     seq_a, seq_b = "ACGTTGCAAGGGTTCA", "ggatccTTAACCggat"
     genomes, refined = _layout(tmp_path)
@@ -553,10 +552,8 @@ def test_a_colon_in_a_bin_id_composes_no_other_bins_id(tmp_path):
 def test_two_bin_files_stemming_to_one_bin_id_fail(tmp_path):
     """`bin.1.fa` + `bin.1.fna` are two bins the tail would key as one.
 
-    This raise is what makes `(kind, bin_id)` name a single MAG file, which is what
-    makes the synthetic read_id unique: each file's ordinals start at 1, so a shared
-    bin_id would compose `MAG:bin.1:1` twice. The control renames the second file
-    and both bins survive with their own bin_id.
+    The control renames the second file and both bins survive with their own
+    bin_id.
     """
     genomes, refined = _layout(tmp_path)
     _fasta(refined / "bin.1.fa", {"c1": "ACGTTGCAAGGGTTCA"})
