@@ -152,14 +152,15 @@ async def test_completed_upsert_closes_the_gate_and_is_idempotent(gate):
 
 async def test_no_data_upsert_closes_the_gate(gate):
     """The StepNoData path: assembly_hash found no contig, so the terminal action
-    never runs and this is what closes the row."""
+    never runs and this is what closes the row. Reports True — the write landed."""
     await _write_pending(gate)
     async with gate["pool"].acquire() as conn, conn.transaction():
-        await upsert_assembly_sample_no_data(
+        written = await upsert_assembly_sample_no_data(
             conn,
             processing_idx=gate["processing_idx"],
             prep_sample_idx=gate["prep_sample_idx"],
         )
+    assert written is True
     assert await _state(gate) == "no_data"
 
 
@@ -184,7 +185,8 @@ async def test_terminal_writers_stand_alone_without_a_pending_row(gate, writer, 
 
 async def test_no_data_does_not_overwrite_completed(gate):
     """'no_data' never walks a 'completed' row back — the guard on the DO UPDATE
-    in `upsert_assembly_sample_no_data`, which carries the reasoning."""
+    in `upsert_assembly_sample_no_data`, which carries the reasoning. Reports
+    False, so the caller can log the suppression instead of discarding it."""
     async with gate["pool"].acquire() as conn, conn.transaction():
         await upsert_assembly_sample_completed(
             conn,
@@ -192,11 +194,12 @@ async def test_no_data_does_not_overwrite_completed(gate):
             prep_sample_idx=gate["prep_sample_idx"],
         )
     async with gate["pool"].acquire() as conn, conn.transaction():
-        await upsert_assembly_sample_no_data(
+        written = await upsert_assembly_sample_no_data(
             conn,
             processing_idx=gate["processing_idx"],
             prep_sample_idx=gate["prep_sample_idx"],
         )
+    assert written is False
     assert await _state(gate) == "completed"
 
 

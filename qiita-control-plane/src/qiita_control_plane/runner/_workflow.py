@@ -762,11 +762,16 @@ async def run_workflow(
         # now-terminal ticket shows no stale "stuck retrying" reason.
         _log.info("workflow %d ended with no data: %s", work_ticket_idx, exc)
         # Close the assembly_sample gate (see `_record_assembly_gate_no_data`)
-        # before the transition, not after: a gate write that raises leaves the
-        # ticket non-terminal, which a `/run` redrive re-attempts (assembly_hash
-        # re-raises StepNoData deterministically). Transitioning first would
-        # strand a NO_DATA ticket behind a 'pending' gate with nothing left to
-        # move it.
+        # before the transition, not after. A raise here comes from inside an
+        # `except` handler, so this try's other handlers never see it: it escapes
+        # to `dispatch._run_and_log` and the ticket stays PROCESSING with NULL
+        # failure_*. Two things move it from there — a startup reconcile re-drive
+        # (`resume=True`), and an operator cancel followed by `/run`; `/run` alone
+        # 409s on PROCESSING. Either re-drive reaches this write again, because
+        # assembly_hash re-raises StepNoData deterministically. Transitioning
+        # first would leave a terminal NO_DATA ticket instead — reconcile skips
+        # terminal states and `/run` 409s on them — behind a 'pending' gate row
+        # with nothing left to move it.
         if (
             action is not None
             and _workflow_writes_assembly_gate(action.steps)

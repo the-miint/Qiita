@@ -36,7 +36,9 @@ duplicates further down are historical strata; leave them where they are.
   assembled no contig of any kind (the terminal action never runs on that path). Both key on
   the id the mint returned, never on `action_context` — a submitter can put a
   `processing_idx` key there and it reaches the runner's bindings intact. A re-run of the
-  same identity reopens `'no_data'` back to `'pending'` and leaves `'completed'` alone.
+  same identity reopens `'no_data'` back to `'pending'` and leaves `'completed'` alone; the
+  `'no_data'` write reports whether it landed, and the runner WARNs with the run and sample
+  when it did not, so the gate reading `'completed'` under a NO_DATA ticket is in the journal.
   `ActionDefinition` now refuses, at construction, an action that declares
   `finalize-assembly-sample` without threading `processing_idx` through some step's
   `params:` — the gate row would have no key. That covers the YAML sweep in CI and the

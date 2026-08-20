@@ -30,9 +30,15 @@
 --
 -- 'no_data' is a state value rather than a left-'pending' row or a 'completed'
 -- one. Left 'pending', the row says "still running" about a run that has ended
--- and will never move again. Written 'completed', it contradicts the ticket,
--- which reads NO_DATA over the same unit — this workflow is prep_sample-scoped,
--- so ticket and gate row describe the same (run, sample).
+-- and will never move again. Written 'completed', it claims contigs for a run
+-- that assembled none.
+--
+-- A row an EARLIER run of the same identity already drove to 'completed' is the
+-- one shape in which the row does read 'completed' under a ticket that ended
+-- NO_DATA: it is left standing rather than walked back, for the reason on
+-- repositories/assembly.py::upsert_assembly_sample_no_data. This workflow is
+-- prep_sample-scoped, so gate row and ticket describe the same (run, sample),
+-- and there the two disagree.
 --
 -- `state` is a deliberate TEXT + CHECK (no Postgres ENUM, no Pydantic twin) —
 -- the gate has no wire surface, so it stays out of the enum-parity discipline

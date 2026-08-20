@@ -25,6 +25,7 @@ from ..repositories.assembly import (
     upsert_assembly_sample_no_data,
 )
 from ..repositories.processing import mint_processing
+from ._base import _log
 from ._mask import MASK_IDX_BINDING
 
 # action_context key naming the step-1 assembler. Its default is single-sourced
@@ -154,8 +155,21 @@ async def _record_assembly_gate_no_data(
     sample produced no contig of any kind, which abandons the remaining entries —
     including `finalize-assembly-sample` — so without this write the row would sit
     at 'pending' for a run that has ended and will never move again.
+
+    The write's guard leaves a standing 'completed' row from an earlier run of the
+    same identity alone (reasoning on
+    `repositories.assembly.upsert_assembly_sample_no_data`); this logs when that
+    happens.
     """
     async with pool.acquire() as conn, conn.transaction():
-        await upsert_assembly_sample_no_data(
+        written = await upsert_assembly_sample_no_data(
             conn, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
+        )
+    if not written:
+        _log.warning(
+            "assembly_sample gate (processing %d, prep_sample %d) stays 'completed':"
+            " an earlier run of this identity assembled contigs, so this run's"
+            " 'no_data' is not written",
+            processing_idx,
+            prep_sample_idx,
         )

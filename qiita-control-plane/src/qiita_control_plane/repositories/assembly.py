@@ -138,8 +138,9 @@ async def upsert_assembly_sample_no_data(
     *,
     processing_idx: int,
     prep_sample_idx: int,
-) -> None:
-    """Write the `(processing_idx, prep_sample_idx)` gate row to 'no_data'.
+) -> bool:
+    """Write the `(processing_idx, prep_sample_idx)` gate row to 'no_data'; return
+    False when the guard left a standing 'completed' row alone.
 
     The other terminal writer: assembly_hash raised StepNoData, so the workflow
     stops before `finalize-assembly-sample` and the runner closes the gate here.
@@ -148,17 +149,25 @@ async def upsert_assembly_sample_no_data(
     the asymmetry with `upsert_assembly_sample_completed` above. An earlier run
     under the same processing_idx that reached 'completed' left contigs in
     DuckLake; a later run of that identity finding none does not remove them, so
-    writing 'no_data' over it would make the gate deny rows that are there.
+    writing 'no_data' over it would make the gate deny rows that are there. The
+    gate then reads 'completed' while the ticket that just ended reads NO_DATA
+    over the same (run, sample). The return value is what lets a caller say so —
+    `runner._processing._record_assembly_gate_no_data` logs it. Unlike the mask
+    twin (`repositories.block.upsert_mask_sample_completed`) this does not raise:
+    'completed' still describes contigs that are in DuckLake, so it remains the
+    answer a consumer asking for contigs needs.
     """
     require_transaction(conn)
-    await conn.execute(
+    written = await conn.fetchval(
         "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
         " VALUES ($1, $2, 'no_data')"
         " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = 'no_data'"
-        "   WHERE qiita.assembly_sample.state <> 'completed'",
+        "   WHERE qiita.assembly_sample.state <> 'completed'"
+        " RETURNING prep_sample_idx",
         processing_idx,
         prep_sample_idx,
     )
+    return written is not None
 
 
 async def fetch_assembly_sample_state(
