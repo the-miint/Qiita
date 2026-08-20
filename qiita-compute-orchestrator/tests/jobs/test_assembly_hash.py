@@ -7,11 +7,12 @@ below takes its reverse complement from the same miint scalar the production
 expression uses. Calls execute() directly.
 Covers: happy path (LCG + MAG, synthetic read_ids, hash-keyed chunks, dedup of
 identical contigs), synthetic-id disambiguation of a contig id reused across bins,
-soft-masked (lowercase) contigs folding onto their upper-case twin, the unbinned
-noLCG residue (its exclusion key, its bin_id, and what it does to a hash-collision
-group), the two identity collisions the step refuses (a repeated synthetic read_id
-in each of the three kinds, plus what its failure reports; and two bin files
-stemming to one bin_id), and empty -> StepNoData.
+soft-masked (lowercase) contigs folding onto their upper-case twin and which
+record's bytes that fold then stores, the unbinned noLCG residue (its exclusion
+key, its bin_id, and what it does to a hash-collision group), the two identity
+collisions the step refuses (a repeated synthetic read_id in each of the three
+kinds, plus what its failure reports; and two bin files stemming to one bin_id),
+and empty -> StepNoData.
 """
 
 from __future__ import annotations
@@ -52,12 +53,10 @@ def _rc(seq: str) -> str:
     """miint's `sequence_dna_reverse_complement` over the upper-cased sequence —
     the same call `canonical_sequence_hash_expr` makes for the second strand.
 
-    `upper()` wraps the argument because `sequence_dna_reverse_complement`
-    preserves case (https://the-miint.github.io/duckdb-miint/utilities/):
-    complement first and upper-case after, and a soft-masked base comes back
-    uncomplemented, folding the two strands under different alphabets. Cached
-    per distinct sequence — this is called from assertion sites rather than
-    from a fixture."""
+    `sequence_dna_reverse_complement` preserves case
+    (https://the-miint.github.io/duckdb-miint/utilities/), so `upper()` wraps the
+    argument, not the result. Cached per distinct sequence — this is called from
+    assertion sites rather than from a fixture."""
     with open_miint_conn() as conn:
         return conn.execute("SELECT sequence_dna_reverse_complement(upper(?))", [seq]).fetchone()[0]
 
@@ -100,7 +99,10 @@ def test_happy_path_manifest_bin_map_and_chunks(tmp_path):
     # circular.fa is a single multi-FASTA of circular contigs; each record is its
     # OWN LCG genome, so its bin_id IS the contig id (from the read, not a filename)
     # — no per-contig split step.
-    _fasta(genomes / "circular.fa", {"c1": "AAAACCCCGGGGTTTT", "c2": "GGGGAAAATTTTCCCC"})
+    # c2 is not a reverse-complement palindrome and its RC hashes lower than it
+    # does, so its `_hash` comparison exercises the strand fold; the other three
+    # fixtures are palindromes, where the fold is the identity.
+    _fasta(genomes / "circular.fa", {"c1": "AAAACCCCGGGGTTTT", "c2": "GGGGAAAACCCCTTTT"})
     _fasta(refined / "bin.1.fa", {"x1": "ACGTACGTACGTACGT", "x2": "TTTTGGGGCCCCAAAA"})
 
     out = _run(
@@ -119,7 +121,7 @@ def test_happy_path_manifest_bin_map_and_chunks(tmp_path):
     assert manifest == sorted(
         [
             ("LCG:c1:c1", str(_hash("AAAACCCCGGGGTTTT")), 16),
-            ("LCG:c2:c2", str(_hash("GGGGAAAATTTTCCCC")), 16),
+            ("LCG:c2:c2", str(_hash("GGGGAAAACCCCTTTT")), 16),
             ("MAG:bin.1:x1", str(_hash("ACGTACGTACGTACGT")), 16),
             ("MAG:bin.1:x2", str(_hash("TTTTGGGGCCCCAAAA")), 16),
         ]
@@ -253,6 +255,13 @@ def test_soft_masked_contigs_hash_as_their_upper_case_twin(tmp_path):
     a palindrome (so the fold is not the identity) and `md5(min(strand))` differs
     from `min(md5(strand))` on it (so a LEAST moved back over the sequences fails
     here rather than passing by coincidence).
+
+    Which of the three records' bytes land in the chunks is asserted too. The
+    representative is `DISTINCT ON (sequence_hash) ... ORDER BY sequence_hash,
+    read_id`, which picks `LCG:c1:c1` here, and its bytes are chunked as read —
+    so the stored strand and casing follow that tie-break. The lake replaces
+    these chunks by `feature_idx`, so the bytes a load stores are the ones a
+    reader reassembles.
     """
     genomes, refined = _layout(tmp_path)
     seq = "GCTAAAGACAATTACA"
@@ -270,16 +279,16 @@ def test_soft_masked_contigs_hash_as_their_upper_case_twin(tmp_path):
         ("LCG:c2:c2", str(_hash(seq.lower()))),
         ("LCG:c3:c3", str(_hash(_rc(seq).lower()))),
     ]
-    # Three records, one canonical sequence -> one feature, so one chunk set.
+    # Three records, one canonical sequence -> one feature, so one chunk set, and
+    # the reassembled bytes are the winning record's, byte for byte.
     assert len({h for _, h in manifest}) == 1
     glob = str(out["assembly_chunks"] / "part_*.parquet")
     with duckdb.connect(":memory:") as con:
-        assert (
-            con.execute(
-                f"SELECT count(DISTINCT sequence_hash) FROM read_parquet('{glob}')"
-            ).fetchone()[0]
-            == 1
-        )
+        assert con.execute(
+            "SELECT CAST(sequence_hash AS VARCHAR), "
+            "string_agg(chunk_data, '' ORDER BY chunk_index) "
+            f"FROM read_parquet('{glob}') GROUP BY sequence_hash"
+        ).fetchall() == [(str(_hash(seq)), seq)]
 
 
 def test_hash_equal_nolcg_records_share_the_residue_verdict(tmp_path):

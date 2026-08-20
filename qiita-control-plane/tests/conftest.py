@@ -34,6 +34,7 @@ from qiita_control_plane.testing.sessions import (  # noqa: E402, F401
     regular_user_session,
     wet_lab_admin_session,
 )
+from qiita_control_plane.testing.terminology import created_terminologies  # noqa: E402, F401
 
 
 @pytest.fixture(scope="session", autouse=True)

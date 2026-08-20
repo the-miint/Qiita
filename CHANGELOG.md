@@ -22,6 +22,65 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **NCBI Taxonomy releases read from a taxdump archive (#439).**
+  `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
+  into the term rows of a release, so taxa no longer arrive as hand-written seed
+  migrations. A live taxon takes its scientific name as its label and its genbank
+  common name as its second name; a taxon NCBI merged away becomes an obsolete
+  term pointing at the taxon it merged into; and a taxon NCBI deleted outright
+  becomes an obsolete term with no replacement, so a reload never mistakes
+  routine NCBI deletion for a terminology that silently lost terms. The archive
+  is read in place, with nothing unpacked, through duckdb-miint's taxdump
+  readers, so a member whose row layout contradicts what the taxdump documents
+  refuses the read naming the line at fault — as does an archive recording one
+  taxon as live, merged, and deleted at once. Term rows land in taxon-id order,
+  so the same archive always yields the same release digest.
+
+- **`terminology_term.alternate_label` — a second name for a term (#439).** Holds the
+  name a source vocabulary supplies alongside the one that becomes the term's
+  label; for NCBI Taxonomy the label is the scientific name and this is the
+  genbank common name, which would otherwise be dropped and is what a person
+  looking for a taxon is most likely to type. Nullable and single-valued, and
+  bounded to the same width as the label so it stays a name rather than
+  accumulating free-text definitions; an empty string is rejected, leaving NULL
+  as the only spelling of absence. A release's terms table carries it and is
+  authoritative for it, so a release supplying no second name clears any value
+  stored against the term. A resolved terminology term carries it through
+  metadata reads.
+
+- **`qiita-admin terminology` — prepare and load an ontology release (#439).**
+  `robot-command` prints the ROBOT export command to run against a staged OWL file;
+  nothing in the control plane executes ROBOT, on any host. `prepare-owl` turns that
+  export into the three files `load` consumes — a terms table, a header-only closure
+  stub, and a manifest declaring the digests of both — recording a deprecated class
+  as obsolete and an absorbed one as merged into the class that absorbed it, and
+  keeping only the term ids of a chosen prefix so classes imported from other
+  vocabularies stay out. Neither prepare command computes subsumption, so a loaded
+  terminology resolves terms while subsumption queries have nothing to answer from.
+  `load` takes the three files individually, verifies both tables against the
+  manifest before parsing either, applies the release in one transaction, and reports
+  how many terms were inserted, relabelled, obsoleted, or merged.
+  `--tolerate-anomalies` absorbs three anomalies instead of refusing the load:
+  terms the release silently dropped are auto-obsoleted, an unresolvable replacement
+  pointer is recorded as a note, and a closure row naming an endpoint the release
+  does not define is dropped, which lowers the reported closure count. A live term
+  carrying a replacement pointer refuses the load either way.
+
+- **What a terminology release must be (#439).** A manifest may name its tables only
+  by bare filename, so no declared path can reach outside the directory the manifest
+  itself sits in. A release may not reference a term it does not define — an obsolete
+  term's replacement pointer and both endpoints of every closure row have to resolve
+  within the release itself. Term rows are upserted, never replaced, so any term
+  already referenced by biosample metadata stays resolvable; obsoletion is recorded
+  on the row instead. A term the source does not name keeps the label already stored
+  for it, falling back to its own term id when the database holds nothing, so a
+  release that retires a term id without naming it cannot overwrite the name the term
+  was loaded under. Each of a term's two names has its own counter, so a reload that
+  changes only second names reports what moved rather than all zeros.
+  `TerminologyStatus` and `TerminologyTermObsoletionKind` now live in
+  `qiita_common.models.terminology` rather than `models.reference`; both stay
+  importable from `qiita_common.models`.
+
 - **Unbinned assembly contigs are stored, as a third `assembly_membership` kind (#460).**
   `assembly_hash` hashes the `noLCG.fa` residue — the contigs no DAS_Tool-refined bin
   claimed — alongside the circular genomes and the refined MAGs, so they are minted a
@@ -1031,6 +1090,22 @@ duplicates further down are historical strata; leave them where they are.
   `bin_quality`'s delete now reads the keys `assembly_membership` names in the same
   registration, which carries the run's key on every row and is never empty where the load
   runs at all (`assembly_hash` raises `StepNoData` at zero contigs of any kind).
+  The file stated the delete's cost twice and the two disagreed: `LAKE_COMMIT_BUDGET` read a
+  40k/400k timing as "the DELETE's cost does not grow with the table … so it prunes rather
+  than scanning", while `replace_key_delete_sql` 25 lines above said a `feature_idx` set does
+  not prune. That timing was taken on a contiguous incoming key set, which neither comment
+  said. `replace_key_delete_sql` is now the only site that states it, and the budget points
+  there: what the delete reads follows the SPREAD of the incoming key set against the
+  per-file key ranges, not the key's arity and not the table's size. Measured on DuckDB
+  1.5.4 / ducklake d318a545 — a composite `(prep_sample_idx, processing_idx)` pair scans
+  17,544 rows of 1,000,008 and opens 1 of 57 files; a `feature_idx` set spread over the
+  identity space scans 1,003,121 of 1,003,200 and opens all 57; a `feature_idx` set confined
+  to one narrow window scans 17,602 of 1,003,200 and still opens all 57; a contiguous
+  `feature_idx` block scans 2,000 rows and opens 1 file at both 40k rows over 20 files and
+  400k over 200, where the same key count spread over the identity space scans 39,982 of
+  40,000 and 399,819 of 400,000. The `WITH … DELETE … USING` comparison now reports the mean
+  paired difference and its interval (-0.8 to +1.0 ms across four key sets on statements of
+  3-37 ms, widest 95% CI [-3.2, +2.9] ms) rather than a bare non-significant p-value.
 
 - **`test_assembly_hash`'s canonical-hash oracle mis-complemented a soft-masked contig
   (#460).** Its hand-rolled reverse complement translated through an upper-case-only table
@@ -1043,6 +1118,15 @@ duplicates further down are historical strata; leave them where they are.
   case. The `LEAST`-over-hashes composition is still re-derived in Python, so a change to
   how the two hashes combine still fails the oracle. A soft-masked fixture covers it; every
   sequence the file hashed before was either upper-case or a palindrome.
+  `read_fastx` preserves input case (probed: an all-upper control record comes back
+  unchanged, its lowercase twin comes back lowercase), so the soft-masked fixture reaches
+  `canonical_sequence_hash_expr` still lowercase and the test pins the `upper()` inside that
+  expression rather than a transformation the reader already did. That test now also pins
+  which record's bytes reach the chunks: the fold keeps one representative per hash
+  (`DISTINCT ON (sequence_hash) … ORDER BY sequence_hash, read_id`) and chunks it as read, so
+  a different tie-break stores a different strand and casing with every hash assertion
+  unmoved. One happy-path fixture is no longer a reverse-complement palindrome, so its
+  `_hash` comparison exercises the fold instead of the identity.
 
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
   (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
