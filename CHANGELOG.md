@@ -23,7 +23,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Added
 
 - **`qiita_lake.alignment_origin_spanning`, a side table for reads that cross a circular
-  contig's origin (#466).** An aligner treats a circular contig as a linear one, so a read
+  contig's origin (#465).** An aligner treats a circular contig as a linear one, so a read
   crossing the origin emits one SAM record per side of it, each covering only its own share
   of the query. The new table records the merged read — query interval, reference interval,
   strand, pooled identity and coverage, fragment count — one row per (read, feature), while
@@ -39,7 +39,7 @@ duplicates further down are historical strata; leave them where they are.
   `alignment_delete_covers_every_alignment_scoped_lake_table` pins the list against the
   catalog, so a future table keyed by `alignment_idx` cannot skip the purge.
 
-- **A contract test for how miint's minimap2 reports an origin-spanning read (#466).**
+- **A contract test for how miint's minimap2 reports an origin-spanning read (#465).**
   Upstream documents the behaviour and ships the pooling for it
   (`circular_query_coverage`, `cigar_pooled_identity`); what this test pins is the tie to
   our own floor. Measured on miint `9fc4d12` (minimap2 `0477498`), 20 kb contig and a 6 kb
@@ -54,7 +54,7 @@ duplicates further down are historical strata; leave them where they are.
   `test_origin_spanning_read_splits_into_one_record_per_side`.
 
 - **`docs/duckdb-miint.md` records that `cigar_query_coverage` is per-record, and what
-  that costs us today (#466).** The entry links upstream's circular-coverage contract
+  that costs us today (#465).** The entry links upstream's circular-coverage contract
   rather than restating it, and states the standing consequence: because `align_sharded`
   scores the floor per SAM record, long reads crossing the origin of a circular reference
   contig are dropped before they reach `alignment` — silently, and concentrated on closed
