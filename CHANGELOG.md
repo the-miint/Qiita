@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **Assembly completion is first-class state: `qiita.assembly_sample` (#465).**
+- **Assembly completion is first-class state: `qiita.assembly_sample` (#466).**
   The per-`(processing_idx, prep_sample)` gate `long-read-assembly` was missing, alongside
   `qiita.mask_sample` and `qiita.alignment_sample`. Completion existed only as work-ticket
   state, so a consumer asking "is this sample's assembly done?" had to infer it from row

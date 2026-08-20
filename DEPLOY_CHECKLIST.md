@@ -49,7 +49,7 @@ _None yet._
   backfill them is a separate decision. The migrate→restart window has the same shape — an
   assembly ticket completing between bucket 3 and the bucket-4 restart runs under old code
   that writes no gate row. Re-submitting such a sample after the restart is admitted and
-  re-writes it (no disallow-without-delete site applies to `long-read-assembly`). (#465)
+  re-writes it (no disallow-without-delete site applies to `long-read-assembly`). (#466)
 
 ### 4. Deploy
 
@@ -76,14 +76,14 @@ _None yet._
   neither adding a bind mount, resource, or env var: the `assembly_hash` step reads one more
   file (`noLCG.fa`) out of the `genomes_dir` it already binds (#460), and a terminal
   `finalize-assembly-sample` entry was appended after `register-files` — an in-process
-  control-plane primitive writing the `qiita.assembly_sample` gate, not a SLURM step (#465).
+  control-plane primitive writing the `qiita.assembly_sample` gate, not a SLURM step (#466).
   Confirm the second landed: under a stale synced copy every new assembly's gate row stays
   at `pending`.
   ```bash
   sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
   psql "$DATABASE_URL" -Atc "SELECT steps::text LIKE '\''%finalize-assembly-sample%'\'' FROM qiita.action WHERE action_id = '\''long-read-assembly'\'' AND version = '\''1.0.0'\'';"'
   ```
-  Expect `t`. (#465)
+  Expect `t`. (#466)
 
 ### 6. After the deploy verifies green
 
