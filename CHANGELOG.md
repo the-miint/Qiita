@@ -40,13 +40,27 @@ duplicates further down are historical strata; leave them where they are.
   catalog, so a future table keyed by `alignment_idx` cannot skip the purge.
 
 - **A contract test for how miint's minimap2 reports an origin-spanning read (#465).**
-  Upstream documents no circular handling, and the side table above rests on the answer.
-  Measured on miint `9fc4d12` (minimap2 `0477498`), 20 kb contig and a 6 kb read built
-  across the origin: 2 SAM records, each `cigar_query_coverage` 0.5 at
-  `cigar_sequence_identity` 1.0, under `map-hifi`, `map-ont` and the default preset, with
-  `string_agg(cigar, '')` over the pair also scoring 0.5. The control — a read of the same
-  length from the middle of the same contig — gives one record at coverage 1.0.
+  Upstream documents the behaviour and ships the pooling for it
+  (`circular_query_coverage`, `cigar_pooled_identity`); what this test pins is the tie to
+  our own floor. Measured on miint `9fc4d12` (minimap2 `0477498`), 20 kb contig and a 6 kb
+  read built across the origin: 2 SAM records, each `cigar_query_coverage` 0.5 at
+  `cigar_sequence_identity` 1.0, under `map-hifi`, `map-ont` and the default preset.
+  Concatenated with `string_agg(cigar, '')` the pair scores 0.5 coverage but 1.0 identity
+  — a clip consumes query length without being an aligned column — while
+  `circular_query_coverage` returns 1.0 coverage over 2 fragments. The control, a read of
+  the same length from the middle of the same contig, gives one record at coverage 1.0.
+  Every score is asserted against `_MIN_QUERY_COVERAGE_MINIMAP2`, so lowering that floor
+  turns the test red instead of silently invalidating the side table's DDL scope claim.
   `test_origin_spanning_read_splits_into_one_record_per_side`.
+
+- **`docs/duckdb-miint.md` records that `cigar_query_coverage` is per-record, and what
+  that costs us today (#465).** The entry links upstream's circular-coverage contract
+  rather than restating it, and states the standing consequence: because `align_sharded`
+  scores the floor per SAM record, long reads crossing the origin of a circular reference
+  contig are dropped before they reach `alignment` — silently, and concentrated on closed
+  chromosomes, plasmids and phages. Also corrects the `align_minimap2` entry: `query_table`
+  is the only positional argument, and `subject_table` / `index_path` are exactly-one-of
+  rather than independently optional.
 - **Unbinned assembly contigs are stored, as a third `assembly_membership` kind (#460).**
   `assembly_hash` hashes the `noLCG.fa` residue — the contigs no DAS_Tool-refined bin
   claimed — alongside the circular genomes and the refined MAGs, so they are minted a

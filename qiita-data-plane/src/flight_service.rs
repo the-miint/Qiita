@@ -2936,6 +2936,10 @@ fn delete_read_mask_block(
 /// without joining this list.
 const ALIGNMENT_DELETE_TABLES: &[&str] = &["alignment", "alignment_origin_spanning"];
 
+/// Both deletes read the leading count as `counts[0]`, which panics on an empty
+/// list. Emptying the list is a build failure instead.
+const _: () = assert!(!ALIGNMENT_DELETE_TABLES.is_empty());
+
 /// Delete `where_clause`'s rows from each of `tables`, in order, returning one
 /// count per table positionally. The shared body of `delete_alignment` and
 /// `delete_alignment_block`; each builds its own clause and shapes its own
@@ -3623,6 +3627,24 @@ mod tests {
             .unwrap_or_else(|_| "/tmp/qiita-integration-ducklake-data".to_string());
         std::fs::create_dir_all(&data_path).unwrap();
         data_path
+    }
+
+    /// Lay down every lake table the data plane creates at boot, in `main.rs`'s
+    /// order (exclusion last — its `_visible` views join reference + alignment).
+    ///
+    /// The catalog-shape tests below decide what belongs in a registry by QUERYING
+    /// the catalog, so each one is only as complete as the tables its connection
+    /// happens to hold: a table this function does not create is invisible to the
+    /// shape query and joins no registry, silently. Adding an `ensure_*` here is
+    /// what keeps that a one-place edit instead of one per test.
+    #[cfg(feature = "integration")]
+    fn setup_full_lake(conn: &duckdb::Connection) {
+        ducklake::ensure_reference_tables(conn).unwrap();
+        ducklake::ensure_read_tables(conn).unwrap();
+        ducklake::ensure_alignment_tables(conn).unwrap();
+        ducklake::ensure_assembly_tables(conn).unwrap();
+        ducklake::ensure_registration_lock(conn).unwrap();
+        ducklake::ensure_exclusion_tables(conn).unwrap();
     }
 
     /// Orphan-only sequence deletion: a feature owned by another reference
@@ -5676,8 +5698,7 @@ mod tests {
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-        ducklake::ensure_reference_tables(&conn).unwrap();
-        ducklake::ensure_assembly_tables(&conn).unwrap();
+        setup_full_lake(&conn);
 
         for entry in REPLACE_KEY_TABLES {
             let table = entry.table;
@@ -5712,10 +5733,7 @@ mod tests {
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-        ducklake::ensure_reference_tables(&conn).unwrap();
-        ducklake::ensure_assembly_tables(&conn).unwrap();
-        ducklake::ensure_read_tables(&conn).unwrap();
-        ducklake::ensure_alignment_tables(&conn).unwrap();
+        setup_full_lake(&conn);
 
         // Content-addressed shape: keyed by feature_idx, carrying sequence bytes or
         // their hash, and scoped by nothing else. Matching the shape rather than an
@@ -5777,11 +5795,7 @@ mod tests {
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-        ducklake::ensure_reference_tables(&conn).unwrap();
-        ducklake::ensure_assembly_tables(&conn).unwrap();
-        ducklake::ensure_read_tables(&conn).unwrap();
-        ducklake::ensure_alignment_tables(&conn).unwrap();
-        ducklake::ensure_exclusion_tables(&conn).unwrap();
+        setup_full_lake(&conn);
 
         let mut stmt = conn
             .prepare(

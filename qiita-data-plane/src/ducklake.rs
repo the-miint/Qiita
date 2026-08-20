@@ -476,16 +476,30 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- it — more when the read is longer than the contig and wraps past the
         -- origin more than once. Identity and mapq do not separate those records
         -- from any other good alignment; query coverage does, because each covers
-        -- only its own share of the read. Upstream does not document this;
-        -- `test_origin_spanning_read_splits_into_one_record_per_side` measures it
-        -- against the shipped miint and carries the numbers. The fragment rows
-        -- stay in `alignment` unchanged, one per SAM record with its CIGAR; only
-        -- the merged read is recorded here, and only where the evidence exists.
+        -- only its own share of the read. Upstream documents the behaviour and
+        -- ships the aggregate that pools it —
+        -- https://the-miint.github.io/duckdb-miint/alignment_analysis/#circular-query-coverage
+        -- — and `test_origin_spanning_read_splits_into_one_record_per_side` pins
+        -- the per-record numbers our own gate turns on. The fragment rows stay in
+        -- `alignment` unchanged, one per SAM record with its CIGAR; only the
+        -- merged read is recorded here, and only where the evidence exists.
         --
-        -- Scope: this describes rows written by a producer whose query-coverage
-        -- gate is pooled over a read's fragments, because that is what admits the
-        -- fragments to `alignment` in the first place. The sharded reference
-        -- aligner is not such a producer. `align_sharded`'s phase-1 COPY applies
+        -- Scope: this describes rows written by a producer that scores a read the
+        -- way miint's `circular_query_coverage` does — pooling the fragments'
+        -- QUERY INTERVALS, i.e. the union of the query bases they align over the
+        -- read length — because that is what admits the fragments to `alignment`
+        -- in the first place. Pooling a CONCATENATED CIGAR is a different number
+        -- and does not admit them: each fragment clips the other's share of the
+        -- read and that clip re-enters `cigar_query_coverage`'s denominator, so
+        -- `string_agg(cigar, '')` over an origin-spanning pair scores what one
+        -- fragment alone scores. The concatenating form is the only pooled
+        -- query-coverage gate in the repo (`align_sharded`'s phase-2 QUALIFY), so
+        -- extending that gate to the single-end arm admits nothing and leaves this
+        -- table empty. Identity is unaffected by the same concatenation — a clip
+        -- is not an aligned column, so it never enters the denominator.
+        --
+        -- The sharded reference aligner is not a producer as it stands, either.
+        -- `align_sharded`'s phase-1 COPY applies
         -- `_MIN_QUERY_COVERAGE_MINIMAP2` per SAM record on the way into the
         -- staging Parquet, and minimap2 serves only the single-end long-read arm
         -- there (`align_planner._ALIGNER_BY_PLATFORM`), so an origin-spanning
@@ -545,7 +559,16 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             -- join back to those rows; carried here so this table stands alone,
             -- since reverse is where the interval interpretation flips.
             is_reverse      BOOLEAN,
-            -- The pooled scores that admitted the read. Recorded nowhere else.
+            -- The pooled scores that admitted the read. Defined as miint's
+            -- `circular_query_coverage` defines them, so two producers cannot fill
+            -- these columns with different numbers: `pooled_coverage` is its
+            -- `coverage` (the fragments' query intervals unioned, over the read
+            -- length) and `pooled_identity` is its `identity`, which it takes from
+            -- `cigar_pooled_identity` — matching bases over aligned bases across
+            -- the fragments, not a mean of their per-fragment identities. The
+            -- upstream link in the table note above carries both. Recorded nowhere
+            -- else: `alignment` carries the per-fragment CIGARs these are pooled
+            -- from, not the pooled result.
             pooled_identity DOUBLE,
             pooled_coverage DOUBLE,
             -- SAM records merged into this row. BIGINT so a producer's count(*)
