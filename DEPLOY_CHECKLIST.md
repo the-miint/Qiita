@@ -48,7 +48,7 @@ _None yet._
   decision. The migrate→restart window has the same shape — an
   assembly ticket completing between bucket 3 and the bucket-4 restart runs under old code
   that writes no gate row. Re-submitting such a sample after the restart is admitted and
-  re-writes it (no disallow-without-delete site applies to `long-read-assembly`). (#466)
+  re-writes it (no disallow-without-delete site applies to `long-read-assembly`). (#467)
 
 ### 4. Deploy
 
@@ -75,7 +75,7 @@ _None yet._
   neither adding a bind mount, resource, or env var: the `assembly_hash` step reads one more
   file (`noLCG.fa`) out of the `genomes_dir` it already binds (#460), and a terminal
   `finalize-assembly-sample` entry was appended after `register-files` — an in-process
-  control-plane primitive writing the `qiita.assembly_sample` gate, not a SLURM step (#466).
+  control-plane primitive writing the `qiita.assembly_sample` gate, not a SLURM step (#467).
   Confirm the second landed: all three `qiita.assembly_sample` writes are gated on the
   terminal entry being present in the synced `steps`, so under a stale copy no gate row is
   written at all and the table stays empty — which reads like a migration that did not
@@ -86,7 +86,7 @@ _None yet._
   ```
   Expect `t`. `f` is the stale copy. **Empty output** is a third outcome, not a pass: `-Atc`
   prints nothing for zero rows, so it means no `long-read-assembly` 1.0.0 row matched at
-  all. Re-run `qiita-admin actions sync` for either. (#466)
+  all. Re-run `qiita-admin actions sync` for either. (#467)
 
 ### 6. After the deploy verifies green
 
