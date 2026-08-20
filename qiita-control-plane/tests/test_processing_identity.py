@@ -6,8 +6,6 @@ here we cover the pure params-shape + gate logic.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from qiita_common.actions import WorkflowAction, WorkflowStep
 
 from qiita_control_plane.runner._processing import (
@@ -17,20 +15,32 @@ from qiita_control_plane.runner._processing import (
 )
 
 
-def _step(**kw) -> SimpleNamespace:
-    return SimpleNamespace(params=kw.get("params", {}))
+def _step(params: dict[str, str] | None = None) -> WorkflowStep:
+    return WorkflowStep(
+        kind="step",
+        name="assembly_load",
+        step_type="singleton",
+        module="qiita_compute_orchestrator.jobs.assembly_load",
+        params=params or {},
+        baseline_resources={"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    )
 
 
 def test_workflow_needs_processing_gate():
     """A step threading processing_idx via params: signals the runner to mint."""
-    threads = [_step(params={"processing_idx": "processing_idx"})]
+    threads = [_step({"processing_idx": "processing_idx"})]
     assert _workflow_needs_processing(threads) is True
 
-    other = [_step(params={"assembler": "assembler"})]
+    other = [_step({"assembler": "assembler"})]
     assert _workflow_needs_processing(other) is False
 
     none = [_step()]
     assert _workflow_needs_processing(none) is False
+
+    # An `action:` entry has no `params:` field at all, so it can never carry the
+    # signal — what lets the shared predicate narrow on WorkflowStep.
+    gate_only = [WorkflowAction(kind="action", name="finalize-assembly-sample")]
+    assert _workflow_needs_processing(gate_only) is False
 
 
 def test_build_processing_params_shape_and_assembler_default():

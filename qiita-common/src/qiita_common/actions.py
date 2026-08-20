@@ -25,7 +25,7 @@ union keyed on `kind` for the WorkflowStep / WorkflowAction Pydantic arms.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import timedelta
 from typing import Annotated, Any, Literal
 
@@ -57,9 +57,8 @@ NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 # The runner binding name the minted processing_idx travels under. A step names it
 # as the value side of a `params:` pair (`processing_idx: processing_idx` ->
 # <job>.Inputs.processing_idx), which both signals the runner to mint the run
-# identity before the step loop and carries the value into the step. Defined here
-# so the load-time validator on ActionDefinition below and the runner's own
-# pre-loop check read one value rather than re-typing the string.
+# identity before the step loop and carries the value into the step. Read through
+# `action_threads_processing_idx` below, the one predicate that tests for it.
 PROCESSING_IDX_BINDING = "processing_idx"
 
 
@@ -424,6 +423,30 @@ WorkflowEntry = Annotated[
 ]
 
 
+def action_threads_processing_idx(steps: Iterable[WorkflowEntry]) -> bool:
+    """True iff some entry threads PROCESSING_IDX_BINDING through its `params:`.
+
+    The single statement of the rule, for the two sites that have to agree on
+    it: `ActionDefinition._assembly_gate_declares_a_processing_identity` below
+    refuses an action declaring the terminal `finalize-assembly-sample` entry
+    without it, and the control-plane runner mints the run identity before its
+    step loop when it holds (`runner._processing._workflow_needs_processing`).
+    A second implementation drifts in one of two directions. Stricter here than
+    in the runner, the validator refuses an action the runner would have run —
+    and `load_actions` propagates the ValidationError, so that fails the whole
+    `workflows/` sweep rather than the one action. Looser here, the runner stops
+    minting under a gate that still declares itself.
+
+    Only `step:` entries can thread anything — `WorkflowAction` carries no
+    `params` field.
+    """
+    return any(
+        PROCESSING_IDX_BINDING in entry.params.values()
+        for entry in steps
+        if isinstance(entry, WorkflowStep)
+    )
+
+
 class ActionDefinition(BaseModel):
     """Top-level action definition. YAML is source-of-truth; the sync routine
     upserts the YAML-authoritative columns into qiita.action.
@@ -570,10 +593,7 @@ class ActionDefinition(BaseModel):
             isinstance(e, WorkflowAction) and e.name == LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE
             for e in self.steps
         )
-        if declares_gate and not any(
-            PROCESSING_IDX_BINDING in (getattr(e, "params", None) or {}).values()
-            for e in self.steps
-        ):
+        if declares_gate and not action_threads_processing_idx(self.steps):
             raise ValueError(
                 f"an action declaring the {LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE} "
                 f"entry must thread {PROCESSING_IDX_BINDING!r} through some step's "

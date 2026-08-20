@@ -9,6 +9,7 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import (
+    PROCESSING_IDX_BINDING,
     ActionCeiling,
     ActionDefinition,
     WorkflowAction,
@@ -78,7 +79,6 @@ from ._mask import (
 )
 from ._processing import (
     ASSEMBLER_BINDING,
-    PROCESSING_IDX_BINDING,
     _create_assembly_gate_pending,
     _mint_processing_idx,
     _record_assembly_gate_no_data,

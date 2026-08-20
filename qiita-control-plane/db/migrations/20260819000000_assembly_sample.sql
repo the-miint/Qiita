@@ -80,9 +80,10 @@ COMMENT ON TABLE qiita.assembly_sample IS
     'Completion is this column''s value: the presence of '
     'qiita.assembly_membership or DuckLake rows does not imply it, because the '
     'assembly tail writes those across several workflow entries. ''completed'' '
-    'and ''no_data'' are terminal for the run; ''pending'' and a missing row '
-    'both mean the run is not over. Twin of qiita.mask_sample / '
-    'qiita.alignment_sample.';
+    'and ''no_data'' are terminal for the run; what ''pending'' and a missing '
+    'row do and do not tell a consumer is the read contract at '
+    'repositories/assembly.py::fetch_assembly_sample_state. Twin of '
+    'qiita.mask_sample / qiita.alignment_sample.';
 
 -- The PRIMARY KEY leads with processing_idx, and every gate function in
 -- repositories/assembly.py supplies both key columns, so it serves all of them.

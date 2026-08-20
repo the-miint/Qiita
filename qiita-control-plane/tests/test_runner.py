@@ -5893,7 +5893,7 @@ async def test_assembly_gate_closes_at_no_data_when_a_step_produced_none(
     backend = FakeBackendClient()
 
     async def _no_data(*_args, **_kwargs):
-        raise StepNoData(step_name="assembly_load", reason="no contigs to hash")
+        raise StepNoData(step_name="assembly_hash", reason="no contigs to hash")
 
     monkeypatch.setattr(backend, "run_step", _no_data)
     try:
@@ -5931,7 +5931,7 @@ async def test_assembly_gate_write_that_raises_leaves_a_recoverable_ticket(
     backend = FakeBackendClient()
 
     async def _no_data(*_args, **_kwargs):
-        raise StepNoData(step_name="assembly_load", reason="no contigs to hash")
+        raise StepNoData(step_name="assembly_hash", reason="no contigs to hash")
 
     monkeypatch.setattr(backend, "run_step", _no_data)
 
@@ -6171,6 +6171,51 @@ async def test_assembly_gate_declared_without_a_threaded_processing_idx_fails_at
         await teardown()
 
 
+async def test_assembly_gate_backstop_refuses_the_pair_validation_cannot_produce(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """The runner's per-ticket refusal, which `_fetch_action`'s model_validate now
+    keeps a real ticket from reaching (the test above meets the load-time one
+    instead). Reached by handing the runner an ActionDefinition assembled past
+    validation — `model_copy` re-runs no validators — so the guard stays exercised
+    rather than becoming an untested branch: `_workflow_writes_assembly_gate` and
+    `_workflow_needs_processing` are separate reads of `action.steps`, and this is
+    where they would disagree."""
+    from qiita_control_plane.runner import _workflow
+
+    work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
+    _stub_masked_reads(monkeypatch, tmp_path)
+
+    fetch_action = _workflow._fetch_action
+
+    async def _drop_the_threaded_params(*args, **kwargs):
+        action = await fetch_action(*args, **kwargs)
+        loader, gate = action.steps
+        return action.model_copy(update={"steps": [loader.model_copy(update={"params": {}}), gate]})
+
+    monkeypatch.setattr(_workflow, "_fetch_action", _drop_the_threaded_params)
+    try:
+        with pytest.raises(BackendFailure) as ei:
+            await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+        assert "processing_idx" in ei.value.reason
+        row = await postgres_pool.fetchrow(
+            "SELECT state, failure_stage FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        assert row["state"] == "failed"
+        assert row["failure_stage"] == "submission"
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT count(*) FROM qiita.assembly_sample WHERE prep_sample_idx = $1",
+                prep_sample_idx,
+            )
+            == 0
+        )
+    finally:
+        await teardown()
+
+
 async def test_assembly_gate_reopens_a_no_data_row_for_a_re_run_of_the_same_identity(
     postgres_pool, monkeypatch, tmp_path
 ):
@@ -6186,7 +6231,7 @@ async def test_assembly_gate_reopens_a_no_data_row_for_a_re_run_of_the_same_iden
     backend = FakeBackendClient()
 
     async def _no_data(*_args, **_kwargs):
-        raise StepNoData(step_name="assembly_load", reason="no contigs to hash")
+        raise StepNoData(step_name="assembly_hash", reason="no contigs to hash")
 
     monkeypatch.setattr(backend, "run_step", _no_data)
     second_ticket_idx = None
@@ -6297,7 +6342,7 @@ async def test_assembly_gate_keeps_completed_and_logs_when_a_later_run_finds_non
         second_backend = FakeBackendClient()
 
         async def _no_data(*_args, **_kwargs):
-            raise StepNoData(step_name="assembly_load", reason="no contigs to hash")
+            raise StepNoData(step_name="assembly_hash", reason="no contigs to hash")
 
         monkeypatch.setattr(second_backend, "run_step", _no_data)
         with caplog.at_level(logging.WARNING, logger="qiita_control_plane.runner"):

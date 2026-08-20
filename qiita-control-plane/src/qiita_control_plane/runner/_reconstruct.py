@@ -9,6 +9,7 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import (
+    PROCESSING_IDX_BINDING,
     WorkflowAction,
     WorkflowStep,
 )
@@ -44,7 +45,6 @@ from ..shard_orchestration import (
 )
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
 from ._mask import ALIGNMENT_IDX_BINDING, MASK_IDX_BINDING
-from ._processing import PROCESSING_IDX_BINDING
 from ._read_ingest import (
     ROUTER_PENDING_BINDING,
     SHARD_MAPPING_BINDING,

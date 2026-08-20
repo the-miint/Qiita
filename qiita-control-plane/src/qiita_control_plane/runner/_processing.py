@@ -17,7 +17,11 @@ from __future__ import annotations
 from typing import Any
 
 import asyncpg
-from qiita_common.actions import PROCESSING_IDX_BINDING, WorkflowAction
+from qiita_common.actions import (
+    PROCESSING_IDX_BINDING,
+    WorkflowAction,
+    action_threads_processing_idx,
+)
 from qiita_common.api_paths import LibraryPrimitive
 
 from ..repositories.assembly import (
@@ -36,14 +40,14 @@ ASSEMBLER_BINDING = "assembler"
 
 
 def _workflow_needs_processing(steps: list[Any]) -> bool:
-    """True iff some entry threads `processing_idx` through its `params:` — the
-    signal the runner mints the processing identity before the step loop. Mirrors
-    `_workflow_needs_mask` (a scalar param, so it keys off `params` values)."""
-    for entry in steps:
-        params = getattr(entry, "params", None) or {}
-        if PROCESSING_IDX_BINDING in params.values():
-            return True
-    return False
+    """The runner's signal to mint the processing identity before the step loop.
+
+    Reads `qiita_common.actions.action_threads_processing_idx`, which owns the
+    rule and which the load-time validator on ActionDefinition reads too. Named
+    here to sit beside the runner's other pre-loop signals (`_workflow_needs_mask`,
+    `_workflow_writes_assembly_gate`).
+    """
+    return action_threads_processing_idx(steps)
 
 
 def _build_processing_params(
