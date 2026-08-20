@@ -208,6 +208,13 @@ class Settings:
     # footer simply omits the SHA. Never required at boot — a missing
     # build stamp must not keep the unit down.
     build_sha: str | None = None
+    # Calver (e.g. 2026.7.15) derived from the deployed commit's date,
+    # rendered in the landing-page footer as the authoritative deploy
+    # version. Set per-deploy by the deploy scripts (which write
+    # BUILD_VERSION into build.env); a from-source dev boot or a test
+    # leaves it None and the footer falls back to the static package
+    # version. Never required at boot.
+    build_version: str | None = None
     # reference_idx of the canonical `artifact_sequence_set` reference the QC
     # step trims adapters against. Optional in the dataclass (tests and
     # QC-less deploys don't need it); set from QIITA_DEFAULT_ADAPTER_REFERENCE_IDX.
@@ -361,6 +368,7 @@ class Settings:
             path_scratch_staging=upload_root,
             contact_email=contact_email,
             build_sha=os.environ.get("BUILD_SHA") or None,
+            build_version=os.environ.get("BUILD_VERSION") or None,
             default_adapter_reference_idx=_parse_optional_positive_int_env(
                 "QIITA_DEFAULT_ADAPTER_REFERENCE_IDX"
             ),

@@ -22,8 +22,22 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **NCBI Taxonomy releases read from a taxdump archive (#439).**
-  `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
+- **`build_version` / `BUILD_VERSION` is now covered by tests (#309).** The landing page
+  renders `settings.build_version or _PACKAGE_VERSION` (`landing.py`), so a from-source
+  boot without `BUILD_VERSION` falls back to the static package version instead of the
+  literal `None`. The new cases mirror the existing `build_sha` / `BUILD_SHA` pair — one
+  asserting the calver is shown, one asserting the empty-string case normalizes to `None`,
+  one asserting the package-version fallback — so both arms are covered in `test_landing.py`
+  and `test_config.py`.
+
+- **`DEPLOY_CHECKLIST.md` drops a stale `(#324)` note (#431).** That entry was verbatim in
+  the archived 2026-07-30 deploy note, so an operator was being told to re-note a schema
+  gate (`reference-add` / `local-reference-add` requiring a genome map when `shard_index` is
+  true) already on a live deploy. It was the only copy — `main` carried the same guard from
+  the moment #324 landed — and `deploy-note-check` ignores this file, so removing it is
+  safe.
+
+- **NCBI Taxonomy releases read from a taxdump archive (#439).**  `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
   into the term rows of a release, so taxa no longer arrive as hand-written seed
   migrations. A live taxon takes its scientific name as its label and its genbank
   common name as its second name; a taxon NCBI merged away becomes an obsolete
@@ -2212,6 +2226,14 @@ duplicates further down are historical strata; leave them where they are.
   reached, and the one gap it cannot close — a kill between two renames — is written down
   where the guarantee is stated.
 
+- **`docs/architecture.md` updated: N=0 sharded path no longer exists (#431).**
+  `plan-shards` returns zero shards on N=0 rather than raising; the
+  plan-shards **runner arm** treats that zero-shard result as an error
+  and fails the ticket, and a CLI guard (`--shard-index requires
+  --genome-map`) additionally catches the case before any network call.
+  Two bullets in the sharded-index fan-out section corrected to reflect
+  the current behavior.
+
 - **One `cap_rows` helper behind every capped list route (#427).** The
   fetch-`cap + 1` / slice-back / set-`truncated` split was written inline at each
   list route — the two sequenced-sample rosters, the prep-sample study roster,
@@ -2297,6 +2319,13 @@ duplicates further down are historical strata; leave them where they are.
   both resolve through it instead of each re-asserting the three Optional fields
   and rebuilding a `FlatBaselineResources` by hand, so what actually runs and what
   the guard checks cannot drift.
+- **Landing-page footer now shows the deploy date (calver) instead of the static package version (#431).**
+  `QIITA_BUILD_VERSION` is derived from the deployed commit's date in `local-deploy.sh` and
+  injected via `build.env`; `landing.py` prefers it, falling back to the package version for
+  dev boots.
+- **`align_sharded` probe comment corrected: the count probe is kept for correctness, not
+  because `LIMIT 1` is slower (#431).** Row-group stats make `LIMIT 1` faster in most shapes;
+  the count probe is needed because the mixed-batch rejection requires `total`.
 
 - **`align_sharded` hands the aligner a materialized query relation instead of the lazy
   Parquet view (#391).** Both sharded aligners read the query relation once per shard, so
