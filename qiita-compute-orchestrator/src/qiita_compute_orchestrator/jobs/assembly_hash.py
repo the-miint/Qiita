@@ -7,34 +7,34 @@ outputs and produces the inputs the SHARED reference-load machinery consumes
 downstream (mint-features -> write-assembly-membership -> assembly_load):
 
   - `manifest.parquet` — `(read_id, sequence_hash, sequence_length_bp)`, one row
-    per contig. `read_id` is a SYNTHETIC globally-unique id
-    `kind || ':' || bin_id || ':' || contig_id` (a raw contig id can repeat across
-    bins/files, so it is never keyed on alone). This is the exact shape
+    per contig. `read_id` is a SYNTHETIC id
+    `kind || ':' || bin_id || ':' || sequence_index` — a contig's own id repeats
+    across bins and files, so it is not an identity. This is the exact shape
     `mint-features` consumes and `build_feature_id_map` re-keys.
   - `assembly_chunks/` — a DIRECTORY of `part_*.parquet`
     `(sequence_hash, chunk_index, chunk_data)`, the hash-keyed 64 KB chunks
     `write_feature_sequence_chunks` re-keys to feature_idx. Identical contigs (same
     canonical bytes) collapse to one set of chunks (DISTINCT ON sequence_hash),
     exactly like `hash_sequences`.
-  - `bin_map.parquet` — `(read_id, kind, bin_id)`, the per-contig bin membership
-    `write-assembly-membership` / `assembly_load` join against.
+  - `bin_map.parquet` — `(read_id, kind, bin_id, contig_id)`, the per-contig bin
+    membership `write-assembly-membership` / `assembly_load` join against.
+    `contig_id` is the assembler's own id for the record, carried beside the key
+    rather than inside it; nothing joins on it.
 
-**The synthetic read_id must be unique across the whole scan.** Two routes compose one
-id twice. `read_fastx` returns one row per record, so two records in ONE file whose
-headers share a first token come back as two rows with the same `read_id` — and
-sharing a file they share `kind` and `bin_id`, so the whole triple repeats. Records in
-different files differ in `kind` or `bin_id` and are safe by that alone, which is what
-the id is synthetic for (above). Separately, `:` is a separator and is not escaped, so
-a `:` inside a bin_id or a contig id lets two distinct triples compose to one string:
-bins `a:b.fa`/contig `c` and `a.fa`/contig `b:c` both give `MAG:a:b:c`.
+**The synthetic read_id is unique across the scan by construction.** Its last
+component is `read_fastx`'s `sequence_index`, a 1-based ordinal over the records of
+ONE file that restarts at 1 in the next
+(https://the-miint.github.io/duckdb-miint/reading/), and `(kind, bin_id)` names
+exactly one file: LCG and UNBINNED are a single file each, and `_file_meta` refuses
+two refined-bin FASTAs that stem to one bin_id. So no two records carry the same
+triple. The composition is injective on top of that — `kind` is one of the
+`assembly_constants` literals and `sequence_index` is digits, neither holding a
+`:`, so the first and the last `:` of the string are the two separators however
+many `:` a bin_id carries.
 
-Either way, pass 2 joins `winner` on that id over a fresh scan of every record, so one
-colliding pair puts both contigs' chunks under each of their two `sequence_hash`
-values — the stored bytes for a feature then hold a sequence that is not that
-feature's. The check below runs over the full scan rather than the surviving rows,
-because pass 2 re-derives the id from every record the DELETE would have removed too.
-`bin_id` has a third collision route this check cannot see; `_file_meta` rejects it
-there.
+Pass 2 joins `winner` on that id over a fresh scan, so it also rests on
+`sequence_index` being the record's position in the file rather than an artifact of
+one scan — pinned in `tests/jobs/test_read_fastx_miint_contract.py`.
 
 **Shared canonical identity.** `sequence_hash` is
 `qiita_common.chunking.canonical_sequence_hash_expr` — the SAME expression
@@ -118,9 +118,6 @@ _DUCKDB_THREADS = 4
 # multi-MB contig records can't materialise a giant chunk before the chunker runs.
 _READ_FASTX_MAX_BATCH_BYTES = "128MB"
 
-# How many colliding synthetic read_ids the uniqueness failure names.
-_DUPLICATE_ID_SAMPLE = 5
-
 
 class Inputs(BaseModel):
     """Typed input contract for assembly_hash.
@@ -164,16 +161,18 @@ def _file_meta(genomes_dir: Path, refined_bins_dir: Path) -> list[tuple[str, str
     - LCG: the single `<genomes_dir>/circular.fa` multi-FASTA of circular contigs.
       `bin_id` is NULL — an LCG contig is its own genome, so its bin_id is the
       contig id itself (the read_fastx record id), COALESCE'd in the scan rather
-      than carried here.
+      than carried here. Two records of that one file whose headers share a first
+      token therefore land under one `(kind, bin_id)`, each keeping its own
+      read_id, feature and chunks.
     - UNBINNED: the single `<genomes_dir>/noLCG.fa` multi-FASTA, same NULL-bin_id
       shape as LCG. This row covers the WHOLE file; the residue subset is taken
       per record in `execute` (see the module docstring).
     - MAG: each refined-bin FASTA under `<refined_bins_dir>`; `bin_id` = the
       filename stem (a bin groups many contigs under one file). Two files stemming
-      to one bin_id raise: `_FASTA_GLOBS` accepts several suffixes, so `bin.1.fa`
-      and `bin.1.fna` are two bins the rest of the tail would key as one — and
-      unlike a repeated contig id, the read_id check downstream does not see it
-      (distinct contig ids compose distinct read_ids under the shared bin_id).
+      to one bin_id raise, which is what makes `(kind, bin_id)` name a single file
+      for this kind — the property the synthetic read_id's uniqueness rests on
+      (module docstring). `_FASTA_GLOBS` accepts several suffixes, so `bin.1.fa`
+      and `bin.1.fna` would otherwise be two bins the rest of the tail keys as one.
 
     Empty files are dropped (`read_fastx` raises on a 0-record input, and one empty
     path aborts the whole `VARCHAR[]` scan)."""
@@ -244,18 +243,19 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
             conn.executemany("INSERT INTO file_meta VALUES (?, ?, ?)", meta)
 
-            # Pass 1 — per-contig metadata (kind, bin_id, synthetic read_id, hash,
-            # length). No sequence bytes retained, so manifest + bin_map cost a tiny
-            # table. The synthetic read_id disambiguates a contig id reused across
-            # bins/files. `sequence_hash` is the SHARED canonical hash so identical
-            # bytes mint the same feature_idx as a reference sequence.
+            # Pass 1 — per-contig metadata (kind, bin_id, contig_id, synthetic
+            # read_id, hash, length). No sequence bytes retained, so manifest +
+            # bin_map cost a tiny table. `sequence_hash` is the SHARED canonical
+            # hash so identical bytes mint the same feature_idx as a reference
+            # sequence.
             conn.execute(
                 "CREATE TEMP TABLE contig AS "
                 "SELECT "
                 "  fm.kind AS kind, "
                 "  COALESCE(fm.bin_id, rf.read_id) AS bin_id, "
+                "  rf.read_id AS contig_id, "
                 "  fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) "
-                "|| ':' || rf.read_id AS read_id, "
+                "|| ':' || CAST(rf.sequence_index AS VARCHAR) AS read_id, "
                 f"  {canonical_sequence_hash_expr('rf.sequence1')} AS sequence_hash, "
                 "  CAST(length(rf.sequence1) AS BIGINT) AS sequence_length_bp "
                 f"FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
@@ -263,30 +263,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "JOIN file_meta fm ON rf.filepath = fm.filepath",
                 [paths],
             )
-
-            # Uniqueness of the synthetic read_id across the whole scan (module
-            # docstring: what a collision does to the stored chunks).
-            # `count(*) OVER ()` is evaluated over the whole grouped result before
-            # LIMIT clips it, so the total collision count rides the sample rather
-            # than costing a second aggregation over `contig`.
-            dupes = conn.execute(
-                "SELECT read_id, n, count(*) OVER () AS colliding FROM ("
-                "  SELECT read_id, count(*) AS n FROM contig "
-                "  GROUP BY read_id HAVING count(*) > 1) "
-                "ORDER BY read_id LIMIT ?",
-                [_DUPLICATE_ID_SAMPLE],
-            ).fetchall()
-            if dupes:
-                colliding = dupes[0][2]
-                shown = ", ".join(f"{read_id!r} x{n}" for read_id, n, _ in dupes)
-                raise ValueError(
-                    f"contig ids are not unique for prep_sample_idx={inputs.prep_sample_idx}: "
-                    f"{colliding} synthetic read_id(s) `kind:bin_id:contig_id` repeat across "
-                    f"{inputs.genomes_dir} and {inputs.refined_bins_dir}; first {len(dupes)}: "
-                    f"{shown}. Two routes reach this: two records in one FASTA whose headers "
-                    "share a first token, and a ':' inside a bin_id or a contig id, which lets "
-                    "two distinct triples compose to one string."
-                )
 
             # Reduce the UNBINNED rows to the RESIDUE: drop the noLCG contigs a
             # refined bin already claims, matched on the canonical sequence_hash
@@ -314,7 +290,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"TO '{manifest_out}' ({PARQUET_OPTS})"
             )
             conn.execute(
-                "COPY (SELECT read_id, kind, bin_id FROM contig) "
+                "COPY (SELECT read_id, kind, bin_id, contig_id FROM contig) "
                 f"TO '{bin_map_out}' ({PARQUET_OPTS})"
             )
 
@@ -353,7 +329,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "      include_filepath:=true) rf "
                 "    JOIN file_meta fm ON rf.filepath = fm.filepath "
                 "    JOIN winner w ON w.read_id = "
-                "      (fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) || ':' || rf.read_id)"
+                "      (fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) || ':' "
+                "       || CAST(rf.sequence_index AS VARCHAR))"
                 "  )"
                 f") TO '{chunks_part_out}' ({PARQUET_OPTS_CHUNKED})",
                 [paths],

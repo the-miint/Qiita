@@ -63,8 +63,8 @@ the assay owner does by hand today.
 
 WHY THE ID IS TRUNCATED AT `_len-`
 ----------------------------------
-Whatever is left becomes the LCG bin_id in assembly_hash, which keys read_id as
-`kind:bin_id:contig_id`. What the probe established:
+Whatever is left becomes the LCG bin_id in assembly_hash, and so the subject id in
+`qiita.assembly_membership`. What the probe established:
 
   * myloasm is DETERMINISTIC — two runs over the same reads gave byte-identical
     headers. A literal re-run of a sample moves nothing.
@@ -234,8 +234,8 @@ def _validate(con: duckdb.DuckDBPyConnection) -> None:
         )
 
     # An LCG's bin_id IS its contig id (assembly_hash COALESCEs it from the
-    # record), and read_id is `kind:bin_id:contig_id` — so a duplicate id would
-    # collapse two distinct genomes onto one identity downstream.
+    # record), so a duplicate id puts two distinct genomes under one
+    # `assembly_membership` subject downstream.
     dupes = con.execute(
         "SELECT contig_id, count(*) AS n FROM contig GROUP BY 1 HAVING n > 1"
         " ORDER BY 1 LIMIT 5"

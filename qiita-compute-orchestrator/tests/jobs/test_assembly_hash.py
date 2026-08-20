@@ -5,14 +5,14 @@ Runs against the team-mirror miint build (conftest stages it): the job reads FAS
 with miint `read_fastx` and chunks with `sequence_split`, and the `_hash` oracle
 below takes its reverse complement from the same miint scalar the production
 expression uses. Calls execute() directly.
-Covers: happy path (LCG + MAG, synthetic read_ids, hash-keyed chunks, dedup of
-identical contigs), synthetic-id disambiguation of a contig id reused across bins,
-soft-masked (lowercase) contigs folding onto their upper-case twin and which
-record's bytes that fold then stores, the unbinned noLCG residue (its exclusion
-key, its bin_id, and what it does to a hash-collision group), the two identity
-collisions the step refuses (a repeated synthetic read_id in each of the three
-kinds, plus what its failure reports; and two bin files stemming to one bin_id),
-and empty -> StepNoData.
+Covers: happy path (LCG + MAG, synthetic read_ids, the contig_id beside them,
+hash-keyed chunks, dedup of identical contigs), synthetic-id disambiguation of a
+contig id reused across bins and repeated within one file, soft-masked (lowercase)
+contigs folding onto their upper-case twin and which record's bytes that fold then
+stores, the unbinned noLCG residue (its exclusion key, its bin_id, and what it does
+to a hash-collision group), a bin_id carrying the id's own separator, the one
+identity collision the step refuses (two bin files stemming to one bin_id), and
+empty -> StepNoData.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import duckdb
 import pytest
 from qiita_common.backend_failure import StepNoData
 
-from qiita_compute_orchestrator.jobs.assembly_hash import _DUPLICATE_ID_SAMPLE, Inputs, execute
+from qiita_compute_orchestrator.jobs.assembly_hash import Inputs, execute
 from qiita_compute_orchestrator.miint import open_miint_conn
 
 
@@ -112,7 +112,7 @@ def test_happy_path_manifest_bin_map_and_chunks(tmp_path):
         tmp_path / "ws",
     )
 
-    # manifest: synthetic read_id kind:bin_id:contig, canonical hash, length.
+    # manifest: synthetic read_id kind:bin_id:sequence_index, canonical hash, length.
     manifest = _rows(
         out["manifest"],
         "read_id, CAST(sequence_hash AS VARCHAR), sequence_length_bp",
@@ -120,22 +120,23 @@ def test_happy_path_manifest_bin_map_and_chunks(tmp_path):
     )
     assert manifest == sorted(
         [
-            ("LCG:c1:c1", str(_hash("AAAACCCCGGGGTTTT")), 16),
-            ("LCG:c2:c2", str(_hash("GGGGAAAACCCCTTTT")), 16),
-            ("MAG:bin.1:x1", str(_hash("ACGTACGTACGTACGT")), 16),
-            ("MAG:bin.1:x2", str(_hash("TTTTGGGGCCCCAAAA")), 16),
+            ("LCG:c1:1", str(_hash("AAAACCCCGGGGTTTT")), 16),
+            ("LCG:c2:2", str(_hash("GGGGAAAACCCCTTTT")), 16),
+            ("MAG:bin.1:1", str(_hash("ACGTACGTACGTACGT")), 16),
+            ("MAG:bin.1:2", str(_hash("TTTTGGGGCCCCAAAA")), 16),
         ]
     )
 
-    # bin_map: kind + bin_id per synthetic read_id. Each LCG contig is its own bin
-    # (bin_id == contig id); the MAG's contigs share the file's bin_id.
-    bin_map = _rows(out["bin_map"], "read_id, kind, bin_id", "read_id")
+    # bin_map: kind + bin_id per synthetic read_id, and the contig id the id itself
+    # no longer carries. Each LCG contig is its own bin (bin_id == contig id); the
+    # MAG's contigs share the file's bin_id, so `x1`/`x2` survive only here.
+    bin_map = _rows(out["bin_map"], "read_id, kind, bin_id, contig_id", "read_id")
     assert bin_map == sorted(
         [
-            ("LCG:c1:c1", "LCG", "c1"),
-            ("LCG:c2:c2", "LCG", "c2"),
-            ("MAG:bin.1:x1", "MAG", "bin.1"),
-            ("MAG:bin.1:x2", "MAG", "bin.1"),
+            ("LCG:c1:1", "LCG", "c1", "c1"),
+            ("LCG:c2:2", "LCG", "c2", "c2"),
+            ("MAG:bin.1:1", "MAG", "bin.1", "x1"),
+            ("MAG:bin.1:2", "MAG", "bin.1", "x2"),
         ]
     )
 
@@ -171,7 +172,7 @@ def test_identical_contigs_dedup_to_one_chunk_set(tmp_path):
     )
     # Same raw contig id "ctg" in two bins — synthetic read_ids disambiguate.
     manifest = _rows(out["manifest"], "read_id", "read_id")
-    assert manifest == [("MAG:bin.1:ctg",), ("MAG:bin.2:ctg",)]
+    assert manifest == [("MAG:bin.1:1",), ("MAG:bin.2:1",)]
 
     glob = str(out["assembly_chunks"] / "part_*.parquet")
     with duckdb.connect(":memory:") as con:
@@ -193,7 +194,7 @@ def test_lcg_only_no_mag(tmp_path):
         tmp_path / "ws",
     )
     bin_map = _rows(out["bin_map"], "read_id, kind, bin_id", "read_id")
-    assert bin_map == [("LCG:c1:c1", "LCG", "c1")]
+    assert bin_map == [("LCG:c1:1", "LCG", "c1")]
 
 
 def test_binned_contig_is_excluded_from_the_residue_despite_a_different_header(tmp_path):
@@ -215,10 +216,10 @@ def test_binned_contig_is_excluded_from_the_residue_despite_a_different_header(t
 
     # `binned` appears once, as the MAG. `unbinned` is the residue, and its bin_id
     # is its own contig id — the same shape LCG uses, so (kind, bin_id) is uniform.
-    assert _rows(out["bin_map"], "read_id, kind, bin_id", "read_id") == sorted(
+    assert _rows(out["bin_map"], "read_id, kind, bin_id, contig_id", "read_id") == sorted(
         [
-            ("MAG:bin.1:renamed_by_dastool", "MAG", "bin.1"),
-            ("UNBINNED:ctgB:ctgB", "UNBINNED", "ctgB"),
+            ("MAG:bin.1:1", "MAG", "bin.1", "renamed_by_dastool"),
+            ("UNBINNED:ctgB:2", "UNBINNED", "ctgB", "ctgB"),
         ]
     )
     manifest = _rows(out["manifest"], "CAST(sequence_hash AS VARCHAR)", "1")
@@ -242,7 +243,7 @@ def test_a_reverse_complemented_bin_contig_still_excludes_its_nolcg_record(tmp_p
         tmp_path / "ws",
     )
     assert _rows(out["bin_map"], "read_id, kind, bin_id", "read_id") == [
-        ("MAG:bin.1:ctgA", "MAG", "bin.1")
+        ("MAG:bin.1:1", "MAG", "bin.1")
     ]
 
 
@@ -258,7 +259,7 @@ def test_soft_masked_contigs_hash_as_their_upper_case_twin(tmp_path):
 
     Which of the three records' bytes land in the chunks is asserted too. The
     representative is `DISTINCT ON (sequence_hash) ... ORDER BY sequence_hash,
-    read_id`, which picks `LCG:c1:c1` here, and its bytes are chunked as read —
+    read_id`, which picks `LCG:c1:1` here, and its bytes are chunked as read —
     so the stored strand and casing follow that tie-break. The lake replaces
     these chunks by `feature_idx`, so the bytes a load stores are the ones a
     reader reassembles.
@@ -275,9 +276,9 @@ def test_soft_masked_contigs_hash_as_their_upper_case_twin(tmp_path):
 
     manifest = _rows(out["manifest"], "read_id, CAST(sequence_hash AS VARCHAR)", "read_id")
     assert manifest == [
-        ("LCG:c1:c1", str(_hash(seq))),
-        ("LCG:c2:c2", str(_hash(seq.lower()))),
-        ("LCG:c3:c3", str(_hash(_rc(seq).lower()))),
+        ("LCG:c1:1", str(_hash(seq))),
+        ("LCG:c2:2", str(_hash(seq.lower()))),
+        ("LCG:c3:3", str(_hash(_rc(seq).lower()))),
     ]
     # Three records, one canonical sequence -> one feature, so one chunk set, and
     # the reassembled bytes are the winning record's, byte for byte.
@@ -309,7 +310,7 @@ def test_hash_equal_nolcg_records_share_the_residue_verdict(tmp_path):
     )
     # ctgB carries `shared`'s canonical hash too, so it leaves with ctgA.
     assert _rows(out["bin_map"], "read_id, kind, bin_id", "read_id") == sorted(
-        [("MAG:bin.1:ctgA", "MAG", "bin.1"), ("UNBINNED:ctgC:ctgC", "UNBINNED", "ctgC")]
+        [("MAG:bin.1:1", "MAG", "bin.1"), ("UNBINNED:ctgC:3", "UNBINNED", "ctgC")]
     )
 
 
@@ -332,10 +333,10 @@ def test_hash_equal_records_in_one_file_each_keep_a_bin_map_row(tmp_path):
     )
     assert _rows(out["bin_map"], "read_id, kind, bin_id", "read_id") == sorted(
         [
-            ("LCG:c1:c1", "LCG", "c1"),
-            ("LCG:c2:c2", "LCG", "c2"),
-            ("UNBINNED:n1:n1", "UNBINNED", "n1"),
-            ("UNBINNED:n2:n2", "UNBINNED", "n2"),
+            ("LCG:c1:1", "LCG", "c1"),
+            ("LCG:c2:2", "LCG", "c2"),
+            ("UNBINNED:n1:1", "UNBINNED", "n1"),
+            ("UNBINNED:n2:2", "UNBINNED", "n2"),
         ]
     )
     # Four records, two canonical sequences -> two chunk sets.
@@ -363,7 +364,7 @@ def test_unbinned_only_sample_is_not_no_data(tmp_path):
         tmp_path / "ws",
     )
     assert _rows(out["bin_map"], "read_id, kind, bin_id", "read_id") == [
-        ("UNBINNED:ctgA:ctgA", "UNBINNED", "ctgA")
+        ("UNBINNED:ctgA:1", "UNBINNED", "ctgA")
     ]
 
 
@@ -434,13 +435,12 @@ def test_no_contigs_is_no_data(tmp_path, write_empty_files):
         )
 
 
-def test_repeated_contig_id_fails_instead_of_collapsing(tmp_path):
-    """Two records whose headers share a first token fail the step.
+def test_repeated_contig_id_stores_each_contigs_own_bytes(tmp_path):
+    """Two LCG records whose headers share a first token keep separate identities.
 
-    What an uncaught collision does to the stored bytes is the job module's
-    uniqueness paragraph. The control here is the byte-identical fixture with only
-    the second header's first token changed: it succeeds, and each sequence_hash
-    carries its OWN bytes.
+    `read_fastx` returns the shared first token as both records' id, so the pair
+    shares a bin_id; the synthetic ids differ in `sequence_index`, so each contig's
+    chunks land under its own `sequence_hash`.
 
     Neither sequence equals its own reverse complement, and one is soft-masked, so
     the stored-bytes assertion discriminates on both axes the canonical hash folds.
@@ -449,65 +449,15 @@ def test_repeated_contig_id_fails_instead_of_collapsing(tmp_path):
     genomes, refined = _layout(tmp_path)
     (genomes / "circular.fa").write_text(f">ctg1 first\n{seq_a}\n>ctg1 second\n{seq_b}\n")
 
-    with pytest.raises(ValueError, match="LCG:ctg1:ctg1"):
-        _run(
-            Inputs(
-                genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=3
-            ),
-            tmp_path / "ws",
-        )
-
-    control_genomes, control_refined = _layout(tmp_path / "control")
-    (control_genomes / "circular.fa").write_text(f">ctg1 first\n{seq_a}\n>ctg9 second\n{seq_b}\n")
     out = _run(
         Inputs(
-            genomes_dir=control_genomes,
-            refined_bins_dir=control_refined,
-            prep_sample_idx=42,
-            work_ticket_idx=3,
+            genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=3
         ),
-        tmp_path / "control-ws",
+        tmp_path / "ws",
     )
-    assert _reassembled(out["assembly_chunks"]) == {
-        str(_hash(seq_a)): seq_a,
-        str(_hash(seq_b)): seq_b,
-    }
-
-
-def test_repeated_contig_id_within_one_bin_fails(tmp_path):
-    """The MAG arm of the same collision.
-
-    A MAG's bin_id is its FILE stem, not a contig id, so the LCG and UNBINNED cases
-    either side of this one leave `MAG:<stem>:<contig>` untested: there the repeat has
-    to come from two records inside one bin FASTA. The control is the same file with
-    the second header's first token changed.
-    """
-    seq_a, seq_b = "ACGTTGCAAGGGTTCA", "ggatccTTAACCggat"
-    genomes, refined = _layout(tmp_path)
-    (refined / "bin.1.fa").write_text(f">ctg1 first\n{seq_a}\n>ctg1 second\n{seq_b}\n")
-
-    with pytest.raises(ValueError, match="MAG:bin.1:ctg1"):
-        _run(
-            Inputs(
-                genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=3
-            ),
-            tmp_path / "ws",
-        )
-
-    control_genomes, control_refined = _layout(tmp_path / "control")
-    (control_refined / "bin.1.fa").write_text(f">ctg1 first\n{seq_a}\n>ctg9 second\n{seq_b}\n")
-    out = _run(
-        Inputs(
-            genomes_dir=control_genomes,
-            refined_bins_dir=control_refined,
-            prep_sample_idx=42,
-            work_ticket_idx=3,
-        ),
-        tmp_path / "control-ws",
-    )
-    assert _rows(out["bin_map"], "read_id, kind, bin_id", "read_id") == [
-        ("MAG:bin.1:ctg1", "MAG", "bin.1"),
-        ("MAG:bin.1:ctg9", "MAG", "bin.1"),
+    assert _rows(out["bin_map"], "read_id, kind, bin_id, contig_id", "read_id") == [
+        ("LCG:ctg1:1", "LCG", "ctg1", "ctg1"),
+        ("LCG:ctg1:2", "LCG", "ctg1", "ctg1"),
     ]
     assert _reassembled(out["assembly_chunks"]) == {
         str(_hash(seq_a)): seq_a,
@@ -515,52 +465,98 @@ def test_repeated_contig_id_within_one_bin_fails(tmp_path):
     }
 
 
-def test_repeated_contig_id_fails_even_when_the_residue_delete_would_drop_one(tmp_path):
-    """The uniqueness check reads the whole scan, not the surviving rows.
+def test_repeated_contig_id_within_one_bin_keeps_both_rows(tmp_path):
+    """The MAG arm of the same repeat.
 
-    Both noLCG records are named `ctg1`; a refined bin claims the bytes of one, so
-    the residue DELETE removes that row and leaves a single UNBINNED survivor with a
-    unique id. The control renames only the second header: the DELETE still fires —
-    one UNBINNED row survives out of two noLCG records — which is what makes the
-    raise above evidence that the check ran BEFORE it.
+    A MAG's bin_id is its FILE stem, not a contig id, so the two records shared a
+    bin_id before the repeat as well and `sequence_index` is the whole of what
+    separates their ids.
+    """
+    seq_a, seq_b = "ACGTTGCAAGGGTTCA", "ggatccTTAACCggat"
+    genomes, refined = _layout(tmp_path)
+    (refined / "bin.1.fa").write_text(f">ctg1 first\n{seq_a}\n>ctg1 second\n{seq_b}\n")
+
+    out = _run(
+        Inputs(
+            genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=3
+        ),
+        tmp_path / "ws",
+    )
+    assert _rows(out["bin_map"], "read_id, kind, bin_id, contig_id", "read_id") == [
+        ("MAG:bin.1:1", "MAG", "bin.1", "ctg1"),
+        ("MAG:bin.1:2", "MAG", "bin.1", "ctg1"),
+    ]
+    assert _reassembled(out["assembly_chunks"]) == {
+        str(_hash(seq_a)): seq_a,
+        str(_hash(seq_b)): seq_b,
+    }
+
+
+def test_the_residue_delete_leaves_the_survivors_ordinal_where_it_was(tmp_path):
+    """A dropped UNBINNED row does not renumber the record after it.
+
+    Both noLCG records are named `ctg1`; a refined bin claims the bytes of the
+    first, so the residue DELETE removes its row. The survivor keeps ordinal 2 —
+    pass 2 re-derives ids from the FILE, so a survivor renumbered to 1 would find no
+    `winner` and lose its chunks.
     """
     genomes, refined = _layout(tmp_path)
     binned, residue = "AAAAAAAACCCCGGGG", "TTTTAAAACCCCGGGG"
     (genomes / "noLCG.fa").write_text(f">ctg1 binned\n{binned}\n>ctg1 residue\n{residue}\n")
     _fasta(refined / "bin.1.fa", {"renamed": binned})
 
-    with pytest.raises(ValueError, match="UNBINNED:ctg1:ctg1"):
-        _run(
-            Inputs(
-                genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=3
-            ),
-            tmp_path / "ws",
-        )
-
-    control_genomes, control_refined = _layout(tmp_path / "control")
-    (control_genomes / "noLCG.fa").write_text(f">ctg1 binned\n{binned}\n>ctg2 residue\n{residue}\n")
-    _fasta(control_refined / "bin.1.fa", {"renamed": binned})
     out = _run(
         Inputs(
-            genomes_dir=control_genomes,
-            refined_bins_dir=control_refined,
-            prep_sample_idx=42,
-            work_ticket_idx=3,
+            genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=3
         ),
-        tmp_path / "control-ws",
+        tmp_path / "ws",
     )
-    assert _rows(out["bin_map"], "read_id, kind, bin_id", "read_id") == [
-        ("MAG:bin.1:renamed", "MAG", "bin.1"),
-        ("UNBINNED:ctg2:ctg2", "UNBINNED", "ctg2"),
+    assert _rows(out["bin_map"], "read_id, kind, bin_id, contig_id", "read_id") == [
+        ("MAG:bin.1:1", "MAG", "bin.1", "renamed"),
+        ("UNBINNED:ctg1:2", "UNBINNED", "ctg1", "ctg1"),
     ]
+    assert _reassembled(out["assembly_chunks"]) == {
+        str(_hash(binned)): binned,
+        str(_hash(residue)): residue,
+    }
+
+
+def test_a_colon_in_a_bin_id_composes_no_other_bins_id(tmp_path):
+    """A bin_id holding the id's own separator still composes a distinct read_id.
+
+    `:` is not escaped. With a contig id as the last component, bin `a:b` / contig
+    `c` and bin `a` / contig `b:c` both compose `MAG:a:b:c`; with `sequence_index`
+    there the last `:` is always the one before the digits, so these two bins get
+    `MAG:a:b:1` and `MAG:a:1` and each keeps its own bytes.
+    """
+    seq_a, seq_b = "ACGTTGCAAGGGTTCA", "ggatccTTAACCggat"
+    genomes, refined = _layout(tmp_path)
+    _fasta(refined / "a:b.fa", {"c": seq_a})
+    _fasta(refined / "a.fa", {"b:c": seq_b})
+
+    out = _run(
+        Inputs(
+            genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=3
+        ),
+        tmp_path / "ws",
+    )
+    assert _rows(out["bin_map"], "read_id, kind, bin_id, contig_id", "read_id") == [
+        ("MAG:a:1", "MAG", "a", "b:c"),
+        ("MAG:a:b:1", "MAG", "a:b", "c"),
+    ]
+    assert _reassembled(out["assembly_chunks"]) == {
+        str(_hash(seq_a)): seq_a,
+        str(_hash(seq_b)): seq_b,
+    }
 
 
 def test_two_bin_files_stemming_to_one_bin_id_fail(tmp_path):
     """`bin.1.fa` + `bin.1.fna` are two bins the tail would key as one.
 
-    The read_id check cannot reach this: the contig ids differ, so every synthetic
-    read_id is unique and the two files' contigs land silently in one bin. The
-    control renames the second file and both bins survive with their own bin_id.
+    This raise is what makes `(kind, bin_id)` name a single MAG file, which is what
+    makes the synthetic read_id unique: each file's ordinals start at 1, so a shared
+    bin_id would compose `MAG:bin.1:1` twice. The control renames the second file
+    and both bins survive with their own bin_id.
     """
     genomes, refined = _layout(tmp_path)
     _fasta(refined / "bin.1.fa", {"c1": "ACGTTGCAAGGGTTCA"})
@@ -582,39 +578,6 @@ def test_two_bin_files_stemming_to_one_bin_id_fail(tmp_path):
         tmp_path / "control-ws",
     )
     assert _rows(out["bin_map"], "read_id, kind, bin_id", "read_id") == [
-        ("MAG:bin.1:c1", "MAG", "bin.1"),
-        ("MAG:bin.2:c2", "MAG", "bin.2"),
+        ("MAG:bin.1:1", "MAG", "bin.1"),
+        ("MAG:bin.2:1", "MAG", "bin.2"),
     ]
-
-
-def test_the_reported_collision_count_is_the_total_not_the_sample(tmp_path):
-    """The failure names every colliding id it counted and shows `_DUPLICATE_ID_SAMPLE`.
-
-    The count rides the sampled rows as `count(*) OVER ()`, which is evaluated over
-    the whole grouped result; the LIMIT that clips the sample must not clip it. With
-    _DUPLICATE_ID_SAMPLE + 2 colliding ids, a clipped count would read
-    _DUPLICATE_ID_SAMPLE and be indistinguishable from a full one at exactly the cap.
-    """
-    colliding = _DUPLICATE_ID_SAMPLE + 2
-    genomes, refined = _layout(tmp_path)
-    # Each id twice, every sequence distinct so nothing folds onto a shared hash.
-    records = "".join(
-        f">ctg{i} {half}\nACGTTGCAAGGGTTC{c}\n"
-        for i in range(colliding)
-        for half, c in (("a", "A"), ("b", "T"))
-    )
-    (genomes / "circular.fa").write_text(records)
-
-    with pytest.raises(ValueError) as exc:
-        _run(
-            Inputs(
-                genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=3
-            ),
-            tmp_path / "ws",
-        )
-    message = str(exc.value)
-    assert f"{colliding} synthetic read_id(s)" in message
-    assert f"first {_DUPLICATE_ID_SAMPLE}:" in message
-    # Only the sample is named, and it is the lexicographically first block.
-    named = [f"LCG:ctg{i}:ctg{i}" for i in range(colliding) if f"'LCG:ctg{i}:ctg{i}'" in message]
-    assert named == [f"LCG:ctg{i}:ctg{i}" for i in range(_DUPLICATE_ID_SAMPLE)]
