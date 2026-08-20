@@ -49,6 +49,22 @@ duplicates further down are historical strata; leave them where they are.
   every sample assembled under the same params, and the DuckLake rows stamped with it are
   beyond any FK's reach, so a cascade would drop the gate for all of them and leave data
   with no completion state.
+  **The pool cascade clears the new gate, and the gate is indexed for it.**
+  `delete_sequenced_pool_cascade` already cleared `qiita.mask_sample` and
+  `qiita.alignment_sample` before deleting `qiita.prep_sample`; `qiita.assembly_sample` is a
+  third `prep_sample` FK with `ON DELETE RESTRICT`, so without the matching clear a
+  force-delete of a pool carrying a gate row raises `ForeignKeyViolationError` — an
+  unhandled 500, reached after a 409 that tells the operator to retry with `force=true`,
+  and after the DuckLake purge that the Postgres rollback does not undo. `prep_sample_idx`
+  is the gate's non-leading PK column, so both that clear and the FK's own RESTRICT check
+  would sequential-scan; the table's migration creates
+  `qiita_assembly_sample_prep_sample_idx` over it, single-column because
+  `prep_sample_idx` is the whole predicate at both sites.
+  **A FAILED or cancelled ticket leaves the row `'pending'` forever** — the two terminal
+  writers are the only ones, and there is no sweeper. Left as is, and stated in the gate
+  contract: nothing reads the gate at submit time, so unlike `alignment_sample` (whose rows
+  gate the align planner) a stale `'pending'` refuses nothing, and a re-run under the same
+  params re-resolves the same key and closes it.
 
 - **NCBI Taxonomy releases read from a taxdump archive (#439).**
   `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`

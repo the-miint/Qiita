@@ -83,6 +83,18 @@ COMMENT ON TABLE qiita.assembly_sample IS
     'repositories/assembly.py::fetch_assembly_sample_state. Twin of '
     'qiita.mask_sample / qiita.alignment_sample.';
 
+-- The PRIMARY KEY leads with processing_idx, which serves every read the gate has
+-- (all four repositories/assembly.py entry points supply both key columns). The
+-- accesses that lead with prep_sample_idx instead come from the FK: the
+-- ON DELETE RESTRICT check Postgres runs before deleting a qiita.prep_sample, and
+-- the matching clear in actions/sequenced_pool.py's pool cascade. A composite
+-- btree cannot be used on its non-leading column, so both would sequential-scan.
+-- Single-column because prep_sample_idx is the whole predicate at both sites;
+-- qiita.alignment_sample's equivalent index carries a second column only because
+-- its pool-discovery read GROUPs BY it, and this gate has no such read.
+CREATE INDEX qiita_assembly_sample_prep_sample_idx
+    ON qiita.assembly_sample (prep_sample_idx);
+
 CREATE TRIGGER assembly_sample_set_updated_at
     BEFORE UPDATE ON qiita.assembly_sample
     FOR EACH ROW EXECUTE FUNCTION qiita.set_updated_at();

@@ -39,9 +39,12 @@ _None yet._
   which went stale when unbinned contigs became a third kind. (#460)
 
 - `20260819000000_assembly_sample.sql` — plain `make migrate`, no out-of-band setup. One
-  empty table, `qiita.assembly_sample`: the per-`(processing_idx, prep_sample)` completion
-  gate for `long-read-assembly`, alongside the existing `qiita.mask_sample` and
-  `qiita.alignment_sample`. **No backfill**: assemblies already completed on this host get
+  empty table and its index, `qiita.assembly_sample`: the per-`(processing_idx,
+  prep_sample)` completion gate for `long-read-assembly`, alongside the existing
+  `qiita.mask_sample` and `qiita.alignment_sample`. The index is created with the table, so
+  it is a plain `CREATE INDEX` over zero rows — no `CONCURRENTLY`, nothing to lock, unlike
+  `20260806120000_alignment_sample_prep_sample_idx.sql` which indexed a populated table.
+  **No backfill**: assemblies already completed on this host get
   no gate row, so they read as not-assembled. No code reads the gate yet; whether to
   backfill them is a separate decision. The migrate→restart window has the same shape — an
   assembly ticket completing between bucket 3 and the bucket-4 restart runs under old code

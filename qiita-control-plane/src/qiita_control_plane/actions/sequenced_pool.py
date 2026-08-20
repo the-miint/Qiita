@@ -322,8 +322,8 @@ async def delete_sequenced_pool_cascade(
         above cannot reach them) then the blocks themselves (→ block_member
         CASCADEs; a block is planned per (pool, mask/alignment), so every block
         covering one of this pool's samples is this pool's) →
-      mask_sample + alignment_sample (per-(mask/alignment, prep_sample) completion
-        gates) →
+      mask_sample + alignment_sample + assembly_sample
+        (per-(mask/alignment/assembly, prep_sample) completion gates) →
       prep_sample (→ sequence_range CASCADEs) → sequenced_pool.
 
     NOT cleared here: `qiita.genome.prep_sample_idx` (a qiita-origin genome's
@@ -395,15 +395,22 @@ async def delete_sequenced_pool_cascade(
             "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])",
             block_idxs,
         )
-    # Per-(mask/alignment, prep_sample) completion gates. Both prep_sample_idx FKs
-    # are ON DELETE RESTRICT, so any live gate row would block the prep_sample
-    # delete below. Clear them here (after sequenced_sample, before prep_sample).
+    # Per-(mask/alignment/assembly, prep_sample) completion gates. All three
+    # prep_sample_idx FKs are ON DELETE RESTRICT, so any live gate row would block
+    # the prep_sample delete below — an unhandled ForeignKeyViolationError out of a
+    # force-delete that has already purged the pool's DuckLake rows, which the
+    # Postgres rollback does not restore. Clear them here (after sequenced_sample,
+    # before prep_sample). A new gate table of this shape belongs in this list.
     await conn.execute(
         "DELETE FROM qiita.mask_sample WHERE prep_sample_idx = ANY($1::bigint[])",
         prep_sample_idxs,
     )
     await conn.execute(
         "DELETE FROM qiita.alignment_sample WHERE prep_sample_idx = ANY($1::bigint[])",
+        prep_sample_idxs,
+    )
+    await conn.execute(
+        "DELETE FROM qiita.assembly_sample WHERE prep_sample_idx = ANY($1::bigint[])",
         prep_sample_idxs,
     )
     prep_sample_deleted = _rowcount(

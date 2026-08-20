@@ -183,6 +183,16 @@ async def fetch_assembly_sample_state(
     about such a sample and get None. The ticket carries that outcome; this gate
     does not.
 
+    'pending' likewise outlives a ticket that FAILED or was cancelled. The only
+    terminal writers are `finalize-assembly-sample` and the runner's StepNoData
+    handler, and nothing sweeps, so the row goes on reading "not over" for a run
+    that has ended — read the work_ticket for that, as in the None case above. It
+    is a stale row rather than a wrong answer: a consumer that needs contigs reads
+    'completed' alone, and no submit-time site refuses a re-run over a 'pending'
+    row (qiita.alignment_sample's gate rows do gate the align planner; this gate
+    has no such consumer), so a resubmission under the same params re-resolves the
+    same key and closes it.
+
     Point-in-time read: no FOR UPDATE, no transaction requirement, and it accepts
     a pool or a connection — it gates a read, it does not finalize.
     """

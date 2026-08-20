@@ -64,8 +64,10 @@ def _build_processing_params(
 
       - mask_idx: WHICH masked pass-set is assembled. This is the gating input
         predicate — assembling mask A vs mask B for the same sample+assembler must
-        be two DISTINCT identities, not a false duplicate. Read from `bound` (the
-        masked-reads resolver binds it before this runs).
+        be two DISTINCT identities, not a false duplicate. Read from `bound`, where
+        it arrives either from action_context (assembly, bound and checked non-NULL
+        before the masked-reads resolver runs) or from the read-mask minting branch
+        — so the mint this feeds has to stay after both.
       - assembler: the step-1 assembler, defaulting to the action's context_schema
         default when the submitter omits it (so omitted-vs-explicit-default
         collapse to one identity). `assembler_default` is passed by the caller
