@@ -66,6 +66,7 @@ from .force_fail import (
     _validate_force_fail_args,
 )
 from .mask import (
+    _MASK_IDX_COVERAGE_ACTION_IDS,
     _PURGE_FAILED_ACTION_IDS,
     _READ_MASK_PARQUET_NOT_FOUND,
     _RESUBMITTABLE_SCOPE_KIND,
@@ -99,6 +100,14 @@ from .owner_id import (
     _write_owner_biosample_id_tsv,
 )
 from .role import _VALID_ROLE_VALUES, _handle_set_system_role, _set_system_role
+from .terminology import (
+    DEFAULT_ROBOT_COMMAND_LINE,
+    DEFAULT_ROBOT_EXPORT_FILENAME,
+    _handle_terminology_load,
+    _handle_terminology_prepare_owl,
+    _handle_terminology_prepare_taxdump,
+    _handle_terminology_robot_command,
+)
 from .ticket_cancel import _handle_ticket_cancel
 
 # ---------------------------------------------------------------------------
@@ -212,6 +221,129 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cancel.set_defaults(handler=_handle_ticket_cancel)
 
     add_fanout_parser(sub)
+
+    p_terminology = sub.add_parser("terminology", help="Terminology release operations")
+    p_terminology_sub = p_terminology.add_subparsers(dest="terminology_cmd", required=True)
+
+    # Note that this command is *intended to be temporary* and will go away
+    # once the terminology release is integrated with apptainer/workflow/slurm.
+    p_robot_command = p_terminology_sub.add_parser(
+        "robot-command",
+        help=(
+            "Print the ROBOT export command to run against a staged OWL file."
+            " Nothing is executed — run the printed command yourself, then feed"
+            " its output to `terminology prepare-owl`."
+        ),
+    )
+    p_robot_command.add_argument(
+        "--input",
+        required=True,
+        help="OWL filename to export, named without a directory",
+    )
+    p_robot_command.add_argument(
+        "--export",
+        default=DEFAULT_ROBOT_EXPORT_FILENAME,
+        help=f"export filename ROBOT should write (default: {DEFAULT_ROBOT_EXPORT_FILENAME})",
+    )
+    p_robot_command.add_argument(
+        "--executable",
+        default=DEFAULT_ROBOT_COMMAND_LINE,
+        help=(
+            "command that runs ROBOT, ending with the executable itself"
+            f' (e.g. "apptainer exec /images/robot.sif robot"); default:'
+            f" {DEFAULT_ROBOT_COMMAND_LINE}"
+        ),
+    )
+    p_robot_command.set_defaults(handler=_handle_terminology_robot_command)
+
+    p_prepare_owl = p_terminology_sub.add_parser(
+        "prepare-owl",
+        help=(
+            "Turn a ROBOT export into the release tables and the manifest that"
+            " declares them, ready for `terminology load`."
+        ),
+    )
+    p_prepare_owl.add_argument(
+        "--export",
+        type=Path,
+        default=Path(DEFAULT_ROBOT_EXPORT_FILENAME),
+        help=f"path to ROBOT's export (default: ./{DEFAULT_ROBOT_EXPORT_FILENAME})",
+    )
+    p_prepare_owl.add_argument("--name", required=True, help="terminology name to load under")
+    p_prepare_owl.add_argument("--version", required=True, help="release version to load under")
+    p_prepare_owl.add_argument(
+        "--term-id-prefix",
+        default=None,
+        help=(
+            "keep only term ids carrying this prefix (e.g. UBERON:), excluding"
+            " classes the release imports from other vocabularies"
+        ),
+    )
+    p_prepare_owl.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="directory to write the release files into (default: the export's own directory)",
+    )
+    p_prepare_owl.set_defaults(handler=_handle_terminology_prepare_owl)
+
+    p_prepare_taxdump = p_terminology_sub.add_parser(
+        "prepare-taxdump",
+        help=(
+            "Turn an NCBI taxdump archive into the release tables and the"
+            " manifest that declares them, ready for `terminology load`. Reads"
+            " the archive in place; nothing is unpacked."
+        ),
+    )
+    # Required, unlike prepare-owl's --export: that names a file our own
+    # robot-command told the operator to create, while the archive is NCBI's
+    # and sits wherever they downloaded it.
+    p_prepare_taxdump.add_argument(
+        "--taxdump",
+        required=True,
+        type=Path,
+        help="path to NCBI's taxdump.tar.gz or new_taxdump.tar.gz",
+    )
+    p_prepare_taxdump.add_argument("--name", required=True, help="terminology name to load under")
+    p_prepare_taxdump.add_argument("--version", required=True, help="release version to load under")
+    p_prepare_taxdump.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="directory to write the release files into (default: the archive's own directory)",
+    )
+    p_prepare_taxdump.set_defaults(handler=_handle_terminology_prepare_taxdump)
+
+    p_terminology_load = p_terminology_sub.add_parser(
+        "load",
+        help=(
+            "Apply a prepared release to the database (direct DB; needs"
+            " DATABASE_URL). The three files are named individually and are"
+            " copied into a temporary directory, so no staging directory has to"
+            " exist on the host. Prints the per-term counts of what changed."
+        ),
+    )
+    p_terminology_load.add_argument(
+        "--manifest", required=True, type=Path, help="path to the release's manifest.json"
+    )
+    p_terminology_load.add_argument(
+        "--terms", required=True, type=Path, help="path to the release's terms table"
+    )
+    p_terminology_load.add_argument(
+        "--closure", required=True, type=Path, help="path to the release's closure table"
+    )
+    p_terminology_load.add_argument(
+        "--tolerate-anomalies",
+        action="store_true",
+        help=(
+            "absorb structural anomalies instead of refusing the load:"
+            " auto-obsolete terms the release dropped without deprecating them,"
+            " record an unresolvable replacement pointer as a note, and drop a"
+            " closure row naming an endpoint the release does not define, which"
+            " lowers the closure count the load reports"
+        ),
+    )
+    p_terminology_load.set_defaults(handler=_handle_terminology_load)
 
     p_mask = sub.add_parser("mask", help="Mask-definition maintenance operations")
     p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
@@ -470,6 +602,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "is the direct/on-host form and is not reachable off-host."
         ),
     )
+    p_export.add_argument(
+        "--compress",
+        action="store_true",
+        help=(
+            "Ask the data plane to zstd-compress the DoGet stream. Off by"
+            " default because compression costs more time than it saves on a"
+            " fast link (break-even is around 4 Gbit/s), so it is a loss"
+            " on-host and a large win over the TLS edge from off-site. Output"
+            " files are identical either way."
+        ),
+    )
     p_export.set_defaults(handler=_handle_masked_read_export)
 
     p_readiness = sub.add_parser(
@@ -559,9 +702,12 @@ async def _purge_failed(
         # --execute can refuse on it before any destructive work). The shared-mask
         # guard is only sound once every NON-failed ticket carries its mask_idx;
         # a non-failed sharer with a NULL mask_idx is invisible to the guard, so
-        # the mask could be wrongly deleted out from under a live result.
+        # the mask could be wrongly deleted out from under a live result. Scoped to
+        # _MASK_IDX_COVERAGE_ACTION_IDS rather than this run's `action_ids`: the
+        # guard reads tickets of every action, so narrowing the candidate set with
+        # --action must not narrow what counts as a blind spot.
         non_failed_missing_mask_idx = await _count_non_failed_missing_mask_idx(
-            pool, action_ids=action_ids
+            pool, action_ids=_MASK_IDX_COVERAGE_ACTION_IDS
         )
 
         candidates = await _select_purge_failed_candidates(pool, action_ids=action_ids, limit=limit)
@@ -618,6 +764,10 @@ async def _purge_failed(
             "executed": execute,
             "with_tickets": with_tickets,
             "action_ids": list(action_ids),
+            # The coverage gate's own scope, reported separately because it is
+            # deliberately wider than the candidate `action_ids` above — a reader
+            # comparing the count to the wrong list looks in the wrong place.
+            "coverage_action_ids": list(_MASK_IDX_COVERAGE_ACTION_IDS),
             "non_failed_missing_mask_idx": non_failed_missing_mask_idx,
             "candidates": len(candidates),
             "eligible": [
@@ -641,13 +791,14 @@ async def _purge_failed(
         if non_failed_missing_mask_idx:
             raise RuntimeError(
                 f"mask-idx coverage incomplete: {non_failed_missing_mask_idx} non-failed"
-                f" work_ticket(s) for {list(action_ids)} have mask_idx IS NULL, so the"
-                " shared-mask guard cannot see them and a shared mask could be wrongly"
-                " deleted. A non-failed masking ticket should always carry its mask_idx"
-                " (minted at submit time); the one-time backfill that populated"
-                " pre-tracking tickets has been retired. Investigate why these are"
-                " unmasked (a submit-path regression, or a pre-tracking ticket that"
-                " backfill never reached) and set their mask_idx before re-running."
+                f" work_ticket(s) for {list(_MASK_IDX_COVERAGE_ACTION_IDS)} have mask_idx"
+                " IS NULL, so the shared-mask guard cannot see them and a shared mask"
+                " could be wrongly deleted. Note this list is WIDER than the --action"
+                " selection: the guard reads tickets of every action, so the blind spot"
+                " may be outside what this run would purge. A non-failed ticket that"
+                " mints or consumes a mask should always carry its mask_idx (the runner"
+                " writes it before the step loop). Investigate why these are unmasked and"
+                " set their mask_idx before re-running."
             )
 
         # --execute: process each eligible candidate in isolation. Mask deletes
@@ -779,15 +930,16 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
         print(
             f"  *** MASK-IDX COVERAGE INCOMPLETE:"
             f" {report['non_failed_missing_mask_idx']} non-failed work_ticket(s)"
-            f" for {report['action_ids']} have mask_idx IS NULL."
+            f" for {report['coverage_action_ids']} have mask_idx IS NULL."
         )
         print(
             "      The shared-mask guard cannot see them; a shared mask could be wrongly deleted."
         )
         print(
-            "      A non-failed masking ticket should always carry its mask_idx; the"
-            " one-time backfill has been retired. Investigate and set their mask_idx"
-            " before proceeding. --execute will REFUSE until this is 0."
+            "      That list is WIDER than --action: the guard reads tickets of every"
+            " action, so the blind spot may be outside what this run would purge."
+            " Investigate and set their mask_idx before proceeding."
+            " --execute will REFUSE until this is 0."
         )
     print(f"  candidates: {report['candidates']}")
     print(f"  eligible:   {len(report['eligible'])}")
@@ -1087,6 +1239,7 @@ __all__ = [
     "_FAILURE_STAGES_REQUIRING_STEP_NAME",
     "_FAILURE_STAGE_CHOICES",
     "_FORCE_FAIL_ELIGIBLE_STATES",
+    "_MASK_IDX_COVERAGE_ACTION_IDS",
     "_OWNER_ID_BASE_COLUMNS",
     "_OWNER_ID_POOL_COLUMNS",
     "_PURGE_FAILED_ACTION_IDS",

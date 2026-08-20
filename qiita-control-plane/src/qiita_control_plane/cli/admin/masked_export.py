@@ -5,10 +5,8 @@ Split out of the former single-file ``cli.admin`` module; behavior unchanged.
 
 import argparse
 import base64
-import contextlib
 import itertools
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -19,6 +17,7 @@ from qiita_common.api_paths import (
     PATH_ADMIN_PREFIX,
     PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT,
 )
+from qiita_common.flight_constants import ipc_compression_headers
 from qiita_common.parquet import ROW_GROUP_SIZE_BYTES
 
 from qiita_control_plane.miint import connect_with_miint
@@ -37,7 +36,7 @@ def _sql_str(path: Path) -> str:
     return str(path).replace("'", "''")
 
 
-# The read_masked view's columns, in the verbatim order the miint FORMAT FASTQ
+# The read_masked macro's columns, in the verbatim order the miint FORMAT FASTQ
 # writer requires (read_id, sequence1, qual1, sequence2, qual2). Projected by the
 # fastq COPY; aliasing any of these away raises a BinderException (pinned by the
 # orchestrator's masked-export fastq contract test).
@@ -45,32 +44,11 @@ _READ_MASKED_COLUMNS = "read_id, sequence1, qual1, sequence2, qual2"
 
 
 def _commit_partials(copy_fn, pairs: list[tuple[Path, Path]]) -> None:
-    """Run `copy_fn` (which COPYs the masked rows into each pair's `.partial`),
-    then move each partial into place. Each partial is chmod 0600 *before* the
-    rename — the reads are privacy-masked sequence data, so the file is never
-    visible at its final name under a looser umask, even for an instant.
-
-    All-or-nothing across the pair: on any failure (COPY error, or a rename/chmod
-    failing partway through a paired R1+R2 commit) every partial AND every
-    already-committed final is removed, so a retry never finds a half-written
-    file or a lone R1 without its R2. The partial paths are known up front so a
-    failure *inside* the COPY (which may have already created some partials) is
-    cleaned up too."""
-    committed: list[Path] = []
-    try:
-        copy_fn()
-        for partial, final in pairs:
-            partial.chmod(0o600)
-            os.replace(partial, final)
-            committed.append(final)
-    except BaseException:
-        for partial, _ in pairs:
-            with contextlib.suppress(FileNotFoundError):
-                partial.unlink()
-        for final in committed:
-            with contextlib.suppress(FileNotFoundError):
-                final.unlink()
-        raise
+    """`_common.commit_partials` at mode 0600: these reads are privacy-masked sequence
+    data, so each partial is chmod'd *before* its rename and the file is never visible
+    at its final name under a looser umask, even for an instant. The all-or-nothing
+    commit itself is shared — see there."""
+    _common.commit_partials(copy_fn, pairs, mode=0o600)
 
 
 def _peek_paired(reader):
@@ -190,7 +168,15 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
 
 def _export_stem(sample: dict, run_idx, pool_idx) -> str:
     """Per-sample output filename stem, single-sourced so the export loop and the
-    fastq overwrite pre-scan can't drift: ``<accession>.<run>.<pool>.<prep_sample>``."""
+    fastq overwrite pre-scan can't drift: ``<accession>.<run>.<pool>.<prep_sample>``.
+
+    **This composite embeds our internal identifiers and predates the rule against
+    letting them leave Qiita** (see CLAUDE.md). It survives because this command is
+    system_admin-only and changing the stem would silently rename every existing
+    export and route around the `_SAFE_ACCESSION` charset check above. Do not copy
+    the shape to a new surface: a published artifact names its samples with
+    `qiita.exported_identifier.export_id`.
+    """
     return f"{sample['biosample_accession']}.{run_idx}.{pool_idx}.{sample['prep_sample_idx']}"
 
 
@@ -350,12 +336,18 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     # small offset/validity/fixed-width buffers, leaving the bulk sequence/quality
     # byte buffers zero-copy). The parquet path streams straight to a ParquetWriter
     # (no Acero), so it needs no realignment and keeps those bulk buffers zero-copy.
-    read_opts = (
-        flight.FlightCallOptions(
-            read_options=ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
-        )
-        if args.format == "fastq"
-        else None
+    #
+    # Built unconditionally so the two independent knobs — realignment (fastq
+    # only) and compression (`--compress`) — cannot drop each other. The earlier
+    # form returned `None` for parquet, which left no place to put a header.
+    # Empty headers plus `read_options=None` is equivalent to passing no options.
+    read_opts = flight.FlightCallOptions(
+        headers=ipc_compression_headers(args.compress),
+        read_options=(
+            ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
+            if args.format == "fastq"
+            else None
+        ),
     )
     # The fastq writer needs a miint DuckDB connection; open it once and reuse it
     # across all samples (each sample re-registers the `masked` view) rather than

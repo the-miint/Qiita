@@ -17,7 +17,7 @@ would actually surface):
      any alignment hit.
 The hit set is the union; minimap2 runs on the reads rype didn't already flag,
 so the two indexes never re-examine the same read. Host classification runs on
-the TRIMMED QC-pass sequences (the same trims the `read_masked` view applies), so
+the TRIMMED QC-pass sequences (the same trims the `read_masked` macro applies), so
 a hit reflects the read as it would be served.
 
 **Reason precedence (privacy-critical).** The final reason is, per read:
@@ -132,7 +132,7 @@ _MM2_HOST = "host_filter_minimap2_hits"
 _READ_META = "host_filter_read_meta"
 
 # A QC-pass read's trimmed sequence/qual: the same substr / list-slice math the
-# read_masked view applies (1-based start, length arg for substr; 1-based
+# read_masked macro applies (1-based start, length arg for substr; 1-based
 # inclusive slice for the qual array). Built from the read.parquet columns joined
 # to the qc_mask trims. `r` is the read alias, `q` the qc_mask alias.
 _TRIM_SEQ1 = (

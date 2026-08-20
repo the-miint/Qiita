@@ -19,21 +19,15 @@ smoke covers full-pipeline execution). The ticket-status assertion is
 therefore permissive on `state`.
 """
 
-import base64
 import json
 import os
-import socket
 import subprocess
 import sys
-import time
 import uuid
 from pathlib import Path
 
-import httpx
 import pytest
 from qiita_common.models import WorkTicketState
-
-from qiita_control_plane.testing.postgres import resolve_postgres_url
 
 _FASTQ_TO_PARQUET_YAML_PATH = (
     Path(__file__).parent.parent.parent
@@ -47,110 +41,6 @@ _FASTQ_TO_PARQUET_YAML_PATH = (
 # read. WorkTicketState is a StrEnum, so its members compare equal to
 # the plain strings the CLI prints.
 _WORK_TICKET_STATES = frozenset(WorkTicketState)
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture
-def cp_server(tmp_path, signing_key):
-    """Spawn the control-plane app under uvicorn against the test
-    Postgres; yield its base URL.
-
-    `COMPUTE_ORCHESTRATOR_URL` points at a dead port so the
-    work-ticket POST's compute-backend guard passes (it only checks the
-    client is non-None) while the background dispatch simply fails —
-    irrelevant to what this test pins. The CP→CO token file must exist
-    on disk because `ComputeBackendClient.__init__` reads it eagerly,
-    so the fixture writes a dummy one.
-    """
-    port = _free_port()
-    token_file = tmp_path / "cp-to-co.token"
-    token_file.write_text("unused-dispatch-token")
-    # Settings.from_env() requires PATH_SCRATCH, CONTACT_EMAIL, and (since the
-    # cookie split) LOGIN_COOKIE_SECRET_KEY — the CP would fail to boot without
-    # them. PATH_SCRATCH/ticket and PATH_SCRATCH/staging are derived but don't
-    # need to exist for this smoke (the dispatch points at a dead orchestrator
-    # port, so the runner never reaches mkdir); the value just needs to be an
-    # absolute path so the boot-time validation passes.
-    env = {
-        **os.environ,
-        "DATABASE_URL": resolve_postgres_url(),
-        # CP signs Flight tickets with the Ed25519 private seed; the cookie key
-        # is a distinct required secret (from_env fails without it).
-        "FLIGHT_TICKET_SIGNING_KEY": base64.b64encode(signing_key).decode(),
-        "LOGIN_COOKIE_SECRET_KEY": base64.b64encode(b"\x02" * 32).decode(),
-        "COMPUTE_ORCHESTRATOR_URL": "http://127.0.0.1:1",
-        "CP_TO_CO_TOKEN_PATH": str(token_file),
-        "PATH_SCRATCH": str(tmp_path / "scratch"),
-        "CONTACT_EMAIL": "qiita-test@example.org",
-    }
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "qiita_control_plane.main:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--log-level",
-            "warning",
-        ],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    base_url = f"http://127.0.0.1:{port}"
-
-    def _fail(reason: str) -> None:
-        proc.terminate()
-        out, err = proc.communicate(timeout=5)
-        pytest.fail(
-            f"{reason}\nstdout: {out.decode()[:2000]}\nstderr: {err.decode()[:2000]}"
-        )
-
-    deadline = time.monotonic() + 20.0
-    healthy = False
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            _fail(f"cp server exited during startup (rc={proc.returncode})")
-        try:
-            resp = httpx.get(f"{base_url}/health", timeout=1.0)
-            if resp.status_code == 200:
-                # The CP's aggregated /health probes the CO and DP
-                # too, but this fixture intentionally configures a
-                # dead CO (see COMPUTE_ORCHESTRATOR_URL above) and
-                # doesn't spawn a DP — so the aggregate top-level
-                # status will be `degraded`. Check the cp sub-
-                # service instead, since that's the only piece this
-                # test cares about being up. Fall back to top-level
-                # status for legacy /health responses that omit the
-                # services dict.
-                body = resp.json()
-                services = body.get("services") or {}
-                cp_status = services.get("cp", body.get("status"))
-                if cp_status == "ok":
-                    healthy = True
-                    break
-        except httpx.HTTPError:
-            pass
-        time.sleep(0.25)
-    if not healthy:
-        _fail("cp server did not become healthy within 20s")
-
-    yield base_url
-
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
 
 
 @pytest.fixture

@@ -25,7 +25,7 @@ description: >
   once ALL its covering blocks are done.
 
   The reads are the MASKED reads — the host-depleted, QC-passed reads the
-  `read-mask-block` milestone produced (the DuckLake `read_masked` view). The
+  read-masking step produced (the DuckLake `read_masked` macro). The
   `align_sharded` job STREAMS them from the data plane at runtime (POST
   /read/ticket/doget, keyed on work_ticket_idx): the control plane resolves the
   block's `block_member` sub-ranges, signs the `read_masked_block` selector scoped

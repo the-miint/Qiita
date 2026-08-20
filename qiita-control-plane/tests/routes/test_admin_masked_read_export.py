@@ -4,7 +4,7 @@
     — the roster manifest (one row per non-retired sample, with filename parts).
   * POST /admin/masked-read-export/ticket
     — a per-sample DoGet ticket scoped to (prep_sample_idx, mask_idx) on the
-      data plane's read_masked view.
+      data plane's read_masked macro.
 
 Both are dual-gated: system_admin role PLUS admin:masked_read_export scope. The
 ticket is the human counterpart to the service-account POST

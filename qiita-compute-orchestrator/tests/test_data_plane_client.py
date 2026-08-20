@@ -202,10 +202,14 @@ async def test_open_reference_chunk_stream_passes_none_feature_idx(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_fetch_alignment_doget_sends_work_ticket_idx_and_returns_raw_bytes():
-    """The body carries ONLY {work_ticket_idx} (no table / alignment_idx / cohort
-    — the CP reads those from action_context); the base64 ticket is decoded back
-    to the raw signed bytes."""
+async def test_fetch_alignment_doget_sends_work_ticket_idx_and_columns():
+    """The body carries the scope key and the projection, and nothing else.
+
+    Still no table / alignment_idx / cohort — the CP reads those from
+    action_context. `columns` is the one thing the caller genuinely owns: only
+    the consumer knows which columns it will bind, so it names them and the CP
+    validates and signs them. The base64 ticket is decoded back to raw bytes.
+    """
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -213,12 +217,17 @@ async def test_fetch_alignment_doget_sends_work_ticket_idx_and_returns_raw_bytes
         return _ticket_response()
 
     async with _client(handler) as http:
-        result = await fetch_alignment_doget_ticket(http=http, work_ticket_idx=42)
+        result = await fetch_alignment_doget_ticket(
+            http=http, work_ticket_idx=42, columns=("feature_idx", "cigar")
+        )
 
     assert result == _RAW_TICKET
     assert len(captured) == 1
     assert captured[0].url.path == URL_ALIGNMENT_DOGET
-    assert json.loads(captured[0].content) == {"work_ticket_idx": 42}
+    assert json.loads(captured[0].content) == {
+        "work_ticket_idx": 42,
+        "columns": ["feature_idx", "cigar"],
+    }
 
 
 @pytest.mark.parametrize("status", [404, 422, 403, 500])
@@ -231,7 +240,9 @@ async def test_fetch_alignment_doget_raises_on_non_2xx(status):
 
     async with _client(handler) as http:
         with pytest.raises(httpx.HTTPStatusError):
-            await fetch_alignment_doget_ticket(http=http, work_ticket_idx=42)
+            await fetch_alignment_doget_ticket(
+                http=http, work_ticket_idx=42, columns=("feature_idx",)
+            )
 
 
 async def test_open_alignment_stream_composes_ticket_and_stream(monkeypatch):
@@ -246,8 +257,9 @@ async def test_open_alignment_stream_composes_ticket_and_stream(monkeypatch):
         yield object()
         captured["cp_client_closed"] = True
 
-    async def fake_fetch(*, http, work_ticket_idx):
+    async def fake_fetch(*, http, work_ticket_idx, columns):
         captured["work_ticket_idx"] = work_ticket_idx
+        captured["columns"] = list(columns)
         return b"signed-alignment-ticket"
 
     @contextmanager
@@ -269,11 +281,17 @@ async def test_open_alignment_stream_composes_ticket_and_stream(monkeypatch):
     monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
 
     sentinel_conn = object()
-    async with dpc.open_alignment_stream(sentinel_conn, work_ticket_idx=42) as rel:
+    async with dpc.open_alignment_stream(
+        sentinel_conn, work_ticket_idx=42, columns=("feature_idx", "position")
+    ) as rel:
         assert rel == "alignment"
         assert captured["cp_client_closed"] is True
 
     assert captured["work_ticket_idx"] == 42
+    # The projection is the caller's, carried through untouched — the seam does
+    # not substitute a default of its own, which is what keeps the consumer the
+    # single source of truth for which columns it binds.
+    assert captured["columns"] == ["feature_idx", "position"]
     assert captured["stream"]["conn"] is sentinel_conn
     assert captured["stream"]["data_plane_url"] == "grpc://dp.test:50051"
     assert captured["stream"]["ticket_bytes"] == b"signed-alignment-ticket"

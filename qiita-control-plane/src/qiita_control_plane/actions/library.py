@@ -43,11 +43,13 @@ from qiita_common.models import (
     read_mask_reason_sql_list,
 )
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
+from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_sql
 
 from ..auth.tickets import sign_action, sign_ticket
 from ..miint import duckdb_connect
 from ..repositories.assembly import insert_assembly_membership_rows
 from ..repositories.block import (
+    MaskSampleInvalidated,
     fetch_block_members,
     finalize_alignment_sample,
     finalize_mask_sample,
@@ -60,7 +62,7 @@ from ..repositories.block import (
     upsert_mask_sample_completed,
 )
 from ..repositories.reference_exclusion import resolve_excluded_features
-from ..repositories.reference_membership import count_reference_shards
+from ..repositories.reference_membership import GENOME_MAP_PAIRS_SQL, count_reference_shards
 from ..shard_planner import _SHARD_COUNT, LineageItem, tile_by_lineage
 from .reference import IllegalStatusTransition, transition_reference_status
 
@@ -1048,32 +1050,10 @@ async def write_shard_assignment(
     return total_updated
 
 
-# Taxonomy rank columns, coarsest→finest, in the lineage sort-key order. `class`
-# and `order` are quoted — `order` is a SQL keyword and `class` is reserved in
-# some dialects; DuckDB stores the reference_taxonomy columns under these exact
-# (lowercase, prefix-stripped) names (see the data plane's qiita_lake schema).
-_TAXONOMY_RANK_COLUMNS = (
-    "domain",
-    "phylum",
-    '"class"',
-    '"order"',
-    "family",
-    "genus",
-    "species",
-    "strain",
-)
-
-# The shard planner streams taxonomy through the exclusion-aware VIEW, never the
-# raw base table, so a curated exclusion can't be bypassed. Accepted consequence:
-# an excluded feature loses its taxonomy row (its LEFT JOIN in _genome_lineages
-# misses). A genome keeps its real lineage as long as >=1 of its members survives
-# classified — the arg_min FILTER picks the lowest classified member, so blocking
-# one contig of a multi-contig genome does not relocate the whole genome to the
-# unclassified shard. Only a genome whose every member is excluded sorts as
-# unclassified, and that is moot (its features never surface post-exclusion in any
-# feature table or lineage). Reads go through _visible; register-files still writes
-# the raw base.
-_REFERENCE_TAXONOMY_TABLE = "reference_taxonomy_visible"
+# Reads go through the exclusion-aware view; register-files still writes the raw
+# base. `qiita_common.taxonomy` carries why, alongside the reduction that depends
+# on it.
+_REFERENCE_TAXONOMY_TABLE = TAXONOMY_SOURCE_TABLE
 
 
 def _do_get_reference_taxonomy(data_plane_url: str, ticket_bytes: bytes, out_path: Path) -> Path:
@@ -1107,6 +1087,10 @@ async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path:
     Public (used by both the reference-load plan-shards step here and the
     feature-table runner resolver, runner/_feature_table.py).
 
+    The row set is `GENOME_MAP_PAIRS_SQL`, shared verbatim with the REST genome
+    map: the compute side consumes this Parquet and a client consumes that map,
+    so which features have genomes cannot be allowed to differ between them.
+
     An empty result still writes a valid two-column Parquet (schema created up
     front) so DuckDB's read_parquet doesn't fail on a zero-genome reference."""
     schema = pa.schema([("feature_idx", pa.int64()), ("genome_idx", pa.int64())])
@@ -1114,10 +1098,7 @@ async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path:
     try:
         async with pool.acquire() as conn, conn.transaction():
             cursor = await conn.cursor(
-                "SELECT rm.feature_idx, fg.genome_idx"
-                " FROM qiita.reference_membership rm"
-                " JOIN qiita.feature_genome fg USING (feature_idx)"
-                " WHERE rm.reference_idx = $1",
+                "SELECT rm.feature_idx, fg.genome_idx" + GENOME_MAP_PAIRS_SQL,
                 reference_idx,
             )
             while batch := await cursor.fetch(_CHUNK_SIZE):
@@ -1135,27 +1116,15 @@ async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path:
 
 def _genome_lineages(con: duckdb.DuckDBPyConnection) -> list[LineageItem]:
     """Reduce the DuckDB `member_genome` (feature_idx, genome_idx) + `taxonomy`
-    relations to one LineageItem per genome. The lineage is the semicolon-joined
-    rank string of the genome's lowest-feature_idx *classified* member (via
-    `arg_min` under a `FILTER (WHERE lineage <> '')`, the per-member lineage
-    computed once in a CTE), so the representative is deterministic regardless of
-    scan order and skips members whose taxonomy is
-    absent. That FILTER matters under exclusion: a genome is one organism, so its
-    contigs share one lineage; blocking the lowest contig (its LEFT JOIN then
-    misses) must not drag the healthy siblings to the unclassified shard. When NO
-    member is classified (all ranks NULL, or every taxonomy row missing), the
-    filtered aggregate is empty → NULL → the `lineage or ''` fallback yields ''
-    (unclassified, which sorts first in the tiler)."""
-    ranks = ", ".join(f"t.{col}" for col in _TAXONOMY_RANK_COLUMNS)
+    relations to one LineageItem per genome, using the shared reduction in
+    `qiita_common.taxonomy` — which is the single definition of *which* member speaks
+    for a genome, and says why there.
+
+    The only thing left here is the tiler's own convention: a genome with no
+    classified member reduces to NULL, and the tiler wants `''` (unclassified, which
+    sorts first). Nothing else about the reduction lives in this module."""
     rows = con.execute(
-        f"WITH member_lineage AS ("
-        f"  SELECT mg.genome_idx, mg.feature_idx, concat_ws(';', {ranks}) AS lineage"
-        f"    FROM member_genome mg"
-        f"    LEFT JOIN taxonomy t ON t.feature_idx = mg.feature_idx"
-        f")"
-        f" SELECT genome_idx, arg_min(lineage, feature_idx) FILTER (WHERE lineage <> '') AS lineage"
-        f"  FROM member_lineage"
-        f" GROUP BY genome_idx"
+        genome_lineage_select_sql(member_genome="member_genome", taxonomy="taxonomy")
     ).fetchall()
     return [LineageItem(item_id=genome_idx, lineage=lineage or "") for genome_idx, lineage in rows]
 
@@ -1522,7 +1491,7 @@ def _read_mask_counts(read_mask_path: Path) -> tuple[int, int, int, int]:
     every row; `biological` is `pass` + the `host_*` hits (a human read is still a
     biological read); `spikein` is disjoint from biological (a spike-in is added in
     the lab); `quality_filtered` is the `pass` SUBSET of biological, the rows the
-    read_masked view surfaces. `qc_*` and `twist_no_adaptor` count toward `raw`
+    read_masked macro surfaces. `qc_*` and `twist_no_adaptor` count toward `raw`
     only.
 
     The predicate used to be `reason NOT LIKE 'qc_%'` — fail-OPEN, so any new
@@ -1696,6 +1665,12 @@ async def register_files(
     basenames across loads, so the bare name would collide with an
     already-registered file in the same per-table dir.
 
+    Some tables are REPLACED on their key rather than appended to (the data
+    plane's `REPLACE_KEY_TABLES`), so a load can supersede rows an earlier one
+    wrote. Those per-table counts come back in `replaced` — non-zero entries
+    only, the data plane drops the rest — and logging them here is what records
+    the delete.
+
     Raises pyarrow.flight.FlightError on transport / data-plane failure.
     """
     token = sign_action(
@@ -1713,6 +1688,13 @@ async def register_files(
     if not results:
         return []
     result_body = json.loads(results[0].body.to_pybytes())
+    replaced = result_body.get("replaced") or {}
+    if replaced:
+        _log.info(
+            "register_files superseded rows on the load's replace key (work_ticket_idx=%s): %s",
+            work_ticket_idx,
+            replaced,
+        )
     return result_body.get("registered", [])
 
 
@@ -2264,6 +2246,12 @@ async def reconcile_block(
                 # Already finalized (idempotent re-run, or a concurrent block
                 # finalizer won this sample's race) — nothing to do.
                 continue
+            if state == "invalidated":
+                # The pair was withdrawn. Skipped BEFORE _finalize_sample_metrics,
+                # which writes this sample's counts onto sequenced_sample: those
+                # counts would describe a pass-set no consumer may read. The
+                # withdrawal stands until someone restores the pair.
+                raise MaskSampleInvalidated(mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
             if await has_incomplete_covering_block(
                 conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
             ):

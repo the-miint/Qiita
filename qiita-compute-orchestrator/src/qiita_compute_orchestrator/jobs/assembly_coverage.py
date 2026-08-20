@@ -98,6 +98,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ._assembly import NOLCG_FILE
 
 # YAML step name this module implements.
 YAML_STEP_NAME = "assembly_coverage"
@@ -106,9 +107,6 @@ YAML_STEP_NAME = "assembly_coverage"
 # (`tmp=${reads##*/}; sample=${tmp%.*}`), so the name that matters is the one
 # binning.sh copies this to inside work_files/ — not this one.
 _BAM_NAME = "coverage.bam"
-
-# The assemble step's non-circular contigs; the thing being binned.
-_NOLCG_NAME = "noLCG.fa"
 
 # PacBio HiFi. `map-hifi` is accepted by align_minimap2 (probed; an unknown preset
 # raises `Unknown minimap2 preset`, so acceptance is not a silent no-op). This is
@@ -171,7 +169,7 @@ class Inputs(BaseModel):
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    nolcg = inputs.genomes_dir / _NOLCG_NAME
+    nolcg = inputs.genomes_dir / NOLCG_FILE
     if not inputs.genomes_dir.is_dir():
         raise FileNotFoundError(f"genomes_dir not found: {inputs.genomes_dir}")
     if not inputs.masked_reads_fastq.exists():

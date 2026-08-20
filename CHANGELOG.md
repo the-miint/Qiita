@@ -22,6 +22,355 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **NCBI Taxonomy releases read from a taxdump archive (#439).**
+  `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
+  into the term rows of a release, so taxa no longer arrive as hand-written seed
+  migrations. A live taxon takes its scientific name as its label and its genbank
+  common name as its second name; a taxon NCBI merged away becomes an obsolete
+  term pointing at the taxon it merged into; and a taxon NCBI deleted outright
+  becomes an obsolete term with no replacement, so a reload never mistakes
+  routine NCBI deletion for a terminology that silently lost terms. The archive
+  is read in place, with nothing unpacked, through duckdb-miint's taxdump
+  readers, so a member whose row layout contradicts what the taxdump documents
+  refuses the read naming the line at fault — as does an archive recording one
+  taxon as live, merged, and deleted at once. Term rows land in taxon-id order,
+  so the same archive always yields the same release digest.
+
+- **`terminology_term.alternate_label` — a second name for a term (#439).** Holds the
+  name a source vocabulary supplies alongside the one that becomes the term's
+  label; for NCBI Taxonomy the label is the scientific name and this is the
+  genbank common name, which would otherwise be dropped and is what a person
+  looking for a taxon is most likely to type. Nullable and single-valued, and
+  bounded to the same width as the label so it stays a name rather than
+  accumulating free-text definitions; an empty string is rejected, leaving NULL
+  as the only spelling of absence. A release's terms table carries it and is
+  authoritative for it, so a release supplying no second name clears any value
+  stored against the term. A resolved terminology term carries it through
+  metadata reads.
+
+- **`qiita-admin terminology` — prepare and load an ontology release (#439).**
+  `robot-command` prints the ROBOT export command to run against a staged OWL file;
+  nothing in the control plane executes ROBOT, on any host. `prepare-owl` turns that
+  export into the three files `load` consumes — a terms table, a header-only closure
+  stub, and a manifest declaring the digests of both — recording a deprecated class
+  as obsolete and an absorbed one as merged into the class that absorbed it, and
+  keeping only the term ids of a chosen prefix so classes imported from other
+  vocabularies stay out. Neither prepare command computes subsumption, so a loaded
+  terminology resolves terms while subsumption queries have nothing to answer from.
+  `load` takes the three files individually, verifies both tables against the
+  manifest before parsing either, applies the release in one transaction, and reports
+  how many terms were inserted, relabelled, obsoleted, or merged.
+  `--tolerate-anomalies` absorbs three anomalies instead of refusing the load:
+  terms the release silently dropped are auto-obsoleted, an unresolvable replacement
+  pointer is recorded as a note, and a closure row naming an endpoint the release
+  does not define is dropped, which lowers the reported closure count. A live term
+  carrying a replacement pointer refuses the load either way.
+
+- **What a terminology release must be (#439).** A manifest may name its tables only
+  by bare filename, so no declared path can reach outside the directory the manifest
+  itself sits in. A release may not reference a term it does not define — an obsolete
+  term's replacement pointer and both endpoints of every closure row have to resolve
+  within the release itself. Term rows are upserted, never replaced, so any term
+  already referenced by biosample metadata stays resolvable; obsoletion is recorded
+  on the row instead. A term the source does not name keeps the label already stored
+  for it, falling back to its own term id when the database holds nothing, so a
+  release that retires a term id without naming it cannot overwrite the name the term
+  was loaded under. Each of a term's two names has its own counter, so a reload that
+  changes only second names reports what moved rather than all zeros.
+  `TerminologyStatus` and `TerminologyTermObsoletionKind` now live in
+  `qiita_common.models.terminology` rather than `models.reference`; both stay
+  importable from `qiita_common.models`.
+
+- **Unbinned assembly contigs are stored, as a third `assembly_membership` kind (#460).**
+  `assembly_hash` hashes the `noLCG.fa` residue — the contigs no DAS_Tool-refined bin
+  claimed — alongside the circular genomes and the refined MAGs, so they are minted a
+  `feature_idx` against the shared `qiita.feature` and recorded under `kind = 'UNBINNED'`
+  with the contig id as `bin_id` (the `(kind, bin_id)` shape `LCG` already uses). Unbinned
+  contigs can be valid sequence, DNA viruses in particular; previously they died with the
+  workspace.
+  **It is the residue, not all of `noLCG.fa`.** The refined MAGs are drawn from those same
+  contigs, so hashing the file whole would give every binned contig a second membership row
+  for one `feature_idx` — the bytes dedup, the membership does not. The exclusion is keyed
+  on the canonical sequence hash, not the contig id. Id preservation through binning and
+  refinement is measured for `hifiasm_meta` only: 198,747/198,747 refined-bin records across
+  57 assembly workspaces on the deploy host carried a first-token contig id identical to
+  their `noLCG.fa` record (whole-header on a 6-ticket subset, 5,660/5,660). It is
+  unmeasured for `myloasm` — no myloasm assembly exists on the host, and its header
+  grammar differs — so an id key would rest on an unmeasured assembler; the same match
+  measured there is what would make one viable. Two consequences of keying on content —
+  a bin holding a contig on the opposite strand still excludes its noLCG record (the
+  canonical hash folds both strands), and noLCG records sharing a canonical sequence
+  leave the residue together.
+  `StepNoData` narrows to match: only an assembler that produced no contig at all is
+  no-data, so a sample whose contigs all went unbinned now stores them. The `kind` value set
+  moves to `qiita_common.assembly_constants`, the contract layer both Python services
+  depend on, and the Postgres and DuckLake `assembly_membership` comments name it instead of
+  enumerating members (a comment-only migration).
+
+- **A published feature table's rows can now be labelled without our identifiers (#448).**
+  `POST /exported-feature` mints the public handle for a feature-axis entity, the way
+  `/exported-identifier` already does for the sample axis — so a table, its taxonomy sidecar
+  and its sheared tree can all label a row the same way, which is what lets them be used
+  together. It is deliberately a **hybrid**: a real accession wins wherever one exists
+  (`genome.source_id` for a genome, `reference_membership.accession` for a feature, which is
+  why that kind is keyed on the `(reference, feature)` pair — identical bytes can be named
+  differently in two references), and a minted `QF<n>` is the fallback for an entity with no
+  accession. An accession is something a reader can actually resolve; replacing
+  `GCF_000006605` with a handle of ours would make the artifact worse.
+  **A collision is not an error.** Two genomes can share a `source_id` under different
+  `source`s, so the published namespace is a UNIQUE index and the mint resolves a clash by
+  giving the loser a minted handle — while still reporting the accession it wanted, so nobody
+  has to guess why one label changed shape. That arbitration cannot live client-side: a caller
+  sees the entities of one artifact, never the accession someone else published last week. Nor
+  can it live in the generated column, which sees only its own row. Where two entities in one
+  request want the same accession, the lower identifier keeps it.
+  An identifier is retired rather than deleted when the thing it named goes away, and what
+  happens to its string then depends on the kind: a **genome** releases its accession, because
+  the source's name for an organism means the same thing when the genome is re-loaded; a
+  **feature** reserves its accession forever, because a FASTA header names nothing outside the
+  load that emitted it and releasing it would let one published label come to name two
+  different sequences. The cost is accepted: re-loading a reference gives its features minted
+  handles instead of the accessions they had.
+
+- **A published bundle can now say what produced it, without naming an `alignment_idx` (#448).**
+  `POST /exported-processing` mints `QP<n>` for a processing — the third axis alongside
+  `/exported-identifier` (a table's columns) and `/exported-feature` (its rows). Coverage
+  filtering makes a feature table a function of the cohort it was built over rather than of the
+  samples in it, so a record of the processing is what makes the table reproducible at all, and
+  the only handle for it was internal. Unlike the feature mint this one is entirely minted with
+  no accession half: a processing is something we performed, so no outside authority has a name
+  for it. The request carries the **cohort** as well as the alignment, and takes
+  `/exported-identifier`'s gate step for step over that pair — the cohort authorizes and is not
+  part of the handle, so two callers publishing different slices of one processing still cite it
+  identically. Minting is a write, and without that gate any human could collect a handle for
+  every processing in the system, including ones over data they cannot read.
+  `GET …/sequenced-pool/{pool}/alignment` now also reports each definition's **`params_hash`**
+  (hex) — the digest the control plane deduplicates on. It is the server's own answer to "was
+  this the same processing", so it is what a manifest cites for reproducibility, and it is
+  reported from storage rather than recomputed on the way out. The CLI **recomputes it from the
+  `params` beside it and refuses to build on a mismatch**, which turns "the config arrived
+  intact" from an assumption into a checked fact — everything the build derives, starting with
+  which reference the whole table is relabelled through, is read off those params.
+
+- **A feature table can now ship its taxonomy, keyed the same way as its rows (#448).**
+  `qiita feature-table build --taxonomy` writes a third bundle member: one row per published
+  row, carrying the same `feature_id` and the eight ranks with their `d__`/`p__` prefixes
+  restored, so the two files join on one column. Parquet with eight columns rather than a
+  lineage string, because `concat_ws` skips NULLs — a lineage missing a middle rank silently
+  promotes every rank below it, so `d__Bacteria;f__Listeriaceae` reads as though the phylum
+  were Listeriaceae. An unclassified genome appears with NULL ranks rather than being left
+  out: a row missing from the sidecar reads as unclassified anyway, and nothing would
+  distinguish the two. A sidecar that does not describe the table beside it — short,
+  duplicated, or unnamed — is refused, since each of those is silent in a file people will
+  join regardless. The per-genome reduction behind it is now shared with the shard planner,
+  so a genome that tiles under one lineage publishes those same ranks.
+
+- **Every feature-table bundle now carries a manifest, and it is not optional (#448).** Coverage
+  filtering makes a table a function of the whole cohort it was built over rather than only of
+  the samples in it, so the same processing over a different cohort yields a different table —
+  a table without this record cannot be reproduced. `<stem>.manifest.json` names the processing
+  by its minted public handle **and** by the content-derived `params_hash` the client verified
+  before reading anything off `params`; the reference by name and version; the aligner, coverage
+  scope and threshold, and the gate if there was one; the cohort as `export_id`s; the published
+  row count; the bundle's own file list; and the versions of duckdb, the loaded miint build and
+  this CLI. The miint build is read from the catalog rather than assumed, because every
+  bioinformatics primitive is compiled into the extension, so two clients on different builds
+  can produce different numbers from identical input.
+  **No internal identifier appears anywhere in it** — that is what the two mints were for.
+  `params` is not copied verbatim for the same reason (it carries `reference_idx`, `mask_idx`
+  and `shard_ids`), so `aligner` is lifted out and the digest stands for the rest. There is no
+  build timestamp, deliberately: nothing would use one, and leaving it out makes the manifest a
+  pure function of its inputs, so two bundles built the same way are byte-identical and can be
+  diffed to show it.
+
+- **A feature table can now ship the reference's tree, sheared to the rows it publishes (#448).**
+  `qiita feature-table build --tree` writes the phylogeny pruned to the published keep-set,
+  as a node table (`node_index, name, branch_length, edge_id, parent_index, is_tip`) whose tip
+  names are the table's own `feature_id`s. Pruned ancestors have their branch lengths **summed
+  onto the surviving edge**, so a tip-to-tip distance in the shipped tree is the distance in
+  the whole one. Parquet rather than Newick, so the file needs no convention to read and the
+  Newick writer's edge-id default is the consumer's decision instead of ours; `edge_id` rides
+  along because it is the handle back to the reference's placements. The tips are renamed
+  *before* the shear rather than translated after, which is what makes one vocabulary
+  structural — the keep-set and the tree cannot disagree about which tip is which — and it
+  leaves an unpublished tip nameless, so a reference-internal FASTA header cannot reach a
+  published file. Four things are refused rather than approximated, each of them otherwise a
+  tree somebody would join to the table anyway: a reference with no phylogeny, a published row
+  with no tip, a row owning more than one tip (a contig-level tree, which the shear would
+  happily emit with duplicate tip labels), and a tip belonging to more than one **published**
+  genome (a plasmid published under two organisms cannot be one genome-named tip — whereas one
+  merely *present* under a second genome the table never mentions shears cleanly). Publishing
+  no rows at all is not one of these: an empty cohort gets an empty tree, the way it already
+  gets an empty table.
+
+- **The build now reports what it could not roll up (#448).** The genome map's INNER JOIN silently
+  drops alignments to features with no genome, and for some references that is most of what
+  was streamed. A build that cannot carry everything says the share and why — a
+  feature-rooted table is not built yet — rather than leaving a table that is quietly a
+  fraction of the data.
+
+- **The feature-table analytic is now shared, and breadth of coverage has a per-sample
+  scope (#448).** The SQL that turns alignment rows into an OGU table moved out of the
+  compute-orchestrator job into `qiita_common.feature_table`, so the upcoming client-side
+  recipe runs the same analytic rather than a second copy of it — the relation names, the
+  pre-woltka survivor join, and the full-genome-length denominator are all one definition
+  now. Text only; `qiita-common` gains no `duckdb` dependency. On top of that, coverage can
+  be measured **per `(sample, genome)`** instead of pooled over the whole cohort: pooled
+  keeps delegating to miint's `genome_coverage`, while per-sample reproduces that macro's own
+  method with one more `GROUP BY` key, over the same denominator, so one threshold means the
+  same thing either way. The scopes are asymmetric on purpose — pooling unions intervals, so
+  pooled breadth is always at least the best single sample's, and per-sample can only ever
+  remove rows. Behaviour is unchanged for the existing server-side job, which stays pooled.
+
+- **Alignments can be gated on CIGAR sequence identity and query coverage (#448).** A gate filters
+  the breadth calculation as well as the counts — an alignment that fails it is not a
+  placement, so it must not contribute covered bases — and `cigar` rides the signed projection
+  only when a gate reads it. Paired data is judged a placement at a time, so mates are kept or
+  dropped together rather than orphaned, using the same placement key the orchestrator's
+  aligner uses (now shared, one definition, instead of a second copy). Three ways the gate
+  could have quietly produced a wrong answer are refused with an actionable message instead:
+  a slice whose CIGARs cannot be scored for identity at all (which would have dropped every
+  row and returned an empty table), a paired placement whose mate is missing or unscorable
+  (which `string_agg` would have scored on the surviving mate alone), and an unpaired gate
+  applied to paired data. The gate SQL is unreachable without having run those checks.
+
+- **A feature table can be relabelled to public identifiers (#448).** The counts come out keyed by
+  `prep_sample_idx` and `genome_idx`, which mean nothing outside this system; the relabel
+  joins the genome map and the exported-identifier mint to name them by the genome's
+  `source_id` and the sample's minted `export_id` instead, and the relabelled relation carries
+  those two columns and the value — not the identifiers it joined on. That also makes the
+  table writable as BIOM at all, which requires both id columns as text. Four ways the
+  relabel could have published a wrong table are refused with an actionable message: a label
+  relation that repeats a key (which would inflate every count for it), a count whose genome
+  or sample has no handle (a NULL id in a published file), and two genomes or two samples
+  sharing one handle (which a BIOM write would silently sum into one row). The
+  `source_id`-collision refusal is scoped to the genomes a table actually emits, so a
+  collision elsewhere in the reference does not fail a build whose output is correct. An empty
+  cohort travels the same relabel as a populated one, so it cannot yield a differently-shaped
+  file. On the client side, the two maps are fetched, staged into DuckDB with explicit native
+  types, and released once copied; the genome map's roll-up key and public label are staged
+  from the one response so they cannot disagree about which genomes exist.
+
+- **A feature table can be written as Parquet or BIOM, bundled with the map needed to read
+  it (#448).** One format per run — they hold the same numbers, so the choice is only about what
+  reads the file next, and Parquet is the default. **The caller names the table** and the
+  identifier map is named after it, so a pair stays visibly together and two builds of one
+  cohort can share a directory; a name whose extension contradicts the requested format is
+  refused rather than quietly rewritten. The bundle is both files or neither: the table names
+  its samples by their public handle alone, so without the exported-identifier map beside it
+  nobody can join it back to their own records. An artifact already at either name is refused
+  before anything is written — the two writers disagree on their own about overwriting, one refusing and one
+  replacing silently, so a second run would otherwise destroy a published file in one format
+  and fail in the other. The map carries, in the file rather than only in the terminal, the
+  warning that it is the one artifact holding an internal identifier and must not be shipped
+  onward. BIOM is a new surface for this repo, so what miint's writer does with our data is
+  now pinned by its own contract test and documented: it sums duplicate entries silently,
+  drops zeros, refuses NULL and empty identifiers, requires `value` as DOUBLE exactly, and
+  **ignores any extra column** — so it is the relabel's projection, not the writer, that
+  keeps our identifiers out of a published file.
+
+- **`qiita feature-table build` — a feature table, computed on your own machine (#448).** The first
+  CLI surface for any of the analytic-export routes, and the first thing that composes them:
+  the alignment slice and the reference lengths arrive as Flight streams, the genome map and
+  the public sample handles as REST reads, and the analytic, the relabel, and the write all
+  run locally under the caller's own token. Nothing is computed server-side and nothing is
+  persisted. `qiita alignment list` and `qiita alignment cohort` are the discovery half —
+  which alignments ran over a pool, and which of its samples you may build a table from —
+  since an `--alignment-idx` was otherwise unobtainable without a psql shell. Both scope
+  their answer to what the caller may read, which is what makes them agree with the ticket
+  mint. **There is no `--reference-idx`:** the alignment records the reference it ran
+  against, so a caller cannot name a different one and fetch the wrong genome map. The
+  cohort defaults to the pool's full mintable set and can be narrowed sample by sample —
+  which changes the table rather than filtering it, since breadth of coverage is measured
+  over the cohort. A CIGAR gate is opt-in per threshold, pools a placement's mates unless
+  told otherwise (correct for single-end data too, and the cheap alternative loses
+  correctness silently), and pays for the wide `cigar` column on the wire only when it is
+  asked for. Everything cheap and refusable happens before the two bulk streams: a wrong
+  alignment, an empty cohort, an over-cap genome map, or an output name already in use all
+  stop the run before a byte of alignment data moves.
+- **Mask lifecycle: a config can be deprecated, and an individual run withdrawn (#445).**
+  A mask's `params_hash` covers the resolved thresholds, not the code that applies them
+  (`filter_version` is the workflow YAML version, not the miint build), so a config whose
+  scoring turned out wrong re-resolved to the same `mask_idx` and masked new data with the
+  same defect. There was nowhere to say so: `qiita.mask_definition` had no lifecycle column,
+  and `mask_sample.state` was a two-value completion gate.
+
+  Two markers, because they answer different questions. `mask_definition.status` =
+  `'deprecated'` says the CONFIG is void — `qiita.mint_mask_definition` refuses to return the
+  row (SQLSTATE 23514, surfaced as a 409 by `POST /mask-definition`) and align planning
+  refuses it, which is what stops new bad data. `mask_sample.state` = `'invalidated'` says a
+  RUN of a sound config is not trustworthy: one measured incident had 26 prep-samples under
+  one mask of which 7 classified wrongly, so deprecating the mask would have voided 19 sound
+  results to flag 7. Both carry who/when/why, enforced by a biconditional CHECK.
+
+  Invalidation is a `state` VALUE rather than a column beside `state` so every masked-read
+  consumer refuses it without being edited — the gate contract is that a consumer proceeds
+  only on `'completed'`, so a third value is refused by construction. Neither marker deletes:
+  the GET routes keep listing deprecated masks (with an optional `?status=` filter) so what
+  filtered published data stays answerable, and `samples_invalidated` is tallied separately
+  from `samples_pending` rather than folded in.
+
+  New: `PATCH /mask-definition/{idx}/status`, `PATCH /mask-definition/{idx}/sample-status`
+  (bulk, since the judgement is made per cohort), the `mask_definition:lifecycle` scope at
+  the system_admin ceiling, and `MaskDefinitionStatus`.
+
+- **The two maps that turn alignment rows into a feature table (#438).** A client can now
+  mint a ticket for its alignment cohort but cannot label the result: alignment rows carry
+  `feature_idx`, and a published table needs genomes and public sample names. Both
+  translations are control-plane REST reads rather than signed Flight tickets, for one
+  reason — their columns exist **only in Postgres**, so there is nothing for the data plane
+  to serve.
+
+  - `GET /api/v1/reference/{reference_idx}/genome-map` — the whole reference's
+    `feature_idx` → `(genome_idx, source, source_id)` lookup, ordered by
+    `(feature_idx, genome_idx)`. Both genome columns ship because `qiita.genome`'s
+    uniqueness is the composite `(source, source_id)`, so a consumer relabelling
+    `genome_idx` to a public id needs the pair to assert no collision. A feature shared
+    across genomes (a plasmid) contributes one entry per genome, so the count is of
+    PAIRS. Same INNER JOIN as `export_member_genome`, whose Parquet the compute side
+    already consumes — pinned by a test that compares the route's pairs against the real
+    exported file, because the two silently disagreeing about which features have genomes
+    would make the client's roll-up diverge from the cluster's.
+
+  - `POST /api/v1/exported-identifier` — mints the public `export_id` (`QM<n>`) for each
+    processed sample in a cohort, backed by a new `qiita.exported_identifier` table.
+    **Replaces a composed label that leaked our identifiers.** The earlier design named
+    samples `<accession>.<run>.<pool>.<prep_sample>` (or `<accession>.<prep_sample>`
+    unpooled), and both forms publish internal idxs — meaningless outside this system,
+    revealing of our structure, and not a handle we promise to keep. No accession can
+    substitute: a biosample sequenced repeatedly has several prep_samples, so its accession
+    cannot say which sequencing a row came from, and `ena_run_accession` is NULL until
+    submission. An identifier names a *processed* sample, `(alignment_idx,
+    prep_sample_idx)` — unique at rest by `qiita.alignment_sample`'s primary key, with
+    `alignment_idx` subsuming reference, aligner, mask and shard-set via
+    `alignment_definition`'s params hash — so the same sample under two alignments gets two
+    handles. Idempotent by a partial unique index on live rows, so a published identifier
+    is stable. `export_id` is a `GENERATED ALWAYS` column: Postgres is its only author, and
+    it can be neither forged by a caller nor edited after publication. Never deleted, only
+    retired — purging an alignment detaches and retires the row (the `ON DELETE SET NULL`
+    plus a retire-on-detach trigger, which is what lets that purge satisfy the
+    exactly-one-processing check at all), so a citation keeps resolving and says what
+    happened. Forward-planned for other processing types by `num_nonnulls`, the same idiom
+    as `qiita.reference_exclusion`. Dropped the label's 422 on a missing
+    `biosample_accession`: an identifier is always constructible, so an unaccessioned
+    sample is now nameable. POST because a cohort routinely spans pools and would exceed
+    nginx's 8 KB request-line cap in query params.
+
+  The genome map **refuses with a 413** above its cap rather than truncating, naming the
+  real size — the one capped read here that does. A lookup table silently missing rows
+  drops those features from the caller's roll-up, producing a *wrong* feature table rather
+  than a partial one, and nobody checks `truncated` on a map. JSON for both is a known,
+  accepted limit: the first real reference that trips the 413 is the trigger to build the
+  streamed Parquet form, not to raise the cap. Measured at 196 ms for a 250 001-row fetch
+  off a 1M-member reference, with no sort node — the existing primary keys serve both the
+  filter and the ordering.
+
+  The label map is the human alignment mint's sibling by construction: same cohort cap,
+  same `Tier.VIEWER` all-or-nothing gate via `filter_prep_samples_caller_can_read`, same
+  refusal wording, and the same access-checked-before-anything-else ordering, so a refusal
+  never discloses which samples exist for a cohort the caller may not read. No new scope
+  (`reference:read` and `prep_sample:read` respectively), no migration, no deploy note.
+
 - **A client-side way to discover a `mask_idx` (#423, closes #345).** Continuing a masked pool into
   `long-read-assembly` requires a `mask_idx`, and nothing outside a psql shell could
   produce one: `mask-definition` had only `POST` (mint) and `DELETE`, and the admin
@@ -255,6 +604,113 @@ duplicates further down are historical strata; leave them where they are.
   pool tiled by a stale planner is otherwise only discoverable one walltime ceiling
   per block later.
 
+- **A scientist can pull their own alignment data.**
+  `POST /alignment/{alignment_idx}/ticket/doget` signs a Flight DoGet ticket for
+  a cohort the caller names, closing the gap between "my samples were aligned"
+  and "I can read the alignment" — until now the only mint was
+  service-account-only and read its cohort from a work ticket. Guarded by a new
+  `alignment:doget` scope, on every role ceiling and deliberately off
+  `SERVICE_ACCOUNT_SCOPE_CEILING`. For a plain user the boundary is per-study —
+  `Tier.VIEWER` on every study each `prep_sample_idx` is still linked to — while
+  `wet_lab_admin` and above bypass that check as they do every other resource
+  gate, so for them the role is the boundary.
+  Validation runs 404 (no such alignment) → 403 (access) → 422 (cohort
+  completeness) → sign, and that order is load-bearing — reversed, the 422 would
+  tell a caller which samples are finished for an alignment they cannot read. A
+  partially-readable cohort is refused rather than narrowed: coverage filtering
+  makes a feature table cohort-dependent, so a trimmed cohort answers a
+  different scientific question under the name of the one that was asked.
+  Rationale in `docs/architecture.md` and `docs/auth.md`. (#436)
+- **Two reads answer "what has been aligned for this pool, and what may I
+  mint?"** `GET /sequencing-run/{run}/sequenced-pool/{pool}/alignment` lists the
+  alignments over a pool with their config and completion counts;
+  `.../alignment/{alignment_idx}/cohort` resolves the prep_samples that are both
+  readable and `completed`. Both **narrow** to the caller's slice rather than
+  403ing a pool that spans studies they only partly hold — a pool spans studies,
+  so rejecting it would make it undiscoverable to someone who legitimately owns
+  part of it, and narrowing is safe on a listing where no scientific result
+  depends on it. Counts are caller-scoped for the same reason: showing the
+  pool's real numbers to someone who may read half of them would set them up for
+  a 403 from the all-or-nothing mint. Open to role `user`, unlike the
+  wet_lab_admin-gated pool-completion rollup beside them.
+  (#436)
+- **A Flight DoGet ticket can carry a signed column list, and the alignment
+  surface now requires one (#435).** The consumer names the columns it wants, the
+  control plane validates them against a per-table allowlist at mint time (422
+  on an unknown, duplicated, or empty list — **and on an absent one**, since a
+  projectable table's ticket without a list is a ticket the data plane refuses)
+  and signs them, and the data plane validates again before projecting exactly
+  that set, in that order. Only `alignment_visible` is projectable; every other
+  table streams `SELECT *` and rejects a list rather than ignoring it. This makes
+  a wide column opt-in instead of a design discussion — `cigar` dominates an
+  alignment payload, so anything that needs it can now ask, and everything else
+  keeps paying nothing. The measured share, and the shape it was measured on, are
+  in `docs/architecture.md`.
+
+  A signed ticket carrying a field the data plane does not recognise is now
+  **rejected rather than ignored** (`deny_unknown_fields` on `TicketPayload`).
+  Ignoring one means serving a ticket under a wider reading than the signer
+  intended, which is the failure mode a mixed-version deploy produces silently;
+  it now fails loudly instead. `count_masked`, which reuses a DoGet ticket,
+  likewise refuses a projection list rather than disregarding it.
+- **DoGet streams can be zstd-compressed, at the client's request (#434).** A client
+  sends `qiita-ipc-compression: zstd` as gRPC metadata and the data plane
+  compresses that stream's Arrow IPC bodies; anything else is rejected rather
+  than ignored, and no header means today's uncompressed behaviour byte for
+  byte. Measured 4.4–7.0x on real production shapes. **Off by default on
+  purpose**: compression makes a DoGet *slower* over a fast link (break-even
+  ~4 Gbit/s), and every in-repo caller is above that line — the control-plane
+  runner reaches the data plane over loopback, compute jobs over the cluster
+  fabric. `qiita-admin masked-read-export --compress` opts in for off-site runs,
+  where it is a large win. Rationale and the break-even arithmetic are in
+  `docs/architecture.md`. No operator action: no new env var, no migration.
+- **Three DuckLake facts the export path depends on are now pinned by test (#433).**
+  `qiita-data-plane/src/ducklake.rs` (integration tier): DuckDB's Arrow export
+  emits **no** `DictionaryArray` for VARCHAR even at 2 distinct values but
+  **does** for ENUM, so a dictionary on the wire has to be built by us; and a
+  plain DuckLake scan through `stream_arrow` comes back near-ordered while an
+  equi-join carries no ordering guarantee at all, though its observed disorder
+  stays coarse rather than row-level. The tests assert a **lower bound on average
+  sorted-run length**, not exact inversion counts, because the counts scale with
+  row count and move run to run — so what is pinned is "a scan is near-ordered"
+  and "a join is not row-scattered", which is the property the order-sensitive
+  encodings actually consume. Measured at 1.6M rows: 0 inversions for the scan,
+  a few hundred for the join (~4,000-row runs). Row order was a prose assumption
+  behind several encoding options before this. These are facts about DuckDB that
+  the export path relies on whatever we decide about compression, which is why
+  they are in-tree while the instrument below is not.
+- **The DoGet compression and representation axes were measured (#433).** The
+  evaluation concluded **ZSTD at the IPC layer**, requested per call and
+  defaulting to off, with every array-representation option (run-end encoding,
+  `Utf8View`, dictionaries, integer narrowing) and every batch-geometry change
+  measured as neutral or negative. Off by default because compression makes a
+  DoGet *slower* above roughly 4 Gbit/s of client bandwidth — break-even is
+  `bandwidth = encode_rate × (1 − 1/ratio)` — and every in-repo caller is above
+  that line; LZ4 measured about half zstd's ratio on every production shape and
+  is rejected rather than offered. No production behaviour changes here; the next
+  release note implements the decision.
+
+  **What it was measured on**, recorded here because the decision has to outlive
+  the instrument: six Arrow payloads extracted from production DuckLake and
+  encoded through the same `FlightDataEncoderBuilder` a DoGet uses — masked reads
+  (short-read and HiFi), HiFi alignment, and WOL3 phylogeny + taxonomy. Every
+  shape's bytes are dominated by a single column. The HiFi alignment payload is
+  775.6 MiB, of which `cigar` is 746.1 MiB (96.2%; mean CIGAR ≈ 1,092 bytes over
+  716,187 rows) and the six identifier/position columns are 29.5 MiB combined; the
+  HiFi read payload splits 46.8% `sequence1` / 52.7% `qual1`. Identifier columns
+  are ≤1.1% of those shapes, which is why narrowing and run-end encoding had
+  nothing to play for. The equivalent **short-read alignment** shape was never
+  available, so no CIGAR share is claimed for it — short-read CIGARs are
+  near-degenerate and would be a much smaller fraction.
+
+  **The instrument itself is deliberately not in the repo**, and was never meant
+  to land in it. Two of its three run targets consume local-only production
+  Parquet, so nobody could re-run them from a clean checkout; what would have
+  stayed in CI was a 626-line calibration suite for an instrument nothing else
+  called, plus a cargo feature and two dev-dependencies carried solely for it —
+  coverage in appearance only. Re-deriving the decision (a new arrow-rs codec, an
+  unmeasured column shape, a proposal to change the default) means building an
+  instrument again and comparing against the numbers above.
 - **Two DuckDB memory behaviours job code reasons about are now pinned by test
   (#391).** `qiita-compute-orchestrator/tests/test_duckdb_memory_behavior.py`: an
   in-memory `CREATE TABLE` far larger than `memory_limit` **spills to
@@ -534,6 +990,277 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **xdist workers shared one miint extension directory, so they installed on top of
+  each other (#462).** `setup_miint_test_env` named the directory per *component*
+  (`qiita-control-plane-duckdb-ext` under the system temp), and the control-plane suite
+  is the one that runs `-n auto --dist worksteal` — so N worker processes pointed
+  `extension_directory` at one path and each ran its own `INSTALL miint`. A cold INSTALL
+  downloads into a `tmp-<uuid>` file and renames that over `miint.duckdb_extension` and
+  its `.info`, which makes N workers N concurrent writers to those two paths; CI saw it as
+  `IO Error: Could not set lock on file …miint.duckdb_extension.tmp-<uuid>.duckdb_extension.info`
+  surfacing through an unrelated `_handle_feature_table_build` assertion, because the
+  install that failed is the one the code under test performs (`connect_with_miint()`),
+  not a conftest fixture — which is also why a fixture-level lock could not have covered
+  it. The directory now carries the worker id when `PYTEST_XDIST_WORKER` is set
+  (`qiita-control-plane-gw0-duckdb-ext`) and is unchanged for the single-process suites
+  (qiita-common, the orchestrator, the integration tier). The worker also has to *replace*
+  the directory it inherits rather than `setdefault` past it: a worker gets its environment
+  from the controller, which ran the same helper first and had already exported the shared
+  path, so the split alone left every worker pointing back at it — measured, the per-worker
+  directories came out 0 bytes and the shared one held the only install. Only that one
+  value is replaced, so a directory pinned from outside still reaches the suite as given.
+  It costs no extra downloads on a cold cache — each worker already downloaded its own
+  copy, only the rename target changes — each directory still caches across runs (24.5s
+  cold, 4.9s warm for the tier), and the name still matches the documented
+  `rm -rf "$TMPDIR"/qiita-*-duckdb-ext`, which a new unit test pins along with the split
+  and the inheritance. It does multiply the cached bytes: 67 MB per worker under the system
+  temp, 670 MB across the 10 workers `-n auto` picks on a 10-core machine. The race itself
+  was not reproduced locally — 5×8 concurrent cold installs on linux/amd64 and 3×8 on
+  macOS, both at DuckDB 1.5.4, produced no lock error — so the shared directory is the
+  established defect and the lock error is a reasoned, not demonstrated, consequence of it.
+
+- **`POST /exported-feature` would have published a qiita-derived genome's composed
+  `source_id` verbatim (#462).** `_INSERT_GENOME` offered `qiita.genome.source_id` as the
+  accession candidate for every genome, on the premise that `source_id` is NOT NULL and so
+  the genome kind always has an accession to offer. NOT NULL holds; "is an accession" does
+  not, for `source='qiita'` — a genome assembled from one of our own prep_samples has no
+  external authority behind its source_id, and `export_feature_id` labels rows in a feature
+  table, its taxonomy sidecar and its sheared tree. The statement now offers the accession
+  only for a source on an allowlist of external repositories (`genbank`, `refseq`), so an
+  internal source gets the hybrid's other half — a NULL accession, `accession_published`
+  false, and the minted `QF<idx>` the generated column produces from that pairing. Written
+  as an allowlist rather than `<> 'qiita'` so a further internal source mints a handle
+  until it is listed, instead of publishing. `_INSERT_FEATURE` is untouched: it already
+  reads a nullable `reference_membership.accession`. The one writer of such a genome row is
+  a `qiita reference load` genome map declaring `genome_source='qiita'` with a
+  `prep_sample_idx`; two new unit tests fail if a `GenomeSource` member is left
+  unclassified by the predicate, or if `qiita` is classified external — the latter pinned
+  as a literal, since every other assertion reads its expectation out of the predicate and
+  so agrees with whatever it says. The route's OpenAPI description names the new case.
+
+- **Re-running `long-read-assembly` over a sample doubled its `assembly_membership` and
+  `bin_quality` rows (#460).** `processing_idx` hashes `{workflow, version, mask_idx,
+  assembler}`, so a second run resolves to the SAME identity whenever those four hold — an
+  edited workflow file included — and the submit path admits it: the prep_sample arm of
+  `_check_disallow_without_delete` binds only the non-terminal states, so a COMPLETED ticket
+  does not block a fresh one, and no assembly result carries a DELETE gate. Both tables were
+  appended rather than replaced, leaving both runs' rows under one `(prep_sample_idx,
+  processing_idx)` with nothing on the row to tell them apart. Measured across two
+  registrations of the same rows: `assembly_membership` 0 → 2 → 4, `bin_quality` 0 → 1 → 2.
+  `register_files` now replaces both on the composite `(prep_sample_idx, processing_idx)`, so
+  a re-run supersedes that sample's rows for that run — a row agreeing on one half of the key
+  (another sample of the same run, the same sample under a different run) is untouched. The
+  replace-by-key statement widened from one key column to a row constructor to carry it; the
+  file paths stay bound parameters.
+  A re-run that yields no refined MAG is the case the key alone does not cover: CheckM
+  covers refined bins only, so `assembly_load` writes `bin_quality` empty-with-schema, the
+  file names no key, and a delete reading it removed nothing — measured, the previous run's
+  MAG rows survived a re-run whose `assembly_membership` was replaced out from under them
+  (`replaced` empty, 1 row before and after; the same load carrying one MAG row replaced it).
+  `bin_quality`'s delete now reads the keys `assembly_membership` names in the same
+  registration, which carries the run's key on every row and is never empty where the load
+  runs at all (`assembly_hash` raises `StepNoData` at zero contigs of any kind).
+  The file stated the delete's cost twice and the two disagreed: `LAKE_COMMIT_BUDGET` read a
+  40k/400k timing as "the DELETE's cost does not grow with the table … so it prunes rather
+  than scanning", while `replace_key_delete_sql` 25 lines above said a `feature_idx` set does
+  not prune. That timing was taken on a contiguous incoming key set, which neither comment
+  said. `replace_key_delete_sql` is now the only site that states it, and the budget points
+  there: what the delete reads follows the SPREAD of the incoming key set against the
+  per-file key ranges, not the key's arity and not the table's size. Measured on DuckDB
+  1.5.4 / ducklake d318a545 — a composite `(prep_sample_idx, processing_idx)` pair scans
+  17,544 rows of 1,000,008 and opens 1 of 57 files; a `feature_idx` set spread over the
+  identity space scans 1,003,121 of 1,003,200 and opens all 57; a `feature_idx` set confined
+  to one narrow window scans 17,602 of 1,003,200 and still opens all 57; a contiguous
+  `feature_idx` block scans 2,000 rows and opens 1 file at both 40k rows over 20 files and
+  400k over 200, where the same key count spread over the identity space scans 39,982 of
+  40,000 and 399,819 of 400,000. The `WITH … DELETE … USING` comparison now reports the mean
+  paired difference and its interval (-0.8 to +1.0 ms across four key sets on statements of
+  3-37 ms, widest 95% CI [-3.2, +2.9] ms) rather than a bare non-significant p-value.
+
+- **`test_assembly_hash`'s canonical-hash oracle mis-complemented a soft-masked contig
+  (#460).** Its hand-rolled reverse complement translated through an upper-case-only table
+  and upper-cased the result afterwards, so a lowercase base passed through uncomplemented
+  and the "reverse strand" it hashed was the plain reverse. Over 2,000 random 16 bp
+  lowercase sequences the oracle disagreed with `canonical_sequence_hash_expr` on 1,362
+  (68.1%); over the same sequences upper-cased, on 0. The oracle now takes its reverse
+  complement from miint's `sequence_dna_reverse_complement` — the scalar the production
+  expression calls — applied to the upper-cased sequence, since that function preserves
+  case. The `LEAST`-over-hashes composition is still re-derived in Python, so a change to
+  how the two hashes combine still fails the oracle. A soft-masked fixture covers it; every
+  sequence the file hashed before was either upper-case or a palindrome.
+  `read_fastx` preserves input case (probed: an all-upper control record comes back
+  unchanged, its lowercase twin comes back lowercase), so the soft-masked fixture reaches
+  `canonical_sequence_hash_expr` still lowercase and the test pins the `upper()` inside that
+  expression rather than a transformation the reader already did. That test now also pins
+  which record's bytes reach the chunks: the fold keeps one representative per hash
+  (`DISTINCT ON (sequence_hash) … ORDER BY sequence_hash, read_id`) and chunks it as read, so
+  a different tie-break stores a different strand and casing with every hash assertion
+  unmoved. One happy-path fixture is no longer a reverse-complement palindrome, so its
+  `_hash` comparison exercises the fold instead of the identity.
+
+- **A sequence two loads both produced was stored twice, and reassembled twice as long
+  (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
+  carry ONE feature across every producer — but each load still wrote that feature's rows in
+  full: the compute job writing the staging Parquet has no DuckLake access to anti-join
+  against, and DuckLake enforces no PK/UNIQUE. Two assembly runs producing the same contig,
+  or two references sharing a sequence, therefore left two rows in `assembled_sequence` /
+  `reference_sequences` and two per `chunk_index` in their chunk tables, so
+  `string_agg(chunk_data, '' ORDER BY chunk_index)` returned the sequence concatenated with
+  itself while `sequence_length_bp` still described one copy. Measured on the deploy
+  2026-08-13: 182,988 `assembled_sequence` rows over 129,290 distinct features, 53,698 of
+  them duplicated. `register_files` now REPLACES those four tables on `feature_idx` — the
+  incoming Parquet's keys are deleted from the lake in the same transaction, ahead of every
+  `ducklake_add_data_files` — so a second load converges instead of accumulating, and the
+  per-table counts ride back to the control plane, which logs them. `REPLACE_KEY_TABLES` in
+  `qiita-data-plane/src/flight_service.rs` is the registry and carries the admission
+  conditions. The assembly tables were latent (absent from `ALLOWED_TABLES`, so nothing
+  reads them over Flight); the reference pair is on the read path. Where a feature's copies
+  differ — the canonical hash keeps a sequence, its reverse complement and its case variants
+  on one `feature_idx` — the newest load's bytes now win; before, both were kept and read
+  back concatenated, which is neither strand and matches no declared length.
+
+- **Concurrent registrations of one feature no longer each kept a copy (#457).** The
+  replace-by-key delete above closes the race only where the feature is ALREADY in the lake:
+  DuckLake detects a conflict where two transactions touch the same existing row, so those
+  writers serialize. When the feature is NEW, nobody's delete matches, nothing conflicts, and
+  every writer commits — measured with 4 concurrent writers of one feature: 1 row when it
+  already existed, 4 when it did not, and 4 for two bare `ducklake_add_data_files` with no
+  delete at all. A registration touching a content-addressed table now bumps the single-row
+  `qiita_lake.registration_lock` inside its transaction, giving concurrent writers a row to
+  contend for (measured: back to 1 row), and retries its own transaction when it loses rather
+  than failing the ticket — it cannot be retried from the top, because its staging files were
+  already moved. Registrations touching none of those tables skip the lock and never contend.
+  `delete_reference` takes the same lock and retry, because it writes two of the same tables:
+  without the lock a registration could add a feature between its snapshot and its commit,
+  where the orphan filter would not see the claim, and without the retry a registration's
+  delete could newly conflict it out.
+
+- **A retired `exported_feature` row could be edited out of the published namespace
+  (#448).** Every CHECK on that table is written `retired OR …`, because a detached row has
+  lost the columns they test — so a retired row is exactly where they stop guarding, and it
+  is also where the namespace index is still reading `entity_kind`. Three UPDATEs each
+  released a reserved accession: flipping `entity_kind` to `genome` drops the row out of the
+  index predicate, and clearing `accession_published` or `accession` regenerates
+  `export_feature_id` to `QF<idx>`. A second entity could then publish a string that had
+  already named a different sequence, which is the one thing the table promises cannot
+  happen. All three are now rejected by the trigger, above its retired early-return. No code
+  path issued any of them, so nothing shipped wrong — this closes the hole, it does not
+  repair damage.
+
+- **Reference ingest cut a fixed three characters to strip a rank prefix (#448).** Latent,
+  not live: every prefix in `RANK_PREFIXES` is three characters today. But the check that
+  *requires* the prefix is generated from that tuple while the strip hard-coded its length,
+  so a four-character prefix would have left a stray character in every published taxonomy
+  sidecar with nothing to catch it. The strip now takes its length from the prefix it is
+  removing.
+
+- **A blocked contig's tip could be published in a sheared tree, under its genome's public
+  name (#448).** The alignment and the taxonomy reach this recipe through exclusion-aware views, so a
+  curator's blocklist already governs the table and its sidecar; the phylogeny deliberately has
+  no such view — a row-wise anti-join would orphan a tip's internal parents and malform the tree
+  — and the tree consumer is expected to apply the blocklist to its own keep-set instead. It was
+  not. A genome that publishes on the strength of one contig, with a curator's block on the
+  contig its tip is wired to, got that blocked tip's position written into the published tree.
+  The build now reads the reference's blocklist and names a tip only when it is both published
+  and unblocked. A genome with a second, unblocked tip publishes that one instead of being
+  refused as ambiguous; a genome left with no usable tip is refused, naming it, since its only
+  position in the tree comes from sequence the blocklist rejects.
+
+- **A duckdb failure during a feature-table build reached the user as a traceback (#448).** The
+  analytic runs on the caller's own machine, which makes duckdb's own failures both the
+  likeliest thing to go wrong on a large reference — the peak is a whole tree, and the shear
+  is single-threaded and allocation-bound — and the hardest to place, since an out-of-memory
+  or a spill with nowhere to go says nothing about whose memory ran out. Now a message that
+  says the analytic failed here, alongside the transport and refusal messages that were
+  already handled.
+
+- **The roll-up's coverage report understated the share it could not carry (#448).** It counted the
+  rows of a join to the genome map, and a feature belonging to several genomes — which
+  `feature_genome` allows on purpose, since identical bytes are one feature and a plasmid two
+  organisms carry belongs to both — fans that feature's alignment row out once per genome. Only
+  the denominator inflated, so a build reporting "1 of 4 (25.0%)" was really dropping 1 of 3
+  (33.3%). Counted directly now, the way the relabel's own diagnostics already did.
+
+- **The per-genome taxonomy reduction could return two rows for one genome (#448).** Picking a
+  representative member and joining its row back matches twice if the caller's relations hold a
+  duplicate at the winning position, where the aggregate this replaced could not multiply at
+  all. The sidecar's row-count check would have caught it; the shard planner, the other consumer,
+  has none — and two items sharing one id tile one genome into two shards. One row per genome is
+  now a property of the SQL. A reference whose taxonomy genuinely repeats a feature is refused
+  instead, measured on the streamed rows: two rows for one feature can disagree, and choosing
+  between two lineages silently is not ours to do.
+
+- **An alignment config whose stored form would stop matching its own digest is now refused at
+  the mint (#448).** Postgres stores a JSON number as `numeric` and renders it back in plain decimal,
+  so `1.5e30` returns as an integer literal that Python re-reads as an `int`, and `-0.0` returns
+  as `0.0`. Either way the config read back no longer hashes to the `params_hash` stored beside
+  it — permanently, for that `alignment_idx`. Nothing hits this today (no alignment config
+  carries a float), but now that the digest is published and re-verified by clients, such a row
+  would refuse every build over it with nothing to point at. The mint asks Postgres to normalize
+  the blob and refuses a config that would not survive, so the failure lands on whoever adds the
+  value. A small-magnitude float like `1.23e-05` does round-trip and is still allowed.
+
+- **The documented `phylogeny_tip_feature` table never existed (#448).** Sites across
+  `docs/architecture.md` and `CLAUDE.md` — an ER-diagram entity, three table inventories, an
+  ingestion step, a worked clade-scoped query — described a Postgres junction table mapping
+  `(reference_idx, node_index) → feature_idx`, contradicting the migration that deliberately
+  did not build one. A phylogeny tip carries `feature_idx` as a **column on its own DuckLake
+  row**; clade queries stay inside that one table instead of crossing to Postgres. The
+  architecture doc also now records why phylogeny has no exclusion-aware `_visible` view (a
+  row-wise anti-join would orphan internal parents and malform the tree, so a consumer shears
+  to its keep-set instead). Alongside it, `CLAUDE.md` claimed `feature_idx` is "stored as
+  Postgres `uuid`" — it is a BIGINT identity, and the uuid is the separate `sequence_hash`, so
+  the claim was an invitation to write `feature_idx::uuid`.
+
+- **`shear_tree` and the Newick writer are now documented from a probe rather than assumed (#448).**
+  `docs/duckdb-miint.md` had no `shear_tree` entry at all and the architecture doc recorded its
+  presence in the pinned miint mirror as unverified. It is present, and the entry now carries
+  its real signature, the separate-connection relation resolution, the float branch-length
+  summation, and both distinct failure messages. The load-bearing find is in the writer:
+  **`COPY … (FORMAT NEWICK)` turns on jplace-style `{N}` edge annotations by default whenever an
+  `edge_id` column is present**, so passing a sheared tree straight through — as upstream's own
+  example does — writes a file plain-Newick parsers may reject.
+- **A workflow that consumes a read mask now records it on `work_ticket.mask_idx` (#444).**
+  The column was introduced for the minting path (`read-mask`, `fastq-to-parquet`), where
+  the runner persists the mask it minted. `long-read-assembly` consumes an existing mask's
+  `read_masked` pass-set instead, taking `mask_idx` from `action_context`, and never wrote
+  it to the ticket — so every assembly ticket read NULL while depending on a mask. The
+  shared-mask guard in `qiita-admin mask purge-failed` keys on that column, so a mask a
+  completed assembly reads looked unreferenced and was eligible for deletion; the
+  dependency survived only in `action_context` JSONB and `qiita.processing.params`, which
+  no guard reads. The runner now persists the consumed `mask_idx` before staging the reads
+  — the staging resolver's other terminal exit is `NO_DATA` (an empty pass-set), which is
+  not a failure, so persisting afterwards would leave exactly those tickets NULL in a state
+  the guard still protects. A context naming a mask that does not exist is now rejected by
+  name rather than by foreign-key violation. A migration backfills existing tickets from
+  `action_context->>'mask_idx'`, joining on text so no untrusted value is ever cast, and
+  skipping rows whose named mask no longer exists (which `ON DELETE SET NULL` would have
+  left NULL anyway). The `work_ticket.mask_idx` column comment now describes both minting
+  and consuming.
+
+  `purge-failed`'s mask-idx coverage gate — which refuses `--execute` while any non-failed
+  ticket has a NULL `mask_idx`, since the guard would be blind to it — was scoped to the
+  run's candidate actions, so selecting one with `--action` also narrowed what counted as a
+  blind spot while the guard itself reads tickets of every action. It now uses its own
+  list, which includes `long-read-assembly`, and the refusal message and dry-run banner
+  name that list rather than the candidate one.
+
+- **Deleting a reference whose feature an assembly also claims no longer 500s (#443).**
+  Assembled contigs and reference sequences are minted through the same
+  `mint_features` path on the same canonical hash, so a contig whose bytes match a
+  reference sequence collapses to one `feature_idx`. The orphan-feature computation
+  in `delete_reference_cascade` counted only `reference_membership` and
+  `reference_annotation` claims, so such a feature looked orphaned and the
+  `DELETE FROM qiita.feature` hit `qiita.assembly_membership`'s NO ACTION foreign
+  key — a `ForeignKeyViolationError` that aborted the whole cascade as an unmapped
+  500. `qiita.assembly_membership` now counts as a claim that keeps a feature, so the
+  delete succeeds and the shared feature survives exactly as one claimed by a second
+  reference does. The data plane's `delete_reference` orphan filter is unchanged, so
+  the two stores now GC on deliberately different rules: the lake still drops the
+  `reference_sequences` copy of a feature no REFERENCE claims, and the assembly's own
+  bytes in `assembled_sequence` / `assembled_sequence_chunks` carry it from there,
+  keyed by the retained `qiita.feature` row.
+
 - **A study link retired mid-request answers 404 instead of 500 (#386).** The
   study-scoped metadata write for a biosample or sequenced-sample checks the
   caller's study link before writing, and the database re-checks it at the write
@@ -810,6 +1537,40 @@ duplicates further down are historical strata; leave them where they are.
   [the-miint/RYpe#21](https://github.com/the-miint/RYpe/issues/21) (load the index once
   per invocation — index load is 98.4% of classify wall clock); removal of our
   workaround tracked at #403.
+- **`qiita.alignment_sample` is now indexed by `prep_sample_idx`.** Its primary
+  key is `(alignment_idx, prep_sample_idx)`, which serves every consumer that
+  leads with a known alignment — but the new pool-alignment discovery read asks
+  the opposite question ("which alignments touch THESE samples?") with no
+  `alignment_idx` predicate, and a composite btree cannot be used on its
+  non-leading column. That sequential-scanned an unboundedly-growing table (one
+  row per alignment config × sample, across every reference, aligner and rerun)
+  from a route open to any authenticated user. Added
+  `(prep_sample_idx, alignment_idx)`, built `CONCURRENTLY`, turning that
+  sequential scan into an index scan. Not index-only — the query counts
+  `state = 'completed'`, which is off the index — see the migration for why
+  `INCLUDE (state)` was not taken. (#436)
+- **A multi-sample masked-read DoGet scanned the entire `read` table; `read_masked`
+  is now a scoped table macro instead of a view (#433).** DuckDB derives a transitive
+  predicate across a join equality for `col = const` but **not** for
+  `col IN (list)`, so a view could only ever receive a multi-sample scope on one
+  side of the `read`/`read_mask` join: the `read` scan got no filter, DuckLake
+  pruned nothing, and every file in the lake was read. Production `EXPLAIN`
+  confirms it — a single-sample equality returns 5,356 rows in 0.147 s, while a
+  ~100-sample `IN` list fully scans a ~20.7-billion-row table (32 GB RAM and
+  >250 GB swap before being killed). `read_masked(p_mask_idx, p_preps)` takes the
+  scope as arguments so it lands on **both** inputs. On a local DuckLake of
+  1,000,000 rows over 200 samples, a realistic block (one partial head sample, 18
+  complete, one partial tail) selecting 84,600 rows went from 1,033,599 rows
+  scanned to 178,599, against a floor of 169,200. Affects `read_masked` and
+  `read_masked_block` — production's main read path — but **not** single-sample
+  blocks (a one-element `IN` is rewritten to `=`), which is why it went unnoticed.
+  Rejected after measuring: passing the block's `sequence_idx` range as further
+  parameters (identical row counts) and pushing per-member `(sample, range)` pairs
+  down as an `EXISTS` (1,900,000 rows — worse than the view, it defeats file
+  pruning). Result rows, column set and column order are unchanged. Side effect:
+  an unscoped fleet-wide masked read is now **unrepresentable** rather than
+  refused, so the control plane's mandatory-filter invariant is defence in depth
+  instead of the only guard.
 - **Restart recovery no longer resumes into a dead step attempt, and `/run` no longer strands a live SLURM job (#402).**
   Establishes one invariant across the runner and the redrive route: **only a LIVE
   attempt is adoptable.** Both defects below were latent until a step could have
@@ -1360,6 +2121,51 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **A feature-table build now reads its reference before it streams anything (#448).** The
+  reference's name and version are only needed by the manifest, written last, so the read that
+  fetches them ran last too — which meant a reference this alignment names but the caller cannot
+  read was discovered *after* a whole cohort had crossed the wire. It is the cheapest thing in the
+  build that can refuse, so it now runs first. The processing mint stays last, deliberately: it is
+  a write, and a public handle minted for a build that then fails names a bundle nobody has.
+
+- **A BIOM file written by a feature-table build now names `qiita-miint` as its generator
+  (#448).** `qiita` named the project rather than the system that produced the file.
+
+- **The paired-row count asks miint instead of masking the SAM flag (#448).** `flags & 1 <> 0`
+  became `alignment_is_paired(flags)`, which is what `docs/duckdb-miint.md` tells callers to
+  use. Same numbers either way, which is why it is pinned by a test — nothing else would
+  notice a regression.
+
+- **Every route keyed on an `alignment_idx` now returns one wording for "no such alignment"
+  (#448).** The delete route answered `Alignment definition not found` while the three cohort
+  routes answered `alignment not found`, and no test asserted either, so one condition had two
+  bodies a client could come to depend on. Converged on the shared constant and pinned.
+
+- **The gate every alignment-cohort route runs is now one function, not three copies (#448).**
+  `POST /alignment/.../ticket/doget`, `POST /exported-identifier` and `POST
+  /exported-processing` all check that the alignment exists, then that the caller may read
+  the whole cohort, then that the cohort is completed — and that *order* is a disclosure
+  decision: reversed, the completeness refusal would list samples of an alignment the caller
+  has no right to read. Three routes hand-writing a security-relevant sequence is three
+  chances for one to be reordered alone, so it is now written once, with the reasoning
+  beside it, and the routes differ only in the clause that completes their 422.
+
+- **Reference ingest's rank-prefix check and its column projection are now generated from
+  the shared rank tuples (#448).** They were spelled out, eight clauses each, in the job — which
+  was harmless until the published taxonomy sidecar started *restoring* those prefixes by
+  position from the same tuples. A drift between the two would have silently relabelled
+  ranks in a file people join, and nothing would have caught it; now a change to the tuple
+  changes what ingest accepts.
+
+- **The all-or-nothing multi-file commit is now shared by both CLIs' exports (#448).** The
+  masked-read export's commit — write partials, then rename each into place, and on any
+  failure remove every partial *and* every already-committed file — moved to the shared CLI
+  helpers so the feature-table bundle uses the same one rather than a second copy. The
+  privacy chmod stays with the masked-read export, the only caller whose bytes need it. The
+  rollback of an already-committed file now has direct tests, which no caller's own suite
+  reached, and the one gap it cannot close — a kill between two renames — is written down
+  where the guarantee is stated.
 
 - **`docs/architecture.md` updated: N=0 sharded path no longer exists (#431).**
   `plan-shards` returns zero shards on N=0 rather than raising; the

@@ -7,6 +7,7 @@ rows) per pool item. Also carries the sequence-range allocator and the mask
 definition (read-filtering config identity) models.
 """
 
+from enum import StrEnum
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -26,6 +27,7 @@ from qiita_common.models._base import (
     MetadataRequestModel,
     NonBlankText,
     PatchRequestModel,
+    PrepSampleCohort,
     ReadCounts,
 )
 from qiita_common.models.biosample import (
@@ -853,18 +855,26 @@ class SequenceRange(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-MaskSampleState = Literal["pending", "completed"]
+MaskSampleState = Literal["pending", "completed", "invalidated"]
 """A sample's per-`(mask_idx, prep_sample)` masking state.
 
 Mirrors the `qiita.mask_sample.state` TEXT/CHECK column (NOT a Postgres ENUM —
 see the `mask_sample` migration for why the gate stays out of the enum-parity
 discipline). `'completed'` means the read_mask is whole; `'pending'` means it is
-not. The canonical statement of the gate contract lives on
+not; `'invalidated'` means it was whole and has since been withdrawn, because the
+run that produced it is not trustworthy. The canonical statement of the gate
+contract lives on
 `qiita_control_plane.repositories.block.fetch_mask_sample_state`.
 
 Consumers of masked reads act only on `'completed'`. Absence of a state is not
 `'pass'`: `MaskedReadExportSample.mask_state` is `None` when no gate row exists,
 and the DoGet ticket route 409s that case the same as `'pending'`.
+
+`'invalidated'` is per-RUN, and deliberately not the same judgement as
+`MaskDefinitionStatus.DEPRECATED`, which is per-CONFIG: a sound config can
+produce an untrustworthy run (a job that OOM-escalated into a larger Arrow batch,
+say), and voiding the config to flag one such run would void every sound run
+beside it.
 """
 
 MaskStateSource = Literal["mask_sample", "work_ticket"]
@@ -882,6 +892,27 @@ nobody ever tried to mask. These rows are what the ticket supplies.
 A ticket that has not started is not among them: the mask is written onto the
 ticket inside the run, so a queued ticket carries no mask to be found by.
 """
+
+
+class MaskDefinitionStatus(StrEnum):
+    """Lifecycle of a read-filtering CONFIG (`qiita.mask_definition.status`).
+
+    Mirrors a TEXT + CHECK column, NOT a Postgres `CREATE TYPE ... AS ENUM` — per
+    the enum-parity carve-out in CLAUDE.md it therefore has no `ENUM_PAIRS` entry
+    and is out of scope for the parity test. Keep this set and the CHECK list in
+    the `mask_lifecycle` migration in sync by hand.
+
+    `DEPRECATED` says the configuration itself is void: `qiita.mint_mask_definition`
+    refuses to return the row, so no new data can be masked under it. It says
+    nothing about any individual run — a run of a sound config is withdrawn with
+    `MaskSampleState` `'invalidated'` instead.
+
+    Deprecation never deletes: the GET routes keep listing deprecated masks so
+    "what filter produced this published submission?" stays answerable.
+    """
+
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
 
 
 class MaskDefinitionMintRequest(BaseModel):
@@ -926,6 +957,15 @@ class MaskDefinition(BaseModel):
     filter_version: str
     params: dict[str, Any]
     created_at: AwareDatetime
+    # Lifecycle. A deprecated mask is still returned by every read route — the
+    # record of what filtered published data outlives the judgement that the
+    # filter was wrong. The three provenance fields are set exactly when
+    # `status` is DEPRECATED (a CHECK enforces the biconditional).
+    status: MaskDefinitionStatus
+    deprecated_at: AwareDatetime | None = None
+    deprecated_by_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+    deprecation_reason: str | None = None
+    superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
 
 
 class MaskDefinitionSummary(MaskDefinition):
@@ -941,11 +981,15 @@ class MaskDefinitionSummary(MaskDefinition):
     `samples_completed` are masked and durable — the set a masked-read pull or an
     assembly submission can act on. `samples_pending` are not whole: a covering
     block still in flight on the block path, a ticket not yet completed on the
-    per-sample one.
+    per-sample one. `samples_invalidated` finished and were withdrawn.
     """
 
     samples_completed: Annotated[int, Field(ge=0)]
     samples_pending: Annotated[int, Field(ge=0)]
+    # Runs withdrawn after the fact. Counted separately rather than folded into
+    # either bucket above: an invalidated run is neither usable nor still coming,
+    # and rolling it into `samples_pending` would read as "wait for it".
+    samples_invalidated: Annotated[int, Field(ge=0)]
 
 
 class MaskDefinitionListResponse(BaseModel):
@@ -967,8 +1011,9 @@ class MaskDefinitionListResponse(BaseModel):
 class MaskPrepSample(BaseModel):
     """One sample in a mask's per-sample roster.
 
-    `mask_state` answers "is this sample's read_mask whole?" — `'completed'` if
-    so, `'pending'` if not. `source` names where that came from:
+    `mask_state` answers "may this sample's read_mask be read?" — `'completed'` if
+    so; `'pending'` if it is not whole yet, `'invalidated'` if it was whole and has
+    since been withdrawn. `source` names where that came from:
 
       * `'mask_sample'` — the gate row, which both masking paths write.
         `work_ticket_state` is None; the gate is a rollup, so no single ticket
@@ -1005,6 +1050,89 @@ class MaskPrepSampleListResponse(BaseModel):
     sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
 
 
+class MaskDefinitionStatusUpdate(BaseModel):
+    """Body for PATCH /api/v1/mask-definition/{mask_idx}/status.
+
+    Deprecating requires a `reason`: a bare `status` change leaves whoever later
+    finds a deprecated mask behind published data with no way to tell whether the
+    filter was wrong or the mask was merely superseded. `superseded_by` names the
+    replacement when a re-mint under corrected code produced one; it is accepted
+    only alongside DEPRECATED, matching the CHECK on the column.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: MaskDefinitionStatus
+    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
+
+    @model_validator(mode="after")
+    def _reason_required_to_deprecate(self) -> MaskDefinitionStatusUpdate:
+        if self.status is MaskDefinitionStatus.DEPRECATED:
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("reason is required when status is 'deprecated'")
+        else:
+            if self.reason is not None:
+                raise ValueError("reason is only accepted when status is 'deprecated'")
+            if self.superseded_by is not None:
+                raise ValueError("superseded_by is only accepted when status is 'deprecated'")
+        return self
+
+
+class MaskSampleStatusUpdate(BaseModel):
+    """Body for PATCH /api/v1/mask-definition/{mask_idx}/sample-status.
+
+    Withdraws (or restores) specific runs of one mask. Bulk because that is the
+    unit the judgement is made in — "these N samples of this mask ran with a
+    defect" — and applying it one call per sample leaves a partially-withdrawn
+    mask for someone to reason about.
+
+    `state` accepts only the two settable values. `'pending'` is the masking
+    pipeline's to write and is not reachable here: a run that finished cannot
+    become unfinished.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[list[Annotated[int, Field(gt=0)]], Field(min_length=1)]
+    state: Literal["completed", "invalidated"]
+    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+
+    @model_validator(mode="after")
+    def _reason_required_to_invalidate(self) -> MaskSampleStatusUpdate:
+        if self.state == "invalidated":
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("reason is required when state is 'invalidated'")
+        elif self.reason is not None:
+            raise ValueError("reason is only accepted when state is 'invalidated'")
+        if len(set(self.prep_sample_idx)) != len(self.prep_sample_idx):
+            raise ValueError("prep_sample_idx must not repeat")
+        return self
+
+
+class MaskSampleStatusUpdateResponse(BaseModel):
+    """Returned by PATCH /api/v1/mask-definition/{mask_idx}/sample-status.
+
+    `updated` are the pairs whose state changed. `unchanged` already held the
+    requested state (the call is idempotent, so re-running a withdrawal is not an
+    error). `not_found` had no gate row under this mask at all — reported rather
+    than silently skipped, because a caller naming a sample that was never masked
+    under this mask has almost certainly named the wrong mask.
+
+    `skipped_pending` were left `'pending'`: the masking pipeline flips that value
+    to `'completed'` when the run lands, so a withdrawal written over it would be
+    undone without anyone being told, and there is no pass-set to withdraw yet.
+    Re-issue for those samples once they complete.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    state: Literal["completed", "invalidated"]
+    updated: list[int]
+    unchanged: list[int]
+    not_found: list[int]
+    skipped_pending: list[int] = []
+
+
 class MaskDefinitionDeleteResponse(BaseModel):
     """Returned by DELETE /api/v1/mask-definition/{mask_idx}.
 
@@ -1030,14 +1158,76 @@ class AlignmentDefinitionDeleteResponse(BaseModel):
     rows_deleted: int
 
 
+class PoolAlignmentSummary(BaseModel):
+    """One alignment over a pool, as the CALLER sees it.
+
+    **Both counts are scoped to the samples the caller may read**, not to the
+    alignment's real membership. That is deliberate and load-bearing: the
+    alignment DoGet mint is all-or-nothing, so a caller shown the pool's true
+    counts would request a cohort it cannot fully read and get a 403. Discovery
+    and the mint have to agree about what "your cohort" means.
+
+    `params` is the alignment's config blob verbatim (reference, aligner, mask,
+    shard set) — the same JSON `alignment_definition.params` stores, so an
+    alignment_idx is self-describing without a second lookup.
+
+    `params_hash` is the SHA-256 of that blob's canonical JSON, hex-rendered — the
+    digest the control plane deduplicates definitions on. It is here so a client can
+    recompute it from the `params` beside it (`qiita_common.hashing.
+    canonical_params_hash`) and **refuse on mismatch**: everything a client derives
+    from `params` is only as trustworthy as the round trip that delivered them, and a
+    published manifest cites this digest as the reproducibility key. A client that
+    copied a hash it never checked would be publishing a claim it cannot support.
+    """
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    params: dict[str, Any]
+    params_hash: str
+    samples_completed: int
+    samples_total: int
+
+
+class PoolAlignmentList(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{run}/sequenced-pool/{pool}/alignment.
+
+    An alignment the caller can read NO sample of is absent entirely rather than
+    present with zero counts — a zero-count row would still disclose that the
+    alignment exists over data they have no access to.
+    """
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    alignments: list[PoolAlignmentSummary]
+
+
+class PoolAlignmentCohort(BaseModel):
+    """Returned by GET .../sequenced-pool/{pool}/alignment/{alignment_idx}/cohort.
+
+    The prep_samples that are BOTH readable by the caller and `'completed'` for
+    this alignment — a valid alignment-DoGet mint body by construction. Sorted,
+    so the same pool and alignment always produce the same request bytes; the
+    cohort is signed into a ticket, and an unstable order would make two
+    identical requests sign different payloads.
+
+    Empty is a legitimate answer, not an error: it means "nothing here you may
+    mint", which is what a narrowing read should say rather than a 403 that
+    would confirm which alignments touch data the caller lacks.
+    """
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: list[Annotated[int, Field(gt=0)]]
+
+
 class ReadMaskedDoGetTicketRequest(BaseModel):
     """Body for POST /api/v1/read-masked/ticket/doget.
 
     Signs a Flight DoGet ticket scoped to a single (prep_sample_idx, mask_idx)
-    on the data plane's `read_masked` view. Both identifiers are mandatory: the
-    data plane's empty-filter path would dump every sample's pass reads across
-    every mask, so the route never signs an unfiltered read_masked ticket
-    (the mandatory-filter invariant).
+    on the data plane's `read_masked` macro. Both identifiers are mandatory —
+    they are the macro's required arguments — and the route refuses to sign a
+    ticket missing either, as defence in depth (the mandatory-filter invariant,
+    `routes/read_masked.py`).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1076,6 +1266,111 @@ class MaskedReadExportSample(BaseModel):
     mask_state: MaskSampleState | None = None
 
 
+class ExportedIdentifierRequest(BaseModel):
+    """Body for POST /api/v1/exported-identifier — mint (or recover) the public
+    handle for each processed sample in a cohort.
+
+    ``alignment_idx`` names the processing; together with each ``prep_sample_idx``
+    it identifies one processed sample, which is what an ``export_id`` stands for.
+    The pair is the request's shape rather than the URL's because the cohort has to
+    ride a body: it is a pool's or a study's worth of samples, past nginx's 8 KB
+    request-line cap in query params, and it routinely SPANS pools.
+
+    ``PrepSampleCohort`` is shared with the alignment ticket mint, cap included:
+    the two bound the same thing — a cohort a scientist assembles — for the same
+    payload-size and disclosure-width reasons. Non-empty because a cohort with no
+    members has no answer to give; a caller that meant "all of them" has to say
+    which.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: PrepSampleCohort
+
+
+class ExportedIdentifier(BaseModel):
+    """One processed sample's public handle, and the accessions it does NOT
+    replace.
+
+    ``export_id`` (``QM<idx>``) is the identifier a published table carries. It is
+    minted by Postgres as a generated column, so nothing in Python composes it and
+    no caller can supply one.
+
+    ``prep_sample_idx`` is echoed back because this map's whole job is the
+    translation: the caller's alignment rows are keyed by it, so without it there
+    is nothing to join ``export_id`` to. It is an identifier the caller already
+    sent us, which is why returning it is not a leak — but it belongs in the map
+    only, never in the artifact the map is shipped beside.
+
+    The two accessions ride along because they are already public, and because
+    neither can do ``export_id``'s job: a biosample sequenced repeatedly has
+    several prep_samples, so its accession cannot say which sequencing a row came
+    from, and ``ena_run_accession`` is NULL until the data is submitted. Both are
+    nullable and purely informational — an unaccessioned sample still gets an
+    ``export_id``.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    export_id: str
+    biosample_accession: str | None = None
+    ena_run_accession: str | None = None
+
+
+class ExportedIdentifierResponse(BaseModel):
+    """Returned by POST /api/v1/exported-identifier: one entry per requested
+    prep_sample, ascending by prep_sample_idx.
+
+    Every requested sample is present or the whole request failed, so there is no
+    partial answer to signal and no `truncated` — the cohort is already bounded by
+    the request body's own cap.
+    """
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    identifiers: list[ExportedIdentifier]
+    count: Annotated[int, Field(ge=0)]
+
+
+class ExportedProcessingRequest(BaseModel):
+    """Body for POST /api/v1/exported-processing — mint (or recover) the public
+    handle for the processing a bundle was built from.
+
+    ``alignment_idx`` is what the handle names. ``prep_sample_idx`` is not part of
+    that name at all: it is **how the caller proves they may have it**. Minting is a
+    write, and a route that wrote on behalf of data the caller cannot read would let
+    anyone walk the `alignment_idx` range and collect a handle for every processing in
+    the system. So the cohort rides the body and takes exactly the gate
+    ``/exported-identifier`` takes for the same pair — a caller who could not build
+    the table has no manifest to write.
+
+    Identical in shape to ``ExportedIdentifierRequest``: two routes over
+    one `(processing, cohort)` pair that authorized it differently would be two
+    answers to "may I read this data".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: PrepSampleCohort
+
+
+class ExportedProcessingResponse(BaseModel):
+    """Returned by POST /api/v1/exported-processing.
+
+    ``export_processing_id`` (``QP<idx>``) is what a published manifest cites. It is
+    minted by Postgres as a generated column, so nothing in Python composes one and
+    no caller can supply one.
+
+    ``alignment_idx`` is echoed back so the caller can tell which of several
+    processings the handle belongs to. It is an identifier they already sent us,
+    which is why returning it is not a leak — but it belongs in this response only,
+    never in the manifest the handle goes into.
+    """
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    export_processing_id: str
+
+
 class MaskedReadExportManifest(BaseModel):
     """Returned by GET /admin/sequenced-pool/{sequenced_pool_idx}/masked-read-export.
 
@@ -1096,7 +1391,7 @@ class MaskedReadExportTicketRequest(BaseModel):
     """Body for POST /admin/masked-read-export/ticket.
 
     Mints a Flight DoGet ticket scoped to one (prep_sample_idx, mask_idx) on the
-    data plane's read_masked view — the human (system_admin) counterpart to the
+    data plane's read_masked macro — the human (system_admin) counterpart to the
     service-account POST /read-masked/ticket/doget. Minted just-in-time per
     sample by the export CLI. Both identifiers mandatory (the data plane's
     empty-filter path would dump every sample's pass reads). system_admin +

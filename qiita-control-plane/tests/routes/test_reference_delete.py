@@ -224,6 +224,103 @@ async def test_delete_reference_orphan_vs_shared_features(client, postgres_pool)
         )
 
 
+async def test_delete_reference_keeps_a_feature_an_assembly_claims(
+    client, postgres_pool, human_admin_session
+):
+    """A feature an assembly also claims survives the delete; one only this
+    reference claimed is still GC'd.
+
+    Assembled contigs and reference sequences are minted through the same
+    `mint_features` path on the same canonical hash, so a contig whose bytes match a
+    reference sequence collapses to one `feature_idx`. `assembly_membership`'s FK on
+    `qiita.feature` is NO ACTION: a cascade that counted such a feature as an orphan
+    raises ForeignKeyViolationError and takes the whole delete down with it.
+    """
+    from qiita_control_plane.repositories.processing import mint_processing
+    from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
+
+    ref_idx = await _create_ref(client, f"del-assembly-{uuid.uuid4()}")
+
+    async def _feature():
+        return await postgres_pool.fetchval(
+            "INSERT INTO qiita.feature (sequence_hash) VALUES (gen_random_uuid())"
+            " RETURNING feature_idx"
+        )
+
+    contig, orphan = await _feature(), await _feature()
+    await postgres_pool.executemany(
+        "INSERT INTO qiita.reference_membership (reference_idx, feature_idx) VALUES ($1, $2)",
+        [(ref_idx, contig), (ref_idx, orphan)],
+    )
+
+    biosample, prep_sample = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=human_admin_session["principal_idx"]
+    )
+    version = f"v-{uuid.uuid4()}"
+    async with postgres_pool.acquire() as conn:
+        processing = await mint_processing(
+            conn,
+            workflow="long-read-assembly",
+            version=version,
+            params={"workflow": "long-read-assembly", "version": version, "assembler": "flye"},
+        )
+    await postgres_pool.execute(
+        # kind/bin_id as assembly_hash emits them for a refined bin: the bin_id is
+        # the bin FASTA's filename stem. (An LCG's bin_id is its contig read_id.)
+        "INSERT INTO qiita.assembly_membership"
+        " (prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
+        " VALUES ($1, $2, 'MAG', 'bin.1', $3)",
+        prep_sample,
+        processing["processing_idx"],
+        contig,
+    )
+
+    try:
+        resp = await client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["orphan_feature_count"] == 1
+        assert resp.json()["membership_deleted"] == 2
+
+        # The contig's feature and the assembly row naming it are untouched.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", contig
+            )
+            == 1
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT count(*) FROM qiita.assembly_membership WHERE feature_idx = $1", contig
+            )
+            == 1
+        )
+        # The feature only this reference claimed is GC'd, as before.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", orphan
+            )
+            is None
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.assembly_membership WHERE feature_idx = ANY($1::bigint[])",
+            [contig, orphan],
+        )
+        await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample)
+        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.processing WHERE processing_idx = $1",
+            processing["processing_idx"],
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_membership WHERE feature_idx = ANY($1::bigint[])",
+            [contig, orphan],
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", [contig, orphan]
+        )
+
+
 async def test_delete_reference_gcs_annotated_features(client, postgres_pool):
     """An ANNOTATED interval's feature is GC'd on delete, exactly like a member's.
 

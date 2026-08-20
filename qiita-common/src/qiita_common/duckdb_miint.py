@@ -226,23 +226,50 @@ def is_empty_sequence_file(path: Path) -> bool:
 
 def setup_miint_test_env(component: str) -> None:
     """Test-harness helper: point miint installs at the team mirror and a
-    per-component private extension directory, via `setdefault` (a no-op when
-    the env is already set). Call at conftest top. `component` names the
-    private dir (`qiita-<component>-duckdb-ext` under the system temp), kept
-    distinct per component so a mirror build in one suite doesn't collide with
-    another's cached extension.
+    private extension directory, via `setdefault` (a no-op when the env is
+    already set). Call at conftest top. `component` names the private dir
+    (`qiita-<component>-duckdb-ext` under the system temp), kept distinct per
+    component so a mirror build in one suite doesn't collide with another's
+    cached extension.
+
+    Under xdist the worker id joins the name (`qiita-<component>-gw0-duckdb-ext`),
+    so no two processes share a directory. A worker is a separate process and each
+    one installs: a cold INSTALL downloads its own copy into a `tmp-<uuid>` file
+    and renames that over the final `miint.duckdb_extension` and its `.info`, so
+    one directory across N workers is N concurrent writers to those two paths. The
+    split costs no extra downloads on a cold cache — the download already happens
+    once per worker, the rename target is all that changes — and each directory
+    caches for later runs the same way. It also puts the owning worker in the path,
+    so a file-level DuckDB error naming that directory says which process owns it.
+
+    A worker inherits its environment from the xdist controller, which ran this
+    same helper first and so already exported the plain per-component directory —
+    `setdefault` alone leaves every worker pointing back at that one shared path.
+    So a worker also REPLACES that value, and only that value: a directory pinned
+    from outside is a different string and survives untouched, which is the
+    `setdefault` contract this keeps.
 
     The conftest fixtures INSTALL (not FORCE INSTALL) into that dir, so it caches
     across runs and NEVER refreshes. After the mirror rebuilds — e.g. a new miint
     function lands — a warm cache still holds the old build, and the symptom is a
     bare `Catalog Error: ... does not exist` from the new function, which points at
-    the code rather than at the cache. Clear it:
+    the code rather than at the cache. Clear it — the glob matches the per-worker
+    directories too:
 
         rm -rf "$TMPDIR"/qiita-*-duckdb-ext        # NOT /tmp on macOS
 
     CI is unaffected (it always starts cold), and the deploy is covered by
     compute-readiness's miint probes."""
     os.environ.setdefault("MIINT_EXTENSION_REPO", MIINT_MIRROR_URL)
-    ext_dir = os.path.join(tempfile.gettempdir(), f"qiita-{component}-duckdb-ext")
-    os.makedirs(ext_dir, exist_ok=True)
-    os.environ.setdefault("MIINT_EXTENSION_DIRECTORY", ext_dir)
+    # xdist sets this in each worker's environment before the worker imports
+    # conftest; it is unset in the controller and in a plain single-process run.
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    shared_dir = os.path.join(tempfile.gettempdir(), f"qiita-{component}-duckdb-ext")
+    if worker:
+        ext_dir = os.path.join(tempfile.gettempdir(), f"qiita-{component}-{worker}-duckdb-ext")
+        if os.environ.get(MIINT_EXTENSION_DIRECTORY_VAR) == shared_dir:
+            del os.environ[MIINT_EXTENSION_DIRECTORY_VAR]
+    else:
+        ext_dir = shared_dir
+    os.environ.setdefault(MIINT_EXTENSION_DIRECTORY_VAR, ext_dir)
+    os.makedirs(os.environ[MIINT_EXTENSION_DIRECTORY_VAR], exist_ok=True)
