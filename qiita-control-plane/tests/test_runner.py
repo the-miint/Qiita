@@ -2373,15 +2373,18 @@ class _FakeAlignmentIdxPool:
         return self.alignment_idx
 
 
-async def test_run_action_primitive_delete_alignment_sample_dispatches(monkeypatch, tmp_path):
+@pytest.mark.parametrize("bound", [{}, {"alignment_idx": 77}], ids=["absent", "agrees"])
+async def test_run_action_primitive_delete_alignment_sample_dispatches(
+    monkeypatch, tmp_path, bound
+):
     """The delete-alignment-sample arm calls the DELETE_ALIGNMENT_SAMPLE primitive
     with prep_sample_idx from the scope target and alignment_idx from the
     `work_ticket.alignment_idx` COLUMN, plus the signing_key / data_plane_url for
     the delete DoAction.
 
-    `bound` carries a different alignment_idx, which the arm must ignore: that dict
-    is the submitter's `action_context` verbatim, and honouring it would let a
-    caller name any alignment's rows for deletion."""
+    Run with the `alignment_idx` key absent from `bound` and with it agreeing: the
+    column is the source either way, so an arm that read `bound` instead would
+    KeyError on the first case."""
     from qiita_common.actions import WorkflowAction
     from qiita_common.api_paths import LibraryPrimitive
 
@@ -2406,7 +2409,7 @@ async def test_run_action_primitive_delete_alignment_sample_dispatches(monkeypat
     out = await _run_action_primitive(
         pool,
         entry,
-        {"alignment_idx": 999},  # the caller-chosen value, which must not be used
+        bound,
         tmp_path,
         {"kind": "prep_sample", "prep_sample_idx": 42},
         work_ticket_idx=9,
@@ -2424,6 +2427,40 @@ async def test_run_action_primitive_delete_alignment_sample_dispatches(monkeypat
     assert len(pool.calls) == 1
     assert "qiita.work_ticket" in pool.calls[0][0]
     assert pool.calls[0][1] == (9,)
+
+
+async def test_run_action_primitive_delete_alignment_sample_refuses_context_disagreement(
+    monkeypatch, tmp_path
+):
+    """The delete scopes on the ticket COLUMN; a step's `params:` binds
+    `alignment_idx` from `action_context` (align's `align_sharded` stamps that value
+    onto every row it emits). A ticket whose context names a different alignment
+    than its column would therefore have the delete clear alignment 77's rows for
+    the sample while the register that follows writes under 999 — a re-run appends
+    instead of replacing. Refuse rather than delete the wrong alignment's rows."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    async def fake_delete(**kwargs):
+        raise AssertionError("the primitive must not be reached on a context/column mismatch")
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE, fake_delete)
+
+    entry = WorkflowAction(kind="action", name="delete-alignment-sample", inputs=[], outputs=[])
+    with pytest.raises(RuntimeError, match="action_context declares 999"):
+        await _run_action_primitive(
+            _FakeAlignmentIdxPool(77),
+            entry,
+            {"alignment_idx": 999},
+            tmp_path,
+            {"kind": "prep_sample", "prep_sample_idx": 42},
+            work_ticket_idx=9,
+            signing_key=b"sekret",
+            data_plane_url="grpc://dp:50051",
+        )
 
 
 async def test_run_action_primitive_delete_alignment_sample_refuses_null_alignment_idx(

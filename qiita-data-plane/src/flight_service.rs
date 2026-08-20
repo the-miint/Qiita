@@ -518,14 +518,16 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` /
 ///   `delete_alignment_sample` — logical DELETEs, idempotent against themselves:
 ///   a replay with no write in between deletes zero rows. Not commutative with
-///   one. The three that run as a pre-`register-files` replace
-///   (`delete_read_mask_block`, `delete_alignment_block`,
-///   `delete_alignment_sample`) sit in a workflow that registers rows under the
-///   same scope a few steps later, so a replay landing after that registration
-///   drops what it wrote. What bounds that window is the token's own expiry,
-///   checked on every DoAction body in `auth::verify_ticket_raw`: 300s from
+///   one. Two run as a pre-`register-files` replace —
+///   `delete_read_mask_block` in `read-mask-block` and `delete_alignment_block`
+///   in `align` — so they sit in a workflow that registers rows under the same
+///   scope a few steps later and a replay landing after that registration drops
+///   what it wrote. `delete_alignment_sample` is the same shape and takes on the
+///   same exposure once a workflow adopts it. What bounds that window is the
+///   token's own expiry, checked on every DoAction body in
+///   `auth::verify_ticket_raw`: 300s from
 ///   `qiita_control_plane.auth.tickets.sign_action`'s default, and
-///   `MAX_TICKET_LIFETIME` refuses any token minted with a longer one.
+///   `MAX_TICKET_LIFETIME` refuses any token whose expiry is more than 3600s out.
 /// - `export_read` — re-materializes the same sample's bytes to the same ticket
 ///   path via atomic publish; a replay reproduces identical output. (The block
 ///   exports that used to sit beside it are gone: block-scoped compute now
@@ -6009,10 +6011,9 @@ mod tests {
     /// The second is the columns. `delete_lake_rows` applies ONE clause to every
     /// listed table, so a table joining the list without `prep_sample_idx` or
     /// `sequence_idx` makes the narrower deletes unrunnable. That is loud rather
-    /// than silent — DuckDB bind-errors on the missing column and
-    /// `delete_lake_rows` rolls the transaction back, verified to leave the
-    /// leading table's rows intact — so this catches it in CI instead of at the
-    /// first ticket.
+    /// than silent — DuckDB raises a Binder Error on the missing column and
+    /// `delete_lake_rows` ROLLBACKs, leaving the leading table's rows intact — so
+    /// this catches it in CI instead of at the first ticket.
     ///
     /// Views are excluded: `alignment_visible` carries `alignment_idx` from the
     /// base table it selects and has no rows of its own.

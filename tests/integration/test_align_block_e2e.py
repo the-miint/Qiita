@@ -32,9 +32,10 @@ Two things this milestone introduced are otherwise unproven end-to-end:
    subsequent delete-alignment-block cleans the duplicate back to the exact
    footprint.
 
-The per-sample sibling `delete_alignment_sample` rides along at the end: it is not
-part of the `align` tail, but it shares this module's DuckLake alignment helpers
-and the same real data plane.
+`delete_alignment_sample`, not part of that tail, round-trips at the end: it clears
+the same two DuckLake tables staged above, and `data_plane` is module-scoped and
+drops/recreates the `qiita_ducklake` catalog on setup — a module of its own would
+spawn a second data plane and reset the catalog again for one test.
 
 Shared fixtures (`data_plane`, `postgres_pool`, `human_admin_session`,
 `ducklake_connect`) live in conftest.py.
