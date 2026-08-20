@@ -100,6 +100,14 @@ from .owner_id import (
     _write_owner_biosample_id_tsv,
 )
 from .role import _VALID_ROLE_VALUES, _handle_set_system_role, _set_system_role
+from .terminology import (
+    DEFAULT_ROBOT_COMMAND_LINE,
+    DEFAULT_ROBOT_EXPORT_FILENAME,
+    _handle_terminology_load,
+    _handle_terminology_prepare_owl,
+    _handle_terminology_prepare_taxdump,
+    _handle_terminology_robot_command,
+)
 from .ticket_cancel import _handle_ticket_cancel
 
 # ---------------------------------------------------------------------------
@@ -213,6 +221,129 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cancel.set_defaults(handler=_handle_ticket_cancel)
 
     add_fanout_parser(sub)
+
+    p_terminology = sub.add_parser("terminology", help="Terminology release operations")
+    p_terminology_sub = p_terminology.add_subparsers(dest="terminology_cmd", required=True)
+
+    # Note that this command is *intended to be temporary* and will go away
+    # once the terminology release is integrated with apptainer/workflow/slurm.
+    p_robot_command = p_terminology_sub.add_parser(
+        "robot-command",
+        help=(
+            "Print the ROBOT export command to run against a staged OWL file."
+            " Nothing is executed — run the printed command yourself, then feed"
+            " its output to `terminology prepare-owl`."
+        ),
+    )
+    p_robot_command.add_argument(
+        "--input",
+        required=True,
+        help="OWL filename to export, named without a directory",
+    )
+    p_robot_command.add_argument(
+        "--export",
+        default=DEFAULT_ROBOT_EXPORT_FILENAME,
+        help=f"export filename ROBOT should write (default: {DEFAULT_ROBOT_EXPORT_FILENAME})",
+    )
+    p_robot_command.add_argument(
+        "--executable",
+        default=DEFAULT_ROBOT_COMMAND_LINE,
+        help=(
+            "command that runs ROBOT, ending with the executable itself"
+            f' (e.g. "apptainer exec /images/robot.sif robot"); default:'
+            f" {DEFAULT_ROBOT_COMMAND_LINE}"
+        ),
+    )
+    p_robot_command.set_defaults(handler=_handle_terminology_robot_command)
+
+    p_prepare_owl = p_terminology_sub.add_parser(
+        "prepare-owl",
+        help=(
+            "Turn a ROBOT export into the release tables and the manifest that"
+            " declares them, ready for `terminology load`."
+        ),
+    )
+    p_prepare_owl.add_argument(
+        "--export",
+        type=Path,
+        default=Path(DEFAULT_ROBOT_EXPORT_FILENAME),
+        help=f"path to ROBOT's export (default: ./{DEFAULT_ROBOT_EXPORT_FILENAME})",
+    )
+    p_prepare_owl.add_argument("--name", required=True, help="terminology name to load under")
+    p_prepare_owl.add_argument("--version", required=True, help="release version to load under")
+    p_prepare_owl.add_argument(
+        "--term-id-prefix",
+        default=None,
+        help=(
+            "keep only term ids carrying this prefix (e.g. UBERON:), excluding"
+            " classes the release imports from other vocabularies"
+        ),
+    )
+    p_prepare_owl.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="directory to write the release files into (default: the export's own directory)",
+    )
+    p_prepare_owl.set_defaults(handler=_handle_terminology_prepare_owl)
+
+    p_prepare_taxdump = p_terminology_sub.add_parser(
+        "prepare-taxdump",
+        help=(
+            "Turn an NCBI taxdump archive into the release tables and the"
+            " manifest that declares them, ready for `terminology load`. Reads"
+            " the archive in place; nothing is unpacked."
+        ),
+    )
+    # Required, unlike prepare-owl's --export: that names a file our own
+    # robot-command told the operator to create, while the archive is NCBI's
+    # and sits wherever they downloaded it.
+    p_prepare_taxdump.add_argument(
+        "--taxdump",
+        required=True,
+        type=Path,
+        help="path to NCBI's taxdump.tar.gz or new_taxdump.tar.gz",
+    )
+    p_prepare_taxdump.add_argument("--name", required=True, help="terminology name to load under")
+    p_prepare_taxdump.add_argument("--version", required=True, help="release version to load under")
+    p_prepare_taxdump.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="directory to write the release files into (default: the archive's own directory)",
+    )
+    p_prepare_taxdump.set_defaults(handler=_handle_terminology_prepare_taxdump)
+
+    p_terminology_load = p_terminology_sub.add_parser(
+        "load",
+        help=(
+            "Apply a prepared release to the database (direct DB; needs"
+            " DATABASE_URL). The three files are named individually and are"
+            " copied into a temporary directory, so no staging directory has to"
+            " exist on the host. Prints the per-term counts of what changed."
+        ),
+    )
+    p_terminology_load.add_argument(
+        "--manifest", required=True, type=Path, help="path to the release's manifest.json"
+    )
+    p_terminology_load.add_argument(
+        "--terms", required=True, type=Path, help="path to the release's terms table"
+    )
+    p_terminology_load.add_argument(
+        "--closure", required=True, type=Path, help="path to the release's closure table"
+    )
+    p_terminology_load.add_argument(
+        "--tolerate-anomalies",
+        action="store_true",
+        help=(
+            "absorb structural anomalies instead of refusing the load:"
+            " auto-obsolete terms the release dropped without deprecating them,"
+            " record an unresolvable replacement pointer as a note, and drop a"
+            " closure row naming an endpoint the release does not define, which"
+            " lowers the closure count the load reports"
+        ),
+    )
+    p_terminology_load.set_defaults(handler=_handle_terminology_load)
 
     p_mask = sub.add_parser("mask", help="Mask-definition maintenance operations")
     p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)

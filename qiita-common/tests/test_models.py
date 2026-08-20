@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 import qiita_common.models as models_module
 from qiita_common.auth_constants import MAX_ACCESSION_LENGTH
-from qiita_common.models import FieldDataType
+from qiita_common.models import FieldDataType, TerminologyManifestFile
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
@@ -1478,3 +1478,24 @@ def test_biosample_study_field_create_request_terminology_valid():
 
     assert req.data_type is FieldDataType.TERMINOLOGY
     assert req.terminology_idx == 3
+
+
+def test_terminology_manifest_file_bare_filename():
+    """Tests the case where the declared path names a file in the staging
+    directory itself, which is the shape a prepared release writes."""
+    declared = TerminologyManifestFile(path="terms.tsv", sha256="a" * 64)
+
+    assert declared.model_dump() == {"path": "terms.tsv", "sha256": "a" * 64}
+
+
+@pytest.mark.parametrize(
+    "declared_path",
+    ["nested/terms.tsv", "../terms.tsv", "/etc/passwd", "..", "."],
+    ids=["carries_a_directory", "climbs_out", "is_absolute", "is_the_parent", "is_the_directory"],
+)
+def test_terminology_manifest_file_non_bare_path(declared_path):
+    """Tests the case where the declared path would resolve outside the staging
+    directory holding the manifest: every such shape is refused, naming the
+    value that was declared."""
+    with pytest.raises(ValidationError, match="not a bare filename"):
+        TerminologyManifestFile(path=declared_path, sha256="a" * 64)
