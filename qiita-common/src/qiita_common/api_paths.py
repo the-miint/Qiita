@@ -176,6 +176,14 @@ class LibraryPrimitive(StrEnum):
     # fresh block it deletes 0 rows. See
     # qiita_control_plane.actions.library.delete_alignment_block.
     DELETE_ALIGNMENT_BLOCK = "delete-alignment-block"
+    # Per-sample (align): idempotent sample replace, for a workflow that aligns one
+    # prep_sample per ticket and so has no block to scope by. Runs immediately
+    # BEFORE register-files — deletes this sample's whole alignment footprint under
+    # the ticket's alignment_idx so a re-run deletes-then-re-registers without
+    # double-counting, leaving every other sample's rows for that alignment intact.
+    # On a fresh sample it deletes 0 rows. See
+    # qiita_control_plane.actions.library.delete_alignment_sample.
+    DELETE_ALIGNMENT_SAMPLE = "delete-alignment-sample"
     # Block-compute (align): the `align` workflow's terminal step, the alignment
     # twin of reconcile-block. Marks the block completed, then finalizes each
     # covered sample's alignment_sample gate once ALL its covering blocks are done.

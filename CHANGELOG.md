@@ -22,6 +22,20 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **A per-`prep_sample` alignment delete (#TBD).** The alignment delete surface had two
+  scopes: `delete_alignment` (a whole `alignment_idx`) and `delete_alignment_block` (a
+  block's member sub-ranges). A workflow that aligns one prep_sample per ticket fits
+  neither — the whole-idx purge destroys every other sample's rows, and there is no block
+  to read a cover-map from — so a re-run would double-count. The new
+  `delete_alignment_sample` DoAction deletes the `(alignment_idx, prep_sample_idx)` pair's
+  rows from every `ALIGNMENT_DELETE_TABLES` table in one transaction, and the
+  `delete-alignment-sample` library primitive signs it. Idempotent (a sample with no rows
+  deletes 0), replay-safe, and registered in `REPLAY_SAFE_ACTIONS`. The predicate carries
+  no `sequence_idx` bound and is feature_idx-agnostic, so all of a read's rows go.
+  `delete_alignment_sample_deletes_the_pair_only` pins the exactness on both tables: a
+  sibling sample under the same alignment survives, and the target sample under a different
+  alignment survives. Plumbing only — no shipped workflow references the primitive yet.
+
 - **`qiita_lake.alignment_origin_spanning`, a side table for reads that cross a circular
   contig's origin (#465).** An aligner treats a circular contig as a linear one, so a read
   crossing the origin emits one SAM record per side of it, each covering only its own share

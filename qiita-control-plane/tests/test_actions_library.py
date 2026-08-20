@@ -47,6 +47,7 @@ def test_library_re_exports_match_module_callables():
     assert LIBRARY[LibraryPrimitive.RECONCILE_BLOCK] is lib.reconcile_block
     assert LIBRARY[LibraryPrimitive.FINALIZE_MASK_SAMPLE] is lib.finalize_mask_sample_gate
     assert LIBRARY[LibraryPrimitive.DELETE_ALIGNMENT_BLOCK] is lib.delete_alignment_block
+    assert LIBRARY[LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE] is lib.delete_alignment_sample
     assert LIBRARY[LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK] is lib.reconcile_alignment_block
     assert LIBRARY[LibraryPrimitive.SYNC_REFERENCE_EXCLUSION] is lib.sync_reference_exclusion
 
@@ -162,6 +163,56 @@ def _decode_action_payload(token: bytes) -> dict:
 
     (payload_len,) = struct.unpack(">I", token[1:5])
     return json.loads(token[5 : 5 + payload_len])
+
+
+async def test_delete_alignment_sample_signs_the_pair_and_reports_rows(monkeypatch):
+    """The per-sample alignment replace signs a `delete_alignment_sample` action
+    carrying exactly the `(alignment_idx, prep_sample_idx)` pair — the wire shape
+    the Rust `DeleteAlignmentSamplePayload` accepts, whose `deny_unknown_fields`
+    rejects anything more — and returns the data plane's rows_deleted."""
+    import json
+
+    from qiita_control_plane.actions import library as lib
+
+    captured: dict = {}
+
+    def _fake_do_action(action_type, data_plane_url, token, timeout_seconds=None):
+        captured["action_type"] = action_type
+        captured["token"] = token
+        return [_FakeResult(json.dumps({"rows_deleted": 12}).encode())]
+
+    monkeypatch.setattr(lib, "_do_action", _fake_do_action)
+
+    result = await lib.delete_alignment_sample(
+        alignment_idx=42,
+        prep_sample_idx=101,
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://dp:50051",
+    )
+
+    assert result == {"prep_sample_idx": 101, "rows_deleted": 12}
+    assert captured["action_type"] == "delete_alignment_sample"
+    assert _decode_action_payload(captured["token"]) == {
+        "action": "delete_alignment_sample",
+        "alignment_idx": 42,
+        "prep_sample_idx": 101,
+    }
+
+
+async def test_delete_alignment_sample_data_reports_zero_on_empty_result(monkeypatch):
+    """A data plane that returns no result body reads as 0 rows deleted, not a
+    KeyError — the same read the block twin does."""
+    from qiita_control_plane.actions import library as lib
+
+    monkeypatch.setattr(lib, "_do_action", lambda *a, **k: [])
+
+    rows = await lib.delete_alignment_sample_data(
+        alignment_idx=7,
+        prep_sample_idx=8,
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://dp:50051",
+    )
+    assert rows == 0
 
 
 async def test_sync_reference_exclusion_data_stages_resolved_set_and_signs(tmp_path, monkeypatch):

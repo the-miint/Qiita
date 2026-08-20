@@ -2361,6 +2361,72 @@ async def test_run_action_primitive_delete_block_mask_rejects_non_block_scope(tm
         )
 
 
+async def test_run_action_primitive_delete_alignment_sample_dispatches(monkeypatch, tmp_path):
+    """The delete-alignment-sample arm calls the DELETE_ALIGNMENT_SAMPLE primitive
+    with prep_sample_idx from the scope target and alignment_idx from the
+    runner-bound `bound`, plus the signing_key / data_plane_url for the delete
+    DoAction. No pool argument — the primitive does no DB work."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_delete(*, alignment_idx, prep_sample_idx, signing_key, data_plane_url):
+        recorded.update(
+            alignment_idx=alignment_idx,
+            prep_sample_idx=prep_sample_idx,
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
+        )
+        return {"prep_sample_idx": prep_sample_idx, "rows_deleted": 0}
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE, fake_delete)
+
+    entry = WorkflowAction(kind="action", name="delete-alignment-sample", inputs=[], outputs=[])
+    out = await _run_action_primitive(
+        None,  # pool — the arm passes none
+        entry,
+        {"alignment_idx": 77},
+        tmp_path,
+        {"kind": "prep_sample", "prep_sample_idx": 42},
+        work_ticket_idx=9,
+        signing_key=b"sekret",
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {}
+    assert recorded == {
+        "alignment_idx": 77,
+        "prep_sample_idx": 42,
+        "signing_key": b"sekret",
+        "data_plane_url": "grpc://dp:50051",
+    }
+
+
+async def test_run_action_primitive_delete_alignment_sample_rejects_non_prep_sample_scope(tmp_path):
+    """delete-alignment-sample needs a prep_sample_idx from the scope target; a
+    block-scoped ticket (which the block twin serves) is a contract error, surfaced
+    loudly rather than deleting a whole sample's rows from a block ticket."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(kind="action", name="delete-alignment-sample", inputs=[], outputs=[])
+    with pytest.raises(RuntimeError, match="prep_sample-scoped"):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"alignment_idx": 1},
+            tmp_path,
+            {"kind": "block", "block_idx": 5},
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
+
+
 # =============================================================================
 # WorkflowEntry.when (conditional gate) + WorkflowStep.params (scalar params)
 # =============================================================================

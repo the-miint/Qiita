@@ -2058,6 +2058,36 @@ async def delete_alignment_block_data(
     return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
 
 
+async def delete_alignment_sample_data(
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> int:
+    """Delete one sample's whole `alignment` footprint under one alignment_idx via
+    the `delete_alignment_sample` DoAction, returning the rows-deleted count. The
+    per-sample twin of `delete_alignment_block_data`, for a workflow that aligns
+    one prep_sample per ticket and so has no cover-map to send.
+
+    Signs a `delete_alignment_sample` action token carrying the `(alignment_idx,
+    prep_sample_idx)` pair and nothing else — the data plane's payload rejects any
+    extra field. What that pair selects is on the Rust `delete_alignment_sample`.
+    Idempotent: a fresh sample (no rows yet) deletes 0 and still succeeds. Raises
+    pyarrow.flight.FlightError on transport / data-plane failure."""
+    token = sign_action(
+        action="delete_alignment_sample",
+        payload={"alignment_idx": alignment_idx, "prep_sample_idx": prep_sample_idx},
+        secret=signing_key,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action, "delete_alignment_sample", data_plane_url, token
+    )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
+
+
 async def delete_alignment_data(
     *,
     alignment_idx: int,
@@ -2372,6 +2402,36 @@ async def delete_alignment_block(
     return {"block_idx": block_idx, "rows_deleted": rows_deleted}
 
 
+async def delete_alignment_sample(
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> dict[str, Any]:
+    """Idempotent sample replace: delete this sample's whole alignment footprint
+    under `alignment_idx` before register-files re-writes it, so a re-run never
+    double-counts. The per-sample twin of `delete_alignment_block`, for a workflow
+    that aligns one prep_sample per ticket and so has no cover-map to read.
+
+    Takes no `pool`: both identifiers come from the ticket, so unlike the block
+    twin there is no `block_member` lookup to do. Like it, this touches only
+    DuckLake — the Postgres `alignment_sample` gate row is the terminal step's to
+    flip, and clearing a gate is `DELETE /alignment-definition/{idx}` (which
+    CASCADEs it), not a mid-workflow replace.
+
+    On a fresh sample this deletes 0 rows (nothing registered yet); on a re-run it
+    clears the prior rows so the subsequent register-files leaves exactly one copy.
+    Returns the rows-deleted count for the workflow log."""
+    rows_deleted = await delete_alignment_sample_data(
+        alignment_idx=alignment_idx,
+        prep_sample_idx=prep_sample_idx,
+        signing_key=signing_key,
+        data_plane_url=data_plane_url,
+    )
+    return {"prep_sample_idx": prep_sample_idx, "rows_deleted": rows_deleted}
+
+
 async def reconcile_alignment_block(
     pool: asyncpg.Pool,
     *,
@@ -2466,6 +2526,7 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
     LibraryPrimitive.FINALIZE_MASK_SAMPLE: finalize_mask_sample_gate,
     LibraryPrimitive.DELETE_ALIGNMENT_BLOCK: delete_alignment_block,
+    LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE: delete_alignment_sample,
     LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,
     LibraryPrimitive.SYNC_REFERENCE_EXCLUSION: sync_reference_exclusion,
 }

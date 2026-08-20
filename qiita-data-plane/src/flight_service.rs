@@ -515,8 +515,8 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   overwrite, so a replay after success fails closed (AlreadyExists), never a
 ///   double-registration.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
-///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` —
-///   logical DELETEs; re-running deletes zero rows.
+///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` /
+///   `delete_alignment_sample` — logical DELETEs; re-running deletes zero rows.
 /// - `export_read` — re-materializes the same sample's bytes to the same ticket
 ///   path via atomic publish; a replay reproduces identical output. (The block
 ///   exports that used to sit beside it are gone: block-scoped compute now
@@ -541,6 +541,7 @@ const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "delete_read_mask_block",
     "delete_alignment",
     "delete_alignment_block",
+    "delete_alignment_sample",
     "export_read",
     "count_masked",
     "mask_metrics",
@@ -956,6 +957,44 @@ impl FlightService for QiitaFlightService {
                 .await
                 .map_err(|e| {
                     Status::internal(format!("delete_alignment_block task join failed: {e}"))
+                })??;
+
+                let result_body = serde_json::to_vec(&deleted)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "delete_alignment_sample" => {
+                let payload =
+                    auth::verify_delete_alignment_sample(&action.body, &self.flight_public_key)
+                        .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "delete_alignment_sample" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'delete_alignment_sample', \
+                         payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // delete_alignment). The closure opens and drops its own
+                // connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let alignment_idx = payload.alignment_idx;
+                let prep_sample_idx = payload.prep_sample_idx;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_alignment_sample(&catalog, &data_path, alignment_idx, prep_sample_idx)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("delete_alignment_sample task join failed: {e}"))
                 })??;
 
                 let result_body = serde_json::to_vec(&deleted)
@@ -2928,22 +2967,22 @@ fn delete_read_mask_block(
 }
 
 /// Every `qiita_lake` table an alignment delete clears, in delete order.
-/// `alignment` leads: `delete_alignment` / `delete_alignment_block` report its
-/// count as `rows_deleted`, which the control plane surfaces over REST.
+/// `alignment` leads: every `delete_alignment*` reports its count as
+/// `rows_deleted`.
 ///
 /// `alignment_delete_covers_every_alignment_scoped_lake_table` pins the set
 /// against the catalog, so a third table keyed by `alignment_idx` cannot be added
 /// without joining this list.
 const ALIGNMENT_DELETE_TABLES: &[&str] = &["alignment", "alignment_origin_spanning"];
 
-/// Both deletes read the leading count as `counts[0]`, which panics on an empty
+/// Every delete reads the leading count as `counts[0]`, which panics on an empty
 /// list. Emptying the list is a build failure instead.
 const _: () = assert!(!ALIGNMENT_DELETE_TABLES.is_empty());
 
 /// Delete `where_clause`'s rows from each of `tables`, in order, returning one
-/// count per table positionally. The shared body of `delete_alignment` and
-/// `delete_alignment_block`; each builds its own clause and shapes its own
-/// response.
+/// count per table positionally. The shared body of `delete_alignment`,
+/// `delete_alignment_block` and `delete_alignment_sample`; each builds its own
+/// clause and shapes its own response.
 ///
 /// The tables go in lockstep because they describe each other:
 /// `alignment_origin_spanning` names the `alignment` rows that make up one
@@ -2959,9 +2998,10 @@ const _: () = assert!(!ALIGNMENT_DELETE_TABLES.is_empty());
 ///
 /// `tables` and `where_clause` are interpolated and `params` binds any `?` the
 /// clause carries, so the caller owns the injection argument for both — as
-/// `replace_key_delete_sql`'s does at its own site. Both callers here pass an
-/// `ALIGNMENT_DELETE_TABLES` literal; `delete_alignment` passes a fixed clause
-/// with a bound `?`, `delete_alignment_block` inlines Ed25519-verified i64s.
+/// `replace_key_delete_sql`'s does at its own site. Every caller here passes an
+/// `ALIGNMENT_DELETE_TABLES` literal; `delete_alignment` and
+/// `delete_alignment_sample` pass a fixed clause with bound `?`s,
+/// `delete_alignment_block` inlines Ed25519-verified i64s.
 fn delete_lake_rows(
     conn: &duckdb::Connection,
     tables: &[&str],
@@ -3085,6 +3125,52 @@ fn delete_alignment_block(
 
     Ok(serde_json::json!({
         "alignment_idx": alignment_idx,
+        "rows_deleted": counts[0],
+    }))
+}
+
+/// Delete one sample's whole footprint under one `alignment_idx` from every
+/// `ALIGNMENT_DELETE_TABLES` table. The idempotent-sample-replace primitive, for
+/// a workflow that aligns one prep_sample per ticket and so has no block to scope
+/// by: run immediately before `register-files`, a re-run deletes the prior run's
+/// rows before writing fresh ones and never double-counts.
+///
+/// Neither existing scope serves that ticket: `delete_alignment` takes the whole
+/// align-config identity, which would destroy every other sample's rows, and
+/// `delete_alignment_block` needs a `block_member` cover-map a per-sample ticket
+/// does not have. Both key columns are in the DDL of both tables
+/// (`ducklake::ensure_alignment_tables`), so the one clause applies to each.
+/// The predicate carries no `sequence_idx` bound — the sample is the unit — and
+/// is feature_idx-agnostic, so ALL of a read's alignment rows go (a read produces
+/// several via cross-shard + PE multiplicity).
+///
+/// Transaction, lockstep and parquet lifecycle are `delete_lake_rows`', count
+/// reporting is `delete_alignment`'s. Idempotent: a sample with no rows yet
+/// deletes 0 and still succeeds. Both integers are Ed25519-verified i64s.
+fn delete_alignment_sample(
+    catalog_connstr: &str,
+    data_path: &str,
+    alignment_idx: i64,
+    prep_sample_idx: i64,
+) -> Result<serde_json::Value, Status> {
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    let counts = delete_lake_rows(
+        &conn,
+        ALIGNMENT_DELETE_TABLES,
+        "alignment_idx = ? AND prep_sample_idx = ?",
+        &[
+            &alignment_idx as &dyn duckdb::ToSql,
+            &prep_sample_idx as &dyn duckdb::ToSql,
+        ],
+    )?;
+
+    Ok(serde_json::json!({
+        "alignment_idx": alignment_idx,
+        "prep_sample_idx": prep_sample_idx,
         "rows_deleted": counts[0],
     }))
 }
@@ -4092,6 +4178,123 @@ mod tests {
         let second = delete_alignment_block(&connstr, &data_path, align_a, &members)
             .expect("idempotent re-delete failed");
         assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
+
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
+             DELETE FROM qiita_lake.alignment_origin_spanning \
+                 WHERE alignment_idx IN ({align_a}, {align_b});"
+        ));
+    }
+
+    /// `delete_alignment_sample` deletes EXACTLY one `(alignment_idx,
+    /// prep_sample_idx)` pair's rows from every `ALIGNMENT_DELETE_TABLES` table.
+    /// Both halves of the pair are load-bearing: a sibling sample under the SAME
+    /// alignment_idx survives (so the delete is not `delete_alignment`), and the
+    /// target sample's rows under a DIFFERENT alignment_idx survive (so it is not
+    /// keyed on prep_sample_idx alone). All of a read's rows go regardless of
+    /// feature_idx, and a sample with no rows deletes an idempotent 0.
+    ///
+    /// Every one of those regions is seeded in the side table too, so the one
+    /// clause is shown to select the same rows there as in `alignment`.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn delete_alignment_sample_deletes_the_pair_only() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_alignment_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let align_a: i64 = 960_300;
+        let align_b: i64 = 960_301;
+        let prep_a: i64 = 960_310;
+        let prep_b: i64 = 960_311;
+        // A sample that never registered rows — the idempotent-zero case.
+        let prep_empty: i64 = 960_312;
+
+        // align_a/prep_a is the target: seq 100 has TWO rows (feature 10 + 11 — a
+        // read aligned to two shards' features), exercising the feature_idx-agnostic
+        // multiplicity delete. align_a/prep_b is a sibling sample under the same
+        // align-config identity; align_b/prep_a is the same sample under a different
+        // one. Identity columns only, as in the other alignment delete tests.
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
+             DELETE FROM qiita_lake.alignment_origin_spanning \
+                 WHERE alignment_idx IN ({align_a}, {align_b});
+             INSERT INTO qiita_lake.alignment \
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
+                 ({align_a}, {prep_a}, 100, 10), \
+                 ({align_a}, {prep_a}, 100, 11), \
+                 ({align_a}, {prep_a}, 101, 10), \
+                 ({align_a}, {prep_b}, 200, 10), \
+                 ({align_a}, {prep_b}, 201, 10), \
+                 ({align_b}, {prep_a}, 100, 10);
+             INSERT INTO qiita_lake.alignment_origin_spanning \
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
+                 ({align_a}, {prep_a}, 100, 10), \
+                 ({align_a}, {prep_b}, 200, 10), \
+                 ({align_b}, {prep_a}, 100, 10);"
+        ))
+        .unwrap();
+
+        let first = delete_alignment_sample(&connstr, &data_path, align_a, prep_a)
+            .expect("delete_alignment_sample failed");
+        // Three rows: two at seq 100 (multiplicity) + one at 101.
+        assert_eq!(first["rows_deleted"], 3, "the pair's 3 rows deleted");
+        assert_eq!(first["alignment_idx"], align_a);
+        assert_eq!(first["prep_sample_idx"], prep_a);
+
+        let count = |table: &str, align: i64, prep: i64| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.{table} \
+                     WHERE alignment_idx = {align} AND prep_sample_idx = {prep}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("alignment", align_a, prep_a), 0, "the pair is gone");
+        assert_eq!(
+            count("alignment", align_a, prep_b),
+            2,
+            "a sibling sample under the SAME alignment survives"
+        );
+        assert_eq!(
+            count("alignment", align_b, prep_a),
+            1,
+            "the SAME sample under a different alignment survives"
+        );
+
+        // The same three properties on the side table.
+        assert_eq!(
+            count("alignment_origin_spanning", align_a, prep_a),
+            0,
+            "the pair's evidence is gone"
+        );
+        assert_eq!(
+            count("alignment_origin_spanning", align_a, prep_b),
+            1,
+            "the sibling sample's evidence survives"
+        );
+        assert_eq!(
+            count("alignment_origin_spanning", align_b, prep_a),
+            1,
+            "the other alignment's evidence survives"
+        );
+
+        // Idempotency: re-deleting the now-empty pair is success with 0 rows.
+        let second = delete_alignment_sample(&connstr, &data_path, align_a, prep_a)
+            .expect("idempotent re-delete failed");
+        assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
+
+        // A sample that never registered rows is the same 0-row success.
+        let never = delete_alignment_sample(&connstr, &data_path, align_a, prep_empty)
+            .expect("delete of a sample with no rows failed");
+        assert_eq!(never["rows_deleted"], 0, "a sample with no rows deletes 0");
 
         let _ = conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
@@ -5775,7 +5978,7 @@ mod tests {
     }
 
     /// Every `qiita_lake` BASE TABLE scoped by `alignment_idx` is in
-    /// `ALIGNMENT_DELETE_TABLES`, so both alignment deletes clear it.
+    /// `ALIGNMENT_DELETE_TABLES`, so every alignment delete clears it.
     ///
     /// The same shape-query direction as
     /// `every_content_addressed_lake_table_is_registered`: an `alignment_idx`
@@ -5820,14 +6023,14 @@ mod tests {
             assert!(
                 ALIGNMENT_DELETE_TABLES.contains(&table.as_str()),
                 "qiita_lake.{table} is scoped by alignment_idx but absent from \
-                 ALIGNMENT_DELETE_TABLES, so delete_alignment / delete_alignment_block \
-                 leave its rows behind; found scoped tables: {scoped:?}"
+                 ALIGNMENT_DELETE_TABLES, so the delete_alignment* handlers leave its \
+                 rows behind; found scoped tables: {scoped:?}"
             );
         }
         assert_eq!(
             ALIGNMENT_DELETE_TABLES.first(),
             Some(&"alignment"),
-            "delete_alignment / delete_alignment_block report counts[0] as rows_deleted"
+            "the delete_alignment* handlers report counts[0] as rows_deleted"
         );
     }
 

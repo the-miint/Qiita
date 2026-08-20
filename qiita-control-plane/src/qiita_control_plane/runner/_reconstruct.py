@@ -695,6 +695,25 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE:
+        # Idempotent sample replace (align): delete this sample's whole alignment
+        # footprint under the ticket's alignment_idx BEFORE register-files re-writes
+        # it, so a re-run never double-counts. Every other sample's rows for that
+        # alignment survive. No file inputs: prep_sample_idx from the scope target,
+        # alignment_idx from the ticket. No pool — the primitive does no DB work.
+        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+            raise RuntimeError(
+                f"delete-alignment-sample requires a prep_sample-scoped ticket; got "
+                f"{scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE](
+            alignment_idx=bound[ALIGNMENT_IDX_BINDING],
+            prep_sample_idx=scope_target["prep_sample_idx"],
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK:
         # Terminal step of the `align` workflow: mark this block completed, then
         # finalize each covered sample whose last covering block just completed

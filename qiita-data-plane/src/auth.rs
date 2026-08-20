@@ -486,6 +486,39 @@ pub fn verify_delete_alignment(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed payload for the `delete_alignment_sample` DoAction — the per-sample
+/// idempotent replace.
+///
+/// Wire shape pinned by
+/// `qiita_control_plane.actions.library.delete_alignment_sample_data`:
+/// `{"action": "delete_alignment_sample", "alignment_idx": N,
+///   "prep_sample_idx": M}`. What the pair selects, and why the sample rather
+/// than the block or the whole alignment is the unit, is on
+/// `flight_service::delete_alignment_sample`. `deny_unknown_fields` keeps the
+/// contract tight: any extra field is a design slip surfaced loudly here — a
+/// `members` list in particular, which would be a caller reaching for the block
+/// scope and getting a whole-sample delete.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteAlignmentSamplePayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "delete_alignment_sample".
+    pub action: String,
+    /// `i64`, as `DeleteAlignmentPayload::alignment_idx`.
+    pub alignment_idx: i64,
+    /// `i64`, matching the `alignment.prep_sample_idx BIGINT` DuckLake column.
+    pub prep_sample_idx: i64,
+}
+
+/// Verify a `delete_alignment_sample` DoAction token and return its parsed payload.
+pub fn verify_delete_alignment_sample(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<DeleteAlignmentSamplePayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 /// Parsed payload for the `mask_metrics` DoAction.
 ///
 /// Wire shape pinned by `qiita_control_plane.actions.library.mask_metrics_data`:
@@ -919,7 +952,8 @@ mod tests {
     }
 
     // --------------------------------------------------------------------
-    // delete_alignment / delete_alignment_block action token variants
+    // delete_alignment / delete_alignment_block / delete_alignment_sample
+    // action token variants
     // --------------------------------------------------------------------
 
     #[test]
@@ -987,6 +1021,41 @@ mod tests {
             br#"{"action":"delete_alignment_block","alignment_idx":1,"members":[],"smuggled":9}"#;
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
         match verify_delete_alignment_block(&ticket, &test_vk()).unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_delete_alignment_sample_round_trip() {
+        let payload =
+            br#"{"action":"delete_alignment_sample","alignment_idx":42,"prep_sample_idx":101}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        let parsed =
+            verify_delete_alignment_sample(&ticket, &test_vk()).expect("valid token should verify");
+        assert_eq!(parsed.action, "delete_alignment_sample");
+        assert_eq!(parsed.alignment_idx, 42);
+        assert_eq!(parsed.prep_sample_idx, 101);
+    }
+
+    #[test]
+    fn verify_delete_alignment_sample_rejects_bad_signature() {
+        let payload =
+            br#"{"action":"delete_alignment_sample","alignment_idx":1,"prep_sample_idx":2}"#;
+        let mut ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        ticket[14] ^= 0xFF;
+        assert_eq!(
+            verify_delete_alignment_sample(&ticket, &test_vk()).unwrap_err(),
+            AuthError::InvalidSignature
+        );
+    }
+
+    #[test]
+    fn verify_delete_alignment_sample_rejects_extra_fields() {
+        // deny_unknown_fields, on the `members` case the payload doc names.
+        let payload = br#"{"action":"delete_alignment_sample","alignment_idx":1,"prep_sample_idx":2,"members":[]}"#;
+        let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+        match verify_delete_alignment_sample(&ticket, &test_vk()).unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }
