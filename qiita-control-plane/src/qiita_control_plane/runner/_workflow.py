@@ -192,6 +192,13 @@ async def run_workflow(
     action: ActionDefinition | None = None
     index: int | None = None
     uploads_to_consume: list[int] = []
+    # The processing_idx this run MINTED, and the only value either
+    # qiita.assembly_sample write below is keyed on. `bound` is seeded from
+    # action_context, which is stored verbatim and passes `validate_context` with
+    # unknown keys intact, so a submitter can put a `processing_idx` there; before
+    # the mint overwrites it that value is another run's identity, or none at all.
+    # None means the mint has not run, which is what the gate writes read.
+    minted_processing_idx: int | None = None
 
     try:
         # Everything from the action fetch through the step loop is INSIDE the
@@ -526,15 +533,15 @@ async def run_workflow(
                 .get(ASSEMBLER_BINDING, {})
                 .get("default")
             )
-            bound.update(
-                await _mint_processing_idx(
-                    pool,
-                    action_id=action.action_id,
-                    action_version=action.version,
-                    bound=bound,
-                    assembler_default=assembler_default,
-                )
+            processing_bindings = await _mint_processing_idx(
+                pool,
+                action_id=action.action_id,
+                action_version=action.version,
+                bound=bound,
+                assembler_default=assembler_default,
             )
+            bound.update(processing_bindings)
+            minted_processing_idx = processing_bindings[PROCESSING_IDX_BINDING]
 
         # Completion gate: a workflow declaring the terminal
         # `finalize-assembly-sample` action gets its qiita.assembly_sample row
@@ -548,9 +555,22 @@ async def run_workflow(
                     f"{LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE}) must be "
                     f"prep_sample-scoped; got {scope_target['kind']!r}"
                 )
+            if minted_processing_idx is None:
+                # `_workflow_writes_assembly_gate` and `_workflow_needs_processing`
+                # are independent reads of `action.steps`; a workflow declaring the
+                # terminal action without threading `processing_idx` through some
+                # step's `params:` leaves the gate with no key. Refusing here stops
+                # the run rather than assembling behind a gate no write ever
+                # materializes.
+                raise _submission_bad_input(
+                    "a workflow that gates assembly completion (declares "
+                    f"{LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE}) must thread "
+                    f"{PROCESSING_IDX_BINDING} through a step's params so the run "
+                    "identity the gate row is keyed on is minted"
+                )
             await _create_assembly_gate_pending(
                 pool,
-                processing_idx=bound[PROCESSING_IDX_BINDING],
+                processing_idx=minted_processing_idx,
                 prep_sample_idx=scope_target["prep_sample_idx"],
             )
 
@@ -750,11 +770,11 @@ async def run_workflow(
         if (
             action is not None
             and _workflow_writes_assembly_gate(action.steps)
-            and PROCESSING_IDX_BINDING in bound
+            and minted_processing_idx is not None
         ):
             await _record_assembly_gate_no_data(
                 pool,
-                processing_idx=bound[PROCESSING_IDX_BINDING],
+                processing_idx=minted_processing_idx,
                 prep_sample_idx=scope_target["prep_sample_idx"],
             )
         await _transition_to_no_data(pool, work_ticket_idx)

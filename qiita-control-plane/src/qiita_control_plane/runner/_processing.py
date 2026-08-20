@@ -138,8 +138,9 @@ async def _create_assembly_gate_pending(
 
     Run immediately after the processing_idx mint, which is the earliest point
     the gate's key exists: the identity is a hash of the run's params, so there
-    is nothing to key on at HTTP submit. Idempotent, so a resume re-runs it
-    without disturbing a row a prior attempt already closed.
+    is nothing to key on at HTTP submit. Idempotent; what it does to a row a
+    previous run left closed is stated on
+    `repositories.assembly.create_assembly_sample_pending`.
     """
     async with pool.acquire() as conn, conn.transaction():
         await create_assembly_sample_pending(

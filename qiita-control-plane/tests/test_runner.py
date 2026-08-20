@@ -5941,6 +5941,252 @@ async def test_assembly_gate_is_absent_when_no_data_precedes_the_mint(
         await teardown()
 
 
+async def _mint_unrelated_processing(pool) -> int:
+    """A processing_idx belonging to some other run, for the injected-context tests."""
+    from qiita_control_plane.repositories.processing import mint_processing
+
+    version = uuid.uuid4().hex
+    async with pool.acquire() as conn:
+        row = await mint_processing(
+            conn,
+            workflow="some-other-workflow",
+            version=version,
+            params={"workflow": "some-other-workflow", "version": version},
+        )
+    return row["processing_idx"]
+
+
+async def _inject_action_context(pool, work_ticket_idx: int, **keys) -> None:
+    """Merge keys into a ticket's persisted action_context, the way a submitter's
+    extra keys arrive: action_context is stored verbatim and no shipped
+    context_schema sets `additionalProperties: false`, so `validate_context` passes
+    them through into the runner's `bound`."""
+    context = json.loads(
+        await pool.fetchval(
+            "SELECT action_context::text FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+    )
+    context.update(keys)
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET action_context = $2::jsonb WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        json.dumps(context),
+    )
+
+
+async def test_assembly_gate_ignores_a_processing_idx_from_action_context(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """Both gate writes key on the processing_idx the runner MINTED, never on a
+    `processing_idx` in action_context.
+
+    The pre-mint StepNoData above is where the two differ: the mint never runs, so
+    `bound` still carries whatever the submitter sent. Keyed off `bound`, this
+    ticket closes a gate row belonging to another run of another identity for this
+    sample — a row its submitter does not own."""
+    work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
+    other = await _mint_unrelated_processing(postgres_pool)
+    await _inject_action_context(postgres_pool, work_ticket_idx, processing_idx=other)
+    # A live 'pending' row under the injected key, as a concurrent run of that
+    # identity over this sample would have left.
+    await postgres_pool.execute(
+        "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'pending')",
+        other,
+        prep_sample_idx,
+    )
+    _stub_masked_reads(monkeypatch, tmp_path, empty=True)
+    try:
+        await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+            )
+            == "no_data"
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT state FROM qiita.assembly_sample"
+                " WHERE processing_idx = $1 AND prep_sample_idx = $2",
+                other,
+                prep_sample_idx,
+            )
+            == "pending"
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.assembly_sample WHERE processing_idx = $1", other
+        )
+        await teardown()
+        await postgres_pool.execute("DELETE FROM qiita.processing WHERE processing_idx = $1", other)
+
+
+async def test_assembly_gate_ignores_an_action_context_processing_idx_that_does_not_exist(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """The same injection pointing at no qiita.processing row at all.
+
+    Keyed off action_context, the gate write raises ForeignKeyViolationError from
+    inside the StepNoData handler, before the NO_DATA transition — leaving the
+    ticket PROCESSING with NULL failure_* and reproducing on every `/run` redrive,
+    because the resolver raises StepNoData deterministically. Keyed off the mint
+    there is no key, so nothing is written and the ticket reaches NO_DATA."""
+    work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
+    gone = (
+        await postgres_pool.fetchval(
+            "SELECT coalesce(max(processing_idx), 0) FROM qiita.processing"
+        )
+    ) + 10_000
+    await _inject_action_context(postgres_pool, work_ticket_idx, processing_idx=gone)
+    _stub_masked_reads(monkeypatch, tmp_path, empty=True)
+    try:
+        await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        row = await postgres_pool.fetchrow(
+            "SELECT state, failure_type, failure_stage, failure_reason FROM qiita.work_ticket"
+            " WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        assert row["state"] == "no_data"
+        assert (row["failure_type"], row["failure_stage"], row["failure_reason"]) == (
+            None,
+            None,
+            None,
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT count(*) FROM qiita.assembly_sample WHERE prep_sample_idx = $1",
+                prep_sample_idx,
+            )
+            == 0
+        )
+    finally:
+        await teardown()
+
+
+async def test_assembly_gate_declared_without_a_threaded_processing_idx_fails_at_submission(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """`_workflow_needs_processing` and `_workflow_writes_assembly_gate` are
+    independent reads of `action.steps`. A workflow that declares the terminal
+    action without threading `processing_idx` has no key to write the gate row
+    under, so the run would produce contigs behind a gate that never materializes.
+    Refuse the ticket at submission instead."""
+    ungated_step = {k: v for k, v in _ASSEMBLY_GATE_STEPS[0].items() if k != "params"}
+    work_ticket_idx, _mask_idx, prep_sample_idx, teardown = await _seed_assembly_ticket(
+        postgres_pool,
+        prefix="asm-gate",
+        steps=[ungated_step, _ASSEMBLY_GATE_STEPS[1]],
+        extra_context={"assembler": "hifiasm_meta"},
+    )
+    _stub_masked_reads(monkeypatch, tmp_path)
+    try:
+        with pytest.raises(BackendFailure) as ei:
+            await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+        row = await postgres_pool.fetchrow(
+            "SELECT state, failure_stage, failure_reason FROM qiita.work_ticket"
+            " WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        assert row["state"] == "failed"
+        assert row["failure_stage"] == "submission"
+        assert "processing_idx" in row["failure_reason"]
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT count(*) FROM qiita.assembly_sample WHERE prep_sample_idx = $1",
+                prep_sample_idx,
+            )
+            == 0
+        )
+    finally:
+        await teardown()
+
+
+async def test_assembly_gate_reopens_a_no_data_row_for_a_re_run_of_the_same_identity(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """A re-run under the same params re-resolves the same processing_idx, so the
+    pre-loop pending write lands on the row the previous run closed at 'no_data'.
+    It has to reopen: 'no_data' says the run assembled nothing, and while the new
+    run is in flight that is a claim about a run that has not finished. The row
+    stays 'pending' when this run FAILs — the gate contract's stale-'pending' case
+    — rather than going on asserting the earlier run's outcome."""
+    first_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
+    _stub_masked_reads(monkeypatch, tmp_path)
+
+    backend = FakeBackendClient()
+
+    async def _no_data(*_args, **_kwargs):
+        raise StepNoData(step_name="assembly_load", reason="no contigs to hash")
+
+    monkeypatch.setattr(backend, "run_step", _no_data)
+    second_ticket_idx = None
+    try:
+        await _run(first_ticket_idx, postgres_pool, backend, tmp_path / "ws1")
+        first_gate = await postgres_pool.fetchrow(
+            "SELECT processing_idx, state FROM qiita.assembly_sample WHERE prep_sample_idx = $1",
+            prep_sample_idx,
+        )
+        assert first_gate["state"] == "no_data"
+
+        # A second ticket for the same action version, sample, and action_context,
+        # so the mint re-resolves the SAME processing_idx.
+        source = await postgres_pool.fetchrow(
+            "SELECT action_id, action_version, originator_principal_idx, prep_sample_idx,"
+            " action_context FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            first_ticket_idx,
+        )
+        second_ticket_idx = await postgres_pool.fetchval(
+            "INSERT INTO qiita.work_ticket ("
+            "  action_id, action_version, originator_principal_idx,"
+            "  scope_target_kind, prep_sample_idx, action_context"
+            ") VALUES ($1, $2, $3, 'prep_sample', $4, $5::jsonb) RETURNING work_ticket_idx",
+            source["action_id"],
+            source["action_version"],
+            source["originator_principal_idx"],
+            source["prep_sample_idx"],
+            source["action_context"],
+        )
+
+        seen: list[str | None] = []
+        second_backend = FakeBackendClient()
+
+        async def _record_gate_then_fail(**_kwargs):
+            seen.append(
+                await postgres_pool.fetchval(
+                    "SELECT state FROM qiita.assembly_sample WHERE prep_sample_idx = $1",
+                    prep_sample_idx,
+                )
+            )
+            raise RuntimeError("the assembler died")
+
+        monkeypatch.setattr(second_backend, "run_step", _record_gate_then_fail)
+        with pytest.raises(RuntimeError):
+            await _run(second_ticket_idx, postgres_pool, second_backend, tmp_path / "ws2")
+
+        assert seen == ["pending"]
+        second_gate = await postgres_pool.fetchrow(
+            "SELECT processing_idx, state FROM qiita.assembly_sample WHERE prep_sample_idx = $1",
+            prep_sample_idx,
+        )
+        assert second_gate["processing_idx"] == first_gate["processing_idx"]
+        assert second_gate["state"] == "pending"
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+                second_ticket_idx,
+            )
+            == "failed"
+        )
+    finally:
+        if second_ticket_idx is not None:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", second_ticket_idx
+            )
+        await teardown()
+
+
 async def test_masked_reads_workflow_rejects_a_mask_that_does_not_exist(
     postgres_pool, monkeypatch, tmp_path
 ):

@@ -43,6 +43,27 @@ duplicates further down are historical strata; leave them where they are.
   whether the run is over reads both, one that needs contigs reads `'completed'` alone. The
   `'no_data'` writer is guarded against overwriting `'completed'`: an earlier run under the
   same identity left contigs in DuckLake, and a later one finding none does not remove them.
+  **Terminal is per-run, so a re-run reopens `'no_data'` — and only `'no_data'`.** The same
+  params re-resolve to the same `processing_idx`, so the pre-loop `'pending'` write lands on
+  the row the previous run closed. Leaving it would have the gate answer `'no_data'` for the
+  whole duration of the new run, and go on answering it if that run FAILs — a row asserting
+  the sample assembled nothing about a run that errored. The pending write therefore walks
+  `'no_data'` back to `'pending'` and leaves `'completed'` where it is: the same asymmetry the
+  `'completed'` writer already rests on, which overwrites a prior run's `'no_data'`.
+  **Both of the runner's gate writes key on the minted `processing_idx`, never on
+  `action_context`.** `action_context` is stored verbatim and no context schema sets
+  `additionalProperties: false`, so a submitter's own `processing_idx` key reaches the
+  runner's bindings intact. The mint overwrites it before every other consumer reads it, but
+  the pre-mint `StepNoData` — an empty masked pass-set, which raises in the input resolver
+  before the mint — reaches the `'no_data'` write with the submitter's value still there. A
+  value naming another run's identity closed that run's gate row for this sample; one naming
+  no `qiita.processing` row at all raised `ForeignKeyViolationError` out of the `StepNoData`
+  handler, before the NO_DATA transition, leaving the ticket `processing` with NULL
+  `failure_*` and reproducing on every `/run` redrive. The runner now carries the minted id in
+  a local that is `None` until the mint runs. A workflow that declares
+  `finalize-assembly-sample` without threading `processing_idx` through a step's `params:` has
+  no key either, and is refused at submission rather than assembling behind a gate that never
+  materializes.
   `state` is TEXT + CHECK with no Postgres ENUM and no Pydantic twin (the gate has no wire
   surface), so it stays out of the enum-parity discipline. The FK to `qiita.processing` is
   `ON DELETE RESTRICT` where `alignment_sample` CASCADEs: one `processing` row is shared by

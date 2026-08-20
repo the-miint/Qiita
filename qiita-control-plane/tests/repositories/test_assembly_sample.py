@@ -114,21 +114,23 @@ async def test_create_pending_requires_a_transaction(gate):
             )
 
 
-@pytest.mark.parametrize("terminal", ["completed", "no_data"])
-async def test_create_pending_never_reopens_a_closed_row(gate, terminal):
-    """The resume/redrive case: re-minting the same params re-resolves the same
-    processing_idx and re-runs this, which must not walk a terminal row back to
-    'pending'."""
+@pytest.mark.parametrize(
+    ("closed", "expected"), [("completed", "completed"), ("no_data", "pending")]
+)
+async def test_create_pending_reopens_no_data_but_not_completed(gate, closed, expected):
+    """The resume/redrive case, both arms: re-minting the same params re-resolves
+    the same processing_idx and re-runs this over whatever the last run left. The
+    asymmetry it must hold is stated on `create_assembly_sample_pending`."""
     await _write_pending(gate)
     await gate["pool"].execute(
         "UPDATE qiita.assembly_sample SET state = $3"
         " WHERE processing_idx = $1 AND prep_sample_idx = $2",
         gate["processing_idx"],
         gate["prep_sample_idx"],
-        terminal,
+        closed,
     )
     await _write_pending(gate)
-    assert await _state(gate) == terminal
+    assert await _state(gate) == expected
 
 
 # ---------------------------------------------------------------------------
