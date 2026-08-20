@@ -23,69 +23,30 @@ duplicates further down are historical strata; leave them where they are.
 ### Added
 
 - **Assembly completion is first-class state: `qiita.assembly_sample` (#466).**
-  The per-`(processing_idx, prep_sample)` gate `long-read-assembly` was missing, alongside
-  `qiita.mask_sample` and `qiita.alignment_sample`. Completion existed only as work-ticket
-  state, so a consumer asking "is this sample's assembly done?" had to infer it from row
-  presence — which does not hold here: `write-assembly-membership` writes
-  `qiita.assembly_membership` several entries before `register-files` lands the DuckLake
-  tables, so a ticket that dies in between leaves a partial footprint that looks finished.
-  The runner materializes the row `'pending'` when it mints the run's `processing_idx` (the
-  earliest point the key exists — the identity is a params hash, so there is nothing to key
-  on at HTTP submit), and a new terminal `finalize-assembly-sample` library action writes
-  `'completed'` after `register-files`.
-  **Three states, because assembly has two terminal outcomes.** A sample that assembled
-  nothing is not an error: `assembly_hash` raises `StepNoData`, the ticket lands in NO_DATA,
-  and the step loop is abandoned — so the terminal action never runs. The runner's
-  `StepNoData` handler writes `'no_data'` instead. Left `'pending'` the row would read
-  "still running" for a run that has ended and can never move again; written `'completed'`
-  it would contradict the ticket, which reads NO_DATA over the same unit (the workflow is
-  prep_sample-scoped). `{'completed', 'no_data'}` is the terminal set — a consumer asking
-  whether the run is over reads both, one that needs contigs reads `'completed'` alone. The
-  `'no_data'` writer is guarded against overwriting `'completed'`: an earlier run under the
-  same identity left contigs in DuckLake, and a later one finding none does not remove them.
-  **Terminal is per-run, so a re-run reopens `'no_data'` — and only `'no_data'`.** The same
-  params re-resolve to the same `processing_idx`, so the pre-loop `'pending'` write lands on
-  the row the previous run closed. Leaving it would have the gate answer `'no_data'` for the
-  whole duration of the new run, and go on answering it if that run FAILs — a row asserting
-  the sample assembled nothing about a run that errored. The pending write therefore walks
-  `'no_data'` back to `'pending'` and leaves `'completed'` where it is: the same asymmetry the
-  `'completed'` writer already rests on, which overwrites a prior run's `'no_data'`.
-  **Both of the runner's gate writes key on the minted `processing_idx`, never on
-  `action_context`.** `action_context` is stored verbatim and no context schema sets
-  `additionalProperties: false`, so a submitter's own `processing_idx` key reaches the
-  runner's bindings intact. The mint overwrites it before every other consumer reads it, with
-  one exception: the pre-mint `StepNoData` — an empty masked pass-set raises in the input
-  resolver, which runs before the mint — so a `'no_data'` write keyed on the bindings would
-  still see the submitter's value. A value naming another run's identity closes that run's
-  gate row for this sample; one naming no `qiita.processing` row at all raises
-  `ForeignKeyViolationError` out of the `StepNoData` handler, before the NO_DATA transition,
-  leaving the ticket `processing` with NULL `failure_*` and reproducing on every `/run`
-  redrive. The runner therefore carries the minted id in a local that is `None` until the mint
-  runs. A workflow that declares `finalize-assembly-sample` without threading `processing_idx`
-  through a step's `params:` has no key either, and is refused at submission rather than
-  assembling behind a gate that never materializes.
-  `state` is TEXT + CHECK with no Postgres ENUM and no Pydantic twin (the gate has no wire
-  surface), so it stays out of the enum-parity discipline. The FK to `qiita.processing` is
-  `ON DELETE RESTRICT` where `alignment_sample` CASCADEs: one `processing` row is shared by
-  every sample assembled under the same params, and the DuckLake rows stamped with it are
-  beyond any FK's reach, so a cascade would drop the gate for all of them and leave data
-  with no completion state.
-  **The pool cascade clears the new gate, and the gate is indexed for it.**
-  `delete_sequenced_pool_cascade` already cleared `qiita.mask_sample` and
-  `qiita.alignment_sample` before deleting `qiita.prep_sample`; `qiita.assembly_sample` is a
-  third `prep_sample` FK with `ON DELETE RESTRICT`, so without the matching clear a
-  force-delete of a pool carrying a gate row raises `ForeignKeyViolationError` — an
-  unhandled 500, reached after a 409 that tells the operator to retry with `force=true`,
-  and after the DuckLake purge that the Postgres rollback does not undo. `prep_sample_idx`
-  is the gate's non-leading PK column, so both that clear and the FK's own RESTRICT check
-  would sequential-scan; the table's migration creates
-  `qiita_assembly_sample_prep_sample_idx` over it, single-column because
-  `prep_sample_idx` is the whole predicate at both sites.
-  **A FAILED or cancelled ticket leaves the row `'pending'` forever** — the two terminal
-  writers are the only ones, and there is no sweeper. Left as is, and stated in the gate
-  contract: nothing reads the gate at submit time, so unlike `alignment_sample` (whose rows
-  gate the align planner) a stale `'pending'` refuses nothing, and a re-run under the same
-  params re-resolves the same key and closes it.
+  The per-`(processing_idx, prep_sample)` completion gate `long-read-assembly` was missing,
+  alongside `qiita.mask_sample` and `qiita.alignment_sample`. Completion existed only as
+  work-ticket state, and row presence does not stand in for it: `write-assembly-membership`
+  writes `qiita.assembly_membership` several entries before `register-files` lands the
+  DuckLake tables, so a ticket that dies in between leaves a partial footprint that looks
+  finished. New table (`state` TEXT + CHECK over `pending` / `completed` / `no_data`, plus an
+  index on `prep_sample_idx`), a repository layer, and a terminal `finalize-assembly-sample`
+  library action appended to the workflow, which writes `'completed'`.
+  The runner materializes the row `'pending'` right after it mints the run's
+  `processing_idx`, and writes `'no_data'` from its `StepNoData` handler when the sample
+  assembled no contig of any kind (the terminal action never runs on that path). Both key on
+  the id the mint returned, never on `action_context` — a submitter can put a
+  `processing_idx` key there and it reaches the runner's bindings intact. A re-run of the
+  same identity reopens `'no_data'` back to `'pending'` and leaves `'completed'` alone.
+  `ActionDefinition` now refuses, at construction, an action that declares
+  `finalize-assembly-sample` without threading `processing_idx` through some step's
+  `params:` — the gate row would have no key. That covers the YAML sweep in CI and the
+  `qiita.action` reconstruction alike; the runner keeps the same refusal per ticket.
+  `delete_sequenced_pool_cascade` clears the new gate alongside `qiita.mask_sample` and
+  `qiita.alignment_sample` before deleting `qiita.prep_sample`.
+  A FAILED or cancelled ticket leaves the row `'pending'`: the two terminal writers are the
+  only ones and nothing sweeps. Nothing reads the gate at submit time, so a stale `'pending'`
+  refuses no re-run, and a re-run under the same params re-resolves the same key and closes
+  it.
 
 - **NCBI Taxonomy releases read from a taxdump archive (#439).**
   `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`

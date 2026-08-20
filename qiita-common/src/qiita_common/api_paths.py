@@ -200,8 +200,7 @@ class LibraryPrimitive(StrEnum):
     FINALIZE_MASK_SAMPLE = "finalize-mask-sample"
     # Per-sample assembly completion: the terminal step of the long-read-assembly
     # workflow. Writes 'completed' into the qiita.assembly_sample gate for this
-    # ticket's (processing_idx, prep_sample). Runs AFTER register-files so the gate
-    # never reads 'completed' before the contigs are in DuckLake. See
+    # ticket's (processing_idx, prep_sample). See
     # qiita_control_plane.actions.library.finalize_assembly_sample_gate.
     FINALIZE_ASSEMBLY_SAMPLE = "finalize-assembly-sample"
 

@@ -232,11 +232,12 @@ steps:
 
   # Terminal: write 'completed' into the qiita.assembly_sample gate for this
   # ticket's (processing_idx, prep_sample). No file inputs: prep_sample_idx from
-  # the scope target, processing_idx from the run identity. MUST run last —
-  # after register-files makes the contigs durable — so 'completed' never
-  # advertises sequences that aren't in DuckLake. Removing this entry also
-  # removes the runner's 'pending' and 'no_data' gate writes, which key off it
-  # (runner._processing._workflow_writes_assembly_gate).
+  # the scope target, processing_idx from the run identity. Runs last, after
+  # register-files makes the contigs durable: moved ahead of it, 'completed'
+  # advertises sequences that are not in DuckLake. The runner keys its own two
+  # gate writes ('pending' before the loop, 'no_data' on the StepNoData path) on
+  # this entry being declared, so removing it removes those too.
+  # See qiita_control_plane.actions.library.finalize_assembly_sample_gate.
   - action: finalize-assembly-sample
     inputs: []
     outputs: []

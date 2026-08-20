@@ -2335,12 +2335,11 @@ async def finalize_assembly_sample_gate(
     """Terminal step of the long-read-assembly workflow: record this sample's
     assembly as completed in the qiita.assembly_sample gate.
 
-    Runs AFTER register-files, so the gate never reads 'completed' before the
-    contigs are in DuckLake. The row is already 'pending' — the runner
-    materialized it when it minted this run's processing_idx — and the write is an
-    idempotent upsert, so a workflow retried from the start re-affirms
-    'completed'. The gate's state contract lives on
-    `repositories.assembly.fetch_assembly_sample_state`.
+    The row is already 'pending' — the runner materialized it when it minted this
+    run's processing_idx — and the write is an idempotent upsert, so a workflow
+    retried from the start re-affirms 'completed'. Where the entry sits in the
+    step list, and why, is on the workflow YAML entry that declares it; the gate's
+    state contract lives on `repositories.assembly.fetch_assembly_sample_state`.
     """
     async with pool.acquire() as conn, conn.transaction():
         await upsert_assembly_sample_completed(

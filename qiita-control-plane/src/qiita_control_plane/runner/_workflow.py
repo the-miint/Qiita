@@ -192,7 +192,7 @@ async def run_workflow(
     action: ActionDefinition | None = None
     index: int | None = None
     uploads_to_consume: list[int] = []
-    # The processing_idx this run MINTED — the only value either
+    # The processing_idx this run minted — the only value either
     # qiita.assembly_sample write below is keyed on, and None until the mint runs.
     # `bound` is seeded from action_context, which is stored verbatim and passes
     # `validate_context` with unknown keys intact, so a submitter can put a
@@ -556,12 +556,12 @@ async def run_workflow(
                     f"prep_sample-scoped; got {scope_target['kind']!r}"
                 )
             if minted_processing_idx is None:
-                # `_workflow_writes_assembly_gate` and `_workflow_needs_processing`
-                # are independent reads of `action.steps`; a workflow declaring the
-                # terminal action without threading `processing_idx` through some
-                # step's `params:` leaves the gate with no key. Refusing here stops
-                # the run rather than assembling behind a gate no write ever
-                # materializes.
+                # Per-ticket backstop for the load-time refusal on ActionDefinition
+                # (`_assembly_gate_declares_a_processing_identity`), which owns the
+                # argument and which `_fetch_action` applies to the qiita.action row
+                # as well. `_workflow_writes_assembly_gate` and
+                # `_workflow_needs_processing` are independent reads of
+                # `action.steps`; this is where they would disagree.
                 raise _submission_bad_input(
                     "a workflow that gates assembly completion (declares "
                     f"{LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE}) must thread "

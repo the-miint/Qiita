@@ -5916,8 +5916,8 @@ async def test_assembly_gate_closes_at_no_data_when_a_step_produced_none(
 async def test_assembly_gate_is_absent_when_no_data_precedes_the_mint(
     postgres_pool, monkeypatch, tmp_path
 ):
-    """The OTHER StepNoData: an empty masked pass-set raises in the pre-loop input
-    resolver, which runs BEFORE the processing_idx mint, so there is no key to write
+    """The other StepNoData: an empty masked pass-set raises in the pre-loop input
+    resolver, which runs before the processing_idx mint, so there is no key to write
     a gate row under and none is written. The ticket carries that outcome; the gate
     does not. Pinned so the asymmetry with the no-contigs case above stays a
     decision — see repositories.assembly.fetch_assembly_sample_state."""
@@ -5960,7 +5960,7 @@ async def _mint_unrelated_processing(pool) -> int:
 async def test_assembly_gate_ignores_a_processing_idx_from_action_context(
     postgres_pool, monkeypatch, tmp_path
 ):
-    """Both gate writes key on the processing_idx the runner MINTED, never on a
+    """Both gate writes key on the processing_idx the runner minted, never on a
     `processing_idx` a submitter put in action_context — which reaches the
     runner's bindings intact, see `minted_processing_idx` in `runner/_workflow.py`.
 
@@ -6053,9 +6053,12 @@ async def test_assembly_gate_declared_without_a_threaded_processing_idx_fails_at
     postgres_pool, monkeypatch, tmp_path
 ):
     """A workflow that declares the terminal action without threading
-    `processing_idx` has no key to write the gate row under, and is refused at
-    the SUBMISSION stage rather than run — the guard in `runner/_workflow.py`
-    carries why the two declarations can come apart."""
+    `processing_idx` has no key to write the gate row under. Seeded straight into
+    qiita.action, bypassing the YAML load, so it reaches `_fetch_action` — whose
+    `ActionDefinition.model_validate` applies the same refusal the load does. The
+    ticket fails at the SUBMISSION stage with no gate row written either way."""
+    from pydantic import ValidationError
+
     ungated_step = {k: v for k, v in _ASSEMBLY_GATE_STEPS[0].items() if k != "params"}
     work_ticket_idx, _mask_idx, prep_sample_idx, teardown = await _seed_assembly_ticket(
         postgres_pool,
@@ -6065,9 +6068,8 @@ async def test_assembly_gate_declared_without_a_threaded_processing_idx_fails_at
     )
     _stub_masked_reads(monkeypatch, tmp_path)
     try:
-        with pytest.raises(BackendFailure) as ei:
+        with pytest.raises(ValidationError):
             await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
-        assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
         row = await postgres_pool.fetchrow(
             "SELECT state, failure_stage, failure_reason FROM qiita.work_ticket"
             " WHERE work_ticket_idx = $1",

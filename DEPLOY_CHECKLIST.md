@@ -42,11 +42,10 @@ _None yet._
   empty table and its index, `qiita.assembly_sample`: the per-`(processing_idx,
   prep_sample)` completion gate for `long-read-assembly`, alongside the existing
   `qiita.mask_sample` and `qiita.alignment_sample`. The index is created with the table, so
-  it is a plain `CREATE INDEX` over zero rows — no `CONCURRENTLY`, nothing to lock, unlike
-  `20260806120000_alignment_sample_prep_sample_idx.sql` which indexed a populated table.
-  **No backfill**: assemblies already completed on this host get
-  no gate row, so they read as not-assembled. No code reads the gate yet; whether to
-  backfill them is a separate decision. The migrate→restart window has the same shape — an
+  it is a plain `CREATE INDEX` over zero rows — no `CONCURRENTLY`, nothing to lock.
+  **No backfill**: assemblies already completed on this host get no gate row, so they read
+  as not-assembled. No code reads the gate yet; whether to backfill them is a separate
+  decision. The migrate→restart window has the same shape — an
   assembly ticket completing between bucket 3 and the bucket-4 restart runs under old code
   that writes no gate row. Re-submitting such a sample after the restart is admitted and
   re-writes it (no disallow-without-delete site applies to `long-read-assembly`). (#466)
@@ -77,13 +76,17 @@ _None yet._
   file (`noLCG.fa`) out of the `genomes_dir` it already binds (#460), and a terminal
   `finalize-assembly-sample` entry was appended after `register-files` — an in-process
   control-plane primitive writing the `qiita.assembly_sample` gate, not a SLURM step (#466).
-  Confirm the second landed: under a stale synced copy every new assembly's gate row stays
-  at `pending`.
+  Confirm the second landed: all three `qiita.assembly_sample` writes are gated on the
+  terminal entry being present in the synced `steps`, so under a stale copy no gate row is
+  written at all and the table stays empty — which reads like a migration that did not
+  apply rather than a sync that did not land.
   ```bash
   sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
   psql "$DATABASE_URL" -Atc "SELECT steps::text LIKE '\''%finalize-assembly-sample%'\'' FROM qiita.action WHERE action_id = '\''long-read-assembly'\'' AND version = '\''1.0.0'\'';"'
   ```
-  Expect `t`. (#466)
+  Expect `t`. `f` is the stale copy. **Empty output** is a third outcome, not a pass: `-Atc`
+  prints nothing for zero rows, so it means no `long-read-assembly` 1.0.0 row matched at
+  all. Re-run `qiita-admin actions sync` for either. (#466)
 
 ### 6. After the deploy verifies green
 

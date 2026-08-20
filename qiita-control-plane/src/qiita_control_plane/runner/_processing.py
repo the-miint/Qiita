@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 import asyncpg
-from qiita_common.actions import WorkflowAction
+from qiita_common.actions import PROCESSING_IDX_BINDING, WorkflowAction
 from qiita_common.api_paths import LibraryPrimitive
 
 from ..repositories.assembly import (
@@ -26,12 +26,6 @@ from ..repositories.assembly import (
 )
 from ..repositories.processing import mint_processing
 from ._mask import MASK_IDX_BINDING
-
-# Binding name the runner threads the minted processing_idx under. A step lists it
-# in its `params:` (processing_idx -> <job>.Inputs.processing_idx), which both
-# signals the runner to mint the identity before the step loop and carries the
-# value into the step. The write-assembly-membership action reads it from `bound`.
-PROCESSING_IDX_BINDING = "processing_idx"
 
 # action_context key naming the step-1 assembler. Its default is single-sourced
 # from the action's context_schema (see `_mint_processing_idx`), never hardcoded
@@ -121,8 +115,8 @@ def _workflow_writes_assembly_gate(steps: list[Any]) -> bool:
     The signal for both of the runner's own qiita.assembly_sample writes: the
     'pending' row after the processing_idx mint, and the 'no_data' row in the
     StepNoData handler. Keying on the terminal action's presence rather than on
-    the action_id means the workflow that declares the gate is the workflow that
-    gets it, and the three writes cannot drift apart.
+    the action_id means a workflow gets the runner's two writes exactly when it
+    declares the third.
     """
     gate = LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE
     return any(isinstance(entry, WorkflowAction) and entry.name == gate for entry in steps)

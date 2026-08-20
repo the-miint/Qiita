@@ -31,6 +31,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.auth_constants import (
     MAX_NAME_LENGTH,
     MAX_VERSION_LENGTH,
@@ -52,6 +53,14 @@ from qiita_common.models import (
 # StepSubmitRequest deliberately stays shape-only — the prefix check
 # belongs at the layers that actually import / dispatch.
 NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
+
+# The runner binding name the minted processing_idx travels under. A step names it
+# as the value side of a `params:` pair (`processing_idx: processing_idx` ->
+# <job>.Inputs.processing_idx), which both signals the runner to mint the run
+# identity before the step loop and carries the value into the step. Defined here
+# so the load-time validator on ActionDefinition below and the runner's own
+# pre-loop check read one value rather than re-typing the string.
+PROCESSING_IDX_BINDING = "processing_idx"
 
 
 # action_context property keys that name a fastq file path. The
@@ -542,6 +551,34 @@ class ActionDefinition(BaseModel):
                 f"duplicate step name(s) {dupes}: `step:` entry names must be unique "
                 "within an action — SLURM job naming and job adoption key on the "
                 "name. (`action:` entries run in-process and may repeat.)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _assembly_gate_declares_a_processing_identity(self) -> ActionDefinition:
+        # The qiita.assembly_sample gate row is keyed on (processing_idx,
+        # prep_sample), and the runner mints that processing_idx only when some
+        # entry threads PROCESSING_IDX_BINDING through its `params:`. An action
+        # that declares the terminal gate action without that thread has no key
+        # to write the row under, so every ticket it accepts assembles behind a
+        # gate no write ever materializes. Both halves are static properties of
+        # `steps`, so reject the pair here: the load sweep the test suite runs
+        # over `workflows/` fails on a YAML mistake, and `_fetch_action`'s
+        # model_validate applies the same refusal to a qiita.action row. The
+        # runner repeats the check per ticket; this site owns the argument.
+        declares_gate = any(
+            isinstance(e, WorkflowAction) and e.name == LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE
+            for e in self.steps
+        )
+        if declares_gate and not any(
+            PROCESSING_IDX_BINDING in (getattr(e, "params", None) or {}).values()
+            for e in self.steps
+        ):
+            raise ValueError(
+                f"an action declaring the {LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE} "
+                f"entry must thread {PROCESSING_IDX_BINDING!r} through some step's "
+                "`params:` — the gate row is keyed on the processing_idx that "
+                "threading mints"
             )
         return self
 

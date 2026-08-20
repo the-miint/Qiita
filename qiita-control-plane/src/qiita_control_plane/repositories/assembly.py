@@ -68,9 +68,7 @@ async def insert_assembly_membership_rows(
 # =============================================================================
 # assembly_sample gate (per-(processing_idx, prep_sample) completion)
 # =============================================================================
-# One row per (run, sample). The runner materializes it 'pending' when it mints
-# the run's processing_idx, and exactly one of the two terminal writers below
-# closes it. Read contract: `fetch_assembly_sample_state`.
+# One row per (run, sample). Read contract: `fetch_assembly_sample_state`.
 
 
 async def create_assembly_sample_pending(
@@ -79,16 +77,21 @@ async def create_assembly_sample_pending(
     processing_idx: int,
     prep_sample_idx: int,
 ) -> None:
-    """Materialize the `(processing_idx, prep_sample_idx)` gate row at PENDING.
+    """Materialize the `(processing_idx, prep_sample_idx)` gate row at 'pending'.
 
-    Idempotent, which is what makes a resumed or redriven ticket safe: the same
-    params re-resolve to the same processing_idx, so this runs again over whatever
-    the last run left. It reopens 'no_data' and leaves 'completed' — the same
-    asymmetry `upsert_assembly_sample_no_data` is guarded on, for the reason
-    stated there. 'no_data' says the run that wrote it assembled nothing; a new
-    run of the same identity has not finished, so leaving it would have the gate
-    answer for a run that is still going — and answer 'no_data' about a run that
-    may go on to FAIL.
+    Idempotent: the same params re-resolve to the same processing_idx, so a
+    resumed or redriven ticket runs this again over whatever the last run left. It
+    reopens 'no_data' and leaves 'completed' — the same asymmetry
+    `upsert_assembly_sample_no_data` is guarded on, for the reason stated there.
+    'no_data' says the run that wrote it assembled nothing; a new run of the same
+    identity has not finished, so leaving it would have the gate answer for a run
+    that is still going — and answer 'no_data' about a run that may go on to FAIL.
+
+    The reopen composes with 'pending' never being closed on a failure path: a run
+    that ends 'no_data', followed by one that reopens the row and then FAILs,
+    leaves 'pending' standing with the earlier terminal answer overwritten and no
+    sweeper to restore it. Another re-run under the same params re-resolves the
+    same key and can close it; nothing else will.
 
     Twin of `repositories.block.create_mask_sample_pending`, one sample at a time
     — assembly is per-sample-ticket, not a block fan-out. Those twins have no
@@ -117,9 +120,8 @@ async def upsert_assembly_sample_completed(
     The `finalize-assembly-sample` terminal action's writer. An upsert rather
     than an UPDATE so it stands alone on a ticket whose pending row was never
     written, and re-affirms 'completed' on a workflow retried from the start.
-    Unguarded: 'completed' is reachable from every other state, including a prior
-    run's 'no_data' — contigs arriving where a previous run of the same identity
-    found none is a move forward.
+    Unguarded, where `upsert_assembly_sample_no_data` is guarded: 'completed' is
+    reachable from every other state, a prior run's 'no_data' included.
     """
     require_transaction(conn)
     await conn.execute(
@@ -168,14 +170,14 @@ async def fetch_assembly_sample_state(
     """Return the `(processing_idx, prep_sample_idx)` gate row's state, or None
     when no row exists.
 
-    THE assembly_sample gate contract (canonical statement; other consumers point
+    The assembly_sample gate contract (canonical statement; other consumers point
     here rather than restate it). The gate has three states, all written
     first-class by the assembly workflow: 'pending' when the runner mints the run
     identity, then 'completed' at the terminal `finalize-assembly-sample` action,
     or 'no_data' when assembly_hash found no contig of any kind and the ticket
     ended NO_DATA.
 
-    THE INVARIANT: completion is read from this state, never from the presence of
+    The invariant: completion is read from this state, never from the presence of
     qiita.assembly_membership or DuckLake rows — the assembly tail writes those
     across several entries, so a partial footprint is indistinguishable from a
     finished one by row presence alone. {'completed', 'no_data'} is the terminal
@@ -190,7 +192,7 @@ async def fetch_assembly_sample_state(
 
     None also covers a sample the run never reached: a ticket whose masked
     pass-set is empty raises StepNoData in the runner's pre-loop input resolver,
-    which runs BEFORE the processing_idx mint, so there is no key to write a row
+    which runs before the processing_idx mint, so there is no key to write a row
     under. The identity itself may still exist — another sample's ticket under the
     same params mints the same processing_idx — so a consumer holding one can ask
     about such a sample and get None. The ticket carries that outcome; this gate

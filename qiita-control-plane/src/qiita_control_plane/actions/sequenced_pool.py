@@ -326,10 +326,12 @@ async def delete_sequenced_pool_cascade(
         (per-(mask/alignment/assembly, prep_sample) completion gates) →
       prep_sample (→ sequence_range CASCADEs) → sequenced_pool.
 
-    NOT cleared here: `qiita.genome.prep_sample_idx` (a qiita-origin genome's
-    source sample, also ON DELETE RESTRICT) — a narrower, separately-tracked gap,
-    so a pool with a derived-genome source sample still cannot be deleted until
-    that is handled.
+    Not cleared here: the two remaining ON DELETE RESTRICT references to
+    `qiita.prep_sample` — `qiita.genome.prep_sample_idx` (a qiita-origin genome's
+    source sample) and `qiita.exported_identifier.prep_sample_idx` (a published
+    handle naming it). `assert_sequenced_pool_deletable` gates on neither, so a
+    pool carrying either raises ForeignKeyViolationError out of the prep_sample
+    delete below and cannot be deleted.
 
     Returns the per-table delete counts for the caller's response (the derived
     gate-row and block-cover-map deletes are not surfaced — internal cleanup, not
