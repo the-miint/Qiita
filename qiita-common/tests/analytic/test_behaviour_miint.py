@@ -1,10 +1,10 @@
-"""Behavioural tests for `qiita_common.feature_table` against REAL duckdb-miint.
+"""Behavioural tests for `qiita_common.analytic` against REAL duckdb-miint.
 
-The builders return SQL text and open no connection, so `qiita-common`'s own tests
-assert on strings; the analytic's behaviour is pinned here and in the orchestrator's
-`test_estimate_feature_table.py`. This module is the client-side half's home and
-carries the properties that suite cannot: **the per-sample coverage scope**, which
-no server-side caller uses.
+The builders return SQL text and open no connection, so the sibling modules here
+assert on strings; the analytic's behaviour is pinned in this one and in the
+orchestrator's `test_estimate_feature_table.py`. This module carries the properties
+that suite cannot: **the per-sample coverage scope**, which no server-side caller
+uses.
 
 Every test drives the shared builders end to end — the staging renames, the
 lengths roll-up, the survivor set, the pre-woltka join, and `woltka_ogu` itself —
@@ -23,9 +23,19 @@ import contextlib
 
 import duckdb
 import pytest
-from qiita_common import feature_table as ft
 
-from qiita_control_plane.miint import connect_with_miint_staged
+from qiita_common import analytic as ft
+from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+
+
+def _miint_conn() -> duckdb.DuckDBPyConnection:
+    """An in-memory connection with miint LOADed from the extension directory the
+    conftest stages. LOAD-only, like every service-side connect: the INSTALL happens
+    once per session there, not once per test."""
+    conn = duckdb.connect(":memory:", config=miint_connect_config())
+    conn.execute(miint_load_sql())
+    return conn
+
 
 # ---------------------------------------------------------------------------
 # Fixture vocabulary. Contigs are `feature_idx`, genomes `genome_idx`.
@@ -150,7 +160,7 @@ def _table(
     """Run the whole analytic for `scope` at `threshold` and return the feature
     table, sorted — keyed by our own identifiers, as the server-side consumer leaves
     it."""
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(
             conn, scope, threshold, alignment=alignment, mapping=mapping, lengths=lengths, gate=gate
         )
@@ -215,7 +225,7 @@ def test_joining_the_wrong_scopes_survivor_set_is_a_bind_error():
     genome survived in, inflating its counts. This asserts the mismatch cannot get
     that far.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(conn, alignment=_ALIGNMENT, mapping=_MAP, lengths=_LENGTHS, threshold=0.01)
         conn.execute(ft.coverage_alignments_view_sql())
         conn.execute(ft.survivor_table_sql(ft.CoverageScope.PER_SAMPLE), [0.01])
@@ -310,7 +320,7 @@ def test_empty_and_populated_paths_agree_on_column_types():
     types; this is what checks the declaration against what woltka actually
     returns.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(conn, alignment=_ALIGNMENT, mapping=_MAP, lengths=_LENGTHS, threshold=0.0)
         conn.execute(ft.ogu_input_table_sql(survivor_scope=None))
 
@@ -502,7 +512,7 @@ def test_cigar_does_not_reach_the_gated_relation():
     """The wide column stops at the gate. Downstream reads `ALIGNMENT_TABLE`, which
     carries exactly `ALIGNMENT_COLUMNS` — so the coverage view and woltka's input
     never pay for it, and the streamed copy that held it is dropped."""
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(
             conn,
             alignment=[(1, 1, 10, 0, 0, 150, "150=", None)],
@@ -604,7 +614,7 @@ def test_the_analytic_releases_the_relations_it_finishes_with():
     relations in the pipeline, and they would otherwise live until the connection closes.
     """
     scope = ft.CoverageScope.POOLED
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(conn, scope, 0.01)
         surviving = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
         assert ft.OGU_INPUT_TABLE in surviving
@@ -719,7 +729,7 @@ def _public_table(
     which is what the client achieves by minting FROM the roll-up's own output; a test
     that wants the two to DISAGREE passes it explicitly.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(
             conn, scope, threshold, alignment=alignment, mapping=mapping, lengths=lengths, gate=gate
         )
@@ -751,7 +761,7 @@ def test_no_internal_identifier_survives_into_the_public_table():
     that keeps `prep_sample_idx` and `genome_idx` out of a file somebody publishes,
     and the writers downstream inherit it from this table alone.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(conn, ft.CoverageScope.POOLED, 0.01)
         conn.execute(ft.ogu_output_table_sql(populated=populated))
         _stage_labels(conn, feature_handles=_feature_handles(_MAP), handles=_HANDLES)
@@ -839,7 +849,7 @@ def test_an_empty_cohort_relabels_to_the_same_columns_and_types():
     short-circuit — and must still land in the public table with the same schema a
     populated cohort produces. This is the path a caller exercises least.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(conn, ft.CoverageScope.POOLED, 1.0)
         assert not populated
         conn.execute(ft.ogu_output_table_sql(populated=populated))
@@ -930,7 +940,7 @@ def _shear(conn) -> ft.TreeClearance:
 def _labelled(*, mapping=_MAP, lengths=_LENGTHS, threshold=0.01):
     """A connection carrying everything the shear needs: the roll-up done, the labels
     minted from its own output, and the relabel run — the client's order exactly."""
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(
             conn, ft.CoverageScope.POOLED, threshold, mapping=mapping, lengths=lengths
         )
@@ -1111,7 +1121,7 @@ def test_the_rollup_report_counts_a_shared_features_alignment_row_once():
     shared_map = [*_MAP, (10, 500)]
     unmapped_row = (1, 7, 77, 0, 0, 100)
     alignment = [*_ALIGNMENT, unmapped_row]
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(conn, alignment=alignment, mapping=shared_map, lengths=_LENGTHS, threshold=0.01)
         cursor = conn.execute(ft.rollup_coverage_diagnostics_sql())
         names = [d[0] for d in cursor.description]

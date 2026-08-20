@@ -2122,6 +2122,15 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **`qiita_common.feature_table` is now the `qiita_common.analytic` package (#TBD).** Closes
+  #456. The one module became eight — `relations`, `stage`, `coverage`, `gate`, `ogu`, `label`,
+  `sidecar`, `write` — re-exported from `analytic/__init__.py`, so a consumer's only change is
+  the import line. No SQL text, no error message, and no assertion changed: every builder's
+  output and every check's message is byte-identical, and the string-level tests moved verbatim
+  into per-module files. `qiita-common` now declares `duckdb>=1.5.4`, which is what lets the
+  analytic's behavioural tests — the only home of the per-sample coverage scope — live beside
+  the code they pin rather than in the control-plane suite.
+
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that
   fetches them ran last too — which meant a reference this alignment names but the caller cannot

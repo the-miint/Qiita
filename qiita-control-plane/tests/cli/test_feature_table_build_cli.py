@@ -2,7 +2,7 @@
 and both Flight streams faked — real miint, real analytic, real writers.
 
 The pieces this wires are pinned elsewhere: the analytic against real miint in
-`tests/test_feature_table_analytic.py`, the maps / relabel / bundle in
+`qiita-common`'s `tests/analytic/test_behaviour_miint.py`, the maps / relabel / bundle in
 `tests/cli/test_feature_table_cli.py`, the BIOM writer's own behaviours in
 `tests/test_biom_writer_contract.py`. **What is only testable here is the wiring**:
 which columns ride the ticket, which scope reaches the survivor set, whether the
@@ -22,7 +22,7 @@ import json
 import httpx
 import pyarrow as pa
 import pytest
-from qiita_common import feature_table as ft
+from qiita_common import analytic as ft
 from qiita_common.hashing import canonical_params_hash
 
 from qiita_control_plane.cli.user import feature_table as ftc

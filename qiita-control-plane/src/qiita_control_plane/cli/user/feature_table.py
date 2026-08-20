@@ -1,6 +1,6 @@
 """qiita user CLI — the client-side feature table.
 
-The analytic itself is `qiita_common.feature_table`, shared with the server-side
+The analytic itself is `qiita_common.analytic`, shared with the server-side
 compute job; this module is the half that only a client has: fetching the two
 identifier maps over REST, staging every input into the user's own DuckDB,
 relabelling the result to public handles, and writing the bundle — the table plus
@@ -24,7 +24,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from qiita_common import feature_table as ft
+from qiita_common import analytic as ft
 from qiita_common.api_paths import (
     PATH_ALIGNMENT_COHORT_DOGET,
     PATH_ALIGNMENT_PREFIX,

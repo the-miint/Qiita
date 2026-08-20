@@ -6,6 +6,7 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 import argparse
 from pathlib import Path
 
+from qiita_common.analytic import CoverageScope
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
@@ -22,7 +23,6 @@ from qiita_common.api_paths import (
     PATH_STUDY_BY_IDX,
     PATH_STUDY_PREFIX,
 )
-from qiita_common.feature_table import CoverageScope
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,

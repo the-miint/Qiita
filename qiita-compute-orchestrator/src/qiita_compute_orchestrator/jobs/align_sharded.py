@@ -154,7 +154,7 @@ from typing import Literal
 
 import duckdb
 from pydantic import BaseModel
-from qiita_common.feature_table import PAIRED_PLACEMENT_PARTITION
+from qiita_common.analytic import PAIRED_PLACEMENT_PARTITION
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
