@@ -131,11 +131,13 @@ rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/workflows/"                 
 # qiita-api service user via systemd; no secrets here.
 build_sha=${QIITA_BUILD_SHA:-}
 build_sha=${build_sha:0:7}
-if [ -n "$build_sha" ]; then
-    printf 'BUILD_SHA=%s\n' "$build_sha" > /opt/qiita/control-plane/build.env
-else
-    : > /opt/qiita/control-plane/build.env
-    echo "build stamp: QIITA_BUILD_SHA unset — landing footer will show version only" >&2
+build_version=${QIITA_BUILD_VERSION:-}
+{
+    [ -n "$build_sha" ] && printf 'BUILD_SHA=%s\n' "$build_sha"
+    [ -n "$build_version" ] && printf 'BUILD_VERSION=%s\n' "$build_version"
+} > /opt/qiita/control-plane/build.env
+if [ -z "$build_sha" ] && [ -z "$build_version" ]; then
+    echo "build stamp: QIITA_BUILD_SHA and QIITA_BUILD_VERSION unset — landing footer will show static package version" >&2
 fi
 chmod 0644 /opt/qiita/control-plane/build.env
 

@@ -641,8 +641,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # ~1 KB, and a MIXED column pays a real scan (0.147 s at 3M rows, 50/50).
                 # So the single-end case this projection exists for is precisely the one
                 # that does not get the shortcut — it is cheap by encoding, not by
-                # pruning. A short-circuiting
-                # `LIMIT 1` probe would be far SLOWER, since that one does scan.
+                # pruning. A `LIMIT 1` probe would also avoid scanning (row-group stats
+                # prune it) and is in fact faster in most shapes, but it cannot produce
+                # `total`, and the mixed-batch rejection below needs both numbers to
+                # name the counts in its error (`paired not in (0, total)`). That
+                # correctness requirement — not performance — is why the count probe is
+                # used here.
                 #
                 # `total > 0` is load-bearing now that this runs ahead of the empty
                 # check: an empty read batch makes `paired == total == 0`, which is
