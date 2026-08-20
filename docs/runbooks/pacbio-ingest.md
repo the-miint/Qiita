@@ -6,7 +6,7 @@ Not needed for Illumina.
 
 This covers only what is different about PacBio. Everything the two platforms
 share — where to run the command, working from a remote machine, the studies and
-samples the pre-flight file has to match, building that file and opening it once
+biosamples the pre-flight file has to match, building that file and opening it once
 first, how to retry, and why not to use `--force` — is in
 [`getting-started.md`](getting-started.md), which these examples carry on from.
 
@@ -28,20 +28,24 @@ qiita submit-pacbio-ingest \
   carry the run's name in a file Qiita reads; PacBio's do not. Nothing checks
   what you type, so use the run folder's own name.
 - **The protocol is always `long_read_metagenomics`.** This command only takes
-  the two PacBio sheet types and both are metagenomics, so it is never
-  `long_read_amplicon`, whatever the sheet is called. Look the number up on your
-  own site with `qiita prep-protocol list` rather than copying one — on
-  `qiita-miint` it is **3**, and **5** is the amplicon protocol you must not
-  pick. Nothing will catch a wrong number for you.
-- **Re-running reports samples that are already loaded as `skipped`.**
+  the two PacBio sheet types and both are metagenomics, so it is never the
+  amplicon protocol, whatever the sheet is called. Look the number up on your own
+  site with `qiita prep-protocol list` rather than copying one from anywhere —
+  nothing will catch a wrong number for you, and a wrong one mislabels every
+  prep_sample in the run.
+- **Re-running the identical command is the retry.** prep_samples still missing
+  get submitted; ones already in flight are skipped.
 
 ## `pool-completion` will not tell you the load finished
 
-That command reports on host-filtering, and on Illumina demultiplexing — neither
-of which a freshly loaded PacBio run has done yet. So it reads
-`samples_not_submitted: N` and `demux_state: not_submitted`, which here means
-"not filtered yet", not "something went wrong".
+It reports on two later things, not on the load. Its per-prep_sample counts are
+about read masking — PacBio runs **are** host-filtered, exactly like Illumina
+ones, via `qiita submit-host-filter-pool`; you just have not done it yet at this
+point. Its `demux_state` is about Illumina demultiplexing, which PacBio never
+does at all, because the instrument delivers the reads already demultiplexed.
 
-PacBio runs are never demultiplexed by Qiita, so **`fully_processed` stays
-`false` for a PacBio pool forever.** Use `complete` as the signal that the
-samples are done instead.
+So a freshly loaded PacBio pool reads `samples_not_submitted: N` and
+`demux_state: not_submitted`. The first means "not masked yet" and changes once
+you mask; the second never changes. Because it never changes, **`fully_processed`
+stays `false` for a PacBio pool forever** — use `complete` as the signal that the
+prep_samples are done instead.

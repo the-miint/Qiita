@@ -237,8 +237,9 @@ async def mint_or_reuse_sequence_range(
                 reason=(
                     f"prep_sample {prep_sample_idx}'s read numbering was deleted while "
                     "this step was retrying, so the step could not finish against it — "
-                    "the mint said it already existed (409), then the read-back did not "
-                    "find it (404). Submit the sample again"
+                    "reserving the numbering reported that it already existed (409), "
+                    "then reading it back did not find it (404). Submit the prep_sample "
+                    "again"
                 ),
             ) from exc
         if existing.minted_by_work_ticket_idx != work_ticket_idx:
@@ -260,8 +261,8 @@ async def mint_or_reuse_sequence_range(
                     f"{owner_detail}, not by this one (ticket {work_ticket_idx}). "
                     "Loading them again would store every read twice, so this step "
                     "stopped without writing anything. To load them again on purpose, "
-                    "delete the sample first — its read numbering goes with it — or "
-                    "delete the whole pool with `qiita delete-sequenced-pool`, then "
+                    "delete the prep_sample first — its read numbering goes with it — "
+                    "or delete the whole pool with `qiita delete-sequenced-pool`, then "
                     "submit again"
                 ),
             ) from exc
@@ -286,7 +287,7 @@ async def mint_or_reuse_sequence_range(
             else:
                 # COMPLETED (reads registered), or a state with no in-place redrive.
                 recovery = (
-                    "there is no way to resume from this state — delete the sample "
+                    "there is no way to resume from this state — delete the prep_sample "
                     "(its read numbering goes with it) and submit again"
                 )
             raise BackendFailure(
@@ -297,7 +298,7 @@ async def mint_or_reuse_sequence_range(
                     f"prep_sample {prep_sample_idx}'s read numbering was reserved by "
                     f"ticket {work_ticket_idx}, which is no longer running "
                     f"(state={state!r}), so this attempt is out of date. Renumbering "
-                    f"now could store the sample's reads twice, so it stopped. "
+                    f"now could store the prep_sample's reads twice, so it stopped. "
                     f"{recovery}"
                 ),
             ) from exc
@@ -318,7 +319,7 @@ async def mint_or_reuse_sequence_range(
                     f"({existing.sequence_idx_start}..{existing.sequence_idx_stop}), but "
                     f"the input now has {count} — the range must match the prior mint "
                     "count exactly, so the input is not the one that was numbered. "
-                    "Delete the sample and submit again"
+                    "Delete the prep_sample and submit again"
                 ),
             ) from exc
         return existing.sequence_idx_start

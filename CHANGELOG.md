@@ -2161,7 +2161,11 @@ duplicates further down are historical strata; leave them where they are.
   DuckLake's lack of uniqueness, and `ON DELETE CASCADE` in order to act. They now name what
   happened to the reader's data and which command to run, keeping the identifiers, roles,
   recovery commands and — since `failure_reason` is an ops-triage surface as much as a user
-  one — the detail that says which call failed. They also stop implying that forcing a re-run duplicates
+  one — the detail that says which call failed. The `force` explanation now lives in
+  `qiita_common.work_ticket_constants` and is consumed by the CLI flags, the 409 body and
+  the wire model's field description, because four copies had to be edited to fix it once.
+  Objects are named by kind throughout — `biosample` or `prep_sample`, never a bare
+  "sample" — outside the control-plane code that is deliberately generic over both. They also stop implying that forcing a re-run duplicates
   reads: the read-numbering step refuses a range another ticket reserved, before anything is
   written, so a forced re-run stops there instead — which is what the messages now say.
 

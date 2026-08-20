@@ -28,6 +28,7 @@ from qiita_common.models._base import (
     ReadCounts,
     ScopeTarget,
 )
+from qiita_common.work_ticket_constants import FORCE_RESUBMIT_EXPLANATION
 
 
 class StepType(StrEnum):
@@ -312,25 +313,22 @@ class WorkTicketCreateRequest(BaseModel):
     `resource_override` is an optional per-run resource bump, gated server-side
     to wet_lab_admin / system_admin and bounded by the action's ceiling.
 
-    `force` re-submits a sequenced_pool action even when a COMPLETED ticket
-    already exists for the same `(pool, action, version)`. Default-refused
-    because the pool's reads are already stored; forcing waives that refusal
-    only — the re-run still stops at the read-loading step, which will not
-    number the same reads twice — so the recovery for a stored result is
-    `delete-sequenced-pool` then resubmit. It is privileged regardless
-    of scope: setting `force=true` requires wet_lab_admin / system_admin (403
-    otherwise) for ANY action. It only *changes submission behavior* for the
-    sequenced_pool COMPLETED gate, though — for other scopes, or when no
-    COMPLETED ticket exists, an authorized `force=true` is simply a no-op. It
-    never relaxes the in-flight gate (a PENDING/QUEUED/PROCESSING ticket still
-    blocks)."""
+    `force` is described once, for every surface that offers it, in
+    `qiita_common.work_ticket_constants.FORCE_RESUBMIT_EXPLANATION` — which is
+    this field's description. What follows is the wire semantics an operator
+    does not see. It is privileged regardless of scope: setting `force=true`
+    requires wet_lab_admin / system_admin (403 otherwise) for ANY action. It
+    only *changes submission behavior* for the sequenced_pool COMPLETED gate,
+    though — for other scopes, or when no COMPLETED ticket exists, an
+    authorized `force=true` is simply a no-op. It never relaxes the in-flight
+    gate (a PENDING/QUEUED/PROCESSING ticket still blocks)."""
 
     action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
     scope_target: ScopeTarget
     action_context: dict[str, Any] = Field(default_factory=dict)
     resource_override: ResourceOverride | None = None
-    force: bool = False
+    force: bool = Field(default=False, description=FORCE_RESUBMIT_EXPLANATION)
 
 
 class WorkTicketResponse(BaseModel):

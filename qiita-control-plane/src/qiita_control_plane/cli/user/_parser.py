@@ -36,6 +36,7 @@ from qiita_common.models import (
     Tier,
     WorkTicketState,
 )
+from qiita_common.work_ticket_constants import FORCE_RESUBMIT_EXPLANATION
 
 from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
@@ -1292,24 +1293,13 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "Qiita prep_protocol_idx to FK every per-sample row to. Applied"
-            " uniformly across the pool (the preflight carries no Qiita"
-            " prep_protocol identifier), unlike the per-row study_idx, which"
-            " resolves from the preflight's project.bioproject_accession via"
-            " /study/lookup-by-accession."
+            " uniformly across the pool."
         ),
     )
     p_submit_bcl.add_argument(
         "--force",
         action="store_true",
-        help=(
-            "Submit again even though a bcl-convert ticket for this pool has"
-            " already COMPLETED. Without it the submission is refused, because"
-            " the pool's reads are already stored. This waives the refusal"
-            " only: the re-run still stops at the read-loading step, which"
-            " will not number the same reads twice. To genuinely load the run"
-            " again, delete-sequenced-pool first, then resubmit. Requires"
-            " wet_lab_admin or system_admin."
-        ),
+        help=(FORCE_RESUBMIT_EXPLANATION),
     )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
 
@@ -1392,11 +1382,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help=(
-            "Submit each sample's bam-to-parquet ticket again even when one has"
-            " already COMPLETED. Those samples' reads are already stored, and the"
-            " re-run stops at the read-loading step rather than number them twice"
-            " — to genuinely load them again, delete the pool first. Requires"
-            " wet_lab_admin or system_admin."
+            "Requires wet_lab_admin or system_admin, and changes nothing else"
+            " here: the COMPLETED-ticket refusal this waives is scoped to"
+            " sequenced_pool actions, and PacBio ingest submits one"
+            " prep_sample-scoped ticket per sample. A re-submit over an"
+            " already-loaded prep_sample is admitted with or without it, and"
+            " stops at the read-loading step either way. To load a pool's reads"
+            " again, delete the pool and submit fresh."
         ),
     )
     p_submit_pacbio.set_defaults(handler=_handle_submit_pacbio_ingest)

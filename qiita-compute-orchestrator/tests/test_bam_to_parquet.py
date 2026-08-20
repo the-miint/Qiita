@@ -406,9 +406,9 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
     # `ticket run` would send the operator to a 409.
     if terminal_state == WorkTicketState.FAILED.value:
         assert f"qiita ticket run {1}" in ei.value.reason
-        assert "delete the sample" not in ei.value.reason
+        assert "delete the prep_sample" not in ei.value.reason
     else:
-        assert "delete the sample" in ei.value.reason
+        assert "delete the prep_sample" in ei.value.reason
         assert "ticket run" not in ei.value.reason
 
 
@@ -495,6 +495,6 @@ def test_execute_refuses_when_the_minter_state_is_unknown(monkeypatch, tmp_path)
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert "no longer running" in ei.value.reason
     # No ticket row to redrive — `/run` would 404. Delete-first is the only recovery.
-    assert "delete the sample" in ei.value.reason
+    assert "delete the prep_sample" in ei.value.reason
     assert "ticket run" not in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()

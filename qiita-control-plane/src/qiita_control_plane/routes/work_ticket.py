@@ -86,6 +86,7 @@ from qiita_common.models import (
     WorkTicketStepLogs,
     WorkTicketSummary,
 )
+from qiita_common.work_ticket_constants import FORCE_RESUBMIT_EXPLANATION
 
 from ..actions.context_validator import validate_context
 from ..actions.reference import (
@@ -427,12 +428,9 @@ async def _check_disallow_without_delete(
                 detail={
                     "reason": (
                         "a ticket for this pool and action has already COMPLETED, so "
-                        "the pool's reads are already stored. To start over, delete "
-                        "the pool (`qiita delete-sequenced-pool`) and submit again. "
-                        "To re-run deliberately, pass force=true (--force in the "
-                        "CLI; wet_lab_admin or system_admin) — note the run will stop "
-                        "at the read-loading step, which refuses to number the same "
-                        "reads twice."
+                        "the pool's reads are already stored. Pass force=true "
+                        "(--force in the CLI) to submit anyway: "
+                        f"{FORCE_RESUBMIT_EXPLANATION}"
                     ),
                     "blocking_work_ticket_idx": completed,
                 },
