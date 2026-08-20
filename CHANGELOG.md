@@ -36,6 +36,7 @@ duplicates further down are historical strata; leave them where they are.
   true) already on a live deploy. It was the only copy — `main` carried the same guard from
   the moment #324 landed — and `deploy-note-check` ignores this file, so removing it is
   safe.
+
 - **NCBI Taxonomy releases read from a taxdump archive (#439).**  `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
   into the term rows of a release, so taxa no longer arrive as hand-written seed
   migrations. A live taxon takes its scientific name as its label and its genbank
