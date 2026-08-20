@@ -2980,9 +2980,8 @@ const ALIGNMENT_DELETE_TABLES: &[&str] = &["alignment", "alignment_origin_spanni
 const _: () = assert!(!ALIGNMENT_DELETE_TABLES.is_empty());
 
 /// Delete `where_clause`'s rows from each of `tables`, in order, returning one
-/// count per table positionally. The shared body of `delete_alignment`,
-/// `delete_alignment_block` and `delete_alignment_sample`; each builds its own
-/// clause and shapes its own response.
+/// count per table positionally. The shared body of the `delete_alignment*`
+/// handlers; each builds its own clause and shapes its own response.
 ///
 /// The tables go in lockstep because they describe each other:
 /// `alignment_origin_spanning` names the `alignment` rows that make up one
@@ -2998,10 +2997,9 @@ const _: () = assert!(!ALIGNMENT_DELETE_TABLES.is_empty());
 ///
 /// `tables` and `where_clause` are interpolated and `params` binds any `?` the
 /// clause carries, so the caller owns the injection argument for both — as
-/// `replace_key_delete_sql`'s does at its own site. Every caller here passes an
-/// `ALIGNMENT_DELETE_TABLES` literal; `delete_alignment` and
-/// `delete_alignment_sample` pass a fixed clause with bound `?`s,
-/// `delete_alignment_block` inlines Ed25519-verified i64s.
+/// `replace_key_delete_sql`'s does at its own site. Every caller passes an
+/// `ALIGNMENT_DELETE_TABLES` literal and a clause whose values are either bound
+/// `?`s or inlined Ed25519-verified i64s.
 fn delete_lake_rows(
     conn: &duckdb::Connection,
     tables: &[&str],
@@ -3131,22 +3129,20 @@ fn delete_alignment_block(
 
 /// Delete one sample's whole footprint under one `alignment_idx` from every
 /// `ALIGNMENT_DELETE_TABLES` table. The idempotent-sample-replace primitive, for
-/// a workflow that aligns one prep_sample per ticket and so has no block to scope
-/// by: run immediately before `register-files`, a re-run deletes the prior run's
-/// rows before writing fresh ones and never double-counts.
+/// a workflow that aligns one prep_sample per ticket: run immediately before
+/// `register-files`, a re-run deletes the prior run's rows before writing fresh
+/// ones and never double-counts. Such a ticket has no `block_member` cover-map to
+/// hand `delete_alignment_block`, and `delete_alignment` would take every other
+/// sample's rows with it.
 ///
-/// Neither existing scope serves that ticket: `delete_alignment` takes the whole
-/// align-config identity, which would destroy every other sample's rows, and
-/// `delete_alignment_block` needs a `block_member` cover-map a per-sample ticket
-/// does not have. Both key columns are in the DDL of both tables
-/// (`ducklake::ensure_alignment_tables`), so the one clause applies to each.
-/// The predicate carries no `sequence_idx` bound — the sample is the unit — and
-/// is feature_idx-agnostic, so ALL of a read's alignment rows go (a read produces
-/// several via cross-shard + PE multiplicity).
+/// Both key columns are in the DDL of both tables
+/// (`ducklake::ensure_alignment_tables`), so the one clause applies to each. The
+/// predicate carries no `sequence_idx` bound — the sample is the unit — and is
+/// feature_idx-agnostic, so ALL of a read's alignment rows go.
 ///
 /// Transaction, lockstep and parquet lifecycle are `delete_lake_rows`', count
 /// reporting is `delete_alignment`'s. Idempotent: a sample with no rows yet
-/// deletes 0 and still succeeds. Both integers are Ed25519-verified i64s.
+/// deletes 0 and still succeeds.
 fn delete_alignment_sample(
     catalog_connstr: &str,
     data_path: &str,
@@ -4188,7 +4184,7 @@ mod tests {
 
     /// `delete_alignment_sample` deletes EXACTLY one `(alignment_idx,
     /// prep_sample_idx)` pair's rows from every `ALIGNMENT_DELETE_TABLES` table.
-    /// Both halves of the pair are load-bearing: a sibling sample under the SAME
+    /// Both halves of the pair are pinned: a sibling sample under the SAME
     /// alignment_idx survives (so the delete is not `delete_alignment`), and the
     /// target sample's rows under a DIFFERENT alignment_idx survive (so it is not
     /// keyed on prep_sample_idx alone). All of a read's rows go regardless of

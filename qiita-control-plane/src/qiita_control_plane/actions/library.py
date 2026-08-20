@@ -2420,8 +2420,6 @@ async def delete_alignment_sample(
     flip, and clearing a gate is `DELETE /alignment-definition/{idx}` (which
     CASCADEs it), not a mid-workflow replace.
 
-    On a fresh sample this deletes 0 rows (nothing registered yet); on a re-run it
-    clears the prior rows so the subsequent register-files leaves exactly one copy.
     Returns the rows-deleted count for the workflow log."""
     rows_deleted = await delete_alignment_sample_data(
         alignment_idx=alignment_idx,
