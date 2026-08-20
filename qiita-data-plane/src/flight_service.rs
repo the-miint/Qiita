@@ -516,7 +516,16 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   double-registration.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
 ///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` /
-///   `delete_alignment_sample` — logical DELETEs; re-running deletes zero rows.
+///   `delete_alignment_sample` — logical DELETEs, idempotent against themselves:
+///   a replay with no write in between deletes zero rows. Not commutative with
+///   one. The three that run as a pre-`register-files` replace
+///   (`delete_read_mask_block`, `delete_alignment_block`,
+///   `delete_alignment_sample`) sit in a workflow that registers rows under the
+///   same scope a few steps later, so a replay landing after that registration
+///   drops what it wrote. What bounds that window is the token's own expiry,
+///   checked on every DoAction body in `auth::verify_ticket_raw`: 300s from
+///   `qiita_control_plane.auth.tickets.sign_action`'s default, and
+///   `MAX_TICKET_LIFETIME` refuses any token minted with a longer one.
 /// - `export_read` — re-materializes the same sample's bytes to the same ticket
 ///   path via atomic publish; a replay reproduces identical output. (The block
 ///   exports that used to sit beside it are gone: block-scoped compute now
@@ -3127,13 +3136,27 @@ fn delete_alignment_block(
     }))
 }
 
-/// Delete one sample's whole footprint under one `alignment_idx` from every
-/// `ALIGNMENT_DELETE_TABLES` table. The idempotent-sample-replace primitive, for
-/// a workflow that aligns one prep_sample per ticket: run immediately before
-/// `register-files`, a re-run deletes the prior run's rows before writing fresh
-/// ones and never double-counts. Such a ticket has no `block_member` cover-map to
-/// hand `delete_alignment_block`, and `delete_alignment` would take every other
-/// sample's rows with it.
+/// Delete one `(alignment_idx, prep_sample_idx)` pair's rows from every
+/// `ALIGNMENT_DELETE_TABLES` table — the idempotent-sample-replace primitive: run
+/// immediately before `register-files` and a re-run deletes the prior run's rows
+/// before writing fresh ones, so it never double-counts.
+///
+/// The pair is the unit because none of the three mechanisms already here selects
+/// it:
+///
+/// * `delete_alignment` keys on `alignment_idx` alone, so it takes every other
+///   sample's rows with it.
+/// * `delete_alignment_block` needs a `block_member` cover-map, which a caller
+///   holding one prep_sample has none of.
+/// * `REPLACE_KEY_TABLES` is matched on the destination TABLE name alone (see
+///   `register_files`), so an `alignment` entry keyed on this pair would fire on
+///   the block-scoped `align` workflow's registrations too. `tile_partition`
+///   splits a straddling sample across consecutive blocks and
+///   `replace_key_delete_sql` deletes every lake row whose key tuple appears in
+///   the incoming Parquet, so the second block's registration would delete the
+///   first's rows for the shared sample — `REPLACE_KEY_TABLES`' condition 1 (the
+///   incoming files carry the complete row set for every key they mention)
+///   failing.
 ///
 /// Both key columns are in the DDL of both tables
 /// (`ducklake::ensure_alignment_tables`), so the one clause applies to each. The
@@ -3166,7 +3189,6 @@ fn delete_alignment_sample(
 
     Ok(serde_json::json!({
         "alignment_idx": alignment_idx,
-        "prep_sample_idx": prep_sample_idx,
         "rows_deleted": counts[0],
     }))
 }
@@ -4240,7 +4262,6 @@ mod tests {
         // Three rows: two at seq 100 (multiplicity) + one at 101.
         assert_eq!(first["rows_deleted"], 3, "the pair's 3 rows deleted");
         assert_eq!(first["alignment_idx"], align_a);
-        assert_eq!(first["prep_sample_idx"], prep_a);
 
         let count = |table: &str, align: i64, prep: i64| -> i64 {
             conn.query_row(
@@ -5973,16 +5994,25 @@ mod tests {
         }
     }
 
-    /// Every `qiita_lake` BASE TABLE scoped by `alignment_idx` is in
-    /// `ALIGNMENT_DELETE_TABLES`, so every alignment delete clears it.
+    /// Membership runs both ways. Every `qiita_lake` BASE TABLE scoped by
+    /// `alignment_idx` is in `ALIGNMENT_DELETE_TABLES`, and every table in the
+    /// list carries every column a `delete_alignment*` clause keys on.
     ///
-    /// The same shape-query direction as
+    /// The first direction is the shape query, as in
     /// `every_content_addressed_lake_table_is_registered`: an `alignment_idx`
     /// column means the rows belong to one align-config identity and die with it,
     /// so a table added later carrying that column and left off the list would
     /// survive a DELETE that is supposed to purge the whole alignment — and
     /// disallow-without-delete would then re-admit a submission over rows that are
     /// still there.
+    ///
+    /// The second is the columns. `delete_lake_rows` applies ONE clause to every
+    /// listed table, so a table joining the list without `prep_sample_idx` or
+    /// `sequence_idx` makes the narrower deletes unrunnable. That is loud rather
+    /// than silent — DuckDB bind-errors on the missing column and
+    /// `delete_lake_rows` rolls the transaction back, verified to leave the
+    /// leading table's rows intact — so this catches it in CI instead of at the
+    /// first ticket.
     ///
     /// Views are excluded: `alignment_visible` carries `alignment_idx` from the
     /// base table it selects and has no rows of its own.
@@ -6028,6 +6058,37 @@ mod tests {
             Some(&"alignment"),
             "the delete_alignment* handlers report counts[0] as rows_deleted"
         );
+
+        // The columns the three clauses key on: `delete_alignment` on
+        // alignment_idx, `delete_alignment_sample` on that plus prep_sample_idx,
+        // `delete_alignment_block` on that plus `block_read_where_clause`'s
+        // sequence_idx.
+        for table in ALIGNMENT_DELETE_TABLES {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT column_name FROM duckdb_columns() \
+                     WHERE database_name = 'qiita_lake' AND table_name = ?",
+                )
+                .unwrap();
+            let columns: Vec<String> = stmt
+                .query_map([table], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(
+                !columns.is_empty(),
+                "qiita_lake.{table} is in ALIGNMENT_DELETE_TABLES but the catalog \
+                 holds no such table"
+            );
+            for key in ["alignment_idx", "prep_sample_idx", "sequence_idx"] {
+                assert!(
+                    columns.iter().any(|c| c == key),
+                    "qiita_lake.{table} is in ALIGNMENT_DELETE_TABLES but carries no \
+                     {key}, which a delete_alignment* clause keys on — every delete \
+                     using it would bind-error and roll back; found columns: {columns:?}"
+                );
+            }
+        }
     }
 
     /// Concurrent registrations of one feature leave ONE row, and every writer

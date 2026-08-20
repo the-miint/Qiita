@@ -2361,11 +2361,27 @@ async def test_run_action_primitive_delete_block_mask_rejects_non_block_scope(tm
         )
 
 
+class _FakeAlignmentIdxPool:
+    """A pool whose only query is the arm's `work_ticket.alignment_idx` read."""
+
+    def __init__(self, alignment_idx):
+        self.alignment_idx = alignment_idx
+        self.calls: list = []
+
+    async def fetchval(self, sql, *args):
+        self.calls.append((sql, args))
+        return self.alignment_idx
+
+
 async def test_run_action_primitive_delete_alignment_sample_dispatches(monkeypatch, tmp_path):
     """The delete-alignment-sample arm calls the DELETE_ALIGNMENT_SAMPLE primitive
     with prep_sample_idx from the scope target and alignment_idx from the
-    runner-bound `bound`, plus the signing_key / data_plane_url for the delete
-    DoAction. No pool argument — the primitive does no DB work."""
+    `work_ticket.alignment_idx` COLUMN, plus the signing_key / data_plane_url for
+    the delete DoAction.
+
+    `bound` carries a different alignment_idx, which the arm must ignore: that dict
+    is the submitter's `action_context` verbatim, and honouring it would let a
+    caller name any alignment's rows for deletion."""
     from qiita_common.actions import WorkflowAction
     from qiita_common.api_paths import LibraryPrimitive
 
@@ -2385,11 +2401,12 @@ async def test_run_action_primitive_delete_alignment_sample_dispatches(monkeypat
 
     monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE, fake_delete)
 
+    pool = _FakeAlignmentIdxPool(77)
     entry = WorkflowAction(kind="action", name="delete-alignment-sample", inputs=[], outputs=[])
     out = await _run_action_primitive(
-        None,  # pool — the arm passes none
+        pool,
         entry,
-        {"alignment_idx": 77},
+        {"alignment_idx": 999},  # the caller-chosen value, which must not be used
         tmp_path,
         {"kind": "prep_sample", "prep_sample_idx": 42},
         work_ticket_idx=9,
@@ -2403,6 +2420,42 @@ async def test_run_action_primitive_delete_alignment_sample_dispatches(monkeypat
         "signing_key": b"sekret",
         "data_plane_url": "grpc://dp:50051",
     }
+    # One read, against qiita.work_ticket, bound to THIS ticket.
+    assert len(pool.calls) == 1
+    assert "qiita.work_ticket" in pool.calls[0][0]
+    assert pool.calls[0][1] == (9,)
+
+
+async def test_run_action_primitive_delete_alignment_sample_refuses_null_alignment_idx(
+    monkeypatch, tmp_path
+):
+    """A ticket whose `alignment_idx` column is NULL has no alignment to scope the
+    delete to — no planner set it, or a mid-flight DELETE /alignment-definition
+    detached it (ON DELETE SET NULL). Refuse rather than fall back to the
+    caller-chosen `action_context` value."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    async def fake_delete(**kwargs):
+        raise AssertionError("the primitive must not be reached on a NULL alignment_idx")
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE, fake_delete)
+
+    entry = WorkflowAction(kind="action", name="delete-alignment-sample", inputs=[], outputs=[])
+    with pytest.raises(RuntimeError, match="alignment_idx"):
+        await _run_action_primitive(
+            _FakeAlignmentIdxPool(None),
+            entry,
+            {"alignment_idx": 999},
+            tmp_path,
+            {"kind": "prep_sample", "prep_sample_idx": 42},
+            work_ticket_idx=9,
+            signing_key=b"sekret",
+            data_plane_url="grpc://dp:50051",
+        )
 
 
 async def test_run_action_primitive_delete_alignment_sample_rejects_non_prep_sample_scope(tmp_path):

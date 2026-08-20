@@ -32,6 +32,10 @@ Two things this milestone introduced are otherwise unproven end-to-end:
    subsequent delete-alignment-block cleans the duplicate back to the exact
    footprint.
 
+The per-sample sibling `delete_alignment_sample` rides along at the end: it is not
+part of the `align` tail, but it shares this module's DuckLake alignment helpers
+and the same real data plane.
+
 Shared fixtures (`data_plane`, `postgres_pool`, `human_admin_session`,
 `ducklake_connect`) live in conftest.py.
 """
@@ -601,3 +605,79 @@ async def test_align_block_delete_then_register_leaves_no_duplicate_rows(
     # following register re-lays exactly one copy.
     await _delete_then_register("run4-recover", wt=block * 10 + 4)
     assert count() == footprint
+
+
+async def test_delete_alignment_sample_round_trips_the_signed_action(data_plane):
+    """The `delete_alignment_sample` action string survives the CP→DP wire.
+
+    The Python `sign_action(action=...)` string, the gRPC action header, and the
+    Rust `do_action` match arm are three independent spellings of one literal, and
+    nothing else pins them together: `replay_safe_actions_matches_dispatcher`
+    catches a registry entry with no arm but not an arm with no entry, the Rust
+    `delete_alignment_sample` tests call the function directly, and the
+    control-plane unit tests monkeypatch `_do_action` away. So a one-character
+    divergence would pass every other tier and 400 on the first real ticket.
+
+    Signing with the real `delete_alignment_sample_data` and getting a row count
+    back means the header reached the dispatcher, the dispatcher reached
+    `auth::verify_delete_alignment_sample`, and the verifier accepted the payload
+    the CP builds. A divergent string is `unknown action type` instead."""
+    from qiita_control_plane.actions.library import delete_alignment_sample_data
+
+    alignment_idx = 981_100
+    prep_sample_idx = 981_200
+
+    conn = ducklake_connect(data_plane["data_path"])
+    try:
+        conn.execute(
+            "INSERT INTO qiita_lake.alignment"
+            " (alignment_idx, prep_sample_idx, sequence_idx, feature_idx)"
+            " VALUES (?, ?, 1, 10), (?, ?, 2, 10)",
+            [alignment_idx, prep_sample_idx, alignment_idx, prep_sample_idx],
+        )
+        conn.execute(
+            "INSERT INTO qiita_lake.alignment_origin_spanning"
+            " (alignment_idx, prep_sample_idx, sequence_idx, feature_idx)"
+            " VALUES (?, ?, 1, 10)",
+            [alignment_idx, prep_sample_idx],
+        )
+    finally:
+        conn.close()
+
+    deleted = await delete_alignment_sample_data(
+        alignment_idx=alignment_idx,
+        prep_sample_idx=prep_sample_idx,
+        signing_key=data_plane["secret"],
+        data_plane_url=_data_plane_url(data_plane),
+    )
+    # `rows_deleted` is the leading table's count — 2, not the 3 rows the two
+    # tables held between them.
+    assert deleted == 2
+    assert (
+        _count_alignment_rows(
+            data_plane, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+        )
+        == 0
+    )
+    conn = ducklake_connect(data_plane["data_path"])
+    try:
+        (side,) = conn.execute(
+            "SELECT count(*) FROM qiita_lake.alignment_origin_spanning"
+            " WHERE alignment_idx = ? AND prep_sample_idx = ?",
+            [alignment_idx, prep_sample_idx],
+        ).fetchone()
+    finally:
+        conn.close()
+    assert side == 0
+
+    # Idempotent on the wire too: the same signed action again is 0 rows, not an
+    # error — the property REPLAY_SAFE_ACTIONS classifies it on.
+    assert (
+        await delete_alignment_sample_data(
+            alignment_idx=alignment_idx,
+            prep_sample_idx=prep_sample_idx,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        )
+        == 0
+    )

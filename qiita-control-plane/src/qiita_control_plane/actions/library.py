@@ -2065,14 +2065,13 @@ async def delete_alignment_sample_data(
     signing_key: bytes,
     data_plane_url: str,
 ) -> int:
-    """Delete one sample's whole `alignment` footprint under one alignment_idx via
-    the `delete_alignment_sample` DoAction, returning the rows-deleted count. The
-    per-sample twin of `delete_alignment_block_data`, for a workflow that aligns
-    one prep_sample per ticket and so has no cover-map to send.
+    """Delete one `(alignment_idx, prep_sample_idx)` pair's alignment rows via the
+    `delete_alignment_sample` DoAction, returning the rows-deleted count. The
+    per-sample twin of `delete_alignment_block_data`.
 
-    Signs a `delete_alignment_sample` action token carrying the `(alignment_idx,
-    prep_sample_idx)` pair and nothing else — the data plane's payload rejects any
-    extra field. What that pair selects is on the Rust `delete_alignment_sample`.
+    Signs an action token carrying that pair and nothing else — the data plane's
+    payload rejects any extra field. What the pair selects, and why it rather than
+    the block or the whole alignment, is on the Rust `delete_alignment_sample`.
     Idempotent: a fresh sample (no rows yet) deletes 0 and still succeeds. Raises
     pyarrow.flight.FlightError on transport / data-plane failure."""
     token = sign_action(
@@ -2409,12 +2408,11 @@ async def delete_alignment_sample(
     signing_key: bytes,
     data_plane_url: str,
 ) -> dict[str, Any]:
-    """Idempotent sample replace: delete this sample's whole alignment footprint
-    under `alignment_idx` before register-files re-writes it, so a re-run never
-    double-counts. The per-sample twin of `delete_alignment_block`, for a workflow
-    that aligns one prep_sample per ticket and so has no cover-map to read.
+    """Idempotent sample replace: run before register-files re-writes this
+    sample's alignment rows, so a re-run never double-counts. The per-sample twin
+    of `delete_alignment_block`.
 
-    Takes no `pool`: both identifiers come from the ticket, so unlike the block
+    Takes no `pool`: the caller supplies both identifiers, so unlike the block
     twin there is no `block_member` lookup to do. Like it, this touches only
     DuckLake — the Postgres `alignment_sample` gate row is the terminal step's to
     flip, and clearing a gate is `DELETE /alignment-definition/{idx}` (which

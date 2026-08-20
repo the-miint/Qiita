@@ -494,10 +494,10 @@ pub fn verify_delete_alignment(
 /// `{"action": "delete_alignment_sample", "alignment_idx": N,
 ///   "prep_sample_idx": M}`. What the pair selects, and why the sample rather
 /// than the block or the whole alignment is the unit, is on
-/// `flight_service::delete_alignment_sample`. `deny_unknown_fields` keeps the
-/// contract tight: any extra field is a design slip surfaced loudly here — a
-/// `members` list in particular, which would be a caller reaching for the block
-/// scope and getting a whole-sample delete.
+/// `flight_service::delete_alignment_sample`. `deny_unknown_fields` rejects any
+/// extra field rather than dropping it — a `members` list in particular, which
+/// a caller reaching for the block scope would send and which this delete would
+/// otherwise ignore while taking the whole sample.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteAlignmentSamplePayload {
@@ -1052,7 +1052,7 @@ mod tests {
 
     #[test]
     fn verify_delete_alignment_sample_rejects_extra_fields() {
-        // deny_unknown_fields, on the `members` case the payload doc names.
+        // A `members` list: a caller reaching for the block scope.
         let payload = br#"{"action":"delete_alignment_sample","alignment_idx":1,"prep_sample_idx":2,"members":[]}"#;
         let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
         match verify_delete_alignment_sample(&ticket, &test_vk()).unwrap_err() {
