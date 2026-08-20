@@ -23,7 +23,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Added
 
 - **`qiita_lake.alignment_origin_spanning`, a side table for reads that cross a circular
-  contig's origin (#465).** An aligner treats a circular contig as a linear one, so a read
+  contig's origin (#466).** An aligner treats a circular contig as a linear one, so a read
   crossing the origin emits one SAM record per side of it, each covering only its own share
   of the query. The new table records the merged read — query interval, reference interval,
   strand, pooled identity and coverage, fragment count — one row per (read, feature), while
@@ -39,7 +39,7 @@ duplicates further down are historical strata; leave them where they are.
   `alignment_delete_covers_every_alignment_scoped_lake_table` pins the list against the
   catalog, so a future table keyed by `alignment_idx` cannot skip the purge.
 
-- **A contract test for how miint's minimap2 reports an origin-spanning read (#465).**
+- **A contract test for how miint's minimap2 reports an origin-spanning read (#466).**
   Upstream documents the behaviour and ships the pooling for it
   (`circular_query_coverage`, `cigar_pooled_identity`); what this test pins is the tie to
   our own floor. Measured on miint `9fc4d12` (minimap2 `0477498`), 20 kb contig and a 6 kb
@@ -54,13 +54,72 @@ duplicates further down are historical strata; leave them where they are.
   `test_origin_spanning_read_splits_into_one_record_per_side`.
 
 - **`docs/duckdb-miint.md` records that `cigar_query_coverage` is per-record, and what
-  that costs us today (#465).** The entry links upstream's circular-coverage contract
+  that costs us today (#466).** The entry links upstream's circular-coverage contract
   rather than restating it, and states the standing consequence: because `align_sharded`
   scores the floor per SAM record, long reads crossing the origin of a circular reference
   contig are dropped before they reach `alignment` — silently, and concentrated on closed
   chromosomes, plasmids and phages. Also corrects the `align_minimap2` entry: `query_table`
   is the only positional argument, and `subject_table` / `index_path` are exactly-one-of
   rather than independently optional.
+- **NCBI Taxonomy releases read from a taxdump archive (#439).**
+  `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
+  into the term rows of a release, so taxa no longer arrive as hand-written seed
+  migrations. A live taxon takes its scientific name as its label and its genbank
+  common name as its second name; a taxon NCBI merged away becomes an obsolete
+  term pointing at the taxon it merged into; and a taxon NCBI deleted outright
+  becomes an obsolete term with no replacement, so a reload never mistakes
+  routine NCBI deletion for a terminology that silently lost terms. The archive
+  is read in place, with nothing unpacked, through duckdb-miint's taxdump
+  readers, so a member whose row layout contradicts what the taxdump documents
+  refuses the read naming the line at fault — as does an archive recording one
+  taxon as live, merged, and deleted at once. Term rows land in taxon-id order,
+  so the same archive always yields the same release digest.
+
+- **`terminology_term.alternate_label` — a second name for a term (#439).** Holds the
+  name a source vocabulary supplies alongside the one that becomes the term's
+  label; for NCBI Taxonomy the label is the scientific name and this is the
+  genbank common name, which would otherwise be dropped and is what a person
+  looking for a taxon is most likely to type. Nullable and single-valued, and
+  bounded to the same width as the label so it stays a name rather than
+  accumulating free-text definitions; an empty string is rejected, leaving NULL
+  as the only spelling of absence. A release's terms table carries it and is
+  authoritative for it, so a release supplying no second name clears any value
+  stored against the term. A resolved terminology term carries it through
+  metadata reads.
+
+- **`qiita-admin terminology` — prepare and load an ontology release (#439).**
+  `robot-command` prints the ROBOT export command to run against a staged OWL file;
+  nothing in the control plane executes ROBOT, on any host. `prepare-owl` turns that
+  export into the three files `load` consumes — a terms table, a header-only closure
+  stub, and a manifest declaring the digests of both — recording a deprecated class
+  as obsolete and an absorbed one as merged into the class that absorbed it, and
+  keeping only the term ids of a chosen prefix so classes imported from other
+  vocabularies stay out. Neither prepare command computes subsumption, so a loaded
+  terminology resolves terms while subsumption queries have nothing to answer from.
+  `load` takes the three files individually, verifies both tables against the
+  manifest before parsing either, applies the release in one transaction, and reports
+  how many terms were inserted, relabelled, obsoleted, or merged.
+  `--tolerate-anomalies` absorbs three anomalies instead of refusing the load:
+  terms the release silently dropped are auto-obsoleted, an unresolvable replacement
+  pointer is recorded as a note, and a closure row naming an endpoint the release
+  does not define is dropped, which lowers the reported closure count. A live term
+  carrying a replacement pointer refuses the load either way.
+
+- **What a terminology release must be (#439).** A manifest may name its tables only
+  by bare filename, so no declared path can reach outside the directory the manifest
+  itself sits in. A release may not reference a term it does not define — an obsolete
+  term's replacement pointer and both endpoints of every closure row have to resolve
+  within the release itself. Term rows are upserted, never replaced, so any term
+  already referenced by biosample metadata stays resolvable; obsoletion is recorded
+  on the row instead. A term the source does not name keeps the label already stored
+  for it, falling back to its own term id when the database holds nothing, so a
+  release that retires a term id without naming it cannot overwrite the name the term
+  was loaded under. Each of a term's two names has its own counter, so a reload that
+  changes only second names reports what moved rather than all zeros.
+  `TerminologyStatus` and `TerminologyTermObsoletionKind` now live in
+  `qiita_common.models.terminology` rather than `models.reference`; both stay
+  importable from `qiita_common.models`.
+
 - **Unbinned assembly contigs are stored, as a third `assembly_membership` kind (#460).**
   `assembly_hash` hashes the `noLCG.fa` residue — the contigs no DAS_Tool-refined bin
   claimed — alongside the circular genomes and the refined MAGs, so they are minted a

@@ -245,16 +245,18 @@ class TerminologyTermRef(BaseModel):
     qiita.terminology_term row scoped to the field's terminology_idx.
     Carries the term's idx (the FK target on
     *_metadata.value_terminology_term_idx), its term_id (the CURIE the
-    caller passed) and its label (the human-readable term name).
-    `kind` discriminates this variant from other dict-shaped value
-    variants on MetadataEntry.value. value_column is the target
-    value_* column for a terminology-term write.
+    caller passed), its label (the human-readable term name), and its
+    alternate_label (a second name the source vocabulary supplies, None
+    when it supplies none). `kind` discriminates this variant from other
+    dict-shaped value variants on MetadataEntry.value. value_column is
+    the target value_* column for a terminology-term write.
     """
 
     kind: Literal["terminology_term"] = "terminology_term"
     idx: Annotated[int, Field(gt=0)]
     term_id: Annotated[str, Field(min_length=1)]
     label: Annotated[str, Field(min_length=1)]
+    alternate_label: Annotated[str, Field(min_length=1)] | None = None
 
     @property
     def value_column(self) -> str:
@@ -304,7 +306,7 @@ class MetadataEntry(BaseModel):
     the value: TEXT -> str, NUMERIC -> Decimal, DATE -> date,
     BOOLEAN -> bool; a MissingReasonRef
     carries an intentionally-missing entry's reason idx + name; a
-    TerminologyTermRef carries a terminology-term entry's idx + term_id + label.
+    TerminologyTermRef carries the entry's resolved terminology term.
     Both Ref variants supersede data_type-driven decoding.
     """
 
