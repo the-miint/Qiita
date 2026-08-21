@@ -5,9 +5,9 @@
 # on disk and still referenced by the snapshots that predate the delete, so
 # every superseded load accumulates:
 #
-#   * `register_files` replace-by-key (REPLACE_KEY_TABLES) supersedes rows in
-#     assembled_sequence / *_chunks / reference_sequences / *_chunks and leaves
-#     the previous load's Parquet behind;
+#   * `register_files` replace-by-key supersedes rows in every table listed in
+#     REPLACE_KEY_TABLES (flight_service.rs) and leaves the previous load's
+#     Parquet behind;
 #   * delete_reference / delete_mask / delete_pool_reads / delete_alignment
 #     reclaim nothing from disk either;
 #   * a registration whose catalog transaction rolls back leaves the moved file
@@ -126,12 +126,13 @@ if [[ -z "${DUCKDB_BIN}" ]]; then
     cat >&2 <<'EOF'
 ERROR: no duckdb CLI on PATH.
 
-Install one (version 1.5.4, matching what the data plane links):
+Install one, matching what the data plane links. The run-as account has no home,
+so install it somewhere that account can reach:
 
-  mkdir -p ~/.local/bin && cd "$(mktemp -d)" \
+  cd "$(mktemp -d)" \
     && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip \
     && unzip -q duckdb_cli-linux-amd64.zip \
-    && install -m 0755 duckdb ~/.local/bin/duckdb
+    && sudo install -m 0755 duckdb /usr/local/bin/duckdb
 
 Then re-run this script (or point QIITA_DUCKDB_BIN at the binary).
 EOF
@@ -160,8 +161,10 @@ if [[ ! -r "${DATA_PATH}" || ! -x "${DATA_PATH}" ]]; then
 fi
 if [[ ! -w "${DATA_PATH}" ]]; then
     echo "ERROR: ${DATA_PATH} is not writable by $(id -un)." >&2
-    echo "  It is 0750 qiita-data; reclamation unlinks files there, so group read" >&2
-    echo "  is not enough. Re-run as: sudo -u qiita-data bash scripts/lake-gc.sh" >&2
+    echo "  It is 0750 qiita-data. Group read is not enough even to REPORT: the" >&2
+    echo "  dry-run orphan scan fails on a read-only attach, so DuckLake needs to" >&2
+    echo "  write here in both modes." >&2
+    echo "  Re-run as: sudo -u qiita-data bash scripts/lake-gc.sh" >&2
     exit 1
 fi
 
@@ -201,15 +204,15 @@ fi
 # transaction.
 MARK="@@lake-gc@@"
 
-# All three steps, ONE duckdb process, ONE transaction.
+# All three steps in one duckdb process, across TWO transactions: steps 1-2
+# together, step 3 on its own. Measured on 1.5.4 for both halves — cleanup_old_files
+# sees step 1's expiry from inside the same transaction, and step 3's catalog read
+# is the snapshot from its BEGIN, so it must open after 1-2 finish. See the
+# per-step comments below.
 #
-# Measured on 1.5.4: cleanup_old_files sees step 1's expiry from inside the same
-# transaction, so the ordering the header describes needs no process split, and
-# the catalog side is all-or-nothing.
-#
-# What the transaction does NOT cover: the unlinking. A file removed by step 2 or
-# 3 stays removed even if the transaction then rolls back (measured — ROLLBACK
-# left the file gone). The transaction bounds the CATALOG changes only.
+# What a transaction does NOT cover: the unlinking. A file removed by step 2 or 3
+# stays removed even if the transaction then rolls back (measured — ROLLBACK left
+# the file gone). A transaction bounds the CATALOG changes only.
 #
 # `CALL` is the documented invocation form for these table functions
 # (https://ducklake.select/docs/stable/duckdb/maintenance/expire_snapshots).
@@ -243,11 +246,22 @@ run_maintenance() {
         echo "SET memory_limit = '${LAKE_MEMORY_LIMIT}';"
         echo "SET temp_directory='${SESSION_TMPDIR}';"
         echo "ATTACH 'ducklake:postgres:${CONN_SANITIZED}' AS qiita_lake (DATA_PATH '${DATA_PATH}');"
+        # Steps 1-2 share a transaction: cleanup only sees the expiry from inside
+        # it, and the two are one catalog outcome.
         echo "BEGIN TRANSACTION;"
         echo ".print ${MARK}snapshots"
         echo "CALL ducklake_expire_snapshots('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});"
         echo ".print ${MARK}old_files"
         echo "CALL ducklake_cleanup_old_files('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});"
+        echo "COMMIT;"
+        # Step 3 takes its OWN transaction, and must. Measured on 1.5.4: an orphan
+        # scan run inside a transaction that opened earlier reports a file another
+        # session registered and COMMITTED in the meantime — its catalog read is
+        # the snapshot from that BEGIN. At dry_run := false that unlinks a live
+        # file whose catalog row survives. Re-opening takes the read after the
+        # work above, which the same probe showed reports nothing. Keep this
+        # COMMIT/BEGIN pair; folding step 3 upward reintroduces the window.
+        echo "BEGIN TRANSACTION;"
         echo ".print ${MARK}orphans"
         echo "CALL ducklake_delete_orphaned_files('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});"
         echo "COMMIT;"

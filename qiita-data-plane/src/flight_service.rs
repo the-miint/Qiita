@@ -505,9 +505,12 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 /// justified because every action the data plane dispatches is idempotent or
 /// otherwise replay-safe (see `docs/auth.md#ticket-replay`):
 ///
-/// - `register_files` — dest names are ticket-unique and `move_file` refuses to
-///   overwrite, so a replay after success fails closed (AlreadyExists), never a
-///   double-registration.
+/// - `register_files` — a replay after success hits the staging-existence check
+///   first and returns `not_found`, its files having been moved out. Where the
+///   source survives instead (the EXDEV copy branch of `move_file`), the minted
+///   dest name is deterministic for the registration — see `lake_dest_filename`
+///   — so `move_file` refuses to overwrite and it fails closed rather than
+///   double-registering.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
 ///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` —
 ///   logical DELETEs; re-running deletes zero rows.
@@ -2303,8 +2306,7 @@ fn register_files(
         }
     }
 
-    // One scope key for the whole registration — every file below shares it, and
-    // it does not vary per file.
+    // One scope key for the whole registration; it does not vary per file.
     let scope = staging_scope(&payload.staging_dir, scratch_root);
 
     // Move all files to permanent storage.
@@ -2385,8 +2387,8 @@ fn register_files(
     // `registration_lock` gives every such registration a row to contend for, so
     // the new-feature case conflicts too (measured: back to 1 row).
     //
-    // The loser's work is fully re-runnable — its files are already at their
-    // ticket-unique lake paths and the delete+add is idempotent against whatever
+    // The loser's work is fully re-runnable — its files are already at the paths
+    // `lake_dest_filename` minted and the delete+add is idempotent against whatever
     // snapshot it re-reads — so it retries here rather than failing the ticket. A
     // retry from the top would not work: the staging files were moved above, so
     // the caller's next attempt gets `not_found`.
@@ -3079,8 +3081,8 @@ fn delete_alignment_block(
 ///   so it separates the two loads only where the producer itself re-ran — the
 ///   case a redrive that drops the producer's `qiita.work_ticket_step` row
 ///   produces. A redrive that leaves the producer fast-forwarded rebuilds its
-///   outputs under the original attempt (`runner/_reconstruct.py`), yielding the
-///   same `staging_dir` and the same collision. That still fails at
+///   outputs under the original attempt, yielding the same `staging_dir` and the
+///   same collision. That still fails at
 ///   [`move_file`] rather than corrupting anything, but it is not covered here.
 ///
 /// Deterministic for a given (ticket, staging dir), so a replayed DoAction
@@ -4597,6 +4599,17 @@ mod tests {
         // stable, just not portable across a move of whatever holds it.
         let outside = staging_scope("/elsewhere/staging", std::path::Path::new("/scratch"));
         assert_eq!(outside, "/elsewhere/staging");
+        // config.rs takes PATH_SCRATCH through a bare PathBuf::from with no
+        // normalization, so a host may hand us a trailing slash. strip_prefix
+        // compares components, not bytes, so it must not change the answer.
+        assert_eq!(
+            staging_scope(
+                &format!("/scratch/{rel}"),
+                std::path::Path::new("/scratch/")
+            ),
+            rel,
+            "a trailing slash on the scratch root must not change the scope"
+        );
     }
 
     // --- register_files filename validation (pure; no DuckDB) ---
@@ -4911,7 +4924,7 @@ mod tests {
     }
 
     /// End-to-end `register_files`: seed a Parquet in a staging dir, register it
-    /// into DuckLake, and assert the file was moved to ticket-unique lake storage
+    /// into DuckLake, and assert the file was moved to the lake path
     /// and its rows are queryable through the catalog. Exercises the
     /// move-then-register path and its wrapping transaction against a real
     /// DuckLake catalog.
@@ -4926,7 +4939,7 @@ mod tests {
         let ref_idx: i64 = 970_000;
         let feat_a: i64 = 970_010;
         let feat_b: i64 = 970_011;
-        // Ticket-unique dest names come from work_ticket_idx (lake_dest_filename).
+        // The dest name is minted by `lake_dest_filename`, which keys on this.
         // Derive it from the PID so a manual re-run against a persistent catalog
         // mints a fresh file name instead of colliding with the prior run's
         // still-registered lake file (move_file refuses to overwrite). CI resets

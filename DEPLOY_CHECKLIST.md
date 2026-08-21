@@ -31,10 +31,11 @@ _None yet._
 
 ### 5. Verify
 
-- **`scripts/lake-gc.sh` reports against the live catalog.** Read-only in its default mode
-  (it acts only under `--reclaim`), so this is safe to run as a check, and its output sizes
-  the reclaimable pile for the bucket-6 decision. Run as the account that owns the data
-  path; `--help` explains the flags.
+- **`scripts/lake-gc.sh` reports against the live catalog.** Its default mode is inert —
+  it acts only under `--reclaim` — so it is safe to run as a check, and its output sizes
+  the reclaimable pile for the bucket-6 decision. Not read-only, though: DuckLake needs to
+  write the data path even for the dry-run orphan scan, so run it as the account that owns
+  that path, not merely one with group read. `--help` explains the flags.
   ```bash
   sudo -u qiita-data /usr/local/bin/duckdb --version   # 1.5.4, reachable by that account
   sudo -u qiita-data bash /home/qiita/qiita-miint/scripts/lake-gc.sh

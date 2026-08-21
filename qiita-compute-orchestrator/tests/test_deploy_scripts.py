@@ -846,9 +846,21 @@ def _lake_gc_env(tmp_path, *, writable: bool = True) -> dict:
         "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=localhost user=lake_rw'\n"
         f"PATH_PERSISTENT={persistent}\n"
     )
-    stub = shutil.which("true")
-    assert stub, "no `true` on PATH to stub duckdb with"
-    return {**os.environ, "DP_ENV": str(dp_env), "QIITA_DUCKDB_BIN": stub}
+    # Stub duckdb with a shim that SAVES the SQL it is handed. `true` would
+    # discard it, leaving the thing these tests are about — dry_run, the
+    # transaction split — unasserted: a hardcoded `dry_run := false` would pass.
+    captured = tmp_path / "captured.sql"
+    stub = tmp_path / "duckdb-stub"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "while [ $# -gt 0 ]; do\n"
+        f'  if [ "$1" = -f ]; then cat "$2" >> "{captured}"; fi\n'
+        "  shift\n"
+        "done\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    return {**os.environ, "DP_ENV": str(dp_env), "QIITA_DUCKDB_BIN": str(stub)}
 
 
 def test_lake_gc_defaults_to_report_only(tmp_path) -> None:
@@ -860,6 +872,9 @@ def test_lake_gc_defaults_to_report_only(tmp_path) -> None:
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert "report only" in result.stdout
     assert "Nothing was removed" in result.stdout
+    sql = (tmp_path / "captured.sql").read_text()
+    assert "dry_run := true" in sql, "report mode must ask the database for a dry run"
+    assert "dry_run := false" not in sql
 
 
 def test_lake_gc_reclaim_mode_announces_it_acts(tmp_path) -> None:
@@ -870,29 +885,38 @@ def test_lake_gc_reclaim_mode_announces_it_acts(tmp_path) -> None:
         env={**_lake_gc_env(tmp_path), "ASSUME_YES": "1"},
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    assert "--reclaim" in result.stdout
     assert "Nothing was removed" not in result.stdout
+    # The banner alone is a weak signal — report mode's banner also contains the
+    # string "--reclaim" ("pass --reclaim to act"). The SQL is what discriminates.
+    sql = (tmp_path / "captured.sql").read_text()
+    assert "dry_run := false" in sql, "--reclaim must ask the database to act"
+    assert "dry_run := true" not in sql
 
 
 def test_lake_gc_reclaim_requires_typed_confirmation(tmp_path) -> None:
     """--reclaim expires snapshot history irreversibly, so it must not proceed on
     the flag alone. Anything other than the typed word aborts before the first
     maintenance call."""
-    result = subprocess.run(
-        ["bash", str(_LAKE_GC), "--reclaim"],
-        capture_output=True,
-        text=True,
-        input="",
-        env=_lake_gc_env(tmp_path),
-    )
-    assert result.returncode == 1, f"expected an abort:\n{result.stdout}"
-    assert "Aborted" in result.stderr
+    env = _lake_gc_env(tmp_path)
+    for reply in ("", "yes\n", "y\n", "RECLAIM\n"):
+        result = subprocess.run(
+            ["bash", str(_LAKE_GC), "--reclaim"],
+            capture_output=True,
+            text=True,
+            input=reply,
+            env=env,
+        )
+        assert result.returncode == 1, f"expected an abort for {reply!r}:\n{result.stdout}"
+        assert "Aborted" in result.stderr
+    assert not (tmp_path / "captured.sql").exists(), "aborting must not reach the database"
 
 
 def test_lake_gc_refuses_unwritable_data_path(tmp_path) -> None:
-    """Reclamation unlinks files under a 0750 qiita-data dir, so group read is
-    not enough. Failing here names the right run-as instead of surfacing as a
-    permission error from inside duckdb."""
+    """The gate is unconditional, so it fires in report mode too — which is what
+    this exercises. DuckLake needs to write the data path even for the dry-run
+    orphan scan (it fails read-only there), so a group-read operator cannot run
+    even the report. Failing here names the right run-as instead of surfacing as
+    a permission error from inside duckdb."""
     if os.geteuid() == 0:
         pytest.skip("root ignores the write bit")
     result = subprocess.run(
@@ -924,20 +948,25 @@ def test_lake_gc_uses_the_documented_call_form() -> None:
         assert f"CALL ducklake_{fn}(" in code, f"{fn} must be invoked with CALL"
 
 
-def test_lake_gc_runs_all_maintenance_in_one_transaction() -> None:
-    """The three steps are ordered (expiry gates cleanup) and share a catalog
-    outcome, so they run in one transaction in one duckdb process rather than
-    three. Note the transaction bounds the CATALOG only — an unlinked file stays
-    unlinked through a rollback (measured), which the script header states."""
+def test_lake_gc_scopes_the_orphan_scan_to_its_own_transaction() -> None:
+    """Steps 1-2 share a transaction (cleanup only sees the expiry from inside
+    it). Step 3 must open a NEW one: measured on 1.5.4, an orphan scan inside a
+    transaction that opened earlier reports a file another session registered and
+    COMMITTED in the meantime, so acting on it would unlink a live file whose
+    catalog row survives. Asserting positions, not mere presence — a CALL that
+    drifts across a COMMIT is exactly the regression this guards."""
     code = _lake_gc_code()
-    assert "BEGIN TRANSACTION;" in code
-    assert "COMMIT;" in code
-    # One place that invokes duckdb, so the three CALLs cannot drift apart into
-    # separate sessions.
-    assert code.count('"${DUCKDB_BIN}" -noheader -list -f') == 2, (
-        "expected exactly the two branches of the single duckdb invocation "
-        "(with and without PGPASSFILE)"
-    )
+    assert code.count("BEGIN TRANSACTION;") == 2, "expected the 1-2 / 3 split"
+    assert code.count("COMMIT;") == 2
+    begin1 = code.index("BEGIN TRANSACTION;")
+    commit1 = code.index("COMMIT;")
+    begin2 = code.index("BEGIN TRANSACTION;", commit1)
+    commit2 = code.index("COMMIT;", begin2)
+    expire = code.index("CALL ducklake_expire_snapshots(")
+    cleanup = code.index("CALL ducklake_cleanup_old_files(")
+    orphans = code.index("CALL ducklake_delete_orphaned_files(")
+    assert begin1 < expire < cleanup < commit1, "expire+cleanup belong to the first transaction"
+    assert begin2 < orphans < commit2, "the orphan scan belongs to its own, later transaction"
 
 
 def test_lake_gc_always_passes_older_than_explicitly() -> None:

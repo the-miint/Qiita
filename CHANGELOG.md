@@ -1024,7 +1024,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **A redriven work ticket can register its files again (#472).** `lake_dest_filename`
+- **A redriven work ticket whose producer step re-ran can register its files again (#472).** `lake_dest_filename`
   minted `wt<work_ticket_idx>-<basename>`, whose uniqueness assumed one load per ticket.
   A redrive replays a ticket's storage tail into a fresh `attempt-<n>` workspace, so the
   second load targeted the byte-identical path the first had already registered and
