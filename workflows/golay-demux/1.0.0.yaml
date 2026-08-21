@@ -17,7 +17,8 @@ description: >
   The per-sample barcode roster (`barcode_map`, each entry carrying its
   `barcodes_are_rc` provenance flag) is embedded in action_context and
   materialized by the runner (the orchestrator has no DB access). The multiplexed
-  FASTQ + Golay table are compute-node-visible host paths.
+  FASTQ are compute-node-visible host paths; the Golay (12,11,8) decode cloud is
+  generated in-job (no vendored table / fixed path).
 
 scopes: []
 
@@ -27,7 +28,7 @@ audience:
 
 context_schema:
   type: object
-  required: [index_reads_path, forward_reads_path, golay_table_path, barcode_map]
+  required: [index_reads_path, forward_reads_path, barcode_map]
   properties:
     # multiplexed I1 barcode FASTQ (12-nt Golay codes; longer indexes sliced to 12).
     index_reads_path:
@@ -44,11 +45,8 @@ context_schema:
       type: string
       minLength: 1
       pattern: "^/"
-    # Golay (12,11,8) error-correction table Parquet (raw/corrected/errors).
-    golay_table_path:
-      type: string
-      minLength: 1
-      pattern: "^/"
+    # (The Golay (12,11,8) decode cloud is generated in-job — no vendored table
+    #  path here; see golay_demux._build_golay_cloud.)
     # per-sample roster [{prep_sample_idx, barcode, barcodes_are_rc}, ...], built
     # from the prep template; the runner materializes it to a Parquet
     # (`_resolve_barcode_map`). barcodes_are_rc is a per-sample provenance fact.
@@ -65,12 +63,13 @@ context_schema:
 
 steps:
   # demux + per-sample ingest in one native job. `barcode_map` and
-  # `reads_staging_root` are runner-resolved; the FASTQ + Golay host paths are
-  # plain action_context values; `reverse_reads_path` binds only when present.
+  # `reads_staging_root` are runner-resolved; the FASTQ host paths are plain
+  # action_context values; `reverse_reads_path` binds only when present. The Golay
+  # decode cloud is generated in-job (no vendored table input).
   - step: golay_demux
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.golay_demux
-    inputs: [index_reads_path, forward_reads_path, golay_table_path, barcode_map, reads_staging_root]
+    inputs: [index_reads_path, forward_reads_path, barcode_map, reads_staging_root]
     optional_inputs: [reverse_reads_path]
     outputs: [read_staging_dir]
     baseline_resources:
