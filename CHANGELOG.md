@@ -30,11 +30,13 @@ duplicates further down are historical strata; leave them where they are.
   `ducklake_expire_snapshots` → `ducklake_cleanup_old_files` → `ducklake_delete_orphaned_files`
   in that order — measured on 1.5.4, `cleanup_old_files` reports nothing until the
   snapshots referencing a file are expired, so running it alone is a no-op. It **reports
-  by default** and only acts under `--reclaim`, keeps 7 days of snapshot history unless
-  `--older-than` says otherwise, and never passes `cleanup_all` (that bypasses the mtime
-  filter, and `register_files` moves a file into the lake dir before its catalog
-  transaction commits, so a concurrent load's file would be indistinguishable from an
-  orphan). Runs as `qiita-data`, the account that owns the data path.
+  by default**, prompts for a typed confirmation under `--reclaim`, keeps 7 days of
+  snapshot history unless `--older-than` says otherwise, and never passes `cleanup_all`.
+  Registrations must be quiesced before reclaiming: `older_than` filters on filesystem
+  mtime and `register_files` places files with `rename`, which carries over the mtime the
+  producing job gave them in staging, so the cutoff does not bound "recently placed" —
+  the script header carries that argument in full. Runs as `qiita-data`, the account that
+  owns the data path.
 
 
 - **`build_version` / `BUILD_VERSION` is now covered by tests (#309).** The landing page
@@ -1025,7 +1027,7 @@ duplicates further down are historical strata; leave them where they are.
   second load targeted the byte-identical path the first had already registered and
   `move_file` refused it — `refusing to overwrite existing lake file
   …/assembled_sequence_chunks/wt6939-part_00000.parquet`, which blocked the unbinned-residue
-  backfill for all 57 candidate samples. The name now also carries a digest of the
+  backfill for all 57 candidate prep_samples. The name now also carries a digest of the
   registration's `staging_dir`, which encodes the attempt. It stays deterministic for a
   given (ticket, staging dir), so a replayed DoAction recomputes the same name and
   `move_file` still refuses a true double-registration — the refusal that keeps

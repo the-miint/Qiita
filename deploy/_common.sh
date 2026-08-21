@@ -329,3 +329,28 @@ qiita_buckets_12() {
 pass() { printf '  \xe2\x9c\x93 %s: %s\n' "$1" "$2"; n_pass=$((${n_pass:-0} + 1)); }
 fail() { printf '  \xe2\x9c\x97 %s: %s\n' "$1" "$2"; n_fail=$((${n_fail:-0} + 1)); }
 skip() { printf '  \xc2\xb7 %s: %s\n' "$1" "$2"; n_skip=$((${n_skip:-0} + 1)); }
+
+# ATTACH takes no bind parameters, so connection strings and paths are
+# interpolated into SQL. Reject the same characters
+# qiita-data-plane/src/ducklake.rs validate_sql_literal does — this is input
+# validation, not sanitization. Exits non-zero rather than returning, because
+# every caller's next act is to interpolate the value it just checked.
+# $1 = value, $2 = label used in the error.
+reject_sql_metacharacters() {
+    local value="$1" label="$2"
+    case "${value}" in
+        *\'*|*\;*)
+            echo "ERROR: ${label} contains a quote or semicolon; refusing to interpolate it into SQL." >&2
+            exit 1
+            ;;
+    esac
+}
+
+# The lake data path, byte-identical to the data plane's derivation — config.rs
+# does a bare format!("{path_persistent_raw}/ducklake") with NO normalization,
+# and DuckLake pins that exact string into the catalog at creation. Do not
+# "tidy" a trailing slash off the input: on a host with PATH_PERSISTENT=/data/
+# the catalog holds "/data//ducklake", and the tidied "/data/ducklake" is
+# rejected outright with `DATA_PATH parameter ... does not match existing data
+# path in the catalog`. $1 = PATH_PERSISTENT.
+qiita_lake_data_path() { printf '%s/ducklake' "$1"; }

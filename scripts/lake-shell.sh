@@ -100,20 +100,6 @@ EOF
     exit 1
 fi
 
-# ATTACH takes no bind parameters, so connection strings and paths are
-# interpolated into SQL. Reject the same characters
-# qiita-data-plane/src/ducklake.rs validate_sql_literal does — this is input
-# validation, not sanitization.
-reject_sql_metacharacters() {
-    local value="$1" label="$2"
-    case "${value}" in
-        *\'*|*\;*)
-            echo "ERROR: ${label} contains a quote or semicolon; refusing to interpolate it into SQL." >&2
-            exit 1
-            ;;
-    esac
-}
-
 # The password-splitting itself lives in deploy/_common.sh (qiita_split_conn_password,
 # unit-tested in test_deploy_scripts.py). These three hold its last result.
 CONN_SANITIZED=""
@@ -197,13 +183,7 @@ PERSISTENT="$(read_env_var "${DP_ENV}" PATH_PERSISTENT)"
 [[ -n "${LAKE_CONNSTR}" ]] || { echo "ERROR: DUCKLAKE_CATALOG_CONNSTR is unset in ${DP_ENV}" >&2; exit 1; }
 [[ -n "${PERSISTENT}" ]]   || { echo "ERROR: PATH_PERSISTENT is unset in ${DP_ENV}" >&2; exit 1; }
 
-# Byte-identical to the data plane's derivation — config.rs does a bare
-# format!("{path_persistent_raw}/ducklake") with NO normalization, and DuckLake
-# pins that exact string into the catalog at creation. Do not "tidy" a trailing
-# slash off PERSISTENT here: on a host with PATH_PERSISTENT=/data/ the catalog
-# holds "/data//ducklake", and the tidied "/data/ducklake" is rejected outright
-# with `DATA_PATH parameter ... does not match existing data path in the catalog`.
-DATA_PATH="${PERSISTENT}/ducklake"
+DATA_PATH="$(qiita_lake_data_path "${PERSISTENT}")"
 if [[ ! -d "${DATA_PATH}" ]]; then
     echo "ERROR: lake data path ${DATA_PATH} is not a directory" >&2
     exit 1

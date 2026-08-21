@@ -53,11 +53,12 @@ _None yet._
   to overwrite the file that ticket's original run had registered. Observed 2026-08-21 on
   work_ticket 6939 — `refusing to overwrite existing lake file
   <PATH_PERSISTENT>/ducklake/assembled_sequence_chunks/wt6939-part_00000.parquet` — and all
-  57 candidates collide the same way. The name now also carries a digest of the
-  registration's `staging_dir`, so a redrive lands on its own path; the procedure below
-  needs no other change. 6939 was restored to `completed` and the 16,395 `UNBINNED`
-  `assembly_membership` rows its partial run wrote were deleted, so no sample is left
-  half-backfilled. (#fix/lake-dest-filename-and-gc)
+  57 candidate prep_samples collide the same way. The name now also carries a digest of the
+  registration's `staging_dir`, so a redrive whose producer step re-ran lands on its own
+  path; the procedure below drops `assembly_load`'s row, so it does. 6939 was restored to
+  `completed` and the 16,395 `UNBINNED` `assembly_membership` rows its partial run wrote
+  were deleted, so no prep_sample is left half-backfilled.
+  (#fix/lake-dest-filename-and-gc)
 
 - **Readiness was re-verified 2026-08-21 and the candidate set is intact**: 7,234 ticket
   workspaces, 57 carrying all six retained steps, and all 342 of those workspaces passing
@@ -294,9 +295,11 @@ sys.exit(1 if bad else 0)'
 - **Nothing has ever reclaimed superseded lake files, and `scripts/lake-gc.sh` is the first
   thing that can.** Every `register_files` replace-by-key and every `delete_reference` /
   `delete_mask` / `delete_pool_reads` / `delete_alignment` leaves its Parquet on disk. The
-  script reports by default and acts only under `--reclaim`; running it is an operator
-  decision, not a deploy step, because `--reclaim` expires snapshot history (7 days kept
-  unless `--older-than` says otherwise) and that is not reversible.
+  script reports by default and acts only under `--reclaim`, behind a typed confirmation;
+  running it is an operator decision, not a deploy step, because `--reclaim` expires
+  snapshot history (7 days kept unless `--older-than` says otherwise) and that is not
+  reversible. Quiesce registrations first — the script header says why the cutoff alone
+  does not make a concurrent load safe.
   (#fix/lake-dest-filename-and-gc)
 
 ---

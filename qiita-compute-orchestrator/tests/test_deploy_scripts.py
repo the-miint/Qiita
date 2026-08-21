@@ -650,15 +650,29 @@ def test_lake_shell_passes_shellcheck() -> None:
     )
 
 
-def test_lake_shell_derives_data_path_exactly_like_the_data_plane() -> None:
+def test_lake_data_path_helper_derives_exactly_like_the_data_plane() -> None:
     """DuckLake pins DATA_PATH into the catalog at creation and rejects an attach
-    whose DATA_PATH differs by even a slash, so the script must reproduce
+    whose DATA_PATH differs by even a slash, so the derivation must reproduce
     config.rs's bare `format!("{path_persistent_raw}/ducklake")` — no trailing-slash
-    normalization. A `${PERSISTENT%/}` here breaks every host whose
-    PATH_PERSISTENT ends in `/`."""
-    body = _LAKE_SHELL.read_text()
-    assert 'DATA_PATH="${PERSISTENT}/ducklake"' in body
-    assert "PERSISTENT%/" not in body
+    normalization. A `${PERSISTENT%/}` anywhere breaks every host whose
+    PATH_PERSISTENT ends in `/`. Exercised through the helper rather than grepped
+    for, and both callers are pinned to it."""
+
+    def derive(persistent: str) -> str:
+        result = subprocess.run(
+            ["bash", "-c", f'source "{_COMMON}"; qiita_lake_data_path "$1"', "_", persistent],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+
+    assert derive("/data") == "/data/ducklake"
+    assert derive("/data/") == "/data//ducklake", "a trailing slash must survive verbatim"
+    for script in (_LAKE_SHELL, _LAKE_GC):
+        body = script.read_text()
+        assert "PERSISTENT%/" not in body, f"{script.name} normalizes the trailing slash"
+        assert "qiita_lake_data_path" in body, f"{script.name} must use the shared helper"
 
 
 def _call_split_conn_password(connstr: str) -> list[str]:
@@ -853,11 +867,26 @@ def test_lake_gc_reclaim_mode_announces_it_acts(tmp_path) -> None:
         ["bash", str(_LAKE_GC), "--reclaim"],
         capture_output=True,
         text=True,
-        env=_lake_gc_env(tmp_path),
+        env={**_lake_gc_env(tmp_path), "ASSUME_YES": "1"},
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert "--reclaim" in result.stdout
     assert "Nothing was removed" not in result.stdout
+
+
+def test_lake_gc_reclaim_requires_typed_confirmation(tmp_path) -> None:
+    """--reclaim expires snapshot history irreversibly, so it must not proceed on
+    the flag alone. Anything other than the typed word aborts before the first
+    maintenance call."""
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC), "--reclaim"],
+        capture_output=True,
+        text=True,
+        input="",
+        env=_lake_gc_env(tmp_path),
+    )
+    assert result.returncode == 1, f"expected an abort:\n{result.stdout}"
+    assert "Aborted" in result.stderr
 
 
 def test_lake_gc_refuses_unwritable_data_path(tmp_path) -> None:
@@ -878,10 +907,9 @@ def test_lake_gc_refuses_unwritable_data_path(tmp_path) -> None:
 
 
 def test_lake_gc_never_passes_cleanup_all() -> None:
-    """`cleanup_all := true` bypasses the mtime filter, and register_files moves
-    a file into the lake dir before its catalog transaction commits — so a
-    concurrent load's just-placed file would be indistinguishable from an
-    orphan. The mtime filter is the only thing separating them."""
+    """`cleanup_all := true` drops the mtime filter outright, so a reclaim would
+    also sweep files produced inside the cutoff. The script header carries the
+    rationale, including why that filter is not sufficient on its own."""
     assert "cleanup_all" not in _lake_gc_code()
 
 

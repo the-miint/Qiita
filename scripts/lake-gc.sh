@@ -25,11 +25,13 @@
 # reports nothing for a file whose rows were all deleted until the snapshots
 # referencing it are expired. Running 2 without 1 is a no-op, not a shortcut.
 #
-# REPORTS BY DEFAULT — nothing is removed unless you pass --reclaim.
+# For an operator reclaiming space on the deploy host. Reports by default;
+# nothing is removed unless you pass --reclaim, which then prompts for a typed
+# confirmation. Running it is an operator decision, not a deploy step.
 #
 # EXPIRING SNAPSHOTS IS NOT REVERSIBLE: it drops the catalog history that
-# time-travel queries read. --older-than sets how much history is kept
-# (default 7 days).
+# time-travel queries read. --older-than sets how much history is kept (default
+# 7 days) and is the same cutoff the two file-deleting steps filter on.
 #
 # Why not READ_ONLY for the report: ducklake_delete_orphaned_files fails with
 # "Cannot append to a readonly database" even at dry_run := true (measured,
@@ -37,13 +39,22 @@
 # drop orphan reporting, so the attach is writable and `dry_run` is what makes
 # the default run inert. Do not add READ_ONLY without re-checking step 3.
 #
-# `cleanup_all := true` is deliberately NOT offered. It bypasses the mtime
-# filter, and register_files MOVES a file into the lake dir before its catalog
-# transaction commits — so a concurrent load's just-placed file is
-# indistinguishable from an orphan while that window is open. The mtime filter
-# is what keeps this from deleting a load in flight. `older_than` is always
-# passed explicitly rather than relying on the extension's default, so the
-# retention this script applies does not move under an upstream default change.
+# QUIESCE REGISTRATIONS BEFORE --reclaim; the cutoff does not do it for you.
+# `older_than` filters on filesystem mtime (measured, 1.5.4: of two
+# byte-identical unreferenced files, only the one stamped 30 days back was listed
+# under a 7-day cutoff). register_files places a file with std::fs::rename, which
+# carries over the mtime the producing job gave it in staging — so a lake file's
+# mtime is when it was PRODUCED, not when it entered the lake. A Parquet that sat
+# in staging longer than the cutoff is eligible the instant it is moved, during
+# the window before its catalog transaction commits, when it has no catalog entry
+# and reads as an orphan. That window is common on a redrive, whose staging files
+# can be weeks old. No `older_than` value closes it: run this when nothing is
+# registering.
+#
+# `cleanup_all := true` is not offered: it drops the mtime filter outright, so a
+# reclaim would sweep files produced inside the cutoff too. `older_than` is always
+# passed explicitly rather than relying on the extension's default, so what this
+# script destroys does not move under an upstream default change.
 #
 # Usage:
 #   bash scripts/lake-gc.sh                          # report only
@@ -107,20 +118,6 @@ if [[ ! "${RETENTION}" =~ ^[1-9][0-9]*\ (MINUTE|HOUR|DAY|WEEK|MONTH)S?$ ]]; then
     exit 1
 fi
 
-# ATTACH takes no bind parameters, so connection strings and paths are
-# interpolated into SQL. Reject the same characters
-# qiita-data-plane/src/ducklake.rs validate_sql_literal does — this is input
-# validation, not sanitization.
-reject_sql_metacharacters() {
-    local value="$1" label="$2"
-    case "${value}" in
-        *\'*|*\;*)
-            echo "ERROR: ${label} contains a quote or semicolon; refusing to interpolate it into SQL." >&2
-            exit 1
-            ;;
-    esac
-}
-
 DUCKDB_BIN="${QIITA_DUCKDB_BIN:-$(command -v duckdb || true)}"
 if [[ -z "${DUCKDB_BIN}" ]]; then
     cat >&2 <<'EOF'
@@ -150,11 +147,14 @@ PERSISTENT="$(read_env_var "${DP_ENV}" PATH_PERSISTENT)"
 [[ -n "${LAKE_CONNSTR}" ]] || { echo "ERROR: DUCKLAKE_CATALOG_CONNSTR is unset in ${DP_ENV}" >&2; exit 1; }
 [[ -n "${PERSISTENT}" ]]   || { echo "ERROR: PATH_PERSISTENT is unset in ${DP_ENV}" >&2; exit 1; }
 
-# Byte-identical to the data plane's derivation — do NOT strip a trailing slash
-# off PERSISTENT: DuckLake pins DATA_PATH into the catalog at creation and
-# rejects an attach that differs by one.
-DATA_PATH="${PERSISTENT}/ducklake"
+DATA_PATH="$(qiita_lake_data_path "${PERSISTENT}")"
 [[ -d "${DATA_PATH}" ]] || { echo "ERROR: lake data path ${DATA_PATH} is not a directory" >&2; exit 1; }
+if [[ ! -r "${DATA_PATH}" || ! -x "${DATA_PATH}" ]]; then
+    echo "ERROR: cannot read ${DATA_PATH}" >&2
+    echo "  It is 0750 qiita-data — you must be in the owning group." >&2
+    echo "  Check with: ls -ld ${DATA_PATH} && id" >&2
+    exit 1
+fi
 if [[ ! -w "${DATA_PATH}" ]]; then
     echo "ERROR: ${DATA_PATH} is not writable by $(id -un)." >&2
     echo "  It is 0750 qiita-data; reclamation unlinks files there, so group read" >&2
@@ -195,13 +195,21 @@ fi
 
 # Every duckdb invocation goes through here so the PGPASSFILE handling exists in
 # exactly one place, and so each query gets the identical attach preamble.
-# `-noheader -list` makes the output one bare path per line for the shell to
-# count and size; `.bail on` turns an attach failure into a non-zero exit
-# instead of an empty result that reads like "nothing to reclaim".
+# `.bail on` turns an attach failure into a non-zero exit instead of an empty
+# result that reads like "nothing to reclaim".
+#
+# Measured output shapes under `-noheader -list` (1.5.4): cleanup_old_files and
+# delete_orphaned_files return one bare path per line, which report_paths counts
+# and sizes; expire_snapshots returns a 7-column snapshot row, which is only
+# line-counted here. A shape change in the first two would surface as a 0.00 GB
+# total, so they are what the caller must re-check on a version bump.
 run_lake_sql() {
     local query="$1" sql="${TMPROOT}/q.sql"
     {
         echo ".bail on"
+        # ducklake + postgres only. Unlike lake-shell.sh this never reads a
+        # sequence, so it needs no miint and does not switch extension_directory
+        # to the staged build.
         echo "INSTALL ducklake; LOAD ducklake;"
         echo "INSTALL postgres; LOAD postgres;"
         # qiita-data's home is /dev/null, so INSTALL would resolve
@@ -222,24 +230,35 @@ run_lake_sql() {
 
 # Size a newline-separated file list. `stat` differs between GNU and BSD, so try
 # both rather than assuming the deploy host's coreutils.
-file_size() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0; }
+# `stat` differs between GNU and BSD, so try both. Echoes nothing when neither
+# works; the caller counts that rather than adding a zero, because the byte total
+# is what the report is for and a silent undercount reads as "less to reclaim".
+file_size() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null; }
 
-# Print one summary line for a newline-separated file list. In --reclaim mode the
-# files are already unlinked by the time this runs, so only the count is exact;
-# the byte total covers whatever still exists (all of it in report mode, none of
-# it after a reclaim). Stated in the header line rather than silently differing.
+# One summary line per file list. Sizes are only taken in report mode — after a
+# --reclaim the files are already unlinked, so the count is the only exact figure.
 report_paths() {
-    local label="$1" paths="$2" n=0 bytes=0 sz
+    local label="$1" paths="$2" n=0 bytes=0 unmeasured=0 sz
     while IFS= read -r p; do
         [[ -n "${p}" ]] || continue
         n=$((n + 1))
-        if [[ -e "${p}" ]]; then sz="$(file_size "${p}")"; bytes=$((bytes + sz)); fi
+        [[ "${DRY_RUN}" == true ]] || continue
+        if sz="$(file_size "${p}")" && [[ -n "${sz}" ]]; then
+            bytes=$((bytes + sz))
+        else
+            unmeasured=$((unmeasured + 1))
+        fi
     done <<< "${paths}"
-    if [[ "${DRY_RUN}" == true ]]; then
-        printf '  %-34s %6d file(s)  %s\n' "${label}" "${n}" \
-            "$(awk -v b="${bytes}" 'BEGIN { printf "%.2f GB", b/1073741824 }')"
-    else
+    if [[ "${DRY_RUN}" != true ]]; then
         printf '  %-34s %6d file(s)  removed\n' "${label}" "${n}"
+        return
+    fi
+    local human
+    human="$(awk -v b="${bytes}" 'BEGIN { printf "%.2f GB", b/1073741824 }')"
+    if [[ "${unmeasured}" -gt 0 ]]; then
+        printf '  %-34s %6d file(s)  %s (+%d unmeasured)\n' "${label}" "${n}" "${human}" "${unmeasured}"
+    else
+        printf '  %-34s %6d file(s)  %s\n' "${label}" "${n}" "${human}"
     fi
 }
 
@@ -253,6 +272,23 @@ else
     echo "         MODE: --reclaim — snapshots will be expired and files unlinked"
 fi
 echo
+
+# Typed confirmation, matching deploy/redeploy.sh's RUN_MIGRATE gate: the only
+# other place in this repo where one keystroke starts something that cannot be
+# undone. ASSUME_YES=1 skips it for automation.
+if [[ "${DRY_RUN}" != true && -z "${ASSUME_YES:-}" ]]; then
+    echo "Snapshots older than ${RETENTION} will be dropped; time-travel queries cannot"
+    echo "reach them afterwards. A registration in flight whose staging file predates"
+    echo "the cutoff can be swept with them — see the header. Quiesce first."
+    # `read` returns non-zero at EOF, which under `set -e` would kill the script
+    # with a bare exit 1 and no reason — so the EOF case is handled here rather
+    # than left to the `[[ ]]` below, which would never run.
+    if ! read -r -p "Type 'reclaim' to proceed: " reply || [[ "${reply}" != "reclaim" ]]; then
+        echo "Aborted — nothing was expired or unlinked." >&2
+        exit 1
+    fi
+    echo
+fi
 
 # 1. Snapshots. In report mode this is the set that WOULD be expired; because it
 #    has not happened, step 2's report below can only see files already

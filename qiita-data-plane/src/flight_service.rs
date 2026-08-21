@@ -3065,17 +3065,27 @@ fn delete_alignment_block(
 ///
 /// * `wt{work_ticket_idx}` traces the file back to the ticket that wrote it.
 /// * A digest of the registration's staging dir separates two loads from ONE
-///   ticket. A ticket can load twice: a redrive replays its storage tail into a
-///   fresh `attempt-<n>` workspace, and the ticket alone yields the
-///   byte-identical path the first load already registered, which [`move_file`]
-///   refuses. `staging_dir` carries the attempt, so it differs across redrives.
+///   ticket. A ticket can load twice: a redrive replays its storage tail, and
+///   the ticket alone yields the byte-identical path the first load already
+///   registered, which [`move_file`] refuses.
 ///
-/// Deterministic for a given (ticket, staging dir): a replayed DoAction
-/// recomputes the same name, so [`move_file`] still refuses a true
-/// double-registration. Tables outside `REPLACE_KEY_TABLES` — e.g.
-/// `reference_membership` — have no replace-by-key to absorb a second
-/// registration, so that refusal is what keeps `register_files` replay-safe for
-/// them; randomness here would double their rows on replay.
+///   The scope of that: `staging_dir` is the PRODUCER step's output directory,
+///   so it separates the two loads only where the producer itself re-ran — the
+///   case a redrive that drops the producer's `qiita.work_ticket_step` row
+///   produces. A redrive that leaves the producer fast-forwarded rebuilds its
+///   outputs under the original attempt (`runner/_reconstruct.py`), yielding the
+///   same `staging_dir` and the same collision. That still fails at
+///   [`move_file`] rather than corrupting anything, but it is not covered here.
+///
+/// Deterministic for a given (ticket, staging dir), so a replayed DoAction
+/// recomputes the same name. Most replays never reach [`move_file`]: the first
+/// run moved the staging files out, so the source-existence check in
+/// `register_files` returns `not_found` first. The name carries the guard on the
+/// one path where the source survives — the EXDEV branch below copies and then
+/// tolerates a failed `remove_file(src)`, leaving source and destination both in
+/// place. There the refusal is what stops a second registration of the tables
+/// outside `REPLACE_KEY_TABLES` (e.g. `reference_membership`), which have no
+/// replace-by-key to absorb one; a random name would register them twice.
 ///
 /// DuckLake names its own INSERT-written data files uniquely for the same
 /// reason; this is the equivalent for our "register an existing file" path.
@@ -4501,16 +4511,13 @@ mod tests {
         );
     }
 
-    // Regression (backfill redrive): ONE ticket can register twice. Redriving a
-    // ticket's storage tail replays it into a fresh `attempt-<n>` workspace, so
-    // the second load reaches register_files with the same work_ticket_idx and
-    // the same producer basenames as the first. Keying the name on the ticket
-    // alone made that second load target the byte-identical path the first had
-    // already registered, and move_file refused it with AlreadyExists —
-    // observed on the live host as `refusing to overwrite existing lake file
-    // …/assembled_sequence_chunks/wt6939-part_00000.parquet`, which blocked the
-    // whole unbinned-residue backfill. staging_dir carries the attempt, so it is
-    // what separates the two.
+    // Regression: ONE ticket can register twice. A redrive replays a ticket's
+    // storage tail, so the second load reaches register_files with the same
+    // work_ticket_idx and the same producer basenames as the first. Keyed on the
+    // ticket alone, that second load targeted the path the first had already
+    // registered and move_file refused it with AlreadyExists. The producer's
+    // re-run puts the second load under a different staging_dir, which is what
+    // separates them.
     #[test]
     fn lake_dest_filename_separates_redrives_of_one_ticket() {
         let first = lake_dest_filename(
