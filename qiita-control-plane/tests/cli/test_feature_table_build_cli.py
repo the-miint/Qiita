@@ -222,6 +222,9 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
         "min_identity": None,
         "min_query_coverage": None,
         "unpaired_gate": False,
+        "circular_gate": False,
+        "circular_min_coverage": ft.CIRCULAR_MIN_COVERAGE,
+        "circular_min_identity": ft.CIRCULAR_MIN_IDENTITY,
         "format": ftc.DEFAULT_TABLE_FORMAT,
         "taxonomy": False,
         "tree": False,
@@ -457,6 +460,99 @@ def test_the_gate_pools_mates_by_default(monkeypatch, tmp_path):
     )
     ftc._handle_feature_table_build(unpaired, parser=None)
     assert "mate_position" not in rec["columns"]
+
+
+def test_a_circular_gate_counts_a_read_the_reference_origin_split(monkeypatch, tmp_path):
+    """The mode end to end. Feature 20 is 10 kb and read 2 crosses its origin: two
+    records covering half the read each, which the per-record gate at 0.9 discards and
+    the pooled one keeps. The two records are one read, so the table counts it once."""
+    split = [
+        (1, 1, 10, 0, 0, 500, "500="),
+        (1, 2, 20, 0, 9_000, 10_000, "1000=1000S"),
+        (1, 2, 20, 2048, 0, 1_000, "1000H1000="),
+    ]
+    rec = _patched(monkeypatch, alignment=split)
+    args = _namespace(tmp_path, circular_gate=True, coverage_threshold=0.0)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    # `mate_position` does not ride: the circular axis tells mates apart by the read1 bit.
+    assert rec["columns"] == [*ft.ALIGNMENT_COLUMNS, "cigar"]
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0), ("QM1", "GCF_200", 1.0)]
+
+    per_record = _patched(monkeypatch, alignment=split)
+    dropped = _namespace(
+        tmp_path,
+        min_query_coverage=ft.CIRCULAR_MIN_COVERAGE,
+        coverage_threshold=0.0,
+        output=tmp_path / "b.parquet",
+    )
+    assert ftc._handle_feature_table_build(dropped, parser=None) == 0
+    assert _table_rows(dropped.output) == [("QM1", "GCF_100", 1.0)]
+    assert per_record["columns"] != rec["columns"]
+
+
+def test_a_circular_gate_streams_the_lengths_even_with_no_coverage_filter(monkeypatch, tmp_path):
+    """It asks how much of a read one contig explains, so it needs a length per feature —
+    a whole-reference read the ungated path skips entirely at threshold 0."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=0.0)
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["lengths_minted"] == 0
+
+    rec = _patched(monkeypatch)
+    circular = _namespace(
+        tmp_path, circular_gate=True, coverage_threshold=0.0, output=tmp_path / "b.parquet"
+    )
+    assert ftc._handle_feature_table_build(circular, parser=None) == 0
+    assert rec["lengths_minted"] == 1
+
+
+def test_the_circular_thresholds_reach_the_predicate(monkeypatch, tmp_path):
+    """They are parameters, so a caller can move them: the same slice keeps the split
+    read at the default 0.90 coverage floor and loses it when the floor is raised past
+    what the read explains."""
+    partial = [
+        (1, 1, 10, 0, 0, 500, "500="),
+        (1, 2, 20, 0, 9_000, 10_000, "1000=1000S"),  # half the read, alone
+    ]
+    _patched(monkeypatch, alignment=partial)
+    strict = _namespace(tmp_path, circular_gate=True, coverage_threshold=0.0)
+    assert ftc._handle_feature_table_build(strict, parser=None) == 0
+    assert _table_rows(strict.output) == [("QM1", "GCF_100", 1.0)]
+
+    _patched(monkeypatch, alignment=partial)
+    lax = _namespace(
+        tmp_path,
+        circular_gate=True,
+        circular_min_coverage=0.4,
+        coverage_threshold=0.0,
+        output=tmp_path / "b.parquet",
+    )
+    assert ftc._handle_feature_table_build(lax, parser=None) == 0
+    assert _table_rows(lax.output) == [("QM1", "GCF_100", 1.0), ("QM1", "GCF_200", 1.0)]
+
+
+def test_a_circular_gate_with_a_cigar_threshold_is_refused_before_any_round_trip(
+    monkeypatch, tmp_path, capsys
+):
+    """Two different questions, and combining them drops exactly the split records the
+    pooling exists to rescue. Refused from the flags alone, before the first REST call."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, min_query_coverage=0.9)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "--circular-min-identity" in capsys.readouterr().err
+    assert "alignments_fetched" not in rec
+
+
+def test_a_circular_gate_with_the_unpaired_flag_is_refused(monkeypatch, tmp_path, capsys):
+    """`--unpaired-gate` says how to pool a placement's mates, which the circular axis
+    does not do — so together they say nothing coherent."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, unpaired_gate=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "--unpaired-gate" in capsys.readouterr().err
 
 
 def test_an_unpaired_gate_over_paired_reads_is_refused(monkeypatch, tmp_path, capsys):
@@ -696,6 +792,22 @@ def test_parser_wires_the_build_with_parquet_and_pooled_as_defaults():
     assert args.prep_sample_idx is None  # omitted -> resolved from the pool
     assert args.min_identity is None and args.min_query_coverage is None
     assert args.unpaired_gate is False
+    assert args.circular_gate is False
+    # The circular thresholds default even when the mode is off, so the flag defaults and
+    # the dataclass's are the same two values rather than two copies.
+    assert args.circular_min_coverage == ft.CIRCULAR_MIN_COVERAGE
+    assert args.circular_min_identity == ft.CIRCULAR_MIN_IDENTITY
+
+
+def test_parser_takes_the_circular_mode_and_its_two_thresholds():
+    """Both are settable on the command, which is the point of them being parameters."""
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    args = _build_parser().parse_args(
+        _build_argv(circular_min_coverage="0.8", circular_min_identity="0.99") + ["--circular-gate"]
+    )
+    assert args.circular_gate is True
+    assert (args.circular_min_coverage, args.circular_min_identity) == (0.8, 0.99)
 
 
 def test_parser_takes_a_repeated_cohort_and_the_per_sample_scope():
@@ -1102,6 +1214,19 @@ def test_the_manifest_records_the_gate_that_filtered_the_table(monkeypatch, tmp_
         "min_identity": 0.9,
         "min_query_coverage": None,
         "mates_pooled": True,
+    }
+
+
+def test_the_manifest_records_the_circular_gates_own_thresholds(monkeypatch, tmp_path):
+    """The other axis has other keys, and reporting it under the CIGAR ones would record
+    a build with two thresholds as one with none."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, circular_min_identity=0.99)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _manifest(tmp_path)["table"]["gate"] == {
+        "circular_min_coverage": ft.CIRCULAR_MIN_COVERAGE,
+        "circular_min_identity": 0.99,
     }
 
 

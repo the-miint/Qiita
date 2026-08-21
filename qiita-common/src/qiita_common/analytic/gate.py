@@ -1,8 +1,15 @@
-"""The CIGAR identity / query-coverage gate.
+"""The alignment gate: what an alignment must clear to be counted.
 
 An alignment row that fails the gate is not a placement, so the gate is applied to
 the staged slice itself — before the coverage calculation and before woltka — rather
 than to any one consumer of it.
+
+**Two scoring axes, and a gate picks one.** The CIGAR axis scores a row's own CIGAR,
+or a placement's two mates pooled (`paired`). The circular axis (`circular`) pools
+every record the aligner split one read into against one reference, through miint's
+[`circular_query_coverage`](https://the-miint.github.io/duckdb-miint/alignment_analysis/#circular-query-coverage)
+— the only reading under which a read spanning the origin of a circular reference
+scores as the one molecule it is. `AlignmentGate` carries both axes' thresholds.
 """
 
 from __future__ import annotations
@@ -11,10 +18,20 @@ from dataclasses import dataclass
 
 from .relations import (
     ALIGNMENT_TABLE,
+    CIRCULAR_ALIGNMENTS_VIEW,
+    FEATURE_LENGTHS_TABLE,
+    FEATURE_TOPOLOGY_VIEW,
     STREAMED_ALIGNMENT_TABLE,
+    drop_circular_inputs_statements,
     drop_streamed_alignment_table_sql,
 )
 from .stage import ALIGNMENT_COLUMNS
+
+# The circular gate's thresholds, as defaults. Named here so the CLI's flag defaults and
+# the dataclass's are one value, and so a caller reading the SQL finds no literal in it:
+# both ride as bound parameters.
+CIRCULAR_MIN_COVERAGE = 0.90
+CIRCULAR_MIN_IDENTITY = 0.95
 
 # One PLACEMENT of a read, as a GROUP BY / PARTITION BY key over alignment rows.
 #
@@ -53,14 +70,55 @@ class AlignmentGate:
     Getting it wrong in the cheap direction is a silent correctness loss, so
     `check_gate_diagnostics` refuses an unpaired gate over a slice that contains
     paired reads rather than trusting the caller to have known.
+
+    **`circular` scores the other axis and replaces both CIGAR thresholds.** It pools
+    every record one read was split into against one reference and judges the read
+    there, keeping every row of a group that clears
+    `circular_min_coverage`, `circular_min_identity`, and same-strandedness. A read
+    crossing the origin of a circular reference held as a linearised contig arrives as
+    two records covering half the read each, so a per-row coverage floor discards it
+    while pooled coverage scores it 1.0. The two axes cannot be combined: a per-row
+    query-coverage floor would drop those halves before the pooling could see them, and
+    a placement's mates are a different grouping than a read's fragments, so both
+    combinations raise below.
+
+    The circular thresholds carry defaults where the CIGAR ones do not: a CIGAR gate with
+    neither threshold filters nothing and is refused, while `circular` names a grouping,
+    so it takes `CIRCULAR_MIN_COVERAGE` / `CIRCULAR_MIN_IDENTITY` and a caller moves
+    either. `circular_min_identity` is optional
+    for one documented reason: pooled identity is NULL unless the aligner wrote an
+    extended (`=`/`X`) CIGAR, and `NULL >= threshold` drops the row — so on a legacy-`M`
+    alignment an identity term rejects everything, and dropping the term is the only way
+    to gate such data on coverage and strand.
     """
 
     min_identity: float | None = None
     min_query_coverage: float | None = None
     paired: bool = False
+    circular: bool = False
+    circular_min_coverage: float = CIRCULAR_MIN_COVERAGE
+    circular_min_identity: float | None = CIRCULAR_MIN_IDENTITY
 
     def __post_init__(self) -> None:
-        if self.min_identity is None and self.min_query_coverage is None:
+        if self.circular:
+            if self.min_identity is not None or self.min_query_coverage is not None:
+                raise ValueError(
+                    "AlignmentGate cannot score both axes: min_identity / "
+                    "min_query_coverage judge one record's own CIGAR, and a "
+                    "query-coverage floor discards exactly the split records a circular "
+                    "gate pools — the halves of an origin-spanning read cover half of it "
+                    "each. Use circular_min_coverage / circular_min_identity instead."
+                )
+            if self.paired:
+                raise ValueError(
+                    "AlignmentGate cannot pool on both axes: `paired` groups a "
+                    "placement's two mates, `circular` groups one read's fragments "
+                    "against one reference. `circular_query_coverage` keeps mates apart "
+                    "itself (R1 and R2 are different molecules), so pass paired=False — "
+                    "and see check_gate_diagnostics, which refuses a circular gate over "
+                    "paired data outright."
+                )
+        elif self.min_identity is None and self.min_query_coverage is None:
             raise ValueError(
                 "AlignmentGate needs at least one threshold (min_identity or "
                 "min_query_coverage): a gate with neither filters nothing while still "
@@ -70,11 +128,24 @@ class AlignmentGate:
         for name, value in (
             ("min_identity", self.min_identity),
             ("min_query_coverage", self.min_query_coverage),
+            ("circular_min_coverage", self.circular_min_coverage),
+            ("circular_min_identity", self.circular_min_identity),
         ):
             if value is not None and not 0.0 <= value <= 1.0:
                 raise ValueError(
                     f"AlignmentGate.{name} must be a proportion in [0, 1], got {value!r}"
                 )
+
+    @property
+    def scores_identity(self) -> bool:
+        """Whether this gate reads a sequence identity at all — the CIGAR one per record
+        or the pooled one per read. What decides whether the diagnostics count scorable
+        rows, and whether an all-legacy-`M` slice is refused."""
+        return (
+            self.circular_min_identity is not None
+            if self.circular
+            else self.min_identity is not None
+        )
 
 
 @dataclass(frozen=True)
@@ -92,16 +163,29 @@ class GateClearance:
 
     @property
     def statements(self) -> tuple[tuple[str, list[float]], ...]:
-        """The remaining `(sql, parameters)` pairs, in the order they must run: apply
-        the gate, then release the streamed copy that holds `cigar`.
+        """The remaining `(sql, parameters)` pairs, in the order they must run: define
+        whatever the gate reads besides the slice, apply the gate, then release what the
+        gated path put up — the streamed copy that holds `cigar`, and for a circular gate
+        the two rename views and the per-feature lengths staged for them.
 
         Iterating this is the whole rest of the protocol, so a caller cannot bind the
-        wrong parameters to the predicate or forget the cleanup.
+        wrong parameters to the predicate or forget the cleanup. The circular gate's two
+        views live here rather than with the caller for the same reason: the first reads
+        the streamed slice, so it cannot be defined before the stream is drained, and
+        defining it is not a decision the caller has to make.
         """
-        return (
-            (gated_alignment_table_sql(clearance=self), gate_parameters(self.gate)),
-            (drop_streamed_alignment_table_sql(), []),
+        setup: tuple[tuple[str, list[float]], ...] = (
+            ((circular_alignments_view_sql(), []), (feature_topology_view_sql(), []))
+            if self.gate.circular
+            else ()
         )
+        gated = (gated_alignment_table_sql(clearance=self), gate_parameters(self.gate))
+        circular_drops = (
+            tuple((sql, []) for sql in drop_circular_inputs_statements())
+            if self.gate.circular
+            else ()
+        )
+        return (*setup, gated, *circular_drops, (drop_streamed_alignment_table_sql(), []))
 
 
 def _gate_terms(gate: AlignmentGate, cigar_expr: str) -> list[tuple[str, float]]:
@@ -116,9 +200,31 @@ def _gate_terms(gate: AlignmentGate, cigar_expr: str) -> list[tuple[str, float]]
     return terms
 
 
+def _circular_terms(gate: AlignmentGate) -> list[tuple[str, float]]:
+    """The circular gate's predicates over `circular_query_coverage`'s output columns,
+    with their bound values, in ONE order — same device as `_gate_terms`.
+
+    `mixed_strand` is not among them and is not a knob. A genuine origin span is one
+    molecule that linearisation cut, so its fragments lie on the same strand; fragments
+    on opposite strands are an inverted repeat, a chimera or a misassembly, and pooling
+    them manufactures coverage the read does not have. Admitting them would not relax a
+    cutoff, it would change what the coverage number counts — so the exclusion is part
+    of the predicate rather than a setting, and it appears in the SQL directly.
+
+    `max_ref_gap` is reported by the macro and not read here: it is what would separate a
+    wrap from a chimera that reaches the same coverage, and on a reference small enough
+    for a read to wrap more than once it cannot (duckdb-miint#240).
+    """
+    terms: list[tuple[str, float]] = [("coverage >= ?", gate.circular_min_coverage)]
+    if gate.circular_min_identity is not None:
+        terms.append(("identity >= ?", gate.circular_min_identity))
+    return terms
+
+
 def gate_parameters(gate: AlignmentGate) -> list[float]:
     """The values to bind to `gated_alignment_table_sql`'s placeholders, in order."""
-    return [value for _, value in _gate_terms(gate, "cigar")]
+    terms = _circular_terms(gate) if gate.circular else _gate_terms(gate, "cigar")
+    return [value for _, value in terms]
 
 
 def gate_alignment_columns(gate: AlignmentGate | None) -> tuple[str, ...]:
@@ -126,13 +232,53 @@ def gate_alignment_columns(gate: AlignmentGate | None) -> tuple[str, ...]:
     whatever `gate` needs to read.
 
     `cigar` rides only when something scores it (see `ALIGNMENT_COLUMNS` for what
-    that column costs) and `mate_position` only when the gate pools, since its sole
-    use is keying the partition. Both are in the ticket's allowlist.
+    that column costs) and `mate_position` only when the gate pools mates, since its
+    sole use is keying that partition — a circular gate groups a read's fragments and
+    tells mates apart by the SAM read1 bit it already has. Both are in the ticket's
+    allowlist.
     """
     if gate is None:
         return ALIGNMENT_COLUMNS
     extra = ("cigar",) + (("mate_position",) if gate.paired else ())
     return ALIGNMENT_COLUMNS + extra
+
+
+def circular_alignments_view_sql() -> str:
+    """Define `CIRCULAR_ALIGNMENTS_VIEW`: the streamed slice under the column names
+    `circular_query_coverage` reads (`read_id`, `reference`).
+
+    Our `sequence_idx` is the read and our `feature_idx` is the reference it aligned to,
+    so the rename is the whole of it — the same shape `map_table_sql` does for
+    `genome_coverage`. A VIEW: the macro resolves relation names on this connection,
+    where a view is as visible as a table, so materializing would copy the widest
+    relation in the pipeline for one reader.
+    """
+    return (
+        f"CREATE VIEW {CIRCULAR_ALIGNMENTS_VIEW} AS "
+        f"SELECT sequence_idx AS read_id, feature_idx AS reference, "
+        f"flags, position, stop_position, cigar "
+        f"FROM {STREAMED_ALIGNMENT_TABLE}"
+    )
+
+
+def feature_topology_view_sql() -> str:
+    """Define `FEATURE_TOPOLOGY_VIEW`: the `reference_lengths` argument
+    `circular_query_coverage` requires, over `FEATURE_LENGTHS_TABLE`.
+
+    **Every feature is declared circular, and that claim does not reach the result.**
+    The macro rejects a NULL `is_circular` because only the caller knows a reference's
+    topology, and it moves exactly one output column — `max_ref_gap`, read modulo the
+    reference length on a circular reference and as a plain distance on a linear one.
+    `coverage`, `identity` and `mixed_strand`, which are the three this gate reads, are
+    computed identically either way. So the claim is the one under which the gap column
+    would mean "wrap distance", and nothing else; qiita records real circularity only for
+    assembled contigs (`assembly_membership.kind`), never for a reference's features.
+    """
+    return (
+        f"CREATE VIEW {FEATURE_TOPOLOGY_VIEW} AS "
+        f"SELECT feature_idx AS reference, sequence_length_bp AS length, "
+        f"TRUE AS is_circular FROM {FEATURE_LENGTHS_TABLE}"
+    )
 
 
 def streamed_alignment_table_sql(source: str, *, gate: AlignmentGate) -> str:
@@ -169,9 +315,13 @@ def gated_alignment_table_sql(*, clearance: GateClearance) -> str:
     so the CIGARs are parsed once rather than on every downstream scan.
 
     An unpaired gate filters per row with `WHERE`. A paired one pools each
-    placement's mates and filters with `QUALIFY`, which applies after the window.
+    placement's mates and filters with `QUALIFY`, which applies after the window. A
+    circular one judges the read against the reference and keeps the whole group, so it
+    filters with a SEMI JOIN onto what cleared.
     """
     gate = clearance.gate
+    if gate.circular:
+        return _circular_gated_sql(gate)
     scored, clause = (
         (f"string_agg(cigar, '') OVER (PARTITION BY {PAIRED_PLACEMENT_PARTITION})", "QUALIFY")
         if gate.paired
@@ -185,9 +335,37 @@ def gated_alignment_table_sql(*, clearance: GateClearance) -> str:
     )
 
 
+def _circular_gated_sql(gate: AlignmentGate) -> str:
+    """The circular arm of `gated_alignment_table_sql`: keep every record of each
+    `(read, reference)` group that cleared the pooled predicate.
+
+    The macro answers per group, not per record, so the filter is a SEMI JOIN back onto
+    the slice — a fragment is kept because the READ it belongs to is a good match for
+    that reference, which is the question a pooled gate asks. `is_read1` is part of the
+    key because the macro keeps mates apart, and `alignment_is_read1` is how our rows
+    say which mate they are.
+
+    A CTE rather than a subquery in the join: the macro resolves its relation arguments
+    through `query_table`, which takes only literals, so it cannot sit in a lateral
+    position — a CTE is the form upstream names for this.
+    """
+    predicate = " AND ".join(sql for sql, _ in _circular_terms(gate))
+    return (
+        f"CREATE TABLE {ALIGNMENT_TABLE} AS "
+        f"WITH cleared AS ("
+        f"SELECT read_id, is_read1, reference FROM circular_query_coverage("
+        f"{CIRCULAR_ALIGNMENTS_VIEW}, {FEATURE_TOPOLOGY_VIEW}) "
+        f"WHERE {predicate} AND NOT mixed_strand"
+        f") SELECT {', '.join(f'a.{column}' for column in ALIGNMENT_COLUMNS)} "
+        f"FROM {STREAMED_ALIGNMENT_TABLE} a SEMI JOIN cleared c "
+        f"ON a.sequence_idx = c.read_id AND a.feature_idx = c.reference "
+        f"AND alignment_is_read1(a.flags) = c.is_read1"
+    )
+
+
 def gate_diagnostics_sql(gate: AlignmentGate) -> str:
     """One row for `check_gate_diagnostics`, over `STREAMED_ALIGNMENT_TABLE`:
-    `(total_rows, scorable_rows, unpoolable_partitions, paired_rows)`.
+    `(total_rows, scorable_rows, unpoolable_partitions, unpoolable_rows, paired_rows)`.
 
     Each count is computed only when it could matter — parsing every CIGAR, and
     grouping every placement, are both real work over the slice that still holds
@@ -201,17 +379,33 @@ def gate_diagnostics_sql(gate: AlignmentGate) -> str:
     `sum()` over zero groups is NULL, which would turn `total_rows` into NULL and
     silently stop `check_gate_diagnostics`' `== 0` early return from firing.
     """
-    scorable = "count(cigar_sequence_identity(cigar))" if gate.min_identity is not None else "NULL"
+    scorable = "count(cigar_sequence_identity(cigar))" if gate.scores_identity else "NULL"
     # miint's own predicate over the SAM flag, not hand-rolled bit math: the
     # `alignment_is_*` family is what `docs/duckdb-miint.md` tells callers to use, and
     # it reads the same `flags` USMALLINT the lake stores. 0x1 is set on both mates
     # whether or not either mapped, so it answers "is this slice paired data?" even
     # when a mate's row never arrived.
     paired_rows = "count(*) FILTER (WHERE alignment_is_paired(flags))"
+    if gate.circular:
+        # The rows `circular_query_coverage` will not see. It excludes secondary and
+        # unmapped records and records missing a coordinate, so each one would leave the
+        # gated slice unless a sibling record of the same read carried its group — a
+        # drop no threshold asked for. Counted here so the check can refuse instead.
+        unpoolable_rows = (
+            "count(*) FILTER (WHERE alignment_is_secondary(flags) "
+            "OR alignment_is_unmapped(flags) "
+            "OR position IS NULL OR stop_position IS NULL)"
+        )
+        return (
+            f"SELECT count(*) AS total_rows, {scorable} AS scorable_rows, "
+            f"0 AS unpoolable_partitions, {unpoolable_rows} AS unpoolable_rows, "
+            f"{paired_rows} AS paired_rows "
+            f"FROM {STREAMED_ALIGNMENT_TABLE}"
+        )
     if not gate.paired:
         return (
             f"SELECT count(*) AS total_rows, {scorable} AS scorable_rows, "
-            f"0 AS unpoolable_partitions, {paired_rows} AS paired_rows "
+            f"0 AS unpoolable_partitions, 0 AS unpoolable_rows, {paired_rows} AS paired_rows "
             f"FROM {STREAMED_ALIGNMENT_TABLE}"
         )
     # A partition that cannot be a single placement's mates, in the three ways it
@@ -231,6 +425,7 @@ def gate_diagnostics_sql(gate: AlignmentGate) -> str:
         f"count(*) FILTER (WHERE rows_in_partition <> with_cigar "
         f"OR (with_mate > 0 AND rows_in_partition = 1) "
         f"OR rows_in_partition > 2) AS unpoolable_partitions, "
+        f"0 AS unpoolable_rows, "
         f"coalesce(sum(paired), 0) AS paired_rows FROM placement"
     )
 
@@ -241,6 +436,7 @@ def check_gate_diagnostics(
     total_rows: int,
     scorable_rows: int | None,
     unpoolable_partitions: int,
+    unpoolable_rows: int,
     paired_rows: int,
 ) -> GateClearance:
     """Refuse every gate failure that would otherwise produce a plausible wrong
@@ -260,24 +456,47 @@ def check_gate_diagnostics(
         # legitimate result elsewhere in this analytic.
         return GateClearance(gate)
 
-    if gate.min_identity is not None:
+    if gate.scores_identity:
         if scorable_rows is None:
             raise ValueError(
-                "check_gate_diagnostics: scorable_rows is NULL while min_identity is "
-                "set. The row must come from gate_diagnostics_sql(the same gate), "
-                "which only emits NULL there when identity is not being gated."
+                "check_gate_diagnostics: scorable_rows is NULL while an identity "
+                "threshold is set. The row must come from gate_diagnostics_sql(the same "
+                "gate), which only emits NULL there when identity is not being gated."
             )
         if scorable_rows == 0:
             raise ValueError(
                 f"None of the {total_rows} alignment rows can be scored for sequence "
-                f"identity: `cigar_sequence_identity` needs a CIGAR carrying `=`/`X` "
-                f"ops (an 'eqx' CIGAR) and returns NULL otherwise, and "
+                f"identity: identity needs a CIGAR carrying `=`/`X` "
+                f"ops (an 'eqx' CIGAR) and is NULL otherwise, and "
                 f"`NULL >= threshold` drops the row — so this gate would silently "
                 f"discard EVERY row and return an empty feature table that looks like "
                 f"a real result. Either re-align with eqx CIGARs, drop the identity "
                 f"threshold, or gate on query coverage instead, which any CIGAR "
                 f"supports."
             )
+
+    if gate.circular:
+        if unpoolable_rows:
+            raise ValueError(
+                f"{unpoolable_rows} of {total_rows} alignment rows cannot be pooled by "
+                f"read: `circular_query_coverage` excludes secondary (FLAG 0x100) and "
+                f"unmapped (0x4) records, and records missing a coordinate. Each one "
+                f"would leave the gated slice without failing any threshold — and a "
+                f"secondary record is how a read says it also placed elsewhere, so "
+                f"dropping those changes every multi-mapped read's count. Gate on the "
+                f"CIGAR instead (min_identity / min_query_coverage), which scores every "
+                f"row it is given."
+            )
+        if paired_rows:
+            raise ValueError(
+                f"{paired_rows} of {total_rows} alignment rows are paired (SAM FLAG "
+                f"0x1), but a circular gate pools a read's FRAGMENTS and keeps mates "
+                f"apart — R1 and R2 are different molecules — so it judges a "
+                f"placement's mates independently and orphans one when they disagree. "
+                f"Pass `paired=True` without `circular` for paired data; the circular "
+                f"axis is for the single-end long reads a reference's origin splits."
+            )
+        return GateClearance(gate)
 
     if not gate.paired and paired_rows:
         raise ValueError(

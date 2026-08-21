@@ -6,7 +6,11 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 import argparse
 from pathlib import Path
 
-from qiita_common.analytic import CoverageScope
+from qiita_common.analytic import (
+    CIRCULAR_MIN_COVERAGE,
+    CIRCULAR_MIN_IDENTITY,
+    CoverageScope,
+)
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
@@ -812,6 +816,38 @@ def _build_parser() -> argparse.ArgumentParser:
             "Score each alignment row on its own CIGAR instead of pooling a placement's"
             " mates. Only for a slice whose mates did not both map, which cannot be"
             " pooled; pooling is the default and is correct for single-end data too."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--circular-gate",
+        action="store_true",
+        help=(
+            "Judge each read against each reference with every record the aligner split"
+            " it into pooled, instead of scoring records one at a time. A read crossing"
+            " the origin of a circular reference is emitted as two records covering half"
+            " of it each, which a per-record coverage floor discards; pooled, it scores"
+            " what it is. Replaces --min-identity / --min-query-coverage, and single-end"
+            " only — mates are different molecules and are never pooled together."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--circular-min-coverage",
+        type=_proportion_arg,
+        default=CIRCULAR_MIN_COVERAGE,
+        help=(
+            "Minimum proportion of a read that one reference must explain, pooled over"
+            f" the read's records, under --circular-gate (default {CIRCULAR_MIN_COVERAGE})."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--circular-min-identity",
+        type=_proportion_arg,
+        default=CIRCULAR_MIN_IDENTITY,
+        help=(
+            "Minimum pooled sequence identity a read must clear against a reference under"
+            f" --circular-gate (default {CIRCULAR_MIN_IDENTITY}). Needs an eqx (=/X)"
+            " CIGAR, as --min-identity does; the build refuses rather than silently drop"
+            " every row if none can be scored."
         ),
     )
     p_ft_build.add_argument(

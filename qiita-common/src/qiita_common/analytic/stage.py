@@ -15,7 +15,12 @@ that obliges of a caller.
 
 from __future__ import annotations
 
-from .relations import ALIGNMENT_TABLE, GENOME_LENGTHS_TABLE, MAP_TABLE
+from .relations import (
+    ALIGNMENT_TABLE,
+    FEATURE_LENGTHS_TABLE,
+    GENOME_LENGTHS_TABLE,
+    MAP_TABLE,
+)
 
 # The alignment columns the analytic binds — and, because they ride the DoGet
 # ticket, the only ones the data plane will stream. One list, used for both the
@@ -63,6 +68,21 @@ def map_table_sql(source: str) -> str:
     return (
         f"CREATE TABLE {MAP_TABLE} AS "
         f"SELECT feature_idx AS contig_id, genome_idx AS genome_id FROM {source}"
+    )
+
+
+def feature_lengths_table_sql(source: str) -> str:
+    """Stage the per-feature lengths from `source` (the caller's reference_sequences
+    stream) into `FEATURE_LENGTHS_TABLE`, unrolled.
+
+    The circular gate needs a length per aligned feature, and the stream is one-shot —
+    so when that gate runs, this is what the stream is drained into and
+    `genome_lengths_table_sql` reads THIS relation rather than the stream. Every other
+    path stages the roll-up directly and never creates this one.
+    """
+    return (
+        f"CREATE TABLE {FEATURE_LENGTHS_TABLE} AS "
+        f"SELECT feature_idx, sequence_length_bp FROM {source}"
     )
 
 

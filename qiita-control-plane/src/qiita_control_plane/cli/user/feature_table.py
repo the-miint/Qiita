@@ -440,7 +440,7 @@ def _stage_alignment(con, flight_client, ticket: bytes, *, gate: ft.AlignmentGat
         return
     clearance = _cleared(con, ft.gate_diagnostics_sql(gate), ft.check_gate_diagnostics, gate)
     # The clearance carries the rest of the protocol in order — apply the gate, then
-    # release the streamed copy that holds `cigar`.
+    # release what the gated path put up, the streamed copy holding `cigar` included.
     for sql, parameters in clearance.statements:
         con.execute(sql, parameters)
 
@@ -581,6 +581,27 @@ def _tool_versions(con) -> dict[str, str]:
     }
 
 
+def _manifest_gate(gate: ft.AlignmentGate | None) -> dict[str, Any] | None:
+    """What the manifest records about the gate: the thresholds of the axis it scored.
+
+    The two axes have disjoint keys because they answer different questions — one per
+    alignment record, one per read against a reference — so a reader can tell which was
+    applied from the record itself.
+    """
+    if gate is None:
+        return None
+    if gate.circular:
+        return {
+            "circular_min_coverage": gate.circular_min_coverage,
+            "circular_min_identity": gate.circular_min_identity,
+        }
+    return {
+        "min_identity": gate.min_identity,
+        "min_query_coverage": gate.min_query_coverage,
+        "mates_pooled": gate.paired,
+    }
+
+
 def _manifest_payload(
     *,
     args: argparse.Namespace,
@@ -632,13 +653,10 @@ def _manifest_payload(
             "rows": rows,
             "coverage_scope": args.coverage_scope,
             "coverage_threshold": args.coverage_threshold,
-            "gate": None
-            if gate is None
-            else {
-                "min_identity": gate.min_identity,
-                "min_query_coverage": gate.min_query_coverage,
-                "mates_pooled": gate.paired,
-            },
+            # One arm per scoring axis, with the keys the axis actually has — a circular
+            # gate reported under the CIGAR keys would record "no thresholds" for a
+            # build that had two.
+            "gate": _manifest_gate(gate),
             # Sorted, so the record does not depend on the order the mint answered in.
             "cohort": sorted(identifier["export_id"] for identifier in identifiers),
         },
@@ -820,7 +838,7 @@ def _write_bundle(
 
 
 def _gate_from_args(args: argparse.Namespace) -> ft.AlignmentGate | None:
-    """The gate the flags describe, or None when neither threshold was given.
+    """The gate the flags describe, or None when no threshold and no mode was given.
 
     **Mates are pooled unless `--unpaired-gate` says otherwise**, because pooling is
     also correct for single-end rows (their partition is one row) while the per-row form
@@ -828,7 +846,30 @@ def _gate_from_args(args: argparse.Namespace) -> ft.AlignmentGate | None:
     Getting it wrong in the cheap direction is a silent correctness loss, so the default
     is the safe one — and `check_gate_diagnostics` refuses the unsafe combination
     anyway, naming the unpaired form as the way out of the case it cannot pool.
+
+    **`--circular-gate` is the other axis**, so it carries its own two thresholds and
+    takes neither of the CIGAR ones; `AlignmentGate` refuses the combinations, and the
+    flag checks here name the flag rather than the field.
     """
+    if args.circular_gate:
+        if args.min_identity is not None or args.min_query_coverage is not None:
+            raise ValueError(
+                "--circular-gate scores a read pooled over its records; --min-identity "
+                "and --min-query-coverage score one record at a time, and a per-record "
+                "coverage floor drops exactly the split records the pooling exists to "
+                "rescue. Use --circular-min-identity / --circular-min-coverage."
+            )
+        if args.unpaired_gate:
+            raise ValueError(
+                "--unpaired-gate says how to pool a placement's mates, which "
+                "--circular-gate does not do: it pools a read's records against one "
+                "reference and keeps mates apart. Pass one or the other."
+            )
+        return ft.AlignmentGate(
+            circular=True,
+            circular_min_coverage=args.circular_min_coverage,
+            circular_min_identity=args.circular_min_identity,
+        )
     if args.min_identity is None and args.min_query_coverage is None:
         if args.unpaired_gate:
             raise ValueError(
@@ -933,12 +974,22 @@ def _run_build(
                 table_sql=table_sql,
             )
 
-        if ft.coverage_filter_applies(args.coverage_threshold):
+        # One stream, two possible shapes. A circular gate needs a length per FEATURE
+        # (it asks how much of a read one contig explains), the coverage filter needs
+        # one per genome — and the stream is one-shot, so when both are wanted the
+        # per-feature table is what it is drained into and the roll-up reads that.
+        circular_gate = gate is not None and gate.circular
+        filtering = ft.coverage_filter_applies(args.coverage_threshold)
+        if circular_gate or filtering:
             _reference_stream(
                 table=_SEQUENCES_TABLE,
                 relation=_LENGTHS_STREAM,
-                table_sql=ft.genome_lengths_table_sql,
+                table_sql=(
+                    ft.feature_lengths_table_sql if circular_gate else ft.genome_lengths_table_sql
+                ),
             )
+            if circular_gate and filtering:
+                con.execute(ft.genome_lengths_table_sql(ft.FEATURE_LENGTHS_TABLE))
         if args.taxonomy:
             _reference_stream(
                 table=_TAXONOMY_TABLE,

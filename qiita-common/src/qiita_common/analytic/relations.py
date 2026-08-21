@@ -27,8 +27,23 @@ ALIGNMENT_TABLE = "alignment_slice"
 # the alignment arrives as a one-shot Flight stream that cannot be scanned twice.
 STREAMED_ALIGNMENT_TABLE = "alignment_streamed"
 MAP_TABLE = "contig_to_genome"
+
+# The reference's per-feature lengths, as streamed. Staged only for a circular gate,
+# which needs the per-feature form `circular_query_coverage` takes; the ungated and
+# per-row-gated paths roll the same stream straight up to `GENOME_LENGTHS_TABLE`,
+# which is all the coverage denominator needs.
+FEATURE_LENGTHS_TABLE = "feature_lengths"
 GENOME_LENGTHS_TABLE = "genome_lengths"
+
 COVERAGE_ALIGNMENTS_VIEW = "cov_alignments"
+
+# The circular gate's two arguments, both VIEWs renaming what we already hold into the
+# column names `circular_query_coverage` reads. It resolves relation names on the
+# caller's own connection, where a VIEW is as visible as a TABLE, so neither is
+# materialized.
+CIRCULAR_ALIGNMENTS_VIEW = "circ_alignments"
+FEATURE_TOPOLOGY_VIEW = "feature_topology"
+
 OGU_INPUT_TABLE = "ogu_input"
 
 # The counts, materialized. Both the populated and the empty path land here, so the
@@ -108,6 +123,17 @@ def drop_streamed_alignment_table_sql() -> str:
     again, and it holds `cigar` — so on a client machine over a large cohort, keeping
     it roughly doubles the analytic's peak memory for no benefit."""
     return f"DROP TABLE {STREAMED_ALIGNMENT_TABLE}"
+
+
+def drop_circular_inputs_statements() -> tuple[str, ...]:
+    """Release the circular gate's two rename views and the per-feature lengths one of
+    them reads, once the gate has been applied. The views go first because each reads a
+    table below it, and the lengths are staged for this gate alone."""
+    return (
+        f"DROP VIEW {CIRCULAR_ALIGNMENTS_VIEW}",
+        f"DROP VIEW {FEATURE_TOPOLOGY_VIEW}",
+        f"DROP TABLE {FEATURE_LENGTHS_TABLE}",
+    )
 
 
 def drop_ogu_input_table_sql() -> str:

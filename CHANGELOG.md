@@ -22,6 +22,25 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`qiita feature-table build --circular-gate` — judge a read pooled over the records it
+  was split into (#TBD).** A read crossing the origin of a circular reference held as a
+  linearised contig is emitted as two records covering half of it each, so a per-record
+  query-coverage floor discards it — silently, and worst for the small plasmids and phages
+  most often recovered as complete circles. The new gate mode asks duckdb-miint's
+  `circular_query_coverage` how much of each read one reference explains with every record
+  pooled, and keeps a read whose coverage and pooled identity clear their thresholds and
+  whose fragments lie on one strand. Both thresholds are parameters —
+  `--circular-min-coverage` (0.90) and `--circular-min-identity` (0.95); the same-strand
+  requirement is not, because fragments on opposite strands are not one molecule and
+  pooling them manufactures coverage. It replaces `--min-identity` / `--min-query-coverage`
+  rather than combining with them, refuses a slice holding secondary, unmapped or
+  coordinate-less records (the macro cannot see those, so they would leave the table
+  without failing any threshold), and refuses paired data, whose mates are separate
+  molecules the pooling keeps apart. The bundle manifest records whichever axis was
+  applied. (Note: the alignment ingest applies its own per-record 0.90 query-coverage floor,
+  so a read split at an origin is dropped before it reaches the lake — this gate can only
+  pool what was stored.)
+
 - **NCBI Taxonomy releases read from a taxdump archive (#439).**
   `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
   into the term rows of a release, so taxa no longer arrive as hand-written seed

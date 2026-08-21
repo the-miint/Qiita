@@ -16,6 +16,7 @@ def _clear(gate: ft.AlignmentGate) -> ft.GateClearance:
         total_rows=10,
         scorable_rows=10,
         unpoolable_partitions=0,
+        unpoolable_rows=0,
         paired_rows=10 if gate.paired else 0,
     )
 
@@ -153,7 +154,7 @@ def test_the_paired_count_asks_miint_rather_than_masking_the_flag():
     assert "&" not in sql
 
 
-def _check(gate, *, total=1000, scorable=1000, unpoolable=0, paired_rows=None):
+def _check(gate, *, total=1000, scorable=1000, unpoolable=0, unpoolable_rows=0, paired_rows=None):
     """`check_gate_diagnostics` with the clean-slice defaults, so each test states only
     the count it is about. `paired_rows` defaults to what `gate.paired` implies."""
     return ft.check_gate_diagnostics(
@@ -161,6 +162,7 @@ def _check(gate, *, total=1000, scorable=1000, unpoolable=0, paired_rows=None):
         total_rows=total,
         scorable_rows=scorable,
         unpoolable_partitions=unpoolable,
+        unpoolable_rows=unpoolable_rows,
         paired_rows=(total if gate.paired else 0) if paired_rows is None else paired_rows,
     )
 
@@ -294,3 +296,176 @@ def test_the_paired_diagnostics_coalesce_their_sums():
     sql = ft.gate_diagnostics_sql(ft.AlignmentGate(min_query_coverage=0.5, paired=True))
     assert "coalesce(sum(rows_in_partition), 0) AS total_rows" in sql
     assert "coalesce(sum(paired), 0) AS paired_rows" in sql
+
+
+# ---------------------------------------------------------------------------
+# The circular-pooled arm
+# ---------------------------------------------------------------------------
+
+
+def test_the_circular_thresholds_are_parameters_with_defaults_not_literals():
+    """Both ride as bound `?` — a caller changes them without touching SQL, and the SQL
+    carries no number a reader could mistake for policy. The defaults live in one place
+    so the CLI's flag defaults and the dataclass's cannot drift."""
+    gate = ft.AlignmentGate(circular=True)
+    assert (gate.circular_min_coverage, gate.circular_min_identity) == (
+        ft.CIRCULAR_MIN_COVERAGE,
+        ft.CIRCULAR_MIN_IDENTITY,
+    )
+    assert (ft.CIRCULAR_MIN_COVERAGE, ft.CIRCULAR_MIN_IDENTITY) == (0.90, 0.95)
+
+    sql = _gated_sql(gate)
+    assert "coverage >= ?" in sql
+    assert "identity >= ?" in sql
+    assert "0.9" not in sql and "0.95" not in sql
+    assert ft.gate_parameters(gate) == [0.90, 0.95]
+
+
+def test_the_circular_thresholds_are_settable():
+    gate = ft.AlignmentGate(circular=True, circular_min_coverage=0.5, circular_min_identity=0.75)
+    assert ft.gate_parameters(gate) == [0.5, 0.75]
+
+
+def test_a_circular_gate_without_an_identity_threshold_never_mentions_identity():
+    """The escape hatch for a legacy-`M` alignment, whose pooled identity is NULL: with
+    the term present `NULL >= threshold` would reject every read."""
+    gate = ft.AlignmentGate(circular=True, circular_min_identity=None)
+    sql = _gated_sql(gate)
+    assert "identity >=" not in sql
+    assert ft.gate_parameters(gate) == [0.90]
+
+
+def test_the_mixed_strand_exclusion_is_not_a_parameter():
+    """It is not a cutoff to relax: fragments on opposite strands are not one molecule,
+    so pooling them manufactures coverage. Every circular gate carries it, and no field
+    turns it off."""
+    for gate in (
+        ft.AlignmentGate(circular=True),
+        ft.AlignmentGate(circular=True, circular_min_coverage=0.0, circular_min_identity=None),
+    ):
+        assert "AND NOT mixed_strand" in _gated_sql(gate)
+
+
+def test_the_circular_gate_reads_the_macro_by_relation_name_from_a_cte():
+    """`circular_query_coverage` resolves its arguments through `query_table`, which
+    takes only literals — so it cannot sit in a lateral position, and upstream names a
+    CTE as the form for this."""
+    sql = _gated_sql(ft.AlignmentGate(circular=True))
+    assert (
+        f"circular_query_coverage({ft.CIRCULAR_ALIGNMENTS_VIEW}, {ft.FEATURE_TOPOLOGY_VIEW})" in sql
+    )
+    assert "WITH cleared AS (" in sql
+
+
+def test_the_circular_gate_keeps_a_cleared_groups_rows_with_a_semi_join():
+    """The macro answers per `(read, reference)`, and the gate keeps every record of a
+    group that cleared — including the mate key, since the macro keeps mates apart."""
+    sql = _gated_sql(ft.AlignmentGate(circular=True))
+    assert "SEMI JOIN cleared c" in sql
+    assert "a.sequence_idx = c.read_id" in sql
+    assert "a.feature_idx = c.reference" in sql
+    assert "alignment_is_read1(a.flags) = c.is_read1" in sql
+
+
+def test_the_circular_gated_relation_drops_cigar_again():
+    """Same rule as the other arm: `ALIGNMENT_TABLE` is `ALIGNMENT_COLUMNS` and nothing
+    else, so `cigar` stops at the gate whichever axis scored it."""
+    sql = _gated_sql(ft.AlignmentGate(circular=True))
+    projection = sql.split(") SELECT ", 1)[1].split(" FROM ", 1)[0]
+    assert "cigar" not in projection
+    for column in ft.ALIGNMENT_COLUMNS:
+        assert f"a.{column}" in projection, column
+
+
+def test_a_circular_gate_asks_for_cigar_but_not_mate_position():
+    """`mate_position` keys the paired partition and nothing else; the circular axis
+    tells mates apart by the SAM read1 bit already in `flags`."""
+    columns = ft.gate_alignment_columns(ft.AlignmentGate(circular=True))
+    assert columns == ft.ALIGNMENT_COLUMNS + ("cigar",)
+
+
+def test_the_circular_clearance_defines_its_views_then_releases_them():
+    """The whole protocol in order: the slice-reading view cannot exist before the
+    stream is drained, and everything the gate staged goes when it is done."""
+    gate = ft.AlignmentGate(circular=True)
+    statements = [sql for sql, _ in _clear(gate).statements]
+    assert statements[0] == ft.circular_alignments_view_sql()
+    assert statements[1] == ft.feature_topology_view_sql()
+    assert statements[2] == ft.gated_alignment_table_sql(clearance=_clear(gate))
+    assert statements[3:] == [
+        f"DROP VIEW {ft.CIRCULAR_ALIGNMENTS_VIEW}",
+        f"DROP VIEW {ft.FEATURE_TOPOLOGY_VIEW}",
+        f"DROP TABLE {ft.FEATURE_LENGTHS_TABLE}",
+        f"DROP TABLE {ft.STREAMED_ALIGNMENT_TABLE}",
+    ]
+
+
+def test_the_views_rename_our_columns_into_the_macros_vocabulary():
+    """Our `sequence_idx` is its `read_id` and our `feature_idx` its `reference`; the
+    lengths relation is keyed the same way and carries the circularity claim it
+    requires."""
+    alignments = ft.circular_alignments_view_sql()
+    assert "sequence_idx AS read_id" in alignments
+    assert "feature_idx AS reference" in alignments
+    assert f"FROM {ft.STREAMED_ALIGNMENT_TABLE}" in alignments
+
+    topology = ft.feature_topology_view_sql()
+    assert "feature_idx AS reference" in topology
+    assert "sequence_length_bp AS length" in topology
+    assert "TRUE AS is_circular" in topology
+    assert f"FROM {ft.FEATURE_LENGTHS_TABLE}" in topology
+
+
+def test_the_circular_diagnostics_count_the_rows_the_macro_cannot_see():
+    """Secondary and unmapped records, and records missing a coordinate, are excluded by
+    the macro — so they would leave the gated slice without failing a threshold. The
+    count is what lets the check refuse instead."""
+    sql = ft.gate_diagnostics_sql(ft.AlignmentGate(circular=True))
+    assert "alignment_is_secondary(flags)" in sql
+    assert "alignment_is_unmapped(flags)" in sql
+    assert "position IS NULL OR stop_position IS NULL" in sql
+    assert sql.count(ft.STREAMED_ALIGNMENT_TABLE) == 1
+
+
+def test_check_refuses_a_circular_gate_over_rows_it_cannot_pool():
+    with pytest.raises(ValueError, match="pooled"):
+        _check(ft.AlignmentGate(circular=True), unpoolable_rows=3)
+
+
+def test_check_refuses_a_circular_gate_over_paired_data():
+    with pytest.raises(ValueError, match="paired"):
+        _check(ft.AlignmentGate(circular=True), paired_rows=7)
+
+
+def test_check_passes_a_clean_circular_slice():
+    assert _check(ft.AlignmentGate(circular=True)).gate.circular
+
+
+def test_a_circular_gate_refuses_the_other_axis_thresholds():
+    """Two different questions. A per-record coverage floor drops exactly the split
+    records the pooling exists to rescue, so the combination is a mistake rather than a
+    stricter gate."""
+    for kwargs in ({"min_identity": 0.9}, {"min_query_coverage": 0.9}):
+        with pytest.raises(ValueError, match="axis|axes"):
+            ft.AlignmentGate(circular=True, **kwargs)
+
+
+def test_a_circular_gate_refuses_to_also_pool_mates():
+    with pytest.raises(ValueError, match="axes"):
+        ft.AlignmentGate(circular=True, paired=True)
+
+
+def test_a_circular_gate_needs_no_explicit_threshold():
+    """Unlike the CIGAR axis: turning the mode on says what to keep, because its
+    thresholds have defaults. A gate with neither CIGAR threshold is still refused."""
+    assert ft.AlignmentGate(circular=True).circular
+    with pytest.raises(ValueError, match="threshold"):
+        ft.AlignmentGate()
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"circular_min_coverage": 1.5}, {"circular_min_identity": -0.1}]
+)
+def test_a_circular_threshold_outside_zero_to_one_is_refused(kwargs):
+    with pytest.raises(ValueError, match="proportion"):
+        ft.AlignmentGate(circular=True, **kwargs)

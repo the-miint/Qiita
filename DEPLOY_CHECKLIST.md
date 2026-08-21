@@ -57,6 +57,16 @@ _None yet._
   Expect `1`. A `0` means the staged build predates the function — re-stage the extension
   before telling anyone `--tree` works. (#448)
 
+- **The staged miint build must carry `circular_query_coverage`** — `qiita feature-table
+  build --circular-gate` calls it, and it is newer than `shear_tree`. Same probe, same
+  account, one word changed:
+  ```bash
+  sudo -u qiita-api env MIINT_EXTENSION_DIRECTORY="$(grep -oP '(?<=^MIINT_EXTENSION_DIRECTORY=).*' /etc/qiita/control-plane.env)" \
+    python3 -c "import duckdb, os; c=duckdb.connect(':memory:', config={'extension_directory': os.environ['MIINT_EXTENSION_DIRECTORY'], 'allow_unsigned_extensions': 'true'}); c.execute('LOAD miint'); print(c.execute(\"SELECT count(*) FROM duckdb_functions() WHERE function_name='circular_query_coverage'\").fetchone()[0])"
+  ```
+  Expect `1`. A `0` means the staged build predates the function — re-stage the extension
+  before telling anyone `--circular-gate` works. (#TBD)
+
 - **`long-read-assembly` 1.0.0 is edited in place, not versioned** — `activate.sh`'s
   `qiita-admin actions sync` re-syncs it, so the `qiita.action` list check `make
   verify-deploy` already runs is the confirmation it landed. It gained no step and no

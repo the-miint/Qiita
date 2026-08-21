@@ -31,7 +31,7 @@ The modules, in the order a recipe reaches them:
 | `relations` | the relation names, what each one is (TABLE vs VIEW), and its release |
 | `stage` | the three input streams → named relations |
 | `coverage` | the scope, the survivor set, and what the roll-up leaves behind |
-| `gate` | the CIGAR identity / query-coverage gate and its clearance |
+| `gate` | the alignment gate — CIGAR or circular-pooled — and its clearance |
 | `ogu` | `woltka_ogu`'s input and output — today's one table flavour |
 | `label` | the relabel to public handles |
 | `sidecar` | the taxonomy sidecar and the sheared tree |
@@ -51,10 +51,14 @@ from .coverage import (
     survivor_table_sql,
 )
 from .gate import (
+    CIRCULAR_MIN_COVERAGE,
+    CIRCULAR_MIN_IDENTITY,
     PAIRED_PLACEMENT_PARTITION,
     AlignmentGate,
     GateClearance,
     check_gate_diagnostics,
+    circular_alignments_view_sql,
+    feature_topology_view_sql,
     gate_alignment_columns,
     gate_diagnostics_sql,
     gate_parameters,
@@ -85,7 +89,10 @@ from .ogu import (
 from .relations import (
     ALIGNMENT_TABLE,
     BLOCKED_FEATURE_TABLE,
+    CIRCULAR_ALIGNMENTS_VIEW,
     COVERAGE_ALIGNMENTS_VIEW,
+    FEATURE_LENGTHS_TABLE,
+    FEATURE_TOPOLOGY_VIEW,
     GENOME_LABEL_TABLE,
     GENOME_LENGTHS_TABLE,
     LABELLED_RELATION,
@@ -100,6 +107,7 @@ from .relations import (
     TAXONOMY_SIDECAR_RELATION,
     TAXONOMY_TABLE,
     TREE_TABLE,
+    drop_circular_inputs_statements,
     drop_ogu_input_table_sql,
     drop_phylogeny_statements,
     drop_streamed_alignment_table_sql,
@@ -125,6 +133,7 @@ from .sidecar import (
 from .stage import (
     ALIGNMENT_COLUMNS,
     alignment_table_sql,
+    feature_lengths_table_sql,
     genome_lengths_table_sql,
     map_table_sql,
 )
@@ -139,14 +148,23 @@ from .write import (
 __all__ = [
     "ALIGNMENT_COLUMNS",
     "ALIGNMENT_TABLE",
+    "AlignmentGate",
     "BIOM_GENERATED_BY",
     "BLOCKED_FEATURE_TABLE",
+    "CIRCULAR_ALIGNMENTS_VIEW",
+    "CIRCULAR_MIN_COVERAGE",
+    "CIRCULAR_MIN_IDENTITY",
     "COVERAGE_ALIGNMENTS_VIEW",
+    "CoverageScope",
+    "FEATURE_LENGTHS_TABLE",
+    "FEATURE_TOPOLOGY_VIEW",
     "GENOME_LABEL_TABLE",
     "GENOME_LENGTHS_TABLE",
+    "GateClearance",
     "LABELLED_COLUMNS",
     "LABELLED_RELATION",
     "LABELLED_SCHEMA",
+    "LabelClearance",
     "MAP_TABLE",
     "OGU_INPUT_TABLE",
     "OGU_OUTPUT_TABLE",
@@ -155,6 +173,7 @@ __all__ = [
     "PAIRED_PLACEMENT_PARTITION",
     "PHYLOGENY_COLUMNS",
     "PHYLOGENY_TABLE",
+    "RollupCoverage",
     "SAMPLE_LABEL_TABLE",
     "SHEAR_INPUT_RELATION",
     "SHEAR_KEEP_SET_RELATION",
@@ -165,11 +184,6 @@ __all__ = [
     "TREE_COLUMNS",
     "TREE_SCHEMA",
     "TREE_TABLE",
-    "AlignmentGate",
-    "CoverageScope",
-    "GateClearance",
-    "LabelClearance",
-    "RollupCoverage",
     "TaxonomyClearance",
     "TreeClearance",
     "alignment_table_sql",
@@ -179,12 +193,16 @@ __all__ = [
     "check_relabel_diagnostics",
     "check_taxonomy_diagnostics",
     "check_tree_diagnostics",
+    "circular_alignments_view_sql",
     "coverage_alignments_view_sql",
     "coverage_filter_applies",
+    "drop_circular_inputs_statements",
     "drop_ogu_input_table_sql",
     "drop_phylogeny_statements",
     "drop_streamed_alignment_table_sql",
     "empty_ogu_select_sql",
+    "feature_lengths_table_sql",
+    "feature_topology_view_sql",
     "gate_alignment_columns",
     "gate_diagnostics_sql",
     "gate_parameters",
