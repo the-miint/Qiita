@@ -82,6 +82,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     fetch_missing_value_reason_idxs_by_names,
     fetch_study_field,
     fetch_study_fields_by_display_names,
+    fetch_study_fields_for_study,
     fetch_terminology_term_idxs_by_term_ids,
     insert_entity_to_study,
     link_entity_to_studies,
@@ -6432,3 +6433,122 @@ async def test_create_study_field_and_read_back_globally_linked(ctx, spec):
         "created_by_idx": ctx["principal_idx"],
     }
     assert dict(record) == expected
+
+
+# ---------------------------------------------------------------------------
+# fetch_study_fields_for_study (parametrized over both specs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_study_fields_for_study_orders_and_resolves(ctx, spec):
+    """Tests the case where a study carries a purely-local and a globally-linked
+    field: both come back ordered by display_name, the linked one with
+    data_type / required COALESCEd from its global-field row.
+    """
+    suffix = secrets.token_hex(4)
+    # Prefixes fix the sort order independently of insertion order.
+    local_name = f"AAA Local {suffix}"
+    linked_name = f"ZZZ Linked {suffix}"
+    global_idx = await _seed_global_field(
+        ctx,
+        spec=spec,
+        internal_name=f"lfs_{suffix}",
+        display_name=f"Global {suffix}",
+        data_type=FieldDataType.NUMERIC,
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        linked_idx = await create_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=linked_name,
+            created_by_idx=ctx["principal_idx"],
+            global_field_idx=global_idx,
+        )
+        local_idx = await create_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=local_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].extend([linked_idx, local_idx])
+
+    rows = await fetch_study_fields_for_study(ctx["pool"], spec=spec, study_idx=ctx["study_idx"])
+    expected = [
+        {
+            "idx": local_idx,
+            "study_idx": ctx["study_idx"],
+            spec.study_field_global_fk_column: None,
+            "display_name": local_name,
+            "description": None,
+            "data_type": FieldDataType.TEXT,
+            "required": False,
+            "terminology_idx": None,
+            "tier_override": None,
+            "created_by_idx": ctx["principal_idx"],
+            # created_at is DB-assigned; copy it from the actual row.
+            "created_at": rows[0]["created_at"],
+        },
+        {
+            "idx": linked_idx,
+            "study_idx": ctx["study_idx"],
+            spec.study_field_global_fk_column: global_idx,
+            "display_name": linked_name,
+            "description": None,
+            "data_type": FieldDataType.NUMERIC,
+            "required": False,
+            "terminology_idx": None,
+            "tier_override": None,
+            "created_by_idx": ctx["principal_idx"],
+            "created_at": rows[1]["created_at"],
+        },
+    ]
+    assert [dict(row) for row in rows] == expected
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_study_fields_for_study_no_fields_empty(ctx, spec):
+    """Tests the case where the study carries no fields of the entity's kind:
+    the read yields an empty list rather than raising.
+    """
+    rows = await fetch_study_fields_for_study(ctx["pool"], spec=spec, study_idx=ctx["study_idx"])
+    assert rows == []
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_study_fields_for_study_scoped_to_study(ctx, spec):
+    """Tests the case where a field exists on a different study: the read is
+    scoped to the requested study_idx and excludes it.
+    """
+    display_name = f"Scoped {secrets.token_hex(4)}"
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        idx = await create_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
+
+    other_study_idx = await ctx["pool"].fetchval(
+        "SELECT COALESCE(MAX(idx), 0) + 100000 FROM qiita.study"
+    )
+    rows = await fetch_study_fields_for_study(ctx["pool"], spec=spec, study_idx=other_study_idx)
+    assert rows == []

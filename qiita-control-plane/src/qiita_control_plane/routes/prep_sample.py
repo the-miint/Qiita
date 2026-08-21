@@ -1,11 +1,7 @@
 """Prep-sample routes.
 
-Two routers live here: a prep-sample-scoped one (prefix=/prep-sample) for the
-study-membership read and the operator retirement PATCH, and a study-scoped one
-(prefix=/study) for minting a study-local prep_sample field, which is
-authorized on the study rather than on any one prep_sample. A prep_sample row
-itself is created by the sequenced-sample composer (its only subtype today),
-never by a POST here.
+A prep_sample row itself is created by the sequenced-sample composer
+(its only subtype today), never by a POST here.
 
 The prep-sample-scoped handlers gate on caller scope plus
 require_role_at_least(WET_LAB_ADMIN), matching the sibling sequenced_sample
@@ -45,12 +41,13 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
+from ..repositories._sample_helpers import fetch_study_fields_for_study
 from ..repositories.prep_sample import (
     fetch_active_studies_for_prep_sample,
     set_prep_sample_retired,
 )
 from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
-from ._helpers import cap_rows, create_and_map_study_field
+from ._helpers import cap_rows, create_and_map_study_field, map_study_field_row
 
 router = APIRouter(prefix=PATH_PREP_SAMPLE_PREFIX, tags=["prep-sample"])
 study_scoped_router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["prep-sample"])
@@ -187,3 +184,37 @@ async def create_prep_sample_field(
         )
 
     return response
+
+
+@study_scoped_router.get(PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY)
+async def list_prep_sample_fields_in_study(
+    study_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> list[PrepSampleStudyFieldResponse]:
+    """List the prep_sample field definitions on the path's study, by display_name.
+
+    Caller must be a HumanUser holding Scope.PREP_SAMPLE_READ with viewer tier
+    or higher on the study (wet_lab_admin and system_admin bypass tier).
+    require_study_exists composes alongside require_study_access so an
+    admin-bypass caller still gets 404 on a non-existent study rather than an
+    empty list. Viewer tier suffices because this returns field definitions
+    and no metadata values. Returns both globally-linked and purely-local fields;
+    a linked field's data_type, required, and terminology_idx arrive resolved
+    from its global field.
+    """
+    rows = await fetch_study_fields_for_study(
+        pool, spec=PREP_SAMPLE_METADATA_SPEC, study_idx=study_idx
+    )
+    fields = [
+        map_study_field_row(
+            row, spec=PREP_SAMPLE_METADATA_SPEC, response_model=PrepSampleStudyFieldResponse
+        )
+        for row in rows
+    ]
+    return fields

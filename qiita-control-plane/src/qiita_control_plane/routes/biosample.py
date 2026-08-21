@@ -65,6 +65,7 @@ from ..repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     MetadataMissingRequiredFieldsError,
     fetch_global_metadata,
+    fetch_study_fields_for_study,
 )
 from ..repositories.biosample import (
     BiosampleLookupKey,
@@ -89,6 +90,7 @@ from ._helpers import (
     create_and_map_study_field,
     detail_for_unlinked_entity,
     etag_for_updated_at,
+    map_study_field_row,
     metadata_entries_from_rows,
     raise_for_unique_violation,
     raise_http_for_sample_metadata_write_error,
@@ -304,6 +306,40 @@ async def create_biosample_field(
         )
 
     return response
+
+
+@router.get(PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY)
+async def list_biosample_fields_in_study(
+    study_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> list[BiosampleStudyFieldResponse]:
+    """List the biosample field definitions on the path's study, by display_name.
+
+    Caller must be a HumanUser holding Scope.BIOSAMPLE_READ with viewer tier or
+    higher on the study (wet_lab_admin and system_admin bypass tier).
+    require_study_exists composes alongside require_study_access so an
+    admin-bypass caller still gets 404 on a non-existent study rather than an
+    empty list. Viewer tier suffices because this returns field definitions
+    and no metadata values. Returns both globally-linked and purely-local fields;
+    a linked field's data_type, required, and terminology_idx arrive resolved
+    from its global field.
+    """
+    rows = await fetch_study_fields_for_study(
+        pool, spec=BIOSAMPLE_METADATA_SPEC, study_idx=study_idx
+    )
+    fields = [
+        map_study_field_row(
+            row, spec=BIOSAMPLE_METADATA_SPEC, response_model=BiosampleStudyFieldResponse
+        )
+        for row in rows
+    ]
+    return fields
 
 
 # Hard cap on the bulk-id read. Sized to comfortably cover any single

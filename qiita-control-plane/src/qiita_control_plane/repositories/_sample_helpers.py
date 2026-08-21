@@ -1756,27 +1756,22 @@ async def _get_or_create_local_study_field(
     return row["idx"], False, row[FOUND_GLOBAL_FIELD_IDX_ALIAS]
 
 
-async def fetch_study_field(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    *,
-    spec: EntityMetadataSpec,
-    idx: int,
-) -> asyncpg.Record | None:
-    """Return one {entity}_study_field row by idx, or None on miss.
+def _study_field_read_sql(spec: EntityMetadataSpec) -> str:
+    """Compose the SELECT/FROM/JOIN prefix every {entity}_study_field read shares,
+    for the caller to append its own WHERE to.
 
     A globally-linked row leaves data_type / required / terminology_idx NULL
-    (they live on the global-field row), so the read LEFT JOINs the global
-    field and COALESCEs those three into their effective values. tier_override
-    has no global counterpart (the global row carries default_tier, a distinct
-    concept) and is returned as stored. The global FK column comes through
-    under its entity-specific name (spec.study_field_global_fk_column); the
-    row's own idx comes through as `idx`. Accepts either a pool or a
-    connection.
+    (they live on the global-field row), so the read LEFT JOINs the global field
+    and COALESCEs those three into their effective values. tier_override has no
+    global counterpart (the global row carries default_tier, a distinct concept)
+    and comes through as stored. The global FK column keeps its entity-specific
+    name (spec.study_field_global_fk_column); the row's own idx comes through as
+    `idx`.
     """
     # f-string interpolation of identifiers is safe: spec fields are frozen
     # module-level constants, never reached by caller input.
     fk_column = spec.study_field_global_fk_column
-    return await pool_or_conn.fetchrow(
+    return (
         f"SELECT"
         f"    sf.idx,"
         f"    sf.study_idx,"
@@ -1792,9 +1787,43 @@ async def fetch_study_field(
         f" FROM {spec.study_field_table} sf"
         f" LEFT JOIN {spec.global_field_table} gf"
         f"     ON gf.idx = sf.{fk_column}"
-        f" WHERE sf.idx = $1",
-        idx,
     )
+
+
+async def fetch_study_field(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    idx: int,
+) -> asyncpg.Record | None:
+    """Return one {entity}_study_field row by idx, or None on miss.
+
+    Values inherited from a linked global field arrive already resolved. The row
+    names the global FK by its entity-specific column and the row's own idx as
+    `idx`. Accepts either a pool or a connection.
+    """
+    sql = f"{_study_field_read_sql(spec)} WHERE sf.idx = $1"
+    row = await pool_or_conn.fetchrow(sql, idx)
+    return row
+
+
+async def fetch_study_fields_for_study(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+) -> list[asyncpg.Record]:
+    """Return every {entity}_study_field row on study_idx, ordered by display_name.
+
+    Values inherited from a linked global field arrive already resolved; each row
+    names the global FK by its entity-specific column and its own idx as `idx`. A
+    study with no fields yields an empty list. Unbounded by design: the row count
+    is the study's curated field vocabulary, not a per-sample roster. Accepts
+    either a pool or a connection.
+    """
+    sql = f"{_study_field_read_sql(spec)} WHERE sf.study_idx = $1 ORDER BY sf.display_name"
+    rows = await pool_or_conn.fetch(sql, study_idx)
+    return rows
 
 
 async def create_study_field(

@@ -21,6 +21,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A study's sample field definitions can be read back.** `GET
+  /api/v1/study/{study_idx}/biosample-field` and `.../prep-sample-field` list the study's
+  field definitions, so a client no longer has to infer what already exists by attempting
+  a create and interpreting the 409 from the `(study_idx, display_name)` unique
+  constraint — which is what made bulk field-creation scripts impossible to re-run safely.
+  Both verbs share one path, so no new REST constants were needed. Each row arrives with
+  the values a globally-linked field inherits already resolved, so a caller sees one shape
+  whether the field is linked or purely local. Gated on the entity read scope
+  (`biosample:read` / `prep_sample:read`) at viewer tier — lower than the create route's
+  admin, because these return field definitions and no metadata values.
+
 - **`qiita feature-table build --circular-gate` — judge a read pooled over the records it
   was split into (#475).** A read crossing the origin of a circular reference held as a
   linearised contig is emitted as two records covering half of it each, so a per-record

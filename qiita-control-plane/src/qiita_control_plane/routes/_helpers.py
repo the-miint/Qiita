@@ -528,9 +528,7 @@ async def create_and_map_study_field(
 
     Create-side conflicts map to 409 and DB-level violations to 422 (the
     Pydantic body should preempt the CHECK, but it is the last defense). The
-    caller owns the transaction. Response keys come from response_model's own
-    aliases, so each entity's wire spelling of the two idx fields follows its
-    model rather than being rebuilt here.
+    caller owns the transaction.
     """
     noun = spec.entity_kind
     try:
@@ -567,6 +565,22 @@ async def create_and_map_study_field(
     except asyncpg.CheckViolationError:
         raise HTTPException(status_code=422, detail=f"violates a database constraint on {noun}")
 
+    return map_study_field_row(row, spec=spec, response_model=response_model)
+
+
+def map_study_field_row[T: SampleStudyFieldResponse](
+    row: asyncpg.Record,
+    *,
+    spec: EntityMetadataSpec,
+    response_model: type[T],
+) -> T:
+    """Shape one {entity}_study_field row into response_model.
+
+    The row must come from a read that resolves the inherited columns, since
+    this only renames. Response keys come from response_model's own aliases, so
+    each entity's wire spelling of the two idx fields follows its model rather
+    than being rebuilt here.
+    """
     # The row names the global link by its SQL column; the response names both
     # idx fields by the subclass's alias.
     payload = {
@@ -584,7 +598,8 @@ async def create_and_map_study_field(
         "created_by_idx": row["created_by_idx"],
         "created_at": row["created_at"],
     }
-    return response_model.model_validate(payload)
+    validated = response_model.model_validate(payload)
+    return validated
 
 
 def raise_for_unique_violation(
