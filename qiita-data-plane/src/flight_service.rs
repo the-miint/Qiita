@@ -716,8 +716,9 @@ impl FlightService for QiitaFlightService {
                 // crosses no await.
                 let catalog = self.catalog_connstr.clone();
                 let data_path = self.data_path.clone();
+                let scratch_root = self.scratch_root.clone();
                 let registration = tokio::task::spawn_blocking(move || {
-                    register_files(&catalog, &data_path, &payload)
+                    register_files(&catalog, &data_path, &scratch_root, &payload)
                 })
                 .await
                 .map_err(|e| Status::internal(format!("register_files task join failed: {e}")))??;
@@ -2261,6 +2262,7 @@ struct Registration {
 fn register_files(
     catalog_connstr: &str,
     data_path: &str,
+    scratch_root: &std::path::Path,
     payload: &auth::ActionPayload,
 ) -> Result<Registration, Status> {
     let staging = std::path::Path::new(&payload.staging_dir);
@@ -2301,6 +2303,10 @@ fn register_files(
         }
     }
 
+    // One scope key for the whole registration — every file below shares it, and
+    // it does not vary per file.
+    let scope = staging_scope(&payload.staging_dir, scratch_root);
+
     // Move all files to permanent storage.
     // (DuckLake table, permanent path). The path is carried as a String because
     // every consumer below binds it into SQL or reports it.
@@ -2332,7 +2338,7 @@ fn register_files(
         // refuses to overwrite besides, as a hard safety net.
         let dest = dest_dir.join(lake_dest_filename(
             payload.work_ticket_idx,
-            &payload.staging_dir,
+            &scope,
             basename,
         ));
         move_file(&src, &dest)?;
@@ -3089,13 +3095,35 @@ fn delete_alignment_block(
 ///
 /// DuckLake names its own INSERT-written data files uniquely for the same
 /// reason; this is the equivalent for our "register an existing file" path.
-fn lake_dest_filename(work_ticket_idx: i64, staging_dir: &str, basename: &str) -> String {
-    let digest = Sha256::digest(staging_dir.as_bytes());
+///
+/// `scope` comes from [`staging_scope`], not from the raw `staging_dir`.
+fn lake_dest_filename(work_ticket_idx: i64, scope: &str, basename: &str) -> String {
+    let digest = Sha256::digest(scope.as_bytes());
     // 48 bits, enough to separate the attempts one ticket can have
     // (`max_retries` bounds them). A collision lands on move_file's
     // AlreadyExists, not a silent clobber.
-    let scope: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
-    format!("wt{work_ticket_idx}-{scope}-{basename}")
+    let hex: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+    format!("wt{work_ticket_idx}-{hex}-{basename}")
+}
+
+/// The part of a registration's staging dir that identifies WHICH registration
+/// it is, independent of where scratch happens to be mounted.
+///
+/// `PATH_SCRATCH` is host configuration: a migration, a remount, or a differently
+/// laid-out replacement host changes it without changing which registration a
+/// given staging dir denotes. Keying [`lake_dest_filename`] on the absolute path
+/// would make the digest — and so the destination name — move with it, which
+/// would break the determinism that guard depends on. Keying on the path
+/// RELATIVE to the scratch root does not.
+///
+/// A staging dir outside the scratch root falls back to the full path. That is
+/// still correct (it only has to be stable and distinct), just not stable across
+/// a move of whatever holds it.
+fn staging_scope(staging_dir: &str, scratch_root: &std::path::Path) -> String {
+    std::path::Path::new(staging_dir)
+        .strip_prefix(scratch_root)
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| staging_dir.to_string())
 }
 
 /// Move a file, falling back to copy+delete for cross-filesystem moves.
@@ -4539,6 +4567,38 @@ mod tests {
         }
     }
 
+    // PATH_SCRATCH is host configuration: a migration, a remount, or a
+    // differently laid-out replacement host changes it without changing which
+    // registration a staging dir denotes. Keying the digest on the absolute path
+    // would move the minted name with the mount point and break the determinism
+    // move_file's guard depends on.
+    #[test]
+    fn staging_scope_is_stable_across_a_moved_scratch_root() {
+        let rel = "ticket/6939/assembly_load/attempt-1/output";
+        let a = staging_scope(&format!("/scratch/{rel}"), std::path::Path::new("/scratch"));
+        let b = staging_scope(
+            &format!("/mnt/new-scratch/{rel}"),
+            std::path::Path::new("/mnt/new-scratch"),
+        );
+        assert_eq!(a, rel, "the scope is the path relative to the scratch root");
+        assert_eq!(a, b, "the scope must not carry the mount point");
+        assert_eq!(
+            lake_dest_filename(6939, &a, "part_00000.parquet"),
+            lake_dest_filename(6939, &b, "part_00000.parquet"),
+            "a moved scratch root must not change the minted name"
+        );
+        // Still separates attempts once the mount point is gone.
+        let other_attempt = staging_scope(
+            "/scratch/ticket/6939/assembly_load/attempt-0/output",
+            std::path::Path::new("/scratch"),
+        );
+        assert_ne!(a, other_attempt);
+        // A staging dir outside the root keeps the full path: distinct and
+        // stable, just not portable across a move of whatever holds it.
+        let outside = staging_scope("/elsewhere/staging", std::path::Path::new("/scratch"));
+        assert_eq!(outside, "/elsewhere/staging");
+    }
+
     // --- register_files filename validation (pure; no DuckDB) ---
 
     /// `register_files` rejects any filename that could escape the staging dir
@@ -4562,8 +4622,13 @@ mod tests {
                 files,
                 work_ticket_idx: 1,
             };
-            let err = register_files("unused-connstr", "unused-data-path", &payload)
-                .expect_err("a traversal filename must be rejected");
+            let err = register_files(
+                "unused-connstr",
+                "unused-data-path",
+                std::path::Path::new("/"),
+                &payload,
+            )
+            .expect_err("a traversal filename must be rejected");
             assert_eq!(
                 err.code(),
                 tonic::Code::InvalidArgument,
@@ -4912,8 +4977,8 @@ mod tests {
             work_ticket_idx: ticket,
         };
 
-        let outcome =
-            register_files(&connstr, &data_path, &payload).expect("register_files failed");
+        let outcome = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
+            .expect("register_files failed");
         assert_eq!(outcome.registered.len(), 1, "one file registered");
         assert!(
             outcome.replaced.is_empty(),
@@ -5087,6 +5152,7 @@ mod tests {
         let outcome_a = register_files(
             &connstr,
             &data_path,
+            std::path::Path::new("/"),
             &assembly_register_payload(&staging_a, 2, ticket_a),
         )
         .expect("run A register_files failed");
@@ -5108,6 +5174,7 @@ mod tests {
         let outcome_b = register_files(
             &connstr,
             &data_path,
+            std::path::Path::new("/"),
             &assembly_register_payload(&staging_b, 2, ticket_b),
         )
         .expect("run B register_files failed");
@@ -5213,6 +5280,7 @@ mod tests {
             register_files(
                 &connstr,
                 &data_path,
+                std::path::Path::new("/"),
                 &assembly_register_payload(&staging, 1, base_ticket + attempt),
             )
             .unwrap_or_else(|e| panic!("attempt {attempt} register_files failed: {e}"));
@@ -5290,10 +5358,12 @@ mod tests {
             files,
             work_ticket_idx: ticket,
         };
-        register_files(connstr, data_path, &payload).unwrap_or_else(|e| {
-            let names: Vec<&str> = tables.iter().map(|(table, _)| *table).collect();
-            panic!("register_files({names:?}) failed: {e}")
-        })
+        register_files(connstr, data_path, std::path::Path::new("/"), &payload).unwrap_or_else(
+            |e| {
+                let names: Vec<&str> = tables.iter().map(|(table, _)| *table).collect();
+                panic!("register_files({names:?}) failed: {e}")
+            },
+        )
     }
 
     #[cfg(feature = "integration")]
@@ -5777,7 +5847,7 @@ mod tests {
                     let start = &start;
                     scope.spawn(move || {
                         start.wait();
-                        register_files(connstr, data_path, payload)
+                        register_files(connstr, data_path, std::path::Path::new("/"), payload)
                     })
                 })
                 .collect();
@@ -5874,7 +5944,7 @@ mod tests {
                 files,
                 work_ticket_idx: ticket,
             };
-            let outcome = register_files(&connstr, &data_path, &payload)
+            let outcome = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
                 .unwrap_or_else(|e| panic!("register_files failed: {e}"));
             // Keep `staging` alive until after the call.
             drop(staging);

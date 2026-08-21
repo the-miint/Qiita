@@ -28,8 +28,11 @@ duplicates further down are historical strata; leave them where they are.
   replace-by-key and every `delete_reference` / `delete_mask` / `delete_pool_reads` /
   `delete_alignment` has been accumulating. The script drives DuckLake's own
   `ducklake_expire_snapshots` → `ducklake_cleanup_old_files` → `ducklake_delete_orphaned_files`
-  in that order — measured on 1.5.4, `cleanup_old_files` reports nothing until the
-  snapshots referencing a file are expired, so running it alone is a no-op. It **reports
+  in that order, in ONE transaction in one duckdb process, using the documented `CALL`
+  form — measured on 1.5.4, `cleanup_old_files` reports nothing until the snapshots
+  referencing a file are expired (running it alone is a no-op) but does see that expiry
+  from inside the same transaction. The transaction bounds the CATALOG only: an unlinked
+  file stays unlinked through a rollback, also measured. It **reports
   by default**, prompts for a typed confirmation under `--reclaim`, keeps 7 days of
   snapshot history unless `--older-than` says otherwise, and never passes `cleanup_all`.
   Registrations must be quiesced before reclaiming: `older_than` filters on filesystem
@@ -1028,8 +1031,11 @@ duplicates further down are historical strata; leave them where they are.
   `move_file` refused it — `refusing to overwrite existing lake file
   …/assembled_sequence_chunks/wt6939-part_00000.parquet`, which blocked the unbinned-residue
   backfill for all 57 candidate prep_samples. The name now also carries a digest of the
-  registration's `staging_dir`, which encodes the attempt. It stays deterministic for a
-  given (ticket, staging dir), so a replayed DoAction recomputes the same name and
+  registration's staging dir **relative to `PATH_SCRATCH`**, which encodes the attempt
+  without pinning the name to where scratch is mounted — a migration or remount changes
+  that root without changing which registration a staging dir denotes. It stays
+  deterministic for a given (ticket, staging scope), so a replayed DoAction recomputes the
+  same name and
   `move_file` still refuses a true double-registration — the refusal that keeps
   `register_files` replay-safe for the tables outside `REPLACE_KEY_TABLES`
   (e.g. `reference_membership`), which have no replace-by-key to absorb one.

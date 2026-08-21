@@ -56,6 +56,9 @@
 # passed explicitly rather than relying on the extension's default, so what this
 # script destroys does not move under an upstream default change.
 #
+# It reclaims; it does not COMPACT. Merging many small Parquets into fewer
+# (ducklake_merge_adjacent_files) is a separate operation this does not perform.
+#
 # Usage:
 #   bash scripts/lake-gc.sh                          # report only
 #   bash scripts/lake-gc.sh --reclaim                # remove what it reports
@@ -193,8 +196,26 @@ if [[ -n "${CONN_PASSWORD}" ]]; then
     printf '*:*:*:%s:%s\n' "${escaped_user}" "${escaped_password}" >> "${PGPASS_FILE}"
 fi
 
-# Every duckdb invocation goes through here so the PGPASSFILE handling exists in
-# exactly one place, and so each query gets the identical attach preamble.
+# Separates the three result sets in one invocation's output. `.print` is a
+# client-side dot command, so it emits between result sets without joining the
+# transaction.
+MARK="@@lake-gc@@"
+
+# All three steps, ONE duckdb process, ONE transaction.
+#
+# Measured on 1.5.4: cleanup_old_files sees step 1's expiry from inside the same
+# transaction, so the ordering the header describes needs no process split, and
+# the catalog side is all-or-nothing.
+#
+# What the transaction does NOT cover: the unlinking. A file removed by step 2 or
+# 3 stays removed even if the transaction then rolls back (measured — ROLLBACK
+# left the file gone). The transaction bounds the CATALOG changes only.
+#
+# `CALL` is the documented invocation form for these table functions
+# (https://ducklake.select/docs/stable/duckdb/maintenance/expire_snapshots).
+# `SELECT * FROM` behaves identically here (measured, same rows, same deletions),
+# but the docs are what the next reader will check this against.
+#
 # `.bail on` turns an attach failure into a non-zero exit instead of an empty
 # result that reads like "nothing to reclaim".
 #
@@ -202,24 +223,34 @@ fi
 # delete_orphaned_files return one bare path per line, which report_paths counts
 # and sizes; expire_snapshots returns a 7-column snapshot row, which is only
 # line-counted here. A shape change in the first two would surface as a 0.00 GB
-# total, so they are what the caller must re-check on a version bump.
-run_lake_sql() {
-    local query="$1" sql="${TMPROOT}/q.sql"
+# total, so they are what to re-check on a version bump.
+run_maintenance() {
+    local sql="${TMPROOT}/gc.sql"
     {
         echo ".bail on"
-        # ducklake + postgres only. Unlike lake-shell.sh this never reads a
-        # sequence, so it needs no miint and does not switch extension_directory
-        # to the staged build.
+        # FIRST: INSTALL resolves against $HOME/.duckdb, and this runs as
+        # qiita-data, whose home is /dev/null ("Can't find the home directory").
+        # Redirect before anything can install.
+        echo "SET home_directory='${SESSION_TMPDIR}';"
+        # ducklake, plus postgres for the catalog backend — `ducklake:postgres:`
+        # below needs it. It would autoload, but autoINSTALL is the part that
+        # would reach for a home this account does not have, so both are named.
+        # No miint: this never reads a sequence (unlike lake-shell.sh), so it
+        # also never switches extension_directory to the staged build.
         echo "INSTALL ducklake; LOAD ducklake;"
         echo "INSTALL postgres; LOAD postgres;"
-        # qiita-data's home is /dev/null, so INSTALL would resolve
-        # $HOME/.duckdb/extensions and die with "Can't find the home directory".
-        echo "SET home_directory='${SESSION_TMPDIR}';"
         echo "SET threads = ${LAKE_THREADS};"
         echo "SET memory_limit = '${LAKE_MEMORY_LIMIT}';"
         echo "SET temp_directory='${SESSION_TMPDIR}';"
         echo "ATTACH 'ducklake:postgres:${CONN_SANITIZED}' AS qiita_lake (DATA_PATH '${DATA_PATH}');"
-        echo "${query}"
+        echo "BEGIN TRANSACTION;"
+        echo ".print ${MARK}snapshots"
+        echo "CALL ducklake_expire_snapshots('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});"
+        echo ".print ${MARK}old_files"
+        echo "CALL ducklake_cleanup_old_files('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});"
+        echo ".print ${MARK}orphans"
+        echo "CALL ducklake_delete_orphaned_files('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});"
+        echo "COMMIT;"
     } > "${sql}"
     if [[ -s "${PGPASS_FILE}" ]]; then
         PGPASSFILE="${PGPASS_FILE}" "${DUCKDB_BIN}" -noheader -list -f "${sql}"
@@ -228,8 +259,15 @@ run_lake_sql() {
     fi
 }
 
-# Size a newline-separated file list. `stat` differs between GNU and BSD, so try
-# both rather than assuming the deploy host's coreutils.
+# One section of run_maintenance's output, by marker. $1 = section name.
+section() {
+    printf '%s\n' "${MAINTENANCE_OUT}" |
+        awk -v start="${MARK}$1" -v mark="${MARK}" '
+            $0 == start { on = 1; next }
+            on && index($0, mark) == 1 { on = 0 }
+            on { print }'
+}
+
 # `stat` differs between GNU and BSD, so try both. Echoes nothing when neither
 # works; the caller counts that rather than adding a zero, because the byte total
 # is what the report is for and a silent undercount reads as "less to reclaim".
@@ -290,26 +328,21 @@ if [[ "${DRY_RUN}" != true && -z "${ASSUME_YES:-}" ]]; then
     echo
 fi
 
+MAINTENANCE_OUT="$(run_maintenance)"
+
 # 1. Snapshots. In report mode this is the set that WOULD be expired; because it
-#    has not happened, step 2's report below can only see files already
-#    unreferenced by a previous run, and so understates what a --reclaim would
-#    free. That gap is inherent to reporting without mutating, not a defect.
-snapshots="$(run_lake_sql \
-    "SELECT * FROM ducklake_expire_snapshots('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});")"
-snapshot_count="$(printf '%s' "${snapshots}" | grep -c . || true)"
+#    has not happened, step 2 below can only see files already unreferenced by an
+#    earlier run, and so understates what a --reclaim would free. That gap is
+#    inherent to reporting without mutating, not a defect.
+snapshot_count="$(section snapshots | grep -c . || true)"
 printf '  %-34s %6d snapshot(s)\n' "snapshots older than retention" "${snapshot_count}"
 
-# 2. Files no surviving snapshot references. Only meaningful after step 1 has
-#    actually run, which is why --reclaim does both in one invocation.
-old_files="$(run_lake_sql \
-    "SELECT * FROM ducklake_cleanup_old_files('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});")"
-report_paths "superseded data files" "${old_files}"
+# 2. Files no surviving snapshot references.
+report_paths "superseded data files" "$(section old_files)"
 
 # 3. Files under the data path the catalog never references — a registration
 #    whose catalog transaction rolled back after its file was already moved.
-orphans="$(run_lake_sql \
-    "SELECT * FROM ducklake_delete_orphaned_files('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});")"
-report_paths "unreferenced orphan files" "${orphans}"
+report_paths "unreferenced orphan files" "$(section orphans)"
 
 echo
 if [[ "${DRY_RUN}" == true ]]; then

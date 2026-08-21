@@ -913,6 +913,33 @@ def test_lake_gc_never_passes_cleanup_all() -> None:
     assert "cleanup_all" not in _lake_gc_code()
 
 
+def test_lake_gc_uses_the_documented_call_form() -> None:
+    """DuckLake documents these table functions as `CALL f(...)`. `SELECT * FROM
+    f(...)` behaves identically (measured on 1.5.4 — same rows, same deletions),
+    but a reader checking this against the docs should find the documented form.
+    https://ducklake.select/docs/stable/duckdb/maintenance/expire_snapshots"""
+    code = _lake_gc_code()
+    assert "SELECT * FROM ducklake_" not in code
+    for fn in ("expire_snapshots", "cleanup_old_files", "delete_orphaned_files"):
+        assert f"CALL ducklake_{fn}(" in code, f"{fn} must be invoked with CALL"
+
+
+def test_lake_gc_runs_all_maintenance_in_one_transaction() -> None:
+    """The three steps are ordered (expiry gates cleanup) and share a catalog
+    outcome, so they run in one transaction in one duckdb process rather than
+    three. Note the transaction bounds the CATALOG only — an unlinked file stays
+    unlinked through a rollback (measured), which the script header states."""
+    code = _lake_gc_code()
+    assert "BEGIN TRANSACTION;" in code
+    assert "COMMIT;" in code
+    # One place that invokes duckdb, so the three CALLs cannot drift apart into
+    # separate sessions.
+    assert code.count('"${DUCKDB_BIN}" -noheader -list -f') == 2, (
+        "expected exactly the two branches of the single duckdb invocation "
+        "(with and without PGPASSFILE)"
+    )
+
+
 def test_lake_gc_always_passes_older_than_explicitly() -> None:
     """Relying on the extension's default retention would let an upstream change
     silently move how much history this script destroys."""
