@@ -100,7 +100,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             # Print the header comment block (everything after the shebang, up
             # to the first non-comment line) as the usage text — one copy, not two.
-            awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "${BASH_SOURCE[0]}"
+            qiita_usage_from_header "${BASH_SOURCE[0]}"
             exit 0
             ;;
         --reclaim) DRY_RUN=false ;;
@@ -121,23 +121,7 @@ if [[ ! "${RETENTION}" =~ ^[1-9][0-9]*\ (MINUTE|HOUR|DAY|WEEK|MONTH)S?$ ]]; then
     exit 1
 fi
 
-DUCKDB_BIN="${QIITA_DUCKDB_BIN:-$(command -v duckdb || true)}"
-if [[ -z "${DUCKDB_BIN}" ]]; then
-    cat >&2 <<'EOF'
-ERROR: no duckdb CLI on PATH.
-
-Install one, matching what the data plane links. The run-as account has no home,
-so install it somewhere that account can reach:
-
-  cd "$(mktemp -d)" \
-    && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip \
-    && unzip -q duckdb_cli-linux-amd64.zip \
-    && sudo install -m 0755 duckdb /usr/local/bin/duckdb
-
-Then re-run this script (or point QIITA_DUCKDB_BIN at the binary).
-EOF
-    exit 1
-fi
+qiita_resolve_duckdb_bin
 
 if [[ ! -r "${DP_ENV}" ]]; then
     echo "ERROR: cannot read ${DP_ENV}" >&2
@@ -152,13 +136,7 @@ PERSISTENT="$(read_env_var "${DP_ENV}" PATH_PERSISTENT)"
 [[ -n "${PERSISTENT}" ]]   || { echo "ERROR: PATH_PERSISTENT is unset in ${DP_ENV}" >&2; exit 1; }
 
 DATA_PATH="$(qiita_lake_data_path "${PERSISTENT}")"
-[[ -d "${DATA_PATH}" ]] || { echo "ERROR: lake data path ${DATA_PATH} is not a directory" >&2; exit 1; }
-if [[ ! -r "${DATA_PATH}" || ! -x "${DATA_PATH}" ]]; then
-    echo "ERROR: cannot read ${DATA_PATH}" >&2
-    echo "  It is 0750 qiita-data — you must be in the owning group." >&2
-    echo "  Check with: ls -ld ${DATA_PATH} && id" >&2
-    exit 1
-fi
+qiita_require_lake_data_path "${DATA_PATH}"
 if [[ ! -w "${DATA_PATH}" ]]; then
     echo "ERROR: ${DATA_PATH} is not writable by $(id -un)." >&2
     echo "  It is 0750 qiita-data. Group read is not enough even to REPORT: the" >&2
@@ -188,16 +166,8 @@ IFS=$'\t' read -r CONN_SANITIZED CONN_USER CONN_PASSWORD \
     < <(qiita_split_conn_password "${LAKE_CONNSTR}")
 reject_sql_metacharacters "${CONN_SANITIZED}" "the lake catalog connection string"
 
-TMPROOT="$(mktemp -d "${SESSION_TMPDIR%/}/qiita-lake-gc.XXXXXX")"
-chmod 700 "${TMPROOT}"
-trap 'rm -rf "${TMPROOT}"' EXIT INT TERM HUP
-PGPASS_FILE="${TMPROOT}/pgpass"
-: > "${PGPASS_FILE}"; chmod 600 "${PGPASS_FILE}"
-if [[ -n "${CONN_PASSWORD}" ]]; then
-    escaped_user="${CONN_USER//\\/\\\\}";     escaped_user="${escaped_user//:/\\:}"
-    escaped_password="${CONN_PASSWORD//\\/\\\\}"; escaped_password="${escaped_password//:/\\:}"
-    printf '*:*:*:%s:%s\n' "${escaped_user}" "${escaped_password}" >> "${PGPASS_FILE}"
-fi
+qiita_pgpass_init "qiita-lake-gc"
+[[ -z "${CONN_PASSWORD}" ]] || qiita_pgpass_add "${CONN_USER}" "${CONN_PASSWORD}"
 
 # Separates the three result sets in one invocation's output. `.print` is a
 # client-side dot command, so it emits between result sets without joining the
@@ -266,11 +236,7 @@ run_maintenance() {
         echo "CALL ducklake_delete_orphaned_files('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});"
         echo "COMMIT;"
     } > "${sql}"
-    if [[ -s "${PGPASS_FILE}" ]]; then
-        PGPASSFILE="${PGPASS_FILE}" "${DUCKDB_BIN}" -noheader -list -f "${sql}"
-    else
-        "${DUCKDB_BIN}" -noheader -list -f "${sql}"
-    fi
+    qiita_run_duckdb -noheader -list -f "${sql}"
 }
 
 # One section of run_maintenance's output, by marker. $1 = section name.
@@ -329,9 +295,16 @@ echo
 # other place in this repo where one keystroke starts something that cannot be
 # undone. ASSUME_YES=1 skips it for automation.
 if [[ "${DRY_RUN}" != true && -z "${ASSUME_YES:-}" ]]; then
-    echo "Snapshots older than ${RETENTION} will be dropped; time-travel queries cannot"
-    echo "reach them afterwards. A registration in flight whose staging file predates"
-    echo "the cutoff can be swept with them — see the header. Quiesce first."
+    # Spell out both things --older-than controls. It reads as a retention knob,
+    # but the same cutoff is the mtime filter the two file-deleting steps use, so
+    # shrinking it to reclaim harder also widens what they will unlink.
+    echo "'${RETENTION}' is used twice:"
+    echo "  * every snapshot created more than ${RETENTION} ago is dropped —"
+    echo "    time-travel queries cannot reach them afterwards, and that is final;"
+    echo "  * every candidate file last modified more than ${RETENTION} ago becomes"
+    echo "    eligible for deletion."
+    echo "A registration in flight whose staging file predates the cutoff can be"
+    echo "swept with them — see the header. Quiesce first."
     # `read` returns non-zero at EOF, which under `set -e` would kill the script
     # with a bare exit 1 and no reason — so the EOF case is handled here rather
     # than left to the `[[ ]]` below, which would never run.

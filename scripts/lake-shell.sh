@@ -70,7 +70,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             # Print the header comment block (everything after the shebang, up
             # to the first non-comment line) as the usage text — one copy, not two.
-            awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "${BASH_SOURCE[0]}"
+            qiita_usage_from_header "${BASH_SOURCE[0]}"
             exit 0
             ;;
         --no-cp) WANT_CP=0 ;;
@@ -79,26 +79,7 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-# The DuckDB CLI should match the version the data plane links (duckdb crate
-# 1.10504.0 == DuckDB 1.5.4): the ducklake extension is versioned with DuckDB,
-# and a newer one may want to migrate the catalog schema it opens.
-DUCKDB_VERSION="1.5.4"
-DUCKDB_BIN="${QIITA_DUCKDB_BIN:-$(command -v duckdb || true)}"
-if [[ -z "${DUCKDB_BIN}" ]]; then
-    cat >&2 <<EOF
-ERROR: no duckdb CLI on PATH.
-
-Install one into your own account (no root needed):
-
-  mkdir -p ~/.local/bin && cd "\$(mktemp -d)" \\
-    && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip \\
-    && unzip -q duckdb_cli-linux-amd64.zip \\
-    && install -m 0755 duckdb ~/.local/bin/duckdb
-
-Then re-run this script (or point QIITA_DUCKDB_BIN at the binary).
-EOF
-    exit 1
-fi
+qiita_resolve_duckdb_bin
 
 # The password-splitting itself lives in deploy/_common.sh (qiita_split_conn_password,
 # unit-tested in test_deploy_scripts.py). These three hold its last result.
@@ -110,64 +91,11 @@ split_conn_password() {
         < <(qiita_split_conn_password "$1")
 }
 
-# Every duckdb invocation goes through here so the PGPASSFILE handling exists in
-# exactly one place. The file is only handed over when it actually holds an
-# entry — libpq ignores an empty one anyway, but not setting the variable keeps
-# a password-less deployment obviously password-less.
-run_duckdb() {
-    if [[ -s "${PGPASS_FILE}" ]]; then
-        PGPASSFILE="${PGPASS_FILE}" "${DUCKDB_BIN}" "$@"
-    else
-        "${DUCKDB_BIN}" "$@"
-    fi
-}
-
-# Both temp files can hold a credential, so create them at 0600 BEFORE anything
-# is written — a redirection would otherwise create them at the umask's mode and
-# only be narrowed afterwards. The 0700 parent already blocks other users; this
-# is belt-and-braces. Trap the signals a dropped session actually sends, not just
-# EXIT, so a pgpass file never outlives the shell.
-TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/qiita-lake-shell.XXXXXX")"
-chmod 700 "${TMPROOT}"
-trap 'rm -rf "${TMPROOT}"' EXIT INT TERM HUP
+qiita_pgpass_init "qiita-lake-shell"
+# init.sql is lake-shell-only, and can hold a credential-bearing ATTACH, so it
+# gets the same 0600-before-write treatment inside the shared TMPROOT.
 INIT_SQL="${TMPROOT}/init.sql"
-PGPASS_FILE="${TMPROOT}/pgpass"
 : > "${INIT_SQL}"; chmod 600 "${INIT_SQL}"
-: > "${PGPASS_FILE}"; chmod 600 "${PGPASS_FILE}"
-
-# pgpass lines are `host:port:database:user:password` with `:` and `\` escaped.
-# Both connections are keyed on the username alone (wildcard host/port/db),
-# which is unambiguous as long as they do not share one — and if they do share a
-# username with different passwords, error rather than let the first line win.
-#
-# The seen-set is two parallel indexed arrays and a linear scan rather than an
-# associative array, because macOS ships bash 3.2 — which has none, and which
-# `make test` exercises this script under on the mac CI runner. The `_COUNT`
-# scalar bounds the scan instead of `${#array[@]}`: under `set -u`, bash 3.2
-# treats an empty array as unset. Passwords may hold any byte, so a single
-# delimited-string map would need escaping that a scan does not.
-PGPASS_SEEN_COUNT=0
-PGPASS_SEEN_USERS=()
-PGPASS_SEEN_PASSWORDS=()
-add_pgpass_entry() {
-    local user="$1" password="$2" escaped_user escaped_password i
-    for ((i = 0; i < PGPASS_SEEN_COUNT; i++)); do
-        [[ "${PGPASS_SEEN_USERS[i]}" == "${user}" ]] || continue
-        if [[ "${PGPASS_SEEN_PASSWORDS[i]}" != "${password}" ]]; then
-            echo "ERROR: the lake catalog and the control-plane database both connect as '${user}'" >&2
-            echo "  with different passwords, so they cannot be keyed apart in a pgpass file." >&2
-            echo "  Re-run with --no-cp, or give one of them its own role." >&2
-            exit 1
-        fi
-        return 0
-    done
-    PGPASS_SEEN_USERS[PGPASS_SEEN_COUNT]="${user}"
-    PGPASS_SEEN_PASSWORDS[PGPASS_SEEN_COUNT]="${password}"
-    PGPASS_SEEN_COUNT=$((PGPASS_SEEN_COUNT + 1))
-    escaped_user="${user//\\/\\\\}"; escaped_user="${escaped_user//:/\\:}"
-    escaped_password="${password//\\/\\\\}"; escaped_password="${escaped_password//:/\\:}"
-    printf '*:*:*:%s:%s\n' "${escaped_user}" "${escaped_password}" >> "${PGPASS_FILE}"
-}
 
 # ---- the lake (required) ----------------------------------------------------
 
@@ -184,20 +112,11 @@ PERSISTENT="$(read_env_var "${DP_ENV}" PATH_PERSISTENT)"
 [[ -n "${PERSISTENT}" ]]   || { echo "ERROR: PATH_PERSISTENT is unset in ${DP_ENV}" >&2; exit 1; }
 
 DATA_PATH="$(qiita_lake_data_path "${PERSISTENT}")"
-if [[ ! -d "${DATA_PATH}" ]]; then
-    echo "ERROR: lake data path ${DATA_PATH} is not a directory" >&2
-    exit 1
-fi
-if [[ ! -r "${DATA_PATH}" || ! -x "${DATA_PATH}" ]]; then
-    echo "ERROR: cannot read ${DATA_PATH}" >&2
-    echo "  It is mode 0750 qiita-data:qiita-data — you must be in the owning group." >&2
-    echo "  Check with: ls -ld ${DATA_PATH} && id" >&2
-    exit 1
-fi
+qiita_require_lake_data_path "${DATA_PATH}"
 
 split_conn_password "${LAKE_CONNSTR}"
 LAKE_CONNSTR="${CONN_SANITIZED}"
-[[ -z "${CONN_PASSWORD}" ]] || add_pgpass_entry "${CONN_USER}" "${CONN_PASSWORD}"
+[[ -z "${CONN_PASSWORD}" ]] || qiita_pgpass_add "${CONN_USER}" "${CONN_PASSWORD}"
 reject_sql_metacharacters "${LAKE_CONNSTR}" "the lake catalog connection string"
 reject_sql_metacharacters "${DATA_PATH}" "the lake data path"
 
@@ -212,7 +131,7 @@ if [[ "${WANT_CP}" -eq 1 ]]; then
         else
             split_conn_password "${CP_URL}"
             CP_URL="${CONN_SANITIZED}"
-            [[ -z "${CONN_PASSWORD}" ]] || add_pgpass_entry "${CONN_USER}" "${CONN_PASSWORD}"
+            [[ -z "${CONN_PASSWORD}" ]] || qiita_pgpass_add "${CONN_USER}" "${CONN_PASSWORD}"
             reject_sql_metacharacters "${CP_URL}" "the control-plane connection string"
         fi
     else
@@ -269,7 +188,7 @@ reject_sql_metacharacters "${MIINT_EXT_DIR}" "MIINT_EXTENSION_DIRECTORY"
 # unreadable) and a CP outage is exactly when someone wants to poke at the lake,
 # probe it in a throwaway process first and drop it if it does not answer.
 if [[ -n "${CP_URL}" ]]; then
-    if ! CP_PROBE_ERROR="$(run_duckdb -bail -c \
+    if ! CP_PROBE_ERROR="$(qiita_run_duckdb -bail -c \
         "INSTALL postgres; LOAD postgres; ATTACH '${CP_URL}' AS probe (TYPE postgres, READ_ONLY);" \
         2>&1 >/dev/null)"; then
         echo "NOTE: the control-plane database did not answer, so qiita_cp is not attached." >&2
@@ -365,4 +284,4 @@ fi
 # -unsigned is required to load miint at all: it ships through the team's mirror,
 # whose signing chain is not DuckDB's. This is the CLI equivalent of the
 # `allow_unsigned_extensions` the services set in miint_connect_config().
-run_duckdb -unsigned -init "${INIT_SQL}" "${DUCKDB_ARGS[@]+"${DUCKDB_ARGS[@]}"}"
+qiita_run_duckdb -unsigned -init "${INIT_SQL}" "${DUCKDB_ARGS[@]+"${DUCKDB_ARGS[@]}"}"

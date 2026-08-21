@@ -354,3 +354,115 @@ reject_sql_metacharacters() {
 # rejected outright with `DATA_PATH parameter ... does not match existing data
 # path in the catalog`. $1 = PATH_PERSISTENT.
 qiita_lake_data_path() { printf '%s/ducklake' "$1"; }
+
+# --- DuckDB CLI + pgpass plumbing, shared by scripts/lake-*.sh ---------------
+
+# The DuckDB CLI must match the version the data plane links (duckdb crate
+# 1.10504.0 == DuckDB 1.5.4): the ducklake extension is versioned with DuckDB,
+# and a newer one may want to migrate the catalog schema it opens.
+QIITA_DUCKDB_VERSION="1.5.4"
+
+# Resolve the duckdb CLI into DUCKDB_BIN, or exit with install instructions.
+# Two install sites because the callers run as different accounts: a human with
+# a home, or a service account (qiita-data) whose home is /dev/null.
+qiita_resolve_duckdb_bin() {
+    DUCKDB_BIN="${QIITA_DUCKDB_BIN:-$(command -v duckdb || true)}"
+    [ -n "${DUCKDB_BIN}" ] && return 0
+    cat >&2 <<EOF
+ERROR: no duckdb CLI on PATH.
+
+Install v${QIITA_DUCKDB_VERSION} — it must match what the data plane links.
+
+  cd "\$(mktemp -d)" \\
+    && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v${QIITA_DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip \\
+    && unzip -q duckdb_cli-linux-amd64.zip
+
+Then, for your own account (no root needed):
+    mkdir -p ~/.local/bin && install -m 0755 duckdb ~/.local/bin/duckdb
+Or, to reach it from a service account with no home (e.g. qiita-data):
+    sudo install -m 0755 duckdb /usr/local/bin/duckdb
+
+Then re-run this script (or point QIITA_DUCKDB_BIN at the binary).
+EOF
+    exit 1
+}
+
+# Print a script's own header comment block as its usage text — one copy, not
+# two. $1 = the script file (pass "${BASH_SOURCE[0]}").
+qiita_usage_from_header() {
+    awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$1"
+}
+
+# A 0700 temp dir holding an empty 0600 pgpass, removed on exit. The file is
+# created at 0600 BEFORE anything is written — a redirection would otherwise
+# create it at the umask's mode and only narrow it afterwards. Traps the signals
+# a dropped session actually sends, not just EXIT, so a pgpass never outlives
+# the shell. Sets TMPROOT and PGPASS_FILE. $1 = temp-dir name prefix.
+qiita_pgpass_init() {
+    TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/$1.XXXXXX")"
+    chmod 700 "${TMPROOT}"
+    # shellcheck disable=SC2064  # expand TMPROOT now: it must not be re-read at trap time
+    trap "rm -rf '${TMPROOT}'" EXIT INT TERM HUP
+    PGPASS_FILE="${TMPROOT}/pgpass"
+    : > "${PGPASS_FILE}"; chmod 600 "${PGPASS_FILE}"
+}
+
+# Append one entry to the pgpass. Lines are `host:port:database:user:password`
+# with `:` and `\` escaped. Entries are keyed on the username alone (wildcard
+# host/port/db), which is unambiguous as long as two connections do not share
+# one — and if they do share a username with different passwords, error rather
+# than let the first line win.
+#
+# The seen-set is two parallel indexed arrays and a linear scan rather than an
+# associative array, because macOS ships bash 3.2 — which has none, and which
+# `make test` exercises these scripts under on the mac CI runner. The `_COUNT`
+# scalar bounds the scan instead of `${#array[@]}`: under `set -u`, bash 3.2
+# treats an empty array as unset. Passwords may hold any byte, so a single
+# delimited-string map would need escaping that a scan does not.
+QIITA_PGPASS_SEEN_COUNT=0
+QIITA_PGPASS_SEEN_USERS=()
+QIITA_PGPASS_SEEN_PASSWORDS=()
+qiita_pgpass_add() {
+    local user="$1" password="$2" escaped_user escaped_password i
+    for ((i = 0; i < QIITA_PGPASS_SEEN_COUNT; i++)); do
+        [[ "${QIITA_PGPASS_SEEN_USERS[i]}" == "${user}" ]] || continue
+        if [[ "${QIITA_PGPASS_SEEN_PASSWORDS[i]}" != "${password}" ]]; then
+            echo "ERROR: two connections both connect as '${user}' with different" >&2
+            echo "  passwords, so they cannot be keyed apart in a pgpass file." >&2
+            echo "  Give one of them its own role (lake-shell.sh: or re-run --no-cp)." >&2
+            exit 1
+        fi
+        return 0
+    done
+    QIITA_PGPASS_SEEN_USERS[QIITA_PGPASS_SEEN_COUNT]="${user}"
+    QIITA_PGPASS_SEEN_PASSWORDS[QIITA_PGPASS_SEEN_COUNT]="${password}"
+    QIITA_PGPASS_SEEN_COUNT=$((QIITA_PGPASS_SEEN_COUNT + 1))
+    escaped_user="${user//\\/\\\\}"; escaped_user="${escaped_user//:/\\:}"
+    escaped_password="${password//\\/\\\\}"; escaped_password="${escaped_password//:/\\:}"
+    printf '*:*:*:%s:%s\n' "${escaped_user}" "${escaped_password}" >> "${PGPASS_FILE}"
+}
+
+# Every duckdb invocation goes through here so the PGPASSFILE handling exists in
+# exactly one place. The file is only handed over when it actually holds an
+# entry — libpq ignores an empty one anyway, but not setting the variable keeps
+# a password-less deployment obviously password-less.
+qiita_run_duckdb() {
+    if [[ -s "${PGPASS_FILE}" ]]; then
+        PGPASSFILE="${PGPASS_FILE}" "${DUCKDB_BIN}" "$@"
+    else
+        "${DUCKDB_BIN}" "$@"
+    fi
+}
+
+# The lake data path must be a directory this account can traverse and read.
+# $1 = the path. Callers needing to WRITE it check that themselves.
+qiita_require_lake_data_path() {
+    local path="$1"
+    [ -d "${path}" ] || { echo "ERROR: lake data path ${path} is not a directory" >&2; exit 1; }
+    if [ ! -r "${path}" ] || [ ! -x "${path}" ]; then
+        echo "ERROR: cannot read ${path}" >&2
+        echo "  It is mode 0750 qiita-data:qiita-data — you must be in the owning group." >&2
+        echo "  Check with: ls -ld ${path} && id" >&2
+        exit 1
+    fi
+}

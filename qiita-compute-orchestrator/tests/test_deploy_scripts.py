@@ -629,27 +629,6 @@ def test_missing_sources_some_missing_returns_one_and_lists_them(tmp_path: Path)
 # same bash -n + shellcheck gate as the deploy scripts. ------------------------
 
 
-def test_lake_shell_exists_and_executable() -> None:
-    assert _LAKE_SHELL.is_file(), f"{_LAKE_SHELL} missing"
-    assert _LAKE_SHELL.stat().st_mode & 0o111, f"{_LAKE_SHELL} is not executable"
-
-
-def test_lake_shell_is_valid_bash() -> None:
-    result = subprocess.run(["bash", "-n", str(_LAKE_SHELL)], capture_output=True, text=True)
-    assert result.returncode == 0, f"bash -n failed for lake-shell.sh:\n{result.stderr}"
-
-
-def test_lake_shell_passes_shellcheck() -> None:
-    if shutil.which("shellcheck") is None:
-        pytest.skip("shellcheck not installed")
-    result = subprocess.run(
-        ["shellcheck", "-S", "warning", str(_LAKE_SHELL)], capture_output=True, text=True
-    )
-    assert result.returncode == 0, (
-        f"shellcheck flagged lake-shell.sh:\n{result.stdout}\n{result.stderr}"
-    )
-
-
 def test_lake_data_path_helper_derives_exactly_like_the_data_plane() -> None:
     """DuckLake pins DATA_PATH into the catalog at creation and rejects an attach
     whose DATA_PATH differs by even a slash, so the derivation must reproduce
@@ -771,33 +750,39 @@ def test_lake_shell_refuses_to_open_without_the_staged_miint_extension(tmp_path:
 # lake-shell.sh, so it gets the same bash -n + shellcheck gate. ---------------
 
 
+_LAKE_SCRIPTS = (_LAKE_SHELL, _LAKE_GC)
+
+
+@pytest.mark.parametrize("script", _LAKE_SCRIPTS, ids=lambda p: p.name)
+def test_lake_script_exists_and_executable(script: Path) -> None:
+    assert script.is_file(), f"{script} missing"
+    assert script.stat().st_mode & 0o111, f"{script} is not executable"
+
+
+@pytest.mark.parametrize("script", _LAKE_SCRIPTS, ids=lambda p: p.name)
+def test_lake_script_is_valid_bash(script: Path) -> None:
+    result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed for {script.name}:\n{result.stderr}"
+
+
+@pytest.mark.parametrize("script", _LAKE_SCRIPTS, ids=lambda p: p.name)
+def test_lake_script_passes_shellcheck(script: Path) -> None:
+    if shutil.which("shellcheck") is None:
+        pytest.skip("shellcheck not installed")
+    result = subprocess.run(
+        ["shellcheck", "-S", "warning", str(script)], capture_output=True, text=True
+    )
+    assert result.returncode == 0, (
+        f"shellcheck flagged {script.name}:\n{result.stdout}\n{result.stderr}"
+    )
+
+
 def _lake_gc_code() -> str:
     """The script with comment-only lines stripped, so an invariant test can
     assert about what the script *runs* without matching the header prose that
     explains the same thing."""
     return "\n".join(
         line for line in _LAKE_GC.read_text().splitlines() if not line.lstrip().startswith("#")
-    )
-
-
-def test_lake_gc_exists_and_executable() -> None:
-    assert _LAKE_GC.is_file(), f"{_LAKE_GC} missing"
-    assert _LAKE_GC.stat().st_mode & 0o111, f"{_LAKE_GC} is not executable"
-
-
-def test_lake_gc_is_valid_bash() -> None:
-    result = subprocess.run(["bash", "-n", str(_LAKE_GC)], capture_output=True, text=True)
-    assert result.returncode == 0, f"bash -n failed for lake-gc.sh:\n{result.stderr}"
-
-
-def test_lake_gc_passes_shellcheck() -> None:
-    if shutil.which("shellcheck") is None:
-        pytest.skip("shellcheck not installed")
-    result = subprocess.run(
-        ["shellcheck", "-S", "warning", str(_LAKE_GC)], capture_output=True, text=True
-    )
-    assert result.returncode == 0, (
-        f"shellcheck flagged lake-gc.sh:\n{result.stdout}\n{result.stderr}"
     )
 
 
