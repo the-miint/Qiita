@@ -74,7 +74,9 @@ class Inputs(BaseModel):
 
     reads: Path | None = None
     sortmerna_ref: Path
-    primer: str
+    # EMP V4 515F default; only consulted when orient_primer (dead otherwise), so
+    # optional — matches the workflow context_schema default and lets a submit omit it.
+    primer: str = "GTGYCAGCMGCCGCGGTAA"
     trim: int
     orient_primer: bool = False
     sequenced_pool_idx: int

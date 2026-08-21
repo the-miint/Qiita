@@ -115,6 +115,8 @@ async def _mint_processing_idx(
     async with pool.acquire() as conn:
         row = await mint_processing(conn, workflow=action_id, version=action_version, params=params)
     bindings: dict[str, Any] = {PROCESSING_IDX_BINDING: row["processing_idx"]}
-    if params["assembler"] is not None:
+    # `assembler` is absent for a non-assembly workflow (params drops None knobs),
+    # so `.get` — only bind it back when the identity actually hashed it.
+    if params.get("assembler") is not None:
         bindings[ASSEMBLER_BINDING] = params["assembler"]
     return bindings
