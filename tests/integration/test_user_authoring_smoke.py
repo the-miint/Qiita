@@ -7,7 +7,7 @@ study, biosample, sequencing-run, sequenced-pool, sequenced-sample,
 fastq-to-parquet ticket submit, ticket status. Driving the actual CLI
 (not raw HTTP) also pins the flag names documented in
 docs/runbooks/getting-started.md (study, biosample) and
-docs/runbooks/user-cli-quickstart.md (the rest) against argparse drift.
+docs/runbooks/manual-sample-walkthrough.md (the rest) against argparse drift.
 
 Each step clears a per-resource auth gate (study owner / run-or-pool
 creator / per-study ADMIN) — the regression guard against any gate

@@ -63,7 +63,7 @@ NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 # the strings — a key renamed in the YAML then lights up its importers
 # rather than silently drifting. The gate enforces that each such path's
 # basename is prefixed by the prep_sample's sequenced_pool_item_id (see
-# docs/runbooks/user-cli-quickstart.md).
+# docs/runbooks/manual-sample-walkthrough.md).
 FASTQ_PATH_CONTEXT_KEYS: tuple[str, str] = ("fastq_path", "reverse_fastq_path")
 
 

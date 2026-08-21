@@ -2170,14 +2170,17 @@ duplicates further down are historical strata; leave them where they are.
   written, so a forced re-run stops there instead — which is what the messages now say.
 
 - **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`,
-  `user-cli-quickstart.md` and `pacbio-ingest.md` are what a person with samples reads, so they
+  `manual-sample-walkthrough.md` and `pacbio-ingest.md` are what a person with samples reads, so
   no longer explain themselves in route paths, guard-function names, column constraints and HTTP
   status codes. What a reader has to *do* differently is unchanged and every mechanism that
   changes an outcome is still stated — in terms of what they will see. Identifiers they type or
   read back (CLI flags, ticket states, pre-flight column names, `skipped`) stay verbatim.
 
-- **`user-cli-quickstart.md` is now the by-hand path only, and the landing page points at the
-  new runbook (#461).** It kept a full copy of login, profile, study and biosample creation,
+- **`user-cli-quickstart.md` becomes `manual-sample-walkthrough.md`, the by-hand path only, and
+  the landing page points at the new runbook (#461).** The old name claimed to be the quickstart
+  for a procedure nobody should run on a live system; it exists to prove a deploy works and to
+  learn the CLI, and `getting-started.md` is the quickstart. It kept a full copy of login,
+  profile, study and biosample creation,
   which the getting-started runbook now owns; what remains is what is unique to it — minting a
   run, pool and sequenced-sample yourself and submitting `fastq-to-parquet` against FASTQs you
   already hold. `pacbio-ingest.md` likewise drops where-to-run-the-CLI, the pre-flight

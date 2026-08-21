@@ -33,8 +33,12 @@ qiita submit-pacbio-ingest \
   site with `qiita prep-protocol list` rather than copying one from anywhere —
   nothing will catch a wrong number for you, and a wrong one mislabels every
   prep_sample in the run.
-- **Re-running the identical command is the retry.** prep_samples still missing
-  get submitted; ones already in flight are skipped.
+- **Re-running the identical command is the retry**, but it is not free. The run
+  and pool are reused and missing prep_samples are added, and any whose job is
+  still running are reported `skipped`. A prep_sample whose reads already loaded
+  is **not** skipped — it gets a fresh job, which then stops at the read-numbering
+  step because its reads are already numbered. That is safe (nothing is stored
+  twice) but it shows up as a failed job, so expect it and do not chase it.
 
 ## `pool-completion` will not tell you the load finished
 

@@ -347,7 +347,7 @@ read-loading failures is in
 
 - **One sample at a time, with no pre-flight file** — registering a run, pool and
   sample by hand and processing FASTQs you already hold:
-  [`user-cli-quickstart.md`](user-cli-quickstart.md).
+  [`manual-sample-walkthrough.md`](manual-sample-walkthrough.md).
 - **What happens to the reads next** — read masking (host-filtering among it),
   alignment and feature tables: `qiita submit-host-filter-pool`, `submit-block-mask-pool`,
   `submit-align-pool`, `feature-table build`.

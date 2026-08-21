@@ -1105,7 +1105,7 @@ End-to-end execution runs through the end-user `qiita` CLI
 `qiita sequenced-sample create` / `qiita ticket submit` /
 `qiita ticket status`). Steps 0-3 of
 [`docs/runbooks/getting-started.md`](getting-started.md) cover login through
-the biosample; [`docs/runbooks/user-cli-quickstart.md`](user-cli-quickstart.md)
+the biosample; [`docs/runbooks/manual-sample-walkthrough.md`](manual-sample-walkthrough.md)
 carries it from there to a `COMPLETED` ticket.
 
 Together the two drive the smoke from a fresh user PAT through to a

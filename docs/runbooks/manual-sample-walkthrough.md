@@ -1,15 +1,16 @@
-# User CLI quickstart
+# Manual sample walkthrough
 
 > Registering **one prep_sample by hand** — no pre-flight file — and
 > processing FASTQs you already hold. Everything here you can do with an
 > ordinary account; no admin is involved at any point.
 
-**This is not how you bring in real data.** Two reasons to walk it: an
-operator runs it after a deploy to prove the system works end to end, and a
-user runs it once to check they understand the CLI. Neither is a good idea
-on a live system. To bring in an actual sequencing run, one command does the
-run, the pool and every prep_sample for you from the run's pre-flight file —
-[`getting-started.md`](getting-started.md) — and that is the path to use.
+**This is not how you bring in real data**, and it is not the quickstart —
+[`getting-started.md`](getting-started.md) is. There are two reasons to walk
+this one: an operator runs it after a deploy to prove the system works end to
+end, and a user runs it once to check they understand the CLI. Neither is a
+good idea on a live system. To bring in an actual sequencing run, one command
+does the run, the pool and every prep_sample for you from the run's pre-flight
+file — that is the path to use.
 
 ## Before you start
 

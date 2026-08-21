@@ -446,15 +446,18 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         # resilient: a single ticket's failure is recorded and the loop CONTINUES,
         # so one bad sample never strands the rest (mirrors submit-host-filter-pool).
         #
-        # A 409 is NOT a failure — it is the convergence signal: a sample already
-        # COMPLETED (disallow-without-delete) or already in-flight
-        # (PENDING/QUEUED/PROCESSING) rejects a duplicate submit with 409. That is
-        # exactly "already done / already running", so we record it as SKIPPED and
-        # do NOT count it toward the non-zero exit — re-running the gesture to
-        # retry a failed sample must not report the finished ones as failures.
-        # (A FAILED sample's ticket is reset by the route and re-submitted 201,
-        # so it converges without a skip. --force is the separate, deliberate
-        # re-ingest path and intentionally NOT the recovery route here.)
+        # A 409 is NOT a failure — it means the prep_sample already has a ticket
+        # in flight (PENDING/QUEUED/PROCESSING), so this submit is a duplicate of
+        # work already running. Recorded as SKIPPED and NOT counted toward the
+        # non-zero exit, so re-running to retry one sample does not report the
+        # running ones as failures.
+        #
+        # A COMPLETED ticket does NOT land here: the prep_sample arm of
+        # _check_disallow_without_delete binds NON_TERMINAL states only, so an
+        # already-loaded prep_sample is admitted (202) and then fails at the
+        # read-numbering step, which refuses a range another ticket reserved.
+        # A FAILED sample's ticket is reset by the route and re-submitted, so it
+        # converges without a skip.
         failures: list[dict] = []
         skipped: list[dict] = []
         for entry in per_sample:
@@ -477,8 +480,8 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                 )
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 409:
-                    # Already ingested (COMPLETED) or already in-flight — converged,
-                    # not failed. Skip without contributing to the non-zero exit.
+                    # Already in flight — converged, not failed. Skip without
+                    # contributing to the non-zero exit.
                     skipped.append(
                         {
                             "pacbio_sample_idx": entry["pacbio_sample_idx"],
