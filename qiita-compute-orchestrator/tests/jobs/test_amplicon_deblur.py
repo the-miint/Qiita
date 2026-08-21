@@ -1,10 +1,9 @@
-"""Pure-unit tests for the amplicon_deblur Inputs contract (no miint).
+"""tests for the amplicon_deblur Inputs contract (no miint).
 
-Pins the optionality the live e2e exposed: a submit passes only the required
-context (sortmerna_reference_idx→sortmerna_ref, trim) and lets the runner stream
-reads, so `reads` and `primer` MUST be optional — the workflow YAML's
-context_schema defaults are NOT auto-applied to action_context, so a missing
-`primer` would otherwise fail Inputs validation before the job runs.
+pin the optionality the live e2e exposed: a submit passes only sortmerna_ref and
+trim and lets the runner stream reads, so `reads` and `primer` must be optional.
+YAML context_schema defaults are not auto-applied, so a required `primer` would
+otherwise fail validation.
 """
 
 from __future__ import annotations

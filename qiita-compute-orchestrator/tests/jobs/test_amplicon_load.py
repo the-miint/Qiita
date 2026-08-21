@@ -1,11 +1,8 @@
-"""Tests for the amplicon_load native job.
+"""tests for the amplicon_load job.
 
-Calls execute() directly. Synthesizes deblur's `asv_counts`
-(prep_sample_idx, sequence_hash, count) + mint-features' `feature_map`
-(sequence_hash, feature_idx) and asserts the single DuckLake-shape staging
-Parquet `amplicon_membership` (prep_sample_idx, processing_idx, feature_idx,
-count). No miint — a plain in-memory DuckDB writes the fixtures and reads the
-result back, isolating the sequence_hash join + processing_idx stamp.
+call execute() directly on synthesized asv_counts + feature_map, and assert the
+amplicon_membership staging parquet. no miint; a plain in-memory DuckDB writes
+the fixtures and reads the result back.
 """
 
 from __future__ import annotations

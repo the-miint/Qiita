@@ -1,13 +1,8 @@
-"""Pure-unit tests for the in-job Golay (12,11,8) decode-cloud generator.
+"""tests for the in-job Golay decode-cloud generator.
 
-The demux no longer reads a vendored `(raw, corrected, errors)` Parquet — it
-generates the extended-binary-Golay [24,12] decode cloud from a baked systematic
-generator (`golay_demux._golay_cloud_rows`). These tests pin the code's
-correctness invariants WITHOUT the 36 MB vendored table (min distance 8 → k≤3
-neighbours are uniquely correctable; the counts are exactly combinatorial), and
-— when the vendored table happens to be present locally — assert the generated
-cloud reproduces it byte-for-byte for errors≤3. No infrastructure; runs in the
-pure-unit tier.
+pin the correctness invariants without the vendored table (min distance 8, so
+k<=3 neighbours are unique and the counts are combinatorial). when the vendored
+table is present locally, also assert an exact match for errors<=3.
 """
 
 from __future__ import annotations

@@ -1,12 +1,9 @@
-"""Real-miint smoke for golay_demux's demux half (`_run_demux`).
+"""real-miint smoke for golay_demux's demux half (`_run_demux`).
 
-Exercises the in-job Golay cloud generation + the reverse-complement + the
-barcode→prep_sample assignment end to end against tiny synthetic FASTQ, using
-miint's `read_fastx` / `sequence_dna_reverse_complement` (the hardened revcomp,
-not a hand-rolled one). Calls `_run_demux` directly — the per-sample ingest half
-(mint_or_reuse_sequence_range) is the shared helper already pinned by
-test_ingest_reads, so it is not re-tested here. `_smoke` suffix: needs the staged
-miint extension (conftest stages it once per session), runs in the pure-unit tier.
+exercise the in-job Golay cloud, the revcomp, and the barcode→prep_sample
+assignment on tiny synthetic FASTQ, using miint's read_fastx and
+sequence_dna_reverse_complement. the ingest half is the shared
+mint_or_reuse_sequence_range, already covered by test_ingest_reads.
 """
 
 from __future__ import annotations

@@ -1,10 +1,8 @@
 action_id: amplicon
 version: 1.0.0
 target_kind: sequenced_pool
-# No target_processing_kinds: like long-read-assembly there is no "denoised"
-# ProcessingKind, and the run identity is the amplicon knobs (trim / primer /
-# orient_primer / sortmerna_reference_idx), which the runner hashes into a
-# processing_idx before the step loop.
+# no target_processing_kinds; the run identity is the amplicon knobs, which the
+# runner hashes into a processing_idx before the step loop.
 
 description: >
   Rapid 16S amplicon denoising for a sequenced pool's already-ingested reads
@@ -29,8 +27,7 @@ description: >
 scopes: []
 
 audience:
-  # A processing workflow over a pool's stored reads. Available to end users and
-  # above; no service-account (LIMS) submission today.
+  # processing over a pool's reads; users and up, no service account.
   service: false
   human_roles: [user, wet_lab_admin, system_admin]
 
@@ -38,34 +35,28 @@ context_schema:
   type: object
   required: [sortmerna_reference_idx, trim]
   properties:
-    # The loaded SortMeRNA 16S reference (a sequence_reference). The runner
-    # materializes its sequences to a FASTA (`sortmerna_ref`) via the data plane —
-    # a STABLE reference identity, not a fixed operator path. Part of the run
-    # identity (a different pre-filter reference is a different result).
+    # loaded SortMeRNA 16S reference; materialized by the runner. part of the
+    # run identity (a different reference is a different result).
     sortmerna_reference_idx:
       type: integer
       minimum: 1
-    # bp truncation length (150 for the GG2 V4 catalog). Result-affecting.
+    # truncation length (150 for the GG2 V4 catalog). result-affecting.
     trim:
       type: integer
       minimum: 1
-    # Forward primer; only consulted when orient_primer. Rapid 16S reads arrive
-    # primer-stripped, so orient defaults off and the primer is otherwise unused.
+    # forward primer; used only when orient_primer (off by default).
     primer:
       type: string
       minLength: 1
       default: GTGYCAGCMGCCGCGGTAA
-    # Run the primer search/orient/extract step (default off — see above).
+    # run the primer orient step (default off).
     orient_primer:
       type: boolean
       default: false
 
 steps:
-  # Denoise the pool's reads into ASVs. The step declares NO reads input — the
-  # pool's raw reads STREAM from the data plane at runtime (the absence of a reads
-  # input is the streaming signal, like the block workflows). Only `sortmerna_ref`
-  # (the materialized reference FASTA) is runner-resolved; the scalar knobs ride
-  # `params:`. Emits the mint-features manifest + per-sample counts.
+  # denoise into ASVs. no reads input — the pool's reads stream at runtime.
+  # only sortmerna_ref is runner-resolved; the knobs ride params.
   - step: denoise
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.amplicon_deblur
@@ -77,15 +68,13 @@ steps:
       mem_gb: 64
       walltime: PT8H
 
-  # Mint a feature_idx per distinct ASV sequence_hash against the shared feature
-  # space. Consumes the manifest, produces the (sequence_hash, feature_idx) map.
+  # mint a feature_idx per ASV against the shared feature space.
   - action: mint-features
     inputs: [asv_manifest]
     outputs: [feature_map]
 
-  # Join the per-sample counts to the feature map and write the DuckLake
-  # amplicon_membership staging Parquet. processing_idx (minted pre-loop from the
-  # amplicon knobs) rides params — its presence also signals the runner to mint it.
+  # join counts to the feature map, write amplicon_membership. processing_idx
+  # rides params and signals the runner to mint it.
   - step: amplicon_load
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.amplicon_load
@@ -97,17 +86,13 @@ steps:
       mem_gb: 8
       walltime: PT1H
 
-  # Load amplicon_membership.parquet into the DuckLake `amplicon_membership` table
-  # (pure append — a re-run reuses the same processing_idx, gated by
-  # disallow-without-delete).
+  # load amplicon_membership into the lake (pure append; the re-run gate handles it).
   - action: register-files
     inputs: [staging_dir]
     outputs: []
 
 action_ceiling:
-  # mem_gb above the denoise baseline (64) so a memory retry has headroom to
-  # escalate — MAFFT/deblur over a large pool can spike (see the escalation-
-  # headroom guard in test_actions_loader.py).
+  # mem_gb above the denoise baseline so a memory retry can escalate.
   cpu: 8
   mem_gb: 128
   walltime: PT12H
