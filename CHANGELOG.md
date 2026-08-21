@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **`scripts/lake-gc.sh` reports and reclaims unreferenced lake files (#PR).** DuckLake
+- **`scripts/lake-gc.sh` reports and reclaims unreferenced lake files (#472).** DuckLake
   never reclaims a data file on its own: deleting rows leaves the Parquet on disk and
   still held by the snapshots that predate the delete, so every `register_files`
   replace-by-key and every `delete_reference` / `delete_mask` / `delete_pool_reads` /
@@ -1021,7 +1021,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **A redriven work ticket can register its files again (#PR).** `lake_dest_filename`
+- **A redriven work ticket can register its files again (#472).** `lake_dest_filename`
   minted `wt<work_ticket_idx>-<basename>`, whose uniqueness assumed one load per ticket.
   A redrive replays a ticket's storage tail into a fresh `attempt-<n>` workspace, so the
   second load targeted the byte-identical path the first had already registered and

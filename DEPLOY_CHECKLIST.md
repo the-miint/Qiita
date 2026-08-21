@@ -42,7 +42,7 @@ _None yet._
   Expect three counted rows and `Nothing was removed`. A `DATA_PATH parameter … does not
   match` means the derivation drifted from `PATH_PERSISTENT`; a missing `duckdb` means the
   CLI isn't on a path that account can traverse (its home is not readable to it).
-  (#fix/lake-dest-filename-and-gc)
+  (#472)
 
 ### 6. After the deploy verifies green
 
@@ -58,7 +58,7 @@ _None yet._
   path; the procedure below drops `assembly_load`'s row, so it does. 6939 was restored to
   `completed` and the 16,395 `UNBINNED` `assembly_membership` rows its partial run wrote
   were deleted, so no prep_sample is left half-backfilled.
-  (#fix/lake-dest-filename-and-gc)
+  (#472)
 
 - **Readiness was re-verified 2026-08-21 and the candidate set is intact**: 7,234 ticket
   workspaces, 57 carrying all six retained steps, and all 342 of those workspaces passing
@@ -290,7 +290,7 @@ sys.exit(1 if bad else 0)'
   staging dir, which is what lets one ticket register twice (a redrive). Files already on
   disk are not renamed, so both shapes coexist. Anything matching lake filenames should key
   on the `wt<idx>-` prefix, not on the whole name.
-  (#fix/lake-dest-filename-and-gc)
+  (#472)
 
 - **Nothing has ever reclaimed superseded lake files, and `scripts/lake-gc.sh` is the first
   thing that can.** Every `register_files` replace-by-key and every `delete_reference` /
@@ -300,7 +300,7 @@ sys.exit(1 if bad else 0)'
   snapshot history (7 days kept unless `--older-than` says otherwise) and that is not
   reversible. Quiesce registrations first — the script header says why the cutoff alone
   does not make a concurrent load safe.
-  (#fix/lake-dest-filename-and-gc)
+  (#472)
 
 ---
 
