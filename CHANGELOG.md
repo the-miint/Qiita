@@ -2179,7 +2179,9 @@ duplicates further down are historical strata; leave them where they are.
 - **`user-cli-quickstart.md` becomes `manual-sample-walkthrough.md`, the by-hand path only, and
   the landing page points at the new runbook (#461).** The old name claimed to be the quickstart
   for a procedure nobody should run on a live system; it exists to prove a deploy works and to
-  learn the CLI, and `getting-started.md` is the quickstart. It kept a full copy of login,
+  learn the CLI, and `getting-started.md` is the quickstart. Two manual steps the new runbook
+  has to document — pre-opening the pre-flight file, and needing a machine that mounts the
+  cluster's filesystem — are tracked for removal in #470 and #471. It kept a full copy of login,
   profile, study and biosample creation,
   which the getting-started runbook now owns; what remains is what is unique to it — minting a
   run, pool and sequenced-sample yourself and submitting `fastq-to-parquet` against FASTQs you
