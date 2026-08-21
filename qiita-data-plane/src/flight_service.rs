@@ -2330,7 +2330,11 @@ fn register_files(
         // across loads, so placing the bare basename would collide with an
         // already-registered file in the same per-table dir. `move_file`
         // refuses to overwrite besides, as a hard safety net.
-        let dest = dest_dir.join(lake_dest_filename(payload.work_ticket_idx, basename));
+        let dest = dest_dir.join(lake_dest_filename(
+            payload.work_ticket_idx,
+            &payload.staging_dir,
+            basename,
+        ));
         move_file(&src, &dest)?;
         // Both SQL passes below name the destination as a string, so resolve it
         // once here rather than re-deriving (and re-erroring on) it twice.
@@ -2356,8 +2360,8 @@ fn register_files(
     //
     // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above have
     // already happened and are NOT rolled back. That is intentional and safe.
-    // Each dest name is ticket-unique (lake_dest_filename prefixes the work
-    // ticket) and move_file refuses to overwrite, so a rolled-back registration
+    // Each dest name is registration-unique (lake_dest_filename keys on the work
+    // ticket and the staging dir) and move_file refuses to overwrite, so a rolled-back registration
     // leaves at most an unreferenced orphan Parquet on disk — never a collision
     // and never a double-registration. This matches how DuckLake already
     // tolerates orphan Parquets (the delete_* actions reclaim nothing from disk
@@ -3055,15 +3059,33 @@ fn delete_alignment_block(
 /// (`part_00000.parquet`, `reference_<table>.parquet`) on every load, so the
 /// bare basename is NOT unique within a per-table lake dir: two registrations
 /// into the same table would target the same path and the second would clobber
-/// the first's live, catalog-registered file. Prefixing with the originating
-/// work ticket makes the name unique across loads (every load is a distinct
-/// ticket) while staying unique within a load (the basename — part index or
-/// table name — still distinguishes files under one ticket), and lets an
-/// operator trace any lake file back to the ticket that wrote it. DuckLake
-/// names its own INSERT-written data files uniquely for the same reason; this
-/// is the equivalent for our "register an existing file" path.
-fn lake_dest_filename(work_ticket_idx: i64, basename: &str) -> String {
-    format!("wt{work_ticket_idx}-{basename}")
+/// the first's live, catalog-registered file. The basename — part index or
+/// table name — still distinguishes files within one registration; the two
+/// components below separate one registration from another:
+///
+/// * `wt{work_ticket_idx}` traces the file back to the ticket that wrote it.
+/// * A digest of the registration's staging dir separates two loads from ONE
+///   ticket. A ticket can load twice: a redrive replays its storage tail into a
+///   fresh `attempt-<n>` workspace, and the ticket alone yields the
+///   byte-identical path the first load already registered, which [`move_file`]
+///   refuses. `staging_dir` carries the attempt, so it differs across redrives.
+///
+/// Deterministic for a given (ticket, staging dir): a replayed DoAction
+/// recomputes the same name, so [`move_file`] still refuses a true
+/// double-registration. Tables outside `REPLACE_KEY_TABLES` — e.g.
+/// `reference_membership` — have no replace-by-key to absorb a second
+/// registration, so that refusal is what keeps `register_files` replay-safe for
+/// them; randomness here would double their rows on replay.
+///
+/// DuckLake names its own INSERT-written data files uniquely for the same
+/// reason; this is the equivalent for our "register an existing file" path.
+fn lake_dest_filename(work_ticket_idx: i64, staging_dir: &str, basename: &str) -> String {
+    let digest = Sha256::digest(staging_dir.as_bytes());
+    // 48 bits, enough to separate the attempts one ticket can have
+    // (`max_retries` bounds them). A collision lands on move_file's
+    // AlreadyExists, not a silent clobber.
+    let scope: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+    format!("wt{work_ticket_idx}-{scope}-{basename}")
 }
 
 /// Move a file, falling back to copy+delete for cross-filesystem moves.
@@ -4456,22 +4478,58 @@ mod tests {
     // other in the shared per-table lake dir.
     #[test]
     fn lake_dest_filename_is_traceable_and_unique_across_tickets() {
-        let a = lake_dest_filename(27, "part_00000.parquet");
-        let b = lake_dest_filename(31, "part_00000.parquet");
-        assert_eq!(a, "wt27-part_00000.parquet", "name embeds the work ticket");
+        let staging = "/scratch/ticket/27/assembly_load/attempt-0/output";
+        let a = lake_dest_filename(27, staging, "part_00000.parquet");
+        let b = lake_dest_filename(31, staging, "part_00000.parquet");
+        assert!(a.starts_with("wt27-"), "name embeds the work ticket: {a}");
+        assert!(
+            a.ends_with("-part_00000.parquet"),
+            "name preserves the producer basename: {a}"
+        );
         assert_ne!(
             a, b,
             "same basename under different tickets must not collide"
         );
         // Deterministic — no randomness, so a resume/retry recomputes the same
         // name and the move_file guard can detect a true double-registration.
-        assert_eq!(a, lake_dest_filename(27, "part_00000.parquet"));
-        // Distinct basenames within one ticket stay distinct (multiple parts
-        // and the flat per-table files share a ticket).
+        assert_eq!(a, lake_dest_filename(27, staging, "part_00000.parquet"));
+        // Distinct basenames within one registration stay distinct (multiple
+        // parts and the flat per-table files share a ticket).
         assert_ne!(
-            lake_dest_filename(27, "part_00001.parquet"),
-            lake_dest_filename(27, "reference_membership.parquet")
+            lake_dest_filename(27, staging, "part_00001.parquet"),
+            lake_dest_filename(27, staging, "reference_membership.parquet")
         );
+    }
+
+    // Regression (backfill redrive): ONE ticket can register twice. Redriving a
+    // ticket's storage tail replays it into a fresh `attempt-<n>` workspace, so
+    // the second load reaches register_files with the same work_ticket_idx and
+    // the same producer basenames as the first. Keying the name on the ticket
+    // alone made that second load target the byte-identical path the first had
+    // already registered, and move_file refused it with AlreadyExists —
+    // observed on the live host as `refusing to overwrite existing lake file
+    // …/assembled_sequence_chunks/wt6939-part_00000.parquet`, which blocked the
+    // whole unbinned-residue backfill. staging_dir carries the attempt, so it is
+    // what separates the two.
+    #[test]
+    fn lake_dest_filename_separates_redrives_of_one_ticket() {
+        let first = lake_dest_filename(
+            6939,
+            "/scratch/ticket/6939/assembly_load/attempt-0/output",
+            "part_00000.parquet",
+        );
+        let redrive = lake_dest_filename(
+            6939,
+            "/scratch/ticket/6939/assembly_load/attempt-1/output",
+            "part_00000.parquet",
+        );
+        assert_ne!(
+            first, redrive,
+            "a redrive of one ticket must not target the first load's path"
+        );
+        for name in [&first, &redrive] {
+            assert!(name.starts_with("wt6939-"), "still traceable: {name}");
+        }
     }
 
     // --- register_files filename validation (pure; no DuckDB) ---
@@ -4854,11 +4912,12 @@ mod tests {
             outcome.replaced.is_empty(),
             "reference_membership is not a REPLACE_KEY_TABLES target, so nothing is replaced"
         );
-        // The dest carries the ticket-unique minted name under the per-table dir.
+        // The dest carries the registration-unique minted name under the
+        // per-table dir.
         let dest = std::path::Path::new(&outcome.registered[0]);
         assert_eq!(
             dest.file_name().and_then(|f| f.to_str()).unwrap(),
-            lake_dest_filename(ticket, "reference_membership.parquet")
+            lake_dest_filename(ticket, &payload.staging_dir, "reference_membership.parquet")
         );
         assert!(dest.exists(), "registered lake file present on disk");
         assert!(

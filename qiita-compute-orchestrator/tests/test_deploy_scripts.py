@@ -26,6 +26,7 @@ _DEPLOY = _REPO_ROOT / "deploy"
 _COMMON = _DEPLOY / "_common.sh"
 _BUILD_SIF = _REPO_ROOT / "scripts" / "build-sif.sh"
 _LAKE_SHELL = _REPO_ROOT / "scripts" / "lake-shell.sh"
+_LAKE_GC = _REPO_ROOT / "scripts" / "lake-gc.sh"
 
 # The scripts introduced/maintained for the deploy-ease work. Kept
 # explicit (not a glob) so a new deploy script is a deliberate add here.
@@ -749,3 +750,148 @@ def test_lake_shell_refuses_to_open_without_the_staged_miint_extension(tmp_path:
     )
     assert result.returncode == 1, f"expected a hard failure, got:\n{result.stdout}"
     assert "MIINT_EXTENSION_DIRECTORY" in result.stderr
+
+
+# --- scripts/lake-gc.sh: DuckLake reclamation. Reports by default; --reclaim
+# expires snapshots and unlinks files. Sources deploy/_common.sh like
+# lake-shell.sh, so it gets the same bash -n + shellcheck gate. ---------------
+
+
+def _lake_gc_code() -> str:
+    """The script with comment-only lines stripped, so an invariant test can
+    assert about what the script *runs* without matching the header prose that
+    explains the same thing."""
+    return "\n".join(
+        line for line in _LAKE_GC.read_text().splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def test_lake_gc_exists_and_executable() -> None:
+    assert _LAKE_GC.is_file(), f"{_LAKE_GC} missing"
+    assert _LAKE_GC.stat().st_mode & 0o111, f"{_LAKE_GC} is not executable"
+
+
+def test_lake_gc_is_valid_bash() -> None:
+    result = subprocess.run(["bash", "-n", str(_LAKE_GC)], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed for lake-gc.sh:\n{result.stderr}"
+
+
+def test_lake_gc_passes_shellcheck() -> None:
+    if shutil.which("shellcheck") is None:
+        pytest.skip("shellcheck not installed")
+    result = subprocess.run(
+        ["shellcheck", "-S", "warning", str(_LAKE_GC)], capture_output=True, text=True
+    )
+    assert result.returncode == 0, (
+        f"shellcheck flagged lake-gc.sh:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_lake_gc_help_exits_zero_and_names_reclaim() -> None:
+    result = subprocess.run(["bash", str(_LAKE_GC), "--help"], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "--reclaim" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "7; DROP TABLE x",  # injection shape — the value lands in an INTERVAL literal
+        "7 FORTNIGHTS",  # not an INTERVAL unit
+        "DAYS",  # no quantity
+        "-1 DAYS",  # negative retention would expire everything
+    ],
+)
+def test_lake_gc_rejects_malformed_retention(bad: str) -> None:
+    """--older-than is interpolated into `now() - INTERVAL <value>`, so it is
+    constrained to the shape an INTERVAL takes rather than screened afterwards."""
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC), "--older-than", bad], capture_output=True, text=True
+    )
+    assert result.returncode == 1, f"expected refusal for {bad!r}:\n{result.stdout}"
+    assert "--older-than must be" in result.stderr
+
+
+def test_lake_gc_rejects_unknown_argument() -> None:
+    result = subprocess.run(["bash", str(_LAKE_GC), "--wat"], capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "unknown argument" in result.stderr
+
+
+def _lake_gc_env(tmp_path, *, writable: bool = True) -> dict:
+    """A data-plane env plus a lake dir, with duckdb stubbed by `true` so the
+    script's own logic runs without a catalog. `true` prints nothing, which is the
+    same shape as a maintenance call that reclaims nothing. Resolved via PATH —
+    it is /usr/bin/true on macOS and /bin/true on most Linux."""
+    persistent = tmp_path / "persistent"
+    (persistent / "ducklake").mkdir(parents=True)
+    if not writable:
+        (persistent / "ducklake").chmod(0o500)
+    dp_env = tmp_path / "data-plane.env"
+    dp_env.write_text(
+        "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=localhost user=lake_rw'\n"
+        f"PATH_PERSISTENT={persistent}\n"
+    )
+    stub = shutil.which("true")
+    assert stub, "no `true` on PATH to stub duckdb with"
+    return {**os.environ, "DP_ENV": str(dp_env), "QIITA_DUCKDB_BIN": stub}
+
+
+def test_lake_gc_defaults_to_report_only(tmp_path) -> None:
+    """No flag must never reclaim: the whole point of the default run is that an
+    operator can look before anything is unlinked."""
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC)], capture_output=True, text=True, env=_lake_gc_env(tmp_path)
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "report only" in result.stdout
+    assert "Nothing was removed" in result.stdout
+
+
+def test_lake_gc_reclaim_mode_announces_it_acts(tmp_path) -> None:
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC), "--reclaim"],
+        capture_output=True,
+        text=True,
+        env=_lake_gc_env(tmp_path),
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "--reclaim" in result.stdout
+    assert "Nothing was removed" not in result.stdout
+
+
+def test_lake_gc_refuses_unwritable_data_path(tmp_path) -> None:
+    """Reclamation unlinks files under a 0750 qiita-data dir, so group read is
+    not enough. Failing here names the right run-as instead of surfacing as a
+    permission error from inside duckdb."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the write bit")
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC)],
+        capture_output=True,
+        text=True,
+        env=_lake_gc_env(tmp_path, writable=False),
+    )
+    assert result.returncode == 1
+    assert "not writable" in result.stderr
+    assert "qiita-data" in result.stderr
+
+
+def test_lake_gc_never_passes_cleanup_all() -> None:
+    """`cleanup_all := true` bypasses the mtime filter, and register_files moves
+    a file into the lake dir before its catalog transaction commits — so a
+    concurrent load's just-placed file would be indistinguishable from an
+    orphan. The mtime filter is the only thing separating them."""
+    assert "cleanup_all" not in _lake_gc_code()
+
+
+def test_lake_gc_always_passes_older_than_explicitly() -> None:
+    """Relying on the extension's default retention would let an upstream change
+    silently move how much history this script destroys."""
+    code = _lake_gc_code()
+    pattern = r"ducklake_(?:expire_snapshots|cleanup_old_files|delete_orphaned_files)\([^;]*"
+    calls = re.findall(pattern, code)
+    assert len(calls) == 3, f"expected the three maintenance calls, found {len(calls)}"
+    for call in calls:
+        assert "older_than :=" in call, f"call without an explicit older_than: {call}"
+        assert "dry_run :=" in call, f"call without an explicit dry_run: {call}"

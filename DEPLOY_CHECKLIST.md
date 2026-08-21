@@ -31,24 +31,33 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- **`scripts/lake-gc.sh` reports against the live catalog.** Read-only in its default mode
+  (it acts only under `--reclaim`), so this is safe to run as a check, and its output sizes
+  the reclaimable pile for the bucket-6 decision. Run as the account that owns the data
+  path; `--help` explains the flags.
+  ```bash
+  sudo -u qiita-data /usr/local/bin/duckdb --version   # 1.5.4, reachable by that account
+  sudo -u qiita-data bash /home/qiita/qiita-miint/scripts/lake-gc.sh
+  ```
+  Expect three counted rows and `Nothing was removed`. A `DATA_PATH parameter … does not
+  match` means the derivation drifted from `PATH_PERSISTENT`; a missing `duckdb` means the
+  CLI isn't on a path that account can traverse (its home is not readable to it).
+  (#fix/lake-dest-filename-and-gc)
 
 ### 6. After the deploy verifies green
 
-- **BLOCKED — do not run the backfill below yet.** It redrives each ticket under its
-  existing `work_ticket_idx`, and `register-files` fails at the file move:
-  `lake_dest_filename` (`qiita-data-plane/src/flight_service.rs`) mints
-  `wt<work_ticket_idx>-<basename>`, which is unique only across tickets, not across two
-  loads from one ticket; `move_file` then refuses to overwrite the file that ticket's
-  original run already registered. Observed 2026-08-21 on work_ticket 6939: the six
-  retained steps fast-forwarded, `assembly_hash` → `assembly_load` replayed clean, then
-  `register-files` failed `permanent` with `refusing to overwrite existing lake file
-  <PATH_PERSISTENT>/ducklake/assembled_sequence_chunks/wt6939-part_00000.parquet`. All 57
-  candidates collide the same way. The destination name must become unique per
-  registration rather than per ticket before this runs; the procedure below then needs no
-  other change. 6939 was restored to `completed` and the 16,395 `UNBINNED`
+- **Needs the data plane from this wave — do not run the backfill below on an older
+  build.** It redrives each ticket under its existing `work_ticket_idx`, which used to
+  fail at the file move: `lake_dest_filename` minted `wt<work_ticket_idx>-<basename>`,
+  unique across tickets but not across two loads from one ticket, so `move_file` refused
+  to overwrite the file that ticket's original run had registered. Observed 2026-08-21 on
+  work_ticket 6939 — `refusing to overwrite existing lake file
+  <PATH_PERSISTENT>/ducklake/assembled_sequence_chunks/wt6939-part_00000.parquet` — and all
+  57 candidates collide the same way. The name now also carries a digest of the
+  registration's `staging_dir`, so a redrive lands on its own path; the procedure below
+  needs no other change. 6939 was restored to `completed` and the 16,395 `UNBINNED`
   `assembly_membership` rows its partial run wrote were deleted, so no sample is left
-  half-backfilled.
+  half-backfilled. (#fix/lake-dest-filename-and-gc)
 
 - **Readiness was re-verified 2026-08-21 and the candidate set is intact**: 7,234 ticket
   workspaces, 57 carrying all six retained steps, and all 342 of those workspaces passing
@@ -274,7 +283,21 @@ sys.exit(1 if bad else 0)'
 
 ### Notes (no host action)
 
-_None yet._
+- **Lake data files registered from this build carry an extra name segment.** The shape
+  goes from `wt<work_ticket_idx>-<basename>` to
+  `wt<work_ticket_idx>-<12 hex>-<basename>`; the hex is a digest of the registration's
+  staging dir, which is what lets one ticket register twice (a redrive). Files already on
+  disk are not renamed, so both shapes coexist. Anything matching lake filenames should key
+  on the `wt<idx>-` prefix, not on the whole name.
+  (#fix/lake-dest-filename-and-gc)
+
+- **Nothing has ever reclaimed superseded lake files, and `scripts/lake-gc.sh` is the first
+  thing that can.** Every `register_files` replace-by-key and every `delete_reference` /
+  `delete_mask` / `delete_pool_reads` / `delete_alignment` leaves its Parquet on disk. The
+  script reports by default and acts only under `--reclaim`; running it is an operator
+  decision, not a deploy step, because `--reclaim` expires snapshot history (7 days kept
+  unless `--older-than` says otherwise) and that is not reversible.
+  (#fix/lake-dest-filename-and-gc)
 
 ---
 
