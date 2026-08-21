@@ -31,35 +31,19 @@ _None yet._
 
 ### 5. Verify
 
-- **`scripts/lake-gc.sh` reports against the live catalog.** Its default mode is inert —
-  it acts only under `--reclaim` — so it is safe to run as a check, and its output sizes
-  the reclaimable pile for the bucket-6 decision. Not read-only, though: DuckLake needs to
-  write the data path even for the dry-run orphan scan, so run it as the account that owns
-  that path, not merely one with group read. `--help` explains the flags.
-  ```bash
-  sudo -u qiita-data /usr/local/bin/duckdb --version   # 1.5.4, reachable by that account
-  sudo -u qiita-data bash /home/qiita/qiita-miint/scripts/lake-gc.sh
-  ```
-  Expect three counted rows and `Nothing was removed`. A `DATA_PATH parameter … does not
-  match` means the derivation drifted from `PATH_PERSISTENT`; a missing `duckdb` means the
-  CLI isn't on a path that account can traverse (its home is not readable to it).
-  (#472)
+_None yet._
 
 ### 6. After the deploy verifies green
 
-- **Needs the data plane from this wave — do not run the backfill below on an older
-  build.** It redrives each ticket under its existing `work_ticket_idx`, which used to
-  fail at the file move: `lake_dest_filename` minted `wt<work_ticket_idx>-<basename>`,
-  unique across tickets but not across two loads from one ticket, so `move_file` refused
-  to overwrite the file that ticket's original run had registered. Observed 2026-08-21 on
-  work_ticket 6939 — `refusing to overwrite existing lake file
-  <PATH_PERSISTENT>/ducklake/assembled_sequence_chunks/wt6939-part_00000.parquet` — and all
-  57 candidate prep_samples collide the same way. The name now also carries a digest of the
-  registration's `staging_dir`, so a redrive whose producer step re-ran lands on its own
-  path; the procedure below drops `assembly_load`'s row, so it does. 6939 was restored to
-  `completed` and the 16,395 `UNBINNED` `assembly_membership` rows its partial run wrote
-  were deleted, so no prep_sample is left half-backfilled.
-  (#472)
+- **The data plane this backfill needs is live.** It redrives each ticket under its
+  existing `work_ticket_idx`, which used to fail at the file move — `lake_dest_filename`
+  minted `wt<work_ticket_idx>-<basename>`, unique across tickets but not across two loads
+  from one ticket, so `move_file` refused to overwrite the file that ticket's original run
+  had registered. The name now also carries a digest of the registration's `staging_dir`,
+  so a redrive whose producer step re-ran lands on its own path; the procedure below drops
+  `assembly_load`'s row, so it does. Deployed 2026-08-21 in `4fc4ce3d`
+  ([archived](docs/deploy-archive/2026-08-21-4fc4ce3d.md)) — do not run this against an
+  older build. (#472)
 
 - **Readiness was re-verified 2026-08-21 and the candidate set is intact**: 7,234 ticket
   workspaces, 57 carrying all six retained steps, and all 342 of those workspaces passing
@@ -285,23 +269,7 @@ sys.exit(1 if bad else 0)'
 
 ### Notes (no host action)
 
-- **Lake data files registered from this build carry an extra name segment.** The shape
-  goes from `wt<work_ticket_idx>-<basename>` to
-  `wt<work_ticket_idx>-<12 hex>-<basename>`; the hex is a digest of the registration's
-  staging dir, which is what lets one ticket register twice (a redrive). Files already on
-  disk are not renamed, so both shapes coexist. Anything matching lake filenames should key
-  on the `wt<idx>-` prefix, not on the whole name.
-  (#472)
-
-- **Nothing has ever reclaimed superseded lake files, and `scripts/lake-gc.sh` is the first
-  thing that can.** Every `register_files` replace-by-key and every `delete_reference` /
-  `delete_mask` / `delete_pool_reads` / `delete_alignment` leaves its Parquet on disk. The
-  script reports by default and acts only under `--reclaim`, behind a typed confirmation;
-  running it is an operator decision, not a deploy step, because `--reclaim` expires
-  snapshot history (7 days kept unless `--older-than` says otherwise) and that is not
-  reversible. Deleting orphans needs the separate `--reclaim-orphans`, and that one does
-  require quiescing registrations first — the script header says why.
-  (#472)
+_None yet._
 
 ---
 
