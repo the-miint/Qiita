@@ -1004,6 +1004,44 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **Two assembled contigs in one FASTA whose headers share a first token store each
+  other's bytes (#464).** `read_fastx` returns one row per record, so two such records come
+  back under one `read_id`; sharing a file they also share `kind` and `bin_id`, so
+  `assembly_hash`'s whole synthetic `kind:bin_id:contig_id` repeats. Pass 2 joins the
+  per-hash `winner` on that id over a fresh scan of every record, so each of the pair's two
+  `sequence_hash` values receives both contigs' chunks — the bytes stored for a feature then
+  include a sequence that is not that feature's, at the same `chunk_index`. Measured on a
+  two-record fixture of 16 bp contigs: 2 chunk rows and 32 bytes under each of the two
+  hashes, against 1 row and 16 bytes for the byte-identical fixture whose second header's
+  first token differs. A colliding run leaves the manifest, bin_map and chunks all
+  well-formed, so nothing downstream can notice it. The id's last component is now
+  `read_fastx`'s per-file ordinal `sequence_index` rather than the contig id, which makes
+  `kind:bin_id:sequence_index` unique by construction and also closes the other route to a
+  repeated id, an unescaped `:` inside a bin_id — the job module carries the argument, and
+  the two `sequence_index` facts it rests on are pinned against the real miint build in
+  `qiita-compute-orchestrator/tests/jobs/test_read_fastx_miint_contract.py`. The contig id
+  leaves the key and rides `bin_map` as its own `contig_id` column — no consumer joins on
+  it; it is what lets a workspace under investigation say which assembled contig became
+  which `feature_idx`, which for a MAG contig nothing else records. The step also counts
+  the pass-2 rejoin now: `count(DISTINCT sequence_hash)` over the chunk Parquet against the
+  distinct hashes pass 1 saw with bytes to store. A later divergence between the two
+  `_READ_ID_EXPR` sites therefore fails the step rather than minting a `qiita.feature` that
+  has a manifest row, an `assembly_membership` row and zero stored bytes — an outcome
+  nothing downstream raises on, since `register_files` replaces chunks on `feature_idx` and
+  a reader just gets an empty `string_agg`. Measured on a two-contig fixture whose composed
+  id is NULL for one of them: manifest and `bin_map` carry both rows, the chunk Parquet
+  carries one hash, and without the count the step exits 0. A zero-length contig record is
+  left out of the count — `sequence_split('')` returns an empty list, so it has no chunk to
+  rejoin and is input we did not produce.
+
+- **Two refined-bin FASTAs stemming to one `bin_id` merged into one bin (#464).**
+  `_FASTA_GLOBS` accepts `.fa` / `.fna` / `.fasta`, and `_local_id` strips the suffix, so
+  `bin.1.fa` and `bin.1.fna` both became `bin.1` — one bin where there were two, in
+  `bin_map` and so in `qiita.assembly_membership` and the `bin_quality` join it feeds, both
+  of which key a bin on `(prep_sample_idx, processing_idx, kind, bin_id)`. Measured as 1
+  distinct `bin_id` in `bin_map` against 2 for the same pair renamed. `_file_meta` now
+  raises, naming both filenames; the synthetic read_id above rests on that raise too.
+
 - **xdist workers shared one miint extension directory, so they installed on top of
   each other (#462).** `setup_miint_test_env` named the directory per *component*
   (`qiita-control-plane-duckdb-ext` under the system temp), and the control-plane suite
@@ -2135,6 +2173,28 @@ duplicates further down are historical strata; leave them where they are.
   command prints it.
 
 ### Changed
+
+- **`mint-features` pins its declared `inputs:` list (#464).** The runner's dispatch resolved
+  the manifest as `entry.inputs[0]`, so a workflow naming any other binding minted features out
+  of whatever path sat there. It now requires `inputs: [manifest]` and reads `bound["manifest"]`
+  by name, failing the entry otherwise — the shape `mint-annotation-features`,
+  `write-membership` and `write-assembly-membership` already use. The optional genome map is
+  unchanged: it stays an `action_context` binding (`genome_map_path`), not a declared input.
+
+- **`qiita.assembly_membership` documents its key prefix and its `bin_id` column (#464).**
+  A comment-only migration. The table comment: `(prep_sample_idx, processing_idx, kind,
+  bin_id)` is the subject identity, with `feature_idx` completing the row per member contig,
+  and `kind` tells a refined bin from a circular or an unbinned contig (value set still
+  enumerated only in `qiita_common.assembly_constants`, which the comment points at). How
+  far that identity separates two subjects depends on what `bin_id` holds, so the table
+  comment points at the `bin_id` column comment instead of restating it. A subject records
+  grouping and nothing about completeness, for any kind; the `bin_quality` lake table
+  measures that, per refined bin, from CheckM. `bin_id` gains its first column comment: a
+  refined bin's FASTA filename stem — one file, one bin, which `_file_meta` enforces — or,
+  for a circular or unbinned contig, that contig's own assembler-given id, its FASTA
+  header's first token. Producer-chosen either way, and two headers in one file can share a
+  first token, which is why the key scopes `bin_id` rather than treating it as globally
+  unique or as one contig per row. None of that is recoverable from the bare `TEXT` column.
 
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that

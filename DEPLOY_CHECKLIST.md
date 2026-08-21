@@ -38,6 +38,11 @@ _None yet._
   (`qiita-common/src/qiita_common/assembly_constants.py`) instead of listing its members,
   which went stale when unbinned contigs became a third kind. (#460)
 
+- `20260819000000_assembly_membership_subject_comment.sql` — plain `make migrate`, no
+  out-of-band setup. Comment only, no schema change: it supersedes the
+  `qiita.assembly_membership` table comment `20260818000000` above sets, and adds the first
+  comment on the `bin_id` column. (#464)
+
 ### 4. Deploy
 
 _None yet._

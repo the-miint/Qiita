@@ -343,11 +343,17 @@ async def _run_action_primitive(
     input/output shape — a generic dispatcher would just push the same
     `if name == ...` ladder somewhere else."""
     if entry.name == LibraryPrimitive.MINT_FEATURES:
-        manifest_path = Path(bound[entry.inputs[0]])
-        # `genome_map_path` is a workflow-context optional, not an entry
-        # input — the YAML's mint-features `inputs:` stays single-valued.
-        # Pulled directly from `bound` so a ticket whose action_context
-        # carries it picks up genome-association writes for free.
+        # Resolved by fixed binding NAME, not positionally, and the declared list
+        # is pinned — a YAML naming some other binding would otherwise mint
+        # features out of whatever path sat first. Same shape as the other
+        # input-pinning dispatches in this ladder.
+        if set(entry.inputs) != {"manifest"}:
+            raise RuntimeError(f"mint-features expects inputs [manifest]; got {entry.inputs!r}")
+        manifest_path = Path(bound["manifest"])
+        # `genome_map_path` is a workflow-context optional, not an entry input —
+        # the YAML's mint-features `inputs:` stays single-valued. Pulled directly
+        # from `bound` so a ticket whose action_context carries it picks up
+        # genome-association writes for free.
         genome_map = bound.get("genome_map_path")
         feature_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
             pool,

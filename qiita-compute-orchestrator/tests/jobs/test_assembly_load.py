@@ -20,16 +20,17 @@ import duckdb
 import pytest
 
 # Three contigs across two bins, one circular genome, and one unbinned-residue
-# contig. bin.1 has two contigs; bin.2 shares bin.1:x1's bytes (same hash -> same
+# contig, keyed by assembly_hash's synthetic `kind:bin_id:sequence_index`. bin.1 has
+# two contigs; bin.2's contig shares bin.1's first contig's bytes (same hash -> same
 # feature_idx) to exercise the distinct-membership / dedup path. The UNBINNED row
 # carries its own contig id as bin_id, the shape assembly_hash emits, and has no
 # CheckM counterpart — bin_quality holds MAG rows alone.
 _SEQUENCES = {
-    "LCG:circ1:c1": ("AAAACCCCGGGGTTTT", 100),
-    "MAG:bin.1:x1": ("ACGTACGTACGTACGT", 200),
-    "MAG:bin.1:x2": ("TTTTGGGGCCCCAAAA", 300),
-    "MAG:bin.2:y1": ("ACGTACGTACGTACGT", 200),  # identical bytes to x1
-    "UNBINNED:ctgU:ctgU": ("GGGGCCCCAAAATTTT", 400),
+    "LCG:circ1:1": ("AAAACCCCGGGGTTTT", 100),
+    "MAG:bin.1:1": ("ACGTACGTACGTACGT", 200),
+    "MAG:bin.1:2": ("TTTTGGGGCCCCAAAA", 300),
+    "MAG:bin.2:1": ("ACGTACGTACGTACGT", 200),  # identical bytes to bin.1's first
+    "UNBINNED:ctgU:1": ("GGGGCCCCAAAATTTT", 400),
 }
 
 
@@ -38,8 +39,11 @@ def _hash(seq: str) -> UUID:
 
 
 def _bin_kind(read_id: str) -> tuple[str, str]:
-    kind, bin_id, _contig = read_id.split(":")
-    return kind, bin_id
+    """`kind:bin_id:sequence_index` -> (kind, bin_id). Neither `kind` nor
+    `sequence_index` holds a `:`, so the FIRST and the LAST one are the two
+    separators; a bin_id may hold any number in between."""
+    kind, rest = read_id.split(":", 1)
+    return kind, rest.rsplit(":", 1)[0]
 
 
 def _write(path: Path, schema: str, rows: list[tuple]) -> None:
