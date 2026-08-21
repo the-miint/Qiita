@@ -37,6 +37,10 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_SHARD_INDEX_STATUS,
     PATH_REFERENCE_STATUS,
 )
+from qiita_common.assembly_constants import (
+    ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+    ASSEMBLED_SEQUENCE_TABLE,
+)
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     DoGetTicketRequest,
@@ -741,11 +745,10 @@ async def delete_reference(
 # Tables that can appear in a DoGet ticket, CP-side mirror of the data plane's
 # ALLOWED_TABLES whitelist in flight_service.rs. Must stay in sync with it
 # (test_cp_doget_allowlist_matches_the_rust_one_exactly parses the Rust const and
-# fails on drift). `read_masked` (the masked-read surface) and the two block-read
-# selectors are what the data plane reaches via Flight in addition to the
-# reference_* tables; the bare `read` / `read_mask` TABLES are deliberately absent
-# from both allowlists (privacy by construction — see the PRIVACY note on the
-# Rust const for why the members-scoped `read_block` selector is not a hole).
+# fails on drift). Each non-reference entry below names the route that serves it.
+# The bare `read` / `read_mask` TABLES are deliberately absent from both
+# allowlists (privacy by construction — see the PRIVACY note on the Rust const
+# for why the members-scoped `read_block` selector is not a hole).
 _DOGET_ALLOWED_TABLES = frozenset(
     {
         "reference_sequences",
@@ -770,6 +773,11 @@ _DOGET_ALLOWED_TABLES = frozenset(
         # signer, the allowlist, and the scope rule cannot drift from each other.
         READ_BLOCK_TABLE,
         READ_MASKED_BLOCK_TABLE,
+        # The assembly surfaces, served by routes/assembly.py and scoped to one
+        # run's contig features. Named from the shared constants for the same
+        # reason as the block-read pair above.
+        ASSEMBLED_SEQUENCE_TABLE,
+        ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
     }
 )
 
@@ -777,12 +785,22 @@ _DOGET_ALLOWED_TABLES = frozenset(
 # reached through its own dedicated route, which enforces a scope the generic
 # reference route cannot: `read_masked` via /read-masked/ticket/doget
 # (prep_sample_idx + mask_idx), `alignment_visible` via /alignment/ticket/doget
-# (alignment_idx + cohort), and the block-read selectors via /read/ticket/doget
-# (a block's members). The reference route restricts itself to the reference_*
-# tables whose membership it resolves — including `reference_taxonomy_visible`,
-# so external taxonomy reads also go through the exclusion view.
+# (alignment_idx + cohort), the block-read selectors via /read/ticket/doget
+# (a block's members), and the assembly surfaces via /assembly/ticket/doget (one
+# run's contig features — a reference_idx filter means nothing to a table keyed
+# on sample-derived contigs). The reference route restricts itself to the
+# reference_* tables whose membership it resolves — including
+# `reference_taxonomy_visible`, so external taxonomy reads also go through the
+# exclusion view.
 _REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
-    {"read_masked", "alignment_visible", READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE}
+    {
+        "read_masked",
+        "alignment_visible",
+        READ_BLOCK_TABLE,
+        READ_MASKED_BLOCK_TABLE,
+        ASSEMBLED_SEQUENCE_TABLE,
+        ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+    }
 )
 
 

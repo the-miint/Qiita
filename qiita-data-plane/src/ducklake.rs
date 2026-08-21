@@ -543,9 +543,10 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// `bin_quality` on `(prep_sample_idx, processing_idx)`. The keys and what
 /// admits each table are in `flight_service::REPLACE_KEY_TABLES`.
 ///
-/// NOTE: not yet exposed via Flight (absent from `flight_service::ALLOWED_TABLES`).
-/// register_files loads them and they are SQL-queryable in the catalog; they are
-/// intentionally not on the external Flight read-back path (`ALLOWED_TABLES`).
+/// `assembled_sequence` / `assembled_sequence_chunks` are Flight-readable (they
+/// are in `flight_service::ALLOWED_TABLES`, scoped by `feature_idx`).
+/// `assembly_membership` and `bin_quality` are not: they are register_files write
+/// targets, SQL-queryable in the catalog, off the external read-back path.
 pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "-- One row per UNIQUE contig (content-hash deduped), keyed by the minted

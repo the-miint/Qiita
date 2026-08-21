@@ -243,7 +243,11 @@ class StepCancelResponse(BaseModel):
 # shard is ~hundreds/thousands of features; the cap guards ticket/query size
 # (the list rides the signed ticket payload and becomes a `feature_idx IN (...)`
 # on the data plane) without constraining any realistic shard roster.
-_MAX_DOGET_FEATURE_IDX = 100_000
+#
+# Public because two sites bound a list for that one reason: the subset a caller
+# may send here, and the contig roster the assembly DoGet route resolves CP-side
+# (`routes/assembly.py`) — both end up as that same IN list.
+MAX_DOGET_FEATURE_IDX = 100_000
 
 
 class DoGetTicketRequest(BaseModel):
@@ -259,7 +263,7 @@ class DoGetTicketRequest(BaseModel):
     # sign_ticket (which rejects one). Whole-reference is expressed by *omitting*
     # the field, never by an empty list.
     feature_idx: list[Annotated[int, Field(gt=0)]] | None = Field(
-        default=None, min_length=1, max_length=_MAX_DOGET_FEATURE_IDX
+        default=None, min_length=1, max_length=MAX_DOGET_FEATURE_IDX
     )
     model_config = ConfigDict(extra="forbid")
 
@@ -331,6 +335,30 @@ class AlignmentCohortDoGetTicketRequest(BaseModel):
     prep_sample_idx: PrepSampleCohort
     # Required here, unlike its optional twin above — see the class docstring.
     columns: ProjectionColumns
+
+
+class AssemblyDoGetTicketRequest(BaseModel):
+    """Body for POST /api/v1/assembly/ticket/doget.
+
+    Names one assembly RUN — a ``(prep_sample_idx, processing_idx)`` pair — whose
+    contig sequences the caller wants to stream. The route resolves that pair's
+    contig ``feature_idx`` roster and signs a ``feature_idx``-filtered ticket;
+    why the pair itself cannot be signed is at the route
+    (``routes/assembly.py``).
+
+    ``table`` picks which surface the ticket reads: ``assembled_sequence`` (one
+    row per contig: hash + length) or ``assembled_sequence_chunks`` (the bytes,
+    reassembled with ``string_agg(chunk_data, '' ORDER BY chunk_index)``). Both
+    resolve the same roster; they differ only in what a row carries. The route
+    holds the closed set — spelled as a plain string here, like every other
+    ticket body's ``table``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    processing_idx: Annotated[int, Field(gt=0)]
+    table: str = Field(min_length=1, max_length=MAX_TABLE_NAME_LENGTH)
 
 
 class ReadDoGetTicketRequest(BaseModel):

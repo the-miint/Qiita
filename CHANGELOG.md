@@ -22,6 +22,28 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Per-run contig read-back over Arrow Flight (#TBD).** `POST
+  /assembly/ticket/doget` takes a `(prep_sample_idx, processing_idx)` pair and
+  signs a DoGet ticket for that assembly run's contigs on
+  `assembled_sequence` / `assembled_sequence_chunks`, which are now in the data
+  plane's `ALLOWED_TABLES`. Neither table has a `prep_sample_idx` column — a
+  contig is stored once under the content-deduped `feature_idx` every run
+  producing those bytes shares — so the control plane resolves the roster from
+  `qiita.assembly_membership` and signs `feature_idx`; the caller names no
+  features, and `extra="forbid"` on the body leaves it nothing that reaches the
+  filter. A pair with no membership row is a 404, never a ticket with an empty
+  filter, and the data plane refuses an empty filter on either table
+  independently (`requires_scoped_filter`), so "every sample's contigs" is not
+  representable. The route reuses the service-only `ticket:doget` rather than
+  minting a scope: that scope is on `SERVICE_ACCOUNT_SCOPE_CEILING` and on no
+  human role ceiling, so the principals gaining contig read-back are exactly the
+  service accounts already holding it — but this is the first *sample-derived*
+  sequence surface it reaches, where every prior table was reference data or the
+  derived per-read `alignment` slice. `assembly_membership` and `bin_quality`
+  stay off the read path. The orchestrator seam is
+  `data_plane_client.open_assembly_chunk_stream`, the assembly twin of
+  `open_reference_chunk_stream`.
+
 - **NCBI Taxonomy releases read from a taxdump archive (#439).**
   `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
   into the term rows of a release, so taxa no longer arrive as hand-written seed

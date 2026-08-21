@@ -332,6 +332,15 @@ const ALLOWED_TABLES: &[&str] = &[
     // here, unlike every other table — and always scoped by alignment_idx +
     // prep_sample_idx (see build_query / ALIGNMENT_PROJECTION_COLUMNS).
     "alignment_visible",
+    // One assembly run's contigs — sample-derived sequence, where everything
+    // above is reference data or per-read derived output. Neither table has a
+    // prep_sample_idx column, so a ticket names the contigs by `feature_idx`,
+    // and the control plane is what turns a `(prep_sample_idx, processing_idx)`
+    // pair into that set (`routes/assembly.py`). An empty filter is refused in
+    // `build_query` (see `requires_scoped_filter`) — here it would read every
+    // contig of every sample.
+    "assembled_sequence",
+    "assembled_sequence_chunks",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -3129,6 +3138,17 @@ fn is_alignment_doget_surface(table: &str) -> bool {
     table == "alignment_visible"
 }
 
+/// Tables `build_query` refuses to serve on an empty filter.
+///
+/// The `reference_*` tables are broadly readable by design (an unfiltered SELECT
+/// there mirrors the anonymous REST `GET /reference/{idx}`), so the refusal is
+/// per-table rather than global. Listed here are the ones an empty filter would
+/// turn into the whole alignment sink, or every sample's contigs.
+fn requires_scoped_filter(table: &str) -> bool {
+    is_alignment_doget_surface(table)
+        || matches!(table, "assembled_sequence" | "assembled_sequence_chunks")
+}
+
 /// Build a SQL query for the given table and filter.
 ///
 /// SQL injection defense model:
@@ -3184,10 +3204,9 @@ fn build_query(
         // *empty* case, not every under-scoped one: a non-empty but non-scoping
         // filter (e.g. feature_idx alone) still passes today. Making an unfiltered
         // read opt-in via an allowlist is still a tracked durability follow-up.
-        // The reference_* tables are broadly readable by design (this mirrors
-        // the anonymous REST `GET /reference/{idx}`), so an unfiltered SELECT is
-        // legitimate there — reject empty filters only for the alignment surface.
-        if is_alignment_doget_surface(table) {
+        // Which tables are refused, and why the reference_* ones are not, is at
+        // `requires_scoped_filter`.
+        if requires_scoped_filter(table) {
             return Err(Status::invalid_argument(format!(
                 "{table} requires a non-empty filter (refusing full-table read)"
             )));
@@ -5749,10 +5768,9 @@ mod tests {
         ));
     }
 
-    /// The reference pair takes the same path as the assembly pair, and unlike it
-    /// is Flight-readable (`ALLOWED_TABLES`), so a duplicate there reaches a
-    /// consumer. Two references sharing a sequence each ship that feature's rows;
-    /// after both loads there is one of each.
+    /// The reference pair takes the same path as the assembly pair. Two
+    /// references sharing a sequence each ship that feature's rows; after both
+    /// loads there is one of each.
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
@@ -7007,6 +7025,90 @@ mod tests {
             build_query("alignment_visible", &empty, &[], &[]).is_err(),
             "empty filter on alignment_visible must be rejected"
         );
+    }
+
+    /// A `feature_idx` filter, the only scope an assembly ticket carries.
+    fn feature_scope(values: &[i64]) -> auth::TicketFilter {
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "feature_idx".to_string(),
+            values.iter().map(|v| serde_json::Value::from(*v)).collect(),
+        );
+        filter
+    }
+
+    #[test]
+    fn assembly_surfaces_are_doget_allowed_and_the_junction_is_not() {
+        // The two sequence surfaces are Flight-readable; `assembly_membership`
+        // (which the control plane reads from Postgres to build the roster) and
+        // `bin_quality` are register_files write targets only.
+        for readable in ["assembled_sequence", "assembled_sequence_chunks"] {
+            assert!(
+                ALLOWED_TABLES.contains(&readable),
+                "{readable:?} must be DoGet-readable for the contig read-back"
+            );
+        }
+        for sink in ["assembly_membership", "bin_quality"] {
+            assert!(
+                !ALLOWED_TABLES.contains(&sink),
+                "{sink:?} must not be Flight-reachable"
+            );
+        }
+    }
+
+    #[test]
+    fn build_query_assembly_scopes_by_feature_idx() {
+        for table in ["assembled_sequence", "assembled_sequence_chunks"] {
+            let (sql, full) = build_query(table, &feature_scope(&[11, 22, 33]), &[], &[]).unwrap();
+            assert_eq!(full, format!("qiita_lake.{table}"));
+            assert_eq!(
+                sql,
+                format!("SELECT * FROM qiita_lake.{table} WHERE feature_idx IN (11,22,33)"),
+                "got: {sql}"
+            );
+            // No membership JOIN: these are not MEMBERSHIP_JOIN_TABLES, so a
+            // bare `feature_idx` binds against the base table.
+            assert!(!sql.contains("JOIN"), "got: {sql}");
+        }
+    }
+
+    #[test]
+    fn build_query_assembly_refuses_an_empty_filter() {
+        // The whole-table read this would be is every sample's contigs. Unlike
+        // the reference_* tables (broadly readable by design), it is refused —
+        // see `requires_scoped_filter`.
+        let empty = auth::TicketFilter::new();
+        for table in ["assembled_sequence", "assembled_sequence_chunks"] {
+            let err = build_query(table, &empty, &[], &[])
+                .expect_err("an empty filter on an assembly surface must be rejected");
+            assert!(err.message().contains(table), "got: {err}");
+        }
+        // Control: the same empty filter IS served for a reference table, so the
+        // assertion above is about these tables and not about empty filters.
+        assert!(build_query("reference_sequences", &empty, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn build_query_assembly_takes_no_projection_and_no_members() {
+        // No projection allowlist (only the alignment surface has one), so a
+        // signed column list is refused rather than dropped; and `members` is
+        // only meaningful for the block-read selectors.
+        for table in ["assembled_sequence", "assembled_sequence_chunks"] {
+            assert!(
+                build_query(
+                    table,
+                    &feature_scope(&[11]),
+                    &[],
+                    &columns(&["feature_idx"])
+                )
+                .is_err(),
+                "{table} must reject a projection column list"
+            );
+            assert!(
+                build_query(table, &feature_scope(&[11]), &block_members(), &[]).is_err(),
+                "{table} must reject a block members selector"
+            );
+        }
     }
 
     /// A minimally-scoped alignment ticket filter. The scoping guards have their
