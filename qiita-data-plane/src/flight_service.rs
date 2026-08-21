@@ -4985,11 +4985,14 @@ mod tests {
             "reference_membership is not a REPLACE_KEY_TABLES target, so nothing is replaced"
         );
         // The dest carries the registration-unique minted name under the
-        // per-table dir.
+        // per-table dir. Composed through the same `staging_scope` the caller
+        // uses — recomputing the scope here by hand would be a second
+        // implementation that drifts the moment the derivation changes.
         let dest = std::path::Path::new(&outcome.registered[0]);
+        let scope = staging_scope(&payload.staging_dir, std::path::Path::new("/"));
         assert_eq!(
             dest.file_name().and_then(|f| f.to_str()).unwrap(),
-            lake_dest_filename(ticket, &payload.staging_dir, "reference_membership.parquet")
+            lake_dest_filename(ticket, &scope, "reference_membership.parquet")
         );
         assert!(dest.exists(), "registered lake file present on disk");
         assert!(
