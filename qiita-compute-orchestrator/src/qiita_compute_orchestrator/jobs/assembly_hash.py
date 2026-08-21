@@ -54,9 +54,10 @@ as passed, so a small in-memory `file_meta(filepath, kind, bin_id)` table (built
 from the input paths) JOINs the scan back to each contig's kind + bin without
 fragile filename regex. A MAG's bin_id is its file (one FASTA per bin groups many
 contigs); the LCG contigs arrive as a single `circular.fa` multi-FASTA and the
-unbinned residue as a single `noLCG.fa` one, and each of those records is its own
-subject, so their bin_id is the contig id itself — carried as a NULL
-`file_meta.bin_id` and COALESCE'd from the read_fastx record in the scan. (That
+unbinned residue as a single `noLCG.fa` one, so their bin_id is the contig id
+itself — carried as a NULL `file_meta.bin_id` and COALESCE'd from the read_fastx
+record in the scan. How far a producer-chosen contig id separates two subjects is
+stated on `qiita.assembly_membership`'s `bin_id` column. (That
 also means the container needs no per-contig FASTA split: `read_fastx` reads the
 whole multi-FASTA and the id column IS the bin_id.)
 
