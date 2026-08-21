@@ -11,7 +11,8 @@ contig id reused across bins and repeated within one file, soft-masked (lowercas
 contigs folding onto their upper-case twin and which record's bytes that fold then
 stores, the unbinned noLCG residue (its exclusion key, its bin_id, and what it does
 to a hash-collision group), a bin_id carrying the id's own separator, the one
-identity collision the step refuses (two bin files stemming to one bin_id), and
+identity collision the step refuses (two bin files stemming to one bin_id), the
+pass-2 rejoin count and the zero-length record it does not count, and
 empty -> StepNoData.
 """
 
@@ -27,6 +28,7 @@ import duckdb
 import pytest
 from qiita_common.backend_failure import StepNoData
 
+from qiita_compute_orchestrator.jobs import assembly_hash
 from qiita_compute_orchestrator.jobs.assembly_hash import Inputs, execute
 from qiita_compute_orchestrator.miint import open_miint_conn
 
@@ -578,3 +580,67 @@ def test_two_bin_files_stemming_to_one_bin_id_fail(tmp_path):
         ("MAG:bin.1:1", "MAG", "bin.1"),
         ("MAG:bin.2:1", "MAG", "bin.2"),
     ]
+
+
+def test_a_contig_pass_2_cannot_rejoin_fails_the_step(tmp_path, monkeypatch):
+    """A contig that reaches the manifest but not the chunks fails the step.
+
+    Both passes read one `_READ_ID_EXPR`, so the divergence is injected as the
+    NULL arm of it: `ghost`'s composed id is NULL in pass 1 and in pass 2 alike,
+    and `NULL = NULL` is NULL, so pass 2's `winner` join drops exactly that record
+    while pass 1 has already written its manifest and bin_map rows. `keeper` is
+    the control — it rejoins, and the same layout without the patch (below) runs
+    to completion with both contigs' bytes stored.
+    """
+    ghost, keeper = "ACGTTGCAAGGGTTCA", "ggatccTTAACCggat"
+    genomes, refined = _layout(tmp_path)
+    _fasta(genomes / "circular.fa", {"ghost": ghost, "keeper": keeper})
+
+    monkeypatch.setattr(
+        assembly_hash,
+        "_READ_ID_EXPR",
+        f"CASE WHEN rf.read_id = 'ghost' THEN NULL ELSE {assembly_hash._READ_ID_EXPR} END",
+    )
+    with pytest.raises(ValueError, match=r"stored chunks for 1 of 2 distinct contig sequences"):
+        _run(
+            Inputs(
+                genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=3
+            ),
+            tmp_path / "ws",
+        )
+
+    monkeypatch.undo()
+    out = _run(
+        Inputs(
+            genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=3
+        ),
+        tmp_path / "control-ws",
+    )
+    assert _reassembled(out["assembly_chunks"]) == {
+        str(_hash(ghost)): ghost,
+        str(_hash(keeper)): keeper,
+    }
+
+
+def test_a_zero_length_contig_record_does_not_fail_the_rejoin_count(tmp_path):
+    """`sequence_split('')` yields no chunk, so the empty record has none to
+    rejoin — and the step still succeeds, because the count leaves it out.
+
+    Input the assembler produced and an operator cannot edit; the record keeps its
+    manifest and bin_map rows, and the contig beside it stores its bytes.
+    """
+    seq = "ACGTTGCAAGGGTTCA"
+    genomes, refined = _layout(tmp_path)
+    (genomes / "circular.fa").write_text(f">empty\n\n>keeper\n{seq}\n")
+
+    out = _run(
+        Inputs(
+            genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=42, work_ticket_idx=3
+        ),
+        tmp_path / "ws",
+    )
+    assert _rows(out["manifest"], "read_id, sequence_length_bp", "read_id") == [
+        ("LCG:empty:1", 0),
+        ("LCG:keeper:2", 16),
+    ]
+    assert _reassembled(out["assembly_chunks"]) == {str(_hash(seq)): seq}

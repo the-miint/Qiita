@@ -18,7 +18,13 @@ downstream (mint-features -> write-assembly-membership -> assembly_load):
     exactly like `hash_sequences`.
   - `bin_map.parquet` — `(read_id, kind, bin_id, contig_id)`, the per-contig bin
     membership `write-assembly-membership` / `assembly_load` join against.
-    `contig_id` is the assembler's own id for the record; nothing joins on it.
+    `contig_id` is the assembler's own id for the record. No consumer joins on it;
+    it is carried so a workspace under investigation can say which assembled
+    contig became which `feature_idx` — the name the assembler, DAS_Tool and
+    CheckM all use. Nothing else records it: for a MAG the `bin_id` is the FASTA's
+    stem and the `read_id`'s last component is the record's ordinal, and
+    `bin_map.parquet` stays in the workspace rather than being registered in the
+    lake, so the trace lives as long as the workspace does and no longer.
 
 **The synthetic read_id is unique across the scan by construction.** Its last
 component is `read_fastx`'s `sequence_index`, a 1-based ordinal over the records of
@@ -119,7 +125,8 @@ _READ_FASTX_MAX_BATCH_BYTES = "128MB"
 
 # The synthetic read_id (module docstring), over a `read_fastx rf` x `file_meta fm`
 # join. Both passes compose it and pass 2 joins `winner` on the string pass 1
-# composed, so a divergence between the two leaves a contig with no chunks.
+# composed; a divergence between the two is what the rejoin count after pass 2
+# refuses.
 _READ_ID_EXPR = (
     "fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) || ':' || CAST(rf.sequence_index AS VARCHAR)"
 )
@@ -335,6 +342,41 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f") TO '{chunks_part_out}' ({PARQUET_OPTS_CHUNKED})",
                 [paths],
             )
+
+            # Every sequence_hash that has bytes must come back from pass 2 — one
+            # `winner` per distinct hash, one chunk set per winner. When the two
+            # `_READ_ID_EXPR` sites diverge (a WHERE added to one scan, an
+            # alias rename its baked `rf.`/`fm.` prefixes stop matching, a NULL
+            # reaching the `||` chain so the join compares NULL to NULL), the
+            # contig keeps the manifest and bin_map rows pass 1 wrote and loses
+            # its chunks: mint-features gives it a qiita.feature and
+            # write-assembly-membership a membership row, both for a feature with
+            # zero stored bytes, and register-files replaces chunks on feature_idx
+            # so nothing accumulates — a reader gets an empty string_agg, not an
+            # error. A mismatch says the composition above is wrong, not that the
+            # input is: the contigs involved are otherwise complete, and the same
+            # data re-runs clean once the expression is fixed — unlike a check
+            # over input an operator cannot edit, where every re-run fails the
+            # same way. `sequence_split('')` returns an empty list, so a
+            # zero-length contig record legitimately writes no chunk and is left
+            # out of the count. Cost is one column-pruned UUID scan over a Parquet
+            # that is tiny by design.
+            rejoined, expected = conn.execute(
+                "SELECT ("
+                f"  SELECT count(DISTINCT sequence_hash) FROM read_parquet('{chunks_part_out}')"
+                "), ("
+                "  SELECT count(DISTINCT sequence_hash) FROM contig"
+                "  WHERE sequence_length_bp > 0"
+                ")"
+            ).fetchone()
+            if rejoined != expected:
+                raise ValueError(
+                    f"assembly_hash pass 2 stored chunks for {rejoined} of {expected} "
+                    "distinct contig sequences for "
+                    f"prep_sample_idx={inputs.prep_sample_idx}: {expected - rejoined} would "
+                    "reach qiita.feature with a manifest row and no stored bytes. The two "
+                    "read_id compositions disagree — see _READ_ID_EXPR."
+                )
         success = True
     finally:
         # On any failure remove partial outputs so the launcher's manifest walker

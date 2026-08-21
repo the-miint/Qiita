@@ -39,8 +39,11 @@ def _hash(seq: str) -> UUID:
 
 
 def _bin_kind(read_id: str) -> tuple[str, str]:
-    kind, bin_id, _sequence_index = read_id.split(":")
-    return kind, bin_id
+    """`kind:bin_id:sequence_index` -> (kind, bin_id). Neither `kind` nor
+    `sequence_index` holds a `:`, so the FIRST and the LAST one are the two
+    separators; a bin_id may hold any number in between."""
+    kind, rest = read_id.split(":", 1)
+    return kind, rest.rsplit(":", 1)[0]
 
 
 def _write(path: Path, schema: str, rows: list[tuple]) -> None:

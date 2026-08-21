@@ -1006,7 +1006,19 @@ duplicates further down are historical strata; leave them where they are.
   repeated id, an unescaped `:` inside a bin_id — the job module carries the argument, and
   the two `sequence_index` facts it rests on are pinned against the real miint build in
   `qiita-compute-orchestrator/tests/jobs/test_read_fastx_miint_contract.py`. The contig id
-  leaves the key and rides `bin_map` as its own `contig_id` column; nothing joins on it.
+  leaves the key and rides `bin_map` as its own `contig_id` column — no consumer joins on
+  it; it is what lets a workspace under investigation say which assembled contig became
+  which `feature_idx`, which for a MAG contig nothing else records. The step also counts
+  the pass-2 rejoin now: `count(DISTINCT sequence_hash)` over the chunk Parquet against the
+  distinct hashes pass 1 saw with bytes to store. A later divergence between the two
+  `_READ_ID_EXPR` sites therefore fails the step rather than minting a `qiita.feature` that
+  has a manifest row, an `assembly_membership` row and zero stored bytes — an outcome
+  nothing downstream raises on, since `register_files` replaces chunks on `feature_idx` and
+  a reader just gets an empty `string_agg`. Measured on a two-contig fixture whose composed
+  id is NULL for one of them: manifest and `bin_map` carry both rows, the chunk Parquet
+  carries one hash, and without the count the step exits 0. A zero-length contig record is
+  left out of the count — `sequence_split('')` returns an empty list, so it has no chunk to
+  rejoin and is input we did not produce.
 
 - **Two refined-bin FASTAs stemming to one `bin_id` merged into one bin (#464).**
   `_FASTA_GLOBS` accepts `.fa` / `.fna` / `.fasta`, and `_local_id` strips the suffix, so
@@ -2157,15 +2169,18 @@ duplicates further down are historical strata; leave them where they are.
 
 - **`qiita.assembly_membership` documents its key prefix and its `bin_id` column (#464).**
   A comment-only migration. The table comment: `(prep_sample_idx, processing_idx, kind,
-  bin_id)` is the subject identity — one circular genome, one refined bin, or one unbinned
-  contig — with `feature_idx` completing the row per member contig, and `kind` is what tells
-  the three apart (value set still enumerated only in `qiita_common.assembly_constants`,
-  which the comment points at). A subject records grouping and nothing about completeness,
-  for any kind; the `bin_quality` lake table measures that, per refined bin, from CheckM.
-  `bin_id` gains its first column comment: what it holds depends on `kind` — a refined
-  bin's FASTA filename stem, or, for a circular or unbinned contig, that contig's own
-  assembler-given id — which is the fact that makes the three-way subject claim hold, and
-  is not recoverable from the bare `TEXT` column.
+  bin_id)` is the subject identity, with `feature_idx` completing the row per member contig,
+  and `kind` tells a refined bin from a circular or an unbinned contig (value set still
+  enumerated only in `qiita_common.assembly_constants`, which the comment points at). How
+  far that identity separates two subjects depends on what `bin_id` holds, so the table
+  comment points at the `bin_id` column comment instead of restating it. A subject records
+  grouping and nothing about completeness, for any kind; the `bin_quality` lake table
+  measures that, per refined bin, from CheckM. `bin_id` gains its first column comment: a
+  refined bin's FASTA filename stem — one file, one bin, which `_file_meta` enforces — or,
+  for a circular or unbinned contig, that contig's own assembler-given id, its FASTA
+  header's first token. Producer-chosen either way, and two headers in one file can share a
+  first token, which is why the key scopes `bin_id` rather than treating it as globally
+  unique or as one contig per row. None of that is recoverable from the bare `TEXT` column.
 
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that
