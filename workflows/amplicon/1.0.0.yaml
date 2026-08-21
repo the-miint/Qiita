@@ -10,10 +10,11 @@ description: >
   Rapid 16S amplicon denoising for a sequenced pool's already-ingested reads
   (golay-demux or bcl-convert stored them in the DuckLake `read` table). Runs the
   deblur pipeline REFERENCE-AGNOSTICALLY: 16S reads are not host/human sequence,
-  so they are NOT masked — the runner STREAMS the pool's raw reads (`pool_reads`)
-  from the `read` table and materializes the SortMeRNA 16S pre-filter reference
-  (`sortmerna_ref`) from a loaded sequence_reference (by reference_idx, off fixed
-  operator paths).
+  so they are NOT masked — the `denoise` step STREAMS the pool's raw reads from the
+  `read` table at runtime (a pool-scoped `read_block` DoGet, the same seam the block
+  workflows use; the step declares no reads input) and materializes the SortMeRNA
+  16S pre-filter reference (`sortmerna_ref`) from a loaded sequence_reference (by
+  reference_idx, off fixed operator paths).
 
   The `denoise` step (native, miint) trims → per-sample dereplicates → SortMeRNA
   16S pre-filters → UCHIME chimera-filters → MAFFT-aligns → deblur-denoises into
@@ -60,14 +61,15 @@ context_schema:
       default: false
 
 steps:
-  # Denoise the pool's reads into ASVs. `pool_reads` (raw reads streamed from the
-  # `read` table) and `sortmerna_ref` (the materialized reference FASTA) are
-  # runner-resolved; the scalar knobs ride `params:`. Emits the mint-features
-  # manifest + per-sample counts.
+  # Denoise the pool's reads into ASVs. The step declares NO reads input — the
+  # pool's raw reads STREAM from the data plane at runtime (the absence of a reads
+  # input is the streaming signal, like the block workflows). Only `sortmerna_ref`
+  # (the materialized reference FASTA) is runner-resolved; the scalar knobs ride
+  # `params:`. Emits the mint-features manifest + per-sample counts.
   - step: denoise
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.amplicon_deblur
-    inputs: [pool_reads, sortmerna_ref]
+    inputs: [sortmerna_ref]
     params: {primer: primer, trim: trim, orient_primer: orient_primer}
     outputs: [asv_counts, asv_manifest]
     baseline_resources:

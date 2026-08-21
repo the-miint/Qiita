@@ -57,14 +57,6 @@ STAGED_READS_BINDING = "reads"
 # consume `masked_reads_fastq`.
 STAGED_MASKED_READS_BINDING = "masked_reads_fastq"
 READS_STAGING_ROOT_BINDING = "reads_staging_root"
-# The amplicon workflow (sequenced_pool-scoped) consumes the pool's RAW reads —
-# 16S is not host/human sequence, so it is not masked. `pool_reads` is consumed by
-# the denoise step but produced by none, so the runner binds it: the union of the
-# pool's prep_samples' stored `read` rows, one Parquet. Raw `read` is not
-# DoGet-able (privacy; see flight_service.rs ALLOWED_TABLES), so per-sample reads
-# come via the durable staging copy (fast path) or the `export_read` DoAction — the
-# same sanctioned raw-read materialization `_resolve_staged_reads` uses.
-POOL_READS_BINDING = "pool_reads"
 
 
 # Bindings a sharded build ticket's build steps consume: the per-shard feature
@@ -513,115 +505,6 @@ async def _resolve_staged_reads(
             f"wrote no file at {dest}"
         )
     return {STAGED_READS_BINDING: dest}
-
-
-def _concat_read_parts(parts: list[str], out_path: str) -> None:
-    """Concatenate per-sample `read`-shaped Parquets into one `pool_reads.parquet`
-    (the read_masked shape the denoise step reads: prep_sample_idx, sequence_idx,
-    read_id, sequence1, ...). DuckDB `read_parquet([...])` unions the parts by name
-    and COPY streams them out — no ORDER BY (deblur re-groups per sample_id
-    internally), so the write stays streaming/bounded-memory over a whole pool.
-    Module-level so it runs in a thread executor (DuckDB is sync)."""
-    import duckdb  # noqa: PLC0415
-
-    conn = duckdb.connect(":memory:")
-    try:
-        conn.execute(
-            "COPY (SELECT prep_sample_idx, sequence_idx, read_id, sequence1, qual1, "
-            "sequence2, qual2 FROM read_parquet(?, union_by_name=true)) "
-            f"TO '{validate_parquet_path(Path(out_path))}' (FORMAT PARQUET)",
-            [parts],
-        )
-    finally:
-        conn.close()
-
-
-async def _resolve_pool_reads(
-    pool: asyncpg.Pool,
-    scope_target: dict[str, Any],
-    staging_root: Path,
-    *,
-    data_plane_url: str,
-    signing_key: bytes,
-    workspace: Path,
-) -> dict[str, Path]:
-    """Bind `pool_reads` to the union of a sequenced_pool's prep_samples' stored
-    raw reads for the amplicon workflow.
-
-    Resolves the pool's prep_sample_idx set (sequenced_sample x prep_sample, live
-    samples only), sources each sample's reads — the durable staging copy
-    `compute_reads_staging_path` (fast path) or, when that ephemeral copy is gone,
-    the persistent DuckLake `read` table via the `export_read` DoAction (the data
-    plane writes the file; raw reads never transit the control plane) — and
-    concatenates them into one `<workspace>/pool_reads.parquet`.
-
-    A sample with zero stored reads (a blank / no-template control, common in a
-    16S pool) is SKIPPED, not fatal: deblur groups per sample, so an empty sample
-    simply contributes nothing. Only when the WHOLE pool is empty is it a terminal
-    NO_DATA. An unreachable data plane / a reported-but-missing file is
-    SUBMISSION/BAD_INPUT (FAILED), like the other pre-loop resolvers."""
-    sequenced_pool_idx = scope_target["sequenced_pool_idx"]
-    prep_rows = await pool.fetch(
-        "SELECT ss.prep_sample_idx FROM qiita.sequenced_sample ss "
-        "JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx "
-        "WHERE ss.sequenced_pool_idx = $1 AND ps.retired = false "
-        "ORDER BY ss.prep_sample_idx",
-        sequenced_pool_idx,
-    )
-    prep_sample_idxs = [r["prep_sample_idx"] for r in prep_rows]
-    if not prep_sample_idxs:
-        raise _submission_bad_input(
-            f"sequenced_pool {sequenced_pool_idx} has no live prep_samples to denoise"
-        )
-
-    workspace.mkdir(parents=True, exist_ok=True)
-    parts: list[str] = []
-    for prep_sample_idx in prep_sample_idxs:
-        durable = compute_reads_staging_path(staging_root, prep_sample_idx)
-        if durable.exists():
-            parts.append(str(durable))
-            continue
-        dest = workspace / f"reads_{prep_sample_idx}.parquet"
-        token = sign_action(
-            action="export_read",
-            payload={"prep_sample_idx": prep_sample_idx, "dest": str(dest)},
-            secret=signing_key,
-        )
-        try:
-            result = await asyncio.get_running_loop().run_in_executor(
-                None, _runner_pkg._do_action_export_read, data_plane_url, token
-            )
-        except Exception as exc:
-            raise _submission_dp_fetch_failure(
-                f"could not materialize reads for prep_sample {prep_sample_idx} "
-                f"(pool {sequenced_pool_idx}) from the data plane: "
-                f"{type(exc).__name__}: {exc}",
-                exc,
-            ) from exc
-        if result.get("count", 0) == 0:
-            # No stored reads for this sample (a blank / NTC, or not yet ingested).
-            # Skip it — a per-sample gap is not a pool-level failure.
-            continue
-        if not dest.exists():
-            raise _submission_bad_input(
-                f"the data plane reported reads for prep_sample {prep_sample_idx} but "
-                f"wrote no file at {dest}"
-            )
-        parts.append(str(dest))
-
-    if not parts:
-        raise StepNoData(
-            reason=(
-                f"sequenced_pool {sequenced_pool_idx}: no prep_sample has stored reads "
-                "to denoise (the pool must be ingested first)"
-            )
-        )
-
-    pool_reads = workspace / "pool_reads.parquet"
-    await asyncio.get_running_loop().run_in_executor(
-        None, _runner_pkg._concat_read_parts, parts, str(pool_reads)
-    )
-    return {POOL_READS_BINDING: pool_reads}
 
 
 async def _resolve_staged_masked_reads(

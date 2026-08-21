@@ -82,12 +82,10 @@ from ._processing import (
 )
 from ._read_ingest import (
     BARCODE_MAP_BINDING,
-    POOL_READS_BINDING,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
     SAMPLE_MAP_BINDING,
     _resolve_barcode_map,
-    _resolve_pool_reads,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
@@ -348,25 +346,9 @@ async def run_workflow(
                 )
             )
 
-        # Pool-reads binding (amplicon workflow): `pool_reads` is consumed by the
-        # denoise step but produced by none, so bind it from the sequenced_pool's
-        # stored raw reads (16S is not masked). sequenced_pool-scoped only.
-        if _workflow_declares_input(action.steps, POOL_READS_BINDING):
-            if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
-                raise _submission_bad_input(
-                    "a workflow that consumes `pool_reads` must be sequenced_pool-scoped; "
-                    f"got {scope_target['kind']!r}"
-                )
-            bound.update(
-                await _resolve_pool_reads(
-                    pool,
-                    scope_target,
-                    upload_staging_root,
-                    data_plane_url=data_plane_url,
-                    signing_key=signing_key,
-                    workspace=workspace,
-                )
-            )
+        # NB: the amplicon workflow declares NO reads input — its `denoise` step
+        # STREAMS the pool's raw reads from the data plane at runtime (like the
+        # block workflows), so the runner binds nothing here.
 
         # Staged-read binding (read-mask workflows): `reads` is consumed by qc /
         # host_filter but produced by no step, so bind it from stored reads.

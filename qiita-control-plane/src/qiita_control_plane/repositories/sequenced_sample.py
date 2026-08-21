@@ -449,6 +449,33 @@ async def fetch_sequenced_pool_samples(
     return list(rows)
 
 
+async def fetch_pool_members(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
+) -> list[tuple[int, int, int]]:
+    """The pool's read-block members: one `(prep_sample_idx, sequence_idx_start,
+    sequence_idx_stop)` per ACTIVE sequenced_sample that has stored reads — each
+    sample's FULL sequence_range, NOT tiled.
+
+    The pool-scoped analogue of `fetch_block_members`: a pool-scoped amplicon read
+    ticket streams the whole pool's reads through the `read_block` selector, so it
+    needs the same `(prep_sample_idx, lo, hi)` member shape the block path signs.
+    Unlike block tiling (`block_planner`), members are NOT split on a read-count
+    boundary — deblur groups per sample and must see each sample whole. The INNER
+    JOIN on qiita.sequence_range drops un-ingested samples (nothing to stream);
+    retired prep_samples are excluded, matching `_enumerate_pool_samples`."""
+    rows = await pool_or_conn.fetch(
+        "SELECT ss.prep_sample_idx, sr.sequence_idx_start, sr.sequence_idx_stop"
+        "  FROM qiita.sequenced_sample ss"
+        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        "  JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
+        " WHERE ss.sequenced_pool_idx = $1"
+        "   AND ps.retired = false"
+        " ORDER BY ss.prep_sample_idx",
+        sequenced_pool_idx,
+    )
+    return [(r["prep_sample_idx"], r["sequence_idx_start"], r["sequence_idx_stop"]) for r in rows]
+
+
 # same-pattern-ok: run-scoped sibling of fetch_sequenced_pool_samples; different
 # join/scope, kept as a separate function rather than parameterized by scope
 async def fetch_sequenced_samples_for_run(
