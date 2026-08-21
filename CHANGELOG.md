@@ -1009,6 +1009,25 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
+- **The circular gate's identity check now asks the question the gate answers (#TBD).**
+  Its diagnostics counted scorable alignment RECORDS with `cigar_sequence_identity` while
+  the gate itself applies `cigar_pooled_identity` per read: a read whose records mix a
+  legacy `M` CIGAR with an extended one has NULL pooled identity, so it was dropped whole
+  — including the records that did score — while the diagnostic reported those records as
+  scorable and nothing refused. The circular arm now counts unscorable READS over the
+  macro's own grouping key and refuses the slice, naming the two ways a read gets no
+  pooled identity.
+
+- **A circular threshold given without `--circular-gate` is refused instead of ignored
+  (#TBD).** `qiita feature-table build --circular-min-coverage 0.5` with no
+  `--circular-gate` built an entirely UNGATED table and said nothing, because the flags
+  were read only inside the mode. They now default to a sentinel rather than to the
+  threshold, so "omitted" and "given" are distinguishable, and giving one without the
+  mode refuses the way `--unpaired-gate` alone already does. `--circular-min-identity`
+  also accepts `none` — the spelling `--lane` already uses — which is the only way to
+  express the documented no-identity gate for an alignment whose CIGARs cannot be scored
+  (a threshold of 0 does not: a NULL score fails `>= 0` too).
+
 - **xdist workers shared one miint extension directory, so they installed on top of
   each other (#462).** `setup_miint_test_env` named the directory per *component*
   (`qiita-control-plane-duckdb-ext` under the system temp), and the control-plane suite

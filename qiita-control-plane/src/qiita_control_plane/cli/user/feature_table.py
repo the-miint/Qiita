@@ -49,6 +49,7 @@ from qiita_common.models import (
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 
 from .. import _common
+from ._helpers import _UNSET
 from .alignment import (
     _alignment_reference_idx,
     _alignment_summary,
@@ -582,11 +583,8 @@ def _tool_versions(con) -> dict[str, str]:
 
 
 def _manifest_gate(gate: ft.AlignmentGate | None) -> dict[str, Any] | None:
-    """What the manifest records about the gate: the thresholds of the axis it scored.
-
-    The two axes have disjoint keys because they answer different questions — one per
-    alignment record, one per read against a reference — so a reader can tell which was
-    applied from the record itself.
+    """What the manifest records about the gate: the thresholds of the axis it scored,
+    under that axis's own key names, so a reader can tell which one was applied.
     """
     if gate is None:
         return None
@@ -653,9 +651,6 @@ def _manifest_payload(
             "rows": rows,
             "coverage_scope": args.coverage_scope,
             "coverage_threshold": args.coverage_threshold,
-            # One arm per scoring axis, with the keys the axis actually has — a circular
-            # gate reported under the CIGAR keys would record "no thresholds" for a
-            # build that had two.
             "gate": _manifest_gate(gate),
             # Sorted, so the record does not depend on the order the mint answered in.
             "cohort": sorted(identifier["export_id"] for identifier in identifiers),
@@ -847,10 +842,15 @@ def _gate_from_args(args: argparse.Namespace) -> ft.AlignmentGate | None:
     is the safe one — and `check_gate_diagnostics` refuses the unsafe combination
     anyway, naming the unpaired form as the way out of the case it cannot pool.
 
-    **`--circular-gate` is the other axis**, so it carries its own two thresholds and
+    `--circular-gate` selects the other axis, so it carries its own two thresholds and
     takes neither of the CIGAR ones; `AlignmentGate` refuses the combinations, and the
-    flag checks here name the flag rather than the field.
+    checks here name the flags rather than the fields.
     """
+    circular_thresholds = {
+        "--circular-min-coverage": args.circular_min_coverage,
+        "--circular-min-identity": args.circular_min_identity,
+    }
+    given = [flag for flag, value in circular_thresholds.items() if value is not _UNSET]
     if args.circular_gate:
         if args.min_identity is not None or args.min_query_coverage is not None:
             raise ValueError(
@@ -865,10 +865,20 @@ def _gate_from_args(args: argparse.Namespace) -> ft.AlignmentGate | None:
                 "--circular-gate does not do: it pools a read's records against one "
                 "reference and keeps mates apart. Pass one or the other."
             )
-        return ft.AlignmentGate(
-            circular=True,
-            circular_min_coverage=args.circular_min_coverage,
-            circular_min_identity=args.circular_min_identity,
+        thresholds = {
+            name: default if value is _UNSET else value
+            for name, value, default in (
+                ("circular_min_coverage", args.circular_min_coverage, ft.CIRCULAR_MIN_COVERAGE),
+                ("circular_min_identity", args.circular_min_identity, ft.CIRCULAR_MIN_IDENTITY),
+            )
+        }
+        return ft.AlignmentGate(circular=True, **thresholds)
+    if given:
+        # Same shape as the --unpaired-gate refusal below: a flag that only says HOW to
+        # judge does nothing on its own, and doing nothing quietly is the failure.
+        raise ValueError(
+            f"{' and '.join(given)} set the circular gate's thresholds, so without "
+            f"--circular-gate they gate nothing at all."
         )
     if args.min_identity is None and args.min_query_coverage is None:
         if args.unpaired_gate:

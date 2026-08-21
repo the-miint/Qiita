@@ -140,10 +140,10 @@ def test_identity_is_pooled_over_the_records_not_averaged(conn):
 
 
 def test_identity_is_NULL_on_a_legacy_M_cigar(conn):
-    """`M` records that a base aligned, not whether it matched, so no identity is
-    recoverable — and `NULL >= threshold` is NULL, so the gate's identity term would
-    silently reject every such read. That is the case `check_gate_diagnostics` refuses a
-    slice for; it counts on this being NULL rather than 1.0."""
+    """NULL, not 1.0 — which is what `check_gate_diagnostics`' unscorable-reads refusal
+    counts on; its message is where the consequence is spelled out. Coverage still
+    answers on the same input, which is what makes dropping the identity term a usable
+    answer rather than a lost mode."""
     legacy = [(1, 0, 7, 27_001, 30_001, "3000M3000S"), (1, 2048, 7, 1, 3_001, "3000H3000M")]
     pooled = _pooled(conn, legacy)[1]
     assert pooled[1] is None  # identity

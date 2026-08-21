@@ -1,8 +1,12 @@
-"""Shared fixtures for the qiita-common test suite.
+"""Fixtures for the analytic tests, and only for them.
 
 `qiita_common.analytic` is SQL text, and text is only worth what it does on a
-connection — so `tests/analytic/test_behaviour_miint.py` executes it against real
-duckdb-miint. That needs the extension present before anything LOADs it.
+connection — so `test_behaviour_miint.py` and `test_circular_gate_contract.py` execute
+it against real duckdb-miint. That needs the extension present before anything LOADs it.
+
+Scoped to this directory rather than to `tests/`: every other qiita-common test is pure
+Python, and staging the extension for them would make the whole tier reach the mirror on
+a cold cache.
 """
 
 from qiita_common.duckdb_miint import setup_miint_test_env

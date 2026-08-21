@@ -26,6 +26,7 @@ from qiita_common import analytic as ft
 from qiita_common.hashing import canonical_params_hash
 
 from qiita_control_plane.cli.user import feature_table as ftc
+from qiita_control_plane.cli.user._helpers import _UNSET
 from qiita_control_plane.miint import connect_with_miint
 
 # One 1000 bp genome fully covered in sample 1, and one 10 000 bp genome each sample
@@ -223,8 +224,8 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
         "min_query_coverage": None,
         "unpaired_gate": False,
         "circular_gate": False,
-        "circular_min_coverage": ft.CIRCULAR_MIN_COVERAGE,
-        "circular_min_identity": ft.CIRCULAR_MIN_IDENTITY,
+        "circular_min_coverage": _UNSET,
+        "circular_min_identity": _UNSET,
         "format": ftc.DEFAULT_TABLE_FORMAT,
         "taxonomy": False,
         "tree": False,
@@ -532,6 +533,51 @@ def test_the_circular_thresholds_reach_the_predicate(monkeypatch, tmp_path):
     assert _table_rows(lax.output) == [("QM1", "GCF_100", 1.0), ("QM1", "GCF_200", 1.0)]
 
 
+def test_a_circular_threshold_without_the_mode_is_refused_not_ignored(
+    monkeypatch, tmp_path, capsys
+):
+    """A flag that only says HOW to judge does nothing on its own — the same shape as
+    `--unpaired-gate` alone, and the same refusal. Silently building an UNGATED table
+    from a command that named a threshold is the failure this closes."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_min_coverage=0.5)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "--circular-min-coverage" in err and "--circular-gate" in err
+    assert "alignments_fetched" not in rec
+    assert not args.output.exists()
+
+
+def test_the_circular_thresholds_default_only_when_omitted(monkeypatch, tmp_path):
+    """Given, they are used; omitted, the shared constants are. The namespace cannot
+    tell those apart from the value alone, which is why the flags default to a
+    sentinel."""
+    _patched(monkeypatch)
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True))
+    assert (gate.circular_min_coverage, gate.circular_min_identity) == (
+        ft.CIRCULAR_MIN_COVERAGE,
+        ft.CIRCULAR_MIN_IDENTITY,
+    )
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True, circular_min_coverage=0.5))
+    assert (gate.circular_min_coverage, gate.circular_min_identity) == (
+        0.5,
+        ft.CIRCULAR_MIN_IDENTITY,
+    )
+
+
+def test_the_identity_term_can_be_dropped_for_an_alignment_that_cannot_be_scored(
+    monkeypatch, tmp_path
+):
+    """`--circular-min-identity none` is the documented escape hatch: pooled identity is
+    NULL on a legacy-`M` CIGAR and `NULL >= 0` is NULL too, so a threshold of 0 does not
+    express it. Reaching the dataclass's `None` is the whole point."""
+    _patched(monkeypatch)
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True, circular_min_identity=None))
+    assert gate.circular_min_identity is None
+    assert gate.circular_min_coverage == ft.CIRCULAR_MIN_COVERAGE
+
+
 def test_a_circular_gate_with_a_cigar_threshold_is_refused_before_any_round_trip(
     monkeypatch, tmp_path, capsys
 ):
@@ -793,10 +839,10 @@ def test_parser_wires_the_build_with_parquet_and_pooled_as_defaults():
     assert args.min_identity is None and args.min_query_coverage is None
     assert args.unpaired_gate is False
     assert args.circular_gate is False
-    # The circular thresholds default even when the mode is off, so the flag defaults and
-    # the dataclass's are the same two values rather than two copies.
-    assert args.circular_min_coverage == ft.CIRCULAR_MIN_COVERAGE
-    assert args.circular_min_identity == ft.CIRCULAR_MIN_IDENTITY
+    # Omitted is a sentinel, not the threshold: passing one without --circular-gate has
+    # to be distinguishable from not passing it at all.
+    assert args.circular_min_coverage is _UNSET
+    assert args.circular_min_identity is _UNSET
 
 
 def test_parser_takes_the_circular_mode_and_its_two_thresholds():
@@ -808,6 +854,12 @@ def test_parser_takes_the_circular_mode_and_its_two_thresholds():
     )
     assert args.circular_gate is True
     assert (args.circular_min_coverage, args.circular_min_identity) == (0.8, 0.99)
+
+    # `none` drops the identity term, the way `--lane none` spells a NULL lane.
+    dropped = _build_parser().parse_args(
+        _build_argv(circular_min_identity="none") + ["--circular-gate"]
+    )
+    assert dropped.circular_min_identity is None
 
 
 def test_parser_takes_a_repeated_cohort_and_the_per_sample_scope():

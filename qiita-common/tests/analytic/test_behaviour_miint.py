@@ -125,16 +125,12 @@ def _stage(conn, *, alignment, mapping, lengths, threshold, gate=None):
             # exactly what the client-side recipe does when both are wanted.
             conn.execute(ft.feature_lengths_table_sql("_len_src"))
         conn.execute(ft.streamed_alignment_table_sql("_align_projected", gate=gate))
-        total, scorable, unpoolable, unpoolable_rows, paired_rows = conn.execute(
-            ft.gate_diagnostics_sql(gate)
-        ).fetchone()
+        cursor = conn.execute(ft.gate_diagnostics_sql(gate))
+        names = [column[0] for column in cursor.description]
+        # By NAME, as both consumers do — a renamed count is a TypeError here rather
+        # than one number silently arriving as another's argument.
         clearance = ft.check_gate_diagnostics(
-            gate,
-            total_rows=total,
-            scorable_rows=scorable,
-            unpoolable_partitions=unpoolable,
-            unpoolable_rows=unpoolable_rows,
-            paired_rows=paired_rows,
+            gate, **dict(zip(names, cursor.fetchone(), strict=True))
         )
         # The clearance carries the rest of the protocol in order — the gate and the
         # release of the streamed copy holding `cigar`.
@@ -735,6 +731,63 @@ def test_the_circular_gate_drops_fragments_on_opposite_strands():
     a caller can lower."""
     inverted = [_JUNCTION_READ[0], (1, 1, 10, 2064, 0, 3_000, "3000=3000S", None)]
     assert _gated_reads(inverted, gate=ft.AlignmentGate(circular=True)) == []
+
+
+def test_a_read_whose_records_disagree_about_the_cigar_encoding_is_refused():
+    """The diagnostic has to ask the question the gate asks. Pooled identity is NULL when
+    a read's records mix `M` with `=`/`X`, so that read is dropped WHOLE — including the
+    record that did score. Counted per record, three of these four rows are scorable and
+    nothing refuses; counted per read, one group has no identity and this raises.
+    """
+    mixed = [
+        (1, 1, 10, 0, 27_000, 30_000, "3000=3000S", None),
+        (1, 1, 10, 2048, 0, 3_000, "3000H3000=", None),
+        (1, 2, 10, 0, 20_000, 23_000, "3000=3000S", None),  # scorable on its own
+        (1, 2, 10, 2048, 10_000, 13_000, "3000H3000M", None),  # legacy M poisons the read
+    ]
+    with pytest.raises(ValueError, match="poolable sequence identity"):
+        _gated_reads(mixed, gate=ft.AlignmentGate(circular=True))
+
+    # Without the identity term there is nothing to be unscorable about, and both reads
+    # are judged on coverage and strand alone.
+    no_identity = ft.AlignmentGate(circular=True, circular_min_identity=None)
+    assert _gated_reads(mixed, gate=no_identity) == [
+        (1, 0),
+        (1, 27_000),
+        (2, 10_000),
+        (2, 20_000),
+    ]
+
+
+def test_the_circular_diagnostics_count_reads_not_records():
+    """The count the refusal above reads. One read scorable, one not — as READS; the
+    per-record count would say 3 of 4 rows can be scored and clear the slice."""
+    mixed = [
+        (1, 1, 10, 0, 27_000, 30_000, "3000=3000S", None),
+        (1, 1, 10, 2048, 0, 3_000, "3000H3000=", None),
+        (1, 2, 10, 0, 20_000, 23_000, "3000=3000S", None),
+        (1, 2, 10, 2048, 10_000, 13_000, "3000H3000M", None),
+    ]
+    gate = ft.AlignmentGate(circular=True)
+    with _miint_conn() as conn:
+        conn.execute(
+            "CREATE TABLE _src AS "
+            + _values(
+                mixed,
+                'prep_sample_idx, sequence_idx, feature_idx, flags, "position",'
+                " stop_position, cigar, mate_position",
+                "?::BIGINT, ?::BIGINT, ?::BIGINT, ?::USMALLINT, ?::BIGINT, ?::BIGINT,"
+                " ?::VARCHAR, ?::BIGINT",
+            ),
+            [x for r in mixed for x in r],
+        )
+        conn.execute(ft.streamed_alignment_table_sql("_src", gate=gate))
+        cursor = conn.execute(ft.gate_diagnostics_sql(gate))
+        row = dict(zip([c[0] for c in cursor.description], cursor.fetchone(), strict=True))
+    assert row["total_rows"] == 4
+    assert row["unscorable_groups"] == 1
+    # The per-record figure is not what this axis asks, so it is not reported at all.
+    assert row["scorable_rows"] is None
 
 
 def test_a_circular_gate_over_a_slice_holding_secondaries_is_refused():

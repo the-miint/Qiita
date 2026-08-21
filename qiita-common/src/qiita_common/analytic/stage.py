@@ -79,6 +79,13 @@ def feature_lengths_table_sql(source: str) -> str:
     so when that gate runs, this is what the stream is drained into and
     `genome_lengths_table_sql` reads THIS relation rather than the stream. Every other
     path stages the roll-up directly and never creates this one.
+
+    **Whole-reference, with no narrowing to the features the cohort aligned to**, unlike
+    the roll-up which aggregates on arrival. There is nothing to narrow against yet: the
+    lengths stream is opened BEFORE the alignment so a failure in it does not come after
+    a cohort's rows have crossed the wire, so the aligned feature set is not known here.
+    `circular_query_coverage` ignores references its input never mentions, so the extra
+    rows cost two BIGINTs each and nothing else, and the gate's clearance releases them.
     """
     return (
         f"CREATE TABLE {FEATURE_LENGTHS_TABLE} AS "

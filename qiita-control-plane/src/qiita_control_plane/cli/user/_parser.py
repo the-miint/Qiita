@@ -44,11 +44,13 @@ from qiita_common.models import (
 from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
 from ._helpers import (
+    _UNSET,
     _handle_patch,
     _handle_read,
     _handle_study_field_create,
     _lane_arg,
     _proportion_arg,
+    _proportion_or_none_arg,
 )
 from .alignment import _handle_alignment_cohort, _handle_alignment_list
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
@@ -830,10 +832,13 @@ def _build_parser() -> argparse.ArgumentParser:
             " only — mates are different molecules and are never pooled together."
         ),
     )
+    # Both default to `_UNSET`, not to the threshold, so "omitted" is distinguishable
+    # from "given" — passing either without --circular-gate is refused rather than
+    # silently ignored.
     p_ft_build.add_argument(
         "--circular-min-coverage",
         type=_proportion_arg,
-        default=CIRCULAR_MIN_COVERAGE,
+        default=_UNSET,
         help=(
             "Minimum proportion of a read that one reference must explain, pooled over"
             f" the read's records, under --circular-gate (default {CIRCULAR_MIN_COVERAGE})."
@@ -841,13 +846,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ft_build.add_argument(
         "--circular-min-identity",
-        type=_proportion_arg,
-        default=CIRCULAR_MIN_IDENTITY,
+        type=_proportion_or_none_arg,
+        default=_UNSET,
         help=(
             "Minimum pooled sequence identity a read must clear against a reference under"
-            f" --circular-gate (default {CIRCULAR_MIN_IDENTITY}). Needs an eqx (=/X)"
-            " CIGAR, as --min-identity does; the build refuses rather than silently drop"
-            " every row if none can be scored."
+            f" --circular-gate (default {CIRCULAR_MIN_IDENTITY}), or 'none' to gate on"
+            " coverage and strand alone. Needs an eqx (=/X) CIGAR; the build refuses"
+            " rather than silently drop reads it cannot score."
         ),
     )
     p_ft_build.add_argument(

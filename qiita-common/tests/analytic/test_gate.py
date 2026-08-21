@@ -17,6 +17,7 @@ def _clear(gate: ft.AlignmentGate) -> ft.GateClearance:
         scorable_rows=10,
         unpoolable_partitions=0,
         unpoolable_rows=0,
+        unscorable_groups=0,
         paired_rows=10 if gate.paired else 0,
     )
 
@@ -154,7 +155,16 @@ def test_the_paired_count_asks_miint_rather_than_masking_the_flag():
     assert "&" not in sql
 
 
-def _check(gate, *, total=1000, scorable=1000, unpoolable=0, unpoolable_rows=0, paired_rows=None):
+def _check(
+    gate,
+    *,
+    total=1000,
+    scorable=1000,
+    unpoolable=0,
+    unpoolable_rows=0,
+    unscorable_groups=0,
+    paired_rows=None,
+):
     """`check_gate_diagnostics` with the clean-slice defaults, so each test states only
     the count it is about. `paired_rows` defaults to what `gate.paired` implies."""
     return ft.check_gate_diagnostics(
@@ -163,6 +173,7 @@ def _check(gate, *, total=1000, scorable=1000, unpoolable=0, unpoolable_rows=0, 
         scorable_rows=scorable,
         unpoolable_partitions=unpoolable,
         unpoolable_rows=unpoolable_rows,
+        unscorable_groups=unscorable_groups,
         paired_rows=(total if gate.paired else 0) if paired_rows is None else paired_rows,
     )
 
