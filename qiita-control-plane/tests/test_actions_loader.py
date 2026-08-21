@@ -262,6 +262,84 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
     assert len({s.entrypoint for s in container_steps}) == 4
 
 
+def test_load_actions_loads_on_disk_amplicon_yaml():
+    """`workflows/amplicon/1.0.0.yaml` loads with the reference-agnostic Rapid 16S
+    shape: sequenced_pool-scoped; context REQUIRES sortmerna_reference_idx + trim;
+    the step chain is denoise (module; STREAMS the pool's reads — declares no reads
+    input) → mint-features → amplicon_load (module; threads processing_idx) →
+    register-files."""
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "amplicon" in by_id, "workflows/amplicon/1.0.0.yaml must load"
+    amplicon = by_id["amplicon"]
+
+    assert amplicon.target_kind == ScopeTargetKind.SEQUENCED_POOL
+    assert amplicon.version == "1.0.0"
+    assert amplicon.context_schema["required"] == ["sortmerna_reference_idx", "trim"]
+
+    assert [s.name for s in amplicon.steps] == [
+        "denoise",
+        "mint-features",
+        "amplicon_load",
+        "register-files",
+    ]
+
+    denoise = next(s for s in amplicon.steps if s.name == "denoise")
+    assert denoise.module == "qiita_compute_orchestrator.jobs.amplicon_deblur"
+    # No reads input — the pool's reads STREAM at runtime (the absence is the signal).
+    assert "pool_reads" not in denoise.inputs and "reads" not in denoise.inputs
+    assert denoise.inputs == ["sortmerna_ref"]
+    assert denoise.params == {"primer": "primer", "trim": "trim", "orient_primer": "orient_primer"}
+    assert denoise.outputs == ["asv_counts", "asv_manifest"]
+
+    load_step = next(s for s in amplicon.steps if s.name == "amplicon_load")
+    assert load_step.module == "qiita_compute_orchestrator.jobs.amplicon_load"
+    # processing_idx via params -> runner mints the run identity before the loop.
+    assert load_step.params == {"processing_idx": "processing_idx"}
+    # Pure native + library primitives; no container steps.
+    assert not [s for s in amplicon.steps if getattr(s, "container", None)]
+
+
+def test_load_actions_loads_on_disk_golay_demux_yaml():
+    """`workflows/golay-demux/1.0.0.yaml` loads with the ingest shape:
+    sequenced_pool-scoped; context REQUIRES index_reads_path + forward_reads_path +
+    barcode_map (no golay_table_path — the decode cloud is generated in-job); the
+    step chain is golay_demux (module) → register-files."""
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "golay-demux" in by_id, "workflows/golay-demux/1.0.0.yaml must load"
+    golay = by_id["golay-demux"]
+
+    assert golay.target_kind == ScopeTargetKind.SEQUENCED_POOL
+    assert golay.version == "1.0.0"
+    assert golay.context_schema["required"] == [
+        "index_reads_path",
+        "forward_reads_path",
+        "barcode_map",
+    ]
+    # The vendored golay table is gone — the cloud is generated in-job.
+    assert "golay_table_path" not in golay.context_schema["properties"]
+
+    assert [s.name for s in golay.steps] == ["golay_demux", "register-files"]
+
+    demux = next(s for s in golay.steps if s.name == "golay_demux")
+    assert demux.module == "qiita_compute_orchestrator.jobs.golay_demux"
+    assert "golay_table_path" not in demux.inputs
+    assert demux.optional_inputs == ["reverse_reads_path"]
+
+
 def test_load_actions_loads_on_disk_host_reference_add_yaml():
     """The actual on-disk `workflows/host-reference-add/1.0.0.yaml` loads as a
     valid ActionDefinition with the host-indexing shape:
