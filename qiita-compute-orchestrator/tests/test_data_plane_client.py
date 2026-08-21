@@ -353,7 +353,7 @@ async def test_open_reference_sequences_stream_mints_whole_reference(monkeypatch
 
 async def test_fetch_assembly_doget_sends_the_run_pair_and_table():
     """The body carries `(prep_sample_idx, processing_idx)` and the table, and
-    nothing else — no feature list, because the CP resolves the roster."""
+    nothing else — a job names the run, never a contig."""
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -380,9 +380,9 @@ async def test_fetch_assembly_doget_sends_the_run_pair_and_table():
 
 @pytest.mark.parametrize("status", [404, 422, 403, 500])
 async def test_fetch_assembly_doget_raises_on_non_2xx(status):
-    """Any non-2xx (404 a pair with no loaded contigs, 422 an unknown table or an
-    oversized roster, 403 missing scope, 5xx) raises HTTPStatusError for the
-    caller to map to a BackendFailure."""
+    """Any non-2xx (404 a pair that never assembled, 422 an unknown table, 403
+    missing scope, 5xx) raises HTTPStatusError for the caller to map to a
+    BackendFailure."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(status, content=json.dumps({"detail": "nope"}))

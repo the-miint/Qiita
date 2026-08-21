@@ -26,5 +26,9 @@ KIND_UNBINNED = "UNBINNED"  # a noLCG contig that no refined bin claimed
 # plane's `ALLOWED_TABLES` is the Rust half of the pair; neither language can
 # import the other, so `test_cp_doget_allowlist_matches_the_rust_one_exactly`
 # parses the Rust const and fails on drift.
+#
+# `assembly_membership` is deliberately NOT here: it is on neither allowlist. The
+# data plane reads it to resolve which contigs one run produced
+# (`build_assembly_run_query`), but no ticket can name it as a table.
 ASSEMBLED_SEQUENCE_TABLE = "assembled_sequence"
 ASSEMBLED_SEQUENCE_CHUNKS_TABLE = "assembled_sequence_chunks"

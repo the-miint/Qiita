@@ -388,16 +388,16 @@ async def fetch_assembly_doget_ticket(
 ) -> bytes:
     """POST /assembly/ticket/doget and return the raw signed ticket bytes.
 
-    The body names the assembly RUN — a `(prep_sample_idx, processing_idx)` pair;
-    the CP resolves that run's contig `feature_idx` roster and signs it (see
-    `routes/assembly.py`).
+    The body names the assembly RUN — a `(prep_sample_idx, processing_idx)` pair
+    — and that pair is what the CP signs; the data plane resolves the run's
+    contigs itself (see `routes/assembly.py`).
 
     `http` is the authed httpx client (Bearer with the compute SA PAT, base_url =
     the CP) from `cp_client.make_cp_client()`. The CP returns the ticket
     base64-encoded; this decodes it to the raw bytes `open_doget_stream` wraps in
     a `flight.Ticket`. Raises `httpx.HTTPStatusError` on any non-2xx (404 a pair
-    with no loaded contigs, 422 an unknown table or an oversized roster, 403
-    missing scope, 5xx) — the caller maps it to a BackendFailure.
+    that never assembled, 422 an unknown table, 403 missing scope, 5xx) — the
+    caller maps it to a BackendFailure.
     """
     resp = await http.post(
         URL_ASSEMBLY_DOGET,
@@ -419,16 +419,16 @@ async def open_assembly_chunk_stream(
     processing_idx: int,
     relation: str = "assembly_chunks",
 ) -> AsyncIterator[str]:
-    """Mint a roster-scoped DoGet ticket (CO→CP) and stream that assembly run's
+    """Mint a run-scoped DoGet ticket (CO→CP) and stream that assembly run's
     `assembled_sequence_chunks` rows (CO→DP Flight) into `conn` as `relation`,
     yielding the registered relation name for the caller to reassemble from
     inside the `async with` body.
 
     The assembly twin of `open_reference_chunk_stream`, and reassembled the same
     way: `SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index)
-    FROM <relation> GROUP BY feature_idx`. Which contigs arrive is decided
-    CP-side from the pair, not by the caller — a job asks for "this run's
-    contigs" and cannot name features of its own.
+    FROM <relation> GROUP BY feature_idx`. Which contigs arrive follows from the
+    signed pair, not from the caller — a job asks for "this run's contigs" and
+    cannot name features of its own.
 
     Rides the shared `_open_ticket_stream`, so the CP client is closed as soon as
     the ticket is minted; only the Flight client/stream stays open for the body's

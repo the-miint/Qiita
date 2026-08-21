@@ -5,15 +5,21 @@ contig sequences ONE assembly run produced — a ``(prep_sample_idx,
 processing_idx)`` pair — on the data plane's ``assembled_sequence`` /
 ``assembled_sequence_chunks`` tables.
 
-The body names the pair; the ticket carries a ``feature_idx`` set. Neither lake
-table has a ``prep_sample_idx`` column — a contig is stored once, keyed by the
+The pair itself is what rides the ticket. Neither lake table has a
+``prep_sample_idx`` column — a contig is stored once, keyed by the
 content-deduped ``feature_idx`` it shares with every other run that produced the
-same bytes — so "this run's assembly" is not a filter a Flight ticket can
-express. ``qiita.assembly_membership`` is where the pair maps to a feature set,
-it lives in Postgres, and the data plane has no database, so the route reads the
-roster and signs it. The caller never names features; unlike the block-read
-route, the resolved set does ride the ticket, because the data plane has nothing
-else to match on.
+same bytes — but ``assembly_membership`` is a DuckLake table as well as a
+Postgres one, so "this run's contigs" is a fact the data plane can resolve for
+itself, as a semi join, exactly the way a ``reference_idx`` filter resolves
+through ``reference_membership``. Both identifiers are CP-minted and signed; the
+data plane treats them as the opaque integers it treats every other identifier
+as.
+
+What the data plane reads is therefore the DuckLake copy of the junction, which
+is replace-keyed on this same pair — so a re-run's ticket names that re-run's
+contigs. The Postgres copy is written ``ON CONFLICT DO NOTHING`` and keeps
+superseded rows (see ``DEPLOY_CHECKLIST.md``), which is why it is used below only
+to answer "did this run assemble at all", never to bound what streams.
 """
 
 import base64
@@ -27,7 +33,6 @@ from qiita_common.assembly_constants import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import AssemblyDoGetTicketRequest, DoGetTicketResponse
-from qiita_common.models.step import MAX_DOGET_FEATURE_IDX
 
 from ..auth.guards import require_service_with_scope
 from ..auth.principal import ServiceAccount
@@ -56,24 +61,24 @@ async def create_assembly_doget_ticket(
     # pass-set, which is the assembly workflow's only read input.
     _sa: ServiceAccount = Depends(require_service_with_scope(Scope.TICKET_DOGET)),
 ) -> DoGetTicketResponse:
-    """Sign a DoGet ticket scoped to one assembly run's contig features.
+    """Sign a DoGet ticket scoped to one assembly run.
 
     Service-account-only (``ticket:doget``) — minted at job RUNTIME, like every
     other DoGet mint route (short TTL; a SLURM queue can outlive a submit-time
     ticket).
 
-    Refusals, each of which would otherwise stream a different run's contigs
-    under this run's name, or none at all:
+    The signed filter is the pair and nothing else. A caller cannot name a
+    contig: ``extra="forbid"`` on the body leaves no field that reaches the
+    filter, and the data plane refuses a ``feature_idx`` on these two tables
+    outright, so neither end of the wire can widen or narrow a run.
+
+    Refusals:
 
     * a table outside the two assembly surfaces → 422 (the reference / alignment
       / read surfaces each have their own route and their own scope rule);
-    * no ``qiita.assembly_membership`` row for the pair → 404, never a
-      whole-table ticket. An unknown ``prep_sample_idx``, an unknown
-      ``processing_idx``, a pair whose run has not loaded yet, and a pair that
-      never assembled are one answer here: there are no contigs to stream;
-    * a roster past ``MAX_DOGET_FEATURE_IDX`` → 422 naming the count. The list
-      rides the signed ticket payload and becomes one ``feature_idx IN (...)`` on
-      the data plane, which is the bound that constant already states.
+    * a pair that never assembled → 404, never a ticket. An unknown
+      ``prep_sample_idx``, an unknown ``processing_idx``, and a real pair that
+      never assembled are one answer here: there are no contigs to stream.
 
     Authorization is scope-only at this layer, matching the reference /
     read_masked / alignment / read doget routes: any service account holding
@@ -86,12 +91,11 @@ async def create_assembly_doget_ticket(
             detail=f"Unknown table {body.table!r}; allowed: {sorted(ASSEMBLY_DOGET_TABLES)}",
         )
 
-    feature_idx = await _fetch_assembly_roster(
+    if not await _assembly_run_exists(
         pool,
         prep_sample_idx=body.prep_sample_idx,
         processing_idx=body.processing_idx,
-    )
-    if not feature_idx:
+    ):
         raise HTTPException(
             status_code=404,
             detail=(
@@ -99,42 +103,37 @@ async def create_assembly_doget_ticket(
                 f"{body.prep_sample_idx}, processing_idx={body.processing_idx}"
             ),
         )
-    if len(feature_idx) > MAX_DOGET_FEATURE_IDX:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"assembly roster is {len(feature_idx)} features, over the "
-                f"{MAX_DOGET_FEATURE_IDX} a DoGet ticket carries"
-            ),
-        )
 
     ticket_bytes = sign_ticket(
         table=body.table,
-        filter={"feature_idx": feature_idx},
+        filter={
+            "prep_sample_idx": [body.prep_sample_idx],
+            "processing_idx": [body.processing_idx],
+        },
         secret=signing_key,
     )
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())
 
 
-async def _fetch_assembly_roster(
+async def _assembly_run_exists(
     pool: asyncpg.Pool,
     *,
     prep_sample_idx: int,
     processing_idx: int,
-) -> list[int]:
-    """The contig features one assembly run produced, ascending.
+) -> bool:
+    """Whether this run linked any contig at all — the 404's only question.
 
-    DISTINCT because ``assembly_membership``'s key includes ``(kind, bin_id)``: a
-    contig a refined bin claims is also carried under whichever other kind the
-    run emitted it as, so the same ``feature_idx`` appears on more than one row.
-    Every bin of the run is included — the ticket is the run's whole assembly,
-    not one bin's.
+    A diagnostic, not the read boundary: the data plane resolves which contigs
+    stream from its own copy of the junction. The two copies can disagree on
+    CONTENT after a re-run (Postgres keeps superseded rows, DuckLake replaces
+    them), but not on existence in the direction this gate acts: the workflow
+    runs ``write-assembly-membership`` before ``register-files``, so a run whose
+    contigs are in the lake has rows here too, and the gate cannot refuse a run
+    the data plane could serve.
     """
-    rows = await pool.fetch(
-        "SELECT DISTINCT feature_idx FROM qiita.assembly_membership"
-        " WHERE prep_sample_idx = $1 AND processing_idx = $2"
-        " ORDER BY feature_idx",
+    return await pool.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM qiita.assembly_membership"
+        " WHERE prep_sample_idx = $1 AND processing_idx = $2)",
         prep_sample_idx,
         processing_idx,
     )
-    return [row["feature_idx"] for row in rows]

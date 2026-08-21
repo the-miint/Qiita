@@ -243,10 +243,6 @@ class StepCancelResponse(BaseModel):
 # shard is ~hundreds/thousands of features; the cap guards ticket/query size
 # (the list rides the signed ticket payload and becomes a `feature_idx IN (...)`
 # on the data plane) without constraining any realistic shard roster.
-#
-# Public because two sites bound a list for that one reason: the subset a caller
-# may send here, and the contig roster the assembly DoGet route resolves CP-side
-# (`routes/assembly.py`) — both end up as that same IN list.
 MAX_DOGET_FEATURE_IDX = 100_000
 
 
@@ -341,10 +337,10 @@ class AssemblyDoGetTicketRequest(BaseModel):
     """Body for POST /api/v1/assembly/ticket/doget.
 
     Names one assembly RUN — a ``(prep_sample_idx, processing_idx)`` pair — whose
-    contig sequences the caller wants to stream. The route resolves that pair's
-    contig ``feature_idx`` roster and signs a ``feature_idx``-filtered ticket;
-    why the pair itself cannot be signed is at the route
-    (``routes/assembly.py``).
+    contig sequences the caller wants to stream. Both identifiers are signed onto
+    the ticket verbatim and the data plane resolves the run's contigs itself,
+    through the lake's ``assembly_membership``; the route
+    (``routes/assembly.py``) carries why that resolution lives there.
 
     ``table`` picks which surface the ticket reads: ``assembled_sequence`` (one
     row per contig: hash + length) or ``assembled_sequence_chunks`` (the bytes,

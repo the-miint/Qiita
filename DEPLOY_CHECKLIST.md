@@ -408,7 +408,11 @@ sys.exit(1 if bad else 0)'
   provisioned a second principal holding only `ticket:doget` for reference streaming (the
   least-privilege split in
   [`compute-service-account-provisioning.md`](docs/runbooks/compute-service-account-provisioning.md)),
-  that principal now reaches contigs too. (#TBD)
+  that principal now reaches contigs too. The ticket carries the pair, and the data plane
+  resolves which contigs it reaches from the DuckLake `assembly_membership` at read time —
+  so a run re-registered while a ticket is still live (≤1 h) streams the re-registered
+  rows, and a run whose contigs are in the lake but whose Postgres membership was cleared
+  answers 404 at the route. (#TBD)
 
 - **`qiita.assembly_membership.kind` gains a third value, `UNBINNED`.** A
   long-read-assembly run also records the contigs no refined bin claimed, with the contig

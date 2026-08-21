@@ -504,15 +504,15 @@ URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
 # =============================================================================
 # /assembly/* — Flight DoGet ticket for one assembly run's contigs
 # =============================================================================
-# Signs a DoGet ticket scoped to the contig `feature_idx` set ONE assembly run —
-# a `(prep_sample_idx, processing_idx)` pair — produced, on the data plane's
-# `assembled_sequence` / `assembled_sequence_chunks` tables. POST is
-# service-account-only (Scope.TICKET_DOGET) — the job mints it at runtime, the
-# same shape as /alignment/ticket/doget.
+# Signs a DoGet ticket scoped to ONE assembly run — a `(prep_sample_idx,
+# processing_idx)` pair — on the data plane's `assembled_sequence` /
+# `assembled_sequence_chunks` tables. POST is service-account-only
+# (Scope.TICKET_DOGET) — the job mints it at runtime, the same shape as
+# /alignment/ticket/doget.
 #
-# The body names the pair; the route resolves the roster from
-# qiita.assembly_membership and signs `feature_idx` alone. Why the pair itself
-# cannot be signed is at the route (routes/assembly.py).
+# The body names the pair and the pair is what is signed; the data plane
+# resolves that run's contigs through the lake's own assembly_membership. Why
+# the resolution lives there is at the route (routes/assembly.py).
 
 PATH_ASSEMBLY_PREFIX = "/assembly"
 PATH_ASSEMBLY_DOGET = "/ticket/doget"

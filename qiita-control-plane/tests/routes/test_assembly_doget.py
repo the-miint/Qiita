@@ -5,11 +5,11 @@ a `(prep_sample_idx, processing_idx)` pair — produced, on the data plane's
 `assembled_sequence` / `assembled_sequence_chunks` tables. Service-account-only
 (Scope.TICKET_DOGET), same as the alignment doget route.
 
-The signed `feature_idx` list IS the authorization boundary here: the data plane
-has no `prep_sample_idx` to re-check against, so whatever the route resolves is
-what streams. These tests therefore assert the roster VERBATIM against a fixture
-seeded with the three neighbours a wrong query would pick up — the same sample's
-other run, the same run's other sample, and a contig belonging to no assembly.
+The signed pair IS the scope: the data plane resolves the run's contigs from the
+lake's own `assembly_membership`. So what these tests pin is that the ticket
+carries the pair and NOTHING else — no feature list, and no body field that could
+add one. Which contigs that pair reaches is pinned where it is resolved, against
+a real DuckLake, in `tests/integration/test_doget.py`.
 """
 
 import base64
@@ -108,22 +108,19 @@ async def sa_no_scope_client(postgres_pool, compute_worker_service_account):
 
 @pytest_asyncio.fixture
 async def env(postgres_pool):
-    """Two samples x two assembly runs, laid out so a wrong roster is visible.
+    """Two samples x two assembly runs, so each half of the pair discriminates.
 
     `qiita.assembly_membership` FKs prep_sample, processing and feature, so none
-    of the three can be invented. The contigs:
+    of the three can be invented. Three runs exist — (A, a), (A, b), (B, a) — so
+    the route's existence gate cannot be satisfied by a neighbour agreeing on
+    only one half of the key, and the ticket it signs cannot silently drop
+    either half.
 
-    * `run_a` (sample A, processing A) — `lcg` under KIND_LCG, `mag` and
-      `shared` under KIND_MAG in one bin, and `mag` AGAIN under a second
-      (kind, bin_id) so the DISTINCT has something to collapse;
-    * `run_b` (sample A, processing B) — a different run of the SAME sample,
-      holding `other_run` plus `shared`. `shared` is the content-dedup case: one
-      feature_idx claimed by two runs, so it must appear in both rosters;
-    * `run_c` (sample B, processing A) — the SAME run identity on a different
-      sample, holding `other_sample`;
-    * `unclaimed` — a real feature no assembly_membership row names.
-
-    Yields the ids; the roster of `run_a` is exactly {lcg, mag, shared}.
+    Which CONTIGS a run reaches is not a property of this layer any more; the
+    data plane resolves it from the lake's own `assembly_membership`, and the
+    fixture that discriminates it (a contig two runs share, a contig no run
+    claims, a contig two bins of one run claim) lives with that resolution in
+    `tests/integration/test_doget.py`.
     """
     suffix = secrets.token_hex(4)
     principal_idx = await seed_user_principal(
@@ -138,7 +135,7 @@ async def env(postgres_pool):
 
     features = {
         name: await seed_bare_feature(postgres_pool)
-        for name in ("lcg", "mag", "shared", "other_run", "other_sample", "unclaimed")
+        for name in ("lcg", "mag", "other_run", "other_sample")
     }
 
     async def _processing(tag: str) -> int:
@@ -166,11 +163,7 @@ async def env(postgres_pool):
         [
             (ps_a, proc_a, KIND_LCG, "contig_1", features["lcg"]),
             (ps_a, proc_a, KIND_MAG, "bin.1", features["mag"]),
-            (ps_a, proc_a, KIND_MAG, "bin.1", features["shared"]),
-            # Same feature, second (kind, bin_id) — the DISTINCT's job.
-            (ps_a, proc_a, KIND_MAG, "bin.2", features["mag"]),
             (ps_a, proc_b, KIND_MAG, "bin.1", features["other_run"]),
-            (ps_a, proc_b, KIND_MAG, "bin.1", features["shared"]),
             (ps_b, proc_a, KIND_MAG, "bin.1", features["other_sample"]),
         ],
     )
@@ -271,55 +264,48 @@ async def test_ticket_doget_is_service_only_and_on_no_human_ceiling():
 
 
 # ---------------------------------------------------------------------------
-# The signed roster — exactly this run's contigs and no others
+# The signed scope — the run, and nothing but the run
 # ---------------------------------------------------------------------------
 
 
-async def test_doget_signs_exactly_this_runs_contigs(ctx, env):
-    """The roster is the run's whole assembly, deduplicated, ascending — and
-    excludes the same sample's OTHER run, the same run's OTHER sample, and a
-    feature no assembly claims. Asserted verbatim: on this surface the signed
-    list is the authorization boundary, so "some rows came back" is not the
-    property under test."""
+async def test_doget_signs_the_run_pair_and_no_contig(ctx, env):
+    """Both identifiers ride the ticket, each single-valued, and no third column
+    does. The data plane refuses a `feature_idx` on these tables, so a ticket
+    naming a contig is not just unsigned here — it is unserveable there."""
     resp = await ctx["sa"].post(URL_ASSEMBLY_DOGET, json=_body(env))
     assert resp.status_code == 201, resp.text
     payload = _decode_ticket_payload(resp.json()["ticket"])
 
     assert payload["table"] == ASSEMBLED_SEQUENCE_CHUNKS_TABLE
-    expected = sorted([env["lcg"], env["mag"], env["shared"]])
-    assert payload["filter"] == {"feature_idx": expected}
-    for absent in ("other_run", "other_sample", "unclaimed"):
-        assert env[absent] not in payload["filter"]["feature_idx"], absent
-    # Nothing but feature_idx is signed: the data plane has no prep_sample_idx
-    # column to match on for these tables.
-    assert set(payload["filter"]) == {"feature_idx"}
+    assert payload["filter"] == {
+        "prep_sample_idx": [env["prep_sample_a"]],
+        "processing_idx": [env["processing_a"]],
+    }
     assert "members" not in payload and "columns" not in payload
 
 
-async def test_doget_second_run_of_the_same_sample_gets_its_own_roster(ctx, env):
-    """processing_idx is the run discriminator: the same prep_sample under the
-    other run resolves to that run's contigs. `shared` is in BOTH rosters —
-    a contig two runs produced is one content-deduped feature_idx, and scoping
-    by membership rows (not by "features minted during this run") is what makes
-    it stream for each."""
-    resp = await ctx["sa"].post(URL_ASSEMBLY_DOGET, json=_body(env, run="processing_b"))
+@pytest.mark.parametrize(
+    ("sample", "run"),
+    [
+        pytest.param("prep_sample_a", "processing_b", id="same-sample-other-run"),
+        pytest.param("prep_sample_b", "processing_a", id="same-run-other-sample"),
+    ],
+)
+async def test_doget_signs_the_pair_it_was_given(ctx, env, sample, run):
+    """Neither identifier is dropped or defaulted: the ticket for a neighbouring
+    run differs from the one above in exactly the component the body changed."""
+    resp = await ctx["sa"].post(URL_ASSEMBLY_DOGET, json=_body(env, sample=sample, run=run))
     assert resp.status_code == 201, resp.text
     payload = _decode_ticket_payload(resp.json()["ticket"])
-    assert payload["filter"] == {"feature_idx": sorted([env["other_run"], env["shared"]])}
+    assert payload["filter"] == {
+        "prep_sample_idx": [env[sample]],
+        "processing_idx": [env[run]],
+    }
 
 
-async def test_doget_second_sample_of_the_same_run_gets_its_own_roster(ctx, env):
-    """The mirror of the above on the other key: same processing_idx, different
-    prep_sample_idx."""
-    resp = await ctx["sa"].post(URL_ASSEMBLY_DOGET, json=_body(env, sample="prep_sample_b"))
-    assert resp.status_code == 201, resp.text
-    payload = _decode_ticket_payload(resp.json()["ticket"])
-    assert payload["filter"] == {"feature_idx": [env["other_sample"]]}
-
-
-async def test_doget_signs_the_same_roster_for_both_surfaces(ctx, env):
+async def test_doget_signs_the_same_scope_for_both_surfaces(ctx, env):
     """`assembled_sequence` and `assembled_sequence_chunks` differ only in what a
-    row carries; the scope is the same roster."""
+    row carries; the scope is the same run."""
     chunks = _decode_ticket_payload(
         (await ctx["sa"].post(URL_ASSEMBLY_DOGET, json=_body(env))).json()["ticket"]
     )
@@ -341,9 +327,14 @@ async def test_doget_signs_the_same_roster_for_both_surfaces(ctx, env):
 
 @pytest.mark.parametrize("missing", ["sample", "run"])
 async def test_doget_pair_with_no_contigs_404(ctx, env, missing):
-    """A pair with no assembly_membership row is a 404, never a ticket with an
-    empty (whole-table) filter. An unknown identifier and a real one that simply
-    never assembled are the same answer."""
+    """A pair no assembly_membership row names is a 404, never a ticket. An
+    unknown identifier and a real one that simply never assembled are the same
+    answer.
+
+    Both halves of the key are exercised because the OTHER half stays real: the
+    gate must not admit `(sample A, no such run)` on the strength of sample A's
+    other run, nor `(no such sample, run a)` on the strength of run a's other
+    sample."""
     body = _body(env)
     body["prep_sample_idx" if missing == "sample" else "processing_idx"] = 2_000_000_000
     resp = await ctx["sa"].post(URL_ASSEMBLY_DOGET, json=body)
@@ -356,8 +347,8 @@ async def test_doget_pair_with_no_contigs_404(ctx, env, missing):
     ["assembly_membership", "bin_quality", "reference_sequences", "read_masked", "", "assembled"],
 )
 async def test_doget_table_outside_the_two_surfaces_422(ctx, env, table):
-    """Only the two sequence surfaces. `assembly_membership` is the junction the
-    route itself reads from Postgres and is not Flight-readable; the reference /
+    """Only the two sequence surfaces. `assembly_membership` is the junction
+    that RESOLVES their scope and is not itself Flight-readable; the reference /
     read surfaces have their own routes and their own scope rules."""
     resp = await ctx["sa"].post(URL_ASSEMBLY_DOGET, json=_body(env, table=table))
     assert resp.status_code == 422, resp.text
@@ -407,8 +398,8 @@ async def test_doget_assembly_surfaces_in_cp_allowlist():
 
 
 async def test_doget_assembly_not_signable_via_reference_route():
-    """The assembly surfaces are served only by this route, scoped to a run's
-    roster — never by the reference route with a reference_idx filter."""
+    """The assembly surfaces are served only by this route, scoped to one run —
+    never by the reference route with a reference_idx filter."""
     from qiita_control_plane.routes.reference import _REFERENCE_DOGET_TABLES
 
     assert ASSEMBLED_SEQUENCE_TABLE not in _REFERENCE_DOGET_TABLES

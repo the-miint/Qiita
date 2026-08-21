@@ -334,11 +334,11 @@ const ALLOWED_TABLES: &[&str] = &[
     "alignment_visible",
     // One assembly run's contigs — sample-derived sequence, where everything
     // above is reference data or per-read derived output. Neither table has a
-    // prep_sample_idx column, so a ticket names the contigs by `feature_idx`,
-    // and the control plane is what turns a `(prep_sample_idx, processing_idx)`
-    // pair into that set (`routes/assembly.py`). An empty filter is refused in
-    // `build_query` (see `requires_scoped_filter`) — here it would read every
-    // contig of every sample.
+    // prep_sample_idx column; a ticket names the run by `(prep_sample_idx,
+    // processing_idx)` and `build_assembly_run_query` resolves it through
+    // `qiita_lake.assembly_membership`, the same shape as the `reference_idx`
+    // resolution the MEMBERSHIP_JOIN_TABLES get. A `feature_idx` filter is NOT
+    // accepted on either, and neither is an empty one.
     "assembled_sequence",
     "assembled_sequence_chunks",
 ];
@@ -356,6 +356,9 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
     "prep_sample_idx",
     // Scopes an alignment DoGet to a single alignment run (feature-table consumer).
     "alignment_idx",
+    // With prep_sample_idx, names the assembly RUN an assembly DoGet resolves
+    // through `assembly_membership` (`build_assembly_run_query`).
+    "processing_idx",
 ];
 
 /// Columns a signed ticket may ask the alignment DoGet to project: every column
@@ -3142,11 +3145,22 @@ fn is_alignment_doget_surface(table: &str) -> bool {
 ///
 /// The `reference_*` tables are broadly readable by design (an unfiltered SELECT
 /// there mirrors the anonymous REST `GET /reference/{idx}`), so the refusal is
-/// per-table rather than global. Listed here are the ones an empty filter would
-/// turn into the whole alignment sink, or every sample's contigs.
+/// per-table rather than global. What is listed is the one table an empty filter
+/// would turn into the whole alignment sink. The assembly surfaces are not
+/// listed and do not need to be: like `read_masked`, their scope IS their query
+/// shape (`build_assembly_run_query`), which has no empty form to refuse.
 fn requires_scoped_filter(table: &str) -> bool {
     is_alignment_doget_surface(table)
-        || matches!(table, "assembled_sequence" | "assembled_sequence_chunks")
+}
+
+/// The DoGet surfaces whose scope is one assembly RUN.
+///
+/// Neither carries `prep_sample_idx` — a contig is stored once, keyed by the
+/// content-deduped `feature_idx` it shares with every other run that produced
+/// the same bytes — so which contigs are "this run's" is a fact held by
+/// `assembly_membership`, and `build_assembly_run_query` reads it there.
+fn is_assembly_run_surface(table: &str) -> bool {
+    matches!(table, "assembled_sequence" | "assembled_sequence_chunks")
 }
 
 /// Build a SQL query for the given table and filter.
@@ -3191,6 +3205,12 @@ fn build_query(
     // list, so it cannot be assembled by the generic WHERE-clause path below.
     if table == "read_masked" {
         return build_read_masked_query(filter);
+    }
+
+    // An assembly surface is scoped by a run, which is a fact in another table
+    // rather than a column of this one — also not a generic WHERE clause.
+    if is_assembly_run_surface(table) {
+        return build_assembly_run_query(table, filter);
     }
 
     if filter.is_empty() {
@@ -3339,6 +3359,54 @@ fn build_read_masked_query(filter: &auth::TicketFilter) -> Result<(String, Strin
     Ok((
         format!("SELECT * FROM {}", read_masked_relation(mask_idx, &preps)),
         "qiita_lake.read_masked".to_string(),
+    ))
+}
+
+/// Build the assembly DoGet: one run's contigs, selected by a semi join against
+/// the lake's own `assembly_membership` rather than by a roster the ticket
+/// carries.
+///
+/// The ticket names the run and nothing else — exactly one `prep_sample_idx`,
+/// exactly one `processing_idx`, no third column. Several values, or an extra
+/// column, would blend contigs from heterogeneous runs into one
+/// indistinguishable stream, the same failure the single-`alignment_idx` guard
+/// prevents; `feature_idx` in particular is refused, so no ticket can name
+/// contigs directly on these tables.
+///
+/// `IN (subquery)`, not a literal list: DuckDB plans it as a SEMI hash join and
+/// pushes the resolved keys' min/max and a Bloom filter into the lake scan as
+/// dynamic filters. Measured on DuckDB 1.5.4 / ducklake d318a545, a catalog of
+/// 3.6M chunk rows over 200 files, a 26,129-contig run: this form's scan emits
+/// 245,457 rows in 140 ms, while the same roster as 26,129 literals is rewritten
+/// into a MARK join above an unfiltered scan — 3,600,000 rows, 1,793 ms — with
+/// both forms opening the same 200 files and returning the same 235,161 rows.
+/// Where per-file `feature_idx` ranges are narrow enough to prune at all, the two
+/// prune identically (1 file of 200 on a contiguous run). Semi-join semantics
+/// also make the DISTINCT implicit: a contig that two `(kind, bin_id)` rows claim
+/// is one output row, not two.
+///
+/// `assembly_membership` stays out of `ALLOWED_TABLES` — it is readable here as
+/// the scope resolver, never as a stream: no column of it reaches the output.
+fn build_assembly_run_query(
+    table: &str,
+    filter: &auth::TicketFilter,
+) -> Result<(String, String), Status> {
+    let prep_sample_idx = single_i64_filter(filter, "prep_sample_idx")?;
+    let processing_idx = single_i64_filter(filter, "processing_idx")?;
+    if filter.len() != 2 {
+        return Err(Status::invalid_argument(format!(
+            "{table} accepts only prep_sample_idx and processing_idx, got {} columns",
+            filter.len()
+        )));
+    }
+    let full_table = format!("qiita_lake.{table}");
+    Ok((
+        format!(
+            "SELECT * FROM {full_table} WHERE feature_idx IN (\
+             SELECT feature_idx FROM qiita_lake.assembly_membership \
+             WHERE prep_sample_idx = {prep_sample_idx} AND processing_idx = {processing_idx})"
+        ),
+        full_table,
     ))
 }
 
@@ -7039,9 +7107,10 @@ mod tests {
 
     #[test]
     fn assembly_surfaces_are_doget_allowed_and_the_junction_is_not() {
-        // The two sequence surfaces are Flight-readable; `assembly_membership`
-        // (which the control plane reads from Postgres to build the roster) and
-        // `bin_quality` are register_files write targets only.
+        // The two sequence surfaces are Flight-readable. `assembly_membership`
+        // is read to RESOLVE their scope (`build_assembly_run_query`) but is not
+        // a table a ticket can name; `bin_quality` is a register_files write
+        // target only.
         for readable in ["assembled_sequence", "assembled_sequence_chunks"] {
             assert!(
                 ALLOWED_TABLES.contains(&readable),
@@ -7056,35 +7125,86 @@ mod tests {
         }
     }
 
+    /// A well-formed assembly ticket filter: the run, and only the run.
+    fn assembly_run_scope(prep_sample_idx: i64, processing_idx: i64) -> auth::TicketFilter {
+        filter_of(&[
+            ("prep_sample_idx", vec![serde_json::json!(prep_sample_idx)]),
+            ("processing_idx", vec![serde_json::json!(processing_idx)]),
+        ])
+    }
+
     #[test]
-    fn build_query_assembly_scopes_by_feature_idx() {
+    fn build_query_assembly_resolves_the_run_through_membership() {
         for table in ["assembled_sequence", "assembled_sequence_chunks"] {
-            let (sql, full) = build_query(table, &feature_scope(&[11, 22, 33]), &[], &[]).unwrap();
+            let (sql, full) = build_query(table, &assembly_run_scope(42, 7), &[], &[]).unwrap();
             assert_eq!(full, format!("qiita_lake.{table}"));
             assert_eq!(
                 sql,
-                format!("SELECT * FROM qiita_lake.{table} WHERE feature_idx IN (11,22,33)"),
+                format!(
+                    "SELECT * FROM qiita_lake.{table} WHERE feature_idx IN (\
+                     SELECT feature_idx FROM qiita_lake.assembly_membership \
+                     WHERE prep_sample_idx = 42 AND processing_idx = 7)"
+                ),
                 "got: {sql}"
             );
-            // No membership JOIN: these are not MEMBERSHIP_JOIN_TABLES, so a
-            // bare `feature_idx` binds against the base table.
-            assert!(!sql.contains("JOIN"), "got: {sql}");
         }
     }
 
     #[test]
-    fn build_query_assembly_refuses_an_empty_filter() {
-        // The whole-table read this would be is every sample's contigs. Unlike
-        // the reference_* tables (broadly readable by design), it is refused —
-        // see `requires_scoped_filter`.
+    fn build_query_assembly_requires_exactly_the_run_key() {
+        // Every rejected shape below would stream contigs the named run did not
+        // produce, or none at all.
         let empty = auth::TicketFilter::new();
+        let cases: &[(&str, auth::TicketFilter)] = &[
+            ("empty filter", empty.clone()),
+            (
+                "prep_sample_idx alone",
+                filter_of(&[("prep_sample_idx", vec![serde_json::json!(42)])]),
+            ),
+            (
+                "processing_idx alone",
+                filter_of(&[("processing_idx", vec![serde_json::json!(7)])]),
+            ),
+            (
+                "two runs",
+                filter_of(&[
+                    ("prep_sample_idx", vec![serde_json::json!(42)]),
+                    (
+                        "processing_idx",
+                        vec![serde_json::json!(7), serde_json::json!(8)],
+                    ),
+                ]),
+            ),
+            (
+                "two samples",
+                filter_of(&[
+                    (
+                        "prep_sample_idx",
+                        vec![serde_json::json!(42), serde_json::json!(43)],
+                    ),
+                    ("processing_idx", vec![serde_json::json!(7)]),
+                ]),
+            ),
+            (
+                "the run plus a named contig",
+                filter_of(&[
+                    ("prep_sample_idx", vec![serde_json::json!(42)]),
+                    ("processing_idx", vec![serde_json::json!(7)]),
+                    ("feature_idx", vec![serde_json::json!(11)]),
+                ]),
+            ),
+            ("a contig roster alone", feature_scope(&[11, 22, 33])),
+        ];
         for table in ["assembled_sequence", "assembled_sequence_chunks"] {
-            let err = build_query(table, &empty, &[], &[])
-                .expect_err("an empty filter on an assembly surface must be rejected");
-            assert!(err.message().contains(table), "got: {err}");
+            for (label, filter) in cases {
+                assert!(
+                    build_query(table, filter, &[], &[]).is_err(),
+                    "{table} must reject {label}"
+                );
+            }
         }
         // Control: the same empty filter IS served for a reference table, so the
-        // assertion above is about these tables and not about empty filters.
+        // first case above is about these tables and not about empty filters.
         assert!(build_query("reference_sequences", &empty, &[], &[]).is_ok());
     }
 
@@ -7097,7 +7217,7 @@ mod tests {
             assert!(
                 build_query(
                     table,
-                    &feature_scope(&[11]),
+                    &assembly_run_scope(42, 7),
                     &[],
                     &columns(&["feature_idx"])
                 )
@@ -7105,10 +7225,30 @@ mod tests {
                 "{table} must reject a projection column list"
             );
             assert!(
-                build_query(table, &feature_scope(&[11]), &block_members(), &[]).is_err(),
+                build_query(table, &assembly_run_scope(42, 7), &block_members(), &[]).is_err(),
                 "{table} must reject a block members selector"
             );
         }
+    }
+
+    #[test]
+    fn build_query_assembly_membership_reaches_no_output_column() {
+        // The junction answers "which contigs are this run's" and stops there:
+        // the subquery yields feature_idx, so no membership column can ride out
+        // on a stream whose table is not it (see the allowlist test above).
+        let (sql, full) = build_query(
+            "assembled_sequence_chunks",
+            &assembly_run_scope(42, 7),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(full, "qiita_lake.assembled_sequence_chunks");
+        assert!(sql.starts_with("SELECT * FROM qiita_lake.assembled_sequence_chunks"));
+        assert!(
+            !sql.contains("kind") && !sql.contains("bin_id"),
+            "got: {sql}"
+        );
     }
 
     /// A minimally-scoped alignment ticket filter. The scoping guards have their

@@ -38,20 +38,34 @@ def _seed_reference_rows(data_plane):
         conn.close()
 
 
-# One assembly run's contigs (`ASSEMBLY_RUN_FEATURE_IDXS`) plus another run's,
-# seeded interleaved so a query that ignored the roster would return both.
+# One assembly run, and the three neighbours a mis-scoped resolution would pick
+# up. `ASSEMBLY_RUN` is the run under test; every other contig below is seeded
+# into the SAME two tables, interleaved by feature_idx, so nothing separates them
+# except which membership rows name them.
+ASSEMBLY_SAMPLE, ASSEMBLY_RUN = 8801, 9901
+ASSEMBLY_OTHER_RUN = 9902  # same sample, second assembly run
+ASSEMBLY_OTHER_SAMPLE = 8802  # same run identity, second sample
+
+# The run's own contigs: one LCG, one MAG, and one that a SECOND (kind, bin_id)
+# of the same run also claims (700013) — the duplicate a semi join must collapse.
+# 700013 is additionally claimed by the other run: a contig two runs assembled to
+# identical bytes is ONE content-deduped feature_idx, so it belongs to both.
 ASSEMBLY_RUN_FEATURE_IDXS = [700011, 700013]
-ASSEMBLY_OTHER_RUN_FEATURE_IDXS = [700012, 700014]
+ASSEMBLY_OTHER_RUN_FEATURE_IDXS = [700012, 700013]
+ASSEMBLY_OTHER_SAMPLE_FEATURE_IDX = 700014
+ASSEMBLY_UNCLAIMED_FEATURE_IDX = 700015  # a contig no membership row names
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _seed_assembly_rows(data_plane):
-    """Seed the two assembly surfaces against the live DuckLake.
+    """Seed the two assembly surfaces and their membership against the live
+    DuckLake.
 
-    Neither table has a `prep_sample_idx` column — which is the whole reason the
-    control plane resolves a roster and signs `feature_idx` — so "another run's
-    contigs" is expressed here the only way the lake expresses it: other
-    feature_idx values in the same table.
+    Neither sequence table has a `prep_sample_idx` column — a contig is stored
+    once, keyed by the content-deduped `feature_idx` — so "this run's contigs" is
+    a fact only `assembly_membership` holds, and resolving it is what the data
+    plane's `build_assembly_run_query` does. Seeding all four neighbours into one
+    table is what makes that resolution falsifiable.
     """
     conn = ducklake_connect(data_plane["data_path"])
     try:
@@ -60,16 +74,31 @@ def _seed_assembly_rows(data_plane):
             "(700011, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID, 8), "
             "(700012, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22'::UUID, 8), "
             "(700013, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a33'::UUID, 8), "
-            "(700014, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a44'::UUID, 8)"
+            "(700014, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a44'::UUID, 8), "
+            "(700015, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a55'::UUID, 8)"
         )
         conn.execute(
             "INSERT INTO qiita_lake.assembled_sequence_chunks VALUES "
             "(700011, 0, 'AAAACCCC'), (700012, 0, 'GGGGTTTT'), "
             "(700013, 0, 'ACGT'), (700013, 1, 'TGCA'), "
-            "(700014, 0, 'TTTTAAAA')"
+            "(700014, 0, 'TTTTAAAA'), (700015, 0, 'CCCCGGGG')"
+        )
+        conn.execute(
+            "INSERT INTO qiita_lake.assembly_membership VALUES "
+            f"({ASSEMBLY_SAMPLE}, {ASSEMBLY_RUN}, 'LCG', 'contig_1', 700011), "
+            f"({ASSEMBLY_SAMPLE}, {ASSEMBLY_RUN}, 'MAG', 'bin.1', 700013), "
+            # Same contig, second bin of the SAME run — one output row, not two.
+            f"({ASSEMBLY_SAMPLE}, {ASSEMBLY_RUN}, 'MAG', 'bin.2', 700013), "
+            f"({ASSEMBLY_SAMPLE}, {ASSEMBLY_OTHER_RUN}, 'MAG', 'bin.1', 700012), "
+            f"({ASSEMBLY_SAMPLE}, {ASSEMBLY_OTHER_RUN}, 'MAG', 'bin.1', 700013), "
+            f"({ASSEMBLY_OTHER_SAMPLE}, {ASSEMBLY_RUN}, 'MAG', 'bin.1', 700014)"
         )
     finally:
         conn.close()
+
+
+def _assembly_run_filter(prep_sample_idx=ASSEMBLY_SAMPLE, processing_idx=ASSEMBLY_RUN):
+    return {"prep_sample_idx": [prep_sample_idx], "processing_idx": [processing_idx]}
 
 
 @pytest.fixture
@@ -126,22 +155,22 @@ def test_doget_empty_result(data_plane, flight_client):
     assert reader.read_all().num_rows == 0
 
 
-def test_doget_assembly_chunks_streams_only_the_signed_roster(
+def test_doget_assembly_chunks_streams_exactly_this_runs_contigs(
     data_plane, flight_client
 ):
-    """The roster IS the scope: the data plane has no prep_sample_idx on these
-    tables, so it serves exactly the feature_idx set the ticket names. The other
-    run's contigs sit in the same table and must not appear."""
+    """The signed pair IS the scope, and the data plane resolves it: the ticket
+    names no contig, and what streams is exactly the run's own — excluding the
+    same sample's other run, the same run's other sample, and a contig no
+    membership row claims. Asserted verbatim; "some rows came back" is not the
+    property under test.
+
+    700013 is claimed twice by this run (two bins) and once by the other run: it
+    appears once here, because the resolution is a semi join and not a join."""
     ticket_bytes = _sign_ticket(
-        "assembled_sequence_chunks",
-        {"feature_idx": ASSEMBLY_RUN_FEATURE_IDXS},
-        data_plane["secret"],
+        "assembled_sequence_chunks", _assembly_run_filter(), data_plane["secret"]
     )
     table = flight_client.do_get(flight.Ticket(ticket_bytes)).read_all()
 
-    returned = set(table.column("feature_idx").to_pylist())
-    assert sorted(returned) == ASSEMBLY_RUN_FEATURE_IDXS
-    assert not returned & set(ASSEMBLY_OTHER_RUN_FEATURE_IDXS)
     # 700013's two chunks reassemble in chunk_index order, the form every
     # consumer of this surface uses.
     rows = sorted(
@@ -157,19 +186,48 @@ def test_doget_assembly_chunks_streams_only_the_signed_roster(
         (700013, 0, "ACGT"),
         (700013, 1, "TGCA"),
     ]
+    returned = set(table.column("feature_idx").to_pylist())
+    assert sorted(returned) == ASSEMBLY_RUN_FEATURE_IDXS
+    assert 700012 not in returned, "the same sample's other run"
+    assert ASSEMBLY_OTHER_SAMPLE_FEATURE_IDX not in returned, (
+        "the same run's other sample"
+    )
+    assert ASSEMBLY_UNCLAIMED_FEATURE_IDX not in returned, "a contig no run claims"
 
 
-def test_doget_assembled_sequence_streams_only_the_signed_roster(
-    data_plane, flight_client
+@pytest.mark.parametrize(
+    ("prep_sample_idx", "processing_idx", "expected"),
+    [
+        pytest.param(
+            ASSEMBLY_SAMPLE,
+            ASSEMBLY_OTHER_RUN,
+            ASSEMBLY_OTHER_RUN_FEATURE_IDXS,
+            id="same-sample-other-run",
+        ),
+        pytest.param(
+            ASSEMBLY_OTHER_SAMPLE,
+            ASSEMBLY_RUN,
+            [ASSEMBLY_OTHER_SAMPLE_FEATURE_IDX],
+            id="same-run-other-sample",
+        ),
+        pytest.param(ASSEMBLY_SAMPLE, 9999, [], id="pair-that-never-assembled"),
+    ],
+)
+def test_doget_assembly_each_half_of_the_pair_discriminates(
+    data_plane, flight_client, prep_sample_idx, processing_idx, expected
 ):
-    """The flat surface takes the same roster and streams the per-contig row."""
+    """Neither half of the run key is ignorable. Change only `processing_idx` and
+    the SAME sample yields the other run's contigs (700013 in both — one
+    content-deduped feature two runs assembled); change only `prep_sample_idx`
+    and the same run yields the other sample's. A pair naming no run streams
+    nothing rather than everything."""
     ticket_bytes = _sign_ticket(
         "assembled_sequence",
-        {"feature_idx": ASSEMBLY_RUN_FEATURE_IDXS},
+        _assembly_run_filter(prep_sample_idx, processing_idx),
         data_plane["secret"],
     )
     table = flight_client.do_get(flight.Ticket(ticket_bytes)).read_all()
-    assert sorted(table.column("feature_idx").to_pylist()) == ASSEMBLY_RUN_FEATURE_IDXS
+    assert sorted(table.column("feature_idx").to_pylist()) == sorted(expected)
     assert set(table.column_names) >= {
         "feature_idx",
         "sequence_hash",
@@ -183,33 +241,60 @@ def test_doget_assembled_sequence_streams_only_the_signed_roster(
         pytest.param(
             "assembled_sequence",
             {},
-            "requires a non-empty filter",
+            "missing single-valued filter column",
             id="unscoped-sequence",
         ),
         pytest.param(
             "assembled_sequence_chunks",
             {},
-            "requires a non-empty filter",
+            "missing single-valued filter column",
             id="unscoped-chunks",
         ),
         pytest.param(
+            "assembled_sequence_chunks",
+            {"feature_idx": [700011, 700014]},
+            "missing single-valued filter column",
+            id="contig-roster-is-not-a-scope",
+        ),
+        pytest.param(
+            "assembled_sequence_chunks",
+            {
+                "prep_sample_idx": [ASSEMBLY_SAMPLE],
+                "processing_idx": [ASSEMBLY_RUN, ASSEMBLY_OTHER_RUN],
+            },
+            "expected exactly one value",
+            id="two-runs-blended",
+        ),
+        pytest.param(
+            "assembled_sequence_chunks",
+            {
+                "prep_sample_idx": [ASSEMBLY_SAMPLE],
+                "processing_idx": [ASSEMBLY_RUN],
+                "feature_idx": [ASSEMBLY_OTHER_SAMPLE_FEATURE_IDX],
+            },
+            "accepts only prep_sample_idx and processing_idx",
+            id="run-plus-a-smuggled-contig",
+        ),
+        pytest.param(
             "assembly_membership",
-            {"feature_idx": [700011]},
+            {"prep_sample_idx": [ASSEMBLY_SAMPLE]},
             "unknown table",
             id="junction-not-readable",
         ),
     ],
 )
-def test_doget_assembly_unscoped_or_off_surface_is_refused(
+def test_doget_assembly_off_scope_or_off_surface_is_refused(
     data_plane, flight_client, table, filter_dict, message
 ):
-    """Two refusals the assembly path depends on, at the server rather than the
-    signer: an empty filter (which would read every sample's contigs) and the
-    membership junction (a register_files write target, not Flight-readable).
+    """The refusals the assembly path depends on, at the server rather than the
+    signer: an unscoped ticket (which would read every sample's contigs), a
+    ticket naming contigs directly, one blending two runs into an
+    indistinguishable stream, and the membership junction itself — which the
+    server READS to resolve a run but will not stream.
 
     Signed here directly rather than through the control plane — no CP route
-    produces either, which is the point: the data plane refuses regardless of
-    what signed it. InvalidArgument surfaces as ArrowInvalid, not FlightError.
+    produces any of them, which is the point: the data plane refuses regardless
+    of what signed it. InvalidArgument surfaces as ArrowInvalid, not FlightError.
     """
     from qiita_control_plane.auth.tickets import _sign_payload
 

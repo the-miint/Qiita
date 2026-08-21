@@ -774,8 +774,8 @@ _DOGET_ALLOWED_TABLES = frozenset(
         READ_BLOCK_TABLE,
         READ_MASKED_BLOCK_TABLE,
         # The assembly surfaces, served by routes/assembly.py and scoped to one
-        # run's contig features. Named from the shared constants for the same
-        # reason as the block-read pair above.
+        # `(prep_sample_idx, processing_idx)` run. Named from the shared
+        # constants for the same reason as the block-read pair above.
         ASSEMBLED_SEQUENCE_TABLE,
         ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
     }
@@ -787,8 +787,8 @@ _DOGET_ALLOWED_TABLES = frozenset(
 # (prep_sample_idx + mask_idx), `alignment_visible` via /alignment/ticket/doget
 # (alignment_idx + cohort), the block-read selectors via /read/ticket/doget
 # (a block's members), and the assembly surfaces via /assembly/ticket/doget (one
-# run's contig features — a reference_idx filter means nothing to a table keyed
-# on sample-derived contigs). The reference route restricts itself to the
+# `(prep_sample_idx, processing_idx)` run — a reference_idx filter means nothing
+# to a table keyed on sample-derived contigs). The reference route restricts itself to the
 # reference_* tables whose membership it resolves — including
 # `reference_taxonomy_visible`, so external taxonomy reads also go through the
 # exclusion view.
