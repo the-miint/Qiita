@@ -1250,7 +1250,7 @@ async def plan_shards(
 # DuckDB JOIN that resolves each assembly contig to its bin + feature_idx.
 # bin_map (read_id -> kind, bin_id) x manifest (read_id -> sequence_hash) x
 # feature_map (sequence_hash -> feature_idx). The read_id is assembly_hash's
-# synthetic globally-unique id (kind:bin_id:contig_id), so the join is 1:1 per
+# synthetic per-contig id, unique across that job's scan, so the join is 1:1 per
 # contig. INNER JOINs by construction: every bin_map read_id is a manifest read_id
 # (both from the same assembly_hash scan) and every manifest hash was minted by
 # mint-features, so no contig is dropped. Exposed as a module constant so the join

@@ -181,10 +181,10 @@ steps:
       walltime: PT4H
 
   # Hash the LCG contigs, the MAG contigs, and the unbinned noLCG residue into the
-  # reference-load shape: manifest (synthetic globally-unique read_id, SHARED
-  # canonical sequence_hash), hash-keyed assembly_chunks/, and bin_map
-  # (read_id → kind, bin_id). Zero contigs of any kind is StepNoData. Sequences
-  # are run-agnostic, so this step carries no processing_idx.
+  # reference-load shape: manifest (synthetic per-contig read_id, SHARED canonical
+  # sequence_hash), hash-keyed assembly_chunks/, and bin_map (read_id → kind,
+  # bin_id, contig_id). Zero contigs of any kind is StepNoData. Sequences are
+  # run-agnostic, so this step carries no processing_idx.
   - step: assembly_hash
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.assembly_hash

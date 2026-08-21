@@ -38,7 +38,12 @@ _None yet._
   (`qiita-common/src/qiita_common/assembly_constants.py`) instead of listing its members,
   which went stale when unbinned contigs became a third kind. (#460)
 
-- `20260819000000_assembly_sample.sql` — plain `make migrate`, no out-of-band setup. One
+- `20260819000000_assembly_membership_subject_comment.sql` — plain `make migrate`, no
+  out-of-band setup. Comment only, no schema change: it supersedes the
+  `qiita.assembly_membership` table comment `20260818000000` above sets, and adds the first
+  comment on the `bin_id` column. (#464)
+
+- `20260819000001_assembly_sample.sql` — plain `make migrate`, no out-of-band setup. One
   empty table and its index, `qiita.assembly_sample`: the per-`(processing_idx,
   prep_sample)` completion gate for `long-read-assembly`, alongside the existing
   `qiita.mask_sample` and `qiita.alignment_sample`. The index is created with the table, so
