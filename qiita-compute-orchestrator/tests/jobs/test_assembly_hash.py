@@ -444,6 +444,13 @@ def test_repeated_contig_id_stores_each_contigs_own_bytes(tmp_path):
     shares a bin_id; the synthetic ids differ in `sequence_index`, so each contig's
     chunks land under its own `sequence_hash`.
 
+    Neither shipped producer emits this header shape, so this pins the invariant
+    rather than a reachable input. `assemble.sh` writes `>${2}` from an awk field,
+    which is whitespace-free by construction, so the first token is the whole GFA
+    segment name; `myloasm_split` writes `contig_id` and refuses a duplicate
+    outright. Reaching the case at all needs a space in the header, which is what
+    puts the disambiguator in the comment field where `read_fastx` drops it.
+
     Neither sequence equals its own reverse complement, and one is soft-masked, so
     the stored-bytes assertion discriminates on both axes the canonical hash folds.
     """
@@ -472,7 +479,7 @@ def test_repeated_contig_id_within_one_bin_keeps_both_rows(tmp_path):
 
     A MAG's bin_id is its FILE stem, not a contig id, so the two records shared a
     bin_id before the repeat as well and `sequence_index` is the whole of what
-    separates their ids.
+    separates their ids. Same unreachable header shape as the LCG arm above.
     """
     seq_a, seq_b = "ACGTTGCAAGGGTTCA", "ggatccTTAACCggat"
     genomes, refined = _layout(tmp_path)
