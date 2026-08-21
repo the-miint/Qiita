@@ -61,20 +61,15 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-- **BLOCKED — do not run the backfill below yet.** It redrives each ticket under its
-  existing `work_ticket_idx`, and `register-files` fails at the file move:
-  `lake_dest_filename` (`qiita-data-plane/src/flight_service.rs`) mints
-  `wt<work_ticket_idx>-<basename>`, which is unique only across tickets, not across two
-  loads from one ticket; `move_file` then refuses to overwrite the file that ticket's
-  original run already registered. Observed 2026-08-21 on work_ticket 6939: the six
-  retained steps fast-forwarded, `assembly_hash` → `assembly_load` replayed clean, then
-  `register-files` failed `permanent` with `refusing to overwrite existing lake file
-  <PATH_PERSISTENT>/ducklake/assembled_sequence_chunks/wt6939-part_00000.parquet`. All 57
-  candidates collide the same way. The destination name must become unique per
-  registration rather than per ticket before this runs; the procedure below then needs no
-  other change. 6939 was restored to `completed` and the 16,395 `UNBINNED`
-  `assembly_membership` rows its partial run wrote were deleted, so no sample is left
-  half-backfilled.
+- **The data plane this backfill needs is live.** It redrives each ticket under its
+  existing `work_ticket_idx`, which used to fail at the file move — `lake_dest_filename`
+  minted `wt<work_ticket_idx>-<basename>`, unique across tickets but not across two loads
+  from one ticket, so `move_file` refused to overwrite the file that ticket's original run
+  had registered. The name now also carries a digest of the registration's `staging_dir`,
+  so a redrive whose producer step re-ran lands on its own path; the procedure below drops
+  `assembly_load`'s row, so it does. Deployed 2026-08-21 in `4fc4ce3d`
+  ([archived](docs/deploy-archive/2026-08-21-4fc4ce3d.md)) — do not run this against an
+  older build. (#472)
 
 - **Readiness was re-verified 2026-08-21 and the candidate set is intact**: 7,234 ticket
   workspaces, 57 carrying all six retained steps, and all 342 of those workspaces passing
