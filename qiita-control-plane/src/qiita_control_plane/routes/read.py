@@ -15,10 +15,9 @@ signs tickets for RAW ``read`` rows, which is a strict superset of the
 human/host reads. Like its siblings the ticket is minted at RUNTIME (short TTL; a
 SLURM queue can outlive a submit-time ticket).
 
-Also serves the sequenced_pool-scoped ``amplicon`` workflow, whose ``denoise``
-step streams the whole pool's raw reads the same way — members are the pool's
-full per-sample ranges (``fetch_pool_members``, no tiling) instead of a block's
-tiled cover-map.
+Also serves the sequenced_pool-scoped ``amplicon`` workflow, which streams the
+whole pool the same way — members are the pool's full per-sample ranges
+(``fetch_pool_members``, no tiling) instead of a block's tiled map.
 
 The body carries only ``work_ticket_idx``. Everything that scopes the ticket is
 read CP-side:
@@ -71,10 +70,8 @@ async def create_read_doget_ticket(
     for the raw selector those reads are human-containing:
 
     * unknown ``work_ticket_idx`` → 404;
-    * a work ticket that is neither BLOCK- nor SEQUENCED_POOL-scoped → 422 (only
-      those have members; the per-sample read path does not use this route). A
-      block streams its tiled sub-ranges; a sequenced_pool (amplicon) streams the
-      whole pool, one full range per sample;
+    * a ticket that is neither BLOCK- nor SEQUENCED_POOL-scoped → 422. A block
+      streams its tiled sub-ranges; a pool streams the whole pool;
     * an ``action_context`` whose alignment intent disagrees with the
       ``work_ticket.alignment_idx`` column → 422 (a mid-flight alignment DELETE;
       see ``resolve_block_read_scope``);
@@ -99,10 +96,7 @@ async def create_read_doget_ticket(
     if kind not in (ScopeTargetKind.BLOCK.value, ScopeTargetKind.SEQUENCED_POOL.value):
         raise HTTPException(
             status_code=422,
-            detail=(
-                "a read DoGet ticket requires a block- or sequenced_pool-scoped work "
-                f"ticket; work ticket {body.work_ticket_idx} is {kind!r}-scoped"
-            ),
+            detail=f"work ticket {body.work_ticket_idx} is not block- or pool-scoped",
         )
 
     # asyncpg hands JSONB back as str under the default codec (or a dict if one
@@ -123,9 +117,7 @@ async def create_read_doget_ticket(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    # Members: a BLOCK reads its tiled cover-map from block_member; a
-    # SEQUENCED_POOL (amplicon) streams the whole pool, one FULL range per sample
-    # (no tiling — deblur groups per sample and must see each whole).
+    # a block uses its tiled members; a pool uses full per-sample ranges.
     if kind == ScopeTargetKind.BLOCK.value:
         raw_members = await fetch_block_members(pool, row["block_idx"])
         scope_label = f"block {row['block_idx']}"
@@ -139,10 +131,7 @@ async def create_read_doget_ticket(
     if not members:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"{scope_label} has no members — refusing to sign an unscoped read "
-                "ticket (a block planning bug, or a pool with no ingested reads)"
-            ),
+            detail=f"{scope_label} has no members; refusing an unscoped ticket",
         )
 
     ticket_bytes = sign_ticket(table=table, filter=filter_, members=members, secret=signing_key)

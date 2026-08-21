@@ -43,10 +43,8 @@ _log = logging.getLogger(__name__)
 # durable copies under.
 
 SAMPLE_MAP_BINDING = "sample_map"
-# The golay-demux workflow's per-sample barcode roster: like `sample_map`, a
-# roster the CP knows and the demux step needs, materialized to a Parquet
-# (`params:` carry only scalars). Each entry carries its own `barcodes_are_rc`
-# provenance flag (a per-sample sample-sheet fact, not a uniform knob).
+# golay-demux's per-sample barcode roster, materialized to a parquet like
+# `sample_map`. each entry carries its own barcodes_are_rc flag.
 BARCODE_MAP_BINDING = "barcode_map"
 STAGED_READS_BINDING = "reads"
 # A workflow that consumes ready-for-consumption reads (assembly) declares
@@ -294,9 +292,7 @@ async def _resolve_sample_map(action_context: dict[str, Any], workspace: Path) -
 
 
 def _write_barcode_map_parquet(roster: list[dict[str, Any]], out_path: Path) -> None:
-    """Write the `{prep_sample_idx, barcode, barcodes_are_rc}` roster to a Parquet
-    `(prep_sample_idx BIGINT, barcode VARCHAR, barcodes_are_rc BOOLEAN)` for the
-    golay_demux step. pyarrow writes it directly, mirroring `_write_sample_map_parquet`."""
+    """write the barcode roster to a parquet for the golay_demux step."""
     import pyarrow as pa  # noqa: PLC0415
     import pyarrow.parquet as pq  # noqa: PLC0415
 
@@ -314,16 +310,11 @@ def _write_barcode_map_parquet(roster: list[dict[str, Any]], out_path: Path) -> 
 
 
 async def _resolve_barcode_map(action_context: dict[str, Any], workspace: Path) -> dict[str, Path]:
-    """Materialize the golay-demux barcode roster from action_context into a local
-    Parquet for the `golay_demux` step. Same pre-loop, inside-try placement as
-    `_resolve_sample_map` so a failure lands in the outer FAILED handler. Raises a
-    SUBMISSION-attributed BAD_INPUT on a missing/empty roster."""
+    """materialize the golay-demux barcode roster to a parquet. mirrors
+    `_resolve_sample_map`; BAD_INPUT on a missing or empty roster."""
     roster = action_context.get(BARCODE_MAP_BINDING)
     if not roster:
-        raise _submission_bad_input(
-            "a golay-demux workflow requires a non-empty `barcode_map` roster in "
-            "action_context (the CP embeds it from the prep template at submit time)"
-        )
+        raise _submission_bad_input("golay-demux requires a non-empty barcode_map")
     workspace.mkdir(parents=True, exist_ok=True)
     out = workspace / "barcode_map.parquet"
     _write_barcode_map_parquet(roster, out)

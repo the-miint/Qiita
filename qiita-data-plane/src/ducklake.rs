@@ -610,14 +610,10 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Per-sample denoised-ASV feature counts from an amplicon (deblur) run — the
-/// lightweight, "alignment-like" amplicon surface: feature membership + abundance
-/// per sample, NOT per-read SAM rows like `alignment`. `processing_idx` identifies
-/// the deblur run's config (qiita.processing), exactly like `assembly_membership`;
-/// `feature_idx` is the canonical-hash-minted ASV identity. This is the DuckLake
-/// copy the derived amplicon feature table aggregates (count per (sample, feature))
-/// — never itself a stored feature table. Pure append (a run's rows are its own),
-/// so deliberately NOT in `REPLACE_KEY_TABLES`.
+/// per-sample ASV feature counts from a deblur run: feature membership plus
+/// abundance, keyed by `processing_idx` (the run) and `feature_idx` (the ASV).
+/// the derived amplicon feature table aggregates this; it is never itself
+/// stored. pure append, so deliberately not in `REPLACE_KEY_TABLES`.
 pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_membership (

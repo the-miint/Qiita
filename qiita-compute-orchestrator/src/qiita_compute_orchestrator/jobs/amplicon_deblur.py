@@ -1,21 +1,16 @@
-"""Rapid 16S amplicon denoising — the deblur pipeline as a native miint job.
+"""Rapid 16S deblur as a native miint job.
 
-Ports duckdb-miint's Rapid 16S deblur (filter → denoise) into Qiita, REFERENCE-
-AGNOSTIC: it denoises the pool's reads into ASVs and emits, per sample, the ASV's
-canonical sequence_hash + abundance. It does NOT match against GG2 — feature_idx
-is minted from the sequence_hash (mint-features) and the closed-reference feature
-table is DERIVED later by intersecting feature_idx with a reference's membership.
+Reference-agnostic. Denoise the pool's reads into ASVs; emit each ASV's canonical
+sequence_hash and per-sample count. mint-features mints feature_idx from the hash;
+the closed-reference table is derived later.
 
-Refinements over the historical deblur.sql (validated to reproduce the golden):
-  * primer search/orient is conditional (`orient_primer`, default off — Rapid 16S
-    reads are already primer-stripped, so the old CASE was dead work);
-  * chimera detection (UCHIME-denovo) runs BEFORE the expensive MSA;
-  * feature identity is the system-wide canonical sequence hash.
+Refinements over the historical deblur.sql (reproduce the golden):
+  * primer orient is optional (`orient_primer`, default off);
+  * UCHIME chimera detection runs before the MSA;
+  * feature identity is the shared canonical hash.
 
-Outputs (consumed by the amplicon workflow):
-  * asv_manifest — DISTINCT `sequence_hash` for the `mint-features` action.
-  * asv_counts   — `(prep_sample_idx, sequence_hash, count)` per sample; joined to
-    the minted `feature_idx` into `amplicon_membership` downstream.
+Outputs: asv_manifest (distinct sequence_hash for mint-features) and asv_counts
+(prep_sample_idx, sequence_hash, count).
 """
 
 from __future__ import annotations
@@ -38,18 +33,12 @@ from ..miint import (
 )
 from ..read_source import bind_step_reads
 
-# IUPAC nucleotide codes (incl. degeneracy) a forward primer may contain. Used to
-# validate `primer` before it is inlined into the orient regex — a malformed
-# primer must fail loud, not silently produce a wrong extraction.
+# IUPAC codes a primer may contain; validated before use.
 _IUPAC_DNA = frozenset("ACGTURYSWKMBDHVN")
 
 YAML_STEP_NAME = "denoise"
 
-# DuckDB's ops here are light; SortMeRNA/MAFFT/VSEARCH do the heavy work as separate
-# processes with their own parallelism, so DuckDB stays modest and leaves the
-# cgroup's cores + RAM to them. (Only SortMeRNA rides the GPL-boundary binary;
-# MAFFT is BSD and VSEARCH dual-licensed — the boundary routing is enforced by
-# MIINT_GPL_BOUNDARY_PATH, not asserted here.)
+# keep DuckDB light; the tools run as separate processes.
 _DUCKDB_THREADS = 4
 _DUCKDB_FALLBACK_MEMORY_GB = 8
 _DUCKDB_RESERVE_GB = 32
@@ -58,24 +47,17 @@ _DUCKDB_RESERVE_GB = 32
 class Inputs(BaseModel):
     """Typed input contract for the amplicon denoise step.
 
-    reads: OPTIONAL, and unset in practice — the amplicon workflow stages no reads,
-        so the pool's raw reads STREAM from the data plane at runtime (the absence
-        of a bound reads path is the streaming signal, exactly like the block
-        workflows). `bind_step_reads` resolves it to the shared export projection
-        (prep_sample_idx, sequence_idx, read_id, sequence1, ...); prep_sample_idx is
-        the per-sample partition, sequence1 is the read.
-    sortmerna_ref: a FASTA of the SortMeRNA 16S reference, materialized by the
-        runner from a loaded sequence_reference (NOT a fixed operator path).
-    primer: forward primer (EMP V4 515F); only consulted when orient_primer.
-    orient_primer: run the primer search/orient/extract step. Default False —
-        Rapid 16S reads arrive primer-stripped.
-    trim: bp truncation length (150 for the GG2 V4 catalog).
+    reads: unset in practice; the pool's reads stream from the data plane.
+        bind_step_reads binds the shared read projection.
+    sortmerna_ref: SortMeRNA 16S FASTA, materialized by the runner from a reference.
+    primer: forward primer (EMP V4 515F); used only when orient_primer.
+    orient_primer: run the primer orient step. Default off.
+    trim: truncation length (150 for the GG2 V4 catalog).
     """
 
     reads: Path | None = None
     sortmerna_ref: Path
-    # EMP V4 515F default; only consulted when orient_primer (dead otherwise), so
-    # optional — matches the workflow context_schema default and lets a submit omit it.
+    # used only when orient_primer; optional so a submit can omit it.
     primer: str = "GTGYCAGCMGCCGCGGTAA"
     trim: int
     orient_primer: bool = False
@@ -84,8 +66,7 @@ class Inputs(BaseModel):
     work_ticket_idx: int
 
 
-# deblur.sql `filter` for Rapid 16S (primer-orient skipped): trim → per-sample
-# derep (abundance >= 2) → SortMeRNA 16S pre-filter → drop samples with < 2 unique.
+# filter: trim, per-sample derep, SortMeRNA, drop thin samples.
 _FILTER_SQL = """
 CREATE OR REPLACE TABLE trimmed AS
 SELECT sample_id, sample_id || '_r' || sequence_index AS read_id,
@@ -108,8 +89,7 @@ SELECT * FROM joined WHERE sample_id IN (
     SELECT sample_id FROM joined GROUP BY sample_id HAVING COUNT(DISTINCT sequence1) >= 2);
 """
 
-# Chimera BEFORE the MSA (a chimera is a chimera irrespective of denoising, and it
-# shrinks the MAFFT input), then re-apply MAFFT's >=2-unique-per-sample requirement.
+# chimera filter before the MSA, then drop thin samples.
 _CHIMERA_SQL = """
 CREATE OR REPLACE TABLE chimera_calls AS
 SELECT * FROM detect_chimera_uchime_denovo('alignable', sample_id := 'sample_id',
@@ -122,7 +102,7 @@ SELECT * FROM nonchim WHERE sample_id IN (
     SELECT sample_id FROM nonchim GROUP BY sample_id HAVING COUNT(DISTINCT sequence1) >= 2);
 """
 
-# Per-sample MAFFT MSA → deblur denoise.
+# per-sample MAFFT MSA, then deblur denoise.
 _DENOISE_SQL = """
 CREATE OR REPLACE TABLE aligned AS
 SELECT am.sample_id, am.read_id, am.aligned_sequence, d.abundance
@@ -133,8 +113,7 @@ FROM deblur('aligned', sequence_col := 'aligned_sequence', sample_id := 'sample_
 ORDER BY abundance DESC;
 """
 
-# primer search/orient/extract (only when orient_primer): forward or RC-orient the
-# read to the primer, then trim. Kept for protocols that need it.
+# orient each read to the primer (only when orient_primer).
 _ORIENT_SQL = """
 CREATE OR REPLACE TABLE _inputs_oriented AS
 SELECT sample_id, sequence_index,
@@ -154,18 +133,14 @@ FROM _inputs;
 
 def _set_session_vars(conn, *, primer: str, trim: int, sortmerna_ref: Path, orient: bool) -> None:
     conn.execute(f"SET VARIABLE rapid_trim = {int(trim)};")
-    # Generic SQL-string safety (rejects quote/backslash/control chars) — same
-    # validator the reads/output paths use; not parquet-suffix-gated, so it applies
-    # to the FASTA too and REJECTS a bad path rather than silently escaping it.
+    # reject unsafe path characters (applies to the FASTA too).
     safe_ref = validate_parquet_path(sortmerna_ref)
     conn.execute(f"SET VARIABLE miint_sortmerna_ref = '{safe_ref}';")
     if orient:
-        # Validate, don't mangle: a malformed primer must fail loud, not run and
-        # silently produce a wrong extraction regex (fail-fast contract). Bare
-        # ValueError -> BAD_INPUT via the native-job dispatcher.
+        # validate, don't mangle; a bad primer must fail loud.
         upper = primer.upper()
         if not upper or set(upper) - _IUPAC_DNA:
-            raise ValueError(f"primer is not a valid IUPAC nucleotide sequence: {primer!r}")
+            raise ValueError(f"primer is not valid IUPAC: {primer!r}")
         conn.execute(f"SET VARIABLE rapid_fwd_primer = '{upper}';")
         conn.execute(
             "SET VARIABLE rapid_regex_fwd = "
@@ -182,8 +157,8 @@ def _set_session_vars(conn, *, primer: str, trim: int, sortmerna_ref: Path, orie
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    """denoise the pool's reads into ASVs; emit the mint-features manifest + per-sample
-    ASV counts. StepNoData when nothing survives filtering/denoising."""
+    """denoise the pool's reads into ASVs; emit the manifest and counts.
+    StepNoData when nothing survives."""
     workspace = workspace.resolve()
     inputs.sortmerna_ref = inputs.sortmerna_ref.resolve()
     if not inputs.sortmerna_ref.exists():
@@ -209,17 +184,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             sortmerna_ref=inputs.sortmerna_ref,
             orient=inputs.orient_primer,
         )
-        # The pool's raw reads STREAM from the data plane at runtime — the amplicon
-        # workflow stages no reads (the absence of a bound path is the streaming
-        # signal). bind_step_reads drains the stream to a node-local spill and binds
-        # a lazy view in the shared export shape.
+        # stream the pool's reads from the data plane (nothing staged).
         async with bind_step_reads(
             conn,
             reads=inputs.reads,
             work_ticket_idx=inputs.work_ticket_idx,
             workspace=duckdb_tmp,
         ) as reads_rel:
-            # _inputs(sample_id, sequence_index, sequence1): prep_sample_idx is sample_id.
+            # _inputs(sample_id, sequence_index, sequence1); sample_id is prep_sample_idx.
             conn.execute(
                 "CREATE OR REPLACE VIEW _inputs AS "
                 "SELECT prep_sample_idx AS sample_id, sequence_idx AS sequence_index, sequence1 "
@@ -256,10 +228,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             if conn.execute("SELECT count(*) FROM asv").fetchone()[0] == 0:
                 raise StepNoData(step_name=YAML_STEP_NAME, reason="no ASV survived denoising")
 
-            # Atomic publish: COPY to a `.partial` sibling, then os.replace — a COPY
-            # interrupted mid-write (OOM / walltime kill) can never leave a truncated
-            # asv_counts/asv_manifest under its real name for the launcher's manifest
-            # walker to promote (matches ingest_reads / golay_demux).
+            # publish atomically: write `.partial`, then rename into place.
             counts_partial = counts_out.parent / f"{counts_out.name}.partial"
             manifest_partial = manifest_out.parent / f"{manifest_out.name}.partial"
             safe_counts = validate_parquet_path(counts_partial)

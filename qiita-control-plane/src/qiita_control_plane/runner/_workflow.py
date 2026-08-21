@@ -325,16 +325,13 @@ async def run_workflow(
         # it is the upstream `bcl_convert` step's output, bound during the loop.
         if _workflow_declares_input(action.steps, SAMPLE_MAP_BINDING):
             bound.update(await _resolve_sample_map(bound, workspace))
-        # The golay-demux workflow's `golay_demux` step consumes the same shape:
-        # a runner-materialized barcode roster Parquet plus the reads-staging root.
+        # golay-demux consumes the same shape: a barcode roster + the staging root.
         if _workflow_declares_input(action.steps, BARCODE_MAP_BINDING):
             bound.update(await _resolve_barcode_map(bound, workspace))
         if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
 
-        # SortMeRNA reference materialization (amplicon `denoise` step): resolve the
-        # `sortmerna_reference_idx` sequence_reference to a FASTA the step reads.
-        # Like the reference resolvers above, off fixed operator paths.
+        # amplicon's denoise: materialize the SortMeRNA reference to a FASTA.
         if _workflow_declares_input(action.steps, SORTMERNA_REF_BINDING):
             bound.update(
                 await _resolve_sortmerna_ref(
@@ -346,9 +343,7 @@ async def run_workflow(
                 )
             )
 
-        # NB: the amplicon workflow declares NO reads input — its `denoise` step
-        # STREAMS the pool's raw reads from the data plane at runtime (like the
-        # block workflows), so the runner binds nothing here.
+        # amplicon declares no reads input; denoise streams them at runtime.
 
         # Staged-read binding (read-mask workflows): `reads` is consumed by qc /
         # host_filter but produced by no step, so bind it from stored reads.

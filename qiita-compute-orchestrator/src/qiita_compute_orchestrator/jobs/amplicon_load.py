@@ -1,22 +1,14 @@
-"""Native job: join the deblur ASV counts to their minted feature_idx and write
-the DuckLake `amplicon_membership` staging Parquet register-files hands to the
-data plane. The tail of the amplicon workflow, the amplicon analogue of
-assembly_load — but far lighter.
+"""join the deblur counts to their feature_idx and write `amplicon_membership`.
 
-Unlike assembly_load it stores NO sequences and NO Postgres membership: an ASV's
-bytes live in the shared feature space (mint-features already upserted the
-sequence_hash), and `amplicon_membership` is a DuckLake-only surface the derived
-feature table aggregates on demand (never itself a stored feature table). So the
-job's whole work is one join:
+the tail of the amplicon workflow, and far lighter than assembly_load: it stores
+no sequences and no Postgres membership. the whole job is one join:
 
   asv_counts (prep_sample_idx, sequence_hash, count)
     JOIN feature_map (sequence_hash, feature_idx)
     -> amplicon_membership.parquet (prep_sample_idx, processing_idx, feature_idx, count)
 
-The single staging output's basename == the DuckLake table name, so register-files
-loads it by stem. `amplicon_membership` is pure-append (not in the data plane's
-REPLACE_KEY_TABLES) — a re-run with the same params reuses the same processing_idx,
-so disallow-without-delete gates the re-append rather than a key replace.
+the output basename is the table name, so register-files loads it by stem.
+the table is pure-append; the re-run gate handles duplicates.
 """
 
 from __future__ import annotations
@@ -37,21 +29,18 @@ from ..miint import (
 
 YAML_STEP_NAME = "amplicon_load"
 
-# The join + COPY is light (a hash join over the pool's distinct ASVs); DuckDB
-# stays modest. Off-SLURM fallback; under SLURM the limit tracks the cgroup.
+# the join is light; DuckDB stays modest.
 _DUCKDB_MEMORY_GB = 4
 _DUCKDB_THREADS = 4
 
 
 class Inputs(BaseModel):
-    """Typed input contract for amplicon_load.
+    """input contract for amplicon_load.
 
     asv_counts: deblur's per-sample counts (prep_sample_idx, sequence_hash, count).
     feature_map: mint-features' (sequence_hash, feature_idx) map.
-    processing_idx: threaded via the step's `params:` (so the runner mints the run
-        identity before the loop). work_ticket_idx is a framework-injected scope
-        scalar. NOTE: no prep_sample_idx here — amplicon is sequenced_pool-scoped
-        and the per-sample prep_sample_idx comes from asv_counts itself.
+    processing_idx: threaded via the step's `params:`. work_ticket_idx is injected.
+        no prep_sample_idx; it comes from asv_counts (the pool is the scope).
     """
 
     asv_counts: Path
@@ -103,13 +92,10 @@ def _write_amplicon_membership(
     processing_idx: int,
     out: str,
 ) -> None:
-    """DuckLake `amplicon_membership`: one row per (prep_sample, processing,
-    feature_idx) with its abundance. Joins deblur's `asv_counts` to `feature_map`
-    on sequence_hash (the same identity key mint-features keyed on) and stamps the
-    run's processing_idx. Sorted (prep_sample_idx, feature_idx) for catalog pruning
-    + row-group pushdown. An ASV whose sequence_hash is absent from feature_map is
-    an upstream contract break (mint-features saw the same manifest), so an INNER
-    join is deliberate — a missing feature_idx must fail loud downstream, not drop."""
+    """write `amplicon_membership`: one row per (prep_sample, processing,
+    feature_idx) with its count. joins asv_counts to feature_map on sequence_hash
+    and stamps processing_idx, sorted for pruning. the inner join is deliberate;
+    a missing feature_idx should fail loud, not drop."""
     conn.execute(
         "COPY ("
         "  SELECT"

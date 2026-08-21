@@ -1,20 +1,15 @@
-"""Golay-barcode demultiplex a pool's multiplexed 16S run into the DuckLake `read`
-table — the EMP-style analogue of bcl-convert+ingest_reads for runs that arrive as
-one multiplexed FASTQ set (R1 forward + R2 + I1 Golay index) rather than a per-sample
-BCL demux. Ported from duckdb-miint's demux_qiita.sql.
+"""Golay-barcode demux of a pool's multiplexed 16S run into the DuckLake `read`
+table — the analogue of bcl-convert+ingest_reads for runs that arrive as one
+multiplexed FASTQ set (R1 + R2 + I1) rather than a per-sample BCL demux. Ported
+from duckdb-miint's demux_qiita.sql.
 
-Two halves in one sequenced_pool-scoped job:
-  1. demux: build the prep barcodes' Golay error-correction cloud, pair the I1 index
-     stream against R1/R2 by record order (I1 reverse-complemented — Illumina submits
-     it RC to the prep), and assign each read to the prep_sample its corrected index
-     matches. R2 is carried through (EMP includes it; historically unused downstream).
-  2. ingest: per sample, mint a contiguous sequence_idx range (the shared idempotent
-     mint_or_reuse_sequence_range) and write the sorted read.parquet — a durable copy
-     the read-mask workflow consumes plus a register-files part for the `read` table.
+Two halves: demux (build the Golay cloud, pair I1 against R1/R2 by record order with
+I1 reverse-complemented, assign each read to its prep_sample) and ingest (mint a
+sequence_idx range per sample, write the sorted read.parquet). R2 rides through,
+unused downstream.
 
-TODO(converge): the per-sample read.parquet write duplicates fastq_to_parquet /
-ingest_reads' two-pass shape — promote it to a shared read-ingest core (and consider
-packing I1 into a `comment` column) rather than three copies.
+TODO(converge): the per-sample write duplicates fastq_to_parquet/ingest_reads; fold
+into a shared read-ingest core.
 """
 
 from __future__ import annotations
@@ -44,23 +39,18 @@ from ..sequence_range_retry import mint_or_reuse_sequence_range
 
 YAML_STEP_NAME = "golay_demux"
 
-# read_fastx over a whole multiplexed lane is the heavy serial part; per-sample writes
-# run sequentially (one COPY at a time — no cgroup-memory division needed).
+# per-sample writes run one at a time, so each gets the full budget.
 _DUCKDB_THREADS = 4
 _DUCKDB_FALLBACK_MEMORY_GB = 8
 
-# Extended binary Golay [24,12] code (min distance 8), the EMP 16S barcode code. A
-# 12-nt barcode encodes 24 bits at 2 bits/nt under QIIME's A=11/C=00/T=10/G=01 map;
-# the 4096 codewords are the valid barcodes. `errors` is the bit-distance to the
-# nearest codeword — errors<=3 are uniquely correctable (distance 8), errors>=4 are
-# ambiguous (dropped). Generating the decode cloud here reproduces duckdb-miint's
-# shipped golay table (raw, corrected, errors) EXACTLY for errors<=3 (pinned by a
-# test against the vendored table), so the demux builds its codebook in-job rather
-# than reading a fixed operator path.
+# extended binary Golay [24,12], the EMP 16S barcode code. a 12-nt barcode is
+# 24 bits at 2 bits/nt (A=11 C=00 T=10 G=01); the 4096 codewords are the valid
+# barcodes. `errors` is bit-distance to the nearest codeword; <=3 correctable,
+# >=4 ambiguous. generated in-job (matches the vendored table for errors<=3,
+# pinned by a test), so no fixed operator path.
 #
-# Systematic generator: codeword(m) = (m << 12) | parity(m), the 12-bit message m
-# in the high half, parity XORing _GOLAY_PARITY[i] for each set high bit. The parity
-# basis was extracted from the code itself; _MAX_CORRECTABLE bounds the cloud radius.
+# systematic generator: codeword(m) = (m<<12) | parity(m); the parity basis was
+# extracted from the code itself.
 _GOLAY_PARITY = (
     0b011111111111,
     0b111011100010,
@@ -75,12 +65,12 @@ _GOLAY_PARITY = (
     0b110110111000,
     0b101101110001,
 )
-_BITS_TO_NT = ("C", "G", "T", "A")  # index by the 2-bit value: 00->C 01->G 10->T 11->A
-_MAX_CORRECTABLE = 3  # errors>=4 are ambiguous (corrected is NULL), never joined
+_BITS_TO_NT = ("C", "G", "T", "A")  # 2-bit value: 00->C 01->G 10->T 11->A
+_MAX_CORRECTABLE = 3  # errors>=4 are ambiguous, never joined
 
 
 def _golay_codeword(message: int) -> int:
-    """The 24-bit Golay codeword for a 12-bit `message` (systematic encoding)."""
+    """the 24-bit codeword for a 12-bit message (systematic)."""
     parity = 0
     for i in range(12):
         if message & (1 << (11 - i)):
@@ -89,15 +79,14 @@ def _golay_codeword(message: int) -> int:
 
 
 def _bits_to_dna(word: int) -> str:
-    """A 24-bit word -> its 12-nt barcode (2 bits/nt, most-significant nt first)."""
+    """a 24-bit word to its 12-nt barcode (2 bits/nt)."""
     return "".join(_BITS_TO_NT[(word >> (2 * (11 - p))) & 0b11] for p in range(12))
 
 
 def _golay_cloud_rows(max_errors: int) -> list[tuple[str, str, int]]:
-    """`(raw, corrected, errors)` for every codeword and every bit-neighbour within
-    `max_errors` flips — the decode cloud the demux joins observed index reads to.
-    Neighbours are unique per codeword for max_errors<=3 (min distance 8), so no
-    collision handling is needed. Default threshold 1.5 -> radius 1 -> 102,400 rows."""
+    """(raw, corrected, errors) for every codeword and its neighbours within
+    `max_errors` flips. neighbours are unique for max_errors<=3, so no dedup.
+    default threshold 1.5 gives radius 1 and 102,400 rows."""
     rows: list[tuple[str, str, int]] = []
     for message in range(4096):
         codeword = _golay_codeword(message)
@@ -112,15 +101,13 @@ def _golay_cloud_rows(max_errors: int) -> list[tuple[str, str, int]]:
 
 
 def _correctable_radius(threshold: float) -> int:
-    """Largest integer error count strictly below `threshold`, capped at
-    _MAX_CORRECTABLE — the cloud radius `errors < threshold` selects."""
+    """largest error count below `threshold`, capped at _MAX_CORRECTABLE."""
     below = math.ceil(threshold) - 1 if float(threshold).is_integer() else math.floor(threshold)
     return max(0, min(_MAX_CORRECTABLE, below))
 
 
 def _build_golay_cloud(conn, max_errors: int) -> None:
-    """Materialize the Golay decode cloud as the `golay_cloud(raw, corrected,
-    errors)` table the demux join reads (replacing the vendored Parquet)."""
+    """build the `golay_cloud(raw, corrected, errors)` table the demux joins."""
     import pyarrow as pa  # noqa: PLC0415
 
     rows = _golay_cloud_rows(max_errors)
@@ -137,19 +124,16 @@ def _build_golay_cloud(conn, max_errors: int) -> None:
 
 
 class Inputs(BaseModel):
-    """Typed input contract for golay_demux.
+    """input contract for golay_demux.
 
-    index_reads_path: multiplexed I1 barcode FASTQ (12-nt Golay codes; longer index
-        reads are sliced to the first 12).
-    forward_reads_path: multiplexed R1 forward FASTQ (paired to I1 by record order).
-    reverse_reads_path: multiplexed R2 FASTQ (optional; carried as sequence2/qual2).
-    barcode_map: runner-staged roster Parquet
-        (prep_sample_idx BIGINT, barcode VARCHAR, barcodes_are_rc BOOLEAN) — each
-        barcode's RC flag is a per-sample sample-sheet fact, not a uniform knob.
-    golay_error_threshold: max Golay errors to accept a barcode match (EMP: 1.5).
-        The (12,11,8) decode cloud is GENERATED in-job (no vendored table / fixed
-        path); this bounds its radius.
-    reads_staging_root: scratch root the durable per-sample read.parquet copies hang under.
+    index_reads_path: multiplexed I1 barcode FASTQ (12-nt Golay codes).
+    forward_reads_path: multiplexed R1 FASTQ (paired to I1 by record order).
+    reverse_reads_path: multiplexed R2 FASTQ (optional; kept as sequence2/qual2).
+    barcode_map: runner-staged roster (prep_sample_idx, barcode, barcodes_are_rc);
+        the RC flag is per-sample provenance.
+    golay_error_threshold: max Golay errors to accept a match (EMP: 1.5). the
+        decode cloud is generated in-job; this bounds its radius.
+    reads_staging_root: scratch root for the durable per-sample copies.
     """
 
     index_reads_path: Path
@@ -164,8 +148,8 @@ class Inputs(BaseModel):
 
 
 def _run_demux(inputs: Inputs, demuxed_out: Path, duckdb_tmp: Path, *, memory_gb: int) -> None:
-    """Demux the multiplexed FASTQ to an intermediate Parquet keyed by prep_sample_idx.
-    Paths are inlined (sanitised) — DuckDB rejects bound params in CREATE VIEW / SET."""
+    """demux the FASTQ to an intermediate parquet keyed by prep_sample_idx.
+    paths are inlined (sanitised); DuckDB rejects bound params in CREATE VIEW/SET."""
     i1 = validate_parquet_path(inputs.index_reads_path)
     r1 = validate_parquet_path(inputs.forward_reads_path)
     bc = validate_parquet_path(inputs.barcode_map)
@@ -178,11 +162,9 @@ def _run_demux(inputs: Inputs, demuxed_out: Path, duckdb_tmp: Path, *, memory_gb
 
     with open_miint_conn() as conn:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=_DUCKDB_THREADS)
-        # Generate the Golay decode cloud in-job (no vendored table / fixed path),
-        # bounded to the radius `threshold` selects.
+        # build the decode cloud in-job, bounded by the threshold.
         _build_golay_cloud(conn, _correctable_radius(threshold))
-        # prep barcodes, each RC'd per its own barcodes_are_rc flag; expand against the
-        # Golay cloud (unique index on raw makes the demux join a hash lookup).
+        # prep barcodes, RC'd per their flag; expand against the cloud.
         conn.execute(
             "CREATE OR REPLACE VIEW prep_bc AS SELECT prep_sample_idx, "
             "IF(barcodes_are_rc, sequence_dna_reverse_complement(barcode), barcode) AS barcode "
@@ -195,7 +177,7 @@ def _run_demux(inputs: Inputs, demuxed_out: Path, duckdb_tmp: Path, *, memory_gb
             f"WHERE g.errors < {threshold}"
         )
         conn.execute("CREATE UNIQUE INDEX gc_idx ON golay_codes(raw)")
-        # I1 length varies; EMP V4 is 12 nt, but some runs ship longer index reads.
+        # I1 length varies; some runs ship longer index reads than 12 nt.
         conn.execute(
             "SET VARIABLE demux_i1_12 = "
             f"(SELECT length(sequence1) = 12 FROM read_fastx('{i1}') LIMIT 1)"
@@ -224,7 +206,7 @@ def _run_demux(inputs: Inputs, demuxed_out: Path, duckdb_tmp: Path, *, memory_gb
 
 
 def _sample_counts(demuxed_out: Path, duckdb_tmp: Path, *, memory_gb: int) -> list[tuple[int, int]]:
-    """(prep_sample_idx, read_count) per demuxed sample, ascending. Empty → no match."""
+    """(prep_sample_idx, read_count) per sample, ascending; empty if no match."""
     with open_conn() as conn:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=_DUCKDB_THREADS)
         rows = conn.execute(
@@ -244,9 +226,8 @@ def _write_sample_reads(
     *,
     memory_gb: int,
 ) -> None:
-    """Write one sample's read.parquet from its slice of the demuxed intermediate:
-    re-number 1..N (a scattered subset of lane indices), assign sequence_idx, sort by it.
-    Atomic publish via a .partial sibling (the durable copy doubles as the retry sentinel)."""
+    """write one sample's read.parquet from its slice: re-number the reads,
+    assign sequence_idx, sort by it. publish via a .partial sibling."""
     partial = out_path.parent / f"{out_path.name}.partial"
     safe_partial = validate_parquet_path(partial)
     try:
@@ -276,9 +257,8 @@ def _hardlink(src: Path, dst: Path) -> None:
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    """Golay-demultiplex the pool's multiplexed FASTQ and ingest per-sample reads.
-    Returns {"read_staging_dir": workspace} for register-files. StepNoData when no
-    read matches any prep barcode."""
+    """demux the pool's FASTQ and ingest per-sample reads. returns
+    {"read_staging_dir": workspace}; StepNoData when no read matches a barcode."""
     workspace = workspace.resolve()
     inputs.index_reads_path = inputs.index_reads_path.resolve()
     inputs.forward_reads_path = inputs.forward_reads_path.resolve()
@@ -299,10 +279,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if not counts:
             raise StepNoData(
                 step_name=YAML_STEP_NAME,
-                reason=(
-                    f"sequenced_pool {inputs.sequenced_pool_idx}: no read matched any prep "
-                    f"barcode within the Golay error threshold"
-                ),
+                reason=f"pool {inputs.sequenced_pool_idx}: no read matched a barcode",
             )
 
         async with make_cp_client() as http:

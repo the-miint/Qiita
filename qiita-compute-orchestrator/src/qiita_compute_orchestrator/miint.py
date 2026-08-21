@@ -115,16 +115,13 @@ def duckdb_tmp_dir(workspace: Path) -> Iterator[Path]:
 
 @contextmanager
 def mafft_scratch_cwd(base: Path) -> Iterator[Path]:
-    """run the body with CWD in `<base>/.mafft` so MAFFT's scratch (order/pre/trace)
-    lands there, not the launch dir — miint's linked MAFFT writes those to CWD and
-    ignores TMPDIR. removed on exit.
+    """run with CWD in `<base>/.mafft` so MAFFT's scratch lands there; MAFFT
+    writes it to CWD and ignores TMPDIR. removed on exit.
 
-    chdir is process-global, so the body must be synchronous miint work using only
-    absolute paths (a blocking conn.execute monopolizes the loop thread, so nothing
-    else runs while CWD is moved). TODO(duckdb-miint, unfiled): verify this still
-    reproduces on the latest miint, then file upstream (MAFFT scratch should honor
-    TMPDIR — likely a fix in the vendored MAFFT fork) so this helper can go away;
-    wire the issue number here + into docs/duckdb-miint.md "Open upstream gaps"."""
+    chdir is process-global, so the body must be synchronous miint work using
+    absolute paths. TODO(duckdb-miint, unfiled): verify on the latest miint, then
+    file upstream so this helper can go away; wire the number here + in
+    docs/duckdb-miint.md."""
     scratch = base / ".mafft"
     scratch.mkdir(parents=True, exist_ok=True)
     prev = Path.cwd()
