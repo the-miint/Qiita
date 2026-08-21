@@ -872,10 +872,32 @@ def test_lake_gc_reclaim_mode_announces_it_acts(tmp_path) -> None:
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert "Nothing was removed" not in result.stdout
     # The banner alone is a weak signal — report mode's banner also contains the
-    # string "--reclaim" ("pass --reclaim to act"). The SQL is what discriminates.
+    # string "--reclaim" ("pass --reclaim to act"). The SQL is what discriminates,
+    # and --reclaim is deliberately mixed: steps 1-2 act, step 3 stays dry.
     sql = (tmp_path / "captured.sql").read_text()
-    assert "dry_run := false" in sql, "--reclaim must ask the database to act"
-    assert "dry_run := true" not in sql
+    assert "ducklake_expire_snapshots('qiita_lake', dry_run := false" in sql
+    assert "ducklake_cleanup_old_files('qiita_lake', dry_run := false" in sql
+    assert "ducklake_delete_orphaned_files('qiita_lake', dry_run := true" in sql, (
+        "--reclaim must NOT delete orphans: a registration in flight has its file "
+        "on disk with no catalog row, which is what that step deletes"
+    )
+
+
+def test_lake_gc_reclaim_orphans_is_the_only_way_to_delete_orphans(tmp_path) -> None:
+    """The orphan step is the only one that can reach a file belonging to a
+    registration in flight (register_files moves the file before opening the
+    catalog transaction). It gets its own flag so the safe bulk reclaim needs no
+    quiescing, and only this one carries that precondition."""
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC), "--reclaim-orphans"],
+        capture_output=True,
+        text=True,
+        env={**_lake_gc_env(tmp_path), "ASSUME_YES": "1"},
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    sql = (tmp_path / "captured.sql").read_text()
+    assert "ducklake_delete_orphaned_files('qiita_lake', dry_run := false" in sql
+    assert "dry_run := true" not in sql, "--reclaim-orphans acts on all three steps"
 
 
 def test_lake_gc_reclaim_requires_typed_confirmation(tmp_path) -> None:

@@ -26,8 +26,9 @@
 # referencing it are expired. Running 2 without 1 is a no-op, not a shortcut.
 #
 # For an operator reclaiming space on the deploy host. Reports by default;
-# nothing is removed unless you pass --reclaim, which then prompts for a typed
-# confirmation. Running it is an operator decision, not a deploy step.
+# nothing is removed unless you pass --reclaim (or --reclaim-orphans), which then
+# prompts for a typed confirmation. Running it is an operator decision, not a
+# deploy step.
 #
 # EXPIRING SNAPSHOTS IS NOT REVERSIBLE: it drops the catalog history that
 # time-travel queries read. --older-than sets how much history is kept (default
@@ -39,17 +40,24 @@
 # drop orphan reporting, so the attach is writable and `dry_run` is what makes
 # the default run inert. Do not add READ_ONLY without re-checking step 3.
 #
-# QUIESCE REGISTRATIONS BEFORE --reclaim; the cutoff does not do it for you.
-# `older_than` filters on filesystem mtime (measured, 1.5.4: of two
-# byte-identical unreferenced files, only the one stamped 30 days back was listed
-# under a 7-day cutoff). register_files places a file with std::fs::rename, which
-# carries over the mtime the producing job gave it in staging — so a lake file's
-# mtime is when it was PRODUCED, not when it entered the lake. A Parquet that sat
-# in staging longer than the cutoff is eligible the instant it is moved, during
-# the window before its catalog transaction commits, when it has no catalog entry
-# and reads as an orphan. That window is common on a redrive, whose staging files
-# can be weeks old. No `older_than` value closes it: run this when nothing is
-# registering.
+# Step 3 is the only one that can touch a live file, so it has its own flag.
+# register_files moves a Parquet to its lake path BEFORE opening the catalog
+# transaction that registers it, so in that window the file is on disk with no
+# catalog row — which is exactly what step 3 deletes. Steps 1-2 cannot reach it:
+# cleanup_old_files only removes files the catalog once referenced and no longer
+# does, and a mid-flight file was never referenced.
+#
+# The mtime cutoff does not separate the two. `older_than` filters on filesystem
+# mtime (measured, 1.5.4: of two byte-identical unreferenced files, only the one
+# stamped 30 days back was listed under a 7-day cutoff), and rename carries over
+# the mtime the producing job gave the file in staging — so a lake file's mtime is
+# when it was PRODUCED, not when it entered the lake, and a Parquet that sat in
+# staging longer than the cutoff is eligible the instant it is moved. That is
+# common on a redrive, whose staging files can be weeks old.
+#
+# So --reclaim runs steps 1-2 and only REPORTS step 3; it needs no quiescing.
+# --reclaim-orphans additionally deletes what step 3 finds, and DOES require that
+# nothing is registering.
 #
 # `cleanup_all := true` is not offered: it drops the mtime filter outright, so a
 # reclaim would sweep files produced inside the cutoff too. `older_than` is always
@@ -61,7 +69,8 @@
 #
 # Usage:
 #   bash scripts/lake-gc.sh                          # report only
-#   bash scripts/lake-gc.sh --reclaim                # remove what it reports
+#   bash scripts/lake-gc.sh --reclaim                # expire + remove superseded
+#   bash scripts/lake-gc.sh --reclaim-orphans        # ALSO remove orphans; quiesce first
 #   bash scripts/lake-gc.sh --older-than '30 DAYS'   # keep 30 days of history
 #
 # Run as the account that owns the lake data path (qiita-data on the deploy
@@ -94,6 +103,7 @@ REPO_ROOT="$( cd "${SCRIPT_DIR}/.." && pwd )"
 source "${REPO_ROOT}/deploy/_common.sh"
 
 DRY_RUN=true
+ORPHAN_DRY_RUN=true
 RETENTION="7 DAYS"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -104,6 +114,7 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         --reclaim) DRY_RUN=false ;;
+        --reclaim-orphans) DRY_RUN=false; ORPHAN_DRY_RUN=false ;;
         --older-than)
             shift
             [[ $# -gt 0 ]] || { echo "ERROR: --older-than needs a value, e.g. '30 DAYS'" >&2; exit 1; }
@@ -233,7 +244,7 @@ run_maintenance() {
         # COMMIT/BEGIN pair; folding step 3 upward reintroduces the window.
         echo "BEGIN TRANSACTION;"
         echo ".print ${MARK}orphans"
-        echo "CALL ducklake_delete_orphaned_files('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});"
+        echo "CALL ducklake_delete_orphaned_files('qiita_lake', dry_run := ${ORPHAN_DRY_RUN}, older_than := ${CUTOFF});"
         echo "COMMIT;"
     } > "${sql}"
     qiita_run_duckdb -noheader -list -f "${sql}"
@@ -256,18 +267,18 @@ file_size() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null; }
 # One summary line per file list. Sizes are only taken in report mode — after a
 # --reclaim the files are already unlinked, so the count is the only exact figure.
 report_paths() {
-    local label="$1" paths="$2" n=0 bytes=0 unmeasured=0 sz
+    local label="$1" paths="$2" dry="$3" n=0 bytes=0 unmeasured=0 sz
     while IFS= read -r p; do
         [[ -n "${p}" ]] || continue
         n=$((n + 1))
-        [[ "${DRY_RUN}" == true ]] || continue
+        [[ "${dry}" == true ]] || continue
         if sz="$(file_size "${p}")" && [[ -n "${sz}" ]]; then
             bytes=$((bytes + sz))
         else
             unmeasured=$((unmeasured + 1))
         fi
     done <<< "${paths}"
-    if [[ "${DRY_RUN}" != true ]]; then
+    if [[ "${dry}" != true ]]; then
         printf '  %-34s %6d file(s)  removed\n' "${label}" "${n}"
         return
     fi
@@ -287,7 +298,12 @@ echo "         retention: keeping snapshots newer than ${RETENTION}"
 if [[ "${DRY_RUN}" == true ]]; then
     echo "         MODE: report only — nothing will be removed (pass --reclaim to act)"
 else
-    echo "         MODE: --reclaim — snapshots will be expired and files unlinked"
+    if [[ "${ORPHAN_DRY_RUN}" == true ]]; then
+        echo "         MODE: --reclaim — expire snapshots, remove superseded files;"
+        echo "               orphans are REPORTED only (pass --reclaim-orphans to remove)"
+    else
+        echo "         MODE: --reclaim-orphans — the above, plus unlinking orphans"
+    fi
 fi
 echo
 
@@ -303,8 +319,11 @@ if [[ "${DRY_RUN}" != true && -z "${ASSUME_YES:-}" ]]; then
     echo "    time-travel queries cannot reach them afterwards, and that is final;"
     echo "  * every candidate file last modified more than ${RETENTION} ago becomes"
     echo "    eligible for deletion."
-    echo "A registration in flight whose staging file predates the cutoff can be"
-    echo "swept with them — see the header. Quiesce first."
+    if [[ "${ORPHAN_DRY_RUN}" != true ]]; then
+        echo "Orphan deletion is included. A registration in flight has its file on"
+        echo "disk with no catalog row yet, which is indistinguishable from an orphan,"
+        echo "and the cutoff does not separate them — see the header. Quiesce first."
+    fi
     # `read` returns non-zero at EOF, which under `set -e` would kill the script
     # with a bare exit 1 and no reason — so the EOF case is handled here rather
     # than left to the `[[ ]]` below, which would never run.
@@ -325,18 +344,24 @@ snapshot_count="$(section snapshots | grep -c . || true)"
 printf '  %-34s %6d snapshot(s)\n' "snapshots older than retention" "${snapshot_count}"
 
 # 2. Files no surviving snapshot references.
-report_paths "superseded data files" "$(section old_files)"
+report_paths "superseded data files" "$(section old_files)" "${DRY_RUN}"
 
 # 3. Files under the data path the catalog never references — a registration
 #    whose catalog transaction rolled back after its file was already moved.
-report_paths "unreferenced orphan files" "$(section orphans)"
+report_paths "unreferenced orphan files" "$(section orphans)" "${ORPHAN_DRY_RUN}"
 
 echo
 if [[ "${DRY_RUN}" == true ]]; then
-    echo "Nothing was removed. Re-run with --reclaim to expire and unlink the above."
+    echo "Nothing was removed. Re-run with --reclaim to expire snapshots and remove"
+    echo "superseded files (orphans need --reclaim-orphans, and quiescing)."
     echo "The superseded-file count understates the result of a --reclaim run: those"
     echo "files stay referenced until the snapshots in step 1 are actually expired."
 else
     echo "Reclaimed. Snapshots older than ${RETENTION} are gone; time-travel queries"
     echo "cannot reach them."
+    # An `&& echo` here would be the script's last command, so under `set -e` a
+    # false condition would exit 1.
+    if [[ "${ORPHAN_DRY_RUN}" == true ]]; then
+        echo "Orphans were reported, not removed."
+    fi
 fi

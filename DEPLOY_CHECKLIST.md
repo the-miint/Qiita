@@ -299,8 +299,8 @@ sys.exit(1 if bad else 0)'
   script reports by default and acts only under `--reclaim`, behind a typed confirmation;
   running it is an operator decision, not a deploy step, because `--reclaim` expires
   snapshot history (7 days kept unless `--older-than` says otherwise) and that is not
-  reversible. Quiesce registrations first — the script header says why the cutoff alone
-  does not make a concurrent load safe.
+  reversible. Deleting orphans needs the separate `--reclaim-orphans`, and that one does
+  require quiescing registrations first — the script header says why.
   (#472)
 
 ---

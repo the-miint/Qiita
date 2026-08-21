@@ -33,8 +33,14 @@ duplicates further down are historical strata; leave them where they are.
   referencing a file are expired (running it alone is a no-op) but does see that expiry
   from inside the same transaction. The transaction bounds the CATALOG only: an unlinked
   file stays unlinked through a rollback, also measured. It **reports
-  by default**, prompts for a typed confirmation under `--reclaim`, keeps 7 days of
-  snapshot history unless `--older-than` says otherwise, and never passes `cleanup_all`.
+  by default**, prompts for a typed confirmation before acting, keeps 7 days of snapshot
+  history unless `--older-than` says otherwise, and never passes `cleanup_all`. Orphan
+  deletion is behind its own `--reclaim-orphans`: it is the only step that can reach a
+  file belonging to a registration in flight, because `register_files` moves a Parquet to
+  its lake path before opening the catalog transaction that registers it, and in that
+  window the file is on disk with no catalog row — indistinguishable from an orphan.
+  Steps 1-2 cannot reach it (`cleanup_old_files` only removes files the catalog once
+  referenced), so plain `--reclaim` needs no quiescing.
   Registrations must be quiesced before reclaiming: `older_than` filters on filesystem
   mtime and `register_files` places files with `rename`, which carries over the mtime the
   producing job gave them in staging, so the cutoff does not bound "recently placed" —
