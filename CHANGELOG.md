@@ -22,6 +22,22 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **A per-sample masked-read Flight stream for native jobs (#477).**
+  `data_plane_client` gains `fetch_read_masked_doget_ticket` +
+  `open_read_masked_stream`: a job names a `(prep_sample_idx, mask_idx)` pair, the CP
+  signs a DoGet ticket scoped to exactly that pair, and the data plane's `read_masked`
+  macro rows stream into a registered DuckDB relation. Per-SAMPLE, alongside the
+  existing per-BLOCK `open_read_block_stream`; both scope keys ride the wire because
+  the scope is one pair, not a member list there would be a reason to keep CP-side.
+  The relation carries `sequence_idx`, which the CP-side FASTQ streamer
+  (`runner/_read_ingest.py`) does not — it writes the VARCHAR `read_id` — so an
+  `alignment`-producing consumer streams here rather than reusing that FASTQ. The
+  mask-completion gate comes for free: the CP already 409s unless
+  `mask_sample.state = 'completed'`, so 'pending', 'invalidated' and no-gate-row are
+  all refused at mint and no consumer re-derives the check. No new scope
+  (`read_masked:doget` is already in `SERVICE_ACCOUNT_SCOPE_CEILING` and was granted to
+  the compute service account on the 2026-07-23 deploy), so no operator action.
+
 - **`scripts/lake-gc.sh` reports and reclaims unreferenced lake files (#472).** DuckLake
   never reclaims a data file on its own: deleting rows leaves the Parquet on disk and
   still held by the snapshots that predate the delete, so every `register_files`
@@ -1029,6 +1045,22 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **Corrected the claim that miint cannot see TEMP or registered-Arrow relations (#477).**
+  It resolves them since [duckdb-miint#193](https://github.com/the-miint/duckdb-miint/issues/193);
+  our copies of that claim predated the fix and had gone stale in `docs/duckdb-miint.md`,
+  `data_plane_client.open_read_block_stream`, and `read_source`. What still holds is now
+  stated separately, because it is different in kind: CTEs never resolve (not catalog
+  objects), and miint's fixed-temp-name paths — `massql`, and the per-sample
+  (`sample_id := …`) branches of `uchime_ref` / `sylph_profile` / `woltka_ogu`,
+  [duckdb-miint#207](https://github.com/the-miint/duckdb-miint/issues/207) — use a
+  connection that does not inherit and still need a regular non-temp TABLE. Verified on
+  the deploy-staged build `9fc4d12`: `woltka_ogu` with `sample_id` returned
+  `Catalog Error` over both a TEMP TABLE and a registered Arrow relation while the same
+  call without it resolved all three, so `qiita_common.feature_table`'s "stage a real
+  TABLE" comments are correct and are left alone. Independently of visibility, a
+  registered Arrow stream is consumed exactly once — a second scan returns zero rows
+  silently — which is what the read spill in `read_source` actually rests on.
 
 - **A redriven work ticket whose producer step re-ran can register its files again (#472).** `lake_dest_filename`
   minted `wt<work_ticket_idx>-<basename>`, whose uniqueness assumed one load per ticket.

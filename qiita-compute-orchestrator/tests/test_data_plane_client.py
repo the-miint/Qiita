@@ -20,11 +20,16 @@ from contextlib import asynccontextmanager, contextmanager
 
 import httpx
 import pytest
-from qiita_common.api_paths import URL_ALIGNMENT_DOGET, URL_REFERENCE_DOGET
+from qiita_common.api_paths import (
+    URL_ALIGNMENT_DOGET,
+    URL_READ_MASKED_DOGET,
+    URL_REFERENCE_DOGET,
+)
 
 import qiita_compute_orchestrator.data_plane_client as dpc
 from qiita_compute_orchestrator.data_plane_client import (
     fetch_alignment_doget_ticket,
+    fetch_read_masked_doget_ticket,
     fetch_reference_doget_ticket,
 )
 
@@ -339,3 +344,136 @@ async def test_open_reference_sequences_stream_mints_whole_reference(monkeypatch
         "feature_idx": None,
     }
     assert captured["ticket_bytes"] == b"signed-lengths-ticket"
+
+
+# ---------------------------------------------------------------------------
+# read_masked DoGet (per-sample masked reads) — mints by (prep_sample_idx,
+# mask_idx). Unlike the block/alignment mints, BOTH scope keys ride the wire:
+# the scope is one pair, not a member list there would be a reason to keep
+# CP-side, and the pair is the data plane's read_masked macro arguments.
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_read_masked_doget_sends_both_scope_keys():
+    """The body carries exactly `prep_sample_idx` + `mask_idx`, and the base64
+    ticket is decoded back to raw bytes.
+
+    Pinning `extra` here matters because the CP model is `extra="forbid"`: an
+    added key would 422 in production, and asserting the whole body (rather than
+    a subset) is what makes that a test failure instead of a deploy failure.
+    """
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _ticket_response()
+
+    async with _client(handler) as http:
+        result = await fetch_read_masked_doget_ticket(http=http, prep_sample_idx=7, mask_idx=3)
+
+    assert result == _RAW_TICKET
+    assert len(captured) == 1
+    assert captured[0].url.path == URL_READ_MASKED_DOGET
+    assert json.loads(captured[0].content) == {"prep_sample_idx": 7, "mask_idx": 3}
+
+
+@pytest.mark.parametrize("status", [404, 409, 422, 403, 500])
+async def test_fetch_read_masked_doget_raises_on_non_2xx(status):
+    """Any non-2xx raises HTTPStatusError for the caller to map to a
+    BackendFailure.
+
+    409 is in the list deliberately: it is the mask-completion gate (the sample is
+    'pending', 'invalidated', or has no gate row under this mask_idx), and it is
+    the one a consumer is most likely to actually hit. It must surface, not be
+    swallowed into an empty stream — an absent pass-set and an empty pass-set are
+    different facts.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=json.dumps({"detail": "nope"}))
+
+    async with _client(handler) as http:
+        with pytest.raises(httpx.HTTPStatusError):
+            await fetch_read_masked_doget_ticket(http=http, prep_sample_idx=7, mask_idx=3)
+
+
+async def test_open_read_masked_stream_composes_ticket_and_stream(monkeypatch):
+    """The composed seam fetches a `(prep_sample_idx, mask_idx)`-scoped ticket over
+    a CP client that is CLOSED before the stream opens, then streams it against the
+    settings' data_plane_url, yielding the registered relation."""
+    captured: dict = {}
+
+    @asynccontextmanager
+    async def fake_make_cp_client():
+        captured["cp_client_open"] = True
+        yield object()
+        captured["cp_client_closed"] = True
+
+    async def fake_fetch(*, http, prep_sample_idx, mask_idx):
+        captured["prep_sample_idx"] = prep_sample_idx
+        captured["mask_idx"] = mask_idx
+        return b"signed-read-masked-ticket"
+
+    @contextmanager
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+        captured["stream"] = {
+            "conn": conn,
+            "data_plane_url": data_plane_url,
+            "ticket_bytes": ticket_bytes,
+            "relation": relation,
+        }
+        yield relation
+
+    class _Settings:
+        data_plane_url = "grpc://dp.test:50051"
+
+    monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
+    monkeypatch.setattr(dpc, "fetch_read_masked_doget_ticket", fake_fetch)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
+    monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
+
+    sentinel_conn = object()
+    async with dpc.open_read_masked_stream(sentinel_conn, prep_sample_idx=7, mask_idx=3) as rel:
+        assert rel == "masked_reads"
+        assert captured["cp_client_closed"] is True
+
+    assert captured["prep_sample_idx"] == 7
+    assert captured["mask_idx"] == 3
+    assert captured["stream"]["conn"] is sentinel_conn
+    assert captured["stream"]["data_plane_url"] == "grpc://dp.test:50051"
+    assert captured["stream"]["ticket_bytes"] == b"signed-read-masked-ticket"
+    assert captured["stream"]["relation"] == "masked_reads"
+
+
+async def test_open_read_masked_stream_relation_name_is_overridable(monkeypatch):
+    """The relation name is a parameter, not a fixture of the seam — a consumer
+    that already binds `masked_reads` for something else can name this one
+    differently, and the default must not be baked into the stream call."""
+    captured: dict = {}
+
+    @asynccontextmanager
+    async def fake_make_cp_client():
+        yield object()
+
+    async def fake_fetch(*, http, prep_sample_idx, mask_idx):
+        return b"t"
+
+    @contextmanager
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+        captured["relation"] = relation
+        yield relation
+
+    class _Settings:
+        data_plane_url = "grpc://dp.test:50051"
+
+    monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
+    monkeypatch.setattr(dpc, "fetch_read_masked_doget_ticket", fake_fetch)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
+    monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
+
+    async with dpc.open_read_masked_stream(
+        object(), prep_sample_idx=7, mask_idx=3, relation="denovo_reads"
+    ) as rel:
+        assert rel == "denovo_reads"
+
+    assert captured["relation"] == "denovo_reads"
