@@ -22,7 +22,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
-- **Per-run contig read-back over Arrow Flight (#TBD).** `POST
+- **Per-run contig read-back over Arrow Flight (#476).** `POST
   /assembly/ticket/doget` takes a `(prep_sample_idx, processing_idx)` pair and
   signs a DoGet ticket for that assembly run's contigs on
   `assembled_sequence` / `assembled_sequence_chunks`, which are now in the data

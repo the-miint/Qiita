@@ -412,7 +412,7 @@ sys.exit(1 if bad else 0)'
   resolves which contigs it reaches from the DuckLake `assembly_membership` at read time —
   so a run re-registered inside the mint's 300 s TTL streams the re-registered rows, and a
   run whose contigs are in the lake but whose Postgres membership was cleared answers 404
-  at the route. (#TBD)
+  at the route. (#476)
 
 - **`qiita.assembly_membership.kind` gains a third value, `UNBINNED`.** A
   long-read-assembly run also records the contigs no refined bin claimed, with the contig
