@@ -517,9 +517,12 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 /// justified because every action the data plane dispatches is idempotent or
 /// otherwise replay-safe (see `docs/auth.md#ticket-replay`):
 ///
-/// - `register_files` — dest names are ticket-unique and `move_file` refuses to
-///   overwrite, so a replay after success fails closed (AlreadyExists), never a
-///   double-registration.
+/// - `register_files` — a replay after success hits the staging-existence check
+///   first and returns `not_found`, its files having been moved out. Where the
+///   source survives instead (the EXDEV copy branch of `move_file`), the minted
+///   dest name is deterministic for the registration — see `lake_dest_filename`
+///   — so `move_file` refuses to overwrite and it fails closed rather than
+///   double-registering.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
 ///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` —
 ///   logical DELETEs; re-running deletes zero rows.
@@ -728,8 +731,9 @@ impl FlightService for QiitaFlightService {
                 // crosses no await.
                 let catalog = self.catalog_connstr.clone();
                 let data_path = self.data_path.clone();
+                let scratch_root = self.scratch_root.clone();
                 let registration = tokio::task::spawn_blocking(move || {
-                    register_files(&catalog, &data_path, &payload)
+                    register_files(&catalog, &data_path, &scratch_root, &payload)
                 })
                 .await
                 .map_err(|e| Status::internal(format!("register_files task join failed: {e}")))??;
@@ -2273,6 +2277,7 @@ struct Registration {
 fn register_files(
     catalog_connstr: &str,
     data_path: &str,
+    scratch_root: &std::path::Path,
     payload: &auth::ActionPayload,
 ) -> Result<Registration, Status> {
     let staging = std::path::Path::new(&payload.staging_dir);
@@ -2313,6 +2318,9 @@ fn register_files(
         }
     }
 
+    // One scope key for the whole registration; it does not vary per file.
+    let scope = staging_scope(&payload.staging_dir, scratch_root);
+
     // Move all files to permanent storage.
     // (DuckLake table, permanent path). The path is carried as a String because
     // every consumer below binds it into SQL or reports it.
@@ -2342,7 +2350,11 @@ fn register_files(
         // across loads, so placing the bare basename would collide with an
         // already-registered file in the same per-table dir. `move_file`
         // refuses to overwrite besides, as a hard safety net.
-        let dest = dest_dir.join(lake_dest_filename(payload.work_ticket_idx, basename));
+        let dest = dest_dir.join(lake_dest_filename(
+            payload.work_ticket_idx,
+            &scope,
+            basename,
+        ));
         move_file(&src, &dest)?;
         // Both SQL passes below name the destination as a string, so resolve it
         // once here rather than re-deriving (and re-erroring on) it twice.
@@ -2368,8 +2380,8 @@ fn register_files(
     //
     // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above have
     // already happened and are NOT rolled back. That is intentional and safe.
-    // Each dest name is ticket-unique (lake_dest_filename prefixes the work
-    // ticket) and move_file refuses to overwrite, so a rolled-back registration
+    // Each dest name is registration-unique (lake_dest_filename keys on the work
+    // ticket and the staging dir) and move_file refuses to overwrite, so a rolled-back registration
     // leaves at most an unreferenced orphan Parquet on disk — never a collision
     // and never a double-registration. This matches how DuckLake already
     // tolerates orphan Parquets (the delete_* actions reclaim nothing from disk
@@ -2387,8 +2399,8 @@ fn register_files(
     // `registration_lock` gives every such registration a row to contend for, so
     // the new-feature case conflicts too (measured: back to 1 row).
     //
-    // The loser's work is fully re-runnable — its files are already at their
-    // ticket-unique lake paths and the delete+add is idempotent against whatever
+    // The loser's work is fully re-runnable — its files are already at the paths
+    // `lake_dest_filename` minted and the delete+add is idempotent against whatever
     // snapshot it re-reads — so it retries here rather than failing the ticket. A
     // retry from the top would not work: the staging files were moved above, so
     // the caller's next attempt gets `not_found`.
@@ -3067,15 +3079,65 @@ fn delete_alignment_block(
 /// (`part_00000.parquet`, `reference_<table>.parquet`) on every load, so the
 /// bare basename is NOT unique within a per-table lake dir: two registrations
 /// into the same table would target the same path and the second would clobber
-/// the first's live, catalog-registered file. Prefixing with the originating
-/// work ticket makes the name unique across loads (every load is a distinct
-/// ticket) while staying unique within a load (the basename — part index or
-/// table name — still distinguishes files under one ticket), and lets an
-/// operator trace any lake file back to the ticket that wrote it. DuckLake
-/// names its own INSERT-written data files uniquely for the same reason; this
-/// is the equivalent for our "register an existing file" path.
-fn lake_dest_filename(work_ticket_idx: i64, basename: &str) -> String {
-    format!("wt{work_ticket_idx}-{basename}")
+/// the first's live, catalog-registered file. The basename — part index or
+/// table name — still distinguishes files within one registration; the two
+/// components below separate one registration from another:
+///
+/// * `wt{work_ticket_idx}` traces the file back to the ticket that wrote it.
+/// * A digest of the registration's staging dir separates two loads from ONE
+///   ticket. A ticket can load twice: a redrive replays its storage tail, and
+///   the ticket alone yields the byte-identical path the first load already
+///   registered, which [`move_file`] refuses.
+///
+///   The scope of that: `staging_dir` is the PRODUCER step's output directory,
+///   so it separates the two loads only where the producer itself re-ran — the
+///   case a redrive that drops the producer's `qiita.work_ticket_step` row
+///   produces. A redrive that leaves the producer fast-forwarded rebuilds its
+///   outputs under the original attempt, yielding the same `staging_dir` and the
+///   same collision. That still fails at
+///   [`move_file`] rather than corrupting anything, but it is not covered here.
+///
+/// Deterministic for a given (ticket, staging dir), so a replayed DoAction
+/// recomputes the same name. Most replays never reach [`move_file`]: the first
+/// run moved the staging files out, so the source-existence check in
+/// `register_files` returns `not_found` first. The name carries the guard on the
+/// one path where the source survives — the EXDEV branch below copies and then
+/// tolerates a failed `remove_file(src)`, leaving source and destination both in
+/// place. There the refusal is what stops a second registration of the tables
+/// outside `REPLACE_KEY_TABLES` (e.g. `reference_membership`), which have no
+/// replace-by-key to absorb one; a random name would register them twice.
+///
+/// DuckLake names its own INSERT-written data files uniquely for the same
+/// reason; this is the equivalent for our "register an existing file" path.
+///
+/// `scope` comes from [`staging_scope`], not from the raw `staging_dir`.
+fn lake_dest_filename(work_ticket_idx: i64, scope: &str, basename: &str) -> String {
+    let digest = Sha256::digest(scope.as_bytes());
+    // 48 bits, enough to separate the attempts one ticket can have
+    // (`max_retries` bounds them). A collision lands on move_file's
+    // AlreadyExists, not a silent clobber.
+    let hex: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+    format!("wt{work_ticket_idx}-{hex}-{basename}")
+}
+
+/// The part of a registration's staging dir that identifies WHICH registration
+/// it is, independent of where scratch happens to be mounted.
+///
+/// `PATH_SCRATCH` is host configuration: a migration, a remount, or a differently
+/// laid-out replacement host changes it without changing which registration a
+/// given staging dir denotes. Keying [`lake_dest_filename`] on the absolute path
+/// would make the digest — and so the destination name — move with it, which
+/// would break the determinism that guard depends on. Keying on the path
+/// RELATIVE to the scratch root does not.
+///
+/// A staging dir outside the scratch root falls back to the full path. That is
+/// still correct (it only has to be stable and distinct), just not stable across
+/// a move of whatever holds it.
+fn staging_scope(staging_dir: &str, scratch_root: &std::path::Path) -> String {
+    std::path::Path::new(staging_dir)
+        .strip_prefix(scratch_root)
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| staging_dir.to_string())
 }
 
 /// Move a file, falling back to copy+delete for cross-filesystem moves.
@@ -4543,21 +4605,97 @@ mod tests {
     // other in the shared per-table lake dir.
     #[test]
     fn lake_dest_filename_is_traceable_and_unique_across_tickets() {
-        let a = lake_dest_filename(27, "part_00000.parquet");
-        let b = lake_dest_filename(31, "part_00000.parquet");
-        assert_eq!(a, "wt27-part_00000.parquet", "name embeds the work ticket");
+        let staging = "/scratch/ticket/27/assembly_load/attempt-0/output";
+        let a = lake_dest_filename(27, staging, "part_00000.parquet");
+        let b = lake_dest_filename(31, staging, "part_00000.parquet");
+        assert!(a.starts_with("wt27-"), "name embeds the work ticket: {a}");
+        assert!(
+            a.ends_with("-part_00000.parquet"),
+            "name preserves the producer basename: {a}"
+        );
         assert_ne!(
             a, b,
             "same basename under different tickets must not collide"
         );
         // Deterministic — no randomness, so a resume/retry recomputes the same
         // name and the move_file guard can detect a true double-registration.
-        assert_eq!(a, lake_dest_filename(27, "part_00000.parquet"));
-        // Distinct basenames within one ticket stay distinct (multiple parts
-        // and the flat per-table files share a ticket).
+        assert_eq!(a, lake_dest_filename(27, staging, "part_00000.parquet"));
+        // Distinct basenames within one registration stay distinct (multiple
+        // parts and the flat per-table files share a ticket).
         assert_ne!(
-            lake_dest_filename(27, "part_00001.parquet"),
-            lake_dest_filename(27, "reference_membership.parquet")
+            lake_dest_filename(27, staging, "part_00001.parquet"),
+            lake_dest_filename(27, staging, "reference_membership.parquet")
+        );
+    }
+
+    // Regression: ONE ticket can register twice. A redrive replays a ticket's
+    // storage tail, so the second load reaches register_files with the same
+    // work_ticket_idx and the same producer basenames as the first. Keyed on the
+    // ticket alone, that second load targeted the path the first had already
+    // registered and move_file refused it with AlreadyExists. The producer's
+    // re-run puts the second load under a different staging_dir, which is what
+    // separates them.
+    #[test]
+    fn lake_dest_filename_separates_redrives_of_one_ticket() {
+        let first = lake_dest_filename(
+            6939,
+            "/scratch/ticket/6939/assembly_load/attempt-0/output",
+            "part_00000.parquet",
+        );
+        let redrive = lake_dest_filename(
+            6939,
+            "/scratch/ticket/6939/assembly_load/attempt-1/output",
+            "part_00000.parquet",
+        );
+        assert_ne!(
+            first, redrive,
+            "a redrive of one ticket must not target the first load's path"
+        );
+        for name in [&first, &redrive] {
+            assert!(name.starts_with("wt6939-"), "still traceable: {name}");
+        }
+    }
+
+    // PATH_SCRATCH is host configuration: a migration, a remount, or a
+    // differently laid-out replacement host changes it without changing which
+    // registration a staging dir denotes. Keying the digest on the absolute path
+    // would move the minted name with the mount point and break the determinism
+    // move_file's guard depends on.
+    #[test]
+    fn staging_scope_is_stable_across_a_moved_scratch_root() {
+        let rel = "ticket/6939/assembly_load/attempt-1/output";
+        let a = staging_scope(&format!("/scratch/{rel}"), std::path::Path::new("/scratch"));
+        let b = staging_scope(
+            &format!("/mnt/new-scratch/{rel}"),
+            std::path::Path::new("/mnt/new-scratch"),
+        );
+        assert_eq!(a, rel, "the scope is the path relative to the scratch root");
+        assert_eq!(a, b, "the scope must not carry the mount point");
+        assert_eq!(
+            lake_dest_filename(6939, &a, "part_00000.parquet"),
+            lake_dest_filename(6939, &b, "part_00000.parquet"),
+            "a moved scratch root must not change the minted name"
+        );
+        // Still separates attempts once the mount point is gone.
+        let other_attempt = staging_scope(
+            "/scratch/ticket/6939/assembly_load/attempt-0/output",
+            std::path::Path::new("/scratch"),
+        );
+        assert_ne!(a, other_attempt);
+        // A staging dir outside the root keeps the full path: distinct and
+        // stable, just not portable across a move of whatever holds it.
+        let outside = staging_scope("/elsewhere/staging", std::path::Path::new("/scratch"));
+        assert_eq!(outside, "/elsewhere/staging");
+        // config.rs takes PATH_SCRATCH through a bare PathBuf::from with no
+        // normalization, so a host may hand us a trailing slash. strip_prefix
+        // compares components, not bytes, so it must not change the answer.
+        assert_eq!(
+            staging_scope(
+                &format!("/scratch/{rel}"),
+                std::path::Path::new("/scratch/")
+            ),
+            rel,
+            "a trailing slash on the scratch root must not change the scope"
         );
     }
 
@@ -4584,8 +4722,13 @@ mod tests {
                 files,
                 work_ticket_idx: 1,
             };
-            let err = register_files("unused-connstr", "unused-data-path", &payload)
-                .expect_err("a traversal filename must be rejected");
+            let err = register_files(
+                "unused-connstr",
+                "unused-data-path",
+                std::path::Path::new("/"),
+                &payload,
+            )
+            .expect_err("a traversal filename must be rejected");
             assert_eq!(
                 err.code(),
                 tonic::Code::InvalidArgument,
@@ -4868,7 +5011,7 @@ mod tests {
     }
 
     /// End-to-end `register_files`: seed a Parquet in a staging dir, register it
-    /// into DuckLake, and assert the file was moved to ticket-unique lake storage
+    /// into DuckLake, and assert the file was moved to the lake path
     /// and its rows are queryable through the catalog. Exercises the
     /// move-then-register path and its wrapping transaction against a real
     /// DuckLake catalog.
@@ -4883,7 +5026,7 @@ mod tests {
         let ref_idx: i64 = 970_000;
         let feat_a: i64 = 970_010;
         let feat_b: i64 = 970_011;
-        // Ticket-unique dest names come from work_ticket_idx (lake_dest_filename).
+        // The dest name is minted by `lake_dest_filename`, which keys on this.
         // Derive it from the PID so a manual re-run against a persistent catalog
         // mints a fresh file name instead of colliding with the prior run's
         // still-registered lake file (move_file refuses to overwrite). CI resets
@@ -4934,18 +5077,22 @@ mod tests {
             work_ticket_idx: ticket,
         };
 
-        let outcome =
-            register_files(&connstr, &data_path, &payload).expect("register_files failed");
+        let outcome = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
+            .expect("register_files failed");
         assert_eq!(outcome.registered.len(), 1, "one file registered");
         assert!(
             outcome.replaced.is_empty(),
             "reference_membership is not a REPLACE_KEY_TABLES target, so nothing is replaced"
         );
-        // The dest carries the ticket-unique minted name under the per-table dir.
+        // The dest carries the registration-unique minted name under the
+        // per-table dir. Composed through the same `staging_scope` the caller
+        // uses — recomputing the scope here by hand would be a second
+        // implementation that drifts the moment the derivation changes.
         let dest = std::path::Path::new(&outcome.registered[0]);
+        let scope = staging_scope(&payload.staging_dir, std::path::Path::new("/"));
         assert_eq!(
             dest.file_name().and_then(|f| f.to_str()).unwrap(),
-            lake_dest_filename(ticket, "reference_membership.parquet")
+            lake_dest_filename(ticket, &scope, "reference_membership.parquet")
         );
         assert!(dest.exists(), "registered lake file present on disk");
         assert!(
@@ -5108,6 +5255,7 @@ mod tests {
         let outcome_a = register_files(
             &connstr,
             &data_path,
+            std::path::Path::new("/"),
             &assembly_register_payload(&staging_a, 2, ticket_a),
         )
         .expect("run A register_files failed");
@@ -5129,6 +5277,7 @@ mod tests {
         let outcome_b = register_files(
             &connstr,
             &data_path,
+            std::path::Path::new("/"),
             &assembly_register_payload(&staging_b, 2, ticket_b),
         )
         .expect("run B register_files failed");
@@ -5234,6 +5383,7 @@ mod tests {
             register_files(
                 &connstr,
                 &data_path,
+                std::path::Path::new("/"),
                 &assembly_register_payload(&staging, 1, base_ticket + attempt),
             )
             .unwrap_or_else(|e| panic!("attempt {attempt} register_files failed: {e}"));
@@ -5311,10 +5461,12 @@ mod tests {
             files,
             work_ticket_idx: ticket,
         };
-        register_files(connstr, data_path, &payload).unwrap_or_else(|e| {
-            let names: Vec<&str> = tables.iter().map(|(table, _)| *table).collect();
-            panic!("register_files({names:?}) failed: {e}")
-        })
+        register_files(connstr, data_path, std::path::Path::new("/"), &payload).unwrap_or_else(
+            |e| {
+                let names: Vec<&str> = tables.iter().map(|(table, _)| *table).collect();
+                panic!("register_files({names:?}) failed: {e}")
+            },
+        )
     }
 
     #[cfg(feature = "integration")]
@@ -5798,7 +5950,7 @@ mod tests {
                     let start = &start;
                     scope.spawn(move || {
                         start.wait();
-                        register_files(connstr, data_path, payload)
+                        register_files(connstr, data_path, std::path::Path::new("/"), payload)
                     })
                 })
                 .collect();
@@ -5894,7 +6046,7 @@ mod tests {
                 files,
                 work_ticket_idx: ticket,
             };
-            let outcome = register_files(&connstr, &data_path, &payload)
+            let outcome = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
                 .unwrap_or_else(|e| panic!("register_files failed: {e}"));
             // Keep `staging` alive until after the call.
             drop(staging);

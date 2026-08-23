@@ -61,8 +61,48 @@ duplicates further down are historical strata; leave them where they are.
   `feature_idx` ranges are narrow enough to prune at all, both prune to the same
   1 file of 200.
 
-- **NCBI Taxonomy releases read from a taxdump archive (#439).**
-  `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
+- **`scripts/lake-gc.sh` reports and reclaims unreferenced lake files (#472).** DuckLake
+  never reclaims a data file on its own: deleting rows leaves the Parquet on disk and
+  still held by the snapshots that predate the delete, so every `register_files`
+  replace-by-key and every `delete_reference` / `delete_mask` / `delete_pool_reads` /
+  `delete_alignment` has been accumulating. The script drives DuckLake's own
+  `ducklake_expire_snapshots` → `ducklake_cleanup_old_files` → `ducklake_delete_orphaned_files`
+  in that order, in ONE transaction in one duckdb process, using the documented `CALL`
+  form — measured on 1.5.4, `cleanup_old_files` reports nothing until the snapshots
+  referencing a file are expired (running it alone is a no-op) but does see that expiry
+  from inside the same transaction. The transaction bounds the CATALOG only: an unlinked
+  file stays unlinked through a rollback, also measured. It **reports
+  by default**, prompts for a typed confirmation before acting, keeps 7 days of snapshot
+  history unless `--older-than` says otherwise, and never passes `cleanup_all`. Orphan
+  deletion is behind its own `--reclaim-orphans`: it is the only step that can reach a
+  file belonging to a registration in flight, because `register_files` moves a Parquet to
+  its lake path before opening the catalog transaction that registers it, and in that
+  window the file is on disk with no catalog row — indistinguishable from an orphan.
+  Steps 1-2 cannot reach it (`cleanup_old_files` only removes files the catalog once
+  referenced), so plain `--reclaim` needs no quiescing.
+  Registrations must be quiesced before reclaiming: `older_than` filters on filesystem
+  mtime and `register_files` places files with `rename`, which carries over the mtime the
+  producing job gave them in staging, so the cutoff does not bound "recently placed" —
+  the script header carries that argument in full. Runs as `qiita-data`, the account that
+  owns the data path.
+
+
+- **`build_version` / `BUILD_VERSION` is now covered by tests (#309).** The landing page
+  renders `settings.build_version or _PACKAGE_VERSION` (`landing.py`), so a from-source
+  boot without `BUILD_VERSION` falls back to the static package version instead of the
+  literal `None`. The new cases mirror the existing `build_sha` / `BUILD_SHA` pair — one
+  asserting the calver is shown, one asserting the empty-string case normalizes to `None`,
+  one asserting the package-version fallback — so both arms are covered in `test_landing.py`
+  and `test_config.py`.
+
+- **`DEPLOY_CHECKLIST.md` drops a stale `(#324)` note (#431).** That entry was verbatim in
+  the archived 2026-07-30 deploy note, so an operator was being told to re-note a schema
+  gate (`reference-add` / `local-reference-add` requiring a genome map when `shard_index` is
+  true) already on a live deploy. It was the only copy — `main` carried the same guard from
+  the moment #324 landed — and `deploy-note-check` ignores this file, so removing it is
+  safe.
+
+- **NCBI Taxonomy releases read from a taxdump archive (#439).**  `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
   into the term rows of a release, so taxa no longer arrive as hand-written seed
   migrations. A live taxon takes its scientific name as its label and its genbank
   common name as its second name; a taxon NCBI merged away becomes an obsolete
@@ -1028,6 +1068,61 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **A redriven work ticket whose producer step re-ran can register its files again (#472).** `lake_dest_filename`
+  minted `wt<work_ticket_idx>-<basename>`, whose uniqueness assumed one load per ticket.
+  A redrive replays a ticket's storage tail into a fresh `attempt-<n>` workspace, so the
+  second load targeted the byte-identical path the first had already registered and
+  `move_file` refused it — `refusing to overwrite existing lake file
+  …/assembled_sequence_chunks/wt6939-part_00000.parquet`, which blocked the unbinned-residue
+  backfill for all 57 candidate prep_samples. The name now also carries a digest of the
+  registration's staging dir **relative to `PATH_SCRATCH`**, which encodes the attempt
+  without pinning the name to where scratch is mounted — a migration or remount changes
+  that root without changing which registration a staging dir denotes. It stays
+  deterministic for a given (ticket, staging scope), so a replayed DoAction recomputes the
+  same name and
+  `move_file` still refuses a true double-registration — the refusal that keeps
+  `register_files` replay-safe for the tables outside `REPLACE_KEY_TABLES`
+  (e.g. `reference_membership`), which have no replace-by-key to absorb one.
+
+
+- **Two assembled contigs in one FASTA whose headers share a first token store each
+  other's bytes (#464).** `read_fastx` returns one row per record, so two such records come
+  back under one `read_id`; sharing a file they also share `kind` and `bin_id`, so
+  `assembly_hash`'s whole synthetic `kind:bin_id:contig_id` repeats. Pass 2 joins the
+  per-hash `winner` on that id over a fresh scan of every record, so each of the pair's two
+  `sequence_hash` values receives both contigs' chunks — the bytes stored for a feature then
+  include a sequence that is not that feature's, at the same `chunk_index`. Measured on a
+  two-record fixture of 16 bp contigs: 2 chunk rows and 32 bytes under each of the two
+  hashes, against 1 row and 16 bytes for the byte-identical fixture whose second header's
+  first token differs. A colliding run leaves the manifest, bin_map and chunks all
+  well-formed, so nothing downstream can notice it. The id's last component is now
+  `read_fastx`'s per-file ordinal `sequence_index` rather than the contig id, which makes
+  `kind:bin_id:sequence_index` unique by construction and also closes the other route to a
+  repeated id, an unescaped `:` inside a bin_id — the job module carries the argument, and
+  the two `sequence_index` facts it rests on are pinned against the real miint build in
+  `qiita-compute-orchestrator/tests/jobs/test_read_fastx_miint_contract.py`. The contig id
+  leaves the key and rides `bin_map` as its own `contig_id` column — no consumer joins on
+  it; it is what lets a workspace under investigation say which assembled contig became
+  which `feature_idx`, which for a MAG contig nothing else records. The step also counts
+  the pass-2 rejoin now: `count(DISTINCT sequence_hash)` over the chunk Parquet against the
+  distinct hashes pass 1 saw with bytes to store. A later divergence between the two
+  `_READ_ID_EXPR` sites therefore fails the step rather than minting a `qiita.feature` that
+  has a manifest row, an `assembly_membership` row and zero stored bytes — an outcome
+  nothing downstream raises on, since `register_files` replaces chunks on `feature_idx` and
+  a reader just gets an empty `string_agg`. Measured on a two-contig fixture whose composed
+  id is NULL for one of them: manifest and `bin_map` carry both rows, the chunk Parquet
+  carries one hash, and without the count the step exits 0. A zero-length contig record is
+  left out of the count — `sequence_split('')` returns an empty list, so it has no chunk to
+  rejoin and is input we did not produce.
+
+- **Two refined-bin FASTAs stemming to one `bin_id` merged into one bin (#464).**
+  `_FASTA_GLOBS` accepts `.fa` / `.fna` / `.fasta`, and `_local_id` strips the suffix, so
+  `bin.1.fa` and `bin.1.fna` both became `bin.1` — one bin where there were two, in
+  `bin_map` and so in `qiita.assembly_membership` and the `bin_quality` join it feeds, both
+  of which key a bin on `(prep_sample_idx, processing_idx, kind, bin_id)`. Measured as 1
+  distinct `bin_id` in `bin_map` against 2 for the same pair renamed. `_file_meta` now
+  raises, naming both filenames; the synthetic read_id above rests on that raise too.
 
 - **xdist workers shared one miint extension directory, so they installed on top of
   each other (#462).** `setup_miint_test_env` named the directory per *component*
@@ -2161,6 +2256,28 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **`mint-features` pins its declared `inputs:` list (#464).** The runner's dispatch resolved
+  the manifest as `entry.inputs[0]`, so a workflow naming any other binding minted features out
+  of whatever path sat there. It now requires `inputs: [manifest]` and reads `bound["manifest"]`
+  by name, failing the entry otherwise — the shape `mint-annotation-features`,
+  `write-membership` and `write-assembly-membership` already use. The optional genome map is
+  unchanged: it stays an `action_context` binding (`genome_map_path`), not a declared input.
+
+- **`qiita.assembly_membership` documents its key prefix and its `bin_id` column (#464).**
+  A comment-only migration. The table comment: `(prep_sample_idx, processing_idx, kind,
+  bin_id)` is the subject identity, with `feature_idx` completing the row per member contig,
+  and `kind` tells a refined bin from a circular or an unbinned contig (value set still
+  enumerated only in `qiita_common.assembly_constants`, which the comment points at). How
+  far that identity separates two subjects depends on what `bin_id` holds, so the table
+  comment points at the `bin_id` column comment instead of restating it. A subject records
+  grouping and nothing about completeness, for any kind; the `bin_quality` lake table
+  measures that, per refined bin, from CheckM. `bin_id` gains its first column comment: a
+  refined bin's FASTA filename stem — one file, one bin, which `_file_meta` enforces — or,
+  for a circular or unbinned contig, that contig's own assembler-given id, its FASTA
+  header's first token. Producer-chosen either way, and two headers in one file can share a
+  first token, which is why the key scopes `bin_id` rather than treating it as globally
+  unique or as one contig per row. None of that is recoverable from the bare `TEXT` column.
+
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that
   fetches them ran last too — which meant a reference this alignment names but the caller cannot
@@ -2205,6 +2322,14 @@ duplicates further down are historical strata; leave them where they are.
   rollback of an already-committed file now has direct tests, which no caller's own suite
   reached, and the one gap it cannot close — a kill between two renames — is written down
   where the guarantee is stated.
+
+- **`docs/architecture.md` updated: N=0 sharded path no longer exists (#431).**
+  `plan-shards` returns zero shards on N=0 rather than raising; the
+  plan-shards **runner arm** treats that zero-shard result as an error
+  and fails the ticket, and a CLI guard (`--shard-index requires
+  --genome-map`) additionally catches the case before any network call.
+  Two bullets in the sharded-index fan-out section corrected to reflect
+  the current behavior.
 
 - **One `cap_rows` helper behind every capped list route (#427).** The
   fetch-`cap + 1` / slice-back / set-`truncated` split was written inline at each
@@ -2291,6 +2416,13 @@ duplicates further down are historical strata; leave them where they are.
   both resolve through it instead of each re-asserting the three Optional fields
   and rebuilding a `FlatBaselineResources` by hand, so what actually runs and what
   the guard checks cannot drift.
+- **Landing-page footer now shows the deploy date (calver) instead of the static package version (#431).**
+  `QIITA_BUILD_VERSION` is derived from the deployed commit's date in `local-deploy.sh` and
+  injected via `build.env`; `landing.py` prefers it, falling back to the package version for
+  dev boots.
+- **`align_sharded` probe comment corrected: the count probe is kept for correctness, not
+  because `LIMIT 1` is slower (#431).** Row-group stats make `LIMIT 1` faster in most shapes;
+  the count probe is needed because the mixed-batch rejection requires `total`.
 
 - **`align_sharded` hands the aligner a materialized query relation instead of the lazy
   Parquet view (#391).** Both sharded aligners read the query relation once per shard, so
