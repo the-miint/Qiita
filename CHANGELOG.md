@@ -75,6 +75,7 @@ duplicates further down are historical strata; leave them where they are.
   the script header carries that argument in full. Runs as `qiita-data`, the account that
   owns the data path.
 
+
 - **`build_version` / `BUILD_VERSION` is now covered by tests (#309).** The landing page
   renders `settings.build_version or _PACKAGE_VERSION` (`landing.py`), so a from-source
   boot without `BUILD_VERSION` falls back to the static package version instead of the
