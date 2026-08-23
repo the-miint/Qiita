@@ -5461,6 +5461,30 @@ async def test_runner_local_passthrough_threads_paths(
     ]
 
 
+async def test_dispatch_mint_features_rejects_unknown_inputs(postgres_pool, library_spy, tmp_path):
+    """An `inputs:` list mint-features cannot resolve fails the entry rather than
+    minting features out of whichever binding sat first."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(
+        kind="action", name="mint-features", inputs=["contig_manifest"], outputs=["feature_map"]
+    )
+    with pytest.raises(RuntimeError, match="mint-features expects inputs"):
+        await _run_action_primitive(
+            postgres_pool,
+            entry,
+            {"contig_manifest": str(tmp_path / "m.parquet")},
+            tmp_path / "ws",
+            {"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=1,
+            signing_key=b"\x00" * 32,
+            data_plane_url="grpc://unused:50051",
+        )
+    assert library_spy.calls == []
+
+
 # --- deliberate output shadowing (read-mask: lima_mask self-shadows partial_mask) ---
 #
 # The read-mask chain threads a `partial_mask` binding through syndna -> lima -> qc.

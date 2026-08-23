@@ -16,11 +16,12 @@ from httpx import ASGITransport, AsyncClient
 def _build_minimal_settings(
     contact_email: str = "qiita-help@example.org",
     build_sha: str | None = None,
+    build_version: str | None = None,
 ):
     """Most Settings fields are unused by the landing route — only
-    `contact_email` and `build_sha` are read. Construct one directly
-    (Settings.from_env() would also work but would require monkeypatching
-    the full required-env set)."""
+    `contact_email`, `build_sha` and `build_version` are read. Construct
+    one directly (Settings.from_env() would also work but would require
+    monkeypatching the full required-env set)."""
     from qiita_control_plane.config import Settings
 
     return Settings(
@@ -29,6 +30,7 @@ def _build_minimal_settings(
         data_plane_url="unused",
         contact_email=contact_email,
         build_sha=build_sha,
+        build_version=build_version,
     )
 
 
@@ -207,4 +209,32 @@ async def test_landing_footer_omits_build_sha_when_absent(app):
     assert "/commit/" not in body
     assert "None" not in body
     # The version label itself is still present (the footer didn't break).
+    assert "UC San Diego" in body
+
+
+async def test_landing_footer_renders_build_version(app):
+    """When the deploy stamps a calver (BUILD_VERSION), the footer must
+    show it so an operator can confirm the running build matches the
+    deploy. The calver is plain text — it is a date, not a commit, so it
+    renders verbatim after the version label, with no commit link."""
+    app.state.settings = _build_minimal_settings(build_version="2026.8.6")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        response = await ac.get("/")
+    body = response.text
+    assert "v2026.8.6" in body
+    assert "/commit/" not in body
+    assert "None" not in body
+
+
+async def test_landing_footer_falls_back_to_package_version_when_build_version_absent(app):
+    """A from-source / first-deploy boot leaves build_version None. The
+    footer must then fall back to the static package version (landing.py
+    renders `settings.build_version or _PACKAGE_VERSION`), not the literal
+    'None' or empty parens. This is the #309 fallback arm."""
+    app.state.settings = _build_minimal_settings(build_version=None)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        response = await ac.get("/")
+    body = response.text
+    assert "None" not in body
+    # A non-empty version label is still rendered — the fallback kicked in.
     assert "UC San Diego" in body

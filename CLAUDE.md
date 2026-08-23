@@ -242,7 +242,7 @@ reference_idx ── reference_membership ── feature_idx ── feature_geno
 ```
 
 - `reference_idx` = (name, version) pair for a reference database; `kind` distinguishes sequence references from taxonomy authorities
-- `genome_idx` = logical entity across references (nullable — not all features are genomes, e.g., 16S records). Carries the public `(source, source_id)` accession
+- `genome_idx` = logical entity across references (nullable — not all features are genomes, e.g., 16S records). Keyed by `(source, source_id)`; whether that `source_id` is an external accession or an internal name is per-`source`, and `repositories/exported_feature.py` is the authority
 - `feature_idx` = specific sequence, deduplicated by MD5 hash via DuckDB `md5()` (identical bytes = same `feature_idx`). A **BIGINT identity** — the 128-bit hash is the separate `feature.sequence_hash uuid`. A feature's human-facing name lives on the *membership* (`reference_membership.accession`, nullable), not on `feature`
 
 `feature_idx` bridges sample processing results (alignment detail, counts) and reference data (sequences, taxonomy, annotations, phylogeny). Alignment output contains `feature_idx` but **not** `reference_idx` — reference scoping is a query-time join against `reference_membership`.
