@@ -7,17 +7,39 @@ outputs and produces the inputs the SHARED reference-load machinery consumes
 downstream (mint-features -> write-assembly-membership -> assembly_load):
 
   - `manifest.parquet` — `(read_id, sequence_hash, sequence_length_bp)`, one row
-    per contig. `read_id` is a SYNTHETIC globally-unique id
-    `kind || ':' || bin_id || ':' || contig_id` (a raw contig id can repeat across
-    bins/files, so it is never keyed on alone). This is the exact shape
+    per contig. `read_id` is a SYNTHETIC id
+    `kind || ':' || bin_id || ':' || sequence_index` — a contig's own id repeats
+    across bins and files, so it is not an identity. This is the exact shape
     `mint-features` consumes and `build_feature_id_map` re-keys.
   - `assembly_chunks/` — a DIRECTORY of `part_*.parquet`
     `(sequence_hash, chunk_index, chunk_data)`, the hash-keyed 64 KB chunks
     `write_feature_sequence_chunks` re-keys to feature_idx. Identical contigs (same
     canonical bytes) collapse to one set of chunks (DISTINCT ON sequence_hash),
     exactly like `hash_sequences`.
-  - `bin_map.parquet` — `(read_id, kind, bin_id)`, the per-contig bin membership
-    `write-assembly-membership` / `assembly_load` join against.
+  - `bin_map.parquet` — `(read_id, kind, bin_id, contig_id)`, the per-contig bin
+    membership `write-assembly-membership` / `assembly_load` join against.
+    `contig_id` is the assembler's own id for the record. No consumer joins on it;
+    it is carried so a workspace under investigation can say which assembled
+    contig became which `feature_idx` — the name the assembler, DAS_Tool and
+    CheckM all use. Nothing else records it: for a MAG the `bin_id` is the FASTA's
+    stem and the `read_id`'s last component is the record's ordinal, and
+    `bin_map.parquet` stays in the workspace rather than being registered in the
+    lake, so the trace lives as long as the workspace does and no longer.
+
+**The synthetic read_id is unique across the scan by construction.** Its last
+component is `read_fastx`'s `sequence_index`, a 1-based ordinal over the records of
+ONE file that restarts at 1 in the next
+(https://the-miint.github.io/duckdb-miint/reading/), and `(kind, bin_id)` names
+exactly one file: LCG and UNBINNED are a single file each, and `_file_meta` refuses
+two refined-bin FASTAs that stem to one bin_id. So no two records carry the same
+triple. The composition is injective on top of that — `kind` is one of the
+`assembly_constants` literals and `sequence_index` is digits, neither holding a
+`:`, so the first and the last `:` of the string are the two separators however
+many `:` a bin_id carries.
+
+Pass 2 joins `winner` on that id over a fresh scan, so it also rests on
+`sequence_index` being the record's position in the file rather than an artifact of
+one scan — pinned in `tests/jobs/test_read_fastx_miint_contract.py`.
 
 **Shared canonical identity.** `sequence_hash` is
 `qiita_common.chunking.canonical_sequence_hash_expr` — the SAME expression
@@ -32,9 +54,10 @@ as passed, so a small in-memory `file_meta(filepath, kind, bin_id)` table (built
 from the input paths) JOINs the scan back to each contig's kind + bin without
 fragile filename regex. A MAG's bin_id is its file (one FASTA per bin groups many
 contigs); the LCG contigs arrive as a single `circular.fa` multi-FASTA and the
-unbinned residue as a single `noLCG.fa` one, and each of those records is its own
-subject, so their bin_id is the contig id itself — carried as a NULL
-`file_meta.bin_id` and COALESCE'd from the read_fastx record in the scan. (That
+unbinned residue as a single `noLCG.fa` one, so their bin_id is the contig id
+itself — carried as a NULL `file_meta.bin_id` and COALESCE'd from the read_fastx
+record in the scan. How far a producer-chosen contig id separates two subjects is
+stated on `qiita.assembly_membership`'s `bin_id` column. (That
 also means the container needs no per-contig FASTA split: `read_fastx` reads the
 whole multi-FASTA and the id column IS the bin_id.)
 
@@ -101,15 +124,23 @@ _DUCKDB_THREADS = 4
 # multi-MB contig records can't materialise a giant chunk before the chunker runs.
 _READ_FASTX_MAX_BATCH_BYTES = "128MB"
 
+# The synthetic read_id (module docstring), over a `read_fastx rf` x `file_meta fm`
+# join. Both passes compose it and pass 2 joins `winner` on the string pass 1
+# composed; a divergence between the two is what the rejoin count after pass 2
+# refuses.
+_READ_ID_EXPR = (
+    "fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) || ':' || CAST(rf.sequence_index AS VARCHAR)"
+)
+
 
 class Inputs(BaseModel):
     """Typed input contract for assembly_hash.
 
     `genomes_dir` (holds `circular.fa` + `noLCG.fa`) and `refined_bins_dir` (MAG bins)
     are the upstream container steps' outputs. `prep_sample_idx` / `work_ticket_idx` are
-    framework-injected scope scalars (declared for an explicit contract even though
-    this step doesn't read them — sequences are run-agnostic, so no processing_idx
-    is needed here).
+    framework-injected scope scalars, declared for an explicit contract: nothing this
+    step writes is keyed on either, and sequences are run-agnostic, so it needs no
+    processing_idx either.
     """
 
     genomes_dir: Path
@@ -149,7 +180,10 @@ def _file_meta(genomes_dir: Path, refined_bins_dir: Path) -> list[tuple[str, str
       shape as LCG. This row covers the WHOLE file; the residue subset is taken
       per record in `execute` (see the module docstring).
     - MAG: each refined-bin FASTA under `<refined_bins_dir>`; `bin_id` = the
-      filename stem (a bin groups many contigs under one file).
+      filename stem (a bin groups many contigs under one file). `_FASTA_GLOBS`
+      accepts several suffixes, so `bin.1.fa` and `bin.1.fna` stem to one bin_id;
+      that raises. The rest of the tail would key them as one bin, and the
+      synthetic read_id needs `(kind, bin_id)` to name one file (module docstring).
 
     Empty files are dropped (`read_fastx` raises on a 0-record input, and one empty
     path aborts the whole `VARCHAR[]` scan)."""
@@ -158,10 +192,18 @@ def _file_meta(genomes_dir: Path, refined_bins_dir: Path) -> list[tuple[str, str
         path = genomes_dir / name
         if path.is_file() and not is_empty_sequence_file(path):
             meta.append((str(path), kind, None))
+    bin_files: dict[str, Path] = {}
     for path in _fasta_files(refined_bins_dir):
         if is_empty_sequence_file(path):
             continue
-        meta.append((str(path), KIND_MAG, _local_id(path)))
+        bin_id = _local_id(path)
+        if bin_id in bin_files:
+            raise ValueError(
+                f"two refined-bin FASTAs stem to bin_id {bin_id!r} under {refined_bins_dir}: "
+                f"{bin_files[bin_id].name} and {path.name}"
+            )
+        bin_files[bin_id] = path
+        meta.append((str(path), KIND_MAG, bin_id))
     return meta
 
 
@@ -212,18 +254,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
             conn.executemany("INSERT INTO file_meta VALUES (?, ?, ?)", meta)
 
-            # Pass 1 — per-contig metadata (kind, bin_id, synthetic read_id, hash,
-            # length). No sequence bytes retained, so manifest + bin_map cost a tiny
-            # table. The synthetic read_id disambiguates a contig id reused across
-            # bins/files. `sequence_hash` is the SHARED canonical hash so identical
-            # bytes mint the same feature_idx as a reference sequence.
+            # Pass 1 — per-contig metadata (kind, bin_id, contig_id, synthetic
+            # read_id, hash, length). No sequence bytes retained, so manifest +
+            # bin_map cost a tiny table. `sequence_hash` is the SHARED canonical
+            # hash so identical bytes mint the same feature_idx as a reference
+            # sequence.
             conn.execute(
                 "CREATE TEMP TABLE contig AS "
                 "SELECT "
                 "  fm.kind AS kind, "
                 "  COALESCE(fm.bin_id, rf.read_id) AS bin_id, "
-                "  fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) "
-                "|| ':' || rf.read_id AS read_id, "
+                "  rf.read_id AS contig_id, "
+                f"  {_READ_ID_EXPR} AS read_id, "
                 f"  {canonical_sequence_hash_expr('rf.sequence1')} AS sequence_hash, "
                 "  CAST(length(rf.sequence1) AS BIGINT) AS sequence_length_bp "
                 f"FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
@@ -258,7 +300,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"TO '{manifest_out}' ({PARQUET_OPTS})"
             )
             conn.execute(
-                "COPY (SELECT read_id, kind, bin_id FROM contig) "
+                "COPY (SELECT read_id, kind, bin_id, contig_id FROM contig) "
                 f"TO '{bin_map_out}' ({PARQUET_OPTS})"
             )
 
@@ -296,12 +338,46 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"    FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
                 "      include_filepath:=true) rf "
                 "    JOIN file_meta fm ON rf.filepath = fm.filepath "
-                "    JOIN winner w ON w.read_id = "
-                "      (fm.kind || ':' || COALESCE(fm.bin_id, rf.read_id) || ':' || rf.read_id)"
+                f"    JOIN winner w ON w.read_id = ({_READ_ID_EXPR})"
                 "  )"
                 f") TO '{chunks_part_out}' ({PARQUET_OPTS_CHUNKED})",
                 [paths],
             )
+
+            # Every sequence_hash that has bytes must come back from pass 2 — one
+            # `winner` per distinct hash, one chunk set per winner. When the two
+            # `_READ_ID_EXPR` sites diverge (a WHERE added to one scan, an
+            # alias rename its baked `rf.`/`fm.` prefixes stop matching, a NULL
+            # reaching the `||` chain so the join compares NULL to NULL), the
+            # contig keeps the manifest and bin_map rows pass 1 wrote and loses
+            # its chunks: mint-features gives it a qiita.feature and
+            # write-assembly-membership a membership row, both for a feature with
+            # zero stored bytes, and register-files replaces chunks on feature_idx
+            # so nothing accumulates — a reader gets an empty string_agg, not an
+            # error. A mismatch says the composition above is wrong, not that the
+            # input is: the contigs involved are otherwise complete, and the same
+            # data re-runs clean once the expression is fixed — unlike a check
+            # over input an operator cannot edit, where every re-run fails the
+            # same way. `sequence_split('')` returns an empty list, so a
+            # zero-length contig record legitimately writes no chunk and is left
+            # out of the count. Cost is one column-pruned UUID scan over a Parquet
+            # that is tiny by design.
+            rejoined, expected = conn.execute(
+                "SELECT ("
+                f"  SELECT count(DISTINCT sequence_hash) FROM read_parquet('{chunks_part_out}')"
+                "), ("
+                "  SELECT count(DISTINCT sequence_hash) FROM contig"
+                "  WHERE sequence_length_bp > 0"
+                ")"
+            ).fetchone()
+            if rejoined != expected:
+                raise ValueError(
+                    f"assembly_hash pass 2 stored chunks for {rejoined} of {expected} "
+                    "distinct contig sequences for "
+                    f"prep_sample_idx={inputs.prep_sample_idx}: {expected - rejoined} would "
+                    "reach qiita.feature with a manifest row and no stored bytes. The two "
+                    "read_id compositions disagree — see _READ_ID_EXPR."
+                )
         success = True
     finally:
         # On any failure remove partial outputs so the launcher's manifest walker

@@ -205,14 +205,15 @@ pub fn verify_ticket(
 pub struct ActionPayload {
     /// Action type, e.g., "register_files".
     pub action: String,
-    /// Staging directory containing the Parquet files to register.
+    /// Staging directory containing the Parquet files to register. Also one of
+    /// the two inputs to each placed lake file's name — see
+    /// `flight_service::lake_dest_filename` for why both are needed.
     pub staging_dir: String,
     /// Map of {filename: ducklake_table_name}.
     pub files: HashMap<String, String>,
-    /// Originating work ticket. The data plane prefixes each placed lake file
-    /// with `wt{work_ticket_idx}-` so destination names are unique across
-    /// loads — the producer reuses fixed basenames (e.g. `part_00000.parquet`)
-    /// — and trace back to the ticket that wrote them. Required: pinned by
+    /// Originating work ticket. Composed with `staging_dir` into each placed
+    /// lake file's name (`flight_service::lake_dest_filename`), so the file
+    /// traces back to the ticket that wrote it. Required: pinned by
     /// `qiita_control_plane.actions.library.register_files`.
     pub work_ticket_idx: i64,
 }
