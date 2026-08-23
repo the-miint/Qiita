@@ -65,7 +65,7 @@ _None yet._
     python3 -c "import duckdb, os; c=duckdb.connect(':memory:', config={'extension_directory': os.environ['MIINT_EXTENSION_DIRECTORY'], 'allow_unsigned_extensions': 'true'}); c.execute('LOAD miint'); print(c.execute(\"SELECT count(*) FROM duckdb_functions() WHERE function_name='circular_query_coverage'\").fetchone()[0])"
   ```
   Expect `1`. A `0` means the staged build predates the function — re-stage the extension
-  before telling anyone `--circular-gate` works. (#TBD)
+  before telling anyone `--circular-gate` works. (#475)
 
 - **`long-read-assembly` 1.0.0 is edited in place, not versioned** — `activate.sh`'s
   `qiita-admin actions sync` re-syncs it, so the `qiita.action` list check `make

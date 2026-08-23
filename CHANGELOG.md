@@ -23,7 +23,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Added
 
 - **`qiita feature-table build --circular-gate` — judge a read pooled over the records it
-  was split into (#TBD).** A read crossing the origin of a circular reference held as a
+  was split into (#475).** A read crossing the origin of a circular reference held as a
   linearised contig is emitted as two records covering half of it each, so a per-record
   query-coverage floor discards it — silently, and worst for the small plasmids and phages
   most often recovered as complete circles. The new gate mode asks duckdb-miint's
@@ -1009,7 +1009,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Fixed
 
-- **The circular gate's identity check now asks the question the gate answers (#TBD).**
+- **The circular gate's identity check now asks the question the gate answers (#475).**
   Its diagnostics counted scorable alignment RECORDS with `cigar_sequence_identity` while
   the gate itself applies `cigar_pooled_identity` per read: a read whose records mix a
   legacy `M` CIGAR with an extended one has NULL pooled identity, so it was dropped whole
@@ -1019,7 +1019,7 @@ duplicates further down are historical strata; leave them where they are.
   pooled identity.
 
 - **A circular threshold given without `--circular-gate` is refused instead of ignored
-  (#TBD).** `qiita feature-table build --circular-min-coverage 0.5` with no
+  (#475).** `qiita feature-table build --circular-min-coverage 0.5` with no
   `--circular-gate` built an entirely UNGATED table and said nothing, because the flags
   were read only inside the mode. They now default to a sentinel rather than to the
   threshold, so "omitted" and "given" are distinguishable, and giving one without the
@@ -2160,7 +2160,7 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
-- **`qiita_common.feature_table` is now the `qiita_common.analytic` package (#TBD).** Closes
+- **`qiita_common.feature_table` is now the `qiita_common.analytic` package (#475).** Closes
   #456. The one module became eight — `relations`, `stage`, `coverage`, `gate`, `ogu`, `label`,
   `sidecar`, `write` — re-exported from `analytic/__init__.py`, so a consumer's only change is
   the import line. No SQL text, no error message, and no assertion changed: every builder's
