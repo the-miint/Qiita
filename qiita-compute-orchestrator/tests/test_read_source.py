@@ -88,7 +88,7 @@ async def test_missing_parquet_fails_fast(tmp_path):
 
 async def test_stream_branch_drains_to_a_local_parquet(monkeypatch, tmp_path):
     """No staged Parquet ⇒ stream the block, and MATERIALIZE it: a Flight reader
-    is single-consumption, and miint resolves names on a separate connection."""
+    is single-consumption and align_sharded scans its reads twice."""
     source = tmp_path / "streamed.parquet"
     _write_reads_parquet(source, 3)
     captured: dict = {}

@@ -245,12 +245,11 @@ async def open_read_block_stream(
     job therefore asks for "my block's reads" and cannot accidentally request the
     wrong kind.
 
-    **Materialize, don't re-scan.** A Flight reader is consumed ONCE. Callers that
-    scan their reads more than a time (align_sharded builds two relations over
-    them) or hand them to miint (which resolves relation names on a SEPARATE
-    connection, so a registered stream relation is invisible there — see
-    docs/duckdb-miint.md) must `CREATE TABLE … AS SELECT` from `relation` inside
-    the body, exactly as `estimate_feature_table` does with its alignment slice.
+    **Materialize, don't re-scan.** A Flight reader is consumed ONCE: a second scan
+    of the registered name returns zero rows with no error. Callers that scan their
+    reads more than a time (align_sharded builds two relations over them) must
+    `CREATE TABLE … AS SELECT` from `relation` inside the body, exactly as
+    `estimate_feature_table` does with its alignment slice.
 
     An EMPTY stream is legitimate, not an error: a completed mask can carry 0
     passing reads (a blank/no-template control, or a fully host/QC-filtered
