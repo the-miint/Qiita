@@ -358,9 +358,9 @@ async def test_fetch_read_masked_doget_sends_both_scope_keys():
     """The body carries exactly `prep_sample_idx` + `mask_idx`, and the base64
     ticket is decoded back to raw bytes.
 
-    Pinning `extra` here matters because the CP model is `extra="forbid"`: an
-    added key would 422 in production, and asserting the whole body (rather than
-    a subset) is what makes that a test failure instead of a deploy failure.
+    Whole-body equality, not a subset: the contract this holds is "the CO sends
+    these two keys and no others". The CP's own `extra="forbid"` is pinned CP-side
+    in `tests/routes/test_read_masked.py` and is not observable from here.
     """
     captured: list[httpx.Request] = []
 
@@ -382,11 +382,9 @@ async def test_fetch_read_masked_doget_raises_on_non_2xx(status):
     """Any non-2xx raises HTTPStatusError for the caller to map to a
     BackendFailure.
 
-    409 is in the list deliberately: it is the mask-completion gate (the sample is
-    'pending', 'invalidated', or has no gate row under this mask_idx), and it is
-    the one a consumer is most likely to actually hit. It must surface, not be
-    swallowed into an empty stream — an absent pass-set and an empty pass-set are
-    different facts.
+    409 is the mask-completion gate (the sample is 'pending', 'invalidated', or has
+    no gate row under this mask_idx). It must surface rather than be swallowed into
+    an empty stream — an absent pass-set and an empty pass-set are different facts.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -446,9 +444,8 @@ async def test_open_read_masked_stream_composes_ticket_and_stream(monkeypatch):
 
 
 async def test_open_read_masked_stream_relation_name_is_overridable(monkeypatch):
-    """The relation name is a parameter, not a fixture of the seam — a consumer
-    that already binds `masked_reads` for something else can name this one
-    differently, and the default must not be baked into the stream call."""
+    """A caller-supplied relation name reaches `open_doget_stream`, so a consumer
+    that already binds `masked_reads` can name this one differently."""
     captured: dict = {}
 
     @asynccontextmanager
@@ -477,3 +474,43 @@ async def test_open_read_masked_stream_relation_name_is_overridable(monkeypatch)
         assert rel == "denovo_reads"
 
     assert captured["relation"] == "denovo_reads"
+
+
+async def test_open_read_masked_stream_mint_failure_never_opens_the_stream(monkeypatch):
+    """A refused mint propagates, and no Flight stream is opened and no relation
+    registered on the way out.
+
+    This is the composed seam's half of the 409 contract. The fetcher test above
+    pins that a non-2xx raises; what a consumer depends on is that the raise
+    happens BEFORE anything is bound, so a refused mask-completion gate cannot be
+    mistaken for a stream that yielded no rows.
+    """
+    opened: list[str] = []
+
+    @asynccontextmanager
+    async def fake_make_cp_client():
+        yield object()
+
+    async def fake_fetch(*, http, prep_sample_idx, mask_idx):
+        raise httpx.HTTPStatusError(
+            "409", request=httpx.Request("POST", "http://cp.test"), response=httpx.Response(409)
+        )
+
+    @contextmanager
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+        opened.append(relation)
+        raise AssertionError("stream opened despite a refused mint")
+
+    class _Settings:
+        data_plane_url = "grpc://dp.test:50051"
+
+    monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
+    monkeypatch.setattr(dpc, "fetch_read_masked_doget_ticket", fake_fetch)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
+    monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
+
+    with pytest.raises(httpx.HTTPStatusError):
+        async with dpc.open_read_masked_stream(object(), prep_sample_idx=7, mask_idx=3):
+            raise AssertionError("body ran despite a refused mint")
+
+    assert opened == []

@@ -28,15 +28,17 @@ duplicates further down are historical strata; leave them where they are.
   signs a DoGet ticket scoped to exactly that pair, and the data plane's `read_masked`
   macro rows stream into a registered DuckDB relation. Per-SAMPLE, alongside the
   existing per-BLOCK `open_read_block_stream`; both scope keys ride the wire because
-  the scope is one pair, not a member list there would be a reason to keep CP-side.
-  The relation carries `sequence_idx`, which the CP-side FASTQ streamer
-  (`runner/_read_ingest.py`) does not — it writes the VARCHAR `read_id` — so an
-  `alignment`-producing consumer streams here rather than reusing that FASTQ. The
-  mask-completion gate comes for free: the CP already 409s unless
+  the scope is one pair, not a member list that there would be a reason to keep CP-side.
+  **Nothing calls it yet** — the de novo alignment job is the consumer and lands
+  separately. The relation carries `sequence_idx`, which the CP-side FASTQ streamer
+  (`runner/_read_ingest.py`) does not — it writes the VARCHAR `read_id` — which is
+  why an `alignment`-producing consumer will stream here rather than reuse that
+  FASTQ. The mask-completion gate needed no code here: the CP already 409s unless
   `mask_sample.state = 'completed'`, so 'pending', 'invalidated' and no-gate-row are
   all refused at mint and no consumer re-derives the check. No new scope
-  (`read_masked:doget` is already in `SERVICE_ACCOUNT_SCOPE_CEILING` and was granted to
-  the compute service account on the 2026-07-23 deploy), so no operator action.
+  (`read_masked:doget` is already in `SERVICE_ACCOUNT_SCOPE_CEILING`, and the compute
+  service account's active token carries it — verified against the live control-plane
+  database, not just the 2026-07-23 deploy archive), so no operator action.
 
 - **`scripts/lake-gc.sh` reports and reclaims unreferenced lake files (#472).** DuckLake
   never reclaims a data file on its own: deleting rows leaves the Parquet on disk and

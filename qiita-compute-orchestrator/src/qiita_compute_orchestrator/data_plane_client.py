@@ -249,7 +249,7 @@ async def open_read_block_stream(
 
     **Materialize, don't re-scan.** A Flight reader is consumed ONCE: a second scan
     of the registered name returns zero rows with no error. Callers that scan their
-    reads more than a time (align_sharded builds two relations over them) must
+    reads more than once (align_sharded builds two relations over them) must
     `CREATE TABLE … AS SELECT` from `relation` inside the body, exactly as
     `estimate_feature_table` does with its alignment slice.
 
@@ -282,21 +282,14 @@ async def fetch_read_masked_doget_ticket(
     opposite of `fetch_read_doget_ticket` / `fetch_alignment_doget_ticket`, which
     send only `work_ticket_idx` to keep a large member list CP-side: a read_masked
     ticket's scope is exactly one `(prep_sample_idx, mask_idx)` pair, so there is no
-    list to keep off the wire, and the pair IS the data plane's `read_masked` macro
-    arguments. The CP re-asserts both before signing — it never signs an unfiltered
-    read_masked ticket, which would dump every sample's pass reads fleet-wide.
+    list that there would be a reason to keep off the wire, and the pair IS the data
+    plane's `read_masked` macro arguments — which is also why an unfiltered form is
+    unrepresentable rather than merely refused, the DP rejecting any filter but
+    those two keys.
 
-    Called at job RUNTIME, not delivered at submit: tickets are short-TTL and a
-    SLURM queue can outlive a submit-time ticket. Same rationale as every other
-    mint here.
-
-    `http` is the authed httpx client (Bearer with the compute SA PAT, base_url =
-    the CP) from `cp_client.make_cp_client()`. The CP returns the ticket
-    base64-encoded; this decodes it to the raw bytes `open_doget_stream` wraps in a
-    `flight.Ticket`. Raises `httpx.HTTPStatusError` on any non-2xx — the caller maps
-    it to a BackendFailure. The one worth knowing is **409**: the CP refuses to sign
-    unless `mask_sample.state = 'completed'` for this pair (see
-    `open_read_masked_stream`).
+    Transport and error mapping are the module's (see the header). The status worth
+    naming here is **409**: the mask-completion gate, described on
+    `open_read_masked_stream`.
     """
     resp = await http.post(
         URL_READ_MASKED_DOGET,
@@ -332,20 +325,18 @@ async def open_read_masked_stream(
     `alignment`-producing consumer streams here rather than reusing that FASTQ —
     `alignment` rows are keyed on `sequence_idx`.
 
-    **Completion gate, for free.** The CP refuses to sign unless
+    **Completion gate, requiring no code here.** The CP refuses to sign unless
     `mask_sample.state = 'completed'` for this pair, so a 409 is what a caller gets
     for a mask still in flight ('pending'), a withdrawn run ('invalidated'), or no
     gate row at all — each of which would otherwise yield an absent or silently
     partial pass-set. A consumer does not re-derive that check.
 
-    **Reference the relation exactly ONCE.** A Flight reader is consumed once; a
-    second scan of the registered name returns zero rows with no error. Handing the
-    name straight to a miint table function is fine (it resolves on a helper
-    connection that inherits the caller's temporary objects), with the exception of
-    miint's fixed-temp-name paths — see the "Reading tables/views inside table
-    functions" entry in docs/duckdb-miint.md for which those are. A caller that
-    needs more than one pass materializes with `CREATE TABLE … AS SELECT` inside the
-    body, paying the memory that buys.
+    **Reference the relation exactly ONCE**, the same constraint
+    `open_read_block_stream` documents above. Handing the name straight to a miint
+    table function works; the exceptions are miint's fixed-temp-name paths, listed
+    under "Reading tables/views inside table functions" in docs/duckdb-miint.md. A
+    caller needing more than one pass materializes with `CREATE TABLE … AS SELECT`
+    inside the body, paying the memory that buys.
 
     An EMPTY stream is legitimate, not an error: a completed mask can carry 0
     passing reads (a blank/no-template control, or a fully host/QC-filtered sample),

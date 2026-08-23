@@ -5,8 +5,8 @@ tests pin that, plus the two properties the module note calls load-bearing:
 
 * the Parquet branch binds a LAZY VIEW (materializing a whole sample would
   reintroduce the memory-scales-with-input shape that OOM-killed PacBio ingest);
-* the stream branch MATERIALIZES (a Flight reader is consumed once, and miint
-  resolves relation names on a separate connection).
+* the stream branch MATERIALIZES (a Flight reader is consumed once, and
+  align_sharded scans its reads twice).
 """
 
 from contextlib import asynccontextmanager
