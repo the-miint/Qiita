@@ -2740,6 +2740,30 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Removed
 
+- **The single-end rype projections are gone (#478).** `align_sharded._ROUTING_QUERY` and
+  `host_filter._RYPE_QUERY` narrowed the classify relation to `sequence1` so miint would not
+  read rype's `is_paired` off the mere presence of an all-NULL `sequence2` column, which
+  halved the Arrow batch and doubled the full index reloads. `rype_classify` now derives
+  `is_paired` from that column's CONTENTS
+  ([duckdb-miint#199](https://github.com/the-miint/duckdb-miint/issues/199), closed
+  2026-08-01), sampled from the first chunk of its single pass over the relation, so the
+  narrowing can no longer change batch sizing either way. Both jobs hand rype the full query
+  relation. The restated `rype_classify` contracts in both job docstrings and in
+  `docs/duckdb-miint.md`'s function inventory now link the upstream page instead of copying
+  it — the copies had drifted to the inverse of current behaviour — and the
+  `docs/duckdb-miint.md` "Open upstream gaps" row for #199 is dropped with its workaround.
+  `test_align_sharded_routes_from_a_view_carrying_both_mates` and
+  `test_host_filter_hands_both_tools_both_mates` keep the two properties that outlived the
+  workaround: routing reads a VIEW, and both aligners still receive `sequence2`. Closes the
+  removal tracked at #403. One sizing behaviour does change for a block that mixes single-
+  and paired-end reads: upstream samples the first chunk of its single pass, so such a
+  block is now sized from whichever shape leads, where the old gate forced the paired
+  (larger) estimate. `align_sharded` rejects a mixed batch outright; `host_filter` does not,
+  but a read-mask block is planned per `sequencing_run_idx` and a run carries one platform.
+  The comments and `docs/duckdb-miint.md` entries describing rype's per-call TEMP-table
+  corpus copy are corrected too — `rype_classify` streams the relation as of
+  [duckdb-miint#245](https://github.com/the-miint/duckdb-miint/pull/245).
+
 - **The intake `human_filtering` policy flag (#303).** Host filtering no longer reads a
   per-project intent recorded at intake — a sample's host is a property of the sample, not
   of the project it was booked under. The pre-flight readers, the roster field, the
