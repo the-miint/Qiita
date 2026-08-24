@@ -16,6 +16,7 @@ that roll back, build the SQL inline against the open connection instead.
 import json
 import secrets
 import uuid
+from datetime import UTC, datetime
 
 import asyncpg
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
@@ -28,7 +29,7 @@ from qiita_common.hashing import canonical_params_hash
 # seed helpers, so they stay reachable from here.
 from qiita_common.models import NCBI_TAXONOMY_HUMAN_TERM_ID as NCBI_TAXONOMY_HUMAN_TERM_ID
 from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
-from qiita_common.models import FieldDataType, ReferenceStatus
+from qiita_common.models import FieldDataType, GenomeSource, ReferenceStatus, TerminologyStatus
 
 from qiita_control_plane.miint import connect_with_miint
 from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
@@ -43,6 +44,11 @@ from ..repositories._sample_helpers import (
 # Seeded NCBI Taxonomy fixture data — must match the seed migration at
 # qiita-control-plane/db/migrations/20260525000000_seed_ncbi_taxonomy.sql.
 NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
+
+# Pinned loaded_at for seeded terminology rows, so a seeded row is fully
+# determined rather than stamped at insert time. UTC-aware and
+# microsecond-stable so it survives a Postgres TIMESTAMPTZ round trip.
+SEEDED_TERMINOLOGY_LOADED_AT = datetime(2026, 1, 15, 12, 30, 0, tzinfo=UTC)
 
 
 async def fetch_ncbi_taxonomy_term(pool: asyncpg.Pool, term_id: str) -> asyncpg.Record | None:
@@ -72,6 +78,52 @@ async def fetch_missing_value_reason_idx(pool: asyncpg.Pool, name: str) -> int |
     migration ('not applicable', 'not collected', 'missing: control sample', …).
     """
     return await pool.fetchval("SELECT idx FROM qiita.missing_value_reason WHERE name = $1", name)
+
+
+async def seed_terminology(
+    pool: asyncpg.Pool,
+    *,
+    name: str,
+    version: str = "1.0.0",
+    status: TerminologyStatus = TerminologyStatus.LOADING,
+    loaded_at: datetime = SEEDED_TERMINOLOGY_LOADED_AT,
+) -> int:
+    """Insert a qiita.terminology row and return its idx.
+
+    The initial status is settable, so a seed can start from 'active' or
+    'failed' rather than only from the column's 'loading' default.
+    """
+    return await pool.fetchval(
+        "INSERT INTO qiita.terminology (name, version, loaded_at, status)"
+        " VALUES ($1, $2, $3, $4::qiita.terminology_status) RETURNING idx",
+        name,
+        version,
+        loaded_at,
+        str(status),
+    )
+
+
+async def delete_terminology_cascade(pool: asyncpg.Pool, terminology_idx: int) -> None:
+    """Delete a terminology along with its closure and term rows.
+
+    NULLs replaced_by before deleting the terms: that self-referential FK is
+    ON DELETE RESTRICT, so a term another term points at survives the delete
+    while the pointer stands.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "UPDATE qiita.terminology_term SET replaced_by = NULL WHERE terminology_idx = $1",
+            terminology_idx,
+        )
+        await conn.execute(
+            "DELETE FROM qiita.terminology_closure WHERE terminology_idx = $1",
+            terminology_idx,
+        )
+        await conn.execute(
+            "DELETE FROM qiita.terminology_term WHERE terminology_idx = $1",
+            terminology_idx,
+        )
+        await conn.execute("DELETE FROM qiita.terminology WHERE idx = $1", terminology_idx)
 
 
 async def seed_host_reference(
@@ -876,18 +928,30 @@ async def seed_bare_feature(pool: asyncpg.Pool) -> int:
     )
 
 
-async def seed_genome(pool: asyncpg.Pool, *, source: str = "refseq") -> tuple[int, str]:
+async def seed_genome(
+    pool: asyncpg.Pool,
+    *,
+    source: GenomeSource = GenomeSource.REFSEQ,
+    prep_sample_idx: int | None = None,
+) -> tuple[int, str]:
     """Insert a `qiita.genome`; return `(genome_idx, source_id)`.
 
     The source_id is returned because `qiita.genome`'s uniqueness is the
     composite `(source, source_id)` — a caller asserting on provenance needs the
     generated accession, and generating it here is what keeps it unique.
+
+    `prep_sample_idx` is required for `GenomeSource.QIITA` and refused for any
+    other source: `genome_qiita_origin_check` is a biconditional. A test that wants
+    a source outside the vocabulary — `genome_source_check` rejecting it — writes
+    the INSERT itself; this helper only produces rows the CHECKs accept.
     """
     source_id = f"GCF_{uuid.uuid4().hex[:12]}"
     genome_idx = await pool.fetchval(
-        "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2) RETURNING genome_idx",
-        source,
+        "INSERT INTO qiita.genome (source, source_id, prep_sample_idx)"
+        " VALUES ($1, $2, $3) RETURNING genome_idx",
+        str(source),
         source_id,
+        prep_sample_idx,
     )
     return genome_idx, source_id
 

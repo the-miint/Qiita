@@ -61,7 +61,9 @@ async def mint_exported_feature_map(
     to keep. Where a real accession exists it is used instead of anything we mint,
     because an accession is what a reader can actually resolve; `QF<n>` is the
     fallback for an entity with none, or one whose accession another entity already
-    publishes.
+    publishes. A genome whose `source` is Qiita's own — assembled from a prep_sample
+    rather than imported — always takes a minted handle: it carries a `source_id`,
+    but no external repository resolves it.
 
     **The three artifacts of a bundle share this vocabulary.** The table, the
     taxonomy sidecar and the sheared tree all label a row with the

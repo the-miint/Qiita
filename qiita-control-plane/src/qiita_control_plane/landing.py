@@ -28,9 +28,9 @@ _templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 # "unknown" keeps a from-source CP boot (without an installed dist)
 # from 500ing the landing page.
 try:
-    _VERSION = version("qiita-control-plane")
+    _PACKAGE_VERSION = version("qiita-control-plane")
 except PackageNotFoundError:
-    _VERSION = "unknown"
+    _PACKAGE_VERSION = "unknown"
 
 
 router = APIRouter()
@@ -47,7 +47,10 @@ async def landing(
         "landing.html",
         {
             "contact_email": settings.contact_email,
-            "version": _VERSION,
+            # Prefer the deploy-derived calver (set per-deploy from the
+            # committed date via BUILD_VERSION); fall back to the static
+            # package version for from-source dev boots.
+            "version": settings.build_version or _PACKAGE_VERSION,
             # Short git SHA of the deployed commit (None in dev / tests —
             # the template then renders the version alone). Set per-deploy
             # via the BUILD_SHA env var; see Settings.build_sha.

@@ -11,6 +11,8 @@ test_cli_login.py. This file covers admin-specific surface plus the
 argparse wiring on the admin entry point.
 """
 
+import argparse
+
 import httpx
 import pytest
 from qiita_common.api_paths import (
@@ -19,6 +21,26 @@ from qiita_common.api_paths import (
     URL_AUTH_WHOAMI,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
+
+from qiita_control_plane.cli.admin._helpers import (
+    EXIT_PRECONDITION_FAILED,
+    requires_database_url,
+)
+
+# The return code the stub handler hands back, distinct from every code the
+# decorator itself can produce, so a passed-through code is unambiguous.
+_HANDLER_RETURN_CODE = 7
+
+
+def _handler_recording_into(calls: list[str]):
+    """A decorated handler that records the database_url it was passed."""
+
+    @requires_database_url
+    def handler(args, parser, database_url):
+        calls.append(database_url)
+        return _HANDLER_RETURN_CODE
+
+    return handler
 
 
 def test_read_token_from_env(monkeypatch):
@@ -1849,6 +1871,47 @@ def test_fanout_pump_posts_and_reports_fail_stop(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "FAIL-STOPPED" in err
     assert "released 0" in err
+
+
+def test_requires_database_url(monkeypatch):
+    """Tests the case where DATABASE_URL holds a value: the handler runs,
+    receives that value, and its own return code passes through."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user@host/db")
+    calls: list[str] = []
+    handler = _handler_recording_into(calls)
+
+    rc = handler(argparse.Namespace(), argparse.ArgumentParser())
+
+    assert rc == _HANDLER_RETURN_CODE
+    assert calls == ["postgresql://user@host/db"]
+
+
+def test_requires_database_url_unset(monkeypatch, capsys):
+    """Tests the case where DATABASE_URL is unset: the handler never runs and
+    the precondition exit code is returned, naming the variable on stderr."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    calls: list[str] = []
+    handler = _handler_recording_into(calls)
+
+    rc = handler(argparse.Namespace(), argparse.ArgumentParser())
+
+    assert rc == EXIT_PRECONDITION_FAILED
+    assert calls == []
+    assert "DATABASE_URL" in capsys.readouterr().err
+
+
+def test_requires_database_url_empty(monkeypatch, capsys):
+    """Tests the case where DATABASE_URL holds the empty string: it counts as
+    unset, because an empty connection string is unusable."""
+    monkeypatch.setenv("DATABASE_URL", "")
+    calls: list[str] = []
+    handler = _handler_recording_into(calls)
+
+    rc = handler(argparse.Namespace(), argparse.ArgumentParser())
+
+    assert rc == EXIT_PRECONDITION_FAILED
+    assert calls == []
+    assert "DATABASE_URL" in capsys.readouterr().err
 
 
 def test_export_stem_is_the_pooled_composite():

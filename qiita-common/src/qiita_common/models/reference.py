@@ -1,6 +1,6 @@
 """Reference-database models: staging lifecycle, reference metadata, indexes,
-terminology / field-data enums, and the closed sequencing-platform and
-access-tier enums shared with the biosample, study, and sequencing surfaces."""
+field-data enums, and the closed sequencing-platform and access-tier enums
+shared with the biosample, study, and sequencing surfaces."""
 
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -156,36 +156,6 @@ class GenomeSource(StrEnum):
     GENBANK = "genbank"
     REFSEQ = "refseq"
     QIITA = "qiita"
-
-
-class TerminologyStatus(StrEnum):
-    """Lifecycle states of a terminology row.
-
-    Mirrors the Postgres `qiita.terminology_status` enum. `loading` while a
-    load is in flight; `active` when the load is complete and the row
-    reflects a consistent terminology version; `failed` when a load aborted
-    and the row's contents may be inconsistent with the source.
-    """
-
-    LOADING = "loading"
-    ACTIVE = "active"
-    FAILED = "failed"
-
-
-class TerminologyTermObsoletionKind(StrEnum):
-    """Reason a terminology_term row was marked obsolete on the most
-    recent load.
-
-    Mirrors the Postgres `qiita.terminology_term_obsoletion_kind` enum.
-    `source_deprecated` when the source vocabulary deprecates the term;
-    `source_merged` when the source merges this term into another;
-    `silently_dropped` when the term disappears from a reload without a
-    recorded replacement.
-    """
-
-    SOURCE_DEPRECATED = "source_deprecated"
-    SOURCE_MERGED = "source_merged"
-    SILENTLY_DROPPED = "silently_dropped"
 
 
 class FieldDataType(StrEnum):

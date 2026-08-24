@@ -1247,7 +1247,7 @@ async def plan_shards(
 # DuckDB JOIN that resolves each assembly contig to its bin + feature_idx.
 # bin_map (read_id -> kind, bin_id) x manifest (read_id -> sequence_hash) x
 # feature_map (sequence_hash -> feature_idx). The read_id is assembly_hash's
-# synthetic globally-unique id (kind:bin_id:contig_id), so the join is 1:1 per
+# synthetic per-contig id, unique across that job's scan, so the join is 1:1 per
 # contig. INNER JOINs by construction: every bin_map read_id is a manifest read_id
 # (both from the same assembly_hash scan) and every manifest hash was minted by
 # mint-features, so no contig is dropped. Exposed as a module constant so the join
@@ -1665,11 +1665,11 @@ async def register_files(
     basenames across loads, so the bare name would collide with an
     already-registered file in the same per-table dir.
 
-    Content-addressed tables are REPLACED on their key rather than appended to
-    (the data plane's `REPLACE_KEY_TABLES`), so a load can supersede rows an
-    earlier one wrote. Those per-table counts come back in `replaced` — non-zero
-    entries only, the data plane drops the rest — and logging them here is what
-    records the delete.
+    Some tables are REPLACED on their key rather than appended to (the data
+    plane's `REPLACE_KEY_TABLES`), so a load can supersede rows an earlier one
+    wrote. Those per-table counts come back in `replaced` — non-zero entries
+    only, the data plane drops the rest — and logging them here is what records
+    the delete.
 
     Raises pyarrow.flight.FlightError on transport / data-plane failure.
     """
@@ -1691,7 +1691,7 @@ async def register_files(
     replaced = result_body.get("replaced") or {}
     if replaced:
         _log.info(
-            "register_files replaced rows in content-addressed tables (work_ticket_idx=%s): %s",
+            "register_files superseded rows on the load's replace key (work_ticket_idx=%s): %s",
             work_ticket_idx,
             replaced,
         )

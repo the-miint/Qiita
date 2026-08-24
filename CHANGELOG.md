@@ -38,6 +38,130 @@ duplicates further down are historical strata; leave them where they are.
   off fixed paths). A same-pool re-run is refused pending an explicit delete/`--force`.
   The closed-reference (e.g. GG2) feature table is **derived on demand** by intersecting
   feature_idx with a reference's membership — never stored (a tracked follow-up).
+- **`scripts/lake-gc.sh` reports and reclaims unreferenced lake files (#472).** DuckLake
+  never reclaims a data file on its own: deleting rows leaves the Parquet on disk and
+  still held by the snapshots that predate the delete, so every `register_files`
+  replace-by-key and every `delete_reference` / `delete_mask` / `delete_pool_reads` /
+  `delete_alignment` has been accumulating. The script drives DuckLake's own
+  `ducklake_expire_snapshots` → `ducklake_cleanup_old_files` → `ducklake_delete_orphaned_files`
+  in that order, in ONE transaction in one duckdb process, using the documented `CALL`
+  form — measured on 1.5.4, `cleanup_old_files` reports nothing until the snapshots
+  referencing a file are expired (running it alone is a no-op) but does see that expiry
+  from inside the same transaction. The transaction bounds the CATALOG only: an unlinked
+  file stays unlinked through a rollback, also measured. It **reports
+  by default**, prompts for a typed confirmation before acting, keeps 7 days of snapshot
+  history unless `--older-than` says otherwise, and never passes `cleanup_all`. Orphan
+  deletion is behind its own `--reclaim-orphans`: it is the only step that can reach a
+  file belonging to a registration in flight, because `register_files` moves a Parquet to
+  its lake path before opening the catalog transaction that registers it, and in that
+  window the file is on disk with no catalog row — indistinguishable from an orphan.
+  Steps 1-2 cannot reach it (`cleanup_old_files` only removes files the catalog once
+  referenced), so plain `--reclaim` needs no quiescing.
+  Registrations must be quiesced before reclaiming: `older_than` filters on filesystem
+  mtime and `register_files` places files with `rename`, which carries over the mtime the
+  producing job gave them in staging, so the cutoff does not bound "recently placed" —
+  the script header carries that argument in full. Runs as `qiita-data`, the account that
+  owns the data path.
+
+
+- **`build_version` / `BUILD_VERSION` is now covered by tests (#309).** The landing page
+  renders `settings.build_version or _PACKAGE_VERSION` (`landing.py`), so a from-source
+  boot without `BUILD_VERSION` falls back to the static package version instead of the
+  literal `None`. The new cases mirror the existing `build_sha` / `BUILD_SHA` pair — one
+  asserting the calver is shown, one asserting the empty-string case normalizes to `None`,
+  one asserting the package-version fallback — so both arms are covered in `test_landing.py`
+  and `test_config.py`.
+
+- **`DEPLOY_CHECKLIST.md` drops a stale `(#324)` note (#431).** That entry was verbatim in
+  the archived 2026-07-30 deploy note, so an operator was being told to re-note a schema
+  gate (`reference-add` / `local-reference-add` requiring a genome map when `shard_index` is
+  true) already on a live deploy. It was the only copy — `main` carried the same guard from
+  the moment #324 landed — and `deploy-note-check` ignores this file, so removing it is
+  safe.
+
+- **NCBI Taxonomy releases read from a taxdump archive (#439).**  `qiita-admin terminology prepare-taxdump --taxdump` reads a `taxdump.tar.gz`
+  into the term rows of a release, so taxa no longer arrive as hand-written seed
+  migrations. A live taxon takes its scientific name as its label and its genbank
+  common name as its second name; a taxon NCBI merged away becomes an obsolete
+  term pointing at the taxon it merged into; and a taxon NCBI deleted outright
+  becomes an obsolete term with no replacement, so a reload never mistakes
+  routine NCBI deletion for a terminology that silently lost terms. The archive
+  is read in place, with nothing unpacked, through duckdb-miint's taxdump
+  readers, so a member whose row layout contradicts what the taxdump documents
+  refuses the read naming the line at fault — as does an archive recording one
+  taxon as live, merged, and deleted at once. Term rows land in taxon-id order,
+  so the same archive always yields the same release digest.
+
+- **`terminology_term.alternate_label` — a second name for a term (#439).** Holds the
+  name a source vocabulary supplies alongside the one that becomes the term's
+  label; for NCBI Taxonomy the label is the scientific name and this is the
+  genbank common name, which would otherwise be dropped and is what a person
+  looking for a taxon is most likely to type. Nullable and single-valued, and
+  bounded to the same width as the label so it stays a name rather than
+  accumulating free-text definitions; an empty string is rejected, leaving NULL
+  as the only spelling of absence. A release's terms table carries it and is
+  authoritative for it, so a release supplying no second name clears any value
+  stored against the term. A resolved terminology term carries it through
+  metadata reads.
+
+- **`qiita-admin terminology` — prepare and load an ontology release (#439).**
+  `robot-command` prints the ROBOT export command to run against a staged OWL file;
+  nothing in the control plane executes ROBOT, on any host. `prepare-owl` turns that
+  export into the three files `load` consumes — a terms table, a header-only closure
+  stub, and a manifest declaring the digests of both — recording a deprecated class
+  as obsolete and an absorbed one as merged into the class that absorbed it, and
+  keeping only the term ids of a chosen prefix so classes imported from other
+  vocabularies stay out. Neither prepare command computes subsumption, so a loaded
+  terminology resolves terms while subsumption queries have nothing to answer from.
+  `load` takes the three files individually, verifies both tables against the
+  manifest before parsing either, applies the release in one transaction, and reports
+  how many terms were inserted, relabelled, obsoleted, or merged.
+  `--tolerate-anomalies` absorbs three anomalies instead of refusing the load:
+  terms the release silently dropped are auto-obsoleted, an unresolvable replacement
+  pointer is recorded as a note, and a closure row naming an endpoint the release
+  does not define is dropped, which lowers the reported closure count. A live term
+  carrying a replacement pointer refuses the load either way.
+
+- **What a terminology release must be (#439).** A manifest may name its tables only
+  by bare filename, so no declared path can reach outside the directory the manifest
+  itself sits in. A release may not reference a term it does not define — an obsolete
+  term's replacement pointer and both endpoints of every closure row have to resolve
+  within the release itself. Term rows are upserted, never replaced, so any term
+  already referenced by biosample metadata stays resolvable; obsoletion is recorded
+  on the row instead. A term the source does not name keeps the label already stored
+  for it, falling back to its own term id when the database holds nothing, so a
+  release that retires a term id without naming it cannot overwrite the name the term
+  was loaded under. Each of a term's two names has its own counter, so a reload that
+  changes only second names reports what moved rather than all zeros.
+  `TerminologyStatus` and `TerminologyTermObsoletionKind` now live in
+  `qiita_common.models.terminology` rather than `models.reference`; both stay
+  importable from `qiita_common.models`.
+
+- **Unbinned assembly contigs are stored, as a third `assembly_membership` kind (#460).**
+  `assembly_hash` hashes the `noLCG.fa` residue — the contigs no DAS_Tool-refined bin
+  claimed — alongside the circular genomes and the refined MAGs, so they are minted a
+  `feature_idx` against the shared `qiita.feature` and recorded under `kind = 'UNBINNED'`
+  with the contig id as `bin_id` (the `(kind, bin_id)` shape `LCG` already uses). Unbinned
+  contigs can be valid sequence, DNA viruses in particular; previously they died with the
+  workspace.
+  **It is the residue, not all of `noLCG.fa`.** The refined MAGs are drawn from those same
+  contigs, so hashing the file whole would give every binned contig a second membership row
+  for one `feature_idx` — the bytes dedup, the membership does not. The exclusion is keyed
+  on the canonical sequence hash, not the contig id. Id preservation through binning and
+  refinement is measured for `hifiasm_meta` only: 198,747/198,747 refined-bin records across
+  57 assembly workspaces on the deploy host carried a first-token contig id identical to
+  their `noLCG.fa` record (whole-header on a 6-ticket subset, 5,660/5,660). It is
+  unmeasured for `myloasm` — no myloasm assembly exists on the host, and its header
+  grammar differs — so an id key would rest on an unmeasured assembler; the same match
+  measured there is what would make one viable. Two consequences of keying on content —
+  a bin holding a contig on the opposite strand still excludes its noLCG record (the
+  canonical hash folds both strands), and noLCG records sharing a canonical sequence
+  leave the residue together.
+  `StepNoData` narrows to match: only an assembler that produced no contig at all is
+  no-data, so a sample whose contigs all went unbinned now stores them. The `kind` value set
+  moves to `qiita_common.assembly_constants`, the contract layer both Python services
+  depend on, and the Postgres and DuckLake `assembly_membership` comments name it instead of
+  enumerating members (a comment-only migration).
 
 - **A published feature table's rows can now be labelled without our identifiers (#448).**
   `POST /exported-feature` mints the public handle for a feature-axis entity, the way
@@ -921,6 +1045,169 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **A redriven work ticket whose producer step re-ran can register its files again (#472).** `lake_dest_filename`
+  minted `wt<work_ticket_idx>-<basename>`, whose uniqueness assumed one load per ticket.
+  A redrive replays a ticket's storage tail into a fresh `attempt-<n>` workspace, so the
+  second load targeted the byte-identical path the first had already registered and
+  `move_file` refused it — `refusing to overwrite existing lake file
+  …/assembled_sequence_chunks/wt6939-part_00000.parquet`, which blocked the unbinned-residue
+  backfill for all 57 candidate prep_samples. The name now also carries a digest of the
+  registration's staging dir **relative to `PATH_SCRATCH`**, which encodes the attempt
+  without pinning the name to where scratch is mounted — a migration or remount changes
+  that root without changing which registration a staging dir denotes. It stays
+  deterministic for a given (ticket, staging scope), so a replayed DoAction recomputes the
+  same name and
+  `move_file` still refuses a true double-registration — the refusal that keeps
+  `register_files` replay-safe for the tables outside `REPLACE_KEY_TABLES`
+  (e.g. `reference_membership`), which have no replace-by-key to absorb one.
+
+
+- **Two assembled contigs in one FASTA whose headers share a first token store each
+  other's bytes (#464).** `read_fastx` returns one row per record, so two such records come
+  back under one `read_id`; sharing a file they also share `kind` and `bin_id`, so
+  `assembly_hash`'s whole synthetic `kind:bin_id:contig_id` repeats. Pass 2 joins the
+  per-hash `winner` on that id over a fresh scan of every record, so each of the pair's two
+  `sequence_hash` values receives both contigs' chunks — the bytes stored for a feature then
+  include a sequence that is not that feature's, at the same `chunk_index`. Measured on a
+  two-record fixture of 16 bp contigs: 2 chunk rows and 32 bytes under each of the two
+  hashes, against 1 row and 16 bytes for the byte-identical fixture whose second header's
+  first token differs. A colliding run leaves the manifest, bin_map and chunks all
+  well-formed, so nothing downstream can notice it. The id's last component is now
+  `read_fastx`'s per-file ordinal `sequence_index` rather than the contig id, which makes
+  `kind:bin_id:sequence_index` unique by construction and also closes the other route to a
+  repeated id, an unescaped `:` inside a bin_id — the job module carries the argument, and
+  the two `sequence_index` facts it rests on are pinned against the real miint build in
+  `qiita-compute-orchestrator/tests/jobs/test_read_fastx_miint_contract.py`. The contig id
+  leaves the key and rides `bin_map` as its own `contig_id` column — no consumer joins on
+  it; it is what lets a workspace under investigation say which assembled contig became
+  which `feature_idx`, which for a MAG contig nothing else records. The step also counts
+  the pass-2 rejoin now: `count(DISTINCT sequence_hash)` over the chunk Parquet against the
+  distinct hashes pass 1 saw with bytes to store. A later divergence between the two
+  `_READ_ID_EXPR` sites therefore fails the step rather than minting a `qiita.feature` that
+  has a manifest row, an `assembly_membership` row and zero stored bytes — an outcome
+  nothing downstream raises on, since `register_files` replaces chunks on `feature_idx` and
+  a reader just gets an empty `string_agg`. Measured on a two-contig fixture whose composed
+  id is NULL for one of them: manifest and `bin_map` carry both rows, the chunk Parquet
+  carries one hash, and without the count the step exits 0. A zero-length contig record is
+  left out of the count — `sequence_split('')` returns an empty list, so it has no chunk to
+  rejoin and is input we did not produce.
+
+- **Two refined-bin FASTAs stemming to one `bin_id` merged into one bin (#464).**
+  `_FASTA_GLOBS` accepts `.fa` / `.fna` / `.fasta`, and `_local_id` strips the suffix, so
+  `bin.1.fa` and `bin.1.fna` both became `bin.1` — one bin where there were two, in
+  `bin_map` and so in `qiita.assembly_membership` and the `bin_quality` join it feeds, both
+  of which key a bin on `(prep_sample_idx, processing_idx, kind, bin_id)`. Measured as 1
+  distinct `bin_id` in `bin_map` against 2 for the same pair renamed. `_file_meta` now
+  raises, naming both filenames; the synthetic read_id above rests on that raise too.
+
+- **xdist workers shared one miint extension directory, so they installed on top of
+  each other (#462).** `setup_miint_test_env` named the directory per *component*
+  (`qiita-control-plane-duckdb-ext` under the system temp), and the control-plane suite
+  is the one that runs `-n auto --dist worksteal` — so N worker processes pointed
+  `extension_directory` at one path and each ran its own `INSTALL miint`. A cold INSTALL
+  downloads into a `tmp-<uuid>` file and renames that over `miint.duckdb_extension` and
+  its `.info`, which makes N workers N concurrent writers to those two paths; CI saw it as
+  `IO Error: Could not set lock on file …miint.duckdb_extension.tmp-<uuid>.duckdb_extension.info`
+  surfacing through an unrelated `_handle_feature_table_build` assertion, because the
+  install that failed is the one the code under test performs (`connect_with_miint()`),
+  not a conftest fixture — which is also why a fixture-level lock could not have covered
+  it. The directory now carries the worker id when `PYTEST_XDIST_WORKER` is set
+  (`qiita-control-plane-gw0-duckdb-ext`) and is unchanged for the single-process suites
+  (qiita-common, the orchestrator, the integration tier). The worker also has to *replace*
+  the directory it inherits rather than `setdefault` past it: a worker gets its environment
+  from the controller, which ran the same helper first and had already exported the shared
+  path, so the split alone left every worker pointing back at it — measured, the per-worker
+  directories came out 0 bytes and the shared one held the only install. Only that one
+  value is replaced, so a directory pinned from outside still reaches the suite as given.
+  It costs no extra downloads on a cold cache — each worker already downloaded its own
+  copy, only the rename target changes — each directory still caches across runs (24.5s
+  cold, 4.9s warm for the tier), and the name still matches the documented
+  `rm -rf "$TMPDIR"/qiita-*-duckdb-ext`, which a new unit test pins along with the split
+  and the inheritance. It does multiply the cached bytes: 67 MB per worker under the system
+  temp, 670 MB across the 10 workers `-n auto` picks on a 10-core machine. The race itself
+  was not reproduced locally — 5×8 concurrent cold installs on linux/amd64 and 3×8 on
+  macOS, both at DuckDB 1.5.4, produced no lock error — so the shared directory is the
+  established defect and the lock error is a reasoned, not demonstrated, consequence of it.
+
+- **`POST /exported-feature` would have published a qiita-derived genome's composed
+  `source_id` verbatim (#462).** `_INSERT_GENOME` offered `qiita.genome.source_id` as the
+  accession candidate for every genome, on the premise that `source_id` is NOT NULL and so
+  the genome kind always has an accession to offer. NOT NULL holds; "is an accession" does
+  not, for `source='qiita'` — a genome assembled from one of our own prep_samples has no
+  external authority behind its source_id, and `export_feature_id` labels rows in a feature
+  table, its taxonomy sidecar and its sheared tree. The statement now offers the accession
+  only for a source on an allowlist of external repositories (`genbank`, `refseq`), so an
+  internal source gets the hybrid's other half — a NULL accession, `accession_published`
+  false, and the minted `QF<idx>` the generated column produces from that pairing. Written
+  as an allowlist rather than `<> 'qiita'` so a further internal source mints a handle
+  until it is listed, instead of publishing. `_INSERT_FEATURE` is untouched: it already
+  reads a nullable `reference_membership.accession`. The one writer of such a genome row is
+  a `qiita reference load` genome map declaring `genome_source='qiita'` with a
+  `prep_sample_idx`; two new unit tests fail if a `GenomeSource` member is left
+  unclassified by the predicate, or if `qiita` is classified external — the latter pinned
+  as a literal, since every other assertion reads its expectation out of the predicate and
+  so agrees with whatever it says. The route's OpenAPI description names the new case.
+
+- **Re-running `long-read-assembly` over a sample doubled its `assembly_membership` and
+  `bin_quality` rows (#460).** `processing_idx` hashes `{workflow, version, mask_idx,
+  assembler}`, so a second run resolves to the SAME identity whenever those four hold — an
+  edited workflow file included — and the submit path admits it: the prep_sample arm of
+  `_check_disallow_without_delete` binds only the non-terminal states, so a COMPLETED ticket
+  does not block a fresh one, and no assembly result carries a DELETE gate. Both tables were
+  appended rather than replaced, leaving both runs' rows under one `(prep_sample_idx,
+  processing_idx)` with nothing on the row to tell them apart. Measured across two
+  registrations of the same rows: `assembly_membership` 0 → 2 → 4, `bin_quality` 0 → 1 → 2.
+  `register_files` now replaces both on the composite `(prep_sample_idx, processing_idx)`, so
+  a re-run supersedes that sample's rows for that run — a row agreeing on one half of the key
+  (another sample of the same run, the same sample under a different run) is untouched. The
+  replace-by-key statement widened from one key column to a row constructor to carry it; the
+  file paths stay bound parameters.
+  A re-run that yields no refined MAG is the case the key alone does not cover: CheckM
+  covers refined bins only, so `assembly_load` writes `bin_quality` empty-with-schema, the
+  file names no key, and a delete reading it removed nothing — measured, the previous run's
+  MAG rows survived a re-run whose `assembly_membership` was replaced out from under them
+  (`replaced` empty, 1 row before and after; the same load carrying one MAG row replaced it).
+  `bin_quality`'s delete now reads the keys `assembly_membership` names in the same
+  registration, which carries the run's key on every row and is never empty where the load
+  runs at all (`assembly_hash` raises `StepNoData` at zero contigs of any kind).
+  The file stated the delete's cost twice and the two disagreed: `LAKE_COMMIT_BUDGET` read a
+  40k/400k timing as "the DELETE's cost does not grow with the table … so it prunes rather
+  than scanning", while `replace_key_delete_sql` 25 lines above said a `feature_idx` set does
+  not prune. That timing was taken on a contiguous incoming key set, which neither comment
+  said. `replace_key_delete_sql` is now the only site that states it, and the budget points
+  there: what the delete reads follows the SPREAD of the incoming key set against the
+  per-file key ranges, not the key's arity and not the table's size. Measured on DuckDB
+  1.5.4 / ducklake d318a545 — a composite `(prep_sample_idx, processing_idx)` pair scans
+  17,544 rows of 1,000,008 and opens 1 of 57 files; a `feature_idx` set spread over the
+  identity space scans 1,003,121 of 1,003,200 and opens all 57; a `feature_idx` set confined
+  to one narrow window scans 17,602 of 1,003,200 and still opens all 57; a contiguous
+  `feature_idx` block scans 2,000 rows and opens 1 file at both 40k rows over 20 files and
+  400k over 200, where the same key count spread over the identity space scans 39,982 of
+  40,000 and 399,819 of 400,000. The `WITH … DELETE … USING` comparison now reports the mean
+  paired difference and its interval (-0.8 to +1.0 ms across four key sets on statements of
+  3-37 ms, widest 95% CI [-3.2, +2.9] ms) rather than a bare non-significant p-value.
+
+- **`test_assembly_hash`'s canonical-hash oracle mis-complemented a soft-masked contig
+  (#460).** Its hand-rolled reverse complement translated through an upper-case-only table
+  and upper-cased the result afterwards, so a lowercase base passed through uncomplemented
+  and the "reverse strand" it hashed was the plain reverse. Over 2,000 random 16 bp
+  lowercase sequences the oracle disagreed with `canonical_sequence_hash_expr` on 1,362
+  (68.1%); over the same sequences upper-cased, on 0. The oracle now takes its reverse
+  complement from miint's `sequence_dna_reverse_complement` — the scalar the production
+  expression calls — applied to the upper-cased sequence, since that function preserves
+  case. The `LEAST`-over-hashes composition is still re-derived in Python, so a change to
+  how the two hashes combine still fails the oracle. A soft-masked fixture covers it; every
+  sequence the file hashed before was either upper-case or a palindrome.
+  `read_fastx` preserves input case (probed: an all-upper control record comes back
+  unchanged, its lowercase twin comes back lowercase), so the soft-masked fixture reaches
+  `canonical_sequence_hash_expr` still lowercase and the test pins the `upper()` inside that
+  expression rather than a transformation the reader already did. That test now also pins
+  which record's bytes reach the chunks: the fold keeps one representative per hash
+  (`DISTINCT ON (sequence_hash) … ORDER BY sequence_hash, read_id`) and chunks it as read, so
+  a different tie-break stores a different strand and casing with every hash assertion
+  unmoved. One happy-path fixture is no longer a reverse-complement palindrome, so its
+  `_hash` comparison exercises the fold instead of the identity.
 
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
   (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
@@ -1946,6 +2233,28 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **`mint-features` pins its declared `inputs:` list (#464).** The runner's dispatch resolved
+  the manifest as `entry.inputs[0]`, so a workflow naming any other binding minted features out
+  of whatever path sat there. It now requires `inputs: [manifest]` and reads `bound["manifest"]`
+  by name, failing the entry otherwise — the shape `mint-annotation-features`,
+  `write-membership` and `write-assembly-membership` already use. The optional genome map is
+  unchanged: it stays an `action_context` binding (`genome_map_path`), not a declared input.
+
+- **`qiita.assembly_membership` documents its key prefix and its `bin_id` column (#464).**
+  A comment-only migration. The table comment: `(prep_sample_idx, processing_idx, kind,
+  bin_id)` is the subject identity, with `feature_idx` completing the row per member contig,
+  and `kind` tells a refined bin from a circular or an unbinned contig (value set still
+  enumerated only in `qiita_common.assembly_constants`, which the comment points at). How
+  far that identity separates two subjects depends on what `bin_id` holds, so the table
+  comment points at the `bin_id` column comment instead of restating it. A subject records
+  grouping and nothing about completeness, for any kind; the `bin_quality` lake table
+  measures that, per refined bin, from CheckM. `bin_id` gains its first column comment: a
+  refined bin's FASTA filename stem — one file, one bin, which `_file_meta` enforces — or,
+  for a circular or unbinned contig, that contig's own assembler-given id, its FASTA
+  header's first token. Producer-chosen either way, and two headers in one file can share a
+  first token, which is why the key scopes `bin_id` rather than treating it as globally
+  unique or as one contig per row. None of that is recoverable from the bare `TEXT` column.
+
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that
   fetches them ran last too — which meant a reference this alignment names but the caller cannot
@@ -1990,6 +2299,14 @@ duplicates further down are historical strata; leave them where they are.
   rollback of an already-committed file now has direct tests, which no caller's own suite
   reached, and the one gap it cannot close — a kill between two renames — is written down
   where the guarantee is stated.
+
+- **`docs/architecture.md` updated: N=0 sharded path no longer exists (#431).**
+  `plan-shards` returns zero shards on N=0 rather than raising; the
+  plan-shards **runner arm** treats that zero-shard result as an error
+  and fails the ticket, and a CLI guard (`--shard-index requires
+  --genome-map`) additionally catches the case before any network call.
+  Two bullets in the sharded-index fan-out section corrected to reflect
+  the current behavior.
 
 - **One `cap_rows` helper behind every capped list route (#427).** The
   fetch-`cap + 1` / slice-back / set-`truncated` split was written inline at each
@@ -2076,6 +2393,13 @@ duplicates further down are historical strata; leave them where they are.
   both resolve through it instead of each re-asserting the three Optional fields
   and rebuilding a `FlatBaselineResources` by hand, so what actually runs and what
   the guard checks cannot drift.
+- **Landing-page footer now shows the deploy date (calver) instead of the static package version (#431).**
+  `QIITA_BUILD_VERSION` is derived from the deployed commit's date in `local-deploy.sh` and
+  injected via `build.env`; `landing.py` prefers it, falling back to the package version for
+  dev boots.
+- **`align_sharded` probe comment corrected: the count probe is kept for correctness, not
+  because `LIMIT 1` is slower (#431).** Row-group stats make `LIMIT 1` faster in most shapes;
+  the count probe is needed because the mixed-batch rejection requires `total`.
 
 - **`align_sharded` hands the aligner a materialized query relation instead of the lazy
   Parquet view (#391).** Both sharded aligners read the query relation once per shard, so

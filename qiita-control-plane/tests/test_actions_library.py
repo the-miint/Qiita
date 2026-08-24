@@ -367,19 +367,19 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
         bin_map,
         "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR",
         [
-            ("LCG:circ1:c1", "LCG", "circ1"),
-            ("MAG:bin.1:x1", "MAG", "bin.1"),
-            ("MAG:bin.2:y1", "MAG", "bin.2"),
+            ("LCG:circ1:1", "LCG", "circ1"),
+            ("MAG:bin.1:1", "MAG", "bin.1"),
+            ("MAG:bin.2:1", "MAG", "bin.2"),
         ],
     )
     _write(
         manifest,
         "read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT",
         [
-            ("LCG:circ1:c1", str(h1), 10),
-            ("MAG:bin.1:x1", str(h2), 20),
+            ("LCG:circ1:1", str(h1), 10),
+            ("MAG:bin.1:1", str(h2), 20),
             # bin.2 shares bytes with bin.1 -> same hash -> same feature_idx.
-            ("MAG:bin.2:y1", str(h2), 20),
+            ("MAG:bin.2:1", str(h2), 20),
         ],
     )
     _write(feature_map, "sequence_hash UUID, feature_idx BIGINT", [(str(h1), 100), (str(h2), 200)])
@@ -496,9 +496,9 @@ def test_reap_staged_reads_removes_files_and_empty_dirs(tmp_path):
 
 
 async def test_register_files_logs_what_a_load_replaced(monkeypatch, caplog):
-    """The data plane replaces content-addressed tables on their key rather than
-    appending (its REPLACE_KEY_TABLES), so a load can supersede rows an earlier one
-    wrote. The per-table counts ride back in `replaced` and are logged."""
+    """The data plane replaces some tables on their key rather than appending (its
+    REPLACE_KEY_TABLES), so a load can supersede rows an earlier one wrote. The
+    per-table counts ride back in `replaced` and are logged."""
     import json
     import logging
 

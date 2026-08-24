@@ -12,6 +12,8 @@ completed for align_1, ps_c is readable but PENDING, ps_b is unreadable, ps_d is
 an orphan. It seeds no accessions, which is why the tests that care stamp them.
 """
 
+import re
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_EXPORTED_IDENTIFIER
@@ -241,7 +243,11 @@ async def test_refuses_a_partially_readable_cohort_before_completeness(
 async def test_403_does_not_enumerate_the_cohort(role_keyed_clients, pool_alignment_seed):
     """The refusal must not name every blocked sample alongside the study that
     blocked it — over a caller-controlled body that is an enumeration oracle for
-    "which of these exist, and whose are they"."""
+    "which of these exist, and whose are they".
+
+    ps_b is blocked by study_2, ps_d is the orphan. The study must be named (it is
+    what to go ask for); ps_b must not be, in any clause.
+    """
     seed = pool_alignment_seed
     resp = await role_keyed_clients["user"].post(
         URL_EXPORTED_IDENTIFIER,
@@ -249,8 +255,23 @@ async def test_403_does_not_enumerate_the_cohort(role_keyed_clients, pool_alignm
     )
     assert resp.status_code == 403, resp.text
     detail = resp.json()["detail"]
-    assert str(seed["ps_b"]) not in detail
-    assert str(seed["study_2"]) in detail  # the study IS named — it is what to go ask for
+    # Every integer of every clause, compared as sets, rather than substrings of the
+    # whole message. `prep_sample_access_denied_detail` joins its clauses with "; "
+    # and renders each as a count plus `first_few` examples, so a clause holds its
+    # count and its own identifiers and nothing else numeric — and ps_b named
+    # anywhere fails, including appended to the study clause outside its `(e.g. …)`.
+    # Substrings cannot do that job in either direction: `qiita.study.idx` and
+    # `qiita.prep_sample.idx` are separate identity sequences running to similar
+    # magnitudes, so `str(ps_b) in detail` fires on a study idx that equals ps_b,
+    # and `str(study_2) in detail` is satisfied by a prep_sample idx that does.
+    # The same refusal is asserted by substring in routes/test_alignment_cohort_mint.py,
+    # which carries the same collision and is unchanged.
+    clauses = [{int(n) for n in re.findall(r"\d+", part)} for part in detail.split("; ")]
+    blocked_studies, unlinked_samples = {seed["study_2"]}, {seed["ps_d"]}
+    assert clauses == [
+        {len(blocked_studies), *blocked_studies},
+        {len(unlinked_samples), *unlinked_samples},
+    ], detail
     assert "no active study link" in detail
 
 

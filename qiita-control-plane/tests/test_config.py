@@ -357,6 +357,33 @@ def test_settings_build_sha_empty_is_none(monkeypatch):
     assert settings.build_sha is None
 
 
+def test_settings_build_version_set_from_env(monkeypatch):
+    """BUILD_VERSION is optional — set only by the deploy scripts. When
+    the deploy writes it, it lands on the Settings object so the landing
+    footer renders the calver instead of the static package version."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("BUILD_VERSION", "2026.8.6")
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.build_version == "2026.8.6"
+
+
+def test_settings_build_version_empty_is_none(monkeypatch):
+    """An empty BUILD_VERSION (activate.sh writes an empty build.env when
+    the date is unavailable) must normalize to None, not the empty
+    string — the footer keys off truthiness to decide whether to render
+    the calver or fall back to the static package version."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("BUILD_VERSION", "")
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.build_version is None
+
+
 def test_settings_default_adapter_reference_idx_unset_is_none(monkeypatch):
     """Optional setting: a deploy without QC leaves it unset → None."""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
