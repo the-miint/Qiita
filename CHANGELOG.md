@@ -2217,6 +2217,26 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Changed
 
+- **Sequence chunks are stored upper case (#479).** `sequence_split_expr` now normalizes
+  through a new `normalized_sequence_expr`, which `canonical_sequence_hash_expr` also
+  routes through — so the bytes in `reference_sequence_chunks` / `assembled_sequence_chunks`
+  and the hash that keyed them cannot disagree about case. The hash already folded case
+  before folding strands, so a soft-masked record and its uppercase twin shared one
+  `feature_idx`; the split preserving case meant two loads wrote different bytes under that
+  one key, leaving the survivor a function of which reference loaded last. Every index
+  builder that reads `chunk_data` discards case — measured 2026-08-24 against the
+  team-mirror miint build on a reference differing only in a 20 kb soft-masked repeat,
+  `rype_index_create`, `save_minimap2_index` (sr / map-hifi / map-ont / asm5) and
+  `save_bowtie2_index` all produce byte-identical output for it, while a one-base edit to
+  the same reference changes all of them. Strand is not normalized and still follows load
+  order. Case is discarded at load, so `qiita reference export` no longer reproduces a
+  submitted FASTA's soft-masking. `normalized_sequence_expr` carries the detail.
+
+- **`qiita reference export` reassembles chunks through the shared expression (#479).** The
+  genome-FASTA writer inlined its own `string_agg(chunk_data, '' ORDER BY chunk_index)`
+  instead of calling `reassemble_chunks_expr`, a fourth copy of the chunk contract outside
+  the module that single-sources it.
+
 - **`mint-features` pins its declared `inputs:` list (#464).** The runner's dispatch resolved
   the manifest as `entry.inputs[0]`, so a workflow naming any other binding minted features out
   of whatever path sat there. It now requires `inputs: [manifest]` and reads `bound["manifest"]`
