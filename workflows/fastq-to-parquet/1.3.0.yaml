@@ -65,8 +65,21 @@ audience:
 
 context_schema:
   type: object
-  required: [fastq_path]
   properties:
+    # The reads arrive by one of two routes, and the `fastq` step reads both
+    # through the same `fastq_path` binding.
+    #
+    #   *_path       — an absolute host path under PATH_INGEST_ROOTS. Naming
+    #                  one is wet_lab_admin+ (routes/work_ticket.py's
+    #                  _check_ingest_paths): the value is re-opened on a
+    #                  compute node under the job account.
+    #   *_upload_idx — a DoPut handle. The runner rewrites it to the matching
+    #                  `*_path` binding pointing at the staged upload
+    #                  (runner._resolve_upload_handles), and the step stitches
+    #                  the chunked BLOB back into a FASTQ
+    #                  (jobs._blob_input.resolve_fastx_blob_input). This is the
+    #                  route a `user` takes — their reads are on their own
+    #                  machine, which the cluster cannot see.
     fastq_path:
       type: string
       minLength: 1
@@ -75,6 +88,8 @@ context_schema:
       type: string
       minLength: 1
       pattern: "^/"
+    fastq_upload_idx: {type: integer, minimum: 1}
+    reverse_fastq_upload_idx: {type: integer, minimum: 1}
     # Sequencing instrument model (e.g. "NextSeq 550"), forwarded per sample from
     # qiita.sequencing_run. The qc step gates polyG trimming on a 2-color model
     # (NextSeq/NovaSeq/MiniSeq); absent/unknown → polyG OFF. Passed to the qc job
@@ -97,6 +112,14 @@ context_schema:
     host_minimap2_reference_idx:
       type: integer
       minimum: 1
+  # Exactly one forward route. `oneOf` rejects both-present as well as
+  # neither-present: with both, both branches match and oneOf fails.
+  oneOf:
+    - required: [fastq_path]
+    - required: [fastq_upload_idx]
+  # The reverse read is optional, but it cannot arrive by both routes at once.
+  not:
+    required: [reverse_fastq_path, reverse_fastq_upload_idx]
 
 steps:
   - step: fastq

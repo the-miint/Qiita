@@ -400,6 +400,92 @@ def _three_read_fastq(tmp_path):
     return fastq
 
 
+def _write_reads_upload(dest, payload: bytes):
+    """Lay down the `(chunk_index INTEGER, chunk_data BLOB)` Parquet a DoPut'd
+    FASTQ arrives as, the shape `_blob_input` sniffs for. Two chunks so the
+    reassembly order matters."""
+    half = max(1, len(payload) // 2)
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE up (chunk_index INTEGER, chunk_data BLOB)")
+        conn.execute("INSERT INTO up VALUES (1, ?), (0, ?)", [payload[half:], payload[:half]])
+        conn.execute(f"COPY up TO '{dest}' (FORMAT PARQUET)")
+    return dest
+
+
+def test_execute_reads_an_uploaded_fastq(fake_mint, tmp_path):
+    """The user route: `fastq_path` is bound to a chunked-BLOB upload rather
+    than to a FASTQ, because the runner resolved a `fastq_upload_idx` handle.
+    The step stitches it back and produces the same rows the host-path route
+    does — the two front-ends converge before anything reads the sequences."""
+    upload = _write_reads_upload(tmp_path / "upload.parquet", _THREE_READ_FASTQ_CONTENT.encode())
+
+    outputs = _run(
+        Inputs(fastq_path=upload, prep_sample_idx=42, work_ticket_idx=1),
+        tmp_path / "ws",
+    )
+
+    assert fake_mint == [(42, 3)]
+    rows = _read_parquet(outputs["reads"])
+    assert [(r[0], r[1], r[2]) for r in rows] == [
+        (1000, "r1", "ACGT"),
+        (1001, "r2", "TGCA"),
+        (1002, "r3", "ACGT"),
+    ]
+
+
+def test_execute_reads_a_gzipped_uploaded_fastq(fake_mint, tmp_path):
+    """The uploaded bytes keep the client's compression — the CLI does not
+    inflate a `.gz` on the way out — so the stitched file has to be named
+    `.fastq.gz` for miint to inflate it. A wrong name here does not error, it
+    silently parses gzip bytes as text, so this asserts on the reads."""
+    import gzip
+
+    upload = _write_reads_upload(
+        tmp_path / "upload.parquet", gzip.compress(_THREE_READ_FASTQ_CONTENT.encode())
+    )
+
+    outputs = _run(
+        Inputs(fastq_path=upload, prep_sample_idx=42, work_ticket_idx=1),
+        tmp_path / "ws",
+    )
+
+    assert fake_mint == [(42, 3)]
+    assert len(_read_parquet(outputs["reads"])) == 3
+
+
+def test_execute_reads_uploaded_paired_end(fake_mint, tmp_path):
+    """Both mates can arrive as uploads; miint still reads them in lockstep,
+    so the pair shares one sequence_idx."""
+    r1 = _write_reads_upload(tmp_path / "r1.parquet", _THREE_READ_FASTQ_CONTENT.encode())
+    r2 = _write_reads_upload(tmp_path / "r2.parquet", _THREE_READ_FASTQ_CONTENT.encode())
+
+    outputs = _run(
+        Inputs(
+            fastq_path=r1,
+            reverse_fastq_path=r2,
+            prep_sample_idx=42,
+            work_ticket_idx=1,
+        ),
+        tmp_path / "ws",
+    )
+
+    # 3 pairs, not 6 reads: one row per pair.
+    assert fake_mint == [(42, 3)]
+    assert len(_read_parquet(outputs["reads"])) == 3
+
+
+def test_execute_treats_an_empty_uploaded_fastq_as_no_data(tmp_path, monkeypatch):
+    """The empty-input check runs on the STITCHED file, not on the upload
+    Parquet — which is never empty, since it carries the chunk envelope. An
+    upload of an empty FASTQ is the same terminal no-data outcome a host path
+    to an empty FASTQ is."""
+    _assert_mint_not_called(monkeypatch)
+    upload = _write_reads_upload(tmp_path / "upload.parquet", b"")
+
+    with pytest.raises(ValueError, match="empty file"):
+        _run(Inputs(fastq_path=upload, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+
 def _assert_mint_not_called(monkeypatch):
     """Patch fastq_module.mint_sequence_range to raise loudly if
     invoked. Use in recovery-path tests where the mint MUST be skipped —

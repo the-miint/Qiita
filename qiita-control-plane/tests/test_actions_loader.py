@@ -646,6 +646,66 @@ _ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
 _ESCALATION_PENDING_RESIZE: dict[str, dict[str, tuple[str, ...]]] = {}
 
 
+# (action_id, version, action_context, accepted?) — the exactly-one rule the
+# read-ingest workflows use to admit reads by either route.
+_READ_INGEST_ROUTE_CASES = [
+    ("fastq-to-parquet", "1.3.0", {"fastq_path": "/seq/a_R1.fastq"}, True),
+    ("fastq-to-parquet", "1.3.0", {"fastq_upload_idx": 4}, True),
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {"fastq_path": "/seq/a_R1.fastq", "reverse_fastq_path": "/seq/a_R2.fastq"},
+        True,
+    ),
+    ("fastq-to-parquet", "1.3.0", {"fastq_upload_idx": 4, "reverse_fastq_upload_idx": 5}, True),
+    # Both routes for the forward read: ambiguous, and `oneOf` catches it
+    # because BOTH branches match.
+    ("fastq-to-parquet", "1.3.0", {"fastq_path": "/seq/a_R1.fastq", "fastq_upload_idx": 4}, False),
+    # Neither route: no reads to load.
+    ("fastq-to-parquet", "1.3.0", {}, False),
+    # Both routes for the reverse read — caught by the separate `not`, since
+    # the forward read is unambiguous here and `oneOf` is satisfied.
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {
+            "fastq_upload_idx": 4,
+            "reverse_fastq_path": "/seq/a_R2.fastq",
+            "reverse_fastq_upload_idx": 5,
+        },
+        False,
+    ),
+    ("bam-to-parquet", "1.0.0", {"bam_path": "/seq/a.bam"}, True),
+    ("bam-to-parquet", "1.0.0", {"bam_upload_idx": 2}, True),
+    ("bam-to-parquet", "1.0.0", {"bam_path": "/seq/a.bam", "bam_upload_idx": 2}, False),
+    ("bam-to-parquet", "1.0.0", {}, False),
+]
+
+
+@pytest.mark.parametrize(("action_id", "version", "context", "accepted"), _READ_INGEST_ROUTE_CASES)
+def test_read_ingest_accepts_exactly_one_route(action_id, version, context, accepted):
+    """A sample's reads reach the ingest workflows by a host path or by an
+    upload handle, never both and never neither.
+
+    Both spellings resolve to the same step input — the runner rewrites
+    `{prefix}_upload_idx` into the `{prefix}_path` binding — so a context
+    carrying both would leave which file the step reads decided by resolution
+    order rather than by the submitter.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+    from qiita_control_plane.actions.context_validator import validate_context
+
+    actions = {
+        (a.action_id, a.version): a
+        for a in load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    }
+    schema = actions[(action_id, version)].context_schema
+    errors = validate_context(schema, context)
+    assert (not errors) is accepted, errors
+
+
 # Key-name suffixes that mark a context_schema property as a host path. Mirrors
 # `ingest_path._PATH_KEY_SUFFIXES` — the submit gate checks a value under such a
 # key whatever the schema says, and this guard makes the schema say it too, so a

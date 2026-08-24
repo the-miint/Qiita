@@ -280,6 +280,57 @@ def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
 
 
 @contextlib.contextmanager
+def _raw_blob_upload_stream(src: Path) -> Iterator[UploadStream]:
+    """Byte-exact file → `(chunk_index INT, chunk_data BLOB)` chunked stream.
+
+    Same envelope as `_blob_upload_stream` and one difference: a `.gz` source is
+    NOT decompressed. The companion-file streamer inflates because miint's
+    `read_newick` / `read_jplace` only accept on-disk plaintext; reads have no
+    such constraint — `read_fastx` reads gzip directly — and a FASTQ is the one
+    input where sending the inflated bytes actually costs something.
+
+    The server side names the stitched file from these bytes' own gzip magic
+    (`jobs._blob_input.resolve_fastx_blob_input`), since miint detects
+    compression from the extension.
+    """
+    import pyarrow as pa
+
+    schema = pa.schema(
+        [
+            pa.field("chunk_index", pa.int32()),
+            pa.field("chunk_data", pa.binary()),
+        ]
+    )
+
+    def _iter_batches() -> Iterator[Any]:
+        indices: list[int] = []
+        datas: list[bytes] = []
+        idx = 0
+        with src.open("rb") as f:
+            while True:
+                data = f.read(_CHUNK_SIZE)
+                if not data:
+                    break
+                indices.append(idx)
+                datas.append(data)
+                idx += 1
+                if len(indices) >= _CHUNK_ROWS_PER_BATCH:
+                    yield pa.RecordBatch.from_arrays(
+                        [pa.array(indices, type=pa.int32()), pa.array(datas, type=pa.binary())],
+                        schema=schema,
+                    )
+                    indices = []
+                    datas = []
+        if indices:
+            yield pa.RecordBatch.from_arrays(
+                [pa.array(indices, type=pa.int32()), pa.array(datas, type=pa.binary())],
+                schema=schema,
+            )
+
+    yield UploadStream(schema=schema, batches=_iter_batches())
+
+
+@contextlib.contextmanager
 def _passthrough_parquet_stream(src: Path) -> Iterator[UploadStream]:
     """Taxonomy / genome_map already arrive as Parquet — stream their
     existing row batches through unchanged. `iter_batches` is bounded by
@@ -296,6 +347,10 @@ _ROLE_STREAMERS: dict[str, Callable[[Path], Any]] = {
     "taxonomy": _passthrough_parquet_stream,
     "tree": _blob_upload_stream,
     "jplace": _blob_upload_stream,
+    # A sample's reads (FASTQ / BAM) — byte-exact, compression preserved. See
+    # `_raw_blob_upload_stream` for why this is not the `_blob_upload_stream`
+    # entry above.
+    "reads": _raw_blob_upload_stream,
     "genome_map": _passthrough_parquet_stream,
     # A GFF3 is raw text like Newick/jplace — same chunked-BLOB envelope. The
     # server unwraps it with _blob_input.resolve_blob_input and hands the file
@@ -397,7 +452,13 @@ async def upload_file(
     metadata the caller stitches into `action_context`."""
     import asyncio
 
-    create_body = {"description": description or f"{role}: {file_path.name}"}
+    # `source_filename` is the client's own basename. The work_ticket submit
+    # gate reads it to apply the fastq filename-prefix rule to an upload-fed
+    # submission, which has no path to take a basename from.
+    create_body = {
+        "description": description or f"{role}: {file_path.name}",
+        "source_filename": file_path.name,
+    }
     create = await _post(http, token, URL_UPLOAD_PREFIX, body=create_body, expected_status=(201,))
     upload_idx = create["upload_idx"]
     ticket_bytes = base64.b64decode(create["doput_ticket"])
