@@ -22,6 +22,21 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`POST /run-folder/inspect` lets a submit run from a machine that does not mount the
+  cluster (#TBD).** `submit-bcl-convert` read `RunInfo.xml` and `submit-pacbio-ingest`
+  globbed `*/hifi_reads/*.bam`, both on the submitting machine — which is why submitting
+  required a machine that sees the cluster's filesystem, even though the path is only ever
+  re-opened on a compute node. Both reads moved to the control plane. The route is
+  read-only, wet_lab_admin+ (matching who may name a host path at submit), bounded by the
+  same `PATH_INGEST_ROOTS` gate, and returns facts rather than bytes: an Illumina run's
+  `instrument_run_id` / `instrument_model`, or a PacBio run's barcode → HiFi BAM index.
+  The PacBio pairing stays client-side — the glob needs the folder, the pairing needs the
+  pre-flight roster, and only one of those two leaves the submitter's machine. The
+  `index_run_bams` glob moved to `qiita_common.pacbio` so client and server share one
+  implementation. A 403 (rather than a 404) reports the case the account split makes real:
+  the control plane runs as `qiita-api` and cannot always read what `qiita-job` can, and
+  "you cannot read this" must not look like "this is not there".
+
 - **A work_ticket's `action_context` host paths are bounded to configured ingest roots,
   and a regular user loads reads by upload instead (#TBD).** An `action_context` could
   name any absolute path, recorded verbatim and re-opened much later on a compute node.

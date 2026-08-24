@@ -1,7 +1,7 @@
 """Unit tests for the PacBio HiFi ingest submission CLI (cli/user/pacbio.py).
 
 Three surfaces, all pure-unit (no Postgres):
-  * `_index_run_bams` / `_resolve_sample_bams` — the BAM glob + (barcode)
+  * `index_run_bams` / `_resolve_sample_bams` — the BAM glob + (barcode)
     disambiguation, exercised against a synthetic run folder on disk.
   * `_read_pacbio_preflight_rows` — the preflight reader (kl-run-preflight's
     `get_pacbio_sample_info`), exercised end-to-end against a REAL kl-run-preflight
@@ -17,10 +17,11 @@ from pathlib import Path
 
 import httpx
 import pytest
+from qiita_common.models import PacbioRunIndex
+from qiita_common.pacbio import index_run_bams
 
 from qiita_control_plane.cli import _common
 from qiita_control_plane.cli.user import (
-    _index_run_bams,
     _read_pacbio_preflight_rows,
     _resolve_sample_bams,
     main,
@@ -58,7 +59,7 @@ def test_index_run_bams_keys_by_barcode_and_skips_unassigned(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc2")
     _make_bam(tmp_path, "1_A01", "m84_s1", "unassigned")  # dropped
-    index, duplicated = _index_run_bams(tmp_path)
+    index, duplicated = index_run_bams(tmp_path)
     assert set(index) == {"bc1", "bc2"}
     assert duplicated == set()
     # keyed on the *.bam file itself, under the SMRT-cell well dir
@@ -71,7 +72,7 @@ def test_index_run_bams_quarantines_barcode_reused_across_cells(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     _make_bam(tmp_path, "1_B01", "m84_s2", "bc1")  # collision
     _make_bam(tmp_path, "1_B01", "m84_s2", "bc3")
-    index, duplicated = _index_run_bams(tmp_path)
+    index, duplicated = index_run_bams(tmp_path)
     assert set(index) == {"bc3"}
     assert duplicated == {"bc1"}
 
@@ -91,9 +92,24 @@ def _row(barcode: str, idx: int = 1):
     )
 
 
+def _run_index(run_folder) -> PacbioRunIndex:
+    """The index POST /run-folder/inspect returns for `run_folder`.
+
+    The glob itself moved to the control plane (`qiita_common.pacbio`), which
+    is what lets the submit run from a machine that does not mount the cluster.
+    These tests still build it from a real folder — the pairing under test is
+    index x roster, and a real glob keeps the fixture honest about what the
+    server would actually send."""
+    index, duplicated = index_run_bams(run_folder)
+    return PacbioRunIndex(
+        hifi_bam_by_barcode={bc: str(p) for bc, p in index.items()},
+        duplicated_barcodes=sorted(duplicated),
+    )
+
+
 def test_resolve_sample_bams_happy_path(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
-    resolved = _resolve_sample_bams([_row("bc1")], tmp_path, _RaisingParser())
+    resolved = _resolve_sample_bams([_row("bc1")], tmp_path, _run_index(tmp_path), _RaisingParser())
     assert set(resolved) == {"bc1"}
     assert resolved["bc1"].name == "m84_s1.hifi_reads.bc1.bam"
 
@@ -101,7 +117,7 @@ def test_resolve_sample_bams_happy_path(tmp_path):
 def test_resolve_sample_bams_errors_on_missing(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     with pytest.raises(_RaisingParser.Error, match="no HiFi BAM found"):
-        _resolve_sample_bams([_row("bcX", 5)], tmp_path, _RaisingParser())
+        _resolve_sample_bams([_row("bcX", 5)], tmp_path, _run_index(tmp_path), _RaisingParser())
 
 
 def test_resolve_sample_bams_errors_on_cross_cell_barcode(tmp_path):
@@ -109,7 +125,7 @@ def test_resolve_sample_bams_errors_on_cross_cell_barcode(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     _make_bam(tmp_path, "1_B01", "m84_s2", "bc1")
     with pytest.raises(_RaisingParser.Error, match="reused across samples or SMRT cells"):
-        _resolve_sample_bams([_row("bc1", 5)], tmp_path, _RaisingParser())
+        _resolve_sample_bams([_row("bc1", 5)], tmp_path, _run_index(tmp_path), _RaisingParser())
 
 
 def test_resolve_sample_bams_errors_on_two_samples_sharing_a_barcode(tmp_path):
@@ -117,12 +133,17 @@ def test_resolve_sample_bams_errors_on_two_samples_sharing_a_barcode(tmp_path):
     BAM(s) without the SMRT cell — ambiguous, not a silent shared BAM."""
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     with pytest.raises(_RaisingParser.Error, match="reused across samples or SMRT cells"):
-        _resolve_sample_bams([_row("bc1", 1), _row("bc1", 2)], tmp_path, _RaisingParser())
+        _resolve_sample_bams(
+            [_row("bc1", 1), _row("bc1", 2)],
+            tmp_path,
+            _run_index(tmp_path),
+            _RaisingParser(),
+        )
 
 
 def test_resolve_sample_bams_errors_on_empty_run_folder(tmp_path):
     with pytest.raises(_RaisingParser.Error, match="no HiFi BAMs"):
-        _resolve_sample_bams([_row("bc1")], tmp_path, _RaisingParser())
+        _resolve_sample_bams([_row("bc1")], tmp_path, _run_index(tmp_path), _RaisingParser())
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +275,23 @@ def _stub_submit_flow(
         def resp(status, body):
             return httpx.Response(status, json=body, request=httpx.Request(method, url))
 
+        if url.endswith("/run-folder/inspect"):
+            # Glob the real folder, as the route does. The CLI no longer globs
+            # it itself — that is what lets the submit run from a machine with
+            # no view of the cluster — so this leg is where the index enters.
+            index, duplicated = index_run_bams(Path(json["path"]))
+            return resp(
+                200,
+                {
+                    "path": json["path"],
+                    "platform": json["platform"],
+                    "illumina": None,
+                    "pacbio": {
+                        "hifi_bam_by_barcode": {bc: str(p) for bc, p in index.items()},
+                        "duplicated_barcodes": sorted(duplicated),
+                    },
+                },
+            )
         if url.endswith("/auth/whoami"):
             return resp(200, {"kind": "human", "principal_idx": 7})
         if url.endswith("/lookup-by-accession") and "biosample" in url:
@@ -381,8 +419,8 @@ def test_submit_pacbio_ingest_fans_out_bam_to_parquet(monkeypatch, tmp_path, bui
 def test_submit_pacbio_ingest_ambiguous_barcode_aborts_before_network(
     monkeypatch, tmp_path, build_case5_preflight
 ):
-    """A barcode reused across SMRT cells fails fast (exit 2) with NO network
-    call — resolution happens before the flow's _run."""
+    """A barcode reused across SMRT cells fails fast (exit 2) after the run
+    folder is indexed and before anything is minted."""
     db = build_case5_preflight()
     run = tmp_path / "run"
     _make_bam(run, "1_A01", "m84_s1", "bc3011")
@@ -410,14 +448,17 @@ def test_submit_pacbio_ingest_ambiguous_barcode_aborts_before_network(
             ]
         )
     assert ei.value.code == 2
-    assert captured["requests"] == []  # aborted before any HTTP
+    # The run folder is indexed server-side now, so that one call happens; the
+    # pairing against the roster still runs on this machine, and still aborts
+    # before anything is minted.
+    assert [r["url"].split("/api/v1")[-1] for r in captured["requests"]] == ["/run-folder/inspect"]
 
 
 def test_submit_pacbio_ingest_missing_bam_aborts_before_network(
     monkeypatch, tmp_path, build_case5_preflight
 ):
-    """A sample whose barcode has no BAM fails fast (exit 2) before any HTTP,
-    like the ambiguous case — no half-populated pool."""
+    """A sample whose barcode has no BAM fails fast (exit 2) before anything is
+    minted, like the ambiguous case — no half-populated pool."""
     db = build_case5_preflight()
     run = tmp_path / "run"
     _make_bam(run, "1_A01", "m84_s1", "bc3011")
@@ -429,7 +470,7 @@ def test_submit_pacbio_ingest_missing_bam_aborts_before_network(
     with pytest.raises(SystemExit) as ei:
         main(_submit_args(run, db))
     assert ei.value.code == 2
-    assert captured["requests"] == []
+    assert [r["url"].split("/api/v1")[-1] for r in captured["requests"]] == ["/run-folder/inspect"]
 
 
 def test_submit_pacbio_ingest_resilient_to_ticket_failure(
@@ -615,6 +656,6 @@ def test_index_run_bams_skips_combined_bam_without_barcode(tmp_path):
     d.mkdir(parents=True)
     (d / "m84_s1.hifi_reads.bam").write_text("x")  # combined, no barcode
     (d / "m84_s1.hifi_reads.bc1.bam").write_text("x")
-    index, duplicated = _index_run_bams(tmp_path)
+    index, duplicated = index_run_bams(tmp_path)
     assert set(index) == {"bc1"}
     assert duplicated == set()

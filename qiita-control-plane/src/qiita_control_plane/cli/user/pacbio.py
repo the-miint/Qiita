@@ -18,7 +18,7 @@ rather than as a single BCL run bcl-convert demuxes in-workflow:
      across cells is real and cannot be disambiguated by barcode alone. The
      preflight now records the SMRT cell per sample (`smrt_cell`, from the reader),
      so a follow-up can key resolution on `(smrt_cell, barcode)` and drop that
-     collision guard — see `_index_run_bams`. (The sample identity / pool-item-id
+     collision guard — see `qiita_common.pacbio.index_run_bams`. (The sample identity / pool-item-id
      is `pacbio_sample_idx`, never the barcode; the barcode is only the BAM key.)
 
 Preflight read: per-sample PacBio facts come from kl-run-preflight's
@@ -37,10 +37,15 @@ from typing import NamedTuple
 
 import httpx
 from qiita_common.api_paths import (
+    PATH_RUN_FOLDER_INSPECT,
+    PATH_RUN_FOLDER_PREFIX,
     PATH_WORK_TICKET_PREFIX,
 )
 from qiita_common.models import (
+    PacbioRunIndex,
     Platform,
+    RunFolderInspectRequest,
+    RunFolderInspectResponse,
     ScopeTargetKind,
     SequencedPoolCreateRequest,
     SequencingRunCreateRequest,
@@ -65,13 +70,6 @@ _BAM_TO_PARQUET_ACTION_VERSION = "1.0.0"
 # client (this ingest) and the server (the roster's protocol read-back).
 _SHEET_TYPE_ABSQUANT = SHEET_TYPE_PACBIO_ABSQUANT
 _SHEET_TYPE_METAG = "pacbio_metag"
-
-# Per-cell reads PacBio's demux could not assign to a barcode; never a sample.
-_UNASSIGNED_BAM_SUFFIX = ".unassigned.bam"
-
-# Per-SMRT-cell subdirectory holding demultiplexed HiFi BAMs, and the filename
-# field that names it: `{run}/{well}/hifi_reads/{movie}.hifi_reads.{barcode}.bam`.
-_HIFI_READS_DIR = "hifi_reads"
 
 
 class _PacbioPreflightRow(NamedTuple):
@@ -249,53 +247,17 @@ def _validate_pacbio_protocol(
         )
 
 
-def _index_run_bams(run_folder: Path) -> tuple[dict[str, Path], set[str]]:
-    """Index a PacBio run folder's per-barcode HiFi BAMs.
-
-    Globs `{run_folder}/*/hifi_reads/*.bam` — each SMRT cell is a well
-    subdirectory (`1_A01`, `1_B01`, ...) holding its demultiplexed reads — and
-    keys each BAM on its barcode, the second-to-last dot field of the filename
-    (`m84137_..._s1.hifi_reads.bc2073.bam` -> `bc2073`). Per-cell
-    `*.unassigned.bam` files are skipped (reads with no barcode are not samples).
-
-    Returns `(index, duplicated)`: `index` maps barcode -> BAM for every barcode
-    that resolves to exactly one file; `duplicated` is the set of barcodes seen
-    under more than one SMRT cell. A duplicated barcode is left OUT of `index` and
-    is a hard error at resolution time — barcode reuse across SMRT cells within a
-    run is real (e.g. bc2083 under both 1_B01 and 1_C01) and cannot be
-    disambiguated without the SMRT cell. This is the graceful-degradation rule:
-    unique barcodes just resolve; a collision on a barcode a sample actually needs
-    fails loud rather than silently binding the wrong cell's reads. (The preflight
-    now carries a SMRT-cell field; once it is populated, key on `(smrt_cell, barcode)`
-    — matching the well subdirectory or the movie name's `s#` token — and this
-    collision set becomes empty.)
-    """
-    index: dict[str, Path] = {}
-    duplicated: set[str] = set()
-    for bam in sorted(run_folder.glob(f"*/{_HIFI_READS_DIR}/*.bam")):
-        if bam.name.endswith(_UNASSIGNED_BAM_SUFFIX):
-            continue
-        parts = bam.name.split(".")
-        # Require the exact demux shape "<movie>.hifi_reads.<barcode>.bam" so a
-        # non-demuxed combined BAM ("<movie>.hifi_reads.bam") isn't indexed under a
-        # spurious barcode ("hifi_reads"). ["m84_s1", "hifi_reads", "bc2073", "bam"].
-        if len(parts) < 4 or parts[-3] != _HIFI_READS_DIR:
-            continue
-        barcode = parts[-2]
-        if barcode in index or barcode in duplicated:
-            duplicated.add(barcode)
-            index.pop(barcode, None)
-        else:
-            index[barcode] = bam
-    return index, duplicated
-
-
 def _resolve_sample_bams(
     rows: list[_PacbioPreflightRow],
     run_folder: Path,
+    run_index: PacbioRunIndex,
     parser: argparse.ArgumentParser,
 ) -> dict[str, Path]:
-    """Resolve every sample's absolute BAM path before any network call.
+    """Pair every sample against its BAM in the run folder's index.
+
+    `run_index` comes from POST /run-folder/inspect — the control plane globs
+    the folder, because this machine may not mount it. The pairing stays here:
+    it needs the pre-flight roster, which never leaves the client.
 
     Returns barcode -> absolute BAM path. Barcode is the sample's BAM-locating key
     (NOT its identity — that is `pacbio_sample_idx`), and it is not guaranteed
@@ -306,7 +268,8 @@ def _resolve_sample_bams(
     sample whose barcode has no BAM, or either ambiguity — one actionable error
     instead of N FAILED `bam-to-parquet` tickets.
     """
-    index, duplicated = _index_run_bams(run_folder)
+    index = {bc: Path(p) for bc, p in run_index.hifi_bam_by_barcode.items()}
+    duplicated = set(run_index.duplicated_barcodes)
     if not index and not duplicated:
         parser.error(
             f"--run-folder {run_folder} contains no HiFi BAMs (expected */hifi_reads/*.bam)"
@@ -328,10 +291,12 @@ def _resolve_sample_bams(
         elif row.barcode not in index:
             missing.append(label)
         else:
-            # .absolute(), not .resolve(): the orchestrator binds the BAM's parent
-            # dir by its given absolute path, so dereferencing symlinks here could
-            # yield a path outside that bind mount (invisible to the compute node).
-            resolved[row.barcode] = index[row.barcode].absolute()
+            # Already absolute — the server globbed an absolute run folder and
+            # returned absolute paths. Not `.resolve()`d, deliberately: the
+            # orchestrator binds the BAM's parent dir by its given absolute
+            # path, so dereferencing symlinks could yield a path outside that
+            # bind mount, invisible to the compute node.
+            resolved[row.barcode] = index[row.barcode]
     if ambiguous:
         parser.error(
             f"--run-folder {run_folder}: barcode(s) reused across samples or SMRT"
@@ -385,10 +350,12 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
     separate, deliberate re-ingest path (it re-registers reads → lake duplicates),
     NOT the retry route. All calls share one PAT.
     """
+    # The path is checked SERVER-side (POST /run-folder/inspect, below), not
+    # here: it names the folder as the CLUSTER sees it, and a check against this
+    # machine's filesystem proves nothing about that. Only the shape is worth
+    # asserting locally.
     if not args.run_folder.is_absolute():
         parser.error(f"--run-folder must be absolute, got {args.run_folder}")
-    if not args.run_folder.is_dir():
-        parser.error(f"--run-folder {args.run_folder} is not a directory")
     if not args.preflight_blob.is_file():
         parser.error(f"--preflight-blob {args.preflight_blob} is not a regular file")
     blob_bytes = args.preflight_blob.read_bytes()
@@ -396,9 +363,6 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         parser.error(f"--preflight-blob {args.preflight_blob} is empty")
 
     preflight_rows = _read_pacbio_preflight_rows(args.preflight_blob, parser)
-    # Resolve BAMs before any network call — a missing/ambiguous BAM is
-    # operator-actionable and must not create a half-populated pool.
-    bam_by_barcode = _resolve_sample_bams(preflight_rows, args.run_folder, parser)
 
     run_body = SequencingRunCreateRequest(
         instrument_run_id=args.instrument_run_id,
@@ -411,6 +375,28 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
     ).model_dump(exclude_unset=True, mode="json")
 
     def _run(token: str) -> dict:
+        # Step 0: index the run folder on the control plane, then pair it against
+        # the pre-flight roster HERE. The glob needs the folder (which this
+        # machine may not mount); the pairing needs the roster (which never
+        # leaves this machine). Both happen before any row is minted, so a
+        # missing or ambiguous BAM is one actionable error rather than a
+        # half-populated pool.
+        inspected = RunFolderInspectResponse.model_validate(
+            _common.call(
+                "POST",
+                args.base_url,
+                token,
+                f"{PATH_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}",
+                json=RunFolderInspectRequest(
+                    path=str(args.run_folder), platform=Platform.PACBIO_SMRT
+                ).model_dump(mode="json"),
+            )
+        )
+        assert inspected.pacbio is not None  # platform=pacbio_smrt always populates it
+        bam_by_barcode = _resolve_sample_bams(
+            preflight_rows, args.run_folder, inspected.pacbio, parser
+        )
+
         # Shared run → pool → roster provisioning (create-missing; fails fast on an
         # unresolved accession). PacBio keys the pool-item-id on pacbio_sample_idx —
         # the sample's unique preflight id (the barcode is only the BAM-locating key
