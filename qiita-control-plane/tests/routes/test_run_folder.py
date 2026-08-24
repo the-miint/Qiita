@@ -9,6 +9,8 @@ run folder with no HiFi BAMs — against real folders on disk.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_RUN_FOLDER_INSPECT
@@ -226,6 +228,12 @@ async def test_pacbio_indexes_bams_by_barcode(rf_client, wet_lab_admin_token, in
     assert sorted(index) == ["bc1001", "bc1002"]
     assert index["bc1001"].endswith("1_A01/hifi_reads/m84_s1.hifi_reads.bc1001.bam")
     assert body["pacbio"]["duplicated_barcodes"] == []
+    # ABSOLUTE, and under the root. The CLI puts these straight into
+    # `action_context.bam_path`, where the submit gate re-checks them against
+    # PATH_INGEST_ROOTS — a relative path would be refused there, one gesture
+    # later, with nothing pointing back at this route.
+    for bam in index.values():
+        assert bam.startswith(str(ingest_root) + "/"), bam
 
 
 async def test_pacbio_skips_unassigned_reads(rf_client, wet_lab_admin_token, ingest_root):
@@ -308,6 +316,34 @@ async def test_a_file_is_not_a_run_folder(rf_client, wet_lab_admin_token, ingest
 
     assert resp.status_code == 422, resp.text
     assert resp.json()["detail"]["reason"] == "run folder is not a directory"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
+async def test_an_unreadable_run_folder_returns_403_not_404(
+    rf_client, wet_lab_admin_token, ingest_root
+):
+    """The arm the qiita-api / qiita-job split makes real.
+
+    The submit gate can shrug at a permission error and admit, because the step
+    runs as a different account with wider group membership. This route has to
+    open the folder now, so it cannot — and it must not report "cannot read" as
+    "not found", which would send an operator hunting for a typo in a path that
+    is correct. The message names the situation and the two ways out.
+    """
+    token, _ = wet_lab_admin_token
+    closed = ingest_root / "closed-run"
+    closed.mkdir(parents=True, exist_ok=True)
+    (closed / "RunInfo.xml").write_text("<x/>")
+    closed.chmod(0o000)
+    try:
+        resp = await _inspect(rf_client, token, closed, "illumina")
+    finally:
+        closed.chmod(0o755)
+
+    assert resp.status_code == 403, resp.text
+    reason = resp.json()["detail"]["reason"]
+    assert "cannot read this run folder" in reason
+    assert "compute node may still be able to" in reason
 
 
 async def test_relative_path_is_rejected_by_the_model(rf_client, wet_lab_admin_token):
