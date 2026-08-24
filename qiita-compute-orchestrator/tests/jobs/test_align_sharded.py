@@ -1113,6 +1113,113 @@ def test_pooled_cigar_scoring_is_permutation_invariant():
     assert identities != {None} and coverages != {None}
 
 
+def test_origin_spanning_read_splits_into_one_record_per_side():
+    """CONTRACT (duckdb-miint): minimap2 reports a read that crosses a circular
+    contig's origin as one SAM record per side of it, each covering only its own
+    share of the query, so a per-record coverage floor drops the read outright.
+    Upstream documents this and ships the aggregate that pools it back together:
+    https://the-miint.github.io/duckdb-miint/alignment_analysis/#circular-query-coverage
+
+    What this test adds is the tie to OUR floor, and the two pooled forms' split.
+    Measured on miint `9fc4d12` (minimap2 `0477498`), 20 kb contig, 6 kb read built
+    as `contig[17000:] + contig[:3000]`: 2 records, each `cigar_query_coverage` 0.5
+    at `cigar_sequence_identity` 1.0, under `map-hifi`, `map-ont` and the default
+    preset. Over that pair `string_agg(cigar, '')` scores coverage 0.5 but identity
+    1.0 — a clip consumes query length without being an aligned column — while
+    `circular_query_coverage` returns coverage 1.0 over 2 fragments.
+
+    The control is a read of the same length taken from the middle of the same
+    contig: one record at coverage 1.0. Without it, the split could be a property
+    of the read length or of the fixture rather than of the origin.
+
+    Two things rest on this, and both are asserted rather than left to the prose.
+    `_MIN_QUERY_COVERAGE_MINIMAP2` drops both records, since the phase-1 filter
+    scores one record at a time — which is why the sharded reference aligner cannot
+    be the producer for the DuckLake `alignment_origin_spanning` side table (see
+    its DDL in the data plane), and why long reads crossing a circular contig's
+    origin do not reach `alignment` today. And the pooled form the repo already has
+    cannot be widened to cover the read, because the concatenation scores no better
+    than a fragment does; the interval-pooled form is the one that clears the
+    floor, and it is what that table's `pooled_coverage` / `pooled_identity`
+    columns are declared against."""
+    import random
+
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    rng = random.Random(20260819)
+    contig = "".join(rng.choice("ACGT") for _ in range(20_000))
+    spanning = contig[17_000:] + contig[:3_000]
+    control = contig[5_000:11_000]
+    assert len(spanning) == len(control) == 6_000
+
+    with open_miint_conn() as conn:
+        conn.execute("CREATE TABLE subject (read_id BIGINT, sequence1 VARCHAR)")
+        conn.execute("INSERT INTO subject VALUES (777, ?)", [contig])
+        conn.execute("CREATE TABLE query (read_id BIGINT, sequence1 VARCHAR)")
+        conn.execute("INSERT INTO query VALUES (1, ?), (2, ?)", [spanning, control])
+
+        # `subject_table` is a named-only argument; `eqx` is what makes the CIGAR
+        # =/X so `cigar_sequence_identity` scores rather than returning NULL.
+        for preset in ("map-hifi", "map-ont", None):
+            opts = "" if preset is None else f", preset := '{preset}'"
+            rows = conn.execute(
+                "SELECT read_id, count(*), "
+                "  min(cigar_query_coverage(cigar)), max(cigar_query_coverage(cigar)), "
+                "  min(cigar_sequence_identity(cigar)), "
+                "  cigar_query_coverage(string_agg(cigar, '')), "
+                "  cigar_sequence_identity(string_agg(cigar, '')) "
+                f"FROM align_minimap2('query', subject_table := 'subject', eqx := true{opts}) "
+                "GROUP BY read_id ORDER BY read_id"
+            ).fetchall()
+            assert rows == [
+                (1, 2, 0.5, 0.5, 1.0, 0.5, 1.0),
+                (2, 1, 1.0, 1.0, 1.0, 1.0, 1.0),
+            ], f"preset={preset!r} placed the reads differently: {rows}"
+
+            # Tie the measurement to the floor it is measured against, so lowering
+            # the floor for long reads turns this red instead of silently making
+            # the side table's DDL scope paragraph and the changelog wrong. Both
+            # the per-record score and the concatenated pooled one are below it;
+            # the control is above.
+            spanning_row, control_row = rows
+            assert spanning_row[2] < align_sharded._MIN_QUERY_COVERAGE_MINIMAP2, (
+                "an origin-spanning fragment now clears the phase-1 coverage floor, "
+                "so align_sharded persists it and can be the side table's producer"
+            )
+            assert spanning_row[5] < align_sharded._MIN_QUERY_COVERAGE_MINIMAP2, (
+                "the concatenated pooled score now clears the floor, so widening "
+                "the phase-2 QUALIFY to the single-end arm would admit the read"
+            )
+            assert control_row[2] >= align_sharded._MIN_QUERY_COVERAGE_MINIMAP2, (
+                "the control read no longer clears the floor, so the comparison "
+                "above says nothing about the origin"
+            )
+
+        # The pooling that DOES clear the floor, and the definition the DuckLake
+        # `alignment_origin_spanning` columns are declared against. Both arguments
+        # are relations, not table-name strings, and `is_circular` is required —
+        # nothing in an alignment records whether a reference is circular.
+        conn.execute(
+            "CREATE TABLE algn AS SELECT * FROM align_minimap2("
+            "'query', subject_table := 'subject', eqx := true, preset := 'map-hifi')"
+        )
+        conn.execute(
+            "CREATE TABLE ref_len AS "
+            "SELECT '777' AS reference, 20000::BIGINT AS length, true AS is_circular"
+        )
+        pooled = conn.execute(
+            "SELECT read_id, n_fragments, coverage, identity "
+            "FROM circular_query_coverage(algn, ref_len) ORDER BY read_id"
+        ).fetchall()
+        assert pooled == [(1, 2, 1.0, 1.0), (2, 1, 1.0, 1.0)], (
+            f"circular_query_coverage no longer recovers the split read: {pooled}"
+        )
+        assert pooled[0][2] >= align_sharded._MIN_QUERY_COVERAGE_MINIMAP2, (
+            "interval-pooled coverage no longer clears the floor the per-record "
+            "score fails, so the side table's scope paragraph names no viable gate"
+        )
+
+
 def test_align_sharded_se_placements_sharing_a_start_are_scored_separately(tmp_path, monkeypatch):
     """Two SE placements of one read on one feature at the SAME start position are
     scored INDEPENDENTLY — the good one survives the other's failure.
