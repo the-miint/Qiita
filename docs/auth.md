@@ -341,10 +341,12 @@ The system principal (`idx=1`) is rejected by every mutation endpoint above (`di
 | `/api/v1/user/me` | GET | Returns the authenticated user's profile. `require_human` (rejects service-kind 403). |
 | `/api/v1/user/me` | PATCH | Updates profile fields (`affiliation`, `address`, `phone`, `orcid`, `receive_processing_emails`). Requires `self:profile`. `email` and status fields are absent from `UserUpdate` and are silently dropped — email-change requires re-verification via OIDC, status is admin-only. |
 
-What a user cannot self-serve is **access to someone else's study**. Attaching
-a biosample or a sample to a study you do not own requires an `ADMIN`-tier
-`qiita.study_access` row on it, and no route issues one: an operator inserts it
-directly (`INSERT INTO qiita.study_access (study_idx, principal_idx,
+What a user cannot self-serve is **access to someone else's study**. Creating
+a biosample, a prep_sample, or a sequenced_sample under a study you do not own
+requires an `ADMIN`-tier `qiita.study_access` row on it, and no route issues
+one: the owner's own row is auto-granted at study create
+(`repositories/study.py`), and every other row is inserted out-of-band by an
+operator (`INSERT INTO qiita.study_access (study_idx, principal_idx,
 access_tier, granted_by_idx)`).
 
 ### Reference exclusion (curation)
