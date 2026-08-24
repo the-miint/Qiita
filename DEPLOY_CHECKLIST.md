@@ -25,15 +25,38 @@ absolute dirs; `/` is refused.
 sudo bash -c 'grep -q "^PATH_INGEST_ROOTS=" /etc/qiita/control-plane.env || echo "PATH_INGEST_ROOTS=/sequencing" >> /etc/qiita/control-plane.env'   # (#feat/ingest-path-roots-and-upload)
 ```
 
-Set it to the mount(s) sequencing data actually lives on. **No group grant for `qiita-api` is
-needed:** the gate is written for the account split (CP runs as `qiita-api`, steps as
+Set it to the mount(s) sequencing data actually lives on. **The gate itself needs no grant for
+`qiita-api`:** it is written for the account split (CP runs as `qiita-api`, steps as
 `qiita-job`, different groups) — it treats a permission error as "cannot tell" and admits, so a
-run folder only `qiita-job` can read still submits. Add a second root by extending the value
-with `:` rather than adding a line. (#feat/ingest-path-roots-and-upload)
+run folder only `qiita-job` can read still submits. Reading a run folder through
+`POST /run-folder/inspect` does need one; that is bucket 2. Add a second root by extending the
+value with `:` rather than adding a line. (#feat/ingest-path-roots-and-upload)
 
 ### 2. One-time host setup
 
-_None yet._
+**`qiita-api` needs read+traverse on the PacBio run tree**, or `POST /run-folder/inspect`
+answers 403 for those folders and `submit-pacbio-ingest` still has to run from a node that
+mounts `/sequencing`. Illumina needs nothing — `/sequencing/igm_runs/**` is world-readable the
+whole way down, measured. `/sequencing/gcore_runs/**` is group `kl-seq-rw`, which `qiita-job`
+is in and `qiita-api` is not.
+
+Granted as an ACL on directories, not group membership: the route lists directories and opens
+no BAM (`index_run_bams` globs `*/hifi_reads/*.bam` for filenames), and `gcore_runs` is
+`drwxrwsr-x root kl-seq-rw` — adding `qiita-api` to that group would also give the public API's
+service account write on the raw drop directory.
+
+```bash
+ROOT=/sequencing/gcore_runs
+# Access entry + default entry on every existing directory; new project / run / well /
+# hifi_reads dirs inherit both from their parent as they are created.
+sudo find "$ROOT" -type d -exec setfacl -m u:qiita-api:rx,d:u:qiita-api:rx {} +
+sudo -u qiita-api ls -d "$ROOT"/*/*/*/hifi_reads | head -3   # must list, not EACCES
+```
+
+If `setfacl` reports `Operation not supported`, the mount has no ACL support: fall back to
+`sudo usermod -aG kl-seq-rw qiita-api`, which also grants group write on `gcore_runs`, and note
+that a supplementary group is read at process start — the bucket-4 restart is what picks it up.
+(#feat/ingest-path-roots-and-upload)
 
 ### 3. Migrations
 
@@ -63,27 +86,23 @@ Beyond `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>`:
   Expect exit 1 and a 422 whose detail carries `outside every configured ingest root` and an
   `ingest_roots` list matching what bucket 1 set. A 500, or a 202, means the var is wrong.
   (#feat/ingest-path-roots-and-upload)
-- **A submit can now run off the cluster.** `POST /run-folder/inspect` reads the run
-  folder as `qiita-api`, which is a NARROWER account than the `qiita-job` that runs the
-  jobs — it reaches the IGM folders through their world bits, not through `seq_proc` /
-  `knightlab`. So this is worth confirming against a real folder rather than assuming:
+- **A submit can now run off the cluster — both platforms.** `POST /run-folder/inspect`
+  reads the run folder as `qiita-api`, a NARROWER account than the `qiita-job` that runs
+  the jobs: it reaches the IGM folders through their world bits, and the gcore folders
+  only through the ACL bucket 2 grants. Confirm one real folder of each kind:
   ```bash
   curl -sS -X POST https://<fqdn>/api/v1/run-folder/inspect \
     -H "Authorization: Bearer $QIITA_TOKEN" -H 'Content-Type: application/json' \
     -d '{"path": "/sequencing/igm_runs/<a-real-run>", "platform": "illumina"}'
+  curl -sS -X POST https://<fqdn>/api/v1/run-folder/inspect \
+    -H "Authorization: Bearer $QIITA_TOKEN" -H 'Content-Type: application/json' \
+    -d '{"path": "/sequencing/gcore_runs/<project>/<a-real-run>", "platform": "pacbio_smrt"}'
   ```
-  Expect 200 with `illumina.instrument_run_id` / `instrument_model` — measured working
-  for `/sequencing/igm_runs/*`, which is world-readable the whole way down.
-
-  **PacBio is measured NOT working and that is expected.** `/sequencing/gcore_runs/**`
-  is restricted to the `kl-seq-rw` group, which `qiita-job` is in and `qiita-api` is
-  not, so the same call with `"platform": "pacbio_smrt"` answers **403**. Nothing is
-  broken by that: `submit-pacbio-ingest` keeps working exactly as it does today, from a
-  node that mounts `/sequencing`, and the 403 says so. It just does not get the
-  off-cluster submit that Illumina now gets. Closing the gap means granting `qiita-api`
-  read+traverse on that tree — a decision about how much of the raw sequencing data the
-  public API's service account can read, not a deploy step to take by default.
-  (#feat/ingest-path-roots-and-upload)
+  Illumina: 200 with `illumina.instrument_run_id` / `instrument_model` — measured working
+  for `/sequencing/igm_runs/*`, no grant involved. PacBio: 200 with a non-empty
+  `pacbio.hifi_bam_by_barcode`. A **403** there means bucket 2's ACL did not take (it was
+  measured failing before that step); a 200 with an empty index means the ACL took and the
+  folder holds no demuxed BAMs. (#feat/ingest-path-roots-and-upload)
 - **The widened read-ingest schemas synced.** `qiita-admin actions list` must still show
   `fastq-to-parquet 1.3.0` and `bam-to-parquet 1.0.0` enabled — the change is a
   `context_schema` widening in place, not a version bump, so no new version appears and none

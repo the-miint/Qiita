@@ -26,16 +26,15 @@ host's checkout path, mounts, and `prep_protocol` indices.
   `PATH_INGEST_ROOTS` (`/sequencing` here). The control plane checks that at submit
   and refuses a path outside those roots, naming them — so a wrong path is an error at
   your terminal rather than a job that fails hours later.
-- **On this deploy, keep running it from a node that mounts `/sequencing`.** The barcode
-  → BAM glob moved to the control plane (`POST /run-folder/inspect`), which in principle
-  frees the submit from needing that mount — and does, for Illumina. It does not for
-  PacBio here: `/sequencing/gcore_runs/**` is restricted to the `kl-seq-rw` group, which
-  the job account (`qiita-job`) is in and the control plane's account (`qiita-api`) is
-  not. The route answers **403** for those folders, saying exactly that. Nothing is
-  broken — this is the pre-existing arrangement — but the off-cluster submit is not
-  available for PacBio until `qiita-api` is granted read+traverse on that tree.
-- You need `/qmounts` regardless, for the pre-flight `.db` passed to
-  `--preflight-blob`: that file is read locally and always was.
+- **The run folder no longer has to be visible from the machine you type on.** The barcode
+  → BAM glob moved to the control plane (`POST /run-folder/inspect`), which opens the folder
+  as `qiita-api`. That account reaches `/sequencing/gcore_runs/**` through an ACL the deploy
+  grants it (`DEPLOY_CHECKLIST.md`, one-time host setup) rather than through the `kl-seq-rw`
+  group the job account `qiita-job` is in. A **403** from the route means that ACL is missing
+  on the tree you named; until it is in place, submit from a node that mounts `/sequencing`.
+- **The pre-flight `.db` still has to be a local file.** `--preflight-blob` is read on the
+  machine running the CLI and base64'd into the request, so off the cluster copy it over
+  first — it is the one input that does not resolve server-side.
 - Workers have no `sudo`.
 - The PAT identifies the Qiita principal regardless of the Unix account, so
   `sudo -u qiita env QIITA_TOKEN=… qiita …` still acts as the token's owner.
