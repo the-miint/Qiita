@@ -20,11 +20,22 @@ host's checkout path, mounts, and `prep_protocol` indices.
   **directly** — do *not* wrap it in `uv run`, which tries to sync the project and
   will fail (or half-succeed) against the qiita-owned checkout when you are another
   user.
-- **Run it from a node that mounts both `/qmounts` and `/sequencing`** and can reach
-  the control plane. A laptop can reach the control plane but cannot see the data,
-  and run-folder paths are recorded on the ticket and re-resolved on a compute node
-  later — so they must be the *cluster's* paths, not your laptop's. Workers have no
-  `sudo`.
+- **`--run-folder` is a path on the CLUSTER, not on the machine you are typing on.**
+  It is recorded on the ticket and re-opened on a compute node later, so it must name
+  the folder as the cluster sees it, under a directory the deploy configured in
+  `PATH_INGEST_ROOTS` (`/sequencing` here). The control plane checks that at submit
+  and refuses a path outside those roots, naming them — so a wrong path is an error at
+  your terminal rather than a job that fails hours later.
+- **The CLI no longer has to see the run folder itself.** It used to glob
+  `*/hifi_reads/*.bam` locally to map each barcode to its BAM, which is what forced the
+  submit onto a node that mounts `/sequencing`. That read happens on the control plane
+  now (`POST /run-folder/inspect`). You still need to reach `/qmounts` for the
+  pre-flight `.db` you pass with `--preflight-blob`, since that file is read locally.
+- If the control plane answers **403** for the run folder, its service account
+  (`qiita-api`) cannot read that path even though a compute node can — the two run as
+  different Unix accounts with different group membership. Either grant `qiita-api`
+  read+traverse on it, or run the submit from a node that mounts the path, as before.
+- Workers have no `sudo`.
 - The PAT identifies the Qiita principal regardless of the Unix account, so
   `sudo -u qiita env QIITA_TOKEN=… qiita …` still acts as the token's owner.
 
