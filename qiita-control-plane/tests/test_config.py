@@ -13,11 +13,13 @@ _TEST_COOKIE_B64 = base64.b64encode(secrets.token_bytes(32)).decode()
 
 @pytest.fixture(autouse=True)
 def _set_workspace_root(monkeypatch):
-    """Default required env vars for every test (PATH_SCRATCH, CONTACT_EMAIL,
-    FLIGHT_TICKET_SIGNING_KEY, LOGIN_COOKIE_SECRET_KEY). Tests that specifically
-    exercise an env var's absence or invalid value `delenv` / `setenv` to
-    override after this fixture runs."""
+    """Default required env vars for every test (PATH_SCRATCH,
+    PATH_INGEST_ROOTS, CONTACT_EMAIL, FLIGHT_TICKET_SIGNING_KEY,
+    LOGIN_COOKIE_SECRET_KEY). Tests that specifically exercise an env var's
+    absence or invalid value `delenv` / `setenv` to override after this fixture
+    runs."""
     monkeypatch.setenv("PATH_SCRATCH", "/tmp/qiita-test-scratch-unused")
+    monkeypatch.setenv("PATH_INGEST_ROOTS", "/tmp/qiita-test-ingest-unused")
     monkeypatch.setenv("CONTACT_EMAIL", "qiita-test@example.org")
     monkeypatch.setenv("FLIGHT_TICKET_SIGNING_KEY", _TEST_SECRET_B64)
     monkeypatch.setenv("LOGIN_COOKIE_SECRET_KEY", _TEST_COOKIE_B64)

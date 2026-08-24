@@ -97,10 +97,14 @@ async def no_doput_client(make_pat_client):
     return await make_pat_client(label="no-doput", scopes=[Scope.SELF_PROFILE])
 
 
-async def _create_upload(client, *, description: str | None = "test upload"):
+async def _create_upload(
+    client, *, description: str | None = "test upload", source_filename: str | None = None
+):
     body: dict = {}
     if description is not None:
         body["description"] = description
+    if source_filename is not None:
+        body["source_filename"] = source_filename
     return await client.post(URL_UPLOAD_PREFIX, json=body)
 
 
@@ -138,6 +142,47 @@ async def test_create_upload_slot_ok(ctx):
     assert row["sha256"] is None
     assert row["row_count"] is None
     assert row["completed_at"] is None
+
+
+async def test_create_upload_slot_records_source_filename(ctx):
+    """The client's basename is stored and read back. The work_ticket submit
+    gate reads it to apply the fastq filename-prefix rule to an upload-fed
+    submission, which has no path to take a basename from."""
+    resp = await _create_upload(ctx["admin"], source_filename="ABC123_R1.fastq.gz")
+    assert resp.status_code == 201, resp.text
+    idx = _track(ctx, resp)
+
+    stored = await ctx["pool"].fetchval(
+        "SELECT source_filename FROM qiita.upload WHERE upload_idx = $1", idx
+    )
+    assert stored == "ABC123_R1.fastq.gz"
+
+    read_back = await ctx["admin"].get(URL_UPLOAD_BY_IDX.format(upload_idx=idx))
+    assert read_back.status_code == 200, read_back.text
+    assert read_back.json()["source_filename"] == "ABC123_R1.fastq.gz"
+
+
+async def test_create_upload_slot_without_source_filename_is_null(ctx):
+    """Optional. An upload feeding a workflow with no filename rule — a
+    reference FASTA, a tree — has no reason to send one."""
+    resp = await _create_upload(ctx["admin"])
+    assert resp.status_code == 201, resp.text
+    idx = _track(ctx, resp)
+    assert (
+        await ctx["pool"].fetchval(
+            "SELECT source_filename FROM qiita.upload WHERE upload_idx = $1", idx
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("bad", ["/abs/path/R1.fastq", "sub/dir/R1.fastq", "../escape.fastq", ""])
+async def test_create_upload_slot_rejects_non_basename(ctx, bad):
+    """`source_filename` is a basename, not a path. Rejected at the model layer
+    so the client sees a 422 naming the field rather than a 500 from the DB
+    CHECK that backs the same rule."""
+    resp = await _create_upload(ctx["admin"], source_filename=bad)
+    assert resp.status_code == 422, resp.text
 
 
 async def test_create_upload_slot_without_description(ctx):

@@ -646,6 +646,46 @@ _ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
 _ESCALATION_PENDING_RESIZE: dict[str, dict[str, tuple[str, ...]]] = {}
 
 
+# Key-name suffixes that mark a context_schema property as a host path. Mirrors
+# `ingest_path._PATH_KEY_SUFFIXES` — the submit gate checks a value under such a
+# key whatever the schema says, and this guard makes the schema say it too, so a
+# reader of the YAML and the route agree on which fields are paths.
+_HOST_PATH_KEY_SUFFIXES = ("_path", "_dir", "_folder")
+
+
+def test_every_shipped_host_path_property_is_pinned_absolute():
+    """A `*_path` / `*_dir` / `*_folder` string property in a shipped workflow's
+    `context_schema` must declare `pattern: "^/"`.
+
+    Two things read that pattern. `SlurmBackend._resolve_input_binds` turns the
+    value into an apptainer `--bind`, and a relative path there resolves against
+    whatever CWD the launcher started in. The work_ticket submit gate reads it
+    to decide which context keys to bound against `PATH_INGEST_ROOTS`
+    (`ingest_path.host_path_keys`); a property that omits the pattern is still
+    caught by the gate's naming rule, but the YAML then no longer says what the
+    field is, and a reader has to know the route's conventions to find out.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    unpinned = {
+        f"{action.action_id}:{action.version}:{name}"
+        for action in actions
+        for name, spec in (action.context_schema.get("properties") or {}).items()
+        if name.endswith(_HOST_PATH_KEY_SUFFIXES)
+        and isinstance(spec, dict)
+        and spec.get("type") == "string"
+        and spec.get("pattern") != "^/"
+    }
+    assert not unpinned, (
+        'context_schema host-path properties missing `pattern: "^/"` — add it,'
+        " or rename the property if it does not name a host path: "
+        f"{sorted(unpinned)}"
+    )
+
+
 def test_every_shipped_step_can_escalate_on_both_retry_axes():
     """No shipped workflow may pin a step's `mem_gb`/`walltime` at its
     `action_ceiling` unless it is listed above.

@@ -67,6 +67,17 @@ NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 FASTQ_PATH_CONTEXT_KEYS: tuple[str, str] = ("fastq_path", "reverse_fastq_path")
 
 
+# Suffix that marks an `action_context` key as an upload handle rather than a
+# literal value, and the suffix it resolves to. The runner rewrites every
+# `{prefix}_upload_idx` into a `{prefix}_path` binding pointing at the staged
+# file before any step runs (`runner._resolve_upload_handles`), which is how a
+# workflow step reads an uploaded file and a host-path file through the same
+# input name. Defined here so the runner, the work_ticket submit gate, and the
+# CLI that mints the handles share one spelling.
+UPLOAD_IDX_SUFFIX = "_upload_idx"
+PATH_SUFFIX = "_path"
+
+
 # The per-sample read-mask action's bare id (its YAML lives at
 # workflows/read-mask/<version>.yaml). A sample's reads are stored once by the
 # bcl-convert workflow's ingest_reads step; processing a sample then means

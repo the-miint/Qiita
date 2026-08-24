@@ -51,9 +51,26 @@ class UploadCreateRequest(BaseModel):
     `description` is free-form audit text — optional. The slot itself has
     no consumer-specific fields; binding to a reference / study / etc.
     happens later via the work_ticket that references the upload_idx.
+
+    `source_filename` is the basename of the file the client is about to
+    stream. Also optional, and descriptive like `sha256` — nothing opens it.
+    The work_ticket submit gate reads it so the fastq filename-prefix rule
+    (basename carries the prep_sample's sequenced_pool_item_id) applies to an
+    upload-fed submission as well as a path-fed one; an upload feeding a
+    workflow with no such rule has no reason to send it.
     """
 
     description: str | None = Field(default=None, max_length=MAX_NAME_LENGTH)
+    source_filename: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_NAME_LENGTH,
+        # A basename, not a path. Mirrors the DB CHECK on
+        # `upload.source_filename`; rejecting the separator at the model layer
+        # means a client that sends a path gets a 422 naming the field rather
+        # than a 500 from the constraint.
+        pattern=r"^[^/]+$",
+    )
 
 
 # sha256 wire shape: 64 lowercase hex characters. Pinned at the model
@@ -94,6 +111,7 @@ class UploadResponse(BaseModel):
     upload_idx: Annotated[int, Field(gt=0)]
     status: UploadStatus
     description: str | None = None
+    source_filename: str | None = None
     sha256: str | None = None
     row_count: int | None = None
     bytes_received: int | None = None
