@@ -98,35 +98,11 @@ Native job modules export two required symbols — `class Inputs(BaseModel)` (ty
 
 The wire validator enforces shape only (exactly-one). The module-prefix invariant (`qiita_compute_orchestrator.jobs.`) is enforced separately at sync, submit, boot scan, and dispatcher — [`docs/architecture.md`](docs/architecture.md) carries the per-site breakdown.
 
-### Container image tier
-
-Container steps declare a bare SIF filename in `container:` (e.g. `bcl-convert-4.5.4.sif`). The orchestrator joins this against `Settings.path_derived_images` (derived as `PATH_DERIVED/images`; `PATH_DERIVED` env var required when `COMPUTE_BACKEND=slurm`) to resolve the absolute SIF path. Registry-URL forms with `://` pass through; anything else with a path separator → `CONTRACT_VIOLATION`.
-
-**One generic builder, declarative per-workflow spec.** `scripts/build-sif.sh <workflow>` is the *only* SIF build script. A container workflow opts in by adding a spec (`SIF_FILENAME`, optional `SOURCES`, `VERIFY_CMD`, `VERIFY_MATCH`, optional `AUTO_BUILD`) — never a per-workflow build script, and never stage build inputs into the checkout. The spec takes one of two forms, and `deploy/build-sifs.sh` globs both:
-
-- **Single image** — `workflows/<workflow>/sif-build.env`, alongside `Apptainer.def` / `entrypoint.sh` (e.g. `bcl-convert`).
-- **Multiple images** — `workflows/<workflow>/sif-build.d/<image>.env`, one spec per image, each with its own `<image>.def` / `<image>.sh`, for a workflow whose steps need different containers (e.g. `read-mask`'s `lima`; `long-read-assembly`'s `assemble` / `binning` / `bin_refine` / `checkm`).
-
-The builder stages into a temp build root **owned by the invoking user** and only ever *reads* the checkout, so a locked-down service account (e.g. `qiita-orch`) can build without write access to the qiita-owned `/home/qiita` checkout. A CI guard (`qiita-compute-orchestrator/tests/test_sif_build_spec.py`, under `make test`) forbids `scripts/build-*-sif.sh`, requires each spec to be complete, and asserts `SIF_FILENAME` matches the workflow YAML's `container:` value.
-
-**Idempotency is two-gate.** `build-sif.sh` skips a rebuild only when the existing SIF satisfies the spec's `VERIFY_MATCH` (the vendored binary's version) *and* a content hash of the in-repo build inputs (the `Apptainer.def`, `entrypoint.sh`, and `workflows/_shared/manifest_writer.py`) matches the stamp from the last build (`<sif>.buildhash`, computed by `qiita_sif_build_inputs_hash` in `deploy/_common.sh`). The hash deliberately **excludes** the vendored `SOURCES`, so re-vendoring a licensed RPM (4.5.4-1 → 4.5.4-2) doesn't force a rebuild. `FORCE=1` is an emergency override that skips both gates.
-
-**The deploy builds SIFs automatically.** `activate.sh` runs `deploy/build-sifs.sh`, which iterates every spec of either form above and invokes `build-sif.sh` for each, before the service restarts (see the SIF invariant under "Deployments"). So a routine deploy picks up an edited def/entrypoint/manifest with no manual step. A spec may opt out with `AUTO_BUILD=0` (then build it by hand); names starting with `_` (e.g. `_sif-build-smoke`) are never auto-built.
-
-After editing a workflow YAML or its container artifacts (the spec, its `.def` / `.sh`, or the shared `workflows/_shared/manifest_writer.py`), the SIF rebuild happens **automatically at the next deploy** (the content hash detects the change) — **don't write a manual "rebuild the SIF" deploy step**, and `/deploy-note` won't either. These steps run on the **Linux deploy host** — they need `apptainer` and `systemd` — so they don't apply on a macOS dev box (mirrors `make test-workflows`, which skips gracefully off Linux). On macOS, edit the artifacts and run the unit tests.
-
-To build out-of-band (e.g. to verify a def change on the host before a full deploy), **run it as root** — `apptainer build` bind-mounts the invoking account's home, and the `qiita-orch` service account's home is `/dev/null` (build fails to mount it), whereas root's `/root` is real. This matches the deploy's auto-build, which runs as root and then chowns the SIF to `qiita-orch`:
-
-```bash
-# Build one SIF directly, as root (idempotent — two-gate skip above; FORCE=1 to override).
-sudo env PATH_DERIVED=<derived> bash scripts/build-sif.sh <workflow>
-sudo chown qiita-orch:qiita-orch <derived>/images/<sif> <derived>/images/<sif>.buildhash
-make deploy   # the deploy also (re)builds any changed SIF via build-sifs.sh
-sudo systemctl restart qiita-control-plane qiita-compute-orchestrator
-make verify-health
-```
-
-Container input bind mounts are computed by `SlurmBackend._resolve_input_binds` (file → parent dir, directory → itself, deduped by resolved path). This means a step's YAML-declared `inputs:` paths must be absolute when they originate from `action_context` and must be visible from the compute node — bind mounts only expose host paths, they do not copy.
+Container steps declare a bare SIF filename; a workflow opts into the one generic
+builder with a per-workflow spec. The resolution rules, the two spec forms, the
+two-gate idempotency check, and why the deploy rebuilds SIFs automatically are in
+[`docs/container-images.md`](docs/container-images.md) — read it before editing a
+`.def`, an `entrypoint.sh`, or `workflows/_shared/manifest_writer.py`.
 
 ## Naming conventions
 
@@ -160,33 +136,53 @@ Before merging: `make test-control-plane-with-db` runs `dbmate up` against a fre
 
 ## Enum parity (Python ↔ Postgres)
 
-Many closed value sets are **deliberately duplicated**: once as a Python `StrEnum` in `qiita-common` (so Pydantic models type-check at import time, with no DB connection) and once as a Postgres `CREATE TYPE ... AS ENUM` (so the database itself rejects bad values). Per issue #37 this duplication is a chosen compromise — the DB is *not* the single source of truth — so do **not** try to derive one side from the other.
+Many closed value sets are **deliberately duplicated**: once as a Python `StrEnum` in
+`qiita-common` (so Pydantic models type-check at import time, with no DB connection) and once
+as a Postgres `CREATE TYPE ... AS ENUM` (so the database itself rejects bad values). This
+duplication is a chosen compromise — the DB is *not* the single source of truth — so do **not**
+derive one side from the other.
 
-Not every closed value set is a Postgres ENUM. `auth_event.event_type`, `reference.status`, `reference.kind`, and `upload.status` are intentionally plain `TEXT` (with a `CHECK` where appropriate) even though their Python twins exist (`AuthEventType`, `ReferenceStatus`, and `UploadStatus` are `StrEnum`s; `ReferenceKind` is a `Literal`) — see those migrations for the rationale. The rules below apply **only** to value sets that are `CREATE TYPE ... AS ENUM`; a `StrEnum`/`Literal` backed by a `TEXT`/`CHECK` column is a valid, deliberate choice and is out of scope for the parity test.
+**Only value sets that are `CREATE TYPE ... AS ENUM` are in scope.** A `StrEnum`/`Literal`
+backed by a `TEXT`/`CHECK` column is a valid, deliberate choice: `auth_event.event_type`,
+`reference.status`, `reference.kind`, and `upload.status` are intentionally plain `TEXT`. A new
+`StrEnum` with no Postgres ENUM is *not* a defect — do not flag it in review.
 
-Whenever you add, rename, or remove a value in an enum that *does* have a Postgres `CREATE TYPE` twin:
+When you add, rename, or remove a value in an enum that *does* have a `CREATE TYPE` twin:
 
-1. **Change both sides in the same PR.** Update the Python `StrEnum` *and* the Postgres ENUM. Postgres ENUM changes go in a **new migration** (`ALTER TYPE ... ADD VALUE` / rename) — editing an already-applied `CREATE TYPE` migration does not reach databases that already ran it (see Database migrations above).
-2. **Keep the two-way comment.** The Python enum's docstring names its Postgres twin; the Postgres `CREATE TYPE` comment names its Python twin. Both must stay accurate so anyone reading either one is reminded of the other.
-3. **Register the pair for the parity test.** `ENUM_PAIRS` in `qiita-control-plane/tests/test_enum_parity.py` lists every `(Python enum, Postgres ENUM)` pair. `test_enum_parity` fails on value drift; `test_all_postgres_enums_are_covered` fails if a Postgres ENUM in the `qiita` schema is not registered there. Both run under `make test-control-plane-with-db`. A brand-new mirrored enum must be added to `ENUM_PAIRS`.
+1. **Change both sides in the same PR.** Postgres ENUM changes go in a **new migration**
+   (`ALTER TYPE ... ADD VALUE`) — editing an already-applied `CREATE TYPE` does not reach
+   databases that already ran it.
+2. **Keep the two-way comment.** The Python enum's docstring names its Postgres twin and vice
+   versa.
+3. **Register the pair in `ENUM_PAIRS`** (`qiita-control-plane/tests/test_enum_parity.py`).
+   `test_enum_parity` fails on drift; `test_all_postgres_enums_are_covered` fails on an
+   unregistered Postgres ENUM. Both run under `make test-control-plane-with-db`.
 
-This also applies when reviewing code: a PR that changes a `CREATE TYPE ... AS ENUM` or its Python twin without the matching other-side change, two-way comment, and `ENUM_PAIRS` entry is incomplete. A new `StrEnum`/`Literal` with no Postgres ENUM is *not* a defect — see the `TEXT`/`CHECK` carve-out above — so do not flag it for a missing ENUM twin.
+A PR that changes one side without the other, the two-way comment, and the `ENUM_PAIRS` entry is
+incomplete.
 
 ## Operator-facing changes (DEPLOY_CHECKLIST.md)
 
-`DEPLOY_CHECKLIST.md` at the repo root is the operator's deploy checklist — **not** a per-PR change log (that's `CHANGELOG.md`, see "Per-PR changelog" below; the git log is the authoritative record). It is structured as one *living* `## Pending deploy` section: a consolidated, deduplicated, ordered checklist of everything merged but not yet deployed. With many devs merging into one deploy, the operator reads exactly one coherent thing, no matter how many PRs contributed. See the file's own preamble for the bucket layout and the deploy/archive lifecycle.
+`DEPLOY_CHECKLIST.md` is the operator's deploy checklist — **not** a per-PR change log (that's
+`CHANGELOG.md`). It is one *living* `## Pending deploy` section: a consolidated, deduplicated,
+ordered checklist of everything merged but not yet deployed. See the file's own preamble for the
+bucket layout, and [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md) for the
+deploy/archive lifecycle.
 
-**A PR with operator-impacting changes folds its steps into `## Pending deploy` in the same PR** — it does **not** add a standalone heading. Run `/deploy-note` on the branch (`.claude/commands/deploy-note.md`); it detects the operator-impacting changes and merges them into the right bucket, tagged with the PR ref. Fold whenever the PR introduces any of:
+**A PR with operator-impacting changes folds its steps into `## Pending deploy` in the same PR**,
+never as a standalone heading. Run `/deploy-note` on the branch. Fold whenever the PR introduces
+a new required env var, a new shared directory / service-account grant / vendored SIF, a
+migration needing out-of-band setup, a new or changed `workflows/` entry, or a soft API-contract
+change downstream clients should know about.
 
-- A new required env var (CP, DP, or CO) — `from_env()` fail-fast keeps the unit *down* without it, so it goes in the env-vars bucket, set before the restart.
-- A new shared directory with specific owner/group/mode, a service-account scope grant, a vendored binary/SIF, or group membership the operator must establish.
-- A migration that needs out-of-band setup beyond a plain `make migrate` (CREATE EXTENSION, manual backfill).
-- A new/changed `workflows/` entry (reaches `qiita.action` via `qiita-admin actions sync`; add a verify check).
-- A soft API-contract change downstream clients should know about (Notes bucket — no host action).
+**Merge, don't append.** Add your line alongside the *existing* lines for that file, never a
+parallel block. The `deploy-note-check` CI job fails a PR that changes an operator-impacting
+surface (a `.env.*.example` var, `db/migrations/`, `workflows/`, `auth/scopes.py`) without
+touching `DEPLOY_CHECKLIST.md`; the `no-deploy-note` label opts out.
 
-A PR that only changes Python/Rust code, tests, docs, or migrations the dbmate flow handles autonomously needs no fold. When in doubt: "if the operator follows `redeploy.md` without reading this PR, does the deploy succeed and behave as intended?" If no, fold.
-
-**Merge, don't append.** Folding means adding your line alongside the *existing* lines for that file (e.g. one more `sudo bash -c 'echo "KEY=value" >> …compute-orchestrator.env'` next to the others), never starting a parallel block. Reviewers check that an operator-impacting PR folded its steps in and that buckets weren't duplicated. The `deploy-note-check` CI job (`.github/workflows/ci.yml`) also fails a PR that changes an operator-impacting surface (a `.env.*.example` var, a `db/migrations/` file, `workflows/`, or `auth/scopes.py`) without touching `DEPLOY_CHECKLIST.md` — a PR that genuinely needs no operator action carries the `no-deploy-note` label to opt out. The deploy/archive procedure itself — how the operator runs `## Pending deploy`, and how a maintainer archives it off-host via `/deploy-archive` — lives in [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md), the single source of truth for that lifecycle; don't restate it here or in the deploy checklist.
+A PR that only changes Python/Rust code, tests, docs, or migrations the dbmate flow handles
+autonomously needs **no** fold. When in doubt: "if the operator follows `redeploy.md` without
+reading this PR, does the deploy succeed and behave as intended?" If no, fold.
 
 ## Per-PR changelog (CHANGELOG.md)
 
@@ -194,99 +190,39 @@ A PR that only changes Python/Rust code, tests, docs, or migrations the dbmate f
 
 **Every PR adds an entry** under `## [Unreleased]`. The `changelog-check` CI job (`.github/workflows/ci.yml`) fails any PR whose diff doesn't touch `CHANGELOG.md`; a PR that genuinely warrants no entry (a typo fix, a CI-only tweak) carries the `no-changelog` label to opt out. This is a deliberately blanket gate — unlike `deploy-note-check`, it fires on *every* PR, not just operator-impacting ones. A change can warrant a `CHANGELOG.md` entry, a `DEPLOY_CHECKLIST.md` fold, or both; keep the two files from drifting into each other (the changelog says *what changed*, the checklist says *what the operator must do*).
 
+**Never create a new bucket heading** — duplicate headings are how the file previously grew to 5,745 lines with eleven of them. Add your bullet under the existing `### Added` / `### Changed` / `### Fixed` / `### Removed`. Entries predating the last rotation live in [`docs/changelog-archive/`](docs/changelog-archive/).
+
 ## Deployments
 
-We deploy **many PRs at once**: development is a sequence of PRs to `main`, then a single manual deploy that rolls out everything merged since the host's last deploy. We do **not** cut releases yet. The operator-facing instructions for that deploy are the single consolidated `## Pending deploy` checklist in `DEPLOY_CHECKLIST.md` (see the section above), which each PR folds its steps into as it merges. The standing procedure is [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md) (incremental); [`docs/runbooks/first-deploy.md`](docs/runbooks/first-deploy.md) is bootstrap-only.
+We deploy **many PRs at once**: a sequence of PRs to `main`, then a single manual deploy. We do
+not cut releases. Migrations are applied **out-of-band, before the restart** (`make migrate` is
+a separate operator step — `activate.sh` asserts every shipped migration is recorded and aborts
+before any restart if one is missing). New required env vars are written **before** the restart,
+or `from_env()` fail-fast keeps the unit down.
 
-Invariants that hold for every deploy — enforce them when writing deploy-affecting code or reviewing it:
-
-- **Migrations are applied out-of-band, before the restart.** `deploy/local-deploy.sh` and `deploy/activate.sh` do **not** run `dbmate` — `make migrate` is a separate operator step (auto-applying migrations during a deploy is unsafe for expand/contract changes). New code must never assume a schema the deploy script itself will produce. `activate.sh` *does* assert every shipped migration is recorded in `public.schema_migrations` and aborts the deploy before any service restart if one is missing — so a forgotten `make migrate` fails loudly instead of 500ing at runtime. Don't weaken that guard.
-- **Env vars are written before the restart, not after.** Any new required env var (CP/DP/CO) is caught by `from_env()` fail-fast at boot, which means a missing one keeps the systemd unit *down*. The DEPLOY_CHECKLIST.md entry that introduces the var must tell the operator to set it before `local-deploy.sh`, and the var belongs in the matching `.env.*.example`.
-- **`local-deploy.sh` is idempotent and re-runnable.** It rsyncs all four components + `workflows/` + `scripts/`, `uv sync`s with `--reinstall-package qiita-common` (cross-package staleness), runs `qiita-admin actions sync`, and restarts only services whose env file exists. A failed deploy is safe to re-run after fixing the cause.
-- **Workflow YAML ships out-of-tree and is synced, not migrated.** New/changed files under `workflows/` reach `qiita.action` via `qiita-admin actions sync` (run inside `activate.sh`), not via a DB migration.
-- **Container SIFs are built during the deploy, before the restart, and chowned to `qiita-orch`.** `activate.sh` runs `deploy/build-sifs.sh` (which wraps the single generic `scripts/build-sif.sh`) after the rsync and before any service restart: it builds as root, then `chown`s each produced SIF to `qiita-orch`. It is **idempotent** — an unchanged image costs only a fast verify — via a two-gate check (`VERIFY_MATCH` *and* a build-inputs content hash; see "Container image tier"). Absent prerequisites (no `apptainer`, no `PATH_DERIVED`, an unstaged licensed `SOURCES`, or `AUTO_BUILD=0` in a spec) **clean-skip** that image; only a genuine `apptainer build`/`chown` failure aborts the deploy — before any restart, like the migration guard. This is the one build-time action `activate.sh` takes; it stays generic (it hardcodes no workflow — it iterates the per-workflow specs, see "Container image tier").
-
-Operator helpers (do not weaken the invariants above): `make redeploy` (`deploy/redeploy.sh`) is the all-in-one guided redeploy — **run as root** (`sudo make redeploy`) from the admin account, it `sudo -u`'s into the operator (`qiita`) for pull/migrate and into the service accounts (`qiita-api`/`qiita-orch`) for verify, so the no-sudo operator never has to log in (matches the `first-deploy.md` two-role split and `local-deploy.sh`'s own pattern). It reads `DATABASE_URL` from `control-plane.env` itself and hands it to the operator's `make migrate` (so the operator's shell needn't have it), and it **verifies migrations ran and refuses otherwise, it never auto-applies them** (the out-of-band invariant stands; `RUN_MIGRATE=1` opts in after a typed confirm). `make preflight` (`deploy/preflight.sh`) is a read-only config/secret consistency check (PATH_SCRATCH byte-identity, Flight keypair CP↔DP correspondence, token-file perms, connection-string shape) that prints non-secret fingerprints; the host-file secret model (per-service `/etc/qiita/*.env` + separate `0400`/`0440` token files, hand-installed once) is unchanged. `make verify-deploy` (`deploy/verify.sh`) is the single generic post-deploy check (health, `qiita.action` list, `compute-readiness`) with the correct service account/env baked in for each — so the `compute-readiness` run-as is never hand-copied (the recurring #72 defect). `local-deploy.sh`/`activate.sh` stay generic (no per-workflow hardcoding; per-deploy specifics live in the deploy checklist). `preflight.sh`/`verify.sh` are additive and read-only; `build-sifs.sh` (invoked by `activate.sh`) is the one that *writes* — it builds container SIFs and chowns them to `qiita-orch` (see the SIF invariant above), idempotently and before any restart.
-
-When a change touches the deploy path (a new env var, a new `workflows/` entry, a migration needing out-of-band setup, a new host directory, a service-account scope grant), the same PR must: fold its steps into `## Pending deploy` (via `/deploy-note`), update the relevant `.env.*.example`, and — if the standing procedure changes — update `redeploy.md`. Keep `local-deploy.sh`/`activate.sh` generic; per-deploy specifics live in the deploy checklist, never hardcoded in the scripts.
+The full invariant list, the operator helper scripts (`redeploy`, `preflight`, `verify-deploy`),
+and what each one must not weaken are in [`docs/deployments.md`](docs/deployments.md). The
+standing procedure is [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md).
 
 ## Architecture
 
-See `docs/architecture.md` for the full system diagram, `docs/reference-data-staging.md` for how reference databases are ingested, `docs/auth.md` for the authentication / authorization surface (principal subtypes, OIDC + opaque-token paths, role/scope ceilings, admin endpoints, and the `qiita-admin` CLI), and `docs/duckdb-miint.md` for the duckdb-miint SQL extension that powers our bioinformatics functions — that file carries a `Last checked` date; re-verify a signature against upstream before relying on it if the file looks stale. Operational runbooks for the auth surface live under `docs/runbooks/`. What follows is the non-obvious cross-cutting structure.
+`docs/architecture.md` is the system reference — the diagram, the component map and ports, the
+identifier hierarchy, the data-plane Flight design, the compute-orchestrator pattern, and the
+workflow runner all live there, under **Cross-cutting structure**. Read the section you need
+rather than the whole file; it runs past 1,500 lines.
 
-### Component map and ports
-
-| Component | Language | Port | Role |
-|---|---|---|---|
-| `qiita-control-plane` | Python / FastAPI | 8080 | REST API, all identifier minting |
-| `qiita-data-plane` | Rust / Arrow Flight (tonic) | 50051 | Bulk data I/O over gRPC |
-| `qiita-compute-orchestrator` | Python / FastAPI | 8081 | SLURM job lifecycle |
-| `qiita-common` | Python (path dep) | — | Shared Pydantic models, config, REST client |
-
-nginx terminates TLS and routes: `REST → :8080`, `gRPC → :50051` (load-balanced across N data plane instances via `upstream qiita_data_plane` in `deploy/nginx/qiita.conf`).
-
-### Identifier ownership
-
-**All uint64 identifiers are minted exclusively by the control plane.** The data plane treats every identifier as an opaque integer. The hierarchy is:
-
-```
-study_idx → prep_idx → sample_idx → prep_sample_idx → processing_idx → processed_prep_sample_idx
-```
-
-`processing_idx` deduplicates on `SHA-256(canonical JSON parameters)` — same workflow + version + params always resolves to the same `processing_idx`.
-
-Reference identifiers form a parallel hierarchy:
-
-```
-reference_idx ── reference_membership ── feature_idx ── feature_genome ── genome_idx
-```
-
-- `reference_idx` = (name, version) pair for a reference database; `kind` distinguishes sequence references from taxonomy authorities
-- `genome_idx` = logical entity across references (nullable — not all features are genomes, e.g., 16S records). Keyed by `(source, source_id)`; whether that `source_id` is an external accession or an internal name is per-`source`, and `repositories/exported_feature.py` is the authority
-- `feature_idx` = specific sequence, deduplicated by MD5 hash via DuckDB `md5()` (identical bytes = same `feature_idx`). A **BIGINT identity** — the 128-bit hash is the separate `feature.sequence_hash uuid`. A feature's human-facing name lives on the *membership* (`reference_membership.accession`, nullable), not on `feature`
-
-`feature_idx` bridges sample processing results (alignment detail, counts) and reference data (sequences, taxonomy, annotations, phylogeny). Alignment output contains `feature_idx` but **not** `reference_idx` — reference scoping is a query-time join against `reference_membership`.
-
-Phylogeny internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. A tip carries its own `feature_idx` **column** on the DuckLake `reference_phylogeny` row (NULL on internal nodes); there is no junction table, and no exclusion-aware `_visible` view — see [`docs/architecture.md`](docs/architecture.md) under "Phylogeny and Placements" for why, and what a consumer must do instead.
-
-**Hash storage: never carry MD5 as VARCHAR.** DuckDB's `md5(x)` returns the 32-char hex string by default — never write the string form into a column, temp table, or Parquet file. Cast to `UUID` (`md5(x)::uuid`, 128-bit internally) or use `md5_number(x)` for `UHUGEINT`. Both are 16-byte fixed-width, compare/JOIN as integers, and match the Postgres `uuid` column type the wire-side `sequence_hash` already uses — a string-form intermediate forces a CAST at write time and burns memory + I/O between phases. Same rule applies to any other content hash (SHA-256 as fixed-width bytes, etc.); pick the narrowest integer / fixed-width type the hash fits in.
-
-### Data plane design
-
-The data plane is intentionally "dumb": it only operates on identifiers it receives. Its three Arrow Flight operations map directly to DuckLake:
-
-- **DoGet** — select rows by identifier set from a signed Flight ticket
-- **DoPut** — stream RecordBatches to the shared filesystem (`/scratch/ephemeral/staging/`)
-- **DoAction** — register Parquet into DuckLake, delete, or insert from processing method
-
-**Flight ticket signing**: the control plane signs tickets with Ed25519 (asymmetric) before handing them to clients — it holds the private seed (`FLIGHT_TICKET_SIGNING_KEY`); the publicly-reachable data plane holds only the public key (`FLIGHT_TICKET_PUBLIC_KEY`) and verifies signatures on every request, so a data-plane compromise cannot forge tickets. It never trusts the client's claimed identifiers directly.
-
-**Ticket replay is an accepted risk, and every DoAction must stay replay-safe.** Flight tickets have no single-use ledger (the data plane is stateless by design), so a still-valid ticket can be replayed within its ~1h lifetime. We accept this because every DoAction variant is idempotent or otherwise replay-safe. This invariant is enforced: the `REPLAY_SAFE_ACTIONS` registry in `qiita-data-plane/src/flight_service.rs` gates the `do_action` dispatcher (an unlisted action is rejected), a test pins the registry to the dispatcher's arms, and an anchored `# replay:` comment sits at the dispatch. When you add a DoAction, make it idempotent/replay-safe and add it to the registry — or, if it can't be, add replay protection before shipping. See [`docs/auth.md#ticket-replay`](docs/auth.md).
-
-**Result file requirements**: Parquet files written by SLURM jobs must be mode `440` (verified before registration) and must contain the identifier columns sorted in this exact order: `study_idx, prep_idx, sample_idx, prep_sample_idx, processing_idx, processed_prep_sample_idx`. This sort order enables both DuckLake catalog-level file pruning and Parquet row-group predicate pushdown.
-
-**Horizontal scaling**: each data plane instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog. DuckLake's snapshot isolation means instances never block each other. Add instances to `upstream qiita_data_plane` in nginx to scale.
-
-**Two Rust build flavors**: `make build-data-plane` produces a release binary with `--features duckdb/bundled` (statically linked, slow to build). `make build-data-plane-debug` produces a debug binary that dynamically links libduckdb via `DUCKDB_DOWNLOAD_LIB=1` (fast). `make test-integration` and `make test-system` depend on the debug binary because Python integration tests spawn it directly from its target path instead of shelling out to `cargo run`.
-
-### Compute orchestrator pattern
-
-The orchestrator is a passive, **stateless** HTTP service: the control-plane runner drives the decoupled `POST /api/v1/step/{submit,status,result}` trio (plus `POST /api/v1/step/find-by-name`), each dispatching to the configured `ComputeBackend`. `submit_step` `sbatch`es and returns a handle (SLURM job id + workspace paths) immediately; `status_step` is a single non-looping slurmrestd read; `result_step` verifies output (identifier integrity + file mode) and returns the paths. **The CP owns the poll loop** — the orchestrator holds no in-flight job state between calls, so a long job never holds the CP→CO connection open and a CP restart re-attaches from persisted `qiita.work_ticket_step` progress. SLURM jobs themselves remain dumb (read input, write output, exit).
-
-**The orchestrator has no DB access** — workflow lifecycle and DB writes happen entirely on the control plane side. CO → CP callbacks exist today for `POST /sequence-range` (called by the native `fastq_to_parquet` step) and authenticate with the compute service-account PAT (site-chosen principal name; `compute` on the live deploy) installed at `/etc/qiita/co-to-cp.token` ([provisioning](docs/runbooks/compute-service-account-provisioning.md), [rotation](docs/runbooks/orchestrator-token-rotation.md)). SLURM-backend integration (cluster prereqs, identity model, the `qiita-job` JWT auto-refresh timer) lives in [`docs/runbooks/slurm-backend-setup.md`](docs/runbooks/slurm-backend-setup.md).
-
-The control plane's submit-time gate is **one ticket in flight per scope target**: `_check_disallow_without_delete` (`routes/work_ticket.py`) 409s a submission while another ticket for the same `(scope_target, action_id, action_version)` is in a non-terminal state, with the six `work_ticket_one_in_flight_per_*` partial unique indexes as the atomic backstop (`..._per_shard` covers the sharded reference fan-out, and `..._per_reference` excludes it with `shard_id IS NULL`). Every arm — reference, study_prep, prep_sample, block, sequenced_pool — binds `NON_TERMINAL_WORK_TICKET_STATES` and nothing else, so a terminal ticket does not block, COMPLETED included. The one exception is `sequenced_pool`, which additionally refuses a submit over a COMPLETED pool ticket (the pool's reads are already registered in the lake) unless `force=true`, gated to wet_lab_admin+.
-
-**Disallow-without-delete is per-result, and lives outside that ticket check.** Two of the three sites are submit-time planners: the align planner refuses a fresh (`only_missing=false`) plan for any sample already carrying an `alignment_sample` gate row under the resolved `alignment_idx` — DELETE the alignment definition to re-align — and the block planner does the same on `mask_sample` under the resolved `mask_idx`. The third fires at step-run instead: `POST /sequence-range` (`routes/sequence_range.py`) 409s on the unique violation when a prep_sample already has a range, and the orchestrator's `sequence_range_retry.py` turns a range minted by a different ticket into a permanent failure naming the DELETE that clears it — so a read-ingest resubmission over a COMPLETED sample is admitted and then dies. Where no site applies, an action is resubmittable as it stands: a `long-read-assembly` submission over an already-COMPLETED prep_sample runs to completion, and what keeps it from duplicating its lake rows is the data plane's replace-by-key (`REPLACE_KEY_TABLES`), not a refusal.
-
-### Workflow runner
-
-`qiita_control_plane.runner.run_workflow` walks an action's `steps:` list for a single `qiita.work_ticket`. Lives in the control plane (direct DB access for work_ticket / action / reference rows is legitimate here). For each entry:
-
-- `step:` — calls the orchestrator over HTTP via `qiita_common.compute_backend_client.ComputeBackendClient`, driving `submit_step` → poll `status_step` (CP-side loop, ~10s) → `result_step`. Per-`(step_index, attempt)` progress is written to `qiita.work_ticket_step` (write-ahead `submitting` before submit) so a CP restart re-attaches via `reconcile_inflight_tickets` instead of failing in-flight work. A CO-unreachable error is transient and retried in place, never failing the ticket.
-- `action:` — calls the matching primitive in `qiita_control_plane.actions.library.LIBRARY` directly, no HTTP hop.
-
-Status PATCHes declared in YAML (`target_status`) call `qiita_control_plane.actions.reference.transition_reference_status` in-process. Same atomic, transition-validated UPDATE the public `PATCH /reference/{idx}/status` route uses.
+| Looking for | Read |
+|---|---|
+| system diagram, components, ports, identifier hierarchy, Flight ops, orchestrator, runner | [`docs/architecture.md`](docs/architecture.md) |
+| how a `container:` filename resolves to a SIF, the generic builder, spec forms, idempotency | [`docs/container-images.md`](docs/container-images.md) |
+| deploy invariants and the operator helper scripts | [`docs/deployments.md`](docs/deployments.md) |
+| the three test tiers and what infrastructure each needs | [`docs/testing.md`](docs/testing.md) |
+| how reference databases are ingested | [`docs/reference-data-staging.md`](docs/reference-data-staging.md) |
+| the auth surface — principals, OIDC, scopes, admin endpoints | [`docs/auth.md`](docs/auth.md) |
+| the duckdb-miint SQL extension | [`docs/duckdb-miint.md`](docs/duckdb-miint.md) |
+| writing a native job module | [`docs/writing-a-job.md`](docs/writing-a-job.md) |
+| operational runbooks | [`docs/runbooks/`](docs/runbooks/) |
+| changelog entries predating the last rotation | [`docs/changelog-archive/`](docs/changelog-archive/) |
 
 ### qiita-common as a path dependency
 
@@ -309,14 +245,7 @@ The checked-in `.claude/settings.json` sets `PYTEST_ADDOPTS`, `CARGO_TERM_QUIET`
 
 ### Test layout and tiers
 
-The test suite is split into three tiers by the infrastructure each one needs:
-
-- **Pure-unit** (no infrastructure): `make test`. Pure Python + Rust unit tests across all components. Excludes tests carrying the `db` marker.
-- **Control-plane with DB**: `make test-control-plane-with-db`. Brings up Postgres on :5433 (or uses host Postgres via `QIITA_USE_HOST_POSTGRES=1`), applies dbmate migrations, and runs every control-plane test including the `db`-marked ones. Tests opt in either at module scope (`pytestmark = pytest.mark.db` — pulls every test in the file into the DB tier) or per-test (`@pytest.mark.db` decorator on the function — for mixed modules where only some tests need a DB).
-- **Cross-component integration**: `make test-integration`. Same Postgres, plus builds the data-plane debug binary; runs the Python integration suite, then resets the `qiita_ducklake` catalog and runs the Rust DuckLake tests. System tests (`@pytest.mark.system`) are excluded — run those with `make test-system`.
-
-**Shared fixtures across tiers**: the DB / session / OIDC-JWKS fixtures live in `qiita-control-plane/src/qiita_control_plane/testing/` and are imported by both the control-plane and integration conftests so they cannot drift.
-
-**Postgres harness**: `docker-compose.yml` + `initdb/` live under `qiita-control-plane/tests/_postgres/` and are reused by both DB-bound tiers. Port `5433` (not `5432`) avoids collision with a host Postgres.
-
-**DuckLake catalog reset between phases**: `make test-integration` runs the Python suite, drops and recreates the `qiita_ducklake` Postgres database, then runs the Rust suite. DuckLake pins `DATA_PATH` into the catalog at creation time and the two suites use different `DATA_PATH` values; reusing the catalog produces confusing "path mismatch" failures. The Python conftest has the same drop/recreate logic so a single phase is self-contained too — keep the two mechanisms in sync.
+Three tiers by the infrastructure each needs: `make test` (pure-unit, no infrastructure),
+`make test-control-plane-with-db` (adds the `db`-marked tests), `make test-integration`
+(cross-component, Docker). Details, markers, the Postgres harness, and the DuckLake catalog
+reset are in [`docs/testing.md`](docs/testing.md).
