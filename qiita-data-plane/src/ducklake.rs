@@ -431,6 +431,12 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 /// `flight_service::ALIGNMENT_PROJECTION_COLUMNS`, which mirrors the column list
 /// below. An unscoped or unprojected read is refused. This is host-depleted
 /// derived data, not raw human reads.
+///
+/// The second table, `alignment_origin_spanning`, records which `alignment` rows
+/// are one read that crossed a circular contig's origin; its contract is on its
+/// DDL below. It is created here rather than by its own `ensure_*` because
+/// `delete_alignment` / `delete_alignment_block` drop from both, so a catalog
+/// holding one without the other fails those deletes.
 pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qiita_lake.alignment (
@@ -462,6 +468,112 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             tag_yt           VARCHAR,
             tag_md           VARCHAR,
             tag_sa           VARCHAR
+        );
+
+        -- Evidence that a set of `alignment` rows is one read crossing the origin
+        -- of a circular contig. An aligner treats a circular contig as a linear
+        -- one, so a read that crosses the origin emits one SAM record per side of
+        -- it — more when the read is longer than the contig and wraps past the
+        -- origin more than once. Identity and mapq do not separate those records
+        -- from any other good alignment; query coverage does, because each covers
+        -- only its own share of the read. Upstream documents the behaviour and
+        -- ships the aggregate that pools it —
+        -- https://the-miint.github.io/duckdb-miint/alignment_analysis/#circular-query-coverage
+        -- — and `test_origin_spanning_read_splits_into_one_record_per_side` pins
+        -- the per-record numbers our own gate turns on. The fragment rows stay in
+        -- `alignment` unchanged, one per SAM record with its CIGAR; only the
+        -- merged read is recorded here, and only where the evidence exists.
+        --
+        -- Scope: this describes rows written by a producer that scores a read the
+        -- way miint's `circular_query_coverage` does — pooling the fragments'
+        -- QUERY INTERVALS, i.e. the union of the query bases they align over the
+        -- read length — because that is what admits the fragments to `alignment`
+        -- in the first place. Pooling a CONCATENATED CIGAR is a different number
+        -- and does not admit them: each fragment clips the other's share of the
+        -- read and that clip re-enters `cigar_query_coverage`'s denominator, so
+        -- `string_agg(cigar, '')` over an origin-spanning pair scores what one
+        -- fragment alone scores. The concatenating form is the only pooled
+        -- query-coverage gate in the repo (`align_sharded`'s phase-2 QUALIFY), so
+        -- extending that gate to the single-end arm admits nothing and leaves this
+        -- table empty. Identity is unaffected by the same concatenation — a clip
+        -- is not an aligned column, so it never enters the denominator.
+        --
+        -- The sharded reference aligner is not a producer as it stands, either.
+        -- `align_sharded`'s phase-1 COPY applies
+        -- `_MIN_QUERY_COVERAGE_MINIMAP2` per SAM record on the way into the
+        -- staging Parquet, and minimap2 serves only the single-end long-read arm
+        -- there (`align_planner._ALIGNER_BY_PLATFORM`), so an origin-spanning
+        -- read's fragments are filtered out before they are persisted; the pooled
+        -- QUALIFY in its phase 2 runs on the paired-end arm alone.
+        --
+        -- Nothing writes the table yet. `register_files` loads it from a staging
+        -- `alignment_origin_spanning.parquet` — the control plane derives the
+        -- table name from the file stem — and no job under
+        -- `qiita_compute_orchestrator.jobs` emits that file.
+        --
+        -- CONTRACT for such a producer's rows: one row per (read, feature), and a
+        -- consumer applying a query-coverage predicate to `alignment` MUST LEFT
+        -- JOIN this table on (alignment_idx, prep_sample_idx, sequence_idx,
+        -- feature_idx) and judge a matched read on `pooled_coverage` instead —
+        -- `alignment` alone shows the read as one row per fragment, each of
+        -- partial query coverage, so a per-row floor drops it. feature_idx is in
+        -- the key because a read's placements on different features are different
+        -- subjects, scored separately; the same reason
+        -- `qiita_common.feature_table.PAIRED_PLACEMENT_PARTITION` carries it.
+        -- Dropping it pools a fragment onto another feature's score.
+        --
+        -- Superseded by delete-then-register, like `alignment` itself, not by
+        -- `flight_service::REPLACE_KEY_TABLES`: a replace-by-key delete reads the
+        -- keys out of the incoming file, and a re-run that no longer finds a read
+        -- origin-spanning writes no row for it, so it would name no key and the
+        -- stale row would survive its own fragments. `delete_alignment_block`
+        -- deletes by footprint instead and so covers reads the new run omits.
+        CREATE TABLE IF NOT EXISTS qiita_lake.alignment_origin_spanning (
+            -- `alignment`'s leading four, same names, types and order.
+            -- alignment_idx / prep_sample_idx / sequence_idx are NOT NULL because
+            -- the delete predicates name them — `delete_alignment` on
+            -- alignment_idx, `delete_alignment_block` on that plus
+            -- `block_read_where_clause`'s prep_sample_idx / sequence_idx — and a
+            -- NULL is a row no delete can reach. feature_idx is NOT NULL because
+            -- it is the contig whose origin the interval below wraps, and because
+            -- it completes the join key above.
+            alignment_idx   BIGINT NOT NULL,
+            prep_sample_idx BIGINT NOT NULL,
+            sequence_idx    BIGINT NOT NULL,
+            feature_idx     BIGINT NOT NULL,
+            -- The merged QUERY interval. A read that wraps the origin still covers
+            -- the query contiguously, so one pair describes it.
+            query_start     BIGINT,
+            query_stop      BIGINT,
+            -- The circular REFERENCE interval, on `alignment.position` /
+            -- `stop_position`'s axis. feature_start > feature_stop means the
+            -- interval wraps the origin. Resolving a wrapped interval to bases
+            -- needs the subject's length, which is not duplicated here: join
+            -- `sequence_length_bp` on feature_idx in whichever table holds this
+            -- producer's subjects — `reference_sequences` when they are reference
+            -- features, `assembled_sequence` when they are a sample's own contigs.
+            feature_start   BIGINT,
+            feature_stop    BIGINT,
+            -- Strand of the read relative to the contig — miint's
+            -- `alignment_is_reverse` over the fragments' `flags`. Derivable from a
+            -- join back to those rows; carried here so this table stands alone,
+            -- since reverse is where the interval interpretation flips.
+            is_reverse      BOOLEAN,
+            -- The pooled scores that admitted the read. Defined as miint's
+            -- `circular_query_coverage` defines them, so two producers cannot fill
+            -- these columns with different numbers: `pooled_coverage` is its
+            -- `coverage` (the fragments' query intervals unioned, over the read
+            -- length) and `pooled_identity` is its `identity`, which it takes from
+            -- `cigar_pooled_identity` — matching bases over aligned bases across
+            -- the fragments, not a mean of their per-fragment identities. The
+            -- upstream link in the table note above carries both. Recorded nowhere
+            -- else: `alignment` carries the per-fragment CIGARs these are pooled
+            -- from, not the pooled result.
+            pooled_identity DOUBLE,
+            pooled_coverage DOUBLE,
+            -- SAM records merged into this row. BIGINT so a producer's count(*)
+            -- registers without a cast.
+            fragment_count  BIGINT
         );",
     )?;
     Ok(())
@@ -679,6 +791,24 @@ mod tests {
         // them and correctly do NOT re-set them.
         set_catalog_options(&conn).expect("failed to set catalog options");
         conn
+    }
+
+    /// `(column_name, data_type, is_nullable)` for one `qiita_lake` table, in
+    /// declared order, for the schema-drift assertions below. `is_nullable` is
+    /// carried because NOT NULL is a property both alignment DDLs argue for
+    /// explicitly; without it, dropping every NOT NULL leaves these tests green.
+    fn table_schema(conn: &Connection, table: &str) -> Vec<(String, String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name, data_type, is_nullable \
+                 FROM information_schema.columns \
+                 WHERE table_name = ? ORDER BY ordinal_position",
+            )
+            .unwrap();
+        stmt.query_map([table], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
     }
 
     /// Guard that cleans up test rows on drop, even if the test panics.
@@ -970,47 +1100,148 @@ mod tests {
         ensure_alignment_tables(&conn).expect("first ensure_alignment_tables");
         ensure_alignment_tables(&conn).expect("second ensure_alignment_tables (idempotent)");
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT column_name, data_type FROM information_schema.columns \
-                 WHERE table_name = 'alignment' ORDER BY ordinal_position",
-            )
-            .unwrap();
-        let cols: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
+        let cols = table_schema(&conn, "alignment");
         // 5 CP identity columns + the miint SAM columns MINUS the raw subject ids
         // (a.* EXCLUDE (read_id, reference, mate_reference)), in align_sharded COPY
         // order.
-        let expected: &[(&str, &str)] = &[
-            ("alignment_idx", "BIGINT"),
-            ("prep_sample_idx", "BIGINT"),
-            ("sequence_idx", "BIGINT"),
-            ("feature_idx", "BIGINT"),
-            ("mate_feature_idx", "BIGINT"),
-            ("flags", "USMALLINT"),
-            ("position", "BIGINT"),
-            ("stop_position", "BIGINT"),
-            ("mapq", "UTINYINT"),
-            ("cigar", "VARCHAR"),
-            ("mate_position", "BIGINT"),
-            ("template_length", "BIGINT"),
-            ("tag_as", "BIGINT"),
-            ("tag_xs", "BIGINT"),
-            ("tag_ys", "BIGINT"),
-            ("tag_xn", "BIGINT"),
-            ("tag_xm", "BIGINT"),
-            ("tag_xo", "BIGINT"),
-            ("tag_xg", "BIGINT"),
-            ("tag_nm", "BIGINT"),
-            ("tag_yt", "VARCHAR"),
-            ("tag_md", "VARCHAR"),
-            ("tag_sa", "VARCHAR"),
+        let expected: &[(&str, &str, &str)] = &[
+            ("alignment_idx", "BIGINT", "NO"),
+            ("prep_sample_idx", "BIGINT", "NO"),
+            ("sequence_idx", "BIGINT", "NO"),
+            ("feature_idx", "BIGINT", "NO"),
+            ("mate_feature_idx", "BIGINT", "YES"),
+            ("flags", "USMALLINT", "YES"),
+            ("position", "BIGINT", "YES"),
+            ("stop_position", "BIGINT", "YES"),
+            ("mapq", "UTINYINT", "YES"),
+            ("cigar", "VARCHAR", "YES"),
+            ("mate_position", "BIGINT", "YES"),
+            ("template_length", "BIGINT", "YES"),
+            ("tag_as", "BIGINT", "YES"),
+            ("tag_xs", "BIGINT", "YES"),
+            ("tag_ys", "BIGINT", "YES"),
+            ("tag_xn", "BIGINT", "YES"),
+            ("tag_xm", "BIGINT", "YES"),
+            ("tag_xo", "BIGINT", "YES"),
+            ("tag_xg", "BIGINT", "YES"),
+            ("tag_nm", "BIGINT", "YES"),
+            ("tag_yt", "VARCHAR", "YES"),
+            ("tag_md", "VARCHAR", "YES"),
+            ("tag_sa", "VARCHAR", "YES"),
         ];
-        let got: Vec<(&str, &str)> = cols.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+        let got: Vec<(&str, &str, &str)> = cols
+            .iter()
+            .map(|(n, t, null)| (n.as_str(), t.as_str(), null.as_str()))
+            .collect();
         assert_eq!(got, expected, "alignment table schema/order drift");
+    }
+
+    /// `ensure_alignment_tables` also lays down the `alignment_origin_spanning`
+    /// side table, idempotently (it runs on every DP restart), with the column
+    /// order and types a producer's Parquet must carry to register without a cast.
+    /// The identity columns' types are `alignment`'s; the interval columns are on
+    /// `alignment.position` / `stop_position`'s axis and share their BIGINT.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_alignment_tables_lays_down_alignment_origin_spanning() {
+        let conn = setup_conn();
+        ensure_alignment_tables(&conn).expect("first ensure_alignment_tables");
+        ensure_alignment_tables(&conn).expect("second ensure_alignment_tables (idempotent)");
+
+        let cols = table_schema(&conn, "alignment_origin_spanning");
+        let expected: &[(&str, &str, &str)] = &[
+            ("alignment_idx", "BIGINT", "NO"),
+            ("prep_sample_idx", "BIGINT", "NO"),
+            ("sequence_idx", "BIGINT", "NO"),
+            ("feature_idx", "BIGINT", "NO"),
+            ("query_start", "BIGINT", "YES"),
+            ("query_stop", "BIGINT", "YES"),
+            ("feature_start", "BIGINT", "YES"),
+            ("feature_stop", "BIGINT", "YES"),
+            ("is_reverse", "BOOLEAN", "YES"),
+            ("pooled_identity", "DOUBLE", "YES"),
+            ("pooled_coverage", "DOUBLE", "YES"),
+            ("fragment_count", "BIGINT", "YES"),
+        ];
+        let got: Vec<(&str, &str, &str)> = cols
+            .iter()
+            .map(|(n, t, null)| (n.as_str(), t.as_str(), null.as_str()))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "alignment_origin_spanning schema/order drift"
+        );
+    }
+
+    /// The join key the `alignment_origin_spanning` DDL states — (alignment_idx,
+    /// prep_sample_idx, sequence_idx, feature_idx) — attaches an evidence row to
+    /// its own feature's fragments and to nothing else.
+    ///
+    /// The fixture is the case the key exists for: one read placed on two
+    /// features, origin-spanning on the first only. Under the four-column key the
+    /// feature-11 row is unmatched and a consumer judges it on its own per-row
+    /// coverage; drop feature_idx from the key and it is admitted on the pooled
+    /// coverage computed for feature 10, a different subject.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn origin_spanning_join_key_matches_only_its_own_feature() {
+        let conn = setup_conn();
+        ensure_alignment_tables(&conn).expect("ensure_alignment_tables");
+
+        // Unique ids so leftover rows never collide with the other serial tests.
+        let align: i64 = 970_000;
+        let prep: i64 = 970_010;
+        let _cleanup = Cleanup {
+            conn: &conn,
+            table: "alignment",
+            column: "alignment_idx",
+            id: align,
+        };
+        let _cleanup_os = Cleanup {
+            conn: &conn,
+            table: "alignment_origin_spanning",
+            column: "alignment_idx",
+            id: align,
+        };
+
+        conn.execute_batch(&format!(
+            "INSERT INTO qiita_lake.alignment \
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx, cigar) VALUES \
+                 ({align}, {prep}, 1, 10, '3000=3000S'), \
+                 ({align}, {prep}, 1, 10, '3000H3000='), \
+                 ({align}, {prep}, 1, 11, '3000=3000S');
+             INSERT INTO qiita_lake.alignment_origin_spanning \
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx, pooled_coverage) \
+                 VALUES ({align}, {prep}, 1, 10, 1.0);"
+        ))
+        .unwrap();
+
+        let matched: Vec<(i64, Option<f64>)> = conn
+            .prepare(&format!(
+                "SELECT a.feature_idx, os.pooled_coverage \
+                 FROM qiita_lake.alignment a \
+                 LEFT JOIN qiita_lake.alignment_origin_spanning os \
+                   ON os.alignment_idx = a.alignment_idx \
+                  AND os.prep_sample_idx = a.prep_sample_idx \
+                  AND os.sequence_idx = a.sequence_idx \
+                  AND os.feature_idx = a.feature_idx \
+                 WHERE a.alignment_idx = {align} \
+                 ORDER BY a.feature_idx, a.cigar"
+            ))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(
+            matched,
+            vec![(10, Some(1.0)), (10, Some(1.0)), (11, None)],
+            "the four-column key must attach the evidence row to feature 10's two \
+             fragments and leave feature 11 unmatched"
+        );
     }
 
     /// ensure_exclusion_tables is idempotent (run on every DP restart) and lays
