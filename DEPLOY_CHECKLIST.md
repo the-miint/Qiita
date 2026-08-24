@@ -22,7 +22,7 @@ mean every absolute path the orchestrator can open is nameable through the API. 
 absolute dirs; `/` is refused.
 
 ```bash
-sudo bash -c 'grep -q "^PATH_INGEST_ROOTS=" /etc/qiita/control-plane.env || echo "PATH_INGEST_ROOTS=/sequencing" >> /etc/qiita/control-plane.env'   # (#feat/ingest-path-roots-and-upload)
+sudo bash -c 'grep -q "^PATH_INGEST_ROOTS=" /etc/qiita/control-plane.env || echo "PATH_INGEST_ROOTS=/sequencing" >> /etc/qiita/control-plane.env'   # (#484)
 ```
 
 Set it to the mount(s) sequencing data actually lives on. **The gate itself needs no grant for
@@ -30,7 +30,7 @@ Set it to the mount(s) sequencing data actually lives on. **The gate itself need
 `qiita-job`, different groups) — it treats a permission error as "cannot tell" and admits, so a
 run folder only `qiita-job` can read still submits. Reading a run folder through
 `POST /run-folder/inspect` does need one; that is bucket 2. Add a second root by extending the
-value with `:` rather than adding a line. (#feat/ingest-path-roots-and-upload)
+value with `:` rather than adding a line. (#484)
 
 ### 2. One-time host setup
 
@@ -56,7 +56,7 @@ sudo -u qiita-api ls -d "$ROOT"/*/*/*/hifi_reads | head -3   # must list, not EA
 If `setfacl` reports `Operation not supported`, the mount has no ACL support: fall back to
 `sudo usermod -aG kl-seq-rw qiita-api`, which also grants group write on `gcore_runs`, and note
 that a supplementary group is read at process start — the bucket-4 restart is what picks it up.
-(#feat/ingest-path-roots-and-upload)
+(#484)
 
 ### 3. Migrations
 
@@ -65,7 +65,7 @@ Plain `make migrate` — no out-of-band setup.
 - `20260824000000_upload_source_filename.sql` — adds nullable `qiita.upload.source_filename`
   (the client's basename, so the fastq filename-prefix rule applies to an upload-fed
   submission). Existing rows keep NULL, which the gate skips.
-  (#feat/ingest-path-roots-and-upload)
+  (#484)
 
 ### 4. Deploy
 
@@ -85,7 +85,7 @@ Beyond `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>`:
   ```
   Expect exit 1 and a 422 whose detail carries `outside every configured ingest root` and an
   `ingest_roots` list matching what bucket 1 set. A 500, or a 202, means the var is wrong.
-  (#feat/ingest-path-roots-and-upload)
+  (#484)
 - **A submit can now run off the cluster — both platforms.** `POST /run-folder/inspect`
   reads the run folder as `qiita-api`, a NARROWER account than the `qiita-job` that runs
   the jobs: it reaches the IGM folders through their world bits, and the gcore folders
@@ -103,11 +103,11 @@ Beyond `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>`:
   `pacbio.hifi_bam_by_barcode`. A **403** means the ACL did not take, and its `reason` says
   whether the denial is at the run folder (or a parent) or at a directory below it — a
   partial grant is refused rather than reported as an empty index.
-  (#feat/ingest-path-roots-and-upload)
+  (#484)
 - **The widened read-ingest schemas synced.** `qiita-admin actions list` must still show
   `fastq-to-parquet 1.3.0` and `bam-to-parquet 1.0.0` enabled — the change is a
   `context_schema` widening in place, not a version bump, so no new version appears and none
-  should have been auto-deprecated. (#feat/ingest-path-roots-and-upload)
+  should have been auto-deprecated. (#484)
 
 ### 6. After the deploy verifies green
 
@@ -122,17 +122,17 @@ _None yet._
   which streams the file to the data plane and submits against the upload — the same workflow
   either way, since the runner resolves the handle to the same step input. Existing
   wet-lab-admin and system-admin path submissions are unaffected apart from the root bound.
-  (#feat/ingest-path-roots-and-upload)
+  (#484)
 - **`submit-bcl-convert` / `submit-pacbio-ingest` no longer have to run on a machine that
   mounts the cluster.** Both used to read the run folder locally — RunInfo.xml for
   Illumina, the `*/hifi_reads/*.bam` glob for PacBio — which is why the runbook told
   operators which machine to type on. Both reads moved to `POST /run-folder/inspect`. The
   path still has to be the one the CLUSTER sees; what changed is that it is now checked
   and read where it exists, so a wrong path fails at the terminal instead of inside a job.
-  (#feat/ingest-path-roots-and-upload)
+  (#484)
 - **`qiita submit-reads` needs `--data-plane-url`**, like `qiita reference load` — the reads go
   over Flight. From off the host that is the public TLS edge
-  (`grpc+tls://<fqdn>:443`). (#feat/ingest-path-roots-and-upload)
+  (`grpc+tls://<fqdn>:443`). (#484)
 
 ---
 

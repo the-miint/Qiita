@@ -23,7 +23,7 @@ duplicates further down are historical strata; leave them where they are.
 ### Added
 
 - **`POST /run-folder/inspect` lets a submit run from a machine that does not mount the
-  cluster (#TBD).** `submit-bcl-convert` read `RunInfo.xml` and `submit-pacbio-ingest`
+  cluster (#484).** `submit-bcl-convert` read `RunInfo.xml` and `submit-pacbio-ingest`
   globbed `*/hifi_reads/*.bam`, both on the submitting machine — which is why submitting
   required a machine that sees the cluster's filesystem, even though the path is only ever
   re-opened on a compute node. Both reads moved to the control plane. The route is
@@ -38,7 +38,7 @@ duplicates further down are historical strata; leave them where they are.
   "you cannot read this" must not look like "this is not there".
 
 - **A work_ticket's `action_context` host paths are bounded to configured ingest roots,
-  and a regular user loads reads by upload instead (#TBD).** An `action_context` could
+  and a regular user loads reads by upload instead (#484).** An `action_context` could
   name any absolute path, recorded verbatim and re-opened much later on a compute node.
   Nothing checked it at submit, so a path that resolved on the submitting machine and
   nowhere else was accepted and failed inside the job — and any absolute path the
@@ -54,7 +54,7 @@ duplicates further down are historical strata; leave them where they are.
   is covered without a route change; a new `test_actions_loader` guard makes a `*_path` /
   `*_dir` / `*_folder` string property declare `pattern: "^/"` so the YAML and the route
   agree on which fields are paths.
-- **`qiita submit-reads` loads one sample's reads from the machine you are typing on (#TBD).**
+- **`qiita submit-reads` loads one sample's reads from the machine you are typing on (#484).**
   The other half of the same change: a `user` can no longer name a host path, and their
   reads were never on a filesystem the cluster mounts anyway. The gesture validates the
   local file, streams it to the data plane over Flight DoPut, and submits the ingest ticket
@@ -68,7 +68,7 @@ duplicates further down are historical strata; leave them where they are.
   the stitched file from the payload's own gzip magic rather than from anything the client
   claimed — `.fastq.gz`/`.fastq` for reads, `.bam`/`.sam` for alignments, since BGZF is gzip
   and a plaintext payload under those suffixes is text SAM.
-- **`upload.source_filename` records the client's basename (#TBD).** The submit gate requires
+- **`upload.source_filename` records the client's basename (#484).** The submit gate requires
   a fastq's basename to be the prep_sample's `sequenced_pool_item_id` followed by `_` or `.`,
   which ties the R1/R2 pair to the sequenced_sample row. An upload-fed submission has no path
   to take a basename from, so the rule went vacuous exactly on the route a regular user takes;
