@@ -354,12 +354,13 @@ def cp_server(tmp_path, signing_key):
     port = _alloc_free_port()
     token_file = tmp_path / "cp-to-co.token"
     token_file.write_text("unused-dispatch-token")
-    # Settings.from_env() requires PATH_SCRATCH, CONTACT_EMAIL, and (since the
-    # cookie split) LOGIN_COOKIE_SECRET_KEY — the CP would fail to boot without
-    # them. PATH_SCRATCH/ticket and PATH_SCRATCH/staging are derived but don't
-    # need to exist for this smoke (the dispatch points at a dead orchestrator
-    # port, so the runner never reaches mkdir); the value just needs to be an
-    # absolute path so the boot-time validation passes.
+    # Settings.from_env() requires PATH_SCRATCH, CONTACT_EMAIL, PATH_INGEST_ROOTS,
+    # and (since the cookie split) LOGIN_COOKIE_SECRET_KEY — the CP would fail to
+    # boot without them. PATH_SCRATCH/ticket and PATH_SCRATCH/staging are derived
+    # but don't need to exist for this smoke (the dispatch points at a dead
+    # orchestrator port, so the runner never reaches mkdir); the value just needs
+    # to be an absolute path so the boot-time validation passes. PATH_INGEST_ROOTS
+    # is tmp_path so a test can name a host path it created itself.
     env = {
         **os.environ,
         "DATABASE_URL": resolve_postgres_url(),
@@ -370,6 +371,7 @@ def cp_server(tmp_path, signing_key):
         "COMPUTE_ORCHESTRATOR_URL": "http://127.0.0.1:1",
         "CP_TO_CO_TOKEN_PATH": str(token_file),
         "PATH_SCRATCH": str(tmp_path / "scratch"),
+        "PATH_INGEST_ROOTS": str(tmp_path),
         "CONTACT_EMAIL": "qiita-test@example.org",
     }
     proc = subprocess.Popen(
