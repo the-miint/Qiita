@@ -557,7 +557,7 @@ def _check_ingest_paths(
 
 
 async def _fastq_upload_filenames(
-    pool: asyncpg.Pool, *, action_context: dict[str, Any]
+    pool: asyncpg.Pool, *, action_context: dict[str, Any], principal_idx: int
 ) -> dict[str, str]:
     """`{context_key: source_filename}` for every fastq key submitted as an
     upload handle rather than a path.
@@ -568,6 +568,12 @@ async def _fastq_upload_filenames(
     the filename-prefix rule has to read what the client said it sent
     (`upload.source_filename`). One batched fetch, keyed back to the context
     key so the 422 names the field the submitter wrote.
+
+    Scoped to uploads the caller created. The runner refuses another
+    principal's upload anyway (`runner._upload`), but the 422 this feeds quotes
+    the filename back, and a filename here carries a `sequenced_pool_item_id` —
+    so an unscoped lookup would answer "what is upload N called" for any N to
+    anyone holding a prep_sample of their own.
 
     An upload with no `source_filename` (it predates the column, or the client
     did not send one) is omitted: the rule is vacuous without a name, the same
@@ -584,8 +590,10 @@ async def _fastq_upload_filenames(
     if not by_idx:
         return {}
     rows = await pool.fetch(
-        "SELECT upload_idx, source_filename FROM qiita.upload WHERE upload_idx = ANY($1::bigint[])",
+        "SELECT upload_idx, source_filename FROM qiita.upload"
+        " WHERE upload_idx = ANY($1::bigint[]) AND created_by_idx = $2",
         list(by_idx),
+        principal_idx,
     )
     return {
         by_idx[row["upload_idx"]]: row["source_filename"]
@@ -595,7 +603,11 @@ async def _fastq_upload_filenames(
 
 
 async def _check_fastq_filename_prefix(
-    pool: asyncpg.Pool, *, prep_sample_idx: int, action_context: dict[str, Any]
+    pool: asyncpg.Pool,
+    *,
+    prep_sample_idx: int,
+    action_context: dict[str, Any],
+    principal_idx: int,
 ) -> None:
     """422 when a fastq path in `action_context` has a basename that is
     not the prep_sample's `sequenced_pool_item_id` followed by a `_` or
@@ -647,7 +659,9 @@ async def _check_fastq_filename_prefix(
         # it is skipped here rather than rejected.
         if isinstance(action_context.get(key), str)
     }
-    fastq_uploads = await _fastq_upload_filenames(pool, action_context=action_context)
+    fastq_uploads = await _fastq_upload_filenames(
+        pool, action_context=action_context, principal_idx=principal_idx
+    )
     if not fastq_paths and not fastq_uploads:
         return
     pool_item_id = await pool.fetchval(
@@ -864,6 +878,7 @@ async def submit_work_ticket(
             pool,
             prep_sample_idx=scope_target["prep_sample_idx"],
             action_context=body.action_context,
+            principal_idx=principal.principal_idx,
         )
 
     await _check_disallow_without_delete(

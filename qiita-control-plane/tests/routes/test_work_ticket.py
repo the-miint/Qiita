@@ -1970,11 +1970,11 @@ async def upload_slot(postgres_pool, admin_token):
     _, admin_idx = admin_token
     created: list[int] = []
 
-    async def _make(source_filename: str | None) -> int:
+    async def _make(source_filename: str | None, *, owner_idx: int | None = None) -> int:
         idx = await postgres_pool.fetchval(
             "INSERT INTO qiita.upload (created_by_idx, source_filename)"
             " VALUES ($1, $2) RETURNING upload_idx",
-            admin_idx,
+            admin_idx if owner_idx is None else owner_idx,
             source_filename,
         )
         created.append(idx)
@@ -2034,6 +2034,44 @@ async def test_submit_fastq_upload_prefix_mismatch_returns_422(
     mismatched = resp.json()["detail"]["mismatched"]
     assert [m["context_key"] for m in mismatched] == ["fastq_upload_idx"]
     assert mismatched[0]["source_filename"] == "other-sample_R1.fastq.gz"
+
+
+async def test_another_principals_upload_filename_is_not_disclosed(
+    wt_client,
+    admin_token,
+    regular_token,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+    upload_slot,
+):
+    """The filename lookup is scoped to the caller's own uploads.
+
+    A filename here carries a `sequenced_pool_item_id`, and the mismatch 422
+    quotes it back. Unscoped, naming someone else's `upload_idx` against a
+    prep_sample of one's own would answer "what is upload N called" for any N.
+    The runner still refuses the upload itself, so nothing is gained by
+    admitting the submit — but nothing is leaked by it either.
+    """
+    token, _ = admin_token
+    _, other_idx = regular_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, _pool_item_id = prep_sample_with_pool_item
+    theirs = await upload_slot("their-sample_R1.fastq.gz", owner_idx=other_idx)
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_upload_idx": theirs},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert "their-sample_R1.fastq.gz" not in resp.text
+    if resp.status_code == 202:
+        wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
 
 
 async def test_submit_fastq_upload_without_source_filename_skips_the_rule(
