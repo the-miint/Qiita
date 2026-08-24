@@ -72,11 +72,18 @@ Beyond `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>`:
     -H "Authorization: Bearer $QIITA_TOKEN" -H 'Content-Type: application/json' \
     -d '{"path": "/sequencing/igm_runs/<a-real-run>", "platform": "illumina"}'
   ```
-  Expect 200 with `illumina.instrument_run_id` / `instrument_model`. A **403** means
-  `qiita-api` cannot read that folder — grant it read+traverse (group or ACL), or that
-  run's submit has to be typed on a machine that mounts the path. Repeat with
-  `"platform": "pacbio_smrt"` against a PacBio run and expect a populated
-  `pacbio.hifi_bam_by_barcode`. (#feat/ingest-path-roots-and-upload)
+  Expect 200 with `illumina.instrument_run_id` / `instrument_model` — measured working
+  for `/sequencing/igm_runs/*`, which is world-readable the whole way down.
+
+  **PacBio is measured NOT working and that is expected.** `/sequencing/gcore_runs/**`
+  is restricted to the `kl-seq-rw` group, which `qiita-job` is in and `qiita-api` is
+  not, so the same call with `"platform": "pacbio_smrt"` answers **403**. Nothing is
+  broken by that: `submit-pacbio-ingest` keeps working exactly as it does today, from a
+  node that mounts `/sequencing`, and the 403 says so. It just does not get the
+  off-cluster submit that Illumina now gets. Closing the gap means granting `qiita-api`
+  read+traverse on that tree — a decision about how much of the raw sequencing data the
+  public API's service account can read, not a deploy step to take by default.
+  (#feat/ingest-path-roots-and-upload)
 - **The widened read-ingest schemas synced.** `qiita-admin actions list` must still show
   `fastq-to-parquet 1.3.0` and `bam-to-parquet 1.0.0` enabled — the change is a
   `context_schema` widening in place, not a version bump, so no new version appears and none
