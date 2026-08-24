@@ -77,7 +77,7 @@ context_schema:
     #                  `*_path` binding pointing at the staged upload
     #                  (runner._resolve_upload_handles), and the step stitches
     #                  the chunked BLOB back into a FASTQ
-    #                  (jobs._blob_input.resolve_fastx_blob_input). This is the
+    #                  (jobs._blob_input.resolve_reads_blob_input). This is the
     #                  route a `user` takes — their reads are on their own
     #                  machine, which the cluster cannot see.
     fastq_path:

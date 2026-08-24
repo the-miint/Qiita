@@ -54,7 +54,7 @@ context_schema:
     # The DoPut route for the same reads: the runner rewrites this handle into
     # the `bam_path` binding above (runner._resolve_upload_handles) and the
     # step stitches the chunked BLOB back into a BAM
-    # (jobs._blob_input.resolve_blob_input). Naming a `bam_path` is
+    # (jobs._blob_input.resolve_reads_blob_input). Naming a `bam_path` is
     # wet_lab_admin+ (routes/work_ticket.py's _check_ingest_paths) because the
     # value is re-opened on a compute node under the job account; a `user`
     # whose BAM is on their own machine uploads it and names this instead.

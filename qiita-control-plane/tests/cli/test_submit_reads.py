@@ -1,8 +1,8 @@
 """CLI-side tests for `qiita submit-reads`.
 
 Drives the programmatic entry point `cli.user.reads.do_submit_reads` with a
-mocked httpx transport and a fake Flight client, reusing the fakes from
-`test_user_reference.py` — the two gestures share `upload_file`, so they share
+mocked httpx transport and a fake Flight client, reusing the shared fakes in
+`tests/cli/conftest.py` — the two gestures share `upload_file`, so they share
 the harness that stands in for the data plane.
 
 Exercised here: which action a file's name routes to, what lands in

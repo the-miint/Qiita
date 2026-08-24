@@ -228,16 +228,38 @@ def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
 @contextlib.contextmanager
 def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
     """Opaque binary file → `(chunk_index INT, chunk_data BLOB)` chunked
-    stream. Reads `src` in 64 KB blocks and emits one Arrow batch per
+    stream, inflating a `.gz` source as it goes.
+
+    Reads `src` in 64 KB blocks and emits one Arrow batch per
     `_CHUNK_ROWS_PER_BATCH` chunks. Bounded memory even on GG2-scale
     inputs (407 MB phylogeny, multi-GB jplace). Server side stitches
     chunks back into a temp file via `_blob_input.resolve_blob_input`.
 
-    Reads gzipped (`.gz`) inputs transparently — chunk_data carries the
-    decompressed bytes. The server's stitched temp file is then valid
-    plaintext for miint's `read_newick` / `read_jplace`, which only
-    accept on-disk text/JSON. Mirrors the FASTA streamer's treatment of
-    `.gz` for the same reason."""
+    Inflating is what makes the stitched temp file valid plaintext for miint's
+    `read_newick` / `read_jplace`, which only accept on-disk text/JSON.
+    """
+    with _chunked_upload_stream(src, inflate_gz=True) as stream:
+        yield stream
+
+
+@contextlib.contextmanager
+def _raw_blob_upload_stream(src: Path) -> Iterator[UploadStream]:
+    """The same envelope, byte-exact: a `.gz` source is NOT decompressed.
+
+    Reads have no plaintext constraint — `read_fastx` reads gzip directly — and
+    a FASTQ is the input where sending inflated bytes actually costs something.
+    The server names the stitched file from these bytes' own gzip magic
+    (`jobs._blob_input.resolve_reads_blob_input`), since miint detects
+    compression from the extension.
+    """
+    with _chunked_upload_stream(src, inflate_gz=False) as stream:
+        yield stream
+
+
+@contextlib.contextmanager
+def _chunked_upload_stream(src: Path, *, inflate_gz: bool) -> Iterator[UploadStream]:
+    """Shared body of the two blob streamers above; `inflate_gz` is their only
+    difference."""
     import gzip
 
     import pyarrow as pa
@@ -249,64 +271,13 @@ def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
         ]
     )
 
-    opener = gzip.open if src.suffix == ".gz" else open
+    opener = gzip.open if (inflate_gz and src.suffix == ".gz") else open
 
     def _iter_batches() -> Iterator[Any]:
         indices: list[int] = []
         datas: list[bytes] = []
         idx = 0
         with opener(src, "rb") as f:
-            while True:
-                data = f.read(_CHUNK_SIZE)
-                if not data:
-                    break
-                indices.append(idx)
-                datas.append(data)
-                idx += 1
-                if len(indices) >= _CHUNK_ROWS_PER_BATCH:
-                    yield pa.RecordBatch.from_arrays(
-                        [pa.array(indices, type=pa.int32()), pa.array(datas, type=pa.binary())],
-                        schema=schema,
-                    )
-                    indices = []
-                    datas = []
-        if indices:
-            yield pa.RecordBatch.from_arrays(
-                [pa.array(indices, type=pa.int32()), pa.array(datas, type=pa.binary())],
-                schema=schema,
-            )
-
-    yield UploadStream(schema=schema, batches=_iter_batches())
-
-
-@contextlib.contextmanager
-def _raw_blob_upload_stream(src: Path) -> Iterator[UploadStream]:
-    """Byte-exact file → `(chunk_index INT, chunk_data BLOB)` chunked stream.
-
-    Same envelope as `_blob_upload_stream` and one difference: a `.gz` source is
-    NOT decompressed. The companion-file streamer inflates because miint's
-    `read_newick` / `read_jplace` only accept on-disk plaintext; reads have no
-    such constraint — `read_fastx` reads gzip directly — and a FASTQ is the one
-    input where sending the inflated bytes actually costs something.
-
-    The server side names the stitched file from these bytes' own gzip magic
-    (`jobs._blob_input.resolve_fastx_blob_input`), since miint detects
-    compression from the extension.
-    """
-    import pyarrow as pa
-
-    schema = pa.schema(
-        [
-            pa.field("chunk_index", pa.int32()),
-            pa.field("chunk_data", pa.binary()),
-        ]
-    )
-
-    def _iter_batches() -> Iterator[Any]:
-        indices: list[int] = []
-        datas: list[bytes] = []
-        idx = 0
-        with src.open("rb") as f:
             while True:
                 data = f.read(_CHUNK_SIZE)
                 if not data:
