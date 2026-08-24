@@ -22,6 +22,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **A per-`prep_sample` alignment delete (#469).** The alignment delete surface had two
+  scopes: `delete_alignment` (a whole `alignment_idx`) and `delete_alignment_block` (a
+  block's member sub-ranges). A workflow that aligns one prep_sample per ticket fits
+  neither — the whole-idx purge destroys every other sample's rows, and there is no block
+  to read a cover-map from — so a re-run would double-count. The new
+  `delete_alignment_sample` DoAction deletes the `(alignment_idx, prep_sample_idx)` pair's
+  rows from every `ALIGNMENT_DELETE_TABLES` table in one transaction, and the
+  `delete-alignment-sample` library primitive signs it. Idempotent (a sample with no rows
+  deletes 0), replay-safe, and registered in `REPLAY_SAFE_ACTIONS`. The predicate carries
+  no `sequence_idx` bound and is feature_idx-agnostic, so all of a read's rows go.
+  `alignment` is not a `REPLACE_KEY_TABLES` entry instead: replace-by-key is matched on the
+  destination table name alone, so a pair-keyed entry would also fire on the block-scoped
+  `align` workflow's registrations and the second block of a split sample would delete the
+  first's rows. `delete_alignment_sample_deletes_the_pair_only` pins the exactness on both
+  tables: a sibling sample under the same alignment survives, and the target sample under a
+  different alignment survives. The runner arm takes `alignment_idx` from the
+  `work_ticket.alignment_idx` column, never from `action_context` (which the submitter
+  chooses), refuses on NULL, and refuses when a context value is present and disagrees
+  with the column — a step's `params:` binds `alignment_idx` from `action_context`, so a
+  disagreement would clear one alignment's rows while the register that follows wrote
+  under the other. `block_read.resolve_block_read_scope` makes the same cross-check on
+  the block path. Plumbing only — no shipped workflow references the primitive yet, and
+  none can until something writes `work_ticket.alignment_idx` on a prep_sample-scoped
+  ticket (`align_planner.plan_and_submit_alignments`, the column's only writer today,
+  inserts block-scoped ones).
+
 - **Assembly completion is first-class state: `qiita.assembly_sample` (#467).**
   The per-`(processing_idx, prep_sample)` completion gate `long-read-assembly` was missing,
   alongside `qiita.mask_sample` and `qiita.alignment_sample`. Completion existed only as
@@ -1097,6 +1123,26 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **The replay registry's `delete_*` claim (#469).** `REPLAY_SAFE_ACTIONS`' comment said
+  re-running a delete "deletes zero rows". That holds only for a replay with no write in
+  between: `delete_read_mask_block` (in `read-mask-block`) and `delete_alignment_block`
+  (in `align`) run as a pre-`register-files` replace, so a token replayed after that
+  registration drops the rows it wrote — and `delete_alignment_sample` takes on the same
+  exposure once a workflow adopts it. The comment now says so, and names what bounds the
+  window — the token expiry the data plane checks on every DoAction body (300s by
+  default, `MAX_TICKET_LIFETIME` refusing an expiry more than 3600s out).
+  `docs/auth.md#ticket-replay`, which that comment points at, carried the same claim and
+  is corrected with it.
+
+- **`alignment_delete_covers_every_alignment_scoped_lake_table` now checks columns too
+  (#469).** It pinned that every `alignment_idx`-scoped lake table is in
+  `ALIGNMENT_DELETE_TABLES`, but not that a listed table carries the columns the delete
+  clauses key on. `delete_lake_rows` applies one clause to every listed table, so a table
+  joining the list without `prep_sample_idx` or `sequence_idx` makes the narrower deletes
+  unrunnable — loudly (DuckDB raises a Binder Error on the missing column and
+  `delete_lake_rows` ROLLBACKs, so the leading table's rows re-count intact), but not
+  until a ticket runs.
 
 - **A redriven work ticket whose producer step re-ran can register its files again (#472).** `lake_dest_filename`
   minted `wt<work_ticket_idx>-<basename>`, whose uniqueness assumed one load per ticket.

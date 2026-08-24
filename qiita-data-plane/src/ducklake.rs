@@ -434,8 +434,8 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 ///
 /// The second table, `alignment_origin_spanning`, records which `alignment` rows
 /// are one read that crossed a circular contig's origin; its contract is on its
-/// DDL below. It is created here rather than by its own `ensure_*` because
-/// `delete_alignment` / `delete_alignment_block` drop from both, so a catalog
+/// DDL below. It is created here rather than by its own `ensure_*` because every
+/// `flight_service::ALIGNMENT_DELETE_TABLES` delete drops from both, so a catalog
 /// holding one without the other fails those deletes.
 pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
@@ -531,9 +531,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         CREATE TABLE IF NOT EXISTS qiita_lake.alignment_origin_spanning (
             -- `alignment`'s leading four, same names, types and order.
             -- alignment_idx / prep_sample_idx / sequence_idx are NOT NULL because
-            -- the delete predicates name them — `delete_alignment` on
-            -- alignment_idx, `delete_alignment_block` on that plus
-            -- `block_read_where_clause`'s prep_sample_idx / sequence_idx — and a
+            -- a `flight_service::delete_alignment*` predicate keys on each, and a
             -- NULL is a row no delete can reach. feature_idx is NOT NULL because
             -- it is the contig whose origin the interval below wraps, and because
             -- it completes the join key above.
