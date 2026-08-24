@@ -270,6 +270,18 @@ _MIN_SEQUENCE_IDENTITY_MINIMAP2 = 0.90
 # a downstream breadth-of-coverage estimate). minimap2-only: bowtie2 aligns
 # END-TO-END (`score_min 'L,0,-0.05'`, no local mode) so query coverage is ~1.0 by
 # construction and a separate gate would be a no-op.
+#
+# Scored PER SAM RECORD, which drops a long read that crosses the ORIGIN of a
+# circular reference contig. An aligner treats a circular contig as a linear one,
+# so such a read is reported as one record per side of the origin, each covering
+# only its own share of the query; neither side clears this floor, so the read is
+# absent from `alignment` altogether rather than partially represented. Complete
+# circular references — closed chromosomes, plasmids, phages — are where that
+# applies. Measured against a same-length mid-contig control by
+# `test_origin_spanning_read_splits_into_one_record_per_side`, which asserts both
+# the per-record and the concatenated pooled score against this constant; the data
+# plane's `alignment_origin_spanning` DDL says what a producer that kept such a
+# read would have to gate on instead.
 _MIN_QUERY_COVERAGE_MINIMAP2 = 0.90
 
 # The bowtie2 align-time parameter set (the "modified SHOGUN" configuration): collect

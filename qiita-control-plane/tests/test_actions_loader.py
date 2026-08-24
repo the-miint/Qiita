@@ -228,6 +228,7 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
         "write-assembly-membership",
         "assembly_load",
         "register-files",
+        "finalize-assembly-sample",
     ]
 
     export_step = next(s for s in assembly.steps if s.name == "assembly_run_config")
@@ -1265,3 +1266,20 @@ def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
     names = [s.name for s in ftp_130.steps]
     assert names[-1] == "finalize-mask-sample"
     assert names[-2] == "register-files"  # register-files immediately precedes the gate flip
+
+
+def test_load_actions_long_read_assembly_finalizes_gate_after_register_files():
+    """`finalize-assembly-sample` (the assembly_sample completion writer) must be the
+    LAST entry and run strictly AFTER `register-files`: the gate must not read
+    'completed' until the contigs are durable in DuckLake. Pins the terminal
+    ordering so a reorder that flips the gate first surfaces here."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
+    names = [s.name for s in by_id["long-read-assembly"].steps]
+
+    assert names[-1] == "finalize-assembly-sample"
+    assert names[-2] == "register-files"

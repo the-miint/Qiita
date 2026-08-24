@@ -9,6 +9,7 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import (
+    PROCESSING_IDX_BINDING,
     WorkflowAction,
     WorkflowStep,
 )
@@ -44,7 +45,6 @@ from ..shard_orchestration import (
 )
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
 from ._mask import ALIGNMENT_IDX_BINDING, MASK_IDX_BINDING
-from ._processing import PROCESSING_IDX_BINDING
 from ._read_ingest import (
     ROUTER_PENDING_BINDING,
     SHARD_MAPPING_BINDING,
@@ -614,6 +614,36 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE:
+        # Terminal step of the long-read-assembly workflow: write 'completed' into
+        # the assembly_sample gate. No file inputs: prep_sample_idx from the scope
+        # target, processing_idx from the run identity the runner minted before the
+        # loop. Where this entry sits in the step list, and why, is on the workflow
+        # YAML entry that declares it.
+        #
+        # The scope check below is this adapter's own precondition, not a second
+        # copy of the runner's. Through `run_workflow` it cannot fire: the pre-loop
+        # refusal in `_workflow.py` keys on the same declared entry that selects
+        # this arm and rejects a non-prep_sample ticket before the loop. A direct
+        # `_run_action_primitive` call reaches it. The mask sibling above is not in
+        # that position — its pre-loop guard admits block-scoped tickets too, so
+        # its arm is the only prep_sample check on that path.
+        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+            raise RuntimeError(
+                "finalize-assembly-sample requires a prep_sample-scoped ticket; "
+                f"got {scope_target['kind']!r}"
+            )
+        # `bound` rather than a threaded local, for the same reason
+        # write-assembly-membership above reads it: the pre-loop mint has already
+        # overwritten any submitter-supplied `processing_idx` by the time any entry
+        # runs, and the gate keys on the value that stamped the rows it gates.
+        await LIBRARY[LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE](
+            pool,
+            processing_idx=bound[PROCESSING_IDX_BINDING],
+            prep_sample_idx=scope_target["prep_sample_idx"],
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.PERSIST_QC_REPORT:
         # Persist the two fastqc-equivalent QC reports onto this prep_sample's
         # 1:1 sequenced_sample. Each declared input is a Path to a qc_report.json
@@ -696,6 +726,60 @@ async def _run_action_primitive(
             pool,
             block_idx=scope_target["block_idx"],
             alignment_idx=bound[ALIGNMENT_IDX_BINDING],
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE:
+        # Idempotent sample replace (align): runs BEFORE register-files. What the
+        # delete selects is on the data plane's `delete_alignment_sample`.
+        #
+        # `alignment_idx` is read from the ticket column, not from `action_context`
+        # (`bound`), which is whatever the submitter sent. NULL means no planner set
+        # the column, or a `DELETE /alignment-definition/{idx}` detached it
+        # mid-flight (ON DELETE SET NULL).
+        #
+        # The context value is cross-checked against the column rather than ignored,
+        # because the delete and the WRITE scope on different things: a step's
+        # `params:` binds `alignment_idx` from `action_context` (align's
+        # `align_sharded` stamps that value onto every row it emits). Let the two
+        # disagree and this clears one alignment's rows for the sample while the
+        # register that follows writes under the other, so a re-run appends — the
+        # double-count this primitive exists to prevent.
+        #
+        # No ticket satisfies both the prep_sample scope check below and a non-NULL
+        # column today: `align_planner.plan_and_submit_alignments` is the column's
+        # only writer and it inserts block-scoped tickets. Wiring this primitive into
+        # a prep_sample workflow means writing the column from that workflow's runner
+        # path first, as `_persist_mask_idx` does for `mask_idx`.
+        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+            raise RuntimeError(
+                f"delete-alignment-sample requires a prep_sample-scoped ticket; got "
+                f"{scope_target['kind']!r}"
+            )
+        alignment_idx = await pool.fetchval(
+            "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        if alignment_idx is None:
+            raise RuntimeError(
+                f"delete-alignment-sample requires work_ticket {work_ticket_idx} to carry "
+                f"an alignment_idx; the column is NULL (no planner set it, or the "
+                f"alignment definition was deleted mid-flight)"
+            )
+        context_alignment_idx = bound.get(ALIGNMENT_IDX_BINDING)
+        if context_alignment_idx is not None and context_alignment_idx != alignment_idx:
+            raise RuntimeError(
+                f"delete-alignment-sample: work_ticket {work_ticket_idx} carries "
+                f"alignment_idx {alignment_idx} but its action_context declares "
+                f"{context_alignment_idx}; a step binding alignment_idx from "
+                f"action_context would write under {context_alignment_idx} while this "
+                f"delete cleared {alignment_idx}"
+            )
+        await LIBRARY[LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE](
+            alignment_idx=alignment_idx,
+            prep_sample_idx=scope_target["prep_sample_idx"],
             signing_key=signing_key,
             data_plane_url=data_plane_url,
         )

@@ -9,11 +9,13 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import (
+    PROCESSING_IDX_BINDING,
     ActionCeiling,
     ActionDefinition,
     WorkflowAction,
     WorkflowStep,
 )
+from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import (
@@ -77,8 +79,11 @@ from ._mask import (
 )
 from ._processing import (
     ASSEMBLER_BINDING,
+    _create_assembly_gate_pending,
     _mint_processing_idx,
+    _record_assembly_gate_no_data,
     _workflow_needs_processing,
+    _workflow_writes_assembly_gate,
 )
 from ._read_ingest import (
     READS_STAGING_ROOT_BINDING,
@@ -187,6 +192,13 @@ async def run_workflow(
     action: ActionDefinition | None = None
     index: int | None = None
     uploads_to_consume: list[int] = []
+    # The processing_idx this run minted — the only value either
+    # qiita.assembly_sample write below is keyed on, and None until the mint runs.
+    # `bound` is seeded from action_context, which is stored verbatim and passes
+    # `validate_context` with unknown keys intact, so a submitter can put a
+    # `processing_idx` there; before the mint overwrites it that value is another
+    # run's identity, or none at all.
+    minted_processing_idx: int | None = None
 
     try:
         # Everything from the action fetch through the step loop is INSIDE the
@@ -521,14 +533,45 @@ async def run_workflow(
                 .get(ASSEMBLER_BINDING, {})
                 .get("default")
             )
-            bound.update(
-                await _mint_processing_idx(
-                    pool,
-                    action_id=action.action_id,
-                    action_version=action.version,
-                    bound=bound,
-                    assembler_default=assembler_default,
+            processing_bindings = await _mint_processing_idx(
+                pool,
+                action_id=action.action_id,
+                action_version=action.version,
+                bound=bound,
+                assembler_default=assembler_default,
+            )
+            bound.update(processing_bindings)
+            minted_processing_idx = processing_bindings[PROCESSING_IDX_BINDING]
+
+        # Completion gate: a workflow declaring the terminal
+        # `finalize-assembly-sample` action gets its qiita.assembly_sample row
+        # materialized 'pending' here, right after the mint that gives the row its
+        # key (see `_create_assembly_gate_pending`). The gate row is keyed on
+        # (processing_idx, prep_sample), so the ticket must be prep_sample-scoped.
+        if _workflow_writes_assembly_gate(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+                raise _submission_bad_input(
+                    "a workflow that gates assembly completion (declares "
+                    f"{LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE}) must be "
+                    f"prep_sample-scoped; got {scope_target['kind']!r}"
                 )
+            if minted_processing_idx is None:
+                # Per-ticket backstop for the load-time refusal on ActionDefinition
+                # (`_assembly_gate_declares_a_processing_identity`), which owns the
+                # argument and which `_fetch_action` applies to the qiita.action row
+                # as well. `_workflow_writes_assembly_gate` and
+                # `_workflow_needs_processing` are independent reads of
+                # `action.steps`; this is where they would disagree.
+                raise _submission_bad_input(
+                    "a workflow that gates assembly completion (declares "
+                    f"{LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE}) must thread "
+                    f"{PROCESSING_IDX_BINDING} through a step's params so the run "
+                    "identity the gate row is keyed on is minted"
+                )
+            await _create_assembly_gate_pending(
+                pool,
+                processing_idx=minted_processing_idx,
+                prep_sample_idx=scope_target["prep_sample_idx"],
             )
 
         # Default-OFF anchor for the whole-reference rype_router build gate. The
@@ -718,6 +761,27 @@ async def run_workflow(
         # state — no data was produced). Clear any in-place-retry marker so the
         # now-terminal ticket shows no stale "stuck retrying" reason.
         _log.info("workflow %d ended with no data: %s", work_ticket_idx, exc)
+        # Close the assembly_sample gate (see `_record_assembly_gate_no_data`)
+        # before the transition, not after. A raise here comes from inside an
+        # `except` handler, so this try's other handlers never see it: it escapes
+        # to `dispatch._run_and_log` and the ticket stays PROCESSING with NULL
+        # failure_*. Two things move it from there — a startup reconcile re-drive
+        # (`resume=True`), and an operator cancel followed by `/run`; `/run` alone
+        # 409s on PROCESSING. Either re-drive reaches this write again, because
+        # assembly_hash re-raises StepNoData deterministically. Transitioning
+        # first would leave a terminal NO_DATA ticket instead — reconcile skips
+        # terminal states and `/run` 409s on them — behind a 'pending' gate row
+        # with nothing left to move it.
+        if (
+            action is not None
+            and _workflow_writes_assembly_gate(action.steps)
+            and minted_processing_idx is not None
+        ):
+            await _record_assembly_gate_no_data(
+                pool,
+                processing_idx=minted_processing_idx,
+                prep_sample_idx=scope_target["prep_sample_idx"],
+            )
         await _transition_to_no_data(pool, work_ticket_idx)
         return
     except BackendFailure as exc:
