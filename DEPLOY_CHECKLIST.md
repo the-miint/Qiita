@@ -100,9 +100,10 @@ Beyond `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>`:
   ```
   Illumina: 200 with `illumina.instrument_run_id` / `instrument_model` — measured working
   for `/sequencing/igm_runs/*`, no grant involved. PacBio: 200 with a non-empty
-  `pacbio.hifi_bam_by_barcode`. A **403** there means bucket 2's ACL did not take (it was
-  measured failing before that step); a 200 with an empty index means the ACL took and the
-  folder holds no demuxed BAMs. (#feat/ingest-path-roots-and-upload)
+  `pacbio.hifi_bam_by_barcode`. A **403** means the ACL did not take, and its `reason` says
+  whether the denial is at the run folder (or a parent) or at a directory below it — a
+  partial grant is refused rather than reported as an empty index.
+  (#feat/ingest-path-roots-and-upload)
 - **The widened read-ingest schemas synced.** `qiita-admin actions list` must still show
   `fastq-to-parquet 1.3.0` and `bam-to-parquet 1.0.0` enabled — the change is a
   `context_schema` widening in place, not a version bump, so no new version appears and none

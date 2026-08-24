@@ -10,6 +10,7 @@ run folder with no HiFi BAMs — against real folders on disk.
 from __future__ import annotations
 
 import os
+import pwd
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -316,6 +317,74 @@ async def test_a_file_is_not_a_run_folder(rf_client, wet_lab_admin_token, ingest
 
     assert resp.status_code == 422, resp.text
     assert resp.json()["detail"]["reason"] == "run folder is not a directory"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
+async def test_unreadable_well_dirs_return_403_not_an_empty_index(
+    rf_client, wet_lab_admin_token, ingest_root
+):
+    """A grant that reaches the run folder but not the wells under it.
+
+    `Path.glob` swallows the error from a directory it cannot open and yields
+    nothing, so this would otherwise be a 200 carrying an empty BAM index —
+    indistinguishable from a run with no demultiplexed reads.
+    """
+    token, _ = wet_lab_admin_token
+    run = ingest_root / "partial-grant-run"
+    hifi = run / "1_A01" / "hifi_reads"
+    hifi.mkdir(parents=True, exist_ok=True)
+    (hifi / "m84.hifi_reads.bc2073.bam").write_bytes(b"")
+    (run / "1_A01").chmod(0o000)
+    try:
+        resp = await _inspect(rf_client, token, run, "pacbio_smrt")
+    finally:
+        (run / "1_A01").chmod(0o755)
+
+    assert resp.status_code == 403, resp.text
+    assert "silently empty" in resp.json()["detail"]["reason"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
+async def test_an_empty_run_folder_is_still_a_200(rf_client, wet_lab_admin_token, ingest_root):
+    """The control for the test above: readable the whole way down and simply
+    holding no BAMs is a 200 with an empty index, not a 403."""
+    token, _ = wet_lab_admin_token
+    run = ingest_root / "empty-but-readable-run"
+    (run / "1_A01" / "hifi_reads").mkdir(parents=True, exist_ok=True)
+
+    resp = await _inspect(rf_client, token, run, "pacbio_smrt")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["pacbio"]["hifi_bam_by_barcode"] == {}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
+async def test_an_untraversable_ancestor_returns_403_not_422(
+    rf_client, wet_lab_admin_token, ingest_root
+):
+    """The denial an ACL grant actually fixes sits on a PARENT of the run folder,
+    not on the folder itself.
+
+    `Path.is_dir()` reports False for anything it cannot stat, so testing
+    directory-ness first turns this into "run folder is not a directory" — a
+    message that describes the wrong problem and names no fix.
+    """
+    token, _ = wet_lab_admin_token
+    parent = ingest_root / "closed-parent"
+    run = parent / "the-run"
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "RunInfo.xml").write_text("<x/>")
+    parent.chmod(0o000)
+    try:
+        resp = await _inspect(rf_client, token, run, "illumina")
+    finally:
+        parent.chmod(0o755)
+
+    assert resp.status_code == 403, resp.text
+    reason = resp.json()["detail"]["reason"]
+    assert "or one of its parents" in reason
+    # Names the account to grant, rather than "the service account".
+    assert pwd.getpwuid(os.geteuid()).pw_name in reason
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")

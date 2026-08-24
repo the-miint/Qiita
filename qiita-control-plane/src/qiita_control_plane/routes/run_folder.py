@@ -24,7 +24,10 @@ the account — not a 404, which would send the operator hunting for a typo in a
 path that is right.
 """
 
+import os
+import pwd
 from pathlib import Path
+from stat import S_ISDIR
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from qiita_common.api_paths import PATH_RUN_FOLDER_INSPECT, PATH_RUN_FOLDER_PREFIX
@@ -37,7 +40,7 @@ from qiita_common.models import (
     RunFolderInspectRequest,
     RunFolderInspectResponse,
 )
-from qiita_common.pacbio import index_run_bams
+from qiita_common.pacbio import HIFI_READS_DIR, index_run_bams
 
 from ..auth.guards import require_role_at_least
 from ..auth.principal import Principal
@@ -46,6 +49,56 @@ from ..deps import get_settings
 from ..ingest_path import IngestPathError, resolve_ingest_path
 
 router = APIRouter(prefix=PATH_RUN_FOLDER_PREFIX, tags=["run-folder"])
+
+
+def _service_account() -> str:
+    """The account this process runs as, for the permission-denied message.
+
+    Named rather than described: the fix is a group or ACL grant to a specific
+    user, and "the control plane's service account" leaves the operator to work
+    out which one that is.
+    """
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        return f"uid {os.geteuid()}"
+
+
+def _reject_if_unreadable_below(run_folder: Path) -> None:
+    """403 when the empty BAM index is a permission problem rather than an
+    empty run.
+
+    `Path.glob` swallows the `OSError` from a directory it cannot open and
+    yields nothing, so a grant that reaches the run folder but not the well
+    directories under it is indistinguishable from a run with no demultiplexed
+    reads — a wrong answer with a 200 on it. Walk the same two levels the glob
+    walks and let the error out.
+    """
+    try:
+        for well in run_folder.iterdir():
+            # `stat()`, not `is_dir()`: the latter reports False for a path it
+            # cannot stat, which is the very case this function exists to catch.
+            if not S_ISDIR(well.stat().st_mode):
+                continue
+            hifi = well / HIFI_READS_DIR
+            try:
+                hifi_is_dir = S_ISDIR(hifi.stat().st_mode)
+            except FileNotFoundError:
+                continue
+            if hifi_is_dir:
+                next(hifi.iterdir(), None)
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "reason": (
+                    f"the control plane runs as {_service_account()}, which can read this"
+                    " run folder but not a directory under it, so the BAM index would be"
+                    " silently empty. Grant it read+traverse on the whole run tree"
+                ),
+                "path": str(exc.filename or run_folder),
+            },
+        ) from exc
 
 
 def _inspect_illumina(run_folder: Path) -> IlluminaRunInfo:
@@ -70,12 +123,13 @@ def _inspect_illumina(run_folder: Path) -> IlluminaRunInfo:
 def _inspect_pacbio(run_folder: Path) -> PacbioRunIndex:
     """Index `{run}/{well}/hifi_reads/*.bam` by barcode.
 
-    An empty index is returned rather than raised on: whether it is a problem
+    An empty index is returned rather than raised on — whether it is a problem
     depends on the caller's pre-flight roster, which this route does not have.
-    The caller pairs the index against its own rows and reports which sample is
-    missing a BAM — a better error than "no BAMs here".
+    See `PacbioRunIndex` for what the caller does with it.
     """
     index, duplicated = index_run_bams(run_folder)
+    if not index:
+        _reject_if_unreadable_below(run_folder)
     return PacbioRunIndex(
         hifi_bam_by_barcode={barcode: str(path) for barcode, path in sorted(index.items())},
         duplicated_barcodes=sorted(duplicated),
@@ -106,7 +160,40 @@ async def inspect_run_folder(
             },
         ) from exc
 
-    if not run_folder.is_dir():
+    # The gate admits a path it could not stat, because a step running as a
+    # different account may still read it. This route cannot: it has to open the
+    # folder now, so it separates EACCES from every other failure and names the
+    # account, since the fix is a grant to that specific user.
+    #
+    # `Path.is_dir()` cannot do this test. It reports False for anything it
+    # fails to stat — an untraversable ANCESTOR included — so it would answer
+    # "not a directory" for a directory, which is the case an ACL grant fixes.
+    try:
+        is_directory = S_ISDIR(run_folder.stat().st_mode)
+        if is_directory:
+            next(run_folder.iterdir(), None)
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "reason": (
+                    f"the control plane runs as {_service_account()}, which cannot read"
+                    " this run folder or one of its parents; a compute node may still be"
+                    " able to. Grant it read+traverse, or submit from a machine that"
+                    " mounts the path"
+                ),
+                "path": str(run_folder),
+            },
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "reason": f"run folder could not be opened: {exc.strerror}",
+                "path": str(run_folder),
+            },
+        ) from exc
+    if not is_directory:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={
@@ -114,25 +201,6 @@ async def inspect_run_folder(
                 "path": str(run_folder),
             },
         )
-
-    # The gate admits a path it could not stat, because a step running as a
-    # different account may still read it. This route cannot: it has to open the
-    # folder now. Say which account failed, so the fix (a group or ACL grant, or
-    # a mode change on the run folder) is obvious rather than guessed at.
-    try:
-        next(run_folder.iterdir(), None)
-    except PermissionError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "reason": (
-                    "the control plane's service account cannot read this run folder;"
-                    " a compute node may still be able to. Grant it read+traverse, or"
-                    " submit from a machine that mounts the path"
-                ),
-                "path": str(run_folder),
-            },
-        ) from exc
 
     if body.platform is Platform.ILLUMINA:
         return RunFolderInspectResponse(

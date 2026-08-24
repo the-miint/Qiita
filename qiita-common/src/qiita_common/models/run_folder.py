@@ -21,12 +21,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..auth_constants import MAX_NAME_LENGTH
 from .reference import Platform
-
-# Illumina run-folder convention: <YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>.
-# Not enforced here — `qiita_common.illumina` parses RunInfo.xml itself and
-# fails with its own message — but the field length bounds a pathological value.
-MAX_INSTRUMENT_RUN_ID_LENGTH = 256
 
 
 class RunFolderInspectRequest(BaseModel):
@@ -53,7 +49,10 @@ class IlluminaRunInfo(BaseModel):
     dispatch.
     """
 
-    instrument_run_id: Annotated[str, Field(min_length=1, max_length=MAX_INSTRUMENT_RUN_ID_LENGTH)]
+    # Same bound as `SequencingRunCreateRequest.instrument_run_id`, which is
+    # where this value is headed; a looser one here would pass inspect and
+    # then fail the create.
+    instrument_run_id: Annotated[str, Field(min_length=1, max_length=MAX_NAME_LENGTH)]
     instrument_model: Annotated[str, Field(min_length=1)]
 
 
