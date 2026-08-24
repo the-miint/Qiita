@@ -3,6 +3,7 @@
 import pytest
 import yaml
 from pydantic import ValidationError
+from qiita_common.actions import HOST_PATH_KEY_SUFFIXES
 
 _REFERENCE_ADD_YAML = """
 action_id: reference-add
@@ -706,13 +707,6 @@ def test_read_ingest_accepts_exactly_one_route(action_id, version, context, acce
     assert (not errors) is accepted, errors
 
 
-# Key-name suffixes that mark a context_schema property as a host path. Mirrors
-# `ingest_path._PATH_KEY_SUFFIXES` — the submit gate checks a value under such a
-# key whatever the schema says, and this guard makes the schema say it too, so a
-# reader of the YAML and the route agree on which fields are paths.
-_HOST_PATH_KEY_SUFFIXES = ("_path", "_dir", "_folder")
-
-
 def test_every_shipped_host_path_property_is_pinned_absolute():
     """A `*_path` / `*_dir` / `*_folder` string property in a shipped workflow's
     `context_schema` must declare `pattern: "^/"`.
@@ -734,7 +728,7 @@ def test_every_shipped_host_path_property_is_pinned_absolute():
         f"{action.action_id}:{action.version}:{name}"
         for action in actions
         for name, spec in (action.context_schema.get("properties") or {}).items()
-        if name.endswith(_HOST_PATH_KEY_SUFFIXES)
+        if name.endswith(HOST_PATH_KEY_SUFFIXES)
         and isinstance(spec, dict)
         and spec.get("type") == "string"
         and spec.get("pattern") != "^/"

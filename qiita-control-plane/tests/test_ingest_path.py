@@ -209,6 +209,40 @@ def test_rejects_symlink_escaping_the_root(tmp_path):
     assert "resolves to" in exc.value.reason
 
 
+def test_rejects_symlink_escaping_the_root_through_dot_dot(tmp_path):
+    """`<root>/link/../tail` escapes even though it normalizes to `<root>/tail`.
+
+    The kernel resolves `link` before it applies the `..`, so the open lands
+    beside the link's TARGET; `os.path.normpath` cancels the pair textually and
+    lands under the root. Resolving the raw value rather than the normalized one
+    is what separates the two.
+    """
+    outside = tmp_path.parent / "dotdot-target"
+    (outside / "tail").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tail").mkdir()
+    (tmp_path / "link").symlink_to(outside)
+    escape = str(tmp_path / "link" / ".." / "tail")
+
+    import os
+
+    assert os.path.normpath(escape) == str(tmp_path / "tail")  # the lexical rule admits it
+    assert os.path.realpath(escape) == str(outside.parent / "tail")  # the kernel does not
+
+    with pytest.raises(IngestPathError) as exc:
+        resolve_ingest_path(escape, roots=(tmp_path,))
+    assert "resolves to" in exc.value.reason
+
+
+def test_accepts_interior_dot_dot_through_a_real_directory(tmp_path):
+    """The control for the test above: with a real directory in place of the
+    symlink, both spellings agree and the path is admitted."""
+    (tmp_path / "tail").mkdir()
+    (tmp_path / "sub").mkdir()
+    assert resolve_ingest_path(str(tmp_path / "sub" / ".." / "tail"), roots=(tmp_path,)) == (
+        tmp_path / "tail"
+    )
+
+
 def test_accepts_symlink_staying_inside_the_root(tmp_path):
     """A symlink that lands back inside the root is fine — the rule bounds
     where the bytes are, not how the path spells its way there."""

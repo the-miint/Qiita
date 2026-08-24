@@ -78,6 +78,14 @@ UPLOAD_IDX_SUFFIX = "_upload_idx"
 PATH_SUFFIX = "_path"
 
 
+# Key-name suffixes that mark an `action_context` value, or a `context_schema`
+# property, as a host path. Two sites read this from opposite ends: the submit
+# gate checks a value under such a key whatever the schema declares, and the
+# workflow-YAML loader guard makes a property with such a name declare
+# `pattern: "^/"`. One definition, so the two cannot cover different sets.
+HOST_PATH_KEY_SUFFIXES: tuple[str, ...] = (PATH_SUFFIX, "_dir", "_folder")
+
+
 # The per-sample read-mask action's bare id (its YAML lives at
 # workflows/read-mask/<version>.yaml). A sample's reads are stored once by the
 # bcl-convert workflow's ingest_reads step; processing a sample then means

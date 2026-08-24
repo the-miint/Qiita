@@ -31,20 +31,12 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from qiita_common.actions import UPLOAD_IDX_SUFFIX
+from qiita_common.actions import HOST_PATH_KEY_SUFFIXES, UPLOAD_IDX_SUFFIX
 
 # A `context_schema` property is a host path iff it is a string constrained to
-# start with `/`. Every host-path field across the shipped workflows carries
-# exactly this pair, and `test_actions_loader` fails a `*_path` / `*_dir` /
-# `*_folder` string property that omits it, so the two stay in step.
+# start with `/`. Every shipped host-path property carries the pair, and a
+# `HOST_PATH_KEY_SUFFIXES`-named property that omits the pattern fails CI.
 _ABSOLUTE_PATH_PATTERN = "^/"
-
-# Key-name suffixes that mark a host path independently of the schema. The
-# same convention `test_actions_loader` enforces on workflow YAML, so the two
-# cover the same set from opposite ends: the loader guard makes a `*_path` /
-# `*_dir` property declare `pattern: "^/"`, and this makes a `*_path` / `*_dir`
-# context value get checked even when nothing declared it.
-_PATH_KEY_SUFFIXES = ("_path", "_dir")
 
 
 class IngestPathError(ValueError):
@@ -125,7 +117,7 @@ def named_host_paths(
     return {
         key: value
         for key, value in action_context.items()
-        if isinstance(value, str) and (key in declared or key.endswith(_PATH_KEY_SUFFIXES))
+        if isinstance(value, str) and (key in declared or key.endswith(HOST_PATH_KEY_SUFFIXES))
     }
 
 
@@ -156,13 +148,18 @@ def resolve_ingest_path(raw: str, *, roots: tuple[Path, ...]) -> Path:
     Raises `IngestPathError` when the value is not absolute, escapes every
     root, or is definitively absent.
 
-    Containment is checked lexically, on `os.path.normpath` output, because the
-    control plane cannot always traverse far enough to resolve symlinks (see
-    the module docstring). When resolution *does* succeed, the resolved form is
-    checked too, so a symlink pointing out of the mount is caught wherever the
-    control plane can see it. `os.path.realpath` degrades to the unresolved
-    tail rather than raising, so the extra check never fires on a path the
-    lexical rule already accepted for a reason the process cannot observe.
+    Containment is checked twice, and both checks are load-bearing.
+
+    The lexical one, on `os.path.normpath` output, holds even when the control
+    plane cannot traverse far enough to resolve symlinks (see the module
+    docstring). The second resolves the RAW value — not the normalized one —
+    because the kernel resolves a symlink before it applies the `..` that
+    follows it, while `normpath` cancels the pair textually. With a root of
+    `/sequencing` and `/sequencing/link` pointing outside it,
+    `/sequencing/link/../tail` normalizes to `/sequencing/tail` and passes the
+    lexical rule, but opens `/tail` on the compute node. `os.path.realpath`
+    degrades to the unresolved tail rather than raising, so this never fires on
+    a path the lexical rule accepted for a reason the process cannot observe.
     """
     if not raw or not PurePosixPath(raw).is_absolute():
         raise IngestPathError(
@@ -177,7 +174,7 @@ def resolve_ingest_path(raw: str, *, roots: tuple[Path, ...]) -> Path:
             path=raw,
             roots=roots,
         )
-    resolved = Path(os.path.realpath(lexical))
+    resolved = Path(os.path.realpath(raw))
     if resolved != lexical:
         # Compare against the RESOLVED roots. A root can itself sit behind a
         # symlink (`/var` -> `/private/var` on macOS, a mount reached through a
