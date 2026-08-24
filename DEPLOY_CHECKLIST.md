@@ -144,6 +144,14 @@ _None yet._
 
 ### Notes (no host action)
 
+- **A `user` role gains `ticket:doput` on the next deploy.** No host action — role
+  ceilings are code, applied by the restart. **Existing user PATs do not gain it**: token
+  auth resolves to `frozen mint-time scopes & current role ceiling` (`auth/principal.py`),
+  and widening the ceiling cannot add what the token never carried — a user wanting the
+  new capability mints a fresh token.
+  The scope buys a staging slot the caller owns; `reference:write` stays admin-only, so
+  this does not let a user load a reference database. (#484)
+
 - **A `user` can no longer name a host path in `action_context`; it is now wet_lab_admin+.**
   A `fastq_path` / `bam_path` submission from a `user` role returns 403 naming the
   `*_upload_idx` handle to use instead. They load reads with the new `qiita submit-reads`,

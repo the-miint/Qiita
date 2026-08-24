@@ -123,8 +123,11 @@ class Scope(StrEnum):
     # MASK_DEFINITION_DELETE; it is the disallow-without-delete escape hatch.
     ALIGNMENT_DEFINITION_DELETE = "alignment_definition:delete"
     # Generic upload domain. Gates the slot-minting + DoPut path; not
-    # reference-specific. Carried by admins (humans uploading via qiita-admin)
-    # and service accounts (workers driving import flows).
+    # reference-specific. On every role ceiling and on service accounts: it
+    # buys a numbered staging slot the caller owns and nothing else, so what
+    # an upload may then FEED is gated separately (reference-add needs
+    # `reference:write`; a work_ticket naming another principal's upload_idx
+    # is refused at dispatch).
     TICKET_DOPUT = "ticket:doput"
 
     # Biosample data

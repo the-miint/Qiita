@@ -2381,6 +2381,16 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **`ticket:doput` is now on the USER role ceiling (#484).** It was on the two admin
+  ceilings and service accounts only, dating from when reference loading was the sole
+  upload consumer. With host paths in `action_context` restricted to wet_lab_admin+, an
+  upload is a regular user's only route for their own reads, and withholding the scope
+  left them unable to ingest at all. The grant is the staging slot and nothing more: the
+  signed ticket carries `{"action": "doput", "upload_idx": N}`, the data plane derives the
+  path, and `/upload/{idx}/done` and `GET /upload/{idx}` still gate on
+  `created_by_idx == principal`. What an upload may feed is gated separately —
+  reference-add needs `reference:write`, which a USER does not have.
+
 - **`CHANGELOG.md` rotated: the historical strata moved to `docs/changelog-archive/`.**
   The file had reached 5,745 lines under a single never-rotated `## [Unreleased]`,
   carrying eleven redundant bucket headings below the four that PRs write to. The

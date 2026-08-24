@@ -34,6 +34,14 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            # Mint an upload slot and stream into it. On the USER ceiling
+            # because a user who may not name a host path in action_context
+            # (wet_lab_admin+) has this as their only route for their own
+            # reads. It confers no destination choice: the signed ticket
+            # carries `{"action": "doput", "upload_idx": N}` and the data
+            # plane derives the path. Reference-add still needs
+            # `reference:write`, which stays admin-only.
+            Scope.TICKET_DOPUT,
             # Human-callable alignment DoGet mint. On every ceiling, and NOT on
             # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
             Scope.ALIGNMENT_DOGET,
