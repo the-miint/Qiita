@@ -41,6 +41,100 @@ duplicates further down are historical strata; leave them where they are.
   so a read split at an origin is dropped before it reaches the lake — this gate can only
   pool what was stored.)
 
+- **A per-`prep_sample` alignment delete (#469).** The alignment delete surface had two
+  scopes: `delete_alignment` (a whole `alignment_idx`) and `delete_alignment_block` (a
+  block's member sub-ranges). A workflow that aligns one prep_sample per ticket fits
+  neither — the whole-idx purge destroys every other sample's rows, and there is no block
+  to read a cover-map from — so a re-run would double-count. The new
+  `delete_alignment_sample` DoAction deletes the `(alignment_idx, prep_sample_idx)` pair's
+  rows from every `ALIGNMENT_DELETE_TABLES` table in one transaction, and the
+  `delete-alignment-sample` library primitive signs it. Idempotent (a sample with no rows
+  deletes 0), replay-safe, and registered in `REPLAY_SAFE_ACTIONS`. The predicate carries
+  no `sequence_idx` bound and is feature_idx-agnostic, so all of a read's rows go.
+  `alignment` is not a `REPLACE_KEY_TABLES` entry instead: replace-by-key is matched on the
+  destination table name alone, so a pair-keyed entry would also fire on the block-scoped
+  `align` workflow's registrations and the second block of a split sample would delete the
+  first's rows. `delete_alignment_sample_deletes_the_pair_only` pins the exactness on both
+  tables: a sibling sample under the same alignment survives, and the target sample under a
+  different alignment survives. The runner arm takes `alignment_idx` from the
+  `work_ticket.alignment_idx` column, never from `action_context` (which the submitter
+  chooses), refuses on NULL, and refuses when a context value is present and disagrees
+  with the column — a step's `params:` binds `alignment_idx` from `action_context`, so a
+  disagreement would clear one alignment's rows while the register that follows wrote
+  under the other. `block_read.resolve_block_read_scope` makes the same cross-check on
+  the block path. Plumbing only — no shipped workflow references the primitive yet, and
+  none can until something writes `work_ticket.alignment_idx` on a prep_sample-scoped
+  ticket (`align_planner.plan_and_submit_alignments`, the column's only writer today,
+  inserts block-scoped ones).
+
+- **Assembly completion is first-class state: `qiita.assembly_sample` (#467).**
+  The per-`(processing_idx, prep_sample)` completion gate `long-read-assembly` was missing,
+  alongside `qiita.mask_sample` and `qiita.alignment_sample`. Completion existed only as
+  work-ticket state, and row presence does not stand in for it: `write-assembly-membership`
+  writes `qiita.assembly_membership` several entries before `register-files` lands the
+  DuckLake tables, so a ticket that dies in between leaves a partial footprint that looks
+  finished. New table (`state` TEXT + CHECK over `pending` / `completed` / `no_data`, plus an
+  index on `prep_sample_idx`), a repository layer, and a terminal `finalize-assembly-sample`
+  library action appended to the workflow, which writes `'completed'`.
+  The runner materializes the row `'pending'` right after it mints the run's
+  `processing_idx`, and writes `'no_data'` from its `StepNoData` handler when the sample
+  assembled no contig of any kind (the terminal action never runs on that path). Both key on
+  the id the mint returned, never on `action_context` — a submitter can put a
+  `processing_idx` key there and it reaches the runner's bindings intact. A re-run of the
+  same identity reopens `'no_data'` back to `'pending'` and leaves `'completed'` alone; the
+  `'no_data'` write reports whether it landed, and the runner WARNs with the run and sample
+  when it did not, so the gate reading `'completed'` under a NO_DATA ticket is in the journal.
+  `ActionDefinition` now refuses, at construction, an action that declares
+  `finalize-assembly-sample` without threading `processing_idx` through some step's
+  `params:` — the gate row would have no key. That covers the YAML sweep in CI and the
+  `qiita.action` reconstruction alike; the runner keeps the same refusal per ticket.
+  `delete_sequenced_pool_cascade` clears the new gate alongside `qiita.mask_sample` and
+  `qiita.alignment_sample` before deleting `qiita.prep_sample`.
+  A FAILED or cancelled ticket leaves the row `'pending'`: the two terminal writers are the
+  only ones and nothing sweeps. Nothing reads the gate at submit time, so a stale `'pending'`
+  refuses no re-run, and a re-run under the same params re-resolves the same key and closes
+  it.
+
+- **`qiita_lake.alignment_origin_spanning`, a side table for reads that cross a circular
+  contig's origin (#465).** An aligner treats a circular contig as a linear one, so a read
+  crossing the origin emits one SAM record per side of it, each covering only its own share
+  of the query. The new table records the merged read — query interval, reference interval,
+  strand, pooled identity and coverage, fragment count — one row per (read, feature), while
+  the fragment rows stay in `alignment` unchanged. Its DDL in `ducklake.rs` carries the
+  contract, the join key, and which producers it can describe: the sharded reference
+  aligner is not one, because `align_sharded` applies `_MIN_QUERY_COVERAGE_MINIMAP2` per SAM
+  record on the way into the staging Parquet and so drops an origin-spanning read's
+  fragments before they are persisted. Storage and delete plumbing only — nothing writes the
+  table yet, and `register-files` needs no change because it derives its filename→table map
+  from the staging dir by stem. `delete_alignment` and `delete_alignment_block` now delete
+  from a table list (`ALIGNMENT_DELETE_TABLES`) in one transaction rather than from
+  `alignment` alone; `rows_deleted` is unchanged, still the `alignment` count.
+  `alignment_delete_covers_every_alignment_scoped_lake_table` pins the list against the
+  catalog, so a future table keyed by `alignment_idx` cannot skip the purge.
+
+- **A contract test for how miint's minimap2 reports an origin-spanning read (#465).**
+  Upstream documents the behaviour and ships the pooling for it
+  (`circular_query_coverage`, `cigar_pooled_identity`); what this test pins is the tie to
+  our own floor. Measured on miint `9fc4d12` (minimap2 `0477498`), 20 kb contig and a 6 kb
+  read built across the origin: 2 SAM records, each `cigar_query_coverage` 0.5 at
+  `cigar_sequence_identity` 1.0, under `map-hifi`, `map-ont` and the default preset.
+  Concatenated with `string_agg(cigar, '')` the pair scores 0.5 coverage but 1.0 identity
+  — a clip consumes query length without being an aligned column — while
+  `circular_query_coverage` returns 1.0 coverage over 2 fragments. The control, a read of
+  the same length from the middle of the same contig, gives one record at coverage 1.0.
+  Every score is asserted against `_MIN_QUERY_COVERAGE_MINIMAP2`, so lowering that floor
+  turns the test red instead of silently invalidating the side table's DDL scope claim.
+  `test_origin_spanning_read_splits_into_one_record_per_side`.
+
+- **`docs/duckdb-miint.md` records that `cigar_query_coverage` is per-record, and what
+  that costs us today (#465).** The entry links upstream's circular-coverage contract
+  rather than restating it, and states the standing consequence: because `align_sharded`
+  scores the floor per SAM record, long reads crossing the origin of a circular reference
+  contig are dropped before they reach `alignment` — silently, and concentrated on closed
+  chromosomes, plasmids and phages. Also corrects the `align_minimap2` entry: `query_table`
+  is the only positional argument, and `subject_table` / `index_path` are exactly-one-of
+  rather than independently optional.
+
 - **`scripts/lake-gc.sh` reports and reclaims unreferenced lake files (#472).** DuckLake
   never reclaims a data file on its own: deleting rows leaves the Parquet on disk and
   still held by the snapshots that predate the delete, so every `register_files`
@@ -1067,6 +1161,26 @@ duplicates further down are historical strata; leave them where they are.
   also accepts `none` — the spelling `--lane` already uses — which is the only way to
   express the documented no-identity gate for an alignment whose CIGARs cannot be scored
   (a threshold of 0 does not: a NULL score fails `>= 0` too).
+
+- **The replay registry's `delete_*` claim (#469).** `REPLAY_SAFE_ACTIONS`' comment said
+  re-running a delete "deletes zero rows". That holds only for a replay with no write in
+  between: `delete_read_mask_block` (in `read-mask-block`) and `delete_alignment_block`
+  (in `align`) run as a pre-`register-files` replace, so a token replayed after that
+  registration drops the rows it wrote — and `delete_alignment_sample` takes on the same
+  exposure once a workflow adopts it. The comment now says so, and names what bounds the
+  window — the token expiry the data plane checks on every DoAction body (300s by
+  default, `MAX_TICKET_LIFETIME` refusing an expiry more than 3600s out).
+  `docs/auth.md#ticket-replay`, which that comment points at, carried the same claim and
+  is corrected with it.
+
+- **`alignment_delete_covers_every_alignment_scoped_lake_table` now checks columns too
+  (#469).** It pinned that every `alignment_idx`-scoped lake table is in
+  `ALIGNMENT_DELETE_TABLES`, but not that a listed table carries the columns the delete
+  clauses key on. `delete_lake_rows` applies one clause to every listed table, so a table
+  joining the list without `prep_sample_idx` or `sequence_idx` makes the narrower deletes
+  unrunnable — loudly (DuckDB raises a Binder Error on the missing column and
+  `delete_lake_rows` ROLLBACKs, so the leading table's rows re-count intact), but not
+  until a ticket runs.
 
 - **A redriven work ticket whose producer step re-ran can register its files again (#472).** `lake_dest_filename`
   minted `wt<work_ticket_idx>-<basename>`, whose uniqueness assumed one load per ticket.

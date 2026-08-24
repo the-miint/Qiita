@@ -176,6 +176,13 @@ class LibraryPrimitive(StrEnum):
     # fresh block it deletes 0 rows. See
     # qiita_control_plane.actions.library.delete_alignment_block.
     DELETE_ALIGNMENT_BLOCK = "delete-alignment-block"
+    # Per-sample (align): idempotent sample replace, the per-sample twin of
+    # delete-alignment-block. Its slot is the one that twin occupies — immediately
+    # BEFORE register-files, on a prep_sample-scoped ticket — deleting the
+    # (alignment_idx, prep_sample_idx) pair's rows so a re-run deletes-then-
+    # re-registers without double-counting. See
+    # qiita_control_plane.actions.library.delete_alignment_sample.
+    DELETE_ALIGNMENT_SAMPLE = "delete-alignment-sample"
     # Block-compute (align): the `align` workflow's terminal step, the alignment
     # twin of reconcile-block. Marks the block completed, then finalizes each
     # covered sample's alignment_sample gate once ALL its covering blocks are done.
@@ -198,6 +205,11 @@ class LibraryPrimitive(StrEnum):
     # Runs AFTER register-files so the gate never reads 'completed' before the masked
     # reads are in DuckLake. See qiita_control_plane.actions.library.finalize_mask_sample_gate.
     FINALIZE_MASK_SAMPLE = "finalize-mask-sample"
+    # Per-sample assembly completion: the terminal step of the long-read-assembly
+    # workflow. Writes 'completed' into the qiita.assembly_sample gate for this
+    # ticket's (processing_idx, prep_sample). See
+    # qiita_control_plane.actions.library.finalize_assembly_sample_gate.
+    FINALIZE_ASSEMBLY_SAMPLE = "finalize-assembly-sample"
 
 
 # =============================================================================

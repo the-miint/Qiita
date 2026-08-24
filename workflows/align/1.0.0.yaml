@@ -137,7 +137,7 @@ steps:
 
   # Idempotent block replace: delete this block's exact alignment footprint (its
   # member sub-ranges under the ticket's alignment_idx) from the DuckLake
-  # `alignment` table BEFORE register-files re-writes it, so a block re-run (a
+  # alignment tables BEFORE register-files re-writes it, so a block re-run (a
   # retry, or an operator resubmit covering the same footprint) deletes-then-
   # re-registers and never double-counts. On a fresh block it deletes 0 rows.
   # Exact by construction (per-member OR), so a sample split across several blocks
