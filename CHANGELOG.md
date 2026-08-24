@@ -2339,6 +2339,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   the most-accessed file in the repo — 387 tool calls, 127,150 tokens — while the
   union of lines any session ever read was 885 of 5,668 (16%).
 
+- **Data-plane inline test modules split into `#[path]` submodules (#481).** `flight_service.rs`
+  was 9,156 lines of which 5,557 (61%) were `#[cfg(test)]`; `auth.rs` was 1,143 with 514 (45%).
+  The tests move to `flight_service_tests.rs` / `auth_tests.rs` and stay child modules via
+  `#[cfg(test)] #[path = "..."] mod tests;`, so they still reach private items through
+  `use super::*` — no visibility changes. `cargo test` reports the same 116 tests passing
+  before and after. `ducklake.rs` and `main.rs` are deliberately left alone: #244 has a hunk
+  inside `ducklake.rs`'s test module and also touches `main.rs`, so those two wait for it to
+  land.
+
 - **`mint-features` pins its declared `inputs:` list (#464).** The runner's dispatch resolved
   the manifest as `entry.inputs[0]`, so a workflow naming any other binding minted features out
   of whatever path sat there. It now requires `inputs: [manifest]` and reads `bound["manifest"]`
