@@ -59,6 +59,18 @@ _None yet._
   prints nothing for zero rows, so it means no `long-read-assembly` 1.0.0 row matched at
   all. Re-run `qiita-admin actions sync` for either. (#467)
 
+- **The staged miint build must carry `circular_query_coverage`** — `qiita feature-table
+  build --circular-gate` calls it. There is no capability probe: an absent function
+  surfaces as a bare `Catalog Error` naming the function, so check it once here rather
+  than letting a user discover it. Run as the CP service account, against the staged
+  extension directory the CP already LOADs from:
+  ```bash
+  sudo -u qiita-api env MIINT_EXTENSION_DIRECTORY="$(grep -oP '(?<=^MIINT_EXTENSION_DIRECTORY=).*' /etc/qiita/control-plane.env)" \
+    python3 -c "import duckdb, os; c=duckdb.connect(':memory:', config={'extension_directory': os.environ['MIINT_EXTENSION_DIRECTORY'], 'allow_unsigned_extensions': 'true'}); c.execute('LOAD miint'); print(c.execute(\"SELECT count(*) FROM duckdb_functions() WHERE function_name='circular_query_coverage'\").fetchone()[0])"
+  ```
+  Expect `1`. A `0` means the staged build predates the function — re-stage the extension
+  before telling anyone `--circular-gate` works. (#475)
+
 ### 6. After the deploy verifies green
 
 _None yet._

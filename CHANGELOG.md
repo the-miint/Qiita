@@ -21,6 +21,25 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`qiita feature-table build --circular-gate` — judge a read pooled over the records it
+  was split into (#475).** A read crossing the origin of a circular reference held as a
+  linearised contig is emitted as two records covering half of it each, so a per-record
+  query-coverage floor discards it — silently, and worst for the small plasmids and phages
+  most often recovered as complete circles. The new gate mode asks duckdb-miint's
+  `circular_query_coverage` how much of each read one reference explains with every record
+  pooled, and keeps a read whose coverage and pooled identity clear their thresholds and
+  whose fragments lie on one strand. Both thresholds are parameters —
+  `--circular-min-coverage` (0.90) and `--circular-min-identity` (0.95); the same-strand
+  requirement is not, because fragments on opposite strands are not one molecule and
+  pooling them manufactures coverage. It replaces `--min-identity` / `--min-query-coverage`
+  rather than combining with them, refuses a slice holding secondary, unmapped or
+  coordinate-less records (the macro cannot see those, so they would leave the table
+  without failing any threshold), and refuses paired data, whose mates are separate
+  molecules the pooling keeps apart. The bundle manifest records whichever axis was
+  applied. (Note: the alignment ingest applies its own per-record 0.90 query-coverage floor,
+  so a read split at an origin is dropped before it reaches the lake — this gate can only
+  pool what was stored.)
+
 - **A per-`prep_sample` alignment delete (#469).** The alignment delete surface had two
   scopes: `delete_alignment` (a whole `alignment_idx`) and `delete_alignment_block` (a
   block's member sub-ranges). A workflow that aligns one prep_sample per ticket fits
@@ -1122,6 +1141,25 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **The circular gate's identity check now asks the question the gate answers (#475).**
+  Its diagnostics counted scorable alignment RECORDS with `cigar_sequence_identity` while
+  the gate itself applies `cigar_pooled_identity` per read: a read whose records mix a
+  legacy `M` CIGAR with an extended one has NULL pooled identity, so it was dropped whole
+  — including the records that did score — while the diagnostic reported those records as
+  scorable and nothing refused. The circular arm now counts unscorable READS over the
+  macro's own grouping key and refuses the slice, naming the two ways a read gets no
+  pooled identity.
+
+- **A circular threshold given without `--circular-gate` is refused instead of ignored
+  (#475).** `qiita feature-table build --circular-min-coverage 0.5` with no
+  `--circular-gate` built an entirely UNGATED table and said nothing, because the flags
+  were read only inside the mode. They now default to a sentinel rather than to the
+  threshold, so "omitted" and "given" are distinguishable, and giving one without the
+  mode refuses the way `--unpaired-gate` alone already does. `--circular-min-identity`
+  also accepts `none` — the spelling `--lane` already uses — which is the only way to
+  express the documented no-identity gate for an alignment whose CIGARs cannot be scored
+  (a threshold of 0 does not: a NULL score fails `>= 0` too).
 
 - **The replay registry's `delete_*` claim (#469).** `REPLAY_SAFE_ACTIONS`' comment said
   re-running a delete "deletes zero rows". That holds only for a replay with no write in
@@ -2329,6 +2367,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **`qiita_common.feature_table` is now the `qiita_common.analytic` package (#475).** Closes
+  #456. The one module became eight — `relations`, `stage`, `coverage`, `gate`, `ogu`, `label`,
+  `sidecar`, `write` — re-exported from `analytic/__init__.py`, so a consumer's only change is
+  the import line. No SQL text, no error message, and no assertion changed: every builder's
+  output and every check's message is byte-identical, and the string-level tests moved verbatim
+  into per-module files. `qiita-common` now declares `duckdb>=1.5.4`, which is what lets the
+  analytic's behavioural tests — the only home of the per-sample coverage scope — live beside
+  the code they pin rather than in the control-plane suite.
 
 - **`CHANGELOG.md` rotated: the historical strata moved to `docs/changelog-archive/`.**
   The file had reached 5,745 lines under a single never-rotated `## [Unreleased]`,

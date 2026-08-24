@@ -32,7 +32,7 @@ from pathlib import Path
 import duckdb
 import pyarrow.parquet as pq
 import pytest
-from qiita_common import feature_table
+from qiita_common import analytic
 
 # ---------------------------------------------------------------------------
 # Parquet writers (correctly-typed to mirror the real DuckLake / resolver output)
@@ -199,7 +199,7 @@ def test_execute_streams_scopes_writes_and_schema(tmp_path, monkeypatch):
 
     assert captured["work_ticket_idx"] == 42
     assert captured["reference_idx"] == 7
-    assert captured["columns"] == list(feature_table.ALIGNMENT_COLUMNS)
+    assert captured["columns"] == list(analytic.ALIGNMENT_COLUMNS)
 
     out_path = out["ogu_table"]
     assert out_path == tmp_path / "ws" / "ogu_table.parquet"
@@ -515,7 +515,7 @@ def test_job_asks_for_exactly_the_columns_it_binds(tmp_path, monkeypatch):
         threshold=0.01,
     )
 
-    assert captured["columns"] == list(feature_table.ALIGNMENT_COLUMNS)
+    assert captured["columns"] == list(analytic.ALIGNMENT_COLUMNS)
     # This recipe never reads `cigar`, and leaving it out is most of what the
     # projection buys — the one regression a future edit is likeliest to add.
     assert "cigar" not in captured["columns"]
