@@ -22,6 +22,34 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **Assembly completion is first-class state: `qiita.assembly_sample` (#467).**
+  The per-`(processing_idx, prep_sample)` completion gate `long-read-assembly` was missing,
+  alongside `qiita.mask_sample` and `qiita.alignment_sample`. Completion existed only as
+  work-ticket state, and row presence does not stand in for it: `write-assembly-membership`
+  writes `qiita.assembly_membership` several entries before `register-files` lands the
+  DuckLake tables, so a ticket that dies in between leaves a partial footprint that looks
+  finished. New table (`state` TEXT + CHECK over `pending` / `completed` / `no_data`, plus an
+  index on `prep_sample_idx`), a repository layer, and a terminal `finalize-assembly-sample`
+  library action appended to the workflow, which writes `'completed'`.
+  The runner materializes the row `'pending'` right after it mints the run's
+  `processing_idx`, and writes `'no_data'` from its `StepNoData` handler when the sample
+  assembled no contig of any kind (the terminal action never runs on that path). Both key on
+  the id the mint returned, never on `action_context` — a submitter can put a
+  `processing_idx` key there and it reaches the runner's bindings intact. A re-run of the
+  same identity reopens `'no_data'` back to `'pending'` and leaves `'completed'` alone; the
+  `'no_data'` write reports whether it landed, and the runner WARNs with the run and sample
+  when it did not, so the gate reading `'completed'` under a NO_DATA ticket is in the journal.
+  `ActionDefinition` now refuses, at construction, an action that declares
+  `finalize-assembly-sample` without threading `processing_idx` through some step's
+  `params:` — the gate row would have no key. That covers the YAML sweep in CI and the
+  `qiita.action` reconstruction alike; the runner keeps the same refusal per ticket.
+  `delete_sequenced_pool_cascade` clears the new gate alongside `qiita.mask_sample` and
+  `qiita.alignment_sample` before deleting `qiita.prep_sample`.
+  A FAILED or cancelled ticket leaves the row `'pending'`: the two terminal writers are the
+  only ones and nothing sweeps. Nothing reads the gate at submit time, so a stale `'pending'`
+  refuses no re-run, and a re-run under the same params re-resolves the same key and closes
+  it.
+
 - **`qiita_lake.alignment_origin_spanning`, a side table for reads that cross a circular
   contig's origin (#465).** An aligner treats a circular contig as a linear one, so a read
   crossing the origin emits one SAM record per side of it, each covering only its own share

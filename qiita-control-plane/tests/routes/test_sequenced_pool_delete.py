@@ -240,15 +240,16 @@ async def test_delete_pool_happy_path(admin_client, postgres_pool, human_admin_s
         await _cleanup(postgres_pool, ids)
 
 
-async def test_delete_pool_clears_mask_and_alignment_gate_rows(
+async def test_delete_pool_clears_completion_gate_rows(
     admin_client, postgres_pool, human_admin_session
 ):
     """Regression: a completion-gate row for one of the pool's prep_samples must
-    not block the cascade. `qiita.mask_sample` and `qiita.alignment_sample` both
-    reference `prep_sample` ON DELETE RESTRICT, so before this fix the prep_sample
-    delete 500'd once a gate row existed. This PR makes those rows live (the
-    backfill + finalize write them where the per-sample deployment had none), so
-    the cascade must clear both gates before deleting prep_sample."""
+    not block the cascade. `qiita.mask_sample`, `qiita.alignment_sample` and
+    `qiita.assembly_sample` all reference `prep_sample` ON DELETE RESTRICT, so a
+    gate row the cascade does not clear makes the prep_sample delete raise
+    ForeignKeyViolationError — an unhandled 500 out of a force-delete that has
+    already purged the pool's DuckLake rows. The cascade must clear all three
+    before deleting prep_sample."""
     ids = await _seed_pool_with_sample(postgres_pool, human_admin_session["principal_idx"])
     prep = ids["prep_sample_idx"]
     mask_idx = await postgres_pool.fetchval(
@@ -277,6 +278,18 @@ async def test_delete_pool_clears_mask_and_alignment_gate_rows(
         alignment_idx,
         prep,
     )
+    processing_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.processing (params_hash, workflow, version, params)"
+        " VALUES ($1, 'long-read-assembly', '1.0.0', '{}'::jsonb)"
+        " RETURNING processing_idx",
+        uuid.uuid4().bytes + uuid.uuid4().bytes,  # 32-byte params_hash
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        processing_idx,
+        prep,
+    )
     try:
         resp = await admin_client.delete(_url(ids))
         assert resp.status_code == 200, resp.text
@@ -285,7 +298,7 @@ async def test_delete_pool_clears_mask_and_alignment_gate_rows(
             await postgres_pool.fetchval("SELECT 1 FROM qiita.prep_sample WHERE idx = $1", prep)
             is None
         )
-        # Both gate rows gone.
+        # All three gate rows gone.
         assert (
             await postgres_pool.fetchval(
                 "SELECT 1 FROM qiita.mask_sample WHERE prep_sample_idx = $1", prep
@@ -298,7 +311,13 @@ async def test_delete_pool_clears_mask_and_alignment_gate_rows(
             )
             is None
         )
-        # The mask / alignment *definition* rows survive — not pool-owned.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.assembly_sample WHERE prep_sample_idx = $1", prep
+            )
+            is None
+        )
+        # The mask / alignment / processing *definition* rows survive — not pool-owned.
         assert (
             await postgres_pool.fetchval(
                 "SELECT 1 FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
@@ -312,6 +331,12 @@ async def test_delete_pool_clears_mask_and_alignment_gate_rows(
             )
             == 1
         )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.processing WHERE processing_idx = $1", processing_idx
+            )
+            == 1
+        )
     finally:
         await postgres_pool.execute(
             "DELETE FROM qiita.mask_sample WHERE prep_sample_idx = $1", prep
@@ -320,10 +345,16 @@ async def test_delete_pool_clears_mask_and_alignment_gate_rows(
             "DELETE FROM qiita.alignment_sample WHERE prep_sample_idx = $1", prep
         )
         await postgres_pool.execute(
+            "DELETE FROM qiita.assembly_sample WHERE prep_sample_idx = $1", prep
+        )
+        await postgres_pool.execute(
             "DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
         )
         await postgres_pool.execute(
             "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.processing WHERE processing_idx = $1", processing_idx
         )
         await _cleanup(postgres_pool, ids)
 
