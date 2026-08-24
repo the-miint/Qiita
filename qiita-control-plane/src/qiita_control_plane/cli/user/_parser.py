@@ -6,6 +6,11 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 import argparse
 from pathlib import Path
 
+from qiita_common.analytic import (
+    CIRCULAR_MIN_COVERAGE,
+    CIRCULAR_MIN_IDENTITY,
+    CoverageScope,
+)
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
@@ -22,7 +27,6 @@ from qiita_common.api_paths import (
     PATH_STUDY_BY_IDX,
     PATH_STUDY_PREFIX,
 )
-from qiita_common.feature_table import CoverageScope
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
@@ -40,11 +44,13 @@ from qiita_common.models import (
 from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
 from ._helpers import (
+    _UNSET,
     _handle_patch,
     _handle_read,
     _handle_study_field_create,
     _lane_arg,
     _proportion_arg,
+    _proportion_or_none_arg,
 )
 from .alignment import _handle_alignment_cohort, _handle_alignment_list
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
@@ -812,6 +818,41 @@ def _build_parser() -> argparse.ArgumentParser:
             "Score each alignment row on its own CIGAR instead of pooling a placement's"
             " mates. Only for a slice whose mates did not both map, which cannot be"
             " pooled; pooling is the default and is correct for single-end data too."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--circular-gate",
+        action="store_true",
+        help=(
+            "Judge each read against each reference with every record the aligner split"
+            " it into pooled, instead of scoring records one at a time. A read crossing"
+            " the origin of a circular reference is emitted as two records covering half"
+            " of it each, which a per-record coverage floor discards; pooled, it scores"
+            " what it is. Replaces --min-identity / --min-query-coverage, and single-end"
+            " only — mates are different molecules and are never pooled together."
+        ),
+    )
+    # Both default to `_UNSET`, not to the threshold, so "omitted" is distinguishable
+    # from "given" — passing either without --circular-gate is refused rather than
+    # silently ignored.
+    p_ft_build.add_argument(
+        "--circular-min-coverage",
+        type=_proportion_arg,
+        default=_UNSET,
+        help=(
+            "Minimum proportion of a read that one reference must explain, pooled over"
+            f" the read's records, under --circular-gate (default {CIRCULAR_MIN_COVERAGE})."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--circular-min-identity",
+        type=_proportion_or_none_arg,
+        default=_UNSET,
+        help=(
+            "Minimum pooled sequence identity a read must clear against a reference under"
+            f" --circular-gate (default {CIRCULAR_MIN_IDENTITY}), or 'none' to gate on"
+            " coverage and strand alone. Needs an eqx (=/X) CIGAR; the build refuses"
+            " rather than silently drop reads it cannot score."
         ),
     )
     p_ft_build.add_argument(
