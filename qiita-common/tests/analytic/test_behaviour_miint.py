@@ -1,10 +1,10 @@
-"""Behavioural tests for `qiita_common.feature_table` against REAL duckdb-miint.
+"""Behavioural tests for `qiita_common.analytic` against REAL duckdb-miint.
 
-The builders return SQL text and open no connection, so `qiita-common`'s own tests
-assert on strings; the analytic's behaviour is pinned here and in the orchestrator's
-`test_estimate_feature_table.py`. This module is the client-side half's home and
-carries the properties that suite cannot: **the per-sample coverage scope**, which
-no server-side caller uses.
+The builders return SQL text and open no connection, so the sibling modules here
+assert on strings; the analytic's behaviour is pinned in this one and in the
+orchestrator's `test_estimate_feature_table.py`. This module carries the properties
+that suite cannot: **the per-sample coverage scope**, which no server-side caller
+uses.
 
 Every test drives the shared builders end to end — the staging renames, the
 lengths roll-up, the survivor set, the pre-woltka join, and `woltka_ogu` itself —
@@ -23,9 +23,19 @@ import contextlib
 
 import duckdb
 import pytest
-from qiita_common import feature_table as ft
 
-from qiita_control_plane.miint import connect_with_miint_staged
+from qiita_common import analytic as ft
+from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+
+
+def _miint_conn() -> duckdb.DuckDBPyConnection:
+    """An in-memory connection with miint LOADed from the extension directory the
+    conftest stages. LOAD-only, like every service-side connect: the INSTALL happens
+    once per session there, not once per test."""
+    conn = duckdb.connect(":memory:", config=miint_connect_config())
+    conn.execute(miint_load_sql())
+    return conn
+
 
 # ---------------------------------------------------------------------------
 # Fixture vocabulary. Contigs are `feature_idx`, genomes `genome_idx`.
@@ -109,16 +119,18 @@ def _stage(conn, *, alignment, mapping, lengths, threshold, gate=None):
     if gate is None:
         conn.execute(ft.alignment_table_sql("_align_projected"))
     else:
+        if gate.circular:
+            # A circular gate reads a length per feature, so the lengths stream is
+            # drained into the per-feature table and the roll-up below reads that —
+            # exactly what the client-side recipe does when both are wanted.
+            conn.execute(ft.feature_lengths_table_sql("_len_src"))
         conn.execute(ft.streamed_alignment_table_sql("_align_projected", gate=gate))
-        total, scorable, unpoolable, paired_rows = conn.execute(
-            ft.gate_diagnostics_sql(gate)
-        ).fetchone()
+        cursor = conn.execute(ft.gate_diagnostics_sql(gate))
+        names = [column[0] for column in cursor.description]
+        # By NAME, as both consumers do — a renamed count is a TypeError here rather
+        # than one number silently arriving as another's argument.
         clearance = ft.check_gate_diagnostics(
-            gate,
-            total_rows=total,
-            scorable_rows=scorable,
-            unpoolable_partitions=unpoolable,
-            paired_rows=paired_rows,
+            gate, **dict(zip(names, cursor.fetchone(), strict=True))
         )
         # The clearance carries the rest of the protocol in order — the gate and the
         # release of the streamed copy holding `cigar`.
@@ -126,6 +138,8 @@ def _stage(conn, *, alignment, mapping, lengths, threshold, gate=None):
             conn.execute(sql, params)
     conn.execute(ft.map_table_sql("_map_src"))
     if ft.coverage_filter_applies(threshold):
+        # `feature_lengths` is gone by now — the clearance releases it — so the roll-up
+        # reads the stream, as it does on every path that has no circular gate.
         conn.execute(ft.genome_lengths_table_sql("_len_src"))
 
 
@@ -150,7 +164,7 @@ def _table(
     """Run the whole analytic for `scope` at `threshold` and return the feature
     table, sorted — keyed by our own identifiers, as the server-side consumer leaves
     it."""
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(
             conn, scope, threshold, alignment=alignment, mapping=mapping, lengths=lengths, gate=gate
         )
@@ -215,7 +229,7 @@ def test_joining_the_wrong_scopes_survivor_set_is_a_bind_error():
     genome survived in, inflating its counts. This asserts the mismatch cannot get
     that far.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(conn, alignment=_ALIGNMENT, mapping=_MAP, lengths=_LENGTHS, threshold=0.01)
         conn.execute(ft.coverage_alignments_view_sql())
         conn.execute(ft.survivor_table_sql(ft.CoverageScope.PER_SAMPLE), [0.01])
@@ -310,7 +324,7 @@ def test_empty_and_populated_paths_agree_on_column_types():
     types; this is what checks the declaration against what woltka actually
     returns.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(conn, alignment=_ALIGNMENT, mapping=_MAP, lengths=_LENGTHS, threshold=0.0)
         conn.execute(ft.ogu_input_table_sql(survivor_scope=None))
 
@@ -502,7 +516,7 @@ def test_cigar_does_not_reach_the_gated_relation():
     """The wide column stops at the gate. Downstream reads `ALIGNMENT_TABLE`, which
     carries exactly `ALIGNMENT_COLUMNS` — so the coverage view and woltka's input
     never pay for it, and the streamed copy that held it is dropped."""
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(
             conn,
             alignment=[(1, 1, 10, 0, 0, 150, "150=", None)],
@@ -604,7 +618,7 @@ def test_the_analytic_releases_the_relations_it_finishes_with():
     relations in the pipeline, and they would otherwise live until the connection closes.
     """
     scope = ft.CoverageScope.POOLED
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(conn, scope, 0.01)
         surviving = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
         assert ft.OGU_INPUT_TABLE in surviving
@@ -638,6 +652,212 @@ def test_a_paired_gate_with_both_thresholds_scores_the_pooled_cigar():
         gate=ft.AlignmentGate(min_identity=0.5, min_query_coverage=0.95, paired=True),
     )
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# The circular gate, against real miint
+#
+# The fixture is one 30 kb contig (feature 10, genome 100) and a 6 kb read the
+# linearisation cut in two: `3000=3000S` ending where the contig does, `3000H3000=`
+# starting at its origin. Each record explains half the read; together they explain all
+# of it. `_INTERIOR_READ` is the same read placed away from the origin, in one record.
+# ---------------------------------------------------------------------------
+
+_CIRCULAR_LENGTHS = [(10, 30_000)]
+_CIRCULAR_MAP = [(10, 100)]
+_JUNCTION_READ = [
+    (1, 1, 10, 0, 27_000, 30_000, "3000=3000S", None),
+    (1, 1, 10, 2048, 0, 3_000, "3000H3000=", None),
+]
+_INTERIOR_READ = [(1, 2, 10, 0, 10_000, 16_000, "6000=", None)]
+
+
+def _gated_reads(alignment, *, gate) -> list[tuple]:
+    """The `(sequence_idx, position)` the gate left in `ALIGNMENT_TABLE`."""
+    with _miint_conn() as conn:
+        _stage(
+            conn,
+            alignment=alignment,
+            mapping=_CIRCULAR_MAP,
+            lengths=_CIRCULAR_LENGTHS,
+            threshold=0.0,
+            gate=gate,
+        )
+        return conn.execute(
+            f"SELECT sequence_idx, position FROM {ft.ALIGNMENT_TABLE} ORDER BY 1, 2"
+        ).fetchall()
+
+
+def test_the_circular_gate_keeps_the_split_read_a_per_record_gate_drops():
+    """The whole point of the mode, on one fixture: at the same 0.90 coverage floor, the
+    per-record gate discards both halves of the junction read — each explains 0.5 of it —
+    while the circular gate keeps both, because the read is fully explained by the
+    reference it came from. The interior read survives either way."""
+    per_record = ft.AlignmentGate(min_query_coverage=0.90, paired=True)
+    circular = ft.AlignmentGate(circular=True, circular_min_identity=None)
+    reads = _JUNCTION_READ + _INTERIOR_READ
+
+    assert _gated_reads(reads, gate=per_record) == [(2, 10_000)]
+    assert _gated_reads(reads, gate=circular) == [(1, 0), (1, 27_000), (2, 10_000)]
+
+
+def test_the_circular_gate_keeps_or_drops_a_read_whole():
+    """It judges the read, so every record of a cleared group survives and none of a
+    failing one does. Half a junction read is not a placement, and leaving one fragment
+    behind would count the read on evidence the gate rejected."""
+    half = [_JUNCTION_READ[0]]  # one 3 kb record of the 6 kb read: coverage 0.5
+    assert (
+        _gated_reads(half, gate=ft.AlignmentGate(circular=True, circular_min_identity=None)) == []
+    )
+
+
+def test_the_circular_gate_scores_identity_pooled_over_the_records():
+    """One mismatch in 6000 aligned columns clears 0.95 and even 0.999; a record scored
+    on its own would put the mismatch in a 3000-column denominator. The threshold is a
+    parameter, so this asserts the number that is actually compared, not just a side."""
+    with_mismatch = [
+        _JUNCTION_READ[0],
+        (1, 1, 10, 2048, 0, 3_000, "3000H2999=1X", None),
+    ]
+    kept = ft.AlignmentGate(circular=True, circular_min_identity=0.999)
+    dropped = ft.AlignmentGate(circular=True, circular_min_identity=0.9999)
+    assert _gated_reads(with_mismatch, gate=kept) == [(1, 0), (1, 27_000)]
+    assert _gated_reads(with_mismatch, gate=dropped) == []
+
+
+def test_the_circular_gate_drops_fragments_on_opposite_strands():
+    """Same coverage, same identity, not a wrap: an inverted repeat or a chimera the
+    aligner split. `NOT mixed_strand` is what separates them, and it is not a threshold
+    a caller can lower."""
+    inverted = [_JUNCTION_READ[0], (1, 1, 10, 2064, 0, 3_000, "3000=3000S", None)]
+    assert _gated_reads(inverted, gate=ft.AlignmentGate(circular=True)) == []
+
+
+def test_a_read_whose_records_disagree_about_the_cigar_encoding_is_refused():
+    """The diagnostic has to ask the question the gate asks. Pooled identity is NULL when
+    a read's records mix `M` with `=`/`X`, so that read is dropped WHOLE — including the
+    record that did score. Counted per record, three of these four rows are scorable and
+    nothing refuses; counted per read, one group has no identity and this raises.
+    """
+    mixed = [
+        (1, 1, 10, 0, 27_000, 30_000, "3000=3000S", None),
+        (1, 1, 10, 2048, 0, 3_000, "3000H3000=", None),
+        (1, 2, 10, 0, 20_000, 23_000, "3000=3000S", None),  # scorable on its own
+        (1, 2, 10, 2048, 10_000, 13_000, "3000H3000M", None),  # legacy M poisons the read
+    ]
+    with pytest.raises(ValueError, match="poolable sequence identity"):
+        _gated_reads(mixed, gate=ft.AlignmentGate(circular=True))
+
+    # Without the identity term there is nothing to be unscorable about, and both reads
+    # are judged on coverage and strand alone.
+    no_identity = ft.AlignmentGate(circular=True, circular_min_identity=None)
+    assert _gated_reads(mixed, gate=no_identity) == [
+        (1, 0),
+        (1, 27_000),
+        (2, 10_000),
+        (2, 20_000),
+    ]
+
+
+def test_the_circular_diagnostics_count_reads_not_records():
+    """The count the refusal above reads. One read scorable, one not — as READS; the
+    per-record count would say 3 of 4 rows can be scored and clear the slice."""
+    mixed = [
+        (1, 1, 10, 0, 27_000, 30_000, "3000=3000S", None),
+        (1, 1, 10, 2048, 0, 3_000, "3000H3000=", None),
+        (1, 2, 10, 0, 20_000, 23_000, "3000=3000S", None),
+        (1, 2, 10, 2048, 10_000, 13_000, "3000H3000M", None),
+    ]
+    gate = ft.AlignmentGate(circular=True)
+    with _miint_conn() as conn:
+        conn.execute(
+            "CREATE TABLE _src AS "
+            + _values(
+                mixed,
+                'prep_sample_idx, sequence_idx, feature_idx, flags, "position",'
+                " stop_position, cigar, mate_position",
+                "?::BIGINT, ?::BIGINT, ?::BIGINT, ?::USMALLINT, ?::BIGINT, ?::BIGINT,"
+                " ?::VARCHAR, ?::BIGINT",
+            ),
+            [x for r in mixed for x in r],
+        )
+        conn.execute(ft.streamed_alignment_table_sql("_src", gate=gate))
+        cursor = conn.execute(ft.gate_diagnostics_sql(gate))
+        row = dict(zip([c[0] for c in cursor.description], cursor.fetchone(), strict=True))
+    assert row["total_rows"] == 4
+    assert row["unscorable_groups"] == 1
+    # The per-record figure is not what this axis asks, so it is not reported at all.
+    assert row["scorable_rows"] is None
+
+
+def test_a_circular_gate_over_a_slice_holding_secondaries_is_refused():
+    """`circular_query_coverage` never sees a secondary record, so the gate would drop
+    every one that no sibling record's group happened to carry — and a secondary is how a
+    read says it also placed elsewhere, which is what woltka splits a count across."""
+    secondary = _INTERIOR_READ + [(1, 3, 10, 256, 20_000, 26_000, "6000=", None)]
+    with pytest.raises(ValueError, match="pooled"):
+        _gated_reads(secondary, gate=ft.AlignmentGate(circular=True))
+
+
+def test_a_circular_gate_over_paired_data_is_refused():
+    """Mates are different molecules and the macro keeps them apart, so a circular gate
+    judges a placement's halves independently — the same orphaning the paired gate
+    exists to prevent. The refusal names the axis to use instead."""
+    with pytest.raises(ValueError, match="paired"):
+        _gated_reads(
+            [
+                (1, 1, 10, 99, 100, 250, "150=", 200),
+                (1, 1, 10, 147, 200, 350, "150=", 100),
+            ],
+            gate=ft.AlignmentGate(circular=True),
+        )
+
+
+def test_an_all_non_eqx_slice_is_refused_under_the_circular_gate_too():
+    """Pooled identity is NULL on a legacy-`M` CIGAR and `NULL >= threshold` drops the
+    row, so an identity term over such a slice would empty the table and look like a
+    result. Dropping the term is the documented way to gate that data on coverage."""
+    legacy = [
+        (1, 1, 10, 0, 27_000, 30_000, "3000M3000S", None),
+        (1, 1, 10, 2048, 0, 3_000, "3000H3000M", None),
+    ]
+    with pytest.raises(ValueError, match="eqx|identity"):
+        _gated_reads(legacy, gate=ft.AlignmentGate(circular=True))
+    assert _gated_reads(
+        legacy, gate=ft.AlignmentGate(circular=True, circular_min_identity=None)
+    ) == [
+        (1, 0),
+        (1, 27_000),
+    ]
+
+
+def test_the_circular_gate_releases_every_relation_it_staged():
+    """The two rename views and the per-feature lengths are the circular gate's own, and
+    the clearance is what lets go of them — on a client the lengths are a whole
+    reference's worth of rows held for one gate."""
+    with _miint_conn() as conn:
+        _stage(
+            conn,
+            alignment=_JUNCTION_READ,
+            mapping=_CIRCULAR_MAP,
+            lengths=_CIRCULAR_LENGTHS,
+            threshold=0.0,
+            gate=ft.AlignmentGate(circular=True),
+        )
+        live = {
+            name
+            for (name,) in conn.execute(
+                "SELECT table_name FROM duckdb_tables() "
+                "UNION ALL SELECT view_name FROM duckdb_views()"
+            ).fetchall()
+        }
+        for relation in (
+            ft.CIRCULAR_ALIGNMENTS_VIEW,
+            ft.FEATURE_TOPOLOGY_VIEW,
+            ft.FEATURE_LENGTHS_TABLE,
+            ft.STREAMED_ALIGNMENT_TABLE,
+        ):
+            assert relation not in live, relation
 
 
 # ---------------------------------------------------------------------------
@@ -719,7 +939,7 @@ def _public_table(
     which is what the client achieves by minting FROM the roll-up's own output; a test
     that wants the two to DISAGREE passes it explicitly.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(
             conn, scope, threshold, alignment=alignment, mapping=mapping, lengths=lengths, gate=gate
         )
@@ -751,7 +971,7 @@ def test_no_internal_identifier_survives_into_the_public_table():
     that keeps `prep_sample_idx` and `genome_idx` out of a file somebody publishes,
     and the writers downstream inherit it from this table alone.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(conn, ft.CoverageScope.POOLED, 0.01)
         conn.execute(ft.ogu_output_table_sql(populated=populated))
         _stage_labels(conn, feature_handles=_feature_handles(_MAP), handles=_HANDLES)
@@ -839,7 +1059,7 @@ def test_an_empty_cohort_relabels_to_the_same_columns_and_types():
     short-circuit — and must still land in the public table with the same schema a
     populated cohort produces. This is the path a caller exercises least.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(conn, ft.CoverageScope.POOLED, 1.0)
         assert not populated
         conn.execute(ft.ogu_output_table_sql(populated=populated))
@@ -930,7 +1150,7 @@ def _shear(conn) -> ft.TreeClearance:
 def _labelled(*, mapping=_MAP, lengths=_LENGTHS, threshold=0.01):
     """A connection carrying everything the shear needs: the roll-up done, the labels
     minted from its own output, and the relabel run — the client's order exactly."""
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(
             conn, ft.CoverageScope.POOLED, threshold, mapping=mapping, lengths=lengths
         )
@@ -1111,7 +1331,7 @@ def test_the_rollup_report_counts_a_shared_features_alignment_row_once():
     shared_map = [*_MAP, (10, 500)]
     unmapped_row = (1, 7, 77, 0, 0, 100)
     alignment = [*_ALIGNMENT, unmapped_row]
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(conn, alignment=alignment, mapping=shared_map, lengths=_LENGTHS, threshold=0.01)
         cursor = conn.execute(ft.rollup_coverage_diagnostics_sql())
         names = [d[0] for d in cursor.description]
