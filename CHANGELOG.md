@@ -22,6 +22,43 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **A work_ticket's `action_context` host paths are bounded to configured ingest roots,
+  and a regular user loads reads by upload instead (#TBD).** An `action_context` could
+  name any absolute path, recorded verbatim and re-opened much later on a compute node.
+  Nothing checked it at submit, so a path that resolved on the submitting machine and
+  nowhere else was accepted and failed inside the job — and any absolute path the
+  orchestrator could open was nameable through the API by any role the action's audience
+  admitted. Two rules now run at submit (`ingest_path`, wired into `POST /work-ticket`):
+  naming a host path at all requires wet_lab_admin or system_admin, and the path must
+  resolve under one of `PATH_INGEST_ROOTS` (new required control-plane env var) and, where
+  the control plane can tell, exist. The existence check is deliberately conditional — the
+  control plane runs as `qiita-api` and SLURM steps as `qiita-job`, two accounts with
+  different group membership, so EACCES is treated as "cannot tell" and admits while ENOENT
+  is definitive and rejects. Which context keys are host paths comes from the action's own
+  `context_schema` plus the `*_path` / `*_dir` naming convention, so an action that adds one
+  is covered without a route change; a new `test_actions_loader` guard makes a `*_path` /
+  `*_dir` / `*_folder` string property declare `pattern: "^/"` so the YAML and the route
+  agree on which fields are paths.
+- **`qiita submit-reads` loads one sample's reads from the machine you are typing on (#TBD).**
+  The other half of the same change: a `user` can no longer name a host path, and their
+  reads were never on a filesystem the cluster mounts anyway. The gesture validates the
+  local file, streams it to the data plane over Flight DoPut, and submits the ingest ticket
+  naming the resulting `*_upload_idx` handle — which the runner already rewrites into the
+  same `*_path` binding a host path produces, so both routes run the identical workflow.
+  `fastq-to-parquet` and `bam-to-parquet` accept either spelling and exactly one of them
+  (`oneOf`). The upload is byte-exact: unlike the companion-file streamer, which inflates a
+  `.gz` because miint's `read_newick` / `read_jplace` only take plaintext, a FASTQ keeps its
+  compression on the wire. miint detects compression *and* format from the extension
+  (<https://the-miint.github.io/duckdb-miint/reading/>), so `resolve_reads_blob_input` names
+  the stitched file from the payload's own gzip magic rather than from anything the client
+  claimed — `.fastq.gz`/`.fastq` for reads, `.bam`/`.sam` for alignments, since BGZF is gzip
+  and a plaintext payload under those suffixes is text SAM.
+- **`upload.source_filename` records the client's basename (#TBD).** The submit gate requires
+  a fastq's basename to be the prep_sample's `sequenced_pool_item_id` followed by `_` or `.`,
+  which ties the R1/R2 pair to the sequenced_sample row. An upload-fed submission has no path
+  to take a basename from, so the rule went vacuous exactly on the route a regular user takes;
+  the column gives it something to read. Descriptive, like `sha256` — nothing opens it.
+
 - **`scripts/lake-gc.sh` reports and reclaims unreferenced lake files (#472).** DuckLake
   never reclaims a data file on its own: deleting rows leaves the Parquet on disk and
   still held by the snapshots that predate the delete, so every `register_files`
