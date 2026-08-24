@@ -22,6 +22,32 @@ duplicates further down are historical strata; leave them where they are.
 
 ### Added
 
+- **`scripts/lake-gc.sh` reports and reclaims unreferenced lake files (#472).** DuckLake
+  never reclaims a data file on its own: deleting rows leaves the Parquet on disk and
+  still held by the snapshots that predate the delete, so every `register_files`
+  replace-by-key and every `delete_reference` / `delete_mask` / `delete_pool_reads` /
+  `delete_alignment` has been accumulating. The script drives DuckLake's own
+  `ducklake_expire_snapshots` → `ducklake_cleanup_old_files` → `ducklake_delete_orphaned_files`
+  in that order, in ONE transaction in one duckdb process, using the documented `CALL`
+  form — measured on 1.5.4, `cleanup_old_files` reports nothing until the snapshots
+  referencing a file are expired (running it alone is a no-op) but does see that expiry
+  from inside the same transaction. The transaction bounds the CATALOG only: an unlinked
+  file stays unlinked through a rollback, also measured. It **reports
+  by default**, prompts for a typed confirmation before acting, keeps 7 days of snapshot
+  history unless `--older-than` says otherwise, and never passes `cleanup_all`. Orphan
+  deletion is behind its own `--reclaim-orphans`: it is the only step that can reach a
+  file belonging to a registration in flight, because `register_files` moves a Parquet to
+  its lake path before opening the catalog transaction that registers it, and in that
+  window the file is on disk with no catalog row — indistinguishable from an orphan.
+  Steps 1-2 cannot reach it (`cleanup_old_files` only removes files the catalog once
+  referenced), so plain `--reclaim` needs no quiescing.
+  Registrations must be quiesced before reclaiming: `older_than` filters on filesystem
+  mtime and `register_files` places files with `rename`, which carries over the mtime the
+  producing job gave them in staging, so the cutoff does not bound "recently placed" —
+  the script header carries that argument in full. Runs as `qiita-data`, the account that
+  owns the data path.
+
+
 - **`build_version` / `BUILD_VERSION` is now covered by tests (#309).** The landing page
   renders `settings.build_version or _PACKAGE_VERSION` (`landing.py`), so a from-source
   boot without `BUILD_VERSION` falls back to the static package version instead of the
@@ -1016,6 +1042,23 @@ duplicates further down are historical strata; leave them where they are.
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **A redriven work ticket whose producer step re-ran can register its files again (#472).** `lake_dest_filename`
+  minted `wt<work_ticket_idx>-<basename>`, whose uniqueness assumed one load per ticket.
+  A redrive replays a ticket's storage tail into a fresh `attempt-<n>` workspace, so the
+  second load targeted the byte-identical path the first had already registered and
+  `move_file` refused it — `refusing to overwrite existing lake file
+  …/assembled_sequence_chunks/wt6939-part_00000.parquet`, which blocked the unbinned-residue
+  backfill for all 57 candidate prep_samples. The name now also carries a digest of the
+  registration's staging dir **relative to `PATH_SCRATCH`**, which encodes the attempt
+  without pinning the name to where scratch is mounted — a migration or remount changes
+  that root without changing which registration a staging dir denotes. It stays
+  deterministic for a given (ticket, staging scope), so a replayed DoAction recomputes the
+  same name and
+  `move_file` still refuses a true double-registration — the refusal that keeps
+  `register_files` replay-safe for the tables outside `REPLACE_KEY_TABLES`
+  (e.g. `reference_membership`), which have no replace-by-key to absorb one.
+
 
 - **Two assembled contigs in one FASTA whose headers share a first token store each
   other's bytes (#464).** `read_fastx` returns one row per record, so two such records come
