@@ -155,8 +155,9 @@ def test_execute_reads_an_uploaded_sam(fake_mint, tmp_path):
         (42, 1000, "r1", "ACGT", [40, 40, 40, 40], None, None),
         (42, 1001, "r2", "TTTT", [30, 30, 30, 30], None, None),
     ]
-    assert (tmp_path / "ws" / "reads.sam").exists()
-    assert not (tmp_path / "ws" / "reads.bam").exists()
+    # Which suffix the stitch picks is pinned in tests/jobs/test_blob_input.py;
+    # here the point is that neither spelling survives into the outputs.
+    assert not list((tmp_path / "ws").glob("reads.*"))
     assert outputs["read_staging_dir"] == tmp_path / "ws"
 
 
@@ -177,8 +178,11 @@ def test_execute_reads_an_uploaded_bam(fake_mint, tmp_path):
     _run(Inputs(bam_path=upload, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     assert fake_mint == [(42, 2)]
-    assert (tmp_path / "ws" / "reads.bam").exists()
     assert [r[2] for r in _read_parquet(tmp_path / "ws" / "read")] == ["r1", "r2"]
+    # The stitched upload is an input the step materialized, not an output: the
+    # launcher's manifest walker rglobs this workspace, so leaving it here would
+    # publish the submitter's whole BAM as a job result.
+    assert not (tmp_path / "ws" / "reads.bam").exists()
 
 
 def test_header_only_sam_raises_stepnodata(fake_mint, tmp_path):

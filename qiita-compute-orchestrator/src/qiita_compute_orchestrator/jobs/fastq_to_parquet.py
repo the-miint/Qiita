@@ -194,7 +194,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # shape back into a FASTQ before anything reads it; the first is returned
     # untouched. Plain DuckDB — the sniff and the stitch are `read_parquet`,
     # no miint function is involved.
-    with duckdb.connect() as staging_conn:
+    #
+    # `duckdb_tmp_dir` + `apply_duckdb_settings` for the same reason every other
+    # DuckDB block in this file uses them: the stitch's `ORDER BY chunk_index`
+    # runs over the whole upload, and an unconfigured connection would sort it
+    # under the default memory limit and spill outside the workspace.
+    with duckdb_tmp_dir(workspace) as staging_tmp, duckdb.connect() as staging_conn:
+        apply_duckdb_settings(
+            staging_conn,
+            staging_tmp,
+            memory_gb=_DUCKDB_MEMORY_GB,
+            threads=_DUCKDB_THREADS,
+        )
         fastq_path = resolve_reads_blob_input(
             staging_conn,
             path=inputs.fastq_path,
@@ -215,6 +226,20 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             if inputs.reverse_fastq_path is not None
             else None
         )
+
+    # A stitched upload is an input the step materialized, not an output. It sits
+    # in the workspace, which the launcher's manifest walker rglobs after
+    # execute() returns — so it is removed in the same `finally` as the
+    # intermediate Parquet below. `is not` because a host-path submission binds
+    # the caller's own file here, which this step must never delete.
+    stitched = [
+        p
+        for p, given in (
+            (fastq_path, inputs.fastq_path),
+            (reverse_fastq_path, inputs.reverse_fastq_path),
+        )
+        if p is not None and str(p) != str(given)
+    ]
 
     # Empty-input check via a Python decompressed-stream peek (handles
     # plain and .gz). An empty well is a terminal no-data outcome, NOT a
@@ -363,6 +388,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # attempt-N+1 dir on retry so it doesn't cascade. (The DuckDB spill dir
         # is torn down by each `duckdb_tmp_dir` block above.)
         intermediate.unlink(missing_ok=True)
+        for stitched_path in stitched:
+            stitched_path.unlink(missing_ok=True)
 
     # `reads` is the read.parquet path the downstream qc/host_filter steps
     # consume; `read_staging_dir` is the workspace a register-files step loads

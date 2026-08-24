@@ -472,6 +472,11 @@ def test_execute_reads_uploaded_paired_end(fake_mint, tmp_path):
     # 3 pairs, not 6 reads: one row per pair.
     assert fake_mint == [(42, 3)]
     assert len(_read_parquet(outputs["reads"])) == 3
+    # Both stitched mates are inputs the step materialized, not outputs. The
+    # launcher's manifest walker rglobs this workspace after execute() returns,
+    # so leaving them here would publish the submitter's reads as job results.
+    assert not list((tmp_path / "ws").glob("R1.*"))
+    assert not list((tmp_path / "ws").glob("R2.*"))
 
 
 def test_execute_treats_an_empty_uploaded_fastq_as_no_data(tmp_path, monkeypatch):

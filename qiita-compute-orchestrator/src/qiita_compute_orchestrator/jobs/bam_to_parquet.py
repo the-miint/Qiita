@@ -230,22 +230,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         raise FileNotFoundError(f"BAM file not found: {inputs.bam_path}")
 
     workspace.mkdir(parents=True, exist_ok=True)
-    # Two front-ends reach this step. A wet-lab admin names a host path under
-    # PATH_INGEST_ROOTS and the value here IS the BAM; a regular user DoPuts the
-    # file and the runner resolves `bam_upload_idx` to a chunked-BLOB upload
-    # Parquet under the same `bam_path` binding. This loader accepts SAM as well
-    # as BAM, and BGZF is gzip, so the stitched name comes from whether the
-    # payload is compressed: binary container -> `.bam`, text -> `.sam`.
-    with duckdb.connect() as staging_conn:
-        bam_path = resolve_reads_blob_input(
-            staging_conn,
-            path=inputs.bam_path,
-            out_dir=workspace,
-            stem="reads",
-            gzipped_suffix=".bam",
-            plain_suffix=".sam",
-        )
-
     # The caller must declare an unaligned BAM. An aligned BAM would store
     # reverse-strand reads mis-oriented (see module docstring) — not supported yet.
     if not inputs.expect_unaligned:
@@ -259,6 +243,40 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "this workflow expects an unaligned basecaller uBAM"
             ),
         )
+
+    # Two front-ends reach this step. A wet-lab admin names a host path under
+    # PATH_INGEST_ROOTS and the value here IS the BAM; a regular user DoPuts the
+    # file and the runner resolves `bam_upload_idx` to a chunked-BLOB upload
+    # Parquet under the same `bam_path` binding. This loader accepts SAM as well
+    # as BAM, and BGZF is gzip, so the stitched name comes from whether the
+    # payload is compressed: binary container -> `.bam`, text -> `.sam`.
+    #
+    # `duckdb_tmp_dir` + `apply_duckdb_settings` for the same reason every other
+    # DuckDB block in this file uses them: the stitch's `ORDER BY chunk_index`
+    # runs over the whole upload, and an unconfigured connection would sort it
+    # under the default memory limit and spill outside the workspace.
+    with duckdb_tmp_dir(workspace) as staging_tmp, duckdb.connect() as staging_conn:
+        apply_duckdb_settings(
+            staging_conn,
+            staging_tmp,
+            memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
+            threads=_DUCKDB_THREADS,
+        )
+        bam_path = resolve_reads_blob_input(
+            staging_conn,
+            path=inputs.bam_path,
+            out_dir=workspace,
+            stem="reads",
+            gzipped_suffix=".bam",
+            plain_suffix=".sam",
+        )
+
+    # A stitched upload is an input the step materialized, not an output; the
+    # launcher's manifest walker rglobs the workspace after execute() returns, so
+    # it is removed in the same `finally` as the intermediate below. `!=` because
+    # a host-path submission binds the caller's own file here, which this step
+    # must never delete.
+    stitched_bam = bam_path if str(bam_path) != str(inputs.bam_path) else None
 
     # Track the real cgroup, so a `--mem-gb` override and the runner's OOM
     # escalation both actually reach DuckDB's memory_limit (a literal here would
@@ -366,6 +384,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # Clean up the intermediate BEFORE returning so the SLURM launcher's
         # manifest walker (which runs after execute()) sees only the read/ parts.
         intermediate.unlink(missing_ok=True)
+        if stitched_bam is not None:
+            stitched_bam.unlink(missing_ok=True)
 
     # The workspace holds only read/part_*.parquet (intermediate unlinked above),
     # exposed as read_staging_dir so a register-files step loads the parts into the
