@@ -600,9 +600,8 @@ URL_STUDY_LOOKUP_BY_ACCESSION = f"{URL_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESS
 # =============================================================================
 # The bundled submit gestures need two facts that only exist on the filesystem:
 # an Illumina run's instrument_run_id / model (from RunInfo.xml) and a PacBio
-# run's barcode -> HiFi BAM index. Both used to be read by the CLI, which is
-# why submitting required a machine that mounts the cluster. Reading them
-# server-side is what lets the submit run from anywhere.
+# run's barcode -> HiFi BAM index. Reading them server-side is what lets a
+# submit run from a machine that does not mount the cluster.
 #
 # Not a resource under /sequencing-run: no run row exists yet at inspect time —
 # the gesture inspects the folder in order to mint one.

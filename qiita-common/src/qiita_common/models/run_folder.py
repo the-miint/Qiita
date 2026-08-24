@@ -1,15 +1,11 @@
 """Run-folder inspection: the two filesystem reads a submit gesture needs.
 
-Both bundled ingest gestures had to read the run folder before they could mint
-anything — Illumina for the instrument identity in `RunInfo.xml`, PacBio for
-the barcode -> HiFi BAM index — and both read it on the machine running the
-CLI. That is what made submitting require a machine that mounts the cluster,
-even though the path itself is only ever re-opened on a compute node.
-
-`POST /api/v1/run-folder/inspect` does those reads on the control plane
-instead. The response carries facts about the folder, never bytes from it: the
-caller still names the same path in `action_context`, and the workflow still
-opens it on the node.
+A submit gesture must read the run folder before it can mint anything —
+Illumina for the instrument identity in `RunInfo.xml`, PacBio for the barcode
+-> HiFi BAM index. `POST /api/v1/run-folder/inspect` does those reads on the
+control plane, so the submitting machine need not mount the cluster. The
+response carries facts about the folder, never bytes from it: the caller names
+the same path in `action_context`, and the workflow opens it on the node.
 
 The response is platform-discriminated — exactly one of `illumina` / `pacbio`
 is populated — because the two platforms share nothing. A PacBio run folder has

@@ -4,24 +4,20 @@
 filesystem and returns facts about it: an Illumina run's instrument identity
 (from `RunInfo.xml`), or a PacBio run's barcode -> HiFi BAM index.
 
-Both reads used to happen in the CLI, which is what made `submit-bcl-convert`
-and `submit-pacbio-ingest` require a machine that mounts the cluster. Doing them
-here removes that requirement without changing what is stored: the caller still
-puts the same path in `action_context`, and the workflow still opens it on a
-compute node.
+Doing them here is what frees `submit-bcl-convert` and `submit-pacbio-ingest`
+from needing a machine that mounts the cluster. Nothing about what is stored
+changes: the caller puts the same path in `action_context`, and the workflow
+opens it on a compute node.
 
 Read-only, and it returns facts rather than bytes — no file content crosses the
 wire, only the parsed instrument id / model and the BAM filenames. The path is
 bounded by the same `PATH_INGEST_ROOTS` gate the work-ticket submit applies, so
 this endpoint cannot be used to probe the filesystem outside the roots.
 
-**The account split matters here in a way it does not at the submit gate.** The
-control plane runs as `qiita-api`; SLURM steps run as `qiita-job`, with wider
-group membership. The submit gate can shrug at a permission error (it admits,
-and lets the step be the judge), but this route has to actually READ, so it
-cannot. A folder `qiita-job` can read and `qiita-api` cannot gets a 403 naming
-the account — not a 404, which would send the operator hunting for a typo in a
-path that is right.
+Where the submit gate admits a path it cannot stat (see `ingest_path._probe`
+for why), this route has to open the folder now, so every permission failure is
+a 403 naming the account to grant — never a 404, which would send the operator
+hunting for a typo in a path that is right.
 """
 
 import os

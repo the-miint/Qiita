@@ -26,8 +26,8 @@ host's checkout path, mounts, and `prep_protocol` indices.
   `PATH_INGEST_ROOTS` (`/sequencing` here). The control plane checks that at submit
   and refuses a path outside those roots, naming them — so a wrong path is an error at
   your terminal rather than a job that fails hours later.
-- **The run folder no longer has to be visible from the machine you type on.** The barcode
-  → BAM glob moved to the control plane (`POST /run-folder/inspect`), which opens the folder
+- **The run folder need not be visible from the machine you type on.** The barcode → BAM
+  glob runs on the control plane (`POST /run-folder/inspect`), which opens the folder
   as `qiita-api`. That account reaches `/sequencing/gcore_runs/**` through an ACL the deploy
   grants it (`DEPLOY_CHECKLIST.md`, one-time host setup) rather than through the `kl-seq-rw`
   group the job account `qiita-job` is in. A **403** from the route means that ACL is missing

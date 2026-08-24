@@ -1,10 +1,8 @@
 """PacBio SMRT run-folder layout: locating a run's demultiplexed HiFi BAMs.
 
-The PacBio counterpart to `qiita_common.illumina`. Both are here rather than in
-the CLI because the control plane reads the run folder too — the
-`/run-folder/inspect` route is what lets a submit run from a machine that does
-not mount the cluster, and it has to index the folder exactly the way the
-client used to.
+The PacBio counterpart to `qiita_common.illumina`. Both live here, not in the
+CLI, because the `/run-folder/inspect` route indexes the folder too and the two
+sides must agree on the layout.
 """
 
 from __future__ import annotations
