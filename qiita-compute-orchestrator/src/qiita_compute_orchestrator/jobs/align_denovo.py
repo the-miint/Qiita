@@ -27,8 +27,8 @@ from anything this job names.
 `sequence_idx` — the globally-unique read identity — rides as the aligner's
 `read_id`, so the output maps straight onto the lake's `alignment.sequence_idx`
 without a join. The subject's `read_id` is the contig's `feature_idx`, so the
-aligner's `reference` column IS the feature and the CAST is only there to pin the
-width the lake declares.
+aligner's `reference` column IS the feature, and it arrives BIGINT because
+`align_minimap2` preserves the subject table's types.
 
 The gate is the circular-pooled one, and that choice fixes two call parameters.
 
@@ -184,6 +184,13 @@ def _streamed_alignment_sql(alignment_idx: int, prep_sample_idx: int) -> str:
     docstring), so no record has a mate. The column is written anyway because the lake
     table declares it and `register-files` schema-matches on the full column list.
 
+    The remaining CASTs are on values the ALIGNER did not produce, which is why they
+    are not redundant with its output types. `align_minimap2` preserves the input
+    types, so `read_id` and `reference` arrive BIGINT from the subject and query tables
+    and are passed through uncast. A bare integer literal is INTEGER and a bare NULL is
+    INTEGER, so the two stamped constants and `mate_feature_idx` are cast to match what
+    the lake declares.
+
     No unmapped filter: `include_unmapped` defaults false, so `align_minimap2` emits no
     row at all for a query that produced no alignment
     (<https://the-miint.github.io/duckdb-miint/alignment_reference/>). An empty result
@@ -194,7 +201,7 @@ def _streamed_alignment_sql(alignment_idx: int, prep_sample_idx: int) -> str:
         f"SELECT CAST({alignment_idx} AS BIGINT) AS alignment_idx, "
         f"CAST({prep_sample_idx} AS BIGINT) AS prep_sample_idx, "
         "read_id AS sequence_idx, "
-        "CAST(reference AS BIGINT) AS feature_idx, "
+        "reference AS feature_idx, "
         "CAST(NULL AS BIGINT) AS mate_feature_idx, "
         "* EXCLUDE (read_id, reference, mate_reference) "
         "FROM align_minimap2(?, subject_table := ?, preset := ?, "
