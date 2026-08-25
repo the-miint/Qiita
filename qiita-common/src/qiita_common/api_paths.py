@@ -227,7 +227,7 @@ class LibraryPrimitive(StrEnum):
 # trio: submit returns a handle immediately, the CP runner polls status until
 # terminal, then asks for the verified result — so the runner can drive a long
 # SLURM job without holding a connection open. find-by-name closes the
-# write-ahead idempotency gap. See docs/architecture.md "Compute Orchestrator".
+# write-ahead idempotency gap. See docs/architecture/processing.md "Compute Orchestrator".
 
 PATH_STEP_PREFIX = "/step"
 PATH_STEP_SUBMIT = "/submit"
