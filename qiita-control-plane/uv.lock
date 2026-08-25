@@ -652,6 +652,7 @@ name = "qiita-common"
 version = "2026.3.0"
 source = { directory = "../qiita-common" }
 dependencies = [
+    { name = "duckdb" },
     { name = "httpx" },
     { name = "pydantic", extra = ["email"] },
     { name = "pyyaml" },
@@ -659,6 +660,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "duckdb", specifier = ">=1.5.4" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", extras = ["email"], specifier = ">=2.12" },
     { name = "pyyaml", specifier = ">=6.0" },

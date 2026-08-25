@@ -161,7 +161,6 @@ from ._mask import (
     mask_params_both_derivations,
 )
 from ._processing import (
-    PROCESSING_IDX_BINDING,
     _mint_processing_idx,
     _workflow_needs_processing,
 )
@@ -254,7 +253,6 @@ __all__: list[str] = [
     "GENOME_MAP_PATH_BINDING",
     "LIBRARY",
     "LibraryPrimitive",
-    "PROCESSING_IDX_BINDING",
     "MASK_IDX_BINDING",
     "MINT_FEATURES_OUTPUT_BASENAME",
     "Path",

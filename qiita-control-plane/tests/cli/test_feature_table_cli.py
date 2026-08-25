@@ -4,10 +4,10 @@
 Covers the two route helpers (patching `httpx.request`, the entry point
 `_common.call` delegates to), what the JSON responses become once staged into
 DuckDB, and the relabel driver. The analytic and every refusal the relabel makes
-are pinned against real miint in `tests/test_feature_table_analytic.py`; what is
-specific here is the boundary between a REST response and a DuckDB relation, where
-a wrong column type or a lost row would surface as a confusing bind error two steps
-later.
+are pinned against real miint in `qiita-common`'s
+`tests/analytic/test_behaviour_miint.py`; what is specific here is the boundary
+between a REST response and a DuckDB relation, where a wrong column type or a lost
+row would surface as a confusing bind error two steps later.
 """
 
 import json
@@ -15,7 +15,7 @@ import json
 import duckdb
 import httpx
 import pytest
-from qiita_common import feature_table as ft
+from qiita_common import analytic as ft
 from qiita_common.api_paths import URL_EXPORTED_IDENTIFIER, URL_REFERENCE_GENOME_MAP
 
 from qiita_control_plane.cli.user import feature_table as ftc

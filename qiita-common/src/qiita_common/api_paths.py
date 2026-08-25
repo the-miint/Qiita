@@ -176,6 +176,13 @@ class LibraryPrimitive(StrEnum):
     # fresh block it deletes 0 rows. See
     # qiita_control_plane.actions.library.delete_alignment_block.
     DELETE_ALIGNMENT_BLOCK = "delete-alignment-block"
+    # Per-sample (align): idempotent sample replace, the per-sample twin of
+    # delete-alignment-block. Its slot is the one that twin occupies — immediately
+    # BEFORE register-files, on a prep_sample-scoped ticket — deleting the
+    # (alignment_idx, prep_sample_idx) pair's rows so a re-run deletes-then-
+    # re-registers without double-counting. See
+    # qiita_control_plane.actions.library.delete_alignment_sample.
+    DELETE_ALIGNMENT_SAMPLE = "delete-alignment-sample"
     # Block-compute (align): the `align` workflow's terminal step, the alignment
     # twin of reconcile-block. Marks the block completed, then finalizes each
     # covered sample's alignment_sample gate once ALL its covering blocks are done.
@@ -198,6 +205,11 @@ class LibraryPrimitive(StrEnum):
     # Runs AFTER register-files so the gate never reads 'completed' before the masked
     # reads are in DuckLake. See qiita_control_plane.actions.library.finalize_mask_sample_gate.
     FINALIZE_MASK_SAMPLE = "finalize-mask-sample"
+    # Per-sample assembly completion: the terminal step of the long-read-assembly
+    # workflow. Writes 'completed' into the qiita.assembly_sample gate for this
+    # ticket's (processing_idx, prep_sample). See
+    # qiita_control_plane.actions.library.finalize_assembly_sample_gate.
+    FINALIZE_ASSEMBLY_SAMPLE = "finalize-assembly-sample"
 
 
 # =============================================================================
@@ -484,9 +496,10 @@ URL_READ_MASKED_DOGET = f"{URL_READ_MASKED_PREFIX}{PATH_READ_MASKED_DOGET}"
 # Signs a DoGet ticket scoped to ONE block's `(prep_sample_idx, sequence_idx
 # sub-range)` members, so a block-scoped compute job streams its reads from the
 # data plane instead of reading a Parquet the control plane materialized onto
-# shared scratch. POST is service-account-only (Scope.TICKET_DOGET) — the job
-# mints it at runtime (short TTL; a SLURM queue can outlive a submit-time
-# ticket), the same shape as /alignment/ticket/doget.
+# shared scratch. POST is service-account-only (Scope.READ_DOGET — its own scope,
+# not the generic ticket:doget; routes/read.py carries why) — the job mints it at
+# runtime (short TTL; a SLURM queue can outlive a submit-time ticket), the same
+# shape as /alignment/ticket/doget.
 #
 # The body carries only work_ticket_idx. The route reads the block's members
 # from qiita.block_member (keeping a large member list CP-side, off the wire)
@@ -499,6 +512,25 @@ PATH_READ_DOGET = "/ticket/doget"
 
 URL_READ_PREFIX = f"{API_PREFIX}{PATH_READ_PREFIX}"
 URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
+
+# =============================================================================
+# /assembly/* — Flight DoGet ticket for one assembly run's contigs
+# =============================================================================
+# Signs a DoGet ticket scoped to ONE assembly run — a `(prep_sample_idx,
+# processing_idx)` pair — on the data plane's `assembled_sequence` /
+# `assembled_sequence_chunks` tables. POST is service-account-only
+# (Scope.TICKET_DOGET) — the job mints it at runtime, the same shape as
+# /alignment/ticket/doget.
+#
+# The body names the pair and the pair is what is signed; the data plane
+# resolves that run's contigs through the lake's own assembly_membership. Why
+# the resolution lives there is at the route (routes/assembly.py).
+
+PATH_ASSEMBLY_PREFIX = "/assembly"
+PATH_ASSEMBLY_DOGET = "/ticket/doget"
+
+URL_ASSEMBLY_PREFIX = f"{API_PREFIX}{PATH_ASSEMBLY_PREFIX}"
+URL_ASSEMBLY_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_DOGET}"
 
 
 # =============================================================================

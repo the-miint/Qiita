@@ -6,28 +6,41 @@ here we cover the pure params-shape + gate logic.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from qiita_common.actions import WorkflowAction, WorkflowStep
 
 from qiita_control_plane.runner._processing import (
     _build_processing_params,
     _workflow_needs_processing,
+    _workflow_writes_assembly_gate,
 )
 
 
-def _step(**kw) -> SimpleNamespace:
-    return SimpleNamespace(params=kw.get("params", {}))
+def _step(params: dict[str, str] | None = None) -> WorkflowStep:
+    return WorkflowStep(
+        kind="step",
+        name="assembly_load",
+        step_type="singleton",
+        module="qiita_compute_orchestrator.jobs.assembly_load",
+        params=params or {},
+        baseline_resources={"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    )
 
 
 def test_workflow_needs_processing_gate():
     """A step threading processing_idx via params: signals the runner to mint."""
-    threads = [_step(params={"processing_idx": "processing_idx"})]
+    threads = [_step({"processing_idx": "processing_idx"})]
     assert _workflow_needs_processing(threads) is True
 
-    other = [_step(params={"assembler": "assembler"})]
+    other = [_step({"assembler": "assembler"})]
     assert _workflow_needs_processing(other) is False
 
     none = [_step()]
     assert _workflow_needs_processing(none) is False
+
+    # An `action:` entry has no `params:` field at all, so it can never carry the
+    # signal — what lets the shared predicate narrow on WorkflowStep.
+    gate_only = [WorkflowAction(kind="action", name="finalize-assembly-sample")]
+    assert _workflow_needs_processing(gate_only) is False
 
 
 def test_build_processing_params_shape_and_assembler_default():
@@ -109,3 +122,28 @@ def test_mask_idx_is_part_of_the_identity():
     )
     assert mask_a != mask_b
     assert mask_a["mask_idx"] == 1 and mask_b["mask_idx"] == 2
+
+
+def test_workflow_writes_assembly_gate_keys_on_the_terminal_action():
+    """Declaring the `finalize-assembly-sample` action is the single signal for all
+    three assembly_sample writes (pending at mint, completed at the action, no_data
+    on the StepNoData path). A workflow that mints a processing_idx but declares no
+    gate action gets no gate row."""
+    gated = [WorkflowAction(kind="action", name="finalize-assembly-sample")]
+    assert _workflow_writes_assembly_gate(gated) is True
+
+    other_action = [WorkflowAction(kind="action", name="register-files")]
+    assert _workflow_writes_assembly_gate(other_action) is False
+
+    # A `step:` entry never triggers the gate even when its name collides with
+    # the primitive's — only an `action:` entry declares it.
+    colliding_step = [
+        WorkflowStep(
+            kind="step",
+            name="finalize-assembly-sample",
+            step_type="singleton",
+            module="qiita_compute_orchestrator.jobs.assembly_load",
+            baseline_resources={"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+        )
+    ]
+    assert _workflow_writes_assembly_gate(colliding_step) is False
