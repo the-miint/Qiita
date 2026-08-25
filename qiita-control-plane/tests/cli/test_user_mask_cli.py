@@ -12,23 +12,10 @@ from qiita_common.api_paths import (
     URL_MASK_DEFINITION_PREP_SAMPLE,
 )
 
-from .test_user_cli import _stub_post
-
-_BASE = "https://q.example.test"
+from .test_user_cli import _BASE, _run
 
 _LIST_BODY = {"masks": [], "count": 0, "truncated": False}
 _ROSTER_BODY = {"mask_idx": 9, "samples": [], "count": 0, "truncated": False}
-
-
-def _run(monkeypatch, argv, *, response_json, status=200) -> dict:
-    """Drive `qiita <argv>` against a stubbed transport; return the captured
-    request. Asserts a clean exit so a wiring break surfaces here."""
-    from qiita_control_plane.cli.user import main
-
-    captured: dict = {}
-    _stub_post(monkeypatch, captured, response_json=response_json, status=status)
-    assert main(["--base-url", _BASE, *argv]) == 0
-    return captured
 
 
 def test_mask_list_gets_the_prefix_with_no_params(monkeypatch):

@@ -1,6 +1,7 @@
-"""Entity-agnostic wire shapes for the study-local field create surface.
+"""Entity-agnostic wire shapes for the sample field surfaces — the study-local
+field create/read shapes and the global field registry read shape.
 
-Each sample-family-specific entity specialises these by redeclaring only the two idx
+Each sample-family-specific entity specialises these by redeclaring only the idx
 fields that carry its entity-qualified name on the wire; every other column,
 and the purely-local vs globally-linked mode coupling, lives here.
 """
@@ -81,13 +82,15 @@ class SampleStudyFieldCreateRequest(BaseModel):
 
 
 class SampleStudyFieldResponse(BaseModel):
-    """A created study-local field (201 body is the created resource).
+    """One study-local field definition.
 
     Carries every stored column. For a globally-linked row, data_type /
     required / terminology_idx are the values inherited from the global-field
     row (resolved at read time), so they are always populated even though the
-    study-field columns are NULL. Global-field-only columns (internal_name,
-    default_tier) belong to the global-field resource and are excluded.
+    study-field columns are NULL. tier_override is instead always None on a
+    linked row: a global field carries default_tier, so there is nothing per-study
+    to override. internal_name and default_tier belong to the global field, not
+    to this row, and are excluded.
     """
 
     study_field_idx: Annotated[int, Field(gt=0)]
@@ -99,5 +102,24 @@ class SampleStudyFieldResponse(BaseModel):
     required: bool
     terminology_idx: Annotated[int, Field(gt=0)] | None
     tier_override: Tier | None
+    created_by_idx: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime
+
+
+class SampleGlobalFieldResponse(BaseModel):
+    """One global field definition.
+
+    Carries every stored column. terminology_idx is populated exactly when
+    data_type is terminology.
+    """
+
+    global_field_idx: Annotated[int, Field(gt=0)]
+    internal_name: str
+    display_name: str
+    description: str | None
+    data_type: FieldDataType
+    default_tier: Tier
+    required: bool
+    terminology_idx: Annotated[int, Field(gt=0)] | None
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime

@@ -42,6 +42,11 @@ _None yet._
   per-sample writer (`align-denovo`) exists alongside the block one. Safe in any order
   relative to the entry above — the two touch different tables. (#486)
 
+- `20260825000000_sample_field_comment_corrections.sql` — plain `make migrate`, no
+  out-of-band setup. Four `COMMENT` statements on the sample-field tables and columns; no
+  DDL, no data touched, nothing locked beyond the momentary catalog write. Ordering versus
+  the bucket-4 restart is irrelevant — no code reads these comments. (#485)
+
 ### 4. Deploy
 
 _None yet._

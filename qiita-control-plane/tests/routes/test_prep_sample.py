@@ -1,11 +1,4 @@
-"""Integration tests for the prep-sample routes.
-
-Covers the study-membership read (active studies ascending by idx with their
-accessions, accession surfacing, retired-link exclusion, the empty case, the
-404 on an unknown prep_sample_idx, and its auth gates), the operator
-retirement PATCH, and the study-scoped create of a study-local prep_sample
-field (both mode branches, the mode-coupling 422s, and the access matrix).
-"""
+"""Integration tests for the prep-sample routes."""
 
 import secrets
 
@@ -21,6 +14,7 @@ from qiita_common.models import FieldDataType
 
 from qiita_control_plane.main import app
 from qiita_control_plane.testing.db_seeds import (
+    fetch_seeded_metagenome_term,
     retire_prep_sample_to_study_link,
     seed_biosample,
     seed_biosample_to_study_link,
@@ -33,10 +27,12 @@ from .conftest import (
     PREP_SAMPLE_FIELD_SURFACE,
     STUDY_FIELD_CREATE_AUTHZ_CASES,
     STUDY_FIELD_CREATE_CONFLICT_CASES,
+    STUDY_FIELD_LIST_AUTHZ_CASES,
     _grant_study_access,
     _seed_study,
     assert_study_field_create_authz,
     assert_study_field_create_conflict,
+    assert_study_field_list_authz,
     delete_idxs,
     post_study_field,
 )
@@ -420,7 +416,13 @@ async def _post_prep_sample_field(client, ctx, study_idx: int, **body):
     )
 
 
-async def _seed_prep_global_field(ctx, *, data_type=FieldDataType.NUMERIC) -> tuple[int, str]:
+async def _seed_prep_global_field(
+    ctx,
+    *,
+    data_type=FieldDataType.NUMERIC,
+    terminology_idx: int | None = None,
+    required: bool = False,
+) -> tuple[int, str]:
     """Seed one prep_sample_global_field and return (idx, display_name)."""
     suffix = secrets.token_hex(4)
     display_name = f"Global {suffix}"
@@ -430,6 +432,8 @@ async def _seed_prep_global_field(ctx, *, data_type=FieldDataType.NUMERIC) -> tu
         display_name=display_name,
         data_type=data_type,
         created_by_idx=SYSTEM_PRINCIPAL_IDX,
+        terminology_idx=terminology_idx,
+        required=required,
     )
     ctx["created"]["prep_sample_global_field"].append(global_idx)
     return global_idx, display_name
@@ -583,3 +587,143 @@ async def test_create_prep_sample_field_conflict(ctx, case):
     no row is a 422.
     """
     await assert_study_field_create_conflict(ctx, case=case, surface=PREP_SAMPLE_FIELD_SURFACE)
+
+
+# ===========================================================================
+# GET /api/v1/study/{study_idx}/prep-sample-field
+# ===========================================================================
+
+
+async def _list_prep_sample_fields(client, study_idx: int):
+    return await client.get(PREP_SAMPLE_FIELD_SURFACE.url_template.format(study_idx=study_idx))
+
+
+async def test_list_prep_sample_fields_in_study_resolves_linked_and_local(ctx):
+    """Tests the case where a study carries one globally-linked and one
+    purely-local field: both come back ordered by display_name, the linked one
+    with data_type, required, and terminology_idx resolved from its global row.
+
+    The global row's three inherited columns all differ from the local field's,
+    so each one discriminates whether the read resolved it or fell back to the
+    study row.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pf-list"
+    )
+    # Reuse the seeded NCBI Taxonomy so the global field can be TERMINOLOGY,
+    # which the local field cannot be without a terminology of its own.
+    terminology_idx = (await fetch_seeded_metagenome_term(ctx["pool"]))["terminology_idx"]
+    global_idx, _ = await _seed_prep_global_field(
+        ctx,
+        data_type=FieldDataType.TERMINOLOGY,
+        terminology_idx=terminology_idx,
+        required=True,
+    )
+
+    # Names chosen so the local field sorts first, proving the ORDER BY rather
+    # than insertion order.
+    local_name = unique_field_name("AAA-local")
+    linked_name = unique_field_name("ZZZ-linked")
+    local_resp = await _post_prep_sample_field(
+        ctx["user"], ctx, study_idx, display_name=local_name, data_type="text"
+    )
+    assert local_resp.status_code == 201, local_resp.text
+    linked_resp = await _post_prep_sample_field(
+        ctx["user"],
+        ctx,
+        study_idx,
+        display_name=linked_name,
+        prep_sample_global_field_idx=global_idx,
+    )
+    assert linked_resp.status_code == 201, linked_resp.text
+
+    resp = await _list_prep_sample_fields(ctx["user"], study_idx)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    expected = [
+        {
+            "prep_sample_study_field_idx": body[0]["prep_sample_study_field_idx"],
+            "created_at": body[0]["created_at"],
+            "study_idx": study_idx,
+            "prep_sample_global_field_idx": None,
+            "display_name": local_name,
+            "description": None,
+            "data_type": "text",
+            "required": False,
+            "terminology_idx": None,
+            "tier_override": None,
+            "created_by_idx": ctx["user_session"]["principal_idx"],
+        },
+        {
+            "prep_sample_study_field_idx": body[1]["prep_sample_study_field_idx"],
+            "created_at": body[1]["created_at"],
+            "study_idx": study_idx,
+            "prep_sample_global_field_idx": global_idx,
+            "display_name": linked_name,
+            "description": None,
+            "data_type": "terminology",
+            "required": True,
+            "terminology_idx": terminology_idx,
+            "tier_override": None,
+            "created_by_idx": ctx["user_session"]["principal_idx"],
+        },
+    ]
+    assert body == expected
+
+
+async def test_list_prep_sample_fields_in_study_no_fields_empty(ctx):
+    """Tests the case where the study exists but carries no fields: the route
+    returns an empty list rather than a 404."""
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pf-empty"
+    )
+
+    resp = await _list_prep_sample_fields(ctx["user"], study_idx)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == []
+
+
+async def test_list_prep_sample_fields_in_study_excludes_other_studies(ctx):
+    """Tests the case where two studies each carry a field: the response is
+    scoped to the path's study only."""
+    owner_idx = ctx["user_session"]["principal_idx"]
+    study_a = await _seed_study(ctx, owner_idx=owner_idx, suffix="pf-sa")
+    study_b = await _seed_study(ctx, owner_idx=owner_idx, suffix="pf-sb")
+    name_a = unique_field_name("OnlyA")
+    for study_idx, name in ((study_a, name_a), (study_b, unique_field_name("OnlyB"))):
+        created = await _post_prep_sample_field(
+            ctx["user"], ctx, study_idx, display_name=name, data_type="text"
+        )
+        assert created.status_code == 201, created.text
+
+    resp = await _list_prep_sample_fields(ctx["user"], study_a)
+    assert resp.status_code == 200, resp.text
+    assert [row["display_name"] for row in resp.json()] == [name_a]
+
+
+async def test_list_prep_sample_fields_in_study_anonymous_401(ctx):
+    """Tests the case where an unauthenticated caller hits the route: the
+    require_human gate rejects with 401 even for a real study."""
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="pf-anon"
+    )
+
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await _list_prep_sample_fields(anon, study_idx)
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize("case", STUDY_FIELD_LIST_AUTHZ_CASES)
+async def test_list_prep_sample_fields_in_study_authz(ctx, case, no_prep_sample_read_client):
+    """Tests the case where each row of the shared list access matrix calls the
+    route: owner, viewer/member/admin grants, and wet_lab_admin bypass are
+    admitted; no access and a missing scope are refused; a nonexistent study is
+    404 even for a role-bypass caller.
+    """
+    await assert_study_field_list_authz(
+        ctx,
+        case=case,
+        surface=PREP_SAMPLE_FIELD_SURFACE,
+        no_scope_client=no_prep_sample_read_client,
+    )
