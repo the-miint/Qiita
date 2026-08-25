@@ -4,8 +4,9 @@ multiplexed FASTQ set (R1 + R2 + I1) rather than a per-sample BCL demux.
 
 Two halves: demux (build the Golay cloud, pair I1 against R1/R2 by record order with
 I1 reverse-complemented, assign each read to its prep_sample) and ingest (mint a
-sequence_idx range per sample, write the sorted read.parquet). R2 rides through,
-unused downstream.
+sequence_idx range per sample, write the sorted read.parquet). The I1 index keys the
+record, so R1 and R2 land under the same prep_sample; R2 is persisted as
+sequence2/qual2 in `read` (deblur is R1-only, matching the GG2 V4 catalog).
 
 TODO(converge): the per-sample write duplicates fastq_to_parquet/ingest_reads; fold
 into a shared read-ingest core.
