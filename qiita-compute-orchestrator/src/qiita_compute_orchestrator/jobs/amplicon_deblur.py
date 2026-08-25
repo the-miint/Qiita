@@ -9,7 +9,7 @@ Refinements over the historical deblur.sql (reproduce the golden):
   * UCHIME chimera detection runs before the MSA;
   * feature identity is the shared canonical hash.
 
-Outputs: asv_manifest (distinct sequence_hash for mint-features) and asv_counts
+Outputs: manifest (distinct sequence_hash for mint-features) and asv_counts
 (prep_sample_idx, sequence_hash, count).
 """
 
@@ -166,7 +166,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     workspace.mkdir(parents=True, exist_ok=True)
     counts_out = workspace / "asv_counts.parquet"
-    manifest_out = workspace / "asv_manifest.parquet"
+    manifest_out = workspace / "manifest.parquet"
     memory_gb = resolve_duckdb_memory_gb(
         _DUCKDB_FALLBACK_MEMORY_GB, threads=_DUCKDB_THREADS, reserve_gb=_DUCKDB_RESERVE_GB
     )
@@ -248,4 +248,4 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 counts_partial.unlink(missing_ok=True)
                 manifest_partial.unlink(missing_ok=True)
 
-    return {"asv_counts": counts_out, "asv_manifest": manifest_out}
+    return {"asv_counts": counts_out, "manifest": manifest_out}

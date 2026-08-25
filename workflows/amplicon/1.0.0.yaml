@@ -62,7 +62,7 @@ steps:
     module: qiita_compute_orchestrator.jobs.amplicon_deblur
     inputs: [sortmerna_ref]
     params: {primer: primer, trim: trim, orient_primer: orient_primer}
-    outputs: [asv_counts, asv_manifest]
+    outputs: [asv_counts, manifest]
     baseline_resources:
       cpu: 8
       mem_gb: 64
@@ -70,7 +70,7 @@ steps:
 
   # mint a feature_idx per ASV against the shared feature space.
   - action: mint-features
-    inputs: [asv_manifest]
+    inputs: [manifest]
     outputs: [feature_map]
 
   # join counts to the feature map, write amplicon_membership. processing_idx

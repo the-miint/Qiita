@@ -302,7 +302,11 @@ def test_load_actions_loads_on_disk_amplicon_yaml():
     assert "pool_reads" not in denoise.inputs and "reads" not in denoise.inputs
     assert denoise.inputs == ["sortmerna_ref"]
     assert denoise.params == {"primer": "primer", "trim": "trim", "orient_primer": "orient_primer"}
-    assert denoise.outputs == ["asv_counts", "asv_manifest"]
+    assert denoise.outputs == ["asv_counts", "manifest"]
+
+    # mint-features binds the manifest by the literal name the dispatcher pins.
+    mint = next(s for s in amplicon.steps if s.name == "mint-features")
+    assert mint.inputs == ["manifest"]
 
     load_step = next(s for s in amplicon.steps if s.name == "amplicon_load")
     assert load_step.module == "qiita_compute_orchestrator.jobs.amplicon_load"
@@ -310,6 +314,21 @@ def test_load_actions_loads_on_disk_amplicon_yaml():
     assert load_step.params == {"processing_idx": "processing_idx"}
     # Pure native + library primitives; no container steps.
     assert not [s for s in amplicon.steps if getattr(s, "container", None)]
+
+
+def test_every_mint_features_entry_binds_manifest():
+    """The dispatcher pins mint-features to `inputs == ["manifest"]`
+    (_reconstruct.py); a workflow naming the binding anything else fails at submit,
+    not load. Pin it here so a mismatch is caught in the unit tier."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    for a in actions:
+        for s in a.steps:
+            if getattr(s, "name", None) == "mint-features":
+                assert s.inputs == ["manifest"], f"{a.action_id}: mint-features got {s.inputs!r}"
 
 
 def test_load_actions_loads_on_disk_golay_demux_yaml():
