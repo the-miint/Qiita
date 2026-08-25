@@ -86,9 +86,11 @@ from ._processing import (
     _workflow_writes_assembly_gate,
 )
 from ._read_ingest import (
+    BARCODE_MAP_BINDING,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
     SAMPLE_MAP_BINDING,
+    _resolve_barcode_map,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
@@ -106,9 +108,11 @@ from ._reconstruct import (
 )
 from ._reference import (
     QC_ADAPTER_BINDING,
+    SORTMERNA_REF_BINDING,
     _resolve_host_filter_indexes,
     _resolve_qc_adapters,
     _resolve_sharded_align_index_bindings,
+    _resolve_sortmerna_ref,
     _resolve_syndna_index,
     _workflow_needs_adapters,
     _workflow_needs_sharded_align_indexes,
@@ -333,8 +337,25 @@ async def run_workflow(
         # it is the upstream `bcl_convert` step's output, bound during the loop.
         if _workflow_declares_input(action.steps, SAMPLE_MAP_BINDING):
             bound.update(await _resolve_sample_map(bound, workspace))
+        # golay-demux consumes the same shape: a barcode roster + the staging root.
+        if _workflow_declares_input(action.steps, BARCODE_MAP_BINDING):
+            bound.update(await _resolve_barcode_map(bound, workspace))
         if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
+
+        # amplicon's denoise: materialize the SortMeRNA reference to a FASTA.
+        if _workflow_declares_input(action.steps, SORTMERNA_REF_BINDING):
+            bound.update(
+                await _resolve_sortmerna_ref(
+                    pool,
+                    bound,
+                    data_plane_url=data_plane_url,
+                    signing_key=signing_key,
+                    workspace=workspace,
+                )
+            )
+
+        # amplicon declares no reads input; denoise streams them at runtime.
 
         # Staged-read binding (read-mask workflows): `reads` is consumed by qc /
         # host_filter but produced by no step, so bind it from stored reads.

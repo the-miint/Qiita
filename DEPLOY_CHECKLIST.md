@@ -41,6 +41,14 @@ _None yet._
 
 ### 5. Verify
 
+- **Confirm the two amplicon workflows synced.** `golay-demux 1.0.0` and `amplicon 1.0.0`
+  reach `qiita.action` via `qiita-admin actions sync` inside `activate.sh` — no migration.
+  `make verify-deploy` lists `qiita.action`; check both appear. The new DuckLake
+  `amplicon_membership` table is auto-created at data-plane boot (no migration, no action).
+  The `amplicon` workflow additionally needs a SortMeRNA 16S database loaded as an ACTIVE
+  `sequence_reference` (its `reference_idx` is a submit-time context arg) — a per-study data
+  setup, not a deploy step. (#244)
+
 - **`long-read-assembly` 1.0.0 is edited in place, not versioned** — `activate.sh`'s
   `qiita-admin actions sync` re-syncs it, so the `qiita.action` list check `make
   verify-deploy` already runs is the confirmation it landed. One edit rides this deploy,

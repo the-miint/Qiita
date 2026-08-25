@@ -57,30 +57,31 @@ def _build_processing_params(
     *,
     assembler_default: str | None = None,
 ) -> dict[str, Any]:
-    """The canonical params a processing_idx hashes — the SINGLE source of truth
-    for the run's identity shape. RESULT-AFFECTING inputs only (non-result params
-    like threads/mem never enter the hash):
+    """the result-affecting params a processing_idx hashes.
 
-      - mask_idx: WHICH masked pass-set is assembled. This is the gating input
-        predicate — assembling mask A vs mask B for the same sample+assembler must
-        be two DISTINCT identities, not a false duplicate. Read from `bound`, where
-        it arrives either from action_context (assembly, bound and checked non-NULL
-        before the masked-reads resolver runs) or from the read-mask minting branch
-        — so the mint this feeds has to stay after both.
-      - assembler: the step-1 assembler, defaulting to the action's context_schema
-        default when the submitter omits it (so omitted-vs-explicit-default
-        collapse to one identity). `assembler_default` is passed by the caller
-        straight off `context_schema`, so the default literal lives in ONE place.
+    each candidate is entered only when the workflow binds it (None dropped), so
+    assembly hashes {mask_idx, assembler} and amplicon hashes {trim, primer,
+    orient_primer, sortmerna_reference_idx} without polluting each other.
 
-    As more result-affecting params are parameterized (min-contig-length, DAS_Tool
-    threshold, LCG cutoff) they are added here, and every processing_idx re-hashes
-    fleet-wide."""
-    return {
-        "workflow": action_id,
-        "version": action_version,
+      - mask_idx: WHICH masked pass-set is assembled — mask A vs B for the same
+        sample+assembler must be two DISTINCT identities. Read from `bound`
+        (action_context for assembly, or the read-mask minting branch).
+      - assembler: the step-1 assembler, defaulting to the context_schema default
+        when omitted (so omitted == explicit-default). `assembler_default` comes
+        from the caller off `context_schema`.
+
+    sortmerna_reference_idx is the stable reference_idx, not the materialized path."""
+    candidates = {
         "mask_idx": bound.get(MASK_IDX_BINDING),
         "assembler": bound.get(ASSEMBLER_BINDING) or assembler_default,
+        "trim": bound.get("trim"),
+        "primer": bound.get("primer"),
+        "orient_primer": bound.get("orient_primer"),
+        "sortmerna_reference_idx": bound.get("sortmerna_reference_idx"),
     }
+    params: dict[str, Any] = {"workflow": action_id, "version": action_version}
+    params.update({k: v for k, v in candidates.items() if v is not None})
+    return params
 
 
 async def _mint_processing_idx(
@@ -109,7 +110,8 @@ async def _mint_processing_idx(
     async with pool.acquire() as conn:
         row = await mint_processing(conn, workflow=action_id, version=action_version, params=params)
     bindings: dict[str, Any] = {PROCESSING_IDX_BINDING: row["processing_idx"]}
-    if params["assembler"] is not None:
+    # absent for non-assembly workflows; only bind when it was hashed.
+    if params.get("assembler") is not None:
         bindings[ASSEMBLER_BINDING] = params["assembler"]
     return bindings
 

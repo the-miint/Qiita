@@ -15,11 +15,16 @@ tickets for RAW ``read`` rows, which is a strict superset of the
 human/host reads. Like its siblings the ticket is minted at RUNTIME (short TTL; a
 SLURM queue can outlive a submit-time ticket).
 
+Also serves the sequenced_pool-scoped ``amplicon`` workflow, which streams the
+whole pool the same way — members are the pool's full per-sample ranges
+(``fetch_pool_members``, no tiling) instead of a block's tiled map.
+
 The body carries only ``work_ticket_idx``. Everything that scopes the ticket is
 read CP-side:
 
-* the members, from ``qiita.block_member`` — a block can cover hundreds of
-  samples, and that list has no business riding a request body; and
+* the members, from ``qiita.block_member`` (block) or the pool's
+  ``qiita.sequence_range`` rows (sequenced_pool) — that list has no business
+  riding a request body; and
 * the selector (raw ``read_block`` vs mask-scoped ``read_masked_block``), from
   the ticket's ``action_context`` via the shared
   ``block_read.resolve_block_read_scope``.
@@ -47,6 +52,7 @@ from ..auth.tickets import sign_ticket
 from ..block_read import resolve_block_read_scope
 from ..deps import get_db_pool, get_flight_signing_key
 from ..repositories.block import fetch_block_members
+from ..repositories.sequenced_sample import fetch_pool_members
 
 read_router = APIRouter(prefix=PATH_READ_PREFIX, tags=["read"])
 
@@ -64,8 +70,8 @@ async def create_read_doget_ticket(
     for the raw selector those reads are human-containing:
 
     * unknown ``work_ticket_idx`` → 404;
-    * a work ticket that is not BLOCK-scoped → 422 (only a block has members;
-      the per-sample read path does not use this route);
+    * a ticket that is neither BLOCK- nor SEQUENCED_POOL-scoped → 422. A block
+      streams its tiled sub-ranges; a pool streams the whole pool;
     * an ``action_context`` whose alignment intent disagrees with the
       ``work_ticket.alignment_idx`` column → 422 (a mid-flight alignment DELETE;
       see ``resolve_block_read_scope``);
@@ -78,21 +84,19 @@ async def create_read_doget_ticket(
     here.
     """
     row = await pool.fetchrow(
-        "SELECT scope_target_kind, block_idx, alignment_idx, mask_idx, action_context"
+        "SELECT scope_target_kind, block_idx, sequenced_pool_idx, alignment_idx, mask_idx,"
+        " action_context"
         "  FROM qiita.work_ticket WHERE work_ticket_idx = $1",
         body.work_ticket_idx,
     )
     if row is None:
         raise HTTPException(status_code=404, detail="work ticket not found")
 
-    if row["scope_target_kind"] != ScopeTargetKind.BLOCK.value:
+    kind = row["scope_target_kind"]
+    if kind not in (ScopeTargetKind.BLOCK.value, ScopeTargetKind.SEQUENCED_POOL.value):
         raise HTTPException(
             status_code=422,
-            detail=(
-                "a block-read DoGet ticket requires a block-scoped work ticket; "
-                f"work ticket {body.work_ticket_idx} is "
-                f"{row['scope_target_kind']!r}-scoped"
-            ),
+            detail=f"work ticket {body.work_ticket_idx} is not block- or pool-scoped",
         )
 
     # asyncpg hands JSONB back as str under the default codec (or a dict if one
@@ -113,21 +117,21 @@ async def create_read_doget_ticket(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # a block uses its tiled members; a pool uses full per-sample ranges.
+    if kind == ScopeTargetKind.BLOCK.value:
+        raw_members = await fetch_block_members(pool, row["block_idx"])
+        scope_label = f"block {row['block_idx']}"
+    else:
+        raw_members = await fetch_pool_members(pool, row["sequenced_pool_idx"])
+        scope_label = f"sequenced_pool {row['sequenced_pool_idx']}"
     members = [
-        {
-            "prep_sample_idx": prep_sample_idx,
-            "sequence_idx_start": lo,
-            "sequence_idx_stop": hi,
-        }
-        for (prep_sample_idx, lo, hi) in await fetch_block_members(pool, row["block_idx"])
+        {"prep_sample_idx": prep_sample_idx, "sequence_idx_start": lo, "sequence_idx_stop": hi}
+        for (prep_sample_idx, lo, hi) in raw_members
     ]
     if not members:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"block {row['block_idx']} has no members — a planning bug; refusing "
-                "to sign an unscoped read ticket"
-            ),
+            detail=f"{scope_label} has no members; refusing an unscoped ticket",
         )
 
     ticket_bytes = sign_ticket(table=table, filter=filter_, members=members, secret=signing_key)

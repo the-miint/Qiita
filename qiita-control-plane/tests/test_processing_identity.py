@@ -73,6 +73,43 @@ def test_build_processing_params_shape_and_assembler_default():
     )
 
 
+def test_amplicon_params_carry_only_amplicon_knobs():
+    """An amplicon run hashes its own knobs (trim/primer/orient_primer/
+    sortmerna_reference_idx) and NOT the assembly ones — a None candidate is
+    dropped, so the two families never pollute each other's identity."""
+    amplicon = _build_processing_params(
+        "amplicon",
+        "1.0.0",
+        {
+            "trim": 150,
+            "primer": "GTGYCAGCMGCCGCGGTAA",
+            "orient_primer": False,
+            "sortmerna_reference_idx": 3,
+        },
+    )
+    assert amplicon == {
+        "workflow": "amplicon",
+        "version": "1.0.0",
+        "trim": 150,
+        "primer": "GTGYCAGCMGCCGCGGTAA",
+        "orient_primer": False,
+        "sortmerna_reference_idx": 3,
+    }
+    # No assembly knobs leaked in (mask_idx / assembler absent).
+    assert "mask_idx" not in amplicon and "assembler" not in amplicon
+
+
+def test_amplicon_trim_and_reference_are_part_of_the_identity():
+    """Different truncation length OR different SortMeRNA reference -> distinct
+    params (distinct processing_idx): both change the denoised result."""
+    base = {"trim": 150, "primer": "GTGYCAGCMGCCGCGGTAA", "sortmerna_reference_idx": 3}
+    trim_a = _build_processing_params("amplicon", "1.0.0", {**base, "trim": 150})
+    trim_b = _build_processing_params("amplicon", "1.0.0", {**base, "trim": 100})
+    assert trim_a != trim_b
+    ref_b = _build_processing_params("amplicon", "1.0.0", {**base, "sortmerna_reference_idx": 4})
+    assert trim_a != ref_b
+
+
 def test_mask_idx_is_part_of_the_identity():
     """mask_idx is the gating input predicate: the same sample+assembler assembled
     from two different masks must yield DISTINCT params (distinct processing_idx),

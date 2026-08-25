@@ -1,0 +1,84 @@
+action_id: golay-demux
+version: 1.0.0
+target_kind: sequenced_pool
+
+description: >
+  Golay-barcode demultiplex a pool's multiplexed 16S run (EMP-style: one R1
+  forward FASTQ + one I1 barcode FASTQ, plus R2) into per-sample reads in the
+  DuckLake `read` table — the analogue of bcl-convert for runs that arrive
+  already converted-but-multiplexed. Ported from duckdb-miint's demux_qiita.sql.
+
+  The `golay_demux` step pairs I1 against R1/R2 by record order (I1 is submitted
+  RC to the prep), assigns each read to the prep_sample whose barcode its
+  corrected index matches (Golay error-correction cloud), mints a sequence_idx
+  range per sample, and writes the sorted read.parquet; a register-files step
+  loads it into `read`. Downstream: read-mask, then amplicon.
+
+  The per-sample barcode roster (`barcode_map`, each entry carrying its
+  `barcodes_are_rc` provenance flag) is embedded in action_context and
+  materialized by the runner (the orchestrator has no DB access). The multiplexed
+  FASTQ are compute-node-visible host paths; the Golay (12,11,8) decode cloud is
+  generated in-job (no vendored table / fixed path).
+
+scopes: []
+
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [index_reads_path, forward_reads_path, barcode_map]
+  properties:
+    # multiplexed I1 barcode FASTQ (12-nt Golay codes; longer indexes sliced to 12).
+    index_reads_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    # multiplexed R1 forward FASTQ, paired to I1 by record order.
+    forward_reads_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    # multiplexed R2 FASTQ (optional; carried as sequence2/qual2 — EMP includes it).
+    reverse_reads_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    # (the Golay decode cloud is generated in-job; no table path here.)
+    # per-sample roster; the runner materializes it to a parquet.
+    # barcodes_are_rc is per-sample provenance.
+    barcode_map:
+      type: array
+      minItems: 1
+      items:
+        type: object
+        required: [prep_sample_idx, barcode, barcodes_are_rc]
+        properties:
+          prep_sample_idx: {type: integer, minimum: 1}
+          barcode: {type: string, minLength: 1}
+          barcodes_are_rc: {type: boolean}
+
+steps:
+  # demux + per-sample ingest in one job. barcode_map and reads_staging_root are
+  # runner-resolved; the FASTQ paths are plain values. cloud generated in-job.
+  - step: golay_demux
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.golay_demux
+    inputs: [index_reads_path, forward_reads_path, barcode_map, reads_staging_root]
+    optional_inputs: [reverse_reads_path]
+    outputs: [read_staging_dir]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 32
+      walltime: PT4H
+
+  # load the per-sample read parts into the DuckLake `read` table (read/ subdir).
+  - action: register-files
+    inputs: [read_staging_dir]
+    outputs: []
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 56
+  walltime: PT8H

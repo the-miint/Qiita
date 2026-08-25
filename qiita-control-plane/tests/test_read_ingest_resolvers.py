@@ -20,15 +20,18 @@ from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 from qiita_control_plane.runner import (
+    BARCODE_MAP_BINDING,
     SAMPLE_MAP_BINDING,
     STAGED_MASKED_READS_BINDING,
     STAGED_READS_BINDING,
+    _resolve_barcode_map,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
+    _write_reference_fasta,
 )
 
 
@@ -381,3 +384,54 @@ def test_block_read_resolvers_are_gone():
         "_write_empty_reads_parquet",
     ):
         assert not hasattr(runner, name), f"{name} should have been removed"
+
+
+# --- barcode_map (golay-demux) ----------------------------------------------
+
+
+def test_resolve_barcode_map_writes_parquet(tmp_path):
+    """The action_context roster is written with the (prep_sample_idx, barcode,
+    barcodes_are_rc) columns the golay_demux step reads."""
+    action_context = {
+        BARCODE_MAP_BINDING: [
+            {"prep_sample_idx": 5, "barcode": "ACGT", "barcodes_are_rc": True},
+            {"prep_sample_idx": 6, "barcode": "TTGG", "barcodes_are_rc": False},
+        ]
+    }
+    bound = asyncio.run(_resolve_barcode_map(action_context, tmp_path / "ws"))
+    out = bound[BARCODE_MAP_BINDING]
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(
+            f"SELECT prep_sample_idx, barcode, barcodes_are_rc FROM read_parquet('{out}') "
+            "ORDER BY prep_sample_idx"
+        ).fetchall()
+    assert rows == [(5, "ACGT", True), (6, "TTGG", False)]
+
+
+def test_resolve_barcode_map_rejects_empty_roster(tmp_path):
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(_resolve_barcode_map({BARCODE_MAP_BINDING: []}, tmp_path / "ws"))
+    assert exc.value.kind == FailureKind.BAD_INPUT
+
+
+# --- SortMeRNA reference FASTA writer ----------------------------------------
+
+
+def test_write_reference_fasta_reassembles_chunks(tmp_path):
+    """Chunks are grouped by feature_idx, ordered by chunk_index, concatenated,
+    and written one FASTA record per feature (header = feature_idx)."""
+    rows = [
+        (2, 1, "CGA"),  # deliberately out of feature + chunk order
+        (1, 0, "ACG"),
+        (2, 0, "TT"),
+        (1, 1, "GGA"),
+    ]
+    out = tmp_path / "ref.fasta"
+    n = _write_reference_fasta(rows, out)
+    assert n == 2
+    assert out.read_text() == ">1\nACGGGA\n>2\nTTCGA\n"
+
+
+def test_write_reference_fasta_empty_raises(tmp_path):
+    with pytest.raises(ValueError, match="no sequences"):
+        _write_reference_fasta([], tmp_path / "ref.fasta")

@@ -21,6 +21,22 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Rapid 16S amplicon processing: `golay-demux` + `amplicon` workflows (#244).**
+  Two workflows bring EMP-style 16S into Qiita. `golay-demux` (ingest) Golay-barcode
+  demultiplexes a pool's multiplexed FASTQ (R1 + I1 + optional R2) into per-sample reads
+  in the DuckLake `read` table — the analogue of bcl-convert for runs that arrive
+  already-converted-but-multiplexed; the (12,11,8) Golay decode cloud is generated
+  in-job (no vendored table / operator path). `amplicon` (process) denoises a pool's
+  stored reads with deblur (trim → dereplicate → SortMeRNA 16S pre-filter → UCHIME
+  chimera → MAFFT → deblur), **reference-agnostically**: every ASV gets a `feature_idx`
+  from its canonical sequence hash and per-sample counts land in the new DuckLake
+  `amplicon_membership` table (`prep_sample_idx, processing_idx, feature_idx, count`).
+  16S reads are not masked — the `denoise` step **streams** the pool's raw reads from the
+  data plane at runtime (a pool-scoped `read_block` DoGet), nothing staged to scratch; the
+  SortMeRNA reference is materialized from a loaded `sequence_reference` (by reference_idx,
+  off fixed paths). A same-pool re-run is refused pending an explicit delete/`--force`.
+  The closed-reference (e.g. GG2) feature table is **derived on demand** by intersecting
+  feature_idx with a reference's membership — never stored (a tracked follow-up).
 - **Per-run contig read-back over Arrow Flight (#476).** `POST
   /assembly/ticket/doget` takes a `(prep_sample_idx, processing_idx)` pair and
   signs a DoGet ticket for that assembly run's contigs on
