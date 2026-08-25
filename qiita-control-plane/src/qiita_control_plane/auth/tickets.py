@@ -38,7 +38,7 @@ _MEMBERS_TABLES = frozenset({READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE})
 #
 # A table absent from this mapping takes no projection at all: the data plane
 # streams every column and rejects a list outright. Only the alignment surface
-# is listed; why it and nothing else is in `docs/architecture.md`.
+# is listed; why it and nothing else is in `docs/architecture/flight.md`.
 _PROJECTION_COLUMNS: dict[str, frozenset[str]] = {
     "alignment_visible": frozenset(
         {

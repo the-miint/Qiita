@@ -7,7 +7,7 @@ the `container:` form. This is the guide to adding one.
 
 If your step needs bioinformatics tooling or system packages that don't already
 ship in `qiita-compute-orchestrator`'s `pyproject.toml`, it belongs in a
-**container**, not a native job — see [`architecture.md`](architecture.md) and
+**container**, not a native job — see [`architecture/processing.md`](architecture/processing.md) and
 the "Workflow runtimes" section of [`../CLAUDE.md`](../CLAUDE.md). Native jobs
 may only import dependencies already in the orchestrator's environment.
 
@@ -105,7 +105,7 @@ Three kinds of field arrive in `Inputs`:
   `KeyError`).
 - Result Parquet written for DuckLake registration must be mode `0o440` and
   carry the identifier columns in the canonical sort order (see
-  [`architecture.md`](architecture.md) — the data-plane result-file contract).
+  [`architecture/cross-cutting.md`](architecture/cross-cutting.md) — the data-plane result-file contract).
 
 ### Error classification
 

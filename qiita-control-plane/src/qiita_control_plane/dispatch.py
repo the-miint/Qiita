@@ -219,7 +219,7 @@ async def reconcile_inflight_tickets(app: FastAPI) -> int:
     dispatching against the same database. With multiple CP processes, one's
     startup reconcile would re-drive tickets another is actively running. CP HA
     needs fencing (owner column or advisory lock) before that assumption can be
-    lifted; see docs/architecture.md "Work Ticket Lifecycle".
+    lifted; see docs/architecture/processing.md "Work Ticket Lifecycle".
 
     Returns the number of tickets scheduled for resume, for logging.
     """
