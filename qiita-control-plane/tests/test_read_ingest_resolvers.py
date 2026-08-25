@@ -419,7 +419,11 @@ def test_resolve_barcode_map_rejects_empty_roster(tmp_path):
 
 def test_write_reference_fasta_reassembles_chunks(tmp_path):
     """Chunks are grouped by feature_idx, ordered by chunk_index, concatenated,
-    and written one FASTA record per feature (header = feature_idx)."""
+    and written one FASTA record per feature (header = feature_idx) via miint's
+    FORMAT FASTA writer. The client connect helper stands in for the service-side
+    staged one (identical FASTA bytes)."""
+    from qiita_control_plane.miint import connect_with_miint
+
     rows = [
         (2, 1, "CGA"),  # deliberately out of feature + chunk order
         (1, 0, "ACG"),
@@ -427,11 +431,16 @@ def test_write_reference_fasta_reassembles_chunks(tmp_path):
         (1, 1, "GGA"),
     ]
     out = tmp_path / "ref.fasta"
-    n = _write_reference_fasta(rows, out)
+    with connect_with_miint() as con:
+        n = _write_reference_fasta(rows, out, con)
     assert n == 2
     assert out.read_text() == ">1\nACGGGA\n>2\nTTCGA\n"
+    # the intermediate .partial is renamed away, never left behind.
+    assert not (tmp_path / "ref.fasta.partial").exists()
 
 
 def test_write_reference_fasta_empty_raises(tmp_path):
-    with pytest.raises(ValueError, match="no sequences"):
-        _write_reference_fasta([], tmp_path / "ref.fasta")
+    from qiita_control_plane.miint import connect_with_miint
+
+    with connect_with_miint() as con, pytest.raises(ValueError, match="no sequences"):
+        _write_reference_fasta([], tmp_path / "ref.fasta", con)

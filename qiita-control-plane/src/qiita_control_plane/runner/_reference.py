@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
 import asyncpg
+import duckdb
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
@@ -22,6 +24,7 @@ from ..actions.reference import (
     ReferenceNotFound,
 )
 from ..auth.tickets import sign_ticket
+from ..miint import connect_with_miint_staged
 from ._read_ingest import _workflow_declares_input
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
@@ -656,20 +659,43 @@ SORTMERNA_REF_BINDING = "sortmerna_ref"
 SORTMERNA_REFERENCE_IDX_KEY = "sortmerna_reference_idx"
 
 
-def _write_reference_fasta(rows: list[tuple[int, int, str]], out_path: Path) -> int:
-    """reassemble chunked sequences into a FASTA, one record per feature
-    (`>{feature_idx}`; SortMeRNA ignores the header). returns the count; raises
-    on an empty set."""
-    by_feature: dict[int, list[tuple[int, str]]] = {}
-    for feature_idx, chunk_index, chunk_data in rows:
-        by_feature.setdefault(feature_idx, []).append((chunk_index, chunk_data))
-    if not by_feature:
+def _write_reference_fasta(
+    rows: list[tuple[int, int, str]], out_path: Path, con: duckdb.DuckDBPyConnection
+) -> int:
+    """reassemble chunks into a FASTA via miint's FORMAT FASTA writer, one record
+    per feature (header = feature_idx; SortMeRNA ignores it). writes a `.partial`
+    then renames into place; returns the count; raises on an empty set.
+
+    `con` is a miint-loaded connection the caller owns — staged in service, client
+    in tests — mirroring the reference-export writer."""
+    import pyarrow as pa  # noqa: PLC0415
+
+    if not rows:
         raise ValueError("SortMeRNA reference returned no sequences")
-    with out_path.open("w") as fh:
-        for feature_idx in sorted(by_feature):
-            seq = "".join(chunk for _, chunk in sorted(by_feature[feature_idx]))
-            fh.write(f">{feature_idx}\n{seq}\n")
-    return len(by_feature)
+    chunks = pa.table(
+        {
+            "feature_idx": pa.array([r[0] for r in rows], pa.int64()),
+            "chunk_index": pa.array([r[1] for r in rows], pa.int32()),
+            "chunk_data": pa.array([r[2] for r in rows], pa.string()),
+        }
+    )
+    con.register("ref_chunks", chunks)
+    partial = out_path.parent / f"{out_path.name}.partial"
+    sql_path = str(partial).replace("'", "''")
+    try:
+        (count,) = con.execute(
+            "COPY (SELECT feature_idx::VARCHAR AS read_id,"
+            "        string_agg(chunk_data, '' ORDER BY chunk_index) AS sequence1"
+            "   FROM ref_chunks GROUP BY feature_idx ORDER BY feature_idx)"
+            f" TO '{sql_path}' (FORMAT FASTA)"
+        ).fetchone()
+        os.replace(partial, out_path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    finally:
+        con.unregister("ref_chunks")
+    return count
 
 
 async def _resolve_sortmerna_ref(
@@ -717,8 +743,8 @@ async def _resolve_sortmerna_ref(
     workspace.mkdir(parents=True, exist_ok=True)
     fasta = workspace / "sortmerna_ref.fasta"
     try:
-        _write_reference_fasta(rows, fasta)
+        with connect_with_miint_staged() as con:
+            _write_reference_fasta(rows, fasta, con)
     except ValueError as exc:
-        fasta.unlink(missing_ok=True)
         raise _submission_bad_input(f"SortMeRNA reference {reference_idx}: {exc}") from exc
     return {SORTMERNA_REF_BINDING: fasta}
