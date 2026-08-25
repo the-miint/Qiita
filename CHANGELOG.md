@@ -2441,6 +2441,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **Data-plane inline test modules split into `#[path]` submodules (#481).** `flight_service.rs`
+  was 9,398 lines of which 5,712 (61%) were `#[cfg(test)]`; `auth.rs` was 1,143 with 514 (45%).
+  The tests move to `flight_service_tests.rs` / `auth_tests.rs` and stay child modules via
+  `#[cfg(test)] #[path = "..."] mod tests;`, so they still reach private items through
+  `use super::*` — no visibility changes. `cargo test` reports the same 121 tests passing
+  before and after. `ducklake.rs` and `main.rs` are left alone: #244 has a hunk inside
+  `ducklake.rs`'s test module and also touches `main.rs`, so those two wait for it to land.
+
 - **Sequence chunks are stored upper case (#479).** `sequence_split_expr` now normalizes
   through a new `normalized_sequence_expr`, which `canonical_sequence_hash_expr` also
   routes through — so the bytes in `reference_sequence_chunks` / `assembled_sequence_chunks`
