@@ -71,14 +71,22 @@ def _build_processing_params(
         from the caller off `context_schema`.
 
     sortmerna_reference_idx is the stable reference_idx, not the materialized path."""
-    candidates = {
+    candidates: dict[str, Any] = {
         "mask_idx": bound.get(MASK_IDX_BINDING),
         "assembler": bound.get(ASSEMBLER_BINDING) or assembler_default,
-        "trim": bound.get("trim"),
-        "primer": bound.get("primer"),
-        "orient_primer": bound.get("orient_primer"),
-        "sortmerna_reference_idx": bound.get("sortmerna_reference_idx"),
     }
+    # amplicon knobs, gated on `trim` (amplicon-required, assembly never binds it) so
+    # they never enter an assembly identity. orient_primer's default (off) is applied
+    # here, and primer is hashed ONLY when orienting — otherwise it's a no-op knob
+    # (`_set_session_vars` ignores it) and an omitted-vs-explicit primer must not
+    # split the identity.
+    if bound.get("trim") is not None:
+        orient = bool(bound.get("orient_primer"))
+        candidates["trim"] = bound.get("trim")
+        candidates["sortmerna_reference_idx"] = bound.get("sortmerna_reference_idx")
+        candidates["orient_primer"] = orient
+        if orient:
+            candidates["primer"] = bound.get("primer")
     params: dict[str, Any] = {"workflow": action_id, "version": action_version}
     params.update({k: v for k, v in candidates.items() if v is not None})
     return params
