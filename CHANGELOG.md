@@ -36,7 +36,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   SortMeRNA reference is materialized from a loaded `sequence_reference` (by reference_idx,
   off fixed paths). A same-pool re-run is refused pending an explicit delete/`--force`.
   The closed-reference (e.g. GG2) feature table is **derived on demand** by intersecting
-  feature_idx with a reference's membership — never stored (a tracked follow-up).
+  feature_idx with a reference's membership — never stored (a tracked follow-up). The
+  deblur step works around [duckdb-miint#194](https://github.com/the-miint/duckdb-miint/issues/194)
+  (MAFFT litters `order`/`pre`/`trace` into the CWD on some strategies) by running MAFFT
+  in a per-job scratch dir (`miint.mafft_scratch_cwd`).
 - **Per-run contig read-back over Arrow Flight (#476).** `POST
   /assembly/ticket/doget` takes a `(prep_sample_idx, processing_idx)` pair and
   signs a DoGet ticket for that assembly run's contigs on
