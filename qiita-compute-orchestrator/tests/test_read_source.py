@@ -5,8 +5,8 @@ tests pin that, plus the two properties the module note calls load-bearing:
 
 * the Parquet branch binds a LAZY VIEW (materializing a whole sample would
   reintroduce the memory-scales-with-input shape that OOM-killed PacBio ingest);
-* the stream branch MATERIALIZES (a Flight reader is consumed once, and miint
-  resolves relation names on a separate connection).
+* the stream branch MATERIALIZES (a Flight reader is consumed once, and
+  align_sharded scans its reads twice).
 """
 
 from contextlib import asynccontextmanager
@@ -88,7 +88,7 @@ async def test_missing_parquet_fails_fast(tmp_path):
 
 async def test_stream_branch_drains_to_a_local_parquet(monkeypatch, tmp_path):
     """No staged Parquet ⇒ stream the block, and MATERIALIZE it: a Flight reader
-    is single-consumption, and miint resolves names on a separate connection."""
+    is single-consumption and align_sharded scans its reads twice."""
     source = tmp_path / "streamed.parquet"
     _write_reads_parquet(source, 3)
     captured: dict = {}

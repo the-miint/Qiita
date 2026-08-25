@@ -3,13 +3,13 @@ manifest / hash-keyed-chunks / bin_map head of the assembly-storage tail.
 
 Runs against the team-mirror miint build (conftest stages it): the job reads FASTA
 with miint `read_fastx` and chunks with `sequence_split`, and the `_hash` oracle
-below takes its reverse complement from the same miint scalar the production
-expression uses. Calls execute() directly.
+below takes its reverse complement and its case normalization from the same
+production expressions rather than retyping either. Calls execute() directly.
 Covers: happy path (LCG + MAG, synthetic read_ids, the contig_id beside them,
 hash-keyed chunks, dedup of identical contigs), synthetic-id disambiguation of a
 contig id reused across bins and repeated within one file, soft-masked (lowercase)
-contigs folding onto their upper-case twin and which record's bytes that fold then
-stores, the unbinned noLCG residue (its exclusion key, its bin_id, and what it does
+contigs folding onto their upper-case twin and which record's strand that fold
+then stores, the unbinned noLCG residue (its exclusion key, its bin_id, and what it does
 to a hash-collision group), a bin_id carrying the id's own separator, the one
 identity collision the step refuses (two bin files stemming to one bin_id), the
 pass-2 rejoin count and the zero-length record it does not count, and
@@ -27,6 +27,7 @@ from uuid import UUID
 import duckdb
 import pytest
 from qiita_common.backend_failure import StepNoData
+from qiita_common.chunking import normalized_sequence_expr
 
 from qiita_compute_orchestrator.jobs import assembly_hash
 from qiita_compute_orchestrator.jobs.assembly_hash import Inputs, execute
@@ -51,16 +52,30 @@ def _layout(tmp_path):
 
 
 @cache
+def _normalized(seq: str) -> str:
+    """`normalized_sequence_expr` evaluated on a connection — what the job stores,
+    and what both strands of the canonical hash are taken over.
+
+    Evaluated rather than retyped as `seq.upper()`: a Python mirror of it would be
+    a second implementation that drifts silently the day the expression grows a
+    step, and every assertion below would keep passing. Cached per distinct
+    sequence — called from assertion sites, not from a fixture."""
+    with open_miint_conn() as conn:
+        return conn.execute(f"SELECT {normalized_sequence_expr('?')}", [seq]).fetchone()[0]
+
+
+@cache
 def _rc(seq: str) -> str:
-    """miint's `sequence_dna_reverse_complement` over the upper-cased sequence —
-    the same call `canonical_sequence_hash_expr` makes for the second strand.
+    """miint's `sequence_dna_reverse_complement` over the normalized sequence — the
+    same call `canonical_sequence_hash_expr` makes for the second strand.
 
     `sequence_dna_reverse_complement` preserves case
-    (https://the-miint.github.io/duckdb-miint/utilities/), so `upper()` wraps the
-    argument, not the result. Cached per distinct sequence — this is called from
-    assertion sites rather than from a fixture."""
+    (https://the-miint.github.io/duckdb-miint/utilities/), so the normalization
+    wraps the argument, not the result."""
     with open_miint_conn() as conn:
-        return conn.execute("SELECT sequence_dna_reverse_complement(upper(?))", [seq]).fetchone()[0]
+        return conn.execute(
+            f"SELECT sequence_dna_reverse_complement({normalized_sequence_expr('?')})", [seq]
+        ).fetchone()[0]
 
 
 def _hash(seq: str) -> UUID:
@@ -68,10 +83,11 @@ def _hash(seq: str) -> UUID:
     UUID. The LEAST is over the two HASHES, not over the two sequences, so it does
     not in general return the hash of the lex-smaller strand.
 
-    Only the reverse complement comes from miint; the composition around it is
-    re-derived here, so a change to how the two hashes combine still fails."""
+    The reverse complement and the normalization both come from the production
+    expressions; only the composition around them is re-derived here, so a change
+    to how the two hashes combine still fails."""
     return min(
-        UUID(hashlib.md5(seq.upper().encode()).hexdigest()),
+        UUID(hashlib.md5(_normalized(seq).encode()).hexdigest()),
         UUID(hashlib.md5(_rc(seq).encode()).hexdigest()),
     )
 
@@ -261,15 +277,20 @@ def test_soft_masked_contigs_hash_as_their_upper_case_twin(tmp_path):
 
     Which of the three records' bytes land in the chunks is asserted too. The
     representative is `DISTINCT ON (sequence_hash) ... ORDER BY sequence_hash,
-    read_id`, which picks `LCG:c1:1` here, and its bytes are chunked as read —
-    so the stored strand and casing follow that tie-break. The lake replaces
-    these chunks by `feature_idx`, so the bytes a load stores are the ones a
-    reader reassembles.
+    read_id`, which picks `LCG:c1:1` here, and its bytes are chunked — so the
+    stored strand follows that tie-break. Case does not: the split normalizes
+    (`normalized_sequence_expr`), which is why the representative here is the
+    lowercase record and the stored bytes still come back upper case. The lake
+    replaces these chunks by `feature_idx`, so the bytes a load stores are the
+    ones a reader reassembles.
     """
     genomes, refined = _layout(tmp_path)
     seq = "GCTAAAGACAATTACA"
     assert _rc(seq) != seq, "fixture sequence is a palindrome — the test would be vacuous"
-    _fasta(genomes / "circular.fa", {"c1": seq, "c2": seq.lower(), "c3": _rc(seq).lower()})
+    assert seq.lower() != seq, "fixture is already lower case — the casing assert would be vacuous"
+    # c1 wins the representative tie-break AND is the lowercase record, so the
+    # stored bytes below are upper only if the split normalized them.
+    _fasta(genomes / "circular.fa", {"c1": seq.lower(), "c2": seq, "c3": _rc(seq).lower()})
 
     out = _run(
         Inputs(genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=8, work_ticket_idx=3),
@@ -278,12 +299,12 @@ def test_soft_masked_contigs_hash_as_their_upper_case_twin(tmp_path):
 
     manifest = _rows(out["manifest"], "read_id, CAST(sequence_hash AS VARCHAR)", "read_id")
     assert manifest == [
-        ("LCG:c1:1", str(_hash(seq))),
-        ("LCG:c2:2", str(_hash(seq.lower()))),
+        ("LCG:c1:1", str(_hash(seq.lower()))),
+        ("LCG:c2:2", str(_hash(seq))),
         ("LCG:c3:3", str(_hash(_rc(seq).lower()))),
     ]
     # Three records, one canonical sequence -> one feature, so one chunk set, and
-    # the reassembled bytes are the winning record's, byte for byte.
+    # the reassembled bytes are the winning record's strand, upper-cased.
     assert len({h for _, h in manifest}) == 1
     glob = str(out["assembly_chunks"] / "part_*.parquet")
     with duckdb.connect(":memory:") as con:
@@ -451,8 +472,10 @@ def test_repeated_contig_id_stores_each_contigs_own_bytes(tmp_path):
     outright. Reaching the case at all needs a space in the header, which is what
     puts the disambiguator in the comment field where `read_fastx` drops it.
 
-    Neither sequence equals its own reverse complement, and one is soft-masked, so
-    the stored-bytes assertion discriminates on both axes the canonical hash folds.
+    Neither sequence equals its own reverse complement, so the stored-bytes
+    assertion discriminates on strand, which the canonical hash folds but the
+    split preserves. One fixture is soft-masked to pin the other half: the split
+    folds case too, so it comes back upper (`normalized_sequence_expr`).
     """
     seq_a, seq_b = "ACGTTGCAAGGGTTCA", "ggatccTTAACCggat"
     genomes, refined = _layout(tmp_path)
@@ -470,7 +493,7 @@ def test_repeated_contig_id_stores_each_contigs_own_bytes(tmp_path):
     ]
     assert _reassembled(out["assembly_chunks"]) == {
         str(_hash(seq_a)): seq_a,
-        str(_hash(seq_b)): seq_b,
+        str(_hash(seq_b)): _normalized(seq_b),
     }
 
 
@@ -497,7 +520,7 @@ def test_repeated_contig_id_within_one_bin_keeps_both_rows(tmp_path):
     ]
     assert _reassembled(out["assembly_chunks"]) == {
         str(_hash(seq_a)): seq_a,
-        str(_hash(seq_b)): seq_b,
+        str(_hash(seq_b)): _normalized(seq_b),
     }
 
 
@@ -554,7 +577,7 @@ def test_a_colon_in_a_bin_id_composes_no_other_bins_id(tmp_path):
     ]
     assert _reassembled(out["assembly_chunks"]) == {
         str(_hash(seq_a)): seq_a,
-        str(_hash(seq_b)): seq_b,
+        str(_hash(seq_b)): _normalized(seq_b),
     }
 
 
@@ -625,7 +648,7 @@ def test_a_contig_pass_2_cannot_rejoin_fails_the_step(tmp_path, monkeypatch):
     )
     assert _reassembled(out["assembly_chunks"]) == {
         str(_hash(ghost)): ghost,
-        str(_hash(keeper)): keeper,
+        str(_hash(keeper)): _normalized(keeper),
     }
 
 
