@@ -21,8 +21,6 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
-    PATH_RUN_FOLDER_INSPECT,
-    PATH_RUN_FOLDER_PREFIX,
     PATH_SEQUENCED_POOL_ALIGN_PLAN,
     PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN,
     PATH_SEQUENCED_POOL_BY_IDX,
@@ -50,8 +48,6 @@ from qiita_common.models import (
     HostFilterResolution,
     Platform,
     ReferenceStatus,
-    RunFolderInspectRequest,
-    RunFolderInspectResponse,
     ScopeTargetKind,
     SequencedPoolCreateRequest,
     SequencedSampleCreateRequest,
@@ -62,6 +58,7 @@ from qiita_common.models import (
 
 from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
 from .. import _common
+from ._helpers import _inspect_run_folder
 
 # action_id + version for the bundled bcl-convert submission flow. Pinned
 # here so the CLI does not drift from the workflow YAML the operator's
@@ -558,17 +555,7 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
         # identity comes back. The route also applies the PATH_INGEST_ROOTS
         # gate, so a path the eventual work-ticket submit would reject fails
         # here instead, before any row is minted.
-        inspected = RunFolderInspectResponse.model_validate(
-            _common.call(
-                "POST",
-                args.base_url,
-                token,
-                f"{PATH_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}",
-                json=RunFolderInspectRequest(
-                    path=str(args.bcl_input_dir), platform=Platform.ILLUMINA
-                ).model_dump(mode="json"),
-            )
-        )
+        inspected = _inspect_run_folder(args.base_url, token, args.bcl_input_dir, Platform.ILLUMINA)
         assert inspected.illumina is not None  # platform=illumina always populates it
         instrument_run_id = inspected.illumina.instrument_run_id
         instrument_model = inspected.illumina.instrument_model

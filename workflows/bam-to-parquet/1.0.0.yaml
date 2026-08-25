@@ -55,9 +55,8 @@ context_schema:
     # the `bam_path` binding above (runner._resolve_upload_handles) and the
     # step stitches the chunked BLOB back into a BAM
     # (jobs._blob_input.resolve_reads_blob_input). Naming a `bam_path` is
-    # wet_lab_admin+ (routes/work_ticket.py's _check_ingest_paths) because the
-    # value is re-opened on a compute node under the job account; a `user`
-    # whose BAM is on their own machine uploads it and names this instead.
+    # Naming a `bam_path` is wet_lab_admin+; a `user` uploads and names this
+    # instead. Rule and reason: routes/work_ticket.py's _check_ingest_paths.
     bam_upload_idx: {type: integer, minimum: 1}
     # Caller's alignment-state declaration. This loader supports only unaligned
     # basecaller uBAMs (PacBio HiFi / ONT) — an aligned BAM would store

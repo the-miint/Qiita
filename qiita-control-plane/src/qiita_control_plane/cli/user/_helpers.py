@@ -4,10 +4,36 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 """
 
 import argparse
+from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
+from qiita_common.api_paths import PATH_RUN_FOLDER_INSPECT, PATH_RUN_FOLDER_PREFIX
+from qiita_common.models import Platform, RunFolderInspectRequest, RunFolderInspectResponse
 
 from .. import _common
+
+
+def _inspect_run_folder(
+    base_url: str, token: str, run_folder: Path, platform: Platform
+) -> RunFolderInspectResponse:
+    """Read a sequencing run folder on the control plane.
+
+    Doing the read server-side is what frees a submit gesture from a machine
+    that mounts the cluster. The route applies the same PATH_INGEST_ROOTS gate
+    the work-ticket submit does, so a path that submit would reject fails here,
+    before any row is minted. Caller asserts the platform arm it asked for.
+    """
+    return RunFolderInspectResponse.model_validate(
+        _common.call(
+            "POST",
+            base_url,
+            token,
+            f"{PATH_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}",
+            json=RunFolderInspectRequest(path=str(run_folder), platform=platform).model_dump(
+                mode="json"
+            ),
+        )
+    )
 
 
 def _build_body(

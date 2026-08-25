@@ -37,15 +37,11 @@ from typing import NamedTuple
 
 import httpx
 from qiita_common.api_paths import (
-    PATH_RUN_FOLDER_INSPECT,
-    PATH_RUN_FOLDER_PREFIX,
     PATH_WORK_TICKET_PREFIX,
 )
 from qiita_common.models import (
     PacbioRunIndex,
     Platform,
-    RunFolderInspectRequest,
-    RunFolderInspectResponse,
     ScopeTargetKind,
     SequencedPoolCreateRequest,
     SequencingRunCreateRequest,
@@ -54,6 +50,7 @@ from qiita_common.models import (
 
 from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
 from .. import _common
+from ._helpers import _inspect_run_folder
 from .pool import _provision_run_pool_roster
 
 # action_id + version for the per-sample read loader this command fans out to.
@@ -381,17 +378,7 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         # leaves this machine). Both happen before any row is minted, so a
         # missing or ambiguous BAM is one actionable error rather than a
         # half-populated pool.
-        inspected = RunFolderInspectResponse.model_validate(
-            _common.call(
-                "POST",
-                args.base_url,
-                token,
-                f"{PATH_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}",
-                json=RunFolderInspectRequest(
-                    path=str(args.run_folder), platform=Platform.PACBIO_SMRT
-                ).model_dump(mode="json"),
-            )
-        )
+        inspected = _inspect_run_folder(args.base_url, token, args.run_folder, Platform.PACBIO_SMRT)
         assert inspected.pacbio is not None  # platform=pacbio_smrt always populates it
         bam_by_barcode = _resolve_sample_bams(
             preflight_rows, args.run_folder, inspected.pacbio, parser

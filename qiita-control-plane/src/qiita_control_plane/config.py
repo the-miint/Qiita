@@ -338,9 +338,7 @@ class Settings:
         upload_root = scratch / "staging"
 
         # Colon-separated roots a submitter may name a host path under.
-        # Required: without it the work-ticket route would have no boundary
-        # to check an action_context path against, and every absolute path
-        # the orchestrator can open would be reachable from the API.
+        # Required, for the reason `_parse_ingest_roots` gives when refusing '/'.
         ingest_roots = _parse_ingest_roots(require_env("PATH_INGEST_ROOTS"))
 
         contact_email = require_env("CONTACT_EMAIL")

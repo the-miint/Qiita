@@ -70,9 +70,8 @@ context_schema:
     # through the same `fastq_path` binding.
     #
     #   *_path       — an absolute host path under PATH_INGEST_ROOTS. Naming
-    #                  one is wet_lab_admin+ (routes/work_ticket.py's
-    #                  _check_ingest_paths): the value is re-opened on a
-    #                  compute node under the job account.
+    #                  one is wet_lab_admin+ — rule and reason in
+    #                  routes/work_ticket.py's _check_ingest_paths.
     #   *_upload_idx — a DoPut handle. The runner rewrites it to the matching
     #                  `*_path` binding pointing at the staged upload
     #                  (runner._resolve_upload_handles), and the step stitches

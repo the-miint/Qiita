@@ -1,9 +1,8 @@
 """`qiita submit-reads` — load one sample's reads from the local machine.
 
 The route a regular user takes. Naming a host path in `action_context` is
-wet_lab_admin-or-higher (the value is re-opened on a compute node under the job
-account), and a `user`'s reads are on their own machine, which the cluster
-cannot see either way. So this gesture:
+wet_lab_admin-or-higher, and a `user`'s reads are on their own machine, which
+the cluster cannot see either way. So this gesture:
 
   1. validates the local file(s) — present, non-empty, and a format this
      system loads;

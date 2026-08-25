@@ -20,8 +20,7 @@ entry is not there" (definitive â€” reject) from "permission denied" (unknown â€
 admit, and let the step report it). Reporting a permission error as a missing
 path would refuse submissions that would have run.
 
-The roots are also the reach bound: without them, any absolute path the
-orchestrator can open is nameable through the API.
+The roots are the reach bound (`config._parse_ingest_roots`).
 """
 
 from __future__ import annotations
