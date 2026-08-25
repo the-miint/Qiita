@@ -10,8 +10,11 @@ onto shared scratch at submit time:
 
   * the SUBJECT — this run's contigs (`open_assembly_chunk_stream`), through
     `stage_subject` into the same `(read_id, sequence1)` TABLE the index builders
-    use. Read twice here: as the aligner's subject, and for the per-feature lengths
-    the circular gate needs.
+    use. ONE DoGet: the aligner needs its subject as a table, and the per-feature
+    lengths the circular gate needs are then read off that staged table rather than
+    streamed again. A lengths-only DoGet would not need the reassembly at all —
+    `sum(length(chunk_data))` per feature equals the reassembled length without
+    ordering or concatenation.
   * the QUERY — this sample's masked reads (`open_read_masked_stream`; the
     mask-lifecycle refusals that ride that mint are on
     `fetch_read_masked_doget_ticket`). Referenced EXACTLY ONCE, through a projecting
@@ -35,23 +38,32 @@ read, and a per-record query-coverage floor drops both.
 `qiita_common.analytic.gate`'s circular mode pools a read's records against one contig
 through miint's `circular_query_coverage`
 (<https://the-miint.github.io/duckdb-miint/alignment_analysis/#circular-query-coverage>)
-and judges the read there. Two consequences for the aligner call:
+and judges the read there.
+
+The two thresholds themselves — `min_identity` and `min_query_coverage`, defaulting to
+0.95 / 0.90 from the action's `context_schema` — reach the rows through
+`circular_predicate_sql`, bound by `gate_parameters(gate)` in the `WHERE` of the
+`_CLEARED` table below. That is the only place a record is dropped for scoring too low.
+
+Two consequences of the circular choice for the aligner call:
 
   * `eqx := true`. `cigar_pooled_identity` — the aggregate the macro reports as its
     `identity` column — is NULL on a CIGAR carrying no `=`/`X` ops, and
     `check_gate_diagnostics` refuses a whole slice for one such read.
-  * `max_secondary := 0`. `circular_query_coverage` excludes secondary records
-    (FLAG 0x100) — a documented precondition, see the link above — which costs a
-    slice containing them two ways: a secondary alongside a primary rides into the
-    gated output unscored, and a group whose ONLY record is secondary produces no
-    macro row at all and vanishes from the slice entirely. `check_gate_diagnostics`
+  * `max_secondary := 0`. SECONDARY (FLAG 0x100), not supplementary (0x800): the two
+    sides of an origin-spanning read arrive as SUPPLEMENTARY records, which this does
+    not touch and which the macro keeps — "a read split across a supplementary is one
+    molecule whatever the reference's topology" (see the link above). So requesting no
+    secondaries does not cost the crossing this gate exists to catch.
+    `circular_query_coverage` excludes secondary records, a documented precondition,
+    which costs a slice containing them two ways: a secondary alongside a primary rides
+    into the gated output unscored, and a group whose ONLY record is secondary produces
+    no macro row at all and vanishes from the slice entirely. `check_gate_diagnostics`
     refuses either. Requesting none is what puts the slice inside what the gate can
-    judge. Measured, the cost is exactly the secondary placements of a read mapping
-    to more than one contig — supplementary records are untouched, which is why this
-    composes with the pooling at all. `align_sharded` keeps them
-    (`max_secondary := 100`) because its per-record CIGAR gate scores them. Which of
-    the two a de novo abundance estimate wants is an assay question, not a mechanical
-    one.
+    judge. `align_sharded` keeps them (`max_secondary := 100`) because its per-record
+    CIGAR gate scores them; a read that is genuinely high-identity to two contigs — a
+    recent HGT into a shared operon — is therefore not placed twice here. That is the
+    assay call for this workflow, not a limitation of the aligner.
 
 Unmapped records are dropped on the way into the slice, for the reason the macro
 excludes them.
@@ -110,6 +122,13 @@ _ORIGIN_SPANNING_NAME = "alignment_origin_spanning.parquet"
 # it is not also holding the read bytes.
 _DUCKDB_THREADS = 8  # keep equal to the workflow's `cpu:` — see that entry
 _DUCKDB_CAP_GB = 16
+# Carves the cgroup out for the in-process co-consumer that shares the box with DuckDB:
+# minimap2's index over this sample's contigs, which is unspillable. `align_sharded`
+# reserves for the same reason; this is the only carve-out ON TOP of
+# `duckdb_headroom_gb`, which already covers DuckDB's own above-limit RSS overshoot.
+# One index over one sample's contigs, against that job's up-to-`_DUCKDB_THREADS`
+# concurrent shard indexes.
+_DUCKDB_RESERVE_GB = 1
 _DUCKDB_FALLBACK_GB = 4
 
 # In-DuckDB relation names this job owns. The gate's own four are not re-spelled
@@ -165,9 +184,10 @@ def _streamed_alignment_sql(alignment_idx: int, prep_sample_idx: int) -> str:
     docstring), so no record has a mate. The column is written anyway because the lake
     table declares it and `register-files` schema-matches on the full column list.
 
-    Unmapped records go here rather than at the gate: `circular_query_coverage`
-    excludes them, so they would leave the gated slice without failing a threshold, and
-    `check_gate_diagnostics` refuses a slice that still contains any.
+    No unmapped filter: `include_unmapped` defaults false, so `align_minimap2` emits no
+    row at all for a query that produced no alignment
+    (<https://the-miint.github.io/duckdb-miint/alignment_reference/>). An empty result
+    therefore means no read aligned, not that the filter removed everything.
     """
     return (
         f"CREATE TABLE {STREAMED_ALIGNMENT_TABLE} AS "
@@ -178,8 +198,7 @@ def _streamed_alignment_sql(alignment_idx: int, prep_sample_idx: int) -> str:
         "CAST(NULL AS BIGINT) AS mate_feature_idx, "
         "* EXCLUDE (read_id, reference, mate_reference) "
         "FROM align_minimap2(?, subject_table := ?, preset := ?, "
-        "eqx := true, max_secondary := 0) "
-        "WHERE NOT alignment_is_unmapped(flags)"
+        "eqx := true, max_secondary := 0)"
     )
 
 
@@ -224,21 +243,36 @@ def _origin_spanning_sql() -> str:
 
     `mixed_strand` groups never reach here — the gate's predicate excludes them — so
     every fragment of a group shares a strand and `is_reverse` is well-defined.
+
+    The `any_value` columns are constant within a group rather than arbitrary picks:
+    `pooled_identity`, `pooled_coverage` and `fragment_count` are the macro's PER-GROUP
+    answer, joined onto every fragment through `circular_cleared_join`'s full key, and
+    `is_reverse` is constant because mixed-strand groups are excluded above. The join
+    key carries `is_read1` while this GROUP BY does not, which agrees only because the
+    query is single-end (see the module docstring); paired input would merge R1 and R2
+    here while the join separated them.
     """
-    # `list_min`/`list_max` over the record's own intervals rather than an UNNEST: one
-    # row per fragment throughout, so the aggregate below groups fragments to reads
-    # without a second grouping to rebuild the fragment first.
-    interval = "cigar_query_intervals(a.cigar, a.flags)"
-    fragment = (
+    # `cigar_query_intervals` walks the CIGAR, and the query_start/query_stop below are
+    # two reads of ONE such list — so it is computed once per record here and carried as
+    # a column, rather than spelled twice and left to the optimizer to common up.
+    scored = (
         "SELECT a.alignment_idx, a.prep_sample_idx, a.sequence_idx, a.feature_idx, "
         "a.position, a.stop_position, alignment_is_reverse(a.flags) AS is_reverse, "
         "c.identity AS pooled_identity, c.coverage AS pooled_coverage, "
         "c.n_fragments AS fragment_count, l.sequence_length_bp, "
-        f"list_min(list_transform({interval}, x -> x.start)) AS query_start, "
-        f"list_max(list_transform({interval}, x -> x.stop)) AS query_stop "
+        "cigar_query_intervals(a.cigar, a.flags) AS query_interval "
         f"FROM {STREAMED_ALIGNMENT_TABLE} a JOIN {_CLEARED} c "
         f"ON {circular_cleared_join('a', 'c')} "
         f"JOIN {FEATURE_LENGTHS_TABLE} l ON l.feature_idx = a.feature_idx"
+    )
+    # `list_min`/`list_max` over the record's own intervals rather than an UNNEST: one
+    # row per fragment throughout, so the aggregate below groups fragments to reads
+    # without a second grouping to rebuild the fragment first.
+    fragment = (
+        "SELECT * EXCLUDE (query_interval), "
+        "list_min(list_transform(query_interval, x -> x.start)) AS query_start, "
+        "list_max(list_transform(query_interval, x -> x.stop)) AS query_stop "
+        "FROM scored"
     )
     # `position` is 1-based inclusive and `stop_position` exclusive (the aligner's own
     # convention, which the lake stores unchanged), so the contig's last base is
@@ -250,7 +284,7 @@ def _origin_spanning_sql() -> str:
     # its own or a read long enough to lap comes out looking like a plain crossing.
     whole_contig = "position = 1 AND stop_position = sequence_length_bp + 1"
     return (
-        f"WITH fragment AS ({fragment}) "
+        f"WITH scored AS ({scored}), fragment AS ({fragment}) "
         "SELECT alignment_idx, prep_sample_idx, sequence_idx, feature_idx, "
         "min(query_start) AS query_start, max(query_stop) AS query_stop, "
         f"max(position) FILTER (WHERE {at_end}) AS feature_start, "
@@ -290,7 +324,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 conn,
                 duckdb_tmp,
                 memory_gb=resolve_duckdb_memory_gb(
-                    _DUCKDB_FALLBACK_GB, threads=_DUCKDB_THREADS, cap_gb=_DUCKDB_CAP_GB
+                    _DUCKDB_FALLBACK_GB,
+                    threads=_DUCKDB_THREADS,
+                    reserve_gb=_DUCKDB_RESERVE_GB,
+                    cap_gb=_DUCKDB_CAP_GB,
                 ),
                 threads=_DUCKDB_THREADS,
             )

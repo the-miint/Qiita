@@ -119,22 +119,26 @@ steps:
     # `test_align_denovo_cpu_pins_duckdb_threads` fails if the two drift, the same pin
     # `align_sharded` carries for its own (different) reason.
     #
-    # 8 rather than 16, matching `long-read-assembly`'s `assembly_coverage` step, which
-    # aligns the same reads against the same contigs with the same embedded minimap2.
-    # The thread count is also a memory multiplier for the aligner's own per-thread
-    # state, which lives in the cgroup remainder and cannot spill; on that step the
-    # remainder is measured at 87% of a 64 GB request at the median. This job holds no
-    # `SEQUENCE_DATA` lookup, so it should sit well below that — but "should" is
-    # inference, and the first real ticket's `sacct` MaxRSS is what would settle it.
+    # 8 rather than 16: the thread count is also a memory multiplier for the aligner's
+    # own per-thread state, which lives in the cgroup remainder and cannot spill.
     #
-    # mem_gb is NOT VALIDATED AGAINST A REAL SAMPLE. `assembly_coverage`'s now is (see
-    # its module sizing note), and it sits at 87% of this same 64 GB at the median with
-    # its largest samples escalating — so treat that as the upper bound this job should
-    # come in under, not as evidence 64 fits. Size it from the first real ticket's
-    # `sacct` MaxRSS.
+    # mem_gb is NOT VALIDATED AGAINST A REAL SAMPLE, and no measured job is a stand-in.
+    # `assembly_coverage` aligns the same reads against the same contigs, but it holds
+    # a `SEQUENCE_DATA` lookup over the whole read set for its BAM writer and keeps
+    # secondaries, which is what its measured remainder is made of; this job writes
+    # Parquet, holds no such lookup, and requests no secondaries. `align_sharded` shares
+    # this job's shape but indexes a sharded whole reference across up to 8 concurrent
+    # shards against one sample's contigs here. Both bound this job from above without
+    # estimating it.
+    #
+    # So the baseline is a starting point with the ceiling as its safety net, not a
+    # measurement: a sample that does not fit escalates once, and the first real
+    # ticket's `sacct` MaxRSS is what settles the number. The allocation has to cover
+    # `duckdb_headroom_gb(8)` = 6 GB, DuckDB's own limit, and `_DUCKDB_RESERVE_GB` for
+    # the in-process minimap2 index — see those constants in the job module.
     baseline_resources:
       cpu: 8
-      mem_gb: 64
+      mem_gb: 16
       walltime: PT4H
 
   # Idempotent sample replace: delete this (alignment_idx, prep_sample) pair's rows
@@ -168,5 +172,5 @@ steps:
 
 action_ceiling:
   cpu: 8
-  mem_gb: 192
+  mem_gb: 32
   walltime: PT8H

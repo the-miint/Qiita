@@ -517,6 +517,35 @@ def test_an_empty_contig_roster_is_refused_and_leaves_no_partial_output(
     assert not (workspace / "alignment_origin_spanning.parquet").exists()
 
 
+def test_a_query_that_does_not_align_produces_no_row_at_all():
+    """What the absent unmapped filter rests on. `include_unmapped` defaults false, so
+    `align_minimap2` emits no row for a query that found no alignment, rather than one
+    flagged 0x4 (<https://the-miint.github.io/duckdb-miint/alignment_reference/>). Were
+    that to change, unmapped records would reach the gate — `circular_query_coverage`
+    excludes them, so `check_gate_diagnostics` would refuse the whole slice.
+
+    The aligning control is what makes the zero meaningful: without it, a fixture that
+    produces no rows either way would assert nothing.
+    """
+    rng = random.Random(20260825)
+    subject = _rand_seq(rng, 20_000)
+    with open_miint_conn() as conn:
+        conn.execute("CREATE TABLE s AS SELECT 901::BIGINT AS read_id, ? AS sequence1", [subject])
+        conn.execute(
+            "CREATE TABLE q AS SELECT 1::BIGINT AS read_id, ? AS sequence1 "
+            "UNION ALL SELECT 2::BIGINT, ?",
+            [subject[4_000:10_000], _rand_seq(rng, 6_000)],
+        )
+        aligned = conn.execute(
+            "SELECT DISTINCT read_id FROM align_minimap2("
+            "'q', subject_table := 's', preset := 'map-hifi', eqx := true, "
+            "max_secondary := 0) ORDER BY read_id"
+        ).fetchall()
+    # read 1 is a substring of the subject and aligns; read 2 is unrelated and is
+    # absent entirely rather than present-and-unmapped.
+    assert aligned == [(1,)]
+
+
 def test_the_aligner_call_requests_no_secondary_records_and_eqx_cigars(
     monkeypatch, genome, tmp_path
 ):
@@ -526,7 +555,8 @@ def test_the_aligner_call_requests_no_secondary_records_and_eqx_cigars(
     sql = align_denovo._streamed_alignment_sql(_ALIGNMENT_IDX, _PREP_SAMPLE_IDX)
     assert "max_secondary := 0" in sql
     assert "eqx := true" in sql
-    assert "alignment_is_unmapped(flags)" in sql
+    # No unmapped filter, and none requested: see the contract test below.
+    assert "include_unmapped" not in sql
 
     from qiita_common.analytic import AlignmentGate, check_gate_diagnostics
 
