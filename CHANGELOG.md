@@ -35,7 +35,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `amplicon_sequence_chunks`, keyed by feature_idx, mirroring the assembly tables),
   so an ASV is never recomputed to read back.
   16S reads are not masked — the `denoise` step **streams** the pool's raw reads from the
-  data plane at runtime (a pool-scoped `read_block` DoGet), nothing staged to scratch; the
+  data plane at runtime (a pool-scoped `read_block` DoGet); the runner stages nothing (the
+  stream spills transiently to the job workspace); the
   SortMeRNA reference is materialized from a loaded `sequence_reference` (by reference_idx,
   off fixed paths). A same-pool re-run is refused pending an explicit delete/`--force`.
   The closed-reference (e.g. GG2) feature table is **derived on demand** by intersecting

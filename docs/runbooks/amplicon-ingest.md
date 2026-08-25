@@ -37,8 +37,9 @@ repeated here — see [`user-cli-quickstart.md`](user-cli-quickstart.md).
 ## Submit amplicon (denoise)
 
 - _(TODO)_ context: `sortmerna_reference_idx`, `trim`, optional `primer` /
-  `orient_primer`. The pool's reads STREAM from the data plane at runtime (nothing
-  staged to scratch). Writes `amplicon_membership` (reference-agnostic ASV counts).
+  `orient_primer`. The pool's reads STREAM from the data plane at runtime (the runner
+  stages nothing; the stream spills transiently to the job workspace). Writes
+  `amplicon_membership` + the ASV sequence tables (reference-agnostic ASV counts).
 
 ## Re-runs
 

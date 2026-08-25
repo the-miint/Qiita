@@ -41,7 +41,8 @@ _IUPAC_DNA = frozenset("ACGTURYSWKMBDHVN")
 
 YAML_STEP_NAME = "denoise"
 
-# keep DuckDB light; the tools run as separate processes.
+# reserve headroom for miint's in-process co-consumers (SortMeRNA/MAFFT/deblur
+# link statically and share this process's memory), so DuckDB stays modest.
 _DUCKDB_THREADS = 4
 _DUCKDB_FALLBACK_MEMORY_GB = 8
 _DUCKDB_RESERVE_GB = 32
@@ -92,7 +93,9 @@ SELECT * FROM joined WHERE sample_id IN (
     SELECT sample_id FROM joined GROUP BY sample_id HAVING COUNT(DISTINCT sequence1) >= 2);
 """
 
-# chimera filter before the MSA, then drop thin samples.
+# chimera filter before the MSA, then drop thin samples. the uchime parameters are
+# the biocore/deblur port (deblur/workflow.py): 1 mismatch in the A/B region cancels
+# a chimera call, ~3 unique reads per region without mismatches makes one.
 _CHIMERA_SQL = """
 CREATE OR REPLACE TABLE chimera_calls AS
 SELECT * FROM detect_chimera_uchime_denovo('alignable', sample_id := 'sample_id',
@@ -190,7 +193,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             sortmerna_ref=inputs.sortmerna_ref,
             orient=inputs.orient_primer,
         )
-        # stream the pool's reads from the data plane (nothing staged).
+        # stream the pool's reads from the data plane (the runner stages nothing;
+        # the stream spills transiently to the job workspace).
         async with bind_step_reads(
             conn,
             reads=inputs.reads,
@@ -214,13 +218,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             if conn.execute("SELECT count(*) FROM alignable").fetchone()[0] == 0:
                 raise StepNoData(
                     step_name=YAML_STEP_NAME,
-                    reason="no sample retained >=2 unique 16S-matching dereplicated sequences",
+                    reason="no prep_sample retained >=2 unique 16S-matching dereplicated sequences",
                 )
             conn.execute(_CHIMERA_SQL)
             if conn.execute("SELECT count(*) FROM alignable2").fetchone()[0] == 0:
                 raise StepNoData(
                     step_name=YAML_STEP_NAME,
-                    reason="no non-chimeric sample retained >=2 unique sequences",
+                    reason="no non-chimeric prep_sample retained >=2 unique sequences",
                 )
             conn.execute(_DENOISE_SQL)
 

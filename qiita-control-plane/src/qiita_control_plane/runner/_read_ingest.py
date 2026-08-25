@@ -311,7 +311,12 @@ def _write_barcode_map_parquet(roster: list[dict[str, Any]], out_path: Path) -> 
 
 async def _resolve_barcode_map(action_context: dict[str, Any], workspace: Path) -> dict[str, Path]:
     """materialize the golay-demux barcode roster to a parquet. mirrors
-    `_resolve_sample_map`; BAD_INPUT on a missing or empty roster."""
+    `_resolve_sample_map`; BAD_INPUT on a missing or empty roster.
+
+    TODO(sample-sheet-provenance): the submitter hand-builds this roster today. each
+    field (prep_sample_idx, barcode, barcodes_are_rc) is a sample-sheet fact a
+    preflight blob could carry, so a transposed roster can't silently route one
+    sample's reads under another's prep_sample_idx. tracked in Qiita#250."""
     roster = action_context.get(BARCODE_MAP_BINDING)
     if not roster:
         raise _submission_bad_input("golay-demux requires a non-empty barcode_map")

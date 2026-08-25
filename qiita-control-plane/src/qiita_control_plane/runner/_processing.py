@@ -5,8 +5,10 @@ processing_idx minted here; the third write is the terminal
 
 A processing_idx is minted before the step loop (like mask_idx) from the run's
 canonical params — the workflow + version + the inputs and knobs that change the
-RESULT: the mask_idx that selects WHICH reads are assembled, and the assembler.
-Same params -> same processing_idx (idempotent re-run); different params -> a
+RESULT: for assembly the mask_idx that selects WHICH reads are assembled and the
+assembler; for amplicon the trim, sortmerna_reference_idx, and orient_primer (plus
+the primer only when orienting). Same params -> same processing_idx (idempotent
+re-run); different params -> a
 distinct id, so a re-run's bins never collide with a prior run's, and assembling a
 DIFFERENT mask's pass-set is a distinct identity rather than a false duplicate that
 disallow-without-delete would wrongly block.
