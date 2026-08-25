@@ -3639,6 +3639,38 @@ async def test_resolve_qc_adapters_empty_set(postgres_pool, reference_idx, tmp_p
     assert not (tmp_path / "adapters.parquet").exists()
 
 
+async def test_resolve_qc_adapters_repeated_chunk_position(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """Two rows at one (feature_idx, chunk_index) → BAD_INPUT naming the position,
+    and no partial adapters.parquet. The pair below is the reverse-complement one a
+    strand-folded feature hash mints into a single feature; concatenating it returns
+    66 bp for a 33 bp adapter."""
+    from qiita_control_plane import runner
+
+    await _make_adapter_reference(postgres_pool, reference_idx)
+    monkeypatch.setattr(
+        runner,
+        "_do_get_reference_sequence_chunks",
+        lambda _url, _t: [
+            (127, 0, "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"),
+            (127, 0, "ACACTCTTTCCCTACACGACGCTCTTCCGATCT"),
+            (9, 0, "CTGTCTC"),
+        ],
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=reference_idx,
+            data_plane_url="grpc://unused",
+            signing_key=b"x" * 32,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert "(feature_idx 127, chunk_index 0)" in ei.value.reason
+    assert not (tmp_path / "adapters.parquet").exists()
+
+
 async def test_resolve_qc_adapters_dataplane_failure_is_submission_failure(
     postgres_pool, reference_idx, tmp_path, monkeypatch
 ):

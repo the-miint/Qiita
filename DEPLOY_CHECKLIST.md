@@ -73,7 +73,7 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-- **Collapse the 24 reference features the 2026-08-21 collapse left ambiguous** (#479). That run reported them and stopped: their copies were not byte-identical, so it had no basis to pick a survivor, and its entry told the operator to re-run the producing load. That is not the remedy — measured 2026-08-23, 23 of the 24 differ only in soft-masking case (46,327 of 46,624 chunk positions disagree byte-wise, **0** after `upper()`), and only `feature_idx` 127 is a true reverse complement. With the split now storing upper case, the 23 are byte-identical under normalization and collapse unambiguously.
+- **Collapse the 24 reference features the 2026-08-21 collapse left ambiguous** (#479). That run reported them and stopped: their copies were not byte-identical, so it had no basis to pick a survivor, and its entry told the operator to re-run the producing load. That is not the remedy — measured 2026-08-23, 23 of the 24 differ only in soft-masking case (46,327 of 46,624 chunk positions disagree byte-wise, **0** after `upper()`), and only `feature_idx` 127 is a true reverse complement, settled separately below. With the split now storing upper case, the 23 are byte-identical under normalization and collapse unambiguously.
 
   Scope is the `reference_sequences` / `reference_sequence_chunks` pair **only** — measured 2026-08-24, the assembly pair carries 0 duplicated features (the archived backfill resolved it), and `reference_sequences` itself has 0 duplicate rows, so this is a chunk-table repair.
 
@@ -89,6 +89,36 @@ _None yet._
   ```
 
   Expect 24 features: `feature_idx` 1-9, 11-24 and 127.
+
+  **Feature 127 — delete the orientation the adapter FASTA does not declare.** Its two
+  rows at `chunk_index` 0 are exact reverse complements, 33 bp each: the feature hash
+  folds strand, so `AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT` and its reverse complement mint one
+  `feature_idx`, and both rows persisted because they predate the `register_files`
+  replace-by-key the **One-off** note below names. Keep `AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT`
+  — the orientation `fastp_truseq_adapters.fna` declares under
+  `>Illumina_TruSeq_Adapter_Read_2`, and that file is reference 13, the configured
+  `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`. This is not a tie-break: which orientation a read
+  carries follows the library protocol, so the survivor has to be the one the source FASTA
+  declares. Run it under the **Collapse** scaffolding below, before `collapse.sql`:
+
+  ```sql
+  DELETE FROM qiita_lake.reference_sequence_chunks
+   WHERE feature_idx = 127
+     AND chunk_data = 'ACACTCTTTCCCTACACGACGCTCTTCCGATCT';
+  ```
+
+  Expect **1** row deleted; re-running the before-query then returns 23 features, and 127
+  never reaches the collapse.
+
+  **No mask is re-run for this.** Measured 2026-08-24 over 2,113,320 reads on 600 samples:
+  0 retain R2 adapter after trimming and 15 retain R1 adapter — the R1 count is the control
+  showing the detection works — and of 1,994 asymmetrically-trimmed pairs, 0 carry adapter.
+  The stored adapter set is wrong; the masks derived from it are not.
+
+  **Do this promptly after the restart.** `_write_adapter_parquet` now refuses a repeated
+  `(feature_idx, chunk_index)` instead of concatenating the pair into a 66 bp sequence, so
+  between the bucket-4 restart and this delete a `qc` ticket whose adapter reference holds
+  127 fails at input preparation with a BAD_INPUT naming the position. (#494)
 
   **Collapse.** Run [`docs/deploy-archive/2026-08-21-0d771b79.md`](docs/deploy-archive/2026-08-21-0d771b79.md) §6 for its invocation scaffolding — the `qiita-data` run-as, the `PGPASSFILE` handling, `SET home_directory`, `-bail` (the CLI flag, not the dot-command), and the quiesce requirement all still apply unchanged. Two statements in its `collapse.sql` differ; use these instead of the archived ones, verbatim:
 
@@ -106,9 +136,9 @@ _None yet._
       SEMI JOIN dup_feature USING (feature_idx);
   ```
 
-  Expect `collapsible_features` **23**, `ambiguous_features` **1** — `feature_idx` 127, the fastp/truseq adapter, a real strand disagreement left alone by design. Measured against the live lake 2026-08-24: 24 ambiguous under the archived test, 1 under this one. Anything else, stop and re-measure rather than widening the normalization.
+  Expect `collapsible_features` **23**, `ambiguous_features` **0** — the delete above removed `feature_idx` 127 from `dup_feature`, so nothing reaches the ambiguous arm. Measured against the live lake 2026-08-24: 24 ambiguous under the archived test, 1 under this one, and that 1 is 127. Anything else, stop and re-measure rather than widening the normalization.
 
-  **After.** The same before-query, expecting one row (`feature_idx` 127).
+  **After.** The same before-query, expecting **no rows**.
 
   **One-off.** Nothing after this deploy can create these rows: `register_files` replaces `reference_sequence_chunks` on `feature_idx`, pinned by `register_files_replaces_sequences_shared_across_references` in `qiita-data-plane/src/flight_service.rs`. This repairs rows written before that landed; it is not tooling to keep.
 

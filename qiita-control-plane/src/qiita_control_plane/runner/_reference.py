@@ -504,7 +504,7 @@ def _write_adapter_parquet(rows: list[tuple[int, int, str]], out_path: Path) -> 
     feature_idx for determinism; the qc job reads only `sequence` via
     `read_parquet`. Returns the sequence count. Raises ValueError on an empty set
     — an adapter reference with no sequences is a misconfiguration, not a valid QC
-    input.
+    input — and on a repeated (feature_idx, chunk_index).
 
     Parquet (not FASTA) keeps the adapter set in the same columnar format as the
     reads it trims, so the qc job reads it with `read_parquet` and no FASTA
@@ -515,20 +515,35 @@ def _write_adapter_parquet(rows: list[tuple[int, int, str]], out_path: Path) -> 
     Input contract (the reference-load flow, jobs/reference_load.py): chunk_data
     is a substring of a parsed FASTA record, so it is newline-free, and a feature
     is loaded exactly once with monotonic chunk_index (a reference is loaded once,
-    pending→loading→active), so (feature_idx, chunk_index) is unique. Hence no
-    newline sanitation or chunk dedup here — both would mask a real corruption we
-    want to surface."""
+    pending→loading→active), so (feature_idx, chunk_index) is unique. Chunks are
+    concatenated with no newline sanitation. A repeated (feature_idx, chunk_index)
+    raises: concatenating its rows returns a sequence longer than the adapter the
+    reference holds, and picking one row needs a survivor rule this function does
+    not have."""
     import pyarrow as pa  # noqa: PLC0415
     import pyarrow.parquet as pq  # noqa: PLC0415
 
-    by_feature: dict[int, list[tuple[int, str]]] = {}
+    by_feature: dict[int, dict[int, str]] = {}
+    repeated: set[tuple[int, int]] = set()
     for feature_idx, chunk_index, chunk_data in rows:
-        by_feature.setdefault(feature_idx, []).append((chunk_index, chunk_data))
+        chunks = by_feature.setdefault(feature_idx, {})
+        if chunk_index in chunks:
+            repeated.add((feature_idx, chunk_index))
+        chunks[chunk_index] = chunk_data
     if not by_feature:
         raise ValueError("adapter reference returned no sequences")
+    if repeated:
+        positions = ", ".join(
+            f"(feature_idx {feature}, chunk_index {index})" for feature, index in sorted(repeated)
+        )
+        raise ValueError(
+            f"{len(repeated)} chunk position(s) carry more than one row: {positions}"
+            " — repair reference_sequence_chunks before running QC against this"
+            " reference"
+        )
     feature_ids = sorted(by_feature)
     sequences = [
-        "".join(chunk for _, chunk in sorted(by_feature[feature_idx]))
+        "".join(chunk for _, chunk in sorted(by_feature[feature_idx].items()))
         for feature_idx in feature_ids
     ]
     table = pa.table(
