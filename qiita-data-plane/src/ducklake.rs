@@ -727,7 +727,8 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 /// per-sample ASV feature counts from a deblur run: feature membership plus
 /// abundance, keyed by `processing_idx` (the run) and `feature_idx` (the ASV).
 /// the derived amplicon feature table aggregates this; it is never itself
-/// stored. pure append, so deliberately not in `REPLACE_KEY_TABLES`.
+/// stored. replace-keyed on `(prep_sample_idx, processing_idx)` in
+/// `flight_service::REPLACE_KEY_TABLES`, so a re-run replaces its own rows.
 pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_membership (

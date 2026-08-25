@@ -86,7 +86,7 @@ steps:
       mem_gb: 8
       walltime: PT1H
 
-  # load amplicon_membership into the lake (pure append; the re-run gate handles it).
+  # load amplicon_membership into the lake (replace-keyed on prep_sample+processing).
   - action: register-files
     inputs: [staging_dir]
     outputs: []

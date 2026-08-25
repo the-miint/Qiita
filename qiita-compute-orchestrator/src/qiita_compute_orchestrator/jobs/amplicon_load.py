@@ -7,8 +7,9 @@ no sequences and no Postgres membership. the whole job is one join:
     JOIN feature_map (sequence_hash, feature_idx)
     -> amplicon_membership.parquet (prep_sample_idx, processing_idx, feature_idx, count)
 
-the output basename is the table name, so register-files loads it by stem.
-the table is pure-append; the re-run gate handles duplicates.
+the output basename is the table name, so register-files loads it by stem. the
+table is replace-keyed on (prep_sample_idx, processing_idx), so a re-run replaces
+its own rows instead of doubling counts.
 """
 
 from __future__ import annotations

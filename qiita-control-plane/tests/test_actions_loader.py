@@ -280,11 +280,9 @@ def test_load_actions_loads_on_disk_amplicon_yaml():
     assert "amplicon" in by_id, "workflows/amplicon/1.0.0.yaml must load"
     amplicon = by_id["amplicon"]
 
-    # sequenced_pool scope is load-bearing beyond routing: it is what subjects a
-    # re-submit to the pool-level disallow-without-delete gate (a same-pool re-run
-    # refused pending delete/force — pinned generically by the SEQUENCED_POOL gate
-    # tests in routes/test_work_ticket.py), so a re-run can't double-append
-    # amplicon_membership.
+    # sequenced_pool scope subjects a re-submit to the pool COMPLETED gate; a
+    # --force re-run is safe because amplicon_membership is replace-keyed on
+    # (prep_sample_idx, processing_idx), so it replaces rather than doubling.
     assert amplicon.target_kind == ScopeTargetKind.SEQUENCED_POOL
     assert amplicon.version == "1.0.0"
     assert amplicon.context_schema["required"] == ["sortmerna_reference_idx", "trim"]

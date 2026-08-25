@@ -39,12 +39,14 @@ repeated here — see [`user-cli-quickstart.md`](user-cli-quickstart.md).
   `orient_primer`. The pool's reads STREAM from the data plane at runtime (nothing
   staged to scratch). Writes `amplicon_membership` (reference-agnostic ASV counts).
 
-## Re-runs are refused pending DELETE
+## Re-runs
 
-- _(TODO)_ A second submit of the same pool+workflow is refused once the first has
-  COMPLETED (the same pool-level gate bcl-convert uses); `--force` (admin) or an
-  explicit delete is the escape. Re-running with the *same* denoise knobs resolves
-  to the same `processing_idx`, so this prevents duplicate counts.
+- A second submit of the same pool+workflow is refused once the first has COMPLETED
+  (the same pool-level gate bcl-convert uses); `--force` (admin) is the escape. A
+  `--force` re-run with the *same* denoise knobs resolves to the same
+  `processing_idx`, and `amplicon_membership` is replace-keyed on
+  `(prep_sample_idx, processing_idx)`, so the re-run replaces its own rows rather
+  than doubling the counts.
 
 ## Deriving the closed-reference (e.g. GG2) feature table
 

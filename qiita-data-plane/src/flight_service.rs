@@ -2085,6 +2085,14 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
         key: &["prep_sample_idx", "processing_idx"],
         key_source: "assembly_membership",
     },
+    // amplicon's twin of assembly_membership: same key, same argument. amplicon_load
+    // derives the whole run's rows from its own workspace and never reads the lake
+    // back, and a re-run resolves to the same processing_idx, so a --force resubmit
+    // replaces rather than doubling the counts.
+    ReplaceKey::own(
+        "amplicon_membership",
+        &["prep_sample_idx", "processing_idx"],
+    ),
 ];
 
 /// One `REPLACE_KEY_TABLES` entry.
