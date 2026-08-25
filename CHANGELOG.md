@@ -22,7 +22,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Added
 
 
-- **The global sample field registries can be read back.** `GET
+- **The global sample field registries can be read back (#485).** `GET
   /api/v1/biosample-global-field` and `GET /api/v1/prep-sample-global-field` list every
   row of their registry, so a client can resolve a global field's idx through the
   API. Each row carries `internal_name`, the stable key a caller matches
@@ -37,13 +37,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   - **`qiita <entity> list-fields` / `list-global-fields`.** The user-CLI front end for
   the two field reads above, for both `biosample` and `prep-sample`. `list-global-fields`
   prints the registry so the idx `create-field --<entity>-global-field-idx` wants is
-  obtainable, and `list-fields` prints a study's own definitions so a bulk
-  field-creation script can see what already exists. The study-scoped route already exists;
-  the registry routes and their `api_paths` constants land with this change. The generic
-  read handler grew a parameterless mode so all four verbs stay declarations rather than
-  hand-written handlers.
+  obtainable, and `list-fields` prints a study's own definitions.
+  Both route families land with this change; the registries also bring new `api_paths` constants, while the study-scoped reads add a `GET` verb to paths the create routes
+  already declare. The generic read handler grew a parameterless mode so all four verbs
+  stay declarations rather than hand-written handlers.
 
-- **A study's sample field definitions can be read back.** `GET
+- **A study's sample field definitions can be read back (#485).** `GET
   /api/v1/study/{study_idx}/biosample-field` and `.../prep-sample-field` list the study's
   field definitions, so a client no longer has to infer what already exists by attempting
   a create and interpreting the 409 from the `(study_idx, display_name)` unique
