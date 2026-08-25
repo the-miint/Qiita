@@ -76,6 +76,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     create_study_field,
     create_study_field_and_read_back,
     fetch_entity_is_linked_to_study,
+    fetch_global_fields,
     fetch_global_fields_by_keys,
     fetch_global_metadata,
     fetch_local_metadata,
@@ -6552,3 +6553,59 @@ async def test_fetch_study_fields_for_study_scoped_to_study(ctx, spec):
     )
     rows = await fetch_study_fields_for_study(ctx["pool"], spec=spec, study_idx=other_study_idx)
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# fetch_global_fields (parametrized over both specs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_global_fields_orders_by_internal_name(ctx, spec):
+    """Tests the case where the registry holds the seeded rows: the read returns
+    every stored column of every row, ordered by internal_name rather than by
+    insertion order.
+    """
+    # Prefixes fix the sort order independently of insertion order.
+    suffix = secrets.token_hex(4)
+    later = await _seed_global_field_for_spec(
+        ctx, spec, FieldDataType.TEXT, internal_name=f"zzz_{suffix}"
+    )
+    earlier = await _seed_global_field_for_spec(
+        ctx, spec, FieldDataType.NUMERIC, internal_name=f"aaa_{suffix}"
+    )
+
+    rows = await fetch_global_fields(ctx["pool"], spec=spec)
+
+    seeded = [dict(row) for row in rows if row["idx"] in {earlier.idx, later.idx}]
+    expected = [
+        {
+            "idx": earlier.idx,
+            "internal_name": f"aaa_{suffix}",
+            "display_name": earlier.display_name,
+            "description": None,
+            "data_type": FieldDataType.NUMERIC,
+            "default_tier": Tier.PUBLIC,
+            "required": False,
+            "terminology_idx": None,
+            "created_by_idx": ctx["principal_idx"],
+            "created_at": seeded[0]["created_at"],
+        },
+        {
+            "idx": later.idx,
+            "internal_name": f"zzz_{suffix}",
+            "display_name": later.display_name,
+            "description": None,
+            "data_type": FieldDataType.TEXT,
+            "default_tier": Tier.PUBLIC,
+            "required": False,
+            "terminology_idx": None,
+            "created_by_idx": ctx["principal_idx"],
+            "created_at": seeded[1]["created_at"],
+        },
+    ]
+    assert seeded == expected

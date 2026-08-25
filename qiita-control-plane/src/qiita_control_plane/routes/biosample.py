@@ -1,14 +1,8 @@
 """Biosample routes.
 
-Two routers live here: a study-scoped one (prefix=/study) for operations
-authorized on a study, and a biosample-scoped one (prefix=/biosample) for
-operations authorized on the biosample itself. Study-scoped handlers gate on
-caller scope, study existence, and per-study access tier (wet_lab_admin+
-bypass); biosample-scoped handlers gate on caller scope, then on
-owner-or-linked-study access via the repository predicate. Writes apply their
-mutation inside one connection-scoped transaction, delegating multi-table work
-to the repositories.biosample composer. Bulk import, retirement, search, and
-admin metadata-schema endpoints are deferred.
+Writes apply their mutation inside one connection-scoped transaction,
+delegating multi-table work to the biosample composer. Bulk import,
+retirement, search, and admin metadata-schema endpoints are deferred.
 """
 
 from collections.abc import Awaitable, Callable
@@ -21,6 +15,8 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_BY_STUDY,
     PATH_BIOSAMPLE_BY_STUDY_AND_IDX,
+    PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX,
+    PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
@@ -31,6 +27,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
+    BiosampleGlobalFieldResponse,
     BiosampleImportRequest,
     BiosampleImportResponse,
     BiosampleLookupByAccessionRequest,
@@ -64,6 +61,7 @@ from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx
 from ..repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     MetadataMissingRequiredFieldsError,
+    fetch_global_fields,
     fetch_global_metadata,
     fetch_study_fields_for_study,
 )
@@ -90,6 +88,7 @@ from ._helpers import (
     create_and_map_study_field,
     detail_for_unlinked_entity,
     etag_for_updated_at,
+    map_global_field_row,
     map_study_field_row,
     metadata_entries_from_rows,
     raise_for_unique_violation,
@@ -105,6 +104,7 @@ from ._helpers import (
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["biosample"])
 biosample_router = APIRouter(prefix=PATH_BIOSAMPLE_PREFIX, tags=["biosample"])
+global_field_router = APIRouter(prefix=PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX, tags=["biosample"])
 
 
 _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own biosamples"
@@ -338,6 +338,26 @@ async def list_biosample_fields_in_study(
             row, spec=BIOSAMPLE_METADATA_SPEC, response_model=BiosampleStudyFieldResponse
         )
         for row in rows
+    ]
+    return fields
+
+
+@global_field_router.get(PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT)
+async def list_biosample_global_fields(
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+) -> list[BiosampleGlobalFieldResponse]:
+    """List the global biosample field registry, by internal_name.
+
+    Caller must be a HumanUser holding Scope.BIOSAMPLE_READ. The registry is
+    global: a caller with no study grants at all still gets the full list, and
+    only read scope is needed because a global field is a definition,
+    carrying no metadata value and no study's data.
+    """
+    rows = await fetch_global_fields(pool, spec=BIOSAMPLE_METADATA_SPEC)
+    fields = [
+        map_global_field_row(row, response_model=BiosampleGlobalFieldResponse) for row in rows
     ]
     return fields
 

@@ -14,6 +14,8 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
 from qiita_common.api_paths import (
+    PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX,
+    PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT,
     PATH_PREP_SAMPLE_PREFIX,
     PATH_PREP_SAMPLE_RETIRED,
     PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
@@ -22,6 +24,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
+    PrepSampleGlobalFieldResponse,
     PrepSampleRetiredUpdate,
     PrepSampleStudyFieldCreateRequest,
     PrepSampleStudyFieldResponse,
@@ -41,16 +44,22 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
-from ..repositories._sample_helpers import fetch_study_fields_for_study
+from ..repositories._sample_helpers import fetch_global_fields, fetch_study_fields_for_study
 from ..repositories.prep_sample import (
     fetch_active_studies_for_prep_sample,
     set_prep_sample_retired,
 )
 from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
-from ._helpers import cap_rows, create_and_map_study_field, map_study_field_row
+from ._helpers import (
+    cap_rows,
+    create_and_map_study_field,
+    map_global_field_row,
+    map_study_field_row,
+)
 
 router = APIRouter(prefix=PATH_PREP_SAMPLE_PREFIX, tags=["prep-sample"])
 study_scoped_router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["prep-sample"])
+global_field_router = APIRouter(prefix=PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX, tags=["prep-sample"])
 
 # Hard cap on the study-roster read. Sized to comfortably cover any single
 # prep_sample's linked-study roster while bounding per-response payload size.
@@ -216,5 +225,25 @@ async def list_prep_sample_fields_in_study(
             row, spec=PREP_SAMPLE_METADATA_SPEC, response_model=PrepSampleStudyFieldResponse
         )
         for row in rows
+    ]
+    return fields
+
+
+@global_field_router.get(PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT)
+async def list_prep_sample_global_fields(
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+) -> list[PrepSampleGlobalFieldResponse]:
+    """List the global prep_sample field registry, by internal_name.
+
+    Caller must be a HumanUser holding Scope.PREP_SAMPLE_READ. The registry is
+    global: a caller with no study grants at all still gets the full list, and
+    only read scope is needed because a global field is a definition,
+    carrying no metadata value and no study's data.
+    """
+    rows = await fetch_global_fields(pool, spec=PREP_SAMPLE_METADATA_SPEC)
+    fields = [
+        map_global_field_row(row, response_model=PrepSampleGlobalFieldResponse) for row in rows
     ]
     return fields

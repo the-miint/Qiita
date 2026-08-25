@@ -882,3 +882,26 @@ URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
 URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"
 URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"
+
+
+# =============================================================================
+# /biosample-global-field, /prep-sample-global-field — the global field registries
+# =============================================================================
+# A registry is global, so it hangs off its own prefix rather than a segment
+# under /biosample: a literal GET sub-path there is shadowed by that router's
+# GET /{biosample_idx}, which coerces the segment to int and 422s unless it is
+# registered first. Having its own prefix removes any ordering constraint.
+
+PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX = "/biosample-global-field"
+PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT = ""  # list against the prefix itself
+PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX = "/prep-sample-global-field"
+PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT = ""  # list against the prefix itself
+
+URL_BIOSAMPLE_GLOBAL_FIELD_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX}"
+URL_BIOSAMPLE_GLOBAL_FIELD_LIST = (
+    f"{URL_BIOSAMPLE_GLOBAL_FIELD_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT}"
+)
+URL_PREP_SAMPLE_GLOBAL_FIELD_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX}"
+URL_PREP_SAMPLE_GLOBAL_FIELD_LIST = (
+    f"{URL_PREP_SAMPLE_GLOBAL_FIELD_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT}"
+)

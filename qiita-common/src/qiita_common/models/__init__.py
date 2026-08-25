@@ -84,6 +84,7 @@ from qiita_common.models.biosample import (
     NCBI_TAXONOMY_NAME,
     TERMINOLOGY_TERM_VALUE_COLUMN,
     BiosampleAccessionField,
+    BiosampleGlobalFieldResponse,
     BiosampleImportRequest,
     BiosampleImportResponse,
     BiosampleLookupByAccessionRequest,
@@ -126,6 +127,7 @@ from qiita_common.models.host_filter_profile import (
 from qiita_common.models.prep_sample import (
     PREP_SAMPLE_GLOBAL_FIELD_IDX_WIRE,
     PREP_SAMPLE_STUDY_FIELD_IDX_WIRE,
+    PrepSampleGlobalFieldResponse,
     PrepSampleStudyFieldCreateRequest,
     PrepSampleStudyFieldResponse,
 )
@@ -171,6 +173,7 @@ from qiita_common.models.reference import (
 from qiita_common.models.sample_field import (
     GLOBAL_FIELD_IDX_ATTR,
     STUDY_FIELD_IDX_ATTR,
+    SampleGlobalFieldResponse,
     SampleStudyFieldCreateRequest,
     SampleStudyFieldResponse,
     field_wire_name,
@@ -469,6 +472,7 @@ __all__ = [
     "UserUpdate",
     # Biosample.
     "BiosampleAccessionField",
+    "BiosampleGlobalFieldResponse",
     "BiosampleImportRequest",
     "BiosampleImportResponse",
     "BiosampleLookupByAccessionRequest",
@@ -490,6 +494,7 @@ __all__ = [
     "MissingReasonRef",
     "OwnerBiosampleIdExportResponse",
     "OwnerBiosampleIdRow",
+    "SampleGlobalFieldResponse",
     "SampleMetadataValue",
     "SampleMetadataWriteRequest",
     "SampleMetadataWriteResponse",
@@ -564,6 +569,7 @@ __all__ = [
     "AlignPlanRequest",
     "AlignPlanResponse",
     # Prep sample (the processing-kind supertype of sequenced_sample).
+    "PrepSampleGlobalFieldResponse",
     "PrepSampleStudyFieldCreateRequest",
     "PrepSampleStudyFieldResponse",
     # Sequencing-run / sequenced-pool / sequenced-sample.

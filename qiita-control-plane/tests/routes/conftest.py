@@ -17,7 +17,9 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
+    URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
     URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope
@@ -276,29 +278,36 @@ async def _seed_study(ctx, *, owner_idx: int, suffix: str) -> int:
 # Every study-local field route carries the same gate — require_scope,
 # require_study_exists, and require_study_access with a wet_lab_admin bypass —
 # differing only in the tier floor (create at ADMIN, list at VIEWER) and, for
-# create, the conflict semantics. Each entity supplies its bindings once and
-# drives every matrix through the shared helpers below.
+# create, the conflict semantics. The global-field registry read drops the two
+# study gates and keeps only the scope. Each entity supplies its bindings once
+# and drives every matrix through the shared helpers below.
 
 
-class StudyFieldSurface(NamedTuple):
-    """One entity's bindings for its study-local field routes.
+class SampleFieldSurface(NamedTuple):
+    """One entity's bindings for its field routes, study-local and global."""
 
-    `global_fk_key` is the request/response key naming the global-field link,
-    `idx_key` the response key naming the row, and the two `*_created_key`
-    names the ctx cleanup buckets the created rows belong in. `url_template`
-    serves both verbs, since create and list share one path.
-    """
-
-    url_template: str
-    idx_key: str
-    created_key: str
-    global_fk_key: str
+    url_template: str  # create and list share this study-scoped path
+    idx_key: str  # response key naming the study-local row
+    created_key: str  # ctx cleanup bucket for created study-local rows
+    global_fk_key: str  # request/response key naming the global-field link
     seed_global_field: Callable[..., Awaitable[int]]
-    global_created_key: str
+    global_created_key: str  # ctx cleanup bucket for created global rows
     global_field_table: str
+    global_field_url: str  # the registry read; no path parameter
+    read_scope: Scope  # what the registry read requires
+
+    @property
+    def global_idx_key(self) -> str:
+        """The response key naming a registry row's own idx.
+
+        The same spelling as the study-local row's link to it: both models
+        alias one per-entity wire constant, so there is a single string here
+        rather than two that could drift apart.
+        """
+        return self.global_fk_key
 
 
-BIOSAMPLE_FIELD_SURFACE = StudyFieldSurface(
+BIOSAMPLE_FIELD_SURFACE = SampleFieldSurface(
     url_template=URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     idx_key="biosample_study_field_idx",
     created_key="biosample_study_field",
@@ -306,8 +315,10 @@ BIOSAMPLE_FIELD_SURFACE = StudyFieldSurface(
     seed_global_field=seed_biosample_global_field,
     global_created_key="biosample_global_field",
     global_field_table="qiita.biosample_global_field",
+    global_field_url=URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
+    read_scope=Scope.BIOSAMPLE_READ,
 )
-PREP_SAMPLE_FIELD_SURFACE = StudyFieldSurface(
+PREP_SAMPLE_FIELD_SURFACE = SampleFieldSurface(
     url_template=URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     idx_key="prep_sample_study_field_idx",
     created_key="prep_sample_study_field",
@@ -315,10 +326,20 @@ PREP_SAMPLE_FIELD_SURFACE = StudyFieldSurface(
     seed_global_field=seed_prep_sample_global_field,
     global_created_key="prep_sample_global_field",
     global_field_table="qiita.prep_sample_global_field",
+    global_field_url=URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
+    read_scope=Scope.PREP_SAMPLE_READ,
 )
+SAMPLE_FIELD_SURFACES = (BIOSAMPLE_FIELD_SURFACE, PREP_SAMPLE_FIELD_SURFACE)
 
 
-async def post_study_field(ctx, *, surface: StudyFieldSurface, client, study_idx: int, **body):
+def sibling_field_surface(surface: SampleFieldSurface) -> SampleFieldSurface:
+    """Return the other entity's field surface, for a case that must show one
+    entity's binding does not satisfy the other's."""
+    (sibling,) = [other for other in SAMPLE_FIELD_SURFACES if other is not surface]
+    return sibling
+
+
+async def post_study_field(ctx, *, surface: SampleFieldSurface, client, study_idx: int, **body):
     """POST one entity's create-field route and, on 201, track the created row."""
     resp = await client.post(surface.url_template.format(study_idx=study_idx), json=body)
     if resp.status_code == 201:
@@ -326,7 +347,7 @@ async def post_study_field(ctx, *, surface: StudyFieldSurface, client, study_idx
     return resp
 
 
-async def _seed_field_global(ctx, *, surface: StudyFieldSurface, label: str) -> int:
+async def _seed_field_global(ctx, *, surface: SampleFieldSurface, label: str) -> int:
     """Seed one global field for `surface`'s entity and track it for cleanup."""
     suffix = secrets.token_hex(4)
     global_idx = await surface.seed_global_field(
@@ -387,7 +408,7 @@ async def assert_study_field_create_authz(
     ctx,
     *,
     case: str,
-    surface: StudyFieldSurface,
+    surface: SampleFieldSurface,
     no_scope_client,
 ) -> None:
     """Drive one access case of a study-local field create and assert its status.
@@ -434,7 +455,7 @@ async def assert_study_field_list_authz(
     ctx,
     *,
     case: str,
-    surface: StudyFieldSurface,
+    surface: SampleFieldSurface,
     no_scope_client,
 ) -> None:
     """Drive one access case of a study-local field list and assert its status.
@@ -465,7 +486,7 @@ async def assert_study_field_create_conflict(
     ctx,
     *,
     case: str,
-    surface: StudyFieldSurface,
+    surface: SampleFieldSurface,
 ) -> None:
     """Drive one conflict case of a study-local field create and assert its status.
 

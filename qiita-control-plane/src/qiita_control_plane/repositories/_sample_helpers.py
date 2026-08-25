@@ -1826,6 +1826,27 @@ async def fetch_study_fields_for_study(
     return rows
 
 
+async def fetch_global_fields(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+) -> list[asyncpg.Record]:
+    """Return every row of the *_global_field table named by
+    spec.global_field_table, ordered by internal_name.
+
+    The stored row names its own idx as `idx`. Unbounded by design
+    since the row count is the deployment's curated field vocabulary, not a
+    per-sample roster. Accepts either a pool or a connection.
+    """
+    rows = await pool_or_conn.fetch(
+        "SELECT idx, internal_name, display_name, description, data_type,"
+        " default_tier, required, terminology_idx, created_by_idx, created_at"
+        f" FROM {spec.global_field_table}"
+        " ORDER BY internal_name"
+    )
+    return rows
+
+
 async def create_study_field(
     conn: asyncpg.Connection,
     *,

@@ -17,6 +17,7 @@ from qiita_common.models import (
     MetadataEntry,
     MetadataFieldWriteResult,
     MissingReasonRef,
+    SampleGlobalFieldResponse,
     SampleMetadataWriteResponse,
     SampleStudyFieldCreateRequest,
     SampleStudyFieldResponse,
@@ -576,28 +577,37 @@ def map_study_field_row[T: SampleStudyFieldResponse](
 ) -> T:
     """Shape one {entity}_study_field row into response_model.
 
-    The row must come from a read that resolves the inherited columns, since
-    this only renames. Response keys come from response_model's own aliases, so
-    each entity's wire spelling of the two idx fields follows its model rather
-    than being rebuilt here.
+    Every column but the two idx fields is named identically
+    on the wire, so only those are renamed — the row's own idx, which arrives
+    as `idx`, and the global link, which arrives under its entity-specific SQL
+    column — each to whichever entity-qualified spelling response_model
+    declares for it.
     """
-    # The row names the global link by its SQL column; the response names both
-    # idx fields by the subclass's alias.
-    payload = {
-        field_wire_name(response_model, STUDY_FIELD_IDX_ATTR): row["idx"],
-        "study_idx": row["study_idx"],
-        field_wire_name(response_model, GLOBAL_FIELD_IDX_ATTR): row[
-            spec.study_field_global_fk_column
-        ],
-        "display_name": row["display_name"],
-        "description": row["description"],
-        "data_type": row["data_type"],
-        "required": row["required"],
-        "terminology_idx": row["terminology_idx"],
-        "tier_override": row["tier_override"],
-        "created_by_idx": row["created_by_idx"],
-        "created_at": row["created_at"],
-    }
+    payload = dict(row)
+    payload[field_wire_name(response_model, STUDY_FIELD_IDX_ATTR)] = payload.pop("idx")
+    payload[field_wire_name(response_model, GLOBAL_FIELD_IDX_ATTR)] = payload.pop(
+        spec.study_field_global_fk_column
+    )
+    validated = response_model.model_validate(payload)
+    return validated
+
+
+# same-pattern-ok: registry sibling of map_study_field_row; kept separate so each
+# response model is bound to the idx field it actually declares, which a shared
+# idx-attr parameter would stop enforcing
+def map_global_field_row[T: SampleGlobalFieldResponse](
+    row: asyncpg.Record,
+    *,
+    response_model: type[T],
+) -> T:
+    """Shape one {entity}_global_field row into response_model.
+
+    Every column but the row's own idx is named identically on the wire, so
+    only that one key is renamed — to whichever entity-qualified spelling
+    response_model declares for it.
+    """
+    payload = dict(row)
+    payload[field_wire_name(response_model, GLOBAL_FIELD_IDX_ATTR)] = payload.pop("idx")
     validated = response_model.model_validate(payload)
     return validated
 
