@@ -28,6 +28,7 @@ from qiita_common.models._base import (
 from qiita_common.models.host_filter_profile import HostFilterResolution
 from qiita_common.models.reference import FieldDataType
 from qiita_common.models.sample_field import (
+    SampleGlobalFieldResponse,
     SampleStudyFieldCreateRequest,
     SampleStudyFieldResponse,
 )
@@ -42,9 +43,9 @@ from qiita_common.models.sample_field import (
 # Change one and you must change the other in the same PR.
 MATRIX_TUBE_ID_PATTERN = r"^[0-9]{10}$"  # same-pattern-ok: DB CHECK parity (see above)
 
-# The wire spellings of the two idx fields the biosample study-field shapes
-# re-declare with an entity-qualified alias. Named so a caller writing or
-# reading one of those payload keys resolves it here instead of retyping it.
+# The wire spellings of the idx fields the biosample field shapes re-declare
+# with an entity-qualified alias. Named so a caller writing or reading one of
+# those payload keys resolves it here instead of retyping it.
 BIOSAMPLE_STUDY_FIELD_IDX_WIRE = "biosample_study_field_idx"
 BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE = "biosample_global_field_idx"
 
@@ -605,6 +606,14 @@ class BiosampleStudyFieldResponse(SampleStudyFieldResponse):
     global_field_idx: Annotated[int, Field(gt=0)] | None = Field(
         alias=BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE
     )
+
+
+class BiosampleGlobalFieldResponse(SampleGlobalFieldResponse):
+    """One row of GET /api/v1/biosample-global-field, carrying every
+    qiita.biosample_global_field column.
+    """
+
+    global_field_idx: Annotated[int, Field(gt=0)] = Field(alias=BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE)
 
 
 class IdxsListResponse(BaseModel):

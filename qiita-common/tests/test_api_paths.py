@@ -355,6 +355,17 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_STUDY_PREFIX",
         "PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY",
     ),
+    # /biosample-global-field, /prep-sample-global-field
+    (
+        "URL_BIOSAMPLE_GLOBAL_FIELD_LIST",
+        "PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX",
+        "PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT",
+    ),
+    (
+        "URL_PREP_SAMPLE_GLOBAL_FIELD_LIST",
+        "PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX",
+        "PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT",
+    ),
     # /read-masked
     ("URL_READ_MASKED_DOGET", "PATH_READ_MASKED_PREFIX", "PATH_READ_MASKED_DOGET"),
     # /read (Flight DoGet ticket for a block's reads)
