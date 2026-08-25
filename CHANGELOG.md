@@ -1199,6 +1199,18 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Four broken relative links in `docs/deploy-archive/`, and a test that keeps them fixed.**
+  All four targets existed; the paths were repo-root-relative (`](docs/runbooks/redeploy.md)`)
+  inside `docs/deploy-archive/`, where they resolve against the containing directory. They come
+  from `/deploy-archive` copying the `## Pending deploy` body out of `DEPLOY_CHECKLIST.md`, which
+  sits at the repo root and where those links are correct — so the archive step now says to
+  rewrite them as it moves the block, and to drop the `([archived](…))` self-reference a line
+  acquires when it lands in the file it points at. `qiita-common/tests/test_doc_link.py` resolves
+  every relative markdown link in the repo, target file and anchor both, skipping fenced blocks
+  and inline code spans so a doc that spells out a link form is not resolved. Its slug function does
+  not model the `-1` suffix GitHub appends to a repeated heading; disambiguate the heading text
+  rather than the link.
+
 - **Corrected the claim that miint cannot see TEMP or registered-Arrow relations (#477).**
   It resolves them since [duckdb-miint#193](https://github.com/the-miint/duckdb-miint/issues/193);
   our copies of that claim predated the fix and had gone stale in `docs/duckdb-miint.md`,
