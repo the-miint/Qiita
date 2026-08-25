@@ -17,6 +17,7 @@ the profile-key miss, and each ceiling axis.
 
 from __future__ import annotations
 
+import tempfile
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -1034,3 +1035,83 @@ def test_every_escalating_axis_has_exactly_one_escalation_helper():
         "the runner's escalation helpers no longer match the axis map above; add "
         f"the new axis to ESCALATING_RESOURCE_AXES too. Found: {sorted(defined)}"
     )
+
+
+# =============================================================================
+# _write_adapter_parquet — reassembly order and the duplicate-position guard
+# =============================================================================
+#
+# Sync, pure (pyarrow only), so it belongs in this tier. The BAD_INPUT wrapping
+# and the partial-file unlink around it are `_resolve_qc_adapters`' job and are
+# covered in tests/test_runner.py, which needs a reference row.
+
+
+def test_adapter_chunks_reassemble_in_chunk_index_order():
+    """Chunks arrive unordered; the sequence is their chunk_index order, and the
+    Parquet carries one row per feature sorted by feature_idx."""
+    import duckdb
+
+    from qiita_control_plane.runner import _write_adapter_parquet
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "adapters.parquet"
+        count = _write_adapter_parquet(
+            [(9, 1, "TCTC"), (7, 2, "GGGG"), (9, 0, "CTG"), (7, 0, "AG"), (7, 1, "AT")], out
+        )
+        assert count == 2
+        with duckdb.connect(":memory:") as conn:
+            rows = conn.execute(
+                f"SELECT feature_idx, sequence FROM read_parquet('{out}') ORDER BY feature_idx"
+            ).fetchall()
+    assert rows == [(7, "AGATGGGG"), (9, "CTGTCTC")]
+
+
+def test_a_repeated_chunk_position_raises_naming_it():
+    """Two rows at one (feature_idx, chunk_index) raise instead of being joined —
+    the lake declares this table with no primary key, so the repeat reaches here.
+    The fixture pair is one `canonical_sequence_hash_expr` folds into a single
+    feature."""
+    from qiita_control_plane.runner import _write_adapter_parquet
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "adapters.parquet"
+        with pytest.raises(ValueError) as ei:
+            _write_adapter_parquet(
+                [
+                    (127, 0, "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"),
+                    (127, 0, "ACACTCTTTCCCTACACGACGCTCTTCCGATCT"),
+                    (9, 0, "CTGTCTC"),
+                ],
+                out,
+            )
+        assert "1 chunk position(s)" in str(ei.value)
+        assert "(feature_idx 127, chunk_index 0)" in str(ei.value)
+        assert "reference_sequence_chunks" in str(ei.value)
+        assert not out.exists()
+
+
+def test_the_repeated_position_list_is_capped_but_the_count_is_not():
+    """A reference whose every position repeats reports all of them in the count
+    and at most _MAX_REPORTED in the list, so one bad reference cannot write an
+    unbounded string into work_ticket.failure_reason."""
+    from qiita_control_plane.runner._reference import _MAX_REPORTED, _write_adapter_parquet
+
+    repeats = _MAX_REPORTED + 5
+    rows = [(feature, 0, "ACGT") for feature in range(repeats) for _ in range(2)]
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(ValueError) as ei:
+            _write_adapter_parquet(rows, Path(tmp) / "adapters.parquet")
+    message = str(ei.value)
+    assert f"{repeats} chunk position(s)" in message
+    assert message.count("feature_idx") == _MAX_REPORTED
+
+
+def test_an_empty_adapter_set_raises_before_writing_anything():
+    """No sequences is a misconfiguration, not an empty-but-valid adapter set."""
+    from qiita_control_plane.runner import _write_adapter_parquet
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "adapters.parquet"
+        with pytest.raises(ValueError, match="no sequences"):
+            _write_adapter_parquet([], out)
+        assert not out.exists()

@@ -3643,9 +3643,8 @@ async def test_resolve_qc_adapters_repeated_chunk_position(
     postgres_pool, reference_idx, tmp_path, monkeypatch
 ):
     """Two rows at one (feature_idx, chunk_index) → BAD_INPUT naming the position,
-    and no partial adapters.parquet. The pair below is the reverse-complement one a
-    strand-folded feature hash mints into a single feature; concatenating it returns
-    66 bp for a 33 bp adapter."""
+    and no partial adapters.parquet. The fixture pair is one
+    `canonical_sequence_hash_expr` folds into a single feature."""
     from qiita_control_plane import runner
 
     await _make_adapter_reference(postgres_pool, reference_idx)

@@ -476,6 +476,9 @@ QC_ADAPTER_BINDING = "adapter_parquet"
 # route's _DOGET_ALLOWED_TABLES.
 _REFERENCE_CHUNKS_TABLE = "reference_sequence_chunks"
 
+# Cap on how many repeated chunk positions the adapter reassembly error lists.
+_MAX_REPORTED = 20
+
 
 def _do_get_reference_sequence_chunks(
     data_plane_url: str, ticket_bytes: bytes
@@ -498,13 +501,12 @@ def _do_get_reference_sequence_chunks(
 
 def _write_adapter_parquet(rows: list[tuple[int, int, str]], out_path: Path) -> int:
     """Reassemble chunked sequences (group by feature_idx, order by chunk_index,
-    concat chunk_data — the same string_agg the data plane documents) into a
-    Parquet at `out_path`, one row per feature with columns `feature_idx` (BIGINT,
-    provenance) and `sequence` (VARCHAR, the adapter). Rows are sorted by
-    feature_idx for determinism; the qc job reads only `sequence` via
-    `read_parquet`. Returns the sequence count. Raises ValueError on an empty set
-    — an adapter reference with no sequences is a misconfiguration, not a valid QC
-    input — and on a repeated (feature_idx, chunk_index).
+    concat chunk_data) into a Parquet at `out_path`, one row per feature with
+    columns `feature_idx` (BIGINT, provenance) and `sequence` (VARCHAR, the
+    adapter). Rows are sorted by feature_idx for determinism; the qc job reads
+    only `sequence` via `read_parquet`. Returns the sequence count. Raises
+    ValueError on an empty set — an adapter reference with no sequences is a
+    misconfiguration, not a valid QC input — and on a repeated chunk position.
 
     Parquet (not FASTA) keeps the adapter set in the same columnar format as the
     reads it trims, so the qc job reads it with `read_parquet` and no FASTA
@@ -513,13 +515,18 @@ def _write_adapter_parquet(rows: list[tuple[int, int, str]], out_path: Path) -> 
     pre-loop path.
 
     Input contract (the reference-load flow, jobs/reference_load.py): chunk_data
-    is a substring of a parsed FASTA record, so it is newline-free, and a feature
-    is loaded exactly once with monotonic chunk_index (a reference is loaded once,
-    pending→loading→active), so (feature_idx, chunk_index) is unique. Chunks are
-    concatenated with no newline sanitation. A repeated (feature_idx, chunk_index)
-    raises: concatenating its rows returns a sequence longer than the adapter the
-    reference holds, and picking one row needs a survivor rule this function does
-    not have."""
+    is a substring of a parsed FASTA record, hence newline-free, so chunks are
+    concatenated with no newline sanitation — stripping would hide a chunk that is
+    not what the loader wrote. `qiita_common.chunking.reassemble_chunks_expr` holds
+    the chunk contract this reproduces in Python: the column names and the
+    concatenation order.
+
+    `(feature_idx, chunk_index)` uniqueness is a write-path convention, not a
+    constraint — `qiita-data-plane/src/ducklake.rs` declares
+    `reference_sequence_chunks` with no primary key and no UNIQUE — so a repeat
+    reaches here and raises instead of being joined: the join returns a sequence
+    longer than the one the reference holds, and picking a row needs a survivor
+    rule this function does not have."""
     import pyarrow as pa  # noqa: PLC0415
     import pyarrow.parquet as pq  # noqa: PLC0415
 
@@ -533,13 +540,14 @@ def _write_adapter_parquet(rows: list[tuple[int, int, str]], out_path: Path) -> 
     if not by_feature:
         raise ValueError("adapter reference returned no sequences")
     if repeated:
-        positions = ", ".join(
-            f"(feature_idx {feature}, chunk_index {index})" for feature, index in sorted(repeated)
-        )
+        positions = [
+            f"(feature_idx {feature}, chunk_index {index})"
+            for feature, index in sorted(repeated)[:_MAX_REPORTED]
+        ]
         raise ValueError(
-            f"{len(repeated)} chunk position(s) carry more than one row: {positions}"
-            " — repair reference_sequence_chunks before running QC against this"
-            " reference"
+            f"{len(repeated)} chunk position(s) carry more than one row: "
+            f"{', '.join(positions)} — repair {_REFERENCE_CHUNKS_TABLE} before "
+            "running QC against this reference"
         )
     feature_ids = sorted(by_feature)
     sequences = [

@@ -90,16 +90,28 @@ _None yet._
 
   Expect 24 features: `feature_idx` 1-9, 11-24 and 127.
 
-  **Feature 127 — delete the orientation the adapter FASTA does not declare.** Its two
-  rows at `chunk_index` 0 are exact reverse complements, 33 bp each: the feature hash
-  folds strand, so `AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT` and its reverse complement mint one
-  `feature_idx`, and both rows persisted because they predate the `register_files`
-  replace-by-key the **One-off** note below names. Keep `AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT`
-  — the orientation `fastp_truseq_adapters.fna` declares under
-  `>Illumina_TruSeq_Adapter_Read_2`, and that file is reference 13, the configured
-  `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`. This is not a tie-break: which orientation a read
-  carries follows the library protocol, so the survivor has to be the one the source FASTA
-  declares. Run it under the **Collapse** scaffolding below, before `collapse.sql`:
+  **Feature 127 — keep the Read 2 orientation, delete the other.** Its two
+  rows at `chunk_index` 0 are exact reverse complements, 33 bp each; they share one
+  `feature_idx` because `canonical_sequence_hash_expr` folds strand, and both persisted
+  because they predate the `register_files` replace-by-key the **One-off** note below
+  names. Keep `AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT` — the orientation the FASTA reference 13
+  was loaded from declares under `>Illumina_TruSeq_Adapter_Read_2` (`fastp_truseq_adapters.fna`
+  on the deploy host, read there 2026-08-24; it is not in this tree), and 13 is the
+  configured `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`. This is not a tie-break: which
+  orientation a read carries follows the library protocol, so the survivor has to be the one
+  the source FASTA declares.
+
+  Read the two rows first and confirm which is which — the delete matches on the literal,
+  so a mistyped one silently removes nothing:
+
+  ```bash
+  bash scripts/lake-shell.sh -c "
+    SELECT chunk_index, chunk_data, length(chunk_data)
+      FROM qiita_lake.reference_sequence_chunks
+     WHERE feature_idx = 127 ORDER BY chunk_index, chunk_data"
+  ```
+
+  Then, under the **Collapse** scaffolding below and before `collapse.sql`:
 
   ```sql
   DELETE FROM qiita_lake.reference_sequence_chunks
@@ -108,17 +120,50 @@ _None yet._
   ```
 
   Expect **1** row deleted; re-running the before-query then returns 23 features, and 127
-  never reaches the collapse.
+  never reaches the collapse. Because it leaves `dup_feature`, it also skips the collapse's
+  own convergence assertion (archived §6, `sum(length(chunk_data)) <> sequence_length_bp`)
+  and its `upper()`. Assert the first here instead:
 
-  **No mask is re-run for this.** Measured 2026-08-24 over 2,113,320 reads on 600 samples:
-  0 retain R2 adapter after trimming and 15 retain R1 adapter — the R1 count is the control
-  showing the detection works — and of 1,994 asymmetrically-trimmed pairs, 0 carry adapter.
-  The stored adapter set is wrong; the masks derived from it are not.
+  ```bash
+  bash scripts/lake-shell.sh -c "
+    SELECT s.sequence_length_bp, sum(length(c.chunk_data)) AS chunk_bp
+      FROM qiita_lake.reference_sequences s
+      JOIN qiita_lake.reference_sequence_chunks c USING (feature_idx)
+     WHERE s.feature_idx = 127 GROUP BY 1"
+  ```
 
-  **Do this promptly after the restart.** `_write_adapter_parquet` now refuses a repeated
-  `(feature_idx, chunk_index)` instead of concatenating the pair into a 66 bp sequence, so
-  between the bucket-4 restart and this delete a `qc` ticket whose adapter reference holds
-  127 fails at input preparation with a BAD_INPUT naming the position. (#494)
+  Expect `33, 33`. Measured 2026-08-25 before the repair: `sequence_length_bp` is already 33
+  against 66 bytes across the two rows, and both rows are upper case — so the delete
+  restores the invariant, and 127 needs no `upper()` of its own. The same measurement over
+  the whole lake finds 24 features whose `sequence_length_bp` disagrees with their chunk
+  bytes: exactly the 24 in the before-query, so this bucket resolves all of them and none
+  are left behind.
+
+  **No mask is re-run for this.** Measured 2026-08-24 over 2,113,320 reads on 600 prep
+  samples: 0 retain R2 adapter after trimming and 15 retain R1 adapter — the R1 count is the
+  control showing the detection works — and of 1,994 asymmetrically-trimmed pairs, 0 carry
+  adapter. Those counts are paired-end; the single-end path, which has no overlap-analysis
+  arm to fall back on and so rests entirely on the adapter set, was checked separately
+  2026-08-25 and is likewise unaffected. For scale, the host carries 9 masks over 3,678 prep
+  samples (measured 2026-08-25). The stored adapter set is wrong; the masks derived from it
+  are not.
+
+  **Hold `qc` submissions until this runs.** `_write_adapter_parquet` now refuses a repeated
+  chunk position instead of joining the two rows, so from the bucket-4 restart until this
+  delete a `qc` ticket fails at input preparation with a BAD_INPUT naming the position.
+  Both adapter references reach 127 — measured 2026-08-25, `reference_membership` carries it
+  for 10 and 13 — so pointing `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX` at the other one is not
+  a way around the window. Do not run the delete early to
+  close that window — it is irreversible, which is why it sits in this bucket. (#494)
+
+  **A hand re-load can undo the choice.** The loader's survivor rule is
+  `DISTINCT ON (sequence_hash) … ORDER BY sequence_hash, read_id`
+  (`qiita-compute-orchestrator/.../jobs/hash_sequences.py`) — lex-smallest record name, not
+  orientation. Re-loading a FASTA that declares both orientations therefore stores whichever
+  record sorts first, and leaves one row, so there is no repeated position for
+  `_write_adapter_parquet` to catch. Reference 10 declares both (`Trans2` / `Trans2_rc`);
+  reference 13, read on the host 2026-08-24, declares only Read 2. Nothing re-loads a
+  reference on its own — this is a caveat on doing it by hand.
 
   **Collapse.** Run [`docs/deploy-archive/2026-08-21-0d771b79.md`](docs/deploy-archive/2026-08-21-0d771b79.md) §6 for its invocation scaffolding — the `qiita-data` run-as, the `PGPASSFILE` handling, `SET home_directory`, `-bail` (the CLI flag, not the dot-command), and the quiesce requirement all still apply unchanged. Two statements in its `collapse.sql` differ; use these instead of the archived ones, verbatim:
 
@@ -136,7 +181,7 @@ _None yet._
       SEMI JOIN dup_feature USING (feature_idx);
   ```
 
-  Expect `collapsible_features` **23**, `ambiguous_features` **0** — the delete above removed `feature_idx` 127 from `dup_feature`, so nothing reaches the ambiguous arm. Measured against the live lake 2026-08-24: 24 ambiguous under the archived test, 1 under this one, and that 1 is 127. Anything else, stop and re-measure rather than widening the normalization.
+  Expect `collapsible_features` **23**, `ambiguous_features` **0** — the delete above removed `feature_idx` 127 from `dup_feature`, so nothing reaches the ambiguous arm. Measured against the live lake 2026-08-24: 24 ambiguous under the archived test, 1 under this one. Anything else, stop and re-measure rather than widening the normalization.
 
   **After.** The same before-query, expecting **no rows**.
 
