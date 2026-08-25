@@ -1,4 +1,4 @@
-"""Integration tests for the POST /api/v1/study/{study_idx}/biosample route."""
+"""Integration tests for the biosample routes."""
 
 import secrets
 from datetime import date
@@ -3979,18 +3979,27 @@ async def _list_biosample_fields(client, study_idx: int):
 async def test_list_biosample_fields_in_study_resolves_linked_and_local(ctx):
     """Tests the case where a study carries one globally-linked and one
     purely-local field: both come back ordered by display_name, the linked one
-    with data_type and required resolved from its global row.
+    with data_type, required, and terminology_idx resolved from its global row.
+
+    The global row's three inherited columns all differ from the local field's,
+    so each one discriminates whether the read resolved it or fell back to the
+    study row.
     """
     study_idx = await _seed_study(
         ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="lf-mix"
     )
+    # Reuse the seeded NCBI Taxonomy so the global field can be TERMINOLOGY,
+    # which the local field cannot be without a terminology of its own.
+    terminology_idx = (await fetch_seeded_metagenome_term(ctx["pool"]))["terminology_idx"]
     suffix = secrets.token_hex(4)
     global_idx = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"lf_{suffix}",
         display_name=f"Global {suffix}",
-        data_type=FieldDataType.NUMERIC,
+        data_type=FieldDataType.TERMINOLOGY,
         created_by_idx=SYSTEM_PRINCIPAL_IDX,
+        terminology_idx=terminology_idx,
+        required=True,
     )
     ctx["created"]["biosample_global_field"].append(global_idx)
 
@@ -4031,9 +4040,9 @@ async def test_list_biosample_fields_in_study_resolves_linked_and_local(ctx):
             "biosample_global_field_idx": global_idx,
             "display_name": linked_name,
             "description": None,
-            "data_type": "numeric",
-            "required": False,
-            "terminology_idx": None,
+            "data_type": "terminology",
+            "required": True,
+            "terminology_idx": terminology_idx,
             "tier_override": None,
             "created_by_idx": ctx["user_session"]["principal_idx"],
         },

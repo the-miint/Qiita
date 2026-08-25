@@ -14,6 +14,7 @@ from qiita_common.models import FieldDataType
 
 from qiita_control_plane.main import app
 from qiita_control_plane.testing.db_seeds import (
+    fetch_seeded_metagenome_term,
     retire_prep_sample_to_study_link,
     seed_biosample,
     seed_biosample_to_study_link,
@@ -415,7 +416,13 @@ async def _post_prep_sample_field(client, ctx, study_idx: int, **body):
     )
 
 
-async def _seed_prep_global_field(ctx, *, data_type=FieldDataType.NUMERIC) -> tuple[int, str]:
+async def _seed_prep_global_field(
+    ctx,
+    *,
+    data_type=FieldDataType.NUMERIC,
+    terminology_idx: int | None = None,
+    required: bool = False,
+) -> tuple[int, str]:
     """Seed one prep_sample_global_field and return (idx, display_name)."""
     suffix = secrets.token_hex(4)
     display_name = f"Global {suffix}"
@@ -425,6 +432,8 @@ async def _seed_prep_global_field(ctx, *, data_type=FieldDataType.NUMERIC) -> tu
         display_name=display_name,
         data_type=data_type,
         created_by_idx=SYSTEM_PRINCIPAL_IDX,
+        terminology_idx=terminology_idx,
+        required=required,
     )
     ctx["created"]["prep_sample_global_field"].append(global_idx)
     return global_idx, display_name
@@ -592,12 +601,24 @@ async def _list_prep_sample_fields(client, study_idx: int):
 async def test_list_prep_sample_fields_in_study_resolves_linked_and_local(ctx):
     """Tests the case where a study carries one globally-linked and one
     purely-local field: both come back ordered by display_name, the linked one
-    with data_type and required resolved from its global row.
+    with data_type, required, and terminology_idx resolved from its global row.
+
+    The global row's three inherited columns all differ from the local field's,
+    so each one discriminates whether the read resolved it or fell back to the
+    study row.
     """
     study_idx = await _seed_study(
         ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pf-list"
     )
-    global_idx, _ = await _seed_prep_global_field(ctx, data_type=FieldDataType.NUMERIC)
+    # Reuse the seeded NCBI Taxonomy so the global field can be TERMINOLOGY,
+    # which the local field cannot be without a terminology of its own.
+    terminology_idx = (await fetch_seeded_metagenome_term(ctx["pool"]))["terminology_idx"]
+    global_idx, _ = await _seed_prep_global_field(
+        ctx,
+        data_type=FieldDataType.TERMINOLOGY,
+        terminology_idx=terminology_idx,
+        required=True,
+    )
 
     # Names chosen so the local field sorts first, proving the ORDER BY rather
     # than insertion order.
@@ -640,9 +661,9 @@ async def test_list_prep_sample_fields_in_study_resolves_linked_and_local(ctx):
             "prep_sample_global_field_idx": global_idx,
             "display_name": linked_name,
             "description": None,
-            "data_type": "numeric",
-            "required": False,
-            "terminology_idx": None,
+            "data_type": "terminology",
+            "required": True,
+            "terminology_idx": terminology_idx,
             "tier_override": None,
             "created_by_idx": ctx["user_session"]["principal_idx"],
         },

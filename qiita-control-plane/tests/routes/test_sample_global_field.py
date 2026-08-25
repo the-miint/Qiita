@@ -76,21 +76,15 @@ async def _registry_rows(pool, *, surface: SampleFieldSurface, actual: list[dict
     rows = await pool.fetch(
         f"SELECT {columns} FROM {surface.global_field_table} ORDER BY internal_name"
     )
-    expected = [
-        {
-            surface.global_idx_key: row["idx"],
-            "internal_name": row["internal_name"],
-            "display_name": row["display_name"],
-            "description": row["description"],
-            "data_type": row["data_type"],
-            "default_tier": row["default_tier"],
-            "required": row["required"],
-            "terminology_idx": row["terminology_idx"],
-            "created_by_idx": row["created_by_idx"],
-            "created_at": actual_row["created_at"],
-        }
-        for row, actual_row in zip(rows, actual, strict=True)
-    ]
+
+    # Every column carries its own name on the wire but the row's own idx, which
+    # takes the entity-qualified spelling; created_at comes from the body.
+    expected = []
+    for row, actual_row in zip(rows, actual, strict=True):
+        body = {column: row[column] for column in _REGISTRY_COLUMNS}
+        body[surface.global_idx_key] = body.pop("idx")
+        body["created_at"] = actual_row["created_at"]
+        expected.append(body)
     return expected
 
 

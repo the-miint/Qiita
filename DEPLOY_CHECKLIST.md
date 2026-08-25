@@ -35,6 +35,11 @@ _None yet._
   that writes no gate row. Re-submitting such a sample after the restart is admitted and
   re-writes it (no disallow-without-delete site applies to `long-read-assembly`). (#467)
 
+- `20260825000000_sample_field_comment_corrections.sql` — plain `make migrate`, no
+  out-of-band setup. Four `COMMENT` statements on the sample-field tables and columns; no
+  DDL, no data touched, nothing locked beyond the momentary catalog write. Ordering versus
+  the bucket-4 restart is irrelevant — no code reads these comments. (#485)
+
 ### 4. Deploy
 
 _None yet._

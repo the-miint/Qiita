@@ -1763,10 +1763,10 @@ def _study_field_read_sql(spec: EntityMetadataSpec) -> str:
     A globally-linked row leaves data_type / required / terminology_idx NULL
     (they live on the global-field row), so the read LEFT JOINs the global field
     and COALESCEs those three into their effective values. tier_override has no
-    global counterpart (the global row carries default_tier, a distinct concept)
-    and comes through as stored. The global FK column keeps its entity-specific
-    name (spec.study_field_global_fk_column); the row's own idx comes through as
-    `idx`.
+    global counterpart (the global row carries default_tier, a distinct concept),
+    so it comes through as stored (NULL on a linked row). The global FK column
+    keeps its entity-specific name (spec.study_field_global_fk_column);
+    the row's own idx comes through as `idx`.
     """
     # f-string interpolation of identifiers is safe: spec fields are frozen
     # module-level constants, never reached by caller input.

@@ -2,10 +2,6 @@
 
 A prep_sample row itself is created by the sequenced-sample composer
 (its only subtype today), never by a POST here.
-
-The prep-sample-scoped handlers gate on caller scope plus
-require_role_at_least(WET_LAB_ADMIN), matching the sibling sequenced_sample
-routes; prep_sample is that subtype's supertype.
 """
 
 from typing import Annotated
@@ -195,6 +191,9 @@ async def create_prep_sample_field(
     return response
 
 
+# same-pattern-ok: cross-entity twin of list_biosample_fields_in_study.
+# The decorator, path constant, scope, tier, spec, and response model are
+# the whole per-entity declaration, over a mapper that's already generic.
 @study_scoped_router.get(PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY)
 async def list_prep_sample_fields_in_study(
     study_idx: Annotated[int, Field(gt=0)],
@@ -229,6 +228,9 @@ async def list_prep_sample_fields_in_study(
     return fields
 
 
+# same-pattern-ok: cross-entity twin of list_biosample_global_fields, and the
+# study-free sibling of list_prep_sample_fields_in_study; same reason as that one —
+# the gate and the spec/model pair are the declaration, over an already-generic read.
 @global_field_router.get(PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT)
 async def list_prep_sample_global_fields(
     pool: asyncpg.Pool = Depends(get_db_pool),

@@ -436,8 +436,8 @@ async def assert_study_field_create_authz(
 
 # case -> (study owner, tier granted to the regular user, calling client,
 # expected status) for the list route. Mirrors the create matrix but at the
-# VIEWER floor, so member_grant — a 403 on create — must succeed here; that
-# pair is what pins the two routes to different tiers.
+# VIEWER floor, so a member grant must succeed here; that pair is what
+# pins the two routes to different tiers.
 _STUDY_FIELD_LIST_AUTHZ: dict[str, tuple[str | None, str | None, str, int]] = {
     "owner": ("user", None, "user", 200),
     "viewer_grant": ("wet", "viewer", "user", 200),

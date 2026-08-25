@@ -1,8 +1,7 @@
 """Biosample routes.
 
 Writes apply their mutation inside one connection-scoped transaction,
-delegating multi-table work to the biosample composer. Bulk import,
-retirement, search, and admin metadata-schema endpoints are deferred.
+delegating multi-table work to the biosample composer.
 """
 
 from collections.abc import Awaitable, Callable
@@ -308,6 +307,9 @@ async def create_biosample_field(
     return response
 
 
+# same-pattern-ok: cross-entity twin of list_prep_sample_fields_in_study.
+# The decorator, path constant, scope, tier, spec, and response model are
+# the whole per-entity declaration, over a mapper that's already generic.
 @router.get(PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY)
 async def list_biosample_fields_in_study(
     study_idx: Annotated[int, Field(gt=0)],
@@ -342,6 +344,9 @@ async def list_biosample_fields_in_study(
     return fields
 
 
+# same-pattern-ok: cross-entity twin of list_prep_sample_global_fields, and the
+# study-free sibling of list_biosample_fields_in_study; same reason as that one —
+# the gate and the spec/model pair are the declaration, over an already-generic read.
 @global_field_router.get(PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT)
 async def list_biosample_global_fields(
     pool: asyncpg.Pool = Depends(get_db_pool),

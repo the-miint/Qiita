@@ -87,8 +87,10 @@ class SampleStudyFieldResponse(BaseModel):
     Carries every stored column. For a globally-linked row, data_type /
     required / terminology_idx are the values inherited from the global-field
     row (resolved at read time), so they are always populated even though the
-    study-field columns are NULL. internal_name and default_tier belong to the
-    global field, not to this row, and are excluded.
+    study-field columns are NULL. tier_override is instead always None on a
+    linked row: a global field carries default_tier, so there is nothing per-study
+    to override. internal_name and default_tier belong to the global field, not
+    to this row, and are excluded.
     """
 
     study_field_idx: Annotated[int, Field(gt=0)]

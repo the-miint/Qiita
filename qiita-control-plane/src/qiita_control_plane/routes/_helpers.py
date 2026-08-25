@@ -577,11 +577,11 @@ def map_study_field_row[T: SampleStudyFieldResponse](
 ) -> T:
     """Shape one {entity}_study_field row into response_model.
 
-    Every column but the two idx fields is named identically
-    on the wire, so only those are renamed — the row's own idx, which arrives
+    Every column but the two idx fields is named identically on the wire and
+    passes straight through. The two idx fields — the row's own, which arrives
     as `idx`, and the global link, which arrives under its entity-specific SQL
-    column — each to whichever entity-qualified spelling response_model
-    declares for it.
+    column — are each moved to whichever entity-qualified spelling
+    response_model declares, whether or not that differs from the column name.
     """
     payload = dict(row)
     payload[field_wire_name(response_model, STUDY_FIELD_IDX_ATTR)] = payload.pop("idx")
