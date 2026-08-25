@@ -2441,18 +2441,25 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
-- **`CLAUDE.md` trimmed from 11,020 to 5,747 tokens; the reference material moved to `docs/` (#482).**
-  Every token in `CLAUDE.md` is re-sent in front of every API call an agent makes, and compaction
-  never evicts it — measured over 46 sessions, the always-loaded prefix was 18.9% of all input
-  tokens, rising to 32.5% once a compact cadence is adopted. The lookup-shaped sections move to
-  `docs/container-images.md`, `docs/deployments.md`, `docs/testing.md`, and a new
-  **Cross-cutting structure** section in `docs/architecture.md` (component map, identifier
+- **`CLAUDE.md` trimmed from 11,020 to 5,776 tokens, and `docs/architecture.md` split into
+  `docs/architecture/` (#482).** Every token in `CLAUDE.md` is re-sent in front of every API call
+  an agent makes, and compaction never evicts it — measured over 46 sessions, the always-loaded
+  prefix was 18.9% of all input tokens, rising to 32.5% once a compact cadence is adopted. The
+  lookup-shaped sections move to `docs/container-images.md`, `docs/deployments.md`,
+  `docs/testing.md`, and `docs/architecture/cross-cutting.md` (component map, identifier
   ownership, data-plane design, orchestrator pattern, workflow runner). `Enum parity` and
   `Operator-facing changes` are condensed to their rules. Every rule that has to fire without
   being looked up — the development ethos, miint-is-core, naming, REST path constants,
   never-edit-an-applied-migration, the changelog gate — stays resident, and every moved section
-  leaves a pointer plus an index table under `## Architecture`. `docs/architecture.md` joins
-  `CHANGELOG.md` in the don't-whole-file-read rule, since it is now a 1,600-line lookup surface.
+  leaves a pointer plus an index table under `## Architecture`. `docs/architecture.md`'s 1,600
+  lines become eight files — overview, data model, reference data, Flight surface, processing,
+  storage, build/CI, cross-cutting — leaving `architecture.md` a 92-line index that lists every
+  file's sections. Heading levels are normalized per file, and every inbound reference is
+  retargeted to the file carrying the section it cites, `test_makefile_doc_sync.py` and
+  `test_architecture_tree_sync.py` included: both read fenced blocks that now live in
+  `docs/architecture/build-and-deploy.md`. The split is for human navigation, not agent token
+  cost — across 54 transcripts the file took 23 accesses from 8 sessions with zero whole-file
+  reads and a median per-session coverage of 2.4% of its lines.
 
 - **Data-plane inline test modules split into `#[path]` submodules (#481).** `flight_service.rs`
   was 9,398 lines of which 5,712 (61%) were `#[cfg(test)]`; `auth.rs` was 1,143 with 514 (45%).

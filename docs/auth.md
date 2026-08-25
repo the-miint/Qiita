@@ -343,7 +343,7 @@ The system principal (`idx=1`) is rejected by every mutation endpoint above (`di
 
 ### Reference exclusion (curation)
 
-The curated global blocklist that masks bad genomes/features from downstream products (architecture: [Reference exclusion](architecture.md#reference-exclusion-curated-blocklist)). Not under `/admin/*`, but the two mutations and the force-resync are `system_admin`-only by scope. Each mutation, after the atomic Postgres write, **synchronously re-materializes** the DuckLake `reference_exclusion` mirror via the `sync_reference_exclusion` DoAction (a 502 if the data plane is unreachable; the Postgres row persists, so a retry converges).
+The curated global blocklist that masks bad genomes/features from downstream products (architecture: [Reference exclusion](architecture/reference-data.md#reference-exclusion-curated-blocklist)). Not under `/admin/*`, but the two mutations and the force-resync are `system_admin`-only by scope. Each mutation, after the atomic Postgres write, **synchronously re-materializes** the DuckLake `reference_exclusion` mirror via the `sync_reference_exclusion` DoAction (a 502 if the data plane is unreachable; the Postgres row persists, so a retry converges).
 
 | Route | Method | Notes |
 |---|---|---|

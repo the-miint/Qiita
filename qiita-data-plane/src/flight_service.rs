@@ -57,7 +57,7 @@ const IPC_COMPRESSION_NONE: &str = "none";
 /// **The client chooses, not the server.** Whether compression pays depends on
 /// the client's bandwidth, which the server cannot know — behind nginx it cannot
 /// even see the client's address. So the default is off and the client opts in
-/// per call. The break-even arithmetic is in `docs/architecture.md`.
+/// per call. The break-even arithmetic is in `docs/architecture/flight.md`.
 ///
 /// An unrecognised value is an **error, not a fallback**. A client that asked
 /// for compression, silently did not get it, and measured the result would draw
@@ -380,7 +380,7 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
 ///
 /// The allowlist is per-table (see `projection_allowlist`) and today only the
 /// alignment surface has one; every other DoGet table streams `SELECT *` and
-/// refuses a column list outright. Why the asymmetry: `docs/architecture.md`.
+/// refuses a column list outright. Why the asymmetry: `docs/architecture/flight.md`.
 const ALIGNMENT_PROJECTION_COLUMNS: &[&str] = &[
     "alignment_idx",
     "prep_sample_idx",

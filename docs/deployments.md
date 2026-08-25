@@ -5,7 +5,7 @@ standing procedure is [`runbooks/redeploy.md`](runbooks/redeploy.md); the
 per-deploy checklist is [`../DEPLOY_CHECKLIST.md`](../DEPLOY_CHECKLIST.md).
 Referenced from [`CLAUDE.md`](../CLAUDE.md).
 
-We deploy **many PRs at once**: development is a sequence of PRs to `main`, then a single manual deploy that rolls out everything merged since the host's last deploy. We do **not** cut releases yet. The operator-facing instructions for that deploy are the single consolidated `## Pending deploy` checklist in `DEPLOY_CHECKLIST.md` (see the section above), which each PR folds its steps into as it merges. The standing procedure is [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md) (incremental); [`docs/runbooks/first-deploy.md`](docs/runbooks/first-deploy.md) is bootstrap-only.
+We deploy **many PRs at once**: development is a sequence of PRs to `main`, then a single manual deploy that rolls out everything merged since the host's last deploy. We do **not** cut releases yet. The operator-facing instructions for that deploy are the single consolidated `## Pending deploy` checklist in `DEPLOY_CHECKLIST.md` (see the section above), which each PR folds its steps into as it merges. The standing procedure is [`docs/runbooks/redeploy.md`](runbooks/redeploy.md) (incremental); [`docs/runbooks/first-deploy.md`](runbooks/first-deploy.md) is bootstrap-only.
 
 Invariants that hold for every deploy — enforce them when writing deploy-affecting code or reviewing it:
 

@@ -80,7 +80,7 @@ cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 **No development-plan vocabulary in code.** "M0", "M3", "Phase 4", "item 6", "the milestone" — these name a planning document that is not in the repo and will not outlive the branch, so they say nothing to whoever reads the line next. This covers comments, docstrings, test names, and `CHANGELOG.md` prose alike. Write the substance instead: not "M0 measured the break-even at ~4 Gbit/s", just "the measured break-even is ~4 Gbit/s". The `(#N)` carve-out above does not extend to these — a PR number resolves forever, a milestone label does not.
 
-**Don't whole-file-read the big files.** Several source and test modules here run past 3,000 lines (the control-plane CLI/runner test modules, `qiita-data-plane/src/flight_service.rs`). Reading one whole costs more context than every instruction file in this repo combined, so locate first (grep / LSP / a targeted `Read` offset+limit) and read only the span you need. `CHANGELOG.md` and `docs/architecture.md` are long for the same reason: the changelog's header says where to add an entry, so you never need to read the body, and `docs/architecture.md` is a lookup surface of 30+ sections — grep its headings and read the one you need.
+**Don't whole-file-read the big files.** Several source and test modules here run past 3,000 lines (the control-plane CLI/runner test modules, `qiita-data-plane/src/flight_service.rs`). Reading one whole costs more context than every instruction file in this repo combined, so locate first (grep / LSP / a targeted `Read` offset+limit) and read only the span you need. `CHANGELOG.md` is long for the same reason: its header says where to add an entry, so you never need to read the body. `docs/architecture.md` is an index over `docs/architecture/` — grep it for the section you want, then read that one file.
 
 ## miint is a core dependency
 
@@ -96,7 +96,7 @@ A step in a workflow YAML must declare **exactly one** of `container:` or `modul
 
 Native job modules export two required symbols — `class Inputs(BaseModel)` (typed input contract) and `async def execute(inputs, workspace)` (the work) — plus an optional `def plan(inputs) -> JobPlan` for submit-time resource sizing, which the control plane reads once per native step before submit. A single framework dispatcher handles import, validation, and error classification; both the local backend and the SLURM launcher route through it. [`docs/writing-a-job.md`](docs/writing-a-job.md) carries the full contract table.
 
-The wire validator enforces shape only (exactly-one). The module-prefix invariant (`qiita_compute_orchestrator.jobs.`) is enforced separately at sync, submit, boot scan, and dispatcher — [`docs/architecture.md`](docs/architecture.md) carries the per-site breakdown.
+The wire validator enforces shape only (exactly-one). The module-prefix invariant (`qiita_compute_orchestrator.jobs.`) is enforced separately at sync, submit, boot scan, and dispatcher — [`docs/architecture/build-and-deploy.md`](docs/architecture/build-and-deploy.md) carries the per-site breakdown.
 
 Container steps declare a bare SIF filename; a workflow opts into the one generic
 builder with a per-workflow spec. The resolution rules, the two spec forms, the
@@ -206,14 +206,15 @@ standing procedure is [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md).
 
 ## Architecture
 
-`docs/architecture.md` is the system reference — the diagram, the component map and ports, the
-identifier hierarchy, the data-plane Flight design, the compute-orchestrator pattern, and the
-workflow runner all live there, under **Cross-cutting structure**. Read the section you need
-rather than the whole file; it runs past 1,500 lines.
+`docs/architecture.md` is the system reference, split into files under `docs/architecture/` —
+the diagram and components, the data model, reference data, the Flight surface, processing and
+work tickets, storage, build and CI, and the cross-cutting structure (component map and ports,
+identifier ownership, data-plane design, the workflow runner). The index lists every section of
+every file; grep it, then read the one file it names.
 
 | Looking for | Read |
 |---|---|
-| system diagram, components, ports, identifier hierarchy, Flight ops, orchestrator, runner | [`docs/architecture.md`](docs/architecture.md) |
+| system diagram, components, ports, identifier hierarchy, Flight ops, orchestrator, runner | [`docs/architecture.md`](docs/architecture.md) — index over `docs/architecture/` |
 | how a `container:` filename resolves to a SIF, the generic builder, spec forms, idempotency | [`docs/container-images.md`](docs/container-images.md) |
 | deploy invariants and the operator helper scripts | [`docs/deployments.md`](docs/deployments.md) |
 | the three test tiers and what infrastructure each needs | [`docs/testing.md`](docs/testing.md) |
