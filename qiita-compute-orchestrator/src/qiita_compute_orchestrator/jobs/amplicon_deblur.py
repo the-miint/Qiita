@@ -116,19 +116,20 @@ FROM deblur('aligned', sequence_col := 'aligned_sequence', sample_id := 'sample_
 ORDER BY abundance DESC;
 """
 
-# orient each read to the primer (only when orient_primer).
+# orient each read to the primer (only when orient_primer). match on upper(read)
+# so mixed-case input still hits the uppercase primer regex.
 _ORIENT_SQL = """
 CREATE OR REPLACE TABLE _inputs_oriented AS
 SELECT sample_id, sequence_index,
     CASE
-      WHEN regexp_matches(sequence1, getvariable('rapid_regex_fwd'))
-           AND regexp_matches(sequence1, getvariable('rapid_regex_fwd_rc')) THEN NULL
-      WHEN regexp_matches(sequence1, getvariable('rapid_regex_fwd'))
-        THEN regexp_extract(sequence1, getvariable('rapid_regex_fwd_extract'), 2)
-      WHEN regexp_matches(sequence1, getvariable('rapid_regex_fwd_rc'))
-        THEN regexp_extract(sequence_dna_reverse_complement(sequence1),
+      WHEN regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd'))
+           AND regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd_rc')) THEN NULL
+      WHEN regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd'))
+        THEN regexp_extract(upper(sequence1), getvariable('rapid_regex_fwd_extract'), 2)
+      WHEN regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd_rc'))
+        THEN regexp_extract(sequence_dna_reverse_complement(upper(sequence1)),
                             getvariable('rapid_regex_fwd_extract'), 2)
-      ELSE sequence1
+      ELSE upper(sequence1)
     END AS sequence1
 FROM _inputs;
 """
@@ -153,9 +154,11 @@ def _set_session_vars(conn, *, primer: str, trim: int, sortmerna_ref: Path, orie
             "SET VARIABLE rapid_regex_fwd_rc = sequence_dna_as_regexp("
             "sequence_dna_reverse_complement(getvariable('rapid_fwd_primer')));"
         )
+        # capture the rest of the read after the primer. `.+` (not `[ATGC]+`) so an
+        # ambiguity code or lowercase base does not truncate the captured sequence.
         conn.execute(
             "SET VARIABLE rapid_regex_fwd_extract = "
-            "'(' || getvariable('rapid_regex_fwd') || ')([ATGC]+)';"
+            "'(' || getvariable('rapid_regex_fwd') || ')(.+)';"
         )
 
 
