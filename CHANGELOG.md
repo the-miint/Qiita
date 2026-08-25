@@ -21,6 +21,59 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`qiita reference load` warns when the input carries soft-masked bases (#486).** On
+  both front-ends — the `--fasta` upload and `--local`'s `stage_local_fasta`. The
+  split normalizes case, so a soft-masked FASTA is stored upper case and the masking is
+  not recoverable from the lake afterwards. The check evaluates the same
+  `normalized_sequence_expr` the split uses, so the two cannot disagree, and stops at the
+  first lower-case record. Every index builder discards case, so only an export of the
+  reference shows the difference.
+
+- **`align-denovo`: align a sample's masked reads back against its own assembly (#486).**
+  A prep_sample-scoped workflow that aligns one sample against the contigs its own
+  `long-read-assembly` run produced, into the same DuckLake `alignment` table under a de
+  novo `alignment_idx`. The `align_denovo` native job streams both inputs at runtime —
+  contigs over an assembly-run-scoped DoGet, reads over a `(prep_sample, mask)`-scoped
+  `read_masked` DoGet — so nothing is staged onto shared scratch. It gates on the
+  circular-pooled axis rather than per-record CIGAR, which is what admits a read crossing
+  a circular contig's origin; that fixes `eqx := true` and `max_secondary := 0`, and the
+  job docstring carries why and what the second one costs. First producer for
+  `alignment_origin_spanning`, recording only groups whose coordinates show a single
+  origin crossing. Submit-side, a runner pre-loop resolver mints the identity, refuses
+  unless the assembly run's `assembly_sample` gate reads `completed` (NO_DATA when it
+  reads `no_data`), re-attaches to `work_ticket.alignment_idx` on a resume rather than
+  re-deriving, and writes both ticket columns plus the pending `alignment_sample` row.
+  New `finalize-alignment-sample` primitive flips that gate. The step's `cpu:` equals
+  the job's DuckDB thread count and `test_align_denovo_cpu_pins_duckdb_threads` keeps
+  them equal: `align_minimap2` draws its parallelism from that pool (measured
+  near-linear at 1/2/4/8 threads), so a higher `cpu:` allocates cores nothing uses. The
+  same measurement closes the identical gap in `long-read-assembly`'s
+  `assembly_coverage` step, whose `cpu:` drops 16 → 8 to match the pool it actually
+  uses. Closed by lowering the request rather than raising the pool, because `sacct`
+  over 49 completed steps puts that job at 87% of its 64 GB at the median, with ten
+  further attempts dying OUT_OF_MEMORY at exactly 64.0 GB — the thread count is also a
+  memory multiplier for the unspillable extension side, so raising it is the wrong
+  direction. Its `mem_gb` is deliberately unchanged; see the job's sizing note.
+  `test_workflow_params_pin.py`'s aside justifying the gap is corrected: the memory half
+  of that rationale stands, but on the CPU axis the aligner's threads ARE the DuckDB
+  pool.
+
+- **`docs/duckdb-miint.md` records that `max_secondary := 0` is not "primary alignments
+  only" (#486).** Upstream's reference says it is, in three places; a supplementary
+  (`0x800`) record from a split alignment survives it, which is not primary under SAM's
+  `FLAG & 0x900 == 0`. Measured on mirror `9fc4d12`: a read across a subject's start/end
+  junction returns the same two rows at `max_secondary := 0` and at `100`. Filed upstream
+  as [duckdb-miint#255](https://github.com/the-miint/duckdb-miint/issues/255) (docs-only —
+  we carry no workaround, so it is not an Open-upstream-gaps row). The behaviour is what
+  `align_denovo` needs: the setting removes the secondaries `circular_query_coverage`
+  refuses and leaves the supplementary fragments it exists to pool.
+
+- **`circular_predicate_sql` / `circular_cleared_join` in `qiita_common.analytic.gate`
+  (#486).** The circular gate's predicate and its group-join key, factored out of
+  `_circular_gated_sql` so a job that produces alignments applies the same two rather
+  than a second copy. Both still take a `GateClearance`, so a producer reaches them only
+  after `check_gate_diagnostics`.
+
 - **A per-sample masked-read Flight stream for native jobs (#477).**
   `data_plane_client` gains `fetch_read_masked_doget_ticket` +
   `open_read_masked_stream`: a job names a `(prep_sample_idx, mask_idx)` pair, the CP
@@ -1198,6 +1251,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **`docs/deploy-archive/2026-08-21-4fc4ce3d.md` carries a dated correction (#486).** Its
+  claim that the 24 uncollapsed `reference_sequence_chunks` features are
+  reverse-complement pairs needing their producing reference load re-run holds for one of
+  them; the other 23 differ only in soft-masking case. The archived text below the note is
+  unchanged.
 
 - **Corrected the claim that miint cannot see TEMP or registered-Arrow relations (#477).**
   It resolves them since [duckdb-miint#193](https://github.com/the-miint/duckdb-miint/issues/193);
@@ -2440,6 +2499,24 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **The chunk reassembly contract has one definition in tests too (#486).** Six inlined
+  `string_agg(chunk_data, '' ORDER BY chunk_index)` copies — in `test_reference_load.py`,
+  `test_assembly_hash.py`, `test_assembly_load.py` and
+  `tests/integration/test_reference_stream.py` — now call `reassemble_chunks_expr`. The
+  literal in `test_chunking.py` stays, since that assertion is what pins the expression.
+
+- **`ALIGNMENT_IDX_BINDING` and a new `ALIGN_DENOVO_ACTION_ID` in `qiita_common.actions`
+  (#486).** The binding moved there from `runner/_mask.py` so the action contract can
+  assert on it: an action declaring `finalize-alignment-sample` must thread it through
+  some step's `params:`, or the gate would record a sample aligned under an identity none
+  of its rows carry. The action id joins `LONG_READ_ASSEMBLY_ACTION_ID` in the mask-purge
+  guard's coverage set — both actions consume a mask rather than minting one, so a ticket
+  of either carries NULL `mask_idx` until it runs.
+
+- **`qiita.alignment_sample`'s table comment names both writers (#486).** Comment-only
+  migration: the gate now has a per-sample writer alongside the block one, and the old
+  comment described the block path as the only one.
 
 - **Data-plane inline test modules split into `#[path]` submodules (#481).** `flight_service.rs`
   was 9,398 lines of which 5,712 (61%) were `#[cfg(test)]`; `auth.rs` was 1,143 with 514 (45%).

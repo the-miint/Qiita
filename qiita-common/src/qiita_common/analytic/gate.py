@@ -315,7 +315,7 @@ def gated_alignment_table_sql(*, clearance: GateClearance) -> str:
     """
     gate = clearance.gate
     if gate.circular:
-        return _circular_gated_sql(gate)
+        return _circular_gated_sql(clearance)
     scored, clause = (
         (f"string_agg(cigar, '') OVER (PARTITION BY {PAIRED_PLACEMENT_PARTITION})", "QUALIFY")
         if gate.paired
@@ -329,7 +329,41 @@ def gated_alignment_table_sql(*, clearance: GateClearance) -> str:
     )
 
 
-def _circular_gated_sql(gate: AlignmentGate) -> str:
+def circular_predicate_sql(*, clearance: GateClearance) -> str:
+    """What a `(read, reference)` group must clear, over `circular_query_coverage`'s
+    own output columns. Bind `gate_parameters(clearance.gate)` to its placeholders.
+
+    Public because the gated path is not the only consumer: a job that PRODUCES
+    alignments applies the same predicate to the same macro output, and then reports the
+    groups that cleared with more of the macro's columns than a filter needs. One
+    definition, so a threshold that reached only the consumer would not admit rows the
+    producer had already dropped.
+
+    Takes a `GateClearance` for the reason `gated_alignment_table_sql` does: two of
+    this predicate's failure modes are silent, and `check_gate_diagnostics` is what
+    refuses them.
+    """
+    predicate = " AND ".join(sql for sql, _ in _circular_terms(clearance.gate))
+    return f"{predicate} AND NOT mixed_strand"
+
+
+def circular_cleared_join(alignments: str, cleared: str) -> str:
+    """The ON clause matching one alignment row to its `(read, reference)` group in
+    `circular_query_coverage`'s output. `alignments` and `cleared` are table aliases.
+
+    `CIRCULAR_READ_PARTITION`'s three expressions, against the macro's column names.
+    Shared with the producer for the reason `circular_predicate_sql` is: a group key
+    that matched on two of the three would pool R1 and R2 together on one side of the
+    join and not the other.
+    """
+    return (
+        f"{alignments}.sequence_idx = {cleared}.read_id "
+        f"AND {alignments}.feature_idx = {cleared}.reference "
+        f"AND alignment_is_read1({alignments}.flags) = {cleared}.is_read1"
+    )
+
+
+def _circular_gated_sql(clearance: GateClearance) -> str:
     """The circular arm of `gated_alignment_table_sql`: keep every record of each
     `(read, reference)` group that cleared the pooled predicate.
 
@@ -341,17 +375,15 @@ def _circular_gated_sql(gate: AlignmentGate) -> str:
     through `query_table`, which takes only literals, so it cannot sit in a lateral
     position — a CTE is the form upstream names for this.
     """
-    predicate = " AND ".join(sql for sql, _ in _circular_terms(gate))
     return (
         f"CREATE TABLE {ALIGNMENT_TABLE} AS "
         f"WITH cleared AS ("
         f"SELECT read_id, is_read1, reference FROM circular_query_coverage("
         f"{CIRCULAR_ALIGNMENTS_VIEW}, {FEATURE_TOPOLOGY_VIEW}) "
-        f"WHERE {predicate} AND NOT mixed_strand"
+        f"WHERE {circular_predicate_sql(clearance=clearance)}"
         f") SELECT {', '.join(f'a.{column}' for column in ALIGNMENT_COLUMNS)} "
         f"FROM {STREAMED_ALIGNMENT_TABLE} a SEMI JOIN cleared c "
-        f"ON a.sequence_idx = c.read_id AND a.feature_idx = c.reference "
-        f"AND alignment_is_read1(a.flags) = c.is_read1"
+        f"ON {circular_cleared_join('a', 'c')}"
     )
 
 

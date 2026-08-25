@@ -210,6 +210,13 @@ class LibraryPrimitive(StrEnum):
     # ticket's (processing_idx, prep_sample). See
     # qiita_control_plane.actions.library.finalize_assembly_sample_gate.
     FINALIZE_ASSEMBLY_SAMPLE = "finalize-assembly-sample"
+    # Per-sample alignment completion: the terminal step of a prep_sample-scoped
+    # alignment workflow (align-denovo). Writes 'completed' into the
+    # qiita.alignment_sample gate for this ticket's (alignment_idx, prep_sample) — the
+    # per-sample twin of reconcile-alignment-block's gate flip, and the signal the
+    # runner keys its de novo alignment resolver off. See
+    # qiita_control_plane.actions.library.finalize_alignment_sample_gate.
+    FINALIZE_ALIGNMENT_SAMPLE = "finalize-alignment-sample"
 
 
 # =============================================================================

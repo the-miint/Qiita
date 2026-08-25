@@ -28,6 +28,7 @@ Coverage:
 from __future__ import annotations
 
 import gzip
+import logging
 from pathlib import Path
 
 import duckdb
@@ -140,6 +141,30 @@ async def test_three_files_combined_into_one_parquet(tmp_path):
     assert set(by_read) == {"g1", "g2", "g3", "g4"}
     assert by_read["g3"] == "GGGGCCCC"
     assert by_read["g4"] == "AATTCCGG"
+
+
+async def test_soft_masked_input_warns_and_stores_upper(tmp_path, caplog):
+    """A soft-masked record warns and is stored upper case; an all-uppercase
+    manifest warns not at all. `--local` reaches the same split as the remote
+    DoPut path, so it discards case the same way and must say so too."""
+    fa = _write_fasta(tmp_path / "masked.fa", [("g1", "ACGTacgtTTGA")])
+    manifest = _write_manifest(tmp_path / "m.txt", [str(fa)])
+    logger = "qiita_compute_orchestrator.jobs.stage_local_fasta"
+
+    with caplog.at_level(logging.WARNING, logger=logger):
+        outputs = await _run(manifest, tmp_path / "ws")
+
+    assert "soft-masked" in caplog.text
+    assert str(fa) in caplog.text
+    by_read = {rid: data for rid, _idx, data in _read_combined(outputs["fasta_path"])}
+    assert by_read["g1"] == "ACGTACGTTTGA"
+
+    caplog.clear()
+    plain = _write_fasta(tmp_path / "plain.fa", [("g2", "ACGTACGTTTGA")])
+    manifest2 = _write_manifest(tmp_path / "m2.txt", [str(plain)])
+    with caplog.at_level(logging.WARNING, logger=logger):
+        await _run(manifest2, tmp_path / "ws2")
+    assert "soft-masked" not in caplog.text
 
 
 async def test_output_schema_shape(tmp_path):

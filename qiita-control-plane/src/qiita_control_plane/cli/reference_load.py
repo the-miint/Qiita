@@ -7,7 +7,9 @@ What the subcommand does, in order, against a running CP + DP:
      optional):
        a. Open an Arrow RecordBatch stream over the source file (see
           "Arrow streaming" below). No intermediate Parquet is written
-          to local disk; batches go straight to DoPut.
+          to local disk; batches go straight to DoPut. A FASTA carrying
+          soft-masked (lower case) bases warns here: the split stores
+          upper case, so the masking does not survive the load.
        b. POST /upload to mint an upload slot — returns upload_idx +
           signed DoPut Flight ticket.
        c. pyarrow.flight do_put — streams the Arrow batches to the data
@@ -88,7 +90,12 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_PREFIX,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
-from qiita_common.chunking import CHUNK_ROW_GROUP_SIZE, CHUNK_SIZE, sequence_split_expr
+from qiita_common.chunking import (
+    CHUNK_ROW_GROUP_SIZE,
+    CHUNK_SIZE,
+    normalized_sequence_expr,
+    sequence_split_expr,
+)
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
 if TYPE_CHECKING:
@@ -210,6 +217,26 @@ def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
 
     conn = connect_with_miint()
     try:
+        # The split normalizes case (`normalized_sequence_expr`), so a soft-masked
+        # input is stored upper case and the masking is not recoverable from the
+        # lake afterwards. The same expression drives this check, so it cannot
+        # disagree with what the split does. This is a second read of the FASTA,
+        # bounded by LIMIT 1. `stage_local_fasta` carries the same warning for
+        # the --local path, where the flag rides an existing scan instead.
+        if conn.execute(
+            "SELECT 1 FROM read_fastx(?, max_batch_bytes:='"
+            f"{_READ_FASTX_MAX_BATCH_BYTES}') WHERE sequence1 <> "
+            f"{normalized_sequence_expr('sequence1')} LIMIT 1",
+            [str(fasta_path)],
+        ).fetchone():
+            _log.warning(
+                "%s contains soft-masked (lower case) bases. Chunks are stored"
+                " upper case, so the masking is discarded at load and cannot be"
+                " recovered from the lake — an export of this reference will"
+                " return upper case. Every index builder discards case as well,"
+                " so alignment and classification are unaffected.",
+                fasta_path,
+            )
         # miint's native `sequence_split` is the shared chunker (one definition
         # for both the CLI and the orchestrator's stage_local_fasta; see
         # qiita_common.chunking).

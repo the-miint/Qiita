@@ -378,6 +378,25 @@ def test_the_circular_gate_keeps_a_cleared_groups_rows_with_a_semi_join():
     assert "alignment_is_read1(a.flags) = c.is_read1" in sql
 
 
+def test_a_producer_and_the_gated_path_apply_one_circular_predicate():
+    """`circular_predicate_sql` and `circular_cleared_join` are the two pieces a job
+    that PRODUCES alignments reuses — it applies the gate to the macro's output and
+    then reports the cleared groups with more of its columns than a filter needs. They
+    are public so there is ONE predicate and one join key: a second copy would drift,
+    and it would drift silently, admitting rows on one side that the other had
+    dropped."""
+    gate = ft.AlignmentGate(circular=True)
+    clearance = ft.GateClearance(gate)
+    gated = _gated_sql(gate)
+    assert ft.circular_predicate_sql(clearance=clearance) in gated
+    assert ft.circular_cleared_join("a", "c") in gated
+    # Placeholders and bound values are produced by different functions; a mismatch
+    # binds a coverage floor to the identity term.
+    assert ft.circular_predicate_sql(clearance=clearance).count("?") == len(
+        ft.gate_parameters(gate)
+    )
+
+
 def test_the_circular_gated_relation_drops_cigar_again():
     """Same rule as the other arm: `ALIGNMENT_TABLE` is `ALIGNMENT_COLUMNS` and nothing
     else, so `cigar` stops at the gate whichever axis scored it."""

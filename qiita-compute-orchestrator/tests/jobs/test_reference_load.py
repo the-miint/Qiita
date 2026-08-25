@@ -24,6 +24,7 @@ from uuid import UUID
 
 import duckdb
 import pytest
+from qiita_common.chunking import reassemble_chunks_expr
 
 _REFERENCE_LOAD_LOGGER = "qiita_compute_orchestrator.jobs.reference_load"
 
@@ -209,7 +210,7 @@ def test_emits_feature_idx_keyed_chunks(staging_inputs, tmp_path):
         }
         # Reassemble per feature_idx → canonical form.
         rows = conn.execute(
-            "SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index)"
+            f"SELECT feature_idx, {reassemble_chunks_expr()}"
             " FROM read_parquet(?) GROUP BY feature_idx ORDER BY feature_idx",
             [parts_glob],
         ).fetchall()
@@ -263,7 +264,7 @@ def test_chunks_batched_into_disjoint_feature_idx_ranges(staging_inputs, tmp_pat
         # canonical form across the parts.
         parts_glob = str(chunks_dir / "part_*.parquet")
         rows = conn.execute(
-            "SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index)"
+            f"SELECT feature_idx, {reassemble_chunks_expr()}"
             " FROM read_parquet(?) GROUP BY feature_idx",
             [parts_glob],
         ).fetchall()

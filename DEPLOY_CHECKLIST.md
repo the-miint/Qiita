@@ -34,6 +34,11 @@ _None yet._
   assembly ticket completing between bucket 3 and the bucket-4 restart runs under old code
   that writes no gate row. Re-submitting such a sample after the restart is admitted and
   re-writes it (no disallow-without-delete site applies to `long-read-assembly`). (#467)
+- `20260823000000_alignment_sample_denovo_comment.sql` — plain `make migrate`, no
+  out-of-band setup. `COMMENT ON TABLE qiita.alignment_sample` only: no DDL, no rows
+  touched, nothing to lock beyond the catalog row. It re-describes the gate now that a
+  per-sample writer (`align-denovo`) exists alongside the block one. Safe in any order
+  relative to the entry above — the two touch different tables. (#486)
 
 ### 4. Deploy
 
@@ -70,6 +75,18 @@ _None yet._
   ```
   Expect `1`. A `0` means the staged build predates the function — re-stage the extension
   before telling anyone `--circular-gate` works. (#475)
+- **`align-denovo` 1.0.0 is a NEW action** — `activate.sh`'s `qiita-admin actions sync`
+  adds it, so it appears in the `qiita.action` list `make verify-deploy` already prints.
+  Confirm the row exists and that its terminal entry synced: the runner keys its identity
+  mint, both ticket-column writes and the 'pending' gate row off that entry, so a copy
+  missing it accepts the ticket and then fails the FIRST step on a missing
+  `alignment_idx` — a job-attributed validation error for what is really a stale sync.
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -Atc "SELECT steps::text LIKE '\''%finalize-alignment-sample%'\'' FROM qiita.action WHERE action_id = '\''align-denovo'\'' AND version = '\''1.0.0'\'';"'
+  ```
+  Expect `t`. **Empty output** means no `align-denovo` 1.0.0 row synced at all (`-Atc`
+  prints nothing for zero rows). Re-run `qiita-admin actions sync` for either. (#486)
 
 ### 6. After the deploy verifies green
 
@@ -136,6 +153,19 @@ _None yet._
   so a run re-registered inside the mint's 300 s TTL streams the re-registered rows, and a
   run whose contigs are in the lake but whose Postgres membership was cleared answers 404
   at the route. (#476)
+- **`align-denovo` needs no new scope grant.** Its job streams a sample's contigs on the
+  compute service account's existing `ticket:doget` (the surface the note above
+  describes) and its masked reads on `read_masked:doget`. That account already holds the
+  latter: `docs/deploy-archive/2026-07-23-644d2874.md` re-minted its PAT with
+  `read_masked:doget` in the `--scopes` string, though that entry's prose is about
+  granting `read:doget` — read the command, not the paragraph. Nothing to run; noted so
+  the new workflow is not read as needing a re-mint. (#486)
+- **`long-read-assembly`'s `assembly_coverage` step now requests 8 cpus, not 16.** It
+  only ever used 8: `align_minimap2` draws its parallelism from DuckDB's thread pool,
+  and the job sets that to 8. Memory and walltime are unchanged, and the step's measured
+  runtime (p50 10.4 min, max 15.4 min against a PT4H limit) leaves ample room. Reaches
+  `qiita.action` via the `actions sync` that already runs; nothing extra to do. Expect
+  its jobs to queue more easily and to show `AllocCPUS=8` from this deploy on. (#486)
 
 ---
 

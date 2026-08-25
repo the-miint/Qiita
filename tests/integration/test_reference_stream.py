@@ -15,7 +15,9 @@ test_doget.py.
 
 import duckdb
 import pytest
+
 from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_common.chunking import reassemble_chunks_expr
 
 from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 
@@ -70,7 +72,7 @@ def test_open_doget_stream_scoped_to_feature_subset(data_plane):
         with open_doget_stream(conn, data_plane_url=url, ticket_bytes=ticket) as rel:
             seqs = dict(
                 conn.execute(
-                    f"SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index) "
+                    f"SELECT feature_idx, {reassemble_chunks_expr()} "
                     f"FROM {rel} GROUP BY feature_idx"
                 ).fetchall()
             )
