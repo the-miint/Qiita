@@ -1235,6 +1235,18 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   which the new registry read contradicts: `internal_name` is exactly the key a caller
   matches on there. Comment-only migration; no DDL.
 
+- **The QC adapter set refuses a duplicated chunk position instead of concatenating it
+  (#494).** `_write_adapter_parquet` reassembles the configured adapter reference by joining
+  every chunk row for a feature in `chunk_index` order. Its docstring asserted
+  `(feature_idx, chunk_index)` uniqueness and declined to dedup so that a violation would
+  surface; nothing surfaced it. On the live lake `feature_idx` 127 carries two rows at
+  `chunk_index` 0 — an exact reverse-complement pair, which `canonical_sequence_hash_expr`
+  folds into one feature — so the join returned 66 bp for a 33 bp adapter. It now raises
+  naming every repeated `(feature_idx, chunk_index)`, which `_resolve_qc_adapters` turns
+  into a SUBMISSION `BAD_INPUT` with no partial `adapters.parquet` left behind.
+  `DEPLOY_CHECKLIST.md` bucket 6 carries the one-off delete that repairs the row and names
+  the surviving orientation.
+
 - **Four broken relative links in `docs/deploy-archive/`, and a test that keeps them fixed.**
   All four targets existed; the paths were repo-root-relative (`](docs/runbooks/redeploy.md)`)
   inside `docs/deploy-archive/`, where they resolve against the containing directory. They come
