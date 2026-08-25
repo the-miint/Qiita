@@ -457,11 +457,12 @@ rm -f "$MIINT_BOUNDARY_PROBE"
 
 # The amplicon deblur pipeline (align_sortmerna_rrna → detect_chimera_uchime_denovo
 # → align_mafft → deblur, plus the sequence_dna_as_regexp orient step) is the newest
-# set of miint functions the deploy depends on. The boundary tools run out-of-process
-# (miint-gpl-boundary above invokes one); here assert every amplicon FUNCTION is
-# REGISTERED in the staged build, so a stale build missing one fails at deploy, not
-# at the first amplicon submit. Existence-only: invoking deblur needs real 16S input.
-# Lists ([]), not set literals, so the enclosing f-string needs no brace doubling.
+# set of miint functions the deploy depends on. These are all statically linked
+# in-process (NOT behind the GPL boundary, unlike bowtie2/FastTree), so a registration
+# check is the right level: assert every amplicon FUNCTION is REGISTERED in the staged
+# build, so a stale build missing one fails at deploy, not at the first amplicon
+# submit. Existence-only: invoking deblur needs real 16S input. Lists ([]), not set
+# literals, so the enclosing f-string needs no brace doubling.
 MIINT_AMPLICON_PROBE="$(mktemp)"
 cat > "$MIINT_AMPLICON_PROBE" <<'PYEOF'
 import sys
