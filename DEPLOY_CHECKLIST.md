@@ -78,7 +78,23 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **`ticket:doget` now also reaches a sample's assembled contigs — no scope grant, no
+  re-mint.** A new `POST /assembly/ticket/doget` signs a Flight DoGet ticket for one
+  `(prep_sample_idx, processing_idx)` run's contigs on `assembled_sequence` /
+  `assembled_sequence_chunks`, gated on the existing service-only `ticket:doget`, which
+  the live `compute` account already holds. So every service account carrying that scope
+  gains contig read-back at the restart, with nothing to run. Worth knowing rather than
+  doing: it is the first *sample-derived* sequence surface that scope opens — every other
+  table it reaches is reference data or the derived per-read `alignment` slice — and the
+  route authorizes on scope alone, with no per-study or row-level check. If a site
+  provisioned a second principal holding only `ticket:doget` for reference streaming (the
+  least-privilege split in
+  [`compute-service-account-provisioning.md`](docs/runbooks/compute-service-account-provisioning.md)),
+  that principal now reaches contigs too. The ticket carries the pair, and the data plane
+  resolves which contigs it reaches from the DuckLake `assembly_membership` at read time —
+  so a run re-registered inside the mint's 300 s TTL streams the re-registered rows, and a
+  run whose contigs are in the lake but whose Postgres membership was cleared answers 404
+  at the route. (#476)
 
 ---
 

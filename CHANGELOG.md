@@ -21,6 +21,45 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Per-run contig read-back over Arrow Flight (#476).** `POST
+  /assembly/ticket/doget` takes a `(prep_sample_idx, processing_idx)` pair and
+  signs a DoGet ticket for that assembly run's contigs on
+  `assembled_sequence` / `assembled_sequence_chunks`, which are now in the data
+  plane's `ALLOWED_TABLES`. Neither table has a `prep_sample_idx` column — a
+  contig is stored once under the content-deduped `feature_idx` every run
+  producing those bytes shares — so `build_assembly_run_query` resolves the run
+  through the lake's own `assembly_membership` as a semi join, the same shape a
+  `reference_idx` filter takes on the reference tables. The signed scope is the
+  pair itself: exactly one `prep_sample_idx`, exactly one `processing_idx`, and
+  no third filter column. A `feature_idx` on these tables is refused outright, so
+  no ticket can name a contig; an unscoped ticket cannot be built, so "every
+  sample's contigs" is not representable; and several `processing_idx` values
+  are refused rather than blending two runs into one indistinguishable stream —
+  the same guard the single-`alignment_idx` rule makes. A pair no membership row
+  names is a 404 at the route, never a ticket. The route reuses the service-only
+  `ticket:doget` rather than minting a scope: that scope is on
+  `SERVICE_ACCOUNT_SCOPE_CEILING` and on no human role ceiling, so the principals
+  gaining contig read-back are exactly the service accounts already holding it —
+  but this is the first *sample-derived* sequence surface it reaches, where every
+  prior table was reference data or the derived per-read `alignment` slice.
+  `assembly_membership` and `bin_quality` remain absent from `ALLOWED_TABLES`, so
+  neither is nameable by a ticket; `assembly_membership` is read as the scope
+  resolver and no column of it reaches a stream. The orchestrator seam is
+  `data_plane_client.open_assembly_chunk_stream`, the assembly twin of
+  `open_reference_chunk_stream`.
+
+  Resolving the run in the data plane rather than signing a roster is what keeps
+  the read off a per-key cost curve nothing bounds. Measured on DuckDB 1.5.4 /
+  ducklake d318a545 against a catalog of 3.6M chunk rows over 200 files: a
+  26,129-contig run as a literal `feature_idx IN (...)` is rewritten into a MARK
+  join above an unfiltered scan — 3,600,000 rows scanned, 1,793 ms — while the
+  semi join pushes the resolved keys' min/max and a Bloom filter into the scan as
+  dynamic filters, reading 245,457 rows in 140 ms for the identical 235,161-row
+  result. At a 4,968-contig run it is 233 ms against 37 ms. File pruning is
+  unaffected: both forms open the same 200 files there, and where per-file
+  `feature_idx` ranges are narrow enough to prune at all, both prune to the same
+  1 file of 200.
+
 - **`qiita feature-table build --circular-gate` — judge a read pooled over the records it
   was split into (#475).** A read crossing the origin of a circular reference held as a
   linearised contig is emitted as two records covering half of it each, so a per-record
