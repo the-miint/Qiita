@@ -34,7 +34,10 @@ from ..repositories.alignment_definition import (
     mint_alignment_definition,
 )
 from ..repositories.assembly import fetch_assembly_sample_state
-from ..repositories.block import create_alignment_sample_pending
+from ..repositories.block import (
+    create_alignment_sample_pending,
+    fetch_mask_sample_state,
+)
 from ._db import persist_ticket_idx
 from ._upload import _submission_bad_input
 
@@ -53,6 +56,14 @@ ALIGN_MASK_IDX_BINDING = "align_mask_idx"
 PRESET_BINDING = "preset"
 MIN_IDENTITY_BINDING = "min_identity"
 MIN_QUERY_COVERAGE_BINDING = "min_query_coverage"
+
+# The two identities this workflow CONSUMES, mapped to the name each takes in the
+# hashed params. Neither has a context_schema default — both are `required` — so they
+# are resolved and coerced separately from the knobs above.
+_SELECTOR_KEYS = {
+    ASSEMBLY_PROCESSING_IDX_BINDING: "processing_idx",
+    ALIGN_MASK_IDX_BINDING: "mask_idx",
+}
 
 _KNOB_BINDINGS = (PRESET_BINDING, MIN_IDENTITY_BINDING, MIN_QUERY_COVERAGE_BINDING)
 _KNOB_TYPES = {
@@ -111,11 +122,13 @@ def _build_denovo_alignment_params(
     A submitter-supplied knob overrides the action's default; an omitted one collapses
     onto that default, so omitted-vs-explicit-default are one identity.
 
-    **Every value is coerced to its declared type first**, because the hash is over
-    canonical JSON: a JSON-schema `type: number` admits both `1` and `1.0`, which
-    `json.dumps` renders as two different strings and so two different alignment_idx
-    for one config. `_assert_params_survive_storage` cannot catch it — an integer
-    round-trips jsonb unchanged.
+    **Every value is coerced to its declared type first**, the two consumed identities
+    included, because the hash is over canonical JSON. A JSON-schema `type: number`
+    admits both `1` and `1.0`, and `type: integer` admits `42.0` as well — it matches
+    any number with a zero fractional part, so `{"minimum": 1, "type": "integer"}`
+    validates a float. `json.dumps` renders each pair as two different strings, so one
+    config would take two alignment_idx. `_assert_params_survive_storage` cannot catch
+    it: `42.0` round-trips jsonb unchanged, hashing the same before and after.
 
     **This key set is disjoint from the block path's** (`align_planner` hashes
     `{reference_idx, aligner, mask_idx, shard_ids}`), so a de novo alignment_idx can
@@ -133,13 +146,20 @@ def _build_denovo_alignment_params(
             "context_schema; a missing default means the action declaration is wrong, "
             "not the submission"
         )
+    absent = sorted(binding for binding in _SELECTOR_KEYS if bound.get(binding) is None)
+    if absent:
+        raise _submission_bad_input(
+            f"de novo alignment selectors are incomplete: {absent} absent from "
+            "action_context. Each names an identity this workflow consumes — which "
+            "assembly run's contigs, which mask's reads — and neither has a default to "
+            "fall back on"
+        )
     return {
         "subject": _SUBJECT_ASSEMBLY,
         "workflow": action_id,
         "version": action_version,
-        "processing_idx": bound.get(ASSEMBLY_PROCESSING_IDX_BINDING),
-        "mask_idx": bound.get(ALIGN_MASK_IDX_BINDING),
         "aligner": _ALIGNER,
+        **{key: int(bound[binding]) for binding, key in _SELECTOR_KEYS.items()},
         **{key: _KNOB_TYPES[key](value) for key, value in resolved.items()},
     }
 
@@ -178,17 +198,32 @@ async def _require_assembly_subject(
 ) -> None:
     """Refuse to align unless this assembly run finished and produced contigs.
 
-    Reads the gate, whose three-state contract `fetch_assembly_sample_state` states and
-    which other consumers point at rather than restate. This maps those states to the
-    two outcomes a submission has, so no caller has to: 'completed' proceeds, 'no_data'
-    is the terminal-but-not-a-failure `StepNoData` (the run assembled nothing, so this
-    sample has no subject), and everything else is bad input.
+    Reads the gate, whose contract `fetch_assembly_sample_state` states and which other
+    consumers point at rather than restate. This maps its states to the two outcomes a
+    submission has, so no caller has to: 'completed' proceeds, 'no_data' is the
+    terminal-but-not-a-failure `StepNoData` (the run assembled nothing, so this sample
+    has no subject), and everything else is bad input.
+
+    Absence gets its own message rather than falling into the catch-all, because it is
+    reachable for a sample that really did assemble: this is the first consumer to read
+    the gate, and runs that finished before it existed wrote no row (see the
+    `long-read-assembly` entry in `DEPLOY_CHECKLIST.md`). "gate reads None" would send
+    the operator looking for a stalled run instead of at the remedy.
     """
     state = await fetch_assembly_sample_state(
         pool, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
     )
     if state == "completed":
         return
+    if state is None:
+        raise _submission_bad_input(
+            f"no assembly_sample gate row exists for assembly run {processing_idx} and "
+            f"prep_sample {prep_sample_idx}. Absence is never 'assembled', so there is "
+            "nothing to align against. Two ways to get here: the run never reached this "
+            "sample, or it assembled before the gate existed and so wrote no row. "
+            "Either way the remedy is the same — re-submit long-read-assembly for this "
+            "sample, which is admitted and writes the row."
+        )
     if state == "no_data":
         raise StepNoData(
             reason=(
@@ -202,6 +237,33 @@ async def _require_assembly_subject(
         "this workflow aligns against, so there is nothing to align to until the gate "
         "reads 'completed'"
     )
+
+
+async def _require_masked_query(pool: asyncpg.Pool, *, mask_idx: int, prep_sample_idx: int) -> None:
+    """Refuse to align unless this sample's pass-set under `mask_idx` is complete.
+
+    Reads the gate, whose contract `fetch_mask_sample_state` states; the invariant
+    there is that a consumer which must not read an absent, partial or withdrawn
+    pass-set proceeds on 'completed' alone. This is such a consumer: the pass-set is
+    the QUERY the job aligns, so a 'pending' row would align a fraction of the sample's
+    reads and record the result as the whole of it.
+
+    `routes/read_masked.py` applies the same gate when it mints the DoGet ticket, but
+    that runs when the job asks for it — from a compute node already holding an 8-cpu
+    allocation, and after the mint has written both ticket columns and an
+    alignment_sample row at 'pending' that no reconcile sweeps. Checking here refuses
+    the submission before any of that. `_read_ingest` checks the same gate before its
+    own read stream for the same reason.
+    """
+    state = await fetch_mask_sample_state(pool, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+    if state != "completed":
+        raise _submission_bad_input(
+            f"{ALIGN_MASK_IDX_BINDING} {mask_idx} is not masked-complete for prep_sample "
+            f"{prep_sample_idx} (mask_sample.state={state!r}); its pass-set is the query "
+            "this workflow aligns, and an absent or partial one would align a fraction "
+            "of the sample's reads as though it were all of them. Resubmit once masking "
+            "is completed."
+        )
 
 
 async def _resolve_denovo_alignment_idx(

@@ -24,10 +24,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 - **`qiita reference load` warns when the input carries soft-masked bases (#486).** On
   both front-ends — the `--fasta` upload and `--local`'s `stage_local_fasta`. The
   split normalizes case, so a soft-masked FASTA is stored upper case and the masking is
-  not recoverable from the lake afterwards. The check evaluates the same
-  `normalized_sequence_expr` the split uses, so the two cannot disagree, and stops at the
-  first lower-case record. Every index builder discards case, so only an export of the
-  reference shows the difference.
+  not recoverable from the lake afterwards. Both front-ends share one predicate and one
+  message (`soft_masked_expr` / `SOFT_MASK_WARNING` in `qiita_common.chunking`), and the
+  predicate is built from the same `normalized_sequence_expr` the split routes through,
+  so neither can disagree with what is stored. Every index builder discards case, so
+  only an export of the reference shows the difference.
 
 - **`align-denovo`: align a sample's masked reads back against its own assembly (#486).**
   A prep_sample-scoped workflow that aligns one sample against the contigs its own
@@ -1251,6 +1252,30 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **A de novo `alignment_idx` no longer depends on how a submitter spelled its integers
+  (#486).** `assembly_processing_idx` and `align_mask_idx` were hashed into the identity
+  as received, while the knobs beside them were coerced. JSON Schema `type: integer`
+  matches any number with a zero fractional part, so `42.0` validates; canonical JSON
+  then renders it differently from `42`, giving one config two `alignment_idx` — a re-run
+  that neither replaces its own rows nor is recognized as the same alignment. The mint's
+  jsonb round-trip guard cannot see it, because `42.0` stores and re-reads unchanged.
+  Both are coerced now, and an absent one is refused rather than hashed as null.
+
+- **`align-denovo` checks the `mask_sample` gate at submit rather than at runtime
+  (#486).** The pre-loop verified the mask CONFIG existed but not that it had RUN on this
+  sample. `routes/read_masked.py` refuses to sign the `read_masked` DoGet ticket on
+  anything but `'completed'`, so a ticket naming a `'pending'` mask was admitted, minted
+  its identity, wrote both ticket columns, materialized an `alignment_sample` row at
+  `'pending'` that no reconcile sweeps, and only then failed — from a job already holding
+  its allocation. The same gate `_read_ingest` applies to its own read stream now runs
+  before any of that.
+
+- **A missing `assembly_sample` gate row gets its own refusal (#486).** It previously
+  fell into the catch-all reporting `gate reads None`, which reads as a stalled run.
+  Absence is reachable for a sample that really did assemble — runs that finished before
+  the gate existed wrote no row, and `align-denovo` is its first consumer — so the
+  message now names re-submitting `long-read-assembly` as the remedy.
 
 - **`docs/deploy-archive/2026-08-21-4fc4ce3d.md` carries a dated correction (#486).** Its
   claim that the 24 uncollapsed `reference_sequence_chunks` features are

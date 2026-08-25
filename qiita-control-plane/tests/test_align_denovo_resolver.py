@@ -21,6 +21,10 @@ from qiita_control_plane.repositories.assembly import (
     upsert_assembly_sample_completed,
     upsert_assembly_sample_no_data,
 )
+from qiita_control_plane.repositories.block import (
+    create_mask_sample_pending,
+    upsert_mask_sample_completed,
+)
 from qiita_control_plane.repositories.processing import mint_processing
 from qiita_control_plane.runner._alignment import (
     ALIGN_MASK_IDX_BINDING,
@@ -31,10 +35,12 @@ from qiita_control_plane.runner._alignment import (
     _create_alignment_gate_pending,
     _persist_alignment_idx,
     _require_assembly_subject,
+    _require_masked_query,
     _resolve_denovo_alignment_idx,
 )
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
+    seed_legacy_mask_definition,
     seed_user_principal,
 )
 
@@ -103,16 +109,18 @@ async def _resolve(sample, *, work_ticket_idx=None, schema=None, **overrides):
 
 
 async def test_a_completed_assembly_is_the_only_state_that_admits_the_ticket(sample):
-    """The three outcomes, in one place because the caller does not branch on them.
+    """The outcomes, in one place because the caller does not branch on them.
 
     'pending' and a missing row are the same answer — the run is not over — but they
-    reach it differently (a live ticket vs a sample the run never touched), so both
-    are exercised rather than one standing in for the other.
+    reach it differently, and only one of them is reachable for a sample that really
+    did assemble: a run predating the gate wrote no row at all. So each carries its own
+    message, and the assertions pin which is which rather than letting one stand in for
+    the other.
     """
     pool, processing_idx = sample["pool"], sample["processing_idx"]
     prep_sample_idx = sample["prep_sample_idx"]
 
-    with pytest.raises(Exception, match="is not complete"):
+    with pytest.raises(Exception, match="no assembly_sample gate row exists"):
         await _require_assembly_subject(
             pool, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
         )
@@ -155,6 +163,43 @@ async def test_an_assembly_that_produced_nothing_ends_the_ticket_rather_than_fai
         await _require_assembly_subject(
             pool, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
         )
+
+
+async def test_only_a_completed_mask_admits_the_ticket(sample):
+    """The query side of the same question `_require_assembly_subject` asks of the
+    subject. The mask CONFIG existing says nothing about whether it has RUN on this
+    sample: a 'pending' row means a covering block is still masking, so the pass-set is
+    a fraction of the sample's reads, and aligning it would record that fraction as the
+    whole. Absence is not "exempt" either (contract: `fetch_mask_sample_state`).
+
+    Without this the refusal still happens — `routes/read_masked.py` will not sign the
+    DoGet ticket — but only once the job asks, from a node already holding its
+    allocation and after the mint has left an alignment_sample row at 'pending'.
+    """
+    pool, prep_sample_idx = sample["pool"], sample["prep_sample_idx"]
+    mask_idx = await seed_legacy_mask_definition(
+        pool,
+        params={
+            "filter_workflow": "read-mask",
+            "filter_version": "1.0.0",
+            "s": secrets.token_hex(4),
+        },
+        created_by_idx=sample["principal_idx"],
+    )
+
+    with pytest.raises(Exception, match="is not masked-complete"):
+        await _require_masked_query(pool, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+
+    async with pool.acquire() as conn, conn.transaction():
+        await create_mask_sample_pending(
+            conn, mask_idx=mask_idx, prep_sample_idxs=[prep_sample_idx]
+        )
+    with pytest.raises(Exception, match="is not masked-complete"):
+        await _require_masked_query(pool, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+
+    async with pool.acquire() as conn, conn.transaction():
+        await upsert_mask_sample_completed(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+    await _require_masked_query(pool, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
 
 
 async def test_the_same_params_resolve_to_the_same_alignment_idx(sample):

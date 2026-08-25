@@ -37,6 +37,7 @@ from ._alignment import (
     _create_alignment_gate_pending,
     _persist_alignment_idx,
     _require_assembly_subject,
+    _require_masked_query,
     _resolve_denovo_alignment_idx,
     _workflow_writes_alignment_gate,
 )
@@ -613,6 +614,12 @@ async def run_workflow(
                     f"action_context names {ALIGN_MASK_IDX_BINDING} {denovo_mask_idx}, "
                     "which does not exist"
                 )
+            # The mask CONFIG existing is not the mask having RUN on this sample. Both
+            # refusals come before the writes below, and before the mask column, since
+            # neither has a terminal-but-not-a-failure exit to preserve a column for.
+            await _require_masked_query(
+                pool, mask_idx=denovo_mask_idx, prep_sample_idx=prep_sample_idx
+            )
             # Persist the CONSUMED mask onto the ticket BEFORE the assembly-gate check,
             # for the reason the staged-masked-reads branch above persists before its
             # resolver: the check has a terminal exit that is not a failure (a run that

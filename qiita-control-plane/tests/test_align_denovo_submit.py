@@ -15,6 +15,7 @@ import pytest
 from qiita_common.actions import ALIGNMENT_IDX_BINDING, WorkflowAction, WorkflowStep
 from qiita_common.analytic import CIRCULAR_MIN_COVERAGE, CIRCULAR_MIN_IDENTITY
 from qiita_common.api_paths import LibraryPrimitive
+from qiita_common.hashing import canonical_params_hash
 
 from qiita_control_plane.actions import load_actions
 from qiita_control_plane.runner._alignment import (
@@ -181,6 +182,29 @@ def test_an_omitted_knob_collapses_onto_the_action_default():
     assert _params(base) == _params(
         {**base, PRESET_BINDING: "map-hifi", MIN_IDENTITY_BINDING: 0.95}
     )
+
+
+def test_a_float_selector_and_an_integer_selector_are_one_identity():
+    """`{"type": "integer"}` admits `42.0` as well as `42` — JSON Schema matches any
+    number with a zero fractional part — so a client that renders its integers as
+    floats validates. Uncoerced, the two canonicalize to `42.0` and `42`, giving one
+    config two alignment_idx: a re-run neither replaces its own rows nor is recognized
+    as the same alignment. The jsonb round-trip guard on the mint cannot catch it,
+    because `42.0` stores and re-reads unchanged."""
+    ints = _params({ASSEMBLY_PROCESSING_IDX_BINDING: 88, ALIGN_MASK_IDX_BINDING: 99})
+    floats = _params({ASSEMBLY_PROCESSING_IDX_BINDING: 88.0, ALIGN_MASK_IDX_BINDING: 99.0})
+    assert ints == floats
+    assert canonical_params_hash(ints) == canonical_params_hash(floats)
+
+
+def test_a_selector_absent_from_action_context_is_refused():
+    """Unlike a knob, neither consumed identity has a context_schema default, so an
+    absent one has nothing to collapse onto. Hashing it as null would mint a real
+    alignment_idx keyed on "no assembly run"."""
+    with pytest.raises(Exception, match="selectors are incomplete"):
+        _params({ASSEMBLY_PROCESSING_IDX_BINDING: 88})
+    with pytest.raises(Exception, match="selectors are incomplete"):
+        _params({ALIGN_MASK_IDX_BINDING: 99})
 
 
 def test_a_supplied_knob_overrides_the_action_default():

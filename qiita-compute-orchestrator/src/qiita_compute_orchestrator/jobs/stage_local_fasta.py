@@ -57,7 +57,11 @@ import logging
 from pathlib import Path
 
 from pydantic import BaseModel
-from qiita_common.chunking import normalized_sequence_expr, sequence_split_expr
+from qiita_common.chunking import (
+    SOFT_MASK_WARNING,
+    sequence_split_expr,
+    soft_masked_expr,
+)
 from qiita_common.duckdb_miint import is_empty_sequence_file
 from qiita_common.parquet import validate_parquet_path
 
@@ -190,7 +194,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             conn.execute(
                 "CREATE TEMP TABLE read_sanity AS "
                 "SELECT read_id, length(sequence1) AS length, filepath, "
-                f"sequence1 <> {normalized_sequence_expr('sequence1')} AS soft_masked "
+                f"{soft_masked_expr('sequence1')} AS soft_masked "
                 f"FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
                 "include_filepath:=true)",
                 [paths],
@@ -225,23 +229,16 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     f"files -> {files}"
                 )
 
-            # The split normalizes case, so a soft-masked record is stored upper
-            # case and the masking is not recoverable from the lake afterwards.
-            # The flag rides pass 1's existing scan, so this costs no extra read.
+            # The flag rides pass 1's existing scan, so this costs no extra read —
+            # unlike `reference load`, which pays a second bounded one. What the
+            # masking costs is on `SOFT_MASK_WARNING`.
             masked = conn.execute(
                 "SELECT DISTINCT filepath FROM read_sanity WHERE soft_masked "
                 "ORDER BY filepath LIMIT ?",
                 [_MAX_REPORT],
             ).fetchall()
             if masked:
-                _LOG.warning(
-                    "soft-masked (lower case) bases in %s. Chunks are stored upper case,"
-                    " so the masking is discarded at load and cannot be recovered from"
-                    " the lake — an export of this reference will return upper case."
-                    " Every index builder discards case as well, so alignment and"
-                    " classification are unaffected.",
-                    ", ".join(row[0] for row in masked),
-                )
+                _LOG.warning(SOFT_MASK_WARNING, ", ".join(row[0] for row in masked))
 
             # Pass 2 — chunk + write in one streaming COPY using miint's native
             # `sequence_split` (shared chunker; see qiita_common.chunking). Each

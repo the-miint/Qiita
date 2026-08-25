@@ -29,8 +29,10 @@ _None yet._
   `qiita.mask_sample` and `qiita.alignment_sample`. The index is created with the table, so
   it is a plain `CREATE INDEX` over zero rows — no `CONCURRENTLY`, nothing to lock.
   **No backfill**: assemblies already completed on this host get no gate row, so they read
-  as not-assembled. No code reads the gate yet; whether to backfill them is a separate
-  decision. The migrate→restart window has the same shape — an
+  as not-assembled. `align-denovo` (below) is the first consumer to read it, and it refuses
+  a submission naming an assembly run with no row — the refusal names re-submitting
+  `long-read-assembly` for that sample as the remedy. Whether to backfill instead is a
+  separate decision. The migrate→restart window has the same shape — an
   assembly ticket completing between bucket 3 and the bucket-4 restart runs under old code
   that writes no gate row. Re-submitting such a sample after the restart is admitted and
   re-writes it (no disallow-without-delete site applies to `long-read-assembly`). (#467)
