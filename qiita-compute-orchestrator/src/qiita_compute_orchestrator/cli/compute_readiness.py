@@ -455,6 +455,45 @@ else
 fi
 rm -f "$MIINT_BOUNDARY_PROBE"
 
+# The amplicon deblur pipeline (align_sortmerna_rrna → detect_chimera_uchime_denovo
+# → align_mafft → deblur, plus the sequence_dna_as_regexp orient step) is the newest
+# set of miint functions the deploy depends on. The boundary tools run out-of-process
+# (miint-gpl-boundary above invokes one); here assert every amplicon FUNCTION is
+# REGISTERED in the staged build, so a stale build missing one fails at deploy, not
+# at the first amplicon submit. Existence-only: invoking deblur needs real 16S input.
+# Lists ([]), not set literals, so the enclosing f-string needs no brace doubling.
+MIINT_AMPLICON_PROBE="$(mktemp)"
+cat > "$MIINT_AMPLICON_PROBE" <<'PYEOF'
+import sys
+try:
+    import duckdb
+    from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+    conn = duckdb.connect(":memory:", config=miint_connect_config())
+    conn.execute(miint_load_sql())
+    want = [
+        "align_sortmerna_rrna", "detect_chimera_uchime_denovo",
+        "align_mafft", "deblur", "sequence_dna_as_regexp",
+    ]
+    rows = conn.execute(
+        "SELECT DISTINCT function_name FROM duckdb_functions() "
+        "WHERE function_name IN ('align_sortmerna_rrna', 'detect_chimera_uchime_denovo', "
+        "'align_mafft', 'deblur', 'sequence_dna_as_regexp')"
+    ).fetchall()
+    have = [r[0] for r in rows]
+    missing = [f for f in want if f not in have]
+    assert not missing, "missing miint amplicon functions: " + ", ".join(missing)
+except Exception as exc:
+    msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
+    print(msg[:500])
+    sys.exit(1)
+PYEOF
+if MIINT_ERR="$("$PYTHON" "$MIINT_AMPLICON_PROBE" 2>/dev/null)"; then
+    echo "{_PROBE_LINE_PREFIX} miint-amplicon-fns=ok"
+else
+    echo "{_PROBE_LINE_PREFIX} miint-amplicon-fns=fail err=$MIINT_ERR"
+fi
+rm -f "$MIINT_AMPLICON_PROBE"
+
 # The `/ticket` leaf must match the control plane's PATH_SCRATCH/ticket
 # derivation (qiita_control_plane.config.Settings.from_env) — that's the
 # per-ticket workspace SLURM jobs actually run in.

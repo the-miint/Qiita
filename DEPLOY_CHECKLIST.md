@@ -44,7 +44,12 @@ _None yet._
 - **Confirm the two amplicon workflows synced.** `golay-demux 1.0.0` and `amplicon 1.0.0`
   reach `qiita.action` via `qiita-admin actions sync` inside `activate.sh` — no migration.
   `make verify-deploy` lists `qiita.action`; check both appear. The new DuckLake
-  `amplicon_membership` table is auto-created at data-plane boot (no migration, no action).
+  `amplicon_membership`, `amplicon_sequence`, and `amplicon_sequence_chunks` tables are
+  auto-created at data-plane boot (no migration, no action). `make verify-deploy`'s
+  compute-readiness probe now includes a `miint-amplicon-fns` check that asserts the
+  amplicon deblur functions (`align_sortmerna_rrna`, `detect_chimera_uchime_denovo`,
+  `align_mafft`, `deblur`, `sequence_dna_as_regexp`) are registered in the staged miint
+  build — a stale build missing one fails the deploy here, not at the first amplicon submit.
   The `amplicon` workflow additionally needs a SortMeRNA 16S database loaded as an ACTIVE
   `sequence_reference` (its `reference_idx` is a submit-time context arg) — a per-study data
   setup, not a deploy step. (#244)

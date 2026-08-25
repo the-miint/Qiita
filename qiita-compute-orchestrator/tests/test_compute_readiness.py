@@ -314,6 +314,24 @@ def test_probe_script_checks_miint_host_filter_functions():
     assert "miint-host-filter-fns=fail" in script
 
 
+def test_probe_script_checks_amplicon_functions():
+    """The probe asserts the amplicon deblur functions (align_sortmerna_rrna,
+    detect_chimera_uchime_denovo, align_mafft, deblur, sequence_dna_as_regexp) are
+    registered in the staged miint build — the newest deploy dependency, so a stale
+    build missing one surfaces at deploy, not at the first amplicon submit."""
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    for fn in (
+        "align_sortmerna_rrna",
+        "detect_chimera_uchime_denovo",
+        "align_mafft",
+        "deblur",
+        "sequence_dna_as_regexp",
+    ):
+        assert fn in script
+    assert "miint-amplicon-fns=ok" in script
+    assert "miint-amplicon-fns=fail" in script
+
+
 def test_probe_script_checks_gpl_boundary():
     """The probe INVOKES `save_bowtie2_index`, which shells to the GPL-boundary
     host — the one miint surface no other probe exercised, and the exact thing
