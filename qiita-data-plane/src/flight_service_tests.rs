@@ -1,4 +1,4 @@
-//! Unit tests for [`super`]. Split out of `flight_service.rs`, which was 9156 lines
+//! Unit tests for [`super`]. Split out of `flight_service.rs`, which was 9398 lines
 //! with 60% of them tests; the module is still a child of
 //! `flight_service` via `#[path]`, so it reaches private items through `use super::*`.
 
@@ -2734,10 +2734,9 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
     ));
 }
 
-/// The reference pair takes the same path as the assembly pair, and unlike it
-/// is Flight-readable (`ALLOWED_TABLES`), so a duplicate there reaches a
-/// consumer. Two references sharing a sequence each ship that feature's rows;
-/// after both loads there is one of each.
+/// The reference pair takes the same path as the assembly pair. Two
+/// references sharing a sequence each ship that feature's rows; after both
+/// loads there is one of each.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -3984,6 +3983,162 @@ fn build_query_alignment_visible_requires_alignment_idx() {
     assert!(
         build_query("alignment_visible", &empty, &[], &[]).is_err(),
         "empty filter on alignment_visible must be rejected"
+    );
+}
+
+/// A `feature_idx` filter, the only scope an assembly ticket carries.
+fn feature_scope(values: &[i64]) -> auth::TicketFilter {
+    let mut filter = auth::TicketFilter::new();
+    filter.insert(
+        "feature_idx".to_string(),
+        values.iter().map(|v| serde_json::Value::from(*v)).collect(),
+    );
+    filter
+}
+
+#[test]
+fn assembly_surfaces_are_doget_allowed_and_the_junction_is_not() {
+    // The two sequence surfaces are Flight-readable. `assembly_membership`
+    // is read to RESOLVE their scope (`build_assembly_run_query`) but is not
+    // a table a ticket can name; `bin_quality` is a register_files write
+    // target only.
+    for readable in ["assembled_sequence", "assembled_sequence_chunks"] {
+        assert!(
+            ALLOWED_TABLES.contains(&readable),
+            "{readable:?} must be DoGet-readable for the contig read-back"
+        );
+    }
+    for sink in ["assembly_membership", "bin_quality"] {
+        assert!(
+            !ALLOWED_TABLES.contains(&sink),
+            "{sink:?} must not be Flight-reachable"
+        );
+    }
+}
+
+/// A well-formed assembly ticket filter: the run, and only the run.
+fn assembly_run_scope(prep_sample_idx: i64, processing_idx: i64) -> auth::TicketFilter {
+    filter_of(&[
+        ("prep_sample_idx", vec![serde_json::json!(prep_sample_idx)]),
+        ("processing_idx", vec![serde_json::json!(processing_idx)]),
+    ])
+}
+
+#[test]
+fn build_query_assembly_resolves_the_run_through_membership() {
+    for table in ["assembled_sequence", "assembled_sequence_chunks"] {
+        let (sql, full) = build_query(table, &assembly_run_scope(42, 7), &[], &[]).unwrap();
+        assert_eq!(full, format!("qiita_lake.{table}"));
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT * FROM qiita_lake.{table} WHERE feature_idx IN (\
+                 SELECT feature_idx FROM qiita_lake.assembly_membership \
+                 WHERE prep_sample_idx = 42 AND processing_idx = 7)"
+            ),
+            "got: {sql}"
+        );
+    }
+}
+
+#[test]
+fn build_query_assembly_requires_exactly_the_run_key() {
+    // Every rejected shape below would stream contigs the named run did not
+    // produce, or none at all.
+    let empty = auth::TicketFilter::new();
+    let cases: &[(&str, auth::TicketFilter)] = &[
+        ("empty filter", empty.clone()),
+        (
+            "prep_sample_idx alone",
+            filter_of(&[("prep_sample_idx", vec![serde_json::json!(42)])]),
+        ),
+        (
+            "processing_idx alone",
+            filter_of(&[("processing_idx", vec![serde_json::json!(7)])]),
+        ),
+        (
+            "two runs",
+            filter_of(&[
+                ("prep_sample_idx", vec![serde_json::json!(42)]),
+                (
+                    "processing_idx",
+                    vec![serde_json::json!(7), serde_json::json!(8)],
+                ),
+            ]),
+        ),
+        (
+            "two samples",
+            filter_of(&[
+                (
+                    "prep_sample_idx",
+                    vec![serde_json::json!(42), serde_json::json!(43)],
+                ),
+                ("processing_idx", vec![serde_json::json!(7)]),
+            ]),
+        ),
+        (
+            "the run plus a named contig",
+            filter_of(&[
+                ("prep_sample_idx", vec![serde_json::json!(42)]),
+                ("processing_idx", vec![serde_json::json!(7)]),
+                ("feature_idx", vec![serde_json::json!(11)]),
+            ]),
+        ),
+        ("a contig roster alone", feature_scope(&[11, 22, 33])),
+    ];
+    for table in ["assembled_sequence", "assembled_sequence_chunks"] {
+        for (label, filter) in cases {
+            assert!(
+                build_query(table, filter, &[], &[]).is_err(),
+                "{table} must reject {label}"
+            );
+        }
+    }
+    // Control: the same empty filter IS served for a reference table, so the
+    // first case above is about these tables and not about empty filters.
+    assert!(build_query("reference_sequences", &empty, &[], &[]).is_ok());
+}
+
+#[test]
+fn build_query_assembly_takes_no_projection_and_no_members() {
+    // No projection allowlist (only the alignment surface has one), so a
+    // signed column list is refused rather than dropped; and `members` is
+    // only meaningful for the block-read selectors.
+    for table in ["assembled_sequence", "assembled_sequence_chunks"] {
+        assert!(
+            build_query(
+                table,
+                &assembly_run_scope(42, 7),
+                &[],
+                &columns(&["feature_idx"])
+            )
+            .is_err(),
+            "{table} must reject a projection column list"
+        );
+        assert!(
+            build_query(table, &assembly_run_scope(42, 7), &block_members(), &[]).is_err(),
+            "{table} must reject a block members selector"
+        );
+    }
+}
+
+#[test]
+fn build_query_assembly_membership_reaches_no_output_column() {
+    // The junction answers "which contigs are this run's" and stops there:
+    // the subquery yields feature_idx, so no membership column can ride out
+    // on a stream whose table is not it (see the allowlist test above).
+    let (sql, full) = build_query(
+        "assembled_sequence_chunks",
+        &assembly_run_scope(42, 7),
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(full, "qiita_lake.assembled_sequence_chunks");
+    assert!(sql.starts_with("SELECT * FROM qiita_lake.assembled_sequence_chunks"));
+    assert!(
+        !sql.contains("kind") && !sql.contains("bin_id"),
+        "got: {sql}"
     );
 }
 

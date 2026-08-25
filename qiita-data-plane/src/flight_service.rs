@@ -338,6 +338,15 @@ const ALLOWED_TABLES: &[&str] = &[
     // here, unlike every other table — and always scoped by alignment_idx +
     // prep_sample_idx (see build_query / ALIGNMENT_PROJECTION_COLUMNS).
     "alignment_visible",
+    // One assembly run's contigs — sample-derived sequence, where everything
+    // above is reference data or per-read derived output. Neither table has a
+    // prep_sample_idx column; a ticket names the run by `(prep_sample_idx,
+    // processing_idx)` and `build_assembly_run_query` resolves it through
+    // `qiita_lake.assembly_membership`, the same shape as the `reference_idx`
+    // resolution the MEMBERSHIP_JOIN_TABLES get. A `feature_idx` filter is NOT
+    // accepted on either, and neither is an empty one.
+    "assembled_sequence",
+    "assembled_sequence_chunks",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -353,6 +362,9 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
     "prep_sample_idx",
     // Scopes an alignment DoGet to a single alignment run (feature-table consumer).
     "alignment_idx",
+    // With prep_sample_idx, names the assembly RUN an assembly DoGet resolves
+    // through `assembly_membership` (`build_assembly_run_query`).
+    "processing_idx",
 ];
 
 /// Columns a signed ticket may ask the alignment DoGet to project: every column
@@ -2026,10 +2038,10 @@ fn mask_metrics_counts(
 /// 2. Every row set carrying one key is an acceptable substitute for any other.
 ///    `sequence_hash` and `sequence_length_bp` are functions of the feature, so
 ///    those are identical. `chunk_data` is NOT: the canonical hash is
-///    `LEAST(md5(seq), md5(revcomp(seq)))` over the upper-cased sequence, so a
-///    sequence, its reverse complement, and its case variants share one
-///    `feature_idx` while differing byte for byte. Replacing therefore lets the
-///    newest load's strand and casing win.
+///    `LEAST(md5(seq), md5(revcomp(seq)))`, so a sequence and its reverse
+///    complement share one `feature_idx` while differing byte for byte. Replacing
+///    therefore lets the newest load's strand win. Case does not vary here — the
+///    write side normalizes it (`qiita_common.chunking.normalized_sequence_expr`).
 ///
 /// Without the replace both byte strings persist and a reader gets them
 /// concatenated — neither strand, and a length that matches nothing. With it a
@@ -3338,6 +3350,28 @@ fn is_alignment_doget_surface(table: &str) -> bool {
     table == "alignment_visible"
 }
 
+/// Tables `build_query` refuses to serve on an empty filter.
+///
+/// The `reference_*` tables are broadly readable by design (an unfiltered SELECT
+/// there mirrors the anonymous REST `GET /reference/{idx}`), so the refusal is
+/// per-table rather than global. What is listed is the one table an empty filter
+/// would turn into the whole alignment sink. The assembly surfaces are not
+/// listed and do not need to be: like `read_masked`, their scope IS their query
+/// shape (`build_assembly_run_query`), which has no empty form to refuse.
+fn requires_scoped_filter(table: &str) -> bool {
+    is_alignment_doget_surface(table)
+}
+
+/// The DoGet surfaces whose scope is one assembly RUN.
+///
+/// Neither carries `prep_sample_idx` — a contig is stored once, keyed by the
+/// content-deduped `feature_idx` it shares with every other run that produced
+/// the same bytes — so which contigs are "this run's" is a fact held by
+/// `assembly_membership`, and `build_assembly_run_query` reads it there.
+fn is_assembly_run_surface(table: &str) -> bool {
+    matches!(table, "assembled_sequence" | "assembled_sequence_chunks")
+}
+
 /// Build a SQL query for the given table and filter.
 ///
 /// SQL injection defense model:
@@ -3382,6 +3416,12 @@ fn build_query(
         return build_read_masked_query(filter);
     }
 
+    // An assembly surface is scoped by a run, which is a fact in another table
+    // rather than a column of this one — also not a generic WHERE clause.
+    if is_assembly_run_surface(table) {
+        return build_assembly_run_query(table, filter);
+    }
+
     if filter.is_empty() {
         // Defense-in-depth against a full-table read leak. The human-read surface
         // no longer reaches here at all — `read_masked` is a macro that cannot be
@@ -3393,10 +3433,9 @@ fn build_query(
         // *empty* case, not every under-scoped one: a non-empty but non-scoping
         // filter (e.g. feature_idx alone) still passes today. Making an unfiltered
         // read opt-in via an allowlist is still a tracked durability follow-up.
-        // The reference_* tables are broadly readable by design (this mirrors
-        // the anonymous REST `GET /reference/{idx}`), so an unfiltered SELECT is
-        // legitimate there — reject empty filters only for the alignment surface.
-        if is_alignment_doget_surface(table) {
+        // Which tables are refused, and why the reference_* ones are not, is at
+        // `requires_scoped_filter`.
+        if requires_scoped_filter(table) {
             return Err(Status::invalid_argument(format!(
                 "{table} requires a non-empty filter (refusing full-table read)"
             )));
@@ -3529,6 +3568,54 @@ fn build_read_masked_query(filter: &auth::TicketFilter) -> Result<(String, Strin
     Ok((
         format!("SELECT * FROM {}", read_masked_relation(mask_idx, &preps)),
         "qiita_lake.read_masked".to_string(),
+    ))
+}
+
+/// Build the assembly DoGet: one run's contigs, selected by a semi join against
+/// the lake's own `assembly_membership` rather than by a roster the ticket
+/// carries.
+///
+/// The ticket names the run and nothing else — exactly one `prep_sample_idx`,
+/// exactly one `processing_idx`, no third column. Several values, or an extra
+/// column, would blend contigs from heterogeneous runs into one
+/// indistinguishable stream, the same failure the single-`alignment_idx` guard
+/// prevents; `feature_idx` in particular is refused, so no ticket can name
+/// contigs directly on these tables.
+///
+/// `IN (subquery)`, not a literal list: DuckDB plans it as a SEMI hash join and
+/// pushes the resolved keys' min/max and a Bloom filter into the lake scan as
+/// dynamic filters. Measured on DuckDB 1.5.4 / ducklake d318a545, a catalog of
+/// 3.6M chunk rows over 200 files, a 26,129-contig run: this form's scan emits
+/// 245,457 rows in 140 ms, while the same roster as 26,129 literals is rewritten
+/// into a MARK join above an unfiltered scan — 3,600,000 rows, 1,793 ms — with
+/// both forms opening the same 200 files and returning the same 235,161 rows.
+/// Where per-file `feature_idx` ranges are narrow enough to prune at all, the two
+/// prune identically (1 file of 200 on a contiguous run). Semi-join semantics
+/// also make the DISTINCT implicit: a contig that two `(kind, bin_id)` rows claim
+/// is one output row, not two.
+///
+/// `assembly_membership` stays out of `ALLOWED_TABLES` — it is readable here as
+/// the scope resolver, never as a stream: no column of it reaches the output.
+fn build_assembly_run_query(
+    table: &str,
+    filter: &auth::TicketFilter,
+) -> Result<(String, String), Status> {
+    let prep_sample_idx = single_i64_filter(filter, "prep_sample_idx")?;
+    let processing_idx = single_i64_filter(filter, "processing_idx")?;
+    if filter.len() != 2 {
+        return Err(Status::invalid_argument(format!(
+            "{table} accepts only prep_sample_idx and processing_idx, got {} columns",
+            filter.len()
+        )));
+    }
+    let full_table = format!("qiita_lake.{table}");
+    Ok((
+        format!(
+            "SELECT * FROM {full_table} WHERE feature_idx IN (\
+             SELECT feature_idx FROM qiita_lake.assembly_membership \
+             WHERE prep_sample_idx = {prep_sample_idx} AND processing_idx = {processing_idx})"
+        ),
+        full_table,
     ))
 }
 

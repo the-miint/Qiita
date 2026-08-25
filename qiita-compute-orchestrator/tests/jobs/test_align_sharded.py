@@ -530,9 +530,9 @@ def test_align_sharded_query_view_is_what_routing_and_the_probe_read(tmp_path, m
     pass still read a VIEW, and the copy does not exist yet when they run.
 
     Both would be actively worse off against a table: the probe is answered from the
-    Parquet's row-group statistics without touching the sequence columns, and rype
-    materializes its own corpus copy internally, so building ours first would hold two
-    copies of the block at once."""
+    Parquet's row-group statistics without touching the sequence columns, and rype holds
+    its accumulated reads plus its minimizer structures for the length of the classify,
+    so building ours first would stack a full copy of the block on top of that peak."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
     _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", "TTGG")])
@@ -559,7 +559,7 @@ def test_align_sharded_query_view_is_what_routing_and_the_probe_read(tmp_path, m
     )
     asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
 
-    assert routed_query_tables == [align_sharded._ROUTING_QUERY]
+    assert routed_query_tables == [align_sharded._QUERY]
     probe = _sole_index(sql_log, "count(sequence2), count(*)", what="SE/PE probe")
     created = _sole_index(
         sql_log, f"CREATE TABLE {align_sharded._QUERY_MATERIALIZED}", what="materialize"
@@ -567,32 +567,20 @@ def test_align_sharded_query_view_is_what_routing_and_the_probe_read(tmp_path, m
     assert probe < created
 
 
-@pytest.mark.parametrize(
-    ("sequence2", "routing_cols"),
-    [
-        (None, ["read_id", "sequence1"]),
-        ("TTGG", ["read_id", "sequence1", "sequence2"]),
-    ],
-    ids=["single-end", "paired-end"],
-)
-def test_align_sharded_routing_query_drops_an_all_null_mate(
-    tmp_path, monkeypatch, sequence2, routing_cols
-):
-    """A single-end block hands the rype routing pass `sequence1` ALONE; a paired-end one
-    keeps both mates. The ALIGNER keeps both mates either way.
+@pytest.mark.parametrize("sequence2", [None, "TTGG"], ids=["single-end", "paired-end"])
+def test_align_sharded_routes_from_a_view_carrying_both_mates(tmp_path, monkeypatch, sequence2):
+    """The routing pass reads the full `_QUERY`, and reads it as a VIEW.
 
-    This is a batch-SIZING property, not a projection tidy-up, and it is invisible in the
-    output — which is why it needs pinning here. miint derives rype's `is_paired` from the
-    PRESENCE of a `sequence2` column and never from its values (duckdb-miint#199), and rype
-    then assumes a query twice as long, halving its Arrow batch size. Since
-    `rype_classify_arrow` reloads the whole index once per batch, an all-NULL `sequence2`
-    doubles the number of full router-index reads — measured at ~54 min each against the
-    193 GB w=20 WoL3 router. Nothing about the alignments produced would change, so only
-    an assertion on the relation's COLUMN LIST can catch a regression here.
+    Both properties are invisible in the output. A TABLE here would stack a second copy of
+    the block's sequences (~15 GB long-read) on top of rype's own peak, so only
+    `table_type` can pin it.
+
+    The parametrize is the assertion on the column list: the same three columns for either
+    read shape is what says the relation handed to rype is UNCONDITIONAL.
 
     The aligner assertion is the other half: `sequence2` must survive into
     `_QUERY_MATERIALIZED`, because both sharded aligners need it to align a pair natively.
-    Narrowing that relation instead of this one would silently turn PE alignment into SE."""
+    Narrowing that relation would silently turn PE alignment into SE."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
     _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", sequence2)])
@@ -618,9 +606,9 @@ def test_align_sharded_routing_query_drops_an_all_null_mate(
             [d[0] for d in conn.execute(f"SELECT * FROM {query_table} LIMIT 0").description]
         )
         # The KIND matters as much as the columns: a TABLE here would hold a second
-        # copy of the block's sequences (~15 GB long-read) concurrently with the
-        # corpus copy rype makes internally — the hazard docs/duckdb-miint.md
-        # documents, and the reason this is a view over a view.
+        # copy of the block's sequences (~15 GB long-read) on top of rype's own peak,
+        # which is why routing reads the lazy Parquet scan. See the note at the
+        # _QUERY_MATERIALIZED create.
         seen_routing_kinds.append(
             conn.execute(
                 "SELECT table_type FROM information_schema.tables WHERE table_name = ?",
@@ -642,7 +630,7 @@ def test_align_sharded_routing_query_drops_an_all_null_mate(
     )
     asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
 
-    assert seen_routing_cols == [routing_cols]
+    assert seen_routing_cols == [["read_id", "sequence1", "sequence2"]]
     assert seen_routing_kinds == ["VIEW"]
     assert calls[0]["cols"] == ["read_id", "sequence1", "sequence2"]
 

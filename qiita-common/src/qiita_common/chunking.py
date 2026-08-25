@@ -21,7 +21,9 @@ revert to pure SQL.
 
 The constants single-source the chunk width and the ~1 GB row-group size shared
 by the chunked-Parquet write path and the CLI's DoPut batches, so a tuning change
-lands in one place.
+lands in one place. `normalized_sequence_expr` does the same for case: the split
+and the canonical hash both route through it, so stored bytes and the hash that
+keyed them agree.
 
 (This module replaced the old `fasta_chunker.py` Python parser, which was
 removed once both call sites moved to `read_fastx` — see the project memory
@@ -32,6 +34,33 @@ CHUNK_SIZE = 65_536  # bytes per chunk_data cell (64 KB)
 CHUNK_ROW_GROUP_SIZE = 16_384  # rows per Parquet row group (~1 GB at 64 KB chunks)
 
 
+def normalized_sequence_expr(seq: str) -> str:
+    """SQL expression normalizing the sequence column/expression `seq` to the form
+    Qiita stores and hashes: upper case. `sequence_split_expr` (what gets stored)
+    and `canonical_sequence_hash_expr` (what mints the `feature_idx`) both route
+    through here, so the bytes in `*_sequence_chunks` and the hash that keyed them
+    cannot disagree about case. The canonical hash folds case, so two records
+    differing only in case share one `feature_idx`; a split that preserved case
+    wrote different bytes under that one key, leaving the survivor to the lake's
+    replace-by-key and so to load order.
+
+    Case is discarded at load and is not recoverable from the lake, which costs
+    the repeat-masking of a submitted FASTA. Measured 2026-08-24 against the
+    team-mirror miint build (`rype 1.0.0-rc.2-48-g345aee9`, `minimap2 0477498`) on
+    a reference differing only in a 20 kb soft-masked repeat: every index built
+    from it is byte-identical to its uppercase twin's — `rype_index_create`
+    (k=64, w=20), `save_minimap2_index` at presets sr / map-hifi / map-ont / asm5,
+    and `save_bowtie2_index` — while a one-base edit to the same reference changes
+    all of them. That covers the four index builders that read `chunk_data`.
+
+    Strand is NOT normalized: the canonical hash folds strands too, so a sequence
+    and its reverse complement share one `feature_idx` while their stored bytes
+    differ, and which orientation survives still follows load order (see the strand
+    caveat on the control plane's `_write_genome_fasta`).
+    """
+    return f"upper({seq})"
+
+
 def sequence_split_expr(seq: str) -> str:
     """SQL expression splitting the sequence column/expression `seq` into
     `CHUNK_SIZE`-byte chunks via miint's native `sequence_split`: a LIST of
@@ -39,12 +68,15 @@ def sequence_split_expr(seq: str) -> str:
     rows, e.g. ``UNNEST(sequence_split_expr("sequence")) AS c`` then
     ``c.chunk_index`` / ``c.chunk_data``.
 
-    `CHUNK_SIZE` is baked in so the chunk width is single-sourced across both
-    call sites (orchestrator `stage_local_fasta`, CLI `reference load`). Plain
-    SQL text (no duckdb import here); the caller executes it on a connection that
-    has miint loaded.
+    The sequence is normalized through `normalized_sequence_expr` before it is
+    split, so the stored `chunk_data` is upper case regardless of the submitted
+    casing; that function's docstring is the one home for why.
+
+    `CHUNK_SIZE` is baked in so the chunk width is single-sourced across every call
+    site. Plain SQL text (no duckdb import here); the caller executes it on a
+    connection that has miint loaded.
     """
-    return f"sequence_split({seq}, {CHUNK_SIZE})"
+    return f"sequence_split({normalized_sequence_expr(seq)}, {CHUNK_SIZE})"
 
 
 def reassemble_chunks_expr(prefix: str = "") -> str:
@@ -71,7 +103,8 @@ def canonical_sequence_hash_expr(seq: str) -> str:
     `feature_idx`).
 
     A sequence and its reverse complement are the same molecular entity, so we
-    md5 BOTH strands (upper-cased) and keep the lex-smaller:
+    md5 BOTH strands — each `normalized_sequence_expr`-normalized, the same way
+    the stored chunks are — and keep the lex-smaller:
 
         LEAST(md5(upper(seq)), md5(revcomp(upper(seq))))::uuid
 
@@ -83,6 +116,5 @@ def canonical_sequence_hash_expr(seq: str) -> str:
     Plain SQL text; the caller executes it on a miint-loaded connection
     (`sequence_dna_reverse_complement` is a miint scalar honoring IUPAC).
     """
-    return (
-        f"LEAST(md5(upper({seq}))::uuid, md5(sequence_dna_reverse_complement(upper({seq})))::uuid)"
-    )
+    norm = normalized_sequence_expr(seq)
+    return f"LEAST(md5({norm})::uuid, md5(sequence_dna_reverse_complement({norm}))::uuid)"

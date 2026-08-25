@@ -20,11 +20,22 @@ from contextlib import asynccontextmanager, contextmanager
 
 import httpx
 import pytest
-from qiita_common.api_paths import URL_ALIGNMENT_DOGET, URL_REFERENCE_DOGET
+from qiita_common.api_paths import (
+    URL_ALIGNMENT_DOGET,
+    URL_ASSEMBLY_DOGET,
+    URL_READ_MASKED_DOGET,
+    URL_REFERENCE_DOGET,
+)
+from qiita_common.assembly_constants import (
+    ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+    ASSEMBLED_SEQUENCE_TABLE,
+)
 
 import qiita_compute_orchestrator.data_plane_client as dpc
 from qiita_compute_orchestrator.data_plane_client import (
     fetch_alignment_doget_ticket,
+    fetch_assembly_doget_ticket,
+    fetch_read_masked_doget_ticket,
     fetch_reference_doget_ticket,
 )
 
@@ -339,3 +350,281 @@ async def test_open_reference_sequences_stream_mints_whole_reference(monkeypatch
         "feature_idx": None,
     }
     assert captured["ticket_bytes"] == b"signed-lengths-ticket"
+
+
+# ---------------------------------------------------------------------------
+# Assembly DoGet (one run's contigs) — the body names the RUN, never features.
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_assembly_doget_sends_the_run_pair_and_table():
+    """The body carries `(prep_sample_idx, processing_idx)` and the table, and
+    nothing else — a job names the run, never a contig."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _ticket_response()
+
+    async with _client(handler) as http:
+        result = await fetch_assembly_doget_ticket(
+            http=http,
+            prep_sample_idx=11,
+            processing_idx=22,
+            table=ASSEMBLED_SEQUENCE_TABLE,
+        )
+
+    assert result == _RAW_TICKET
+    assert len(captured) == 1
+    assert captured[0].url.path == URL_ASSEMBLY_DOGET
+    assert json.loads(captured[0].content) == {
+        "prep_sample_idx": 11,
+        "processing_idx": 22,
+        "table": ASSEMBLED_SEQUENCE_TABLE,
+    }
+
+
+@pytest.mark.parametrize("status", [404, 422, 403, 500])
+async def test_fetch_assembly_doget_raises_on_non_2xx(status):
+    """Any non-2xx (404 a pair that never assembled, 422 an unknown table, 403
+    missing scope, 5xx) raises HTTPStatusError for the caller to map to a
+    BackendFailure."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=json.dumps({"detail": "nope"}))
+
+    async with _client(handler) as http:
+        with pytest.raises(httpx.HTTPStatusError):
+            await fetch_assembly_doget_ticket(
+                http=http,
+                prep_sample_idx=11,
+                processing_idx=22,
+                table=ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+            )
+
+
+async def test_open_assembly_chunk_stream_composes_ticket_and_stream(monkeypatch):
+    """The composed seam mints a run-scoped ticket for the CHUNKS table (over a CP
+    client closed BEFORE the stream opens), then streams it against the settings'
+    data_plane_url. The table is the seam's, not the caller's — a job asks for
+    "this run's contigs" and names neither the table nor a feature."""
+    captured: dict = {}
+
+    @asynccontextmanager
+    async def fake_make_cp_client():
+        captured["cp_client_open"] = True
+        yield object()
+        captured["cp_client_closed"] = True
+
+    async def fake_fetch(*, http, prep_sample_idx, processing_idx, table):
+        captured["fetch"] = {
+            "prep_sample_idx": prep_sample_idx,
+            "processing_idx": processing_idx,
+            "table": table,
+        }
+        return b"signed-assembly-ticket"
+
+    @contextmanager
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+        captured["stream"] = {
+            "conn": conn,
+            "data_plane_url": data_plane_url,
+            "ticket_bytes": ticket_bytes,
+            "relation": relation,
+        }
+        yield relation
+
+    class _Settings:
+        data_plane_url = "grpc://dp.test:50051"
+
+    monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
+    monkeypatch.setattr(dpc, "fetch_assembly_doget_ticket", fake_fetch)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
+    monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
+
+    sentinel_conn = object()
+    async with dpc.open_assembly_chunk_stream(
+        sentinel_conn, prep_sample_idx=11, processing_idx=22
+    ) as rel:
+        assert rel == "assembly_chunks"
+        assert captured["cp_client_closed"] is True
+
+    assert captured["fetch"] == {
+        "prep_sample_idx": 11,
+        "processing_idx": 22,
+        "table": ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+    }
+    assert captured["stream"]["conn"] is sentinel_conn
+    assert captured["stream"]["data_plane_url"] == "grpc://dp.test:50051"
+    assert captured["stream"]["ticket_bytes"] == b"signed-assembly-ticket"
+    assert captured["stream"]["relation"] == "assembly_chunks"
+
+
+# ---------------------------------------------------------------------------
+# read_masked DoGet (per-sample masked reads) — mints by (prep_sample_idx,
+# mask_idx). Unlike the block/alignment mints, BOTH scope keys ride the wire:
+# the scope is one pair, not a member list there would be a reason to keep
+# CP-side, and the pair is the data plane's read_masked macro arguments.
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_read_masked_doget_sends_both_scope_keys():
+    """The body carries exactly `prep_sample_idx` + `mask_idx`, and the base64
+    ticket is decoded back to raw bytes.
+
+    Whole-body equality, not a subset: the contract this holds is "the CO sends
+    these two keys and no others". The CP's own `extra="forbid"` is pinned CP-side
+    in `tests/routes/test_read_masked.py` and is not observable from here.
+    """
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _ticket_response()
+
+    async with _client(handler) as http:
+        result = await fetch_read_masked_doget_ticket(http=http, prep_sample_idx=7, mask_idx=3)
+
+    assert result == _RAW_TICKET
+    assert len(captured) == 1
+    assert captured[0].url.path == URL_READ_MASKED_DOGET
+    assert json.loads(captured[0].content) == {"prep_sample_idx": 7, "mask_idx": 3}
+
+
+@pytest.mark.parametrize("status", [404, 409, 422, 403, 500])
+async def test_fetch_read_masked_doget_raises_on_non_2xx(status):
+    """Any non-2xx raises HTTPStatusError for the caller to map to a
+    BackendFailure.
+
+    409 is the mask-completion gate (the sample is 'pending', 'invalidated', or has
+    no gate row under this mask_idx). It must surface rather than be swallowed into
+    an empty stream — an absent pass-set and an empty pass-set are different facts.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=json.dumps({"detail": "nope"}))
+
+    async with _client(handler) as http:
+        with pytest.raises(httpx.HTTPStatusError):
+            await fetch_read_masked_doget_ticket(http=http, prep_sample_idx=7, mask_idx=3)
+
+
+async def test_open_read_masked_stream_composes_ticket_and_stream(monkeypatch):
+    """The composed seam fetches a `(prep_sample_idx, mask_idx)`-scoped ticket over
+    a CP client that is CLOSED before the stream opens, then streams it against the
+    settings' data_plane_url, yielding the registered relation."""
+    captured: dict = {}
+
+    @asynccontextmanager
+    async def fake_make_cp_client():
+        captured["cp_client_open"] = True
+        yield object()
+        captured["cp_client_closed"] = True
+
+    async def fake_fetch(*, http, prep_sample_idx, mask_idx):
+        captured["prep_sample_idx"] = prep_sample_idx
+        captured["mask_idx"] = mask_idx
+        return b"signed-read-masked-ticket"
+
+    @contextmanager
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+        captured["stream"] = {
+            "conn": conn,
+            "data_plane_url": data_plane_url,
+            "ticket_bytes": ticket_bytes,
+            "relation": relation,
+        }
+        yield relation
+
+    class _Settings:
+        data_plane_url = "grpc://dp.test:50051"
+
+    monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
+    monkeypatch.setattr(dpc, "fetch_read_masked_doget_ticket", fake_fetch)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
+    monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
+
+    sentinel_conn = object()
+    async with dpc.open_read_masked_stream(sentinel_conn, prep_sample_idx=7, mask_idx=3) as rel:
+        assert rel == "masked_reads"
+        assert captured["cp_client_closed"] is True
+
+    assert captured["prep_sample_idx"] == 7
+    assert captured["mask_idx"] == 3
+    assert captured["stream"]["conn"] is sentinel_conn
+    assert captured["stream"]["data_plane_url"] == "grpc://dp.test:50051"
+    assert captured["stream"]["ticket_bytes"] == b"signed-read-masked-ticket"
+    assert captured["stream"]["relation"] == "masked_reads"
+
+
+async def test_open_read_masked_stream_relation_name_is_overridable(monkeypatch):
+    """A caller-supplied relation name reaches `open_doget_stream`, so a consumer
+    that already binds `masked_reads` can name this one differently."""
+    captured: dict = {}
+
+    @asynccontextmanager
+    async def fake_make_cp_client():
+        yield object()
+
+    async def fake_fetch(*, http, prep_sample_idx, mask_idx):
+        return b"t"
+
+    @contextmanager
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+        captured["relation"] = relation
+        yield relation
+
+    class _Settings:
+        data_plane_url = "grpc://dp.test:50051"
+
+    monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
+    monkeypatch.setattr(dpc, "fetch_read_masked_doget_ticket", fake_fetch)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
+    monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
+
+    async with dpc.open_read_masked_stream(
+        object(), prep_sample_idx=7, mask_idx=3, relation="denovo_reads"
+    ) as rel:
+        assert rel == "denovo_reads"
+
+    assert captured["relation"] == "denovo_reads"
+
+
+async def test_open_read_masked_stream_mint_failure_never_opens_the_stream(monkeypatch):
+    """A refused mint propagates, and no Flight stream is opened and no relation
+    registered on the way out.
+
+    This is the composed seam's half of the 409 contract. The fetcher test above
+    pins that a non-2xx raises; what a consumer depends on is that the raise
+    happens BEFORE anything is bound, so a refused mask-completion gate cannot be
+    mistaken for a stream that yielded no rows.
+    """
+    opened: list[str] = []
+
+    @asynccontextmanager
+    async def fake_make_cp_client():
+        yield object()
+
+    async def fake_fetch(*, http, prep_sample_idx, mask_idx):
+        raise httpx.HTTPStatusError(
+            "409", request=httpx.Request("POST", "http://cp.test"), response=httpx.Response(409)
+        )
+
+    @contextmanager
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+        opened.append(relation)
+        raise AssertionError("stream opened despite a refused mint")
+
+    class _Settings:
+        data_plane_url = "grpc://dp.test:50051"
+
+    monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
+    monkeypatch.setattr(dpc, "fetch_read_masked_doget_ticket", fake_fetch)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
+    monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
+
+    with pytest.raises(httpx.HTTPStatusError):
+        async with dpc.open_read_masked_stream(object(), prep_sample_idx=7, mask_idx=3):
+            raise AssertionError("body ran despite a refused mint")
+
+    assert opened == []

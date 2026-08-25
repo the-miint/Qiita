@@ -1,6 +1,6 @@
 """The taxonomy rank shape, and the per-genome reduction its two consumers share.
 
-**SQL text only** — like `feature_table.py`, this module opens no connection; a caller
+**SQL text only** — like the `analytic` package, this module opens no connection; a caller
 executes what it returns. The rank constants have a third importer (reference ingest),
 which takes the shape without the reduction.
 

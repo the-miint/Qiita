@@ -238,6 +238,7 @@ from qiita_common.models.sequencing import (
 from qiita_common.models.step import (
     AlignmentCohortDoGetTicketRequest,
     AlignmentDoGetTicketRequest,
+    AssemblyDoGetTicketRequest,
     DoGetTicketRequest,
     DoGetTicketResponse,
     FoundJobWire,
@@ -438,6 +439,7 @@ __all__ = [
     # Step wire contract.
     "AlignmentCohortDoGetTicketRequest",
     "AlignmentDoGetTicketRequest",
+    "AssemblyDoGetTicketRequest",
     "ReadDoGetTicketRequest",
     "DoGetTicketRequest",
     "DoGetTicketResponse",
