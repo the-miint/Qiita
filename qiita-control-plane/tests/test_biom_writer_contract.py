@@ -5,7 +5,7 @@ Nothing else in this repo writes BIOM, so every claim the client-side feature-ta
 recipe makes about it starts out unverified — and three of this writer's behaviours
 are decisions it makes silently on our behalf (it sums, it drops, it ignores). Each
 test here corresponds to a line of `docs/duckdb-miint.md`'s BIOM entry and to a
-decision somewhere in `qiita_common.feature_table`: if a future build changes one of
+decision somewhere in `qiita_common.analytic`: if a future build changes one of
 these, the claim that justified the decision fails here rather than in a published
 file.
 
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import duckdb
 import pytest
-from qiita_common import feature_table as ft
+from qiita_common import analytic as ft
 
 from qiita_control_plane.miint import connect_with_miint
 

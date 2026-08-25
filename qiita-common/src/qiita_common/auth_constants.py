@@ -52,11 +52,13 @@ class Scope(StrEnum):
     REFERENCE_EXCLUSION_WRITE = "reference:exclusion:write"
     REFERENCE_REGISTER_FILES = "reference:register_files"
     FEATURE_MINT = "feature:mint"
-    # Sign DoGet tickets for the data plane's reference-data surfaces AND the
+    # Sign DoGet tickets for the data plane's reference-data surfaces, the
     # per-sample `alignment` slice (host-depleted derived data, the feature-table
-    # OGU job's input — see routes/alignment.py). Deliberately NOT split out the way
-    # READ_MASKED_DOGET is below: alignment is not raw human/host reads, so it rides
-    # the generic scope rather than a privacy-sensitive one.
+    # OGU job's input — see routes/alignment.py), and one assembly run's contig
+    # sequences (routes/assembly.py, which carries what that reuse grants).
+    # Deliberately NOT split out the way READ_MASKED_DOGET is below: neither
+    # alignment nor an assembled contig is raw human/host reads, so both ride the
+    # generic scope rather than a privacy-sensitive one.
     TICKET_DOGET = "ticket:doget"
     # Mint an alignment DoGet ticket as a HUMAN, naming the cohort directly.
     #
@@ -83,11 +85,11 @@ class Scope(StrEnum):
     # validation paths.
     ALIGNMENT_DOGET = "alignment:doget"
     # DoGet against the data plane's masked-read surface (`read_masked`).
-    # Deliberately distinct from the generic TICKET_DOGET (which signs reference-data
-    # and alignment tickets): masked reads are privacy-sensitive (the lake
-    # retains human/host reads, excluded only by the read_masked macro), so the
-    # capability to pull them is granted separately — to service accounts that
-    # drive the masked-read consumer path, never piggybacking on reference reads.
+    # Deliberately distinct from the generic TICKET_DOGET above: masked reads are
+    # privacy-sensitive (the lake retains human/host reads, excluded only by the
+    # read_masked macro), so the capability to pull them is granted separately —
+    # to service accounts that drive the masked-read consumer path, never
+    # piggybacking on the surfaces TICKET_DOGET already opens.
     READ_MASKED_DOGET = "read_masked:doget"
     # DoGet against the data plane's BLOCK-read selectors (`read_block` /
     # `read_masked_block`) — one block's `(prep_sample_idx, sequence_idx
@@ -96,10 +98,10 @@ class Scope(StrEnum):
     # Distinct from BOTH neighbours, and strictly the most privileged of the
     # three. `read_block` streams RAW `read` rows: host/human sequence that the
     # `read_masked` macro exists to exclude, so it is a strict superset of what
-    # READ_MASKED_DOGET covers. Riding TICKET_DOGET (reference data + the derived
-    # `alignment` slice) would let any service account minting reference tickets
-    # pull raw reads — an inversion of the model the two scopes above establish.
-    # Granted only to the service account that drives block compute.
+    # READ_MASKED_DOGET covers. Riding TICKET_DOGET would let any service account
+    # minting reference tickets pull raw reads — an inversion of the model the
+    # two scopes above establish. Granted only to the service account that drives
+    # block compute.
     READ_DOGET = "read:doget"
     # Full purge of a mask (the mask_definition row + its DuckLake read_mask
     # rows). Deliberately distinct from the mask-minting capability: deletion

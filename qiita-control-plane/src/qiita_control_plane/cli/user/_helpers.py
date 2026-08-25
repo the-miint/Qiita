@@ -82,6 +82,24 @@ def _proportion_arg(raw: str) -> float:
     return value
 
 
+# The default for a flag whose value set already includes None, so "omitted" and
+# "explicitly none" stay distinguishable — the collision `_lane_arg` avoids by being
+# `required`, which an optional threshold cannot be.
+_UNSET = object()
+
+
+def _proportion_or_none_arg(raw: str) -> float | None:
+    """argparse `type` for a proportion in [0, 1], or 'none' for no threshold at all.
+
+    Same 'none' spelling `_lane_arg` uses. A threshold of 0 is not the same answer:
+    a NULL score fails `>= 0` as surely as it fails `>= 0.95`, so dropping the term is
+    the only way to admit rows that cannot be scored.
+    """
+    if raw.strip().lower() in ("none", "null", ""):
+        return None
+    return _proportion_arg(raw)
+
+
 def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Fetch a resource by idx (GET) and print its JSON body.
 

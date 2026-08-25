@@ -22,13 +22,19 @@ import httpx
 import pytest
 from qiita_common.api_paths import (
     URL_ALIGNMENT_DOGET,
+    URL_ASSEMBLY_DOGET,
     URL_READ_MASKED_DOGET,
     URL_REFERENCE_DOGET,
+)
+from qiita_common.assembly_constants import (
+    ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+    ASSEMBLED_SEQUENCE_TABLE,
 )
 
 import qiita_compute_orchestrator.data_plane_client as dpc
 from qiita_compute_orchestrator.data_plane_client import (
     fetch_alignment_doget_ticket,
+    fetch_assembly_doget_ticket,
     fetch_read_masked_doget_ticket,
     fetch_reference_doget_ticket,
 )
@@ -344,6 +350,114 @@ async def test_open_reference_sequences_stream_mints_whole_reference(monkeypatch
         "feature_idx": None,
     }
     assert captured["ticket_bytes"] == b"signed-lengths-ticket"
+
+
+# ---------------------------------------------------------------------------
+# Assembly DoGet (one run's contigs) — the body names the RUN, never features.
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_assembly_doget_sends_the_run_pair_and_table():
+    """The body carries `(prep_sample_idx, processing_idx)` and the table, and
+    nothing else — a job names the run, never a contig."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _ticket_response()
+
+    async with _client(handler) as http:
+        result = await fetch_assembly_doget_ticket(
+            http=http,
+            prep_sample_idx=11,
+            processing_idx=22,
+            table=ASSEMBLED_SEQUENCE_TABLE,
+        )
+
+    assert result == _RAW_TICKET
+    assert len(captured) == 1
+    assert captured[0].url.path == URL_ASSEMBLY_DOGET
+    assert json.loads(captured[0].content) == {
+        "prep_sample_idx": 11,
+        "processing_idx": 22,
+        "table": ASSEMBLED_SEQUENCE_TABLE,
+    }
+
+
+@pytest.mark.parametrize("status", [404, 422, 403, 500])
+async def test_fetch_assembly_doget_raises_on_non_2xx(status):
+    """Any non-2xx (404 a pair that never assembled, 422 an unknown table, 403
+    missing scope, 5xx) raises HTTPStatusError for the caller to map to a
+    BackendFailure."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=json.dumps({"detail": "nope"}))
+
+    async with _client(handler) as http:
+        with pytest.raises(httpx.HTTPStatusError):
+            await fetch_assembly_doget_ticket(
+                http=http,
+                prep_sample_idx=11,
+                processing_idx=22,
+                table=ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+            )
+
+
+async def test_open_assembly_chunk_stream_composes_ticket_and_stream(monkeypatch):
+    """The composed seam mints a run-scoped ticket for the CHUNKS table (over a CP
+    client closed BEFORE the stream opens), then streams it against the settings'
+    data_plane_url. The table is the seam's, not the caller's — a job asks for
+    "this run's contigs" and names neither the table nor a feature."""
+    captured: dict = {}
+
+    @asynccontextmanager
+    async def fake_make_cp_client():
+        captured["cp_client_open"] = True
+        yield object()
+        captured["cp_client_closed"] = True
+
+    async def fake_fetch(*, http, prep_sample_idx, processing_idx, table):
+        captured["fetch"] = {
+            "prep_sample_idx": prep_sample_idx,
+            "processing_idx": processing_idx,
+            "table": table,
+        }
+        return b"signed-assembly-ticket"
+
+    @contextmanager
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+        captured["stream"] = {
+            "conn": conn,
+            "data_plane_url": data_plane_url,
+            "ticket_bytes": ticket_bytes,
+            "relation": relation,
+        }
+        yield relation
+
+    class _Settings:
+        data_plane_url = "grpc://dp.test:50051"
+
+    monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
+    monkeypatch.setattr(dpc, "fetch_assembly_doget_ticket", fake_fetch)
+    monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
+    monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
+
+    sentinel_conn = object()
+    async with dpc.open_assembly_chunk_stream(
+        sentinel_conn, prep_sample_idx=11, processing_idx=22
+    ) as rel:
+        assert rel == "assembly_chunks"
+        assert captured["cp_client_closed"] is True
+
+    assert captured["fetch"] == {
+        "prep_sample_idx": 11,
+        "processing_idx": 22,
+        "table": ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+    }
+    assert captured["stream"]["conn"] is sentinel_conn
+    assert captured["stream"]["data_plane_url"] == "grpc://dp.test:50051"
+    assert captured["stream"]["ticket_bytes"] == b"signed-assembly-ticket"
+    assert captured["stream"]["relation"] == "assembly_chunks"
 
 
 # ---------------------------------------------------------------------------

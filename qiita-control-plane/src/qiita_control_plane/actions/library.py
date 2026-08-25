@@ -47,7 +47,10 @@ from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_s
 
 from ..auth.tickets import sign_action, sign_ticket
 from ..miint import duckdb_connect
-from ..repositories.assembly import insert_assembly_membership_rows
+from ..repositories.assembly import (
+    insert_assembly_membership_rows,
+    upsert_assembly_sample_completed,
+)
 from ..repositories.block import (
     MaskSampleInvalidated,
     fetch_block_members,
@@ -2058,6 +2061,35 @@ async def delete_alignment_block_data(
     return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
 
 
+async def delete_alignment_sample_data(
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> int:
+    """Delete one `(alignment_idx, prep_sample_idx)` pair's alignment rows via the
+    `delete_alignment_sample` DoAction, returning the rows-deleted count. The
+    per-sample twin of `delete_alignment_block_data`.
+
+    Signs an action token carrying that pair and nothing else — the data plane's
+    payload rejects any extra field. What the pair selects, and why it rather than
+    the block or the whole alignment, is on the Rust `delete_alignment_sample`.
+    Idempotent: a fresh sample (no rows yet) deletes 0 and still succeeds. Raises
+    pyarrow.flight.FlightError on transport / data-plane failure."""
+    token = sign_action(
+        action="delete_alignment_sample",
+        payload={"alignment_idx": alignment_idx, "prep_sample_idx": prep_sample_idx},
+        secret=signing_key,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action, "delete_alignment_sample", data_plane_url, token
+    )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
+
+
 async def delete_alignment_data(
     *,
     alignment_idx: int,
@@ -2323,6 +2355,28 @@ async def finalize_mask_sample_gate(
     return {"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx}
 
 
+async def finalize_assembly_sample_gate(
+    pool: asyncpg.Pool,
+    *,
+    processing_idx: int,
+    prep_sample_idx: int,
+) -> dict[str, int]:
+    """Terminal step of the long-read-assembly workflow: record this sample's
+    assembly as completed in the qiita.assembly_sample gate.
+
+    The row is already 'pending' — the runner materialized it when it minted this
+    run's processing_idx — and the write is an idempotent upsert, so a workflow
+    retried from the start re-affirms 'completed'. Where the entry sits in the
+    step list, and why, is on the workflow YAML entry that declares it; the gate's
+    state contract lives on `repositories.assembly.fetch_assembly_sample_state`.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        await upsert_assembly_sample_completed(
+            conn, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
+        )
+    return {"processing_idx": processing_idx, "prep_sample_idx": prep_sample_idx}
+
+
 async def delete_alignment_block(
     pool: asyncpg.Pool,
     *,
@@ -2370,6 +2424,33 @@ async def delete_alignment_block(
         data_plane_url=data_plane_url,
     )
     return {"block_idx": block_idx, "rows_deleted": rows_deleted}
+
+
+async def delete_alignment_sample(
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> dict[str, Any]:
+    """Idempotent sample replace: run before register-files re-writes this
+    sample's alignment rows, so a re-run never double-counts. The per-sample twin
+    of `delete_alignment_block`.
+
+    Takes no `pool`: the caller supplies both identifiers, so unlike the block
+    twin there is no `block_member` lookup to do. Like it, this touches only
+    DuckLake — the Postgres `alignment_sample` gate row is the terminal step's to
+    flip, and clearing a gate is `DELETE /alignment-definition/{idx}` (which
+    CASCADEs it), not a mid-workflow replace.
+
+    Returns the rows-deleted count for the workflow log."""
+    rows_deleted = await delete_alignment_sample_data(
+        alignment_idx=alignment_idx,
+        prep_sample_idx=prep_sample_idx,
+        signing_key=signing_key,
+        data_plane_url=data_plane_url,
+    )
+    return {"prep_sample_idx": prep_sample_idx, "rows_deleted": rows_deleted}
 
 
 async def reconcile_alignment_block(
@@ -2465,7 +2546,9 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
     LibraryPrimitive.FINALIZE_MASK_SAMPLE: finalize_mask_sample_gate,
+    LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE: finalize_assembly_sample_gate,
     LibraryPrimitive.DELETE_ALIGNMENT_BLOCK: delete_alignment_block,
+    LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE: delete_alignment_sample,
     LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,
     LibraryPrimitive.SYNC_REFERENCE_EXCLUSION: sync_reference_exclusion,
 }

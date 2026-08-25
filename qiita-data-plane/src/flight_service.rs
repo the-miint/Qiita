@@ -299,6 +299,12 @@ pub fn staging_path_for(root: &Path, upload_idx: i64) -> PathBuf {
 /// table MACRO, not a relation, and what its required arguments foreclose is
 /// documented where they are declared (`ducklake.rs`).
 ///
+/// `alignment_origin_spanning` is absent too. It carries `feature_idx`, so
+/// exposing it would need the same `reference_exclusion` anti-join
+/// `alignment_visible` has — otherwise a blocked genome reaches a consumer
+/// through the side table while the view refuses it. Nothing reads it over
+/// Flight today, so no view is built.
+///
 /// `read_block` is the one path to raw `read` rows over Flight, and it is
 /// admissible only because it CANNOT express an unscoped read: it is not a table
 /// name, it is a block-read *selector* form that `build_query` rejects unless the
@@ -332,6 +338,15 @@ const ALLOWED_TABLES: &[&str] = &[
     // here, unlike every other table — and always scoped by alignment_idx +
     // prep_sample_idx (see build_query / ALIGNMENT_PROJECTION_COLUMNS).
     "alignment_visible",
+    // One assembly run's contigs — sample-derived sequence, where everything
+    // above is reference data or per-read derived output. Neither table has a
+    // prep_sample_idx column; a ticket names the run by `(prep_sample_idx,
+    // processing_idx)` and `build_assembly_run_query` resolves it through
+    // `qiita_lake.assembly_membership`, the same shape as the `reference_idx`
+    // resolution the MEMBERSHIP_JOIN_TABLES get. A `feature_idx` filter is NOT
+    // accepted on either, and neither is an empty one.
+    "assembled_sequence",
+    "assembled_sequence_chunks",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -347,6 +362,9 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
     "prep_sample_idx",
     // Scopes an alignment DoGet to a single alignment run (feature-table consumer).
     "alignment_idx",
+    // With prep_sample_idx, names the assembly RUN an assembly DoGet resolves
+    // through `assembly_membership` (`build_assembly_run_query`).
+    "processing_idx",
 ];
 
 /// Columns a signed ticket may ask the alignment DoGet to project: every column
@@ -512,8 +530,19 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   — so `move_file` refuses to overwrite and it fails closed rather than
 ///   double-registering.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
-///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` —
-///   logical DELETEs; re-running deletes zero rows.
+///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` /
+///   `delete_alignment_sample` — logical DELETEs, idempotent against themselves:
+///   a replay with no write in between deletes zero rows. Not commutative with
+///   one. Two run as a pre-`register-files` replace —
+///   `delete_read_mask_block` in `read-mask-block` and `delete_alignment_block`
+///   in `align` — so they sit in a workflow that registers rows under the same
+///   scope a few steps later and a replay landing after that registration drops
+///   what it wrote. `delete_alignment_sample` is the same shape and takes on the
+///   same exposure once a workflow adopts it. What bounds that window is the
+///   token's own expiry, checked on every DoAction body in
+///   `auth::verify_ticket_raw`: 300s from
+///   `qiita_control_plane.auth.tickets.sign_action`'s default, and
+///   `MAX_TICKET_LIFETIME` refuses any token whose expiry is more than 3600s out.
 /// - `export_read` — re-materializes the same sample's bytes to the same ticket
 ///   path via atomic publish; a replay reproduces identical output. (The block
 ///   exports that used to sit beside it are gone: block-scoped compute now
@@ -538,6 +567,7 @@ const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "delete_read_mask_block",
     "delete_alignment",
     "delete_alignment_block",
+    "delete_alignment_sample",
     "export_read",
     "count_masked",
     "mask_metrics",
@@ -954,6 +984,44 @@ impl FlightService for QiitaFlightService {
                 .await
                 .map_err(|e| {
                     Status::internal(format!("delete_alignment_block task join failed: {e}"))
+                })??;
+
+                let result_body = serde_json::to_vec(&deleted)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "delete_alignment_sample" => {
+                let payload =
+                    auth::verify_delete_alignment_sample(&action.body, &self.flight_public_key)
+                        .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "delete_alignment_sample" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'delete_alignment_sample', \
+                         payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // delete_alignment). The closure opens and drops its own
+                // connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let alignment_idx = payload.alignment_idx;
+                let prep_sample_idx = payload.prep_sample_idx;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_alignment_sample(&catalog, &data_path, alignment_idx, prep_sample_idx)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("delete_alignment_sample task join failed: {e}"))
                 })??;
 
                 let result_body = serde_json::to_vec(&deleted)
@@ -2933,16 +3001,86 @@ fn delete_read_mask_block(
     }))
 }
 
-/// Logically delete every `alignment` row for one `alignment_idx` from DuckLake —
-/// the whole-alignment purge the disallow-without-delete resubmission rule needs
-/// (a completed `alignment_sample` must be cleared before re-aligning).
+/// Every `qiita_lake` table an alignment delete clears, in delete order.
+/// `alignment` leads: every `delete_alignment*` reports its count as
+/// `rows_deleted`.
 ///
-/// The alignment twin of `delete_mask`: one DuckLake transaction, logical
-/// `DELETE` only. No raw parquet `unlink` — DuckLake owns file lifecycle and a
-/// manual unlink would corrupt the catalog; orphan parquets are tolerated until a
-/// future maintenance pass (matches `delete_mask`). Idempotent: deleting an
-/// `alignment_idx` with zero rows is success and returns `rows_deleted: 0`, so the
-/// control plane can safely retry. `alignment_idx` is an Ed25519-verified i64.
+/// `alignment_delete_covers_every_alignment_scoped_lake_table` pins the set
+/// against the catalog, so a third table keyed by `alignment_idx` cannot be added
+/// without joining this list.
+const ALIGNMENT_DELETE_TABLES: &[&str] = &["alignment", "alignment_origin_spanning"];
+
+/// Every delete reads the leading count as `counts[0]`, which panics on an empty
+/// list. Emptying the list is a build failure instead.
+const _: () = assert!(!ALIGNMENT_DELETE_TABLES.is_empty());
+
+/// Delete `where_clause`'s rows from each of `tables`, in order, returning one
+/// count per table positionally. The shared body of the `delete_alignment*`
+/// handlers; each builds its own clause and shapes its own response.
+///
+/// The tables go in lockstep because they describe each other:
+/// `alignment_origin_spanning` names the `alignment` rows that make up one
+/// origin-spanning read, so dropping the fragments while keeping the evidence
+/// leaves a read described by rows that are gone.
+///
+/// One DuckLake transaction, so the action is all-or-nothing and the control
+/// plane can safely retry: a failed call leaves every table's rows fully intact,
+/// so a retry sees the same row set. Logical `DELETE` only. No raw parquet
+/// `unlink` — DuckLake owns file lifecycle and a manual unlink would corrupt the
+/// catalog; orphan parquets are tolerated until a future maintenance pass
+/// (matches `delete_mask`).
+///
+/// `tables` and `where_clause` are interpolated and `params` binds any `?` the
+/// clause carries, so the caller owns the injection argument for both — as
+/// `replace_key_delete_sql`'s does at its own site. Every caller passes an
+/// `ALIGNMENT_DELETE_TABLES` literal and a clause whose values are either bound
+/// `?`s or inlined Ed25519-verified i64s.
+fn delete_lake_rows(
+    conn: &duckdb::Connection,
+    tables: &[&str],
+    where_clause: &str,
+    params: &[&dyn duckdb::ToSql],
+) -> Result<Vec<usize>, Status> {
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let deletes = tables
+        .iter()
+        .map(|table| {
+            let sql = format!("DELETE FROM qiita_lake.{table} WHERE {where_clause}");
+            conn.execute(&sql, params)
+                .map_err(|e| Status::internal(format!("delete failed ({sql}): {e}")))
+        })
+        .collect::<Result<Vec<usize>, Status>>();
+
+    let counts = match deletes {
+        Ok(counts) => counts,
+        Err(e) => {
+            // Best-effort rollback; surface the original delete error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+    Ok(counts)
+}
+
+/// Logically delete one `alignment_idx`'s rows from every
+/// `ALIGNMENT_DELETE_TABLES` table in DuckLake — the whole-alignment purge the
+/// disallow-without-delete resubmission rule needs (a completed
+/// `alignment_sample` must be cleared before re-aligning).
+///
+/// The alignment twin of `delete_mask`; transaction, lockstep and parquet
+/// lifecycle are `delete_lake_rows`'. Idempotent: deleting an `alignment_idx`
+/// with zero rows is success and returns `rows_deleted: 0`, so the control plane
+/// can safely retry. `alignment_idx` is an Ed25519-verified i64.
+///
+/// `rows_deleted` is the `alignment` count alone; the side table's count is not
+/// reported. `delete_pool_reads` reports one qualified key per table because the
+/// control plane consumes both (`PoolReadPurgeResponse`); here there is no
+/// consumer, and no producer writing the side table, so a second key would carry
+/// a structural zero. A producer PR that adds a consumer adds the key with it.
 fn delete_alignment(
     catalog_connstr: &str,
     data_path: &str,
@@ -2953,41 +3091,25 @@ fn delete_alignment(
     ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
         .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
-    // Single-statement delete wrapped in an explicit transaction so the action
-    // is all-or-nothing and the control plane can safely retry: a failed call
-    // leaves the alignment's rows fully intact, so a retry sees the same row set.
-    conn.execute_batch("BEGIN TRANSACTION")
-        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
-
-    let deleted = conn.execute(
-        "DELETE FROM qiita_lake.alignment WHERE alignment_idx = ?",
-        [&alignment_idx as &dyn duckdb::ToSql],
-    );
-
-    let rows_deleted = match deleted {
-        Ok(n) => n,
-        Err(e) => {
-            // Best-effort rollback; surface the original delete error.
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(Status::internal(format!(
-                "delete failed (DELETE FROM qiita_lake.alignment WHERE alignment_idx = ?): {e}"
-            )));
-        }
-    };
-    conn.execute_batch("COMMIT")
-        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+    let counts = delete_lake_rows(
+        &conn,
+        ALIGNMENT_DELETE_TABLES,
+        "alignment_idx = ?",
+        &[&alignment_idx as &dyn duckdb::ToSql],
+    )?;
 
     Ok(serde_json::json!({
         "alignment_idx": alignment_idx,
-        "rows_deleted": rows_deleted,
+        "rows_deleted": counts[0],
     }))
 }
 
-/// Delete exactly one block's footprint from the DuckLake `alignment` table: the
-/// rows for `alignment_idx` whose `(prep_sample_idx, sequence_idx)` fall in the
-/// members' sub-ranges. This is the idempotent-block-replace primitive — the
-/// `align` workflow runs it immediately before `register-files`, so a re-run
-/// deletes the prior run's rows before writing fresh ones and never double-counts.
+/// Delete exactly one block's footprint from every `ALIGNMENT_DELETE_TABLES`
+/// table: the rows for `alignment_idx` whose `(prep_sample_idx, sequence_idx)`
+/// fall in the members' sub-ranges. This is the idempotent-block-replace
+/// primitive — the `align` workflow runs it immediately before `register-files`,
+/// so a re-run deletes the prior run's rows before writing fresh ones and never
+/// double-counts.
 ///
 /// The alignment twin of `delete_read_mask_block`: same exact-by-construction
 /// footprint selector (`block_read_where_clause`) scoped further by
@@ -2998,12 +3120,11 @@ fn delete_alignment(
 /// alignment rows (a read produces multiple rows via cross-shard + PE
 /// multiplicity) — exactly what a re-run must replace.
 ///
-/// Mirrors `delete_read_mask_block`: one DuckLake transaction (all-or-nothing,
-/// retriable), logical `DELETE` only (no raw parquet unlink — DuckLake owns file
-/// lifecycle). Idempotent: a fresh block (no rows yet) deletes 0. Empty `members`
-/// is a control-plane bug (the DoAction arm rejects it before this); guarded here
-/// too, returning a zero-count noop. All integers are Ed25519-verified i64s, safe to
-/// inline.
+/// Mirrors `delete_read_mask_block`; transaction, lockstep and parquet lifecycle
+/// are `delete_lake_rows`', count reporting is `delete_alignment`'s. Idempotent:
+/// a fresh block (no rows yet) deletes 0. Empty `members` is a control-plane bug
+/// (the DoAction arm rejects it before this); guarded here too, returning a
+/// zero-count noop. All integers are Ed25519-verified i64s, safe to inline.
 fn delete_alignment_block(
     catalog_connstr: &str,
     data_path: &str,
@@ -3023,40 +3144,78 @@ fn delete_alignment_block(
         .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
     // Scope the shared footprint selector to this align-config identity. The
-    // `read`/`read_mask` blocks key on sequence_idx; the `alignment` sink also
-    // carries a sequence_idx column, so the SAME clause applies.
+    // `read`/`read_mask` blocks key on sequence_idx; every
+    // `ALIGNMENT_DELETE_TABLES` table also carries `prep_sample_idx` and
+    // `sequence_idx`, so the one clause applies to each. The side table holds one
+    // row per read against `alignment`'s one per SAM record, and a member's
+    // sub-range selects the same reads either way.
     let where_clause = format!(
         "alignment_idx = {alignment_idx} AND {}",
         block_read_where_clause(members)
     );
 
-    // Single-statement delete wrapped in an explicit transaction so the action
-    // is all-or-nothing and the control plane can safely retry: a failed call
-    // leaves the block's rows fully intact, so a retry sees the same row set.
-    conn.execute_batch("BEGIN TRANSACTION")
-        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
-
-    let deleted = conn.execute(
-        &format!("DELETE FROM qiita_lake.alignment WHERE {where_clause}"),
-        [],
-    );
-
-    let rows_deleted = match deleted {
-        Ok(n) => n,
-        Err(e) => {
-            // Best-effort rollback; surface the original delete error.
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(Status::internal(format!(
-                "delete failed (DELETE FROM qiita_lake.alignment WHERE {where_clause}): {e}"
-            )));
-        }
-    };
-    conn.execute_batch("COMMIT")
-        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+    let counts = delete_lake_rows(&conn, ALIGNMENT_DELETE_TABLES, &where_clause, &[])?;
 
     Ok(serde_json::json!({
         "alignment_idx": alignment_idx,
-        "rows_deleted": rows_deleted,
+        "rows_deleted": counts[0],
+    }))
+}
+
+/// Delete one `(alignment_idx, prep_sample_idx)` pair's rows from every
+/// `ALIGNMENT_DELETE_TABLES` table — the idempotent-sample-replace primitive: run
+/// immediately before `register-files` and a re-run deletes the prior run's rows
+/// before writing fresh ones, so it never double-counts.
+///
+/// The pair is the unit because none of the three mechanisms already here selects
+/// it:
+///
+/// * `delete_alignment` keys on `alignment_idx` alone, so it takes every other
+///   sample's rows with it.
+/// * `delete_alignment_block` needs a `block_member` cover-map, which a caller
+///   holding one prep_sample has none of.
+/// * `REPLACE_KEY_TABLES` is matched on the destination TABLE name alone (see
+///   `register_files`), so an `alignment` entry keyed on this pair would fire on
+///   the block-scoped `align` workflow's registrations too. `tile_partition`
+///   splits a straddling sample across consecutive blocks and
+///   `replace_key_delete_sql` deletes every lake row whose key tuple appears in
+///   the incoming Parquet, so the second block's registration would delete the
+///   first's rows for the shared sample — `REPLACE_KEY_TABLES`' condition 1 (the
+///   incoming files carry the complete row set for every key they mention)
+///   failing.
+///
+/// Both key columns are in the DDL of both tables
+/// (`ducklake::ensure_alignment_tables`), so the one clause applies to each. The
+/// predicate carries no `sequence_idx` bound — the sample is the unit — and is
+/// feature_idx-agnostic, so ALL of a read's alignment rows go.
+///
+/// Transaction, lockstep and parquet lifecycle are `delete_lake_rows`', count
+/// reporting is `delete_alignment`'s. Idempotent: a sample with no rows yet
+/// deletes 0 and still succeeds.
+fn delete_alignment_sample(
+    catalog_connstr: &str,
+    data_path: &str,
+    alignment_idx: i64,
+    prep_sample_idx: i64,
+) -> Result<serde_json::Value, Status> {
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    let counts = delete_lake_rows(
+        &conn,
+        ALIGNMENT_DELETE_TABLES,
+        "alignment_idx = ? AND prep_sample_idx = ?",
+        &[
+            &alignment_idx as &dyn duckdb::ToSql,
+            &prep_sample_idx as &dyn duckdb::ToSql,
+        ],
+    )?;
+
+    Ok(serde_json::json!({
+        "alignment_idx": alignment_idx,
+        "rows_deleted": counts[0],
     }))
 }
 
@@ -3191,6 +3350,28 @@ fn is_alignment_doget_surface(table: &str) -> bool {
     table == "alignment_visible"
 }
 
+/// Tables `build_query` refuses to serve on an empty filter.
+///
+/// The `reference_*` tables are broadly readable by design (an unfiltered SELECT
+/// there mirrors the anonymous REST `GET /reference/{idx}`), so the refusal is
+/// per-table rather than global. What is listed is the one table an empty filter
+/// would turn into the whole alignment sink. The assembly surfaces are not
+/// listed and do not need to be: like `read_masked`, their scope IS their query
+/// shape (`build_assembly_run_query`), which has no empty form to refuse.
+fn requires_scoped_filter(table: &str) -> bool {
+    is_alignment_doget_surface(table)
+}
+
+/// The DoGet surfaces whose scope is one assembly RUN.
+///
+/// Neither carries `prep_sample_idx` — a contig is stored once, keyed by the
+/// content-deduped `feature_idx` it shares with every other run that produced
+/// the same bytes — so which contigs are "this run's" is a fact held by
+/// `assembly_membership`, and `build_assembly_run_query` reads it there.
+fn is_assembly_run_surface(table: &str) -> bool {
+    matches!(table, "assembled_sequence" | "assembled_sequence_chunks")
+}
+
 /// Build a SQL query for the given table and filter.
 ///
 /// SQL injection defense model:
@@ -3235,6 +3416,12 @@ fn build_query(
         return build_read_masked_query(filter);
     }
 
+    // An assembly surface is scoped by a run, which is a fact in another table
+    // rather than a column of this one — also not a generic WHERE clause.
+    if is_assembly_run_surface(table) {
+        return build_assembly_run_query(table, filter);
+    }
+
     if filter.is_empty() {
         // Defense-in-depth against a full-table read leak. The human-read surface
         // no longer reaches here at all — `read_masked` is a macro that cannot be
@@ -3246,10 +3433,9 @@ fn build_query(
         // *empty* case, not every under-scoped one: a non-empty but non-scoping
         // filter (e.g. feature_idx alone) still passes today. Making an unfiltered
         // read opt-in via an allowlist is still a tracked durability follow-up.
-        // The reference_* tables are broadly readable by design (this mirrors
-        // the anonymous REST `GET /reference/{idx}`), so an unfiltered SELECT is
-        // legitimate there — reject empty filters only for the alignment surface.
-        if is_alignment_doget_surface(table) {
+        // Which tables are refused, and why the reference_* ones are not, is at
+        // `requires_scoped_filter`.
+        if requires_scoped_filter(table) {
             return Err(Status::invalid_argument(format!(
                 "{table} requires a non-empty filter (refusing full-table read)"
             )));
@@ -3382,6 +3568,54 @@ fn build_read_masked_query(filter: &auth::TicketFilter) -> Result<(String, Strin
     Ok((
         format!("SELECT * FROM {}", read_masked_relation(mask_idx, &preps)),
         "qiita_lake.read_masked".to_string(),
+    ))
+}
+
+/// Build the assembly DoGet: one run's contigs, selected by a semi join against
+/// the lake's own `assembly_membership` rather than by a roster the ticket
+/// carries.
+///
+/// The ticket names the run and nothing else — exactly one `prep_sample_idx`,
+/// exactly one `processing_idx`, no third column. Several values, or an extra
+/// column, would blend contigs from heterogeneous runs into one
+/// indistinguishable stream, the same failure the single-`alignment_idx` guard
+/// prevents; `feature_idx` in particular is refused, so no ticket can name
+/// contigs directly on these tables.
+///
+/// `IN (subquery)`, not a literal list: DuckDB plans it as a SEMI hash join and
+/// pushes the resolved keys' min/max and a Bloom filter into the lake scan as
+/// dynamic filters. Measured on DuckDB 1.5.4 / ducklake d318a545, a catalog of
+/// 3.6M chunk rows over 200 files, a 26,129-contig run: this form's scan emits
+/// 245,457 rows in 140 ms, while the same roster as 26,129 literals is rewritten
+/// into a MARK join above an unfiltered scan — 3,600,000 rows, 1,793 ms — with
+/// both forms opening the same 200 files and returning the same 235,161 rows.
+/// Where per-file `feature_idx` ranges are narrow enough to prune at all, the two
+/// prune identically (1 file of 200 on a contiguous run). Semi-join semantics
+/// also make the DISTINCT implicit: a contig that two `(kind, bin_id)` rows claim
+/// is one output row, not two.
+///
+/// `assembly_membership` stays out of `ALLOWED_TABLES` — it is readable here as
+/// the scope resolver, never as a stream: no column of it reaches the output.
+fn build_assembly_run_query(
+    table: &str,
+    filter: &auth::TicketFilter,
+) -> Result<(String, String), Status> {
+    let prep_sample_idx = single_i64_filter(filter, "prep_sample_idx")?;
+    let processing_idx = single_i64_filter(filter, "processing_idx")?;
+    if filter.len() != 2 {
+        return Err(Status::invalid_argument(format!(
+            "{table} accepts only prep_sample_idx and processing_idx, got {} columns",
+            filter.len()
+        )));
+    }
+    let full_table = format!("qiita_lake.{table}");
+    Ok((
+        format!(
+            "SELECT * FROM {full_table} WHERE feature_idx IN (\
+             SELECT feature_idx FROM qiita_lake.assembly_membership \
+             WHERE prep_sample_idx = {prep_sample_idx} AND processing_idx = {processing_idx})"
+        ),
+        full_table,
     ))
 }
 
@@ -3650,6 +3884,24 @@ mod tests {
         data_path
     }
 
+    /// Lay down every lake table the data plane creates at boot, in `main.rs`'s
+    /// order (exclusion last — its `_visible` views join reference + alignment).
+    ///
+    /// The catalog-shape tests below decide what belongs in a registry by QUERYING
+    /// the catalog, so each one is only as complete as the tables its connection
+    /// happens to hold: a table this function does not create is invisible to the
+    /// shape query and joins no registry, silently. Adding an `ensure_*` here is
+    /// what keeps that a one-place edit instead of one per test.
+    #[cfg(feature = "integration")]
+    fn setup_full_lake(conn: &duckdb::Connection) {
+        ducklake::ensure_reference_tables(conn).unwrap();
+        ducklake::ensure_read_tables(conn).unwrap();
+        ducklake::ensure_alignment_tables(conn).unwrap();
+        ducklake::ensure_assembly_tables(conn).unwrap();
+        ducklake::ensure_registration_lock(conn).unwrap();
+        ducklake::ensure_exclusion_tables(conn).unwrap();
+    }
+
     /// Orphan-only sequence deletion: a feature owned by another reference
     /// keeps its sequence; a feature owned only by the deleted reference loses
     /// it. Reference-scoped tables (membership, taxonomy) drop fully.
@@ -3880,10 +4132,15 @@ mod tests {
         ));
     }
 
-    /// `delete_alignment` drops exactly the target alignment_idx's `alignment`
-    /// rows, leaves a different alignment untouched, and is idempotent: a second
-    /// delete of the same alignment_idx succeeds and reports `rows_deleted: 0`.
-    /// The alignment twin of `delete_mask_drops_target_idempotently`.
+    /// `delete_alignment` drops exactly the target alignment_idx's rows from
+    /// every `ALIGNMENT_DELETE_TABLES` table, leaves a different alignment
+    /// untouched in each, and is idempotent: a second delete of the same
+    /// alignment_idx succeeds and reports `rows_deleted: 0`. The alignment twin of
+    /// `delete_mask_drops_target_idempotently`.
+    ///
+    /// The side table carries fewer rows than `alignment` here (only one of the
+    /// two reads is origin-spanning), so `rows_deleted` cannot be satisfied by the
+    /// side table's count.
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
@@ -3899,12 +4156,21 @@ mod tests {
         let align_b: i64 = 960_101;
         let prep: i64 = 960_110;
 
+        // Only the identity columns are populated — this exercises the delete
+        // predicate, and the score columns are not derivable here without an
+        // aligner.
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
+             DELETE FROM qiita_lake.alignment_origin_spanning \
+                 WHERE alignment_idx IN ({align_a}, {align_b});
              INSERT INTO qiita_lake.alignment \
                  (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
                  ({align_a}, {prep}, 1, 10), \
                  ({align_a}, {prep}, 2, 11), \
+                 ({align_b}, {prep}, 1, 10);
+             INSERT INTO qiita_lake.alignment_origin_spanning \
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
+                 ({align_a}, {prep}, 1, 10), \
                  ({align_b}, {prep}, 1, 10);"
         ))
         .unwrap();
@@ -3914,16 +4180,26 @@ mod tests {
         assert_eq!(first["rows_deleted"], 2, "both align_a rows deleted");
         assert_eq!(first["alignment_idx"], align_a);
 
-        let count = |align: i64| -> i64 {
+        let count = |table: &str, align: i64| -> i64 {
             conn.query_row(
-                &format!("SELECT count(*) FROM qiita_lake.alignment WHERE alignment_idx = {align}"),
+                &format!("SELECT count(*) FROM qiita_lake.{table} WHERE alignment_idx = {align}"),
                 [],
                 |r| r.get(0),
             )
             .unwrap()
         };
-        assert_eq!(count(align_a), 0, "align_a rows gone");
-        assert_eq!(count(align_b), 1, "align_b untouched");
+        assert_eq!(count("alignment", align_a), 0, "align_a rows gone");
+        assert_eq!(count("alignment", align_b), 1, "align_b untouched");
+        assert_eq!(
+            count("alignment_origin_spanning", align_a),
+            0,
+            "align_a evidence rows gone"
+        );
+        assert_eq!(
+            count("alignment_origin_spanning", align_b),
+            1,
+            "align_b evidence untouched"
+        );
 
         // Idempotency: re-deleting the now-empty alignment is success with 0 rows.
         let second =
@@ -3931,17 +4207,24 @@ mod tests {
         assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
         let _ = conn.execute_batch(&format!(
-            "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align_b};"
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align_b};
+             DELETE FROM qiita_lake.alignment_origin_spanning WHERE alignment_idx = {align_b};"
         ));
     }
 
-    /// `delete_alignment_block` deletes EXACTLY one block's footprint from the
-    /// `alignment` table: the per-member OR residual keeps a split sample's
-    /// sibling-block sub-range, the `alignment_idx` scope keeps a different
-    /// alignment's rows for the same sample, ALL of a read's rows go (multiplicity
-    /// — a read with two feature_idx rows loses both), and a re-delete is an
-    /// idempotent 0-row noop. The alignment twin of
+    /// `delete_alignment_block` deletes EXACTLY one block's footprint from every
+    /// `ALIGNMENT_DELETE_TABLES` table: the per-member OR residual keeps a split
+    /// sample's sibling-block sub-range, the `alignment_idx` scope keeps a
+    /// different alignment's rows for the same sample, ALL of a read's rows go
+    /// (multiplicity — a read with two feature_idx rows loses both), and a
+    /// re-delete is an idempotent 0-row noop. The alignment twin of
     /// `delete_read_mask_block_deletes_footprint_only`.
+    ///
+    /// The side table gets a row in each of the four regions the footprint
+    /// distinguishes — inside block 1, inside block 2 (still within the coarse
+    /// `BETWEEN` span), a second sample inside block 1, and a different
+    /// alignment_idx — so the one clause is shown to select the same reads there
+    /// as in `alignment`.
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
@@ -3963,8 +4246,14 @@ mod tests {
         // two shards' features), exercising the feature_idx-agnostic multiplicity
         // delete. align_a/prep_b (seq 200-201) is whole in block 1. align_b's row
         // for prep_a (seq 100) is a different align-config identity.
+        //
+        // The side table is one row per origin-spanning READ, so it has no
+        // multiplicity twin for seq 100. Identity columns only, as in
+        // `delete_alignment_drops_target_idempotently`.
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
+             DELETE FROM qiita_lake.alignment_origin_spanning \
+                 WHERE alignment_idx IN ({align_a}, {align_b});
              INSERT INTO qiita_lake.alignment \
                  (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
                  ({align_a}, {prep_a}, 100, 10), \
@@ -3974,6 +4263,12 @@ mod tests {
                  ({align_a}, {prep_a}, 103, 10), \
                  ({align_a}, {prep_b}, 200, 10), \
                  ({align_a}, {prep_b}, 201, 10), \
+                 ({align_b}, {prep_a}, 100, 10);
+             INSERT INTO qiita_lake.alignment_origin_spanning \
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
+                 ({align_a}, {prep_a}, 100, 10), \
+                 ({align_a}, {prep_a}, 103, 10), \
+                 ({align_a}, {prep_b}, 200, 10), \
                  ({align_b}, {prep_a}, 100, 10);"
         ))
         .unwrap();
@@ -4003,10 +4298,10 @@ mod tests {
         );
         assert_eq!(first["alignment_idx"], align_a);
 
-        let count = |align: i64, prep: i64| -> i64 {
+        let count = |table: &str, align: i64, prep: i64| -> i64 {
             conn.query_row(
                 &format!(
-                    "SELECT count(*) FROM qiita_lake.alignment \
+                    "SELECT count(*) FROM qiita_lake.{table} \
                      WHERE alignment_idx = {align} AND prep_sample_idx = {prep}"
                 ),
                 [],
@@ -4016,14 +4311,37 @@ mod tests {
         };
         // Block 2's sub-range of the split sample survives (per-member OR exact).
         assert_eq!(
-            count(align_a, prep_a),
+            count("alignment", align_a, prep_a),
             2,
             "prep_a 102-103 (block 2) untouched"
         );
         // prep_b's whole sample was in block 1 — fully deleted.
-        assert_eq!(count(align_a, prep_b), 0, "prep_b fully deleted");
+        assert_eq!(
+            count("alignment", align_a, prep_b),
+            0,
+            "prep_b fully deleted"
+        );
         // The different alignment's row for the same sample is out of scope.
-        assert_eq!(count(align_b, prep_a), 1, "align_b untouched");
+        assert_eq!(count("alignment", align_b, prep_a), 1, "align_b untouched");
+
+        // The same three properties on the side table. prep_a's surviving row is
+        // seq 103 — inside the coarse BETWEEN 100 AND 201 span, so only the
+        // per-member OR residual keeps it.
+        assert_eq!(
+            count("alignment_origin_spanning", align_a, prep_a),
+            1,
+            "prep_a 103 (block 2) evidence untouched"
+        );
+        assert_eq!(
+            count("alignment_origin_spanning", align_a, prep_b),
+            0,
+            "prep_b evidence fully deleted"
+        );
+        assert_eq!(
+            count("alignment_origin_spanning", align_b, prep_a),
+            1,
+            "align_b evidence untouched"
+        );
 
         // Idempotency: re-deleting the same footprint removes nothing.
         let second = delete_alignment_block(&connstr, &data_path, align_a, &members)
@@ -4031,7 +4349,125 @@ mod tests {
         assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
         let _ = conn.execute_batch(&format!(
-            "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});"
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
+             DELETE FROM qiita_lake.alignment_origin_spanning \
+                 WHERE alignment_idx IN ({align_a}, {align_b});"
+        ));
+    }
+
+    /// `delete_alignment_sample` deletes EXACTLY one `(alignment_idx,
+    /// prep_sample_idx)` pair's rows from every `ALIGNMENT_DELETE_TABLES` table.
+    /// Both halves of the pair are pinned: a sibling sample under the SAME
+    /// alignment_idx survives (so the delete is not `delete_alignment`), and the
+    /// target sample's rows under a DIFFERENT alignment_idx survive (so it is not
+    /// keyed on prep_sample_idx alone). All of a read's rows go regardless of
+    /// feature_idx, and a sample with no rows deletes an idempotent 0.
+    ///
+    /// Every one of those regions is seeded in the side table too, so the one
+    /// clause is shown to select the same rows there as in `alignment`.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn delete_alignment_sample_deletes_the_pair_only() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_alignment_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let align_a: i64 = 960_300;
+        let align_b: i64 = 960_301;
+        let prep_a: i64 = 960_310;
+        let prep_b: i64 = 960_311;
+        // A sample that never registered rows — the idempotent-zero case.
+        let prep_empty: i64 = 960_312;
+
+        // align_a/prep_a is the target: seq 100 has TWO rows (feature 10 + 11 — a
+        // read aligned to two shards' features), exercising the feature_idx-agnostic
+        // multiplicity delete. align_a/prep_b is a sibling sample under the same
+        // align-config identity; align_b/prep_a is the same sample under a different
+        // one. Identity columns only, as in the other alignment delete tests.
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
+             DELETE FROM qiita_lake.alignment_origin_spanning \
+                 WHERE alignment_idx IN ({align_a}, {align_b});
+             INSERT INTO qiita_lake.alignment \
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
+                 ({align_a}, {prep_a}, 100, 10), \
+                 ({align_a}, {prep_a}, 100, 11), \
+                 ({align_a}, {prep_a}, 101, 10), \
+                 ({align_a}, {prep_b}, 200, 10), \
+                 ({align_a}, {prep_b}, 201, 10), \
+                 ({align_b}, {prep_a}, 100, 10);
+             INSERT INTO qiita_lake.alignment_origin_spanning \
+                 (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
+                 ({align_a}, {prep_a}, 100, 10), \
+                 ({align_a}, {prep_b}, 200, 10), \
+                 ({align_b}, {prep_a}, 100, 10);"
+        ))
+        .unwrap();
+
+        let first = delete_alignment_sample(&connstr, &data_path, align_a, prep_a)
+            .expect("delete_alignment_sample failed");
+        // Three rows: two at seq 100 (multiplicity) + one at 101.
+        assert_eq!(first["rows_deleted"], 3, "the pair's 3 rows deleted");
+        assert_eq!(first["alignment_idx"], align_a);
+
+        let count = |table: &str, align: i64, prep: i64| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.{table} \
+                     WHERE alignment_idx = {align} AND prep_sample_idx = {prep}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("alignment", align_a, prep_a), 0, "the pair is gone");
+        assert_eq!(
+            count("alignment", align_a, prep_b),
+            2,
+            "a sibling sample under the SAME alignment survives"
+        );
+        assert_eq!(
+            count("alignment", align_b, prep_a),
+            1,
+            "the SAME sample under a different alignment survives"
+        );
+
+        // The same three properties on the side table.
+        assert_eq!(
+            count("alignment_origin_spanning", align_a, prep_a),
+            0,
+            "the pair's evidence is gone"
+        );
+        assert_eq!(
+            count("alignment_origin_spanning", align_a, prep_b),
+            1,
+            "the sibling sample's evidence survives"
+        );
+        assert_eq!(
+            count("alignment_origin_spanning", align_b, prep_a),
+            1,
+            "the other alignment's evidence survives"
+        );
+
+        // Idempotency: re-deleting the now-empty pair is success with 0 rows.
+        let second = delete_alignment_sample(&connstr, &data_path, align_a, prep_a)
+            .expect("idempotent re-delete failed");
+        assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
+
+        // A sample that never registered rows is the same 0-row success.
+        let never = delete_alignment_sample(&connstr, &data_path, align_a, prep_empty)
+            .expect("delete of a sample with no rows failed");
+        assert_eq!(never["rows_deleted"], 0, "a sample with no rows deletes 0");
+
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
+             DELETE FROM qiita_lake.alignment_origin_spanning \
+                 WHERE alignment_idx IN ({align_a}, {align_b});"
         ));
     }
 
@@ -5723,8 +6159,7 @@ mod tests {
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-        ducklake::ensure_reference_tables(&conn).unwrap();
-        ducklake::ensure_assembly_tables(&conn).unwrap();
+        setup_full_lake(&conn);
 
         for entry in REPLACE_KEY_TABLES {
             let table = entry.table;
@@ -5759,10 +6194,7 @@ mod tests {
         let data_path = delete_test_data_path();
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-        ducklake::ensure_reference_tables(&conn).unwrap();
-        ducklake::ensure_assembly_tables(&conn).unwrap();
-        ducklake::ensure_read_tables(&conn).unwrap();
-        ducklake::ensure_alignment_tables(&conn).unwrap();
+        setup_full_lake(&conn);
 
         // Content-addressed shape: keyed by feature_idx, carrying sequence bytes or
         // their hash, and scoped by nothing else. Matching the shape rather than an
@@ -5800,6 +6232,102 @@ mod tests {
                  so a second load carrying its keys would duplicate them; found shaped tables: \
                  {shaped:?}"
             );
+        }
+    }
+
+    /// Membership runs both ways. Every `qiita_lake` BASE TABLE scoped by
+    /// `alignment_idx` is in `ALIGNMENT_DELETE_TABLES`, and every table in the
+    /// list carries every column a `delete_alignment*` clause keys on.
+    ///
+    /// The first direction is the shape query, as in
+    /// `every_content_addressed_lake_table_is_registered`: an `alignment_idx`
+    /// column means the rows belong to one align-config identity and die with it,
+    /// so a table added later carrying that column and left off the list would
+    /// survive a DELETE that is supposed to purge the whole alignment — and
+    /// disallow-without-delete would then re-admit a submission over rows that are
+    /// still there.
+    ///
+    /// The second is the columns. `delete_lake_rows` applies ONE clause to every
+    /// listed table, so a table joining the list without `prep_sample_idx` or
+    /// `sequence_idx` makes the narrower deletes unrunnable. That is loud rather
+    /// than silent — DuckDB raises a Binder Error on the missing column and
+    /// `delete_lake_rows` ROLLBACKs, leaving the leading table's rows intact — so
+    /// this catches it in CI instead of at the first ticket.
+    ///
+    /// Views are excluded: `alignment_visible` carries `alignment_idx` from the
+    /// base table it selects and has no rows of its own.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn alignment_delete_covers_every_alignment_scoped_lake_table() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        setup_full_lake(&conn);
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT c.table_name FROM duckdb_columns() c \
+                 JOIN duckdb_tables() t \
+                   ON t.database_name = c.database_name AND t.table_name = c.table_name \
+                 WHERE c.database_name = 'qiita_lake' AND c.column_name = 'alignment_idx' \
+                 ORDER BY c.table_name",
+            )
+            .unwrap();
+        let scoped: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert!(
+            !scoped.is_empty(),
+            "the shape query matched nothing — it can no longer catch an omission"
+        );
+        for table in &scoped {
+            assert!(
+                ALIGNMENT_DELETE_TABLES.contains(&table.as_str()),
+                "qiita_lake.{table} is scoped by alignment_idx but absent from \
+                 ALIGNMENT_DELETE_TABLES, so the delete_alignment* handlers leave its \
+                 rows behind; found scoped tables: {scoped:?}"
+            );
+        }
+        assert_eq!(
+            ALIGNMENT_DELETE_TABLES.first(),
+            Some(&"alignment"),
+            "the delete_alignment* handlers report counts[0] as rows_deleted"
+        );
+
+        // The columns the three clauses key on: `delete_alignment` on
+        // alignment_idx, `delete_alignment_sample` on that plus prep_sample_idx,
+        // `delete_alignment_block` on that plus `block_read_where_clause`'s
+        // sequence_idx.
+        for table in ALIGNMENT_DELETE_TABLES {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT column_name FROM duckdb_columns() \
+                     WHERE database_name = 'qiita_lake' AND table_name = ?",
+                )
+                .unwrap();
+            let columns: Vec<String> = stmt
+                .query_map([table], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(
+                !columns.is_empty(),
+                "qiita_lake.{table} is in ALIGNMENT_DELETE_TABLES but the catalog \
+                 holds no such table"
+            );
+            for key in ["alignment_idx", "prep_sample_idx", "sequence_idx"] {
+                assert!(
+                    columns.iter().any(|c| c == key),
+                    "qiita_lake.{table} is in ALIGNMENT_DELETE_TABLES but carries no \
+                     {key}, which a delete_alignment* clause keys on — every delete \
+                     using it would bind-error and roll back; found columns: {columns:?}"
+                );
+            }
         }
     }
 
@@ -5901,10 +6429,9 @@ mod tests {
         ));
     }
 
-    /// The reference pair takes the same path as the assembly pair, and unlike it
-    /// is Flight-readable (`ALLOWED_TABLES`), so a duplicate there reaches a
-    /// consumer. Two references sharing a sequence each ship that feature's rows;
-    /// after both loads there is one of each.
+    /// The reference pair takes the same path as the assembly pair. Two
+    /// references sharing a sequence each ship that feature's rows; after both
+    /// loads there is one of each.
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
@@ -7158,6 +7685,162 @@ mod tests {
         assert!(
             build_query("alignment_visible", &empty, &[], &[]).is_err(),
             "empty filter on alignment_visible must be rejected"
+        );
+    }
+
+    /// A `feature_idx` filter, the only scope an assembly ticket carries.
+    fn feature_scope(values: &[i64]) -> auth::TicketFilter {
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "feature_idx".to_string(),
+            values.iter().map(|v| serde_json::Value::from(*v)).collect(),
+        );
+        filter
+    }
+
+    #[test]
+    fn assembly_surfaces_are_doget_allowed_and_the_junction_is_not() {
+        // The two sequence surfaces are Flight-readable. `assembly_membership`
+        // is read to RESOLVE their scope (`build_assembly_run_query`) but is not
+        // a table a ticket can name; `bin_quality` is a register_files write
+        // target only.
+        for readable in ["assembled_sequence", "assembled_sequence_chunks"] {
+            assert!(
+                ALLOWED_TABLES.contains(&readable),
+                "{readable:?} must be DoGet-readable for the contig read-back"
+            );
+        }
+        for sink in ["assembly_membership", "bin_quality"] {
+            assert!(
+                !ALLOWED_TABLES.contains(&sink),
+                "{sink:?} must not be Flight-reachable"
+            );
+        }
+    }
+
+    /// A well-formed assembly ticket filter: the run, and only the run.
+    fn assembly_run_scope(prep_sample_idx: i64, processing_idx: i64) -> auth::TicketFilter {
+        filter_of(&[
+            ("prep_sample_idx", vec![serde_json::json!(prep_sample_idx)]),
+            ("processing_idx", vec![serde_json::json!(processing_idx)]),
+        ])
+    }
+
+    #[test]
+    fn build_query_assembly_resolves_the_run_through_membership() {
+        for table in ["assembled_sequence", "assembled_sequence_chunks"] {
+            let (sql, full) = build_query(table, &assembly_run_scope(42, 7), &[], &[]).unwrap();
+            assert_eq!(full, format!("qiita_lake.{table}"));
+            assert_eq!(
+                sql,
+                format!(
+                    "SELECT * FROM qiita_lake.{table} WHERE feature_idx IN (\
+                     SELECT feature_idx FROM qiita_lake.assembly_membership \
+                     WHERE prep_sample_idx = 42 AND processing_idx = 7)"
+                ),
+                "got: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_query_assembly_requires_exactly_the_run_key() {
+        // Every rejected shape below would stream contigs the named run did not
+        // produce, or none at all.
+        let empty = auth::TicketFilter::new();
+        let cases: &[(&str, auth::TicketFilter)] = &[
+            ("empty filter", empty.clone()),
+            (
+                "prep_sample_idx alone",
+                filter_of(&[("prep_sample_idx", vec![serde_json::json!(42)])]),
+            ),
+            (
+                "processing_idx alone",
+                filter_of(&[("processing_idx", vec![serde_json::json!(7)])]),
+            ),
+            (
+                "two runs",
+                filter_of(&[
+                    ("prep_sample_idx", vec![serde_json::json!(42)]),
+                    (
+                        "processing_idx",
+                        vec![serde_json::json!(7), serde_json::json!(8)],
+                    ),
+                ]),
+            ),
+            (
+                "two samples",
+                filter_of(&[
+                    (
+                        "prep_sample_idx",
+                        vec![serde_json::json!(42), serde_json::json!(43)],
+                    ),
+                    ("processing_idx", vec![serde_json::json!(7)]),
+                ]),
+            ),
+            (
+                "the run plus a named contig",
+                filter_of(&[
+                    ("prep_sample_idx", vec![serde_json::json!(42)]),
+                    ("processing_idx", vec![serde_json::json!(7)]),
+                    ("feature_idx", vec![serde_json::json!(11)]),
+                ]),
+            ),
+            ("a contig roster alone", feature_scope(&[11, 22, 33])),
+        ];
+        for table in ["assembled_sequence", "assembled_sequence_chunks"] {
+            for (label, filter) in cases {
+                assert!(
+                    build_query(table, filter, &[], &[]).is_err(),
+                    "{table} must reject {label}"
+                );
+            }
+        }
+        // Control: the same empty filter IS served for a reference table, so the
+        // first case above is about these tables and not about empty filters.
+        assert!(build_query("reference_sequences", &empty, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn build_query_assembly_takes_no_projection_and_no_members() {
+        // No projection allowlist (only the alignment surface has one), so a
+        // signed column list is refused rather than dropped; and `members` is
+        // only meaningful for the block-read selectors.
+        for table in ["assembled_sequence", "assembled_sequence_chunks"] {
+            assert!(
+                build_query(
+                    table,
+                    &assembly_run_scope(42, 7),
+                    &[],
+                    &columns(&["feature_idx"])
+                )
+                .is_err(),
+                "{table} must reject a projection column list"
+            );
+            assert!(
+                build_query(table, &assembly_run_scope(42, 7), &block_members(), &[]).is_err(),
+                "{table} must reject a block members selector"
+            );
+        }
+    }
+
+    #[test]
+    fn build_query_assembly_membership_reaches_no_output_column() {
+        // The junction answers "which contigs are this run's" and stops there:
+        // the subquery yields feature_idx, so no membership column can ride out
+        // on a stream whose table is not it (see the allowlist test above).
+        let (sql, full) = build_query(
+            "assembled_sequence_chunks",
+            &assembly_run_scope(42, 7),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(full, "qiita_lake.assembled_sequence_chunks");
+        assert!(sql.starts_with("SELECT * FROM qiita_lake.assembled_sequence_chunks"));
+        assert!(
+            !sql.contains("kind") && !sql.contains("bin_id"),
+            "got: {sql}"
         );
     }
 
