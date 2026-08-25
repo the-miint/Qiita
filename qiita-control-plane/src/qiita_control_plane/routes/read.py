@@ -32,9 +32,9 @@ read CP-side:
 **Privacy.** ``read_block`` streams RAW reads, which may contain host/human
 sequence — the surface ``read_masked`` exists to exclude. So the scoping here is
 load-bearing, not decorative, and it is enforced at three independent boundaries:
-this route signs only for a BLOCK-scoped work ticket with a non-empty member set,
-``sign_ticket`` refuses an empty or wrong-table selector, and the data plane
-refuses an unscoped block read again on the serving side.
+this route signs only for a block- or pool-scoped work ticket with a non-empty
+member set, ``sign_ticket`` refuses an empty or wrong-table selector, and the data
+plane refuses an unscoped block read again on the serving side.
 """
 
 import base64
@@ -64,7 +64,7 @@ async def create_read_doget_ticket(
     signing_key: bytes = Depends(get_flight_signing_key),
     _sa: ServiceAccount = Depends(require_service_with_scope(Scope.READ_DOGET)),
 ) -> DoGetTicketResponse:
-    """Sign a block-read DoGet ticket for the given block work ticket.
+    """Sign a read DoGet ticket for a block- or pool-scoped work ticket.
 
     Fail loud at every step — a bad scope here would stream the wrong reads, and
     for the raw selector those reads are human-containing:
@@ -75,8 +75,8 @@ async def create_read_doget_ticket(
     * an ``action_context`` whose alignment intent disagrees with the
       ``work_ticket.alignment_idx`` column → 422 (a mid-flight alignment DELETE;
       see ``resolve_block_read_scope``);
-    * a block with no members → 422 (a planning bug — never a licence to read
-      unscoped).
+    * a block or pool with no members → 422 (a planning bug, or a pool with no
+      ingested reads — never a licence to read unscoped).
 
     Authorization is scope-only at this layer, matching the reference /
     read_masked / alignment doget routes: any service account holding
@@ -96,7 +96,7 @@ async def create_read_doget_ticket(
     if kind not in (ScopeTargetKind.BLOCK.value, ScopeTargetKind.SEQUENCED_POOL.value):
         raise HTTPException(
             status_code=422,
-            detail=f"work ticket {body.work_ticket_idx} is not block- or pool-scoped",
+            detail=(f"work ticket {body.work_ticket_idx} is {kind!r}-scoped, not block or pool"),
         )
 
     # asyncpg hands JSONB back as str under the default codec (or a dict if one
