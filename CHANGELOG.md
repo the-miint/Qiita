@@ -21,6 +21,28 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+
+- **The global sample field registries can be read back.** `GET
+  /api/v1/biosample-global-field` and `GET /api/v1/prep-sample-global-field` list every
+  row of their registry, so a client can resolve a global field's idx through the
+  API. Each row carries `internal_name`, the stable key a caller matches
+  on, alongside the display name, data type, default tier, and terminology binding. Gated
+  on the entity read scope (`biosample:read` / `prep_sample:read`) over the HumanUser
+  baseline every read in these modules carries, with no study check at all: a registry is
+  global, so there is no study to hold a tier on and a caller with no study grants still
+  gets the full list. Each registry hangs off its own top-level prefix
+  rather than a segment under `/biosample`, where a literal `GET` sub-path would be
+  shadowed by `GET /biosample/{biosample_idx}`.
+
+  - **`qiita <entity> list-fields` / `list-global-fields`.** The user-CLI front end for
+  the two field reads above, for both `biosample` and `prep-sample`. `list-global-fields`
+  prints the registry so the idx `create-field --<entity>-global-field-idx` wants is
+  obtainable, and `list-fields` prints a study's own definitions so a bulk
+  field-creation script can see what already exists. The study-scoped route already exists;
+  the registry routes and their `api_paths` constants land with this change. The generic
+  read handler grew a parameterless mode so all four verbs stay declarations rather than
+  hand-written handlers.
+
 - **A study's sample field definitions can be read back.** `GET
   /api/v1/study/{study_idx}/biosample-field` and `.../prep-sample-field` list the study's
   field definitions, so a client no longer has to infer what already exists by attempting
