@@ -11,10 +11,15 @@ cannot see either way. So this gesture:
      recording the basename on the upload row;
   3. submits the ingest work_ticket naming the upload handles.
 
-The recorded basename is what the submit gate applies the filename-prefix rule
-to (it must be the prep_sample's `sequenced_pool_item_id` followed by `_` or
-`.`), so a mismatch comes back as a 422 from step 3 — after the upload, since
-the rule needs the prep_sample the ticket names.
+For a FASTQ, the recorded basename is what the submit gate applies the
+filename-prefix rule to (it must be the prep_sample's `sequenced_pool_item_id`
+followed by `_` or `.`), so a mismatch comes back as a 422 from step 3 — after
+the upload, since the rule needs the prep_sample the ticket names. **The rule
+does not apply to a BAM**: `FASTQ_PATH_CONTEXT_KEYS` names only the two fastq
+keys, and a PacBio demux BAM is named for its movie and barcode
+(`{movie}.hifi_reads.{barcode}.bam`), which carries no pool item id — the
+barcode is how that file is bound to a sample, upstream in
+`submit-pacbio-ingest`.
 
 Format decides the action: FASTQ (one or two files) → `fastq-to-parquet`, BAM →
 `bam-to-parquet`. Both accept either an `*_upload_idx` handle or a host path,
