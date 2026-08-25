@@ -109,7 +109,7 @@ class SlurmBackend(ComputeBackend):
     `prep_sample_idx`) is not supported yet — the backend handles a single
     SLURM job per step.
 
-    See docs/architecture.md "Backend code-sharing" for the
+    See docs/architecture/processing.md "Backend code-sharing" for the
     canonical-implementation contract: the SLURM container's entrypoint
     must execute the same DuckDB+miint logic that `LocalBackend`'s
     in-process helpers run, so dev / CI and production stay in sync.

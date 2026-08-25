@@ -21,7 +21,7 @@ those are separate principals with their own scope sets.
 
 For the conceptual reference (scopes, ceilings, audit events) see
 [`docs/auth.md`](../auth.md). For the route contract and identifier model
-see the **Raw-read identifiers** paragraph in [`docs/architecture.md`](../architecture.md).
+see the **Raw-read identifiers** paragraph in [`docs/architecture/data-model.md`](../architecture/data-model.md).
 
 > **One-time admin task — not per-user, not recurring.** A *service
 > account* is provisioned once and never "logs in": the orchestrator
