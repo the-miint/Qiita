@@ -80,7 +80,7 @@ cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 **No development-plan vocabulary in code.** "M0", "M3", "Phase 4", "item 6", "the milestone" — these name a planning document that is not in the repo and will not outlive the branch, so they say nothing to whoever reads the line next. This covers comments, docstrings, test names, and `CHANGELOG.md` prose alike. Write the substance instead: not "M0 measured the break-even at ~4 Gbit/s", just "the measured break-even is ~4 Gbit/s". The `(#N)` carve-out above does not extend to these — a PR number resolves forever, a milestone label does not.
 
-**Don't whole-file-read the big files.** Several source and test modules here run past 3,000 lines (the control-plane CLI/runner test modules, `qiita-data-plane/src/flight_service.rs`). Reading one whole costs more context than every instruction file in this repo combined, so locate first (grep / LSP / a targeted `Read` offset+limit) and read only the span you need. `CHANGELOG.md` is long for the same reason: its header says where to add an entry, so you never need to read the body.
+**Don't whole-file-read the big files.** Several source and test modules here run past 3,000 lines (the control-plane CLI/runner test modules, `qiita-data-plane/src/flight_service.rs`). Reading one whole costs more context than every instruction file in this repo combined, so locate first (grep / LSP / a targeted `Read` offset+limit) and read only the span you need. `CHANGELOG.md` and `docs/architecture.md` are long for the same reason: the changelog's header says where to add an entry, so you never need to read the body, and `docs/architecture.md` is a lookup surface of 30+ sections — grep its headings and read the one you need.
 
 ## miint is a core dependency
 

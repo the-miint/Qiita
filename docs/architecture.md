@@ -1525,8 +1525,6 @@ jobs:
 
 ## Cross-cutting structure
 
-Moved here from `CLAUDE.md` so each fact has one home.
-
 ### Component map and ports
 
 | Component | Language | Port | Role |
@@ -1560,7 +1558,7 @@ reference_idx ── reference_membership ── feature_idx ── feature_geno
 
 `feature_idx` bridges sample processing results (alignment detail, counts) and reference data (sequences, taxonomy, annotations, phylogeny). Alignment output contains `feature_idx` but **not** `reference_idx` — reference scoping is a query-time join against `reference_membership`.
 
-Phylogeny internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. A tip carries its own `feature_idx` **column** on the DuckLake `reference_phylogeny` row (NULL on internal nodes); there is no junction table, and no exclusion-aware `_visible` view — see [`docs/architecture.md`](docs/architecture.md) under "Phylogeny and Placements" for why, and what a consumer must do instead.
+Phylogeny internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. A tip carries its own `feature_idx` **column** on the DuckLake `reference_phylogeny` row (NULL on internal nodes); there is no junction table, and no exclusion-aware `_visible` view — see [Phylogeny and Placements](#phylogeny-and-placements) for why, and what a consumer must do instead.
 
 **Hash storage: never carry MD5 as VARCHAR.** DuckDB's `md5(x)` returns the 32-char hex string by default — never write the string form into a column, temp table, or Parquet file. Cast to `UUID` (`md5(x)::uuid`, 128-bit internally) or use `md5_number(x)` for `UHUGEINT`. Both are 16-byte fixed-width, compare/JOIN as integers, and match the Postgres `uuid` column type the wire-side `sequence_hash` already uses — a string-form intermediate forces a CAST at write time and burns memory + I/O between phases. Same rule applies to any other content hash (SHA-256 as fixed-width bytes, etc.); pick the narrowest integer / fixed-width type the hash fits in.
 

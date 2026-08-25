@@ -2441,6 +2441,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **`CLAUDE.md` trimmed from 11,020 to 5,747 tokens; the reference material moved to `docs/` (#482).**
+  Every token in `CLAUDE.md` is re-sent in front of every API call an agent makes, and compaction
+  never evicts it — measured over 46 sessions, the always-loaded prefix was 18.9% of all input
+  tokens, rising to 32.5% once a compact cadence is adopted. The lookup-shaped sections move to
+  `docs/container-images.md`, `docs/deployments.md`, `docs/testing.md`, and a new
+  **Cross-cutting structure** section in `docs/architecture.md` (component map, identifier
+  ownership, data-plane design, orchestrator pattern, workflow runner). `Enum parity` and
+  `Operator-facing changes` are condensed to their rules. Every rule that has to fire without
+  being looked up — the development ethos, miint-is-core, naming, REST path constants,
+  never-edit-an-applied-migration, the changelog gate — stays resident, and every moved section
+  leaves a pointer plus an index table under `## Architecture`. `docs/architecture.md` joins
+  `CHANGELOG.md` in the don't-whole-file-read rule, since it is now a 1,600-line lookup surface.
+
 - **Data-plane inline test modules split into `#[path]` submodules (#481).** `flight_service.rs`
   was 9,398 lines of which 5,712 (61%) were `#[cfg(test)]`; `auth.rs` was 1,143 with 514 (45%).
   The tests move to `flight_service_tests.rs` / `auth_tests.rs` and stay child modules via
@@ -2486,18 +2499,6 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   and one heading per bucket. Measured across 46 agent sessions, `CHANGELOG.md` was
   the most-accessed file in the repo — 387 tool calls, 127,150 tokens — while the
   union of lines any session ever read was 885 of 5,668 (16%).
-
-- **`CLAUDE.md` trimmed from 11,020 to 5,583 tokens; the reference material moved to `docs/` (#482).**
-  Every token in `CLAUDE.md` is re-sent in front of every API call an agent makes, and compaction
-  never evicts it — measured over 46 sessions, the always-loaded prefix was 18.9% of all input
-  tokens, rising to 32.5% once a compact cadence is adopted. The lookup-shaped sections move to
-  `docs/container-images.md`, `docs/deployments.md`, `docs/testing.md`, and a new
-  **Cross-cutting structure** section in `docs/architecture.md` (component map, identifier
-  ownership, data-plane design, orchestrator pattern, workflow runner). `Enum parity` and
-  `Operator-facing changes` are condensed to their rules. Every rule that has to fire without
-  being looked up — the development ethos, miint-is-core, naming, REST path constants,
-  never-edit-an-applied-migration, the changelog gate — stays resident, and every moved section
-  leaves a pointer plus an index table under `## Architecture`.
 
 - **`mint-features` pins its declared `inputs:` list (#464).** The runner's dispatch resolved
   the manifest as `entry.inputs[0]`, so a workflow naming any other binding minted features out
