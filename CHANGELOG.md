@@ -25,7 +25,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   Two workflows bring EMP-style 16S into Qiita. `golay-demux` (ingest) Golay-barcode
   demultiplexes a pool's multiplexed FASTQ (R1 + I1 + optional R2) into per-sample reads
   in the DuckLake `read` table — the analogue of bcl-convert for runs that arrive
-  already-converted-but-multiplexed; the (12,11,8) Golay decode cloud is generated
+  already-converted-but-multiplexed; the [24,12,8] Golay decode cloud is generated
   in-job (no vendored table / operator path). `amplicon` (process) denoises a pool's
   stored reads with deblur (trim → dereplicate → SortMeRNA 16S pre-filter → UCHIME
   chimera → MAFFT → deblur), **reference-agnostically**: every ASV gets a `feature_idx`

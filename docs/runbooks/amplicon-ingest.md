@@ -30,8 +30,9 @@ repeated here — see [`user-cli-quickstart.md`](user-cli-quickstart.md).
 ## Submit golay-demux (ingest)
 
 - _(TODO)_ context: `index_reads_path`, `forward_reads_path`, optional
-  `reverse_reads_path`, and the per-sample `barcode_map` roster (the runner
-  materializes it from the prep template). Loads per-sample reads into `read`.
+  `reverse_reads_path`, and the per-sample `barcode_map` roster submitted in
+  action_context (the runner materializes it to a parquet; the orchestrator has
+  no DB access). Loads per-sample reads into `read`.
 
 ## Submit amplicon (denoise)
 

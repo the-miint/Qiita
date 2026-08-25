@@ -1,7 +1,6 @@
 """Golay-barcode demux of a pool's multiplexed 16S run into the DuckLake `read`
 table — the analogue of bcl-convert+ingest_reads for runs that arrive as one
-multiplexed FASTQ set (R1 + R2 + I1) rather than a per-sample BCL demux. Ported
-from duckdb-miint's demux_qiita.sql.
+multiplexed FASTQ set (R1 + R2 + I1) rather than a per-sample BCL demux.
 
 Two halves: demux (build the Golay cloud, pair I1 against R1/R2 by record order with
 I1 reverse-complemented, assign each read to its prep_sample) and ingest (mint a
@@ -43,11 +42,11 @@ YAML_STEP_NAME = "golay_demux"
 _DUCKDB_THREADS = 4
 _DUCKDB_FALLBACK_MEMORY_GB = 8
 
-# extended binary Golay [24,12], the EMP 16S barcode code. a 12-nt barcode is
+# extended binary Golay [24,12,8], the EMP 16S barcode code. a 12-nt barcode is
 # 24 bits at 2 bits/nt (A=11 C=00 T=10 G=01); the 4096 codewords are the valid
 # barcodes. `errors` is bit-distance to the nearest codeword; <=3 correctable,
-# >=4 ambiguous. generated in-job (matches the vendored table for errors<=3,
-# pinned by a test), so no fixed operator path.
+# >=4 ambiguous. generated in-job from the systematic generator below, so no
+# vendored table or fixed operator path.
 #
 # systematic generator: codeword(m) = (m<<12) | parity(m); the parity basis was
 # extracted from the code itself.

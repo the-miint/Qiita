@@ -6,7 +6,7 @@ description: >
   Golay-barcode demultiplex a pool's multiplexed 16S run (EMP-style: one R1
   forward FASTQ + one I1 barcode FASTQ, plus R2) into per-sample reads in the
   DuckLake `read` table — the analogue of bcl-convert for runs that arrive
-  already converted-but-multiplexed. Ported from duckdb-miint's demux_qiita.sql.
+  already converted-but-multiplexed.
 
   The `golay_demux` step pairs I1 against R1/R2 by record order (I1 is submitted
   RC to the prep), assigns each read to the prep_sample whose barcode its
@@ -17,7 +17,7 @@ description: >
   The per-sample barcode roster (`barcode_map`, each entry carrying its
   `barcodes_are_rc` provenance flag) is embedded in action_context and
   materialized by the runner (the orchestrator has no DB access). The multiplexed
-  FASTQ are compute-node-visible host paths; the Golay (12,11,8) decode cloud is
+  FASTQ are compute-node-visible host paths; the Golay [24,12,8] decode cloud is
   generated in-job (no vendored table / fixed path).
 
 scopes: []

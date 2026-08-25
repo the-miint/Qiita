@@ -112,8 +112,7 @@ SELECT am.sample_id, am.read_id, am.aligned_sequence, d.abundance
 FROM align_mafft('alignable2', sample_id := 'sample_id') am JOIN alignable2 d USING (read_id);
 CREATE OR REPLACE TABLE deblurred AS
 SELECT sample_id, read_id, sequence AS sequence1, abundance
-FROM deblur('aligned', sequence_col := 'aligned_sequence', sample_id := 'sample_id')
-ORDER BY abundance DESC;
+FROM deblur('aligned', sequence_col := 'aligned_sequence', sample_id := 'sample_id');
 """
 
 # orient each read to the primer (only when orient_primer). match on upper(read)
