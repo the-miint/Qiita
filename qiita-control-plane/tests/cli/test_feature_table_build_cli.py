@@ -2,7 +2,7 @@
 and both Flight streams faked — real miint, real analytic, real writers.
 
 The pieces this wires are pinned elsewhere: the analytic against real miint in
-`tests/test_feature_table_analytic.py`, the maps / relabel / bundle in
+`qiita-common`'s `tests/analytic/test_behaviour_miint.py`, the maps / relabel / bundle in
 `tests/cli/test_feature_table_cli.py`, the BIOM writer's own behaviours in
 `tests/test_biom_writer_contract.py`. **What is only testable here is the wiring**:
 which columns ride the ticket, which scope reaches the survivor set, whether the
@@ -22,10 +22,11 @@ import json
 import httpx
 import pyarrow as pa
 import pytest
-from qiita_common import feature_table as ft
+from qiita_common import analytic as ft
 from qiita_common.hashing import canonical_params_hash
 
 from qiita_control_plane.cli.user import feature_table as ftc
+from qiita_control_plane.cli.user._helpers import _UNSET
 from qiita_control_plane.miint import connect_with_miint
 
 # One 1000 bp genome fully covered in sample 1, and one 10 000 bp genome each sample
@@ -222,6 +223,9 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
         "min_identity": None,
         "min_query_coverage": None,
         "unpaired_gate": False,
+        "circular_gate": False,
+        "circular_min_coverage": _UNSET,
+        "circular_min_identity": _UNSET,
         "format": ftc.DEFAULT_TABLE_FORMAT,
         "taxonomy": False,
         "tree": False,
@@ -457,6 +461,144 @@ def test_the_gate_pools_mates_by_default(monkeypatch, tmp_path):
     )
     ftc._handle_feature_table_build(unpaired, parser=None)
     assert "mate_position" not in rec["columns"]
+
+
+def test_a_circular_gate_counts_a_read_the_reference_origin_split(monkeypatch, tmp_path):
+    """The mode end to end. Feature 20 is 10 kb and read 2 crosses its origin: two
+    records covering half the read each, which the per-record gate at 0.9 discards and
+    the pooled one keeps. The two records are one read, so the table counts it once."""
+    split = [
+        (1, 1, 10, 0, 0, 500, "500="),
+        (1, 2, 20, 0, 9_000, 10_000, "1000=1000S"),
+        (1, 2, 20, 2048, 0, 1_000, "1000H1000="),
+    ]
+    rec = _patched(monkeypatch, alignment=split)
+    args = _namespace(tmp_path, circular_gate=True, coverage_threshold=0.0)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    # `mate_position` does not ride: the circular axis tells mates apart by the read1 bit.
+    assert rec["columns"] == [*ft.ALIGNMENT_COLUMNS, "cigar"]
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0), ("QM1", "GCF_200", 1.0)]
+
+    per_record = _patched(monkeypatch, alignment=split)
+    dropped = _namespace(
+        tmp_path,
+        min_query_coverage=ft.CIRCULAR_MIN_COVERAGE,
+        coverage_threshold=0.0,
+        output=tmp_path / "b.parquet",
+    )
+    assert ftc._handle_feature_table_build(dropped, parser=None) == 0
+    assert _table_rows(dropped.output) == [("QM1", "GCF_100", 1.0)]
+    assert per_record["columns"] != rec["columns"]
+
+
+def test_a_circular_gate_streams_the_lengths_even_with_no_coverage_filter(monkeypatch, tmp_path):
+    """It asks how much of a read one contig explains, so it needs a length per feature —
+    a whole-reference read the ungated path skips entirely at threshold 0."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=0.0)
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["lengths_minted"] == 0
+
+    rec = _patched(monkeypatch)
+    circular = _namespace(
+        tmp_path, circular_gate=True, coverage_threshold=0.0, output=tmp_path / "b.parquet"
+    )
+    assert ftc._handle_feature_table_build(circular, parser=None) == 0
+    assert rec["lengths_minted"] == 1
+
+
+def test_the_circular_thresholds_reach_the_predicate(monkeypatch, tmp_path):
+    """They are parameters, so a caller can move them: the same slice keeps the split
+    read at the default 0.90 coverage floor and loses it when the floor is raised past
+    what the read explains."""
+    partial = [
+        (1, 1, 10, 0, 0, 500, "500="),
+        (1, 2, 20, 0, 9_000, 10_000, "1000=1000S"),  # half the read, alone
+    ]
+    _patched(monkeypatch, alignment=partial)
+    strict = _namespace(tmp_path, circular_gate=True, coverage_threshold=0.0)
+    assert ftc._handle_feature_table_build(strict, parser=None) == 0
+    assert _table_rows(strict.output) == [("QM1", "GCF_100", 1.0)]
+
+    _patched(monkeypatch, alignment=partial)
+    lax = _namespace(
+        tmp_path,
+        circular_gate=True,
+        circular_min_coverage=0.4,
+        coverage_threshold=0.0,
+        output=tmp_path / "b.parquet",
+    )
+    assert ftc._handle_feature_table_build(lax, parser=None) == 0
+    assert _table_rows(lax.output) == [("QM1", "GCF_100", 1.0), ("QM1", "GCF_200", 1.0)]
+
+
+def test_a_circular_threshold_without_the_mode_is_refused_not_ignored(
+    monkeypatch, tmp_path, capsys
+):
+    """A flag that only says HOW to judge does nothing on its own — the same shape as
+    `--unpaired-gate` alone, and the same refusal. Silently building an UNGATED table
+    from a command that named a threshold is the failure this closes."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_min_coverage=0.5)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "--circular-min-coverage" in err and "--circular-gate" in err
+    assert "alignments_fetched" not in rec
+    assert not args.output.exists()
+
+
+def test_the_circular_thresholds_default_only_when_omitted(monkeypatch, tmp_path):
+    """Given, they are used; omitted, the shared constants are. The namespace cannot
+    tell those apart from the value alone, which is why the flags default to a
+    sentinel."""
+    _patched(monkeypatch)
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True))
+    assert (gate.circular_min_coverage, gate.circular_min_identity) == (
+        ft.CIRCULAR_MIN_COVERAGE,
+        ft.CIRCULAR_MIN_IDENTITY,
+    )
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True, circular_min_coverage=0.5))
+    assert (gate.circular_min_coverage, gate.circular_min_identity) == (
+        0.5,
+        ft.CIRCULAR_MIN_IDENTITY,
+    )
+
+
+def test_the_identity_term_can_be_dropped_for_an_alignment_that_cannot_be_scored(
+    monkeypatch, tmp_path
+):
+    """`--circular-min-identity none` is the documented escape hatch: pooled identity is
+    NULL on a legacy-`M` CIGAR and `NULL >= 0` is NULL too, so a threshold of 0 does not
+    express it. Reaching the dataclass's `None` is the whole point."""
+    _patched(monkeypatch)
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True, circular_min_identity=None))
+    assert gate.circular_min_identity is None
+    assert gate.circular_min_coverage == ft.CIRCULAR_MIN_COVERAGE
+
+
+def test_a_circular_gate_with_a_cigar_threshold_is_refused_before_any_round_trip(
+    monkeypatch, tmp_path, capsys
+):
+    """Two different questions, and combining them drops exactly the split records the
+    pooling exists to rescue. Refused from the flags alone, before the first REST call."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, min_query_coverage=0.9)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "--circular-min-identity" in capsys.readouterr().err
+    assert "alignments_fetched" not in rec
+
+
+def test_a_circular_gate_with_the_unpaired_flag_is_refused(monkeypatch, tmp_path, capsys):
+    """`--unpaired-gate` says how to pool a placement's mates, which the circular axis
+    does not do — so together they say nothing coherent."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, unpaired_gate=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "--unpaired-gate" in capsys.readouterr().err
 
 
 def test_an_unpaired_gate_over_paired_reads_is_refused(monkeypatch, tmp_path, capsys):
@@ -696,6 +838,28 @@ def test_parser_wires_the_build_with_parquet_and_pooled_as_defaults():
     assert args.prep_sample_idx is None  # omitted -> resolved from the pool
     assert args.min_identity is None and args.min_query_coverage is None
     assert args.unpaired_gate is False
+    assert args.circular_gate is False
+    # Omitted is a sentinel, not the threshold: passing one without --circular-gate has
+    # to be distinguishable from not passing it at all.
+    assert args.circular_min_coverage is _UNSET
+    assert args.circular_min_identity is _UNSET
+
+
+def test_parser_takes_the_circular_mode_and_its_two_thresholds():
+    """Both are settable on the command, which is the point of them being parameters."""
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    args = _build_parser().parse_args(
+        _build_argv(circular_min_coverage="0.8", circular_min_identity="0.99") + ["--circular-gate"]
+    )
+    assert args.circular_gate is True
+    assert (args.circular_min_coverage, args.circular_min_identity) == (0.8, 0.99)
+
+    # `none` drops the identity term, the way `--lane none` spells a NULL lane.
+    dropped = _build_parser().parse_args(
+        _build_argv(circular_min_identity="none") + ["--circular-gate"]
+    )
+    assert dropped.circular_min_identity is None
 
 
 def test_parser_takes_a_repeated_cohort_and_the_per_sample_scope():
@@ -1102,6 +1266,19 @@ def test_the_manifest_records_the_gate_that_filtered_the_table(monkeypatch, tmp_
         "min_identity": 0.9,
         "min_query_coverage": None,
         "mates_pooled": True,
+    }
+
+
+def test_the_manifest_records_the_circular_gates_own_thresholds(monkeypatch, tmp_path):
+    """The other axis has other keys, and reporting it under the CIGAR ones would record
+    a build with two thresholds as one with none."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, circular_min_identity=0.99)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _manifest(tmp_path)["table"]["gate"] == {
+        "circular_min_coverage": ft.CIRCULAR_MIN_COVERAGE,
+        "circular_min_identity": 0.99,
     }
 
 

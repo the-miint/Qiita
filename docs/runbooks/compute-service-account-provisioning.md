@@ -34,13 +34,13 @@ see the **Raw-read identifiers** paragraph in [`docs/architecture.md`](../archit
 ## Scope grant
 
 The compute service account needs `sequence_range:mint` for raw-read
-ingestion and `ticket:doget` for reference-chunk streaming (native index
-build jobs mint a `feature_idx`-scoped DoGet ticket to pull reference
-sequences from the data plane). Both are on `SERVICE_ACCOUNT_SCOPE_CEILING`.
+ingestion and `ticket:doget` for DoGet streaming (native index build jobs mint
+a `feature_idx`-scoped ticket to pull reference sequences from the data plane).
+Both are on `SERVICE_ACCOUNT_SCOPE_CEILING`.
 
-`ticket:doget` is a **read** scope (it signs a ticket to read reference
-chunks), not cross-domain minting authority, so bundling it with
-`sequence_range:mint` on the `compute` principal is the default here.
+`ticket:doget` is a **read** scope, not cross-domain minting authority, so
+bundling it with `sequence_range:mint` on the `compute` principal is the
+default here.
 **Least-privilege alternative:** keep the `sequence_idx`-domain mint isolated
 by provisioning a *separate* service account that holds only `ticket:doget`
 and pointing the reference build path at its token — see "Why a separate
@@ -143,9 +143,13 @@ token carries minting authority across two unrelated identifier
 domains, so keep them on separate principals.
 
 `ticket:doget` is the exception that is bundled onto `compute` by default:
-it is a **read** scope (it signs a short-TTL ticket to read reference
-chunks over Flight), not minting authority, so a compromised token cannot
-create identifiers in any domain. If your threat model still wants the
+it is a **read** scope (it signs a short-TTL Flight ticket), not minting
+authority, so a compromised token cannot create identifiers in any domain.
+It is one scope over a whole list of surfaces, not one per surface: a
+principal granted it to stream reference chunks also reaches every other
+surface `Scope.TICKET_DOGET` enumerates (`qiita-common/.../auth_constants.py`),
+including sample-derived ones, and those routes enforce scope only — no
+per-study or row-level check. If your threat model still wants the
 `sequence_idx` mint isolated from every reference-domain capability,
 provision a separate service account holding only `ticket:doget` and point
 the reference build path's token at it — the same "extra row in

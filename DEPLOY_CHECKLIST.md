@@ -23,7 +23,17 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `20260819000001_assembly_sample.sql` — plain `make migrate`, no out-of-band setup. One
+  empty table and its index, `qiita.assembly_sample`: the per-`(processing_idx,
+  prep_sample)` completion gate for `long-read-assembly`, alongside the existing
+  `qiita.mask_sample` and `qiita.alignment_sample`. The index is created with the table, so
+  it is a plain `CREATE INDEX` over zero rows — no `CONCURRENTLY`, nothing to lock.
+  **No backfill**: assemblies already completed on this host get no gate row, so they read
+  as not-assembled. No code reads the gate yet; whether to backfill them is a separate
+  decision. The migrate→restart window has the same shape — an
+  assembly ticket completing between bucket 3 and the bucket-4 restart runs under old code
+  that writes no gate row. Re-submitting such a sample after the restart is admitted and
+  re-writes it (no disallow-without-delete site applies to `long-read-assembly`). (#467)
 
 ### 4. Deploy
 
@@ -31,7 +41,35 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- **`long-read-assembly` 1.0.0 is edited in place, not versioned** — `activate.sh`'s
+  `qiita-admin actions sync` re-syncs it, so the `qiita.action` list check `make
+  verify-deploy` already runs is the confirmation it landed. One edit rides this deploy,
+  adding no bind mount, resource, or env var: a terminal `finalize-assembly-sample` entry
+  appended after `register-files` — an in-process control-plane primitive writing the
+  `qiita.assembly_sample` gate, not a SLURM step. Confirm it landed: all three
+  `qiita.assembly_sample` writes are gated on the terminal entry being present in the
+  synced `steps`, so under a stale copy no gate row is written at all and the table stays
+  empty — which reads like a migration that did not apply rather than a sync that did not
+  land.
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -Atc "SELECT steps::text LIKE '\''%finalize-assembly-sample%'\'' FROM qiita.action WHERE action_id = '\''long-read-assembly'\'' AND version = '\''1.0.0'\'';"'
+  ```
+  Expect `t`. `f` is the stale copy. **Empty output** is a third outcome, not a pass: `-Atc`
+  prints nothing for zero rows, so it means no `long-read-assembly` 1.0.0 row matched at
+  all. Re-run `qiita-admin actions sync` for either. (#467)
+
+- **The staged miint build must carry `circular_query_coverage`** — `qiita feature-table
+  build --circular-gate` calls it. There is no capability probe: an absent function
+  surfaces as a bare `Catalog Error` naming the function, so check it once here rather
+  than letting a user discover it. Run as the CP service account, against the staged
+  extension directory the CP already LOADs from:
+  ```bash
+  sudo -u qiita-api env MIINT_EXTENSION_DIRECTORY="$(grep -oP '(?<=^MIINT_EXTENSION_DIRECTORY=).*' /etc/qiita/control-plane.env)" \
+    python3 -c "import duckdb, os; c=duckdb.connect(':memory:', config={'extension_directory': os.environ['MIINT_EXTENSION_DIRECTORY'], 'allow_unsigned_extensions': 'true'}); c.execute('LOAD miint'); print(c.execute(\"SELECT count(*) FROM duckdb_functions() WHERE function_name='circular_query_coverage'\").fetchone()[0])"
+  ```
+  Expect `1`. A `0` means the staged build predates the function — re-stage the extension
+  before telling anyone `--circular-gate` works. (#475)
 
 ### 6. After the deploy verifies green
 
@@ -80,6 +118,24 @@ _None yet._
 ### Notes (no host action)
 
 - **`qiita reference export` stops reproducing soft-masking** (#479). Chunks are stored upper case from this deploy on, so an exported FASTA is upper case for anything loaded after it — and for the 23 collapsed in bucket 6. Case is not recoverable from the lake. A reference loaded earlier and never re-loaded keeps its submitted casing indefinitely, since nothing re-loads one on its own; that is only visible through export, because the four index builders that read `chunk_data` all discard case (measured, see `normalized_sequence_expr`). Strand is unchanged: it still follows load order, as the existing caveat on `_write_genome_fasta` says.
+
+- **`ticket:doget` now also reaches a sample's assembled contigs — no scope grant, no
+  re-mint.** A new `POST /assembly/ticket/doget` signs a Flight DoGet ticket for one
+  `(prep_sample_idx, processing_idx)` run's contigs on `assembled_sequence` /
+  `assembled_sequence_chunks`, gated on the existing service-only `ticket:doget`, which
+  the live `compute` account already holds. So every service account carrying that scope
+  gains contig read-back at the restart, with nothing to run. Worth knowing rather than
+  doing: it is the first *sample-derived* sequence surface that scope opens — every other
+  table it reaches is reference data or the derived per-read `alignment` slice — and the
+  route authorizes on scope alone, with no per-study or row-level check. If a site
+  provisioned a second principal holding only `ticket:doget` for reference streaming (the
+  least-privilege split in
+  [`compute-service-account-provisioning.md`](docs/runbooks/compute-service-account-provisioning.md)),
+  that principal now reaches contigs too. The ticket carries the pair, and the data plane
+  resolves which contigs it reaches from the DuckLake `assembly_membership` at read time —
+  so a run re-registered inside the mint's 300 s TTL streams the re-registered rows, and a
+  run whose contigs are in the lake but whose Postgres membership was cleared answers 404
+  at the route. (#476)
 
 ---
 
