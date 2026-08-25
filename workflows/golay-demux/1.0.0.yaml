@@ -58,6 +58,12 @@ context_schema:
           prep_sample_idx: {type: integer, minimum: 1}
           barcode: {type: string, minLength: 1}
           barcodes_are_rc: {type: boolean}
+    # max Golay bit-errors to accept a match (EMP: 1.5). an algorithm tolerance, so
+    # it stays a submit-time param.
+    golay_error_threshold:
+      type: number
+      minimum: 0
+      default: 1.5
 
 steps:
   # demux + per-sample ingest in one job. barcode_map and reads_staging_root are
@@ -67,6 +73,7 @@ steps:
     module: qiita_compute_orchestrator.jobs.golay_demux
     inputs: [index_reads_path, forward_reads_path, barcode_map, reads_staging_root]
     optional_inputs: [reverse_reads_path]
+    params: {golay_error_threshold: golay_error_threshold}
     outputs: [read_staging_dir]
     baseline_resources:
       cpu: 8

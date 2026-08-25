@@ -164,11 +164,11 @@ def _run_demux(inputs: Inputs, demuxed_out: Path, duckdb_tmp: Path, *, memory_gb
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=_DUCKDB_THREADS)
         # build the decode cloud in-job, bounded by the threshold.
         _build_golay_cloud(conn, _correctable_radius(threshold))
-        # prep barcodes, RC'd per their flag; expand against the cloud.
+        # prep barcodes, upper-cased then RC'd per their flag; expand against the cloud.
         conn.execute(
             "CREATE OR REPLACE VIEW prep_bc AS SELECT prep_sample_idx, "
-            "IF(barcodes_are_rc, sequence_dna_reverse_complement(barcode), barcode) AS barcode "
-            f"FROM read_parquet('{bc}')"
+            "IF(barcodes_are_rc, sequence_dna_reverse_complement(upper(barcode)), upper(barcode)) "
+            f"AS barcode FROM read_parquet('{bc}')"
         )
         conn.execute(
             "CREATE OR REPLACE TABLE golay_codes AS "
@@ -177,16 +177,21 @@ def _run_demux(inputs: Inputs, demuxed_out: Path, duckdb_tmp: Path, *, memory_gb
             f"WHERE g.errors < {threshold}"
         )
         conn.execute("CREATE UNIQUE INDEX gc_idx ON golay_codes(raw)")
-        # I1 length varies; some runs ship longer index reads than 12 nt.
-        conn.execute(
-            "SET VARIABLE demux_i1_12 = "
-            f"(SELECT length(sequence1) = 12 FROM read_fastx('{i1}') LIMIT 1)"
-        )
-        # per-record RC'd index read, keyed by record order.
+        # fail loud on any barcode that decodes to no codeword (a typo, the wrong
+        # barcodes_are_rc, or a non-Golay barcode) — else that sample silently drops.
+        bad = conn.execute(
+            "SELECT prep_sample_idx, barcode FROM prep_bc "
+            "WHERE prep_sample_idx NOT IN (SELECT prep_sample_idx FROM golay_codes) "
+            "ORDER BY prep_sample_idx"
+        ).fetchall()
+        if bad:
+            named = ", ".join(f"{r[0]}:{r[1]}" for r in bad)
+            raise ValueError(f"barcodes decode to no Golay codeword: {named}")
+        # per-record RC'd 12-nt index read, keyed by record order. sequence1[:12] is
+        # correct at any length (a shorter I1 just won't match a 12-mer codeword).
         conn.execute(
             "CREATE OR REPLACE VIEW idx_reads AS SELECT sequence_index, "
-            "sequence_dna_reverse_complement("
-            "  IF(getvariable('demux_i1_12'), sequence1, sequence1[:12])) AS index_read "
+            "sequence_dna_reverse_complement(upper(sequence1[:12])) AS index_read "
             f"FROM read_fastx('{i1}')"
         )
         # per-record R1(+R2), keyed by record order (matches I1's order).
@@ -195,12 +200,21 @@ def _run_demux(inputs: Inputs, demuxed_out: Path, duckdb_tmp: Path, *, memory_gb
             "SELECT sequence_index, read_id, sequence1, qual1, sequence2, qual2 "
             f"FROM {fr_clause}"
         )
-        # assign prep_sample_idx by the Golay match; non-matching reads drop.
+        # I1 and R1 pair positionally; a record-count mismatch means one was filtered
+        # independently, which would mis-assign every read past the divergence.
+        n_i1, n_fr = conn.execute(
+            f"SELECT (SELECT count(*) FROM read_fastx('{i1}')), (SELECT count(*) FROM {fr_clause})"
+        ).fetchone()
+        if n_i1 != n_fr:
+            raise ValueError(f"I1 and R1 record counts differ ({n_i1} vs {n_fr})")
+        # assign prep_sample_idx by the Golay match; non-matching reads drop. sorted by
+        # prep_sample_idx so each per-sample write prunes instead of full-scanning.
         conn.execute(
             "COPY (SELECT gc.prep_sample_idx, fr.sequence_index, fr.read_id, "
             "             fr.sequence1, fr.qual1, fr.sequence2, fr.qual2 "
             "      FROM idx_reads ir JOIN golay_codes gc ON gc.raw = ir.index_read "
-            "      JOIN fr_reads fr USING (sequence_index)) "
+            "      JOIN fr_reads fr USING (sequence_index) "
+            "      ORDER BY gc.prep_sample_idx) "
             f"TO '{out}' ({PARQUET_OPTS_INTERMEDIATE})"
         )
 
@@ -263,7 +277,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     inputs.index_reads_path = inputs.index_reads_path.resolve()
     inputs.forward_reads_path = inputs.forward_reads_path.resolve()
     inputs.barcode_map = inputs.barcode_map.resolve()
-    for p in (inputs.index_reads_path, inputs.forward_reads_path, inputs.barcode_map):
+    required = [inputs.index_reads_path, inputs.forward_reads_path, inputs.barcode_map]
+    if inputs.reverse_reads_path is not None:
+        inputs.reverse_reads_path = inputs.reverse_reads_path.resolve()
+        required.append(inputs.reverse_reads_path)
+    for p in required:
         if not p.exists():
             raise FileNotFoundError(f"golay_demux input not found: {p}")
 
@@ -273,37 +291,40 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     memory_gb = resolve_duckdb_memory_gb(_DUCKDB_FALLBACK_MEMORY_GB, threads=_DUCKDB_THREADS)
 
     with duckdb_tmp_dir(workspace) as duckdb_tmp:
+        # the demux intermediate is a full read copy; always remove it, including on
+        # StepNoData and any mid-loop failure, so failed attempts don't strand it.
         demuxed = workspace / "_demuxed.parquet"
-        _run_demux(inputs, demuxed, duckdb_tmp, memory_gb=memory_gb)
-        counts = _sample_counts(demuxed, duckdb_tmp, memory_gb=memory_gb)
-        if not counts:
-            raise StepNoData(
-                step_name=YAML_STEP_NAME,
-                reason=f"pool {inputs.sequenced_pool_idx}: no read matched a barcode",
-            )
-
-        async with make_cp_client() as http:
-            for prep_sample_idx, count in counts:
-                durable = compute_reads_staging_path(inputs.reads_staging_root, prep_sample_idx)
-                durable.parent.mkdir(parents=True, exist_ok=True)
-                start = await mint_or_reuse_sequence_range(
-                    http,
-                    prep_sample_idx,
-                    count,
-                    work_ticket_idx=inputs.work_ticket_idx,
+        try:
+            _run_demux(inputs, demuxed, duckdb_tmp, memory_gb=memory_gb)
+            counts = _sample_counts(demuxed, duckdb_tmp, memory_gb=memory_gb)
+            if not counts:
+                raise StepNoData(
                     step_name=YAML_STEP_NAME,
+                    reason=f"pool {inputs.sequenced_pool_idx}: no read matched a barcode",
                 )
-                await asyncio.to_thread(
-                    _write_sample_reads,
-                    demuxed,
-                    prep_sample_idx,
-                    start,
-                    durable,
-                    duckdb_tmp,
-                    memory_gb=memory_gb,
-                )
-                _hardlink(durable, register_dir / f"{prep_sample_idx}.parquet")
 
-        demuxed.unlink(missing_ok=True)
+            async with make_cp_client() as http:
+                for prep_sample_idx, count in counts:
+                    durable = compute_reads_staging_path(inputs.reads_staging_root, prep_sample_idx)
+                    durable.parent.mkdir(parents=True, exist_ok=True)
+                    start = await mint_or_reuse_sequence_range(
+                        http,
+                        prep_sample_idx,
+                        count,
+                        work_ticket_idx=inputs.work_ticket_idx,
+                        step_name=YAML_STEP_NAME,
+                    )
+                    await asyncio.to_thread(
+                        _write_sample_reads,
+                        demuxed,
+                        prep_sample_idx,
+                        start,
+                        durable,
+                        duckdb_tmp,
+                        memory_gb=memory_gb,
+                    )
+                    _hardlink(durable, register_dir / f"{prep_sample_idx}.parquet")
+        finally:
+            demuxed.unlink(missing_ok=True)
 
     return {"read_staging_dir": workspace}

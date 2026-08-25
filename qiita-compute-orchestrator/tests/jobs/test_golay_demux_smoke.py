@@ -12,6 +12,7 @@ import gzip
 from pathlib import Path
 
 import duckdb
+import pytest
 
 from qiita_compute_orchestrator.jobs.golay_demux import (
     Inputs,
@@ -111,3 +112,57 @@ def test_run_demux_drops_unmatched_index(tmp_path):
     with duckdb.connect(":memory:") as conn:
         rows = conn.execute(f"SELECT prep_sample_idx FROM read_parquet('{demuxed}')").fetchall()
     assert rows == [(11,)]
+
+
+def _inputs(tmp_path, i1, r1, bc_map, *, r2=None):
+    return Inputs(
+        index_reads_path=i1,
+        forward_reads_path=r1,
+        reverse_reads_path=r2,
+        barcode_map=bc_map,
+        golay_error_threshold=1.5,
+        reads_staging_root=tmp_path / "staging",
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        work_ticket_idx=1,
+    )
+
+
+def test_run_demux_raises_on_barcode_that_is_not_a_codeword(tmp_path):
+    """A barcode decoding to no codeword fails loud, not silent-drop. Here a real
+    codeword flagged barcodes_are_rc, whose RC is (almost always) not a codeword."""
+    bc1 = _bits_to_dna(_golay_codeword(1))
+    i1, r1 = tmp_path / "I1.fastq.gz", tmp_path / "R1.fastq.gz"
+    _write_fastq_gz(i1, [("r", _rc(bc1))])
+    _write_fastq_gz(r1, [("r", "ACGTACGTACGTACGT")])
+    bc_map = tmp_path / "barcode_map.parquet"
+    _write_barcode_map(bc_map, [(11, bc1, True)])  # wrong rc flag
+    with (
+        duckdb_tmp_dir(tmp_path / "ws") as duckdb_tmp,
+        pytest.raises(ValueError, match="no Golay codeword"),
+    ):
+        _run_demux(
+            _inputs(tmp_path, i1, r1, bc_map),
+            tmp_path / "_demuxed.parquet",
+            duckdb_tmp,
+            memory_gb=2,
+        )
+
+
+def test_run_demux_carries_r2(tmp_path):
+    """R2 rides through as sequence2 when reverse_reads_path is set."""
+    bc0 = _bits_to_dna(_golay_codeword(0))
+    i1, r1, r2 = tmp_path / "I1.fastq.gz", tmp_path / "R1.fastq.gz", tmp_path / "R2.fastq.gz"
+    _write_fastq_gz(i1, [("read0", _rc(bc0))])
+    _write_fastq_gz(r1, [("read0", "ACGTACGTACGTACGT")])
+    _write_fastq_gz(r2, [("read0", "TTTTGGGGCCCCAAAA")])
+    bc_map = tmp_path / "barcode_map.parquet"
+    _write_barcode_map(bc_map, [(11, bc0, False)])
+    demuxed = tmp_path / "_demuxed.parquet"
+    with duckdb_tmp_dir(tmp_path / "ws") as duckdb_tmp:
+        _run_demux(_inputs(tmp_path, i1, r1, bc_map, r2=r2), demuxed, duckdb_tmp, memory_gb=2)
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(
+            f"SELECT prep_sample_idx, sequence1, sequence2 FROM read_parquet('{demuxed}')"
+        ).fetchall()
+    assert rows == [(11, "ACGTACGTACGTACGT", "TTTTGGGGCCCCAAAA")]
