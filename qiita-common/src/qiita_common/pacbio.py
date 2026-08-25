@@ -14,6 +14,14 @@ UNASSIGNED_BAM_SUFFIX = ".unassigned.bam"
 
 # Per-SMRT-cell subdirectory holding demultiplexed HiFi BAMs, and the filename
 # field that names it: `{run}/{well}/hifi_reads/{movie}.hifi_reads.{barcode}.bam`.
+#
+# The filename IS the barcode contract, not a proxy for one read out of the
+# file. miint exposes no way to check it against the BAM's own `@RG` or a
+# per-read `bc` tag: `read_alignment_header` returns `@SQ` only — `(tid,
+# reference, length)` — which is what duckdb-miint#174 shipped after asking for
+# the other header lines too, and no reader surfaces per-record optional tags.
+# So a run folder whose demux BAMs were renamed pairs reads to the wrong
+# sample, and nothing here can detect that.
 HIFI_READS_DIR = "hifi_reads"
 
 

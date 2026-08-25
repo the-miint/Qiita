@@ -665,8 +665,7 @@ _READ_INGEST_ROUTE_CASES = [
     ("fastq-to-parquet", "1.3.0", {"fastq_path": "/seq/a_R1.fastq", "fastq_upload_idx": 4}, False),
     # Neither route: no reads to load.
     ("fastq-to-parquet", "1.3.0", {}, False),
-    # Both routes for the reverse read — caught by the separate `not`, since
-    # the forward read is unambiguous here and `oneOf` is satisfied.
+    # Both routes for the reverse read.
     (
         "fastq-to-parquet",
         "1.3.0",
@@ -675,6 +674,22 @@ _READ_INGEST_ROUTE_CASES = [
             "reverse_fastq_path": "/seq/a_R2.fastq",
             "reverse_fastq_upload_idx": 5,
         },
+        False,
+    ),
+    # A CROSSED pair: the mates arrive by different routes. Both spellings
+    # resolve to the same step inputs, so this would run — it is refused
+    # because one sample's R1 and R2 having two provenances is a submit slip,
+    # and a mis-paired mate is silent in the output.
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {"fastq_upload_idx": 4, "reverse_fastq_path": "/seq/a_R2.fastq"},
+        False,
+    ),
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {"fastq_path": "/seq/a_R1.fastq", "reverse_fastq_upload_idx": 5},
         False,
     ),
     ("bam-to-parquet", "1.0.0", {"bam_path": "/seq/a.bam"}, True),
@@ -687,7 +702,8 @@ _READ_INGEST_ROUTE_CASES = [
 @pytest.mark.parametrize(("action_id", "version", "context", "accepted"), _READ_INGEST_ROUTE_CASES)
 def test_read_ingest_accepts_exactly_one_route(action_id, version, context, accepted):
     """A sample's reads reach the ingest workflows by a host path or by an
-    upload handle, never both and never neither.
+    upload handle, never both and never neither — and for paired-end, both
+    mates take the same route.
 
     Both spellings resolve to the same step input — the runner rewrites
     `{prefix}_upload_idx` into the `{prefix}_path` binding — so a context

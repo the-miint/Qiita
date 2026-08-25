@@ -1193,6 +1193,20 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **A paired-end read submission can no longer cross routes (#484).** The exactly-one
+  constraint on `fastq-to-parquet` was per key, not per family: it stopped the forward read
+  arriving twice and the reverse read arriving twice, but admitted `fastq_upload_idx` with
+  `reverse_fastq_path` (and the mirror). Such a submission would run — the runner rewrites
+  the handle and leaves the path alone — so this is a submit-slip guard, not a safety one:
+  one sample's mates having two provenances is a mistake, and a mis-paired mate is silent
+  in the output. Now a `oneOf` of two whole-family branches.
+- **`upload.source_filename` rejects newlines and over-length values (#484).** The pattern
+  was `^[^/]+$`, and in pydantic's regex engine `$` also matches before a trailing newline
+  while `[^/]` matches a newline outright — so `"R1.fastq\n"` and `"na\nme.fastq"` both
+  validated, and the value is echoed back in the submit gate's 422. Now `\A[^/\r\n]+\z`,
+  with the length bound exercised on both sides. The model is deliberately stricter than
+  the DB CHECK, which tests only non-empty and slash-free.
+
 - **The circular gate's identity check now asks the question the gate answers (#475).**
   Its diagnostics counted scorable alignment RECORDS with `cigar_sequence_identity` while
   the gate itself applies `cigar_pooled_identity` per read: a read whose records mix a

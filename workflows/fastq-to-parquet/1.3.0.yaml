@@ -112,14 +112,25 @@ context_schema:
     host_minimap2_reference_idx:
       type: integer
       minimum: 1
-  # Exactly one forward route. `oneOf` rejects both-present as well as
-  # neither-present: with both, both branches match and oneOf fails.
+  # Exactly one route, and BOTH mates take it. Each branch requires its own
+  # forward key and excludes the other family outright, so neither-present,
+  # both-present, and a crossed pair (`fastq_upload_idx` with
+  # `reverse_fastq_path`, or the mirror) all leave zero branches matching and
+  # `oneOf` fails. A crossed pair would otherwise run: the runner rewrites the
+  # handle and leaves the path alone, and both halves are gated. It is refused
+  # because R1 and R2 of one sample coming from two provenances is a submit
+  # slip, and a mis-paired mate is silent in the output.
   oneOf:
     - required: [fastq_path]
+      not:
+        anyOf:
+          - required: [fastq_upload_idx]
+          - required: [reverse_fastq_upload_idx]
     - required: [fastq_upload_idx]
-  # The reverse read is optional, but it cannot arrive by both routes at once.
-  not:
-    required: [reverse_fastq_path, reverse_fastq_upload_idx]
+      not:
+        anyOf:
+          - required: [fastq_path]
+          - required: [reverse_fastq_path]
 
 steps:
   - step: fastq

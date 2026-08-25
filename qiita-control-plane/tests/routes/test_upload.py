@@ -176,13 +176,37 @@ async def test_create_upload_slot_without_source_filename_is_null(ctx):
     )
 
 
-@pytest.mark.parametrize("bad", ["/abs/path/R1.fastq", "sub/dir/R1.fastq", "../escape.fastq", ""])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "/abs/path/R1.fastq",
+        "sub/dir/R1.fastq",
+        "../escape.fastq",
+        "",
+        # `$` matches before a trailing newline and `[^/]` matches a newline, so
+        # the obvious `^[^/]+$` admitted both of these. The value is echoed back
+        # in the work-ticket submit gate's 422.
+        "R1.fastq\n",
+        "na\nme.fastq",
+        "na\rme.fastq",
+        # One over MAX_NAME_LENGTH.
+        "x" * 256,
+    ],
+)
 async def test_create_upload_slot_rejects_non_basename(ctx, bad):
-    """`source_filename` is a basename, not a path. Rejected at the model layer
+    """`source_filename` is a single-line basename. Rejected at the model layer
     so the client sees a 422 naming the field rather than a 500 from the DB
-    CHECK that backs the same rule."""
+    CHECK, which backs only part of the same rule (non-empty and slash-free —
+    it does not test length or newlines)."""
     resp = await _create_upload(ctx["admin"], source_filename=bad)
     assert resp.status_code == 422, resp.text
+
+
+async def test_create_upload_slot_accepts_a_max_length_basename(ctx):
+    """The control for the length case above: exactly MAX_NAME_LENGTH passes."""
+    resp = await _create_upload(ctx["admin"], source_filename="x" * 255)
+    assert resp.status_code == 201, resp.text
+    _track(ctx, resp)
 
 
 async def test_create_upload_slot_without_description(ctx):

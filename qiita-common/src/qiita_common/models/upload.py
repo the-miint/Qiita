@@ -65,11 +65,14 @@ class UploadCreateRequest(BaseModel):
         default=None,
         min_length=1,
         max_length=MAX_NAME_LENGTH,
-        # A basename, not a path. Mirrors the DB CHECK on
-        # `upload.source_filename`; rejecting the separator at the model layer
+        # A basename, not a path: rejecting the separator at the model layer
         # means a client that sends a path gets a 422 naming the field rather
-        # than a 500 from the constraint.
-        pattern=r"^[^/]+$",
+        # than a 500 from the DB CHECK. STRICTER than that CHECK, which tests
+        # only non-empty and slash-free — `\A`/`\z` because `$` also matches
+        # before a trailing newline, and the newline classes because `[^/]`
+        # matches one, so `^[^/]+$` admitted both "name.fastq\n" and
+        # "na\nme.fastq". The value is echoed back in the submit gate's 422.
+        pattern=r"\A[^/\r\n]+\z",
     )
 
 
