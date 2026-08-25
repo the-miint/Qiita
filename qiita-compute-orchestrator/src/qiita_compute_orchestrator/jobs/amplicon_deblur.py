@@ -9,22 +9,25 @@ Refinements over the historical deblur.sql (reproduce the golden):
   * UCHIME chimera detection runs before the MSA;
   * feature identity is the shared canonical hash.
 
-Outputs: manifest (distinct sequence_hash for mint-features) and asv_counts
-(prep_sample_idx, sequence_hash, count).
+Outputs: manifest (read_id, sequence_hash, sequence_length_bp for mint-features),
+asv_counts (prep_sample_idx, sequence_hash, count), and asv_chunks (a hash-keyed
+chunk directory carrying each ASV's bytes so amplicon_load can store them).
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 from pydantic import BaseModel
 from qiita_common.backend_failure import StepNoData
-from qiita_common.chunking import canonical_sequence_hash_expr
+from qiita_common.chunking import canonical_sequence_hash_expr, sequence_split_expr
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
     PARQUET_OPTS,
+    PARQUET_OPTS_CHUNKED,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     mafft_scratch_cwd,
@@ -167,6 +170,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     workspace.mkdir(parents=True, exist_ok=True)
     counts_out = workspace / "asv_counts.parquet"
     manifest_out = workspace / "manifest.parquet"
+    chunks_dir = workspace / "asv_chunks"
     memory_gb = resolve_duckdb_memory_gb(
         _DUCKDB_FALLBACK_MEMORY_GB, threads=_DUCKDB_THREADS, reserve_gb=_DUCKDB_RESERVE_GB
     )
@@ -228,24 +232,54 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             if conn.execute("SELECT count(*) FROM asv").fetchone()[0] == 0:
                 raise StepNoData(step_name=YAML_STEP_NAME, reason="no ASV survived denoising")
 
-            # publish atomically: write `.partial`, then rename into place.
-            counts_partial = counts_out.parent / f"{counts_out.name}.partial"
-            manifest_partial = manifest_out.parent / f"{manifest_out.name}.partial"
-            safe_counts = validate_parquet_path(counts_partial)
-            safe_manifest = validate_parquet_path(manifest_partial)
-            try:
-                conn.execute(
-                    f"COPY (SELECT prep_sample_idx, sequence_hash, count FROM asv "
-                    f"ORDER BY prep_sample_idx, sequence_hash) TO '{safe_counts}' ({PARQUET_OPTS})"
-                )
-                conn.execute(
-                    f"COPY (SELECT DISTINCT sequence_hash FROM asv ORDER BY sequence_hash) "
-                    f"TO '{safe_manifest}' ({PARQUET_OPTS})"
-                )
-                os.replace(counts_partial, counts_out)
-                os.replace(manifest_partial, manifest_out)
-            finally:
-                counts_partial.unlink(missing_ok=True)
-                manifest_partial.unlink(missing_ok=True)
+            # one representative sequence per canonical hash, so the ASV bytes are
+            # stored (recovering them means re-running deblur). a sequence and its
+            # revcomp share a hash; pick the lex-smaller bytes deterministically.
+            conn.execute(
+                f"CREATE OR REPLACE TABLE asv_seq AS "
+                f"SELECT DISTINCT ON (sequence_hash) sequence_hash, sequence1, "
+                f"       length(sequence1)::BIGINT AS sequence_length_bp "
+                f"FROM (SELECT {canon} AS sequence_hash, sequence1 FROM deblurred) "
+                f"ORDER BY sequence_hash, sequence1"
+            )
 
-    return {"asv_counts": counts_out, "manifest": manifest_out}
+            _write_outputs(
+                conn, counts_out=counts_out, manifest_out=manifest_out, chunks_dir=chunks_dir
+            )
+
+    return {"asv_counts": counts_out, "manifest": manifest_out, "asv_chunks": chunks_dir}
+
+
+def _write_outputs(conn, *, counts_out: Path, manifest_out: Path, chunks_dir: Path) -> None:
+    """publish the three outputs atomically: per-sample counts, the mint-features
+    manifest (read_id, sequence_hash, sequence_length_bp), and a hash-keyed chunk
+    directory carrying each ASV's bytes. write to `.partial`, then rename in."""
+    counts_partial = counts_out.parent / f"{counts_out.name}.partial"
+    manifest_partial = manifest_out.parent / f"{manifest_out.name}.partial"
+    chunks_partial = chunks_dir.parent / f"{chunks_dir.name}.partial"
+    safe_counts = validate_parquet_path(counts_partial)
+    safe_manifest = validate_parquet_path(manifest_partial)
+    chunks_partial.mkdir(parents=True, exist_ok=True)
+    chunk_part = validate_parquet_path(chunks_partial / "part_00000.parquet")
+    try:
+        conn.execute(
+            f"COPY (SELECT prep_sample_idx, sequence_hash, count FROM asv "
+            f"ORDER BY prep_sample_idx, sequence_hash) TO '{safe_counts}' ({PARQUET_OPTS})"
+        )
+        conn.execute(
+            f"COPY (SELECT sequence_hash::VARCHAR AS read_id, sequence_hash, sequence_length_bp "
+            f"FROM asv_seq ORDER BY sequence_hash) TO '{safe_manifest}' ({PARQUET_OPTS})"
+        )
+        conn.execute(
+            f"COPY (SELECT sequence_hash, c.chunk_index, c.chunk_data FROM ("
+            f"  SELECT sequence_hash, UNNEST({sequence_split_expr('sequence1')}) AS c FROM asv_seq"
+            f") ORDER BY sequence_hash, c.chunk_index) TO '{chunk_part}' ({PARQUET_OPTS_CHUNKED})"
+        )
+        os.replace(counts_partial, counts_out)
+        os.replace(manifest_partial, manifest_out)
+        shutil.rmtree(chunks_dir, ignore_errors=True)  # a re-run may leave a dir
+        os.replace(chunks_partial, chunks_dir)
+    finally:
+        counts_partial.unlink(missing_ok=True)
+        manifest_partial.unlink(missing_ok=True)
+        shutil.rmtree(chunks_partial, ignore_errors=True)

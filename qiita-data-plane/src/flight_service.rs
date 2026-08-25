@@ -2093,6 +2093,10 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
         "amplicon_membership",
         &["prep_sample_idx", "processing_idx"],
     ),
+    // amplicon's ASV sequences, twins of the assembled_sequence tables: keyed on
+    // feature_idx, replaced (not appended) so a re-load of the same ASV converges.
+    ReplaceKey::own("amplicon_sequence", &["feature_idx"]),
+    ReplaceKey::own("amplicon_sequence_chunks", &["feature_idx"]),
 ];
 
 /// One `REPLACE_KEY_TABLES` entry.

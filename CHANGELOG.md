@@ -31,6 +31,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   chimera → MAFFT → deblur), **reference-agnostically**: every ASV gets a `feature_idx`
   from its canonical sequence hash and per-sample counts land in the new DuckLake
   `amplicon_membership` table (`prep_sample_idx, processing_idx, feature_idx, count`).
+  The ASV sequences themselves are stored too (`amplicon_sequence` +
+  `amplicon_sequence_chunks`, keyed by feature_idx, mirroring the assembly tables),
+  so an ASV is never recomputed to read back.
   16S reads are not masked — the `denoise` step **streams** the pool's raw reads from the
   data plane at runtime (a pool-scoped `read_block` DoGet), nothing staged to scratch; the
   SortMeRNA reference is materialized from a loaded `sequence_reference` (by reference_idx,

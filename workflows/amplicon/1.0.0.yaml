@@ -20,9 +20,11 @@ description: >
   `mint-features` mints a feature_idx per ASV against the shared `qiita.feature`
   space; `amplicon_load` joins the counts to the feature map and writes the
   DuckLake `amplicon_membership` (prep_sample_idx, processing_idx, feature_idx,
-  count); register-files loads it. The closed-reference (e.g. GG2) feature table
-  is DERIVED on demand by intersecting feature_idx with a reference's membership —
-  never stored here.
+  count) plus the ASV sequences themselves (`amplicon_sequence` +
+  `amplicon_sequence_chunks`, keyed by feature_idx, so an ASV is never recomputed
+  to read back); register-files loads them. The closed-reference (e.g. GG2)
+  feature table is DERIVED on demand by intersecting feature_idx with a
+  reference's membership — never stored here.
 
 scopes: []
 
@@ -43,7 +45,7 @@ context_schema:
     # truncation length (150 for the GG2 V4 catalog). result-affecting.
     trim:
       type: integer
-      minimum: 1
+      minimum: 6
     # forward primer; used only when orient_primer (off by default).
     primer:
       type: string
@@ -62,7 +64,7 @@ steps:
     module: qiita_compute_orchestrator.jobs.amplicon_deblur
     inputs: [sortmerna_ref]
     params: {primer: primer, trim: trim, orient_primer: orient_primer}
-    outputs: [asv_counts, manifest]
+    outputs: [asv_counts, manifest, asv_chunks]
     baseline_resources:
       cpu: 8
       mem_gb: 64
@@ -73,12 +75,12 @@ steps:
     inputs: [manifest]
     outputs: [feature_map]
 
-  # join counts to the feature map, write amplicon_membership. processing_idx
-  # rides params and signals the runner to mint it.
+  # join counts to the feature map, write amplicon_membership + the ASV sequence
+  # tables. processing_idx rides params and signals the runner to mint it.
   - step: amplicon_load
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.amplicon_load
-    inputs: [asv_counts, feature_map]
+    inputs: [asv_counts, feature_map, manifest, asv_chunks]
     params: {processing_idx: processing_idx}
     outputs: [staging_dir]
     baseline_resources:
@@ -86,7 +88,8 @@ steps:
       mem_gb: 8
       walltime: PT1H
 
-  # load amplicon_membership into the lake (replace-keyed on prep_sample+processing).
+  # load amplicon_membership (replace-keyed on prep_sample+processing) and the ASV
+  # sequence tables (replace-keyed on feature_idx) into the lake.
   - action: register-files
     inputs: [staging_dir]
     outputs: []
