@@ -2038,10 +2038,10 @@ fn mask_metrics_counts(
 /// 2. Every row set carrying one key is an acceptable substitute for any other.
 ///    `sequence_hash` and `sequence_length_bp` are functions of the feature, so
 ///    those are identical. `chunk_data` is NOT: the canonical hash is
-///    `LEAST(md5(seq), md5(revcomp(seq)))` over the upper-cased sequence, so a
-///    sequence, its reverse complement, and its case variants share one
-///    `feature_idx` while differing byte for byte. Replacing therefore lets the
-///    newest load's strand and casing win.
+///    `LEAST(md5(seq), md5(revcomp(seq)))`, so a sequence and its reverse
+///    complement share one `feature_idx` while differing byte for byte. Replacing
+///    therefore lets the newest load's strand win. Case does not vary here — the
+///    write side normalizes it (`qiita_common.chunking.normalized_sequence_expr`).
 ///
 /// Without the replace both byte strings persist and a reader gets them
 /// concatenated — neither strand, and a length that matches nothing. With it a
