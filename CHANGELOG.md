@@ -48,6 +48,63 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   --<entity>-global-field-idx` wants is obtainable, and `list-fields` prints a study's
   own definitions.
 
+- **A per-sample masked-read Flight stream for native jobs (#477).**
+  `data_plane_client` gains `fetch_read_masked_doget_ticket` +
+  `open_read_masked_stream`: a job names a `(prep_sample_idx, mask_idx)` pair, the CP
+  signs a DoGet ticket scoped to exactly that pair, and the data plane's `read_masked`
+  macro rows stream into a registered DuckDB relation. Per-SAMPLE, alongside the
+  existing per-BLOCK `open_read_block_stream`; both scope keys ride the wire because
+  the scope is one pair, not a member list that there would be a reason to keep CP-side.
+  **Nothing calls it yet** — the de novo alignment job is the consumer and lands
+  separately. The relation carries `sequence_idx`, which the CP-side FASTQ streamer
+  (`runner/_read_ingest.py`) does not — it writes the VARCHAR `read_id` — which is
+  why an `alignment`-producing consumer will stream here rather than reuse that
+  FASTQ. The mask-completion gate needed no code here: the CP already 409s unless
+  `mask_sample.state = 'completed'`, so 'pending', 'invalidated' and no-gate-row are
+  all refused at mint and no consumer re-derives the check. No new scope
+  (`read_masked:doget` is already in `SERVICE_ACCOUNT_SCOPE_CEILING`, and the compute
+  service account's active token carries it — verified against the live control-plane
+  database, not just the 2026-07-23 deploy archive), so no operator action.
+
+- **Per-run contig read-back over Arrow Flight (#476).** `POST
+  /assembly/ticket/doget` takes a `(prep_sample_idx, processing_idx)` pair and
+  signs a DoGet ticket for that assembly run's contigs on
+  `assembled_sequence` / `assembled_sequence_chunks`, which are now in the data
+  plane's `ALLOWED_TABLES`. Neither table has a `prep_sample_idx` column — a
+  contig is stored once under the content-deduped `feature_idx` every run
+  producing those bytes shares — so `build_assembly_run_query` resolves the run
+  through the lake's own `assembly_membership` as a semi join, the same shape a
+  `reference_idx` filter takes on the reference tables. The signed scope is the
+  pair itself: exactly one `prep_sample_idx`, exactly one `processing_idx`, and
+  no third filter column. A `feature_idx` on these tables is refused outright, so
+  no ticket can name a contig; an unscoped ticket cannot be built, so "every
+  sample's contigs" is not representable; and several `processing_idx` values
+  are refused rather than blending two runs into one indistinguishable stream —
+  the same guard the single-`alignment_idx` rule makes. A pair no membership row
+  names is a 404 at the route, never a ticket. The route reuses the service-only
+  `ticket:doget` rather than minting a scope: that scope is on
+  `SERVICE_ACCOUNT_SCOPE_CEILING` and on no human role ceiling, so the principals
+  gaining contig read-back are exactly the service accounts already holding it —
+  but this is the first *sample-derived* sequence surface it reaches, where every
+  prior table was reference data or the derived per-read `alignment` slice.
+  `assembly_membership` and `bin_quality` remain absent from `ALLOWED_TABLES`, so
+  neither is nameable by a ticket; `assembly_membership` is read as the scope
+  resolver and no column of it reaches a stream. The orchestrator seam is
+  `data_plane_client.open_assembly_chunk_stream`, the assembly twin of
+  `open_reference_chunk_stream`.
+
+  Resolving the run in the data plane rather than signing a roster is what keeps
+  the read off a per-key cost curve nothing bounds. Measured on DuckDB 1.5.4 /
+  ducklake d318a545 against a catalog of 3.6M chunk rows over 200 files: a
+  26,129-contig run as a literal `feature_idx IN (...)` is rewritten into a MARK
+  join above an unfiltered scan — 3,600,000 rows scanned, 1,793 ms — while the
+  semi join pushes the resolved keys' min/max and a Bloom filter into the scan as
+  dynamic filters, reading 245,457 rows in 140 ms for the identical 235,161-row
+  result. At a 4,968-contig run it is 233 ms against 37 ms. File pruning is
+  unaffected: both forms open the same 200 files there, and where per-file
+  `feature_idx` ranges are narrow enough to prune at all, both prune to the same
+  1 file of 200.
+
 - **`qiita feature-table build --circular-gate` — judge a read pooled over the records it
   was split into (#475).** A read crossing the origin of a circular reference held as a
   linearised contig is emitted as two records covering half of it each, so a per-record
@@ -1177,6 +1234,34 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `*_global_field.internal_name` comments said the column is never shown to end users,
   which the new registry read contradicts: `internal_name` is exactly the key a caller
   matches on there. Comment-only migration; no DDL.
+
+- **Four broken relative links in `docs/deploy-archive/`, and a test that keeps them fixed.**
+  All four targets existed; the paths were repo-root-relative (`](docs/runbooks/redeploy.md)`)
+  inside `docs/deploy-archive/`, where they resolve against the containing directory. They come
+  from `/deploy-archive` copying the `## Pending deploy` body out of `DEPLOY_CHECKLIST.md`, which
+  sits at the repo root and where those links are correct — so the archive step now says to
+  rewrite them as it moves the block, and to drop the `([archived](…))` self-reference a line
+  acquires when it lands in the file it points at. `qiita-common/tests/test_doc_link.py` resolves
+  every relative markdown link in the repo, target file and anchor both, skipping fenced blocks
+  and inline code spans so a doc that spells out a link form is not resolved. Its slug function does
+  not model the `-1` suffix GitHub appends to a repeated heading; disambiguate the heading text
+  rather than the link.
+
+- **Corrected the claim that miint cannot see TEMP or registered-Arrow relations (#477).**
+  It resolves them since [duckdb-miint#193](https://github.com/the-miint/duckdb-miint/issues/193);
+  our copies of that claim predated the fix and had gone stale in `docs/duckdb-miint.md`,
+  `data_plane_client.open_read_block_stream`, and `read_source`. What still holds is now
+  stated separately, because it is different in kind: CTEs never resolve (not catalog
+  objects), and miint's fixed-temp-name paths — `massql`, and the per-sample
+  (`sample_id := …`) branches of `uchime_ref` / `sylph_profile` / `woltka_ogu`,
+  [duckdb-miint#207](https://github.com/the-miint/duckdb-miint/issues/207) — use a
+  connection that does not inherit and still need a regular non-temp TABLE. Verified on
+  the deploy-staged build `9fc4d12`: `woltka_ogu` with `sample_id` returned
+  `Catalog Error` over both a TEMP TABLE and a registered Arrow relation while the same
+  call without it resolved all three, so `qiita_common.feature_table`'s "stage a real
+  TABLE" comments are correct and are left alone. Independently of visibility, a
+  registered Arrow stream is consumed exactly once — a second scan returns zero rows
+  silently — which is what the read spill in `read_source` actually rests on.
 
 - **The circular gate's identity check now asks the question the gate answers (#475).**
   Its diagnostics counted scorable alignment RECORDS with `cigar_sequence_identity` while
@@ -2404,6 +2489,54 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **`CLAUDE.md` trimmed from 11,020 to 5,776 tokens, and `docs/architecture.md` split into
+  `docs/architecture/` (#482).** Every token in `CLAUDE.md` is re-sent in front of every API call
+  an agent makes, and compaction never evicts it — measured over 46 sessions, the always-loaded
+  prefix was 18.9% of all input tokens, rising to 32.5% once a compact cadence is adopted. The
+  lookup-shaped sections move to `docs/container-images.md`, `docs/deployments.md`,
+  `docs/testing.md`, and `docs/architecture/cross-cutting.md` (component map, identifier
+  ownership, data-plane design, orchestrator pattern, workflow runner). `Enum parity` and
+  `Operator-facing changes` are condensed to their rules. Every rule that has to fire without
+  being looked up — the development ethos, miint-is-core, naming, REST path constants,
+  never-edit-an-applied-migration, the changelog gate — stays resident, and every moved section
+  leaves a pointer plus an index table under `## Architecture`. `docs/architecture.md`'s 1,600
+  lines become eight files — overview, data model, reference data, Flight surface, processing,
+  storage, build/CI, cross-cutting — leaving `architecture.md` a 92-line index that lists every
+  file's sections. Heading levels are normalized per file, and every inbound reference is
+  retargeted to the file carrying the section it cites, `test_makefile_doc_sync.py` and
+  `test_architecture_tree_sync.py` included: both read fenced blocks that now live in
+  `docs/architecture/build-and-deploy.md`. The split is for human navigation, not agent token
+  cost — across 54 transcripts the file took 23 accesses from 8 sessions with zero whole-file
+  reads and a median per-session coverage of 2.4% of its lines.
+
+- **Data-plane inline test modules split into `#[path]` submodules (#481).** `flight_service.rs`
+  was 9,398 lines of which 5,712 (61%) were `#[cfg(test)]`; `auth.rs` was 1,143 with 514 (45%).
+  The tests move to `flight_service_tests.rs` / `auth_tests.rs` and stay child modules via
+  `#[cfg(test)] #[path = "..."] mod tests;`, so they still reach private items through
+  `use super::*` — no visibility changes. `cargo test` reports the same 121 tests passing
+  before and after. `ducklake.rs` and `main.rs` are left alone: #244 has a hunk inside
+  `ducklake.rs`'s test module and also touches `main.rs`, so those two wait for it to land.
+
+- **Sequence chunks are stored upper case (#479).** `sequence_split_expr` now normalizes
+  through a new `normalized_sequence_expr`, which `canonical_sequence_hash_expr` also
+  routes through — so the bytes in `reference_sequence_chunks` / `assembled_sequence_chunks`
+  and the hash that keyed them cannot disagree about case. The hash already folded case
+  before folding strands, so a soft-masked record and its uppercase twin shared one
+  `feature_idx`; the split preserving case meant two loads wrote different bytes under that
+  one key, leaving the survivor a function of which reference loaded last. Every index
+  builder that reads `chunk_data` discards case — measured 2026-08-24 against the
+  team-mirror miint build on a reference differing only in a 20 kb soft-masked repeat,
+  `rype_index_create`, `save_minimap2_index` (sr / map-hifi / map-ont / asm5) and
+  `save_bowtie2_index` all produce byte-identical output for it, while a one-base edit to
+  the same reference changes all of them. Strand is not normalized and still follows load
+  order. Case is discarded at load, so `qiita reference export` no longer reproduces a
+  submitted FASTA's soft-masking. `normalized_sequence_expr` carries the detail.
+
+- **`qiita reference export` reassembles chunks through the shared expression (#479).** The
+  genome-FASTA writer inlined its own `string_agg(chunk_data, '' ORDER BY chunk_index)`
+  instead of calling `reassemble_chunks_expr`, a fourth copy of the chunk contract outside
+  the module that single-sources it.
+
 - **`qiita_common.feature_table` is now the `qiita_common.analytic` package (#475).** Closes
   #456. The one module became eight — `relations`, `stage`, `coverage`, `gate`, `ogu`, `label`,
   `sidecar`, `write` — re-exported from `analytic/__init__.py`, so a consumer's only change is
@@ -2944,6 +3077,30 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 
 ### Removed
+
+- **The single-end rype projections are gone (#478).** `align_sharded._ROUTING_QUERY` and
+  `host_filter._RYPE_QUERY` narrowed the classify relation to `sequence1` so miint would not
+  read rype's `is_paired` off the mere presence of an all-NULL `sequence2` column, which
+  halved the Arrow batch and doubled the full index reloads. `rype_classify` now derives
+  `is_paired` from that column's CONTENTS
+  ([duckdb-miint#199](https://github.com/the-miint/duckdb-miint/issues/199), closed
+  2026-08-01), sampled from the first chunk of its single pass over the relation, so the
+  narrowing can no longer change batch sizing either way. Both jobs hand rype the full query
+  relation. The restated `rype_classify` contracts in both job docstrings and in
+  `docs/duckdb-miint.md`'s function inventory now link the upstream page instead of copying
+  it — the copies had drifted to the inverse of current behaviour — and the
+  `docs/duckdb-miint.md` "Open upstream gaps" row for #199 is dropped with its workaround.
+  `test_align_sharded_routes_from_a_view_carrying_both_mates` and
+  `test_host_filter_hands_both_tools_both_mates` keep the two properties that outlived the
+  workaround: routing reads a VIEW, and both aligners still receive `sequence2`. Closes the
+  removal tracked at #403. One sizing behaviour does change for a block that mixes single-
+  and paired-end reads: upstream samples the first chunk of its single pass, so such a
+  block is now sized from whichever shape leads, where the old gate forced the paired
+  (larger) estimate. `align_sharded` rejects a mixed batch outright; `host_filter` does not,
+  but a read-mask block is planned per `sequencing_run_idx` and a run carries one platform.
+  The comments and `docs/duckdb-miint.md` entries describing rype's per-call TEMP-table
+  corpus copy are corrected too — `rype_classify` streams the relation as of
+  [duckdb-miint#245](https://github.com/the-miint/duckdb-miint/pull/245).
 
 - **The intake `human_filtering` policy flag (#303).** Host filtering no longer reads a
   per-project intent recorded at intake — a sample's host is a property of the sample, not

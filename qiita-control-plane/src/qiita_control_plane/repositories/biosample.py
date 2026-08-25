@@ -414,7 +414,7 @@ async def import_biosample_from_owner_biosample_id(
     # is theirs to see, but restricted to study members because sample
     # names sometimes carry incautiously-entered PII. wet_lab_admin and
     # system_admin callers are admitted regardless of tier. (Tier
-    # enforcement is not yet built — see docs/architecture.md.)
+    # enforcement is not yet built — see docs/architecture/data-model.md.)
     (
         field_idx,
         field_created,

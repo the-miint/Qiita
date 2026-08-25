@@ -16,7 +16,7 @@ IPC_COMPRESSION_HEADER = "qiita-ipc-compression"
 
 # The only codec the data plane will apply; anything else is rejected rather
 # than quietly downgraded. Why zstd alone, and why compression defaults to off:
-# `docs/architecture.md`, "DoGet stream compression".
+# `docs/architecture/flight.md`, "DoGet stream compression".
 IPC_COMPRESSION_ZSTD = "zstd"
 # Explicitly asking for no compression. Equivalent to sending no header; it
 # exists so a client can be unambiguous rather than relying on absence.
@@ -32,7 +32,7 @@ def ipc_compression_headers(compress: bool) -> list[tuple[bytes, bytes]]:
 
     **Do not pass `True` reflexively.** Above a break-even bandwidth compression
     makes a DoGet *slower*, and every in-repo caller is above it; this is for
-    clients on slow links. The arithmetic is in `docs/architecture.md`.
+    clients on slow links. The arithmetic is in `docs/architecture/flight.md`.
     """
     if not compress:
         return []

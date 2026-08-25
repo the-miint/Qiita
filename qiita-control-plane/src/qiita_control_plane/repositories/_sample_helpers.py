@@ -1306,7 +1306,7 @@ async def _get_or_create_globally_linked_study_field(
     new display_name bound to an already-linked global field mints an
     additional study-local field for that global rather than reusing the
     existing one. This multi-field-per-global aliasing capability within
-    a single study is intentional; see docs/architecture.md.
+    a single study is intentional; see docs/architecture/data-model.md.
 
     Raises StudyFieldConflictError when an existing row at
     (study_idx, display_name) is purely-local or bound to a different

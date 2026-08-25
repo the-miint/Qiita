@@ -370,6 +370,8 @@ _TRIPLES: list[tuple[str, str, str]] = [
     ("URL_READ_MASKED_DOGET", "PATH_READ_MASKED_PREFIX", "PATH_READ_MASKED_DOGET"),
     # /read (Flight DoGet ticket for a block's reads)
     ("URL_READ_DOGET", "PATH_READ_PREFIX", "PATH_READ_DOGET"),
+    # /assembly (Flight DoGet ticket for one assembly run's contigs)
+    ("URL_ASSEMBLY_DOGET", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_DOGET"),
     # /mask-definition
     (
         "URL_MASK_DEFINITION_BY_IDX",
