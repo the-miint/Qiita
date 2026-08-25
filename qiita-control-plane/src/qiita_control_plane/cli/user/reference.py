@@ -19,6 +19,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
 )
+from qiita_common.chunking import reassemble_chunks_expr
 from qiita_common.models import (
     ReferenceStatus,
     WorkTicketState,
@@ -328,7 +329,12 @@ def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Pa
     its reverse complement collapse to one feature_idx), and only the
     representative record's chunks survive. So a reverse-complement-equal input
     exports the representative record's original strand, which may be the other
-    orientation than the one a given accession was submitted with."""
+    orientation than the one a given accession was submitted with.
+
+    Case is the half of that which IS normalized: chunks are stored upper case
+    (`normalized_sequence_expr`), so an export does not reproduce the soft-masking
+    of a submitted FASTA. Rows written before that normalization landed keep their
+    submitted casing until the reference is loaded again."""
     import pyarrow as pa  # noqa: PLC0415
 
     con.register("chunks", reader)
@@ -345,7 +351,7 @@ def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Pa
             # COPY ... TO returns a single-row `Count` = records written.
             (count,) = con.execute(
                 "COPY (SELECT coalesce(m.accession, 'feature_' || c.feature_idx) AS read_id,"
-                "        string_agg(c.chunk_data, '' ORDER BY c.chunk_index) AS sequence1"
+                f"        {reassemble_chunks_expr('c.')} AS sequence1"
                 "   FROM chunks c JOIN accession_map m USING (feature_idx)"
                 "  GROUP BY c.feature_idx, m.accession"
                 "  ORDER BY c.feature_idx)"

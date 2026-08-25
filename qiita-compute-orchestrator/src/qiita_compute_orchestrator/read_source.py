@@ -42,11 +42,10 @@ So the stream branch does NOT hold the block in DuckDB. It drains the Flight
 reader exactly once with `COPY (SELECT * FROM <stream>) TO <workspace>/…parquet`
 — a streaming write whose memory is flat in row count — and then binds the same
 lazy `read_parquet` view the staged-Parquet branch binds. That also solves the
-two constraints a raw stream relation cannot satisfy on its own: the reader is
-single-consumption (`align_sharded` scans its reads twice), and miint resolves
-relation names on a SEPARATE connection where a registered stream relation is
-invisible (see docs/duckdb-miint.md) — a `read_parquet` view resolves there
-fine, which is exactly what these jobs did before this change.
+constraint a raw stream relation cannot satisfy on its own: the reader is
+single-consumption, and `align_sharded` scans its reads twice — a second scan of
+a registered stream relation returns zero rows with no error, where a
+`read_parquet` view re-scans fine.
 
 The spill file lives in the workspace the caller passes — the job's own scratch,
 which on the deploy is under `PATH_SCRATCH` (a SHARED filesystem, Lustre; a
