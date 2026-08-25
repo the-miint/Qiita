@@ -326,8 +326,14 @@ async def _dispatch_action(
     return outputs
 
 
-async def _ticket_alignment_idx(pool: asyncpg.Pool, work_ticket_idx: int, *, entry: str) -> int:
-    """The alignment identity this ticket is scoped to, refusing NULL.
+async def _ticket_alignment_idx(
+    pool: asyncpg.Pool, work_ticket_idx: int, *, entry: str, scope_target: dict[str, Any]
+) -> int:
+    """The alignment identity this ticket is scoped to, refusing a non-prep_sample
+    scope and refusing NULL.
+
+    The scope check lives here rather than at each arm because both arms scope on the
+    same thing and must refuse identically; the block-scoped path never reaches here.
 
     Both per-sample alignment arms read the COLUMN rather than `action_context` (which
     is whatever the submitter sent) and both must refuse the same way, because they
@@ -337,6 +343,10 @@ async def _ticket_alignment_idx(pool: asyncpg.Pool, work_ticket_idx: int, *, ent
     (`_alignment._persist_alignment_idx`) or `align_planner` — or a
     `DELETE /alignment-definition/{idx}` detached it mid-flight (ON DELETE SET NULL).
     """
+    if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+        raise RuntimeError(
+            f"{entry} requires a prep_sample-scoped ticket; got {scope_target['kind']!r}"
+        )
     alignment_idx = await pool.fetchval(
         "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
         work_ticket_idx,
@@ -680,13 +690,11 @@ async def _run_action_primitive(
         # register scope on the same identity, and the gate must record the one they
         # used. The pre-loop resolver writes the column and binds the same value, so
         # through `run_workflow` the two agree by construction.
-        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
-            raise RuntimeError(
-                "finalize-alignment-sample requires a prep_sample-scoped ticket; "
-                f"got {scope_target['kind']!r}"
-            )
         alignment_idx = await _ticket_alignment_idx(
-            pool, work_ticket_idx, entry=LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE
+            pool,
+            work_ticket_idx,
+            entry=LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE,
+            scope_target=scope_target,
         )
         await LIBRARY[LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE](
             pool,
@@ -798,13 +806,11 @@ async def _run_action_primitive(
         # (`_alignment._persist_alignment_idx`), which writes the column before the
         # step loop; `align_planner.plan_and_submit_alignments` is the block-scoped
         # one. So a NULL here means neither ran for this ticket.
-        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
-            raise RuntimeError(
-                f"delete-alignment-sample requires a prep_sample-scoped ticket; got "
-                f"{scope_target['kind']!r}"
-            )
         alignment_idx = await _ticket_alignment_idx(
-            pool, work_ticket_idx, entry=LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE
+            pool,
+            work_ticket_idx,
+            entry=LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE,
+            scope_target=scope_target,
         )
         context_alignment_idx = bound.get(ALIGNMENT_IDX_BINDING)
         if context_alignment_idx is not None and context_alignment_idx != alignment_idx:

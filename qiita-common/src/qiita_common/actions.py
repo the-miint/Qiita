@@ -439,6 +439,15 @@ WorkflowEntry = Annotated[
 ]
 
 
+def context_schema_default(context_schema: dict[str, Any], key: str) -> Any:
+    """The declared default for one `context_schema` knob, or None if it declares none.
+
+    The submit path and the identity hash must read the same literal: a knob the
+    submitter left unset is hashed at its declared default, and the job is bound the
+    same value."""
+    return context_schema.get("properties", {}).get(key, {}).get("default")
+
+
 def action_threads_processing_idx(steps: Iterable[WorkflowEntry]) -> bool:
     """True iff some entry threads PROCESSING_IDX_BINDING through its `params:`.
 

@@ -53,7 +53,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   over 49 completed steps puts that job at 87% of its 64 GB at the median, with ten
   further attempts dying OUT_OF_MEMORY at exactly 64.0 GB — the thread count is also a
   memory multiplier for the unspillable extension side, so raising it is the wrong
-  direction. Its `mem_gb` is deliberately unchanged; see the job's sizing note.
+  direction. Its `mem_gb` is unchanged; see the job's sizing note.
   `test_workflow_params_pin.py`'s aside justifying the gap is corrected: the memory half
   of that rationale stands, but on the CPU axis the aligner's threads ARE the DuckDB
   pool.

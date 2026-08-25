@@ -20,7 +20,11 @@ import json
 from typing import Any
 
 import asyncpg
-from qiita_common.actions import ALIGNMENT_IDX_BINDING, WorkflowAction
+from qiita_common.actions import (
+    ALIGNMENT_IDX_BINDING,
+    WorkflowAction,
+    context_schema_default,
+)
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import StepNoData
 
@@ -31,6 +35,7 @@ from ..repositories.alignment_definition import (
 )
 from ..repositories.assembly import fetch_assembly_sample_state
 from ..repositories.block import create_alignment_sample_pending
+from ._db import persist_ticket_idx
 from ._upload import _submission_bad_input
 
 # action_context keys the de novo resolver reads. Prefixed like `align/1.0.0.yaml`'s
@@ -80,8 +85,7 @@ def _workflow_writes_alignment_gate(steps: list[Any]) -> bool:
 
 def _knob_defaults(context_schema: dict[str, Any]) -> dict[str, Any]:
     """Each knob's context_schema default, so the hash and the job read one literal."""
-    properties = context_schema.get("properties", {})
-    return {key: properties.get(key, {}).get("default") for key in _KNOB_BINDINGS}
+    return {key: context_schema_default(context_schema, key) for key in _KNOB_BINDINGS}
 
 
 def _build_denovo_alignment_params(
@@ -148,12 +152,9 @@ async def _persist_alignment_idx(
     `delete-alignment-sample` and `finalize-alignment-sample` both read this COLUMN
     rather than action_context, and refuse on NULL; so does the resume path in
     `_resolve_denovo_alignment_idx`, which re-attaches to it instead of re-deriving.
-    Writing it again on a resume writes the same value. Like every runner DB write it
-    fails loud."""
-    await pool.execute(
-        "UPDATE qiita.work_ticket SET alignment_idx = $1 WHERE work_ticket_idx = $2",
-        alignment_idx,
-        work_ticket_idx,
+    Writing it again on a resume writes the same value."""
+    await persist_ticket_idx(
+        pool, column="alignment_idx", work_ticket_idx=work_ticket_idx, value=alignment_idx
     )
 
 

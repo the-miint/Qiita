@@ -15,6 +15,7 @@ from qiita_common.actions import (
     ActionDefinition,
     WorkflowAction,
     WorkflowStep,
+    context_schema_default,
 )
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
@@ -538,11 +539,7 @@ async def run_workflow(
             # Single-source the assembler default from the action's context_schema
             # (the one result-affecting knob today) — the same default the hash and
             # the container use, so neither can drift from a re-declared literal.
-            assembler_default = (
-                action.context_schema.get("properties", {})
-                .get(ASSEMBLER_BINDING, {})
-                .get("default")
-            )
+            assembler_default = context_schema_default(action.context_schema, ASSEMBLER_BINDING)
             processing_bindings = await _mint_processing_idx(
                 pool,
                 action_id=action.action_id,

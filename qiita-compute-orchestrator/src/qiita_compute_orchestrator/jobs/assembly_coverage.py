@@ -86,8 +86,8 @@ SEQUENCE_DATA lookup does push the largest samples past the baseline — but esc
 DOES fix it, which is the half the earlier note here feared it would not.
 
 Raising the baseline to 128 GB would retire that retry, at the cost of doubling the
-request for every sample including the median that fits in 56. NOT DONE, deliberately:
-69 attempts is too small a sample to re-size a production allocation on, and the samples
+request for every sample including the median that fits in 56. Not done: 69 attempts
+is too small a sample to re-size a production allocation on, and the samples
 behind them are not known to span what this workflow will see. Revisit with more runs —
 `sacct --user=qiita-job` from a host that can reach slurmdbd, job names
 `qiita-wt{idx}-assembly_coverage-a{n}`, MaxRSS read off the `.0` sub-step and not the
@@ -144,7 +144,7 @@ _MM2_PRESET = "map-hifi"
 # CEILING, NOT YET SETTLED: for a read set whose sequence bytes * ~1.6 exceed the
 # cgroup remainder, no escalation helps (the lookup is unspillable). Whether one
 # sample's masked HiFi read set fits `baseline_resources` is a sizing question for
-# a real sample — see the module TODO.
+# a real sample: the first production ticket's `sacct` MaxRSS is what settles it.
 # Equal to this step's `baseline_resources.cpu`, and it must stay equal — but the
 # binding reason is MEMORY, not cores. `align_minimap2` draws its parallelism from
 # DuckDB's thread pool (measured near-linear at 1/2/4/8), so this number is also the

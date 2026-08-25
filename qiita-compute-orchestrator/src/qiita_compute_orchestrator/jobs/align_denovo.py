@@ -118,7 +118,6 @@ _DUCKDB_FALLBACK_GB = 4
 # `STREAMED_ALIGNMENT_TABLE`.
 _SUBJECT = "denovo_contig"
 _QUERY = "denovo_query"
-_POOLED = "denovo_pooled"
 _CLEARED = "denovo_cleared"
 
 
@@ -188,6 +187,15 @@ def _origin_spanning_sql() -> str:
     """One row per `(read, contig)` where the fragments the gate cleared ARE a single
     crossing of the contig's origin, in the DuckLake `alignment_origin_spanning` column
     order.
+
+    **What the row carries that its inputs do not.** Every column is derivable from the
+    `alignment` fragments plus the per-feature lengths, so what is persisted is the
+    DERIVATION, not new measurement: which fragment is first along the contig's forward
+    axis depends on the read's strand, and the paragraph below is the rule for it. A
+    consumer that re-derives from the fragments has to reproduce that rule — and the
+    failure mode of getting it wrong is silent, since ordering by query start alone
+    yields a well-formed interval for the reverse copy of the same read. Writing it
+    where the gate's pooled result is already in hand keeps one implementation.
 
     **A multi-fragment group is not evidence of a crossing, and the criterion is the
     coordinates, not the fragment count.** The gate clears any read whose records pool
@@ -348,15 +356,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             conn.execute(circular_alignments_view_sql())
             conn.execute(feature_topology_view_sql())
-            # The macro's whole output, materialized once: the gate reads three of its
-            # columns and the side table reads three more, and re-running it per reader
-            # would pool every read twice.
+            # The cleared groups, materialized once: the COPY's SEMI JOIN and the
+            # origin-spanning side table both read them, and re-running the macro per
+            # reader would pool every read twice.
             conn.execute(
-                f"CREATE TABLE {_POOLED} AS SELECT * FROM circular_query_coverage("
-                f"{CIRCULAR_ALIGNMENTS_VIEW}, {FEATURE_TOPOLOGY_VIEW})"
-            )
-            conn.execute(
-                f"CREATE TABLE {_CLEARED} AS SELECT * FROM {_POOLED} "
+                f"CREATE TABLE {_CLEARED} AS SELECT * FROM circular_query_coverage("
+                f"{CIRCULAR_ALIGNMENTS_VIEW}, {FEATURE_TOPOLOGY_VIEW}) "
                 f"WHERE {circular_predicate_sql(clearance=clearance)}",
                 gate_parameters(gate),
             )

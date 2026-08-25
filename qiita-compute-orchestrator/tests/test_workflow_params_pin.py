@@ -80,7 +80,7 @@ def test_align_cpu_pins_duckdb_threads():
     fails; the job just runs at the wrong size, which is exactly the class of defect
     the sizing work was about.
 
-    Deliberately scoped rather than asserted repo-wide: most native jobs pick threads
+    Scoped to this step rather than asserted repo-wide: most native jobs pick threads
     for DuckDB's per-thread operator memory (sort / HASH_AGG state) and legitimately
     differ from their `cpu:` — `hash_sequences` (cpu 4 / threads 8) among them.
     Generalizing this pin would fail those for no reason.
