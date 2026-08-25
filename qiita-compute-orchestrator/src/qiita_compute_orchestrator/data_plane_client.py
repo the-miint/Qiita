@@ -2,8 +2,9 @@
 
 The two-step path a native job uses to pull rows from the data plane over Arrow
 Flight instead of reading staging Parquet — a reference build job pulling a
-shard's sequences, or the feature-table job pulling an alignment slice / the
-per-feature lengths:
+shard's sequences, the feature-table job pulling an alignment slice / the
+per-feature lengths, or a read consumer pulling a block's reads (per-block) or one
+sample's masked reads (per-sample):
 
 1. a `fetch_*_doget_ticket` call — a CO→CP call (compute service-account PAT) to a
    mint route, returning a signed, scoped DoGet ticket. Runs at job RUNTIME (not
@@ -34,6 +35,7 @@ from qiita_common.api_paths import (
     URL_ALIGNMENT_DOGET,
     URL_ASSEMBLY_DOGET,
     URL_READ_DOGET,
+    URL_READ_MASKED_DOGET,
     URL_REFERENCE_DOGET,
 )
 from qiita_common.assembly_constants import ASSEMBLED_SEQUENCE_CHUNKS_TABLE
@@ -247,12 +249,11 @@ async def open_read_block_stream(
     job therefore asks for "my block's reads" and cannot accidentally request the
     wrong kind.
 
-    **Materialize, don't re-scan.** A Flight reader is consumed ONCE. Callers that
-    scan their reads more than a time (align_sharded builds two relations over
-    them) or hand them to miint (which resolves relation names on a SEPARATE
-    connection, so a registered stream relation is invisible there — see
-    docs/duckdb-miint.md) must `CREATE TABLE … AS SELECT` from `relation` inside
-    the body, exactly as `estimate_feature_table` does with its alignment slice.
+    **Materialize, don't re-scan.** A Flight reader is consumed ONCE: a second scan
+    of the registered name returns zero rows with no error. Callers that scan their
+    reads more than once (align_sharded builds two relations over them) must
+    `CREATE TABLE … AS SELECT` from `relation` inside the body, exactly as
+    `estimate_feature_table` does with its alignment slice.
 
     An EMPTY stream is legitimate, not an error: a completed mask can carry 0
     passing reads (a blank/no-template control, or a fully host/QC-filtered
@@ -266,6 +267,93 @@ async def open_read_block_stream(
 
     async def _mint(http: httpx.AsyncClient) -> bytes:
         return await fetch_read_doget_ticket(http=http, work_ticket_idx=work_ticket_idx)
+
+    async with _open_ticket_stream(conn, mint=_mint, relation=relation) as rel:
+        yield rel
+
+
+async def fetch_read_masked_doget_ticket(
+    *,
+    http: httpx.AsyncClient,
+    prep_sample_idx: int,
+    mask_idx: int,
+) -> bytes:
+    """POST /read-masked/ticket/doget and return the raw signed ticket bytes.
+
+    Both identifiers are carried on the wire and both are required. That is the
+    opposite of `fetch_read_doget_ticket` / `fetch_alignment_doget_ticket`, which
+    send only `work_ticket_idx` to keep a large member list CP-side: a read_masked
+    ticket's scope is exactly one `(prep_sample_idx, mask_idx)` pair, so there is no
+    list that there would be a reason to keep off the wire, and the pair IS the data
+    plane's `read_masked` macro arguments — which is also why an unfiltered form is
+    unrepresentable rather than merely refused, the DP rejecting any filter but
+    those two keys.
+
+    Transport and error mapping are the module's (see the header). The status worth
+    naming here is **409**: the mask-completion gate, described on
+    `open_read_masked_stream`.
+    """
+    resp = await http.post(
+        URL_READ_MASKED_DOGET,
+        json={"prep_sample_idx": prep_sample_idx, "mask_idx": mask_idx},
+    )
+    resp.raise_for_status()
+    return base64.b64decode(resp.json()["ticket"])
+
+
+@asynccontextmanager
+async def open_read_masked_stream(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    prep_sample_idx: int,
+    mask_idx: int,
+    relation: str = "masked_reads",
+) -> AsyncIterator[str]:
+    """Mint a `(prep_sample_idx, mask_idx)`-scoped read_masked DoGet ticket (CO→CP)
+    and stream that sample's passing masked reads (CO→DP Flight) into `conn` as
+    `relation`, yielding the registered relation name.
+
+    PER-SAMPLE, where `open_read_block_stream` is per-BLOCK. A block ticket resolves
+    its reads (raw or masked) from the work ticket, so a block job cannot ask for
+    the wrong kind; this one names the sample and the mask config outright, which is
+    what a per-sample consumer has and a block identity would not give it.
+
+    The relation carries the data plane's `read_masked` macro columns —
+    `mask_idx, prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2,
+    qual2` — with the trims already applied and the macro's unconditional
+    `reason = 'pass'` excluding human/host reads by construction. Note
+    `sequence_idx`: the CP-side FASTQ streamer that feeds the assembly workflow
+    (`runner/_read_ingest.py`) writes the VARCHAR `read_id` instead, which is why an
+    `alignment`-producing consumer streams here rather than reusing that FASTQ —
+    `alignment` rows are keyed on `sequence_idx`.
+
+    **Completion gate, requiring no code here.** The CP refuses to sign unless
+    `mask_sample.state = 'completed'` for this pair, so a 409 is what a caller gets
+    for a mask still in flight ('pending'), a withdrawn run ('invalidated'), or no
+    gate row at all — each of which would otherwise yield an absent or silently
+    partial pass-set. A consumer does not re-derive that check.
+
+    **Reference the relation exactly ONCE**, the same constraint
+    `open_read_block_stream` documents above. Handing the name straight to a miint
+    table function works; the exceptions are miint's fixed-temp-name paths, listed
+    under "Reading tables/views inside table functions" in docs/duckdb-miint.md. A
+    caller needing more than one pass materializes with `CREATE TABLE … AS SELECT`
+    inside the body, paying the memory that buys.
+
+    An EMPTY stream is legitimate, not an error: a completed mask can carry 0
+    passing reads (a blank/no-template control, or a fully host/QC-filtered sample),
+    and a zero-row Arrow stream still carries its schema, so a caller materializes a
+    valid empty table and runs to a clean no-op.
+
+    Rides the shared `_open_ticket_stream`, so the CP client is closed as soon as
+    the ticket is minted; only the Flight client/stream stays open for the body's
+    duration. `data_plane_url` resolves from `get_settings()`.
+    """
+
+    async def _mint(http: httpx.AsyncClient) -> bytes:
+        return await fetch_read_masked_doget_ticket(
+            http=http, prep_sample_idx=prep_sample_idx, mask_idx=mask_idx
+        )
 
     async with _open_ticket_stream(conn, mint=_mint, relation=relation) as rel:
         yield rel

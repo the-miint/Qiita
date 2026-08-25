@@ -22,9 +22,9 @@ Both modes reassemble the per-feature contig into a `(read_id, sequence1)` subje
 via the shared `subject.stage_subject` (`string_agg(chunk_data ORDER BY
 chunk_index)` GROUP BY feature_idx) — the index is built from exactly the bytes
 stored in the data plane, no raw-FASTA side channel. The subject is a non-temp
-TABLE because miint's `save_minimap2_index` opens a SEPARATE connection on the
-same DuckDB instance during bind/execute, which resolves regular `view`/`table`
-names but not TEMP tables / CTEs (see docs/duckdb-miint.md).
+TABLE because that reassembly is a blocking aggregation worth materialising once;
+`stage_subject` owns that reason. `save_minimap2_index` itself resolves a TEMP
+TABLE or a registered Arrow relation fine (measured; see docs/duckdb-miint.md).
 
 miint signature (qiita-verified against the team-mirror build; see
 docs/duckdb-miint.md):
