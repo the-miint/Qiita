@@ -13,9 +13,13 @@ from qiita_common.analytic import (
 )
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
+    PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX,
+    PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_PREFIX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX,
+    PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT,
     PATH_PREP_SAMPLE_PREFIX,
     PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_PREP_SAMPLE_STUDY_LIST,
@@ -137,6 +141,41 @@ def _add_study_field_create_args(subparser: argparse.ArgumentParser, *, entity_n
     )
 
 
+def _add_field_list_subcommands(
+    entity_sub,
+    *,
+    entity_noun: str,
+    study_field_path: str,
+    global_field_path: str,
+) -> None:
+    """Declare one entity's two field-listing subcommands.
+
+    `entity_noun` names the entity in help text.
+    """
+    hyphenated = entity_noun.replace("_", "-")
+
+    p_list_fields = entity_sub.add_parser(
+        "list-fields",
+        help=f"List a study's {hyphenated} field definitions",
+    )
+    p_list_fields.add_argument("--study-idx", type=int, required=True)
+    p_list_fields.set_defaults(
+        handler=_handle_read,
+        read_path=study_field_path,
+        read_idx_arg="study_idx",
+    )
+
+    p_list_global_fields = entity_sub.add_parser(
+        "list-global-fields",
+        help=f"List the global {hyphenated} field definitions",
+    )
+    p_list_global_fields.set_defaults(
+        handler=_handle_read,
+        read_path=global_field_path,
+        read_idx_arg=None,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="qiita", description="Qiita end-user CLI")
     _common.add_base_url_arg(parser)
@@ -209,6 +248,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_study_create.set_defaults(handler=_handle_study_create)
 
+    study_by_idx_path = f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}"
+
     p_study_get = p_study_sub.add_parser(
         "get",
         help="Fetch a study by idx (GET /study/{study_idx})",
@@ -216,7 +257,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_get.add_argument("--study-idx", type=int, required=True)
     p_study_get.set_defaults(
         handler=_handle_read,
-        read_path=f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}",
+        read_path=study_by_idx_path,
         read_idx_arg="study_idx",
     )
 
@@ -238,7 +279,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_patch.set_defaults(
         handler=_handle_patch,
         patch_model=StudyPatchRequest,
-        patch_path=f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}",
+        patch_path=study_by_idx_path,
         patch_idx_arg="study_idx",
         patch_json_fields=("extra_metadata",),
     )
@@ -303,6 +344,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
 
+    biosample_study_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
+
     p_biosample_create_field = p_biosample_sub.add_parser(
         "create-field",
         help="Create a study-local biosample field (POST /study/{S}/biosample-field)",
@@ -311,8 +354,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_biosample_create_field.set_defaults(
         handler=_handle_study_field_create,
         study_field_model=BiosampleStudyFieldCreateRequest,
-        study_field_path=f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}",
+        study_field_path=biosample_study_field_path,
     )
+
+    _add_field_list_subcommands(
+        p_biosample_sub,
+        entity_noun="biosample",
+        study_field_path=biosample_study_field_path,
+        global_field_path=(
+            f"{PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT}"
+        ),
+    )
+
+    biosample_by_idx_path = f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 
     p_biosample_get = p_biosample_sub.add_parser(
         "get",
@@ -321,7 +375,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_biosample_get.add_argument("--biosample-idx", type=int, required=True)
     p_biosample_get.set_defaults(
         handler=_handle_read,
-        read_path=f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}",
+        read_path=biosample_by_idx_path,
         read_idx_arg="biosample_idx",
     )
 
@@ -352,7 +406,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_biosample_patch.set_defaults(
         handler=_handle_patch,
         patch_model=BiosamplePatchRequest,
-        patch_path=f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}",
+        patch_path=biosample_by_idx_path,
         patch_idx_arg="biosample_idx",
         patch_json_fields=(),
     )
@@ -614,6 +668,8 @@ def _build_parser() -> argparse.ArgumentParser:
         read_idx_arg="prep_sample_idx",
     )
 
+    prep_sample_study_field_path = f"{PATH_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"
+
     p_prepsample_create_field = p_prepsample_sub.add_parser(
         "create-field",
         help="Create a study-local prep-sample field (POST /study/{S}/prep-sample-field)",
@@ -622,7 +678,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_prepsample_create_field.set_defaults(
         handler=_handle_study_field_create,
         study_field_model=PrepSampleStudyFieldCreateRequest,
-        study_field_path=f"{PATH_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}",
+        study_field_path=prep_sample_study_field_path,
+    )
+
+    _add_field_list_subcommands(
+        p_prepsample_sub,
+        entity_noun="prep_sample",
+        study_field_path=prep_sample_study_field_path,
+        global_field_path=(
+            f"{PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT}"
+        ),
     )
 
     p_prepsample_retire = p_prepsample_sub.add_parser(

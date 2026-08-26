@@ -17,6 +17,7 @@ from qiita_common.models import (
     MetadataEntry,
     MetadataFieldWriteResult,
     MissingReasonRef,
+    SampleGlobalFieldResponse,
     SampleMetadataWriteResponse,
     SampleStudyFieldCreateRequest,
     SampleStudyFieldResponse,
@@ -528,9 +529,7 @@ async def create_and_map_study_field(
 
     Create-side conflicts map to 409 and DB-level violations to 422 (the
     Pydantic body should preempt the CHECK, but it is the last defense). The
-    caller owns the transaction. Response keys come from response_model's own
-    aliases, so each entity's wire spelling of the two idx fields follows its
-    model rather than being rebuilt here.
+    caller owns the transaction.
     """
     noun = spec.entity_kind
     try:
@@ -567,24 +566,50 @@ async def create_and_map_study_field(
     except asyncpg.CheckViolationError:
         raise HTTPException(status_code=422, detail=f"violates a database constraint on {noun}")
 
-    # The row names the global link by its SQL column; the response names both
-    # idx fields by the subclass's alias.
-    payload = {
-        field_wire_name(response_model, STUDY_FIELD_IDX_ATTR): row["idx"],
-        "study_idx": row["study_idx"],
-        field_wire_name(response_model, GLOBAL_FIELD_IDX_ATTR): row[
-            spec.study_field_global_fk_column
-        ],
-        "display_name": row["display_name"],
-        "description": row["description"],
-        "data_type": row["data_type"],
-        "required": row["required"],
-        "terminology_idx": row["terminology_idx"],
-        "tier_override": row["tier_override"],
-        "created_by_idx": row["created_by_idx"],
-        "created_at": row["created_at"],
-    }
-    return response_model.model_validate(payload)
+    return map_study_field_row(row, spec=spec, response_model=response_model)
+
+
+def map_study_field_row[T: SampleStudyFieldResponse](
+    row: asyncpg.Record,
+    *,
+    spec: EntityMetadataSpec,
+    response_model: type[T],
+) -> T:
+    """Shape one {entity}_study_field row into response_model.
+
+    Every column but the two idx fields is named identically on the wire and
+    passes straight through. The two idx fields — the row's own, which arrives
+    as `idx`, and the global link, which arrives under its entity-specific SQL
+    column — are each moved to whichever entity-qualified spelling
+    response_model declares, whether or not that differs from the column name.
+    """
+    payload = dict(row)
+    payload[field_wire_name(response_model, STUDY_FIELD_IDX_ATTR)] = payload.pop("idx")
+    payload[field_wire_name(response_model, GLOBAL_FIELD_IDX_ATTR)] = payload.pop(
+        spec.study_field_global_fk_column
+    )
+    validated = response_model.model_validate(payload)
+    return validated
+
+
+# same-pattern-ok: registry sibling of map_study_field_row; kept separate so each
+# response model is bound to the idx field it actually declares, which a shared
+# idx-attr parameter would stop enforcing
+def map_global_field_row[T: SampleGlobalFieldResponse](
+    row: asyncpg.Record,
+    *,
+    response_model: type[T],
+) -> T:
+    """Shape one {entity}_global_field row into response_model.
+
+    Every column but the row's own idx is named identically on the wire, so
+    only that one key is renamed — to whichever entity-qualified spelling
+    response_model declares for it.
+    """
+    payload = dict(row)
+    payload[field_wire_name(response_model, GLOBAL_FIELD_IDX_ATTR)] = payload.pop("idx")
+    validated = response_model.model_validate(payload)
+    return validated
 
 
 def raise_for_unique_violation(

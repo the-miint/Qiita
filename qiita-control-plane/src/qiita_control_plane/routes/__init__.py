@@ -8,12 +8,14 @@ from .alignment import alignment_definition_router, alignment_router
 from .assembly import assembly_router
 from .auth import router as auth_router
 from .biosample import biosample_router as biosample_top_level_router
+from .biosample import global_field_router as biosample_global_field_router
 from .biosample import router as biosample_router
 from .exported_feature import router as exported_feature_router
 from .exported_identifier import router as exported_identifier_router
 from .exported_processing import router as exported_processing_router
 from .host_filter_profile import router as host_filter_profile_router
 from .prep_protocol import router as prep_protocol_router
+from .prep_sample import global_field_router as prep_sample_global_field_router
 from .prep_sample import router as prep_sample_router
 from .prep_sample import study_scoped_router as prep_sample_study_router
 from .read import read_router
@@ -39,6 +41,7 @@ api_router.include_router(reference_router)
 api_router.include_router(host_filter_profile_router)
 api_router.include_router(biosample_router)
 api_router.include_router(biosample_top_level_router)
+api_router.include_router(biosample_global_field_router)
 api_router.include_router(sequencing_router)
 api_router.include_router(sequenced_sample_run_router)
 api_router.include_router(sequenced_sample_study_router)
@@ -53,6 +56,7 @@ api_router.include_router(assembly_router)
 api_router.include_router(prep_protocol_router)
 api_router.include_router(prep_sample_router)
 api_router.include_router(prep_sample_study_router)
+api_router.include_router(prep_sample_global_field_router)
 api_router.include_router(exported_feature_router)
 api_router.include_router(exported_processing_router)
 api_router.include_router(exported_identifier_router)

@@ -75,6 +75,34 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   which ties the R1/R2 pair to the sequenced_sample row. An upload-fed submission has no path
   to take a basename from, so the rule went vacuous exactly on the route a regular user takes;
   the column gives it something to read. Descriptive, like `sha256` — nothing opens it.
+
+- **The global sample field registries can be read back (#485).** `GET
+  /api/v1/biosample-global-field` and `GET /api/v1/prep-sample-global-field` list every
+  row of their registry, so a client can resolve a global field's idx through the
+  API. Each row carries `internal_name`, the stable key a caller matches
+  on, alongside the display name, data type, default tier, and terminology binding. Gated
+  on the entity read scope (`biosample:read` / `prep_sample:read`) over the HumanUser
+  baseline every read in these modules carries, with no study check at all: a registry is
+  global, so there is no study to hold a tier on and a caller with no study grants still
+  gets the full list.
+
+- **A study's sample field definitions can be read back (#485).** `GET
+  /api/v1/study/{study_idx}/biosample-field` and `.../prep-sample-field` list the study's
+  field definitions, so a client no longer has to infer what already exists by attempting
+  a create and interpreting the 409 from the `(study_idx, display_name)` unique
+  constraint — which is what made bulk field-creation scripts impossible to re-run safely.
+  Each row arrives with the values a globally-linked field inherits already resolved, so
+  a caller sees one shape whether the field is linked or purely local. Gated on the
+  entity read scope (`biosample:read` / `prep_sample:read`) at viewer tier — lower than
+  the create route's admin, because these return field definitions and no metadata
+  values.
+
+- **`qiita <entity> list-fields` / `list-global-fields` (#485).** The user-CLI front end
+  for the two field reads above, for both `biosample` and `prep-sample`.
+  `list-global-fields` prints the registry so the idx `create-field
+  --<entity>-global-field-idx` wants is obtainable, and `list-fields` prints a study's
+  own definitions.
+
 - **A per-sample masked-read Flight stream for native jobs (#477).**
   `data_plane_client` gains `fetch_read_masked_doget_ticket` +
   `open_read_masked_stream`: a job names a `(prep_sample_idx, mask_idx)` pair, the CP
@@ -1266,6 +1294,28 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   validated, and the value is echoed back in the submit gate's 422. Now `\A[^/\r\n]+\z`,
   with the length bound exercised on both sides. The model is deliberately stricter than
   the DB CHECK, which tests only non-empty and slash-free.
+
+- **Two stored sample-field schema comments no longer contradict the schema (#485).** The
+  `biosample_study_field` / `prep_sample_study_field` table comments listed
+  `tier_override` among the properties a linked row inherits from its global field; a
+  global field has no such column — it carries `default_tier` — so a linked row's NULL
+  `tier_override` is what the inheritance CHECK requires, not an inherited value. The
+  `*_global_field.internal_name` comments said the column is never shown to end users,
+  which the new registry read contradicts: `internal_name` is exactly the key a caller
+  matches on there. Comment-only migration; no DDL.
+
+- **The QC adapter set refuses a duplicated chunk position instead of concatenating it
+  (#494).** `_write_adapter_parquet` reassembles the configured adapter reference by joining
+  every chunk row for a feature in `chunk_index` order. Its docstring asserted
+  `(feature_idx, chunk_index)` uniqueness and declined to dedup so that a violation would
+  surface; nothing surfaced it. On the live lake `feature_idx` 127 carries two rows at
+  `chunk_index` 0 — an exact reverse-complement pair, which `canonical_sequence_hash_expr`
+  folds into one feature — so the join returned 66 bp for a 33 bp adapter. It now raises
+  naming every repeated `(feature_idx, chunk_index)`, which `_resolve_qc_adapters` turns
+  into a SUBMISSION `BAD_INPUT` with no partial `adapters.parquet` left behind.
+  `DEPLOY_CHECKLIST.md` bucket 6 carries the one-off delete that repairs the row and names
+  the surviving orientation.
+
 - **Four broken relative links in `docs/deploy-archive/`, and a test that keeps them fixed.**
   All four targets existed; the paths were repo-root-relative (`](docs/runbooks/redeploy.md)`)
   inside `docs/deploy-archive/`, where they resolve against the containing directory. They come

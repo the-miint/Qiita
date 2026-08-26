@@ -127,14 +127,17 @@ def _proportion_or_none_arg(raw: str) -> float | None:
 
 
 def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Fetch a resource by idx (GET) and print its JSON body.
+    """Fetch a resource (GET) and print its JSON body.
 
-    The per-command `set_defaults` supplies `read_path` (a subpath
-    template) and `read_idx_arg` (the namespace attr whose value fills
-    the template), so the path formats from exactly one identifier.
+    The per-command `set_defaults` supplies `read_path` (a subpath template)
+    and `read_idx_arg` (the namespace attr whose value fills the template), so
+    the path formats from exactly one identifier. A read whose path carries no
+    placeholder declares `read_idx_arg=None`; a template still carrying one
+    then fails loudly rather than dialing a literal `{...}` segment.
     """
     idx_arg = args.read_idx_arg
-    path = args.read_path.format(**{idx_arg: getattr(args, idx_arg)})
+    fill = {} if idx_arg is None else {idx_arg: getattr(args, idx_arg)}
+    path = args.read_path.format(**fill)
     return _common.run_http_subcommand(lambda t: _common.call("GET", args.base_url, t, path))
 
 

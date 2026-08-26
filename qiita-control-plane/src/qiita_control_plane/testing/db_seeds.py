@@ -544,27 +544,30 @@ async def seed_biosample_global_field(
     data_type: FieldDataType,
     created_by_idx: int,
     terminology_idx: int | None = None,
+    required: bool = False,
 ) -> int:
     """Insert a qiita.biosample_global_field row and return its idx.
 
     Mirrors the column subset the seven-row migration seed populates:
     internal_name, display_name, data_type, plus the principal that
-    created the row. required and default_tier rely on schema defaults.
-    description is intentionally omitted -- callers that need a non-null
-    description set it via UPDATE so the helper surface stays small.
-    asyncpg coerces the StrEnum value to text for the
-    qiita.field_data_type cast. terminology_idx must be supplied for
-    data_type=TERMINOLOGY (the CHECK enforces the iff coupling) and
-    omitted otherwise.
+    created the row. required defaults to the schema default, and is
+    settable so a read test can tell an inherited value from a defaulted
+    one. default_tier relies on the schema default; description is
+    intentionally omitted -- callers that need a non-null description set
+    it via UPDATE so the helper surface stays small. asyncpg coerces the
+    StrEnum value to text for the qiita.field_data_type cast.
+    terminology_idx must be supplied for data_type=TERMINOLOGY (the CHECK
+    enforces the iff coupling) and omitted otherwise.
     """
     return await pool.fetchval(
         "INSERT INTO qiita.biosample_global_field"
-        "  (internal_name, display_name, data_type, terminology_idx, created_by_idx)"
-        " VALUES ($1, $2, $3, $4, $5) RETURNING idx",
+        "  (internal_name, display_name, data_type, terminology_idx, required, created_by_idx)"
+        " VALUES ($1, $2, $3, $4, $5, $6) RETURNING idx",
         internal_name,
         display_name,
         data_type,
         terminology_idx,
+        required,
         created_by_idx,
     )
 
@@ -577,12 +580,13 @@ async def seed_prep_sample_global_field(
     data_type: FieldDataType,
     created_by_idx: int,
     terminology_idx: int | None = None,
+    required: bool = False,
 ) -> int:
     """Insert a qiita.prep_sample_global_field row and return its idx.
 
     Parallel to seed_biosample_global_field; mirrors the same column
-    subset (internal_name, display_name, data_type, plus the creating
-    principal). required and default_tier rely on schema defaults;
+    subset (internal_name, display_name, data_type, required, plus the
+    creating principal). default_tier relies on the schema default;
     description is intentionally omitted -- callers that need a non-null
     description set it via UPDATE so the helper surface stays small.
     asyncpg coerces the StrEnum value to text for the
@@ -592,12 +596,13 @@ async def seed_prep_sample_global_field(
     """
     return await pool.fetchval(
         "INSERT INTO qiita.prep_sample_global_field"
-        "  (internal_name, display_name, data_type, terminology_idx, created_by_idx)"
-        " VALUES ($1, $2, $3, $4, $5) RETURNING idx",
+        "  (internal_name, display_name, data_type, terminology_idx, required, created_by_idx)"
+        " VALUES ($1, $2, $3, $4, $5, $6) RETURNING idx",
         internal_name,
         display_name,
         data_type,
         terminology_idx,
+        required,
         created_by_idx,
     )
 

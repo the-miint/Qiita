@@ -18,9 +18,11 @@ from qiita_common.api_paths import (
     URL_AUTH_WHOAMI,
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
+    URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
     URL_BIOSAMPLE_LIST_BY_STUDY,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_PROTOCOL_PREFIX,
+    URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
     URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_SAMPLE_STUDY_LIST,
     URL_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE,
@@ -40,6 +42,10 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_STEP_LOGS,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
+
+from qiita_control_plane.cli.user import main
+
+_BASE = "https://q.example.test"
 
 
 def test_help_exits_cleanly(capsys):
@@ -598,6 +604,15 @@ def _stub_post(
 
     monkeypatch.setattr(_common.httpx, "request", fake_request)
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+
+def _run(monkeypatch, argv, *, response_json, status=200) -> dict:
+    """Drive `qiita <argv>` against a stubbed transport; return the captured
+    request. Asserts a clean exit so a wiring break surfaces here."""
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=response_json, status=status)
+    assert main(["--base-url", _BASE, *argv]) == 0
+    return captured
 
 
 # Canned response_json bodies for the resource creates. Hoisted out of the
@@ -4947,14 +4962,13 @@ def test_pacbio_submission_rejects_syndna_ref_on_a_non_absquant_pool(capsys):
 
 
 class _FieldCliSurface(NamedTuple):
-    """One entity's create-field CLI bindings: subcommand, its global-link flag,
-    the URL the POST must reach, and the request model argparse validates
-    against (its name appears in the exit-2 stderr line)."""
+    """One entity's field-subcommand CLI bindings."""
 
     subcommand: str
     global_fk_flag: str
-    url_template: str
-    model_name: str
+    url_template: str  # create-field and list-fields share this study-scoped path
+    model_name: str  # the request model argparse validates against, named in the exit-2 stderr line
+    global_field_url: str  # the registry list; no path parameter
 
 
 _FIELD_CLI_SURFACES = [
@@ -4964,6 +4978,7 @@ _FIELD_CLI_SURFACES = [
             "--biosample-global-field-idx",
             URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
             "BiosampleStudyFieldCreateRequest",
+            URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
         ),
         id="biosample",
     ),
@@ -4973,6 +4988,7 @@ _FIELD_CLI_SURFACES = [
             "--prep-sample-global-field-idx",
             URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
             "PrepSampleStudyFieldCreateRequest",
+            URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
         ),
         id="prep_sample",
     ),
