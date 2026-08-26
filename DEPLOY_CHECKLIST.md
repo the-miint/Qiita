@@ -82,6 +82,11 @@ mounted `vers=3,noacl,sec=sys`. Three consequences, all measured on the host:
 sudo usermod -aG kl-seq-rw qiita-api   # (#484)
 ```
 
+Deploy host only — the control plane is a systemd unit there and `qiita-api` reads no run folder
+anywhere else. Account group membership is not uniform across this cluster (`qiita-orch` is in
+`qiita-pipeline` on the deploy host and not on a worker, measured), so do not assume this or any
+other grant propagated.
+
 A supplementary group is read at process start, so the **bucket-4 restart** is what picks this
 up; verifying before it will still fail. After the restart:
 
