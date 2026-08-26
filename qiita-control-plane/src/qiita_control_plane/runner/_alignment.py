@@ -25,6 +25,7 @@ from qiita_common.actions import (
     WorkflowAction,
     context_schema_default,
 )
+from qiita_common.analytic import MAX_SECONDARY
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import StepNoData
 
@@ -159,6 +160,11 @@ def _build_denovo_alignment_params(
         "workflow": action_id,
         "version": action_version,
         "aligner": _ALIGNER,
+        # Fixed, and hashed for the same reason `aligner` is: it decides WHICH
+        # alignments the run collects, so two runs at identical thresholds under
+        # different caps are different results. `qiita_common.analytic.MAX_SECONDARY`
+        # is the one copy — the job passes the same constant to `align_minimap2`.
+        "max_secondary": MAX_SECONDARY,
         **{key: int(bound[binding]) for binding, key in _SELECTOR_KEYS.items()},
         **{key: _KNOB_TYPES[key](value) for key, value in resolved.items()},
     }

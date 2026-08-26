@@ -124,12 +124,18 @@ steps:
     #
     # mem_gb is NOT VALIDATED AGAINST A REAL SAMPLE, and no measured job is a stand-in.
     # `assembly_coverage` aligns the same reads against the same contigs, but it holds
-    # a `SEQUENCE_DATA` lookup over the whole read set for its BAM writer and keeps
-    # secondaries, which is what its measured remainder is made of; this job writes
-    # Parquet, holds no such lookup, and requests no secondaries. `align_sharded` shares
-    # this job's shape but indexes a sharded whole reference across up to 8 concurrent
-    # shards against one sample's contigs here. Both bound this job from above without
-    # estimating it.
+    # a `SEQUENCE_DATA` lookup over the whole read set for its BAM writer, which is what
+    # its measured remainder is made of; this job writes Parquet and holds no such
+    # lookup. `align_sharded` shares this job's shape but indexes a sharded whole
+    # reference across up to 8 concurrent shards against one sample's contigs here. Both
+    # bound this job from above without estimating it.
+    #
+    # This job requests the same secondary cap both of them do, so the slice is one row
+    # per placement rather than per read. Measured on the staged build, the realised
+    # count is min(cap, equally-good subjects - 1) — it saturates on how many
+    # near-identical contigs the assembly holds, not on the cap — but on an assembly
+    # rich in collapsed repeats that is still a multiplier the numbers below have never
+    # seen.
     #
     # So the baseline is a starting point with the ceiling as its safety net, not a
     # measurement: a sample that does not fit escalates once, and the first real

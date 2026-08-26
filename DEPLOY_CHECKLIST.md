@@ -235,6 +235,15 @@ _None yet._
   so a run re-registered inside the mint's 300 s TTL streams the re-registered rows, and a
   run whose contigs are in the lake but whose Postgres membership was cleared answers 404
   at the route. (#476)
+- **`qiita feature-table --circular-gate` starts working on sharded alignments.** It
+  refused any slice holding a secondary record, and `align_sharded` collects those by
+  design (`max_secondary := 100`, pruned by identity rather than by flag) — measured
+  2026-08-26, the live `qiita_lake.alignment` carries secondary rows. From this deploy a
+  circular gate scores them per record on the same thresholds instead of refusing. Users
+  who worked around it by dropping `--circular-gate` can stop. Nothing to run; a feature
+  table built with the flag before and after this deploy over the same alignment can
+  differ, because the earlier one could not be built at all. (#486)
+
 - **`align-denovo` needs no new scope grant.** Its job streams a sample's contigs on the
   compute service account's existing `ticket:doget` (the surface the note above
   describes) and its masked reads on `read_masked:doget`. That account already holds the

@@ -146,10 +146,14 @@ def _params(bound, defaults=None):
 
 
 def test_the_identity_hashes_every_result_affecting_input():
-    """What the alignment_idx is: the assembly run, the mask, the aligner, the preset
-    and both thresholds. Written out rather than checked by count, because a key
-    added here re-mints every de novo alignment fleet-wide and a key dropped silently
-    merges two runs that produced different rows."""
+    """What the alignment_idx is: the assembly run, the mask, the aligner, the secondary
+    cap, the preset and both thresholds. Written out rather than checked by count,
+    because a key added here re-mints every de novo alignment fleet-wide and a key
+    dropped silently merges two runs that produced different rows.
+
+    `max_secondary` is in the set because it decides WHICH alignments the run collects:
+    two runs at identical thresholds under different caps hold different rows, and
+    without it the second would resolve the first's id and replace them."""
     params = _params({ASSEMBLY_PROCESSING_IDX_BINDING: 88, ALIGN_MASK_IDX_BINDING: 99})
     assert params == {
         "subject": "assembly",
@@ -158,6 +162,7 @@ def test_the_identity_hashes_every_result_affecting_input():
         "processing_idx": 88,
         "mask_idx": 99,
         "aligner": "minimap2",
+        "max_secondary": 100,
         "preset": "map-hifi",
         "min_identity": 0.95,
         "min_query_coverage": 0.90,

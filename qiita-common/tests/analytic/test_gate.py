@@ -17,6 +17,7 @@ def _clear(gate: ft.AlignmentGate) -> ft.GateClearance:
         scorable_rows=10,
         unpoolable_partitions=0,
         unpoolable_rows=0,
+        secondary_rows=0,
         unscorable_groups=0,
         paired_rows=10 if gate.paired else 0,
     )
@@ -162,6 +163,7 @@ def _check(
     scorable=1000,
     unpoolable=0,
     unpoolable_rows=0,
+    secondary_rows=0,
     unscorable_groups=0,
     paired_rows=None,
 ):
@@ -173,6 +175,7 @@ def _check(
         scorable_rows=scorable,
         unpoolable_partitions=unpoolable,
         unpoolable_rows=unpoolable_rows,
+        secondary_rows=secondary_rows,
         unscorable_groups=unscorable_groups,
         paired_rows=(total if gate.paired else 0) if paired_rows is None else paired_rows,
     )
@@ -457,9 +460,29 @@ def test_the_circular_diagnostics_count_the_rows_the_macro_cannot_see():
     assert sql.count(ft.STREAMED_ALIGNMENT_TABLE) == 1
 
 
-def test_check_refuses_a_circular_gate_over_rows_it_cannot_pool():
-    with pytest.raises(ValueError, match="pooled"):
+def test_check_refuses_a_circular_gate_over_rows_no_axis_can_score():
+    """Unmapped and coordinate-less rows have no pooled group AND no CIGAR span, so
+    they would leave the slice without failing a threshold. Still fatal."""
+    with pytest.raises(ValueError, match="neither axis"):
         _check(ft.AlignmentGate(circular=True), unpoolable_rows=3)
+
+
+def test_check_admits_a_circular_gate_over_secondary_rows():
+    """A secondary carries its own CIGAR and coordinates, so the CIGAR axis scores it
+    per record — the pooling macro excluding it is not a reason to refuse the slice.
+    This is what makes `--circular-gate` usable on an aligner run that keeps
+    secondaries (`align_sharded`, and `align_denovo` since it took the same cap)."""
+    assert _check(ft.AlignmentGate(circular=True), secondary_rows=42).gate.circular
+
+
+def test_the_two_unpoolable_classes_are_counted_apart():
+    """A row that is BOTH secondary and unmapped is unscorable, not a secondary the
+    CIGAR axis can rescue — so the fatal class wins and the two filters are disjoint."""
+    assert "NOT (" in ft.SCORABLE_SECONDARY_ROW
+    assert ft.UNSCORABLE_ROW in ft.SCORABLE_SECONDARY_ROW
+    assert ft.UNSCORABLE_ROW in ft.POOLABLE_ROW
+    assert "NOT alignment_is_secondary(flags)" in ft.POOLABLE_ROW
+    assert "alignment_is_secondary(flags)" in ft.SCORABLE_SECONDARY_ROW
 
 
 def test_check_refuses_a_circular_gate_over_paired_data():

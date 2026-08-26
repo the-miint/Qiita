@@ -50,20 +50,21 @@ Two consequences of the circular choice for the aligner call:
   * `eqx := true`. `cigar_pooled_identity` — the aggregate the macro reports as its
     `identity` column — is NULL on a CIGAR carrying no `=`/`X` ops, and
     `check_gate_diagnostics` refuses a whole slice for one such read.
-  * `max_secondary := 0`. SECONDARY (FLAG 0x100), not supplementary (0x800): the two
-    sides of an origin-spanning read arrive as SUPPLEMENTARY records, which this does
-    not touch and which the macro keeps — "a read split across a supplementary is one
-    molecule whatever the reference's topology" (see the link above). So requesting no
-    secondaries does not cost the crossing this gate exists to catch.
-    `circular_query_coverage` excludes secondary records, a documented precondition,
-    which costs a slice containing them two ways: a secondary alongside a primary rides
-    into the gated output unscored, and a group whose ONLY record is secondary produces
-    no macro row at all and vanishes from the slice entirely. `check_gate_diagnostics`
-    refuses either. Requesting none is what puts the slice inside what the gate can
-    judge. `align_sharded` keeps them (`max_secondary := 100`) because its per-record
-    CIGAR gate scores them; a read that is genuinely high-identity to two contigs — a
-    recent HGT into a shared operon — is therefore not placed twice here. That is the
-    assay call for this workflow, not a limitation of the aligner.
+  * `max_secondary := 100`, the same cap `align_sharded` uses. SECONDARY (FLAG 0x100),
+    not supplementary (0x800): the two sides of an origin-spanning read arrive as
+    SUPPLEMENTARY records, which this does not touch and which the macro keeps — "a read
+    split across a supplementary is one molecule whatever the reference's topology" (see
+    the link above). `circular_query_coverage` excludes SECONDARY records by contract, so
+    the gate scores those on the CIGAR axis instead, per record, against the same two
+    thresholds; `qiita_common.analytic.gate` holds that split and why it is safe. A read
+    genuinely high-identity to two contigs is placed against both.
+
+    Measured on the deploy-staged miint build under `map-hifi`: the cap is applied
+    literally, and the realised count is min(cap, equally-good subjects − 1) — so it
+    saturates on how many near-identical contigs the assembly holds, not on 100. A
+    subject scoring materially below the best one is not reported whatever the cap; the
+    knob that decides that is not exposed
+    ([duckdb-miint#189](https://github.com/the-miint/duckdb-miint/issues/189)).
 
 Unmapped records are dropped on the way into the slice, for the reason the macro
 excludes them.
@@ -85,6 +86,8 @@ from qiita_common.analytic import (
     CIRCULAR_ALIGNMENTS_VIEW,
     FEATURE_LENGTHS_TABLE,
     FEATURE_TOPOLOGY_VIEW,
+    MAX_SECONDARY,
+    SCORABLE_SECONDARY_ROW,
     STREAMED_ALIGNMENT_TABLE,
     AlignmentGate,
     check_gate_diagnostics,
@@ -95,6 +98,8 @@ from qiita_common.analytic import (
     feature_topology_view_sql,
     gate_diagnostics_sql,
     gate_parameters,
+    secondary_parameters,
+    secondary_predicate_sql,
 )
 from qiita_common.parquet import validate_parquet_path
 
@@ -205,7 +210,7 @@ def _streamed_alignment_sql(alignment_idx: int, prep_sample_idx: int) -> str:
         "CAST(NULL AS BIGINT) AS mate_feature_idx, "
         "* EXCLUDE (read_id, reference, mate_reference) "
         "FROM align_minimap2(?, subject_table := ?, preset := ?, "
-        "eqx := true, max_secondary := 0)"
+        f"eqx := true, max_secondary := {MAX_SECONDARY})"
     )
 
 
@@ -270,7 +275,12 @@ def _origin_spanning_sql() -> str:
         "cigar_query_intervals(a.cigar, a.flags) AS query_interval "
         f"FROM {STREAMED_ALIGNMENT_TABLE} a JOIN {_CLEARED} c "
         f"ON {circular_cleared_join('a', 'c')} "
-        f"JOIN {FEATURE_LENGTHS_TABLE} l ON l.feature_idx = a.feature_idx"
+        f"JOIN {FEATURE_LENGTHS_TABLE} l ON l.feature_idx = a.feature_idx "
+        # A crossing is evidenced by a read's FRAGMENTS, which are supplementary records.
+        # A secondary is an alternative placement of the whole read, and it shares the
+        # join key with its primary when it lands on the same contig, so it would enter
+        # this group and move `query_start`/`query_stop` and the end/start FILTERs.
+        "WHERE NOT alignment_is_secondary(a.flags)"
     )
     # `list_min`/`list_max` over the record's own intervals rather than an UNNEST: one
     # row per fragment throughout, so the aggregate below groups fragments to reads
@@ -410,14 +420,27 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 gate_parameters(gate),
             )
 
-            # Every record of a group that cleared. Sorted by the identifier order the
-            # DuckLake `alignment` table is written in, with position/flags as
-            # tiebreakers so an origin-spanning read's fragments land deterministically.
+            # Two arms, the same two `gated_alignment_table_sql` applies on the consumer
+            # side: every record of a READ that cleared pooled, and every SECONDARY that
+            # cleared on its own CIGAR. The first excludes secondaries explicitly — a
+            # secondary placed elsewhere on the same contig shares `_CLEARED`'s key with
+            # its primary, so it would otherwise ride in unscored.
+            #
+            # Sorted by the identifier order the DuckLake `alignment` table is written
+            # in, with position/flags as tiebreakers so an origin-spanning read's
+            # fragments land deterministically.
             conn.execute(
-                f"COPY (SELECT a.* FROM {STREAMED_ALIGNMENT_TABLE} a "
+                f"COPY (SELECT * FROM ("
+                f"SELECT a.* FROM {STREAMED_ALIGNMENT_TABLE} a "
                 f"SEMI JOIN {_CLEARED} c ON {circular_cleared_join('a', 'c')} "
-                "ORDER BY alignment_idx, prep_sample_idx, sequence_idx, feature_idx, "
-                f"position, flags) TO '{alignment_sql}' ({PARQUET_OPTS})"
+                "WHERE NOT alignment_is_secondary(a.flags) "
+                "UNION ALL "
+                f"SELECT * FROM {STREAMED_ALIGNMENT_TABLE} "
+                f"WHERE {SCORABLE_SECONDARY_ROW} "
+                f"AND {secondary_predicate_sql(clearance=clearance)}"
+                ") ORDER BY alignment_idx, prep_sample_idx, sequence_idx, feature_idx, "
+                f"position, flags) TO '{alignment_sql}' ({PARQUET_OPTS})",
+                secondary_parameters(gate),
             )
             conn.execute(
                 f"COPY ({_origin_spanning_sql()} "

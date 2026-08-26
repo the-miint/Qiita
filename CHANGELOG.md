@@ -1280,6 +1280,22 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **A circular alignment gate no longer refuses every slice holding a secondary record
+  (#486).** `check_gate_diagnostics` counted secondary, unmapped and coordinate-less rows
+  as one `unpoolable_rows` bucket and refused the slice on any of them, because
+  `circular_query_coverage` excludes all three. The three do not share a remedy: a
+  secondary carries its own CIGAR and coordinates, so the CIGAR axis scores it per
+  record, while an unmapped or coordinate-less row can be scored on neither axis. The
+  counts are now split and only the second class refuses. `qiita feature-table
+  --circular-gate` (#475) was unusable on real `align_sharded` output as a result —
+  that job collects placements with `max_secondary := 100` and prunes by identity, not
+  by flag, so its stored rows carry secondaries.
+
+  The circular gated relation gains a second arm for them, and the pooled arm now
+  excludes secondaries explicitly: `cleared` is keyed on `(read, is_read1, reference)`,
+  which a secondary placed elsewhere on the SAME reference shares with its primary, so
+  it previously would have ridden in on that clearance without being scored at all.
+
 - **Two stored sample-field schema comments no longer contradict the schema (#485).** The
   `biosample_study_field` / `prep_sample_study_field` table comments listed
   `tier_override` among the properties a linked row inherits from its global field; a
@@ -2584,6 +2600,21 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **`align-denovo` collects secondary alignments (#486).** `max_secondary` moves from 0
+  to `qiita_common.analytic.MAX_SECONDARY` (100), the cap `align_sharded` already uses,
+  so a read placing against several near-identical contigs is recorded against each
+  rather than only the best. The pooled circular gate judges a read's fragments as
+  before; secondaries are judged per record against the same two thresholds. The cap is
+  hashed into `alignment_idx` alongside the aligner, so changing it mints a new
+  alignment rather than replacing rows collected under the old policy.
+
+  Measured on the deploy-staged miint build under `map-hifi`: the cap is applied
+  literally and the realised count is min(cap, equally-good subjects − 1), so it
+  saturates on how many near-identical contigs an assembly holds rather than on 100. A
+  subject scoring materially below the best is not reported whatever the cap; the knob
+  that decides that is not exposed
+  ([duckdb-miint#189](https://github.com/the-miint/duckdb-miint/issues/189)).
 
 - **The chunk reassembly contract has one definition in tests too (#486).** Six inlined
   `string_agg(chunk_data, '' ORDER BY chunk_index)` copies — in `test_reference_load.py`,

@@ -546,30 +546,53 @@ def test_a_query_that_does_not_align_produces_no_row_at_all():
     assert aligned == [(1,)]
 
 
-def test_the_aligner_call_requests_no_secondary_records_and_eqx_cigars(
-    monkeypatch, genome, tmp_path
-):
-    """Both are required by the circular gate — the module docstring says why — and
-    the refusal each avoids is asserted below, so a change to either constant surfaces
-    here rather than as a quietly-shorter output."""
+def test_the_aligner_call_keeps_secondaries_and_asks_for_eqx_cigars(monkeypatch, genome, tmp_path):
+    """The cap matches `align_sharded`'s, and `eqx` is what makes both axes scorable:
+    pooled identity is NULL on a legacy-`M` CIGAR, and so is the per-record identity the
+    secondary arm applies. A change to either constant surfaces here rather than as a
+    quietly different output."""
     sql = align_denovo._streamed_alignment_sql(_ALIGNMENT_IDX, _PREP_SAMPLE_IDX)
-    assert "max_secondary := 0" in sql
+    assert "max_secondary := 100" in sql
     assert "eqx := true" in sql
     # No unmapped filter, and none requested: see the contract test below.
     assert "include_unmapped" not in sql
 
+    # From the contract layer, not a literal here: the control plane hashes the same
+    # constant into `alignment_idx`, and a second copy could drift from the value the
+    # identity was built on.
+    from qiita_common.analytic import MAX_SECONDARY
+
+    assert f"max_secondary := {MAX_SECONDARY}" in sql
+
+
+def test_a_slice_no_axis_can_score_is_still_refused():
+    """Keeping secondaries relaxed exactly one of the two classes the circular gate
+    could not pool. An unmapped or coordinate-less row still has no pooled group AND no
+    CIGAR span, so it would leave the slice without failing a threshold."""
     from qiita_common.analytic import AlignmentGate, check_gate_diagnostics
 
-    with pytest.raises(ValueError, match="cannot be pooled by read"):
+    with pytest.raises(ValueError, match="neither axis"):
         check_gate_diagnostics(
             AlignmentGate(circular=True),
             total_rows=10,
             scorable_rows=None,
             unpoolable_partitions=0,
             unpoolable_rows=1,
+            secondary_rows=0,
             unscorable_groups=0,
             paired_rows=0,
         )
+    # ... and the secondaries the aligner is now asked for are not that class.
+    assert check_gate_diagnostics(
+        AlignmentGate(circular=True),
+        total_rows=10,
+        scorable_rows=None,
+        unpoolable_partitions=0,
+        unpoolable_rows=0,
+        secondary_rows=4,
+        unscorable_groups=0,
+        paired_rows=0,
+    ).gate.circular
 
 
 def test_no_arrow_materialization_in_the_feeding_path():
