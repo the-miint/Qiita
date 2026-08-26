@@ -60,21 +60,38 @@ def _service_account() -> str:
         return f"uid {os.geteuid()}"
 
 
+def _permission_denied(clause: str, path: Path | str) -> HTTPException:
+    """A 403 that opens with the account, because the fix is a grant to it."""
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "reason": f"the control plane runs as {_service_account()}, which {clause}",
+            "path": str(path),
+        },
+    )
+
+
 def _reject_if_unreadable_below(run_folder: Path) -> None:
-    """403 when the empty BAM index is a permission problem rather than an
-    empty run.
+    """403 when a well directory cannot be opened.
 
     `Path.glob` swallows the `OSError` from a directory it cannot open and
     yields nothing, so a grant that reaches the run folder but not the well
-    directories under it is indistinguishable from a run with no demultiplexed
-    reads — a wrong answer with a 200 on it. Walk the same two levels the glob
-    walks and let the error out.
+    directories under it drops those wells' barcodes from the index with no
+    error — a wrong answer with a 200 on it, whether it leaves the index empty
+    or merely short. Walk the same two levels the glob walks and let the error
+    out.
     """
     try:
         for well in run_folder.iterdir():
-            # `stat()`, not `is_dir()`: the latter reports False for a path it
-            # cannot stat, which is the very case this function exists to catch.
-            if not S_ISDIR(well.stat().st_mode):
+            try:
+                # `stat()`, not `is_dir()`: the latter reports False for a path
+                # it cannot stat, which is the case this function exists to
+                # catch. ENOENT here is a dangling symlink, or an entry removed
+                # while the scan runs; the glob skips it too.
+                well_is_dir = S_ISDIR(well.stat().st_mode)
+            except FileNotFoundError:
+                continue
+            if not well_is_dir:
                 continue
             hifi = well / HIFI_READS_DIR
             try:
@@ -84,16 +101,11 @@ def _reject_if_unreadable_below(run_folder: Path) -> None:
             if hifi_is_dir:
                 next(hifi.iterdir(), None)
     except PermissionError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "reason": (
-                    f"the control plane runs as {_service_account()}, which can read this"
-                    " run folder but not a directory under it, so the BAM index would be"
-                    " silently empty. Grant it read+traverse on the whole run tree"
-                ),
-                "path": str(exc.filename or run_folder),
-            },
+        raise _permission_denied(
+            "can read this run folder but not a directory under it, so the BAM"
+            " index would silently omit whatever that directory holds. Grant it"
+            " read+traverse on the whole run tree",
+            exc.filename or run_folder,
         ) from exc
 
 
@@ -106,8 +118,31 @@ def _inspect_illumina(run_folder: Path) -> IlluminaRunInfo:
     data). Its message is already operator-facing, so it becomes the 422 detail
     unchanged.
     """
+    # `read_instrument_run_info` reaches RunInfo.xml through `Path.is_file()`,
+    # which reports False for a path it cannot stat. Without this, a run folder
+    # that lists but does not traverse answers "RunInfo.xml not found" — the
+    # typo-hunt this module exists to avoid. Statting it here keeps the
+    # permission contract in the module that owns it.
+    runinfo_path = run_folder / "RunInfo.xml"
+    try:
+        os.stat(runinfo_path)
+    except PermissionError as exc:
+        raise _permission_denied(
+            "cannot reach RunInfo.xml in this run folder. Grant it read+traverse"
+            " on the whole run tree",
+            runinfo_path,
+        ) from exc
+    except OSError:
+        # ENOENT and the rest: `read_instrument_run_info` names them better.
+        pass
+
     try:
         instrument_run_id, instrument_model = read_instrument_run_info(run_folder)
+    except PermissionError as exc:
+        raise _permission_denied(
+            "cannot read RunInfo.xml in this run folder. Grant it read on the file",
+            runinfo_path,
+        ) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -121,11 +156,12 @@ def _inspect_pacbio(run_folder: Path) -> PacbioRunIndex:
 
     An empty index is returned rather than raised on — whether it is a problem
     depends on the caller's pre-flight roster, which this route does not have.
-    See `PacbioRunIndex` for what the caller does with it.
+    See `PacbioRunIndex` for what the caller does with it. What is raised on is
+    an index the walk could not finish reading (`_reject_if_unreadable_below`),
+    which is not the same thing as an index with nothing in it.
     """
+    _reject_if_unreadable_below(run_folder)
     index, duplicated = index_run_bams(run_folder)
-    if not index:
-        _reject_if_unreadable_below(run_folder)
     return PacbioRunIndex(
         hifi_bam_by_barcode={barcode: str(path) for barcode, path in sorted(index.items())},
         duplicated_barcodes=sorted(duplicated),
@@ -169,17 +205,11 @@ async def inspect_run_folder(
         if is_directory:
             next(run_folder.iterdir(), None)
     except PermissionError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "reason": (
-                    f"the control plane runs as {_service_account()}, which cannot read"
-                    " this run folder or one of its parents; a compute node may still be"
-                    " able to. Grant it read+traverse, or submit from a machine that"
-                    " mounts the path"
-                ),
-                "path": str(run_folder),
-            },
+        raise _permission_denied(
+            "cannot read this run folder or one of its parents; a compute node may"
+            " still be able to. Grant it read+traverse, or submit from a machine"
+            " that mounts the path",
+            run_folder,
         ) from exc
     except OSError as exc:
         raise HTTPException(

@@ -341,7 +341,7 @@ async def test_unreadable_well_dirs_return_403_not_an_empty_index(
         (run / "1_A01").chmod(0o755)
 
     assert resp.status_code == 403, resp.text
-    assert "silently empty" in resp.json()["detail"]["reason"]
+    assert "silently omit" in resp.json()["detail"]["reason"]
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
@@ -356,6 +356,92 @@ async def test_an_empty_run_folder_is_still_a_200(rf_client, wet_lab_admin_token
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["pacbio"]["hifi_bam_by_barcode"] == {}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
+async def test_one_unreadable_well_among_readable_ones_returns_403(
+    rf_client, wet_lab_admin_token, ingest_root
+):
+    """The partial grant that still produces a NON-empty index.
+
+    Gating the guard on an empty index misses this: one readable well fills the
+    map, the unreadable one drops out of the glob, and the caller gets a 200
+    carrying a barcode set that is short by however many wells it could not
+    open. The pre-flight roster then reads those samples as absent from the run.
+    """
+    token, _ = wet_lab_admin_token
+    run = ingest_root / "half-granted-run"
+    _pacbio_bam(run, "1_A01", "m84137_250101_000000", "bc2001")
+    _pacbio_bam(run, "1_B01", "m84137_250101_000000", "bc2002")
+    (run / "1_B01").chmod(0o000)
+    try:
+        resp = await _inspect(rf_client, token, run, "pacbio_smrt")
+    finally:
+        (run / "1_B01").chmod(0o755)
+
+    assert resp.status_code == 403, resp.text
+    assert "silently omit" in resp.json()["detail"]["reason"]
+
+
+async def test_a_dangling_symlink_among_the_wells_is_skipped(
+    rf_client, wet_lab_admin_token, ingest_root
+):
+    """`stat()` on a symlink to nothing raises ENOENT, which is not a denial.
+
+    The walk that catches an unreadable well has to stat every entry, so it
+    meets whatever else the run folder holds — including a link whose target is
+    gone. That is the glob's own behaviour (it skips it), not a 500.
+    """
+    token, _ = wet_lab_admin_token
+    run = ingest_root / "dangling-link-run"
+    _pacbio_bam(run, "1_A01", "m84137_250101_000000", "bc2001")
+    (run / "gone").symlink_to(ingest_root / "no-such-target")
+
+    resp = await _inspect(rf_client, token, run, "pacbio_smrt")
+
+    assert resp.status_code == 200, resp.text
+    assert list(resp.json()["pacbio"]["hifi_bam_by_barcode"]) == ["bc2001"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
+async def test_an_unreadable_runinfo_returns_403_not_500(
+    rf_client, wet_lab_admin_token, ingest_root
+):
+    """The exact shape an ACL grant on directories leaves behind: the run folder
+    traverses, the file inside it does not open. Opening it raises
+    PermissionError from inside the XML reader, which handles only ParseError.
+    """
+    token, _ = wet_lab_admin_token
+    folder = _illumina_folder(ingest_root, "230101_A00123_0009_BHXYZ")
+    (folder / "RunInfo.xml").chmod(0o000)
+    try:
+        resp = await _inspect(rf_client, token, folder, "illumina")
+    finally:
+        (folder / "RunInfo.xml").chmod(0o644)
+
+    assert resp.status_code == 403, resp.text
+    assert "cannot read RunInfo.xml" in resp.json()["detail"]["reason"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
+async def test_a_listable_but_untraversable_run_folder_returns_403_not_404(
+    rf_client, wet_lab_admin_token, ingest_root
+):
+    """Mode 0o444: the prelude's `iterdir()` succeeds, so the folder looks fine,
+    and only the child lookup fails. `Path.is_file()` reports False for a path
+    it cannot stat, so without a stat of our own this answers "RunInfo.xml not
+    found" — the typo hunt the 403 exists to prevent.
+    """
+    token, _ = wet_lab_admin_token
+    folder = _illumina_folder(ingest_root, "230101_A00123_0010_BHXYZ")
+    folder.chmod(0o444)
+    try:
+        resp = await _inspect(rf_client, token, folder, "illumina")
+    finally:
+        folder.chmod(0o755)
+
+    assert resp.status_code == 403, resp.text
+    assert "cannot reach RunInfo.xml" in resp.json()["detail"]["reason"]
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
@@ -413,6 +499,20 @@ async def test_an_unreadable_run_folder_returns_403_not_404(
     reason = resp.json()["detail"]["reason"]
     assert "cannot read this run folder" in reason
     assert "compute node may still be able to" in reason
+
+
+async def test_a_path_with_an_embedded_nul_returns_422_not_500(
+    rf_client, wet_lab_admin_token, ingest_root
+):
+    """The model's `^/` pattern matches at the prefix, so the value reaches the
+    gate; `os.path.realpath` then raises ValueError rather than OSError for it.
+    Answer it the way every other malformed path is answered."""
+    token, _ = wet_lab_admin_token
+
+    resp = await _inspect(rf_client, token, f"{ingest_root}/a\x00b", "illumina")
+
+    assert resp.status_code == 422, resp.text
+    assert "not a usable filesystem path" in resp.json()["detail"]["reason"]
 
 
 async def test_relative_path_is_rejected_by_the_model(rf_client, wet_lab_admin_token):
