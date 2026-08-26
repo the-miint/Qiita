@@ -700,12 +700,12 @@ def test_warn_on_collapsed_records_counts_and_names_the_absorbed_records(tmp_pat
     assert features == 3
 
     with caplog.at_level(logging.WARNING):
-        collapsed = _warn_on_collapsed_records(42, manifest, features)
+        collapsed = _warn_on_collapsed_records("reference 42", manifest)
 
     assert collapsed == 3
     assert len(caplog.records) == 1
     message = caplog.records[0].getMessage()
-    assert "reference 42" in message
+    assert message.startswith("reference 42: ")
     assert "6 submitted record(s) collapsed to 3 feature(s)" in message
     assert "fwd, rev" in message
     # A three-member group is listed together, ordered within the group.
@@ -725,7 +725,7 @@ def test_warn_on_collapsed_records_is_silent_when_nothing_collapsed(tmp_path, ca
     assert features == 2
 
     with caplog.at_level(logging.WARNING):
-        collapsed = _warn_on_collapsed_records(42, manifest, features)
+        collapsed = _warn_on_collapsed_records("reference 42", manifest)
 
     assert collapsed == 0
     assert caplog.records == []
@@ -737,11 +737,11 @@ def test_warn_on_collapsed_records_marks_a_truncated_group_list(tmp_path, caplog
     import logging
 
     from qiita_control_plane.actions.library import (
-        _MAX_REPORTED_COLLAPSES,
+        _MAX_REPORTED,
         _warn_on_collapsed_records,
     )
 
-    pairs = _MAX_REPORTED_COLLAPSES + 3
+    pairs = _MAX_REPORTED + 3
     read_ids, sequences = [], []
     for i in range(pairs):
         # Distinct per pair, and non-palindromic so each pair folds on strand.
@@ -753,29 +753,30 @@ def test_warn_on_collapsed_records_marks_a_truncated_group_list(tmp_path, caplog
     assert features == pairs
 
     with caplog.at_level(logging.WARNING):
-        collapsed = _warn_on_collapsed_records(42, manifest, features)
+        collapsed = _warn_on_collapsed_records("reference 42", manifest)
 
     assert collapsed == pairs
     message = caplog.records[0].getMessage()
     assert message.endswith("(truncated)")
-    assert message.count(";") == _MAX_REPORTED_COLLAPSES - 1
+    assert message.count(";") == _MAX_REPORTED - 1
 
 
-def test_warn_on_collapsed_records_reports_a_manifest_short_of_its_features(tmp_path, caplog):
-    """Fewer records than features means the feature map holds hashes the
-    manifest does not — reported, not silently read as no collapse."""
+def test_warn_on_collapsed_records_leads_with_the_caller_s_scope(tmp_path, caplog):
+    """The helper serves both membership writers, so the thing being loaded is the
+    caller's to name — an assembly run is not a reference."""
     import logging
 
     from qiita_control_plane.actions.library import _warn_on_collapsed_records
 
     manifest = tmp_path / "manifest.parquet"
-    features = _write_manifest(manifest, ["fwd", "solo"], [_FWD, _SOLO])
+    _write_manifest(manifest, ["c_fwd", "c_rev"], [_FWD, _revcomp(_FWD)])
 
     with caplog.at_level(logging.WARNING):
-        collapsed = _warn_on_collapsed_records(42, manifest, features + 1)
+        collapsed = _warn_on_collapsed_records(
+            "assembly run (prep_sample 7, processing 3)", manifest
+        )
 
-    assert collapsed == 0
-    assert len(caplog.records) == 1
-    assert "the manifest holds 2 record(s) against 3 linked feature(s)" in (
-        caplog.records[0].getMessage()
-    )
+    assert collapsed == 1
+    message = caplog.records[0].getMessage()
+    assert message.startswith("assembly run (prep_sample 7, processing 3): ")
+    assert "c_fwd, c_rev" in message

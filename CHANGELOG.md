@@ -21,18 +21,20 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **A reference load reports the records the canonical hash absorbed (#497).** `write-membership`
-  compares the `hash_sequences` manifest (one row per distinct `read_id`) against the features
-  the reference gained (one per distinct canonical hash) and, when they differ, logs a warning
-  naming the shortfall and the `read_id`s that shared a hash. `canonical_sequence_hash_expr` folds
-  case and strand, so two records that are one sequence in two cases, or exact reverse complements,
-  mint one `feature_idx` and only the lex-smallest `read_id`'s chunks are stored; the other record
-  was previously absent from the reference with nothing recording it, because the manifest is a
-  workflow artifact and the dropped bytes never reach the lake. Measured on the `fastp-adapters`
-  reference: 234 submitted records, 177 features, 57 records absent. The warning reports *that*
-  records collapsed and not which kind — the manifest carries no sequence, and an exact duplicate
-  and a strand pair agree on both hash and length — so separating them means reading the submitted
-  FASTA. It warns rather than refuses because both shapes are legitimate submissions.
+- **A reference or assembly load reports the records the canonical hash absorbed (#497).**
+  `write-membership` and `write-assembly-membership` compare their manifest's record count
+  against its distinct canonical hashes and, when they differ, log a warning naming the
+  shortfall and the `read_id`s that shared a hash. `canonical_sequence_hash_expr` folds case
+  and strand, so two records that are one sequence in two cases, or exact reverse complements,
+  mint one `feature_idx` and only the lex-smallest `read_id`'s bytes are stored — the other
+  record was previously absent with nothing recording it, because the manifest is a workflow
+  artifact and the dropped bytes never reach the lake. Measured on the `fastp-adapters`
+  reference: 234 submitted records, 177 features, 57 records absent. The warning reports
+  *that* records collapsed and not why — the manifest carries no sequence, and an exact
+  duplicate and a strand pair agree on both hash and length — so separating them means reading
+  the submitted sequences. For an assembly it also counts one contig placed in several bins,
+  which loses nothing (measured 0 across the deploy's assemblies). It warns rather than
+  refusing because every one of those shapes is a valid submission.
 
 - **The global sample field registries can be read back (#485).** `GET
   /api/v1/biosample-global-field` and `GET /api/v1/prep-sample-global-field` list every

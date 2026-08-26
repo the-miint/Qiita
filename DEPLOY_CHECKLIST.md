@@ -241,21 +241,17 @@ _None yet._
   run whose contigs are in the lake but whose Postgres membership was cleared answers 404
   at the route. (#476)
 
-- **A reference load logs when submitted records collapse into fewer features** (#497).
-  `write-membership` compares the `hash_sequences` manifest (one row per distinct `read_id`)
-  against the features the reference gained (one per distinct canonical hash) and, when they
-  differ, emits a `WARNING` naming the shortfall and the `read_id`s that shared a hash — visible
-  with `journalctl -u qiita-control-plane`. Nothing to run, and nothing fails: the load completes
-  either way, because a FASTA declaring both orientations of an adapter and a genome carrying a
-  duplicated contig are both valid submissions. `canonical_sequence_hash_expr` folds case and
-  strand, so two records that are one sequence in two cases, or exact reverse complements, mint one
-  `feature_idx` and only the lex-smallest `read_id`'s chunks are stored; the other record was
-  previously absent with nothing recording it, since the manifest is a workflow artifact and the
-  dropped bytes never reach the lake. It fires at **load** time only — it does not re-examine
-  references already in the database, so anything loaded before this deploy stays silent regardless
-  of what it dropped. The warning reports *that* records collapsed, not which kind: the manifest
-  carries no sequence, and an exact duplicate and a strand pair agree on both hash and length, so
-  reading the submitted FASTA is what separates them.
+- **A reference or assembly load logs when submitted records collapse into fewer features**
+  (#497). `write-membership` and `write-assembly-membership` compare their manifest's record
+  count against its distinct canonical hashes and, when they differ, emit a `WARNING` naming
+  the shortfall and the `read_id`s that shared a hash — visible with `journalctl -u
+  qiita-control-plane`. Nothing to run, and nothing fails: the load completes either way,
+  because a FASTA declaring both orientations of an adapter, a genome carrying a repeated
+  contig, and one assembly contig placed in several bins are all valid submissions.
+  It fires at **load** time only — it does not re-examine references already in the database,
+  so anything loaded before this deploy stays silent regardless of what it dropped. The
+  warning reports *that* records collapsed and not why: reading the submitted sequences is
+  what separates a strand pair from a duplicate.
 
 - **Reference 10 (`fastp-adapters`) holds 177 of its 234 submitted records; 13
   (`truseq-adapters`) is the configured adapter set** (#497). Measured 2026-08-26 against the live
