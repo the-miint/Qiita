@@ -240,9 +240,10 @@ _None yet._
   design (`max_secondary := 100`, pruned by identity rather than by flag) — measured
   2026-08-26, the live `qiita_lake.alignment` carries secondary rows. From this deploy a
   circular gate scores them per record on the same thresholds instead of refusing. Users
-  who worked around it by dropping `--circular-gate` can stop. Nothing to run; a feature
-  table built with the flag before and after this deploy over the same alignment can
-  differ, because the earlier one could not be built at all. (#486)
+  who worked around it by dropping `--circular-gate` can stop. Nothing to run, and no
+  existing feature table changes: a slice that cleared the old gate held no secondaries,
+  and over such a slice the new arms are a no-op. Only what previously refused moves.
+  (#486)
 
 - **`align-denovo` needs no new scope grant.** Its job streams a sample's contigs on the
   compute service account's existing `ticket:doget` (the surface the note above

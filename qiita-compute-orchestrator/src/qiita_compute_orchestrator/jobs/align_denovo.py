@@ -43,28 +43,23 @@ and judges the read there.
 The two thresholds themselves — `min_identity` and `min_query_coverage`, defaulting to
 0.95 / 0.90 from the action's `context_schema` — reach the rows through
 `circular_predicate_sql`, bound by `gate_parameters(gate)` in the `WHERE` of the
-`_CLEARED` table below. That is the only place a record is dropped for scoring too low.
+`_CLEARED` table below — and, for secondary records, through `secondary_predicate_sql`
+in the second arm of the alignment COPY. Those two are where a record is dropped for
+scoring too low.
 
 Two consequences of the circular choice for the aligner call:
 
   * `eqx := true`. `cigar_pooled_identity` — the aggregate the macro reports as its
     `identity` column — is NULL on a CIGAR carrying no `=`/`X` ops, and
     `check_gate_diagnostics` refuses a whole slice for one such read.
-  * `max_secondary := 100`, the same cap `align_sharded` uses. SECONDARY (FLAG 0x100),
-    not supplementary (0x800): the two sides of an origin-spanning read arrive as
-    SUPPLEMENTARY records, which this does not touch and which the macro keeps — "a read
-    split across a supplementary is one molecule whatever the reference's topology" (see
-    the link above). `circular_query_coverage` excludes SECONDARY records by contract, so
-    the gate scores those on the CIGAR axis instead, per record, against the same two
-    thresholds; `qiita_common.analytic.gate` holds that split and why it is safe. A read
-    genuinely high-identity to two contigs is placed against both.
-
-    Measured on the deploy-staged miint build under `map-hifi`: the cap is applied
-    literally, and the realised count is min(cap, equally-good subjects − 1) — so it
-    saturates on how many near-identical contigs the assembly holds, not on 100. A
-    subject scoring materially below the best one is not reported whatever the cap; the
-    knob that decides that is not exposed
-    ([duckdb-miint#189](https://github.com/the-miint/duckdb-miint/issues/189)).
+  * `max_secondary := MAX_SECONDARY`. Secondary (FLAG 0x100), not supplementary
+    (0x800): the two sides of an origin-spanning read arrive as SUPPLEMENTARY records,
+    which this does not touch and which the macro keeps — "a read split across a
+    supplementary is one molecule whatever the reference's topology" (see the link
+    above). Secondaries are what the macro excludes, and
+    `qiita_common.analytic.gate` is where the two-axis split that judges them lives,
+    along with what the cap does and does not buy. A read genuinely high-identity to two
+    contigs is placed against both.
 
 Unmapped records are dropped on the way into the slice, for the reason the macro
 excludes them.
@@ -276,10 +271,10 @@ def _origin_spanning_sql() -> str:
         f"FROM {STREAMED_ALIGNMENT_TABLE} a JOIN {_CLEARED} c "
         f"ON {circular_cleared_join('a', 'c')} "
         f"JOIN {FEATURE_LENGTHS_TABLE} l ON l.feature_idx = a.feature_idx "
-        # A crossing is evidenced by a read's FRAGMENTS, which are supplementary records.
-        # A secondary is an alternative placement of the whole read, and it shares the
-        # join key with its primary when it lands on the same contig, so it would enter
-        # this group and move `query_start`/`query_stop` and the end/start FILTERs.
+        # A crossing is evidenced by a read's fragments, which are supplementary
+        # records; a secondary is an alternative placement of the whole read, so it
+        # would move `query_start`/`query_stop` and the end/start FILTERs below. It
+        # reaches this join for the reason `_circular_gated_sql` names.
         "WHERE NOT alignment_is_secondary(a.flags)"
     )
     # `list_min`/`list_max` over the record's own intervals rather than an UNNEST: one
@@ -420,11 +415,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 gate_parameters(gate),
             )
 
-            # Two arms, the same two `gated_alignment_table_sql` applies on the consumer
-            # side: every record of a READ that cleared pooled, and every SECONDARY that
-            # cleared on its own CIGAR. The first excludes secondaries explicitly — a
-            # secondary placed elsewhere on the same contig shares `_CLEARED`'s key with
-            # its primary, so it would otherwise ride in unscored.
+            # The producer side of `gated_alignment_table_sql`'s two arms, in its arm
+            # order; that function's docstring is the one copy of why each is shaped the
+            # way it is.
             #
             # Sorted by the identifier order the DuckLake `alignment` table is written
             # in, with position/flags as tiebreakers so an origin-spanning read's

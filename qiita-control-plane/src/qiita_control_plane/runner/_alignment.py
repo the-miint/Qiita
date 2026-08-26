@@ -160,10 +160,10 @@ def _build_denovo_alignment_params(
         "workflow": action_id,
         "version": action_version,
         "aligner": _ALIGNER,
-        # Fixed, and hashed for the same reason `aligner` is: it decides WHICH
+        # Fixed, and hashed for the same reason `aligner` is: it decides which
         # alignments the run collects, so two runs at identical thresholds under
-        # different caps are different results. `qiita_common.analytic.MAX_SECONDARY`
-        # is the one copy — the job passes the same constant to `align_minimap2`.
+        # different caps hold different rows. Imported rather than spelled, so this and
+        # the aligner call the job makes cannot disagree about the value hashed here.
         "max_secondary": MAX_SECONDARY,
         **{key: int(bound[binding]) for binding, key in _SELECTOR_KEYS.items()},
         **{key: _KNOB_TYPES[key](value) for key, value in resolved.items()},

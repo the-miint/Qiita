@@ -18,6 +18,7 @@ def _clear(gate: ft.AlignmentGate) -> ft.GateClearance:
         unpoolable_partitions=0,
         unpoolable_rows=0,
         secondary_rows=0,
+        scorable_secondary_rows=None,
         unscorable_groups=0,
         paired_rows=10 if gate.paired else 0,
     )
@@ -156,6 +157,11 @@ def test_the_paired_count_asks_miint_rather_than_masking_the_flag():
     assert "&" not in sql
 
 
+# Sentinel: "however many `secondary_rows` says", distinct from an explicit None (which
+# means identity is not gated) and from an explicit 0 (none of them scorable).
+_ALL = object()
+
+
 def _check(
     gate,
     *,
@@ -164,11 +170,14 @@ def _check(
     unpoolable=0,
     unpoolable_rows=0,
     secondary_rows=0,
+    scorable_secondary_rows=_ALL,
     unscorable_groups=0,
     paired_rows=None,
 ):
     """`check_gate_diagnostics` with the clean-slice defaults, so each test states only
-    the count it is about. `paired_rows` defaults to what `gate.paired` implies."""
+    the count it is about. `paired_rows` defaults to what `gate.paired` implies, and
+    `scorable_secondary_rows` to all of them — a clean slice's secondaries are scorable,
+    so a test about a different count does not trip the unscorable-secondary floor."""
     return ft.check_gate_diagnostics(
         gate,
         total_rows=total,
@@ -176,6 +185,9 @@ def _check(
         unpoolable_partitions=unpoolable,
         unpoolable_rows=unpoolable_rows,
         secondary_rows=secondary_rows,
+        scorable_secondary_rows=(
+            secondary_rows if scorable_secondary_rows is _ALL else scorable_secondary_rows
+        ),
         unscorable_groups=unscorable_groups,
         paired_rows=(total if gate.paired else 0) if paired_rows is None else paired_rows,
     )
@@ -400,6 +412,31 @@ def test_a_producer_and_the_gated_path_apply_one_circular_predicate():
     )
 
 
+@pytest.mark.parametrize(
+    "gate",
+    [
+        ft.AlignmentGate(circular=True),
+        ft.AlignmentGate(circular=True, circular_min_identity=None),
+        ft.AlignmentGate(min_identity=0.95, min_query_coverage=0.8),
+        ft.AlignmentGate(min_query_coverage=0.8, paired=True),
+    ],
+)
+def test_the_whole_gated_statement_binds_exactly_what_it_asks_for(gate):
+    """The arity pin above covers the pooled arm alone. A circular gate's statement
+    carries a second arm, and `_secondary_terms` re-binds the SAME two floats as
+    `_circular_terms` — so an arity slip or a reordered arm binds a coverage floor to an
+    identity term with no error anywhere, just a wrong answer. This is what
+    `GateClearance.statements` actually executes."""
+    clearance = _clear(gate)
+    sql, parameters = next(
+        (statement, values)
+        for statement, values in clearance.statements
+        if statement.startswith(f"CREATE TABLE {ft.ALIGNMENT_TABLE}")
+    )
+    assert sql.count("?") == len(parameters)
+    assert parameters == ft.gated_alignment_parameters(gate)
+
+
 def test_the_circular_gated_relation_drops_cigar_again():
     """Same rule as the other arm: `ALIGNMENT_TABLE` is `ALIGNMENT_COLUMNS` and nothing
     else, so `cigar` stops at the gate whichever axis scored it."""
@@ -467,22 +504,38 @@ def test_check_refuses_a_circular_gate_over_rows_no_axis_can_score():
         _check(ft.AlignmentGate(circular=True), unpoolable_rows=3)
 
 
-def test_check_admits_a_circular_gate_over_secondary_rows():
+def test_check_admits_a_circular_gate_over_scorable_secondary_rows():
     """A secondary carries its own CIGAR and coordinates, so the CIGAR axis scores it
     per record — the pooling macro excluding it is not a reason to refuse the slice.
     This is what makes `--circular-gate` usable on an aligner run that keeps
     secondaries (`align_sharded`, and `align_denovo` since it took the same cap)."""
-    assert _check(ft.AlignmentGate(circular=True), secondary_rows=42).gate.circular
+    assert _check(
+        ft.AlignmentGate(circular=True), secondary_rows=42, scorable_secondary_rows=42
+    ).gate.circular
 
 
-def test_the_two_unpoolable_classes_are_counted_apart():
-    """A row that is BOTH secondary and unmapped is unscorable, not a secondary the
-    CIGAR axis can rescue — so the fatal class wins and the two filters are disjoint."""
-    assert "NOT (" in ft.SCORABLE_SECONDARY_ROW
-    assert ft.UNSCORABLE_ROW in ft.SCORABLE_SECONDARY_ROW
-    assert ft.UNSCORABLE_ROW in ft.POOLABLE_ROW
-    assert "NOT alignment_is_secondary(flags)" in ft.POOLABLE_ROW
-    assert "alignment_is_secondary(flags)" in ft.SCORABLE_SECONDARY_ROW
+def test_check_refuses_a_circular_gate_whose_secondaries_are_all_unscorable():
+    """The secondary arm scores `cigar_sequence_identity`, NULL on a legacy-`M` CIGAR,
+    and `NULL >= threshold` drops the row. Every secondary would vanish while the pooled
+    records returned a result that looks complete — the same silent loss `scorable_rows
+    == 0` refuses on the CIGAR axis."""
+    with pytest.raises(ValueError, match="secondary alignment row"):
+        _check(ft.AlignmentGate(circular=True), secondary_rows=42, scorable_secondary_rows=0)
+    # Coverage-only: any CIGAR scores, so there is nothing to refuse.
+    assert _check(
+        ft.AlignmentGate(circular=True, circular_min_identity=None),
+        secondary_rows=42,
+        scorable_secondary_rows=None,
+    ).gate.circular
+
+
+def test_a_partly_unscorable_secondary_population_is_dropped_not_refused():
+    """The CIGAR axis drops an unscorable record rather than refusing its slice, because
+    it affects no other record — unlike the pooled axis, where one record makes its whole
+    read unscorable. So a slice keeps going while ANY secondary can be scored."""
+    assert _check(
+        ft.AlignmentGate(circular=True), secondary_rows=42, scorable_secondary_rows=1
+    ).gate.circular
 
 
 def test_check_refuses_a_circular_gate_over_paired_data():

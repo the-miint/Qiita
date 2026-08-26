@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 import duckdb
 import pyarrow as pa
 import pytest
+from qiita_common.analytic import MAX_SECONDARY
 
 from qiita_compute_orchestrator.jobs import align_denovo
 from qiita_compute_orchestrator.jobs.align_denovo import Inputs, execute
@@ -368,9 +369,10 @@ def test_the_aligner_really_splits_a_two_locus_read_the_criterion_refuses():
     That test stages hand-built SAM rows so the SQL is what is under test, which means
     it cannot fail if minimap2 stopped splitting such a read — the refusal would go
     untested rather than unreachable. This runs the job's own aligner call and asserts
-    the split happens, and that the second record is SUPPLEMENTARY (0x800): a secondary
-    would be suppressed by `max_secondary := 0` and the group would never reach the
-    gate at all.
+    the split happens, and that the second record is SUPPLEMENTARY (0x800). The job
+    collects secondaries now, so the two are no longer told apart by whether they arrive
+    at all — but only supplementary records are a read's fragments, and only they reach
+    the pooled arm the crossing is judged on.
 
     Measured on mirror `9fc4d12`. The origin-crossing read is the control — it must
     still split, or the comparison says nothing about the two-locus shape.
@@ -539,7 +541,7 @@ def test_a_query_that_does_not_align_produces_no_row_at_all():
         aligned = conn.execute(
             "SELECT DISTINCT read_id FROM align_minimap2("
             "'q', subject_table := 's', preset := 'map-hifi', eqx := true, "
-            "max_secondary := 0) ORDER BY read_id"
+            f"max_secondary := {MAX_SECONDARY}) ORDER BY read_id"
         ).fetchall()
     # read 1 is a substring of the subject and aligns; read 2 is unrelated and is
     # absent entirely rather than present-and-unmapped.
@@ -552,7 +554,6 @@ def test_the_aligner_call_keeps_secondaries_and_asks_for_eqx_cigars(monkeypatch,
     secondary arm applies. A change to either constant surfaces here rather than as a
     quietly different output."""
     sql = align_denovo._streamed_alignment_sql(_ALIGNMENT_IDX, _PREP_SAMPLE_IDX)
-    assert "max_secondary := 100" in sql
     assert "eqx := true" in sql
     # No unmapped filter, and none requested: see the contract test below.
     assert "include_unmapped" not in sql
@@ -560,8 +561,6 @@ def test_the_aligner_call_keeps_secondaries_and_asks_for_eqx_cigars(monkeypatch,
     # From the contract layer, not a literal here: the control plane hashes the same
     # constant into `alignment_idx`, and a second copy could drift from the value the
     # identity was built on.
-    from qiita_common.analytic import MAX_SECONDARY
-
     assert f"max_secondary := {MAX_SECONDARY}" in sql
 
 
@@ -579,6 +578,7 @@ def test_a_slice_no_axis_can_score_is_still_refused():
             unpoolable_partitions=0,
             unpoolable_rows=1,
             secondary_rows=0,
+            scorable_secondary_rows=None,
             unscorable_groups=0,
             paired_rows=0,
         )
@@ -590,6 +590,7 @@ def test_a_slice_no_axis_can_score_is_still_refused():
         unpoolable_partitions=0,
         unpoolable_rows=0,
         secondary_rows=4,
+        scorable_secondary_rows=4,
         unscorable_groups=0,
         paired_rows=0,
     ).gate.circular

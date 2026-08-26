@@ -130,12 +130,14 @@ steps:
     # reference across up to 8 concurrent shards against one sample's contigs here. Both
     # bound this job from above without estimating it.
     #
-    # This job requests the same secondary cap both of them do, so the slice is one row
-    # per placement rather than per read. Measured on the staged build, the realised
-    # count is min(cap, equally-good subjects - 1) — it saturates on how many
-    # near-identical contigs the assembly holds, not on the cap — but on an assembly
-    # rich in collapsed repeats that is still a multiplier the numbers below have never
-    # seen.
+    # This job now collects secondary alignments, so the slice is one row per placement
+    # rather than per read — a multiplier the numbers below have never seen. It is
+    # bounded twice over: by how many near-identical contigs the assembly holds (see
+    # `MAX_SECONDARY`), and by the same coverage/identity thresholds the pooled arm
+    # applies, which each secondary must clear on its own CIGAR. Neither bound is a
+    # measurement of this job. `assembly_coverage` is weaker evidence than it looks for
+    # the same reason: it requests no cap at all, so its measured remainder was taken
+    # under a different collection policy again.
     #
     # So the baseline is a starting point with the ceiling as its safety net, not a
     # measurement: a sample that does not fit escalates once, and the first real

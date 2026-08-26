@@ -529,6 +529,14 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- `qiita_common.feature_table.PAIRED_PLACEMENT_PARTITION` carries it.
         -- Dropping it pools a fragment onto another feature's score.
         --
+        -- That key does NOT separate a secondary from the read's primary placement
+        -- on the same feature, and the producer now collects secondaries. A
+        -- consumer joining on it would judge such a secondary on the primary's
+        -- `pooled_coverage`, which was never computed over it — the macro excludes
+        -- secondary records. Exclude them (`alignment_is_secondary(flags)`) before
+        -- the join: they are alternative placements of the whole read, scored on
+        -- their own CIGAR, and no row here describes one.
+        --
         -- Superseded by delete-then-register, like `alignment` itself, not by
         -- `flight_service::REPLACE_KEY_TABLES`: a replace-by-key delete reads the
         -- keys out of the incoming file, and a re-run that no longer finds a read
