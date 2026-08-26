@@ -241,6 +241,35 @@ _None yet._
   run whose contigs are in the lake but whose Postgres membership was cleared answers 404
   at the route. (#476)
 
+- **A reference load logs when submitted records collapse into fewer features** (#497).
+  `write-membership` compares the `hash_sequences` manifest (one row per submitted FASTA record)
+  against the features the reference gained (one per distinct canonical hash) and, when they
+  differ, emits a `WARNING` naming the shortfall and the `read_id`s that shared a hash — visible
+  with `journalctl -u qiita-control-plane`. Nothing to run, and nothing fails: the load completes
+  either way, because a FASTA declaring both orientations of an adapter and a genome carrying a
+  duplicated contig are both valid submissions. `canonical_sequence_hash_expr` folds case and
+  strand, so two records that are one sequence in two cases, or exact reverse complements, mint one
+  `feature_idx` and only the lex-smallest `read_id`'s chunks are stored; the other record was
+  previously absent with nothing recording it, since the manifest is a workflow artifact and the
+  dropped bytes never reach the lake. It fires at **load** time only — it does not re-examine
+  references already in the database, so anything loaded before this deploy stays silent regardless
+  of what it dropped. The warning reports *that* records collapsed, not which kind: the manifest
+  carries no sequence, and an exact duplicate and a strand pair agree on both hash and length, so
+  reading the submitted FASTA is what separates them.
+
+- **Reference 10 (`fastp-adapters`) holds 177 of its 234 submitted records; 13
+  (`truseq-adapters`) is the configured adapter set** (#497). Measured 2026-08-26 against the live
+  database: 234 records in the source FASTA, 177 rows in `reference_membership`, each of the 57
+  absent ones an exact reverse-complement pair the canonical hash folded away. Do not point
+  `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX` at 10; 13's two records are not reverse complements of each
+  other, so it collapses nothing. `qiita.reference` carries no retired status and no `retired`
+  column, so 10 stays `active` — this note is the record that it is superseded. Reference 7
+  (`qc-adapters`) has 0 `reference_membership` rows and was never loadable as an adapter set.
+  No remediation rides this deploy and none is planned: every mask minted against 10 (masks 1, 2, 4
+  — 427 prep samples, one study) is paired-end, where `trim_adapters_pe` infers the insert from the
+  R1/revcomp(R2) overlap without consulting the adapter set, and the 54 samples of the single
+  non-test run were re-masked under 13.
+
 ---
 
 ## Deployed history
