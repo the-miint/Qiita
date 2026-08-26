@@ -21,7 +21,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **A reference or assembly load reports the records the canonical hash absorbed (#497).**
+- **A reference or assembly load reports the records the canonical hash absorbed (#501).**
   `write-membership` and `write-assembly-membership` compare their manifest's record count
   against its distinct canonical hashes and, when they differ, log a warning naming the
   shortfall and the `read_id`s that shared a hash. `canonical_sequence_hash_expr` folds case
