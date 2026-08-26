@@ -72,8 +72,17 @@ ROOT=/sequencing/gcore_runs
 # Access entry + default entry on every existing directory; new project / run / well /
 # hifi_reads dirs inherit both from their parent as they are created.
 sudo find "$ROOT" -type d -exec setfacl -m u:qiita-api:rx,d:u:qiita-api:rx {} +
-sudo -u qiita-api ls -d "$ROOT"/*/*/*/hifi_reads | head -3   # must list, not EACCES
+# Runs sit at two depths under $ROOT: most directly (`r84137_.../<well>/hifi_reads`), some
+# under a project dir (`Knightlab/<run>/<well>/hifi_reads`). The find above covers every
+# depth; check both here or a pass on one layout hides a failure on the other.
+sudo -u qiita-api ls -d "$ROOT"/*/*/hifi_reads "$ROOT"/*/*/*/hifi_reads 2>/dev/null | head -3
 ```
+
+That must print paths. **No output is a failure, not a pass** — it is what an unapplied grant
+looks like, since the shell expanding the glob is your account, not `qiita-api`. Before the
+grant, `sudo -u qiita-api ls /sequencing/gcore_runs/` is `Permission denied` on every entry;
+after it, the line above lists. If it still denies, find the component that refuses with
+`sudo -u qiita-api namei -l "$ROOT"` rather than re-running `setfacl`.
 
 If `setfacl` reports `Operation not supported`, the mount has no ACL support: fall back to
 `sudo usermod -aG kl-seq-rw qiita-api`, which also grants group write on `gcore_runs`, and note
