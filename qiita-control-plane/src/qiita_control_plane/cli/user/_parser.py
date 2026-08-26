@@ -1461,7 +1461,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_submit_reads.add_argument(
         "--reverse-fastq",
         type=Path,
-        help="Reverse (R2) FASTQ for paired-end input.",
+        help="Reverse (R2) FASTQ for paired-end input. Not valid with --bam.",
     )
     p_submit_reads.add_argument(
         "--data-plane-url",

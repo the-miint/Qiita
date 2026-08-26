@@ -21,8 +21,10 @@ def write_chunked_blob_upload(dest: Path, payload: bytes) -> Path:
     Two chunks, inserted out of order, so a reassembly that ignores
     `chunk_index` and takes row order produces the wrong bytes rather than
     passing by luck. Every step that resolves a `*_upload_idx` handle meets
-    this shape, so it is built here rather than per test module — the envelope
-    is the data plane's, and a change to it should break one writer.
+    this shape, so the well-formed envelope is built here rather than per test
+    module. `test_blob_input` writes two deliberately malformed ones inline
+    (no chunks; a NULL `chunk_data`) — those are the shapes under test there,
+    not copies of this.
     """
     half = max(1, len(payload) // 2)
     with duckdb.connect(":memory:") as conn:

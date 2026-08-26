@@ -98,6 +98,13 @@ class InstrumentRunInfo(NamedTuple):
     instrument_model: str
 
 
+# The sequencer-written run metadata at the top of a BCL run folder. Named so
+# the control-plane route that stats it before this reader opens it spells it
+# the same way (`routes/run_folder.py`), the way `pacbio.HIFI_READS_DIR` is
+# shared between the indexer and that route.
+RUNINFO_FILENAME = "RunInfo.xml"
+
+
 def read_instrument_run_info(bcl_input_dir: Path) -> InstrumentRunInfo:
     """Read ``RunInfo.xml`` at the top of a BCL run folder and return the
     instrument run ID and resolved model name.
@@ -109,7 +116,7 @@ def read_instrument_run_info(bcl_input_dir: Path) -> InstrumentRunInfo:
     the ``Run``/``Id``/``Instrument`` pieces are missing or empty, or on an
     unrecognized serial prefix.
     """
-    runinfo_path = bcl_input_dir / "RunInfo.xml"
+    runinfo_path = bcl_input_dir / RUNINFO_FILENAME
     if not runinfo_path.is_file():
         raise ValueError(f"RunInfo.xml not found at top level of {bcl_input_dir}")
 

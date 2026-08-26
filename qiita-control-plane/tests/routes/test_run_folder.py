@@ -367,7 +367,7 @@ async def test_one_unreadable_well_among_readable_ones_returns_403(
     Gating the guard on an empty index misses this: one readable well fills the
     map, the unreadable one drops out of the glob, and the caller gets a 200
     carrying a barcode set that is short by however many wells it could not
-    open. The pre-flight roster then reads those samples as absent from the run.
+    open. The pre-flight sequenced_sample roster then reads them as absent.
     """
     token, _ = wet_lab_admin_token
     run = ingest_root / "half-granted-run"
@@ -381,6 +381,73 @@ async def test_one_unreadable_well_among_readable_ones_returns_403(
 
     assert resp.status_code == 403, resp.text
     assert "silently omit" in resp.json()["detail"]["reason"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
+async def test_an_unreadable_non_well_directory_also_returns_403(
+    rf_client, wet_lab_admin_token, ingest_root
+):
+    """A run folder carries siblings of the wells (`metadata`, `statistics`), and
+    an unopenable one is refused even though the barcode map came out complete.
+
+    Whether it hides a `hifi_reads` is exactly what cannot be determined without
+    opening it, so there is no narrower rule available. The bucket-2 ACL grant
+    covers every directory in the tree, so a denial here means it did not land.
+    """
+    token, _ = wet_lab_admin_token
+    run = ingest_root / "unreadable-sibling-run"
+    _pacbio_bam(run, "1_A01", "m84137_250101_000000", "bc2001")
+    (run / "metadata").mkdir(parents=True, exist_ok=True)
+    (run / "metadata").chmod(0o000)
+    try:
+        resp = await _inspect(rf_client, token, run, "pacbio_smrt")
+    finally:
+        (run / "metadata").chmod(0o755)
+
+    assert resp.status_code == 403, resp.text
+    # The grant belongs on the directory that could not be opened, not on the
+    # `hifi_reads` under it whose path never resolved.
+    assert resp.json()["detail"]["path"] == str(run / "metadata")
+
+
+async def test_an_unopenable_well_is_422_not_500(rf_client, wet_lab_admin_token, ingest_root):
+    """A symlink loop among the wells raises ELOOP — an `OSError` that is
+    neither ENOENT nor EACCES.
+
+    `Path.glob` skips it, so before the walk ran on every inspect this folder
+    answered 200. The walk has to answer for every errno a shared mount can
+    raise (ELOOP here, ESTALE and EIO on NFS), and 422 with the errno text is
+    what the route already answers for the same failures on the run folder.
+    """
+    token, _ = wet_lab_admin_token
+    run = ingest_root / "symlink-loop-run"
+    _pacbio_bam(run, "1_A01", "m84137_250101_000000", "bc2001")
+    (run / "loop").symlink_to(run / "loop")
+
+    resp = await _inspect(rf_client, token, run, "pacbio_smrt")
+
+    assert resp.status_code == 422, resp.text
+    assert "could not be read" in resp.json()["detail"]["reason"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
+async def test_a_runinfo_that_exists_but_cannot_be_read_is_not_reported_absent(
+    rf_client, wet_lab_admin_token, ingest_root
+):
+    """A `RunInfo.xml` symlink loop. `Path.is_file()` reports False for it, so
+    leaving it to the reader answers "RunInfo.xml not found" for a file that is
+    right there — the typo hunt again, in a case permissions do not cover."""
+    token, _ = wet_lab_admin_token
+    folder = ingest_root / "runinfo-loop-run"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "RunInfo.xml").symlink_to(folder / "RunInfo.xml")
+
+    resp = await _inspect(rf_client, token, folder, "illumina")
+
+    assert resp.status_code == 422, resp.text
+    reason = resp.json()["detail"]["reason"]
+    assert "could not be read" in reason
+    assert "not found" not in reason
 
 
 async def test_a_dangling_symlink_among_the_wells_is_skipped(

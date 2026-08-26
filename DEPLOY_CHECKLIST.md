@@ -22,7 +22,7 @@ mean every absolute path the orchestrator can open is nameable through the API. 
 absolute dirs; `/` is refused.
 
 ```bash
-sudo bash -c 'grep -q "^PATH_INGEST_ROOTS=" /etc/qiita/control-plane.env || { s=$(grep "^PATH_SCRATCH=" /etc/qiita/control-plane.env | tail -1 | cut -d= -f2-); echo "PATH_INGEST_ROOTS=/sequencing:${s%/}/references/staging" >> /etc/qiita/control-plane.env; }'   # (#484)
+sudo bash -c 'F=/etc/qiita/control-plane.env; grep -q "^PATH_INGEST_ROOTS=" "$F" || { s=$(grep "^PATH_SCRATCH=" "$F" | tail -1 | cut -d= -f2-); s=${s%\"}; s=${s#\"}; s=${s%/}; echo "PATH_INGEST_ROOTS=/sequencing:${s:?PATH_SCRATCH is not set in control-plane.env; set it first}/references/staging" >> "$F"; }'   # (#484)
 ```
 
 Set it to every mount a submitted path may live under, not the sequencing mount alone.
@@ -31,8 +31,14 @@ companions as raw `*_path` keys, and they are staged at
 `${PATH_SCRATCH}/references/staging/{name}/{version}/`
 ([`reference-data-staging.md`](docs/reference-data-staging.md)) — a scratch mount, not a
 sequencing one. Omit it and every `local-reference-add` / `local-host-reference-add` submit
-422s. The command above reads `PATH_SCRATCH` back out of the same env file; check the line it
-appends against where reference sources are actually staged on this host. **The gate itself
+422s. The roots bound the manifest path itself, not the FASTA paths listed inside it —
+`stage_local_fasta._read_manifest` requires each entry be absolute and existing, and checks
+nothing else — so this fence narrows what a submit can name, not what a reference can read.
+The command above reads `PATH_SCRATCH` back out of the same env file and refuses to write
+anything if it is unset — otherwise it would append a plausible-looking `/references/staging`
+that `_parse_ingest_roots` accepts (it checks absolute and not-`/`, never existence), leaving a
+control plane that boots clean and refuses every reference. Check the line it appends against
+where reference sources are actually staged on this host. **The gate itself
 needs no grant for
 `qiita-api`:** it is written for the account split (CP runs as `qiita-api`, steps as
 `qiita-job`, different groups) — it treats a permission error as "cannot tell" and admits, so a

@@ -28,7 +28,7 @@ from stat import S_ISDIR
 from fastapi import APIRouter, Depends, HTTPException, status
 from qiita_common.api_paths import PATH_RUN_FOLDER_INSPECT, PATH_RUN_FOLDER_PREFIX
 from qiita_common.auth_constants import SystemRole
-from qiita_common.illumina import read_instrument_run_info
+from qiita_common.illumina import RUNINFO_FILENAME, read_instrument_run_info
 from qiita_common.models import (
     IlluminaRunInfo,
     PacbioRunIndex,
@@ -48,12 +48,7 @@ router = APIRouter(prefix=PATH_RUN_FOLDER_PREFIX, tags=["run-folder"])
 
 
 def _service_account() -> str:
-    """The account this process runs as, for the permission-denied message.
-
-    Named rather than described: the fix is a group or ACL grant to a specific
-    user, and "the control plane's service account" leaves the operator to work
-    out which one that is.
-    """
+    """The account this process runs as. See `_permission_denied` for why."""
     try:
         return pwd.getpwuid(os.geteuid()).pw_name
     except KeyError:
@@ -61,7 +56,13 @@ def _service_account() -> str:
 
 
 def _permission_denied(clause: str, path: Path | str) -> HTTPException:
-    """A 403 that opens with the account, because the fix is a grant to it."""
+    """A 403 naming the account and the path a grant has to land on.
+
+    The account is named rather than described because the fix is a grant to
+    one specific user, and "the control plane's service account" leaves the
+    operator to work out which. This is the one site that states that; the
+    module docstring says when a 403 rather than a 404 is owed.
+    """
     return HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail={
@@ -71,8 +72,70 @@ def _permission_denied(clause: str, path: Path | str) -> HTTPException:
     )
 
 
+def _stat_or_reject(path: Path, *, denied: Path) -> os.stat_result | None:
+    """`os.stat(path)`, with this module's three answers for its failures.
+
+    EACCES is a 403 naming `denied` — which is the directory whose contents
+    could not be reached, not always `path` itself: a stat of `<well>/hifi_reads`
+    fails with EACCES when the unreadable directory is `<well>`, and that is
+    where the grant has to land.
+
+    ENOENT is a dangling symlink or an entry removed mid-scan, which the glob
+    skips too, so it returns `None`. Everything else (ELOOP, ESTALE, EIO on a
+    shared mount) is a 422 carrying the errno text, matching what
+    `inspect_run_folder` answers for the same failures on the run folder.
+    """
+    try:
+        return os.stat(path)
+    except PermissionError as exc:
+        raise _permission_denied(
+            "can read this run folder but not a directory under it, so the BAM"
+            " index would silently omit whatever that directory holds. Grant it"
+            " read+traverse on the whole run tree",
+            denied,
+        ) from exc
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "reason": f"a directory under the run folder could not be read: {exc.strerror}",
+                "path": str(path),
+            },
+        ) from exc
+
+
+def _entries(directory: Path) -> list[Path]:
+    """`iterdir` materialized, with the same three answers as `_stat_or_reject`.
+
+    `Path.iterdir` opens the directory lazily, so the failure surfaces on the
+    first `next()` rather than at the call — materializing it puts the error
+    where the caller reads.
+    """
+    try:
+        return list(directory.iterdir())
+    except PermissionError as exc:
+        raise _permission_denied(
+            "can read this run folder but not a directory under it, so the BAM"
+            " index would silently omit whatever that directory holds. Grant it"
+            " read+traverse on the whole run tree",
+            directory,
+        ) from exc
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "reason": f"a directory under the run folder could not be read: {exc.strerror}",
+                "path": str(directory),
+            },
+        ) from exc
+
+
 def _reject_if_unreadable_below(run_folder: Path) -> None:
-    """403 when a well directory cannot be opened.
+    """403 when a directory under the run folder cannot be opened.
 
     `Path.glob` swallows the `OSError` from a directory it cannot open and
     yields nothing, so a grant that reaches the run folder but not the well
@@ -80,33 +143,27 @@ def _reject_if_unreadable_below(run_folder: Path) -> None:
     error — a wrong answer with a 200 on it, whether it leaves the index empty
     or merely short. Walk the same two levels the glob walks and let the error
     out.
+
+    Every directory under the run folder is walked, not only the ones that turn
+    out to hold reads: whether an unopenable directory hides a `hifi_reads` is
+    exactly what cannot be determined without opening it. The bucket-2 ACL grant
+    covers the whole tree (`find "$ROOT" -type d -exec setfacl ...`), so a
+    denial here means that grant did not land.
     """
-    try:
-        for well in run_folder.iterdir():
-            try:
-                # `stat()`, not `is_dir()`: the latter reports False for a path
-                # it cannot stat, which is the case this function exists to
-                # catch. ENOENT here is a dangling symlink, or an entry removed
-                # while the scan runs; the glob skips it too.
-                well_is_dir = S_ISDIR(well.stat().st_mode)
-            except FileNotFoundError:
-                continue
-            if not well_is_dir:
-                continue
-            hifi = well / HIFI_READS_DIR
-            try:
-                hifi_is_dir = S_ISDIR(hifi.stat().st_mode)
-            except FileNotFoundError:
-                continue
-            if hifi_is_dir:
-                next(hifi.iterdir(), None)
-    except PermissionError as exc:
-        raise _permission_denied(
-            "can read this run folder but not a directory under it, so the BAM"
-            " index would silently omit whatever that directory holds. Grant it"
-            " read+traverse on the whole run tree",
-            exc.filename or run_folder,
-        ) from exc
+    for well in _entries(run_folder):
+        # `stat()`, not `is_dir()`: the latter reports False for a path it
+        # cannot stat, which is the case this function exists to catch.
+        well_st = _stat_or_reject(well, denied=well)
+        if well_st is None or not S_ISDIR(well_st.st_mode):
+            continue
+        # EACCES on the child of a directory we could stat is a denial ON that
+        # directory, so `denied=well`: `hifi`'s own path never resolved, and
+        # granting on it would not help.
+        hifi = well / HIFI_READS_DIR
+        hifi_st = _stat_or_reject(hifi, denied=well)
+        if hifi_st is None or not S_ISDIR(hifi_st.st_mode):
+            continue
+        _entries(hifi)
 
 
 def _inspect_illumina(run_folder: Path) -> IlluminaRunInfo:
@@ -123,7 +180,7 @@ def _inspect_illumina(run_folder: Path) -> IlluminaRunInfo:
     # that lists but does not traverse answers "RunInfo.xml not found" — the
     # typo-hunt this module exists to avoid. Statting it here keeps the
     # permission contract in the module that owns it.
-    runinfo_path = run_folder / "RunInfo.xml"
+    runinfo_path = run_folder / RUNINFO_FILENAME
     try:
         os.stat(runinfo_path)
     except PermissionError as exc:
@@ -132,9 +189,21 @@ def _inspect_illumina(run_folder: Path) -> IlluminaRunInfo:
             " on the whole run tree",
             runinfo_path,
         ) from exc
-    except OSError:
-        # ENOENT and the rest: `read_instrument_run_info` names them better.
+    except FileNotFoundError:
+        # Genuinely absent. `read_instrument_run_info` names that better than
+        # this pre-check could, and its message becomes the 422 below.
         pass
+    except OSError as exc:
+        # ELOOP, ESTALE and the rest: the reader reaches the file through
+        # `Path.is_file()`, which reports False for all of them, so leaving
+        # them to it answers "RunInfo.xml not found" for a file that exists.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "reason": f"RunInfo.xml could not be read: {exc.strerror}",
+                "path": str(runinfo_path),
+            },
+        ) from exc
 
     try:
         instrument_run_id, instrument_model = read_instrument_run_info(run_folder)
