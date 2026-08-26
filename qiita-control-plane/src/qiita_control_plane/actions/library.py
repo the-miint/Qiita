@@ -77,6 +77,9 @@ _log = logging.getLogger(__name__)
 # feature batch sizes.
 _CHUNK_SIZE = 10_000
 
+# Cap on how many collapsed record groups the membership collapse warning lists.
+_MAX_REPORTED_COLLAPSES = 10
+
 # Deterministic basename `mint_features` writes its feature-map Parquet under.
 # Single-sourced because the runner's restart path (`_reconstruct_action_outputs`)
 # rebuilds this path WITHOUT re-running the primitive, so the two must not drift.
@@ -927,6 +930,73 @@ MEMBERSHIP_ACCESSION_JOIN_SQL = (
     " GROUP BY fm.feature_idx"
 )
 
+# The manifest read_ids sharing one canonical hash, most-collapsed first — the
+# diagnostic behind the collapse warning. Only run when the record count exceeds
+# the feature count, so a load that collapses nothing pays for a Parquet footer
+# count and no scan.
+MEMBERSHIP_COLLAPSED_RECORDS_SQL = (
+    "SELECT list(read_id ORDER BY read_id) AS read_ids"
+    " FROM read_parquet(?)"
+    " GROUP BY sequence_hash HAVING count(*) > 1"
+    " ORDER BY count(*) DESC, min(read_id)"
+    " LIMIT ?"
+)
+
+
+def _warn_on_collapsed_records(
+    duck: duckdb.DuckDBPyConnection,
+    reference_idx: int,
+    manifest_path: Path,
+    features: int,
+) -> int:
+    """Warn when the manifest holds more records than the reference gained
+    features; return how many records were absorbed.
+
+    `canonical_sequence_hash_expr` folds case and strand, so two FASTA records
+    that are one sequence, that sequence in another case, or exact reverse
+    complements mint ONE feature_idx, and `hash_sequences` keeps one record's
+    chunks (`DISTINCT ON (sequence_hash)`, lex-smallest read_id). The other
+    record leaves no trace: the manifest is a workflow artifact and the dropped
+    bytes never reach the lake, so this count is the only point at which the
+    difference is observable at all.
+
+    The manifest carries `(read_id, sequence_hash, sequence_length_bp)` and not
+    the sequence, and an exact duplicate and a reverse-complement pair agree on
+    both hash and length — so this reports THAT records collapsed, never which
+    kind. Reading the submitted FASTA is what separates them.
+
+    Warns rather than raises because both shapes are legitimate submissions: the
+    fastp adapter FASTA declares 234 records that collapse to 177 (each of the 57
+    an exact reverse-complement pair), and a genome carrying a duplicated contig
+    loads the same way.
+    """
+    records = duck.execute("SELECT count(*) FROM read_parquet(?)", [str(manifest_path)]).fetchone()[
+        0
+    ]
+    collapsed = records - features
+    if collapsed <= 0:
+        return 0
+    # One past the cap, so a group beyond it is what marks the list truncated —
+    # the row count alone cannot say, since a group of three contributes two to
+    # `collapsed`.
+    groups = duck.execute(
+        MEMBERSHIP_COLLAPSED_RECORDS_SQL,
+        [str(manifest_path), _MAX_REPORTED_COLLAPSES + 1],
+    ).fetchall()
+    elided = " (truncated)" if len(groups) > _MAX_REPORTED_COLLAPSES else ""
+    sample = "; ".join(", ".join(read_ids) for (read_ids,) in groups[:_MAX_REPORTED_COLLAPSES])
+    _log.warning(
+        "reference %s: %s submitted record(s) collapsed to %s feature(s) — %s record(s) "
+        "are absent from the reference. Records sharing a canonical hash: %s%s",
+        reference_idx,
+        records,
+        features,
+        collapsed,
+        sample,
+        elided,
+    )
+    return collapsed
+
 
 async def write_membership(
     pool: asyncpg.Pool,
@@ -948,6 +1018,12 @@ async def write_membership(
     Returns (linked, already_linked). Idempotent. Raises ValueError if any
     feature_idx is missing from qiita.feature (FK violation surfaced as a
     structured error).
+
+    This is also the one step that sees both sides of the canonical-hash dedup —
+    the manifest is one row per submitted FASTA record, the feature_map one per
+    distinct hash — so it is where a collapse is reported
+    (`_warn_on_collapsed_records`). `mint_features` cannot: it is deliberately
+    reference-agnostic and has no reference_idx to name.
     """
     for label, path in [("manifest", manifest_path), ("feature_map", feature_map_path)]:
         if not path.exists():
@@ -972,6 +1048,7 @@ async def write_membership(
                     )
                 total_linked += chunk_linked
                 total_seen += len(feature_idxs)
+            _warn_on_collapsed_records(duck, reference_idx, manifest_path, total_seen)
     return total_linked, total_seen - total_linked
 
 

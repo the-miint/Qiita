@@ -194,6 +194,30 @@ _None yet._
 
   The collapse rewrites Parquet, so `scripts/lake-gc.sh` has more to reclaim afterwards.
 
+- **Re-key the 6 legacy `mask_definition` rows onto the sequence-derived adapter identity** (#497). `qiita-admin backfill mask-adapter-hash` converts rows only when they carry ONE distinct stored `adapter_set_hash`; this host carries **two**, so the command reports and writes nothing, and the contract phase that removes the byte-derived fallback stays unreachable. `--attribute-all` is the designed way out — the operator asserting which reference a named set of rows was minted from — and the assignment is settled by the record, not a guess: reference 13 (`truseq-adapters`) was created 2026-06-27 12:39, and reference 7 (`qc-adapters`) has 0 `reference_membership` rows so it was never loadable as an adapter set, leaving reference 10 the only `active` `artifact_sequence_set` a mask could resolve before that timestamp. Masks 1, 2, 4 predate it and carry `d89caa61…`; masks 5, 6, 7 follow it and carry `48cd564d…`. Measured 2026-08-26.
+
+  Dry-run first (the default — it writes nothing) and confirm **3 / 0 / 0** for re-key / unattributable / collided in each group:
+
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+    /opt/qiita/control-plane/.venv/bin/qiita-admin backfill mask-adapter-hash \
+      --reference-idx 10 --mask-idx 1 --mask-idx 2 --mask-idx 4 --attribute-all
+    /opt/qiita/control-plane/.venv/bin/qiita-admin backfill mask-adapter-hash \
+      --reference-idx 13 --mask-idx 5 --mask-idx 6 --mask-idx 7 --attribute-all'
+  ```
+
+  Then re-run both with `--execute`. `mask_idx` does not move, so nothing re-masks.
+
+  **After.** Expect **0 rows** — this is what the contract phase reads as its go-ahead:
+
+  ```sql
+  SELECT count(*) FROM qiita.mask_definition
+   WHERE adapter_hash_scheme IS NULL
+     AND params->'resolved_qc'->>'adapter_set_hash' IS NOT NULL;
+  ```
+
+  Bucket 6 because it is irreversible: the byte digest is not recomputable without the adapter Parquet, so `migrate:down` cannot restore a converted row (see the `migrate:down` note in `20260804000000_mask_definition_adapter_hash_scheme.sql`).
+
 
 ### Notes (no host action)
 

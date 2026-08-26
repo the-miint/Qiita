@@ -610,3 +610,102 @@ async def test_register_files_stays_quiet_when_nothing_was_replaced(monkeypatch,
                 == []
             )
         assert "replaced" not in caplog.text
+
+
+def _miint_conn():
+    from qiita_control_plane.miint import connect_with_miint
+
+    return connect_with_miint()
+
+
+def _canonical_hashes(sequences):
+    """The canonical hash of each sequence, one per record (no dedup).
+
+    Evaluates `canonical_sequence_hash_expr` itself rather than mirroring it in
+    Python: it folds both case and strand, and a hand-rolled twin drifts without
+    the test noticing.
+    """
+    from qiita_common.chunking import canonical_sequence_hash_expr
+
+    with _miint_conn() as conn:
+        conn.execute("CREATE TABLE _seq (i INTEGER, sequence VARCHAR)")
+        conn.executemany("INSERT INTO _seq VALUES (?, ?)", list(enumerate(sequences)))
+        rows = conn.execute(
+            f"SELECT i, {canonical_sequence_hash_expr('sequence')} AS h FROM _seq ORDER BY i"
+        ).fetchall()
+    return [h for _, h in rows]
+
+
+def _revcomp(sequence):
+    with _miint_conn() as conn:
+        return conn.execute(
+            "SELECT sequence_dna_reverse_complement(upper(?))", [sequence]
+        ).fetchone()[0]
+
+
+def _write_manifest(path, read_ids, sequences):
+    import duckdb
+
+    hashes = _canonical_hashes(sequences)
+    with duckdb.connect(":memory:") as c:
+        c.execute("CREATE TEMP TABLE t (read_id VARCHAR, sequence_hash UUID)")
+        c.executemany(
+            "INSERT INTO t VALUES (?, ?)",
+            [(r, str(h)) for r, h in zip(read_ids, hashes, strict=True)],
+        )
+        c.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+    return len(set(hashes))
+
+
+# Non-palindromic on purpose: a sequence equal to its own reverse complement
+# cannot tell a strand fold from an identity, so it would pass either way.
+_FWD = "ACGTTGCAAGGTCCATTGCA"
+_MIXED_CASE = "acgtACGTttccGGaa"
+_SOLO = "TTTTGGGGCCCCAAAATTTT"
+
+
+def test_warn_on_collapsed_records_counts_and_names_the_absorbed_records(tmp_path, caplog):
+    """Records folded together by case or strand are absent from the reference;
+    the warning reports how many and which read_ids shared a hash."""
+    import logging
+
+    from qiita_control_plane.actions.library import _warn_on_collapsed_records
+    from qiita_control_plane.miint import duckdb_connect
+
+    read_ids = ["fwd", "rev", "mixed", "mixed_upper", "solo"]
+    sequences = [_FWD, _revcomp(_FWD), _MIXED_CASE, _MIXED_CASE.upper(), _SOLO]
+    manifest = tmp_path / "manifest.parquet"
+    features = _write_manifest(manifest, read_ids, sequences)
+    # fwd/rev fold on strand, mixed/mixed_upper on case, solo stands alone.
+    assert features == 3
+
+    with caplog.at_level(logging.WARNING), duckdb_connect() as duck:
+        collapsed = _warn_on_collapsed_records(duck, 42, manifest, features)
+
+    assert collapsed == 2
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "reference 42" in message
+    assert "5 submitted record(s) collapsed to 3 feature(s)" in message
+    assert "fwd, rev" in message
+    assert "mixed, mixed_upper" in message
+    assert "solo" not in message
+
+
+def test_warn_on_collapsed_records_is_silent_when_nothing_collapsed(tmp_path, caplog):
+    """The control: distinct sequences leave record count equal to feature count,
+    so the same call warns nothing and reports zero."""
+    import logging
+
+    from qiita_control_plane.actions.library import _warn_on_collapsed_records
+    from qiita_control_plane.miint import duckdb_connect
+
+    manifest = tmp_path / "manifest.parquet"
+    features = _write_manifest(manifest, ["fwd", "solo"], [_FWD, _SOLO])
+    assert features == 2
+
+    with caplog.at_level(logging.WARNING), duckdb_connect() as duck:
+        collapsed = _warn_on_collapsed_records(duck, 42, manifest, features)
+
+    assert collapsed == 0
+    assert caplog.records == []
