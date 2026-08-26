@@ -22,7 +22,15 @@ mean every absolute path the orchestrator can open is nameable through the API. 
 absolute dirs; `/` is refused.
 
 ```bash
-sudo bash -c 'F=/etc/qiita/control-plane.env; grep -q "^PATH_INGEST_ROOTS=" "$F" || { s=$(grep "^PATH_SCRATCH=" "$F" | tail -1 | cut -d= -f2-); s=${s%\"}; s=${s#\"}; s=${s%/}; echo "PATH_INGEST_ROOTS=/sequencing:${s:?PATH_SCRATCH is not set in control-plane.env; set it first}/references/staging" >> "$F"; }'   # (#484)
+# (#484)
+sudo bash -c '
+F=/etc/qiita/control-plane.env
+grep -q "^PATH_INGEST_ROOTS=" "$F" && exit 0
+s=$(grep "^PATH_SCRATCH=" "$F" | tail -1 | cut -d= -f2-); s=${s%\"}; s=${s#\"}; s=${s%/}
+: "${s:?PATH_SCRATCH is not set in control-plane.env; set it first}"
+[ -n "$(tail -c1 "$F")" ] && echo >> "$F"   # the file may not end in a newline
+echo "PATH_INGEST_ROOTS=/sequencing:$s/references/staging" >> "$F"
+'
 ```
 
 Set it to every mount a submitted path may live under, not the sequencing mount alone.
