@@ -8,6 +8,10 @@ Prefix table: a one-time snapshot of biocore/kl-metapool's
 ``metapool/config/sequencer_types.yml`` lives at
 ``qiita-common/src/qiita_common/data/sequencer_types.yml``. The file's
 header pins the source SHA + URL and documents the re-vendor protocol.
+
+``RUNINFO_FILENAME`` is exported because the file is stat-ed before it is
+opened — the control plane separates "cannot read" from "not there" for it, and
+both sides have to spell it one way.
 """
 
 from __future__ import annotations
@@ -18,6 +22,9 @@ from typing import Any, NamedTuple
 from xml.etree import ElementTree as ET
 
 import yaml
+
+# The sequencer-written run metadata at the top of a BCL run folder.
+RUNINFO_FILENAME = "RunInfo.xml"
 
 # bcl-convert is Illumina-only. This
 # loader filters out anything whose model_name does not start with the
@@ -96,13 +103,6 @@ class InstrumentRunInfo(NamedTuple):
 
     instrument_run_id: str
     instrument_model: str
-
-
-# The sequencer-written run metadata at the top of a BCL run folder. Named so
-# the control-plane route that stats it before this reader opens it spells it
-# the same way (`routes/run_folder.py`), the way `pacbio.HIFI_READS_DIR` is
-# shared between the indexer and that route.
-RUNINFO_FILENAME = "RunInfo.xml"
 
 
 def read_instrument_run_info(bcl_input_dir: Path) -> InstrumentRunInfo:

@@ -20,6 +20,7 @@ a 403 naming the account to grant — never a 404, which would send the operator
 hunting for a typo in a path that is right.
 """
 
+import errno
 import os
 import pwd
 from pathlib import Path
@@ -72,66 +73,75 @@ def _permission_denied(clause: str, path: Path | str) -> HTTPException:
     )
 
 
-def _stat_or_reject(path: Path, *, denied: Path) -> os.stat_result | None:
-    """`os.stat(path)`, with this module's three answers for its failures.
+# Errnos that mean the entry resolves to nothing, so it can hide no reads: an
+# absent target — a dangling symlink, or an entry removed while the scan runs —
+# and a symlink that never resolves. `Path.glob` indexes a run folder holding
+# either without tripping on it, and this walk exists to match the glob, so it
+# skips them too. Everything else (ESTALE, EIO, ENOTCONN on a shared mount) is
+# a directory that may be there and may hold BAMs, which is the case the walk
+# cannot answer and must not guess at.
+_RESOLVES_TO_NOTHING = frozenset({errno.ENOENT, errno.ELOOP})
 
-    EACCES is a 403 naming `denied` — which is the directory whose contents
-    could not be reached, not always `path` itself: a stat of `<well>/hifi_reads`
+
+def _walk_failure(exc: OSError, *, reported: Path, denied: Path) -> HTTPException:
+    """The one answer this module gives for a failure walking the run tree.
+
+    EACCES is a 403 naming `denied`, the directory whose contents could not be
+    reached — not always the path that raised: a stat of `<well>/hifi_reads`
     fails with EACCES when the unreadable directory is `<well>`, and that is
-    where the grant has to land.
-
-    ENOENT is a dangling symlink or an entry removed mid-scan, which the glob
-    skips too, so it returns `None`. Everything else (ELOOP, ESTALE, EIO on a
-    shared mount) is a 422 carrying the errno text, matching what
-    `inspect_run_folder` answers for the same failures on the run folder.
+    where the grant has to land. Anything else is a 422 carrying the errno
+    text, matching what `inspect_run_folder` answers for the same failures on
+    the run folder itself.
     """
-    try:
-        return os.stat(path)
-    except PermissionError as exc:
-        raise _permission_denied(
+    if isinstance(exc, PermissionError):
+        return _permission_denied(
             "can read this run folder but not a directory under it, so the BAM"
             " index would silently omit whatever that directory holds. Grant it"
             " read+traverse on the whole run tree",
             denied,
-        ) from exc
-    except FileNotFoundError:
-        return None
+        )
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail={
+            "reason": f"an entry under the run folder could not be read: {exc.strerror}",
+            "path": str(reported),
+        },
+    )
+
+
+def _stat_or_skip(path: Path, *, denied: Path) -> os.stat_result | None:
+    """`os.stat(path)`, or `None` for an entry that resolves to nothing."""
+    try:
+        return os.stat(path)
     except OSError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail={
-                "reason": f"a directory under the run folder could not be read: {exc.strerror}",
-                "path": str(path),
-            },
-        ) from exc
+        if exc.errno in _RESOLVES_TO_NOTHING:
+            return None
+        raise _walk_failure(exc, reported=path, denied=denied) from exc
 
 
-def _entries(directory: Path) -> list[Path]:
-    """`iterdir` materialized, with the same three answers as `_stat_or_reject`.
-
-    `Path.iterdir` opens the directory lazily, so the failure surfaces on the
-    first `next()` rather than at the call — materializing it puts the error
-    where the caller reads.
-    """
+def _entries(directory: Path, *, denied: Path) -> list[Path]:
+    """`iterdir` materialized, so the failure surfaces at the call rather than
+    on the first `next()`."""
     try:
         return list(directory.iterdir())
-    except PermissionError as exc:
-        raise _permission_denied(
-            "can read this run folder but not a directory under it, so the BAM"
-            " index would silently omit whatever that directory holds. Grant it"
-            " read+traverse on the whole run tree",
-            directory,
-        ) from exc
-    except FileNotFoundError:
-        return []
     except OSError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail={
-                "reason": f"a directory under the run folder could not be read: {exc.strerror}",
-                "path": str(directory),
-            },
-        ) from exc
+        if exc.errno in _RESOLVES_TO_NOTHING:
+            return []
+        raise _walk_failure(exc, reported=directory, denied=denied) from exc
+
+
+def _reject_if_unopenable(directory: Path, *, denied: Path) -> None:
+    """Open `directory` far enough to surface a denial and no further.
+
+    A well's `hifi_reads` holds one BAM per barcode and this walk needs none of
+    them — only whether the directory opens at all.
+    """
+    try:
+        next(directory.iterdir(), None)
+    except OSError as exc:
+        if exc.errno in _RESOLVES_TO_NOTHING:
+            return
+        raise _walk_failure(exc, reported=directory, denied=denied) from exc
 
 
 def _reject_if_unreadable_below(run_folder: Path) -> None:
@@ -148,22 +158,20 @@ def _reject_if_unreadable_below(run_folder: Path) -> None:
     out to hold reads: whether an unopenable directory hides a `hifi_reads` is
     exactly what cannot be determined without opening it. The bucket-2 ACL grant
     covers the whole tree (`find "$ROOT" -type d -exec setfacl ...`), so a
-    denial here means that grant did not land.
+    denial here means that grant did not land. An entry that resolves to nothing
+    is a different matter — see `_RESOLVES_TO_NOTHING`.
     """
-    for well in _entries(run_folder):
+    for well in _entries(run_folder, denied=run_folder):
         # `stat()`, not `is_dir()`: the latter reports False for a path it
         # cannot stat, which is the case this function exists to catch.
-        well_st = _stat_or_reject(well, denied=well)
+        well_st = _stat_or_skip(well, denied=well)
         if well_st is None or not S_ISDIR(well_st.st_mode):
             continue
-        # EACCES on the child of a directory we could stat is a denial ON that
-        # directory, so `denied=well`: `hifi`'s own path never resolved, and
-        # granting on it would not help.
         hifi = well / HIFI_READS_DIR
-        hifi_st = _stat_or_reject(hifi, denied=well)
+        hifi_st = _stat_or_skip(hifi, denied=well)
         if hifi_st is None or not S_ISDIR(hifi_st.st_mode):
             continue
-        _entries(hifi)
+        _reject_if_unopenable(hifi, denied=hifi)
 
 
 def _inspect_illumina(run_folder: Path) -> IlluminaRunInfo:

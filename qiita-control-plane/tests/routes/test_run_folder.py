@@ -9,6 +9,7 @@ run folder with no HiFi BAMs — against real folders on disk.
 
 from __future__ import annotations
 
+import errno
 import os
 import pwd
 
@@ -410,14 +411,16 @@ async def test_an_unreadable_non_well_directory_also_returns_403(
     assert resp.json()["detail"]["path"] == str(run / "metadata")
 
 
-async def test_an_unopenable_well_is_422_not_500(rf_client, wet_lab_admin_token, ingest_root):
-    """A symlink loop among the wells raises ELOOP — an `OSError` that is
-    neither ENOENT nor EACCES.
+async def test_a_symlink_loop_among_the_wells_is_skipped(
+    rf_client, wet_lab_admin_token, ingest_root
+):
+    """A self-referential symlink raises ELOOP from `stat`, but it resolves to
+    nothing, so it hides no reads.
 
-    `Path.glob` skips it, so before the walk ran on every inspect this folder
-    answered 200. The walk has to answer for every errno a shared mount can
-    raise (ELOOP here, ESTALE and EIO on NFS), and 422 with the errno text is
-    what the route already answers for the same failures on the run folder.
+    Measured: `Path.glob("*/hifi_reads/*.bam")` indexes this run completely and
+    never trips on the link. The walk mirrors the glob, so refusing here would
+    brick a run whose barcode map is correct — over a link on a drop directory
+    the control plane cannot delete.
     """
     token, _ = wet_lab_admin_token
     run = ingest_root / "symlink-loop-run"
@@ -426,11 +429,40 @@ async def test_an_unopenable_well_is_422_not_500(rf_client, wet_lab_admin_token,
 
     resp = await _inspect(rf_client, token, run, "pacbio_smrt")
 
+    assert resp.status_code == 200, resp.text
+    assert list(resp.json()["pacbio"]["hifi_bam_by_barcode"]) == ["bc2001"]
+
+
+async def test_an_entry_the_walk_cannot_resolve_is_422_not_500(
+    rf_client, wet_lab_admin_token, ingest_root, monkeypatch
+):
+    """ESTALE — a directory that may be there and may hold BAMs.
+
+    Unlike ENOENT and ELOOP this one cannot be skipped: the walk does not know
+    whether it hid a `hifi_reads`, and answering 200 would be the short index
+    the guard exists to prevent. It is injected because no portable filesystem
+    operation produces a stale NFS handle on demand.
+    """
+    from qiita_control_plane.routes import run_folder as rf
+
+    token, _ = wet_lab_admin_token
+    run = ingest_root / "stale-handle-run"
+    _pacbio_bam(run, "1_A01", "m84137_250101_000000", "bc2001")
+
+    real_stat = os.stat
+
+    def _stale(path, *args, **kwargs):
+        if str(path).endswith("1_A01"):
+            raise OSError(errno.ESTALE, "Stale file handle", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(rf.os, "stat", _stale)
+    resp = await _inspect(rf_client, token, run, "pacbio_smrt")
+
     assert resp.status_code == 422, resp.text
     assert "could not be read" in resp.json()["detail"]["reason"]
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses regardless of mode bits")
 async def test_a_runinfo_that_exists_but_cannot_be_read_is_not_reported_absent(
     rf_client, wet_lab_admin_token, ingest_root
 ):

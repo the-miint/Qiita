@@ -22,15 +22,19 @@ mean every absolute path the orchestrator can open is nameable through the API. 
 absolute dirs; `/` is refused.
 
 ```bash
-# (#484)
-sudo bash -c '
+# (#484)  Derives the second root from PATH_SCRATCH already in the file, and
+# refuses rather than guess if it is unset. Quoted heredoc: nothing below is
+# expanded on the way in.
+sudo bash -s <<'SH'
 F=/etc/qiita/control-plane.env
+[ -f "$F" ] || { echo "no such file: $F" >&2; exit 1; }
 grep -q "^PATH_INGEST_ROOTS=" "$F" && exit 0
-s=$(grep "^PATH_SCRATCH=" "$F" | tail -1 | cut -d= -f2-); s=${s%\"}; s=${s#\"}; s=${s%/}
+s=$(grep "^PATH_SCRATCH=" "$F" | tail -1 | cut -d= -f2-)
+s=${s%\"}; s=${s#\"}; s=${s%\'}; s=${s#\'}; s=${s%/}   # EnvironmentFile allows either quote
 : "${s:?PATH_SCRATCH is not set in control-plane.env; set it first}"
-[ -n "$(tail -c1 "$F")" ] && echo >> "$F"   # the file may not end in a newline
+[ -n "$(tail -c1 "$F")" ] && echo >> "$F"                # the file may not end in a newline
 echo "PATH_INGEST_ROOTS=/sequencing:$s/references/staging" >> "$F"
-'
+SH
 ```
 
 Set it to every mount a submitted path may live under, not the sequencing mount alone.
@@ -75,14 +79,21 @@ sudo find "$ROOT" -type d -exec setfacl -m u:qiita-api:rx,d:u:qiita-api:rx {} +
 # Runs sit at two depths under $ROOT: most directly (`r84137_.../<well>/hifi_reads`), some
 # under a project dir (`Knightlab/<run>/<well>/hifi_reads`). The find above covers every
 # depth; check both here or a pass on one layout hides a failure on the other.
-sudo -u qiita-api ls -d "$ROOT"/*/*/hifi_reads "$ROOT"/*/*/*/hifi_reads 2>/dev/null | head -3
+sudo -u qiita-api ls -d "$ROOT"/*/*/hifi_reads "$ROOT"/*/*/*/hifi_reads 2>&1 | head -5
 ```
 
-That must print paths. **No output is a failure, not a pass** — it is what an unapplied grant
-looks like, since the shell expanding the glob is your account, not `qiita-api`. Before the
-grant, `sudo -u qiita-api ls /sequencing/gcore_runs/` is `Permission denied` on every entry;
-after it, the line above lists. If it still denies, find the component that refuses with
-`sudo -u qiita-api namei -l "$ROOT"` rather than re-running `setfacl`.
+Read the output rather than counting lines — `2>&1` keeps the reason, which is the whole test:
+
+- **Paths** — the grant landed.
+- **`Permission denied`** — it did not.
+- **`No such file or directory` on a literal `*` path** — that glob matched nothing, which is
+  expected for whichever of the two layouts this deploy does not use. Only worrying if BOTH say it.
+
+The globs are expanded by your own account, not `qiita-api`, so an unapplied grant shows as
+denials rather than as silence. If it still denies after `setfacl`, find the component that
+refuses with `sudo -u qiita-api namei -l "$ROOT"` before re-running the grant — a mount with
+NFSv4 ACLs reports the POSIX mode bits as an approximation, and they can read as world-readable
+while access is denied.
 
 If `setfacl` reports `Operation not supported`, the mount has no ACL support: fall back to
 `sudo usermod -aG kl-seq-rw qiita-api`, which also grants group write on `gcore_runs`, and note
