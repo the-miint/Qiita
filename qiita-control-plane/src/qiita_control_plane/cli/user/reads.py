@@ -109,9 +109,9 @@ async def do_submit_reads(
     kind = _classify(forward)
     if reverse is not None:
         if kind != "fastq":
-            raise ValueError("--reverse is only meaningful for FASTQ reads")
+            raise ValueError("--reverse-fastq is only meaningful with --fastq")
         if _classify(reverse) != "fastq":
-            raise ValueError(f"--reverse {reverse} is not a FASTQ")
+            raise ValueError(f"--reverse-fastq {reverse} is not a FASTQ")
 
     uploads: dict[str, Any] = {}
     context: dict[str, Any] = {}
@@ -212,7 +212,7 @@ async def _run_submit_reads(*, base_url: str, token: str, args: argparse.Namespa
                 token=token,
                 prep_sample_idx=args.prep_sample_idx,
                 forward=args.fastq or args.bam,
-                reverse=args.reverse,
+                reverse=args.reverse_fastq,
                 watch=not args.no_watch,
                 poll_interval_seconds=args.poll_interval_seconds,
                 timeout_seconds=args.timeout_seconds,
@@ -234,10 +234,10 @@ def _handle_submit_reads(args: argparse.Namespace, parser: argparse.ArgumentPars
     forward = args.fastq or args.bam
     try:
         _check_local_file(forward, flag="--fastq" if args.fastq else "--bam")
-        if args.reverse is not None:
+        if args.reverse_fastq is not None:
             if args.bam is not None:
-                parser.error("--reverse is only meaningful with --fastq")
-            _check_local_file(args.reverse, flag="--reverse")
+                parser.error("--reverse-fastq is only meaningful with --fastq")
+            _check_local_file(args.reverse_fastq, flag="--reverse-fastq")
         _classify(forward)
     except ValueError as exc:
         parser.error(str(exc))

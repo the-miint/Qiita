@@ -205,7 +205,7 @@ async def test_reverse_with_a_bam_is_refused(cp_transport, tmp_path, fastq_r2):
     bam = tmp_path / "ABC123.bam"
     bam.write_bytes(b"BAM\x01")
 
-    with pytest.raises(ValueError, match="only meaningful for FASTQ"):
+    with pytest.raises(ValueError, match="only meaningful with --fastq"):
         await _run(transport, FakeFlightClient(), forward=bam, reverse=fastq_r2)
     assert not calls
 
