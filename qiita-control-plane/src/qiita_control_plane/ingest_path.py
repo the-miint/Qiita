@@ -173,7 +173,19 @@ def resolve_ingest_path(raw: str, *, roots: tuple[Path, ...]) -> Path:
             path=raw,
             roots=roots,
         )
-    resolved = Path(os.path.realpath(raw))
+    try:
+        resolved = Path(os.path.realpath(raw))
+    except ValueError as exc:
+        # An embedded NUL: `os.path.realpath` and `os.stat` raise ValueError
+        # for it, not OSError, so neither this function's OSError handling nor
+        # `_probe`'s catches it. `PurePosixPath.is_absolute` and
+        # `os.path.normpath` both accept the value, and the wire models' `^/`
+        # pattern matches at the prefix, so it reaches here from both routes.
+        raise IngestPathError(
+            "host path is not a usable filesystem path",
+            path=raw,
+            roots=roots,
+        ) from exc
     if resolved != lexical:
         # Compare against the RESOLVED roots. A root can itself sit behind a
         # symlink (`/var` -> `/private/var` on macOS, a mount reached through a

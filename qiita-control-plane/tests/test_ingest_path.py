@@ -164,6 +164,19 @@ def test_rejects_path_outside_every_root(tmp_path):
     assert "outside every configured ingest root" in exc.value.reason
 
 
+def test_rejects_a_path_carrying_an_embedded_nul(tmp_path):
+    """`os.path.realpath` and `os.stat` raise ValueError, not OSError, for a NUL
+    byte in the path, so it slips past both this module's OSError handling and
+    `_probe`'s. It reaches here from the wire: `PurePosixPath.is_absolute` and
+    `os.path.normpath` accept it and the request models' `^/` pattern matches at
+    the prefix, so without this arm a submit answers 500 where every other
+    malformed path answers 422.
+    """
+    with pytest.raises(IngestPathError) as exc:
+        resolve_ingest_path(f"{tmp_path}/a\x00b", roots=(tmp_path,))
+    assert "not a usable filesystem path" in exc.value.reason
+
+
 def test_rejects_dot_dot_escape(tmp_path):
     """The normalization runs BEFORE the containment test, so `<root>/../etc`
     is compared as `/etc` and refused — it does not sneak through on the
