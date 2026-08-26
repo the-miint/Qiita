@@ -60,45 +60,49 @@ value with `:` rather than adding a line. (#484)
 
 ### 2. One-time host setup
 
-**`qiita-api` needs read+traverse on the PacBio run tree**, or `POST /run-folder/inspect`
-answers 403 for those folders and `submit-pacbio-ingest` still has to run from a node that
-mounts `/sequencing`. Illumina needs nothing — `/sequencing/igm_runs/**` is world-readable the
-whole way down, measured. `/sequencing/gcore_runs/**` is group `kl-seq-rw`, which `qiita-job`
-is in and `qiita-api` is not.
+**`qiita-api` needs read on the PacBio run tree**, or `POST /run-folder/inspect` answers 403 for
+those folders and `submit-pacbio-ingest` still has to run from a node that mounts `/sequencing`.
+Illumina needs nothing — `/sequencing/igm_runs/**` is readable as `qiita-api` today, measured.
 
-Granted as an ACL on directories, not group membership: the route lists directories and opens
-no BAM (`index_run_bams` globs `*/hifi_reads/*.bam` for filenames), and `gcore_runs` is
-`drwxrwsr-x root kl-seq-rw` — adding `qiita-api` to that group would also give the public API's
-service account write on the raw drop directory.
+`/sequencing/gcore_runs` is a separate NFS mount from `qs-kl.sdsc.edu:/knightlab/stor-31/...`,
+mounted `vers=3,noacl,sec=sys`. Three consequences, all measured on the host:
+
+- **ACLs are not available.** `setfacl` on it returns `Operation not supported` — the mount
+  carries `noacl` and NFSv3 has no POSIX-ACL sideband. The client-side mode bits `getfacl` and
+  `namei` print (`drwxrwsr-x root kl-seq-rw`, `other::r-x`) are what the server reports, not what
+  it enforces: `qiita-api` is refused despite `other::r-x`.
+- **Group membership does work.** `sec=sys` means the server trusts the client's uid/gid list,
+  and `qiita-job` (in `kl-seq-rw`) lists the tree today — which is how PacBio ingest reads it now.
+- **`kl-seq-rw` carries group write** on `gcore_runs`. There is no read-only alternative on this
+  export, so the grant below gives the public API's service account write on the raw instrument
+  drop. The control plane never writes there — the route lists directories and opens no BAM
+  (`index_run_bams` globs `*/hifi_reads/*.bam` for filenames) — but the capability is real.
+
+```bash
+sudo usermod -aG kl-seq-rw qiita-api   # (#484)
+```
+
+A supplementary group is read at process start, so the **bucket-4 restart** is what picks this
+up; verifying before it will still fail. After the restart:
 
 ```bash
 ROOT=/sequencing/gcore_runs
-# Access entry + default entry on every existing directory; new project / run / well /
-# hifi_reads dirs inherit both from their parent as they are created.
-sudo find "$ROOT" -type d -exec setfacl -m u:qiita-api:rx,d:u:qiita-api:rx {} +
-# Runs sit at two depths under $ROOT: most directly (`r84137_.../<well>/hifi_reads`), some
-# under a project dir (`Knightlab/<run>/<well>/hifi_reads`). The find above covers every
-# depth; check both here or a pass on one layout hides a failure on the other.
+# Runs sit at two depths under $ROOT: most directly (`r84137_.../<well>/hifi_reads`), some under
+# a project dir (`Knightlab/<run>/<well>/hifi_reads`). Check both or a pass on one layout hides
+# a failure on the other.
 sudo -u qiita-api ls -d "$ROOT"/*/*/hifi_reads "$ROOT"/*/*/*/hifi_reads 2>&1 | head -5
 ```
 
 Read the output rather than counting lines — `2>&1` keeps the reason, which is the whole test:
 
 - **Paths** — the grant landed.
-- **`Permission denied`** — it did not.
+- **`Permission denied`** — it did not. Check `id qiita-api` lists `kl-seq-rw`, then that the
+  unit has actually restarted since the `usermod`.
 - **`No such file or directory` on a literal `*` path** — that glob matched nothing, which is
   expected for whichever of the two layouts this deploy does not use. Only worrying if BOTH say it.
 
 The globs are expanded by your own account, not `qiita-api`, so an unapplied grant shows as
-denials rather than as silence. If it still denies after `setfacl`, find the component that
-refuses with `sudo -u qiita-api namei -l "$ROOT"` before re-running the grant — a mount with
-NFSv4 ACLs reports the POSIX mode bits as an approximation, and they can read as world-readable
-while access is denied.
-
-If `setfacl` reports `Operation not supported`, the mount has no ACL support: fall back to
-`sudo usermod -aG kl-seq-rw qiita-api`, which also grants group write on `gcore_runs`, and note
-that a supplementary group is read at process start — the bucket-4 restart is what picks it up.
-(#484)
+denials rather than as silence. (#484)
 
 ### 3. Migrations
 
@@ -149,7 +153,7 @@ Beyond `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>`:
 - **A submit can now run off the cluster — both platforms.** `POST /run-folder/inspect`
   reads the run folder as `qiita-api`, a NARROWER account than the `qiita-job` that runs
   the jobs: it reaches the IGM folders through their world bits, and the gcore folders
-  only through the ACL bucket 2 grants. Confirm one real folder of each kind:
+  only through the group membership bucket 2 grants. Confirm one real folder of each kind:
   ```bash
   curl -sS -X POST https://<fqdn>/api/v1/run-folder/inspect \
     -H "Authorization: Bearer $QIITA_TOKEN" -H 'Content-Type: application/json' \
@@ -160,7 +164,7 @@ Beyond `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>`:
   ```
   Illumina: 200 with `illumina.instrument_run_id` / `instrument_model` — measured working
   for `/sequencing/igm_runs/*`, no grant involved. PacBio: 200 with a non-empty
-  `pacbio.hifi_bam_by_barcode`. A **403** means the ACL did not take, and its `reason` says
+  `pacbio.hifi_bam_by_barcode`. A **403** means the grant did not take, and its `reason` says
   whether the denial is at the run folder (or a parent) or at a directory below it — a
   partial grant is refused rather than reported as an empty index.
   (#484)

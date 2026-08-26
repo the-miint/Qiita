@@ -28,10 +28,11 @@ host's checkout path, mounts, and `prep_protocol` indices.
   your terminal rather than a job that fails hours later.
 - **The run folder need not be visible from the machine you type on.** The barcode → BAM
   glob runs on the control plane (`POST /run-folder/inspect`), which opens the folder
-  as `qiita-api`. That account reaches `/sequencing/gcore_runs/**` through an ACL the deploy
-  grants it (`DEPLOY_CHECKLIST.md`, one-time host setup) rather than through the `kl-seq-rw`
-  group the job account `qiita-job` is in. A **403** from the route means that ACL is missing
-  on the tree you named; until it is in place, submit from a node that mounts `/sequencing`.
+  as `qiita-api`, an account with a narrower filesystem view than the `qiita-job` that
+  runs the steps. The deploy grants it read on `/sequencing/gcore_runs/**`
+  (`DEPLOY_CHECKLIST.md`, one-time host setup). A **403** from the route means that grant is
+  missing on the tree you named; until it is in place, submit from a node that mounts
+  `/sequencing`.
 - **The pre-flight `.db` still has to be a local file.** `--preflight-blob` is read on the
   machine running the CLI and base64'd into the request, so off the cluster copy it over
   first — it is the one input that does not resolve server-side.

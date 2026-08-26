@@ -156,10 +156,11 @@ def _reject_if_unreadable_below(run_folder: Path) -> None:
 
     Every directory under the run folder is walked, not only the ones that turn
     out to hold reads: whether an unopenable directory hides a `hifi_reads` is
-    exactly what cannot be determined without opening it. The bucket-2 ACL grant
-    covers the whole tree (`find "$ROOT" -type d -exec setfacl ...`), so a
-    denial here means that grant did not land. An entry that resolves to nothing
-    is a different matter — see `_RESOLVES_TO_NOTHING`.
+    exactly what cannot be determined without opening it. Whatever reaches the
+    run folder is expected to reach the whole tree under it (`DEPLOY_CHECKLIST.md`
+    holds the grant and what it costs), so a denial here means it did not land.
+    An entry that resolves to nothing is a different matter — see
+    `_RESOLVES_TO_NOTHING`.
     """
     for well in _entries(run_folder, denied=run_folder):
         # `stat()`, not `is_dir()`: the latter reports False for a path it
@@ -276,7 +277,7 @@ async def inspect_run_folder(
     #
     # `Path.is_dir()` cannot do this test. It reports False for anything it
     # fails to stat — an untraversable ANCESTOR included — so it would answer
-    # "not a directory" for a directory, which is the case an ACL grant fixes.
+    # "not a directory" for a directory, which is the case a grant fixes.
     try:
         is_directory = S_ISDIR(run_folder.stat().st_mode)
         if is_directory:

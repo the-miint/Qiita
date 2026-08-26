@@ -392,8 +392,9 @@ async def test_an_unreadable_non_well_directory_also_returns_403(
     an unopenable one is refused even though the barcode map came out complete.
 
     Whether it hides a `hifi_reads` is exactly what cannot be determined without
-    opening it, so there is no narrower rule available. The bucket-2 ACL grant
-    covers every directory in the tree, so a denial here means it did not land.
+    opening it, so there is no narrower rule available. Whatever reaches the run
+    folder is expected to reach every directory under it, so a denial here means
+    the deploy grant did not land.
     """
     token, _ = wet_lab_admin_token
     run = ingest_root / "unreadable-sibling-run"
@@ -506,8 +507,8 @@ async def test_a_dangling_symlink_among_the_wells_is_skipped(
 async def test_an_unreadable_runinfo_returns_403_not_500(
     rf_client, wet_lab_admin_token, ingest_root
 ):
-    """The exact shape an ACL grant on directories leaves behind: the run folder
-    traverses, the file inside it does not open. Opening it raises
+    """A grant that reaches the directory but not the file inside it: the run
+    folder traverses, `RunInfo.xml` does not open. Opening it raises
     PermissionError from inside the XML reader, which handles only ParseError.
     """
     token, _ = wet_lab_admin_token
@@ -547,8 +548,8 @@ async def test_a_listable_but_untraversable_run_folder_returns_403_not_404(
 async def test_an_untraversable_ancestor_returns_403_not_422(
     rf_client, wet_lab_admin_token, ingest_root
 ):
-    """The denial an ACL grant actually fixes sits on a PARENT of the run folder,
-    not on the folder itself.
+    """The denial a deploy grant actually fixes sits on a PARENT of the run
+    folder, not on the folder itself.
 
     `Path.is_dir()` reports False for anything it cannot stat, so testing
     directory-ness first turns this into "run folder is not a directory" — a
