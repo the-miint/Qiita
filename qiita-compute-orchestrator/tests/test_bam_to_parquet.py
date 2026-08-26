@@ -26,6 +26,7 @@ import asyncio
 
 import duckdb
 import pytest
+from helpers import write_chunked_blob_upload
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES, WorkTicketState
 
@@ -125,17 +126,6 @@ def test_execute_writes_read_parquet(fake_mint, tmp_path):
     ]
 
 
-def _write_reads_upload(dest, payload: bytes):
-    """Lay down the `(chunk_index INTEGER, chunk_data BLOB)` Parquet a DoPut'd
-    alignment file arrives as. Two chunks so the reassembly order matters."""
-    half = max(1, len(payload) // 2)
-    with duckdb.connect(":memory:") as conn:
-        conn.execute("CREATE TABLE up (chunk_index INTEGER, chunk_data BLOB)")
-        conn.execute("INSERT INTO up VALUES (1, ?), (0, ?)", [payload[half:], payload[:half]])
-        conn.execute(f"COPY up TO '{dest}' (FORMAT PARQUET)")
-    return dest
-
-
 def test_execute_reads_an_uploaded_sam(fake_mint, tmp_path):
     """The user route: `bam_path` is bound to a chunked-BLOB upload rather than
     to an alignment file, because the runner resolved a `bam_upload_idx` handle.
@@ -143,7 +133,7 @@ def test_execute_reads_an_uploaded_sam(fake_mint, tmp_path):
     compressed — and produces the rows the host-path route does."""
     sam = tmp_path / "in.sam"
     _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
-    upload = _write_reads_upload(tmp_path / "upload.parquet", sam.read_bytes())
+    upload = write_chunked_blob_upload(tmp_path / "upload.parquet", sam.read_bytes())
 
     outputs = _run(
         Inputs(bam_path=upload, prep_sample_idx=42, work_ticket_idx=1),
@@ -173,7 +163,7 @@ def test_execute_reads_an_uploaded_bam(fake_mint, tmp_path):
         # `FORMAT BAM` requires REFERENCE_LENGTHS, which an unaligned file has
         # no references to supply.
         conn.execute(f"COPY (SELECT * FROM read_sequences_sam('{sam}')) TO '{bam}' (FORMAT UBAM)")
-    upload = _write_reads_upload(tmp_path / "upload.parquet", bam.read_bytes())
+    upload = write_chunked_blob_upload(tmp_path / "upload.parquet", bam.read_bytes())
 
     _run(Inputs(bam_path=upload, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
