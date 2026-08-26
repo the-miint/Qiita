@@ -22,7 +22,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Added
 
 - **A reference load reports the records the canonical hash absorbed (#497).** `write-membership`
-  compares the `hash_sequences` manifest (one row per submitted FASTA record) against the features
+  compares the `hash_sequences` manifest (one row per distinct `read_id`) against the features
   the reference gained (one per distinct canonical hash) and, when they differ, logs a warning
   naming the shortfall and the `read_id`s that shared a hash. `canonical_sequence_hash_expr` folds
   case and strand, so two records that are one sequence in two cases, or exact reverse complements,

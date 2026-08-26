@@ -194,7 +194,7 @@ _None yet._
 
   The collapse rewrites Parquet, so `scripts/lake-gc.sh` has more to reclaim afterwards.
 
-- **Re-key the 6 legacy `mask_definition` rows onto the sequence-derived adapter identity** (#497). `qiita-admin backfill mask-adapter-hash` converts rows only when they carry ONE distinct stored `adapter_set_hash`; this host carries **two**, so the command reports and writes nothing, and the contract phase that removes the byte-derived fallback stays unreachable. `--attribute-all` is the designed way out — the operator asserting which reference a named set of rows was minted from — and the assignment is settled by the record, not a guess: reference 13 (`truseq-adapters`) was created 2026-06-27 12:39, and reference 7 (`qc-adapters`) has 0 `reference_membership` rows so it was never loadable as an adapter set, leaving reference 10 the only `active` `artifact_sequence_set` a mask could resolve before that timestamp. Masks 1, 2, 4 predate it and carry `d89caa61…`; masks 5, 6, 7 follow it and carry `48cd564d…`. Measured 2026-08-26.
+- **Re-key the 6 legacy `mask_definition` rows onto the sequence-derived adapter identity** (#497; the command itself is #428's). `qiita-admin backfill mask-adapter-hash` converts rows only when they carry ONE distinct stored `adapter_set_hash`; this host carries **two**, so the command reports and writes nothing, and the contract phase that removes the byte-derived fallback stays unreachable. `--attribute-all` is the designed way out — the operator asserting which reference a named set of rows was minted from — and the assignment is settled by the record, not a guess: reference 13 (`truseq-adapters`) was created 2026-06-27 12:39, and reference 7 (`qc-adapters`) has 0 `reference_membership` rows so it was never loadable as an adapter set, leaving reference 10 the only `active` `artifact_sequence_set` a mask could resolve before that timestamp. Masks 1, 2, 4 predate it and carry `d89caa61…`; masks 5, 6, 7 follow it and carry `48cd564d…`. Measured 2026-08-26.
 
   Dry-run first (the default — it writes nothing) and confirm **3 / 0 / 0** for re-key / unattributable / collided in each group:
 
@@ -242,7 +242,7 @@ _None yet._
   at the route. (#476)
 
 - **A reference load logs when submitted records collapse into fewer features** (#497).
-  `write-membership` compares the `hash_sequences` manifest (one row per submitted FASTA record)
+  `write-membership` compares the `hash_sequences` manifest (one row per distinct `read_id`)
   against the features the reference gained (one per distinct canonical hash) and, when they
   differ, emits a `WARNING` naming the shortfall and the `read_id`s that shared a hash — visible
   with `journalctl -u qiita-control-plane`. Nothing to run, and nothing fails: the load completes
@@ -267,8 +267,8 @@ _None yet._
   (`qc-adapters`) has 0 `reference_membership` rows and was never loadable as an adapter set.
   No remediation rides this deploy and none is planned: every mask minted against 10 (masks 1, 2, 4
   — 427 prep samples, one study) is paired-end, where `trim_adapters_pe` infers the insert from the
-  R1/revcomp(R2) overlap without consulting the adapter set, and the 54 samples of the single
-  non-test run were re-masked under 13.
+  R1/revcomp(R2) overlap without consulting the adapter set, and the 54 prep samples of the
+  single non-test run were re-masked under 13.
 
 ---
 

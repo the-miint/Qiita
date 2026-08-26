@@ -931,60 +931,76 @@ MEMBERSHIP_ACCESSION_JOIN_SQL = (
 )
 
 # The manifest read_ids sharing one canonical hash, most-collapsed first — the
-# diagnostic behind the collapse warning. Only run when the record count exceeds
-# the feature count, so a load that collapses nothing pays for a Parquet footer
-# count and no scan.
+# diagnostic behind the collapse warning, run only once the counts already
+# disagree. The tiebreaker reads the list's own first element rather than adding
+# a `min(read_id)` aggregate: `list(... ORDER BY read_id)` has already put it
+# there, and every group ties at two members whenever the collapse is strand
+# pairs.
 MEMBERSHIP_COLLAPSED_RECORDS_SQL = (
     "SELECT list(read_id ORDER BY read_id) AS read_ids"
     " FROM read_parquet(?)"
     " GROUP BY sequence_hash HAVING count(*) > 1"
-    " ORDER BY count(*) DESC, min(read_id)"
+    " ORDER BY count(*) DESC, read_ids[1]"
     " LIMIT ?"
 )
 
 
-def _warn_on_collapsed_records(
-    duck: duckdb.DuckDBPyConnection,
-    reference_idx: int,
-    manifest_path: Path,
-    features: int,
-) -> int:
+def _warn_on_collapsed_records(reference_idx: int, manifest_path: Path, features: int) -> int:
     """Warn when the manifest holds more records than the reference gained
     features; return how many records were absorbed.
 
     `canonical_sequence_hash_expr` folds case and strand, so two FASTA records
-    that are one sequence, that sequence in another case, or exact reverse
-    complements mint ONE feature_idx, and `hash_sequences` keeps one record's
-    chunks (`DISTINCT ON (sequence_hash)`, lex-smallest read_id). The other
-    record leaves no trace: the manifest is a workflow artifact and the dropped
-    bytes never reach the lake, so this count is the only point at which the
-    difference is observable at all.
+    that are one sequence in two cases, or exact reverse complements, mint a
+    single feature_idx and `hash_sequences` stores only one of them. The other
+    record leaves no trace — the manifest is a workflow artifact and the dropped
+    bytes never reach the lake — so this comparison is the only point at which
+    the difference is observable.
 
-    The manifest carries `(read_id, sequence_hash, sequence_length_bp)` and not
-    the sequence, and an exact duplicate and a reverse-complement pair agree on
-    both hash and length — so this reports THAT records collapsed, never which
-    kind. Reading the submitted FASTA is what separates them.
+    Reports that records collapsed, not which kind: the manifest carries
+    `(read_id, sequence_hash, sequence_length_bp)` and no sequence, and an exact
+    duplicate and a reverse-complement pair agree on both hash and length.
+    Reading the submitted FASTA is what separates them. It warns rather than
+    raising because a FASTA declaring both orientations of an adapter and a
+    genome carrying a repeated contig are both loadable submissions.
 
-    Warns rather than raises because both shapes are legitimate submissions: the
-    fastp adapter FASTA declares 234 records that collapse to 177 (each of the 57
-    an exact reverse-complement pair), and a genome carrying a duplicated contig
-    loads the same way.
+    `features` is the membership join's count rather than a second pass over the
+    manifest: `count(DISTINCT sequence_hash)` at reference scale is the
+    un-spillable event-loop hash build `mint_annotation_features` measured and
+    designs around, while `records` is the `count(*)` that same docstring records
+    as a footer read. Fewer records than features means the subset invariant
+    `MEMBERSHIP_ACCESSION_JOIN_SQL` describes has broken, which is reported
+    rather than returned as "nothing collapsed".
+
+    Blocking, and opens its own connection: the caller runs it off the event
+    loop, after releasing its pooled one.
     """
-    records = duck.execute("SELECT count(*) FROM read_parquet(?)", [str(manifest_path)]).fetchone()[
-        0
-    ]
-    collapsed = records - features
-    if collapsed <= 0:
-        return 0
-    # One past the cap, so a group beyond it is what marks the list truncated —
-    # the row count alone cannot say, since a group of three contributes two to
-    # `collapsed`.
-    groups = duck.execute(
-        MEMBERSHIP_COLLAPSED_RECORDS_SQL,
-        [str(manifest_path), _MAX_REPORTED_COLLAPSES + 1],
-    ).fetchall()
+    with duckdb_connect() as duck:
+        duck.execute(f"SET temp_directory='{validate_parquet_path(manifest_path.parent)}'")
+        records = duck.execute(
+            "SELECT count(*) FROM read_parquet(?)", [str(manifest_path)]
+        ).fetchone()[0]
+        if records < features:
+            _log.warning(
+                "reference %s: the manifest holds %s record(s) against %s linked feature(s), so "
+                "the feature map carries hashes the manifest does not and a collapse cannot be "
+                "counted",
+                reference_idx,
+                records,
+                features,
+            )
+            return 0
+        collapsed = records - features
+        if collapsed == 0:
+            return 0
+        # One past the cap, so a group beyond it is what marks the list truncated —
+        # the record count alone cannot say, since a group of three contributes two
+        # to `collapsed`.
+        groups = duck.execute(
+            MEMBERSHIP_COLLAPSED_RECORDS_SQL,
+            [str(manifest_path), _MAX_REPORTED_COLLAPSES + 1],
+        ).fetchall()
     elided = " (truncated)" if len(groups) > _MAX_REPORTED_COLLAPSES else ""
-    sample = "; ".join(", ".join(read_ids) for (read_ids,) in groups[:_MAX_REPORTED_COLLAPSES])
+    listed = "; ".join(", ".join(read_ids) for (read_ids,) in groups[:_MAX_REPORTED_COLLAPSES])
     _log.warning(
         "reference %s: %s submitted record(s) collapsed to %s feature(s) — %s record(s) "
         "are absent from the reference. Records sharing a canonical hash: %s%s",
@@ -992,7 +1008,7 @@ def _warn_on_collapsed_records(
         records,
         features,
         collapsed,
-        sample,
+        listed,
         elided,
     )
     return collapsed
@@ -1019,11 +1035,15 @@ async def write_membership(
     feature_idx is missing from qiita.feature (FK violation surfaced as a
     structured error).
 
-    This is also the one step that sees both sides of the canonical-hash dedup —
-    the manifest is one row per submitted FASTA record, the feature_map one per
-    distinct hash — so it is where a collapse is reported
-    (`_warn_on_collapsed_records`). `mint_features` cannot: it is deliberately
-    reference-agnostic and has no reference_idx to name.
+    This is also where a canonical-hash collapse is reported
+    (`_warn_on_collapsed_records`): it holds the manifest (one row per distinct
+    read_id — `hash_sequences` groups by it, and `stage_local_fasta` rejects a
+    repeated FASTA header, so one row is one submitted record on that path)
+    against the feature_map's one row per distinct hash, and unlike
+    `mint_features` it has a reference_idx to name. `hash_sequences` is where the
+    drop happens and would report it from its own SLURM allocation; reporting
+    here instead puts the warning in the control plane's journal beside the rest
+    of the load.
     """
     for label, path in [("manifest", manifest_path), ("feature_map", feature_map_path)]:
         if not path.exists():
@@ -1048,7 +1068,10 @@ async def write_membership(
                     )
                 total_linked += chunk_linked
                 total_seen += len(feature_idxs)
-            _warn_on_collapsed_records(duck, reference_idx, manifest_path, total_seen)
+    # Outside the pool and the reader: a report-only aggregate has no claim on a
+    # pooled connection, and `mint_features` sets the precedent for keeping a
+    # blocking DuckDB step off the loop the CP also serves its API from.
+    await asyncio.to_thread(_warn_on_collapsed_records, reference_idx, manifest_path, total_seen)
     return total_linked, total_seen - total_linked
 
 

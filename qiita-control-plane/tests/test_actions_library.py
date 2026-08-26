@@ -1,9 +1,11 @@
-"""Unit tests for the action-library registry shape (no DB).
+"""Unit tests for the action library (no DB).
 
-Catches drift between qiita_common.api_paths.LibraryPrimitive (the closed
-set of names workflow YAML can reference via `action:` entries) and the
-qiita_control_plane.actions.library.LIBRARY dispatch dict (what the
-runner actually calls).
+Two subjects. The registry-shape tests catch drift between
+qiita_common.api_paths.LibraryPrimitive (the closed set of names workflow YAML
+can reference via `action:` entries) and the
+qiita_control_plane.actions.library.LIBRARY dispatch dict (what the runner
+actually calls). The rest exercise the SQL and reporting the primitives own,
+against DuckDB and Parquet fixtures rather than a database.
 """
 
 import inspect
@@ -637,21 +639,30 @@ def _canonical_hashes(sequences):
 
 
 def _revcomp(sequence):
+    """miint's reverse complement, case preserved.
+
+    `sequence_dna_reverse_complement` preserves case
+    (https://the-miint.github.io/duckdb-miint/utilities/), so a mixed-case
+    argument yields a mixed-case twin — which is what lets one fixture below
+    fold case and strand at the same time.
+    """
     with _miint_conn() as conn:
-        return conn.execute(
-            "SELECT sequence_dna_reverse_complement(upper(?))", [sequence]
-        ).fetchone()[0]
+        return conn.execute("SELECT sequence_dna_reverse_complement(?)", [sequence]).fetchone()[0]
 
 
 def _write_manifest(path, read_ids, sequences):
     import duckdb
 
     hashes = _canonical_hashes(sequences)
+    # Three columns, matching what hash_sequences emits — the warning's own
+    # argument leans on sequence_length_bp not discriminating.
     with duckdb.connect(":memory:") as c:
-        c.execute("CREATE TEMP TABLE t (read_id VARCHAR, sequence_hash UUID)")
+        c.execute(
+            "CREATE TEMP TABLE t (read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT)"
+        )
         c.executemany(
-            "INSERT INTO t VALUES (?, ?)",
-            [(r, str(h)) for r, h in zip(read_ids, hashes, strict=True)],
+            "INSERT INTO t VALUES (?, ?, ?)",
+            [(r, str(h), len(q)) for r, h, q in zip(read_ids, hashes, sequences, strict=True)],
         )
         c.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
     return len(set(hashes))
@@ -665,30 +676,40 @@ _SOLO = "TTTTGGGGCCCCAAAATTTT"
 
 
 def test_warn_on_collapsed_records_counts_and_names_the_absorbed_records(tmp_path, caplog):
-    """Records folded together by case or strand are absent from the reference;
-    the warning reports how many and which read_ids shared a hash."""
+    """Records folded together by case, by strand, or by both are absent from the
+    reference; the warning reports how many and which read_ids shared a hash."""
     import logging
 
     from qiita_control_plane.actions.library import _warn_on_collapsed_records
-    from qiita_control_plane.miint import duckdb_connect
 
-    read_ids = ["fwd", "rev", "mixed", "mixed_upper", "solo"]
-    sequences = [_FWD, _revcomp(_FWD), _MIXED_CASE, _MIXED_CASE.upper(), _SOLO]
+    read_ids = ["fwd", "rev", "mixed", "mixed_rc", "mixed_upper", "solo"]
+    sequences = [
+        _FWD,
+        _revcomp(_FWD),
+        _MIXED_CASE,
+        # Case-preserving, so this one folds case AND strand together — the
+        # combination a hand-rolled hash oracle got wrong before.
+        _revcomp(_MIXED_CASE),
+        _MIXED_CASE.upper(),
+        _SOLO,
+    ]
     manifest = tmp_path / "manifest.parquet"
     features = _write_manifest(manifest, read_ids, sequences)
-    # fwd/rev fold on strand, mixed/mixed_upper on case, solo stands alone.
+    # fwd/rev fold on strand; mixed/mixed_rc/mixed_upper on case, strand, and
+    # both at once; solo stands alone.
     assert features == 3
 
-    with caplog.at_level(logging.WARNING), duckdb_connect() as duck:
-        collapsed = _warn_on_collapsed_records(duck, 42, manifest, features)
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records(42, manifest, features)
 
-    assert collapsed == 2
+    assert collapsed == 3
     assert len(caplog.records) == 1
     message = caplog.records[0].getMessage()
     assert "reference 42" in message
-    assert "5 submitted record(s) collapsed to 3 feature(s)" in message
+    assert "6 submitted record(s) collapsed to 3 feature(s)" in message
     assert "fwd, rev" in message
-    assert "mixed, mixed_upper" in message
+    # A three-member group is listed together, ordered within the group.
+    assert "mixed, mixed_rc, mixed_upper" in message
     assert "solo" not in message
 
 
@@ -698,14 +719,63 @@ def test_warn_on_collapsed_records_is_silent_when_nothing_collapsed(tmp_path, ca
     import logging
 
     from qiita_control_plane.actions.library import _warn_on_collapsed_records
-    from qiita_control_plane.miint import duckdb_connect
 
     manifest = tmp_path / "manifest.parquet"
     features = _write_manifest(manifest, ["fwd", "solo"], [_FWD, _SOLO])
     assert features == 2
 
-    with caplog.at_level(logging.WARNING), duckdb_connect() as duck:
-        collapsed = _warn_on_collapsed_records(duck, 42, manifest, features)
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records(42, manifest, features)
 
     assert collapsed == 0
     assert caplog.records == []
+
+
+def test_warn_on_collapsed_records_marks_a_truncated_group_list(tmp_path, caplog):
+    """Past the cap the message lists that many groups and says it was cut; the
+    count itself still covers every collapsed record."""
+    import logging
+
+    from qiita_control_plane.actions.library import (
+        _MAX_REPORTED_COLLAPSES,
+        _warn_on_collapsed_records,
+    )
+
+    pairs = _MAX_REPORTED_COLLAPSES + 3
+    read_ids, sequences = [], []
+    for i in range(pairs):
+        # Distinct per pair, and non-palindromic so each pair folds on strand.
+        seq = f"{'ACGTTGCAAGG' * 2}{'ACGT' * (i + 1)}TTCCA"
+        read_ids += [f"r{i:02d}_fwd", f"r{i:02d}_rev"]
+        sequences += [seq, _revcomp(seq)]
+    manifest = tmp_path / "manifest.parquet"
+    features = _write_manifest(manifest, read_ids, sequences)
+    assert features == pairs
+
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records(42, manifest, features)
+
+    assert collapsed == pairs
+    message = caplog.records[0].getMessage()
+    assert message.endswith("(truncated)")
+    assert message.count(";") == _MAX_REPORTED_COLLAPSES - 1
+
+
+def test_warn_on_collapsed_records_reports_a_manifest_short_of_its_features(tmp_path, caplog):
+    """Fewer records than features means the feature map holds hashes the
+    manifest does not — reported, not silently read as no collapse."""
+    import logging
+
+    from qiita_control_plane.actions.library import _warn_on_collapsed_records
+
+    manifest = tmp_path / "manifest.parquet"
+    features = _write_manifest(manifest, ["fwd", "solo"], [_FWD, _SOLO])
+
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records(42, manifest, features + 1)
+
+    assert collapsed == 0
+    assert len(caplog.records) == 1
+    assert "the manifest holds 2 record(s) against 3 linked feature(s)" in (
+        caplog.records[0].getMessage()
+    )
