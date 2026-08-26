@@ -52,7 +52,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `context_schema` plus the `*_path` / `*_dir` naming convention, so an action that adds one
   is covered without a route change; a new `test_actions_loader` guard makes a `*_path` /
   `*_dir` / `*_folder` string property declare `pattern: "^/"` so the YAML and the route
-  agree on which fields are paths.
+  agree on which fields are paths. What the roots must cover is therefore wider than the
+  sequencing mount: `qiita reference load --local` names its manifest and companions as
+  `*_path` keys under the reference staging root, so a value covering only sequencing
+  refuses every local reference add.
 - **`qiita submit-reads` loads one sample's reads from the machine you are typing on (#484).**
   The other half of the same change: a `user` can no longer name a host path, and their
   reads were never on a filesystem the cluster mounts anyway. The gesture validates the

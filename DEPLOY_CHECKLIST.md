@@ -22,10 +22,18 @@ mean every absolute path the orchestrator can open is nameable through the API. 
 absolute dirs; `/` is refused.
 
 ```bash
-sudo bash -c 'grep -q "^PATH_INGEST_ROOTS=" /etc/qiita/control-plane.env || echo "PATH_INGEST_ROOTS=/sequencing" >> /etc/qiita/control-plane.env'   # (#484)
+sudo bash -c 'grep -q "^PATH_INGEST_ROOTS=" /etc/qiita/control-plane.env || { s=$(grep "^PATH_SCRATCH=" /etc/qiita/control-plane.env | tail -1 | cut -d= -f2-); echo "PATH_INGEST_ROOTS=/sequencing:${s%/}/references/staging" >> /etc/qiita/control-plane.env; }'   # (#484)
 ```
 
-Set it to the mount(s) sequencing data actually lives on. **The gate itself needs no grant for
+Set it to every mount a submitted path may live under, not the sequencing mount alone.
+Reference sources are the second one: `qiita reference load --local` names its manifest and
+companions as raw `*_path` keys, and they are staged at
+`${PATH_SCRATCH}/references/staging/{name}/{version}/`
+([`reference-data-staging.md`](docs/reference-data-staging.md)) — a scratch mount, not a
+sequencing one. Omit it and every `local-reference-add` / `local-host-reference-add` submit
+422s. The command above reads `PATH_SCRATCH` back out of the same env file; check the line it
+appends against where reference sources are actually staged on this host. **The gate itself
+needs no grant for
 `qiita-api`:** it is written for the account split (CP runs as `qiita-api`, steps as
 `qiita-job`, different groups) — it treats a permission error as "cannot tell" and admits, so a
 run folder only `qiita-job` can read still submits. Reading a run folder through
@@ -96,7 +104,9 @@ Beyond `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>`:
   ```
   Expect exit 1 and a 422 whose detail carries `outside every configured ingest root` and an
   `ingest_roots` list matching what bucket 1 set. A 500, or a 202, means the var is wrong.
-  (#484)
+  Then confirm the roots are not too *narrow*, which fails the other way — a legitimate
+  submit refused: `ingest_roots` in that same body must contain the reference staging root,
+  or `qiita reference load --local` 422s for every reference. (#484)
 - **A submit can now run off the cluster — both platforms.** `POST /run-folder/inspect`
   reads the run folder as `qiita-api`, a NARROWER account than the `qiita-job` that runs
   the jobs: it reaches the IGM folders through their world bits, and the gcore folders
