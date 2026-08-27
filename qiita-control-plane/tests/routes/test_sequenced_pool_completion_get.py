@@ -99,15 +99,19 @@ async def _add_ticket(db, *, action, owner, prep_sample_idx, state, mask_idx=Non
     await db.execute(
         "INSERT INTO qiita.work_ticket"
         "  (action_id, action_version, originator_principal_idx,"
-        "   scope_target_kind, prep_sample_idx, state,"
+        "   scope_target_kind, prep_sample_idx, mask_idx, state,"
         "   failure_type, failure_stage, failure_reason)"
-        " VALUES ($1, $2, $3, 'prep_sample'::qiita.scope_target_kind, $4,"
-        "         $5::qiita.work_ticket_state,"
-        "         $6::qiita.failure_type, $7::qiita.work_ticket_failure_stage, $8)",
+        " VALUES ($1, $2, $3, 'prep_sample'::qiita.scope_target_kind, $4, $5,"
+        "         $6::qiita.work_ticket_state,"
+        "         $7::qiita.failure_type, $8::qiita.work_ticket_failure_stage, $9)",
         action_id,
         version,
         owner,
         prep_sample_idx,
+        # The mask the run produced. A masking ticket carries one from the
+        # PROCESSING transition on, and the rollup's anti-join correlates on it,
+        # so a NULL here would make the ticket uncorrelatable to its gate row.
+        mask_idx,
         state,
         "permanent" if failed else None,
         "finalize" if failed else None,

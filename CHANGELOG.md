@@ -1333,12 +1333,16 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   more shapes: a block ticket carries `block_idx` with `prep_sample_idx` NULL (the work_ticket
   scope-target CHECK), so an entire block-masked pool read as never submitted, and only
   `read-mask` was matched, not the `fastq-to-parquet` half of `PER_SAMPLE_MASK_ACTION_IDS`. The
-  rollup now takes `completed` and `invalidated` from the gate, keeps work tickets for the
-  states a gate row cannot express (in_flight / no_data / failed), and reaches block tickets
-  through `qiita.block_member`. New `samples_invalidated` bucket on `PoolCompletionStatus`,
-  ranked above `in_flight` — a re-mask in progress does not make a withdrawn pass-set usable —
-  and `samples_not_submitted` becomes the residual, so the six buckets partition the sample set
-  by construction. `GET /sequenced-pool/{P}/work-ticket-summary` keeps asking the ticket
+  rollup now resolves the two the way `repositories.mask_definition._MASKED_SAMPLE_CTE` already
+  does — the gate wins for every (mask, sample) pair that has a gate row, the ticket arm
+  supplies the pairs it does not cover, since the per-sample path has no PENDING phase and a
+  mask that ran without completing leaves no row at all — keeps work tickets for the states no
+  gate row expresses, and reaches block tickets through `qiita.block_member`. New
+  `samples_invalidated` bucket on `PoolCompletionStatus`, ranked above `in_flight` (a re-mask in
+  progress does not make a withdrawn pass-set usable), and new `samples_cancelled`, since
+  `WorkTicketState` names these rollups as a place a deliberate stop stays legible.
+  `samples_not_submitted` becomes the residual, so the seven buckets partition the sample set by
+  construction. `GET /sequenced-pool/{P}/work-ticket-summary` keeps asking the ticket
   question and now has its own `fetch_sequenced_pool_read_mask_coverage` rather than
   subtracting the rollup's residual, which no longer means "has no ticket".
 

@@ -757,6 +757,7 @@ def test_pool_completion_status_complete_flag():
         samples_invalidated=0,
         samples_in_flight=0,
         samples_no_data=0,
+        samples_cancelled=0,
         samples_failed=0,
         samples_not_submitted=0,
     )
@@ -773,6 +774,7 @@ def test_pool_completion_status_complete_flag():
         samples_invalidated=0,
         samples_in_flight=0,
         samples_no_data=1,
+        samples_cancelled=0,
         samples_failed=0,
         samples_not_submitted=0,
     )
@@ -788,15 +790,14 @@ def test_pool_completion_status_complete_flag():
         samples_invalidated=0,
         samples_in_flight=0,
         samples_no_data=0,
+        samples_cancelled=0,
         samples_failed=1,
         samples_not_submitted=0,
     )
     assert with_failure.complete is False
 
     # A withdrawn run is neither usable nor still coming, so it holds `complete`
-    # False. Before `samples_invalidated` existed the same sample was counted in
-    # `samples_completed` and this pool read done — while every masked-read
-    # consumer refused it.
+    # False.
     with_withdrawn = PoolCompletionStatus(
         sequenced_pool_idx=1,
         sequencing_run_idx=1,
@@ -806,6 +807,7 @@ def test_pool_completion_status_complete_flag():
         samples_invalidated=1,
         samples_in_flight=0,
         samples_no_data=0,
+        samples_cancelled=0,
         samples_failed=0,
         samples_not_submitted=0,
     )
@@ -821,6 +823,7 @@ def test_pool_completion_status_complete_flag():
         samples_invalidated=0,
         samples_in_flight=1,
         samples_no_data=0,
+        samples_cancelled=0,
         samples_failed=0,
         samples_not_submitted=0,
     )
@@ -835,6 +838,7 @@ def test_pool_completion_status_complete_flag():
         samples_invalidated=0,
         samples_in_flight=0,
         samples_no_data=0,
+        samples_cancelled=0,
         samples_failed=0,
         samples_not_submitted=0,
     )
@@ -857,6 +861,7 @@ def test_pool_completion_status_fully_processed_flag():
             samples_invalidated=0,
             samples_in_flight=sample_count - samples_completed,
             samples_no_data=0,
+            samples_cancelled=0,
             samples_failed=0,
             samples_not_submitted=0,
         )

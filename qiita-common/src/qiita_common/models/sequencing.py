@@ -412,10 +412,11 @@ class PoolCompletionStatus(BaseModel):
     sequenced_sample tallied into six mutually-exclusive buckets (precedence,
     highest first, so a sample appears in exactly one, and the six sum to
     `sample_count`):
-      completed     — its `qiita.mask_sample` gate row reads 'completed' under at
-                      least one mask in scope. The same gate the masked-read
-                      DoGet, the admin export, the assembly resolver and align
-                      planning read, so this bucket and those four agree.
+      completed     — masked, under at least one mask in scope: a 'completed'
+                      `qiita.mask_sample` gate row, or a COMPLETED masking ticket
+                      for a (mask, sample) pair the gate does not cover. The gate
+                      is the primary source but not the only one — see the
+                      repository function for why that is an anti-join.
       invalidated   — not completed, but a gate row was withdrawn
                       ('invalidated'): a run whose output was judged
                       untrustworthy. Its work ticket still reads COMPLETED — the
@@ -431,9 +432,15 @@ class PoolCompletionStatus(BaseModel):
                       failure). Outranks failed so a sample carrying both a
                       no_data and a stale failed ticket counts as no_data.
       failed        — nothing above applies, but at least one ticket FAILED.
-      not_submitted — the residual: no gate row and no masking ticket at all
-                      (e.g. a sample a partial submit-host-filter-pool fan-out
-                      never reached).
+      cancelled     — nothing above applies, but at least one ticket was
+                      CANCELLED. Its own bucket rather than the residual: a
+                      deliberate stop is not the same as never having been
+                      submitted, and `WorkTicketState` names these rollups as a
+                      place that distinction has to survive.
+      not_submitted — the residual: nothing above applied, meaning no gate row
+                      and no masking ticket in any state named here (e.g. a
+                      sample a partial submit-host-filter-pool fan-out never
+                      reached).
 
     Both the gate and the ticket source span the per-sample AND the block masking
     paths; a block ticket names no prep_sample, so the block arm is reached
@@ -458,14 +465,14 @@ class PoolCompletionStatus(BaseModel):
     demux_state: Literal["completed", "in_flight", "no_data", "failed", "not_submitted"]
     sample_count: Annotated[int, Field(ge=0)]
     samples_completed: Annotated[int, Field(ge=0)]
-    # Runs withdrawn after the fact. Counted separately rather than folded into
-    # completed or in_flight: an invalidated run is neither usable nor still
-    # coming, and either fold would make `complete` read as done. Mirrors
-    # MaskDefinitionSummary.samples_invalidated.
+    # Counted separately rather than folded into completed or in_flight: an
+    # invalidated run is neither usable nor still coming, and either fold would
+    # make `complete` read as done.
     samples_invalidated: Annotated[int, Field(ge=0)]
     samples_in_flight: Annotated[int, Field(ge=0)]
     samples_no_data: Annotated[int, Field(ge=0)]
     samples_failed: Annotated[int, Field(ge=0)]
+    samples_cancelled: Annotated[int, Field(ge=0)]
     samples_not_submitted: Annotated[int, Field(ge=0)]
 
     @computed_field  # type: ignore[prop-decorator]
@@ -535,7 +542,12 @@ class PoolExceptionsResponse(BaseModel):
 
 class PoolReadMaskCoverage(BaseModel):
     """Read-mask ticket coverage for a pool: how many non-retired samples have a
-    read-mask work ticket (any state) vs. none. `with + without == sample_count`."""
+    read-mask work ticket (any state) vs. none. `with + without == sample_count`.
+
+    "Has a ticket" is not "was masked": a block-masked sample has no read-mask
+    ticket of its own, so it counts as `without` here while
+    `PoolCompletionStatus` reports it completed. The two are answering different
+    questions on purpose."""
 
     samples_with_read_mask_ticket: Annotated[int, Field(ge=0)]
     samples_without_read_mask_ticket: Annotated[int, Field(ge=0)]
@@ -546,11 +558,13 @@ class PoolWorkTicketSummary(BaseModel):
 
     The pool's read-mask work-ticket rollup with TICKETS (not samples) as the
     denominator — distinct from `PoolCompletionStatus`, whose per-sample buckets
-    collapse each sample's tickets by precedence. `read_mask` reconciles with the
-    completion rollup (`samples_with_read_mask_ticket` == `sample_count -
-    samples_not_submitted`); `ticket_state_counts` maps each work_ticket_state to
-    the number of the pool's read-mask tickets in it (states with zero tickets are
-    present with a 0 value). Compute-on-read."""
+    collapse each sample's tickets by precedence. Both halves of this response
+    count read-mask TICKETS, so they share a denominator with each other — but not
+    with the completion rollup, whose buckets are keyed on the masking gate and
+    count a block-masked sample that has no read-mask ticket at all.
+    `ticket_state_counts` maps each work_ticket_state to the number of the pool's
+    read-mask tickets in it (states with zero tickets are present with a 0 value).
+    Compute-on-read."""
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]

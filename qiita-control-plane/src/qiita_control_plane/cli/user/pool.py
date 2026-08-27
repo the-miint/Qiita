@@ -1484,6 +1484,7 @@ def _render_pool_completion(body: dict | list) -> None:
         f" {body.get('samples_no_data')} no-data,"
         f" {body.get('samples_in_flight')} in-flight,"
         f" {body.get('samples_failed')} failed,"
+        f" {body.get('samples_cancelled')} cancelled,"
         f" {body.get('samples_not_submitted')} never-submitted",
         file=sys.stderr,
     )
