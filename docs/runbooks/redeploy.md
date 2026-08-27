@@ -66,7 +66,8 @@ the deployed commit for the §8 archive hand-off. Key behaviours:
   partial stage); `SKIP_NATIVE_REFRESH=1` / `SKIP_CLI_REFRESH=1` skip the step-5 /
   step-6 venv refreshes, which otherwise run every deploy and abort it on failure.
   `FORCE_NATIVE_REFRESH=1` / `FORCE_CLI_REFRESH=1` no longer do anything — they
-  overrode a skip that no longer exists; the script says so and refreshes anyway.
+  overrode a skip that no longer exists. Where the refresh runs, the script says so
+  and refreshes regardless; where it is skipped they are silent.
 
 This **root-run, drop-into-each-account** model is why it works where the
 operator account has **no sudo** (the documented default — see
@@ -222,15 +223,13 @@ step above — run `make migrate` and re-run this command.
 >
 > **The refresh is otherwise unconditional**, and a confirm appears only for a
 > *separate* native checkout the script didn't pull — on the same clone there is
-> nothing for you to decide. There used to be an "already current" skip; it shipped
-> a stale venv to production twice (2026-08-21, 2026-08-27) and is gone. What you
-> need from that: **do not reason from "nothing changed in this pull"** — pulling
-> before you run the deploy makes every pull a no-op, and neither that nor an
-> import of `qiita_common` can tell you the venv is current.
-> `SKIP_NATIVE_REFRESH=1` still opts out, and then the refresh is yours to run.
+> nothing for you to decide. **Do not reason from "nothing changed in this pull"**:
+> pulling before you run the deploy makes every pull a no-op, and neither that nor
+> an import of `qiita_common` can tell you the venv is current. Two production
+> deploys shipped a stale venv on that reasoning.
 >
-> After the sync the script verifies by importing every module under `jobs/`, so a
-> job's own `from qiita_common.x import Y` is what fails — that catches a missing
+> After the sync the script verifies by importing every dispatchable job module, so
+> a job's own `from qiita_common.x import Y` is what fails — that catches a missing
 > module and a missing NAME alike, which is what the two incidents were. The
 > compute-node side (`probe/native-import`) runs the same check as the same module,
 > and reports the failing module in its `err=` field.

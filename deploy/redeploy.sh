@@ -51,8 +51,9 @@
 #      SKIP_NATIVE_REFRESH=1 / SKIP_CLI_REFRESH=1 (skip the step-5 / step-6
 #      `uv sync`; both refreshes otherwise run every deploy and abort it on
 #      failure). FORCE_NATIVE_REFRESH=1 / FORCE_CLI_REFRESH=1 no longer do
-#      anything — they overrode a skip that no longer exists; the script says so
-#      and refreshes anyway.
+#      anything — they overrode a skip that no longer exists. Where the refresh
+#      runs, the script says so and refreshes regardless; where it is skipped
+#      (SKIP_*, or step 5 with SLURM_NATIVE_PYTHON unset) they are silent.
 
 set -euo pipefail
 
@@ -188,10 +189,8 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
     # this pull" can see them, is on
     # `qiita_compute_orchestrator.native_import_check`.
     #
-    # `--reinstall-package qiita-common`, not a plain `uv sync`: qiita-common is a
-    # path dep whose version string does not move between commits, so `uv sync`
-    # short-circuits and leaves stale sources in site-packages (CLAUDE.md,
-    # "Cross-package staleness").
+    # `--reinstall-package qiita-common`, not a plain `uv sync` (CLAUDE.md,
+    # "Cross-package staleness"). Step 6 syncs the CLI venv the same way.
     #
     # FORCE_NATIVE_REFRESH is read only to tell the operator it is now redundant.
     [ -n "${FORCE_NATIVE_REFRESH:-}" ] && \
@@ -206,14 +205,12 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
         echo "Refreshing the SLURM native venv (as $QIITA_USER):"
         echo "    cd $native_checkout && $UV sync --reinstall-package qiita-common"
     else
-        # A native checkout OUTSIDE the deploy clone. The live host is single-clone,
-        # so this branch has not fired on any deploy to date — which is also why the
-        # refresh below is weaker here than it looks: `uv sync` on a tree this script
-        # never pulled succeeds against that tree's own sources, and an old but
-        # self-consistent tree imports its own old symbols, so the verification
-        # passes on exactly the staleness it is meant to catch. Comparing this
-        # checkout's HEAD against $QIITA_CLONE's is the available signal if that
-        # topology ever becomes real.
+        # A native checkout OUTSIDE the deploy clone; the live host is single-clone,
+        # so this is the branch not taken there. Scope of the refresh below on this
+        # path: `uv sync` resolves against the tree it runs in, and this script never
+        # pulled that tree, so a tree that is old but self-consistent syncs and
+        # imports its own old symbols. Establishing that it is current needs its HEAD
+        # compared against $QIITA_CLONE's; the sync alone does not.
         confirm "Refresh the SLURM native venv ('$UV sync --reinstall-package qiita-common' in $native_checkout, as $QIITA_USER)?"
     fi
     # Run as the checkout OWNER ($QIITA_USER), never root: a root-owned .venv the
@@ -226,13 +223,12 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
     # runs the same module on a COMPUTE node in step 7.
     if ! sudo -u "$QIITA_USER" "$nativepy" -P -m qiita_compute_orchestrator.native_import_check; then
         echo "ERROR: native venv at $native_checkout cannot import qiita_common /" >&2
-        echo "       qiita_compute_orchestrator.config / every qiita_compute_orchestrator" >&2
-        echo "       .jobs module after the refresh. The failing module and error are" >&2
+        echo "       qiita_compute_orchestrator.config / every dispatchable job module" >&2
+        echo "       after the refresh. The failing module and error are printed" >&2
         echo "       above. The /opt/qiita SERVICE venvs are already deployed and serving" >&2
         echo "       (step 4) — only NATIVE SLURM jobs are at risk." >&2
-        echo "       Re-run this script (idempotent), or by hand. Use the login shell and" >&2
-        echo "       the ABSOLUTE uv path below: sudo's secure_path excludes /usr/local/bin," >&2
-        echo "       so bare 'uv' under 'bash -c' reports 'command not found':" >&2
+        echo "       Re-run this script (idempotent), or by hand — copy the command" >&2
+        echo "       below as-is, absolute uv path included (see the \$UV note above):" >&2
         echo "         sudo -u $QIITA_USER bash -lc \"cd '$native_checkout' && $UV sync --reinstall-package qiita-common\"" >&2
         exit 1
     fi
@@ -306,8 +302,7 @@ echo "--- [6/8] Operator checkout CLI venv (uv run qiita / qiita-admin) ---"
 #
 # Run as the checkout OWNER ($QIITA_USER), never root — a root-owned .venv the
 # operator can't clean is the same footgun the native refresh calls out. uv by
-# absolute path ($UV, defined above step 5) — bare `uv` under `bash -lc` is not
-# reliably on PATH.
+# absolute path ($UV, defined above step 5).
 #
 # Verification mechanism differs from step 5 on purpose: the native step has an
 # explicit interpreter path (SLURM_NATIVE_PYTHON) it invokes directly, but there is
@@ -320,16 +315,15 @@ echo "--- [6/8] Operator checkout CLI venv (uv run qiita / qiita-admin) ---"
 # whether an earlier deploy synced it. FORCE_CLI_REFRESH is kept as a no-op alias
 # so a runbook that still passes it gets what it asked for.
 #
-# Single-entrypoint VERIFICATION by design: it imports only
-# qiita_control_plane.cli.user (the `qiita` entrypoint), not also cli.admin
-# (`qiita-admin`). That's sufficient because cli.user transitively imports the
-# shared qiita_common surface (api_paths / actions / models / …) that BOTH CLIs
-# depend on, so a stale qiita_common trips it regardless of which entrypoint is
-# named — including the missing-NAME shape, since those are `from … import …` at
-# module level. And the remedy refreshes the WHOLE venv, fixing both CLIs.
+# BOTH entrypoints are imported, not just cli.user (`qiita`). cli.admin
+# (`qiita-admin`) imports names no cli.user closure reaches — SYSTEM_PRINCIPAL_IDX
+# and TERMINAL_WORK_TICKET_STATES are admin-only at module level, and the user
+# side's own path to the latter is a deferred in-function import — so a stale
+# qiita_common missing either leaves a cli.user-only probe green and qiita-admin
+# broken. That is the missing-NAME shape step 5 exists to catch, so the verification
+# here has to cover the closure it claims to. The remedy is unchanged either way:
+# the sync refreshes the whole venv.
 cli_checkout="$QIITA_CLONE/qiita-control-plane"
-[ -n "${FORCE_CLI_REFRESH:-}" ] && \
-    echo "(FORCE_CLI_REFRESH is set and no longer needed — the refresh is unconditional.)"
 if [ -n "${SKIP_CLI_REFRESH:-}" ]; then
     # The escape hatch step 5 has always had. It matters more now than it did: this
     # refresh runs on every deploy, and it aborts the script — so without an opt-out
@@ -341,19 +335,24 @@ if [ -n "${SKIP_CLI_REFRESH:-}" ]; then
 elif [ ! -d "$cli_checkout" ]; then
     echo "No $cli_checkout — skipping CLI-venv refresh (unexpected layout)."
 else
+    # Read only to tell the operator it is now redundant, and only where the
+    # refresh actually runs — the same placement step 5 uses, so SKIP_* wins on
+    # both steps rather than printing "unconditional" and then skipping.
+    [ -n "${FORCE_CLI_REFRESH:-}" ] && \
+        echo "(FORCE_CLI_REFRESH is set and no longer needed — the refresh is unconditional.)"
     echo "Refreshing the operator checkout CLI venv (as $QIITA_USER):"
     echo "    cd $cli_checkout && $UV sync --reinstall-package qiita-common"
     sudo -u "$QIITA_USER" bash -lc "cd '$cli_checkout' && '$UV' sync --reinstall-package qiita-common"
     # Fail loud if the just-synced venv still can't import the CLI entrypoint — a
     # broken refresh must abort here, not surface as an ImportError the next time
     # the operator reaches for the CLI.
-    if ! sudo -u "$QIITA_USER" bash -lc "cd '$cli_checkout' && '$UV' run --no-sync python -c 'import qiita_control_plane.cli.user'"; then
+    if ! sudo -u "$QIITA_USER" bash -lc "cd '$cli_checkout' && '$UV' run --no-sync python -c 'import qiita_control_plane.cli.user, qiita_control_plane.cli.admin'"; then
         echo "ERROR: checkout CLI venv at $cli_checkout cannot import" >&2
-        echo "       qiita_control_plane.cli.user after the refresh. The /opt/qiita SERVICE" >&2
+        echo "       qiita_control_plane.cli.user / .admin after the refresh. The /opt/qiita SERVICE" >&2
         echo "       venvs are already deployed and serving (step 4) — only the operator's" >&2
         echo "       interactive CLI is affected." >&2
-        echo "       Re-run this script (idempotent), or by hand (see the uv-path note" >&2
-        echo "       on the native-venv failure above):" >&2
+        echo "       Re-run this script (idempotent), or by hand — copy the command" >&2
+        echo "       below as-is, absolute uv path included (see the \$UV note above):" >&2
         echo "         sudo -u $QIITA_USER bash -lc \"cd '$cli_checkout' && $UV sync --reinstall-package qiita-common\"" >&2
         exit 1
     fi

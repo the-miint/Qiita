@@ -20,12 +20,9 @@ from pathlib import Path
 
 import pytest
 
-_SRC = str(Path(__file__).resolve().parents[1] / "src")
-
 # What redeploy.sh ran before this check existed, and what compute-readiness ran
 # until it was pointed here. Kept verbatim as the CONTROL: each test below asserts
-# it passes on damage the new check fails on, so "the new check is stricter" is
-# measured rather than asserted.
+# it passes on the damage the new check fails on.
 _OLD_PROBE = (
     "import qiita_common, qiita_compute_orchestrator.config, qiita_compute_orchestrator.jobs"
 )
@@ -38,10 +35,7 @@ _NEW_CHECK = (
 def _run(damage: str, body: str) -> subprocess.CompletedProcess[str]:
     """Apply `damage` to a freshly-imported module tree, then run `body`."""
     return subprocess.run(
-        [sys.executable, "-c", f"{damage}\n{body}"],
-        capture_output=True,
-        text=True,
-        cwd=_SRC,
+        [sys.executable, "-c", f"{damage}\n{body}"], capture_output=True, text=True
     )
 
 
@@ -67,7 +61,6 @@ def _run_as_module(damage: str) -> subprocess.CompletedProcess[str]:
         ],
         capture_output=True,
         text=True,
-        cwd=_SRC,
     )
 
 
@@ -195,3 +188,43 @@ def test_the_compute_probe_reports_the_reason_not_a_bare_fail() -> None:
     )
     assert result.status == "fail"
     assert "jobs.qc" in result.detail
+
+
+def _run_compute_native_import_block(module: str) -> str:
+    """Run the generated probe's native-import block against `module`.
+
+    The block is taken from `build_probe_script` rather than retyped, so what runs
+    here is what ships to the compute node.
+    """
+    from qiita_compute_orchestrator.cli.compute_readiness import build_probe_script
+
+    script = build_probe_script(path_scratch="/scratch")
+    start = script.index("NATIVE_IMPORT_MOD=")
+    block = script[start : script.index("\nfi\n", start) + 4]
+    block = block.replace(
+        "NATIVE_IMPORT_MOD=qiita_compute_orchestrator.native_import_check",
+        f"NATIVE_IMPORT_MOD={module}",
+    )
+    return subprocess.run(
+        ["bash", "-c", f"PYTHON={sys.executable}\n{block}"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_the_compute_probe_names_the_reason_when_the_module_is_absent() -> None:
+    """A venv predating this module is the first-deploy case the deploy checklist
+    tells the operator to expect, and there the failure lands on stderr with stdout
+    empty. Capturing stdout alone reports `err=` with nothing after it — the bare
+    `=fail` this probe was changed to stop emitting."""
+    line = _run_compute_native_import_block("qiita_compute_orchestrator.does_not_exist")
+    assert line.endswith("=fail") is False, line
+    assert "native-import=fail err=" in line
+    assert "does_not_exist" in line
+
+
+def test_the_compute_probe_reports_ok_on_a_healthy_venv() -> None:
+    """The control: the block is not simply always red — which it would be if the
+    `if` read a pipeline's status instead of the interpreter's."""
+    line = _run_compute_native_import_block("qiita_compute_orchestrator.native_import_check")
+    assert line.endswith("native-import=ok"), line
