@@ -447,7 +447,7 @@ def _write_annotation_manifest(
         gff_path = tmp_dir / "_no_annotations.gff3"
         gff_path.write_text("##gff-version 3\n")
     else:
-        _LOG.warning(ANNOTATION_STRAND_WARNING, gff_path)
+        _LOG.warning(ANNOTATION_STRAND_WARNING)
 
     # read_gff's `attributes` is already a MAP(VARCHAR,VARCHAR) — no parsing.
     #

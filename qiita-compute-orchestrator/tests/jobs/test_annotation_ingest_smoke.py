@@ -314,24 +314,39 @@ def test_no_gff_yields_a_typed_empty_manifest(tmp_path):
 
 
 def test_a_gff_load_warns_that_the_parent_bytes_keep_their_orientation(tmp_path, caplog):
-    """An annotation's window is a window on its parent's STORED bytes, and those keep
-    the orientation they were submitted in — so the window can stop describing the bases
-    it was cut from, and nothing downstream notices. The load says so. A load with no GFF
-    does not, and the text is `ANNOTATION_STRAND_WARNING` so the CLI front-end cannot
-    word the same hazard differently."""
+    """Pins the gate on the job side: a GFF warns, no GFF is silent. The text is
+    `ANNOTATION_STRAND_WARNING`, which carries why; the CLI front-end emits the same
+    object, so the two cannot word one hazard differently."""
     from qiita_common.chunking import ANNOTATION_STRAND_WARNING
 
     gff = _standard_gff(tmp_path)
     with caplog.at_level(logging.WARNING):
         _run(tmp_path / "with_gff", gff=gff)
-    assert [r.getMessage() for r in caplog.records if "STORED bytes" in r.getMessage()] == [
-        ANNOTATION_STRAND_WARNING % gff
+    assert [r.msg for r in caplog.records if r.msg is ANNOTATION_STRAND_WARNING] == [
+        ANNOTATION_STRAND_WARNING
+    ]
+
+    # The REMOTE shape: a --gff ridden in as an upload arrives as a chunked-BLOB
+    # Parquet, which `resolve_blob_input` stitches into the workspace before
+    # `read_gff` sees it. The warning must survive that unwrap — the two input
+    # shapes are the reason the text names no file.
+    caplog.clear()
+    blob = tmp_path / "gff_upload.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            f"COPY (SELECT 0 AS chunk_index, ?::BLOB AS chunk_data) TO '{blob}' (FORMAT PARQUET)",
+            [gff.read_bytes()],
+        )
+    with caplog.at_level(logging.WARNING):
+        _run(tmp_path / "blob_gff", gff=blob)
+    assert [r.msg for r in caplog.records if r.msg is ANNOTATION_STRAND_WARNING] == [
+        ANNOTATION_STRAND_WARNING
     ]
 
     caplog.clear()
     with caplog.at_level(logging.WARNING):
         _run(tmp_path / "without_gff", gff=None)
-    assert not [r for r in caplog.records if "STORED bytes" in r.getMessage()]
+    assert not [r for r in caplog.records if r.msg is ANNOTATION_STRAND_WARNING]
 
 
 @pytest.mark.parametrize(

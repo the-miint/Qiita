@@ -325,16 +325,22 @@ async def test_do_reference_load_warns_when_a_gff_rides_along(
             )
 
     assert result["upload_idxs"] == {"fasta": 100, "gff": 101}
-    assert [r.getMessage() for r in caplog.records if "STORED bytes" in r.getMessage()] == [
-        ANNOTATION_STRAND_WARNING % gff
+    # Identity on the constant, not a copied fragment of it: a filter spelled out here
+    # would stop matching on a re-word, and the negative test below would then pass
+    # vacuously rather than fail.
+    assert [r.msg for r in caplog.records if r.msg is ANNOTATION_STRAND_WARNING] == [
+        ANNOTATION_STRAND_WARNING
     ]
 
 
 async def test_do_reference_load_without_a_gff_does_not_warn(
     fasta_file, cp_transport, upload_state, caplog
 ):
-    """The warning is scoped to loads that carry annotations. Most references have no
-    GFF, and a reference with none cannot reach the divergence it describes."""
+    """Pins the gate: no GFF, no warning. A load with no GFF records no intervals of
+    its own — it can still overwrite bytes an annotated reference's intervals were cut
+    from, which is the half `ANNOTATION_STRAND_WARNING` names and nothing warns."""
+    from qiita_common.chunking import ANNOTATION_STRAND_WARNING
+
     from qiita_control_plane.cli.reference_load import do_reference_load
 
     transport, _calls = cp_transport
@@ -354,7 +360,7 @@ async def test_do_reference_load_without_a_gff_does_not_warn(
                 watch=False,
             )
 
-    assert not [r for r in caplog.records if "STORED bytes" in r.getMessage()]
+    assert not [r for r in caplog.records if r.msg is ANNOTATION_STRAND_WARNING]
 
 
 async def test_do_reference_load_host_sets_is_host_and_selects_host_action(

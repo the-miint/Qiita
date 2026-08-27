@@ -57,17 +57,20 @@ def normalized_sequence_expr(seq: str) -> str:
     no equivalent, because stored bytes are coordinate-bearing.
     `qiita.reference_annotation` holds each interval's window on its
     `parent_feature_idx` sequence plus a `strand`, and `hash_sequences` cuts those
-    windows out of exactly the bytes that become `chunk_data`. Reverse-complement
-    the stored bytes and every window lands somewhere else while every strand
-    describes the wrong one — a GFF-bearing reference keeps loading, keeps
-    indexing, and starts answering wrong. That is the annotated-reference path;
-    this expression is shared with assembly chunking, which carries no
-    annotations, and one path is enough to settle a shared expression.
+    windows out of the submitted record — the bytes that ordinarily become that
+    feature's `chunk_data`. Reverse-complement what is stored and every window
+    lands somewhere else while every strand describes the wrong one. That is the
+    annotated-reference path; this expression is shared with assembly chunking,
+    which carries no annotations.
 
-    Which orientation survives therefore follows load order. `REPLACE_KEY_TABLES`
-    in `qiita-data-plane/src/flight_service.rs` carries why the newest load's
-    strand wins and why keeping the older one is not expressible; the export-side
-    consequence is on the control plane's `_write_genome_fasta`.
+    Which bytes survive is not this identity's to decide, and is not one rule:
+    within a load, the lex-smallest `read_id` of a canonical hash wins
+    (`hash_sequences`' `DISTINCT ON`); across loads, the newest.
+    `flight_service::REPLACE_KEY_TABLES` carries why the newest load's strand wins
+    and why keeping the older one is not expressible; the export-side consequence
+    is on the control plane's `_write_genome_fasta`. Neither rule is bound to the
+    record an annotation was cut from, so the two can disagree —
+    `ANNOTATION_STRAND_WARNING` is what a `--gff` load is told about that.
     """
     return f"upper({seq})"
 
@@ -94,16 +97,22 @@ def soft_masked_expr(seq: str) -> str:
     return f"{seq} <> {normalized_sequence_expr(seq)}"
 
 
-# What a front-end tells the submitter when a load carries a GFF. One sentence for
-# both `--gff` front-ends (`reference load`, `hash_sequences`) so the two cannot
-# describe the same hazard differently; `normalized_sequence_expr` above is the one
-# home for why the bytes are not folded. `%s` names the GFF.
+# What a front-end tells the submitter when a load carries a GFF. One text for both
+# `--gff` front-ends (`reference load`, `hash_sequences`) so the two cannot describe
+# the same hazard differently; `normalized_sequence_expr` above is the one home for
+# why the bytes are not folded. Carries no `%s`: the job side holds a resolved
+# scratch path (`resolve_blob_input` stitches a chunked upload into the workspace),
+# not the submitter's file, so a name here would mean two different things.
+#
+# Submitter vocabulary, not ours — no minted `*_idx` crosses this boundary.
 ANNOTATION_STRAND_WARNING = (
-    "annotations from %s record windows on their parent's STORED bytes, and those bytes"
-    " keep the orientation they were submitted in: a sequence and its reverse complement"
-    " share one feature_idx, so a window stops describing the bases it was cut from if"
-    " this load's FASTA carries a parent in both orientations, or if a later reference"
-    " load supersedes that parent's bytes. Neither is detected, at load or downstream."
+    "this load carries annotations. Their coordinates are intervals of the FASTA record"
+    " each one names, and Qiita stores that record in the orientation it was submitted"
+    " in — a sequence and its reverse complement are kept as one sequence, not two. An"
+    " interval therefore stops describing the bases it was taken from if one FASTA"
+    " carries a record in both orientations, or if a later reference load overwrites"
+    " that record with the opposite orientation. Submit each record in one orientation"
+    " only; nothing checks it, at load or afterwards."
 )
 
 
