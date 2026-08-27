@@ -2617,14 +2617,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Changed
 
 - **Reference chunk bytes stay on the submitted strand — decided, not left open (#502).**
-  `normalized_sequence_expr` normalizes case and deliberately does not normalize strand, and its
-  docstring now carries why rather than reading as an unresolved leftover. Case is folded on a
-  measurement; strand cannot be, because stored bytes are coordinate-bearing:
-  `qiita.reference_annotation` records `position` / `stop_position` as offsets into the parent
-  feature's sequence, on the same axis as `alignment_slice` / `read_alignments` /
-  `qiita_lake.alignment`, alongside a `strand` column — so reverse-complementing what is stored
-  would relocate every interval and invert every strand value, and a GFF-bearing reference would
-  keep loading, keep indexing, and start answering wrong. Comments only; no behaviour change.
+  `normalized_sequence_expr` normalizes case and deliberately does not normalize strand; its
+  docstring stated the second half as a fact with no reason, which read as an oversight inviting
+  repair. It now carries why, and `canonical_sequence_hash_expr` points at it. Comments only; no
+  behaviour change.
 
 - **`align-denovo` collects secondary alignments (#486).** `max_secondary` moves from 0
   to `qiita_common.analytic.MAX_SECONDARY` (100), the cap `align_sharded` already uses,
