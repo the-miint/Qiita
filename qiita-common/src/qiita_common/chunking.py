@@ -53,10 +53,24 @@ def normalized_sequence_expr(seq: str) -> str:
     and `save_bowtie2_index` — while a one-base edit to the same reference changes
     all of them. That covers the four index builders that read `chunk_data`.
 
-    Strand is NOT normalized: the canonical hash folds strands too, so a sequence
-    and its reverse complement share one `feature_idx` while their stored bytes
-    differ, and which orientation survives still follows load order (see the strand
-    caveat on the control plane's `_write_genome_fasta`).
+    Strand is NOT normalized. Case is folded on the measurement above; strand has
+    no equivalent, because stored bytes are coordinate-bearing.
+    `qiita.reference_annotation` holds each interval's window on its
+    `parent_feature_idx` sequence plus a `strand`, and `hash_sequences` cuts those
+    windows out of the submitted record — the bytes that ordinarily become that
+    feature's `chunk_data`. Reverse-complement what is stored and every window
+    lands somewhere else while every strand describes the wrong one. That is the
+    annotated-reference path; this expression is shared with assembly chunking,
+    which carries no annotations.
+
+    Which bytes survive is not this identity's to decide, and is not one rule:
+    within a load, the lex-smallest `read_id` of a canonical hash wins
+    (`hash_sequences`' `DISTINCT ON`); across loads, the newest.
+    `flight_service::REPLACE_KEY_TABLES` carries why the newest load's strand wins
+    and why keeping the older one is not expressible; the export-side consequence
+    is on the control plane's `_write_genome_fasta`. Neither rule is bound to the
+    record an annotation was cut from, so the two can disagree —
+    `ANNOTATION_STRAND_WARNING` is what a `--gff` load is told about that.
     """
     return f"upper({seq})"
 
@@ -81,6 +95,25 @@ def soft_masked_expr(seq: str) -> str:
     Pairs with `SOFT_MASK_WARNING`, which is what to say when it matches.
     """
     return f"{seq} <> {normalized_sequence_expr(seq)}"
+
+
+# What a front-end tells the submitter when a load carries a GFF. One text for both
+# `--gff` front-ends (`reference load`, `hash_sequences`) so the two cannot describe
+# the same hazard differently; `normalized_sequence_expr` above is the one home for
+# why the bytes are not folded. Carries no `%s`: the job side holds a resolved
+# scratch path (`resolve_blob_input` stitches a chunked upload into the workspace),
+# not the submitter's file, so a name here would mean two different things.
+#
+# Submitter vocabulary, not ours — no minted `*_idx` crosses this boundary.
+ANNOTATION_STRAND_WARNING = (
+    "this load carries annotations. Their coordinates are intervals of the FASTA record"
+    " each one names, and Qiita stores that record in the orientation it was submitted"
+    " in — a sequence and its reverse complement are kept as one sequence, not two. An"
+    " interval therefore stops describing the bases it was taken from if one FASTA"
+    " carries a record in both orientations, or if a later reference load overwrites"
+    " that record with the opposite orientation. Submit each record in one orientation"
+    " only; nothing checks it, at load or afterwards."
+)
 
 
 def sequence_split_expr(seq: str) -> str:
@@ -129,6 +162,9 @@ def canonical_sequence_hash_expr(seq: str) -> str:
     the stored chunks are — and keep the lex-smaller:
 
         LEAST(md5(upper(seq)), md5(revcomp(upper(seq))))::uuid
+
+    The STORED bytes are not folded the same way — `normalized_sequence_expr`
+    carries why not.
 
     Every producer that mints/dedups features against `qiita.feature` MUST use
     this exact expression — reference ingest (`hash_sequences`) and assembly

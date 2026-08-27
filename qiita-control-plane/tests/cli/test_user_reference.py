@@ -120,6 +120,79 @@ async def test_do_reference_load_happy_path(
     assert upload_state["slots"] == {100: "ready", 101: "ready"}
 
 
+async def test_do_reference_load_warns_when_a_gff_rides_along(
+    fasta_file, tmp_path, cp_transport, upload_state, caplog
+):
+    """A `--gff` load says, before any network call, that the annotation windows it is
+    about to record are windows on bytes that keep the orientation they were submitted
+    in. `hash_sequences` warns again server-side, for a load that does not come through
+    this CLI; both read `ANNOTATION_STRAND_WARNING`, so the two cannot word it
+    differently."""
+    from qiita_common.chunking import ANNOTATION_STRAND_WARNING
+
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    gff = tmp_path / "ann.gff3"
+    gff.write_text("##gff-version 3\nr1\tprobe\tgene\t1\t2\t.\t+\t.\tID=g1\n")
+
+    transport, _calls = cp_transport
+    flight_client = FakeFlightClient()
+    flight_client.queue_response(100)  # FASTA
+    flight_client.queue_response(101)  # GFF
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with caplog.at_level(logging.WARNING):
+            result = await do_reference_load(
+                http=http,
+                token="test-pat",
+                flight_client=flight_client,
+                fasta_path=fasta_file,
+                gff_path=gff,
+                name="cli-gff",
+                version="1.0",
+                kind="sequence_reference",
+                watch=False,
+            )
+
+    assert result["upload_idxs"] == {"fasta": 100, "gff": 101}
+    # Identity on the constant, not a copied fragment of it: a filter spelled out here
+    # would stop matching on a re-word, and the negative test below would then pass
+    # vacuously rather than fail.
+    assert [r.msg for r in caplog.records if r.msg is ANNOTATION_STRAND_WARNING] == [
+        ANNOTATION_STRAND_WARNING
+    ]
+
+
+async def test_do_reference_load_without_a_gff_does_not_warn(
+    fasta_file, cp_transport, upload_state, caplog
+):
+    """Pins the gate: no GFF, no warning. A load with no GFF records no intervals of
+    its own — it can still overwrite bytes an annotated reference's intervals were cut
+    from, which is the half `ANNOTATION_STRAND_WARNING` names and nothing warns."""
+    from qiita_common.chunking import ANNOTATION_STRAND_WARNING
+
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, _calls = cp_transport
+    flight_client = FakeFlightClient()
+    flight_client.queue_response(100)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with caplog.at_level(logging.WARNING):
+            await do_reference_load(
+                http=http,
+                token="test-pat",
+                flight_client=flight_client,
+                fasta_path=fasta_file,
+                name="cli-no-gff",
+                version="1.0",
+                kind="sequence_reference",
+                watch=False,
+            )
+
+    assert not [r for r in caplog.records if r.msg is ANNOTATION_STRAND_WARNING]
+
+
 async def test_do_reference_load_host_sets_is_host_and_selects_host_action(
     fasta_file, taxonomy_file, tmp_path, cp_transport, upload_state
 ):
