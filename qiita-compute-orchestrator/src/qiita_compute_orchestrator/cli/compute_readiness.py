@@ -258,10 +258,20 @@ else
     echo "{_PROBE_LINE_PREFIX} native-python-on-compute=fail path=$PYTHON"
 fi
 
-if "$PYTHON" -c 'import qiita_compute_orchestrator.jobs' 2>/dev/null; then
+# The SAME check redeploy.sh runs on the head node after `uv sync`, invoked as a
+# module so neither side can drift into its own idea of "imports cleanly" — see
+# qiita_compute_orchestrator.native_import_check for what it covers and why it is
+# anchored on the job modules rather than on qiita_common. Same capture shape as
+# the miint probes below: the check prints one collapsed line naming the module
+# and the error, and that line is the operator's whole diagnosis — a bare `=fail`
+# leaves nothing to act on, and _parse_probe_log keeps only prefixed lines.
+# -P keeps the cwd off sys.path so a probe launched from inside a source tree
+# cannot shadow the installed package it is there to check.
+NATIVE_IMPORT_MOD=qiita_compute_orchestrator.native_import_check
+if NATIVE_IMPORT_ERR="$("$PYTHON" -P -m "$NATIVE_IMPORT_MOD" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} native-import=ok"
 else
-    echo "{_PROBE_LINE_PREFIX} native-import=fail"
+    echo "{_PROBE_LINE_PREFIX} native-import=fail err=$NATIVE_IMPORT_ERR"
 fi
 
 # miint must LOAD on the compute node from the deploy-staged

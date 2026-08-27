@@ -1320,6 +1320,28 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **A deploy no longer skips the venv refreshes that keep native SLURM jobs off stale
+  code (#507).** `redeploy.sh` steps 5 and 6 could skip `uv sync --reinstall-package
+  qiita-common` when a package-root import probe passed. That probe cannot see the failure
+  it was guarding: two production deploys left the native venv on a stale `qiita_common`
+  and it passed both times — 2026-08-21 missing the whole `assembly_constants` submodule
+  (`import qiita_common` still succeeds), and 2026-08-27 missing only the name
+  `URL_ASSEMBLY_DOGET` from `api_paths` (that module still imports, so no widening on the
+  `qiita_common` side reaches it). Both refreshes are now unconditional; the skip's other
+  condition, "nothing arrived in this pull", was already removed and only ever proved that
+  one pull was a no-op. The post-sync verification moves to the consumer side: new
+  `qiita_compute_orchestrator.native_import_check` imports every module under `jobs/`
+  through the orchestrator's own `scan_native_jobs`, so a job's `from qiita_common.x import
+  Y` is what fails and a missing module and a missing name are caught alike. The
+  compute-readiness `probe/native-import` — which ran `import qiita_compute_orchestrator
+  .jobs` alone, shallower still — now invokes that same module, so head node and compute
+  node cannot disagree about what "imports cleanly" means. Both abort paths print the exact
+  working remedy, `bash -lc` and absolute `uv` included; a measured remediation attempt used
+  bare `uv` and got `command not found`. `FORCE_NATIVE_REFRESH` / `FORCE_CLI_REFRESH` are
+  accepted and ignored. Removed with the skip: `native_pkgs_changed` / `cli_pkgs_changed`
+  and `qiita_paths_touch_native` / `qiita_paths_touch_cli`, dead since the pull-diff
+  condition went, plus the tests that described them as backing a live decision.
+
 - **A circular alignment gate no longer refuses every slice holding a secondary record
   (#486).** `check_gate_diagnostics` counted secondary, unmapped and coordinate-less rows
   as one `unpoolable_rows` bucket and refused the slice on any of them, because
