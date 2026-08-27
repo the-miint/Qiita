@@ -888,17 +888,21 @@ async def get_sequenced_pool_work_ticket_summary(
     denominator — no per-sample precedence collapse, unlike the completion
     rollup's buckets).
 
-    Coverage and the state counts come from the same read-mask-ticket source, so
-    the two halves of one response share a denominator. NOT from the completion
-    rollup: its buckets are keyed on the `mask_sample` gate and answer "was this
-    sample masked", which a block-masked sample answers yes to while having no
-    read-mask ticket at all. `ticket_state_counts` carries every WorkTicketState
-    (states with no tickets read 0). Compute-on-read; same read gate and 404/422
-    fronting as the pool completion endpoint."""
-    coverage = await fetch_sequenced_pool_read_mask_coverage(pool, sequenced_pool_idx)
-    state_counts = await fetch_sequenced_pool_read_mask_ticket_state_counts(
-        pool, sequenced_pool_idx
-    )
+    Coverage and the state counts come from the same read-mask-ticket source and
+    one connection, so the two halves of one response share a denominator and a
+    snapshot. Neither comes from the completion rollup, whose buckets are keyed
+    on the masking gate and answer a different question — a block-masked sample
+    is masked and has no read-mask ticket at all. `ticket_state_counts` carries
+    every WorkTicketState (states with no tickets read 0). Compute-on-read; same
+    read gate and 404/422 fronting as the pool completion endpoint."""
+    # One connection for both reads: they are two halves of one response and a
+    # separate acquisition each would read them from two snapshots, so a
+    # concurrent writer could land between the denominator and the state counts.
+    async with pool.acquire() as conn:
+        coverage = await fetch_sequenced_pool_read_mask_coverage(conn, sequenced_pool_idx)
+        state_counts = await fetch_sequenced_pool_read_mask_ticket_state_counts(
+            conn, sequenced_pool_idx
+        )
     sample_count = coverage["sample_count"]
     with_ticket = coverage["samples_with_ticket"]
     return PoolWorkTicketSummary(

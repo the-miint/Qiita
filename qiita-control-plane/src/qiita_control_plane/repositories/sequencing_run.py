@@ -39,6 +39,7 @@ from . import gate_state_literal
 # shape as `mask_definition`'s leading binds.
 _GATE_COMPLETED = gate_state_literal("completed", MaskSampleState)
 _GATE_INVALIDATED = gate_state_literal("invalidated", MaskSampleState)
+_GATE_PENDING = gate_state_literal("pending", MaskSampleState)
 
 
 class PayloadMismatch(Exception):
@@ -557,81 +558,86 @@ async def fetch_sequenced_pool_completion(
     via require_sequenced_pool_in_run. (The demux/bcl-convert stage is reported
     separately by fetch_sequenced_pool_demux_state.)
 
-    Per-sample classification mirrors qiita_common.models.PoolCompletionStatus
-    (precedence completed > invalidated > in_flight > no_data > failed >
-    cancelled > not_submitted), computed from the gate and from work tickets.
+    Per-sample classification mirrors qiita_common.models.PoolCompletionStatus,
+    which carries the bucket definitions and their precedence.
 
-    **How the two are resolved is the same anti-join `_MASKED_SAMPLE_CTE` uses**
-    (`repositories.mask_definition`), and for the reason stated there: the gate
-    wins for every (mask, sample) pair that HAS a gate row, and the ticket arm
-    supplies the pairs it does not cover. The gate is not a replacement for the
-    ticket arm — the per-sample path has no PENDING phase, so a mask that ran and
-    did not complete leaves no gate row at all. Reading the gate alone would
-    report a sample that `GET /mask-definition` calls completed as never
-    submitted here.
+    **Gate and tickets are resolved by anti-join, forked from
+    `mask_definition._MASKED_SAMPLE_CTE`** — read that comment for why the gate
+    cannot simply replace the ticket arm. Four deliberate differences from it:
 
-    What each source decides:
+      1. `gate_covered` is a projected boolean consumed by one aggregate, not a
+         WHERE that drops the ticket row. So the gate decides `completed` alone;
+         a gate-covered ticket still supplies in_flight / no_data / failed /
+         cancelled, which no gate row expresses.
+      2. `mask_idx IS NOT NULL` gates only the uncovered-completed arm (see
+         below), where the sibling applies it to its whole ticket set.
+      3. No DISTINCT ON collapse — bool_or plus the bucket precedence does that
+         work, over a set that spans several masks rather than one.
+      4. A block arm, which the sibling has no need of.
+
+    The sibling's measured argument for placing its anti-join before the sort
+    does not transfer to a target-list EXISTS; this fork has not been measured.
+
+    Sources:
 
       The gate (qiita.mask_sample) decides `completed` and `invalidated`. Only it
-      can report a withdrawal: a run withdrawn after the fact leaves its
-      work_ticket COMPLETED, since the ticket did complete, which is why the run
-      exists to be withdrawn.
+      can report a withdrawal — see `block.fetch_mask_sample_state`, which is
+      where that contract lives.
 
-      Work tickets supply `in_flight`, `no_data`, `failed` and `cancelled`, which
-      no gate row expresses, plus `completed` for the uncovered pairs above.
+      Work tickets supply in_flight / no_data / failed / cancelled, and
+      `completed` for the (mask, sample) pairs the gate does not cover.
 
-    The uncovered-completed rule requires `mask_idx IS NOT NULL`, per the reader
-    idiom in `qiita_common.actions`: a fastq-to-parquet ticket old enough to
-    predate the mask model physically dropped reads and minted no mask, so its
-    COMPLETED is not a masking result. That filter is deliberately NOT applied to
-    the other arms — `_persist_mask_idx` writes work_ticket.mask_idx only at the
-    PENDING/QUEUED → PROCESSING transition, so filtering everywhere would hide a
-    queued re-mask that `in_flight` should report.
+      A gate row still at `'pending'` marks work outstanding, but only when no
+      terminal ticket state says what became of it — otherwise a permanently
+      failed block would read as still coming.
 
-    Both sources span BOTH masking paths. The per-sample arm matches
-    PER_SAMPLE_MASK_ACTION_IDS on wt.prep_sample_idx; the block arm reaches
-    block-scoped tickets through qiita.block_member, because a block ticket
-    carries block_idx with prep_sample_idx NULL (the work_ticket scope-target
-    CHECK) and so can never match a per-sample join.
+    The uncovered-completed arm requires `mask_idx IS NOT NULL` (`qiita_common
+    .actions` says why a maskless masking ticket is not a masking result). It is
+    not applied to the other arms, where it would hide a queued re-mask that
+    in_flight should report — `_persist_mask_idx` writes the column only at the
+    PENDING/QUEUED → PROCESSING transition. That asymmetry only has an effect in
+    the UNSCOPED form: when `reference_idx` is set, the ref_mask test drops every
+    NULL-mask ticket from every arm, so the scoped form does hide a queued
+    re-mask. A queued ticket names no mask and so cannot be attributed to a
+    reference at all.
 
-    `samples_not_submitted` is the residual, so the seven buckets partition the
-    sample set and sum to `sample_count` by construction rather than by the
-    FILTER predicates happening to be exhaustive. It means "nothing else applied":
-    no gate row, and no ticket in any state this rollup names.
+    Both sources span both masking paths; the block arm reaches its tickets
+    through qiita.block_member, since a block ticket names no prep_sample
+    (`qiita_common.actions`). Block progress is read from the ticket rather than
+    from qiita.block.state because the other arms are ticket states and one
+    source keeps the precedence comparable.
 
-    no_data outranks failed: a sample with both a NO_DATA and a stale FAILED
-    ticket counts as no_data, so an empty well that was retried-then-superseded
-    doesn't get stuck in the failed bucket (and `complete` can still fire).
-    `invalidated` outranks in_flight so a withdrawal stays visible while a
-    re-mask runs: the question the buckets answer is "may I use this now", and a
-    running retry does not make a withdrawn pass-set usable. `cancelled` sits
-    lowest because a sample carrying any other signal has something more
-    actionable to report.
+    `samples_not_submitted` is the residual: it counts whatever no other bucket
+    claimed. That is ALMOST "no gate row and no masking ticket", and is exactly
+    that for every state reachable through the current write paths — but it also
+    absorbs a COMPLETED masking ticket carrying no mask_idx, the pre-mask-model
+    fastq-to-parquet cohort that the per-sample gate backfill excluded for the
+    same reason. A residual is used rather than a positive predicate so the
+    buckets provably sum to `sample_count`.
 
-    Action ids are matched bare, never pinned to a version: the submitter chooses
-    the read-mask version, and "this sample got masked" holds regardless of which
-    version produced it. The in-flight set is bound from
-    NON_TERMINAL_WORK_TICKET_STATES; it appears only inside a bool_or in the
-    target list, never in a WHERE, so no partial-index predicate depends on its
-    spelling. Retired samples are excluded (`ps.retired IS NOT TRUE`) to match
-    the other pool rollups' sample set.
+    Retired samples are excluded (`ps.retired IS NOT TRUE`) to match the other
+    pool rollups' sample set. Action ids are matched bare, never pinned to a
+    version. The in-flight set is bound from NON_TERMINAL_WORK_TICKET_STATES; it
+    appears only inside a bool_or in the target list, never in a WHERE, so no
+    partial-index predicate depends on its spelling.
 
     `reference_idx` optionally scopes both sources to masks that used that host
     reference — as its rype OR its minimap2 reference, read from the mask's
     `params` JSONB. So a per-host-reference completion answers "masked against
     THIS reference?" instead of the reference-agnostic "masked at all?": a sample
     masked only against a DIFFERENT reference reads `not_submitted` here. None
-    keeps the reference-agnostic behavior — the `$4 IS NULL` short-circuit
-    includes every mask."""
+    keeps the reference-agnostic behavior."""
     return await pool_or_conn.fetchrow(
         # The pool's active sample set, named once and reused to bound every CTE
-        # below to this pool. Without it the gate and ticket aggregates run over
-        # every masking row in the database for a per-pool rollup, and
-        # qiita.mask_sample's PK is (mask_idx, prep_sample_idx), so a
-        # prep-sample-leading probe has no index to fall back on.
+        # below to this pool; without it the gate and ticket aggregates run over
+        # every masking row in the database for a per-pool rollup.
         #
-        # Every mask that used $4 as a host reference. Referenced from three
-        # places below, so it is stated once.
+        # It bounds the value list, not the access path: qiita.mask_sample's PK
+        # is (mask_idx, prep_sample_idx) and it carries no other index, so the
+        # gate probe below is prep-sample-leading with nothing to seek on.
+        # qiita.block_member has the converging index for the same PK shape
+        # (block_member_prep_sample_idx); mask_sample would want the twin. Not
+        # added here — this fork's plan has not been measured.
         "WITH pool_sample AS ("
         "  SELECT ss.prep_sample_idx FROM qiita.sequenced_sample ss"
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
@@ -671,7 +677,8 @@ async def fetch_sequenced_pool_completion(
         " sample_gate AS ("
         "  SELECT ms.prep_sample_idx,"
         "    bool_or(ms.state = $8) AS gate_completed,"
-        "    bool_or(ms.state = $9) AS gate_invalidated"
+        "    bool_or(ms.state = $9) AS gate_invalidated,"
+        "    bool_or(ms.state = $12) AS gate_pending"
         "  FROM qiita.mask_sample ms"
         "  WHERE ms.prep_sample_idx IN (SELECT prep_sample_idx FROM pool_sample)"
         "    AND ($4::bigint IS NULL OR ms.mask_idx IN (SELECT mask_idx FROM ref_mask))"
@@ -686,6 +693,7 @@ async def fetch_sequenced_pool_completion(
         "                          AND t.mask_idx IS NOT NULL"
         "                          AND NOT t.gate_covered), false) AS has_completed,"
         "    COALESCE(bool_or(g.gate_invalidated), false) AS has_invalidated,"
+        "    COALESCE(bool_or(g.gate_pending), false) AS has_gate_pending,"
         "    COALESCE(bool_or(t.state = ANY($5::qiita.work_ticket_state[])), false)"
         "      AS has_inflight,"
         "    COALESCE(bool_or(t.state = $6::qiita.work_ticket_state), false) AS has_no_data,"
@@ -695,28 +703,41 @@ async def fetch_sequenced_pool_completion(
         "  LEFT JOIN sample_gate g ON g.prep_sample_idx = ss.prep_sample_idx"
         "  LEFT JOIN sample_ticket t ON t.prep_sample_idx = ss.prep_sample_idx"
         "  GROUP BY ss.prep_sample_idx"
+        "),"
+        # A gate row still at 'pending' means masking was planned and has not
+        # been finalized, so the work is outstanding — but only when no terminal
+        # ticket state says what became of it. Without this a pair whose covering
+        # tickets have all reached COMPLETED while the gate awaits its flip
+        # matches no other arm and falls to the residual, which reads as
+        # never-submitted and tells the operator to re-submit; a block re-plan
+        # then refuses with BlockMaskResubmitError.
+        " classified AS ("
+        "  SELECT *,"
+        "    has_inflight OR (has_gate_pending AND NOT has_no_data"
+        "                     AND NOT has_cancelled AND NOT has_failed) AS outstanding"
+        "  FROM sample_state"
         ")"
         " SELECT"
         "   count(*) AS sample_count,"
         "   count(*) FILTER (WHERE has_completed) AS samples_completed,"
         "   count(*) FILTER (WHERE NOT has_completed AND has_invalidated)"
         "     AS samples_invalidated,"
-        "   count(*) FILTER (WHERE NOT has_completed AND NOT has_invalidated AND has_inflight)"
+        "   count(*) FILTER (WHERE NOT has_completed AND NOT has_invalidated AND outstanding)"
         "     AS samples_in_flight,"
         "   count(*) FILTER (WHERE NOT has_completed AND NOT has_invalidated"
-        "     AND NOT has_inflight AND has_no_data)"
+        "     AND NOT outstanding AND has_no_data)"
         "     AS samples_no_data,"
         "   count(*) FILTER (WHERE NOT has_completed AND NOT has_invalidated"
-        "     AND NOT has_inflight AND NOT has_no_data AND has_failed)"
-        "     AS samples_failed,"
-        "   count(*) FILTER (WHERE NOT has_completed AND NOT has_invalidated"
-        "     AND NOT has_inflight AND NOT has_no_data AND NOT has_failed AND has_cancelled)"
+        "     AND NOT outstanding AND NOT has_no_data AND has_cancelled)"
         "     AS samples_cancelled,"
         "   count(*) FILTER (WHERE NOT has_completed AND NOT has_invalidated"
-        "     AND NOT has_inflight AND NOT has_no_data AND NOT has_failed"
-        "     AND NOT has_cancelled)"
+        "     AND NOT outstanding AND NOT has_no_data AND NOT has_cancelled AND has_failed)"
+        "     AS samples_failed,"
+        "   count(*) FILTER (WHERE NOT has_completed AND NOT has_invalidated"
+        "     AND NOT outstanding AND NOT has_no_data AND NOT has_cancelled"
+        "     AND NOT has_failed)"
         "     AS samples_not_submitted"
-        " FROM sample_state",
+        " FROM classified",
         sequenced_pool_idx,
         list(PER_SAMPLE_MASK_ACTION_IDS),
         BLOCK_MASK_ACTION_ID,
@@ -728,6 +749,7 @@ async def fetch_sequenced_pool_completion(
         _GATE_INVALIDATED,
         WorkTicketState.COMPLETED.value,
         WorkTicketState.CANCELLED.value,
+        _GATE_PENDING,
     )
 
 
@@ -834,8 +856,9 @@ async def fetch_sequenced_pool_read_mask_ticket_state_counts(
     contributes three), the raw view `PoolCompletionStatus`'s per-sample buckets
     (which collapse each sample by precedence) deliberately does not give. States
     with zero tickets are absent from the map; the route fills them in from the
-    WorkTicketState enum. Scoped to read-mask (`READ_MASK_ACTION_ID`) so it
-    reconciles with the completion rollup, not the all-actions delete/edit gate."""
+    WorkTicketState enum. Scoped to `READ_MASK_ACTION_ID`, matching
+    `..._read_mask_coverage` beside it so the two halves of one response share a
+    denominator — not the completion rollup, which no longer keys on tickets."""
     rows = await pool_or_conn.fetch(
         "SELECT wt.state, count(*) AS n"
         " FROM qiita.sequenced_sample ss"

@@ -298,8 +298,9 @@ async def test_get_completion_counts_the_same_sample_as_completed_when_not_withd
 
 async def test_get_completion_reference_scope_echoes_and_narrows(ctx, seeded_pool):
     """?reference_idx=N echoes the scope and narrows host-masking to masks that
-    used that reference. The seeded completed ticket carries no mask_idx, so
-    scoping to any reference reads it as not_submitted (masked, but not against N)."""
+    used that reference. The fixture's mask names no host reference in its
+    params, so scoping to any reference excludes it and the sample reads
+    not_submitted — masked, but not against N."""
     resp = await ctx["wet"].get(
         _url(seeded_pool["run_idx"], seeded_pool["pool_idx"]) + "?reference_idx=555"
     )

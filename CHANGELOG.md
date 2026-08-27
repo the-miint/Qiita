@@ -1339,10 +1339,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   mask that ran without completing leaves no row at all — keeps work tickets for the states no
   gate row expresses, and reaches block tickets through `qiita.block_member`. New
   `samples_invalidated` bucket on `PoolCompletionStatus`, ranked above `in_flight` (a re-mask in
-  progress does not make a withdrawn pass-set usable), and new `samples_cancelled`, since
-  `WorkTicketState` names these rollups as a place a deliberate stop stays legible.
-  `samples_not_submitted` becomes the residual, so the seven buckets partition the sample set by
-  construction. `GET /sequenced-pool/{P}/work-ticket-summary` keeps asking the ticket
+  progress does not make a withdrawn pass-set usable), and new `samples_cancelled`, ranked above
+  `samples_failed` since `WorkTicketState` keeps CANCELLED distinct so a deliberate stop stays
+  legible in these rollups and an operator cancels to stop a failing retry. A gate row still
+  `'pending'` counts as outstanding rather than never-submitted, but only when no terminal ticket
+  state says what became of it. `samples_not_submitted` becomes the residual, so the seven
+  buckets partition the sample set by construction. `GET /sequenced-pool/{P}/work-ticket-summary` keeps asking the ticket
   question and now has its own `fetch_sequenced_pool_read_mask_coverage` rather than
   subtracting the rollup's residual, which no longer means "has no ticket".
 
