@@ -206,6 +206,14 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
         echo "Refreshing the SLURM native venv (as $QIITA_USER):"
         echo "    cd $native_checkout && $UV sync --reinstall-package qiita-common"
     else
+        # A native checkout OUTSIDE the deploy clone. The live host is single-clone,
+        # so this branch has not fired on any deploy to date — which is also why the
+        # refresh below is weaker here than it looks: `uv sync` on a tree this script
+        # never pulled succeeds against that tree's own sources, and an old but
+        # self-consistent tree imports its own old symbols, so the verification
+        # passes on exactly the staleness it is meant to catch. Comparing this
+        # checkout's HEAD against $QIITA_CLONE's is the available signal if that
+        # topology ever becomes real.
         confirm "Refresh the SLURM native venv ('$UV sync --reinstall-package qiita-common' in $native_checkout, as $QIITA_USER)?"
     fi
     # Run as the checkout OWNER ($QIITA_USER), never root: a root-owned .venv the
@@ -214,10 +222,8 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
     sudo -u "$QIITA_USER" bash -lc "cd '$native_checkout' && '$UV' sync --reinstall-package qiita-common"
     # Fail loud if the just-synced venv can't import what native jobs import — a
     # broken refresh must abort here, not surface as a stale job at the next
-    # genome-scale reference-load. This is the cheap head-node check; it imports
-    # every module under `jobs/` rather than the package root, so it fails on the
-    # missing-submodule shape described above. (compute-readiness's
-    # probe/native-import runs the same walk on a COMPUTE node in step 7.)
+    # genome-scale reference-load. This is the cheap head-node check; compute-readiness
+    # runs the same module on a COMPUTE node in step 7.
     if ! sudo -u "$QIITA_USER" "$nativepy" -P -m qiita_compute_orchestrator.native_import_check; then
         echo "ERROR: native venv at $native_checkout cannot import qiita_common /" >&2
         echo "       qiita_compute_orchestrator.config / every qiita_compute_orchestrator" >&2
