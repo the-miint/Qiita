@@ -54,9 +54,9 @@ def normalized_sequence_expr(seq: str) -> str:
     all of them. That covers the four index builders that read `chunk_data`.
 
     Strand is deliberately NOT normalized, and the asymmetry with case is the
-    point rather than an omission. The case argument above is that every consumer
-    of `chunk_data` is case-blind, measured. No such argument exists for strand:
-    stored bytes are COORDINATE-BEARING. `qiita.reference_annotation` records
+    point rather than an omission. Case is folded on the measurement above.
+    Strand cannot be, because stored bytes are coordinate-bearing:
+    `qiita.reference_annotation` records
     `position` / `stop_position` as 1-based half-open offsets into the parent
     feature's sequence, on the same axis as `alignment_slice` / `read_alignments`
     / `qiita_lake.alignment`, alongside a `strand` column. Reverse-complementing

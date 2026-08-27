@@ -2618,9 +2618,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 - **Reference chunk bytes stay on the submitted strand — decided, not left open (#502).**
   `normalized_sequence_expr` normalizes case and deliberately does not normalize strand, and its
-  docstring now carries why rather than reading as an unresolved leftover. The case argument is
-  that every consumer of `chunk_data` is case-blind, measured across the four index builders. No
-  such argument exists for strand, because stored bytes are coordinate-bearing:
+  docstring now carries why rather than reading as an unresolved leftover. Case is folded on a
+  measurement; strand cannot be, because stored bytes are coordinate-bearing:
   `qiita.reference_annotation` records `position` / `stop_position` as offsets into the parent
   feature's sequence, on the same axis as `alignment_slice` / `read_alignments` /
   `qiita_lake.alignment`, alongside a `strand` column — so reverse-complementing what is stored
