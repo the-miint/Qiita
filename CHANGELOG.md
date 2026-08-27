@@ -2616,6 +2616,24 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **Reference chunk bytes stay on the submitted strand, and a `--gff` load now says so (#502).**
+  `normalized_sequence_expr` normalizes case and deliberately does not normalize strand; its
+  docstring stated the second half as a fact with no reason. It now carries why, and
+  `canonical_sequence_hash_expr` points at it.
+
+  A load carrying a GFF warns (`ANNOTATION_STRAND_WARNING`) — at the CLI before any network
+  call, and again in `hash_sequences`, which is the chokepoint every GFF-bearing workflow
+  routes through. An annotation's coordinates are an interval of the FASTA record it names, and
+  that record is stored in the orientation it was submitted in: a sequence and its reverse
+  complement are kept as one sequence, so the interval stops describing the bases it was taken
+  from if one FASTA carries a record in both orientations (`hash_sequences` stores the
+  lex-smallest `read_id`'s chunks but cuts the interval from the GFF seqid's record), or if a
+  later reference load overwrites that record (`reference_sequence_chunks` is replaced on
+  `feature_idx` alone). Both probed against the real code paths; neither is detected, at load or
+  afterwards, and the warning does not fix either — they are tracked in #503. Measured against
+  the live deploy: no reference currently carries annotations, and 27 of 781,637 features are
+  claimed by more than one reference.
+
 - **`align-denovo` collects secondary alignments (#486).** `max_secondary` moves from 0
   to `qiita_common.analytic.MAX_SECONDARY` (100), the cap `align_sharded` already uses,
   so a read placing against several near-identical contigs is recorded against each

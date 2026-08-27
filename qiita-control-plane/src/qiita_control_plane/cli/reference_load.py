@@ -91,6 +91,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import BEARER_PREFIX
 from qiita_common.chunking import (
+    ANNOTATION_STRAND_WARNING,
     CHUNK_ROW_GROUP_SIZE,
     CHUNK_SIZE,
     SOFT_MASK_WARNING,
@@ -705,6 +706,12 @@ async def do_reference_load(
             raise ValueError("--fasta is required (or use --local with --fasta-manifest)")
         if flight_client is None:
             raise ValueError("a Flight client is required for the remote (DoPut) ingest path")
+
+    # Before any network call, so the submitter sees it whatever the load does next.
+    # `hash_sequences` warns again from the job, so a CLI load is told twice — the price
+    # of also covering a submission that posts the work ticket directly.
+    if gff_path is not None:
+        _log.warning(ANNOTATION_STRAND_WARNING)
 
     if reference_idx is None:
         create = await _post(
