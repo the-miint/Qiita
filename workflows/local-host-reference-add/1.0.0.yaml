@@ -75,17 +75,18 @@ success_status: active
 failure_status: failed
 
 steps:
-  # The only new step on the local path: manifest → one combined chunked
-  # fasta.parquet, whose `fasta_path` output feeds hash_sequences (identical to
+  # The only new step on the local path: manifest → a directory of chunked
+  # Parquet parts, whose `fasta_path` output feeds hash_sequences (identical to
   # host-reference-add's hash_sequences). No target_status: the reference stays
   # `pending` through staging and hash_sequences makes the first transition.
   - step: stage_local_fasta
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.stage_local_fasta
     inputs: [fasta_manifest_path]
-    # fasta_path = combined chunked parquet (all files) for hash_sequences. The
-    # host-filter index builds consume the feature-keyed chunks the `load` step
-    # re-emits, so there is no minimap2-specific subset here.
+    # fasta_path = directory of chunked Parquet parts (all files) for
+    # hash_sequences. The host-filter index builds consume the feature-keyed
+    # chunks the `load` step re-emits, so there is no minimap2-specific subset
+    # here.
     outputs: [fasta_path]
     baseline_resources:
       cpu: 4
