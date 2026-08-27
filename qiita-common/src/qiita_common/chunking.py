@@ -94,6 +94,19 @@ def soft_masked_expr(seq: str) -> str:
     return f"{seq} <> {normalized_sequence_expr(seq)}"
 
 
+# What a front-end tells the submitter when a load carries a GFF. One sentence for
+# both `--gff` front-ends (`reference load`, `hash_sequences`) so the two cannot
+# describe the same hazard differently; `normalized_sequence_expr` above is the one
+# home for why the bytes are not folded. `%s` names the GFF.
+ANNOTATION_STRAND_WARNING = (
+    "annotations from %s record windows on their parent's STORED bytes, and those bytes"
+    " keep the orientation they were submitted in: a sequence and its reverse complement"
+    " share one feature_idx, so a window stops describing the bases it was cut from if"
+    " this load's FASTA carries a parent in both orientations, or if a later reference"
+    " load supersedes that parent's bytes. Neither is detected, at load or downstream."
+)
+
+
 def sequence_split_expr(seq: str) -> str:
     """SQL expression splitting the sequence column/expression `seq` into
     `CHUNK_SIZE`-byte chunks via miint's native `sequence_split`: a LIST of

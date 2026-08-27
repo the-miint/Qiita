@@ -2616,11 +2616,21 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
-- **Reference chunk bytes stay on the submitted strand — decided, not left open (#502).**
+- **Reference chunk bytes stay on the submitted strand, and a `--gff` load now says so (#502).**
   `normalized_sequence_expr` normalizes case and deliberately does not normalize strand; its
   docstring stated the second half as a fact with no reason, which read as an oversight inviting
-  repair. It now carries why, and `canonical_sequence_hash_expr` points at it. Comments only; no
-  behaviour change.
+  repair. It now carries why, and `canonical_sequence_hash_expr` points at it.
+
+  A load carrying a GFF warns (`ANNOTATION_STRAND_WARNING`) — at the CLI before any network
+  call, and again in `hash_sequences` for a load that does not come through the CLI. An
+  annotation records a window on its parent's STORED bytes, and those keep the orientation they
+  were submitted in: a sequence and its reverse complement share one `feature_idx`, so the
+  window stops describing the bases it was cut from if one FASTA carries a parent in both
+  orientations (`hash_sequences` keeps the lex-smallest `read_id`'s chunks but cuts the interval
+  from the GFF seqid's record), or if a later reference load supersedes that parent's bytes
+  (`reference_sequence_chunks` is replaced on `feature_idx` alone). Both probed against the real
+  code paths; neither is detected, at load or downstream. No reference currently carries
+  annotations.
 
 - **`align-denovo` collects secondary alignments (#486).** `max_secondary` moves from 0
   to `qiita_common.analytic.MAX_SECONDARY` (100), the cap `align_sharded` already uses,

@@ -22,6 +22,7 @@ claim every consumer depends on.
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 from pathlib import Path
 
@@ -310,6 +311,27 @@ def test_no_gff_yields_a_typed_empty_manifest(tmp_path):
         ).fetchall()
         empty_types = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()
     assert [(c[0], c[1]) for c in empty_types] == [(c[0], c[1]) for c in populated_types]
+
+
+def test_a_gff_load_warns_that_the_parent_bytes_keep_their_orientation(tmp_path, caplog):
+    """An annotation's window is a window on its parent's STORED bytes, and those keep
+    the orientation they were submitted in — so the window can stop describing the bases
+    it was cut from, and nothing downstream notices. The load says so. A load with no GFF
+    does not, and the text is `ANNOTATION_STRAND_WARNING` so the CLI front-end cannot
+    word the same hazard differently."""
+    from qiita_common.chunking import ANNOTATION_STRAND_WARNING
+
+    gff = _standard_gff(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        _run(tmp_path / "with_gff", gff=gff)
+    assert [r.getMessage() for r in caplog.records if "STORED bytes" in r.getMessage()] == [
+        ANNOTATION_STRAND_WARNING % gff
+    ]
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _run(tmp_path / "without_gff", gff=None)
+    assert not [r for r in caplog.records if "STORED bytes" in r.getMessage()]
 
 
 @pytest.mark.parametrize(
