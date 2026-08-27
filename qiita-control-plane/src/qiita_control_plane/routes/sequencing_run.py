@@ -137,6 +137,7 @@ from ..repositories.sequencing_run import (
     fetch_sequenced_pool_completion,
     fetch_sequenced_pool_demux_state,
     fetch_sequenced_pool_preflight,
+    fetch_sequenced_pool_read_mask_coverage,
     fetch_sequenced_pool_read_mask_ticket_state_counts,
     fetch_sequenced_pool_read_metrics,
     fetch_sequenced_pool_sample_exceptions,
@@ -792,6 +793,7 @@ async def get_sequenced_pool_completion(
         demux_state=demux_state,
         sample_count=row["sample_count"],
         samples_completed=row["samples_completed"],
+        samples_invalidated=row["samples_invalidated"],
         samples_in_flight=row["samples_in_flight"],
         samples_no_data=row["samples_no_data"],
         samples_failed=row["samples_failed"],
@@ -877,17 +879,19 @@ async def get_sequenced_pool_work_ticket_summary(
     denominator — no per-sample precedence collapse, unlike the completion
     rollup's buckets).
 
-    Coverage is taken from the completion rollup so the two reconcile by
-    construction (`samples_with_read_mask_ticket` == `sample_count -
-    samples_not_submitted`). `ticket_state_counts` carries every WorkTicketState
+    Coverage and the state counts come from the same read-mask-ticket source, so
+    the two halves of one response share a denominator. NOT from the completion
+    rollup: its buckets are keyed on the `mask_sample` gate and answer "was this
+    sample masked", which a block-masked sample answers yes to while having no
+    read-mask ticket at all. `ticket_state_counts` carries every WorkTicketState
     (states with no tickets read 0). Compute-on-read; same read gate and 404/422
     fronting as the pool completion endpoint."""
-    completion = await fetch_sequenced_pool_completion(pool, sequenced_pool_idx)
+    coverage = await fetch_sequenced_pool_read_mask_coverage(pool, sequenced_pool_idx)
     state_counts = await fetch_sequenced_pool_read_mask_ticket_state_counts(
         pool, sequenced_pool_idx
     )
-    sample_count = completion["sample_count"]
-    without = completion["samples_not_submitted"]
+    sample_count = coverage["sample_count"]
+    without = sample_count - coverage["samples_with_ticket"]
     return PoolWorkTicketSummary(
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=sequencing_run_idx,

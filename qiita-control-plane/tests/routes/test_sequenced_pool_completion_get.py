@@ -10,7 +10,9 @@ here the wiring, response model, and auth.
 """
 
 import json
+import secrets
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
@@ -52,7 +54,44 @@ async def _seed_fastq_action(db):
     return action_id, version
 
 
-async def _add_ticket(db, *, action, owner, prep_sample_idx, state):
+async def _seed_mask(db, owner):
+    """One mask_definition, so a completed ticket has a gate row to write."""
+    return await db.fetchval(
+        "INSERT INTO qiita.mask_definition"
+        "  (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+        " VALUES ($1, 'read-mask', '1.0', '{}'::jsonb, $2) RETURNING mask_idx",
+        secrets.token_bytes(32),
+        owner,
+    )
+
+
+async def _add_gate(db, *, mask_idx, prep_sample_idx, state, owner):
+    """The qiita.mask_sample row the completion rollup reads.
+
+    mask_sample_invalidation_fields is a biconditional: the three provenance
+    columns are set exactly when the state is 'invalidated'."""
+    withdrawn = state == "invalidated"
+    await db.execute(
+        "INSERT INTO qiita.mask_sample"
+        "  (mask_idx, prep_sample_idx, state,"
+        "   invalidated_at, invalidated_by_idx, invalidation_reason)"
+        " VALUES ($1, $2, $3, $4, $5, $6)",
+        mask_idx,
+        prep_sample_idx,
+        state,
+        datetime.now(UTC) if withdrawn else None,
+        owner if withdrawn else None,
+        "test withdrawal" if withdrawn else None,
+    )
+
+
+async def _add_ticket(db, *, action, owner, prep_sample_idx, state, mask_idx=None, gate=True):
+    """Attach a per-sample masking ticket.
+
+    A COMPLETED one also writes its 'completed' gate row, mirroring the
+    production terminal step (`upsert_mask_sample_completed`) that the completion
+    rollup reads. `gate=False` seeds a ticket that completed under a gate row
+    that did not."""
     action_id, version = action
     # work_ticket_failure_consistent requires the failure columns set together on
     # a FAILED ticket and all-NULL otherwise.
@@ -74,6 +113,10 @@ async def _add_ticket(db, *, action, owner, prep_sample_idx, state):
         "finalize" if failed else None,
         "test failure" if failed else None,
     )
+    if state == "completed" and gate and mask_idx is not None:
+        await _add_gate(
+            db, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx, state="completed", owner=owner
+        )
 
 
 async def _seed_bcl_action(db):
@@ -129,13 +172,16 @@ async def seeded_pool(ctx):
     owner = ctx["wet_session"]["principal_idx"]
     action = await _seed_fastq_action(db)
     bcl_action = await _seed_bcl_action(db)
+    mask_idx = await _seed_mask(db, owner)
     created = []
 
     bs0, ps0 = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
     run_idx, pool_idx, ss0 = await seed_sequenced_sample_subtype(
         db, prep_sample_idx=ps0, owner_idx=owner, sequenced_pool_item_id="compl-item-0"
     )
-    await _add_ticket(db, action=action, owner=owner, prep_sample_idx=ps0, state="completed")
+    await _add_ticket(
+        db, action=action, owner=owner, prep_sample_idx=ps0, state="completed", mask_idx=mask_idx
+    )
     created.append((bs0, ps0, ss0))
 
     bs1, ps1 = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
@@ -156,6 +202,7 @@ async def seeded_pool(ctx):
         "owner": owner,
         "action": action,
         "bcl_action": bcl_action,
+        "mask_idx": mask_idx,
     }
 
     await db.execute(
@@ -164,6 +211,8 @@ async def seeded_pool(ctx):
     await db.execute(
         "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2", *bcl_action
     )
+    await db.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
+    await db.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
     for _bs, _ps, ss_idx in created:
         await db.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
@@ -203,6 +252,46 @@ async def test_get_completion_buckets_samples(ctx, seeded_pool):
     assert body["reference_idx"] is None
 
 
+async def test_get_completion_reports_a_withdrawn_run_as_invalidated(ctx, seeded_pool):
+    """The operator surface for the whole fix. `qiita pool-completion` prints
+    `fully_processed` as "DONE and clean"; before this, a pool whose only masked
+    sample had been withdrawn printed exactly that, and every masked-read pull
+    then 409'd. The sample is counted, just not as usable."""
+    db = ctx["pool"]
+    ps0 = await db.fetchval(
+        "SELECT prep_sample_idx FROM qiita.sequenced_sample"
+        " WHERE sequenced_pool_idx = $1 AND sequenced_pool_item_id = 'compl-item-0'",
+        seeded_pool["pool_idx"],
+    )
+    await db.execute(
+        "UPDATE qiita.mask_sample SET state = 'invalidated', invalidated_at = now(),"
+        "  invalidated_by_idx = $3, invalidation_reason = 'withdrawn in test'"
+        " WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        seeded_pool["mask_idx"],
+        ps0,
+        seeded_pool["owner"],
+    )
+    resp = await ctx["wet"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["samples_invalidated"] == 1
+    assert body["samples_completed"] == 0
+    assert body["complete"] is False
+    assert body["fully_processed"] is False
+
+
+async def test_get_completion_counts_the_same_sample_as_completed_when_not_withdrawn(
+    ctx, seeded_pool
+):
+    """Control for the case above — the fixture's sample, untouched, is completed
+    and `samples_invalidated` is zero. Without it the assertions above could hold
+    for a sample that was never counted at all."""
+    resp = await ctx["wet"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
+    body = resp.json()
+    assert body["samples_completed"] == 1
+    assert body["samples_invalidated"] == 0
+
+
 async def test_get_completion_reference_scope_echoes_and_narrows(ctx, seeded_pool):
     """?reference_idx=N echoes the scope and narrows host-masking to masks that
     used that reference. The seeded completed ticket carries no mask_idx, so
@@ -232,6 +321,7 @@ async def _complete_second_sample(db, seeded_pool):
         owner=seeded_pool["owner"],
         prep_sample_idx=ps1,
         state="completed",
+        mask_idx=seeded_pool["mask_idx"],
     )
 
 
@@ -286,6 +376,7 @@ async def test_get_completion_complete_when_all_done(ctx, seeded_pool):
         owner=seeded_pool["owner"],
         prep_sample_idx=ps1,
         state="completed",
+        mask_idx=seeded_pool["mask_idx"],
     )
     resp = await ctx["wet"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
     assert resp.status_code == 200, resp.text

@@ -409,28 +409,44 @@ class PoolCompletionStatus(BaseModel):
     bcl-convert ticket exists; not_submitted when there is none).
 
     The per-sample buckets below — the HOST-MASKING stage: each non-retired
-    sequenced_sample classified by the state of its read-mask work tickets (any
-    version) and tallied into five mutually-exclusive buckets (precedence,
-    highest first, so a sample appears in exactly one):
-      completed     — has at least one COMPLETED read-mask ticket.
-      in_flight     — no COMPLETED ticket but at least one PENDING/QUEUED/
-                      PROCESSING (e.g. a re-submitted retry); work is ongoing.
-      no_data       — no COMPLETED and nothing in flight, but at least one
-                      NO_DATA (an empty/blank well — a terminal outcome that is
-                      NOT a failure). Outranks failed so a sample carrying both a
+    sequenced_sample tallied into six mutually-exclusive buckets (precedence,
+    highest first, so a sample appears in exactly one, and the six sum to
+    `sample_count`):
+      completed     — its `qiita.mask_sample` gate row reads 'completed' under at
+                      least one mask in scope. The same gate the masked-read
+                      DoGet, the admin export, the assembly resolver and align
+                      planning read, so this bucket and those four agree.
+      invalidated   — not completed, but a gate row was withdrawn
+                      ('invalidated'): a run whose output was judged
+                      untrustworthy. Its work ticket still reads COMPLETED — the
+                      ticket did complete, which is why there is a run to
+                      withdraw — so only the gate can report this.
+      in_flight     — neither of the above, but at least one masking ticket is
+                      PENDING/QUEUED/PROCESSING; work is ongoing. Ranked BELOW
+                      invalidated: a re-mask in progress does not make a
+                      withdrawn pass-set usable, and the question this bucket
+                      answers is "may I use this now".
+      no_data       — nothing above applies, but at least one ticket is NO_DATA
+                      (an empty/blank well — a terminal outcome that is NOT a
+                      failure). Outranks failed so a sample carrying both a
                       no_data and a stale failed ticket counts as no_data.
-      failed        — no COMPLETED, nothing in flight, no NO_DATA, but at least
-                      one FAILED.
-      not_submitted — no read-mask ticket at all (e.g. a sample a partial
-                      submit-host-filter-pool fan-out never reached).
+      failed        — nothing above applies, but at least one ticket FAILED.
+      not_submitted — the residual: no gate row and no masking ticket at all
+                      (e.g. a sample a partial submit-host-filter-pool fan-out
+                      never reached).
+
+    Both the gate and the ticket source span the per-sample AND the block masking
+    paths; a block ticket names no prep_sample, so the block arm is reached
+    through `qiita.block_member`.
 
     `complete` is the host-masking done flag: the pool is non-empty and every
-    sample is in a terminal-accounted state — COMPLETED or NO_DATA (so a plate
+    sample is in a terminal-accounted state — completed or no_data (so a plate
     of real data with empty wells still reaches `complete=True`, and a
-    zero-sample pool reads `complete=False`, not vacuously true). `fully_processed`
-    is the end-to-end flag: demux completed AND `complete`. Everything is
-    compute-on-read over the work_ticket table, so it never drifts when a sample
-    is re-processed, re-submitted, or deleted."""
+    zero-sample pool reads `complete=False`, not vacuously true). A withdrawn
+    sample is neither, so a pool holding one reads `complete=False`.
+    `fully_processed` is the end-to-end flag: demux completed AND `complete`.
+    Everything is compute-on-read, so it never drifts when a sample is
+    re-processed, re-submitted, withdrawn, or deleted."""
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
@@ -442,6 +458,11 @@ class PoolCompletionStatus(BaseModel):
     demux_state: Literal["completed", "in_flight", "no_data", "failed", "not_submitted"]
     sample_count: Annotated[int, Field(ge=0)]
     samples_completed: Annotated[int, Field(ge=0)]
+    # Runs withdrawn after the fact. Counted separately rather than folded into
+    # completed or in_flight: an invalidated run is neither usable nor still
+    # coming, and either fold would make `complete` read as done. Mirrors
+    # MaskDefinitionSummary.samples_invalidated.
+    samples_invalidated: Annotated[int, Field(ge=0)]
     samples_in_flight: Annotated[int, Field(ge=0)]
     samples_no_data: Annotated[int, Field(ge=0)]
     samples_failed: Annotated[int, Field(ge=0)]
@@ -451,9 +472,11 @@ class PoolCompletionStatus(BaseModel):
     @property
     def complete(self) -> bool:
         """True when the pool has samples and every one is in a terminal-
-        accounted state for HOST-MASKING: a COMPLETED read-mask ticket or a
-        NO_DATA (empty-well) outcome. Says nothing about demux — see
-        `fully_processed` for the end-to-end signal."""
+        accounted state for HOST-MASKING: a 'completed' mask_sample gate row or a
+        NO_DATA (empty-well) outcome. A withdrawn sample is in neither bucket, so
+        it holds this False — the flag agrees with what the consumers will
+        actually serve. Says nothing about demux — see `fully_processed` for the
+        end-to-end signal."""
         return (
             self.sample_count > 0
             and (self.samples_completed + self.samples_no_data) == self.sample_count

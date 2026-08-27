@@ -217,6 +217,32 @@ async def test_exceptions_regular_user_403(ctx, seeded):
 # --------------------------------------------------------------------------- #
 
 
+async def test_work_ticket_summary_counts_tickets_not_masking(ctx, seeded):
+    """This endpoint and the completion rollup deliberately disagree now.
+
+    `samples_with_read_mask_ticket` asks "does this sample have a read-mask
+    ticket"; the completion rollup asks "was this sample masked", from the
+    `mask_sample` gate. A block-masked sample answers yes to the second and no to
+    the first, so the coverage here is its own query rather than
+    `sample_count - samples_not_submitted` off the rollup. This pins that the two
+    are not wired together again by a later simplification."""
+    from qiita_control_plane.repositories.sequencing_run import (
+        fetch_sequenced_pool_completion,
+        fetch_sequenced_pool_read_mask_coverage,
+    )
+
+    db = ctx["pool"]
+    coverage = await fetch_sequenced_pool_read_mask_coverage(db, seeded["pool_idx"])
+    completion = await fetch_sequenced_pool_completion(db, seeded["pool_idx"])
+    # Both see the same sample set; only the question differs.
+    assert coverage["sample_count"] == completion["sample_count"]
+    resp = await ctx["wet"].get(_wt_url(seeded["run_idx"], seeded["pool_idx"]))
+    assert (
+        resp.json()["read_mask"]["samples_with_read_mask_ticket"]
+        == (coverage["samples_with_ticket"])
+    )
+
+
 async def test_work_ticket_summary_coverage_and_state_counts(ctx, seeded):
     resp = await ctx["wet"].get(_wt_url(seeded["run_idx"], seeded["pool_idx"]))
     assert resp.status_code == 200, resp.text

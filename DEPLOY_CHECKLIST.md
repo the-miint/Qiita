@@ -51,6 +51,16 @@ _None yet._
 
 ### Notes (no host action)
 
+- **`pool-completion` answers a different question after this deploy, so its numbers will move
+  on pools you have already run.** It bucketed samples by read-mask ticket state; it now reads
+  the `qiita.mask_sample` gate, the same one the masked-read pull and the assembly resolver
+  read. Three shifts an operator will see, all of them the summary catching up to what the
+  consumers already do: a withdrawn run moves out of `samples_completed` into a new
+  `samples_invalidated` bucket (and stops holding `fully_processed` true); a block-masked pool
+  stops reading as entirely `samples_not_submitted`; and a `fastq-to-parquet`-masked sample is
+  counted. `GET .../work-ticket-summary` is unchanged — it still counts tickets, which is what
+  its field names say. Soft contract change for downstream clients: `samples_invalidated` is a
+  new required field on the `PoolCompletionStatus` body. (#508)
 - **A PAT minted before this deploy cannot use the new assembly-lifecycle routes.** The new
   `processing:lifecycle` scope is added to the system_admin ceiling, so callers on the OIDC
   path pick it up automatically; a PAT carries its own stored scope set, so its holder runs
