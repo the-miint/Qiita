@@ -1,9 +1,11 @@
-"""Unit tests for the action-library registry shape (no DB).
+"""Unit tests for the action library (no DB).
 
-Catches drift between qiita_common.api_paths.LibraryPrimitive (the closed
-set of names workflow YAML can reference via `action:` entries) and the
-qiita_control_plane.actions.library.LIBRARY dispatch dict (what the
-runner actually calls).
+Two subjects. The registry-shape tests catch drift between
+qiita_common.api_paths.LibraryPrimitive (the closed set of names workflow YAML
+can reference via `action:` entries) and the
+qiita_control_plane.actions.library.LIBRARY dispatch dict (what the runner
+actually calls). The rest exercise the SQL and reporting the primitives own,
+against DuckDB and Parquet fixtures rather than a database.
 """
 
 import inspect
@@ -610,3 +612,171 @@ async def test_register_files_stays_quiet_when_nothing_was_replaced(monkeypatch,
                 == []
             )
         assert "replaced" not in caplog.text
+
+
+def _miint_conn():
+    from qiita_control_plane.miint import connect_with_miint
+
+    return connect_with_miint()
+
+
+def _canonical_hashes(sequences):
+    """The canonical hash of each sequence, one per record (no dedup).
+
+    Evaluates `canonical_sequence_hash_expr` itself rather than mirroring it in
+    Python: it folds both case and strand, and a hand-rolled twin drifts without
+    the test noticing.
+    """
+    from qiita_common.chunking import canonical_sequence_hash_expr
+
+    with _miint_conn() as conn:
+        conn.execute("CREATE TABLE _seq (i INTEGER, sequence VARCHAR)")
+        conn.executemany("INSERT INTO _seq VALUES (?, ?)", list(enumerate(sequences)))
+        rows = conn.execute(
+            f"SELECT i, {canonical_sequence_hash_expr('sequence')} AS h FROM _seq ORDER BY i"
+        ).fetchall()
+    return [h for _, h in rows]
+
+
+def _revcomp(sequence):
+    """miint's reverse complement, case preserved.
+
+    `sequence_dna_reverse_complement` preserves case
+    (https://the-miint.github.io/duckdb-miint/utilities/), so a mixed-case
+    argument yields a mixed-case twin — which is what lets one fixture below
+    fold case and strand at the same time.
+    """
+    with _miint_conn() as conn:
+        return conn.execute("SELECT sequence_dna_reverse_complement(?)", [sequence]).fetchone()[0]
+
+
+def _write_manifest(path, read_ids, sequences):
+    import duckdb
+
+    hashes = _canonical_hashes(sequences)
+    # Three columns, matching what hash_sequences emits — the warning's own
+    # argument leans on sequence_length_bp not discriminating.
+    with duckdb.connect(":memory:") as c:
+        c.execute(
+            "CREATE TEMP TABLE t (read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT)"
+        )
+        c.executemany(
+            "INSERT INTO t VALUES (?, ?, ?)",
+            [(r, str(h), len(q)) for r, h, q in zip(read_ids, hashes, sequences, strict=True)],
+        )
+        c.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+    return len(set(hashes))
+
+
+# Non-palindromic on purpose: a sequence equal to its own reverse complement
+# cannot tell a strand fold from an identity, so it would pass either way.
+_FWD = "ACGTTGCAAGGTCCATTGCA"
+_MIXED_CASE = "acgtACGTttccGGaa"
+_SOLO = "TTTTGGGGCCCCAAAATTTT"
+
+
+def test_warn_on_collapsed_records_counts_and_names_the_absorbed_records(tmp_path, caplog):
+    """Records folded together by case, by strand, or by both are absent from the
+    reference; the warning reports how many and which read_ids shared a hash."""
+    import logging
+
+    from qiita_control_plane.actions.library import _warn_on_collapsed_records
+
+    read_ids = ["fwd", "rev", "mixed", "mixed_rc", "mixed_upper", "solo"]
+    sequences = [
+        _FWD,
+        _revcomp(_FWD),
+        _MIXED_CASE,
+        # Case-preserving, so this one folds case AND strand together — the
+        # combination a hand-rolled hash oracle got wrong before.
+        _revcomp(_MIXED_CASE),
+        _MIXED_CASE.upper(),
+        _SOLO,
+    ]
+    manifest = tmp_path / "manifest.parquet"
+    features = _write_manifest(manifest, read_ids, sequences)
+    # fwd/rev fold on strand; mixed/mixed_rc/mixed_upper on case, strand, and
+    # both at once; solo stands alone.
+    assert features == 3
+
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records("reference 42", manifest)
+
+    assert collapsed == 3
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert message.startswith("reference 42: ")
+    assert "6 submitted record(s) collapsed to 3 feature(s)" in message
+    assert "fwd, rev" in message
+    # A three-member group is listed together, ordered within the group.
+    assert "mixed, mixed_rc, mixed_upper" in message
+    assert "solo" not in message
+
+
+def test_warn_on_collapsed_records_is_silent_when_nothing_collapsed(tmp_path, caplog):
+    """The control: distinct sequences leave record count equal to feature count,
+    so the same call warns nothing and reports zero."""
+    import logging
+
+    from qiita_control_plane.actions.library import _warn_on_collapsed_records
+
+    manifest = tmp_path / "manifest.parquet"
+    features = _write_manifest(manifest, ["fwd", "solo"], [_FWD, _SOLO])
+    assert features == 2
+
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records("reference 42", manifest)
+
+    assert collapsed == 0
+    assert caplog.records == []
+
+
+def test_warn_on_collapsed_records_marks_a_truncated_group_list(tmp_path, caplog):
+    """Past the cap the message lists that many groups and says it was cut; the
+    count itself still covers every collapsed record."""
+    import logging
+
+    from qiita_control_plane.actions.library import (
+        _MAX_REPORTED,
+        _warn_on_collapsed_records,
+    )
+
+    pairs = _MAX_REPORTED + 3
+    read_ids, sequences = [], []
+    for i in range(pairs):
+        # Distinct per pair, and non-palindromic so each pair folds on strand.
+        seq = f"{'ACGTTGCAAGG' * 2}{'ACGT' * (i + 1)}TTCCA"
+        read_ids += [f"r{i:02d}_fwd", f"r{i:02d}_rev"]
+        sequences += [seq, _revcomp(seq)]
+    manifest = tmp_path / "manifest.parquet"
+    features = _write_manifest(manifest, read_ids, sequences)
+    assert features == pairs
+
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records("reference 42", manifest)
+
+    assert collapsed == pairs
+    message = caplog.records[0].getMessage()
+    assert message.endswith("(truncated)")
+    assert message.count(";") == _MAX_REPORTED - 1
+
+
+def test_warn_on_collapsed_records_leads_with_the_caller_s_scope(tmp_path, caplog):
+    """The helper serves both membership writers, so the thing being loaded is the
+    caller's to name — an assembly run is not a reference."""
+    import logging
+
+    from qiita_control_plane.actions.library import _warn_on_collapsed_records
+
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, ["c_fwd", "c_rev"], [_FWD, _revcomp(_FWD)])
+
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records(
+            "assembly run (prep_sample 7, processing 3)", manifest
+        )
+
+    assert collapsed == 1
+    message = caplog.records[0].getMessage()
+    assert message.startswith("assembly run (prep_sample 7, processing 3): ")
+    assert "c_fwd, c_rev" in message

@@ -213,8 +213,27 @@ _None yet._
 
   The collapse rewrites Parquet, so `scripts/lake-gc.sh` has more to reclaim afterwards.
 
-
 ### Notes (no host action)
+
+- **The 6 legacy `mask_definition` rows are already re-keyed — nothing to run** (#501; the
+  command was #428's). `qiita-admin backfill mask-adapter-hash` had been stuck: it converts rows
+  only when they carry ONE distinct stored `adapter_set_hash`, and this host carried two, so it
+  reported and wrote nothing and the contract phase that removes the byte-derived fallback stayed
+  unreachable. The two were attributable from the record rather than the bytes — reference 13
+  (`truseq-adapters`) was created 2026-06-27 12:39 and reference 7 (`qc-adapters`) has 0
+  `reference_membership` rows so was never loadable as an adapter set, leaving reference 10 the
+  only `active` `artifact_sequence_set` a mask could resolve before that timestamp. Masks 1, 2, 4
+  predate it, masks 5, 6, 7 follow it.
+
+  Run 2026-08-26 with `--attribute-all` over each group, 3 rows each. Verified after: **0** rows
+  left with a NULL `adapter_hash_scheme` and a non-NULL `adapter_set_hash`; masks 1/2/4 on
+  reference 10's `fc2f45f2…` and 5/6/7 on 13's `54ea64ab…`, all `sequence_hash_v1`; 10
+  `mask_definition` rows over 10 distinct `params_hash` (no duplicates minted) and every
+  `mask_sample` gate count unchanged, since `mask_idx` does not move. It ran ahead of this deploy
+  rather than in bucket 6 because it depends on nothing here — the tooling has been live since
+  #428. It is irreversible (the byte digest is not recomputable without the adapter Parquet, so
+  `migrate:down` cannot restore a converted row), and re-running it is a no-op: a stamped row is
+  out of the query.
 
 - **`qiita reference export` stops reproducing soft-masking** (#479). Chunks are stored upper case from this deploy on, so an exported FASTA is upper case for anything loaded after it — and for the 23 collapsed in bucket 6. Case is not recoverable from the lake. A reference loaded earlier and never re-loaded keeps its submitted casing indefinitely, since nothing re-loads one on its own; that is only visible through export, because the four index builders that read `chunk_data` all discard case (measured, see `normalized_sequence_expr`). Strand is unchanged: it still follows load order, as the existing caveat on `_write_genome_fasta` says.
 
@@ -258,6 +277,31 @@ _None yet._
   runtime (p50 10.4 min, max 15.4 min against a PT4H limit) leaves ample room. Reaches
   `qiita.action` via the `actions sync` that already runs; nothing extra to do. Expect
   its jobs to queue more easily and to show `AllocCPUS=8` from this deploy on. (#486)
+
+- **A reference or assembly load logs when submitted records collapse into fewer features**
+  (#501). `write-membership` and `write-assembly-membership` compare their manifest's record
+  count against its distinct canonical hashes and, when they differ, emit a `WARNING` naming
+  the shortfall and the `read_id`s that shared a hash — visible with `journalctl -u
+  qiita-control-plane`. Nothing to run, and nothing fails: the load completes either way,
+  because a FASTA declaring both orientations of an adapter, a genome carrying a repeated
+  contig, and one assembly contig placed in several bins are all valid submissions.
+  It fires at **load** time only — it does not re-examine references already in the database,
+  so anything loaded before this deploy stays silent regardless of what it dropped. The
+  warning reports *that* records collapsed and not why: reading the submitted sequences is
+  what separates a strand pair from a duplicate.
+
+- **Reference 10 (`fastp-adapters`) holds 177 of its 234 submitted records; 13
+  (`truseq-adapters`) is the configured adapter set** (#501). Measured 2026-08-26 against the live
+  database: 234 records in the source FASTA, 177 rows in `reference_membership`, each of the 57
+  absent ones an exact reverse-complement pair the canonical hash folded away. Do not point
+  `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX` at 10; 13's two records are not reverse complements of each
+  other, so it collapses nothing. `qiita.reference` carries no retired status and no `retired`
+  column, so 10 stays `active` — this note is the record that it is superseded. Reference 7
+  (`qc-adapters`) has 0 `reference_membership` rows and was never loadable as an adapter set.
+  No remediation rides this deploy and none is planned: every mask minted against 10 (masks 1, 2, 4
+  — 427 prep samples, one study) is paired-end, where `trim_adapters_pe` infers the insert from the
+  R1/revcomp(R2) overlap without consulting the adapter set, and the 54 prep samples of the
+  single non-test run were re-masked under 13.
 
 ---
 
