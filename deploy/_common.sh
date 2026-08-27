@@ -100,37 +100,6 @@ qiita_native_checkout_from_python() {
     printf '%s' "$checkout"
 }
 
-# Does a list of changed paths touch a package a native SLURM venv runs
-# (qiita-common or qiita-compute-orchestrator)? redeploy.sh feeds this the
-# `git diff --name-only <before> <after>` of a pull to decide whether the native
-# venv needs a refresh — the path-prefix match is the part worth unit-testing
-# (e.g. it must match `qiita-common/...` but NOT a sibling like
-# `qiita-common-extra/...`), so it lives here as a pure function while the git +
-# sudo wiring stays in redeploy.sh. Pure (no side effects); the unit test in
-# test_deploy_scripts.py exercises the matching directly.
-#
-# $1 = newline-separated path list. Returns 0 when at least one path is under
-# qiita-common/ or qiita-compute-orchestrator/, 1 when none are (incl. empty).
-qiita_paths_touch_native() {
-    printf '%s\n' "${1:-}" | grep -qE '^(qiita-common|qiita-compute-orchestrator)/'
-}
-
-# Does a list of changed paths touch a package the operator's CHECKOUT CLI venv
-# runs? Operators invoke `uv run qiita` / `qiita-admin` from the checkout's
-# qiita-control-plane venv, which imports qiita_control_plane (and the path-dep
-# qiita_common). redeploy.sh feeds this the same `git diff --name-only` of a pull
-# it feeds qiita_paths_touch_native, to decide whether that CLI venv needs a
-# `--reinstall-package qiita-common` refresh. Pure (no side effects); the unit
-# test in test_deploy_scripts.py exercises the matching directly. NB: qiita-data-
-# plane / qiita-compute-orchestrator are deliberately NOT here — they don't change
-# what the control-plane CLI venv imports.
-#
-# $1 = newline-separated path list. Returns 0 when at least one path is under
-# qiita-common/ or qiita-control-plane/, 1 when none are (incl. empty).
-qiita_paths_touch_cli() {
-    printf '%s\n' "${1:-}" | grep -qE '^(qiita-common|qiita-control-plane)/'
-}
-
 # --- SIF auto-build helpers (used by scripts/build-sif.sh + deploy/build-sifs.sh) ---
 # Pure (echo/return only), so test_deploy_scripts.py exercises them directly while
 # the apptainer/root/chown wiring stays in the entrypoint scripts. This is why the

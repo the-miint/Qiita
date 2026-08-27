@@ -36,7 +36,14 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- **`probe/native-import` got stricter, so a stale compute node now fails `make
+  verify-deploy` instead of passing it.** It ran `import qiita_compute_orchestrator.jobs`
+  and nothing else; it now imports every dispatchable job module, which is what makes a
+  missing `qiita_common` symbol visible, and reports the failing module in its `err=` field
+  (it used to print a bare `=fail`). If it fails on the first deploy after this lands, that
+  venv was already stale and the check is doing its job — refresh it with
+  `sudo -u qiita bash -lc 'cd <native-checkout>/qiita-compute-orchestrator && /usr/local/bin/uv sync --reinstall-package qiita-common'`
+  (absolute `uv`, login shell — bare `uv` is not on `sudo`'s PATH). (#507)
 
 ### 6. After the deploy verifies green
 
@@ -62,6 +69,19 @@ _None yet._
   are the first HTTP surface on the assembly run identity. They sit at `prep_sample:read`
   (every human role holds it, narrowed per study below `wet_lab_admin`) and carry run
   metadata and per-sample gate state only — no sequence data. (#505)
+- **The two venv refreshes now run on every deploy.** `redeploy.sh` steps 5 and 6 no longer
+  skip `uv sync --reinstall-package qiita-common` when an import probe passes — that probe
+  could not see the two stale-venv incidents it was guarding (2026-08-21, 2026-08-27), so
+  the skip is gone rather than re-conditioned. Nothing to do differently; the deploy just
+  spends the sync every time, and prompts only for a *separate* native checkout it did not
+  pull. `FORCE_NATIVE_REFRESH=1` / `FORCE_CLI_REFRESH=1` no longer do anything; the script
+  prints that they are redundant and refreshes regardless, so an old runbook line still
+  gets what it asked for. Step 6's post-sync import now covers `qiita-admin` as well as
+  `qiita`, so a stale symbol only `qiita-admin` imports aborts the deploy instead of
+  surfacing the next time you reach for the CLI. (#507)
+- **New `SKIP_CLI_REFRESH=1`,** mirroring `SKIP_NATIVE_REFRESH=1`. Step 6 now runs every
+  deploy and aborts on failure, so this is the out if its `uv sync` fails for its own
+  reasons on a deploy whose services are already up. (#507)
 
 ---
 
