@@ -137,6 +137,7 @@ from ..repositories.sequencing_run import (
     fetch_sequenced_pool_completion,
     fetch_sequenced_pool_demux_state,
     fetch_sequenced_pool_preflight,
+    fetch_sequenced_pool_read_mask_coverage,
     fetch_sequenced_pool_read_mask_ticket_state_counts,
     fetch_sequenced_pool_read_metrics,
     fetch_sequenced_pool_sample_exceptions,
@@ -767,16 +768,18 @@ async def get_sequenced_pool_completion(
     """Read the pool's end-to-end processing rollup: the demux (bcl-convert)
     stage state plus the host-masking stage. `demux_state` is the pool-scoped
     bcl-convert ticket's state; the per-sample buckets classify each non-retired
-    sequenced_sample by the state of its read-mask work tickets (any version) —
-    completed / in-flight / no-data / failed / not-submitted — with a pool-level
-    `complete` flag for host-masking (every sample COMPLETED or NO_DATA and the
-    pool non-empty, so a plate of real data with empty wells still reaches
-    `complete=True`) and `fully_processed` = demux completed AND `complete` (the
-    single "this pool is done and clean" signal). Surfaced alongside the
-    read-metric and QC rollups.
+    sequenced_sample — completed / invalidated / in-flight / no-data / failed /
+    cancelled / not-submitted — with a pool-level `complete` flag for
+    host-masking (every sample masked or NO_DATA and the pool non-empty, so a
+    plate of real data with empty wells still reaches `complete=True`) and
+    `fully_processed` = demux completed AND `complete` (the single "this pool is
+    done and clean" signal). Whether a sample is masked comes from the
+    `qiita.mask_sample` gate; see `fetch_sequenced_pool_completion` for how the
+    gate and the work tickets are resolved. Surfaced alongside the read-metric
+    and QC rollups.
 
-    Everything is compute-on-read over the work_ticket table, so it never drifts
-    when a sample is re-processed, re-submitted, or deleted. Same read gate as the
+    Everything is compute-on-read, so it never drifts when a sample is
+    re-processed, re-submitted, withdrawn, or deleted. Same read gate as the
     pool metadata / QC-report endpoints: a HumanUser with `Scope.PREP_SAMPLE_READ`
     and system_role at least wet_lab_admin. `require_sequenced_pool_in_run` fronts
     404 (no such pool) / 422 (pool not under this run); a pool with no non-retired
@@ -792,9 +795,11 @@ async def get_sequenced_pool_completion(
         demux_state=demux_state,
         sample_count=row["sample_count"],
         samples_completed=row["samples_completed"],
+        samples_invalidated=row["samples_invalidated"],
         samples_in_flight=row["samples_in_flight"],
         samples_no_data=row["samples_no_data"],
         samples_failed=row["samples_failed"],
+        samples_cancelled=row["samples_cancelled"],
         samples_not_submitted=row["samples_not_submitted"],
     )
 
@@ -804,8 +809,14 @@ def _sequenced_sample_exception_flags(row: Mapping[str, Any]) -> list[str]:
     SQL WHERE in `fetch_sequenced_pool_sample_exceptions`, so every row that query
     returns yields at least one flag. `unprocessed` (no metrics) and `no_reads`
     (processed, 0 survived) are mutually exclusive; `failed_ticket` is a FAILED
-    read-mask ticket with no COMPLETED one (same precedence as the completion
-    rollup)."""
+    read-mask ticket with no COMPLETED one.
+
+    That is a ticket question, so it does not track the completion rollup's
+    buckets: a withdrawn run has a COMPLETED ticket and raises no flag here while
+    the rollup counts it `samples_invalidated`, and a block-masked sample has no
+    per-sample ticket at all. An operator reconciling the two surfaces will find
+    samples the rollup reports as unusable that this drill-down does not
+    list."""
     flags: list[str] = []
     if row["raw_read_count_r1r2"] is None:
         flags.append("unprocessed")
@@ -877,24 +888,30 @@ async def get_sequenced_pool_work_ticket_summary(
     denominator — no per-sample precedence collapse, unlike the completion
     rollup's buckets).
 
-    Coverage is taken from the completion rollup so the two reconcile by
-    construction (`samples_with_read_mask_ticket` == `sample_count -
-    samples_not_submitted`). `ticket_state_counts` carries every WorkTicketState
-    (states with no tickets read 0). Compute-on-read; same read gate and 404/422
-    fronting as the pool completion endpoint."""
-    completion = await fetch_sequenced_pool_completion(pool, sequenced_pool_idx)
-    state_counts = await fetch_sequenced_pool_read_mask_ticket_state_counts(
-        pool, sequenced_pool_idx
-    )
-    sample_count = completion["sample_count"]
-    without = completion["samples_not_submitted"]
+    Coverage and the state counts come from the same read-mask-ticket source and
+    one connection, so the two halves of one response share a denominator and a
+    snapshot. Neither comes from the completion rollup, whose buckets are keyed
+    on the masking gate and answer a different question — a block-masked sample
+    is masked and has no read-mask ticket at all. `ticket_state_counts` carries
+    every WorkTicketState (states with no tickets read 0). Compute-on-read; same
+    read gate and 404/422 fronting as the pool completion endpoint."""
+    # One connection for both reads: they are two halves of one response and a
+    # separate acquisition each would read them from two snapshots, so a
+    # concurrent writer could land between the denominator and the state counts.
+    async with pool.acquire() as conn:
+        coverage = await fetch_sequenced_pool_read_mask_coverage(conn, sequenced_pool_idx)
+        state_counts = await fetch_sequenced_pool_read_mask_ticket_state_counts(
+            conn, sequenced_pool_idx
+        )
+    sample_count = coverage["sample_count"]
+    with_ticket = coverage["samples_with_ticket"]
     return PoolWorkTicketSummary(
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=sequencing_run_idx,
         sample_count=sample_count,
         read_mask=PoolReadMaskCoverage(
-            samples_with_read_mask_ticket=sample_count - without,
-            samples_without_read_mask_ticket=without,
+            samples_with_read_mask_ticket=with_ticket,
+            samples_without_read_mask_ticket=sample_count - with_ticket,
         ),
         # Fill every state so the map is complete regardless of which appear in the DB.
         ticket_state_counts={s.value: state_counts.get(s.value, 0) for s in WorkTicketState},
