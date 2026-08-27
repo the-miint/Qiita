@@ -53,10 +53,24 @@ def normalized_sequence_expr(seq: str) -> str:
     and `save_bowtie2_index` — while a one-base edit to the same reference changes
     all of them. That covers the four index builders that read `chunk_data`.
 
-    Strand is NOT normalized: the canonical hash folds strands too, so a sequence
+    Strand is deliberately NOT normalized, and the asymmetry with case is the
+    point rather than an omission. The case argument above is that every consumer
+    of `chunk_data` is case-blind, measured. No such argument exists for strand:
+    stored bytes are COORDINATE-BEARING. `qiita.reference_annotation` records
+    `position` / `stop_position` as 1-based half-open offsets into the parent
+    feature's sequence, on the same axis as `alignment_slice` / `read_alignments`
+    / `qiita_lake.alignment`, alongside a `strand` column. Reverse-complementing
+    what is stored would relocate every interval on that sequence and invert every
+    strand value, so a GFF-bearing reference would keep loading, keep indexing,
+    and start answering wrong. Normalizing here is therefore not a trade against
+    export fidelity — it is unsound.
+
+    The consequence kept instead: the canonical hash folds strands, so a sequence
     and its reverse complement share one `feature_idx` while their stored bytes
-    differ, and which orientation survives still follows load order (see the strand
-    caveat on the control plane's `_write_genome_fasta`).
+    differ, and which orientation survives follows load order. `REPLACE_KEY_TABLES`
+    in `qiita-data-plane/src/flight_service.rs` carries why the newest load's
+    strand wins and why keeping the older one is not expressible; the export-side
+    consequence is on the control plane's `_write_genome_fasta`.
     """
     return f"upper({seq})"
 
