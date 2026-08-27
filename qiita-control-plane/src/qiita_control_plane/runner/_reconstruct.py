@@ -9,6 +9,7 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import (
+    ALIGNMENT_IDX_BINDING,
     PROCESSING_IDX_BINDING,
     WorkflowAction,
     WorkflowStep,
@@ -44,7 +45,7 @@ from ..shard_orchestration import (
     plan_and_submit_shards,
 )
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
-from ._mask import ALIGNMENT_IDX_BINDING, MASK_IDX_BINDING
+from ._mask import MASK_IDX_BINDING
 from ._read_ingest import (
     ROUTER_PENDING_BINDING,
     SHARD_MAPPING_BINDING,
@@ -323,6 +324,40 @@ async def _dispatch_action(
         pool, work_ticket_idx=work_ticket_idx, step_index=step_index, attempt=attempt
     )
     return outputs
+
+
+async def _ticket_alignment_idx(
+    pool: asyncpg.Pool, work_ticket_idx: int, *, entry: str, scope_target: dict[str, Any]
+) -> int:
+    """The alignment identity this ticket is scoped to, refusing a non-prep_sample
+    scope and refusing NULL.
+
+    The scope check lives here rather than at each arm because both arms scope on the
+    same thing and must refuse identically; the block-scoped path never reaches here.
+
+    Both per-sample alignment arms read the COLUMN rather than `action_context` (which
+    is whatever the submitter sent) and both must refuse the same way, because they
+    scope on the same thing: the delete clears an identity's rows, the register writes
+    under the identity a step's `params:` stamped, and the gate records that the two
+    agree. NULL means neither writer ran — the runner's de novo resolver
+    (`_alignment._persist_alignment_idx`) or `align_planner` — or a
+    `DELETE /alignment-definition/{idx}` detached it mid-flight (ON DELETE SET NULL).
+    """
+    if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+        raise RuntimeError(
+            f"{entry} requires a prep_sample-scoped ticket; got {scope_target['kind']!r}"
+        )
+    alignment_idx = await pool.fetchval(
+        "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    if alignment_idx is None:
+        raise RuntimeError(
+            f"{entry} requires work_ticket {work_ticket_idx} to carry an alignment_idx; "
+            "the column is NULL (nothing set it, or the alignment definition was "
+            "deleted mid-flight)"
+        )
+    return alignment_idx
 
 
 async def _run_action_primitive(
@@ -644,6 +679,30 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE:
+        # Terminal step of a prep_sample-scoped alignment workflow (align-denovo):
+        # flip this sample's alignment_sample gate to 'completed'. No file inputs:
+        # prep_sample_idx from the scope target, alignment_idx from the identity the
+        # runner minted before the loop.
+        #
+        # `alignment_idx` comes from the TICKET column, not from `bound`, for the
+        # reason delete-alignment-sample below reads it there: the delete and the
+        # register scope on the same identity, and the gate must record the one they
+        # used. The pre-loop resolver writes the column and binds the same value, so
+        # through `run_workflow` the two agree by construction.
+        alignment_idx = await _ticket_alignment_idx(
+            pool,
+            work_ticket_idx,
+            entry=LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE,
+            scope_target=scope_target,
+        )
+        await LIBRARY[LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE](
+            pool,
+            alignment_idx=alignment_idx,
+            prep_sample_idx=scope_target["prep_sample_idx"],
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.PERSIST_QC_REPORT:
         # Persist the two fastqc-equivalent QC reports onto this prep_sample's
         # 1:1 sequenced_sample. Each declared input is a Path to a qc_report.json
@@ -735,11 +794,6 @@ async def _run_action_primitive(
         # Idempotent sample replace (align): runs BEFORE register-files. What the
         # delete selects is on the data plane's `delete_alignment_sample`.
         #
-        # `alignment_idx` is read from the ticket column, not from `action_context`
-        # (`bound`), which is whatever the submitter sent. NULL means no planner set
-        # the column, or a `DELETE /alignment-definition/{idx}` detached it
-        # mid-flight (ON DELETE SET NULL).
-        #
         # The context value is cross-checked against the column rather than ignored,
         # because the delete and the WRITE scope on different things: a step's
         # `params:` binds `alignment_idx` from `action_context` (align's
@@ -748,26 +802,16 @@ async def _run_action_primitive(
         # register that follows writes under the other, so a re-run appends — the
         # double-count this primitive exists to prevent.
         #
-        # No ticket satisfies both the prep_sample scope check below and a non-NULL
-        # column today: `align_planner.plan_and_submit_alignments` is the column's
-        # only writer and it inserts block-scoped tickets. Wiring this primitive into
-        # a prep_sample workflow means writing the column from that workflow's runner
-        # path first, as `_persist_mask_idx` does for `mask_idx`.
-        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
-            raise RuntimeError(
-                f"delete-alignment-sample requires a prep_sample-scoped ticket; got "
-                f"{scope_target['kind']!r}"
-            )
-        alignment_idx = await pool.fetchval(
-            "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        # The prep_sample writer is the runner's de novo resolver
+        # (`_alignment._persist_alignment_idx`), which writes the column before the
+        # step loop; `align_planner.plan_and_submit_alignments` is the block-scoped
+        # one. So a NULL here means neither ran for this ticket.
+        alignment_idx = await _ticket_alignment_idx(
+            pool,
             work_ticket_idx,
+            entry=LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE,
+            scope_target=scope_target,
         )
-        if alignment_idx is None:
-            raise RuntimeError(
-                f"delete-alignment-sample requires work_ticket {work_ticket_idx} to carry "
-                f"an alignment_idx; the column is NULL (no planner set it, or the "
-                f"alignment definition was deleted mid-flight)"
-            )
         context_alignment_idx = bound.get(ALIGNMENT_IDX_BINDING)
         if context_alignment_idx is not None and context_alignment_idx != alignment_idx:
             raise RuntimeError(

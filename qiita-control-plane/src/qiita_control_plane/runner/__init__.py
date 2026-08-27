@@ -38,6 +38,7 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import (
+    ALIGNMENT_IDX_BINDING,
     ActionCeiling,
     ActionDefinition,
     FlatBaselineResources,
@@ -80,6 +81,19 @@ from ..actions.reference import (
 from ..auth.tickets import sign_action, sign_ticket
 from ..repositories.block import fetch_block_members
 from ..repositories.mask_definition import mint_mask_definition
+from ._alignment import (
+    ALIGN_MASK_IDX_BINDING,
+    ASSEMBLY_PROCESSING_IDX_BINDING,
+    MIN_IDENTITY_BINDING,
+    MIN_QUERY_COVERAGE_BINDING,
+    PRESET_BINDING,
+    _build_denovo_alignment_params,
+    _create_alignment_gate_pending,
+    _persist_alignment_idx,
+    _require_assembly_subject,
+    _resolve_denovo_alignment_idx,
+    _workflow_writes_alignment_gate,
+)
 from ._base import (
     _INFRA_RETRY_BACKOFF_CAP_SECONDS,
     _INFRA_UNREACHABLE_KINDS,
@@ -148,7 +162,6 @@ from ._feature_table import (
 from ._mask import (
     _QC_RESOLVED_FILTER_TAIL,
     _QC_RESOLVED_MIN_LENGTH,
-    ALIGNMENT_IDX_BINDING,
     MASK_IDX_BINDING,
     AdapterSetHashes,
     _adapter_set_hash_legacy,
@@ -372,6 +385,17 @@ __all__: list[str] = [
     "_write_adapter_parquet",
     "_write_sample_map_parquet",
     "ALIGNMENT_IDX_BINDING",
+    "ALIGN_MASK_IDX_BINDING",
+    "ASSEMBLY_PROCESSING_IDX_BINDING",
+    "MIN_IDENTITY_BINDING",
+    "MIN_QUERY_COVERAGE_BINDING",
+    "PRESET_BINDING",
+    "_build_denovo_alignment_params",
+    "_create_alignment_gate_pending",
+    "_resolve_denovo_alignment_idx",
+    "_persist_alignment_idx",
+    "_require_assembly_subject",
+    "_workflow_writes_alignment_gate",
     "ROUTER_INDEX_PATH_BINDING",
     "ROUTER_PENDING_BINDING",
     "SHARD_DIRECTORY_BINDING",

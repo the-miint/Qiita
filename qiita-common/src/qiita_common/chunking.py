@@ -61,6 +61,28 @@ def normalized_sequence_expr(seq: str) -> str:
     return f"upper({seq})"
 
 
+# What a front-end tells the submitter when their FASTA is soft-masked. One sentence
+# for both chunking front-ends (`reference load`, `stage_local_fasta`) so the two
+# cannot describe the same discarded masking differently. `%s` names the file(s).
+SOFT_MASK_WARNING = (
+    "soft-masked (lower case) bases in %s. Chunks are stored upper case, so the"
+    " masking is discarded at load and cannot be recovered from the lake — an export"
+    " of this reference will return upper case. Every index builder discards case as"
+    " well, so alignment and classification are unaffected."
+)
+
+
+def soft_masked_expr(seq: str) -> str:
+    """SQL predicate, true for a record carrying soft-masked (lower case) bases —
+    i.e. one whose stored form will differ from what was submitted. Built from
+    `normalized_sequence_expr`, the same expression `sequence_split_expr` routes
+    through, so the predicate cannot disagree with what the split discards.
+
+    Pairs with `SOFT_MASK_WARNING`, which is what to say when it matches.
+    """
+    return f"{seq} <> {normalized_sequence_expr(seq)}"
+
+
 def sequence_split_expr(seq: str) -> str:
     """SQL expression splitting the sequence column/expression `seq` into
     `CHUNK_SIZE`-byte chunks via miint's native `sequence_split`: a LIST of

@@ -18,6 +18,7 @@ from ..repositories.mask_definition import (
     mint_mask_definition,
 )
 from ..repositories.reference_membership import reference_sequence_set_hash
+from ._db import persist_ticket_idx
 from ._reference import QC_ADAPTER_BINDING, _resolve_qc_adapters
 from ._upload import _submission_bad_input
 
@@ -39,11 +40,6 @@ from ._upload import _submission_bad_input
 # signals the runner to mint the mask before the step loop and carries the value
 # into the step.
 MASK_IDX_BINDING = "mask_idx"
-
-# The align run's alignment_idx (mask-style identity), read off an align block
-# ticket's `work_ticket.alignment_idx` and threaded into the align_sharded step's
-# `params:` so every emitted row is keyed by it. None for non-align tickets.
-ALIGNMENT_IDX_BINDING = "alignment_idx"
 
 # Binding for the CP-resolved lima argument string. The `lima_export` step lists
 # it in its `params:` and writes it into `lima_config.json`, which the container
@@ -497,12 +493,9 @@ async def _persist_mask_idx(pool: asyncpg.Pool, work_ticket_idx: int, mask_idx: 
     """Write the minted `mask_idx` onto the ticket row (durable ticket→mask
     traceability + a cheap shared-mask guard). Idempotent: a re-mint on resume
     re-resolves to the same mask_idx via the config-hash upsert, so re-running
-    this writes the same value. Like every runner DB write it fails loud — a PG
-    outage raises and unwinds the run via run_workflow's catch-all."""
-    await pool.execute(
-        "UPDATE qiita.work_ticket SET mask_idx = $1 WHERE work_ticket_idx = $2",
-        mask_idx,
-        work_ticket_idx,
+    this writes the same value."""
+    await persist_ticket_idx(
+        pool, column="mask_idx", work_ticket_idx=work_ticket_idx, value=mask_idx
     )
 
 

@@ -77,6 +77,11 @@ _log = logging.getLogger(__name__)
 # feature batch sizes.
 _CHUNK_SIZE = 10_000
 
+# How many collapsed record groups the membership warning names before it says it
+# cut the list. Same name and value as runner/_reference.py and
+# runner/_feature_table.py, which cap their own reports.
+_MAX_REPORTED = 20
+
 # Deterministic basename `mint_features` writes its feature-map Parquet under.
 # Single-sourced because the runner's restart path (`_reconstruct_action_outputs`)
 # rebuilds this path WITHOUT re-running the primitive, so the two must not drift.
@@ -927,6 +932,86 @@ MEMBERSHIP_ACCESSION_JOIN_SQL = (
     " GROUP BY fm.feature_idx"
 )
 
+# The two numbers the collapse report compares, from ONE scan of one narrow
+# column. Manifest-only on purpose: it is the only form both callers can answer.
+# `write_membership`'s join count would do for a reference, but
+# `write_assembly_membership`'s is one row per (contig, bin) placement rather
+# than per feature, so a shared helper cannot take a caller's count and mean the
+# same thing by it.
+MANIFEST_COLLAPSE_COUNTS_SQL = (
+    "SELECT count(*) AS records, count(DISTINCT sequence_hash) AS features FROM read_parquet(?)"
+)
+
+# The manifest read_ids sharing one canonical hash, most-collapsed first — the
+# diagnostic behind the collapse warning, run only once the counts disagree. The
+# tiebreaker reads the list's own first element rather than adding a
+# `min(read_id)` aggregate: `list(... ORDER BY read_id)` has already put it
+# there, and every group ties at two members when the collapse is strand pairs.
+MANIFEST_COLLAPSED_RECORDS_SQL = (
+    "SELECT list(read_id ORDER BY read_id) AS read_ids"
+    " FROM read_parquet(?)"
+    " GROUP BY sequence_hash HAVING count(*) > 1"
+    " ORDER BY count(*) DESC, read_ids[1]"
+    " LIMIT ?"
+)
+
+
+def _warn_on_collapsed_records(scope: str, manifest_path: Path) -> int:
+    """Warn when a manifest holds more records than it does distinct canonical
+    hashes; return how many records were absorbed. `scope` names the thing being
+    loaded, and leads the message.
+
+    `canonical_sequence_hash_expr` folds case and strand, so two records that are
+    one sequence in two cases, or exact reverse complements, mint a single
+    feature_idx and only one of them is stored — `hash_sequences` and
+    `assembly_hash` both keep the lex-smallest read_id via `DISTINCT ON
+    (sequence_hash)`. The absorbed record leaves no other trace: the manifest is
+    a workflow artifact and the dropped bytes never reach the lake.
+
+    Reports that records share a hash, not why: the manifest carries
+    `(read_id, sequence_hash, sequence_length_bp)` and no sequence, and an exact
+    duplicate and a reverse-complement pair agree on both hash and length.
+    Reading the submitted sequences is what separates them. For an assembly that
+    also covers one contig placed in several bins, which repeats a hash under
+    several synthetic read_ids and loses nothing (measured 0 across the deploy's
+    assemblies, 2026-08-26). It warns rather than raising for the same reason:
+    every one of those shapes is a valid submission.
+
+    Blocking, and opens its own connection — the caller runs it off the event
+    loop, after releasing its pooled one. `count(DISTINCT sequence_hash)` is the
+    class of hash build `mint_annotation_features` measured at ~1 GB of RSS at
+    20M features, so the connection gets a spill directory rather than relying on
+    the aggregate staying small.
+    """
+    with duckdb_connect() as duck:
+        duck.execute(f"SET temp_directory='{validate_parquet_path(manifest_path.parent)}'")
+        records, features = duck.execute(
+            MANIFEST_COLLAPSE_COUNTS_SQL, [str(manifest_path)]
+        ).fetchone()
+        collapsed = records - features
+        if collapsed == 0:
+            return 0
+        # One past the cap, so a group beyond it is what marks the list truncated —
+        # the record count alone cannot say, since a group of three contributes two
+        # to `collapsed`.
+        groups = duck.execute(
+            MANIFEST_COLLAPSED_RECORDS_SQL,
+            [str(manifest_path), _MAX_REPORTED + 1],
+        ).fetchall()
+    elided = " (truncated)" if len(groups) > _MAX_REPORTED else ""
+    listed = "; ".join(", ".join(read_ids) for (read_ids,) in groups[:_MAX_REPORTED])
+    _log.warning(
+        "%s: %s submitted record(s) collapsed to %s feature(s) — %s record(s) are absent. "
+        "Records sharing a canonical hash: %s%s",
+        scope,
+        records,
+        features,
+        collapsed,
+        listed,
+        elided,
+    )
+    return collapsed
+
 
 async def write_membership(
     pool: asyncpg.Pool,
@@ -948,6 +1033,14 @@ async def write_membership(
     Returns (linked, already_linked). Idempotent. Raises ValueError if any
     feature_idx is missing from qiita.feature (FK violation surfaced as a
     structured error).
+
+    Reports a canonical-hash collapse (`_warn_on_collapsed_records`) from the
+    manifest it already holds: one row per distinct read_id — `hash_sequences`
+    groups by it, and `stage_local_fasta` rejects a repeated FASTA header, so one
+    row is one submitted record on that path. `hash_sequences` is where the drop
+    happens and would report it from its own SLURM allocation; reporting here
+    instead puts the warning in the control plane's journal beside the rest of
+    the load, and gives it a reference to name.
     """
     for label, path in [("manifest", manifest_path), ("feature_map", feature_map_path)]:
         if not path.exists():
@@ -972,6 +1065,10 @@ async def write_membership(
                     )
                 total_linked += chunk_linked
                 total_seen += len(feature_idxs)
+    # Outside the pool and the reader: a report-only aggregate has no claim on a
+    # pooled connection, and `mint_features` sets the precedent for keeping a
+    # blocking DuckDB step off the loop the CP also serves its API from.
+    await asyncio.to_thread(_warn_on_collapsed_records, f"reference {reference_idx}", manifest_path)
     return total_linked, total_seen - total_linked
 
 
@@ -1286,6 +1383,16 @@ async def write_assembly_membership(
     natural PK): a workflow retried from the start re-links nothing new. Raises
     ValueError (FK violation surfaced structured) if any feature_idx is missing
     from qiita.feature.
+
+    Reports a canonical-hash collapse through the same helper `write_membership`
+    uses: `assembly_hash` writes this manifest in the same
+    `(read_id, sequence_hash, sequence_length_bp)` shape and drops the losing
+    contig's bytes with the same `DISTINCT ON (sequence_hash)`. The helper reads
+    the manifest rather than this stream's row count because the stream is one
+    row per (contig, bin) placement, not per feature — so a contig in several
+    bins repeats a hash here under several synthetic read_ids and is counted as a
+    collapse, having lost nothing. Measured 0 across the deploy's assemblies,
+    2026-08-26.
     """
     for label, path in [
         ("bin_map", bin_map_path),
@@ -1320,6 +1427,11 @@ async def write_assembly_membership(
                     )
                 total_linked += linked
                 total_seen += len(feature_idxs)
+    await asyncio.to_thread(
+        _warn_on_collapsed_records,
+        f"assembly run (prep_sample {prep_sample_idx}, processing {processing_idx})",
+        manifest_path,
+    )
     return total_linked, total_seen - total_linked
 
 
@@ -2377,6 +2489,47 @@ async def finalize_assembly_sample_gate(
     return {"processing_idx": processing_idx, "prep_sample_idx": prep_sample_idx}
 
 
+async def finalize_alignment_sample_gate(
+    pool: asyncpg.Pool,
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+) -> dict[str, int]:
+    """Terminal step of a prep_sample-scoped alignment workflow (align-denovo):
+    record this sample's alignment as completed in the qiita.alignment_sample gate.
+
+    The per-sample twin of `reconcile_alignment_block`'s gate flip, and it needs none
+    of that primitive's block bookkeeping: one ticket aligns the whole sample, so
+    there is no covering set to wait on and no count to reconcile. The row is already
+    'pending' — the runner materialized it when it minted this run's alignment_idx —
+    and a workflow retried from the start re-affirms 'completed'. Runs AFTER
+    register-files so the gate never reads 'completed' before the rows are in DuckLake.
+
+    Unlike the mask gate's per-sample twin there is no cross-path refusal to make: the
+    two mints hash disjoint key sets (see `_build_denovo_alignment_params` in
+    `runner/_alignment.py`), so no block can hold this identity's gate row and there is
+    nothing for this write to stomp.
+
+    Takes the row's FOR UPDATE lock across the check-and-flip, which is what
+    `finalize_alignment_sample` requires of its caller. A missing row is a bug in the
+    submit path, not a state to create here: the gate is keyed on an identity that
+    only the pre-loop resolver mints."""
+    async with pool.acquire() as conn, conn.transaction():
+        state = await lock_alignment_sample(
+            conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+        )
+        if state is None:
+            raise RuntimeError(
+                f"alignment_sample gate row missing for (alignment={alignment_idx}, "
+                f"prep_sample={prep_sample_idx}); it must be materialized PENDING when "
+                "the runner mints the alignment identity, before any step runs"
+            )
+        await finalize_alignment_sample(
+            conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+        )
+    return {"alignment_idx": alignment_idx, "prep_sample_idx": prep_sample_idx}
+
+
 async def delete_alignment_block(
     pool: asyncpg.Pool,
     *,
@@ -2547,6 +2700,7 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
     LibraryPrimitive.FINALIZE_MASK_SAMPLE: finalize_mask_sample_gate,
     LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE: finalize_assembly_sample_gate,
+    LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE: finalize_alignment_sample_gate,
     LibraryPrimitive.DELETE_ALIGNMENT_BLOCK: delete_alignment_block,
     LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE: delete_alignment_sample,
     LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,

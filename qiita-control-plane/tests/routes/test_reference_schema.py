@@ -310,7 +310,7 @@ async def test_reference_membership_accession_defaults_null(postgres_pool):
         await postgres_pool.release(conn)
 
 
-async def test_write_membership_stores_representative_accession(postgres_pool, tmp_path):
+async def test_write_membership_stores_representative_accession(postgres_pool, tmp_path, caplog):
     """write_membership joins the manifest (read_id -> sequence_hash) to the
     feature_map (sequence_hash -> feature_idx) and stores the representative
     accession — the lex-smallest FASTA-header read_id — on each membership row.
@@ -353,8 +353,22 @@ async def test_write_membership_stores_representative_accession(postgres_pool, t
         )
         _write(feature_map, "sequence_hash UUID, feature_idx BIGINT", [(h1, feat1), (h2, feat2)])
 
-        linked, already = await lib.write_membership(postgres_pool, ref_idx, manifest, feature_map)
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            linked, already = await lib.write_membership(
+                postgres_pool, ref_idx, manifest, feature_map
+            )
         assert (linked, already) == (2, 0)
+
+        # The two ACC_B records collapse to one feature, so the real call path —
+        # not just the helper in isolation — reports it, which is what pins
+        # write_membership passing the join's feature count rather than the
+        # number of rows it linked.
+        collapse = [r.getMessage() for r in caplog.records if "collapsed" in r.getMessage()]
+        assert len(collapse) == 1
+        assert "3 submitted record(s) collapsed to 2 feature(s)" in collapse[0]
+        assert "ACC_B1, ACC_B2" in collapse[0]
 
         rows = await postgres_pool.fetch(
             "SELECT feature_idx, accession FROM qiita.reference_membership"

@@ -76,6 +76,21 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   to take a basename from, so the rule went vacuous exactly on the route a regular user takes;
   the column gives it something to read. Descriptive, like `sha256` — nothing opens it.
 
+- **A reference or assembly load reports the records the canonical hash absorbed (#501).**
+  `write-membership` and `write-assembly-membership` compare their manifest's record count
+  against its distinct canonical hashes and, when they differ, log a warning naming the
+  shortfall and the `read_id`s that shared a hash. `canonical_sequence_hash_expr` folds case
+  and strand, so two records that are one sequence in two cases, or exact reverse complements,
+  mint one `feature_idx` and only the lex-smallest `read_id`'s bytes are stored — the other
+  record was previously absent with nothing recording it, because the manifest is a workflow
+  artifact and the dropped bytes never reach the lake. Measured on the `fastp-adapters`
+  reference: 234 submitted records, 177 features, 57 records absent. The warning reports
+  *that* records collapsed and not why — the manifest carries no sequence, and an exact
+  duplicate and a strand pair agree on both hash and length — so separating them means reading
+  the submitted sequences. For an assembly it also counts one contig placed in several bins,
+  which loses nothing (measured 0 across the deploy's assemblies). It warns rather than
+  refusing because every one of those shapes is a valid submission.
+
 - **The global sample field registries can be read back (#485).** `GET
   /api/v1/biosample-global-field` and `GET /api/v1/prep-sample-global-field` list every
   row of their registry, so a client can resolve a global field's idx through the
@@ -102,6 +117,60 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `list-global-fields` prints the registry so the idx `create-field
   --<entity>-global-field-idx` wants is obtainable, and `list-fields` prints a study's
   own definitions.
+
+- **`qiita reference load` warns when the input carries soft-masked bases (#486).** On
+  both front-ends — the `--fasta` upload and `--local`'s `stage_local_fasta`. The
+  split normalizes case, so a soft-masked FASTA is stored upper case and the masking is
+  not recoverable from the lake afterwards. Both front-ends share one predicate and one
+  message (`soft_masked_expr` / `SOFT_MASK_WARNING` in `qiita_common.chunking`), and the
+  predicate is built from the same `normalized_sequence_expr` the split routes through,
+  so neither can disagree with what is stored. Every index builder discards case, so
+  only an export of the reference shows the difference.
+
+- **`align-denovo`: align a sample's masked reads back against its own assembly (#486).**
+  A prep_sample-scoped workflow that aligns one sample against the contigs its own
+  `long-read-assembly` run produced, into the same DuckLake `alignment` table under a de
+  novo `alignment_idx`. The `align_denovo` native job streams both inputs at runtime —
+  contigs over an assembly-run-scoped DoGet, reads over a `(prep_sample, mask)`-scoped
+  `read_masked` DoGet — so nothing is staged onto shared scratch. It gates on the
+  circular-pooled axis rather than per-record CIGAR, which is what admits a read crossing
+  a circular contig's origin; that fixes `eqx := true` and `max_secondary := 0`, and the
+  job docstring carries why and what the second one costs. First producer for
+  `alignment_origin_spanning`, recording only groups whose coordinates show a single
+  origin crossing. Submit-side, a runner pre-loop resolver mints the identity, refuses
+  unless the assembly run's `assembly_sample` gate reads `completed` (NO_DATA when it
+  reads `no_data`), re-attaches to `work_ticket.alignment_idx` on a resume rather than
+  re-deriving, and writes both ticket columns plus the pending `alignment_sample` row.
+  New `finalize-alignment-sample` primitive flips that gate. The step's `cpu:` equals
+  the job's DuckDB thread count and `test_align_denovo_cpu_pins_duckdb_threads` keeps
+  them equal: `align_minimap2` draws its parallelism from that pool (measured
+  near-linear at 1/2/4/8 threads), so a higher `cpu:` allocates cores nothing uses. The
+  same measurement closes the identical gap in `long-read-assembly`'s
+  `assembly_coverage` step, whose `cpu:` drops 16 → 8 to match the pool it actually
+  uses. Closed by lowering the request rather than raising the pool, because `sacct`
+  over 49 completed steps puts that job at 87% of its 64 GB at the median, with ten
+  further attempts dying OUT_OF_MEMORY at exactly 64.0 GB — the thread count is also a
+  memory multiplier for the unspillable extension side, so raising it is the wrong
+  direction. Its `mem_gb` is unchanged; see the job's sizing note.
+  `test_workflow_params_pin.py`'s aside justifying the gap is corrected: the memory half
+  of that rationale stands, but on the CPU axis the aligner's threads ARE the DuckDB
+  pool.
+
+- **`docs/duckdb-miint.md` records that `max_secondary := 0` is not "primary alignments
+  only" (#486).** Upstream's reference says it is, in three places; a supplementary
+  (`0x800`) record from a split alignment survives it, which is not primary under SAM's
+  `FLAG & 0x900 == 0`. Measured on mirror `9fc4d12`: a read across a subject's start/end
+  junction returns the same two rows at `max_secondary := 0` and at `100`. Filed upstream
+  as [duckdb-miint#255](https://github.com/the-miint/duckdb-miint/issues/255) (docs-only —
+  we carry no workaround, so it is not an Open-upstream-gaps row). The behaviour is what
+  `align_denovo` needs: the setting removes the secondaries `circular_query_coverage`
+  refuses and leaves the supplementary fragments it exists to pool.
+
+- **`circular_predicate_sql` / `circular_cleared_join` in `qiita_common.analytic.gate`
+  (#486).** The circular gate's predicate and its group-join key, factored out of
+  `_circular_gated_sql` so a job that produces alignments applies the same two rather
+  than a second copy. Both still take a `GateClearance`, so a producer reaches them only
+  after `check_gate_diagnostics`.
 
 - **A per-sample masked-read Flight stream for native jobs (#477).**
   `data_plane_client` gains `fetch_read_masked_doget_ticket` +
@@ -1295,6 +1364,22 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   with the length bound exercised on both sides. The model is deliberately stricter than
   the DB CHECK, which tests only non-empty and slash-free.
 
+- **A circular alignment gate no longer refuses every slice holding a secondary record
+  (#486).** `check_gate_diagnostics` counted secondary, unmapped and coordinate-less rows
+  as one `unpoolable_rows` bucket and refused the slice on any of them, because
+  `circular_query_coverage` excludes all three. The three do not share a remedy: a
+  secondary carries its own CIGAR and coordinates, so the CIGAR axis scores it per
+  record, while an unmapped or coordinate-less row can be scored on neither axis. The
+  counts are now split and only the second class refuses. `qiita feature-table
+  --circular-gate` (#475) was unusable on real `align_sharded` output as a result —
+  that job collects placements with `max_secondary := 100` and prunes by identity, not
+  by flag, so its stored rows carry secondaries.
+
+  The circular gated relation gains a second arm for them, and the pooled arm now
+  excludes secondaries explicitly: `cleared` is keyed on `(read, is_read1, reference)`,
+  which a secondary placed elsewhere on the SAME reference shares with its primary, so
+  it previously would have ridden in on that clearance without being scored at all.
+
 - **Two stored sample-field schema comments no longer contradict the schema (#485).** The
   `biosample_study_field` / `prep_sample_study_field` table comments listed
   `tier_override` among the properties a linked row inherits from its global field; a
@@ -1315,6 +1400,36 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   into a SUBMISSION `BAD_INPUT` with no partial `adapters.parquet` left behind.
   `DEPLOY_CHECKLIST.md` bucket 6 carries the one-off delete that repairs the row and names
   the surviving orientation.
+
+- **A de novo `alignment_idx` no longer depends on how a submitter spelled its integers
+  (#486).** `assembly_processing_idx` and `align_mask_idx` were hashed into the identity
+  as received, while the knobs beside them were coerced. JSON Schema `type: integer`
+  matches any number with a zero fractional part, so `42.0` validates; canonical JSON
+  then renders it differently from `42`, giving one config two `alignment_idx` — a re-run
+  that neither replaces its own rows nor is recognized as the same alignment. The mint's
+  jsonb round-trip guard cannot see it, because `42.0` stores and re-reads unchanged.
+  Both are coerced now, and an absent one is refused rather than hashed as null.
+
+- **`align-denovo` checks the `mask_sample` gate at submit rather than at runtime
+  (#486).** The pre-loop verified the mask CONFIG existed but not that it had RUN on this
+  sample. `routes/read_masked.py` refuses to sign the `read_masked` DoGet ticket on
+  anything but `'completed'`, so a ticket naming a `'pending'` mask was admitted, minted
+  its identity, wrote both ticket columns, materialized an `alignment_sample` row at
+  `'pending'` that no reconcile sweeps, and only then failed — from a job already holding
+  its allocation. The same gate `_read_ingest` applies to its own read stream now runs
+  before any of that.
+
+- **A missing `assembly_sample` gate row gets its own refusal (#486).** It previously
+  fell into the catch-all reporting `gate reads None`, which reads as a stalled run.
+  Absence is reachable for a sample that really did assemble — runs that finished before
+  the gate existed wrote no row, and `align-denovo` is its first consumer — so the
+  message now names re-submitting `long-read-assembly` as the remedy.
+
+- **`docs/deploy-archive/2026-08-21-4fc4ce3d.md` carries a dated correction (#486).** Its
+  claim that the 24 uncollapsed `reference_sequence_chunks` features are
+  reverse-complement pairs needing their producing reference load re-run holds for one of
+  them; the other 23 differ only in soft-masking case. The archived text below the note is
+  unchanged.
 
 - **Four broken relative links in `docs/deploy-archive/`, and a test that keeps them fixed.**
   All four targets existed; the paths were repo-root-relative (`](docs/runbooks/redeploy.md)`)
@@ -2579,6 +2694,40 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   path, and `/upload/{idx}/done` and `GET /upload/{idx}` still gate on
   `created_by_idx == principal`. What an upload may feed is gated separately —
   reference-add needs `reference:write`, which a USER does not have.
+
+- **`align-denovo` collects secondary alignments (#486).** `max_secondary` moves from 0
+  to `qiita_common.analytic.MAX_SECONDARY` (100), the cap `align_sharded` already uses,
+  so a read placing against several near-identical contigs is recorded against each
+  rather than only the best. The pooled circular gate judges a read's fragments as
+  before; secondaries are judged per record against the same two thresholds. The cap is
+  hashed into `alignment_idx` alongside the aligner, so changing it mints a new
+  alignment rather than replacing rows collected under the old policy.
+
+  Measured on the deploy-staged miint build under `map-hifi`: the cap is applied
+  literally and the realised count is min(cap, equally-good subjects − 1), so it
+  saturates on how many near-identical contigs an assembly holds rather than on 100. A
+  subject scoring materially below the best is not reported whatever the cap; the knob
+  that decides that is not exposed
+  ([duckdb-miint#189](https://github.com/the-miint/duckdb-miint/issues/189)).
+
+- **The chunk reassembly contract has one definition in tests too (#486).** Six inlined
+  `string_agg(chunk_data, '' ORDER BY chunk_index)` copies — in `test_reference_load.py`,
+  `test_assembly_hash.py`, `test_assembly_load.py` and
+  `tests/integration/test_reference_stream.py` — now call `reassemble_chunks_expr`. The
+  literal in `test_chunking.py` stays, since that assertion is what pins the expression.
+
+- **`ALIGNMENT_IDX_BINDING` and a new `ALIGN_DENOVO_ACTION_ID` in `qiita_common.actions`
+  (#486).** The binding moved there from `runner/_mask.py` so the action contract can
+  assert on it: an action declaring `finalize-alignment-sample` must thread it through
+  some step's `params:`, or the gate would record a sample aligned under an identity none
+  of its rows carry. The action id joins `LONG_READ_ASSEMBLY_ACTION_ID` in the mask-purge
+  guard's coverage set — both actions consume a mask rather than minting one, so a ticket
+  of either carries NULL `mask_idx` until it runs.
+
+- **`qiita.alignment_sample`'s table comment names both writers (#486).** Comment-only
+  migration: the gate now has a per-sample writer alongside the block one, and the old
+  comment described the block path as the only one.
+
 - **`CLAUDE.md` trimmed from 11,020 to 5,776 tokens, and `docs/architecture.md` split into
   `docs/architecture/` (#482).** Every token in `CLAUDE.md` is re-sent in front of every API call
   an agent makes, and compaction never evicts it — measured over 46 sessions, the always-loaded

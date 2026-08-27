@@ -506,10 +506,17 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- read's fragments are filtered out before they are persisted; the pooled
         -- QUALIFY in its phase 2 runs on the paired-end arm alone.
         --
-        -- Nothing writes the table yet. `register_files` loads it from a staging
-        -- `alignment_origin_spanning.parquet` — the control plane derives the
-        -- table name from the file stem — and no job under
-        -- `qiita_compute_orchestrator.jobs` emits that file.
+        -- The producer is `qiita_compute_orchestrator.jobs.align_denovo`, which
+        -- aligns a sample's masked reads against its OWN assembled contigs (where a
+        -- circular contig is a real, assembler-called thing rather than a claim about
+        -- a reference). `register_files` loads its staging
+        -- `alignment_origin_spanning.parquet` — the control plane derives the table
+        -- name from the file stem. That job records a group only where the
+        -- coordinates show a single origin crossing: one fragment reaching the contig
+        -- end and one starting at its beginning, and no fragment spanning it end to
+        -- end. A read the gate cleared but that split across two loci, or that lapped
+        -- the contig, keeps its `alignment` rows and gets no row here — for those the
+        -- pair below is not a covering interval.
         --
         -- CONTRACT for such a producer's rows: one row per (read, feature), and a
         -- consumer applying a query-coverage predicate to `alignment` MUST LEFT
@@ -521,6 +528,14 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- subjects, scored separately; the same reason
         -- `qiita_common.feature_table.PAIRED_PLACEMENT_PARTITION` carries it.
         -- Dropping it pools a fragment onto another feature's score.
+        --
+        -- That key does NOT separate a secondary from the read's primary placement
+        -- on the same feature, and the producer now collects secondaries. A
+        -- consumer joining on it would judge such a secondary on the primary's
+        -- `pooled_coverage`, which was never computed over it — the macro excludes
+        -- secondary records. Exclude them (`alignment_is_secondary(flags)`) before
+        -- the join: they are alternative placements of the whole read, scored on
+        -- their own CIGAR, and no row here describes one.
         --
         -- Superseded by delete-then-register, like `alignment` itself, not by
         -- `flight_service::REPLACE_KEY_TABLES`: a replace-by-key delete reads the

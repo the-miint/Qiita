@@ -124,8 +124,18 @@ steps:
     module: qiita_compute_orchestrator.jobs.assembly_coverage
     inputs: [genomes_dir, masked_reads_fastq]
     outputs: [coverage_bam]
+    # cpu EQUALS the job's `_DUCKDB_THREADS`, pinned by
+    # `test_assembly_coverage_cpu_pins_duckdb_threads`: `align_minimap2` draws its
+    # parallelism from DuckDB's thread pool, so the pool size IS the core count and a
+    # higher cpu here reserved cores nothing could use. Lowered from 16 rather than
+    # raising the pool, because on this step the thread count is also a memory
+    # multiplier for the unspillable extension side, and that side is what binds — see
+    # the constant's comment for the 59-step `sacct` measurement.
+    #
+    # The wall-clock cost of 8 rather than 16 is slack this step has: measured p50 10.4
+    # min and max 15.4 min against the PT4H limit below, i.e. 6% of it.
     baseline_resources:
-      cpu: 16
+      cpu: 8
       mem_gb: 64
       walltime: PT4H
 
