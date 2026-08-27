@@ -790,13 +790,59 @@ def test_the_circular_diagnostics_count_reads_not_records():
     assert row["scorable_rows"] is None
 
 
-def test_a_circular_gate_over_a_slice_holding_secondaries_is_refused():
-    """`circular_query_coverage` never sees a secondary record, so the gate would drop
-    every one that no sibling record's group happened to carry — and a secondary is how a
-    read says it also placed elsewhere, which is what woltka splits a count across."""
-    secondary = _INTERIOR_READ + [(1, 3, 10, 256, 20_000, 26_000, "6000=", None)]
-    with pytest.raises(ValueError, match="pooled"):
-        _gated_reads(secondary, gate=ft.AlignmentGate(circular=True))
+def test_a_circular_gate_scores_a_secondary_on_its_own_cigar():
+    """`circular_query_coverage` never sees a secondary record, so the circular gate
+    judges it on the CIGAR axis instead of refusing the slice. A secondary is how a read
+    says it also placed elsewhere, which is what woltka splits a count across.
+
+    Both directions, on one fixture: the full-length secondary clears the same
+    thresholds on its own span and is kept; the clipped one explains a third of its read
+    and is dropped. Neither outcome is reachable through the pooled arm — the macro
+    emits no group for either.
+
+    Sequences 3 and 4 are secondary-ONLY groups, which is what makes this test cover the
+    diagnostics' `poolable > 0` filter as well: without it their pooled identity is NULL,
+    they count as unscorable groups, and the slice is refused before any of the above."""
+    full_length = (1, 3, 10, 256, 20_000, 26_000, "6000=", None)
+    clipped = (1, 4, 10, 256, 40_000, 42_000, "2000=4000S", None)
+    assert _gated_reads(
+        _INTERIOR_READ + [full_length, clipped], gate=ft.AlignmentGate(circular=True)
+    ) == [(2, 10_000), (3, 20_000)]
+
+
+def test_a_clearing_secondary_on_its_primarys_contig_is_kept_exactly_once():
+    """The case both arms could claim: a secondary sharing `(read, is_read1, reference)`
+    with a cleared primary, which also clears on its own CIGAR. Arm 1 would take it for
+    its primary's clearance and arm 2 for its own score, so the arms have to partition
+    the slice rather than merely both be correct. List equality, so a duplicate fails —
+    a read counted twice reaches coverage and woltka as two placements."""
+    same_key_and_clears = (1, 2, 10, 256, 20_000, 26_000, "6000=", None)
+    assert _gated_reads(
+        _INTERIOR_READ + [same_key_and_clears], gate=ft.AlignmentGate(circular=True)
+    ) == [(2, 10_000), (2, 20_000)]
+
+
+def test_a_secondary_that_is_also_unmapped_is_refused_not_scored():
+    """`SCORABLE_SECONDARY_ROW` promises a row the CIGAR axis can judge, and an unmapped
+    record is not one whatever its secondary bit says — there is no aligned span. The
+    fatal class wins, so the slice is refused rather than the row silently dropped."""
+    secondary_and_unmapped = (1, 3, 10, 0x104, None, None, "6000=", None)
+    with pytest.raises(ValueError, match="neither axis"):
+        _gated_reads(
+            _INTERIOR_READ + [secondary_and_unmapped], gate=ft.AlignmentGate(circular=True)
+        )
+
+
+def test_a_secondary_does_not_ride_in_on_its_primarys_clearance():
+    """The pooled arm keys on `(read, is_read1, reference)`, which a secondary placed
+    elsewhere on the SAME contig shares with its primary — a tandem repeat, a collapsed
+    element. Without an explicit exclusion it would be kept because its primary cleared,
+    never having been scored at all. Here the primary clears and the secondary's own
+    CIGAR explains a third of the read, so only the primary survives."""
+    same_read_same_contig = (1, 2, 10, 256, 30_000, 32_000, "2000=4000S", None)
+    assert _gated_reads(
+        _INTERIOR_READ + [same_read_same_contig], gate=ft.AlignmentGate(circular=True)
+    ) == [(2, 10_000)]
 
 
 def test_a_circular_gate_over_paired_data_is_refused():

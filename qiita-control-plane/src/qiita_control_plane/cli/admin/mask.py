@@ -9,7 +9,7 @@ import sys
 import time
 
 import asyncpg
-from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
+from qiita_common.actions import ALIGN_DENOVO_ACTION_ID, LONG_READ_ASSEMBLY_ACTION_ID
 from qiita_common.api_paths import (
     PATH_MASK_DEFINITION_PREFIX,
     PATH_WORK_TICKET_PREFIX,
@@ -43,11 +43,15 @@ _PURGE_FAILED_ACTION_IDS = ("read-mask", "fastq-to-parquet")
 # action, so a blind spot in ANY mask-carrying action makes it unsound, not only
 # among the tickets a given run happens to be purging.
 #
-# long-read-assembly consumes a mask's pass-set rather than minting one; the runner
-# persists that mask_idx from its staged masked-read binding. Not exhaustive over
-# every action that touches a mask — adding one is a decision about which
-# pre-existing NULLs may block --execute.
-_MASK_IDX_COVERAGE_ACTION_IDS = _PURGE_FAILED_ACTION_IDS + (LONG_READ_ASSEMBLY_ACTION_ID,)
+# long-read-assembly and align-denovo both consume a mask's pass-set rather than
+# minting one; the runner persists that mask_idx from action_context before its first
+# step, so a PENDING or QUEUED ticket of either carries NULL and is invisible to the
+# guard until it runs. Not exhaustive over every action that touches a mask — adding
+# one is a decision about which pre-existing NULLs may block --execute.
+_MASK_IDX_COVERAGE_ACTION_IDS = _PURGE_FAILED_ACTION_IDS + (
+    LONG_READ_ASSEMBLY_ACTION_ID,
+    ALIGN_DENOVO_ACTION_ID,
+)
 
 # The failure_reason substring the move-then-read bug leaves behind: host_filter
 # and register-files both succeeded (the mask IS registered in DuckLake), only

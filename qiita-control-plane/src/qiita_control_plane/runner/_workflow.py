@@ -9,11 +9,13 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import (
+    ALIGNMENT_IDX_BINDING,
     PROCESSING_IDX_BINDING,
     ActionCeiling,
     ActionDefinition,
     WorkflowAction,
     WorkflowStep,
+    context_schema_default,
 )
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
@@ -29,6 +31,16 @@ from qiita_common.models import (
 from .. import step_progress
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
 from ..repositories.mask_definition import fetch_mask_definition_by_idx
+from ._alignment import (
+    ALIGN_MASK_IDX_BINDING,
+    ASSEMBLY_PROCESSING_IDX_BINDING,
+    _create_alignment_gate_pending,
+    _persist_alignment_idx,
+    _require_assembly_subject,
+    _require_masked_query,
+    _resolve_denovo_alignment_idx,
+    _workflow_writes_alignment_gate,
+)
 from ._base import (
     _STEP_POLL_INTERVAL_SECONDS,
     WorkflowAborted,
@@ -528,11 +540,7 @@ async def run_workflow(
             # Single-source the assembler default from the action's context_schema
             # (the one result-affecting knob today) — the same default the hash and
             # the container use, so neither can drift from a re-declared literal.
-            assembler_default = (
-                action.context_schema.get("properties", {})
-                .get(ASSEMBLER_BINDING, {})
-                .get("default")
-            )
+            assembler_default = context_schema_default(action.context_schema, ASSEMBLER_BINDING)
             processing_bindings = await _mint_processing_idx(
                 pool,
                 action_id=action.action_id,
@@ -572,6 +580,79 @@ async def run_workflow(
                 pool,
                 processing_idx=minted_processing_idx,
                 prep_sample_idx=scope_target["prep_sample_idx"],
+            )
+
+        # De novo alignment identity + completion gate: a workflow declaring the
+        # terminal `finalize-alignment-sample` action aligns ONE sample against its own
+        # assembly, so there is no planner to have fixed the identity — mint it here,
+        # from the run's canonical params, and materialize its gate row 'pending'.
+        # Same inside-try placement as the resolvers above so a failure lands in the
+        # FAILED handler.
+        if _workflow_writes_alignment_gate(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+                raise _submission_bad_input(
+                    "a workflow that gates alignment completion (declares "
+                    f"{LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE}) must be "
+                    f"prep_sample-scoped; got {scope_target['kind']!r}"
+                )
+            prep_sample_idx = scope_target["prep_sample_idx"]
+            if bound.get(ALIGN_MASK_IDX_BINDING) is None:
+                raise _submission_bad_input(
+                    f"a de novo alignment workflow requires {ALIGN_MASK_IDX_BINDING!r} "
+                    "in action_context: it selects which of the sample's reads are "
+                    "aligned"
+                )
+            if bound.get(ASSEMBLY_PROCESSING_IDX_BINDING) is None:
+                raise _submission_bad_input(
+                    "a de novo alignment workflow requires "
+                    f"{ASSEMBLY_PROCESSING_IDX_BINDING!r} in action_context: it selects "
+                    "which assembly run's contigs are the subject"
+                )
+            denovo_mask_idx = int(bound[ALIGN_MASK_IDX_BINDING])
+            if await fetch_mask_definition_by_idx(pool, denovo_mask_idx) is None:
+                raise _submission_bad_input(
+                    f"action_context names {ALIGN_MASK_IDX_BINDING} {denovo_mask_idx}, "
+                    "which does not exist"
+                )
+            # The mask CONFIG existing is not the mask having RUN on this sample. Both
+            # refusals come before the writes below, and before the mask column, since
+            # neither has a terminal-but-not-a-failure exit to preserve a column for.
+            await _require_masked_query(
+                pool, mask_idx=denovo_mask_idx, prep_sample_idx=prep_sample_idx
+            )
+            # Persist the CONSUMED mask onto the ticket BEFORE the assembly-gate check,
+            # for the reason the staged-masked-reads branch above persists before its
+            # resolver: the check has a terminal exit that is not a failure (a run that
+            # assembled nothing lands the ticket in NO_DATA), and persisting afterwards
+            # would leave that ticket's mask column NULL forever.
+            await _persist_mask_idx(pool, work_ticket_idx, denovo_mask_idx)
+            # Terminal-but-not-a-failure and bad-input both live in this one call, and
+            # it runs BEFORE the mint so no alignment_sample row is left at 'pending'
+            # for a run that will never move it.
+            await _require_assembly_subject(
+                pool,
+                processing_idx=int(bound[ASSEMBLY_PROCESSING_IDX_BINDING]),
+                prep_sample_idx=prep_sample_idx,
+            )
+            bound.update(
+                await _resolve_denovo_alignment_idx(
+                    pool,
+                    action_id=action.action_id,
+                    action_version=action.version,
+                    context_schema=action.context_schema,
+                    bound=bound,
+                    originator_principal_idx=work_ticket["originator_principal_idx"],
+                    work_ticket_idx=work_ticket_idx,
+                )
+            )
+            # The ticket column, not just the binding: `delete-alignment-sample` and
+            # `finalize-alignment-sample` both read it and refuse on NULL, and a resume
+            # re-attaches to it rather than re-deriving the identity.
+            await _persist_alignment_idx(pool, work_ticket_idx, bound[ALIGNMENT_IDX_BINDING])
+            await _create_alignment_gate_pending(
+                pool,
+                alignment_idx=bound[ALIGNMENT_IDX_BINDING],
+                prep_sample_idx=prep_sample_idx,
             )
 
         # Default-OFF anchor for the whole-reference rype_router build gate. The

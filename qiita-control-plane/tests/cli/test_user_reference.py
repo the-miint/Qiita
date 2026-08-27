@@ -1437,6 +1437,31 @@ def test_fasta_upload_stream_chunks_via_read_fastx(tmp_path):
     assert reassembled == {"r1": "ACGTACGT", "r2": "TTTT"}
 
 
+def test_fasta_upload_stream_warns_on_soft_masked_input(tmp_path, caplog):
+    """A soft-masked record draws a warning and streams upper case; an
+    all-uppercase file draws none. The split normalizes case, so the masking is
+    gone from the lake and only the warning tells the loader that."""
+    from qiita_control_plane.cli.reference_load import _fasta_upload_stream
+
+    logger = "qiita_control_plane.cli.reference_load"
+    masked = tmp_path / "masked.fasta"
+    masked.write_text(">r1\nACGTacgtTTGA\n")
+    with caplog.at_level(logging.WARNING, logger=logger):
+        with _fasta_upload_stream(masked) as stream:
+            rows = [row for batch in stream.batches for row in batch.to_pylist()]
+    assert "soft-masked" in caplog.text
+    stored = "".join(r["chunk_data"] for r in sorted(rows, key=lambda r: r["chunk_index"]))
+    assert stored == "ACGTACGTTTGA"
+
+    caplog.clear()
+    plain = tmp_path / "plain.fasta"
+    plain.write_text(">r1\nACGTACGTTTGA\n")
+    with caplog.at_level(logging.WARNING, logger=logger):
+        with _fasta_upload_stream(plain) as stream:
+            list(stream.batches)
+    assert "soft-masked" not in caplog.text
+
+
 def test_fasta_upload_stream_rejects_empty_file(tmp_path):
     """An empty FASTA is rejected with a clear message instead of a raw
     read_fastx 'Empty file' error (matching stage_local_fasta's guard)."""

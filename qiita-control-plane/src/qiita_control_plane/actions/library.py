@@ -2377,6 +2377,47 @@ async def finalize_assembly_sample_gate(
     return {"processing_idx": processing_idx, "prep_sample_idx": prep_sample_idx}
 
 
+async def finalize_alignment_sample_gate(
+    pool: asyncpg.Pool,
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+) -> dict[str, int]:
+    """Terminal step of a prep_sample-scoped alignment workflow (align-denovo):
+    record this sample's alignment as completed in the qiita.alignment_sample gate.
+
+    The per-sample twin of `reconcile_alignment_block`'s gate flip, and it needs none
+    of that primitive's block bookkeeping: one ticket aligns the whole sample, so
+    there is no covering set to wait on and no count to reconcile. The row is already
+    'pending' — the runner materialized it when it minted this run's alignment_idx —
+    and a workflow retried from the start re-affirms 'completed'. Runs AFTER
+    register-files so the gate never reads 'completed' before the rows are in DuckLake.
+
+    Unlike the mask gate's per-sample twin there is no cross-path refusal to make: the
+    two mints hash disjoint key sets (see `_build_denovo_alignment_params` in
+    `runner/_alignment.py`), so no block can hold this identity's gate row and there is
+    nothing for this write to stomp.
+
+    Takes the row's FOR UPDATE lock across the check-and-flip, which is what
+    `finalize_alignment_sample` requires of its caller. A missing row is a bug in the
+    submit path, not a state to create here: the gate is keyed on an identity that
+    only the pre-loop resolver mints."""
+    async with pool.acquire() as conn, conn.transaction():
+        state = await lock_alignment_sample(
+            conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+        )
+        if state is None:
+            raise RuntimeError(
+                f"alignment_sample gate row missing for (alignment={alignment_idx}, "
+                f"prep_sample={prep_sample_idx}); it must be materialized PENDING when "
+                "the runner mints the alignment identity, before any step runs"
+            )
+        await finalize_alignment_sample(
+            conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+        )
+    return {"alignment_idx": alignment_idx, "prep_sample_idx": prep_sample_idx}
+
+
 async def delete_alignment_block(
     pool: asyncpg.Pool,
     *,
@@ -2547,6 +2588,7 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
     LibraryPrimitive.FINALIZE_MASK_SAMPLE: finalize_mask_sample_gate,
     LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE: finalize_assembly_sample_gate,
+    LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE: finalize_alignment_sample_gate,
     LibraryPrimitive.DELETE_ALIGNMENT_BLOCK: delete_alignment_block,
     LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE: delete_alignment_sample,
     LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,

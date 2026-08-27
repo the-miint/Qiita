@@ -7,7 +7,9 @@ What the subcommand does, in order, against a running CP + DP:
      optional):
        a. Open an Arrow RecordBatch stream over the source file (see
           "Arrow streaming" below). No intermediate Parquet is written
-          to local disk; batches go straight to DoPut.
+          to local disk; batches go straight to DoPut. A FASTA carrying
+          soft-masked (lower case) bases warns here: the split stores
+          upper case, so the masking does not survive the load.
        b. POST /upload to mint an upload slot — returns upload_idx +
           signed DoPut Flight ticket.
        c. pyarrow.flight do_put — streams the Arrow batches to the data
@@ -88,7 +90,13 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_PREFIX,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
-from qiita_common.chunking import CHUNK_ROW_GROUP_SIZE, CHUNK_SIZE, sequence_split_expr
+from qiita_common.chunking import (
+    CHUNK_ROW_GROUP_SIZE,
+    CHUNK_SIZE,
+    SOFT_MASK_WARNING,
+    sequence_split_expr,
+    soft_masked_expr,
+)
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
 if TYPE_CHECKING:
@@ -210,6 +218,16 @@ def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
 
     conn = connect_with_miint()
     try:
+        # A second read of the FASTA, bounded by LIMIT 1 — `stage_local_fasta` warns
+        # on the same predicate for the --local path, where it rides an existing scan
+        # instead. What the masking costs is on `SOFT_MASK_WARNING`.
+        if conn.execute(
+            "SELECT 1 FROM read_fastx(?, max_batch_bytes:='"
+            f"{_READ_FASTX_MAX_BATCH_BYTES}') "
+            f"WHERE {soft_masked_expr('sequence1')} LIMIT 1",
+            [str(fasta_path)],
+        ).fetchone():
+            _log.warning(SOFT_MASK_WARNING, fasta_path)
         # miint's native `sequence_split` is the shared chunker (one definition
         # for both the CLI and the orchestrator's stage_local_fasta; see
         # qiita_common.chunking).

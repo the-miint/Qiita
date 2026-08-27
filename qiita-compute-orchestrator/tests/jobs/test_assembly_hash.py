@@ -27,7 +27,7 @@ from uuid import UUID
 import duckdb
 import pytest
 from qiita_common.backend_failure import StepNoData
-from qiita_common.chunking import normalized_sequence_expr
+from qiita_common.chunking import normalized_sequence_expr, reassemble_chunks_expr
 
 from qiita_compute_orchestrator.jobs import assembly_hash
 from qiita_compute_orchestrator.jobs.assembly_hash import Inputs, execute
@@ -105,7 +105,7 @@ def _reassembled(chunks_dir) -> dict[str, str]:
         return dict(
             con.execute(
                 "SELECT CAST(sequence_hash AS VARCHAR), "
-                "string_agg(chunk_data, '' ORDER BY chunk_index) "
+                f"{reassemble_chunks_expr()} "
                 "FROM read_parquet(?) GROUP BY sequence_hash",
                 [str(chunks_dir / "part_*.parquet")],
             ).fetchall()
@@ -310,7 +310,7 @@ def test_soft_masked_contigs_hash_as_their_upper_case_twin(tmp_path):
     with duckdb.connect(":memory:") as con:
         assert con.execute(
             "SELECT CAST(sequence_hash AS VARCHAR), "
-            "string_agg(chunk_data, '' ORDER BY chunk_index) "
+            f"{reassemble_chunks_expr()} "
             f"FROM read_parquet('{glob}') GROUP BY sequence_hash"
         ).fetchall() == [(str(_hash(seq)), seq)]
 

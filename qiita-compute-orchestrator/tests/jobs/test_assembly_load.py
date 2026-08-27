@@ -18,6 +18,7 @@ from uuid import UUID
 
 import duckdb
 import pytest
+from qiita_common.chunking import reassemble_chunks_expr
 
 # Three contigs across two bins, one circular genome, and one unbinned-residue
 # contig, keyed by assembly_hash's synthetic `kind:bin_id:sequence_index`. bin.1 has
@@ -203,7 +204,7 @@ def test_reused_writers_emit_feature_keyed_sequences_and_chunks(tmp_path, stagin
     with duckdb.connect(":memory:") as con:
         reassembled = dict(
             con.execute(
-                "SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index) "
+                f"SELECT feature_idx, {reassemble_chunks_expr()} "
                 "FROM read_parquet(?) GROUP BY feature_idx",
                 [glob],
             ).fetchall()

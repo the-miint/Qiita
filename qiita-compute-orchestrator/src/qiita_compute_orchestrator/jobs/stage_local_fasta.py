@@ -53,10 +53,15 @@ enforces the same at the wire.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from pydantic import BaseModel
-from qiita_common.chunking import sequence_split_expr
+from qiita_common.chunking import (
+    SOFT_MASK_WARNING,
+    sequence_split_expr,
+    soft_masked_expr,
+)
 from qiita_common.duckdb_miint import is_empty_sequence_file
 from qiita_common.parquet import validate_parquet_path
 
@@ -86,6 +91,8 @@ _DUCKDB_THREADS = 8
 # `memory_limit`/`temp_directory` spill (apply_duckdb_settings) and the write
 # buffer (`ROW_GROUP_SIZE` in PARQUET_OPTS_CHUNKED).
 _READ_FASTX_MAX_BATCH_BYTES = "128MB"
+
+_LOG = logging.getLogger(__name__)
 
 # Cap on how many offending read_ids we name in a fail-fast error so a
 # pathologically bad manifest doesn't build a multi-megabyte message.
@@ -186,7 +193,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # records; `include_filepath` lets the dup report name the file.
             conn.execute(
                 "CREATE TEMP TABLE read_sanity AS "
-                "SELECT read_id, length(sequence1) AS length, filepath "
+                "SELECT read_id, length(sequence1) AS length, filepath, "
+                f"{soft_masked_expr('sequence1')} AS soft_masked "
                 f"FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
                 "include_filepath:=true)",
                 [paths],
@@ -220,6 +228,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     f"read_ids -> {names}\n"
                     f"files -> {files}"
                 )
+
+            # The flag rides pass 1's existing scan, so this costs no extra read —
+            # unlike `reference load`, which pays a second bounded one. What the
+            # masking costs is on `SOFT_MASK_WARNING`.
+            masked = conn.execute(
+                "SELECT DISTINCT filepath FROM read_sanity WHERE soft_masked "
+                "ORDER BY filepath LIMIT ?",
+                [_MAX_REPORT],
+            ).fetchall()
+            if masked:
+                _LOG.warning(SOFT_MASK_WARNING, ", ".join(row[0] for row in masked))
 
             # Pass 2 — chunk + write in one streaming COPY using miint's native
             # `sequence_split` (shared chunker; see qiita_common.chunking). Each
