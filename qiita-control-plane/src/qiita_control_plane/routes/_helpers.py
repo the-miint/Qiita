@@ -10,6 +10,7 @@ from typing import NoReturn
 
 import asyncpg
 from fastapi import HTTPException
+from qiita_common.auth_constants import SystemRole
 from qiita_common.models import (
     GLOBAL_FIELD_IDX_ATTR,
     STUDY_FIELD_IDX_ATTR,
@@ -31,7 +32,7 @@ from ..auth.guards import (
     PrepSampleReadAccess,
     filter_prep_samples_caller_can_read,
 )
-from ..auth.principal import Principal
+from ..auth.principal import HumanUser, Principal
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
@@ -910,6 +911,24 @@ async def resolve_idxs_by_natural_key(
     resolved = await fetcher(dedup_ordered)
     missing = [v for v in dedup_ordered if v not in resolved]
     return resolved, missing
+
+
+def gate_roster_narrowing_idx(caller: HumanUser) -> int | None:
+    """The principal_idx a gate-roster read narrows its sample set to, or None for
+    a caller who sees every sample.
+
+    wet_lab_admin and above bypass the per-study check on the submission side
+    (`_check_prep_sample_study_access`), and bypass it here on the same threshold,
+    so a caller who can submit against a sample can also discover the mask that
+    filtered it and the run that assembled it.
+
+    Shared by every roster over a per-(identity, prep_sample) gate — the mask
+    reads and the processing reads — because two thresholds over the same sample
+    set would be two answers to "may I see this sample".
+    """
+    if caller.has_role_at_least(SystemRole.WET_LAB_ADMIN):
+        return None
+    return caller.principal_idx
 
 
 def cap_rows[T](rows: list[T], cap: int) -> tuple[list[T], bool]:

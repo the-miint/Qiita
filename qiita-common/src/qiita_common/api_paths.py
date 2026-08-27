@@ -541,6 +541,39 @@ URL_ASSEMBLY_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_DOGET}"
 
 
 # =============================================================================
+# /processing/* — assembly run identity and its lifecycle
+# =============================================================================
+# A processing_idx is minted by the runner, not by a route: it is the
+# canonical-params hash over {workflow, version, mask_idx, assembler}, and there
+# is nothing to key on at HTTP submit. So this surface has no POST — only the
+# reads and the two lifecycle PATCHes.
+#
+# The three GETs are the human read surface, at Scope.PREP_SAMPLE_READ and
+# narrowed per study for a plain user, matching /mask-definition; the two PATCHes
+# sit at Scope.PROCESSING_LIFECYCLE. Contig bytes stay on the assembly DoGet
+# ticket (POST /assembly/ticket/doget, service-account-only). routes/processing.py
+# carries what each gating rests on.
+
+PATH_PROCESSING_PREFIX = "/processing"
+PATH_PROCESSING_ROOT = ""  # GET (list) against the prefix itself
+PATH_PROCESSING_BY_IDX = "/{processing_idx}"
+PATH_PROCESSING_PREP_SAMPLE = "/{processing_idx}/prep-sample"  # GET the per-sample roster
+# PATCH the run CONFIG's lifecycle (active <-> deprecated). Mirrors
+# PATH_MASK_DEFINITION_STATUS; a deprecated run cannot be minted against.
+PATH_PROCESSING_STATUS = "/{processing_idx}/status"
+# PATCH specific RUNS of the config (completed <-> invalidated), naming the
+# prep_samples in the body. Bulk because the judgement is made per cohort, not
+# per sample. Distinct from the route above, which is the CONFIG's lifecycle.
+PATH_PROCESSING_SAMPLE_STATUS = "/{processing_idx}/sample-status"
+
+URL_PROCESSING_PREFIX = f"{API_PREFIX}{PATH_PROCESSING_PREFIX}"
+URL_PROCESSING_BY_IDX = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_BY_IDX}"
+URL_PROCESSING_PREP_SAMPLE = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_PREP_SAMPLE}"
+URL_PROCESSING_STATUS = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_STATUS}"
+URL_PROCESSING_SAMPLE_STATUS = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_SAMPLE_STATUS}"
+
+
+# =============================================================================
 # /auth/* — OIDC handoff, PAT mint/list/revoke, CLI device flow
 # =============================================================================
 

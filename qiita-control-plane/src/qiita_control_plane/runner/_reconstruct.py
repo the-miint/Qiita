@@ -27,6 +27,7 @@ from qiita_common.models import (
     StepProgressState,
     StepStatus,
     StepStatusWire,
+    WorkTicketFailureStage,
 )
 
 from .. import step_progress
@@ -36,6 +37,7 @@ from ..actions.library import (
     MINT_FEATURES_OUTPUT_BASENAME,
 )
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+from ..repositories.assembly import AssemblySampleInvalidated
 from ..repositories.reference_membership import count_reference_shards
 from ..shard_orchestration import (
     BUILD_SHARD_INDEX_ACTION_ID,
@@ -672,11 +674,26 @@ async def _run_action_primitive(
         # write-assembly-membership above reads it: the pre-loop mint has already
         # overwritten any submitter-supplied `processing_idx` by the time any entry
         # runs, and the gate keys on the value that stamped the rows it gates.
-        await LIBRARY[LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE](
-            pool,
-            processing_idx=bound[PROCESSING_IDX_BINDING],
-            prep_sample_idx=scope_target["prep_sample_idx"],
-        )
+        try:
+            await LIBRARY[LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE](
+                pool,
+                processing_idx=bound[PROCESSING_IDX_BINDING],
+                prep_sample_idx=scope_target["prep_sample_idx"],
+            )
+        except AssemblySampleInvalidated as exc:
+            # A person withdrew this (run, sample) while the run was in flight, and
+            # the gate write refuses rather than re-completing it. Typed here
+            # because the alternative is `run_workflow`'s catch-all, which records
+            # UNKNOWN_PERMANENT — a classification that tells the operator to look
+            # for a bug when what happened is a decision someone made. Permanent:
+            # a redrive re-resolves the same identity and refuses identically until
+            # the pair is restored.
+            raise BackendFailure(
+                kind=FailureKind.BAD_INPUT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=entry.name,
+                reason=str(exc),
+            ) from exc
         return {}
 
     if entry.name == LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE:

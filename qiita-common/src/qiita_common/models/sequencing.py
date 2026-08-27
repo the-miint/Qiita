@@ -29,6 +29,7 @@ from qiita_common.models._base import (
     PatchRequestModel,
     PrepSampleCohort,
     ReadCounts,
+    check_withdrawal_reason,
 )
 from qiita_common.models.biosample import (
     MetadataChecklistRef,
@@ -1068,14 +1069,15 @@ class MaskDefinitionStatusUpdate(BaseModel):
 
     @model_validator(mode="after")
     def _reason_required_to_deprecate(self) -> MaskDefinitionStatusUpdate:
-        if self.status is MaskDefinitionStatus.DEPRECATED:
-            if self.reason is None or not self.reason.strip():
-                raise ValueError("reason is required when status is 'deprecated'")
-        else:
-            if self.reason is not None:
-                raise ValueError("reason is only accepted when status is 'deprecated'")
-            if self.superseded_by is not None:
-                raise ValueError("superseded_by is only accepted when status is 'deprecated'")
+        deprecating = self.status is MaskDefinitionStatus.DEPRECATED
+        check_withdrawal_reason(
+            withdrawing=deprecating,
+            reason=self.reason,
+            field="status",
+            value=MaskDefinitionStatus.DEPRECATED.value,
+        )
+        if not deprecating and self.superseded_by is not None:
+            raise ValueError("superseded_by is only accepted when status is 'deprecated'")
         return self
 
 
@@ -1100,11 +1102,12 @@ class MaskSampleStatusUpdate(BaseModel):
 
     @model_validator(mode="after")
     def _reason_required_to_invalidate(self) -> MaskSampleStatusUpdate:
-        if self.state == "invalidated":
-            if self.reason is None or not self.reason.strip():
-                raise ValueError("reason is required when state is 'invalidated'")
-        elif self.reason is not None:
-            raise ValueError("reason is only accepted when state is 'invalidated'")
+        check_withdrawal_reason(
+            withdrawing=self.state == "invalidated",
+            reason=self.reason,
+            field="state",
+            value="invalidated",
+        )
         if len(set(self.prep_sample_idx)) != len(self.prep_sample_idx):
             raise ValueError("prep_sample_idx must not repeat")
         return self

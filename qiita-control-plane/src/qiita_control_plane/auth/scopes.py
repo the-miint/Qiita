@@ -92,6 +92,11 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # a filter we no longer stand behind. Non-destructive, but not a
             # judgement a service account or wet_lab_admin makes.
             Scope.MASK_DEFINITION_LIFECYCLE,
+            # Deprecating an assembly run / withdrawing its per-sample results is
+            # system_admin-only for the same reason as the mask twin above: it
+            # decides that published contigs were produced by a run we no longer
+            # stand behind.
+            Scope.PROCESSING_LIFECYCLE,
             # Full alignment purge is system_admin-only, same as
             # MASK_DEFINITION_DELETE: deleting an alignment drops its
             # alignment_definition row (cascading the alignment_sample gate) and
