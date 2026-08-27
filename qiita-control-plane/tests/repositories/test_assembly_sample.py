@@ -2,8 +2,10 @@
 
 Exercises qiita.assembly_sample via the repositories.assembly helpers
 (create_assembly_sample_pending / upsert_assembly_sample_completed /
-upsert_assembly_sample_no_data / fetch_assembly_sample_state), plus the schema
-guarantees the writers rest on: the CHECK's value set and the updated_at trigger.
+upsert_assembly_sample_no_data / fetch_assembly_sample_state), plus what those
+writers do to a row an operator withdrew, plus the schema guarantees they rest
+on: the CHECK's value set, the invalidation biconditional, and the updated_at
+trigger.
 
 Each test seeds its own principal + sequenced prep_sample + a qiita.processing
 row, and teardown runs in FK-reverse order so the suite can share the
@@ -17,6 +19,7 @@ import pytest
 import pytest_asyncio
 
 from qiita_control_plane.repositories.assembly import (
+    AssemblySampleInvalidated,
     create_assembly_sample_pending,
     fetch_assembly_sample_state,
     upsert_assembly_sample_completed,
@@ -58,6 +61,7 @@ async def gate(postgres_pool):
         "pool": postgres_pool,
         "processing_idx": processing_idx,
         "prep_sample_idx": prep_sample_idx,
+        "principal_idx": principal_idx,
     }
 
     await postgres_pool.execute(
@@ -152,15 +156,16 @@ async def test_completed_upsert_closes_the_gate_and_is_idempotent(gate):
 
 async def test_no_data_upsert_closes_the_gate(gate):
     """The StepNoData path: assembly_hash found no contig, so the terminal action
-    never runs and this is what closes the row. Reports True — the write landed."""
+    never runs and this is what closes the row. Reports None — nothing stood in
+    the way, so the write landed."""
     await _write_pending(gate)
     async with gate["pool"].acquire() as conn, conn.transaction():
-        written = await upsert_assembly_sample_no_data(
+        standing = await upsert_assembly_sample_no_data(
             conn,
             processing_idx=gate["processing_idx"],
             prep_sample_idx=gate["prep_sample_idx"],
         )
-    assert written is True
+    assert standing is None
     assert await _state(gate) == "no_data"
 
 
@@ -185,8 +190,9 @@ async def test_terminal_writers_stand_alone_without_a_pending_row(gate, writer, 
 
 async def test_no_data_does_not_overwrite_completed(gate):
     """'no_data' never walks a 'completed' row back — the guard on the DO UPDATE
-    in `upsert_assembly_sample_no_data`, which carries the reasoning. Reports
-    False, so the caller can log the suppression instead of discarding it."""
+    in `upsert_assembly_sample_no_data`, which carries the reasoning. Names the
+    state that stood, so the caller can log which of the two guarded states it was
+    instead of discarding the distinction."""
     async with gate["pool"].acquire() as conn, conn.transaction():
         await upsert_assembly_sample_completed(
             conn,
@@ -194,12 +200,12 @@ async def test_no_data_does_not_overwrite_completed(gate):
             prep_sample_idx=gate["prep_sample_idx"],
         )
     async with gate["pool"].acquire() as conn, conn.transaction():
-        written = await upsert_assembly_sample_no_data(
+        standing = await upsert_assembly_sample_no_data(
             conn,
             processing_idx=gate["processing_idx"],
             prep_sample_idx=gate["prep_sample_idx"],
         )
-    assert written is False
+    assert standing == "completed"
     assert await _state(gate) == "completed"
 
 
@@ -221,6 +227,90 @@ async def test_completed_overwrites_no_data(gate):
 
 
 # ---------------------------------------------------------------------------
+# the withdrawn row: what a re-run may and may not do to it
+# ---------------------------------------------------------------------------
+
+
+async def _invalidate(gate) -> None:
+    """Withdraw the pair straight in SQL. The route path is covered in
+    tests/routes/test_assembly_lifecycle.py; here the point is what the WRITERS do
+    to a row already in that state, so the row is put there directly."""
+    await gate["pool"].execute(
+        "UPDATE qiita.assembly_sample"
+        "   SET state = 'invalidated', invalidated_at = now(),"
+        "       invalidated_by_idx = $3, invalidation_reason = 'withdrawn'"
+        " WHERE processing_idx = $1 AND prep_sample_idx = $2",
+        gate["processing_idx"],
+        gate["prep_sample_idx"],
+        gate["principal_idx"],
+    )
+
+
+async def test_create_pending_leaves_an_invalidated_row_alone(gate):
+    """A redrive does not quietly reopen a withdrawal. The re-run proceeds; its
+    terminal write is what refuses."""
+    await _write_pending(gate)
+    await _invalidate(gate)
+    await _write_pending(gate)
+    assert await _state(gate) == "invalidated"
+
+
+async def test_completed_refuses_to_overturn_an_invalidation(gate):
+    """The one state 'completed' is NOT reachable from. Raises rather than
+    returning quietly, because the caller is the terminal action of a run that
+    thinks it succeeded."""
+    await _write_pending(gate)
+    await _invalidate(gate)
+    with pytest.raises(AssemblySampleInvalidated) as ei:
+        async with gate["pool"].acquire() as conn, conn.transaction():
+            await upsert_assembly_sample_completed(
+                conn,
+                processing_idx=gate["processing_idx"],
+                prep_sample_idx=gate["prep_sample_idx"],
+            )
+    assert str(gate["processing_idx"]) in str(ei.value)
+    assert await _state(gate) == "invalidated"
+
+
+async def test_no_data_does_not_overwrite_an_invalidation(gate):
+    """Same guard, the other terminal writer — and unlike its completing twin this
+    one does not raise: the run has already ended, and 'invalidated' is still the
+    answer a consumer asking for contigs needs."""
+    await _write_pending(gate)
+    await _invalidate(gate)
+    async with gate["pool"].acquire() as conn, conn.transaction():
+        standing = await upsert_assembly_sample_no_data(
+            conn,
+            processing_idx=gate["processing_idx"],
+            prep_sample_idx=gate["prep_sample_idx"],
+        )
+    assert standing == "invalidated"
+    assert await _state(gate) == "invalidated"
+
+
+async def test_invalidation_provenance_is_biconditional(gate):
+    """The three columns are set exactly when the state is 'invalidated' — so a
+    withdrawal can never be recorded without a reason, and restoring can never
+    leave one behind."""
+    await _write_pending(gate)
+    with pytest.raises(asyncpg.CheckViolationError):
+        await gate["pool"].execute(
+            "UPDATE qiita.assembly_sample SET state = 'invalidated'"
+            " WHERE processing_idx = $1 AND prep_sample_idx = $2",
+            gate["processing_idx"],
+            gate["prep_sample_idx"],
+        )
+    await _invalidate(gate)
+    with pytest.raises(asyncpg.CheckViolationError):
+        await gate["pool"].execute(
+            "UPDATE qiita.assembly_sample SET state = 'completed'"
+            " WHERE processing_idx = $1 AND prep_sample_idx = $2",
+            gate["processing_idx"],
+            gate["prep_sample_idx"],
+        )
+
+
+# ---------------------------------------------------------------------------
 # schema: the CHECK's value set and the updated_at trigger
 # ---------------------------------------------------------------------------
 
@@ -229,7 +319,7 @@ async def test_state_check_rejects_an_unknown_value(gate):
     await _write_pending(gate)
     with pytest.raises(asyncpg.CheckViolationError):
         await gate["pool"].execute(
-            "UPDATE qiita.assembly_sample SET state = 'invalidated'"
+            "UPDATE qiita.assembly_sample SET state = 'withdrawn'"
             " WHERE processing_idx = $1 AND prep_sample_idx = $2",
             gate["processing_idx"],
             gate["prep_sample_idx"],

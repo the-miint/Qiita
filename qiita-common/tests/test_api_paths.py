@@ -393,6 +393,27 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_MASK_DEFINITION_PREFIX",
         "PATH_MASK_DEFINITION_SAMPLE_STATUS",
     ),
+    # /processing (assembly run identity + its lifecycle)
+    (
+        "URL_PROCESSING_BY_IDX",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_BY_IDX",
+    ),
+    (
+        "URL_PROCESSING_PREP_SAMPLE",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_PREP_SAMPLE",
+    ),
+    (
+        "URL_PROCESSING_STATUS",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_STATUS",
+    ),
+    (
+        "URL_PROCESSING_SAMPLE_STATUS",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_SAMPLE_STATUS",
+    ),
     # /alignment-definition
     (
         "URL_ALIGNMENT_DEFINITION_BY_IDX",

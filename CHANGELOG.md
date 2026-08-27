@@ -21,6 +21,31 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **An assembly run can be deprecated, and one of its samples withdrawn (#505).**
+  `qiita.processing` — the canonical-params hash over `{workflow, version, mask_idx,
+  assembler}` that `qiita.assembly_membership` and the DuckLake assembly tables are stamped
+  with — gains `status` / `deprecated_at` / `deprecated_by_idx` / `deprecation_reason` /
+  `superseded_by`, and `qiita.assembly_sample.state` gains `invalidated` with its own
+  `invalidated_*` provenance. The assembly twin of the mask lifecycle, at the same two
+  granularities: deprecating the CONFIG makes `qiita.mint_processing` raise SQLSTATE 23514
+  rather than return the row, so the params that identify a run built from a pass-set later
+  judged unsound cannot assemble another sample; invalidating a RUN withdraws one
+  `(processing_idx, prep_sample)` pair. Neither deletes — assembly has no delete path, so a
+  deprecated run stays listed, readable and DoGet-signable and the record of what produced
+  published contigs survives the judgement about it. New `/processing` router: `GET` (list
+  with a per-run four-state tally), `GET /{processing_idx}`, `GET /{processing_idx}/prep-sample`
+  (all `prep_sample:read`, narrowed per study below `wet_lab_admin`), and `PATCH
+  /{processing_idx}/status` / `PATCH /{processing_idx}/sample-status` behind a new
+  `processing:lifecycle` scope at the `system_admin` ceiling. The de novo align resolver
+  refuses an invalidated subject with a message naming the withdrawal instead of its
+  "not complete yet" catch-all, and the two gate writers leave a withdrawn row standing —
+  `finalize-assembly-sample` raises `AssemblySampleInvalidated` rather than re-completing it,
+  which the runner's dispatch arm records as a BAD_INPUT step failure rather than letting it
+  reach the UNKNOWN_PERMANENT catch-all. Three helpers the two lifecycles now share instead of
+  duplicating: the per-study roster narrowing (`repositories._sample_scope`), the gate-state
+  member assertion (`repositories.gate_state_literal`), and the PATCH bodies' reason gating
+  (`models._base.check_withdrawal_reason`).
+
 - **A reference or assembly load reports the records the canonical hash absorbed (#501).**
   `write-membership` and `write-assembly-membership` compare their manifest's record count
   against its distinct canonical hashes and, when they differ, log a warning naming the

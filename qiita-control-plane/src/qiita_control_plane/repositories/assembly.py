@@ -16,6 +16,7 @@ Its contract lives on `fetch_assembly_sample_state` below.
 """
 
 import asyncpg
+from qiita_common.api_paths import URL_PROCESSING_SAMPLE_STATUS
 
 from . import require_transaction
 
@@ -87,6 +88,11 @@ async def create_assembly_sample_pending(
     identity has not finished, so leaving it would have the gate answer for a run
     that is still going — and answer 'no_data' about a run that may go on to FAIL.
 
+    'invalidated' is left standing for a third reason: a withdrawal is a judgement
+    someone made about a stored contig set, and a redrive does not quietly
+    overturn it. The re-run proceeds, and its terminal write is what refuses —
+    see `upsert_assembly_sample_completed`.
+
     The reopen composes with 'pending' never being closed on a failure path: a run
     that ends 'no_data', followed by one that reopens the row and then FAILs,
     leaves 'pending' standing with the earlier terminal answer overwritten and no
@@ -109,6 +115,30 @@ async def create_assembly_sample_pending(
     )
 
 
+class AssemblySampleInvalidated(Exception):
+    """Raised when an assembly run tries to complete a `(processing_idx,
+    prep_sample)` pair whose previous run was withdrawn.
+
+    Withdrawal is a judgement someone made about a stored contig set, so a
+    redrive does not quietly overturn it: the fresh contigs land in DuckLake, the
+    gate stays 'invalidated', and consumers keep refusing until someone restores
+    the pair via PATCH /processing/{processing_idx}/sample-status. The
+    alternative is a re-run under the same params — the params are what the
+    identity hashes, so it IS the same run — re-completing what it was withdrawn
+    for, with nothing said. Twin of
+    `repositories.block.MaskSampleInvalidated`."""
+
+    def __init__(self, *, processing_idx: int, prep_sample_idx: int) -> None:
+        self.processing_idx = processing_idx
+        self.prep_sample_idx = prep_sample_idx
+        super().__init__(
+            f"assembly run {processing_idx} for prep_sample {prep_sample_idx} was "
+            "invalidated; an assembly run cannot complete it. Restore it via "
+            f"PATCH {URL_PROCESSING_SAMPLE_STATUS.format(processing_idx=processing_idx)} "
+            "once the output is trusted."
+        )
+
+
 async def upsert_assembly_sample_completed(
     conn: asyncpg.Connection,
     *,
@@ -120,17 +150,32 @@ async def upsert_assembly_sample_completed(
     The `finalize-assembly-sample` terminal action's writer. An upsert rather
     than an UPDATE so it stands alone on a ticket whose pending row was never
     written, and re-affirms 'completed' on a workflow retried from the start.
-    Unguarded, where `upsert_assembly_sample_no_data` is guarded: 'completed' is
-    reachable from every other state, a prior run's 'no_data' included.
+
+    Guarded only against 'invalidated', where `upsert_assembly_sample_no_data` is
+    also guarded against 'completed': 'completed' is reachable from every state a
+    RUN produces, a prior run's 'no_data' included. It is not reachable from the
+    one state a PERSON produces — raises `AssemblySampleInvalidated` there, since
+    the DO UPDATE leaves such a row alone rather than silently re-completing it.
+
+    Raises on the empty return directly, where the mask twin
+    (`repositories.block.upsert_mask_sample_completed`) re-reads the row first:
+    this guard names one state, so an unmoved row has one explanation, while the
+    twin's writers guard on two and have to tell withdrawal from idempotence.
     """
     require_transaction(conn)
-    await conn.execute(
+    written = await conn.fetchval(
         "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
         " VALUES ($1, $2, 'completed')"
-        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = 'completed'",
+        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = 'completed'"
+        "   WHERE qiita.assembly_sample.state <> 'invalidated'"
+        " RETURNING prep_sample_idx",
         processing_idx,
         prep_sample_idx,
     )
+    if written is None:
+        raise AssemblySampleInvalidated(
+            processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
+        )
 
 
 async def upsert_assembly_sample_no_data(
@@ -138,36 +183,49 @@ async def upsert_assembly_sample_no_data(
     *,
     processing_idx: int,
     prep_sample_idx: int,
-) -> bool:
+) -> str | None:
     """Write the `(processing_idx, prep_sample_idx)` gate row to 'no_data'; return
-    False when the guard left a standing 'completed' row alone.
+    None when it was written, else the state the guard left standing.
 
     The other terminal writer: assembly_hash raised StepNoData, so the workflow
     stops before `finalize-assembly-sample` and the runner closes the gate here.
 
-    The DO UPDATE is guarded on the row not already being 'completed', which is
-    the asymmetry with `upsert_assembly_sample_completed` above. An earlier run
-    under the same processing_idx that reached 'completed' left contigs in
-    DuckLake; a later run of that identity finding none does not remove them, so
-    writing 'no_data' over it would make the gate deny rows that are there. The
-    gate then reads 'completed' while the ticket that just ended reads NO_DATA
-    over the same (run, sample). The return value is what lets a caller say so —
-    `runner._processing._record_assembly_gate_no_data` logs it. Unlike the mask
-    twin (`repositories.block.upsert_mask_sample_completed`) this does not raise:
-    'completed' still describes contigs that are in DuckLake, so it remains the
-    answer a consumer asking for contigs needs.
+    The DO UPDATE is guarded on the row holding neither of the two states this
+    write must not overturn, which is the asymmetry with
+    `upsert_assembly_sample_completed` above:
+
+      * 'completed' — an earlier run under the same processing_idx left contigs
+        in DuckLake; a later run of that identity finding none does not remove
+        them, so writing 'no_data' over it would make the gate deny rows that are
+        there. The gate then reads 'completed' while the ticket that just ended
+        reads NO_DATA over the same (run, sample).
+      * 'invalidated' — someone withdrew this pair, and a re-run does not
+        overturn that judgement (`AssemblySampleInvalidated` states why for the
+        completing twin).
+
+    Unlike the mask twin (`repositories.block.upsert_mask_sample_completed`) this
+    does not raise on either: both standing states are still the answer a
+    consumer asking for contigs needs, and this write is on a path that has
+    already ended. The return value is what lets the caller say which one held —
+    `runner._processing._record_assembly_gate_no_data` logs it.
     """
     require_transaction(conn)
     written = await conn.fetchval(
         "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
         " VALUES ($1, $2, 'no_data')"
         " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = 'no_data'"
-        "   WHERE qiita.assembly_sample.state <> 'completed'"
+        "   WHERE qiita.assembly_sample.state NOT IN ('completed', 'invalidated')"
         " RETURNING prep_sample_idx",
         processing_idx,
         prep_sample_idx,
     )
-    return written is not None
+    if written is not None:
+        return None
+    # Re-read rather than infer: the guard names two states and the caller's log
+    # line has to say which one actually stands.
+    return await fetch_assembly_sample_state(
+        conn, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
+    )
 
 
 async def fetch_assembly_sample_state(
@@ -180,19 +238,24 @@ async def fetch_assembly_sample_state(
     when no row exists.
 
     The assembly_sample gate contract (canonical statement; other consumers point
-    here rather than restate it). The gate has three states, all written
-    first-class by the assembly workflow: 'pending' when the runner mints the run
-    identity, then 'completed' at the terminal `finalize-assembly-sample` action,
-    or 'no_data' when assembly_hash found no contig of any kind and the ticket
-    ended NO_DATA.
+    here rather than restate it). Three states are written first-class by the
+    assembly workflow: 'pending' when the runner mints the run identity, then
+    'completed' at the terminal `finalize-assembly-sample` action, or 'no_data'
+    when assembly_hash found no contig of any kind and the ticket ended NO_DATA.
+    A fourth, 'invalidated', is written by an operator withdrawing a completed
+    run whose contigs are not trustworthy — a judgement about one RUN, distinct
+    from deprecating the CONFIG (`ProcessingStatus`).
 
     The invariant: completion is read from this state, never from the presence of
     qiita.assembly_membership or DuckLake rows — the assembly tail writes those
     across several entries, so a partial footprint is indistinguishable from a
-    finished one by row presence alone. {'completed', 'no_data'} is the terminal
-    set: a consumer asking whether the run is over reads both, while a consumer
-    that needs contigs proceeds on 'completed' alone (under 'no_data' there are
-    none). 'pending' and None both mean "not over"; None is never "assembled".
+    finished one by row presence alone. A consumer that needs contigs proceeds
+    ONLY on 'completed', rejecting None (absence is never "assembled"), 'pending',
+    'no_data' (there are none) and 'invalidated' (there are, and they are
+    withdrawn). Expressing withdrawal as a state value rather than a column beside
+    it is what makes that hold without every consumer growing a second check.
+    {'completed', 'no_data', 'invalidated'} is the terminal set, for a consumer
+    asking only whether the run is over.
 
     Terminal is per-run, not per-key: a re-run of the same identity can reopen a
     row this read reported terminal, so a consumer holding an earlier 'no_data'

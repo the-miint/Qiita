@@ -23,7 +23,12 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `20260827000000_assembly_lifecycle.sql` — plain `make migrate`, no out-of-band setup and no
+  backfill: `DEFAULT 'active'` covers every existing `qiita.processing` row and no
+  `assembly_sample` row changes state. Adds the lifecycle columns to both tables, widens
+  `assembly_sample.state` to admit `'invalidated'`, and re-states `qiita.mint_processing`
+  (same 4-argument signature, so it replaces in place) to refuse a deprecated run.
+  (#505)
 
 ### 4. Deploy
 
@@ -39,7 +44,24 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **A PAT minted before this deploy cannot use the new assembly-lifecycle routes.** The new
+  `processing:lifecycle` scope is added to the system_admin ceiling, so callers on the OIDC
+  path pick it up automatically; a PAT carries its own stored scope set, so its holder runs
+  `qiita login` (or `POST /auth/pat`) once. Same shape as the `mask_definition:lifecycle`
+  note in the 2026-08-13 archive, and the 403 says so itself. (#505)
+- **Nothing is deprecated or withdrawn by this deploy — it ships the mechanism only.** Which
+  assembly runs are void, and which per-sample results to withdraw, is a decision to make
+  after it lands. Two behaviour changes take effect immediately, and neither can fire until
+  someone marks something: submitting `long-read-assembly` under a deprecated
+  `qiita.processing` fails at SUBMISSION with BAD_INPUT instead of minting, and a redrive
+  whose `finalize-assembly-sample` lands on a withdrawn `(run, sample)` fails that STEP with
+  BAD_INPUT rather than re-completing the pair — the contigs land in DuckLake either way, and
+  the withdrawal stands until someone restores it. (#505)
+- **New read routes, no host action.** `GET /api/v1/processing`, `GET
+  /api/v1/processing/{processing_idx}` and `GET /api/v1/processing/{processing_idx}/prep-sample`
+  are the first HTTP surface on the assembly run identity. They sit at `prep_sample:read`
+  (every human role holds it, narrowed per study below `wet_lab_admin`) and carry run
+  metadata and per-sample gate state only — no sequence data. (#505)
 
 ---
 
