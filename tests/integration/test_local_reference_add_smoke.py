@@ -16,9 +16,11 @@ What's exercised end-to-end:
   - YAML loader → sync into qiita.action
   - Runner reads the action row, walks every entry, leaving raw `*_path`
     action_context keys untouched (no `*_upload_idx` to resolve)
-  - Real LocalBackend stage_local_fasta: manifest of 2 FASTA files → one
-    fasta.parquet (3 reads across the files)
-  - Real LocalBackend hash_sequences consumes that fasta.parquet
+  - Real LocalBackend stage_local_fasta: manifest of 2 FASTA files → a
+    `fasta_chunks/` directory of Parquet parts (3 reads across the files)
+  - Real LocalBackend hash_sequences consumes that directory — this is the ONLY
+    place a real stage_local_fasta hands a real hash_sequences the directory
+    shape, so it is what pins `read_parquet(<dir>)` for the local path
   - In-process LIBRARY[mint-features] → qiita.feature rows + feature_map.parquet
   - In-process LIBRARY[write-membership] → qiita.reference_membership rows
   - Real LocalBackend load step writes reference_*.parquet
@@ -27,7 +29,7 @@ What's exercised end-to-end:
 
 The assertion surface mirrors the remote smoke: reference reaches `active`, the
 right number of feature/membership rows exist, the work_ticket reaches
-COMPLETED, and the local stager's fasta.parquet materialised in its workspace.
+COMPLETED, and the local stager's parts directory materialised in its workspace.
 """
 
 import uuid
@@ -113,7 +115,7 @@ async def test_local_reference_add_workflow_end_to_end(
     LocalBackend. After the run: ticket COMPLETED, reference 'active', three
     feature/membership rows (the manifest's two FASTA files hold three reads),
     register-files invoked once, and the stage_local_fasta workspace holds the
-    combined fasta.parquet."""
+    chunked Parquet parts."""
     import json
 
     from qiita_common.api_paths import LibraryPrimitive
@@ -230,8 +232,16 @@ async def test_local_reference_add_workflow_end_to_end(
     for name in chunk_parts:
         assert files[name] == "reference_sequence_chunks"
 
-    # The local stager's combined Parquet materialised in its per-entry
-    # workspace (attempt-0), and hash_sequences consumed it into manifest.parquet.
+    # The local stager's parts directory materialised in its per-entry workspace
+    # (attempt-0), and hash_sequences consumed it into manifest.parquet. Assert
+    # the directory AND a part: hash_sequences hands the directory itself to
+    # `read_parquet`, so an empty directory would satisfy `.exists()` while
+    # producing no features, and the feature/membership counts above are what
+    # would then fail — here, further from the cause.
     workspace = workspace_root / str(work_ticket_idx)
-    assert (workspace / "stage_local_fasta" / "attempt-0" / "fasta.parquet").exists()
+    fasta_chunks = workspace / "stage_local_fasta" / "attempt-0" / "fasta_chunks"
+    assert fasta_chunks.is_dir()
+    assert sorted(p.name for p in fasta_chunks.glob("part_*.parquet")) == [
+        "part_00000.parquet"
+    ]
     assert (workspace / "hash_sequences" / "attempt-0" / "manifest.parquet").exists()
