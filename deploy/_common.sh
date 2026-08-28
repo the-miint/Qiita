@@ -57,6 +57,31 @@ qiita_resolve_user_clone() {
     [ -d "$QIITA_CLONE/.git" ] || { echo "ERROR: $QIITA_CLONE is not a git clone" >&2; exit 1; }
 }
 
+# sha256 of stdin, hex digest only. Prefers sha256sum (Linux deploy host); falls
+# back to `shasum -a 256` on a macOS dev/test box. Used by
+# qiita_deploy_self_fingerprint below and qiita_sif_build_inputs_hash further down.
+_qiita_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+    else shasum -a 256 | cut -d' ' -f1; fi
+}
+
+# Fingerprint the bytes a running deploy script has already read into its own
+# process: the script itself plus this file, which it sourced. redeploy.sh takes
+# it either side of its `git pull` to notice that the pull rewrote the script
+# under the running shell (see redeploy.sh step 1).
+#
+# $1 = path to the running script. Echoes a hex digest; returns 1 with a stderr
+# reason if either file is unreadable, so the caller aborts rather than treating
+# an unreadable file as a change.
+qiita_deploy_self_fingerprint() {
+    local script="${1:?qiita_deploy_self_fingerprint needs the path of the running script}"
+    local common
+    common="$(dirname "$script")/_common.sh"
+    [ -r "$script" ] || { echo "ERROR: cannot read $script to fingerprint it" >&2; return 1; }
+    [ -r "$common" ] || { echo "ERROR: cannot read $common to fingerprint it" >&2; return 1; }
+    cat "$script" "$common" | _qiita_sha256
+}
+
 # Resolve the SLURM native-venv checkout from SLURM_NATIVE_PYTHON.
 #
 # Native SLURM jobs run from the venv SLURM_NATIVE_PYTHON points at — a separate
@@ -105,13 +130,6 @@ qiita_native_checkout_from_python() {
 # the apptainer/root/chown wiring stays in the entrypoint scripts. This is why the
 # header says _common.sh is sourced by build-sif.sh too — these definitions have no
 # side effects on source.
-
-# sha256 of stdin, hex digest only. Prefers sha256sum (Linux deploy host); falls
-# back to `shasum -a 256` on a macOS dev/test box. Internal to the hash below.
-_qiita_sha256() {
-    if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
-    else shasum -a 256 | cut -d' ' -f1; fi
-}
 
 # Content hash of a container workflow's IN-REPO build inputs, used by
 # build-sif.sh's idempotency check to detect a changed Apptainer.def /

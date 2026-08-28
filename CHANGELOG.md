@@ -1320,6 +1320,23 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **`redeploy.sh` re-execs itself when the pull replaced it (#510).** Step 1 pulls the clone
+  `redeploy.sh` lives in, so a pull that changes `deploy/redeploy.sh` or `deploy/_common.sh`
+  rewrites the running script. `git checkout` replaces a tracked file by rename, so the running
+  bash keeps reading the pre-pull inode and steps 2-8 execute the code from before the pull;
+  child scripts (`preflight.sh`, `local-deploy.sh`, `verify.sh`) are fresh processes reading the
+  pulled bytes, which is why nothing in the log said otherwise. The deploy that shipped the
+  unconditional step-5/6 venv refreshes (#507) was itself driven by the old conditional script:
+  it printed "Native venv already current", skipped the `uv sync`, and left the SLURM native
+  venv on a `qiita_common` predating `ANNOTATION_STRAND_WARNING`, which `jobs/hash_sequences.py`
+  imports - caught two steps later by `probe/native-import`. Step 1 now fingerprints the script
+  plus the `_common.sh` it sourced either side of the pull (`qiita_deploy_self_fingerprint`) and
+  re-execs the pulled copy when they differ; `QIITA_REDEPLOY_REEXECED` marks the re-exec so a
+  clone that keeps changing warns instead of looping. `test_deploy_scripts.py` covers the
+  fingerprint (rename swap, a change confined to `_common.sh`, fail-loud on an unreadable input),
+  pins the before -> pull -> after -> exec order in step 1, and asserts the bash property the
+  whole thing rests on: a script replaced by rename mid-run finishes on its original body.
+
 - **`pool-completion` no longer reports a withdrawn masking run as usable, and now sees the
   block masking path at all (#508).** `fetch_sequenced_pool_completion` bucketed each sample by
   the state of its per-sample `read-mask` work tickets. That answered a different question from
