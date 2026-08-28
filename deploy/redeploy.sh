@@ -36,11 +36,8 @@
 #     and step 6 the operator's CHECKOUT CLI venv that `uv run qiita` /
 #     `qiita-admin` run from, which nothing else touches.
 #
-# Step 1 pulls the clone this script lives in, so the pull can replace this file
-# and the _common.sh it sourced while they are running. When it does, the script
-# re-execs the pulled copy; without that, steps 2-8 keep running the code from
-# before the pull (see step 1). QIITA_REDEPLOY_REEXECED marks the re-exec so it
-# cannot loop.
+# Step 1's pull can replace this script and the _common.sh it sourced while they
+# are running; when it does, the script re-execs the pulled copy — see step 1.
 #
 # Usage:
 #   sudo QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/redeploy.sh
@@ -73,10 +70,21 @@ require_root "run deploy/redeploy.sh as root (sudo) from your admin account — 
 # clone where pull/build/migrate run, NOT the deployed /opt/qiita copy).
 qiita_resolve_user_clone
 
-# Absolute path to this script, for the step-1 re-exec. Resolved before the pull
-# can move anything, and independent of the caller's cwd (`make redeploy` invokes
-# it as the relative `deploy/redeploy.sh`).
+# Absolute path to this script, independent of the caller's cwd (`make redeploy`
+# invokes it as the relative `deploy/redeploy.sh`). Step 1 watches it for the
+# pull, and the pull only rewrites $QIITA_CLONE — so a $SELF outside that clone
+# leaves the check permanently green. Refuse instead of deploying behind a
+# freshness check that cannot fire. This also catches a $SELF that failed to
+# resolve: the `cd` above does not abort under `set -e`, it yields "/redeploy.sh".
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+case "$SELF" in
+    "$QIITA_CLONE"/*) ;;
+    *)  echo "ERROR: $SELF is not inside QIITA_CLONE ($QIITA_CLONE)." >&2
+        echo "       Step 1 pulls that clone and re-execs this script when the pull" >&2
+        echo "       replaces it; from outside, the pull is invisible here. Run the" >&2
+        echo "       copy that lives in the clone being deployed." >&2
+        exit 1;;
+esac
 
 confirm() {
     # $1 = prompt. Honors ASSUME_YES=1; aborts on anything but an explicit yes.
@@ -95,42 +103,17 @@ echo "--- [1/8] Pull source (as $QIITA_USER) ---"
 # current — an operator who pulls before running the deploy makes every pull a
 # no-op. Both refreshes are unconditional now (see step 5).
 #
-# A fingerprint IS taken either side of the pull, for a different question. The
+# A fingerprint is taken either side of the pull, for a different question. The
 # pull rewrites the clone this script lives in, so it can replace redeploy.sh and
-# _common.sh while they are running. `git checkout` replaces a tracked file by
-# rename, so the running bash keeps reading the pre-pull inode and steps 2-8
-# execute the code from BEFORE the pull: a deploy that ships a change to the
-# deploy script does not run that change, and nothing in the log says so. It has
-# already cost one deploy — the pull that made the step-5 native-venv refresh
-# unconditional was itself run by the old conditional script, which skipped the
-# refresh and left native SLURM jobs importing a stale qiita_common.
-#
-# Only this process is affected: every child script (preflight.sh,
-# local-deploy.sh, verify.sh) is a fresh `bash` that reads the pulled bytes. So
-# the fingerprint covers exactly what this process already read — itself and the
-# _common.sh it sourced — and the recovery is to re-exec.
+# _common.sh while they are running: `git checkout` replaces a tracked file by
+# rename, the running bash keeps reading the pre-pull inode, and steps 2-8 would
+# execute the code from before the pull. Child scripts (preflight.sh,
+# local-deploy.sh, verify.sh) are fresh processes reading the pulled bytes, so the
+# fingerprint covers exactly what this process already read.
 self_before=$(qiita_deploy_self_fingerprint "$SELF")
 sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" pull --ff-only
-self_after=$(qiita_deploy_self_fingerprint "$SELF")
-if [ "$self_after" != "$self_before" ]; then
-    if [ -n "${QIITA_REDEPLOY_REEXECED:-}" ]; then
-        # Re-execing again would loop. Reaching here means the clone changed a
-        # second time (a concurrent write, or a pull that is not converging);
-        # carrying on with the running copy is what terminates.
-        echo "WARNING: redeploy.sh / _common.sh changed again after the re-exec —" >&2
-        echo "         continuing with the running copy instead of re-execing in a" >&2
-        echo "         loop. Re-run the deploy once the clone is settled." >&2
-    else
-        echo "The pull changed deploy/redeploy.sh or deploy/_common.sh — re-execing the"
-        echo "pulled version so steps 2-8 run the code that was just pulled. Step 1"
-        echo "repeats below; its pull is a no-op the second time."
-        # Exported so the re-exec'd process sees it. No positional arguments to
-        # forward — this script is driven entirely by the environment, which exec
-        # carries over.
-        export QIITA_REDEPLOY_REEXECED=1
-        exec bash "$SELF"
-    fi
-fi
+# Execs the pulled copy if the pull changed it, and never returns when it does.
+qiita_deploy_reexec_if_changed "$SELF" "$self_before"
 
 # --- 2. Pending-deploy buckets 1+2 (manual) + preflight ---------------------
 echo "--- [2/8] Env vars + one-time host setup (buckets 1 & 2) ---"

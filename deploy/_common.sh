@@ -58,28 +58,66 @@ qiita_resolve_user_clone() {
 }
 
 # sha256 of stdin, hex digest only. Prefers sha256sum (Linux deploy host); falls
-# back to `shasum -a 256` on a macOS dev/test box. Used by
-# qiita_deploy_self_fingerprint below and qiita_sif_build_inputs_hash further down.
+# back to `shasum -a 256` on a macOS dev/test box.
 _qiita_sha256() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
     else shasum -a 256 | cut -d' ' -f1; fi
 }
 
+# Absolute path to THIS file, resolved as it is sourced. The two deploy-freshness
+# helpers below hash it as the file the sourcing process actually read, rather
+# than re-deriving it from the caller's location or a later cwd.
+QIITA_COMMON_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
 # Fingerprint the bytes a running deploy script has already read into its own
-# process: the script itself plus this file, which it sourced. redeploy.sh takes
-# it either side of its `git pull` to notice that the pull rewrote the script
-# under the running shell (see redeploy.sh step 1).
+# process: the script itself, plus this file, which it sourced. redeploy.sh takes
+# it either side of its `git pull` (see redeploy.sh step 1).
+#
+# Same digest shape as qiita_sif_build_inputs_hash below — name plus per-file
+# sha256, then a hash over that stream — so bytes moving from one file to the
+# other cannot leave the digest unchanged, as hashing their concatenation would.
 #
 # $1 = path to the running script. Echoes a hex digest; returns 1 with a stderr
-# reason if either file is unreadable, so the caller aborts rather than treating
-# an unreadable file as a change.
+# reason if either file is unreadable, so the caller aborts rather than reading an
+# empty digest as a change.
 qiita_deploy_self_fingerprint() {
     local script="${1:?qiita_deploy_self_fingerprint needs the path of the running script}"
-    local common
-    common="$(dirname "$script")/_common.sh"
-    [ -r "$script" ] || { echo "ERROR: cannot read $script to fingerprint it" >&2; return 1; }
-    [ -r "$common" ] || { echo "ERROR: cannot read $common to fingerprint it" >&2; return 1; }
-    cat "$script" "$common" | _qiita_sha256
+    local f
+    for f in "$script" "$QIITA_COMMON_SH"; do
+        [ -r "$f" ] || { echo "ERROR: cannot read $f to fingerprint it" >&2; return 1; }
+    done
+    for f in "$script" "$QIITA_COMMON_SH"; do
+        printf '%s ' "${f##*/}"
+        _qiita_sha256 < "$f"
+    done | _qiita_sha256
+}
+
+# Re-exec the running deploy script when the pull replaced it.
+#
+# $1 = the running script (absolute), $2 = its fingerprint from before the pull.
+# Returns 0 when the two match and the caller carries on. When they differ, execs
+# the pulled copy — replacing this process, so nothing after the call runs.
+#
+# Returns 1 when the fingerprint cannot be taken, and when it changed again after
+# a re-exec already happened: a second re-exec is how this loops, and the caller
+# reaches here before anything is deployed, so aborting costs a re-run.
+qiita_deploy_reexec_if_changed() {
+    local script="${1:?qiita_deploy_reexec_if_changed needs the path of the running script}"
+    local before="${2:?qiita_deploy_reexec_if_changed needs the pre-pull fingerprint}"
+    local after
+    after=$(qiita_deploy_self_fingerprint "$script") || return 1
+    [ "$after" = "$before" ] && return 0
+    if [ -n "${QIITA_REDEPLOY_REEXECED:-}" ]; then
+        echo "ERROR: $script or $QIITA_COMMON_SH changed again after the re-exec." >&2
+        echo "       Nothing has been deployed at this point; re-run once the clone" >&2
+        echo "       has settled." >&2
+        return 1
+    fi
+    echo "The pull changed ${script##*/} or ${QIITA_COMMON_SH##*/} — re-execing the"
+    echo "pulled copy so the rest of the deploy runs the code that was just pulled."
+    echo "The banner and step 1 repeat below; the second pull is a no-op."
+    export QIITA_REDEPLOY_REEXECED=1
+    exec bash "$script"
 }
 
 # Resolve the SLURM native-venv checkout from SLURM_NATIVE_PYTHON.
