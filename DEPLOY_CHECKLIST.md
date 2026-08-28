@@ -39,12 +39,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- **A redeploy whose pull changes `deploy/redeploy.sh` or `deploy/_common.sh` now prints its
-  banner and step 1 twice.** The script re-execs the pulled copy, because a running bash keeps
-  reading the file it started from and would otherwise run steps 2-8 from before the pull. The
-  second pull is a no-op; the deploy carries on from step 2 as usual. If it re-execs and the
-  scripts change *again*, it aborts before step 2 rather than re-execing in a loop — nothing is
-  deployed at that point, so re-run once the clone has settled. (#510)
+_None yet._
 
 ---
 
