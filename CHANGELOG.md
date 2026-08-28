@@ -21,7 +21,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **A `sample_type` biosample global field, backed by a new internal controlled vocabulary (#N).**
+- **A `sample_type` biosample global field, backed by a new internal controlled vocabulary (#509).**
   `Qiita Sample Type` is a terminology this database defines rather than loads from an external
   source: there is no release to load, new terms are appended directly, and `terminology.version`
   carries the date the vocabulary last changed. Eleven terms are seeded, spanning controls, marine
