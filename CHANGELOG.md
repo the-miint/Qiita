@@ -21,6 +21,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A `qiita_sample_type` biosample global field, backed by a new internal controlled vocabulary (#509).**
+  `Qiita Sample Type` is a terminology this database defines rather than loads from an external
+  source: there is no release to load, new terms are appended directly, and `terminology.version`
+  carries the date the vocabulary last changed. Twelve terms are seeded, spanning controls, marine
+  and aquarium waters and filters, and clinical materials. The field is `terminology`-typed,
+  so a value outside the vocabulary is rejected at write time and an import supplies the term_id
+  (`sea_water`, `cerebrospinal_fluid`, ...). It is flagged `required`, which the import gate does
+  not yet enforce.
+
 - **An assembly run can be deprecated, and one of its samples withdrawn (#505).**
   `qiita.processing` — the canonical-params hash over `{workflow, version, mask_idx,
   assembler}` that `qiita.assembly_membership` and the DuckLake assembly tables are stamped
@@ -1321,7 +1330,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Fixed
 
 - **`stage_local_fasta` feeds the manifest to `read_fastx` in batches, so a large
-  reference no longer exhausts the job's file descriptors (#509).** `read_fastx` opens a
+  reference no longer exhausts the job's file descriptors (#513).** `read_fastx` opens a
   file per path in its `VARCHAR[]` and holds that handle until the whole call ends — a
   reader is never released when its file is exhausted — so open descriptors and zlib state
   grow with the number of paths in a single call, not with the bytes read
@@ -1339,6 +1348,28 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   Parquet has no append — which `hash_sequences` consumes unchanged, since it passes the
   value straight to `read_parquet` and that reads a directory as one relation. Same shape
   `hash_sequences` already emits for `reference_sequence_chunks`.
+
+- **`redeploy.sh` re-execs itself when the pull replaced it (#510).** Step 1 pulls the clone
+  `redeploy.sh` lives in, so a pull that changes `deploy/redeploy.sh` or `deploy/_common.sh`
+  rewrites the running script. `git checkout` replaces a tracked file by rename, so the running
+  bash keeps reading the pre-pull inode and steps 2-8 execute the code from before the pull;
+  child scripts (`preflight.sh`, `local-deploy.sh`, `verify.sh`) are fresh processes reading the
+  pulled bytes, so the log gave no sign of the split. The deploy that shipped the unconditional
+  step-5/6 venv refreshes (#507) was itself driven by the old conditional script: it printed
+  "Native venv already current", skipped the `uv sync`, and left the SLURM native venv on a
+  `qiita_common` predating `ANNOTATION_STRAND_WARNING`, which `jobs/hash_sequences.py` imports —
+  surfaced two steps later by `probe/native-import`. Step 1 now fingerprints the script plus the
+  `_common.sh` it sourced either side of the pull (`qiita_deploy_self_fingerprint`, digesting each
+  file under its name the way `qiita_sif_build_inputs_hash` does) and hands off to
+  `qiita_deploy_reexec_if_changed`, which execs the pulled copy. A second change after a re-exec
+  aborts instead of re-execing: nothing is deployed at step 1, so the abort costs a re-run.
+  `redeploy.sh` also refuses to start when it is not running from inside `$QIITA_CLONE` — the
+  pull only rewrites that clone, so from outside the check could never fire. Tests drive the
+  helper end to end (execs the replacement and abandons the original, returns when nothing
+  changed, aborts under the sentinel, and the sentinel reaches the re-exec'd process), cover the
+  fingerprint (rename swap, a change confined to `_common.sh`, bytes moved between the two files,
+  fail-loud on either being unreadable), and pin the bash behaviour underneath: a script replaced
+  by rename mid-run finishes on its original body.
 
 - **`pool-completion` no longer reports a withdrawn masking run as usable, and now sees the
   block masking path at all (#508).** `fetch_sequenced_pool_completion` bucketed each sample by

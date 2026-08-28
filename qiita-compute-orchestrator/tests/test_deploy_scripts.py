@@ -150,6 +150,255 @@ def test_native_checkout_fails_outside_git_clone(tmp_path: Path) -> None:
     assert "git clone" in result.stderr
 
 
+# --- qiita_deploy_self_fingerprint / qiita_deploy_reexec_if_changed ----------
+# redeploy.sh pulls the clone it lives in, so the pull can replace redeploy.sh and
+# _common.sh under the running shell. The fingerprint is how the script notices;
+# the re-exec is what it does about it. Both are exercised end to end below, on a
+# fixture that copies the real _common.sh so the helpers under test are the
+# shipped ones. -----------------------------------------------------------------
+
+_REDEPLOY = _DEPLOY / "redeploy.sh"
+
+
+def _fake_deploy_dir(tmp_path: Path, *, script: str, common_suffix: str = "") -> Path:
+    """A `deploy/`-shaped dir: a script beside a copy of the real `_common.sh`.
+    The copy is what `QIITA_COMMON_SH` resolves to, so a test can edit or delete
+    it. `common_suffix` appends bytes, standing in for a pull that touched only
+    `_common.sh`."""
+    d = tmp_path / "deploy"
+    d.mkdir(parents=True)
+    (d / "_common.sh").write_text(_COMMON.read_text() + common_suffix)
+    path = d / "redeploy.sh"
+    path.write_text(script)
+    return path
+
+
+def _call_self_fingerprint(script: Path, *, prelude: str = "") -> subprocess.CompletedProcess[str]:
+    """Source the fixture's `_common.sh`, then fingerprint the fixture script."""
+    common = script.parent / "_common.sh"
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{common}"; {prelude} qiita_deploy_self_fingerprint "$1"',
+            "_",
+            str(script),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_self_fingerprint_changes_when_the_script_is_replaced_by_rename(tmp_path: Path) -> None:
+    """The production event, exactly: `git checkout` writes a temp file and
+    renames it over the tracked path. Same path, new inode, new bytes."""
+    script = _fake_deploy_dir(tmp_path, script="# old\n")
+    before = _call_self_fingerprint(script)
+    assert before.returncode == 0, before.stderr
+    assert before.stdout.strip() != ""
+
+    replacement = script.parent / "redeploy.sh.pulled"
+    replacement.write_text("# new\n")
+    os.replace(replacement, script)
+
+    after = _call_self_fingerprint(script)
+    assert after.returncode == 0, after.stderr
+    assert after.stdout != before.stdout
+
+
+def test_self_fingerprint_covers_the_sourced_common(tmp_path: Path) -> None:
+    """`_common.sh` is read into the same process, so a pull that changes only it
+    leaves the running script just as stale. Anchoring on the script alone would
+    miss that."""
+    script = _fake_deploy_dir(tmp_path, script="# script\n")
+    before = _call_self_fingerprint(script).stdout
+    common = script.parent / "_common.sh"
+    common.write_text(common.read_text() + "\n# pulled\n")
+    assert _call_self_fingerprint(script).stdout != before
+
+
+def test_self_fingerprint_separates_the_two_files(tmp_path: Path) -> None:
+    """Digesting each file under its name, rather than hashing the two
+    concatenated, is what keeps bytes moving from one to the other visible."""
+    moved = "# moved line\n"
+    in_script = _fake_deploy_dir(tmp_path / "a", script=f"# script\n{moved}")
+    in_common = _fake_deploy_dir(tmp_path / "b", script="# script\n", common_suffix=moved)
+    assert _call_self_fingerprint(in_script).stdout != _call_self_fingerprint(in_common).stdout
+
+
+def test_self_fingerprint_fails_loudly_when_the_script_is_unreadable(tmp_path: Path) -> None:
+    """rc=1 + a stderr reason, not an empty digest. An empty digest compares
+    unequal to the pre-pull one, which would re-exec a file that just failed to
+    read."""
+    script = _fake_deploy_dir(tmp_path, script="# script\n")
+    script.unlink()
+    result = _call_self_fingerprint(script)
+    assert result.returncode == 1
+    assert result.stdout.strip() == ""
+    assert "redeploy.sh" in result.stderr
+
+
+def test_self_fingerprint_fails_loudly_when_common_is_unreadable(tmp_path: Path) -> None:
+    """Same, for the sourced half: the file is gone from disk after this process
+    read it, which is what an interrupted pull can leave behind."""
+    script = _fake_deploy_dir(tmp_path, script="# script\n")
+    common = script.parent / "_common.sh"
+    result = _call_self_fingerprint(script, prelude=f'rm "{common}";')
+    assert result.returncode == 1
+    assert result.stdout.strip() == ""
+    assert "_common.sh" in result.stderr
+
+
+# A script that mimics redeploy.sh step 1 against the fixture's own _common.sh:
+# fingerprint, optionally let a "pull" replace it by rename, then hand off to the
+# helper. v1 prints `original`; the replacement prints `pulled`, so stdout says
+# which body finished the run.
+_PULLED_DEFAULT = "printf 'pulled\\n'"
+
+_STEP1_V1 = """#!/usr/bin/env bash
+set -euo pipefail
+source "{common}"
+SELF="{self}"
+printf 'original\\n'
+before=$(qiita_deploy_self_fingerprint "$SELF")
+if [ -n "{replace}" ]; then
+    cat > "$SELF.pulled" <<'PULLED'
+#!/usr/bin/env bash
+{pulled}
+PULLED
+    mv "$SELF.pulled" "$SELF"
+fi
+qiita_deploy_reexec_if_changed "$SELF" "$before"
+printf 'original-continued\\n'
+"""
+
+
+def _run_step1(
+    tmp_path: Path,
+    *,
+    replace: bool,
+    env: dict[str, str] | None = None,
+    pulled: str = _PULLED_DEFAULT,
+) -> subprocess.CompletedProcess[str]:
+    d = tmp_path / "deploy"
+    d.mkdir(parents=True)
+    (d / "_common.sh").write_text(_COMMON.read_text())
+    script = d / "redeploy.sh"
+    script.write_text(
+        _STEP1_V1.format(
+            common=d / "_common.sh",
+            self=script,
+            replace="1" if replace else "",
+            pulled=pulled,
+        )
+    )
+    return subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **(env or {})},
+    )
+
+
+def test_reexec_runs_the_pulled_body_and_abandons_the_original(tmp_path: Path) -> None:
+    """The whole point, end to end: the helper `exec`s, so the run finishes on the
+    replacement and never returns to the line after the call."""
+    run = _run_step1(tmp_path, replace=True)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.splitlines()[0] == "original"
+    assert run.stdout.splitlines()[-1] == "pulled"
+    assert "original-continued" not in run.stdout
+
+
+def test_reexec_is_a_no_op_when_nothing_changed(tmp_path: Path) -> None:
+    """Control for the test above: same fixture, no replacement. The helper must
+    return so the caller carries on — a deploy that re-execs every time would
+    never leave step 1."""
+    run = _run_step1(tmp_path, replace=False)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.splitlines() == ["original", "original-continued"]
+
+
+def test_reexec_refuses_a_second_time_rather_than_looping(tmp_path: Path) -> None:
+    """With the sentinel already set, a further change aborts. Nothing is deployed
+    at step 1, so the caller can be stopped for the cost of a re-run; carrying on
+    would be running code the process knows is not the pulled code."""
+    run = _run_step1(tmp_path, replace=True, env={"QIITA_REDEPLOY_REEXECED": "1"})
+    assert run.returncode != 0
+    assert "changed again after the re-exec" in run.stderr
+    assert "pulled" not in run.stdout
+    assert "original-continued" not in run.stdout
+
+
+def test_reexec_sentinel_reaches_the_replacement(tmp_path: Path) -> None:
+    """The sentinel is exported, so the re-exec'd process sees it. Were it a plain
+    shell variable the replacement would start with it unset, and a clone that
+    kept changing could re-exec without end."""
+    run = _run_step1(
+        tmp_path,
+        replace=True,
+        pulled="printf 'pulled sentinel=%s\\n' \"$QIITA_REDEPLOY_REEXECED\"",
+    )
+    assert run.returncode == 0, run.stderr
+    assert "pulled sentinel=1" in run.stdout
+
+
+def test_bash_keeps_executing_a_script_replaced_by_rename(tmp_path: Path) -> None:
+    """The premise the re-exec rests on, asserted rather than read off the docs.
+
+    bash holds the script's fd, so a rename over the path swaps the inode without
+    touching what the running shell reads: the process finishes on the original
+    body. That is why steps 2-8 of a redeploy run pre-pull code, and it is a
+    property of bash, not something the deploy arranges. The body is padded well
+    past a single read so the case is not decided by read-ahead alone; either way
+    what is asserted is the observable. The control below shows the swap landed."""
+    script = tmp_path / "self-replacing.sh"
+    padding = "\n".join(f"# pad {i:05d}" * 4 for i in range(4096))
+    body = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "printf 'start\\n'",
+            padding,
+            # The replacement is a script in its own right, so the control below
+            # can run it and show the rename landed.
+            "cat > \"$0.new\" <<'NEW'",
+            "printf 'REPLACEMENT\\n'",
+            "NEW",
+            'mv "$0.new" "$0"',
+            "printf 'end-of-original\\n'",
+            "",
+        ]
+    )
+    script.write_text(body)
+    assert len(body) > 65536, "keep the body well past a single read"
+
+    run = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.splitlines() == ["start", "end-of-original"], (
+        "bash executed something other than the original body after the rename; "
+        f"stdout was {run.stdout!r}"
+    )
+
+    # Control: the swap landed, so a FRESH bash on the same path runs the new body.
+    fresh = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    assert fresh.stdout.splitlines() == ["REPLACEMENT"], (
+        "the rename did not replace the script, so the assertion above proved "
+        f"nothing (stdout={fresh.stdout!r}, stderr={fresh.stderr!r})"
+    )
+
+
+def test_redeploy_refuses_a_self_outside_the_clone(tmp_path: Path) -> None:
+    """The re-exec check can only see a pull that lands in $QIITA_CLONE, so
+    redeploy.sh aborts when it is not running from that clone — otherwise the
+    check is green for a reason unrelated to freshness."""
+    text = _REDEPLOY.read_text()
+    guard = text.find('case "$SELF" in')
+    pull = text.find('git -C "$QIITA_CLONE" pull --ff-only')
+    assert 0 <= guard < pull, "the containment guard must run before the pull"
+    assert '"$QIITA_CLONE"/*' in text
+
+
 # --- qiita_buckets_12: the "skip the bucket 1 & 2 ack when there's nothing to
 # apply" predicate redeploy.sh uses. rc 0 = empty (skip prompt), 1 = has steps
 # (prompt), 2 = unreadable/markers-absent (fail safe → prompt). -----------------
