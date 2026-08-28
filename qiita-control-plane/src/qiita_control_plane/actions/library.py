@@ -2478,9 +2478,13 @@ async def finalize_assembly_sample_gate(
 
     The row is already 'pending' — the runner materialized it when it minted this
     run's processing_idx — and the write is an idempotent upsert, so a workflow
-    retried from the start re-affirms 'completed'. Where the entry sits in the
-    step list, and why, is on the workflow YAML entry that declares it; the gate's
-    state contract lives on `repositories.assembly.fetch_assembly_sample_state`.
+    retried from the start re-affirms 'completed'. The exception is a pair someone
+    withdrew mid-run: `upsert_assembly_sample_completed` raises
+    `AssemblySampleInvalidated` rather than re-completing it, and the dispatch arm
+    in `runner/_reconstruct.py` turns that into a BAD_INPUT step failure. Where the
+    entry sits in the step list, and why, is on the workflow YAML entry that
+    declares it; the gate's state contract lives on
+    `repositories.assembly.fetch_assembly_sample_state`.
     """
     async with pool.acquire() as conn, conn.transaction():
         await upsert_assembly_sample_completed(

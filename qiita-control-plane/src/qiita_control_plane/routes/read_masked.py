@@ -63,7 +63,7 @@ from qiita_common.api_paths import (
     PATH_READ_MASKED_DOGET,
     PATH_READ_MASKED_PREFIX,
 )
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     DoGetTicketResponse,
     MaskDefinition,
@@ -102,7 +102,7 @@ from ..repositories.mask_definition import (
     set_mask_sample_states,
     transition_mask_definition_status,
 )
-from ._helpers import cap_rows
+from ._helpers import cap_rows, gate_roster_narrowing_idx
 
 _MSG_MASK_NOT_FOUND = "Mask definition not found"
 
@@ -197,18 +197,6 @@ async def mint_mask_definition_route(
     return _mask_record_to_response(row)
 
 
-def _narrowing_principal_idx(caller: HumanUser) -> int | None:
-    """The principal_idx the mask reads narrow their sample set to, or None for a
-    caller who sees every sample.
-
-    wet_lab_admin and above bypass the per-study check on the submission side
-    (`_check_prep_sample_study_access`), and bypass it here on the same threshold,
-    so a caller who can submit against a sample can also discover its mask."""
-    if caller.has_role_at_least(SystemRole.WET_LAB_ADMIN):
-        return None
-    return caller.principal_idx
-
-
 @mask_definition_router.get(PATH_MASK_DEFINITION_ROOT)
 async def list_mask_definitions_route(
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -251,7 +239,7 @@ async def list_mask_definitions_route(
             sequenced_pool_idx=sequenced_pool_idx,
             prep_sample_idx=prep_sample_idx,
             status=status,
-            visible_to_principal_idx=_narrowing_principal_idx(caller),
+            visible_to_principal_idx=gate_roster_narrowing_idx(caller),
             limit=_MASK_LIST_HARD_CAP + 1,
         ),
         _MASK_LIST_HARD_CAP,
@@ -333,7 +321,7 @@ async def list_mask_prep_samples_route(
             pool,
             mask_idx,
             sequenced_pool_idx=sequenced_pool_idx,
-            visible_to_principal_idx=_narrowing_principal_idx(caller),
+            visible_to_principal_idx=gate_roster_narrowing_idx(caller),
             limit=_MASK_PREP_SAMPLE_HARD_CAP + 1,
         ),
         _MASK_PREP_SAMPLE_HARD_CAP,

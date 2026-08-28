@@ -29,6 +29,31 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   the vocabulary is rejected at write time and an import supplies the term_id (`sea_water`,
   `cerebrospinal_fluid`, ...). It is flagged `required`, which the import gate does not yet enforce.
 
+- **An assembly run can be deprecated, and one of its samples withdrawn (#505).**
+  `qiita.processing` — the canonical-params hash over `{workflow, version, mask_idx,
+  assembler}` that `qiita.assembly_membership` and the DuckLake assembly tables are stamped
+  with — gains `status` / `deprecated_at` / `deprecated_by_idx` / `deprecation_reason` /
+  `superseded_by`, and `qiita.assembly_sample.state` gains `invalidated` with its own
+  `invalidated_*` provenance. The assembly twin of the mask lifecycle, at the same two
+  granularities: deprecating the CONFIG makes `qiita.mint_processing` raise SQLSTATE 23514
+  rather than return the row, so the params that identify a run built from a pass-set later
+  judged unsound cannot assemble another sample; invalidating a RUN withdraws one
+  `(processing_idx, prep_sample)` pair. Neither deletes — assembly has no delete path, so a
+  deprecated run stays listed, readable and DoGet-signable and the record of what produced
+  published contigs survives the judgement about it. New `/processing` router: `GET` (list
+  with a per-run four-state tally), `GET /{processing_idx}`, `GET /{processing_idx}/prep-sample`
+  (all `prep_sample:read`, narrowed per study below `wet_lab_admin`), and `PATCH
+  /{processing_idx}/status` / `PATCH /{processing_idx}/sample-status` behind a new
+  `processing:lifecycle` scope at the `system_admin` ceiling. The de novo align resolver
+  refuses an invalidated subject with a message naming the withdrawal instead of its
+  "not complete yet" catch-all, and the two gate writers leave a withdrawn row standing —
+  `finalize-assembly-sample` raises `AssemblySampleInvalidated` rather than re-completing it,
+  which the runner's dispatch arm records as a BAD_INPUT step failure rather than letting it
+  reach the UNKNOWN_PERMANENT catch-all. Three helpers the two lifecycles now share instead of
+  duplicating: the per-study roster narrowing (`repositories._sample_scope`), the gate-state
+  member assertion (`repositories.gate_state_literal`), and the PATCH bodies' reason gating
+  (`models._base.check_withdrawal_reason`).
+
 - **A reference or assembly load reports the records the canonical hash absorbed (#501).**
   `write-membership` and `write-assembly-membership` compare their manifest's record count
   against its distinct canonical hashes and, when they differ, log a warning naming the
@@ -1302,6 +1327,60 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **`pool-completion` no longer reports a withdrawn masking run as usable, and now sees the
+  block masking path at all (#508).** `fetch_sequenced_pool_completion` bucketed each sample by
+  the state of its per-sample `read-mask` work tickets. That answered a different question from
+  the one every masked-read consumer asks: the masked-read DoGet, the admin export, the
+  assembly input resolver and align planning all gate on `qiita.mask_sample`, and a run
+  withdrawn after the fact (`state = 'invalidated'`) keeps its COMPLETED ticket — the ticket
+  did complete, which is why there is a run to withdraw. So the summary read `fully_processed`
+  ("DONE and clean" in `qiita pool-completion`) on a pool whose reads every consumer then
+  refused; `complete` and `fully_processed` are computed from `samples_completed`, so the
+  miscount reached the headline flag, not just the tally. The same ticket join was blind to two
+  more shapes: a block ticket carries `block_idx` with `prep_sample_idx` NULL (the work_ticket
+  scope-target CHECK), so an entire block-masked pool read as never submitted, and only
+  `read-mask` was matched, not the `fastq-to-parquet` half of `PER_SAMPLE_MASK_ACTION_IDS`. The
+  rollup now resolves the two the way `repositories.mask_definition._MASKED_SAMPLE_CTE` already
+  does — the gate wins for every (mask, sample) pair that has a gate row, the ticket arm
+  supplies the pairs it does not cover, since the per-sample path has no PENDING phase and a
+  mask that ran without completing leaves no row at all — keeps work tickets for the states no
+  gate row expresses, and reaches block tickets through `qiita.block_member`. New
+  `samples_invalidated` bucket on `PoolCompletionStatus`, ranked above `in_flight` (a re-mask in
+  progress does not make a withdrawn pass-set usable), and new `samples_cancelled`, ranked above
+  `samples_failed` since `WorkTicketState` keeps CANCELLED distinct so a deliberate stop stays
+  legible in these rollups and an operator cancels to stop a failing retry. A gate row still
+  `'pending'` counts as outstanding rather than never-submitted, but only when no terminal ticket
+  state says what became of it. `samples_not_submitted` becomes the residual, so the seven
+  buckets partition the sample set by construction. `GET /sequenced-pool/{P}/work-ticket-summary` keeps asking the ticket
+  question and now has its own `fetch_sequenced_pool_read_mask_coverage` rather than
+  subtracting the rollup's residual, which no longer means "has no ticket".
+
+- **A deploy no longer skips the venv refreshes that keep native SLURM jobs off stale
+  code (#507).** `redeploy.sh` steps 5 and 6 could skip `uv sync --reinstall-package
+  qiita-common` when a package-root import probe passed. That probe cannot see the failure
+  it was guarding: two production deploys left the native venv on a stale `qiita_common`
+  and it passed both times — 2026-08-21 missing the whole `assembly_constants` submodule
+  (`import qiita_common` still succeeds), and 2026-08-27 missing only the name
+  `URL_ASSEMBLY_DOGET` from `api_paths` (that module still imports, so no widening on the
+  `qiita_common` side reaches it). Both refreshes are now unconditional; the skip's other
+  condition, "nothing arrived in this pull", was already removed and only ever proved that
+  one pull was a no-op. The post-sync verification moves to the consumer side: new
+  `qiita_compute_orchestrator.native_import_check` imports every dispatchable job module
+  through the orchestrator's own `scan_native_jobs`, so a job's `from qiita_common.x import
+  Y` is what fails and a missing module and a missing name are caught alike. The
+  compute-readiness `probe/native-import` — which ran `import qiita_compute_orchestrator
+  .jobs` alone, shallower still — now invokes that same module, so head node and compute
+  node cannot disagree about what "imports cleanly" means, and captures stderr as well as
+  stdout so an absent module reports its reason rather than a bare `=fail`. Step 6's import
+  covers `cli.admin` as well as `cli.user`: `SYSTEM_PRINCIPAL_IDX` and
+  `TERMINAL_WORK_TICKET_STATES` are admin-only at module level, so a `cli.user` import was
+  green on exactly the missing-name shape this entry is about. Both abort paths print the
+  exact working remedy, `bash -lc` and absolute `uv` included.
+  `FORCE_NATIVE_REFRESH` / `FORCE_CLI_REFRESH` are accepted and ignored. Removed with the
+  skip: `native_pkgs_changed` / `cli_pkgs_changed` and `qiita_paths_touch_native` /
+  `qiita_paths_touch_cli`, dead since the pull-diff condition went, plus the tests that
+  described them as backing a live decision.
 
 - **A circular alignment gate no longer refuses every slice holding a secondary record
   (#486).** `check_gate_diagnostics` counted secondary, unmapped and coordinate-less rows

@@ -117,6 +117,14 @@ class Scope(StrEnum):
     # service account that mints masks must not be able to void them. system_admin
     # only, in ROLE_IMPLIED_SCOPES.
     MASK_DEFINITION_LIFECYCLE = "mask_definition:lifecycle"
+    # Processing-run LIFECYCLE: deprecate a qiita.processing config, and withdraw
+    # individual (run, sample) pairs of a sound one. Separate from
+    # MASK_DEFINITION_LIFECYCLE because the two name different identities — a mask
+    # can be sound while an assembly built from it is not, and vice versa. There is
+    # no matching :delete scope, because there is no delete path to gate: the
+    # `assembly_sample.processing_idx` FK is ON DELETE RESTRICT. system_admin only,
+    # in ROLE_IMPLIED_SCOPES.
+    PROCESSING_LIFECYCLE = "processing:lifecycle"
     # Full purge of an alignment (the alignment_definition row + its DuckLake
     # alignment rows; the alignment_sample gate cascade-deletes). Deliberately
     # distinct from the align-submitting capability (PREP_SAMPLE_WRITE): deletion
