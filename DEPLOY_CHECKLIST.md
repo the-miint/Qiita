@@ -23,12 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-- `20260827000000_assembly_lifecycle.sql` — plain `make migrate`, no out-of-band setup and no
-  backfill: `DEFAULT 'active'` covers every existing `qiita.processing` row and no
-  `assembly_sample` row changes state. Adds the lifecycle columns to both tables, widens
-  `assembly_sample.state` to admit `'invalidated'`, and re-states `qiita.mint_processing`
-  (same 4-argument signature, so it replaces in place) to refuse a deprecated run.
-  (#505)
+_None yet._
 
 ### 4. Deploy
 
@@ -36,14 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- **`probe/native-import` got stricter, so a stale compute node now fails `make
-  verify-deploy` instead of passing it.** It ran `import qiita_compute_orchestrator.jobs`
-  and nothing else; it now imports every dispatchable job module, which is what makes a
-  missing `qiita_common` symbol visible, and reports the failing module in its `err=` field
-  (it used to print a bare `=fail`). If it fails on the first deploy after this lands, that
-  venv was already stale and the check is doing its job — refresh it with
-  `sudo -u qiita bash -lc 'cd <native-checkout>/qiita-compute-orchestrator && /usr/local/bin/uv sync --reinstall-package qiita-common'`
-  (absolute `uv`, login shell — bare `uv` is not on `sudo`'s PATH). (#507)
+_None yet._
 
 ### 6. After the deploy verifies green
 
@@ -51,37 +39,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- **A PAT minted before this deploy cannot use the new assembly-lifecycle routes.** The new
-  `processing:lifecycle` scope is added to the system_admin ceiling, so callers on the OIDC
-  path pick it up automatically; a PAT carries its own stored scope set, so its holder runs
-  `qiita login` (or `POST /auth/pat`) once. Same shape as the `mask_definition:lifecycle`
-  note in the 2026-08-13 archive, and the 403 says so itself. (#505)
-- **Nothing is deprecated or withdrawn by this deploy — it ships the mechanism only.** Which
-  assembly runs are void, and which per-sample results to withdraw, is a decision to make
-  after it lands. Two behaviour changes take effect immediately, and neither can fire until
-  someone marks something: submitting `long-read-assembly` under a deprecated
-  `qiita.processing` fails at SUBMISSION with BAD_INPUT instead of minting, and a redrive
-  whose `finalize-assembly-sample` lands on a withdrawn `(run, sample)` fails that STEP with
-  BAD_INPUT rather than re-completing the pair — the contigs land in DuckLake either way, and
-  the withdrawal stands until someone restores it. (#505)
-- **New read routes, no host action.** `GET /api/v1/processing`, `GET
-  /api/v1/processing/{processing_idx}` and `GET /api/v1/processing/{processing_idx}/prep-sample`
-  are the first HTTP surface on the assembly run identity. They sit at `prep_sample:read`
-  (every human role holds it, narrowed per study below `wet_lab_admin`) and carry run
-  metadata and per-sample gate state only — no sequence data. (#505)
-- **The two venv refreshes now run on every deploy.** `redeploy.sh` steps 5 and 6 no longer
-  skip `uv sync --reinstall-package qiita-common` when an import probe passes — that probe
-  could not see the two stale-venv incidents it was guarding (2026-08-21, 2026-08-27), so
-  the skip is gone rather than re-conditioned. Nothing to do differently; the deploy just
-  spends the sync every time, and prompts only for a *separate* native checkout it did not
-  pull. `FORCE_NATIVE_REFRESH=1` / `FORCE_CLI_REFRESH=1` no longer do anything; the script
-  prints that they are redundant and refreshes regardless, so an old runbook line still
-  gets what it asked for. Step 6's post-sync import now covers `qiita-admin` as well as
-  `qiita`, so a stale symbol only `qiita-admin` imports aborts the deploy instead of
-  surfacing the next time you reach for the CLI. (#507)
-- **New `SKIP_CLI_REFRESH=1`,** mirroring `SKIP_NATIVE_REFRESH=1`. Step 6 now runs every
-  deploy and aborts on failure, so this is the out if its `uv sync` fails for its own
-  reasons on a deploy whose services are already up. (#507)
+_None yet._
 
 ---
 

@@ -1340,6 +1340,34 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   value straight to `read_parquet` and that reads a directory as one relation. Same shape
   `hash_sequences` already emits for `reference_sequence_chunks`.
 
+- **`pool-completion` no longer reports a withdrawn masking run as usable, and now sees the
+  block masking path at all (#508).** `fetch_sequenced_pool_completion` bucketed each sample by
+  the state of its per-sample `read-mask` work tickets. That answered a different question from
+  the one every masked-read consumer asks: the masked-read DoGet, the admin export, the
+  assembly input resolver and align planning all gate on `qiita.mask_sample`, and a run
+  withdrawn after the fact (`state = 'invalidated'`) keeps its COMPLETED ticket — the ticket
+  did complete, which is why there is a run to withdraw. So the summary read `fully_processed`
+  ("DONE and clean" in `qiita pool-completion`) on a pool whose reads every consumer then
+  refused; `complete` and `fully_processed` are computed from `samples_completed`, so the
+  miscount reached the headline flag, not just the tally. The same ticket join was blind to two
+  more shapes: a block ticket carries `block_idx` with `prep_sample_idx` NULL (the work_ticket
+  scope-target CHECK), so an entire block-masked pool read as never submitted, and only
+  `read-mask` was matched, not the `fastq-to-parquet` half of `PER_SAMPLE_MASK_ACTION_IDS`. The
+  rollup now resolves the two the way `repositories.mask_definition._MASKED_SAMPLE_CTE` already
+  does — the gate wins for every (mask, sample) pair that has a gate row, the ticket arm
+  supplies the pairs it does not cover, since the per-sample path has no PENDING phase and a
+  mask that ran without completing leaves no row at all — keeps work tickets for the states no
+  gate row expresses, and reaches block tickets through `qiita.block_member`. New
+  `samples_invalidated` bucket on `PoolCompletionStatus`, ranked above `in_flight` (a re-mask in
+  progress does not make a withdrawn pass-set usable), and new `samples_cancelled`, ranked above
+  `samples_failed` since `WorkTicketState` keeps CANCELLED distinct so a deliberate stop stays
+  legible in these rollups and an operator cancels to stop a failing retry. A gate row still
+  `'pending'` counts as outstanding rather than never-submitted, but only when no terminal ticket
+  state says what became of it. `samples_not_submitted` becomes the residual, so the seven
+  buckets partition the sample set by construction. `GET /sequenced-pool/{P}/work-ticket-summary` keeps asking the ticket
+  question and now has its own `fetch_sequenced_pool_read_mask_coverage` rather than
+  subtracting the rollup's residual, which no longer means "has no ticket".
+
 - **A deploy no longer skips the venv refreshes that keep native SLURM jobs off stale
   code (#507).** `redeploy.sh` steps 5 and 6 could skip `uv sync --reinstall-package
   qiita-common` when a package-root import probe passed. That probe cannot see the failure

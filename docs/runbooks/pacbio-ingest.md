@@ -80,9 +80,10 @@ qiita --base-url https://qiita-miint.ucsd.edu/ submit-pacbio-ingest \
 
 ## `pool-completion` does not report on ingest
 
-Its per-sample buckets key on the **`read-mask`** action, and `demux_state` keys on
-**`bcl-convert`**. So a freshly-ingested PacBio pool reads `samples_not_submitted: N`
-and `demux_state: not_submitted` — that means *"not masked yet,"* not a failure.
+Its per-sample buckets report host-MASKING, and `demux_state` keys on
+**`bcl-convert`**. PacBio ingest mints `bam-to-parquet`, which is neither, so a
+freshly-ingested PacBio pool reads `samples_not_submitted: N` and
+`demux_state: not_submitted` — that means *"not masked yet,"* not a failure.
 
 PacBio never mints a `bcl-convert` ticket, so **`fully_processed` is permanently
 `false` for a PacBio pool.** Use `complete` as the done signal instead.
