@@ -21,6 +21,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A `sample_type` biosample global field, backed by a new internal controlled vocabulary (#N).**
+  `Qiita Sample Type` is a terminology this database defines rather than loads from an external
+  source: there is no release to load, new terms are appended directly, and `terminology.version`
+  carries the date the vocabulary last changed. Eleven terms are seeded, spanning controls, marine
+  waters and filters, and clinical materials. The field is `terminology`-typed, so a value outside
+  the vocabulary is rejected at write time and an import supplies the term_id (`sea_water`,
+  `cerebrospinal_fluid`, ...). It is flagged `required`, which the import gate does not yet enforce.
+
 - **A reference or assembly load reports the records the canonical hash absorbed (#501).**
   `write-membership` and `write-assembly-membership` compare their manifest's record count
   against its distinct canonical hashes and, when they differ, log a warning naming the
