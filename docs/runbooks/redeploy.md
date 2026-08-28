@@ -113,6 +113,11 @@ We pull here (not via `local-deploy.sh`'s own pull) so the migration
 files are present for the migrate step *before* the deploy script runs.
 The deploy step therefore runs with `SKIP_PULL=1`.
 
+`sudo make redeploy` does this same pull as its step 1. When that pull
+changes `deploy/redeploy.sh` or `deploy/_common.sh`, the script re-execs
+the pulled copy, so the log shows the banner and step 1 twice — expected,
+and the second pull is a no-op. It aborts if that happens twice over.
+
 ## 3. Apply env-var (bucket 1) and one-time host setup (bucket 2)
 
 Run buckets 1 and 2 of the Pending-deploy checklist verbatim. Env vars

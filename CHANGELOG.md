@@ -1329,6 +1329,28 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **`redeploy.sh` re-execs itself when the pull replaced it (#510).** Step 1 pulls the clone
+  `redeploy.sh` lives in, so a pull that changes `deploy/redeploy.sh` or `deploy/_common.sh`
+  rewrites the running script. `git checkout` replaces a tracked file by rename, so the running
+  bash keeps reading the pre-pull inode and steps 2-8 execute the code from before the pull;
+  child scripts (`preflight.sh`, `local-deploy.sh`, `verify.sh`) are fresh processes reading the
+  pulled bytes, so the log gave no sign of the split. The deploy that shipped the unconditional
+  step-5/6 venv refreshes (#507) was itself driven by the old conditional script: it printed
+  "Native venv already current", skipped the `uv sync`, and left the SLURM native venv on a
+  `qiita_common` predating `ANNOTATION_STRAND_WARNING`, which `jobs/hash_sequences.py` imports —
+  surfaced two steps later by `probe/native-import`. Step 1 now fingerprints the script plus the
+  `_common.sh` it sourced either side of the pull (`qiita_deploy_self_fingerprint`, digesting each
+  file under its name the way `qiita_sif_build_inputs_hash` does) and hands off to
+  `qiita_deploy_reexec_if_changed`, which execs the pulled copy. A second change after a re-exec
+  aborts instead of re-execing: nothing is deployed at step 1, so the abort costs a re-run.
+  `redeploy.sh` also refuses to start when it is not running from inside `$QIITA_CLONE` — the
+  pull only rewrites that clone, so from outside the check could never fire. Tests drive the
+  helper end to end (execs the replacement and abandons the original, returns when nothing
+  changed, aborts under the sentinel, and the sentinel reaches the re-exec'd process), cover the
+  fingerprint (rename swap, a change confined to `_common.sh`, bytes moved between the two files,
+  fail-loud on either being unreadable), and pin the bash behaviour underneath: a script replaced
+  by rename mid-run finishes on its original body.
+
 - **`pool-completion` no longer reports a withdrawn masking run as usable, and now sees the
   block masking path at all (#508).** `fetch_sequenced_pool_completion` bucketed each sample by
   the state of its per-sample `read-mask` work tickets. That answered a different question from
