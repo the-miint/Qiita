@@ -29,8 +29,8 @@ context_schema:
   properties:
     # Absolute path to a text file listing one absolute FASTA path per line
     # (blank lines and `#` comments ignored). stage_local_fasta reads it,
-    # parses every file with miint's read_fastx, and emits the combined chunked
-    # fasta.parquet that hash_sequences consumes.
+    # parses every file with miint's read_fastx, and emits the chunked Parquet
+    # parts that hash_sequences consumes.
     fasta_manifest_path: {type: string, pattern: "^/"}
     # Optional companions, raw absolute paths. Same downstream wiring as
     # reference-add: taxonomy / tree / jplace flow into the load step's
@@ -87,8 +87,8 @@ success_status: active
 failure_status: failed
 
 steps:
-  # The only new step on the local path: manifest → one combined chunked
-  # fasta.parquet. Its `fasta_path` output is wired into hash_sequences below,
+  # The only new step on the local path: manifest → a directory of chunked
+  # Parquet parts. Its `fasta_path` output is wired into hash_sequences below,
   # which is byte-for-byte the reference-add hash_sequences step (the remote
   # path produces the same shape from a DoPut'd upload). No target_status: the
   # reference stays `pending` through staging, and hash_sequences makes the

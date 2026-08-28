@@ -1329,6 +1329,26 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **`stage_local_fasta` feeds the manifest to `read_fastx` in batches, so a large
+  reference no longer exhausts the job's file descriptors (#513).** `read_fastx` opens a
+  file per path in its `VARCHAR[]` and holds that handle until the whole call ends — a
+  reader is never released when its file is exhausted — so open descriptors and zlib state
+  grow with the number of paths in a single call, not with the bytes read
+  (duckdb-miint#260). Measured on gzipped WoL3 genomes: ~1 descriptor and ~464 KB of RSS
+  retained per path, both linear. The 196,062-genome web-of-life 3-rc4 ingest therefore
+  needed ~196k descriptors and ~89 GB before its single call could finish: the 32 GB
+  baseline attempt was OOM-killed, and the 64 GB escalation stopped at path 131,070 reporting
+  `Empty file` for a valid 957 KB genome — two short of the hard descriptor limit a
+  SLURM step on this cluster carries (measured: soft 1024, hard 131072) — which is what `read_fastx` reports when an open
+  fails, because kseq++ does not check `gzopen`'s NULL return. Both passes now run one
+  `read_fastx` call per 500 paths, holding ~500 descriptors and ~230 MB: pass 1
+  accumulates into the same temp table so the empty-body and cross-file duplicate-`read_id`
+  checks still span the whole manifest, and pass 2 writes one Parquet part per batch.
+  `fasta_path` is consequently a DIRECTORY of `part_*.parquet` rather than one file —
+  Parquet has no append — which `hash_sequences` consumes unchanged, since it passes the
+  value straight to `read_parquet` and that reads a directory as one relation. Same shape
+  `hash_sequences` already emits for `reference_sequence_chunks`.
+
 - **`redeploy.sh` re-execs itself when the pull replaced it (#510).** Step 1 pulls the clone
   `redeploy.sh` lives in, so a pull that changes `deploy/redeploy.sh` or `deploy/_common.sh`
   rewrites the running script. `git checkout` replaces a tracked file by rename, so the running
