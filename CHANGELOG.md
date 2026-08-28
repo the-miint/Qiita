@@ -21,6 +21,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A `qiita_sample_type` biosample global field, backed by a new internal controlled vocabulary (#509).**
+  `Qiita Sample Type` is a terminology this database defines rather than loads from an external
+  source: there is no release to load, new terms are appended directly, and `terminology.version`
+  carries the date the vocabulary last changed. Twelve terms are seeded, spanning controls, marine
+  and aquarium waters and filters, and clinical materials. The field is `terminology`-typed,
+  so a value outside the vocabulary is rejected at write time and an import supplies the term_id
+  (`sea_water`, `cerebrospinal_fluid`, ...). It is flagged `required`, which the import gate does
+  not yet enforce.
+
 - **An assembly run can be deprecated, and one of its samples withdrawn (#505).**
   `qiita.processing` — the canonical-params hash over `{workflow, version, mask_idx,
   assembler}` that `qiita.assembly_membership` and the DuckLake assembly tables are stamped
