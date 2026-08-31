@@ -238,6 +238,11 @@ async def test_fetch_alignment_doget_sends_work_ticket_idx_and_columns():
     assert json.loads(captured[0].content) == {
         "work_ticket_idx": 42,
         "columns": ["feature_idx", "cigar"],
+        # Always on the wire, and False unless the caller asked for the de novo
+        # arm: the CP defaults it too, so an omitted key would mean the same thing
+        # — but sending it is what makes a wrong default here a visible diff
+        # rather than a silently reference-only combined table.
+        "denovo": False,
     }
 
 
@@ -268,9 +273,10 @@ async def test_open_alignment_stream_composes_ticket_and_stream(monkeypatch):
         yield object()
         captured["cp_client_closed"] = True
 
-    async def fake_fetch(*, http, work_ticket_idx, columns):
+    async def fake_fetch(*, http, work_ticket_idx, columns, denovo):
         captured["work_ticket_idx"] = work_ticket_idx
         captured["columns"] = list(columns)
+        captured["denovo"] = denovo
         return b"signed-alignment-ticket"
 
     @contextmanager

@@ -21,6 +21,45 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Combined (inverted open reference) feature table: `estimate-feature-table` and `qiita
+  feature-table build` can estimate over two alignment arms at once (#515).** Passing a second
+  alignment — the cohort aligned against its OWN assembled contigs — builds one table over both:
+  a read placed by the de novo arm is counted against its own contig, and the reference arm
+  contributes exactly the reads the de novo arm did not place. Server-side it is
+  `denovo_alignment_idx` on the ticket's `action_context`; client-side it is
+  `--denovo-alignment-idx`. Absent either, both drivers behave exactly as before.
+
+  The analytic lives in the new `qiita_common.analytic.reconcile`, shared by both drivers.
+  Precedence is one DELETE applied to the reference slice as it is staged, so every reader after
+  it — the coverage filter, the roll-up diagnostics, woltka's input — sees the reconciled arm.
+  Three consequences are stated there because each looks like a result rather than an error: a
+  reference genome that clears `coverage_threshold` in a reference-only table over the same cohort
+  can drop out of the combined one; a read the de novo arm won can then fail that filter and be
+  counted on neither arm; and the two arms were admitted by their producers under different rules
+  on different axes, which precedence does not re-judge.
+
+  **The de novo map carries `prep_sample_idx` and is joined on the pair.** A contig is
+  content-addressed, so two cohort samples that assemble byte-identical contigs share one
+  `feature_idx` under two genomes; the contig-only join returns both rows and `woltka_ogu` credits
+  half of one sample's read to the other sample's genome. The per-genome length denominators
+  deduplicate on `feature_idx` for the mirror of the same reason — a contig streamed once per
+  sample would otherwise inflate its genomes' denominators and depress their breadth.
+
+- **`GET /assembly/{prep_sample_idx}/{processing_idx}/genome-map` and `POST
+  /assembly/{prep_sample_idx}/{processing_idx}/ticket/doget` (#515).** The de novo arm's two
+  client-reachable surfaces: the run's contig→genome lookup (a control-plane read — `genome_idx`
+  exists only in Postgres), and a human-callable assembly DoGet mint under the new
+  `Scope.ASSEMBLY_DOGET`. That scope is split from `ticket:doget` on the argument
+  `alignment:doget` already makes — the two carry different trust models, not different data — so
+  it is on every human role ceiling and on no service ceiling. Both routes check per-study access
+  BEFORE existence, inverting the alignment routes' ladder: the thing that may not exist here is
+  `(this sample, this run)`, so a 404 first would disclose whether an unreadable sample was
+  assembled, and both refuse a run whose `assembly_sample` gate does not read `completed` — the
+  presence of membership rows never means the assembly finished. The genome map additionally
+  refuses (422) a run whose memberships are not all genome-minted, because a map short by a contig
+  does not read as short downstream: it reads as a genome covering more of a smaller length than
+  it has.
+
 - **Assembly subjects mint a `qiita.genome`, recorded on `assembly_membership.genome_idx` (#514).**
   Every assembled subject — each refined bin, each LCG contig, each unbinned contig — now mints one
   qiita-origin genome, keyed on the SHA-256 of `(prep_sample_idx, processing_idx, kind, bin_id)`

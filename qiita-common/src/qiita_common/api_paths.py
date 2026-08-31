@@ -521,23 +521,38 @@ URL_READ_PREFIX = f"{API_PREFIX}{PATH_READ_PREFIX}"
 URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
 
 # =============================================================================
-# /assembly/* — Flight DoGet ticket for one assembly run's contigs
+# /assembly/* — one assembly run's contigs, and its feature -> genome map
 # =============================================================================
-# Signs a DoGet ticket scoped to ONE assembly run — a `(prep_sample_idx,
-# processing_idx)` pair — on the data plane's `assembled_sequence` /
-# `assembled_sequence_chunks` tables. POST is service-account-only
-# (Scope.TICKET_DOGET) — the job mints it at runtime, the same shape as
-# /alignment/ticket/doget.
+# The two DoGet routes sign the same ticket for the same data plane surfaces
+# (`assembled_sequence` / `assembled_sequence_chunks`), scoped to ONE assembly
+# run — a `(prep_sample_idx, processing_idx)` pair — and differ only in who may
+# ask and how the pair is authorized. The split mirrors /alignment's exactly, for
+# the reason Scope.ALIGNMENT_DOGET states there.
 #
-# The body names the pair and the pair is what is signed; the data plane
-# resolves that run's contigs through the lake's own assembly_membership. Why
-# the resolution lives there is at the route (routes/assembly.py).
+#   PATH_ASSEMBLY_DOGET      service-account-only (Scope.TICKET_DOGET). The job
+#                            mints it at runtime; the pair rides the body.
+#   PATH_ASSEMBLY_RUN_DOGET  human-callable (Scope.ASSEMBLY_DOGET). The caller
+#                            names the run in the path, so the route authorizes
+#                            that prep_sample against the caller's studies before
+#                            signing.
+#
+# Either way the pair is what is signed; the data plane resolves that run's
+# contigs through the lake's own assembly_membership. Why the resolution lives
+# there is at the route (routes/assembly.py).
+#
+# PATH_ASSEMBLY_GENOME_MAP is not a ticket at all — `genome_idx` exists only in
+# Postgres, so it is a control-plane read, the assembly twin of
+# PATH_REFERENCE_GENOME_MAP.
 
 PATH_ASSEMBLY_PREFIX = "/assembly"
 PATH_ASSEMBLY_DOGET = "/ticket/doget"
+PATH_ASSEMBLY_RUN_DOGET = "/{prep_sample_idx}/{processing_idx}/ticket/doget"
+PATH_ASSEMBLY_GENOME_MAP = "/{prep_sample_idx}/{processing_idx}/genome-map"
 
 URL_ASSEMBLY_PREFIX = f"{API_PREFIX}{PATH_ASSEMBLY_PREFIX}"
 URL_ASSEMBLY_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_DOGET}"
+URL_ASSEMBLY_RUN_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_RUN_DOGET}"
+URL_ASSEMBLY_GENOME_MAP = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP}"
 
 
 # =============================================================================

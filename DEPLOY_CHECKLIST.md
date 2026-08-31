@@ -43,10 +43,27 @@ _None yet._
   ```
 
   Assemblies run after this deploy get the mint inline; earlier ones need this. **No existing
-  artifact changes and nothing is at risk if it is skipped** — no consumer reads
-  `assembly_membership.genome_idx` yet, so this is groundwork for a genome-level roll-up over de
-  novo contigs rather than a correction. Re-run the dry run afterwards; an empty plan ("nothing to
-  do") is the completeness signal that roll-up will want. Idempotent, so a repeat costs nothing.
+  artifact changes**, but this is no longer optional groundwork: the combined feature table reads
+  `assembly_membership.genome_idx`, and both drivers refuse a run whose memberships are not all
+  minted rather than build a table over a short map — the REST map with a 422, a server-side
+  submit by failing the work ticket. Either way an assembly run that predates the mint cannot be
+  used as a de novo arm until this has run. Re-run the dry run
+  afterwards; an empty plan ("nothing to do") is the completeness signal. Idempotent, so a repeat
+  costs nothing. (#514, #515)
+
+- **Check the combined feature table's two new routes answer.** (#515)
+
+  ```bash
+  # A run known to be assembled and backfilled — pick one from the backfill's dry run.
+  curl -sS -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $QIITA_TOKEN" \
+    "$BASE/api/v1/assembly/<prep_sample_idx>/<processing_idx>/genome-map"
+  ```
+
+  `200` means the map route and the backfill above both landed. `422` means the backfill has not
+  covered that run yet — go back to the step above. `404` means that pair assembled nothing, a
+  legitimate answer; pick another run. `401` means the PAT is stale, which is why the status code
+  is what is printed: a body-only check reads the same whether the route answered or the token
+  expired.
 
 ### 6. After the deploy verifies green
 
@@ -54,7 +71,12 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **`estimate-feature-table` 1.0.0 gained an optional `denovo_alignment_idx` context key** and a
+  second resolver-staged input. The deploy's workflow sync picks it up; nothing to do by hand. A
+  submit that omits the key behaves exactly as before, so existing callers are unaffected. (#515)
+- **New scope `assembly:doget`, on every human role ceiling and on no service ceiling.** It is
+  role-implied, so no token needs re-minting and no grant is needed — a PAT minted after the
+  restart carries it automatically. (#515)
 
 ---
 

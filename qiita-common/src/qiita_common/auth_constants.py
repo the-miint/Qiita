@@ -84,6 +84,24 @@ class Scope(StrEnum):
     # worker holding both would be two ways into one surface with two different
     # validation paths.
     ALIGNMENT_DOGET = "alignment:doget"
+    # Mint an assembly-run DoGet ticket as a HUMAN, naming the run directly.
+    #
+    # Split from TICKET_DOGET on exactly the argument ALIGNMENT_DOGET above makes,
+    # and reached by the same route shape: the work-ticket mint signs a run the
+    # control plane read out of a validated action_context, this one resolves and
+    # authorizes the run the caller named (Tier.VIEWER on every study its
+    # prep_sample links to). The two ceilings follow from that and not from the
+    # data — this is on every human role ceiling and NOT on
+    # SERVICE_ACCOUNT_SCOPE_CEILING, so a worker keeps the other route and one
+    # surface never has two validation paths.
+    #
+    # What it opens to a human PAT is `assembled_sequence` /
+    # `assembled_sequence_chunks`: contigs assembled from the `read_masked`
+    # pass-set, which TICKET_DOGET already classes as not raw human/host reads —
+    # so this widens WHO may ask for an assembly, never WHAT an assembly ticket
+    # returns. The privacy-sensitive neighbours (READ_MASKED_DOGET, READ_DOGET)
+    # are for the read surfaces and are untouched by it.
+    ASSEMBLY_DOGET = "assembly:doget"
     # DoGet against the data plane's masked-read surface (`read_masked`).
     # Deliberately distinct from the generic TICKET_DOGET above: masked reads are
     # privacy-sensitive (the lake retains human/host reads, excluded only by the

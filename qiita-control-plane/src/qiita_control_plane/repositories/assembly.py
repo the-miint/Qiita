@@ -20,8 +20,16 @@ Its contract lives on `fetch_assembly_sample_state` below.
 import asyncpg
 from qiita_common.api_paths import URL_PROCESSING_SAMPLE_STATUS
 from qiita_common.hashing import canonical_params_hash
+from qiita_common.models import AssemblySampleState
 
-from . import require_transaction
+from . import gate_state_literal, require_transaction
+
+# The two `assembly_sample` states a consumer of contigs may proceed on, asserted
+# against the Literal so a renamed member fails at import rather than matching no
+# rows. Every other value, and absence, is a refusal — `fetch_assembly_sample_state`
+# is the contract that says which is which.
+ASSEMBLY_SAMPLE_COMPLETED = gate_state_literal("completed", AssemblySampleState)
+ASSEMBLY_SAMPLE_NO_DATA = gate_state_literal("no_data", AssemblySampleState)
 
 
 def assembly_genome_source_id(
@@ -352,3 +360,130 @@ async def fetch_assembly_sample_state(
         processing_idx,
         prep_sample_idx,
     )
+
+
+async def fetch_assembly_sample_states(
+    db: asyncpg.Pool | asyncpg.Connection,
+    *,
+    processing_idx: int,
+    prep_sample_idx: list[int],
+) -> dict[int, str]:
+    """The gate state of every named sample under one run, as
+    ``{prep_sample_idx: state}``. Samples with no row are ABSENT from the result,
+    which is the None `fetch_assembly_sample_state` returns, spelled for a cohort.
+
+    The bulk form, for a consumer deciding a whole cohort at once rather than
+    asking per sample. The contract those states carry is on
+    `fetch_assembly_sample_state` and is not repeated here.
+    """
+    rows = await db.fetch(
+        "SELECT prep_sample_idx, state FROM qiita.assembly_sample"
+        " WHERE processing_idx = $1 AND prep_sample_idx = ANY($2)",
+        processing_idx,
+        prep_sample_idx,
+    )
+    return {r["prep_sample_idx"]: r["state"] for r in rows}
+
+
+# The de novo arm's feature -> genome row set, shared verbatim between the Parquet
+# the compute job reads and the REST map a client reads — the assembly twin of
+# `reference_membership.GENOME_MAP_PAIRS_SQL`, and shared for the same reason:
+# the two drivers must not disagree about which contigs have a genome.
+#
+# `$1` is the prep_sample_idx COHORT (an array — the REST read passes one sample,
+# the cohort export passes the lot), `$2` the processing_idx. **Both terms,
+# always.** The pair is the assembly RUN, and a contig is content-addressed across
+# runs and samples alike: dropping processing_idx returns one contig once per run
+# that produced it, dropping prep_sample_idx returns it once per sample. Either way
+# a consumer joining on the contig gets rows it did not ask for.
+#
+# `genome_idx IS NOT NULL` is the completeness filter, and the reason
+# `count_assembly_membership_without_genome` exists beside it: a NULL is a run whose
+# memberships predate the genome mint, and silently dropping those contigs would
+# give their genomes a short denominator rather than an error.
+_ASSEMBLY_GENOME_MAP_FROM = " FROM qiita.assembly_membership am"
+_ASSEMBLY_GENOME_MAP_WHERE = (
+    " WHERE am.prep_sample_idx = ANY($1) AND am.processing_idx = $2 AND am.genome_idx IS NOT NULL"
+)
+ASSEMBLY_GENOME_MAP_PAIRS_SQL = _ASSEMBLY_GENOME_MAP_FROM + _ASSEMBLY_GENOME_MAP_WHERE
+
+# The fetch alone needs the genome row, for the provenance columns the REST entry
+# carries. Not folded into the fragment above, for the reason its reference twin
+# gives: `genome_idx` is FK'd and filtered NOT NULL here, so the join can neither
+# drop nor duplicate a row, and a count that carries it pays for an answer that
+# cannot differ.
+_ASSEMBLY_GENOME_SOURCE_JOIN = " JOIN qiita.genome g ON g.genome_idx = am.genome_idx"
+
+
+async def fetch_assembly_genome_map(
+    db: asyncpg.Pool | asyncpg.Connection,
+    *,
+    prep_sample_idx: int,
+    processing_idx: int,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """One assembly run's contig → genome lookup: one row per (feature, genome)
+    pair with the genome's `source` / `source_id`, ordered by (feature_idx,
+    genome_idx), at most `limit` rows.
+
+    DISTINCT, unlike its reference twin: the membership key carries `(kind, bin_id)`,
+    so one contig can appear on several rows of one run. Repeats collapse only when
+    they also agree on the genome; a contig that belongs to two genomes of the run
+    keeps both pairs, which `analytic.reconcile.denovo_map_table_sql` explains.
+    """
+    return await db.fetch(
+        "SELECT DISTINCT am.feature_idx, am.genome_idx, g.source, g.source_id"
+        + _ASSEMBLY_GENOME_MAP_FROM
+        + _ASSEMBLY_GENOME_SOURCE_JOIN
+        + _ASSEMBLY_GENOME_MAP_WHERE
+        + " ORDER BY am.feature_idx, am.genome_idx LIMIT $3",
+        [prep_sample_idx],
+        processing_idx,
+        limit,
+    )
+
+
+async def count_assembly_genome_map(
+    db: asyncpg.Pool | asyncpg.Connection, *, prep_sample_idx: int, processing_idx: int
+) -> int:
+    """How many (feature, genome) pairs `fetch_assembly_genome_map` would return
+    uncapped — the size a refusal names."""
+    return await db.fetchval(
+        "SELECT count(*) FROM (SELECT DISTINCT am.feature_idx, am.genome_idx"
+        + ASSEMBLY_GENOME_MAP_PAIRS_SQL
+        + ")",
+        [prep_sample_idx],
+        processing_idx,
+    )
+
+
+async def count_assembly_membership_without_genome(
+    db: asyncpg.Pool | asyncpg.Connection,
+    *,
+    prep_sample_idx: list[int],
+    processing_idx: int,
+) -> dict[int, int]:
+    """How many membership rows carry no `genome_idx`, per named prep_sample.
+    prep_samples with none are ABSENT from the result, so an empty dict is a clean
+    run.
+
+    The completeness check the map's `IS NOT NULL` filter needs behind it. A run
+    whose memberships predate the genome mint yields a map that silently omits
+    those contigs, and the omission is not visible in the result: the genomes they
+    belong to keep their other contigs, so their length denominators come back
+    short and their breadth of coverage comes back high. A caller staging this map
+    refuses on a non-empty result rather than building a table over it — the
+    assembly-genome backfill is what makes it empty.
+
+    Cohort-shaped like the two reads above, so a caller checking a whole cohort
+    makes one round trip and its refusal can name every offender rather than the
+    first.
+    """
+    rows = await db.fetch(
+        "SELECT prep_sample_idx, count(*) AS n FROM qiita.assembly_membership"
+        " WHERE prep_sample_idx = ANY($1) AND processing_idx = $2 AND genome_idx IS NULL"
+        " GROUP BY prep_sample_idx ORDER BY prep_sample_idx",
+        prep_sample_idx,
+        processing_idx,
+    )
+    return {r["prep_sample_idx"]: r["n"] for r in rows}

@@ -2,9 +2,10 @@
 
 The builders return SQL text and open no connection, so the sibling modules here
 assert on strings; the analytic's behaviour is pinned in this one and in the
-orchestrator's `test_estimate_feature_table.py`. This module carries the properties
-that suite cannot: **the per-sample coverage scope**, which no server-side caller
-uses.
+orchestrator's `test_estimate_feature_table.py`. The division: this module owns what
+the analytic COMPUTES — including the per-sample coverage scope, which no server-side
+caller uses, and the combined table's reconciliation; that one owns how its driver
+feeds it.
 
 Every test drives the shared builders end to end — the staging renames, the
 lengths roll-up, the survivor set, the pre-woltka join, and `woltka_ogu` itself —
@@ -1416,3 +1417,323 @@ def test_a_tip_shared_with_an_UNPUBLISHED_genome_still_shears_cleanly(tmp_path):
     assert "GCF_000000500" not in published, "G500 must be unpublished for this to test anything"
     assert clearance.tips == 3
     assert {name for _, name, _, _, _, is_tip in rows if is_tip} == published
+
+
+# ---------------------------------------------------------------------------
+# The combined (inverted open reference) table: two arms, one woltka pass.
+#
+# The fixture is built so that every rule the reconciliation depends on has a
+# fixture element only IT explains, and c50 carries three of them at once — it is
+# a reference sequence AND a contig both samples assembled, which is the whole
+# reason `feature_idx` being content-addressed is a hazard here.
+#
+#   reference   R100: c10          R200: c20          R300: c50
+#   de novo     Q900 (sample 1): c50, c51             Q901 (sample 2): c50, c52
+#
+# All five contigs are 1000 bp, so a genome's denominator is a count of contigs
+# and every proportion below is readable without arithmetic.
+# ---------------------------------------------------------------------------
+
+_R_MAP = [(10, 100), (20, 200), (50, 300)]
+_R_LENGTHS = [(10, 1000), (20, 1000), (50, 1000)]
+
+# (prep_sample_idx, feature_idx, genome_idx) — scoped to ONE assembly run.
+_D_MAP = [(1, 50, 900), (1, 51, 900), (2, 50, 901), (2, 52, 901)]
+# One stream per cohort sample, as the assembly read-back is scoped. c50 is in both.
+_D_LENGTHS = {1: [(50, 1000), (51, 1000)], 2: [(50, 1000), (52, 1000)]}
+
+_R_ALIGNMENT = [
+    # (prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position)
+    (1, 1, 10, 0, 0, 500),  # R100, only the reference arm places it
+    (1, 2, 20, 0, 0, 500),  # R200, the remainder case
+    (1, 3, 50, 0, 0, 500),  # R300 — superseded: read 3 is placed de novo too
+    (2, 4, 10, 0, 0, 500),  # R100 again, from the other sample
+]
+_D_ALIGNMENT = [
+    (1, 3, 50, 0, 0, 500),  # Q900, and the read that supersedes its reference row
+    (1, 5, 51, 0, 0, 500),  # Q900's second contig
+    (2, 6, 50, 0, 0, 500),  # Q901 — the SAME contig as read 3, in the other sample
+]
+
+
+def _stage_combined(
+    conn, *, threshold, denovo_map=_D_MAP, denovo_lengths=None, denovo_alignment=None
+):
+    """Stage both arms through the shared builders, in the order both drivers use.
+
+    Deliberately not a branch inside `_stage`: the reference-only path is what that
+    helper pins, and threading a second arm through it would let a change to the
+    combined path alter what every reference-only test above exercises.
+    """
+    denovo_lengths = _D_LENGTHS if denovo_lengths is None else denovo_lengths
+    conn.execute(
+        "CREATE TABLE _r_map AS "
+        + _values(_R_MAP, "feature_idx, genome_idx", "?::BIGINT, ?::BIGINT"),
+        [x for r in _R_MAP for x in r],
+    )
+    conn.execute(
+        "CREATE TABLE _d_map AS "
+        + _values(
+            denovo_map,
+            "prep_sample_idx, feature_idx, genome_idx",
+            "?::BIGINT, ?::BIGINT, ?::BIGINT",
+        ),
+        [x for r in denovo_map for x in r],
+    )
+    conn.execute(
+        "CREATE TABLE _r_len AS "
+        + _values(_R_LENGTHS, "feature_idx, sequence_length_bp", "?::BIGINT, ?::BIGINT"),
+        [x for r in _R_LENGTHS for x in r],
+    )
+    conn.execute(ft.map_table_sql("_r_map"))
+    conn.execute(ft.denovo_map_table_sql("_d_map"))
+
+    if ft.coverage_filter_applies(threshold):
+        conn.execute(ft.genome_lengths_table_sql("_r_len"))
+        conn.execute(ft.denovo_contig_lengths_table_sql())
+        # One INSERT per cohort sample, which is what the per-run assembly DoGet
+        # forces and what the dedupe in the roll-up exists to survive.
+        for sample, rows in sorted(denovo_lengths.items()):
+            conn.execute(
+                f"CREATE OR REPLACE TABLE _d_len_{sample} AS "
+                + _values(rows, "feature_idx, sequence_length_bp", "?::BIGINT, ?::BIGINT"),
+                [x for r in rows for x in r],
+            )
+            conn.execute(ft.denovo_contig_lengths_insert_sql(f"_d_len_{sample}"))
+        conn.execute(ft.denovo_genome_lengths_insert_sql())
+
+    denovo_rows = _D_ALIGNMENT if denovo_alignment is None else denovo_alignment
+    for name, rows in (("_r_align", _R_ALIGNMENT), ("_d_align", denovo_rows)):
+        conn.execute(
+            f"CREATE TABLE {name} AS "
+            + _values(
+                rows,
+                'prep_sample_idx, sequence_idx, feature_idx, flags, "position", stop_position',
+                "?::BIGINT, ?::BIGINT, ?::BIGINT, ?::USMALLINT, ?::BIGINT, ?::BIGINT",
+            ),
+            [x for r in rows for x in r],
+        )
+    conn.execute(ft.alignment_table_sql("_r_align"))
+    for sql in ft.denovo_alignment_statements("_d_align"):
+        conn.execute(sql)
+
+
+def _combined_table(
+    scope=ft.CoverageScope.POOLED,
+    threshold=0.01,
+    *,
+    denovo_map=_D_MAP,
+    denovo_lengths=None,
+    denovo_alignment=None,
+) -> list[tuple]:
+    """The whole combined analytic, sorted. Same shape as `_table`, one arm wider."""
+    with _miint_conn() as conn:
+        _stage_combined(
+            conn,
+            threshold=threshold,
+            denovo_map=denovo_map,
+            denovo_lengths=denovo_lengths,
+            denovo_alignment=denovo_alignment,
+        )
+        for sql, parameters in ft.ogu_input_statements(
+            scope=scope, coverage_threshold=threshold, combined=True
+        ):
+            conn.execute(sql, parameters)
+        populated = conn.execute(ft.ogu_input_count_sql()).fetchone()[0] > 0
+        select = ft.woltka_ogu_select_sql() if populated else ft.empty_ogu_select_sql()
+        return conn.execute(f"SELECT * FROM ({select}) ORDER BY 1, 2").fetchall()
+
+
+def _reference_only_table(threshold=0.01) -> list[tuple]:
+    """The same reference arm with no de novo arm at all — the control every
+    assertion about the combined table is read against."""
+    return _table(
+        ft.CoverageScope.POOLED,
+        threshold,
+        alignment=_R_ALIGNMENT,
+        mapping=_R_MAP,
+        lengths=_R_LENGTHS,
+    )
+
+
+def test_combined_table_places_each_read_on_exactly_one_arm():
+    """The whole reconciliation in one assertion, and every row of it is a rule:
+
+    * read 3 is placed by BOTH arms and lands only on the de novo side (Q900),
+      contributing 1.0 there and nothing to R300 — precedence;
+    * read 2 is placed only by the reference arm and stays there — the remainder;
+    * reads 3 and 6 are on the SAME contig c50 in different samples, and each is
+      whole against its own sample's genome rather than split across both;
+    * R300 is gone: c50 was its only aligned contig and precedence took its only
+      read, so a genome that survives the reference-only control drops out here.
+    """
+    assert _combined_table() == [
+        (1, 100, 1.0),  # read 1
+        (1, 200, 1.0),  # read 2 — the remainder
+        (1, 900, 2.0),  # reads 3 and 5, both whole
+        (2, 100, 1.0),  # read 4
+        (2, 901, 1.0),  # read 6, whole against ITS sample's genome
+    ]
+
+
+def test_the_reference_only_control_keeps_the_genome_the_combined_table_drops():
+    """R300 clears the threshold on the same cohort when there is no de novo arm to
+    take its read. Without this the row missing above is not evidence of precedence
+    — it is indistinguishable from a fixture that never covered R300."""
+    assert _reference_only_table() == [
+        (1, 100, 1.0),
+        (1, 200, 1.0),
+        (1, 300, 1.0),  # read 3, which the combined table gives to Q900 instead
+        (2, 100, 1.0),
+    ]
+
+
+@pytest.mark.parametrize("denovo_map", [_D_MAP, [row for row in _D_MAP if row[:2] != (1, 50)]])
+def test_no_read_is_lost_by_the_reconciliation(denovo_map):
+    """Conservation: every read that reached either arm is still counted, so the
+    table's values sum to the number of distinct reads staged.
+
+    Only the losing direction — a read counted twice cannot show up here, because
+    woltka normalizes a read across the genomes it sees and 0.5 + 0.5 is also 1.0.
+    Precedence's failure to the OTHER side is what
+    `test_combined_table_places_each_read_on_exactly_one_arm` reads.
+
+    The second parameter is the case that makes this discriminate at all: with no
+    genome for c50 in sample 1, a DELETE that superseded on the raw de novo slice
+    rather than through the map would take read 3's reference placement away without
+    giving it a de novo one, and the sum would come back 5.
+    """
+    staged = {row[1] for row in _R_ALIGNMENT} | {row[1] for row in _D_ALIGNMENT}
+    table = _combined_table(denovo_map=denovo_map)
+    assert sum(value for _, _, value in table) == pytest.approx(len(staged))
+
+
+def test_a_contig_two_samples_assembled_is_not_credited_across_them():
+    """c50 is one content-addressed `feature_idx` under Q900 and Q901, so the de novo
+    map holds two rows for it. Joined on the contig alone both match every read on
+    c50, and woltka splits each across the two genomes — 0.5 to the sample that did
+    not produce the read. The join carries `prep_sample_idx` for exactly this.
+
+    Asserted as whole numbers rather than a shape, because the failure is a plausible
+    half rather than an error.
+    """
+    values = {(sample, genome): value for sample, genome, value in _combined_table()}
+    assert values[(1, 900)] == 2.0
+    assert values[(2, 901)] == 1.0
+    assert (1, 901) not in values and (2, 900) not in values
+
+
+def test_a_contig_two_samples_assembled_is_counted_once_in_each_denominator():
+    """c50 arrives on both samples' length streams, so the roll-up sees it twice.
+    Deduplicated, Q901 is 2000 bp and its one 500 bp read is 25% of it; summed raw it
+    is 3000 bp and the same read is 16.7%, so a threshold between the two is what
+    tells the fix from a coincidence.
+
+    Q900 is the control: at 33% undeduplicated it clears 20% either way, so a failure
+    here is specifically the denominator and not the threshold.
+    """
+    assert _combined_table(threshold=0.20) == [
+        (1, 100, 1.0),
+        (1, 200, 1.0),
+        (1, 900, 2.0),
+        (2, 100, 1.0),
+        (2, 901, 1.0),  # 500/2000 = 25% — present only if c50 was counted once
+    ]
+
+
+def test_a_de_novo_placement_with_no_genome_leaves_the_read_to_the_reference_arm():
+    """Precedence is over rollable placements: the DELETE reads the de novo slice
+    THROUGH the map, so a run whose membership carries no genome for a contig falls
+    back to that read's reference placement instead of dropping it from both arms.
+
+    Dropping Q900's c50 row from the map removes read 3 from the de novo arm; it must
+    reappear on R300, which the reference-only control shows is where it would have
+    been all along.
+    """
+    without_c50 = [row for row in _D_MAP if row[:2] != (1, 50)]
+    values = {(s, g): v for s, g, v in _combined_table(denovo_map=without_c50)}
+    assert values[(1, 300)] == 1.0, "read 3 falls back to its reference placement"
+    assert values[(1, 900)] == 1.0, "only read 5 is left on Q900"
+
+
+def test_per_sample_scope_reaches_both_arms():
+    """The per-sample survivor set is built from two hand-rolled branches in one
+    statement, where pooled has the macro on one side; this is the shape that would
+    fail to parse or bind rather than answer wrongly. Every genome here clears 1% in
+    the sample that carries it, so the table is the pooled one.
+    """
+    assert _combined_table(scope=ft.CoverageScope.PER_SAMPLE) == _combined_table()
+
+
+def test_an_unfiltered_combined_table_still_reconciles():
+    """At threshold 0 there is no survivor set, no coverage view and no lengths at
+    all — so precedence is the only thing left standing between the two arms, and it
+    still has to hold. R300 keeps its zero rows; Q900 keeps read 3.
+    """
+    values = {(s, g): v for s, g, v in _combined_table(threshold=0.0)}
+    assert (1, 300) not in values
+    assert values[(1, 900)] == 2.0
+
+
+def test_a_read_the_denovo_arm_won_can_fall_out_of_the_table_entirely():
+    """The third consequence of precedence, and the one most easily misread as a
+    result: precedence runs at staging, the breadth filter runs after it, and both
+    arms inner-join the survivor set. So a read the de novo arm won, on a qiita
+    genome that then fails `coverage_threshold`, is gone from the de novo arm by the
+    filter and from the reference arm by precedence.
+
+    Q900's contigs are inflated to 100 kb here so 1000 covered bases is 1%, under the
+    2% threshold. Read 3 was ALSO placed on R300 by the reference arm, and R300
+    survives on sample 2's own read — so the read's reference home is still in the
+    table and it still is not counted there.
+    """
+    fat = {1: [(50, 50_000), (51, 50_000)], 2: [(50, 1000), (52, 1000)]}
+    extra_reference = [*_R_ALIGNMENT, (2, 7, 50, 0, 0, 900)]
+    with _miint_conn() as conn:
+        _stage_combined(conn, threshold=0.02, denovo_lengths=fat)
+        # The reference arm keeps a second read on c50 so R300 clears the threshold
+        # on its own; without it R300's absence would be ambiguous.
+        conn.execute(
+            "INSERT INTO alignment_slice "
+            + _values(
+                [(2, 7, 50, 0, 0, 900)],
+                'prep_sample_idx, sequence_idx, feature_idx, flags, "position", stop_position',
+                "?::BIGINT, ?::BIGINT, ?::BIGINT, ?::USMALLINT, ?::BIGINT, ?::BIGINT",
+            ),
+            [2, 7, 50, 0, 0, 900],
+        )
+        for sql, parameters in ft.ogu_input_statements(
+            scope=ft.CoverageScope.POOLED, coverage_threshold=0.02, combined=True
+        ):
+            conn.execute(sql, parameters)
+        populated = conn.execute(ft.ogu_input_count_sql()).fetchone()[0] > 0
+        select = ft.woltka_ogu_select_sql() if populated else ft.empty_ogu_select_sql()
+        rows = conn.execute(f"SELECT * FROM ({select}) ORDER BY 1, 2").fetchall()
+
+    values = {(s, g): v for s, g, v in rows}
+    assert (1, 900) not in values, "Q900 failed the breadth filter"
+    assert (1, 300) not in values, "and precedence had already taken read 3 off R300"
+    assert (2, 300) in values, (
+        "R300 survives on the read the de novo arm never touched — without this the "
+        "row above is just a genome nothing covered"
+    )
+    staged = {row[1] for row in extra_reference} | {row[1] for row in _D_ALIGNMENT}
+    assert sum(values.values()) < len(staged), (
+        "so the table counts fewer reads than were staged — the documented consequence"
+    )
+
+
+def test_several_rows_of_one_read_within_an_arm_still_count_once():
+    """`reconcile`'s module docstring makes "what is counted is unchanged by any of
+    this" load-bearing for the whole precedence design, and nothing exercised the
+    de novo arm's half of it.
+
+    Read 5 gets a secondary placement on the same contig — two rows, one genome. It
+    must contribute what one read contributes, not two: `woltka_ogu` splits across
+    DISTINCT `reference` values, and both rows share one. (This says nothing about
+    the arms' UNION ALL: within-arm multiplicity flows through one side of it either
+    way.)
+    """
+    with_secondary = [*_D_ALIGNMENT, (1, 5, 51, 256, 100, 600)]
+    values = {(s, g): v for s, g, v in _combined_table(denovo_alignment=with_secondary)}
+    assert values[(1, 900)] == 2.0, "reads 3 and 5, the secondary adding nothing"

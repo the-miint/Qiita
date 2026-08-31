@@ -125,16 +125,23 @@ def _alignment_reader(columns: list[str], rows: list[tuple]) -> pa.RecordBatchRe
     return table.to_reader()
 
 
-def _lengths_reader() -> pa.RecordBatchReader:
-    """`reference_sequences` as the whole-reference ticket streams it — `sequence_hash`
-    rides along unused, which is what the analytic's projection has to tolerate."""
+def _lengths_reader_rows(rows: list[tuple[int, int]]) -> pa.RecordBatchReader:
+    """`reference_sequences` / `assembled_sequence` as their tickets stream them —
+    `sequence_hash` rides along unused on both, which is what the analytic's
+    projection has to tolerate. One reader for the two because the two surfaces have
+    the same shape; only their scope differs, and that is the ticket's business."""
     return pa.table(
         {
-            "feature_idx": pa.array([f for f, _ in _LENGTHS], pa.int64()),
-            "sequence_hash": pa.array([None] * len(_LENGTHS), pa.string()),
-            "sequence_length_bp": pa.array([n for _, n in _LENGTHS], pa.int64()),
+            "feature_idx": pa.array([f for f, _ in rows], pa.int64()),
+            "sequence_hash": pa.array([None] * len(rows), pa.string()),
+            "sequence_length_bp": pa.array([n for _, n in rows], pa.int64()),
         }
     ).to_reader()
+
+
+def _lengths_reader() -> pa.RecordBatchReader:
+    """The whole reference's lengths — the default every reference-only test uses."""
+    return _lengths_reader_rows(_LENGTHS)
 
 
 def _taxonomy_reader(rows) -> pa.RecordBatchReader:
@@ -217,6 +224,9 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
         "sequencing_run_idx": 4,
         "sequenced_pool_idx": 5,
         "alignment_idx": 3,
+        # Reference-only by default: the combined arm is opt-in, and every existing
+        # test here is about the analytic the reference arm alone produces.
+        "denovo_alignment_idx": None,
         "prep_sample_idx": None,
         "coverage_scope": ft.CoverageScope.POOLED.value,
         "coverage_threshold": 0.01,
@@ -1413,3 +1423,307 @@ def test_an_unresolvable_miint_version_is_a_string_not_a_json_null(miint_row):
     tools = ftc._tool_versions(_VersionCatalog(miint_row))
     assert tools["miint"] == "unknown"
     assert all(isinstance(value, str) for value in tools.values())
+
+
+# ---------------------------------------------------------------------------
+# The combined (inverted open reference) build: --denovo-alignment-idx.
+#
+# The analytic's rules are pinned against real miint in qiita-common; what is
+# pinned here is this driver's own wiring — the second alignment's summary comes
+# from the SAME verified pool listing, the map is fetched per sample and keyed by
+# it, the lengths are fetched only for the samples the map named, and the
+# reference-only path is untouched.
+# ---------------------------------------------------------------------------
+
+_DENOVO_PARAMS = {
+    "subject": "assembly",
+    "aligner": "minimap2",
+    # Same mask as the reference arm's `_PARAMS`; the pairing rule refuses otherwise.
+    "mask_idx": 2,
+    "processing_idx": 11,
+}
+_DENOVO_TICKET = b"denovo-alignment-ticket"
+_DENOVO_LENGTHS_TICKET = b"denovo-lengths-ticket"
+
+# Sample 1 assembled contig 50; sample 2 assembled the same content-addressed
+# contig, under its own genome. Read 2 is placed by BOTH arms — it is the reference
+# arm's row on contig 20 — so precedence has something to decide.
+_DENOVO_MAP = {
+    1: [{"feature_idx": 50, "genome_idx": 900, "source": "qiita", "source_id": "qiita-900"}],
+    2: [{"feature_idx": 50, "genome_idx": 901, "source": "qiita", "source_id": "qiita-901"}],
+}
+_DENOVO_ALIGNMENT = [
+    (1, 2, 50, 0, 0, 500, "500="),  # read 2, also placed by the reference arm
+    (2, 9, 50, 0, 0, 500, "500="),  # sample 2's own, on the same contig
+]
+_DENOVO_LENGTHS = [(50, 1000)]
+
+
+def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None):
+    """`_patched`, plus the three de novo seams. Returns the same recorder, with
+    `denovo_map_samples`, `denovo_lengths_samples` and `arm_tickets` added."""
+    # The exported-feature mint has to answer for BOTH arms' genomes: a qiita genome
+    # is minted a handle exactly as a reference one is, which is the point of the two
+    # arms sharing one `qiita.genome` space.
+    rec = _patched(
+        monkeypatch,
+        feature_handles={100: "GCF_100", 200: "GCF_200", 900: "qiita-900", 901: "qiita-901"},
+    )
+    rec["denovo_map_samples"] = []
+    rec["denovo_lengths_samples"] = []
+    rec["arm_tickets"] = []
+
+    body = {
+        "alignments": [
+            *_ALIGNMENTS_BODY["alignments"],
+            {
+                "alignment_idx": 4,
+                "params": _DENOVO_PARAMS,
+                "params_hash": canonical_params_hash(_DENOVO_PARAMS).hex(),
+                "samples_completed": 2,
+                "samples_total": 2,
+            },
+        ]
+    }
+    monkeypatch.setattr(ftc, "_fetch_pool_alignments", lambda *a, **k: body)
+
+    the_map = _DENOVO_MAP if denovo_map is None else denovo_map
+
+    def _assembly_map(base_url, token, *, prep_sample_idx, processing_idx):
+        rec["denovo_map_samples"].append(prep_sample_idx)
+        rec["denovo_map_processing_idx"] = processing_idx
+        if prep_sample_idx not in the_map:
+            # What the route returns for a sample that assembled nothing, which the
+            # recipe reads as "no de novo arm" rather than as an error.
+            raise httpx.HTTPStatusError(
+                "no contigs",
+                request=httpx.Request("GET", "http://cp"),
+                response=httpx.Response(404),
+            )
+        return the_map[prep_sample_idx]
+
+    monkeypatch.setattr(ftc, "_fetch_assembly_genome_map", _assembly_map)
+
+    def _assembly_ticket(base_url, token, *, prep_sample_idx, processing_idx, table):
+        rec["denovo_lengths_samples"].append(prep_sample_idx)
+        rec["denovo_lengths_table"] = table
+        return _DENOVO_LENGTHS_TICKET
+
+    monkeypatch.setattr(ftc, "_create_assembly_run_doget_ticket", _assembly_ticket)
+
+    # The alignment mint is ONE helper for both arms, dispatching on alignment_idx —
+    # exactly as the human cohort route does, which is subject-agnostic.
+    #
+    # **This fake enforces what the real route enforces**, which the rest of this
+    # module's fakes do not need to: `authorize_completed_alignment_cohort` refuses
+    # a cohort member with no `alignment_sample` row for that alignment, and a
+    # sample that assembled nothing has none — `align-denovo` ends NO_DATA for it
+    # before a gate row exists. A fake that signed any cohort would let the driver
+    # ask for the whole build's samples and still go green, which is exactly the
+    # difference between the two drivers this module exists to catch.
+    def _alignment_ticket(base_url, token, *, alignment_idx, prep_sample_idx, columns):
+        rec["arm_tickets"].append(alignment_idx)
+        rec["columns"] = list(columns)
+        rec["ticket_cohort"] = list(prep_sample_idx)
+        if alignment_idx == 4:
+            rec["denovo_ticket_cohort"] = list(prep_sample_idx)
+            unaligned = sorted(set(prep_sample_idx) - set(the_map))
+            if unaligned:
+                raise httpx.HTTPStatusError(
+                    f"{len(unaligned)} prep_sample(s) not completed for alignment 4",
+                    request=httpx.Request("POST", "http://cp"),
+                    response=httpx.Response(422),
+                )
+            return _DENOVO_TICKET
+        return _ALIGNMENT_TICKET
+
+    monkeypatch.setattr(ftc, "_create_alignment_doget_ticket", _alignment_ticket)
+
+    denovo_rows = _DENOVO_ALIGNMENT if denovo_alignment is None else denovo_alignment
+    readers = {
+        _ALIGNMENT_TICKET: lambda: _alignment_reader(
+            rec["columns"], [r for r in _ALIGNMENT if r[0] in rec["ticket_cohort"]]
+        ),
+        _DENOVO_TICKET: lambda: _alignment_reader(
+            rec["columns"], [r for r in denovo_rows if r[0] in rec["ticket_cohort"]]
+        ),
+        _LENGTHS_TICKET: _lengths_reader,
+        _DENOVO_LENGTHS_TICKET: lambda: _lengths_reader_rows(_DENOVO_LENGTHS),
+        _TAXONOMY_TICKET: lambda: _taxonomy_reader(_TAXONOMY),
+        _PHYLOGENY_TICKET: lambda: _phylogeny_reader(_PHYLOGENY),
+    }
+    monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
+    return rec
+
+
+def test_a_combined_build_counts_each_read_on_one_arm(monkeypatch, tmp_path):
+    """Read 2 is placed by BOTH arms and is counted once, on the de novo side.
+
+    **The discriminator is the 1.0, not the genome.** Without precedence read 2 would
+    sit in both arms, and `woltka_ogu` splits a read across the distinct genomes it
+    sees — so it would come back as 0.5 against `qiita-900` and 0.5 against
+    `GCF_200`, a plausible pair of numbers rather than an error. Asserting the whole
+    value is what tells the two apart.
+
+    Sample 2's read 9 is the second arm's own contribution, on the same
+    content-addressed contig under its own genome: 1.0 there proves the map join
+    carried `prep_sample_idx`, since the contig-only join would have split it too.
+    """
+    rec = _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["arm_tickets"] == [3, 4], "the reference arm first, then the de novo one"
+    rows = _table_rows(args.output)
+    assert ("QM1", "qiita-900", 1.0) in rows
+    assert ("QM2", "qiita-901", 1.0) in rows
+
+
+def test_a_combined_build_keys_the_map_and_the_lengths_by_sample(monkeypatch, tmp_path):
+    """One map fetch and one lengths mint per cohort sample, both at the assembly run
+    the de novo alignment's own params named — never a caller-supplied one. The
+    lengths read the contig surface, which carries hash and length and no bytes."""
+    rec = _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_map_samples"] == [1, 2]
+    assert rec["denovo_map_processing_idx"] == 11
+    assert rec["denovo_lengths_samples"] == [1, 2]
+    assert rec["denovo_lengths_table"] == "assembled_sequence"
+
+
+def test_a_sample_that_assembled_nothing_stays_reference_only(monkeypatch, tmp_path):
+    """The 404 on that sample's map is the design's graceful path, not an error: the
+    build succeeds and the sample keeps its reference placement.
+
+    Run at threshold 0 so breadth of coverage does not confound the point — at 1% it
+    does, and that is the subject of the test below rather than of this one.
+    """
+    rec = _patched_combined(monkeypatch, denovo_map={1: _DENOVO_MAP[1]})
+    args = _namespace(tmp_path, denovo_alignment_idx=4, coverage_threshold=0.0)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_map_samples"] == [1, 2], "both were asked; only one had a run"
+    # **The de novo mint got only the assembled sample.** The real route refuses a
+    # cohort member with no `alignment_sample` row, so passing the whole cohort here
+    # 422s the entire build — turning the graceful path into a hard failure.
+    assert rec["denovo_ticket_cohort"] == [1]
+    rows = _table_rows(args.output)
+    assert ("QM2", "GCF_200", 1.0) in rows, "sample 2 is still on the reference arm"
+    assert not [r for r in rows if r[0] == "QM2" and r[1].startswith("qiita-")], (
+        "and it has no de novo genome, having assembled nothing"
+    )
+
+
+def test_a_sample_with_no_run_is_never_asked_for_its_lengths(monkeypatch, tmp_path):
+    """The lengths cohort comes from the STAGED MAP, not from the requested one: a
+    sample whose map 404'd has no assembly run, and the DoGet mint for it would 404
+    too. Asserted separately from the fallback above because it needs a threshold
+    that actually opens the lengths streams."""
+    rec = _patched_combined(monkeypatch, denovo_map={1: _DENOVO_MAP[1]})
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_lengths_samples"] == [1]
+
+
+def test_the_reference_arm_can_lose_a_genome_to_the_coverage_filter(monkeypatch, tmp_path):
+    """**The consequence of precedence that looks like a result, not an error.**
+
+    G200 clears the 1% threshold in the reference-only build of this same fixture,
+    on the two samples' extending intervals pooled (0.6% + 0.6%). The combined build
+    gives sample 1's read to the de novo arm, so only sample 2's 0.6% is left and
+    G200 drops out entirely — for BOTH samples, pooled scope keeping or dropping a
+    genome cohort-wide.
+
+    `test_a_pooled_build_writes_the_public_table_and_its_map` is the control: it is
+    this fixture with no de novo arm, and G200 is in it twice.
+    """
+    _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert not [r for r in _table_rows(args.output) if r[1] == "GCF_200"]
+
+
+def test_a_reference_alignment_cannot_be_passed_as_the_de_novo_arm(monkeypatch, tmp_path, capsys):
+    """Passing the same alignment twice is refused on `params.subject`, by the rule
+    the server-side resolver applies. Unchecked it is not an error: precedence would
+    reconcile the reference arm against itself and empty it.
+
+    The handler turns the ValueError into a non-zero exit and a message, as it does
+    every other bad-flag refusal — so this asserts the exit code and the wording
+    rather than the exception.
+    """
+    _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=3)
+
+    assert ftc._handle_feature_table_build(args, parser=None) != 0
+    assert "not a de novo alignment" in capsys.readouterr().err
+
+
+def test_the_circular_gate_is_refused_alongside_the_de_novo_arm(monkeypatch, tmp_path):
+    """`--circular-gate` would re-judge both arms against thresholds their producers
+    never aligned at — redundant for the de novo arm, which align_denovo already
+    gated, and wrong for the reference arm, which align_sharded scored per record."""
+    args = _namespace(tmp_path, denovo_alignment_idx=4, circular_gate=True)
+    with pytest.raises(ValueError, match="without it"):
+        ftc._gate_from_args(args)
+
+
+def test_a_cohort_where_nothing_assembled_degrades_to_a_reference_only_build(
+    monkeypatch, tmp_path, capsys
+):
+    """Every sample 404s on its map, so there is no second arm at all. The build must
+    fall back to reference-only rather than sign an unscoped de novo ticket (which the
+    mint refuses) or bind against a de novo slice nothing staged.
+
+    The boundary case of the graceful path, and the one where "skip the samples the
+    map did not name" leaves nothing to skip TO.
+    """
+    rec = _patched_combined(monkeypatch, denovo_map={})
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["arm_tickets"] == [3], "no de novo ticket was minted"
+    assert rec["denovo_lengths_samples"] == []
+    assert _table_rows(args.output) == [
+        ("QM1", "GCF_100", 1.0),
+        ("QM1", "GCF_200", 1.0),
+        ("QM2", "GCF_200", 1.0),
+    ], "the counts are the reference-only build's"
+    # **But the bundle is not.** The table matching a reference-only build is exactly
+    # why the request has to be recorded: without it a combined ask and a
+    # reference-only ask leave no distinguishable trace, and the caller has no way to
+    # tell a degraded build from the one they asked for.
+    denovo = json.loads((tmp_path / "table.manifest.json").read_text())["table"]["denovo"]
+    assert denovo["requested_alignment_idx"] == 4
+    assert denovo["applied"] is False
+    assert denovo["prep_samples_with_a_de_novo_arm"] == 0
+    assert "reference-only table" in capsys.readouterr().err
+
+
+def test_a_partly_assembled_cohort_says_how_many_samples_had_no_arm(monkeypatch, tmp_path, capsys):
+    """A build where SOME samples degrade is the case a caller is least likely to
+    notice: the table is populated, the exit code is 0, and the missing arm shows up
+    only as counts that are lower than expected. Say it on stderr and record it."""
+    _patched_combined(monkeypatch, denovo_map={1: _DENOVO_MAP[1]})
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert "1 of 2 prep_sample(s) have no contigs" in capsys.readouterr().err
+    denovo = json.loads((tmp_path / "table.manifest.json").read_text())["table"]["denovo"]
+    assert denovo["applied"] is True
+    assert denovo["processing_idx"] == 11
+    assert denovo["prep_samples_with_a_de_novo_arm"] == 1
+
+
+def test_a_reference_only_build_records_no_denovo_block(monkeypatch, tmp_path):
+    """The key is absent, not null: a build that never asked for a second arm should
+    read exactly as it did before the arm existed."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert "denovo" not in json.loads((tmp_path / "table.manifest.json").read_text())["table"]

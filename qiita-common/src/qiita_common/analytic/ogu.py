@@ -26,15 +26,22 @@ from .coverage import (
     CoverageScope,
     coverage_alignments_view_sql,
     coverage_filter_applies,
+    survivor_parameters,
     survivor_table_name,
     survivor_table_sql,
+)
+from .reconcile import (
+    denovo_coverage_alignments_view_sql,
+    denovo_ogu_input_select_sql,
 )
 from .relations import (
     ALIGNMENT_TABLE,
     COVERAGE_ALIGNMENTS_VIEW,
+    DENOVO_COVERAGE_ALIGNMENTS_VIEW,
     MAP_TABLE,
     OGU_INPUT_TABLE,
     OGU_OUTPUT_TABLE,
+    drop_denovo_alignment_table_sql,
 )
 
 # The analytic's output schema, name -> SQL type. Both the real path and the 0-row
@@ -51,7 +58,7 @@ OUTPUT_SCHEMA = {
 OUTPUT_COLUMNS = tuple(OUTPUT_SCHEMA)
 
 
-def ogu_input_table_sql(*, survivor_scope: CoverageScope | None) -> str:
+def ogu_input_table_sql(*, survivor_scope: CoverageScope | None, combined: bool = False) -> str:
     """woltka's input: the alignment pre-mapped to genome level, so woltka counts
     at genome granularity. The map's INNER JOIN also drops alignments to features
     with no genome (a 16S record is not an OGU).
@@ -71,27 +78,45 @@ def ogu_input_table_sql(*, survivor_scope: CoverageScope | None) -> str:
     Filtering woltka's OUTPUT instead strands it at 0.5 — a plausible number rather
     than an error.
 
+    **`combined` appends the de novo arm as a `UNION ALL`, into one relation and one
+    woltka pass.** Not two tables merged afterwards: woltka normalizes a read across
+    the distinct genomes IT sees, so a read split over two passes would be counted
+    once in each.
+
+    `UNION ALL` and `UNION` would return the same rows here — `denovo_alignment_statements`
+    has already removed every de-novo-won read from the reference arm, so no row can
+    appear on both sides — and `ALL` is what keeps the recipe from paying a
+    hash-distinct over its largest relation to remove nothing. The survivor set unions
+    the same two arms differently, and says why.
+
     A real non-temp TABLE: woltka resolves it on a separate connection.
     """
+    survivor = survivor_table_name(survivor_scope) if survivor_scope is not None else None
+    by_sample = survivor_scope is CoverageScope.PER_SAMPLE
     sql = (
         f"CREATE TABLE {OGU_INPUT_TABLE} AS "
         f"SELECT a.sequence_idx, a.prep_sample_idx, a.flags, m.genome_id AS reference "
         f"FROM {ALIGNMENT_TABLE} a "
         f"JOIN {MAP_TABLE} m ON a.feature_idx = m.contig_id"
     )
-    if survivor_scope is not None:
-        sql += f" JOIN {survivor_table_name(survivor_scope)} s ON m.genome_id = s.genome_id"
-        if survivor_scope is CoverageScope.PER_SAMPLE:
+    if survivor is not None:
+        sql += f" JOIN {survivor} s ON m.genome_id = s.genome_id"
+        if by_sample:
             sql += " AND a.prep_sample_idx = s.prep_sample_idx"
+    if combined:
+        sql += " UNION ALL " + denovo_ogu_input_select_sql(
+            survivor_relation=survivor, by_sample=by_sample
+        )
     return sql
 
 
 def ogu_input_statements(
-    *, scope: CoverageScope, coverage_threshold: float
+    *, scope: CoverageScope, coverage_threshold: float, combined: bool = False
 ) -> tuple[tuple[str, list[float]], ...]:
     """Everything between the staged inputs and woltka's input relation, as ordered
     `(sql, parameters)` pairs. Requires `ALIGNMENT_TABLE`, `MAP_TABLE`, and — when
-    the threshold filters — `GENOME_LENGTHS_TABLE`.
+    the threshold filters — `GENOME_LENGTHS_TABLE`. `combined` additionally requires
+    the de novo arm's relations, already reconciled by `denovo_alignment_statements`.
 
     **The order and the scope-to-`None` conversion live here rather than in each
     consumer**, for the reason this package exists at all: a consumer that dropped the
@@ -99,7 +124,12 @@ def ogu_input_statements(
     in it. A missed CREATE is a bind error; a missed filter is a plausible wrong
     answer. Same device as `GateClearance.statements`.
 
-    The trailing DROPs are not tidiness. The coverage view, the alignment slice, and
+    `combined` threads through every statement below rather than forming a second
+    sequence: the survivor set and woltka's input each have to see both arms, and an
+    arm applied to one and not the other yields a table whose filter and whose counts
+    disagree about what it contains.
+
+    The trailing DROPs are not tidiness. The coverage views, the alignment slices, and
     the survivor set are all dead once `OGU_INPUT_TABLE` exists, and they are dead
     for the whole remaining run — woltka, the relabel, and the write.
     """
@@ -107,12 +137,28 @@ def ogu_input_statements(
     filtering = coverage_filter_applies(coverage_threshold)
     if filtering:
         statements.append((coverage_alignments_view_sql(), []))
-        statements.append((survivor_table_sql(scope), [coverage_threshold]))
-    statements.append((ogu_input_table_sql(survivor_scope=scope if filtering else None), []))
+        if combined:
+            statements.append((denovo_coverage_alignments_view_sql(), []))
+        statements.append(
+            (
+                survivor_table_sql(scope, combined=combined),
+                survivor_parameters(coverage_threshold, combined=combined),
+            )
+        )
+    statements.append(
+        (
+            ogu_input_table_sql(survivor_scope=scope if filtering else None, combined=combined),
+            [],
+        )
+    )
     if filtering:
-        # The view first: it reads the slice.
+        # The views first: they read the slices.
         statements.append((f"DROP VIEW {COVERAGE_ALIGNMENTS_VIEW}", []))
+        if combined:
+            statements.append((f"DROP VIEW {DENOVO_COVERAGE_ALIGNMENTS_VIEW}", []))
     statements.append((f"DROP TABLE {ALIGNMENT_TABLE}", []))
+    if combined:
+        statements.append((drop_denovo_alignment_table_sql(), []))
     if filtering:
         statements.append((f"DROP TABLE {survivor_table_name(scope)}", []))
     return tuple(statements)

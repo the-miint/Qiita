@@ -809,6 +809,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="From `qiita alignment list`; its params say which reference it used.",
     )
     p_ft_build.add_argument(
+        "--denovo-alignment-idx",
+        type=int,
+        help=(
+            "Also read this alignment — the cohort against its OWN assembled contigs —"
+            " and build a COMBINED (inverted open reference) table. Each read is counted"
+            " once: against its own contig where the de novo arm placed it, against the"
+            " reference otherwise. Reference genomes therefore lose the reads the de novo"
+            " arm wins, so one that clears --coverage-threshold without this flag can drop"
+            " out with it. From `qiita alignment list`; its params must name the same"
+            " mask_idx as --alignment-idx. Cannot be combined with --circular-gate."
+            " A prep_sample in the cohort that assembled nothing simply has no de novo"
+            " arm and stays reference-only; it is not an error."
+        ),
+    )
+    p_ft_build.add_argument(
         "--prep-sample-idx",
         type=int,
         action="append",

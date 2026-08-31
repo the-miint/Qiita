@@ -48,6 +48,7 @@ from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_s
 from ..auth.tickets import sign_action, sign_ticket
 from ..miint import duckdb_connect
 from ..repositories.assembly import (
+    ASSEMBLY_GENOME_MAP_PAIRS_SQL,
     assembly_genome_source_id,
     insert_assembly_membership_rows,
     upsert_assembly_sample_completed,
@@ -1238,6 +1239,63 @@ async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path:
                             "feature_idx": pa.array([r["feature_idx"] for r in batch], pa.int64()),
                             "genome_idx": pa.array([r["genome_idx"] for r in batch], pa.int64()),
                         }
+                    )
+                )
+    finally:
+        writer.close()
+
+
+async def export_assembly_member_genome(
+    pool: asyncpg.Pool,
+    *,
+    prep_sample_idx: list[int],
+    processing_idx: int,
+    out_path: Path,
+) -> None:
+    """Stream one assembly run's `(prep_sample_idx, feature_idx, genome_idx)` triples
+    for a whole cohort from Postgres to a Parquet at `out_path`, in `_CHUNK_SIZE`
+    batches. The de novo arm's counterpart to `export_member_genome`.
+
+    **Three columns, where the reference map has two.** A contig is content-addressed,
+    so two cohort samples that assembled byte-identical contigs share one
+    `feature_idx` under two genomes; the sample is what tells those rows apart, and a
+    consumer joins on the pair. `qiita_common.analytic.reconcile` carries what goes
+    wrong without it.
+
+    DISTINCT for the reason `fetch_assembly_genome_map` is, and with the same limit:
+    it collapses exact repeats, not a contig that legitimately belongs to two genomes
+    of one run.
+
+    The row set is `ASSEMBLY_GENOME_MAP_PAIRS_SQL`, shared verbatim with the REST map
+    the client-side recipe reads, so the two drivers cannot disagree about which
+    contigs have a genome. An empty result still writes a valid three-column Parquet
+    — a cohort whose samples all assembled nothing is a legitimate combined table
+    that degrades to the reference arm.
+    """
+    schema = pa.schema(
+        [
+            ("prep_sample_idx", pa.int64()),
+            ("feature_idx", pa.int64()),
+            ("genome_idx", pa.int64()),
+        ]
+    )
+    writer = pq.ParquetWriter(str(out_path), schema, compression="snappy")
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            cursor = await conn.cursor(
+                "SELECT DISTINCT am.prep_sample_idx, am.feature_idx, am.genome_idx"
+                + ASSEMBLY_GENOME_MAP_PAIRS_SQL,
+                prep_sample_idx,
+                processing_idx,
+            )
+            while batch := await cursor.fetch(_CHUNK_SIZE):
+                writer.write_table(
+                    pa.table(
+                        {
+                            name: pa.array([r[name] for r in batch], pa.int64())
+                            for name in ("prep_sample_idx", "feature_idx", "genome_idx")
+                        },
+                        schema=schema,
                     )
                 )
     finally:
