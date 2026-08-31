@@ -113,7 +113,7 @@ async def test_write_assembly_membership_reports_a_contig_collapse(postgres_pool
 
     try:
         with caplog.at_level(logging.WARNING):
-            linked, already = await lib.write_assembly_membership(
+            written = await lib.write_assembly_membership(
                 postgres_pool,
                 prep_sample_idx,
                 processing_idx,
@@ -122,10 +122,12 @@ async def test_write_assembly_membership_reports_a_contig_collapse(postgres_pool
                 feature_map,
             )
 
-        # One feature in two bins plus the control: the join is per placement,
-        # which is exactly why the report cannot read its row count as a feature
-        # count.
-        assert (linked, already) == (3, 0)
+        # One feature in two bins plus the control: the join is per (bin, feature)
+        # placement, which is exactly why the report cannot read its row count as a
+        # feature count. The DISTINCT in ASSEMBLY_MEMBERSHIP_JOIN_SQL collapses a
+        # repeat WITHIN one bin, which is not this fixture — the pair is split across
+        # b1 and b2 on purpose, so all three placements survive.
+        assert written == 3
 
         collapse = [r.getMessage() for r in caplog.records if "collapsed" in r.getMessage()]
         assert len(collapse) == 1

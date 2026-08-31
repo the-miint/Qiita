@@ -208,8 +208,9 @@ def _write_assembly_membership(
     (prep_sample, processing, kind, bin_id, feature_idx). Joins `bin_map`
     (read_id -> kind, bin_id) against the `id_map` TEMP TABLE (read_id ->
     feature_idx) and stamps the run scalars. DISTINCT so a bin's duplicate
-    (identical) contigs collapse to one row — matching the Postgres ON CONFLICT
-    write the membership action performed."""
+    (identical) contigs collapse to one row — matching the Postgres membership
+    write, whose own DISTINCT is what keeps its upsert from touching one conflict
+    target twice."""
     conn.execute(
         "COPY ("
         "  SELECT DISTINCT"

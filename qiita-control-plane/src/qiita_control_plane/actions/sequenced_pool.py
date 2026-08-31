@@ -99,7 +99,14 @@ class SequencedPoolDeleteBlocked(Exception):
     prep_samples (linked into a study with is_published=true), and `ena`
     sequenced_samples (carrying an ENA experiment/run accession) each block only
     when the caller did not pass force=True — they are destructive overrides an
-    admin must opt into explicitly."""
+    admin must opt into explicitly.
+
+    `promoted_genomes` also always blocks, and force does NOT override it because
+    force cannot fix it: the cascade's genome delete skips a genome a reference
+    claims through `feature_genome`, so `genome.prep_sample_idx`'s RESTRICT would
+    then abort the prep_sample delete — after the pool's DuckLake rows are already
+    purged, which the Postgres rollback does not restore. Refusing here is the only
+    point at which that costs nothing."""
 
     def __init__(
         self,
@@ -109,17 +116,28 @@ class SequencedPoolDeleteBlocked(Exception):
         terminal: int,
         published: int,
         ena: int,
+        promoted_genomes: int = 0,
     ) -> None:
         self.sequenced_pool_idx = sequenced_pool_idx
         self.in_flight = in_flight
         self.terminal = terminal
         self.published = published
         self.ena = ena
+        self.promoted_genomes = promoted_genomes
         if in_flight:
             reason = (
                 f"{in_flight} in-flight work ticket(s) "
                 f"({'/'.join(_WORK_TICKET_IN_FLIGHT_STATES)}) reference it; "
                 "wait for them to finish or cancel them"
+            )
+        elif promoted_genomes:
+            reason = (
+                f"{promoted_genomes} qiita-origin genome(s) from these prep_samples are "
+                "also claimed by a reference (qiita.feature_genome). This delete will not "
+                "drop a reference's claim, and the prep_sample delete would fail partway "
+                "if it proceeded, so the pool cannot be deleted while that reference "
+                "stands — deleting the reference is the only thing that releases the "
+                "claim. force=true does not override this"
             )
         else:
             parts: list[str] = []
@@ -205,10 +223,11 @@ async def assert_sequenced_pool_deletable(
 
     Returns the pool's prep_sample idxs on success (the same set the cascade
     tears down). Raises SequencedPoolNotFound if the pool doesn't exist, or
-    SequencedPoolDeleteBlocked if work tickets / publication / ENA state block
-    it (in-flight tickets always; terminal tickets, published prep_samples, and
-    ENA-submitted samples unless force). Run this *before* any destructive step
-    so a blocked delete touches nothing."""
+    SequencedPoolDeleteBlocked if work tickets / publication / ENA state / a
+    reference's claim on an assembly genome block it. In-flight tickets and a
+    reference-claimed genome always block; terminal tickets, published
+    prep_samples, and ENA-submitted samples block unless force. Run this *before*
+    any destructive step so a blocked delete touches nothing."""
     prep_sample_idxs, counts = await _pool_work_ticket_state_counts(conn, sequenced_pool_idx)
     in_flight = sum(counts.get(s, 0) for s in _WORK_TICKET_IN_FLIGHT_STATES)
     terminal = sum(counts.get(s, 0) for s in _WORK_TICKET_TERMINAL_STATES)
@@ -231,13 +250,32 @@ async def assert_sequenced_pool_deletable(
         sequenced_pool_idx,
     )
 
-    if in_flight or (not force and (terminal or published or ena)):
+    # A qiita-origin genome a reference also claims: the cascade's genome delete
+    # skips it (that skip is deliberate — the reference's claim is not ours to
+    # drop), so RESTRICT would abort the prep_sample delete after the DuckLake
+    # purge. Counted here, where refusing is free.
+    #
+    # Only `feature_genome` is checked. An `assembly_membership` row from ANOTHER
+    # prep_sample pointing at this genome would survive the pool-scoped detach and
+    # break the delete the same way — but it cannot exist: the genome's source_id
+    # hashes its own prep_sample_idx, so no other prep_sample resolves to it.
+    promoted_genomes = await conn.fetchval(
+        "SELECT count(*) FROM qiita.genome g"
+        " WHERE g.prep_sample_idx = ANY($1::bigint[])"
+        "   AND EXISTS ("
+        "     SELECT 1 FROM qiita.feature_genome fg WHERE fg.genome_idx = g.genome_idx"
+        "   )",
+        prep_sample_idxs,
+    )
+
+    if promoted_genomes or in_flight or (not force and (terminal or published or ena)):
         raise SequencedPoolDeleteBlocked(
             sequenced_pool_idx=sequenced_pool_idx,
             in_flight=in_flight,
             terminal=terminal,
             published=published,
             ena=ena,
+            promoted_genomes=promoted_genomes,
         )
     return prep_sample_idxs
 
@@ -311,8 +349,9 @@ async def delete_sequenced_pool_cascade(
     `assert_sequenced_pool_deletable`.
 
     Every prep_sample-referencing FK in the subtree is ON DELETE RESTRICT (with
-    two exceptions that CASCADE: work_ticket_step off work_ticket, and
-    sequence_range off prep_sample), so each must be cleared before prep_sample.
+    three exceptions that CASCADE: work_ticket_step off work_ticket, and
+    sequence_range and assembly_membership off prep_sample), so each must be
+    cleared before prep_sample.
     Order:
       work_ticket (pool- and sample-scoped; → work_ticket_step CASCADEs) →
       prep_sample_metadata → prep_sample_field_exception → prep_sample_to_study →
@@ -324,18 +363,44 @@ async def delete_sequenced_pool_cascade(
         covering one of this pool's samples is this pool's) →
       mask_sample + alignment_sample + assembly_sample
         (per-(mask/alignment/assembly, prep_sample) completion gates) →
-      prep_sample (→ sequence_range CASCADEs) → sequenced_pool.
+      assembly_membership.genome_idx detach + the assembly genomes it pointed at →
+      prep_sample (→ sequence_range and assembly_membership CASCADE) →
+      sequenced_pool.
 
-    Not cleared here: the two remaining ON DELETE RESTRICT references to
-    `qiita.prep_sample` — `qiita.genome.prep_sample_idx` (a qiita-origin genome's
-    source sample) and `qiita.exported_identifier.prep_sample_idx` (a published
-    handle naming it). `assert_sequenced_pool_deletable` gates on neither, so a
-    pool carrying either raises ForeignKeyViolationError out of the prep_sample
-    delete below and cannot be deleted.
+    `qiita.genome` is cleared here, for its assembly-origin rows. Each prep_sample's
+    assembled subjects mint a qiita-origin genome
+    (`repositories.assembly.assembly_genome_source_id`), whose `prep_sample_idx` is
+    ON DELETE RESTRICT, so an assembled pool is undeletable without this step. The
+    detach-then-delete order is forced in both directions:
+    `assembly_membership.genome_idx` has a bare FK (NO ACTION), so the genome delete
+    is blocked while rows point at it; and `genome.prep_sample_idx` RESTRICTs, so the
+    prep_sample delete is blocked while the genome exists. `assembly_membership`
+    itself needs no delete — its `prep_sample_idx` CASCADEs with the prep_sample.
 
-    Returns the per-table delete counts for the caller's response (the derived
-    gate-row and block-cover-map deletes are not surfaced — internal cleanup, not
-    primary counts)."""
+    The genome delete is scoped `NOT EXISTS (... feature_genome ...)`: a reference
+    load may declare qiita-source genomes (`_validate_genome_map` accepts them), and
+    such a genome carries a `prep_sample_idx` too, so it falls inside this predicate
+    while a reference's `feature_genome` rows still point at it. Dropping the
+    reference's claim is not this delete's call. `assert_sequenced_pool_deletable`
+    refuses such a pool up front, so the skip here never leaves the prep_sample
+    delete to raise mid-cascade.
+
+    `qiita.exported_feature.genome_idx` is ON DELETE SET NULL with a BEFORE UPDATE
+    trigger that force-retires the row, so deleting an assembly genome retires any
+    published `QF<n>` handle naming it. `qiita.reference_exclusion.genome_idx` has no
+    FK at all, so a curator's block on a deleted assembly genome survives pointing at
+    an identity that never returns — `genome_idx` is GENERATED ALWAYS AS IDENTITY, and
+    a re-assembly mints a fresh one.
+
+    Still not cleared here: `qiita.exported_identifier.prep_sample_idx` (a published
+    handle naming the prep_sample itself), also ON DELETE RESTRICT and ungated, so a
+    pool carrying one raises ForeignKeyViolationError out of the prep_sample delete
+    below.
+
+    Returns the per-table delete counts for the caller's response. The derived
+    deletes are not surfaced — gate rows, the block cover map, the assembly
+    genome_idx detach and the genome delete itself: internal cleanup, not primary
+    counts."""
     prep_sample_idxs = await _pool_prep_sample_idxs(conn, sequenced_pool_idx)
 
     work_ticket_deleted = _rowcount(
@@ -413,6 +478,23 @@ async def delete_sequenced_pool_cascade(
     )
     await conn.execute(
         "DELETE FROM qiita.assembly_sample WHERE prep_sample_idx = ANY($1::bigint[])",
+        prep_sample_idxs,
+    )
+    # Detach before deleting the genomes: the FK is NO ACTION, so a genome with a
+    # live assembly_membership row cannot be deleted. The membership rows themselves
+    # CASCADE with prep_sample below.
+    await conn.execute(
+        "UPDATE qiita.assembly_membership SET genome_idx = NULL"
+        " WHERE prep_sample_idx = ANY($1::bigint[])",
+        prep_sample_idxs,
+    )
+    # Scoped to genomes no reference claims — see the NOT EXISTS rationale above.
+    await conn.execute(
+        "DELETE FROM qiita.genome g"
+        " WHERE g.prep_sample_idx = ANY($1::bigint[])"
+        "   AND NOT EXISTS ("
+        "     SELECT 1 FROM qiita.feature_genome fg WHERE fg.genome_idx = g.genome_idx"
+        "   )",
         prep_sample_idxs,
     )
     prep_sample_deleted = _rowcount(

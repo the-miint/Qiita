@@ -8,7 +8,9 @@ qiita.feature minted via the SHARED mint-features path — to the bin they belon
 `qiita_common.assembly_constants`). The DuckDB-side JOIN (bin_map x manifest x
 feature_map -> (kind, bin_id, feature_idx)) and the batch streaming live in the
 library primitive; this module owns only the raw bulk-insert SQL, mirroring
-repositories.processing owning qiita.mint_processing's call.
+repositories.processing owning qiita.mint_processing's call. It also owns
+`assembly_genome_source_id`, the one definition of which qiita.genome an assembled
+subject mints as — the inline write and the backfill both call it.
 
 It also owns qiita.assembly_sample, the per-(processing_idx, prep_sample)
 completion gate — the assembly twin of qiita.mask_sample / qiita.alignment_sample.
@@ -17,8 +19,40 @@ Its contract lives on `fetch_assembly_sample_state` below.
 
 import asyncpg
 from qiita_common.api_paths import URL_PROCESSING_SAMPLE_STATUS
+from qiita_common.hashing import canonical_params_hash
 
 from . import require_transaction
+
+
+def assembly_genome_source_id(
+    *, prep_sample_idx: int, processing_idx: int, kind: str, bin_id: str
+) -> str:
+    """The `qiita.genome.source_id` for one assembled subject, shared by the inline
+    mint and the backfill so the two cannot disagree about which genome a contig
+    belongs to.
+
+    The tuple is the subject's identity minus the contig: one genome per
+    ``(prep_sample_idx, processing_idx, kind, bin_id)``, which is
+    `assembly_membership`'s PRIMARY KEY without ``feature_idx``. `processing_idx` is
+    in it because a prep_sample re-assembled under different params yields different
+    contigs, so its bins are different genomes.
+
+    A hash of the tuple rather than the contig bytes: `qiita.genome.prep_sample_idx`
+    is a scalar FK, so two prep_samples assembling a byte-identical single-contig
+    genome would collapse onto one row that can record only one origin.
+
+    `(source, source_id)` is UNIQUE, so a future change to this tuple mints NEW
+    genomes rather than corrupting existing ones — the same property
+    `alignment_definition` relies on. That is why there is no scheme discriminator.
+    """
+    return canonical_params_hash(
+        {
+            "prep_sample_idx": prep_sample_idx,
+            "processing_idx": processing_idx,
+            "kind": kind,
+            "bin_id": bin_id,
+        }
+    ).hex()
 
 
 async def insert_assembly_membership_rows(
@@ -29,39 +63,68 @@ async def insert_assembly_membership_rows(
     kinds: list[str],
     bin_ids: list[str],
     feature_idxs: list[int],
+    genome_idxs: list[int],
 ) -> int:
-    """Bulk-insert one chunk of assembly_membership rows; return the count of
-    newly-linked rows.
+    """Bulk-insert one chunk of assembly_membership rows; return the count of rows
+    written or re-stamped.
 
-    The three lists are positionally aligned: row i links
-    ``(prep_sample_idx, processing_idx, kinds[i], bin_ids[i], feature_idxs[i])``.
-    ``ON CONFLICT DO NOTHING`` on the natural PK makes the write idempotent /
-    replay-safe — a workflow retried from the start re-runs this primitive and
-    re-inserting the same rows links nothing new. Wraps
-    asyncpg.ForeignKeyViolationError into a ValueError so the caller surfaces a
-    structured error instead of leaking the asyncpg exception (a feature_idx that
-    isn't in qiita.feature means upstream mint-features produced inconsistent
-    inputs).
+    The four lists are positionally aligned: row i links
+    ``(prep_sample_idx, processing_idx, kinds[i], bin_ids[i], feature_idxs[i])`` to
+    ``genome_idxs[i]``, the genome its subject was minted as.
+
+    ``DO UPDATE`` on the natural PK. The conflict fires on a workflow retried from
+    the start and on any run over rows a backfill already created; under
+    ``DO NOTHING`` those rows would keep whatever ``genome_idx`` they had, including
+    the NULL a pre-mint row carries. What a NULL costs a reader is on the column's
+    own comment. Re-stamping converges instead.
+
+    **The caller must not hand this a duplicated key.** Postgres refuses to let one
+    ``ON CONFLICT DO UPDATE`` touch a conflict target twice, which the ``DO NOTHING``
+    form tolerated; `ASSEMBLY_MEMBERSHIP_JOIN_SQL` carries the ``DISTINCT`` that
+    guarantees it. Caught below rather than left to leak: it arrives as SQLSTATE
+    21000 (qiita-probed), which is outside `IntegrityConstraintViolationError`
+    entirely, so the FK arm cannot cover it.
+
+    That also decides what the return counts. ``RETURNING`` fires for updated rows
+    too, so this is "rows this chunk wrote or re-stamped", NOT "rows newly linked" —
+    a replay reports its full chunk rather than zero. `write_assembly_membership`
+    derives its collapse report from the manifest, not from this, so nothing reads
+    it as a novelty count.
+
+    Wraps asyncpg.ForeignKeyViolationError into a ValueError so the caller surfaces
+    a structured error instead of leaking the asyncpg exception (a feature_idx that
+    isn't in qiita.feature, or a genome_idx that isn't in qiita.genome, means the
+    caller's upstream produced inconsistent inputs).
     """
     if not feature_idxs:
         return 0
     try:
         rows = await conn.fetch(
             "INSERT INTO qiita.assembly_membership"
-            " (prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
-            " SELECT $1, $2, k, b, f"
-            " FROM unnest($3::text[], $4::text[], $5::bigint[]) AS t(k, b, f)"
-            " ON CONFLICT DO NOTHING"
+            " (prep_sample_idx, processing_idx, kind, bin_id, feature_idx, genome_idx)"
+            " SELECT $1, $2, k, b, f, g"
+            " FROM unnest($3::text[], $4::text[], $5::bigint[], $6::bigint[])"
+            "      AS t(k, b, f, g)"
+            " ON CONFLICT (prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
+            " DO UPDATE SET genome_idx = EXCLUDED.genome_idx"
             " RETURNING feature_idx",
             prep_sample_idx,
             processing_idx,
             kinds,
             bin_ids,
             feature_idxs,
+            genome_idxs,
         )
     except asyncpg.ForeignKeyViolationError as exc:
         raise ValueError(
-            "One or more feature_idx / prep_sample_idx / processing_idx values do not exist"
+            "One or more feature_idx / genome_idx / prep_sample_idx / processing_idx "
+            "values do not exist"
+        ) from exc
+    except asyncpg.CardinalityViolationError as exc:
+        raise ValueError(
+            "the same (kind, bin_id, feature_idx) was submitted twice in one chunk, "
+            "which this upsert cannot resolve — the caller's query is missing its "
+            "DISTINCT (see ASSEMBLY_MEMBERSHIP_JOIN_SQL)"
         ) from exc
     return len(rows)
 
