@@ -556,6 +556,32 @@ class GenomeMapResponse(BaseModel):
     count: Annotated[int, Field(ge=0)]
 
 
+class AssemblyGenomeMapResponse(BaseModel):
+    """Returned by GET /assembly/{prep_sample_idx}/{processing_idx}/genome-map: one
+    assembly run's contig → genome lookup, the de novo arm's counterpart to
+    `GenomeMapResponse`.
+
+    Reuses `GenomeMapEntry`, because a qiita genome is a `qiita.genome` row like
+    any other and a consumer rolls both maps up the same way. What differs is the
+    SCOPE, and it is in the path rather than the entries: this map covers exactly
+    one `(prep_sample_idx, processing_idx)` run, so a caller building a cohort's
+    map holds one response per prep_sample and knows which one each came from. A
+    contig two prep_samples assembled is one content-addressed `feature_idx` under
+    two genomes, so that key is what keeps their reads apart — it is not a label,
+    and a consumer that flattened these responses into one unkeyed map would credit
+    each prep_sample's reads to both genomes.
+
+    Refuses over its cap the way its reference twin does, for the same reason, and
+    carries no `truncated` for the same reason. 404s a run that never assembled —
+    an unknown prep_sample, an unknown processing_idx, and a real pair that
+    assembled nothing are one answer, matching the assembly DoGet routes."""
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    processing_idx: Annotated[int, Field(gt=0)]
+    entries: list[GenomeMapEntry]
+    count: Annotated[int, Field(ge=0)]
+
+
 # Upper bound on the entities a caller names in one exported-feature request,
 # counted ACROSS both kinds. Chosen for the same reason as the prep_sample cohort
 # cap in models/_base.py — request-payload size — but not shared with it: that one

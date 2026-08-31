@@ -12,6 +12,13 @@ description: >
   `coverage_threshold` (a proportion in [0, 1]). The result is a single
   `ogu_table.parquet` (v2 + zstd) in the ticket workspace.
 
+  With the optional `denovo_alignment_idx` the table is COMBINED: it estimates
+  over two alignment runs at once, the cohort against the reference and each
+  sample against its own assembled contigs, with the de novo arm taking
+  precedence for every read it placed. The two arms' genomes are rows of one
+  `qiita.genome` space, so the result is one table over both. Absent that key the
+  behaviour is byte-identical to the reference-only form above.
+
   Compute-on-demand by design: the table is deterministic but cohort-dependent
   (coverage pools over the sample set), so persisting would mean one artifact per
   sample-subset x threshold. No processing_idx / identity is minted, no DuckLake
@@ -63,6 +70,16 @@ context_schema:
       items:
         type: integer
         minimum: 1
+    # OPTIONAL second alignment run: the cohort aligned against its OWN assembled
+    # contigs. Present => a combined (inverted open reference) table. The assembly
+    # run is NOT a separate key — it is in this alignment's hashed params, so the
+    # resolver reads processing_idx off it and the two cannot disagree. That is
+    # also why one value covers the whole cohort: prep_sample_idx is not in that
+    # hash. The resolver validates the subject and the mask and applies the
+    # per-sample arm gate (runner/_feature_table.py).
+    denovo_alignment_idx:
+      type: integer
+      minimum: 1
     # Minimum pooled breadth of coverage a genome must meet to appear in the table
     # (proportion of the FULL genome length covered, incl. unaligned contigs).
     # Recommended 0.01 (1%); required (caller-provided).
@@ -74,7 +91,8 @@ context_schema:
 steps:
   # The single native step. `genome_map_path` (the reference's feature->genome
   # map) is runner-bound before the loop (_resolve_feature_table_bindings, gated
-  # on this input + reference scope). `coverage_threshold` rides `params:`
+  # on this input + reference scope), and `denovo_genome_map_path` beside it when
+  # the context carries `denovo_alignment_idx`. `coverage_threshold` rides `params:`
   # (scalars can't ride `inputs:`). `reference_idx` + `work_ticket_idx` are
   # framework-injected. The job streams the alignment slice (minting its own
   # short-TTL DoGet by work_ticket_idx) + the reference lengths, runs the
@@ -85,7 +103,13 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.estimate_feature_table
     inputs: [genome_map_path]
-    params: {coverage_threshold: coverage_threshold}
+    # Bound only for a combined table, so declared optional: a reference-only
+    # ticket resolves no de novo map and the step must still be dispatchable.
+    optional_inputs: [denovo_genome_map_path]
+    # `denovo_processing_idx` is resolver-bound, not caller-supplied, and absent
+    # for a reference-only ticket — an unbound params key is skipped.
+    params: {coverage_threshold: coverage_threshold,
+             denovo_processing_idx: denovo_processing_idx}
     outputs: [ogu_table]
     baseline_resources:
       cpu: 4

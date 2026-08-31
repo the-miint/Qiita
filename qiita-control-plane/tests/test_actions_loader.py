@@ -1082,7 +1082,15 @@ def test_load_actions_loads_on_disk_estimate_feature_table_yaml():
     step = eft.steps[0]
     assert step.module == "qiita_compute_orchestrator.jobs.estimate_feature_table"
     assert step.inputs == ["genome_map_path"]
-    assert step.params == {"coverage_threshold": "coverage_threshold"}
+    # The de novo arm's two bindings, both resolver-produced and both absent for a
+    # reference-only ticket — the map as an OPTIONAL input (a path), the assembly
+    # run as a params scalar (a scalar cannot ride `inputs:`). Declared required
+    # either way, the step would be undispatchable without a de novo arm.
+    assert step.optional_inputs == ["denovo_genome_map_path"]
+    assert step.params == {
+        "coverage_threshold": "coverage_threshold",
+        "denovo_processing_idx": "denovo_processing_idx",
+    }
     assert step.outputs == ["ogu_table"]
     # reference_idx is framework-injected (REFERENCE scope scalar); binding it via
     # params would collide with that injection at flatten_native_inputs.
@@ -1090,6 +1098,9 @@ def test_load_actions_loads_on_disk_estimate_feature_table_yaml():
 
     required = set(eft.context_schema.get("required", []))
     assert {"alignment_idx", "prep_sample_idx", "coverage_threshold"} <= required
+    # The de novo arm is opt-in: a reference-only ticket names no assembly.
+    assert "denovo_alignment_idx" not in required
+    assert "denovo_alignment_idx" in eft.context_schema["properties"]
 
 
 def test_load_actions_handles_two_versions_of_same_action(tmp_path):

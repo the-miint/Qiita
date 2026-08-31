@@ -178,7 +178,7 @@ async def test_genome_map_refuses_a_reference_over_the_cap_413(client, postgres_
     """Over the cap is a 413, NOT a truncated 200. The detail names the real size
     (not just "more than the cap") so the caller can tell a 2x overshoot from a
     100x one."""
-    monkeypatch.setattr("qiita_control_plane.routes.reference._GENOME_MAP_HARD_CAP", 2)
+    monkeypatch.setattr("qiita_control_plane.routes.reference.GENOME_MAP_HARD_CAP", 2)
     ref = await seed_bare_reference(postgres_pool, label="genome-map")
     feats = [await seed_bare_feature(postgres_pool) for _ in range(3)]
     genome, _ = await seed_genome(postgres_pool)
@@ -201,7 +201,7 @@ async def test_genome_map_at_exactly_the_cap_is_a_200(client, postgres_pool, mon
     """The boundary is inclusive: a map of exactly `cap` entries is served. Pins
     the over-fetch-by-one arithmetic — an off-by-one here would 413 a reference
     that fits."""
-    monkeypatch.setattr("qiita_control_plane.routes.reference._GENOME_MAP_HARD_CAP", 2)
+    monkeypatch.setattr("qiita_control_plane.routes.reference.GENOME_MAP_HARD_CAP", 2)
     ref = await seed_bare_reference(postgres_pool, label="genome-map")
     feats = [await seed_bare_feature(postgres_pool) for _ in range(2)]
     genome, _ = await seed_genome(postgres_pool)

@@ -29,7 +29,8 @@ The modules, in the order a recipe reaches them:
 | Module | What it owns |
 |---|---|
 | `relations` | the relation names, what each one is (TABLE vs VIEW), and its release |
-| `stage` | the three input streams → named relations |
+| `stage` | the reference arm's input streams → named relations |
+| `reconcile` | the de novo arm's own relations, and precedence between the two arms |
 | `coverage` | the scope, the survivor set, and what the roll-up leaves behind |
 | `gate` | the alignment gate — CIGAR or circular-pooled — and its clearance |
 | `ogu` | `woltka_ogu`'s input and output — today's one table flavour |
@@ -47,6 +48,7 @@ from .coverage import (
     coverage_filter_applies,
     rollup_coverage_diagnostics_sql,
     rollup_coverage_warning,
+    survivor_parameters,
     survivor_table_name,
     survivor_table_sql,
 )
@@ -95,11 +97,25 @@ from .ogu import (
     ogu_output_table_sql,
     woltka_ogu_select_sql,
 )
+from .reconcile import (
+    denovo_alignment_statements,
+    denovo_contig_lengths_insert_sql,
+    denovo_contig_lengths_table_sql,
+    denovo_coverage_alignments_view_sql,
+    denovo_genome_lengths_insert_sql,
+    denovo_map_join,
+    denovo_map_table_sql,
+    denovo_ogu_input_select_sql,
+)
 from .relations import (
     ALIGNMENT_TABLE,
     BLOCKED_FEATURE_TABLE,
     CIRCULAR_ALIGNMENTS_VIEW,
     COVERAGE_ALIGNMENTS_VIEW,
+    DENOVO_ALIGNMENT_TABLE,
+    DENOVO_CONTIG_LENGTHS_TABLE,
+    DENOVO_COVERAGE_ALIGNMENTS_VIEW,
+    DENOVO_MAP_TABLE,
     FEATURE_LENGTHS_TABLE,
     FEATURE_TOPOLOGY_VIEW,
     GENOME_LABEL_TABLE,
@@ -117,6 +133,7 @@ from .relations import (
     TAXONOMY_TABLE,
     TREE_TABLE,
     drop_circular_inputs_statements,
+    drop_denovo_alignment_table_sql,
     drop_ogu_input_table_sql,
     drop_phylogeny_statements,
     drop_streamed_alignment_table_sql,
@@ -164,6 +181,11 @@ __all__ = [
     "CIRCULAR_MIN_COVERAGE",
     "CIRCULAR_MIN_IDENTITY",
     "COVERAGE_ALIGNMENTS_VIEW",
+    "DENOVO_ALIGNMENT_TABLE",
+    "DENOVO_CONTIG_LENGTHS_TABLE",
+    "DENOVO_COVERAGE_ALIGNMENTS_VIEW",
+    "denovo_map_join",
+    "DENOVO_MAP_TABLE",
     "CoverageScope",
     "FEATURE_LENGTHS_TABLE",
     "FEATURE_TOPOLOGY_VIEW",
@@ -213,7 +235,15 @@ __all__ = [
     "secondary_predicate_sql",
     "coverage_alignments_view_sql",
     "coverage_filter_applies",
+    "denovo_alignment_statements",
+    "denovo_contig_lengths_insert_sql",
+    "denovo_contig_lengths_table_sql",
+    "denovo_coverage_alignments_view_sql",
+    "denovo_genome_lengths_insert_sql",
+    "denovo_map_table_sql",
+    "denovo_ogu_input_select_sql",
     "drop_circular_inputs_statements",
+    "drop_denovo_alignment_table_sql",
     "drop_ogu_input_table_sql",
     "drop_phylogeny_statements",
     "drop_streamed_alignment_table_sql",
@@ -243,6 +273,7 @@ __all__ = [
     "shear_input_statements",
     "sheared_tree_table_sql",
     "streamed_alignment_table_sql",
+    "survivor_parameters",
     "survivor_table_name",
     "survivor_table_sql",
     "taxonomy_copy_sql",

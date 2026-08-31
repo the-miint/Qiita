@@ -6,10 +6,10 @@ on a SEPARATE connection during bind/execute, so `OGU_INPUT_TABLE` is embedded i
 the generated SQL: a caller that staged a differently-named table gets a bind error.
 That separate connection also cannot see TEMP tables, registered stream relations,
 or CTEs — hence every staging statement in this package creates a regular non-temp
-TABLE. **Two relations are exceptions, both read only on the caller's own connection
-and both VIEWs for the same reason** — materializing would duplicate a large relation
+TABLE. **Some relations are exceptions, read only on the caller's own connection and
+VIEWs for the same reason** — materializing would duplicate a large relation
 in RAM for one reader: `COVERAGE_ALIGNMENTS_VIEW` (read by the `genome_coverage`
-macro) and `LABELLED_RELATION` (read by one COPY).
+macro), its de novo twin, and `LABELLED_RELATION` (read by one COPY).
 
 The releases at the bottom are the other half of the same subject: which relations
 are dead at which point, and what a caller runs to let go of them. On a client
@@ -27,6 +27,28 @@ ALIGNMENT_TABLE = "alignment_slice"
 # the alignment arrives as a one-shot Flight stream that cannot be scanned twice.
 STREAMED_ALIGNMENT_TABLE = "alignment_streamed"
 MAP_TABLE = "contig_to_genome"
+
+# The de novo arm's relations, staged only for a combined table. `reconcile` owns
+# every rule about them, `denovo_map_join` included; what belongs here is that they
+# are SEPARATE relations rather than more rows in the ones above, because the two
+# arms' maps are joined differently and one relation would leave every consumer
+# picking a join shape from a column's nullness.
+#
+# **No name below contains another name in this module as a substring**, which the
+# obvious spellings do — `denovo_alignment_slice` contains `alignment_slice`,
+# `denovo_contig_to_genome` contains `contig_to_genome`. Names in this package are
+# matched as substrings of generated SQL, so a containing name makes a statement
+# about one arm satisfy an assertion about the other.
+DENOVO_ALIGNMENT_TABLE = "denovo_alignment"
+DENOVO_MAP_TABLE = "denovo_contig_genome"
+
+# The assembled contigs' lengths, unioned across the cohort's per-run streams and
+# deduplicated on `feature_idx` — see `reconcile.denovo_genome_lengths_insert_sql`.
+DENOVO_CONTIG_LENGTHS_TABLE = "denovo_contig_lengths"
+
+# The de novo arm's aligned intervals, the mirror of `COVERAGE_ALIGNMENTS_VIEW` and
+# a VIEW for the same reason: one reader, on this connection.
+DENOVO_COVERAGE_ALIGNMENTS_VIEW = "denovo_coverage_alignments"
 
 # The reference's per-feature lengths, as streamed. Staged only for a circular gate,
 # which needs the per-feature form `circular_query_coverage` takes; the ungated and
@@ -134,6 +156,16 @@ def drop_circular_inputs_statements() -> tuple[str, ...]:
         f"DROP VIEW {FEATURE_TOPOLOGY_VIEW}",
         f"DROP TABLE {FEATURE_LENGTHS_TABLE}",
     )
+
+
+def drop_denovo_alignment_table_sql() -> str:
+    """Release the de novo slice once `OGU_INPUT_TABLE` exists — the mirror of the
+    reference arm's own drop, sequenced beside it by `ogu_input_statements`.
+
+    The map and the lengths are not dropped with it, for the reason `MAP_TABLE`
+    outlives `ALIGNMENT_TABLE`: they are small, and a caller may still read them.
+    """
+    return f"DROP TABLE {DENOVO_ALIGNMENT_TABLE}"
 
 
 def drop_ogu_input_table_sql() -> str:

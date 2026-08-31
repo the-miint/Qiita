@@ -29,6 +29,7 @@ from qiita_common.analytic import MAX_SECONDARY
 from qiita_common.api_paths import URL_PROCESSING_SAMPLE_STATUS, LibraryPrimitive
 from qiita_common.backend_failure import StepNoData
 
+from ..feature_table import SUBJECT_ASSEMBLY
 from ..repositories.alignment_definition import (
     ParamsDoNotSurviveStorageError,
     fetch_alignment_definition_by_idx,
@@ -73,8 +74,6 @@ _KNOB_TYPES = {
     MIN_QUERY_COVERAGE_BINDING: float,
 }
 
-# What the reads are aligned AGAINST, as an identity term: the sample's own contigs.
-_SUBJECT_ASSEMBLY = "assembly"
 
 # The aligner, as an identity term. Fixed rather than a knob: the de novo subject is a
 # long-read assembly and `align_denovo` calls minimap2. It is hashed anyway so that
@@ -156,7 +155,7 @@ def _build_denovo_alignment_params(
             "fall back on"
         )
     return {
-        "subject": _SUBJECT_ASSEMBLY,
+        "subject": SUBJECT_ASSEMBLY,
         "workflow": action_id,
         "version": action_version,
         "aligner": _ALIGNER,
