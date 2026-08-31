@@ -21,6 +21,23 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **The assembler's per-contig report is stored, so circularity can become a query-time
+  predicate instead of a routing decision baked into the entrypoint (#517).** Both arms of
+  `assemble.sh` now emit a `contig_attributes.tsv` beside the two published FASTAs, carrying
+  the raw header or GFA segment name, a normalized `yes`/`possibly`/`no` circularity call,
+  depth, and myloasm's k-mer multiplicity. `assembly_load` and the control plane's membership
+  write both join it onto `assembly_membership`, in Postgres and in DuckLake. The two
+  assemblers disagree on the same molecule — one sample's identical 27 kb sequence is
+  `circular-yes` to hifiasm_meta and `circular-possibly` to myloasm — so today which one
+  bypasses binning as an LCG depends on which assembler ran; stored, that can be re-asked
+  without re-assembling. Routing itself is unchanged: `circular-yes` is still the LCG rule and
+  `circular-possibly` still goes to binning. myloasm's depth is the mean of its `depth-A-B-C`
+  triple, which is the scalar myloasm itself derives from it (the `avg_cov` its own circularity
+  gate tests); hifiasm_meta's is the S-line's `dp:f` tag, previously discarded along with the
+  rest of columns 4+. `mult` is NULL below 1 kb, where myloasm reports `0.00` for absence of
+  signal rather than a measured zero. Attributes are NULL for every row written before this,
+  and cannot be backfilled — they are read out of the assemble step's output.
+
 - **Combined (inverted open reference) feature table: `estimate-feature-table` and `qiita
   feature-table build` can estimate over two alignment arms at once (#515).** Passing a second
   alignment — the cohort aligned against its OWN assembled contigs — builds one table over both:
@@ -2840,6 +2857,16 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **`hifiasm_meta` is pinned, and an unrecognised GFA segment name now fails the `assemble`
+  step (#517).** The pin is `hamtv0.3.5`, with both of the binary's internal version strings
+  asserted at build time, matching how myloasm is pinned — unpinned, every rebuild re-resolved
+  the solve against whatever bioconda had that day, and editing anything in the image's
+  `HASH_INPUTS` forces a rebuild, so the DEFAULT assembler could move on a change that had
+  nothing to do with it. The fail-loud follows from the same PR storing the circularity call: a
+  name matching neither the circular nor the linear shape used to cost a misroute to binning,
+  and would now also write a call into the lake for a contig nothing classified. A missing GFA
+  is still an empty assembly, not a violation.
 
 - **Reference chunk bytes stay on the submitted strand, and a `--gff` load now says so (#502).**
   `normalized_sequence_expr` normalizes case and deliberately does not normalize strand; its

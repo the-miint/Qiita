@@ -125,14 +125,51 @@ case "${ASSEMBLER}" in
         # non-canonical name ending in 'c'); a name that doesn't match the circular shape
         # falls through to noLCG (binned), which is the safe default.
         #
-        # This arm is deliberately left as it was, INCLUDING two behaviours the
-        # myloasm arm below does not share: a missing GFA is treated as an empty
-        # assembly rather than a contract violation, and an unrecognised segment
-        # name is routed to noLCG rather than failing the step. Both are the same
-        # fail-open shape, and both are worth revisiting — but changing the
-        # DEFAULT assembler's behaviour is not this change's business, so it is a
-        # follow-up rather than a silent ride-along.
+        # An unrecognised segment name now FAILS the step. It used to fall
+        # through to noLCG, which cost a misroute; now the circularity call is
+        # also stored per contig, so the same name would additionally write a
+        # `no` into the lake for a contig nobody classified. The myloasm arm
+        # fails on an unparseable header for exactly this reason, and the
+        # hifiasm_meta version is pinned (assemble.def), so a name outside the
+        # documented shape means the grammar moved rather than that the assembler
+        # produced something unusual. A missing GFA is still an empty assembly,
+        # not a violation — that half is unchanged.
+        #
+        # The attribute pass runs FIRST so a bad name stops the step before any
+        # FASTA is written. The two FASTA writers below are untouched, which is
+        # what keeps the "empty CLASS is an empty FILE" invariant above: their
+        # shell `>` truncates each into existence whether or not the awk matches,
+        # where awk's own redirection would create a file only on first write.
         if [[ -s "${GFA}" ]]; then
+            # S-line -> one attribute row. `dp:f` is hifiasm_meta's depth; it is
+            # searched for by tag among fields 4+ rather than by position, since
+            # the tag order is not part of the GFA contract. A segment carrying no
+            # `dp:f` stores NULL: the column holds what the assembler reported.
+            # `mult` is empty here — hifiasm_meta has no counterpart to myloasm's
+            # k-mer multiplicity.
+            awk -v attrs="${OUT}/contig_attributes.tsv" '
+                BEGIN { OFS = "\t"; print "contig_id", "raw_name", "circularity", "depth", "mult" > attrs }
+                $1 != "S" { next }
+                {
+                    if ($2 ~ /tg[0-9]+c$/)      { call = "yes" }
+                    else if ($2 ~ /tg[0-9]+l$/) { call = "no" }
+                    else {
+                        bad++
+                        if (bad <= 3) { names = names " " $2 }
+                        next
+                    }
+                    dp = ""
+                    for (i = 4; i <= NF; i++) { if ($i ~ /^dp:f:/) { dp = substr($i, 6) } }
+                    print $2, $2, call, dp, "" > attrs
+                }
+                END {
+                    if (bad) {
+                        printf "assemble: %d GFA segment name(s) match neither the circular (tg<N>c) nor the linear (tg<N>l) shape, e.g.%s\n", bad, names > "/dev/stderr"
+                        printf "          re-probe hifiasm_meta name grammar against the version pinned in assemble.def\n" > "/dev/stderr"
+                        exit 65
+                    }
+                }' "${GFA}"
+
             awk '$1=="S" && $2 ~ /tg[0-9]+c$/  {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/circular.fa"
             awk '$1=="S" && $2 !~ /tg[0-9]+c$/ {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/noLCG.fa"
         fi
@@ -173,7 +210,8 @@ case "${ASSEMBLER}" in
         # step's `derived_inputs: MIINT_EXTENSION_DIRECTORY`.
         if [[ -s "${PRIMARY}" ]]; then
             python3 /opt/qiita/myloasm_split.py \
-                "${PRIMARY}" "${OUT}/circular.fa" "${OUT}/noLCG.fa"
+                "${PRIMARY}" "${OUT}/circular.fa" "${OUT}/noLCG.fa" \
+                "${OUT}/contig_attributes.tsv"
         fi
         ;;
     *)

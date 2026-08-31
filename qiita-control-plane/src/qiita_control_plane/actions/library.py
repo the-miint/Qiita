@@ -33,6 +33,7 @@ import pyarrow as pa
 import pyarrow.flight as _flight
 import pyarrow.parquet as pq
 from qiita_common.api_paths import LibraryPrimitive
+from qiita_common.assembly_constants import CONTIG_ATTRIBUTES_FILE
 from qiita_common.models import (
     INDEX_TYPE_RYPE_ROUTER,
     FeatureHashEntry,
@@ -1448,12 +1449,58 @@ async def plan_shards(
 # (`cardinality_violation`), where the earlier DO NOTHING form silently tolerated it.
 # `assembly_load._write_assembly_membership` already carries this DISTINCT and
 # describes it as matching what this write does; now it does.
+# GROUP BY, not DISTINCT — and the grouping set IS the conflict target, which is
+# what `insert_assembly_membership_rows` requires of its caller. The attribute
+# columns can differ between two rows the key collapses (a bin holding duplicate
+# identical contigs is exactly that case), so carrying them through a DISTINCT
+# would emit one row per variant and hand the upsert the same target twice:
+# SQLSTATE 21000, the failure that function's docstring names. Aggregating to one
+# representative contig id and joining the attributes onto THAT keeps all four
+# values from the same contig, where a per-column aggregate would mix them.
+#
+# The attribute join is LEFT: a contig absent from the sidecar stores NULLs. The
+# same shape is written on the DuckLake side by
+# `qiita_compute_orchestrator.jobs.assembly_load._write_assembly_membership`; the
+# two are copies of one table and must stay in step.
 ASSEMBLY_MEMBERSHIP_JOIN_SQL = (
-    "SELECT DISTINCT bm.kind, bm.bin_id, fm.feature_idx"
-    " FROM read_parquet(?) AS bm"
-    " JOIN read_parquet(?) AS m ON bm.read_id = m.read_id"
-    " JOIN read_parquet(?) AS fm ON m.sequence_hash = fm.sequence_hash"
+    "WITH member AS ("
+    "  SELECT bm.kind AS kind, bm.bin_id AS bin_id, fm.feature_idx AS feature_idx,"
+    "    min(bm.contig_id) AS attr_contig_id"
+    "  FROM read_parquet(?) AS bm"
+    "  JOIN read_parquet(?) AS m ON bm.read_id = m.read_id"
+    "  JOIN read_parquet(?) AS fm ON m.sequence_hash = fm.sequence_hash"
+    "  GROUP BY ALL"
+    ")"
+    " SELECT mb.kind, mb.bin_id, mb.feature_idx,"
+    "   a.raw_name AS raw_name, a.circularity AS circularity,"
+    "   CAST(a.depth AS DOUBLE) AS depth, CAST(a.mult AS DOUBLE) AS mult"
+    " FROM member mb"
+    " LEFT JOIN contig_attribute a ON a.contig_id = mb.attr_contig_id"
 )
+
+
+def _register_contig_attributes(duck: Any, path: Path) -> None:
+    """Register the assemble step's per-contig attribute sidecar as
+    `contig_attribute`, which `ASSEMBLY_MEMBERSHIP_JOIN_SQL` LEFT JOINs.
+
+    An absent file registers the table EMPTY rather than changing the join, so the
+    statement has one shape. It is absent for any run whose assemble step predates
+    the sidecar — reachable by a resumed ticket, whose genomes_dir was written by
+    the old image — and every attribute is then NULL, which is what an unrecorded
+    value means.
+    """
+    if path.is_file():
+        duck.execute(
+            "CREATE TEMP TABLE contig_attribute AS"
+            " SELECT * FROM read_csv(?, delim='\t', header=true, auto_detect=true)",
+            [str(path)],
+        )
+        return
+    duck.execute(
+        "CREATE TEMP TABLE contig_attribute ("
+        "  contig_id VARCHAR, raw_name VARCHAR, circularity VARCHAR,"
+        "  depth DOUBLE, mult DOUBLE)"
+    )
 
 
 async def write_assembly_membership(
@@ -1463,6 +1510,7 @@ async def write_assembly_membership(
     bin_map_path: Path,
     manifest_path: Path,
     feature_map_path: Path,
+    genomes_dir: Path,
 ) -> int:
     """Link a prep_sample's assembly-run contigs to qiita.assembly_membership, and
     mint the qiita.genome each of their subjects is.
@@ -1514,6 +1562,7 @@ async def write_assembly_membership(
     total_written = 0
     async with pool.acquire() as conn:
         with duckdb_connect() as duck:
+            _register_contig_attributes(duck, genomes_dir / CONTIG_ATTRIBUTES_FILE)
             reader = duck.execute(
                 ASSEMBLY_MEMBERSHIP_JOIN_SQL,
                 [str(bin_map_path), str(manifest_path), str(feature_map_path)],
@@ -1551,6 +1600,10 @@ async def write_assembly_membership(
                         bin_ids=bin_ids,
                         feature_idxs=feature_idxs,
                         genome_idxs=genome_idxs,
+                        raw_names=batch.column("raw_name").to_pylist(),
+                        circularities=batch.column("circularity").to_pylist(),
+                        depths=batch.column("depth").to_pylist(),
+                        mults=batch.column("mult").to_pylist(),
                     )
                 total_written += written
     await asyncio.to_thread(

@@ -53,13 +53,18 @@ failure rather than a wrong answer.
 
 WHAT COUNTS AS CIRCULAR
 -----------------------
-ONLY `circular-yes`. myloasm also documents `circular-possibly` (a self-loop that
-fails its depth/connectivity criteria); that value was NOT reproduced by the probe
-— low-depth runs (1-3x) all reported `circular-no` — so it is accepted as a
-well-formed value but routed to noLCG. That is both the safe default (a mis-called
-linear contig is still recovered through binning, whereas a mis-called circular one
-bypasses binning entirely and is stored as a genome that was never closed) and what
-the assay owner does by hand today.
+ONLY `circular-yes`. `circular-possibly` (a self-loop failing myloasm's
+depth/connectivity criteria) is accepted as a well-formed value and routed to
+noLCG. It is not rare: a run over one sample's real masked reads produced six of
+them, and the flip from `yes` sits at a mean depth of 5.5, so a normal-coverage
+sample reaches it. Routing it to binning is the safe default — a mis-called linear
+contig is still recovered through binning, whereas a mis-called circular one
+bypasses binning entirely and is stored as a genome that was never closed — and it
+is what the assay owner does by hand today.
+
+The call is also STORED per contig now, not only routed on, so the decision is
+recoverable at query time without re-running the assembler: `contig_attributes.tsv`
+carries the three-state value beside the raw header it came from.
 
 WHY THE ID IS TRUNCATED AT `_len-`
 ----------------------------------
@@ -107,6 +112,18 @@ MIINT_EXTENSION_DIRECTORY_VAR = "MIINT_EXTENSION_DIRECTORY"
 # two `_circular-` fields into the UNRECOVERABLE direction.
 _LEN_FIELD = r"_len-[0-9]+"
 _CIRC_FIELD = "_circular-"
+# The `_depth-A-B-C_` triple. Rust prints these f64s with `{}`, so an integral
+# value has no decimal point; both shapes are accepted.
+_NUM = r"[0-9]+(?:\.[0-9]+)?"
+_DEPTH_RE = rf"_depth-({_NUM})-({_NUM})-({_NUM})_"
+# `mult=<f>` is written AFTER the space, so it is read_fastx's `comment`, never
+# part of `read_id` — verified against the extension.
+_MULT_RE = rf"^mult=({_NUM})$"
+# myloasm reports `mult` as 0.00 below this length (kmer_multiplicity returns
+# early), which is absence of signal rather than a measured zero, so it is stored
+# NULL. Keyed on the sequence actually written rather than on the value being 0,
+# so the column never has to mean two things.
+_MULT_MIN_LENGTH_BP = 1000
 # Capture group 1 is the circularity value. A header that doesn't match at all
 # yields '' — which `_validate` rejects, so an unparseable header stops the step.
 _CIRCULARITY_RE = rf"{_LEN_FIELD}{_CIRC_FIELD}([a-z]+)_"
@@ -207,9 +224,27 @@ def _load(con: duckdb.DuckDBPyConnection, src: str) -> None:
         "  read_id AS header,"
         "  regexp_replace(read_id, ?, '') AS contig_id,"
         "  regexp_extract(read_id, ?, 1) AS circularity,"
+        # The mean of the triple, which is the scalar myloasm itself derives from
+        # it: `min_read_depth_multi` holds one minimum read depth per identity
+        # threshold, and polishing_mod.rs averages the three into the `avg_cov`
+        # its own circularity gate tests. An empty match yields NULL rather than
+        # 0 — TRY_CAST over a missing group, not a coalesce to a fake reading.
+        "  (TRY_CAST(regexp_extract(read_id, ?, 1) AS DOUBLE)"
+        "   + TRY_CAST(regexp_extract(read_id, ?, 2) AS DOUBLE)"
+        "   + TRY_CAST(regexp_extract(read_id, ?, 3) AS DOUBLE)) / 3.0 AS depth,"
+        "  CASE WHEN length(sequence1) >= ?"
+        "       THEN TRY_CAST(regexp_extract(comment, ?, 1) AS DOUBLE) END AS mult,"
         "  sequence1"
         f" FROM read_fastx({src})",
-        [_DECORATION_RE, _CIRCULARITY_RE],
+        [
+            _DECORATION_RE,
+            _CIRCULARITY_RE,
+            _DEPTH_RE,
+            _DEPTH_RE,
+            _DEPTH_RE,
+            _MULT_MIN_LENGTH_BP,
+            _MULT_RE,
+        ],
     )
 
 
@@ -264,10 +299,35 @@ def _write(con: duckdb.DuckDBPyConnection, out: str, *, circular: bool) -> int:
     return count
 
 
+def _write_attributes(con: duckdb.DuckDBPyConnection, out: str) -> int:
+    """COPY the per-contig attributes to a TSV. Returns the record count.
+
+    One row per contig across BOTH published classes, keyed on `contig_id` — the
+    same cut id `_write` puts in the FASTA headers, and so the id that reaches
+    `bin_map.contig_id`. Keying on the full header instead would not join: the
+    FASTAs carry the cut id, and that is what read_fastx reads back downstream.
+
+    TSV, not Parquet: the container emits its tool's values and `assembly_load`
+    owns all parsing, which is the same split checkm.sh and bin_refine.sh use for
+    CheckM and DAS_Tool output. `HEADER` because the reader selects by name.
+    ORDER BY contig_id so a re-run over identical input produces an identical file.
+    """
+    (count,) = con.execute(
+        "COPY ("
+        "  SELECT contig_id, header AS raw_name, circularity, depth, mult"
+        "  FROM contig ORDER BY contig_id"
+        f") TO {_sql_path(out)} (FORMAT CSV, DELIMITER '\t', HEADER)"
+    ).fetchone()
+    return count
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 4:
-        _die(f"usage: {argv[0]} <assembly_primary.fa> <circular.fa> <noLCG.fa>")
-    primary, circ_out, nolcg_out = argv[1], argv[2], argv[3]
+    if len(argv) != 5:
+        _die(
+            f"usage: {argv[0]} <assembly_primary.fa> <circular.fa> <noLCG.fa>"
+            " <contig_attributes.tsv>"
+        )
+    primary, circ_out, nolcg_out, attrs_out = argv[1], argv[2], argv[3], argv[4]
 
     # `read_fastx` RAISES on a zero-record input ("Error Empty file: …") rather
     # than returning no rows — the same trap `qiita_common.duckdb_miint`'s
@@ -288,6 +348,7 @@ def main(argv: list[str]) -> int:
         _validate(con)
         n_circ = _write(con, circ_out, circular=True)
         n_lin = _write(con, nolcg_out, circular=False)
+        n_attrs = _write_attributes(con, attrs_out)
         # The two classes partition the input by construction (see
         # _CIRCULARITY_RE). Assert it anyway: a silent shortfall here is contigs
         # vanishing between the assembler and the lake.
@@ -297,8 +358,17 @@ def main(argv: list[str]) -> int:
 
     if n_circ + n_lin != total:
         _die(f"split lost records: {n_circ} circular + {n_lin} linear != {total} input")
+    # The attributes cover BOTH classes, so this is the input count, not either
+    # class. A shortfall means a contig reaches the lake with no stored call while
+    # its FASTA record is loaded normally — invisible downstream, since the join
+    # is a LEFT JOIN that renders a missing row as NULL.
+    if n_attrs != total:
+        _die(f"attributes lost records: {n_attrs} rows != {total} input contigs")
 
-    print(f"myloasm_split: {n_circ} circular (LCG), {n_lin} linear (noLCG)")
+    print(
+        f"myloasm_split: {n_circ} circular (LCG), {n_lin} linear (noLCG),"
+        f" {n_attrs} attribute rows"
+    )
     return 0
 
 

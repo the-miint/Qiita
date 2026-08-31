@@ -72,13 +72,20 @@ async def insert_assembly_membership_rows(
     bin_ids: list[str],
     feature_idxs: list[int],
     genome_idxs: list[int],
+    raw_names: list[str | None],
+    circularities: list[str | None],
+    depths: list[float | None],
+    mults: list[float | None],
 ) -> int:
     """Bulk-insert one chunk of assembly_membership rows; return the count of rows
     written or re-stamped.
 
-    The four lists are positionally aligned: row i links
+    The lists are positionally aligned: row i links
     ``(prep_sample_idx, processing_idx, kinds[i], bin_ids[i], feature_idxs[i])`` to
-    ``genome_idxs[i]``, the genome its subject was minted as.
+    ``genome_idxs[i]``, the genome its subject was minted as, and carries that
+    contig's ``raw_names[i]`` / ``circularities[i]`` / ``depths[i]`` / ``mults[i]``
+    — the assembler's own report, any of which may be None. Their meaning is on the
+    columns themselves; do not restate it here.
 
     ``DO UPDATE`` on the natural PK. The conflict fires on a workflow retried from
     the start and on any run over rows a backfill already created; under
@@ -109,12 +116,20 @@ async def insert_assembly_membership_rows(
     try:
         rows = await conn.fetch(
             "INSERT INTO qiita.assembly_membership"
-            " (prep_sample_idx, processing_idx, kind, bin_id, feature_idx, genome_idx)"
-            " SELECT $1, $2, k, b, f, g"
-            " FROM unnest($3::text[], $4::text[], $5::bigint[], $6::bigint[])"
-            "      AS t(k, b, f, g)"
+            " (prep_sample_idx, processing_idx, kind, bin_id, feature_idx, genome_idx,"
+            "  raw_name, circularity, depth, mult)"
+            " SELECT $1, $2, k, b, f, g, rn, c, d, m"
+            " FROM unnest($3::text[], $4::text[], $5::bigint[], $6::bigint[],"
+            "             $7::text[], $8::text[], $9::double precision[],"
+            "             $10::double precision[])"
+            "      AS t(k, b, f, g, rn, c, d, m)"
             " ON CONFLICT (prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
-            " DO UPDATE SET genome_idx = EXCLUDED.genome_idx"
+            # The attributes re-stamp alongside genome_idx for the same reason it
+            # does: a replay over rows written before the sidecar existed must
+            # converge rather than keep their NULLs.
+            " DO UPDATE SET genome_idx = EXCLUDED.genome_idx,"
+            "   raw_name = EXCLUDED.raw_name, circularity = EXCLUDED.circularity,"
+            "   depth = EXCLUDED.depth, mult = EXCLUDED.mult"
             " RETURNING feature_idx",
             prep_sample_idx,
             processing_idx,
@@ -122,6 +137,10 @@ async def insert_assembly_membership_rows(
             bin_ids,
             feature_idxs,
             genome_idxs,
+            raw_names,
+            circularities,
+            depths,
+            mults,
         )
     except asyncpg.ForeignKeyViolationError as exc:
         raise ValueError(

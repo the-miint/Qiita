@@ -701,12 +701,25 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
         -- samples AND runs); the `kind` value set is enumerated in
         -- qiita_common.assembly_constants. The DuckLake copy of
         -- qiita.assembly_membership for bulk joins with the sequences.
+        --
+        -- The four trailing columns are the assembler's own per-contig report,
+        -- nullable and NULL for every row written before they existed. Their
+        -- meaning is stated once, on the Postgres twin
+        -- (qiita.assembly_membership, migration
+        -- 20260901000000_assembly_membership_contig_attributes.sql); do not
+        -- restate it here. The assembler itself is NOT among them -- it is
+        -- captured in qiita.processing via processing_idx, as bin_quality's
+        -- comment below says of the same field.
         CREATE TABLE IF NOT EXISTS qiita_lake.assembly_membership (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,
             kind VARCHAR NOT NULL,
             bin_id VARCHAR NOT NULL,
-            feature_idx BIGINT NOT NULL
+            feature_idx BIGINT NOT NULL,
+            raw_name VARCHAR,
+            circularity VARCHAR,
+            depth DOUBLE,
+            mult DOUBLE
         );
 
         -- Per-MAG CheckM quality. Joins to its contigs via assembly_membership on

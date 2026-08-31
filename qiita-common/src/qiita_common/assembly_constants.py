@@ -32,3 +32,33 @@ KIND_UNBINNED = "UNBINNED"  # a noLCG contig that no refined bin claimed
 # (`build_assembly_run_query`), but no ticket can name it as a table.
 ASSEMBLED_SEQUENCE_TABLE = "assembled_sequence"
 ASSEMBLED_SEQUENCE_CHUNKS_TABLE = "assembled_sequence_chunks"
+
+# Per-contig attributes the assembler reported, one row per contig across BOTH
+# published FASTAs, keyed on the assembler's own contig id (`bin_map.contig_id`).
+# Raw values: the entrypoint normalizes the circularity call and nothing else, and
+# `assembly_load` does the parsing, so a column here is what the tool said rather
+# than a derived quantity. Written by both arms of assemble.sh; a run whose
+# assembler produced nothing writes no genomes_dir at all, so its absence is the
+# same signal as an absent circular.fa.
+CONTIG_ATTRIBUTES_FILE = "contig_attributes.tsv"
+
+# The attribute columns, in the order the entrypoints write them. `assembly_load`
+# reads the file by NAME (read_csv with a header), so this order is documentation
+# rather than a contract — but the two entrypoints must agree with each other, and
+# tests/test_long_read_assembly_entrypoint_pins.py pins them against this tuple.
+#
+#   contig_id    the assembler's own id; joins bin_map.contig_id
+#   raw_name     the full header (myloasm) or GFA segment name (hifiasm_meta),
+#                verbatim, so a normalized value can always be traced back
+#   circularity  yes | possibly | no. myloasm states it in the header;
+#                hifiasm_meta encodes it in the segment name and has no
+#                `possibly`, so that value is myloasm-only.
+#   depth        myloasm: the mean of the header's `depth-A-B-C` triple, which is
+#                the scalar myloasm itself derives from it (the `avg_cov` its
+#                circularity gate tests). hifiasm_meta: the S-line's `dp:f` tag.
+#                The two assemblers compute coverage differently; `raw_name` is
+#                what makes the difference recoverable.
+#   mult         myloasm's k-mer multiplicity. Empty for hifiasm_meta, which has
+#                no counterpart, and empty below 1 kb where myloasm reports 0.00
+#                for absence of signal rather than a measured zero.
+CONTIG_ATTRIBUTE_COLUMNS = ("contig_id", "raw_name", "circularity", "depth", "mult")

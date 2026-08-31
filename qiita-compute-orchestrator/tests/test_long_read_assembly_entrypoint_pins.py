@@ -45,6 +45,10 @@ import re
 from pathlib import Path
 
 import pytest
+from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTE_COLUMNS,
+    CONTIG_ATTRIBUTES_FILE,
+)
 
 from qiita_compute_orchestrator.jobs._assembly import LCG_FILE, NOLCG_FILE
 
@@ -57,12 +61,14 @@ _BINNING_VERIFY = _WORKFLOW_DIR / "binning-verify.sh"
 _BIN_REFINE_SH = _WORKFLOW_DIR / "bin_refine.sh"
 _BIN_REFINE_DEF = _WORKFLOW_DIR / "bin_refine.def"
 _CHECKM_SH = _WORKFLOW_DIR / "checkm.sh"
+_ASSEMBLE_DEF = _WORKFLOW_DIR / "assemble.def"
 
 
 @pytest.mark.parametrize(
     "path",
     [
         _ASSEMBLE_SH,
+        _ASSEMBLE_DEF,
         _BINNING_SH,
         _BINNING_DEF,
         _BINNING_VERIFY,
@@ -146,7 +152,7 @@ def _strip_comment(line: str) -> str:
 @pytest.mark.parametrize(
     ("path", "dir_var", "expected"),
     [
-        (_ASSEMBLE_SH, "OUT", {LCG_FILE, NOLCG_FILE}),
+        (_ASSEMBLE_SH, "OUT", {LCG_FILE, NOLCG_FILE, CONTIG_ATTRIBUTES_FILE}),
         (_BINNING_SH, "GENOMES_DIR", {NOLCG_FILE}),
         (_BIN_REFINE_SH, "GENOMES_DIR", {NOLCG_FILE}),
     ],
@@ -273,6 +279,93 @@ def test_assemble_restores_write_before_clearing_its_output_dirs() -> None:
         f"the loop body chmods {code[chmod]!r} and removes {code[clear]!r}; both "
         'must act on "${d}" or an iteration operates on the wrong directory'
     )
+
+
+def test_both_arms_emit_the_contig_attribute_sidecar() -> None:
+    """Each assembler arm writes the sidecar, with the same columns.
+
+    Two producers, one consumer: `assembly_load` and the control plane's
+    membership write both read this file by column NAME, so the arms must agree
+    with each other and with `CONTIG_ATTRIBUTE_COLUMNS`. They agree on nothing
+    else -- one is an awk over a GFA, the other a DuckDB COPY -- so nothing but
+    this checks it.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert code.count(CONTIG_ATTRIBUTES_FILE) == 2, (
+        f"expected both arms to name {CONTIG_ATTRIBUTES_FILE}; found "
+        f"{code.count(CONTIG_ATTRIBUTES_FILE)} mention(s)"
+    )
+    # The hifiasm arm's header row, written literally in the awk BEGIN block.
+    header = ", ".join(f'"{c}"' for c in CONTIG_ATTRIBUTE_COLUMNS)
+    assert header in code, (
+        f"the hifiasm_meta arm's sidecar header is not {header} -- the two arms "
+        "and the Python constant must spell the columns identically"
+    )
+    # The myloasm arm's projection, in myloasm_split.py's COPY.
+    split = "\n".join(_code_lines(_WORKFLOW_DIR / "myloasm_split.py"))
+    assert "SELECT contig_id, header AS raw_name, circularity, depth, mult" in split, (
+        "myloasm_split.py's attribute projection no longer matches "
+        f"{list(CONTIG_ATTRIBUTE_COLUMNS)}"
+    )
+
+
+def test_hifiasm_arm_fails_on_an_unrecognised_segment_name() -> None:
+    """A GFA segment name matching neither shape stops the step.
+
+    It used to fall through to noLCG, costing a misroute. The call is stored per
+    contig now, so the same name would also write a circularity into the lake for
+    a contig nothing classified -- and hifiasm_meta is pinned, so a name outside
+    the documented shape means the grammar moved rather than that the assembler
+    produced something unusual.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert "/tg[0-9]+l$/" in code, (
+        "the hifiasm_meta arm no longer recognises the LINEAR name shape, so every "
+        "linear contig would be counted as unrecognised"
+    )
+    assert re.search(r"exit 65", code), (
+        "nothing in assemble.sh exits non-zero for an unrecognised segment name; "
+        "a fall-through stores a circularity nobody determined"
+    )
+
+
+def test_hifiasm_arm_reads_depth_by_tag_not_by_position() -> None:
+    """`dp:f` is found by scanning the optional fields, not by column index.
+
+    GFA does not fix the order of a segment's optional tags. Reading $5 would
+    silently store `LN:i`'s or `ts:B:I`'s value as depth the day the order
+    changes, which no downstream check could catch -- a depth is a plausible
+    number whatever it came from.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert "for (i = 4; i <= NF; i++)" in code and "$i ~ /^dp:f:/" in code, (
+        "the hifiasm_meta arm no longer searches fields 4+ for the dp:f tag"
+    )
+
+
+def test_assemble_def_pins_and_asserts_both_assemblers() -> None:
+    """Both assemblers are `=`-pinned in the def AND version-asserted in %test.
+
+    A pin binds the solver only. Nothing about it is observable in the built
+    image, and a rebuild of the same conda version against different upstream
+    sources satisfies the pin while moving the tool -- so the pin without the
+    assertion is the gap that lets a drifted image ship green. This is the
+    assemble image's counterpart to the binning-verify.sh check below.
+    """
+    lines = _code_lines(_ASSEMBLE_DEF)
+    creates = [ln for ln in lines if "micromamba create" in ln]
+    pinned = {}
+    for line in creates:
+        pinned.update(dict(re.findall(r"\b([A-Za-z0-9_.-]+)=([A-Za-z0-9][^\s\"\']*)", line)))
+    assert set(pinned) == {"hifiasm_meta", "myloasm"}, (
+        f"expected both assemblers `=`-pinned on their create lines; got {pinned}"
+    )
+    joined = "\n".join(lines)
+    for package in pinned:
+        assert re.search(rf"{re.escape(package)} --version", joined), (
+            f"{package} is pinned but its version is never asserted in %test, so a "
+            "drifted solve would build green"
+        )
 
 
 def test_binning_stages_the_coverage_bam_unrewritten() -> None:

@@ -86,16 +86,18 @@ From: mambaorg/micromamba:1.5.8
     # circular contigs as ONE multi-FASTA — no per-contig split tool — so the native
     # assembly_hash step reads them with miint read_fastx.
     #
-    #  - hifiasm_meta: unpinned, as it has been — but note the exposure has GROWN,
-    #    because myloasm_split.py is now in this image's HASH_INPUTS. An edit to
-    #    the myloasm splitter invalidates the build hash, forcing a full rebuild,
-    #    which re-resolves this unpinned solve against whatever bioconda has that
-    #    day — so hifiasm_meta can move on a change that had nothing to do with it,
-    #    and %test asserts only that it runs, not which version. Whether to pin
-    #    it is a separate decision, not one blocked on knowing the version; until
-    #    it is taken, each deploy records what its rebuild resolved to
-    #    (DEPLOY_CHECKLIST bucket 5), so the moves are at least visible.
-    micromamba create -y -n hifiasm_meta -c bioconda -c conda-forge hifiasm_meta
+    #  - hifiasm_meta: PINNED, now that the circularity call it produces is
+    #    stored rather than only routed on. Unpinned, any rebuild re-resolved this
+    #    solve against whatever bioconda had that day — and every edit to this
+    #    image's HASH_INPUTS forces a rebuild — so the DEFAULT assembler could move
+    #    on a change that had nothing to do with it.
+    #
+    #    `hamtv0.3.5` is bioconda's version string; the binary reports its own two
+    #    internal versions (`ha base 0.13-r308` / `hamt 0.3-r079`), which is what
+    #    the deployed image was read to be running and what %test asserts below.
+    #    The conda version alone would not catch a rebuild of the same version
+    #    against different upstream sources, which is why both are checked.
+    micromamba create -y -n hifiasm_meta -c bioconda -c conda-forge hifiasm_meta=hamtv0.3.5
     #  - myloasm: PINNED, and the pin is load-bearing in a way hifiasm's absence of
     #    one is not. myloasm's circularity contract is a STRING in its FASTA header,
     #    probed on exactly this version (0.6.0). A drifted solve that RENAMED or
@@ -126,7 +128,12 @@ From: mambaorg/micromamba:1.5.8
     export HOME="$(mktemp -d)"
     micromamba env list | grep -q hifiasm_meta
     micromamba env list | grep -q myloasm
-    micromamba run -n hifiasm_meta hifiasm_meta --version
+    # Both internal version lines, exactly — the same shape as myloasm's assert
+    # below. `--version` writes them on separate lines, so each is matched on its
+    # own. A solve that moved either one fails the BUILD rather than silently
+    # changing what the default assembler's circularity call means.
+    micromamba run -n hifiasm_meta hifiasm_meta --version | grep -Fxq "ha base version: 0.13-r308"
+    micromamba run -n hifiasm_meta hifiasm_meta --version | grep -Fxq "hamt version: 0.3-r079"
     # myloasm's VERSION is asserted, not merely its presence. myloasm_split.py
     # reads circularity out of a header string probed against 0.6.0. A release that
     # renamed those fields would be caught at run time by myloasm_split.py; one

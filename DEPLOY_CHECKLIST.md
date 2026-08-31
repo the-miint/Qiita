@@ -23,13 +23,38 @@ _None yet._
 
 ### 3. Migrations
 
+- **`20260901000000_assembly_membership_contig_attributes.sql`** — adds four nullable columns
+  to `qiita.assembly_membership` (`raw_name`, `circularity`, `depth`, `mult`). `make migrate`
+  applies it; no out-of-band setup. **Not backfillable**: the values are read out of the
+  assemble step's output, so every existing row keeps NULL and only runs assembled after this
+  deploy carry them. (#517)
+
 - **`20260831000000_assembly_membership_genome.sql`** — adds `qiita.assembly_membership.genome_idx`
   (nullable, bare FK to `qiita.genome`, plus an index). `make migrate` applies it; no out-of-band
   setup. (#514)
 
 ### 4. Deploy
 
-_None yet._
+- **In-flight `long-read-assembly` tickets past `assemble` will fail at
+  `write-assembly-membership`.** (#517) That action gains a `genomes_dir` input, and the runner
+  resolves a ticket's step list from the live `qiita.action` row — so a ticket resumed after the
+  sync binds an input list its already-completed steps never produced a binding for. Unlike a
+  new step OUTPUT this is not silently wrong, it raises; but it still strands the ticket. Same
+  query as before the restart:
+
+  ```sql
+  SELECT t.work_ticket_idx, t.state, s.step_name, s.state AS step_state
+  FROM qiita.work_ticket t
+  JOIN qiita.work_ticket_step s USING (work_ticket_idx)
+  WHERE t.action_id = 'long-read-assembly'
+    AND t.state IN ('pending', 'queued', 'processing')
+    AND s.state <> 'failed';
+  ```
+
+  Any row means that ticket needs to finish before the restart or be resubmitted after it.
+  `s.state <> 'failed'` is deliberate — a `running` or `submitted` step is *adopted* on resume
+  (`_adopt_or_submit` re-attaches to the live SLURM job rather than resubmitting), so it is
+  exposed too, not just a `completed` one.
 
 ### 5. Verify
 
@@ -83,6 +108,12 @@ _None yet._
 _None yet._
 
 ### Notes (no host action)
+
+- **The `assemble` SIF rebuilds again, and this time the rebuild pins hifiasm_meta.** (#517)
+  `hifiasm_meta=hamtv0.3.5`, with both internal version strings asserted at build time. If the
+  bucket-5 version recorded on the previous deploy is not `ha base 0.13-r308` / `hamt 0.3-r079`,
+  the pin is moving the default assembler to a different version than the one that has been
+  running — worth knowing before the first assembly ticket after this deploy, not after.
 
 - **`estimate-feature-table` 1.0.0 gained an optional `denovo_alignment_idx` context key** and a
   second resolver-staged input. The deploy's workflow sync picks it up; nothing to do by hand. A

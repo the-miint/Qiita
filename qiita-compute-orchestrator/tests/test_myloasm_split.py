@@ -112,6 +112,7 @@ def _split(tmp_path: Path, fasta: str, staged: str | None) -> subprocess.Complet
             str(primary),
             str(tmp_path / "circular.fa"),
             str(tmp_path / "noLCG.fa"),
+            str(tmp_path / "contig_attributes.tsv"),
         ],
         capture_output=True,
         text=True,
