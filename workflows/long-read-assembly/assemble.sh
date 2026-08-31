@@ -1,6 +1,6 @@
 #!/bin/bash
 # Assemble masked HiFi reads, then split circular genomes (LCG) from the linear
-# contigs (noLCG). Output `genomes_dir` =
+# contigs (noLCG). Two outputs. `genomes_dir` =
 # $QIITA_OUTPUT_PATH/genomes:
 #   circular.fa   every circular contig, ANY size, as one multi-FASTA (ingested as
 #                 LCG; the >=512 kb "large complete genome" cut is a query-time
@@ -10,6 +10,52 @@
 #   noLCG.fa      the non-circular contigs (input to binning + bin_refine)
 # Zero contigs is left as an empty genomes_dir; downstream steps skip cleanly and
 # assembly_hash turns the all-empty result into StepNoData.
+#
+# $QIITA_OUTPUT_PATH/assembler holds the assembler's own output tree, whole and
+# unedited. It is not a declared step output and no step reads it; it is retained
+# by being written under the output root, where `qiita_finish` lists it in
+# manifest.json and the verifier checks each file's size and mode. It is not a
+# second copy of anything either: each arm below points the assembler's `-o`
+# straight at it and then reads its one file back out, so the two published
+# FASTAs are derived from this tree rather than duplicated from it.
+#
+# ASM_DIR must stay under $QIITA_OUTPUT_PATH. With no `outputs:` entry naming it,
+# nothing at run time proves it does — a path pointing elsewhere would restore
+# the original defect silently, since files outside the output root are neither
+# listed nor verified. `test_assemble_runs_the_assembler_into_its_own_output`
+# is what holds it.
+#
+# Nothing here names a file the assembler produces, which is what lets one
+# directory hold both arms' layouts and survive a release that renames one — a
+# rename changes this directory's contents instead of needing a change here.
+# hifiasm_meta is unpinned (assemble.def), so that is not a hypothetical.
+#
+# It is not free. On a 1.24 Gbp masked read set — 12% of one real ticket's reads
+# — the tree is 1.44 GB for myloasm and 697 MB for hifiasm_meta, against the
+# 102 MB / 76 MB single file each arm reads back. Assembly output does not scale
+# linearly with input and has not been measured at a second point, so treat that
+# as a floor rather than a per-ticket figure. Roughly a third of myloasm's is one
+# m/t/r parameter sweep over near-identical copies of the same graph
+# (`1-light_resolve` + `2-heavy_path_resolve`), and another 564 MB is
+# `binary_temp/`, its own scratch. Keeping those is the price of naming no
+# filenames. Nothing is copied at step end: the assembler writes here directly,
+# so the bytes are charged to the per-attempt ticket workspace.
+#
+# That workspace does not currently expire. docs/architecture/storage.md states
+# ephemeral per-ticket directories are deleted 45 days past the ticket's terminal
+# state, but no sweep implementing it exists in this repo, so workspaces — and
+# now these trees — accumulate. This retains in place; it does not archive.
+# Anything that must survive the sweep being implemented needs storage of its
+# own.
+#
+# What bounds the file count is the manifest: `qiita_finish` lists every file
+# under $QIITA_OUTPUT_PATH, and the orchestrator caps how large that manifest may
+# be (`slurm/verify.py`), rejecting an over-large one as a permanent
+# CONTRACT_VIOLATION. The count is structural rather than a function of input
+# size — the sweep above emits a fixed number of graphs — and completed runs
+# wrote 152 files for myloasm and 17 for hifiasm_meta, orders of magnitude under
+# that cap. Several come out zero-byte
+# (`asm.bins.tsv`, `asm.rescue*.fa`); the gates take those as they are.
 #
 # HOW EACH ASSEMBLER SIGNALS CIRCULARITY — the two do NOT agree, and that is the
 # whole reason this is a per-assembler branch rather than one shared tail:
@@ -41,10 +87,21 @@ READS_FASTQ="$(qiita_input masked_reads_fastq)"
 RUN_CONFIG="$(qiita_input run_config)"
 ASSEMBLER="$(jq -er '.assembler' "${RUN_CONFIG}")"
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
 OUT="${QIITA_OUTPUT_PATH}/genomes"
-mkdir -p "${OUT}"
+ASM_DIR="${QIITA_OUTPUT_PATH}/assembler"
+# Both output dirs are cleared before use, not just created. `qiita_finish`
+# leaves every directory 0550 and every file 0440, and a directory stripped of
+# its write bit does not give up its entries — over such a tree `rm -rf` alone
+# exits 1 (probed as a non-root uid on Linux and macOS), and the awk redirect
+# into circular.fa cannot truncate a 0440 file either. So restore write first.
+# The CP hands an ordinary retry a fresh attempt dir; a SLURM-side requeue
+# re-enters this one, which is the case this covers.
+for d in "${OUT}" "${ASM_DIR}"; do
+    [[ -d "${d}" ]] || continue
+    chmod -R u+w "${d}"
+    rm -rf "${d}"
+done
+mkdir -p "${OUT}" "${ASM_DIR}"
 
 # Both arms create BOTH files whenever the assembler produced anything, and
 # neither when it didn't — so an empty CLASS is an empty file while an empty
@@ -57,8 +114,8 @@ mkdir -p "${OUT}"
 # step to keep in sync.
 case "${ASSEMBLER}" in
     hifiasm_meta)
-        micromamba run -n hifiasm_meta hifiasm_meta -t "${THREADS}" -o "${WORK}/asm" "${READS_FASTQ}"
-        GFA="${WORK}/asm.p_ctg.gfa"
+        micromamba run -n hifiasm_meta hifiasm_meta -t "${THREADS}" -o "${ASM_DIR}/asm" "${READS_FASTQ}"
+        GFA="${ASM_DIR}/asm.p_ctg.gfa"
 
         # GFA S-line -> FASTA. hifiasm-meta's documented contig-name shape is
         # `s[0-9]+\.[uc]tg[0-9]{6}[lc]` where the trailing letter is `c` (circular) or `l`
@@ -86,8 +143,8 @@ case "${ASSEMBLER}" in
         # Supporting ONT would mean threading a read type through the action
         # context and swapping this for `--nano-r10` / `--nano-r9`; it is a
         # deliberate match to the input, not a default nobody chose.
-        micromamba run -n myloasm myloasm "${READS_FASTQ}" -o "${WORK}/myloasm" -t "${THREADS}" --hifi
-        PRIMARY="${WORK}/myloasm/assembly_primary.fa"
+        micromamba run -n myloasm myloasm "${READS_FASTQ}" -o "${ASM_DIR}" -t "${THREADS}" --hifi
+        PRIMARY="${ASM_DIR}/assembly_primary.fa"
 
         # A MISSING primary FASTA is a contract violation, not an empty assembly.
         # _lib.sh sets `set -e`, so reaching this line means myloasm exited 0 — and

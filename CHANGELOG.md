@@ -1407,6 +1407,23 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **`assemble` kept only the two FASTAs it published and deleted the rest of the
+  assembler's output (#516).** The step ran each assembler into a `mktemp -d` it removed
+  on EXIT, read one file back out (`assembly_primary.fa` for myloasm, `asm.p_ctg.gfa` for
+  hifiasm_meta) and discarded everything else — myloasm's `alternate_assemblies/`
+  demoted contigs, `final_contig_graph.gfa` and `3-mapping/low_quality_regions.bed`;
+  hifiasm_meta's `asm.a_ctg.gfa` and unitig graphs. The deletion was assembler-agnostic
+  and left nothing to recover from: myloasm removes its own pre-dereplication FASTA
+  internally, so `alternate_assemblies/` was the only route to a demoted contig. Both
+  arms now point `-o` straight at `$QIITA_OUTPUT_PATH/assembler`, so the tree is written
+  where the step's output already lives rather than copied there, and `qiita_finish` lists
+  and the verifier checks it without it being a declared output — nothing names a file the
+  assembler produces, which is what lets one directory hold both arms' layouts and survive
+  a release that renames one (hifiasm_meta is unpinned). No step consumes it. It costs the
+  per-attempt workspace roughly a gigabyte per assembly; `DEPLOY_CHECKLIST.md` carries the
+  measured figures and the conditions they were taken under. Whether the demoted contigs
+  should be *ingested* is a separate assay question and is unchanged here.
+
 - **`stage_local_fasta` feeds the manifest to `read_fastx` in batches, so a large
   reference no longer exhausts the job's file descriptors (#513).** `read_fastx` opens a
   file per path in its `VARCHAR[]` and holds that handle until the whole call ends — a

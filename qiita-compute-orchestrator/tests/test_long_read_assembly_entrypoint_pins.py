@@ -180,6 +180,101 @@ def test_genomes_dir_basenames_match_the_python_constants(
     )
 
 
+def test_assemble_runs_the_assembler_into_its_own_output() -> None:
+    """Both arms point the assembler's `-o` at ${ASM_DIR}, under $QIITA_OUTPUT_PATH.
+
+    That is the whole mechanism: the assembler's tree is retained because it is
+    written where the step's output already lives, not copied there afterwards.
+    An `-o` pointed anywhere else -- a mktemp dir, $TMPDIR, the workspace --
+    discards everything the arm does not read back, and does it silently, since
+    the two published FASTAs are unaffected.
+    """
+    lines = _code_lines(_ASSEMBLE_SH)
+    code = "\n".join(lines)
+    assert 'ASM_DIR="${QIITA_OUTPUT_PATH}/assembler"' in code, (
+        "ASM_DIR is not defined as ${QIITA_OUTPUT_PATH}/assembler. It is not a "
+        "declared output, so nothing at run time checks where it points -- a path "
+        "outside the output root is neither listed in the manifest nor verified, "
+        "and the assembler's tree would be discarded exactly as it was before."
+    )
+    dasho = re.findall(r'-o "([^"]+)"', code)
+    assert dasho, "assemble.sh passes no -o at all -- neither arm names an output dir"
+    assert all(t.startswith("${ASM_DIR}") for t in dasho), (
+        f"assemble.sh runs an assembler with -o {dasho} -- every arm must write into "
+        "${ASM_DIR} so its tree lands under $QIITA_OUTPUT_PATH"
+    )
+    assert len(dasho) == 2, f"expected one -o per assembler arm, found {len(dasho)}: {dasho}"
+
+
+def test_assemble_deletes_nothing_on_exit() -> None:
+    """No `trap ... EXIT` and no mktemp in assemble.sh.
+
+    The three sibling entrypoints each stage working files through a `mktemp -d`
+    they delete on exit. This one must not: everything the assembler writes is an
+    output of the step, and the arms read their one file back out of that same
+    tree. A trap reintroduced here removes it after the manifest is written, so
+    the verifier's `files` list would name paths that no longer exist -- gate 2,
+    a permanent CONTRACT_VIOLATION -- rather than failing quietly.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert "mktemp" not in code, (
+        "assemble.sh calls mktemp; the assembler's tree is a step output and "
+        "belongs under $QIITA_OUTPUT_PATH"
+    )
+    assert not re.search(r"\btrap\b", code), (
+        "assemble.sh installs a trap; an EXIT handler here deletes files the "
+        "manifest already declared"
+    )
+
+
+def test_assemble_restores_write_before_clearing_its_output_dirs() -> None:
+    """Both output dirs are chmod'd writable, then removed, then re-created.
+
+    `qiita_finish` leaves directories 0550 and files 0440. A directory without
+    its write bit does not give up its entries, so `rm -rf` over such a tree
+    exits 1 -- and under `set -e` that aborts the step rather than clearing it.
+    The chmod is what makes the clear work, so it is pinned with it, in order.
+
+    Both dirs, not just the assembler tree: the awk redirect into circular.fa
+    cannot truncate a 0440 file either. The CP gives an ordinary retry a fresh
+    attempt dir; a SLURM-side requeue re-enters this one.
+    """
+    code = _code_lines(_ASSEMBLE_SH)
+    chmod = next((i for i, ln in enumerate(code) if ln.startswith("chmod -R u+w")), None)
+    clear = next((i for i, ln in enumerate(code) if ln.startswith("rm -rf")), None)
+    mkdir = next((i for i, ln in enumerate(code) if ln.startswith("mkdir -p")), None)
+    assert chmod is not None, (
+        "assemble.sh does not restore write before clearing; `rm -rf` over a tree "
+        "qiita_finish left at 0550/0440 exits 1"
+    )
+    assert clear is not None, "nothing in assemble.sh clears its output dirs"
+    assert mkdir is not None, "assemble.sh never creates its output dirs"
+    assert chmod < clear < mkdir, (
+        f"assemble.sh orders chmod/rm/mkdir at {chmod}/{clear}/{mkdir}; the chmod "
+        "must precede the rm (or the rm fails) and both must precede the mkdir "
+        "(or the clear undoes it)"
+    )
+    loop = next((i for i, ln in enumerate(code) if ln.startswith("for d in ")), None)
+    assert loop is not None, "the clear is not a loop over the output dirs"
+    assert "${OUT}" in code[loop] and "${ASM_DIR}" in code[loop], (
+        f"the clear covers {code[loop]!r}; both ${{OUT}} and ${{ASM_DIR}} carry "
+        "0440 files from a previous attempt"
+    )
+    done = next((i for i, ln in enumerate(code) if ln == "done" and i > loop), None)
+    assert done is not None, "the clear loop is never closed"
+    # Both must act on the loop VARIABLE and sit inside the loop. `chmod -R u+w
+    # "${OUT}"` in the body would pass an order-only check while leaving
+    # ${ASM_DIR} at 0550, so its `rm -rf` exits 1 and aborts the step -- the exact
+    # failure this pin is for, on the one directory the order says nothing about.
+    assert loop < chmod < done and loop < clear < done, (
+        f"chmod at {chmod} and rm at {clear} are not both inside the clear loop ({loop}..{done})"
+    )
+    assert '"${d}"' in code[chmod] and '"${d}"' in code[clear], (
+        f"the loop body chmods {code[chmod]!r} and removes {code[clear]!r}; both "
+        'must act on "${d}" or an iteration operates on the wrong directory'
+    )
+
+
 def test_binning_stages_the_coverage_bam_unrewritten() -> None:
     """The staging name is filled by copying ${COVERAGE_BAM}, byte for byte.
 
