@@ -17,7 +17,7 @@ as.
 
 What the data plane reads is therefore the DuckLake copy of the junction, which
 is replace-keyed on this same pair — so a re-run's ticket names that re-run's
-contigs. The Postgres copy is written ``ON CONFLICT DO NOTHING`` and keeps
+contigs. The Postgres copy upserts on the natural key and keeps
 superseded rows (see ``DEPLOY_CHECKLIST.md``), which is why it is used below only
 to answer "did this run assemble at all", never to bound what streams.
 """

@@ -1199,13 +1199,17 @@ async def delete_sequenced_pool(
     prep_sample). Because sequenced_sample↔prep_sample is 1:1 and each
     sequenced_sample belongs to one pool, the deleted prep_samples are
     exclusive to this pool. They are removed outright, which severs **every**
-    study link they hold — not only the run/pool the operator is thinking of.
+    study link they hold — not only the run/pool the operator is thinking of. It also
+    deletes the qiita-origin genomes this pool's assemblies minted, which retires any
+    published `QF<n>` handle naming one (`exported_feature.genome_idx` is ON DELETE SET
+    NULL behind a retire trigger).
 
     Gating: in-flight work tickets (pending/queued/processing) block the delete
-    unconditionally (409). Terminal work tickets (completed/no_data/failed),
-    prep_samples published into a study, and samples carrying an ENA accession
-    each block it unless
-    `force=true`.
+    unconditionally (409), as does a qiita-origin genome from one of these
+    prep_samples that a reference claims through `qiita.feature_genome` — `force`
+    does not override that one, because it cannot make the genome deletable.
+    Terminal work tickets (completed/no_data/failed), prep_samples published into a
+    study, and samples carrying an ENA accession each block it unless `force=true`.
 
     The DuckLake purge (the `read`/`read_mask` rows the pool's bcl-convert run
     wrote, keyed by prep_sample_idx) runs first, then the Postgres teardown —
@@ -1267,8 +1271,9 @@ async def delete_sequenced_pool(
 
     # Re-gate inside the teardown transaction to close the precheck→cascade
     # window: a work ticket that went in-flight since the precheck must abort
-    # the teardown (and 409 loudly) rather than be silently deleted. force=True
-    # here means only a *new in-flight* ticket aborts — terminal tickets,
+    # the teardown (and 409 loudly) rather than be silently deleted. Under
+    # force=True the two that still abort here are a *new in-flight* ticket and a
+    # reference claim on one of these prep_samples' genomes — terminal tickets,
     # published links, and ENA samples are the cascade's to delete.
     async with tx() as conn:
         try:

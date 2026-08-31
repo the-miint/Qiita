@@ -213,7 +213,8 @@ steps:
 
   # Link this run's contigs to qiita.assembly_membership, tagged by (kind, bin_id)
   # and stamped with the run's processing_idx (minted before the loop because
-  # assembly_load threads it via params). Idempotent (ON CONFLICT DO NOTHING).
+  # assembly_load threads it via params). Idempotent: the write upserts on the
+  # natural key, re-stamping each row's minted genome_idx rather than skipping it.
   - action: write-assembly-membership
     inputs: [bin_map, manifest, feature_map]
     outputs: []

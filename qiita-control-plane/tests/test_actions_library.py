@@ -423,6 +423,10 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
         [
             ("LCG:circ1:1", "LCG", "circ1"),
             ("MAG:bin.1:1", "MAG", "bin.1"),
+            # A SECOND identical contig in the SAME bin. `assembly_hash` composes
+            # read_id as kind:bin_id:sequence_index, so duplicated bytes inside one
+            # bin arrive as two read_ids resolving to one feature_idx.
+            ("MAG:bin.1:2", "MAG", "bin.1"),
             ("MAG:bin.2:1", "MAG", "bin.2"),
         ],
     )
@@ -432,6 +436,7 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
         [
             ("LCG:circ1:1", str(h1), 10),
             ("MAG:bin.1:1", str(h2), 20),
+            ("MAG:bin.1:2", str(h2), 20),
             # bin.2 shares bytes with bin.1 -> same hash -> same feature_idx.
             ("MAG:bin.2:1", str(h2), 20),
         ],
@@ -442,6 +447,11 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
         rows = c.execute(
             ASSEMBLY_MEMBERSHIP_JOIN_SQL, [str(bin_map), str(manifest), str(feature_map)]
         ).fetchall()
+    # THREE rows, not four. The duplicate WITHIN bin.1 collapses (the constant's
+    # DISTINCT); the same feature under a DIFFERENT bin does not, because
+    # (kind, bin_id, feature_idx) still differs. Without the DISTINCT this returns
+    # four rows and the Postgres write raises `cardinality_violation` — ON CONFLICT
+    # DO UPDATE refuses to touch one conflict target twice.
     assert sorted(rows) == sorted(
         [("LCG", "circ1", 100), ("MAG", "bin.1", 200), ("MAG", "bin.2", 200)]
     )

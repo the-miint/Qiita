@@ -156,6 +156,11 @@ def canonical_sequence_hashes(sequences: list[str]) -> list[uuid.UUID]:
     minter must use. Returns UUIDs, deduplicated on the canonical hash the way
     `qiita.feature`'s UNIQUE does, so a strand pair yields one entry.
 
+    **The result is NOT positionally aligned with `sequences`.** It is a
+    `SELECT DISTINCT` with no ORDER BY, so both the dedup and DuckDB's hash
+    aggregate can reorder it. A caller that needs to know which hash belongs to
+    which sequence calls this once per sequence.
+
     Uses the client connect path (INSTALL-then-LOAD): tests run off the deploy,
     with no staged `MIINT_EXTENSION_DIRECTORY` and a writable `$HOME`.
     """

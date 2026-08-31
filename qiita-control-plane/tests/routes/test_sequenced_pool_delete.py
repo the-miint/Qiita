@@ -20,11 +20,16 @@ import pyarrow.flight as _flight
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_SEQUENCED_POOL_BY_IDX, compute_reads_staging_path
+from qiita_common.assembly_constants import KIND_MAG
+from qiita_common.models import GenomeSource
 
 from qiita_control_plane.routes import sequencing_run as _sr_routes
 from qiita_control_plane.testing.db_seeds import (
+    seed_bare_feature,
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
+    seed_feature_genome,
+    seed_genome,
     seed_sequenced_sample_subtype,
 )
 
@@ -784,3 +789,129 @@ async def test_delete_pool_reaps_staged_reads(
     finally:
         _install_settings(app)  # restore the no-staging default for other tests
         await _cleanup(postgres_pool, ids)
+
+
+async def test_delete_pool_removes_the_assembly_genomes_its_samples_minted(
+    admin_client, postgres_pool, human_admin_session
+):
+    """Regression, the assembly twin of the gate-row case above.
+
+    An assembled prep_sample's subjects mint qiita-origin `qiita.genome` rows, and
+    `genome.prep_sample_idx` is ON DELETE RESTRICT — so a genome the cascade does not
+    remove makes the prep_sample delete raise ForeignKeyViolationError, an unhandled
+    500 out of a delete that has already purged the pool's DuckLake rows. The
+    `assembly_membership.genome_idx` FK is bare (NO ACTION), so the cascade must
+    detach before it deletes; doing only one of the two fails.
+    """
+    ids = await _seed_pool_with_sample(postgres_pool, human_admin_session["principal_idx"])
+    prep = ids["prep_sample_idx"]
+    processing_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.processing (params_hash, workflow, version, params)"
+        " VALUES ($1, 'long-read-assembly', '1.0.0', '{}'::jsonb)"
+        " RETURNING processing_idx",
+        uuid.uuid4().bytes + uuid.uuid4().bytes,  # 32-byte params_hash
+    )
+    genome_idx, _source_id = await seed_genome(
+        postgres_pool, source=GenomeSource.QIITA, prep_sample_idx=prep
+    )
+    feature_idx = await seed_bare_feature(postgres_pool)
+    await postgres_pool.execute(
+        "INSERT INTO qiita.assembly_membership"
+        " (prep_sample_idx, processing_idx, kind, bin_id, feature_idx, genome_idx)"
+        " VALUES ($1, $2, $5, 'bin.1', $3, $4)",
+        prep,
+        processing_idx,
+        feature_idx,
+        genome_idx,
+        KIND_MAG,
+    )
+
+    try:
+        resp = await admin_client.delete(_url(ids))
+        assert resp.status_code == 200, resp.text
+        # The prep_sample is gone: the RESTRICT on genome.prep_sample_idx would
+        # otherwise have 500'd the cascade after the DuckLake purge.
+        assert (
+            await postgres_pool.fetchval("SELECT 1 FROM qiita.prep_sample WHERE idx = $1", prep)
+            is None
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.genome WHERE genome_idx = $1", genome_idx
+            )
+            is None
+        ), "the assembly genome goes with its prep_sample"
+        # The membership row rides prep_sample's CASCADE.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.assembly_membership WHERE prep_sample_idx = $1", prep
+            )
+            is None
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.assembly_membership WHERE prep_sample_idx = $1", prep
+        )
+        await postgres_pool.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
+        await postgres_pool.execute("DELETE FROM qiita.feature WHERE feature_idx = $1", feature_idx)
+
+
+async def test_delete_pool_refuses_when_a_reference_claims_an_assembly_genome(
+    admin_client, postgres_pool, human_admin_session
+):
+    """The other half: a qiita-origin genome a reference also claims through
+    `feature_genome` is one the cascade deliberately will not remove, so the delete
+    has to be refused UP FRONT rather than aborting mid-cascade — after the DuckLake
+    purge, which the Postgres rollback does not restore. `force` does not override
+    it, because force cannot make the genome deletable.
+    """
+    ids = await _seed_pool_with_sample(postgres_pool, human_admin_session["principal_idx"])
+    prep = ids["prep_sample_idx"]
+    processing_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.processing (params_hash, workflow, version, params)"
+        " VALUES ($1, 'long-read-assembly', '1.0.0', '{}'::jsonb)"
+        " RETURNING processing_idx",
+        uuid.uuid4().bytes + uuid.uuid4().bytes,  # 32-byte params_hash
+    )
+    genome_idx, _source_id = await seed_genome(
+        postgres_pool, source=GenomeSource.QIITA, prep_sample_idx=prep
+    )
+    feature_idx = await seed_bare_feature(postgres_pool)
+    await postgres_pool.execute(
+        "INSERT INTO qiita.assembly_membership"
+        " (prep_sample_idx, processing_idx, kind, bin_id, feature_idx, genome_idx)"
+        " VALUES ($1, $2, $5, 'bin.1', $3, $4)",
+        prep,
+        processing_idx,
+        feature_idx,
+        genome_idx,
+        KIND_MAG,
+    )
+    await seed_feature_genome(postgres_pool, feature_idx=feature_idx, genome_idx=genome_idx)
+
+    try:
+        resp = await admin_client.delete(_url(ids) + "?force=true")
+        assert resp.status_code == 409, resp.text
+        assert "claimed by a reference" in resp.text
+        # Refused before anything was touched.
+        assert (
+            await postgres_pool.fetchval("SELECT 1 FROM qiita.prep_sample WHERE idx = $1", prep)
+            == 1
+        )
+        # Releasing the claim releases the gate — the other half of the refusal.
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature_genome WHERE genome_idx = $1", genome_idx
+        )
+        resp = await admin_client.delete(_url(ids) + "?force=true")
+        assert resp.status_code == 200, resp.text
+    finally:
+        # The successful delete above CASCADEs the membership row and takes the
+        # genome; this covers the path where the body failed before that.
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature_genome WHERE genome_idx = $1", genome_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.assembly_membership WHERE prep_sample_idx = $1", prep
+        )
+        await postgres_pool.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
+        await postgres_pool.execute("DELETE FROM qiita.feature WHERE feature_idx = $1", feature_idx)

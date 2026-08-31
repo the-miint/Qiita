@@ -21,6 +21,45 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Assembly subjects mint a `qiita.genome`, recorded on `assembly_membership.genome_idx` (#514).**
+  Every assembled subject — each refined bin, each LCG contig, each unbinned contig — now mints one
+  qiita-origin genome, keyed on the SHA-256 of `(prep_sample_idx, processing_idx, kind, bin_id)`
+  (`repositories.assembly.assembly_genome_source_id`, the one definition the inline write and the
+  backfill share). A bin's contigs group under one genome; an LCG or unbinned contig is its own.
+  `write_assembly_membership` mints and stamps in the same batch, so the row and its genome are one
+  INSERT. `qiita-admin backfill assembly-genome` converts runs that predate it — a pure Postgres
+  replay, since the identity is a hash of columns already on the row.
+
+  **The edge is deliberately NOT `qiita.feature_genome`.** An assembled contig whose bytes match a
+  reference sequence resolves to the same content-addressed `feature_idx`, and that junction is both
+  how a reference's genome map is derived (there is no reference→genome edge in the schema) and the
+  resolution substrate for the GLOBAL `qiita.reference_exclusion` blocklist, which expands a blocked
+  genome to all its features through it, unscoped by reference. Writing there would put sample-derived
+  genomes inside every reference map sharing a contig and inside the blocklist's reach. A column
+  rather than a second junction because a bare `(feature_idx, genome_idx)` table cannot express the
+  per-run scoping consumers need: `qiita.genome` carries no `processing_idx`, and `prep_sample_idx`
+  is identical for two runs of one prep_sample, so there would be nothing to filter the
+  genome side on.
+
+  The sequenced-pool delete now detaches `genome_idx` and deletes that prep_sample's assembly
+  genomes before deleting the `prep_sample` — without it, every assembled pool would be undeletable,
+  since `genome.prep_sample_idx` is `ON DELETE RESTRICT`. The genome delete is scoped
+  `NOT EXISTS (… feature_genome …)`, because a reference load may legitimately declare qiita-source
+  genomes and those carry a `prep_sample_idx` too. `assert_sequenced_pool_deletable` refuses such a
+  pool up front with a 409 rather than letting the skip abort the delete after the DuckLake purge,
+  which the Postgres rollback does not restore; `force` does not override that one, because it cannot
+  make the genome deletable. One consequence, accepted: deleting an assembly genome retires any
+  published `QF<n>` handle naming it, via `exported_feature.genome_idx`'s `ON DELETE SET NULL`
+  trigger.
+
+  `ASSEMBLY_MEMBERSHIP_JOIN_SQL` gained a `DISTINCT`, restoring the parity
+  `jobs/assembly_load.py` already claimed: two byte-identical contigs in one bin resolve to one
+  `feature_idx`, and the membership write now upserts (`ON CONFLICT … DO UPDATE`, so a replay
+  re-stamps `genome_idx` instead of leaving a pre-mint row NULL) — which Postgres refuses when one
+  statement touches a conflict target twice. `write_assembly_membership` accordingly returns a single
+  count of rows written or re-stamped, rather than the `(linked, already_linked)` pair whose second
+  element is now always zero.
+
 - **A `qiita_sample_type` biosample global field, backed by a new internal controlled vocabulary (#509).**
   `Qiita Sample Type` is a terminology this database defines rather than loads from an external
   source: there is no release to load, new terms are appended directly, and `terminology.version`

@@ -23,7 +23,9 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- **`20260831000000_assembly_membership_genome.sql`** — adds `qiita.assembly_membership.genome_idx`
+  (nullable, bare FK to `qiita.genome`, plus an index). `make migrate` applies it; no out-of-band
+  setup. (#514)
 
 ### 4. Deploy
 
@@ -31,7 +33,20 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- **Run the assembly-genome backfill.** (#514)
+
+  ```bash
+  QA=/home/qiita/qiita-miint/qiita-control-plane/.venv/bin/qiita-admin
+  DB=$(sudo grep -oP '^DATABASE_URL=\K.*' /etc/qiita/control-plane.env)
+  sudo -u qiita env DATABASE_URL="$DB" "$QA" backfill assembly-genome              # dry run
+  sudo -u qiita env DATABASE_URL="$DB" "$QA" backfill assembly-genome --execute
+  ```
+
+  Assemblies run after this deploy get the mint inline; earlier ones need this. **No existing
+  artifact changes and nothing is at risk if it is skipped** — no consumer reads
+  `assembly_membership.genome_idx` yet, so this is groundwork for a genome-level roll-up over de
+  novo contigs rather than a correction. Re-run the dry run afterwards; an empty plan ("nothing to
+  do") is the completeness signal that roll-up will want. Idempotent, so a repeat costs nothing.
 
 ### 6. After the deploy verifies green
 
