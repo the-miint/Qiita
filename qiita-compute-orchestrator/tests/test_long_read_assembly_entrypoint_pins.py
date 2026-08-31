@@ -81,7 +81,7 @@ def test_source_file_is_present_and_parses(path: Path) -> None:
     """Anti-vacuity guard, matching the sibling static pins.
 
     Every assertion below reads one of these files through `_code_lines` — all
-    seven, which is why all seven are listed here rather than the three `binning`
+    eight, which is why all eight are listed here rather than the three `binning`
     ones. A moved file or a `_REPO_ROOT` that stopped resolving would make the
     absence-shaped pins pass for the wrong reason, so fail loudly here first.
     """
@@ -284,7 +284,7 @@ def test_assemble_restores_write_before_clearing_its_output_dirs() -> None:
 def test_both_arms_emit_the_contig_attribute_sidecar() -> None:
     """Each assembler arm writes the sidecar, with the same columns.
 
-    Two producers, one consumer: `assembly_load` and the control plane's
+    Two producers, two consumers: `assembly_load` and the control plane's
     membership write both read this file by column NAME, so the arms must agree
     with each other and with `CONTIG_ATTRIBUTE_COLUMNS`. They agree on nothing
     else -- one is an awk over a GFA, the other a DuckDB COPY -- so nothing but
@@ -301,6 +301,13 @@ def test_both_arms_emit_the_contig_attribute_sidecar() -> None:
         f"the hifiasm_meta arm's sidecar header is not {header} -- the two arms "
         "and the Python constant must spell the columns identically"
     )
+    # The hifiasm arm's DATA row, which must carry the same five fields in the
+    # same order as the header above -- a reordered `print` would leave the header
+    # correct and every value under the wrong column.
+    assert 'print $2, $2, call, dp, "" > attrs' in code, (
+        "the hifiasm_meta arm's sidecar data row no longer writes "
+        f"{list(CONTIG_ATTRIBUTE_COLUMNS)} in header order"
+    )
     # The myloasm arm's projection, in myloasm_split.py's COPY.
     split = "\n".join(_code_lines(_WORKFLOW_DIR / "myloasm_split.py"))
     assert "SELECT contig_id, header AS raw_name, circularity, depth, mult" in split, (
@@ -312,16 +319,25 @@ def test_both_arms_emit_the_contig_attribute_sidecar() -> None:
 def test_hifiasm_arm_fails_on_an_unrecognised_segment_name() -> None:
     """A GFA segment name matching neither shape stops the step.
 
-    It used to fall through to noLCG, costing a misroute. The call is stored per
-    contig now, so the same name would also write a circularity into the lake for
-    a contig nothing classified -- and hifiasm_meta is pinned, so a name outside
-    the documented shape means the grammar moved rather than that the assembler
-    produced something unusual.
+    The call is stored per contig, so a name matching neither shape would write a
+    circularity into the lake for a contig nothing classified -- and hifiasm_meta
+    is pinned, so a name outside the documented shape means the grammar moved
+    rather than that the assembler produced something unusual.
     """
     code = "\n".join(_code_lines(_ASSEMBLE_SH))
-    assert "/tg[0-9]+l$/" in code, (
+    assert "LIN_RE='tg[0-9]+l$'" in code, (
         "the hifiasm_meta arm no longer recognises the LINEAR name shape, so every "
         "linear contig would be counted as unrecognised"
+    )
+    # One grammar for the attribute pass and both FASTA writers: the circular
+    # pattern is defined once and every user reads that variable, so the router
+    # and the stored call cannot disagree about which names are circular.
+    assert "CIRC_RE='tg[0-9]+c$'" in code, (
+        "the circular name shape is no longer defined once in assemble.sh"
+    )
+    assert "tg[0-9]+c$/" not in code, (
+        "a literal circular pattern is back alongside ${CIRC_RE}; the attribute "
+        "pass and the FASTA writers can now drift apart"
     )
     assert re.search(r"exit 65", code), (
         "nothing in assemble.sh exits non-zero for an unrecognised segment name; "
@@ -361,11 +377,28 @@ def test_assemble_def_pins_and_asserts_both_assemblers() -> None:
         f"expected both assemblers `=`-pinned on their create lines; got {pinned}"
     )
     joined = "\n".join(lines)
-    for package in pinned:
-        assert re.search(rf"{re.escape(package)} --version", joined), (
-            f"{package} is pinned but its version is never asserted in %test, so a "
-            "drifted solve would build green"
+    for package, version in pinned.items():
+        # The invocation alone is not the assertion: `<tool> --version` on its own
+        # line satisfies a search for it while checking nothing. Require the output
+        # to reach a grep, so the %test line has to compare against something.
+        asserted = [
+            ln for ln in lines if re.search(rf"{re.escape(package)} --version", ln) and "grep" in ln
+        ]
+        assert asserted, (
+            f"{package} is pinned but its --version output is never compared in "
+            "%test, so a drifted solve would build green"
         )
+        # And what it compares against has to be tied to the pin. The conda
+        # version string is enough for myloasm, whose binary reports it verbatim;
+        # hifiasm_meta reports two internal versions instead, so its own digits
+        # are what the greps carry.
+        digits = re.findall(r"[0-9]+(?:\.[0-9]+)*(?:-r[0-9]+)?", version)
+        tied = any(any(d in ln for d in digits) or re.search(r"-r[0-9]+", ln) for ln in asserted)
+        assert tied, (
+            f"{package}'s %test grep does not name a version -- it would pass "
+            f"against any build (pinned at {version})"
+        )
+    assert "hifiasm_meta" in joined and "myloasm" in joined
 
 
 def test_binning_stages_the_coverage_bam_unrewritten() -> None:

@@ -272,6 +272,63 @@ def test_assembly_membership_parquet_lifts_bins_to_feature_idx(tmp_path, staging
     assert stamps == [(42, 77)]
 
 
+def test_membership_collapses_duplicate_contigs_to_one_coherent_row(tmp_path):
+    """Two IDENTICAL contigs in one bin become one row, carrying one contig's
+    attributes rather than a mix of both.
+
+    The key `(kind, bin_id, feature_idx)` collapses them, but their attribute
+    values differ, so a `SELECT DISTINCT` over the widened column list would emit
+    one row per variant -- two rows on a key the Postgres twin upserts on, which
+    is SQLSTATE 21000 there and a duplicated row here. The general fixture above
+    cannot catch that: no two of its contigs share a key.
+    """
+    dup = "ACGTACGTACGTACGT"
+    seqs = {"MAG:bin.1:1": (dup, 200), "MAG:bin.1:2": (dup, 200)}
+    manifest = tmp_path / "m.parquet"
+    _write(
+        manifest,
+        "read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT",
+        [(rid, str(_hash(s)), len(s)) for rid, (s, _f) in seqs.items()],
+    )
+    feature_map = tmp_path / "fm.parquet"
+    _write(feature_map, "sequence_hash UUID, feature_idx BIGINT", [(str(_hash(dup)), 200)])
+    chunks = tmp_path / "ch"
+    chunks.mkdir()
+    _write(
+        chunks / "part_00000.parquet",
+        "sequence_hash UUID, chunk_index INTEGER, chunk_data VARCHAR",
+        [(str(_hash(dup)), 0, dup)],
+    )
+    bin_map = tmp_path / "bm.parquet"
+    _write(
+        bin_map,
+        "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR, contig_id VARCHAR",
+        [("MAG:bin.1:1", "MAG", "bin.1", "ctgA"), ("MAG:bin.1:2", "MAG", "bin.1", "ctgB")],
+    )
+    inputs = _inputs(
+        tmp_path,
+        {
+            "manifest": manifest,
+            "feature_map": feature_map,
+            "assembly_chunks": chunks,
+            "bin_map": bin_map,
+        },
+        # Deliberately disagreeing, so a row mixing the two is distinguishable
+        # from a row taking all four from one contig.
+        attr_rows=[
+            ("ctgA", "rawA", "yes", 5.0, 1.1),
+            ("ctgB", "rawB", "no", 9.0, 2.2),
+        ],
+    )
+    out = _run(inputs, tmp_path / "ws")
+    pq = out["staging_dir"] / "assembly_membership.parquet"
+    rows = _rows(pq, "kind, bin_id, feature_idx, raw_name, circularity, depth, mult", "1")
+    assert rows == [("MAG", "bin.1", 200, "rawA", "yes", 5.0, 1.1)], (
+        "the two contigs must collapse to ONE row whose four attributes all come "
+        "from the same contig"
+    )
+
+
 def test_membership_carries_the_assembler_attributes(tmp_path, staging_inputs):
     """The sidecar's values reach the membership Parquet, joined on contig_id.
 

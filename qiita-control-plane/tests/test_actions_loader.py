@@ -611,6 +611,33 @@ def test_every_write_membership_step_declares_the_runner_contract_inputs():
     )
 
 
+def test_every_write_assembly_membership_step_declares_the_runner_contract_inputs():
+    """The assembly twin of the guard above, for the same reason.
+
+    `_reconstruct._run_action_primitive` hard-asserts this set, so a workflow left
+    on the pre-`genomes_dir` three-input form fails at dispatch rather than at
+    load. That is exactly the drift the sibling docstring names as the case its
+    enumeration exists to catch, and adding `genomes_dir` is that change."""
+    from pathlib import Path
+
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import load_actions
+
+    required = {"bin_map", "manifest", "feature_map", "genomes_dir"}
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    offenders = {
+        f"{a.action_id}:{s.name}": s.inputs
+        for a in actions
+        for s in a.steps
+        if s.name == LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP and set(s.inputs) != required
+    }
+    assert not offenders, (
+        "these write-assembly-membership steps don't match the runner's required "
+        f"{sorted(required)} contract and will crash at dispatch: {offenders}"
+    )
+
+
 # Steps pinned at their ceiling on an escalating axis, keyed `action_id:version`
 # → {step label: pinned axes}. Being listed either way means the FIRST OOM (or
 # TIMEOUT) of that step fails its ticket permanently at retry_count=0.

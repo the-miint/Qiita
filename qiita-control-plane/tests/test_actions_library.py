@@ -409,11 +409,9 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
     import uuid
 
     import duckdb
+    from qiita_common.assembly_constants import register_contig_attribute_table
 
-    from qiita_control_plane.actions.library import (
-        ASSEMBLY_MEMBERSHIP_JOIN_SQL,
-        _register_contig_attributes,
-    )
+    from qiita_control_plane.actions.library import ASSEMBLY_MEMBERSHIP_JOIN_SQL
 
     h1 = uuid.UUID(int=1)
     h2 = uuid.UUID(int=2)
@@ -466,7 +464,7 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
     )
 
     with duckdb.connect(":memory:") as c:
-        _register_contig_attributes(c, attrs)
+        register_contig_attribute_table(c, attrs)
         rows = c.execute(
             ASSEMBLY_MEMBERSHIP_JOIN_SQL, [str(bin_map), str(manifest), str(feature_map)]
         ).fetchall()

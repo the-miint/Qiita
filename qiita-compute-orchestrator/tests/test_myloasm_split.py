@@ -20,11 +20,11 @@ model, RNG seed) EXCEPT wrap-around, then assembled in two separate runs:
     reads sampled WITHOUT wrap      -> u278ctg_len-577882_circular-no_…
 
 Topology was the only variable, and the control reproduced the negative case, so
-the `circular-` field does track real circularity. `circular-possibly` is
-documented by myloasm but was NOT reproduced (runs starved to 1-3x depth still
-reported `circular-no`); it is therefore accepted as a well-formed value and
-routed to noLCG, which is both the safe direction and what the assay owner does
-by hand.
+the `circular-` field does track real circularity. `circular-possibly` was not reproduced by
+starving depth (runs at 1-3x still reported `circular-no`), but it does occur:
+six contigs across one sample's real masked reads carried it. It is accepted as
+a well-formed value and routed to noLCG, which is both the safe direction and
+what the assay owner does by hand.
 
 Three further behaviours were probed and are relied on below:
   * myloasm is DETERMINISTIC — two runs over the same reads gave byte-identical
@@ -185,6 +185,49 @@ def test_circular_possibly_is_not_treated_as_circular(tmp_path: Path, staged_mii
     assert result.returncode == 0, result.stderr
     assert _ids(tmp_path / "circular.fa") == []
     assert _ids(tmp_path / "noLCG.fa") == ["u9ctg"]
+
+
+def test_sidecar_carries_the_depth_mean_and_the_mult_length_gate(
+    tmp_path: Path, staged_miint: str
+) -> None:
+    """The attribute values, not just the file's presence.
+
+    Three records discriminate the two derivations the splitter performs:
+      * a >=1 kb contig with a SKEWED depth triple, so the stored value can only
+        be the mean (4+5+9)/3 == 6.0 -- a min, max or median would each differ;
+      * a <1 kb contig, where myloasm reports `mult=0.00` for absence of signal
+        rather than a measured zero, so `mult` must be NULL while `depth` is
+        still read;
+      * a lowercase >=1 kb contig, since `length(sequence1)` drives the gate and
+        the fixtures elsewhere are uppercase.
+    """
+    long_seq = "ACGT" * 300  # 1200 bp, over the gate
+    low_seq = "acgt" * 300  # 1200 bp, lowercase
+    short_seq = "ACGT" * 50  # 200 bp, under the gate
+    fasta = (
+        f">u1ctg_len-1200_circular-yes_depth-4-5-9_duplicated-no mult=1.75\n{long_seq}\n"
+        f">u2ctg_len-200_circular-no_depth-7-7-7_duplicated-no mult=0.00\n{short_seq}\n"
+        f">u3ctg_len-1200_circular-no_depth-2-2-2_duplicated-no mult=3.50\n{low_seq}\n"
+    )
+    result = _split(tmp_path, fasta, staged_miint)
+    assert result.returncode == 0, result.stderr
+
+    rows = (tmp_path / "contig_attributes.tsv").read_text().splitlines()
+    assert rows[0] == "contig_id\traw_name\tcircularity\tdepth\tmult"
+    parsed = {r.split("\t")[0]: r.split("\t") for r in rows[1:]}
+    assert set(parsed) == {"u1ctg", "u2ctg", "u3ctg"}
+
+    assert parsed["u1ctg"][2] == "yes"
+    assert float(parsed["u1ctg"][3]) == 6.0, "depth must be the MEAN of the triple"
+    assert float(parsed["u1ctg"][4]) == 1.75
+    # raw_name is the header's first token, which is what bin_map.contig_id is
+    # keyed on before the id is cut.
+    assert parsed["u1ctg"][1] == "u1ctg_len-1200_circular-yes_depth-4-5-9_duplicated-no"
+
+    assert float(parsed["u2ctg"][3]) == 7.0
+    assert parsed["u2ctg"][4] == "", "mult is NULL below the length gate"
+
+    assert float(parsed["u3ctg"][4]) == 3.50, "the gate reads length, not case"
 
 
 def test_trailing_header_fields_do_not_reach_the_id(tmp_path: Path, staged_miint: str) -> None:

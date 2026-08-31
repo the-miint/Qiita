@@ -33,10 +33,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   without re-assembling. Routing itself is unchanged: `circular-yes` is still the LCG rule and
   `circular-possibly` still goes to binning. myloasm's depth is the mean of its `depth-A-B-C`
   triple, which is the scalar myloasm itself derives from it (the `avg_cov` its own circularity
-  gate tests); hifiasm_meta's is the S-line's `dp:f` tag, previously discarded along with the
-  rest of columns 4+. `mult` is NULL below 1 kb, where myloasm reports `0.00` for absence of
-  signal rather than a measured zero. Attributes are NULL for every row written before this,
-  and cannot be backfilled — they are read out of the assemble step's output.
+  gate tests, per myloasm's own source); hifiasm_meta's is the S-line's `dp:f` tag where the
+  segment carries one, previously discarded along with the rest of columns 4+. `mult` is NULL
+  below 1 kb, where myloasm reports `0.00` for absence of signal rather than a measured zero.
+  Attributes are NULL for every row written before this deploy and are not backfilled here:
+  they are read out of the assemble step's output, which for an older run is gone. `kind` still
+  records the routing that was applied, so an LCG row's circularity is not lost, only its
+  `possibly`/`no` distinction. `ensure_assembly_tables` widens an existing DuckLake
+  `assembly_membership` with `ADD COLUMN IF NOT EXISTS` on data-plane start, since
+  `ducklake_add_data_files` rejects a Parquet carrying a column its target lacks.
 
 - **Combined (inverted open reference) feature table: `estimate-feature-table` and `qiita
   feature-table build` can estimate over two alignment arms at once (#515).** Passing a second

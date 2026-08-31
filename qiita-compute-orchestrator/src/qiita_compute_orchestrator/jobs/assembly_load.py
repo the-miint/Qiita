@@ -40,7 +40,11 @@ from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
-from qiita_common.assembly_constants import CONTIG_ATTRIBUTES_FILE, KIND_MAG
+from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTES_FILE,
+    KIND_MAG,
+    register_contig_attribute_table,
+)
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -164,7 +168,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
             build_feature_id_map(conn, inputs.manifest)
 
-            _load_contig_attributes(conn, inputs.genomes_dir / CONTIG_ATTRIBUTES_FILE)
+            register_contig_attribute_table(conn, inputs.genomes_dir / CONTIG_ATTRIBUTES_FILE)
 
             # Reused verbatim from _feature_load — the shared feature space means
             # the sequence + chunk writers are identical to the reference path.
@@ -208,32 +212,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 _READ_TSV = "read_csv(?, delim='\t', header=true, auto_detect=true)"
 
 
-def _load_contig_attributes(conn: duckdb.DuckDBPyConnection, path: Path) -> None:
-    """The `contig_attribute` TEMP TABLE the membership write LEFT JOINs.
-
-    Read with DuckDB, like every other tool table this job consumes — the
-    entrypoints emit their assembler's values and nothing parses them before
-    here. Columns are addressed by name, so the file's column ORDER is free.
-
-    An absent file creates the table EMPTY rather than skipping the join, so the
-    membership write has one shape. The file is absent for any run whose assemble
-    step predates the sidecar, which a resumed ticket can still reach: its
-    `genomes_dir` was written by the old image. Every attribute is then NULL,
-    which is what an unrecorded value means.
-    """
-    if path.is_file():
-        conn.execute(
-            f"CREATE TEMP TABLE contig_attribute AS SELECT * FROM {_READ_TSV}",
-            [str(path)],
-        )
-        return
-    conn.execute(
-        "CREATE TEMP TABLE contig_attribute ("
-        "  contig_id VARCHAR, raw_name VARCHAR, circularity VARCHAR,"
-        "  depth DOUBLE, mult DOUBLE)"
-    )
-
-
 def _write_assembly_membership(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -270,11 +248,11 @@ def _write_assembly_membership(
         "      min(bm.contig_id) AS attr_contig_id"
         "    FROM read_parquet(?) bm"
         "    JOIN id_map im ON bm.read_id = im.read_id"
-        "    GROUP BY ALL"
+        "    GROUP BY bm.kind, bm.bin_id, im.feature_idx"
         "  )"
         "  SELECT m.prep_sample_idx, m.processing_idx, m.kind, m.bin_id, m.feature_idx,"
         "    a.raw_name AS raw_name, a.circularity AS circularity,"
-        "    CAST(a.depth AS DOUBLE) AS depth, CAST(a.mult AS DOUBLE) AS mult"
+        "    a.depth AS depth, a.mult AS mult"
         "  FROM member m"
         "  LEFT JOIN contig_attribute a ON a.contig_id = m.attr_contig_id"
         "  ORDER BY m.feature_idx"

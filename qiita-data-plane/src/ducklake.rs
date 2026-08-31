@@ -704,12 +704,10 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
         --
         -- The four trailing columns are the assembler's own per-contig report,
         -- nullable and NULL for every row written before they existed. Their
-        -- meaning is stated once, on the Postgres twin
-        -- (qiita.assembly_membership, migration
-        -- 20260901000000_assembly_membership_contig_attributes.sql); do not
-        -- restate it here. The assembler itself is NOT among them -- it is
-        -- captured in qiita.processing via processing_idx, as bin_quality's
-        -- comment below says of the same field.
+        -- meaning is stated once, as COMMENT ON COLUMN on the Postgres twin
+        -- qiita.assembly_membership; do not restate it here. The assembler
+        -- itself is NOT among them -- it is captured in qiita.processing via
+        -- processing_idx, as bin_quality's comment below says of the same field.
         CREATE TABLE IF NOT EXISTS qiita_lake.assembly_membership (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,
@@ -742,6 +740,19 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             das_tool_score DOUBLE,
             source_binner VARCHAR
         );",
+    )?;
+    // `CREATE TABLE IF NOT EXISTS` leaves a lake that already holds
+    // assembly_membership at its earlier five columns untouched, and
+    // `ducklake_add_data_files` refuses a Parquet carrying a column the target
+    // lacks ("Column ... exists in file ... but was not found in table"), so
+    // without this every assembly registration into an existing lake fails.
+    // Evolving here rather than in a one-shot operator step keeps this function
+    // the single definition of the lake schema.
+    conn.execute_batch(
+        "ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS raw_name VARCHAR;
+         ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS circularity VARCHAR;
+         ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS depth DOUBLE;
+         ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS mult DOUBLE;",
     )?;
     // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk
     // writer uses (see CHUNK_ROW_GROUP_SIZE).
@@ -1487,6 +1498,72 @@ mod tests {
             let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
             assert_eq!(n, 1, "{table} table should exist exactly once");
         }
+
+        // The shape assembly_load's COPY must match for ducklake_add_data_files
+        // to register without a cast, in that COPY's column order.
+        let cols = table_schema(&conn, "assembly_membership");
+        let expected: &[(&str, &str, &str)] = &[
+            ("prep_sample_idx", "BIGINT", "NO"),
+            ("processing_idx", "BIGINT", "NO"),
+            ("kind", "VARCHAR", "NO"),
+            ("bin_id", "VARCHAR", "NO"),
+            ("feature_idx", "BIGINT", "NO"),
+            ("raw_name", "VARCHAR", "YES"),
+            ("circularity", "VARCHAR", "YES"),
+            ("depth", "DOUBLE", "YES"),
+            ("mult", "DOUBLE", "YES"),
+        ];
+        let got: Vec<(&str, &str, &str)> = cols
+            .iter()
+            .map(|(n, t, null)| (n.as_str(), t.as_str(), null.as_str()))
+            .collect();
+        assert_eq!(got, expected, "assembly_membership schema/order drift");
+    }
+
+    /// A lake created before the attribute columns existed gains them on the next
+    /// boot: `CREATE TABLE IF NOT EXISTS` alone would leave it at five columns and
+    /// `ducklake_add_data_files` would then reject every membership Parquet.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_assembly_tables_widens_a_preexisting_membership_table() {
+        let conn = setup_conn();
+        conn.execute_batch("DROP TABLE IF EXISTS qiita_lake.assembly_membership;")
+            .unwrap();
+        // The pre-attribute shape, as a lake deployed before this change holds it.
+        conn.execute_batch(
+            "CREATE TABLE qiita_lake.assembly_membership (
+                prep_sample_idx BIGINT NOT NULL,
+                processing_idx BIGINT NOT NULL,
+                kind VARCHAR NOT NULL,
+                bin_id VARCHAR NOT NULL,
+                feature_idx BIGINT NOT NULL
+            );",
+        )
+        .unwrap();
+        assert_eq!(table_schema(&conn, "assembly_membership").len(), 5);
+
+        ensure_assembly_tables(&conn).expect("ensure_assembly_tables over a narrow table");
+
+        let names: Vec<String> = table_schema(&conn, "assembly_membership")
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "prep_sample_idx",
+                "processing_idx",
+                "kind",
+                "bin_id",
+                "feature_idx",
+                "raw_name",
+                "circularity",
+                "depth",
+                "mult",
+            ],
+            "the four attribute columns must be appended to an existing table"
+        );
     }
 
     /// read_masked applies the recorded trims (substr on the sequence, list

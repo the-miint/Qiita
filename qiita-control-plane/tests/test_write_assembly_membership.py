@@ -130,8 +130,8 @@ async def test_write_assembly_membership_reports_a_contig_collapse(postgres_pool
 
         # One feature in two bins plus the control: the join is per (bin, feature)
         # placement, which is exactly why the report cannot read its row count as a
-        # feature count. The DISTINCT in ASSEMBLY_MEMBERSHIP_JOIN_SQL collapses a
-        # repeat WITHIN one bin, which is not this fixture — the pair is split across
+        # feature count. ASSEMBLY_MEMBERSHIP_JOIN_SQL's GROUP BY collapses a repeat
+        # WITHIN one bin, which is not this fixture — the pair is split across
         # b1 and b2 on purpose, so all three placements survive.
         assert written == 3
 
@@ -246,6 +246,33 @@ async def test_membership_stores_the_assembler_contig_attributes(postgres_pool, 
             ),
             ("c2", None, None, None, None),
         ]
+
+        # Replay the SAME run against a genomes_dir with no sidecar — the state a
+        # resumed ticket whose assemble step predates the sidecar hands this. The
+        # upsert COALESCEs, so what was recorded survives; a plain
+        # `SET raw_name = EXCLUDED.raw_name` would null all four here.
+        bare = tmp_path / "bare"
+        bare.mkdir()
+        assert (
+            await lib.write_assembly_membership(
+                postgres_pool,
+                prep_sample_idx,
+                processing_idx,
+                bin_map,
+                manifest,
+                feature_map,
+                bare,
+            )
+            == 2
+        )
+        again = await postgres_pool.fetch(
+            "SELECT bin_id, raw_name, circularity, depth, mult"
+            " FROM qiita.assembly_membership WHERE prep_sample_idx = $1 ORDER BY bin_id",
+            prep_sample_idx,
+        )
+        assert [tuple(r) for r in again] == [tuple(r) for r in rows], (
+            "a replay with no sidecar must not erase attributes an earlier pass stored"
+        )
     finally:
         await postgres_pool.execute(
             "DELETE FROM qiita.assembly_membership WHERE prep_sample_idx = $1", prep_sample_idx

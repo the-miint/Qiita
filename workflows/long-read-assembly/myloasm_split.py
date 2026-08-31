@@ -3,7 +3,8 @@ multi-FASTAs, using miint's `read_fastx` reader and `FORMAT FASTA` writer.
 
 Run by assemble.sh's myloasm branch:
 
-    python3 /opt/qiita/myloasm_split.py <assembly_primary.fa> <circular.fa> <noLCG.fa>
+    python3 /opt/qiita/myloasm_split.py <assembly_primary.fa> <circular.fa> <noLCG.fa> \
+        <contig_attributes.tsv>
 
 WHY THE HEADER AND NOT THE GFA
 ------------------------------
@@ -64,7 +65,8 @@ is what the assay owner does by hand today.
 
 The call is also STORED per contig now, not only routed on, so the decision is
 recoverable at query time without re-running the assembler: `contig_attributes.tsv`
-carries the three-state value beside the raw header it came from.
+carries the three-state value beside `raw_name`, the header's first token, which
+is the id the FASTAs and `bin_map.contig_id` are keyed on before truncation.
 
 WHY THE ID IS TRUNCATED AT `_len-`
 ----------------------------------
@@ -97,8 +99,7 @@ from pathlib import Path
 
 import duckdb
 
-# 64 = EX_USAGE, the exit code every entrypoint in this workflow uses for a
-# contract violation the step cannot proceed past.
+# 64 = EX_USAGE, for a contract violation this step cannot proceed past.
 EXIT_CONTRACT_VIOLATION = 64
 
 MIINT_EXTENSION_DIRECTORY_VAR = "MIINT_EXTENSION_DIRECTORY"
@@ -122,7 +123,9 @@ _MULT_RE = rf"^mult=({_NUM})$"
 # myloasm reports `mult` as 0.00 below this length (kmer_multiplicity returns
 # early), which is absence of signal rather than a measured zero, so it is stored
 # NULL. Keyed on the sequence actually written rather than on the value being 0,
-# so the column never has to mean two things.
+# so a genuine 0.00 from a longer contig would still be stored as 0. A NULL mult
+# therefore means "not reported" from either cause -- this gate, or a header with
+# no `mult=` field at all.
 _MULT_MIN_LENGTH_BP = 1000
 # Capture group 1 is the circularity value. A header that doesn't match at all
 # yields '' — which `_validate` rejects, so an unparseable header stops the step.
@@ -224,11 +227,13 @@ def _load(con: duckdb.DuckDBPyConnection, src: str) -> None:
         "  read_id AS header,"
         "  regexp_replace(read_id, ?, '') AS contig_id,"
         "  regexp_extract(read_id, ?, 1) AS circularity,"
-        # The mean of the triple, which is the scalar myloasm itself derives from
-        # it: `min_read_depth_multi` holds one minimum read depth per identity
-        # threshold, and polishing_mod.rs averages the three into the `avg_cov`
-        # its own circularity gate tests. An empty match yields NULL rather than
-        # 0 — TRY_CAST over a missing group, not a coalesce to a fake reading.
+        # The mean of the three printed values. Per myloasm's own source
+        # (polishing_mod.rs), the triple is `min_read_depth_multi` — one minimum
+        # read depth per identity threshold — and the same function averages it
+        # into the `avg_cov` its circularity gate tests, so the mean is the
+        # assembler's own coverage scalar rather than a quantity invented here.
+        # An empty match yields NULL rather than 0 — TRY_CAST over a missing
+        # group, not a coalesce to a fake reading.
         "  (TRY_CAST(regexp_extract(read_id, ?, 1) AS DOUBLE)"
         "   + TRY_CAST(regexp_extract(read_id, ?, 2) AS DOUBLE)"
         "   + TRY_CAST(regexp_extract(read_id, ?, 3) AS DOUBLE)) / 3.0 AS depth,"
@@ -307,10 +312,12 @@ def _write_attributes(con: duckdb.DuckDBPyConnection, out: str) -> int:
     `bin_map.contig_id`. Keying on the full header instead would not join: the
     FASTAs carry the cut id, and that is what read_fastx reads back downstream.
 
-    TSV, not Parquet: the container emits its tool's values and `assembly_load`
-    owns all parsing, which is the same split checkm.sh and bin_refine.sh use for
-    CheckM and DAS_Tool output. `HEADER` because the reader selects by name.
-    ORDER BY contig_id so a re-run over identical input produces an identical file.
+    TSV, not Parquet, and written by DuckDB's own COPY rather than composed by
+    hand. Unlike checkm.sh and bin_refine.sh, which publish their tool's table
+    byte-for-byte, myloasm emits no per-contig table — this one is composed here,
+    from the header fields, because the header is where myloasm states them.
+    `HEADER` because the reader selects by name. ORDER BY contig_id so a re-run
+    over identical input produces an identical file.
     """
     (count,) = con.execute(
         "COPY ("

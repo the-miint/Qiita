@@ -25,7 +25,7 @@ _None yet._
 
 - **`20260901000000_assembly_membership_contig_attributes.sql`** — adds four nullable columns
   to `qiita.assembly_membership` (`raw_name`, `circularity`, `depth`, `mult`). `make migrate`
-  applies it; no out-of-band setup. **Not backfillable**: the values are read out of the
+  applies it; no out-of-band setup. **Not backfilled**: the values are read out of the
   assemble step's output, so every existing row keeps NULL and only runs assembled after this
   deploy carry them. (#517)
 
@@ -35,41 +35,22 @@ _None yet._
 
 ### 4. Deploy
 
-- **In-flight `long-read-assembly` tickets past `assemble` will fail at
-  `write-assembly-membership`.** (#517) That action gains a `genomes_dir` input, and the runner
-  resolves a ticket's step list from the live `qiita.action` row — so a ticket resumed after the
-  sync binds an input list its already-completed steps never produced a binding for. Unlike a
-  new step OUTPUT this is not silently wrong, it raises; but it still strands the ticket. Same
-  query as before the restart:
-
-  ```sql
-  SELECT t.work_ticket_idx, t.state, s.step_name, s.state AS step_state
-  FROM qiita.work_ticket t
-  JOIN qiita.work_ticket_step s USING (work_ticket_idx)
-  WHERE t.action_id = 'long-read-assembly'
-    AND t.state IN ('pending', 'queued', 'processing')
-    AND s.state <> 'failed';
-  ```
-
-  Any row means that ticket needs to finish before the restart or be resubmitted after it.
-  `s.state <> 'failed'` is deliberate — a `running` or `submitted` step is *adopted* on resume
-  (`_adopt_or_submit` re-attaches to the live SLURM job rather than resubmitting), so it is
-  exposed too, not just a `completed` one.
+_None yet._
 
 ### 5. Verify
 
-- **Record the rebuilt image's hifiasm_meta version.** (#516)
+- **Record the rebuilt image's hifiasm_meta version.** (#516, #517)
 
   ```bash
   apptainer exec "${PATH_DERIVED}/images/long-read-assembly-assemble-1.0.0.sif" \
       micromamba run -n hifiasm_meta hifiasm_meta --version
   ```
 
-  This deploy rebuilds the image (`assemble.sh` is in its `HASH_INPUTS`), and the rebuild
-  re-resolves the unpinned hifiasm_meta solve — so whatever ran before is replaced whether or
-  not anyone intended it. Capture the output in the deploy archive entry: it is the record of
-  what this deploy's default assembler actually is, and what the next rebuild has to compare
-  against.
+  This deploy rebuilds the image (`assemble.sh` is in its `HASH_INPUTS`). #517 pins
+  hifiasm_meta to `hamtv0.3.5` and asserts its two internal versions in the def's `%test`, so
+  the build itself now fails on a moved solve rather than shipping one quietly — this step
+  records what that pin resolved to on this host for the archive entry. A `%test` failure here
+  aborts the deploy before any service restart.
 
 - **Run the assembly-genome backfill.** (#514)
 
@@ -109,12 +90,6 @@ _None yet._
 
 ### Notes (no host action)
 
-- **The `assemble` SIF rebuilds again, and this time the rebuild pins hifiasm_meta.** (#517)
-  `hifiasm_meta=hamtv0.3.5`, with both internal version strings asserted at build time. If the
-  bucket-5 version recorded on the previous deploy is not `ha base 0.13-r308` / `hamt 0.3-r079`,
-  the pin is moving the default assembler to a different version than the one that has been
-  running — worth knowing before the first assembly ticket after this deploy, not after.
-
 - **`estimate-feature-table` 1.0.0 gained an optional `denovo_alignment_idx` context key** and a
   second resolver-staged input. The deploy's workflow sync picks it up; nothing to do by hand. A
   submit that omits the key behaves exactly as before, so existing callers are unaffected. (#515)
@@ -133,13 +108,21 @@ _None yet._
   sweep, so ticket workspaces accumulate and these trees will accumulate with them — plan the
   disk on that basis, not on the documented window.
 
-- **The `assemble` SIF rebuilds this deploy, and that re-resolves hifiasm_meta.** (#516)
+- **The `assemble` SIF rebuilds this deploy, and hifiasm_meta is now pinned.** (#516, #517)
   `assemble.sh` is in the image's `HASH_INPUTS` (`sif-build.d/assemble.env`), so editing it
-  invalidates the build hash and forces a full rebuild. hifiasm_meta is **unpinned** in
-  `assemble.def`, so the rebuild re-solves it against whatever bioconda serves that day — the
-  default assembler's version can move on this deploy without anything else changing. myloasm
-  is pinned (0.6.0) and the build asserts it. Expect a slower-than-usual verify for this one
-  image.
+  invalidates the build hash and forces a full rebuild. #517 pins `hifiasm_meta=hamtv0.3.5`
+  and asserts its two internal version strings in `%test`, alongside myloasm's existing 0.6.0
+  pin — so this rebuild resolves both assemblers to a fixed version instead of re-solving the
+  default one against whatever bioconda serves that day, and a moved solve fails the build.
+  Expect a slower-than-usual verify for this one image.
+
+- **The DuckLake `assembly_membership` table gains the four attribute columns on the data
+  plane's next start.** (#517) `ensure_assembly_tables` runs `ALTER TABLE … ADD COLUMN IF NOT
+  EXISTS` on every DP boot, so the existing lake table widens itself — no operator step.
+  Without it `ducklake_add_data_files` would reject every membership Parquet the new
+  `assembly_load` writes, since the file would carry columns the table lacks. The normal
+  restart ordering covers this; it only matters if the DP is left on the old binary while
+  assembly tickets run.
 
 ---
 

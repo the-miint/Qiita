@@ -28,7 +28,6 @@
 # Nothing here names a file the assembler produces, which is what lets one
 # directory hold both arms' layouts and survive a release that renames one — a
 # rename changes this directory's contents instead of needing a change here.
-# hifiasm_meta is unpinned (assemble.def), so that is not a hypothetical.
 #
 # It is not free. On a 1.24 Gbp masked read set — 12% of one real ticket's reads
 # — the tree is 1.44 GB for myloasm and 697 MB for hifiasm_meta, against the
@@ -103,7 +102,7 @@ for d in "${OUT}" "${ASM_DIR}"; do
 done
 mkdir -p "${OUT}" "${ASM_DIR}"
 
-# Both arms create BOTH files whenever the assembler produced anything, and
+# Both arms create BOTH FASTAs whenever the assembler produced anything, and
 # neither when it didn't — so an empty CLASS is an empty file while an empty
 # ASSEMBLY is an empty genomes_dir. Downstream depends on that distinction:
 # assembly_coverage treats a missing OR zero-byte noLCG.fa as "nothing to bin",
@@ -112,47 +111,55 @@ mkdir -p "${OUT}" "${ASM_DIR}"
 # Each arm gets this for free from its writer (a shell `>` redirect truncates into
 # existence; a zero-row COPY still writes its file), so there is no pre-creation
 # step to keep in sync.
+#
+# The attribute sidecar beside them is on the other side of that rule: it is
+# created only where there is an assembly to describe, and its absence is how
+# both readers detect a run with no attributes (see
+# qiita_common.assembly_constants.register_contig_attribute_table).
 case "${ASSEMBLER}" in
     hifiasm_meta)
         micromamba run -n hifiasm_meta hifiasm_meta -t "${THREADS}" -o "${ASM_DIR}/asm" "${READS_FASTQ}"
         GFA="${ASM_DIR}/asm.p_ctg.gfa"
 
         # GFA S-line -> FASTA. hifiasm-meta's documented contig-name shape is
-        # `s[0-9]+\.[uc]tg[0-9]{6}[lc]` where the trailing letter is `c` (circular) or `l`
-        # (linear) — e.g. `s1.utg000001c` vs `s1.utg000001l` (hifiasm-meta man page /
-        # README). We anchor the match to `tg[0-9]+c$` rather than a bare `c$` so only a
-        # well-formed circular segment name matches (a bare `c$` would also catch any
-        # non-canonical name ending in 'c'); a name that doesn't match the circular shape
-        # falls through to noLCG (binned), which is the safe default.
+        # `s[0-9]+\.[uc]tg[0-9]{6}[lc]` where the trailing letter is `c` (circular)
+        # or `l` (linear) — e.g. `s1.utg000001c` vs `s1.utg000001l` (hifiasm-meta
+        # man page / README). Both letters are matched as `tg[0-9]+[cl]$` rather
+        # than a bare `[cl]$`, so only a well-formed name matches: a bare `c$`
+        # would also catch any non-canonical name ending in 'c'.
         #
-        # An unrecognised segment name now FAILS the step. It used to fall
-        # through to noLCG, which cost a misroute; now the circularity call is
-        # also stored per contig, so the same name would additionally write a
-        # `no` into the lake for a contig nobody classified. The myloasm arm
-        # fails on an unparseable header for exactly this reason, and the
-        # hifiasm_meta version is pinned (assemble.def), so a name outside the
-        # documented shape means the grammar moved rather than that the assembler
-        # produced something unusual. A missing GFA is still an empty assembly,
-        # not a violation — that half is unchanged.
+        # A name matching NEITHER shape fails the step. The circularity call is
+        # stored per contig, so an unclassified name would otherwise be routed to
+        # noLCG and ALSO write a `no` into the lake for a contig nobody
+        # classified. The myloasm arm fails on an unparseable header for the same
+        # reason, and this arm's version is pinned (assemble.def), so a name
+        # outside the documented shape means the grammar moved. A missing GFA is
+        # an empty assembly, not a violation.
         #
         # The attribute pass runs FIRST so a bad name stops the step before any
-        # FASTA is written. The two FASTA writers below are untouched, which is
-        # what keeps the "empty CLASS is an empty FILE" invariant above: their
-        # shell `>` truncates each into existence whether or not the awk matches,
+        # FASTA is written. The two FASTA writers keep their own `>` redirects,
+        # which is what holds the "empty CLASS is an empty FILE" invariant above:
+        # the shell truncates each into existence whether or not the awk matches,
         # where awk's own redirection would create a file only on first write.
         if [[ -s "${GFA}" ]]; then
-            # S-line -> one attribute row. `dp:f` is hifiasm_meta's depth; it is
+            # One grammar, defined once and shared by the attribute pass and both
+            # FASTA writers, so the three cannot drift into disagreeing about
+            # which names are circular.
+            CIRC_RE='tg[0-9]+c$'
+            LIN_RE='tg[0-9]+l$'
+
+            # S-line -> one attribute row. `dp:f` is hifiasm_meta's depth tag,
             # searched for by tag among fields 4+ rather than by position, since
-            # the tag order is not part of the GFA contract. A segment carrying no
-            # `dp:f` stores NULL: the column holds what the assembler reported.
-            # `mult` is empty here — hifiasm_meta has no counterpart to myloasm's
+            # tag order is not part of the GFA contract. A segment with no `dp:f`
+            # writes an empty field, which the readers store as NULL. `mult` is
+            # empty for every row — hifiasm_meta has no counterpart to myloasm's
             # k-mer multiplicity.
-            awk -v attrs="${OUT}/contig_attributes.tsv" '
+            awk -v attrs="${OUT}/contig_attributes.tsv" -v circ="${CIRC_RE}" -v lin="${LIN_RE}" '
                 BEGIN { OFS = "\t"; print "contig_id", "raw_name", "circularity", "depth", "mult" > attrs }
                 $1 != "S" { next }
                 {
-                    if ($2 ~ /tg[0-9]+c$/)      { call = "yes" }
-                    else if ($2 ~ /tg[0-9]+l$/) { call = "no" }
+                    if ($2 ~ circ)     { call = "yes" }
+                    else if ($2 ~ lin) { call = "no" }
                     else {
                         bad++
                         if (bad <= 3) { names = names " " $2 }
@@ -170,8 +177,8 @@ case "${ASSEMBLER}" in
                     }
                 }' "${GFA}"
 
-            awk '$1=="S" && $2 ~ /tg[0-9]+c$/  {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/circular.fa"
-            awk '$1=="S" && $2 !~ /tg[0-9]+c$/ {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/noLCG.fa"
+            awk -v re="${CIRC_RE}" '$1=="S" && $2 ~ re {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/circular.fa"
+            awk -v re="${CIRC_RE}" '$1=="S" && $2 !~ re {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/noLCG.fa"
         fi
         ;;
     myloasm)

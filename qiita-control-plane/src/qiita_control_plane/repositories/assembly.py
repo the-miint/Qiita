@@ -95,8 +95,8 @@ async def insert_assembly_membership_rows(
 
     **The caller must not hand this a duplicated key.** Postgres refuses to let one
     ``ON CONFLICT DO UPDATE`` touch a conflict target twice, which the ``DO NOTHING``
-    form tolerated; `ASSEMBLY_MEMBERSHIP_JOIN_SQL` carries the ``DISTINCT`` that
-    guarantees it. Caught below rather than left to leak: it arrives as SQLSTATE
+    form tolerated; `ASSEMBLY_MEMBERSHIP_JOIN_SQL` groups on exactly this key, which
+    is what guarantees it. Caught below rather than left to leak: it arrives as SQLSTATE
     21000 (qiita-probed), which is outside `IntegrityConstraintViolationError`
     entirely, so the FK arm cannot cover it.
 
@@ -124,12 +124,19 @@ async def insert_assembly_membership_rows(
             "             $10::double precision[])"
             "      AS t(k, b, f, g, rn, c, d, m)"
             " ON CONFLICT (prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
-            # The attributes re-stamp alongside genome_idx for the same reason it
-            # does: a replay over rows written before the sidecar existed must
-            # converge rather than keep their NULLs.
+            # The attributes re-stamp alongside genome_idx so a replay over rows
+            # written before the sidecar existed converges rather than keeping
+            # their NULLs. COALESCE, unlike genome_idx's plain assignment, because
+            # genome_idx is recomputed on every run while an attribute can be
+            # absent: they describe one finished assembly, so an incoming NULL
+            # means "this run did not report it", never "it became nothing", and
+            # must not erase a value an earlier pass recorded.
             " DO UPDATE SET genome_idx = EXCLUDED.genome_idx,"
-            "   raw_name = EXCLUDED.raw_name, circularity = EXCLUDED.circularity,"
-            "   depth = EXCLUDED.depth, mult = EXCLUDED.mult"
+            "   raw_name = COALESCE(EXCLUDED.raw_name, qiita.assembly_membership.raw_name),"
+            "   circularity = COALESCE(EXCLUDED.circularity,"
+            "     qiita.assembly_membership.circularity),"
+            "   depth = COALESCE(EXCLUDED.depth, qiita.assembly_membership.depth),"
+            "   mult = COALESCE(EXCLUDED.mult, qiita.assembly_membership.mult)"
             " RETURNING feature_idx",
             prep_sample_idx,
             processing_idx,
@@ -150,8 +157,8 @@ async def insert_assembly_membership_rows(
     except asyncpg.CardinalityViolationError as exc:
         raise ValueError(
             "the same (kind, bin_id, feature_idx) was submitted twice in one chunk, "
-            "which this upsert cannot resolve — the caller's query is missing its "
-            "DISTINCT (see ASSEMBLY_MEMBERSHIP_JOIN_SQL)"
+            "which this upsert cannot resolve — the caller's query must group on "
+            "that key (see ASSEMBLY_MEMBERSHIP_JOIN_SQL)"
         ) from exc
     return len(rows)
 

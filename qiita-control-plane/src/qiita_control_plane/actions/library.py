@@ -33,7 +33,10 @@ import pyarrow as pa
 import pyarrow.flight as _flight
 import pyarrow.parquet as pq
 from qiita_common.api_paths import LibraryPrimitive
-from qiita_common.assembly_constants import CONTIG_ATTRIBUTES_FILE
+from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTES_FILE,
+    register_contig_attribute_table,
+)
 from qiita_common.models import (
     INDEX_TYPE_RYPE_ROUTER,
     FeatureHashEntry,
@@ -1441,16 +1444,16 @@ async def plan_shards(
 # (both from the same assembly_hash scan) and every manifest hash was minted by
 # mint-features, so no contig is dropped. Exposed as a module constant so the join
 # is unit-testable against Parquet fixtures without a Postgres pool.
-# DISTINCT because the synthetic read_id is `kind:bin_id:sequence_index`
+# The synthetic read_id is `kind:bin_id:sequence_index`
 # (`assembly_hash._READ_ID_EXPR`), so two IDENTICAL contigs at different positions in
 # ONE bin arrive as two read_ids resolving to one feature_idx — the same
 # `(kind, bin_id, feature_idx)` twice. `insert_assembly_membership_rows` upserts with
 # DO UPDATE, and Postgres refuses to let one statement touch a conflict target twice
-# (`cardinality_violation`), where the earlier DO NOTHING form silently tolerated it.
-# `assembly_load._write_assembly_membership` already carries this DISTINCT and
-# describes it as matching what this write does; now it does.
-# GROUP BY, not DISTINCT — and the grouping set IS the conflict target, which is
-# what `insert_assembly_membership_rows` requires of its caller. The attribute
+# (`cardinality_violation`).
+#
+# So: GROUP BY, spelled as the conflict target itself rather than `ALL`, because
+# that is what `insert_assembly_membership_rows` requires of its caller and a
+# widened SELECT list must not silently widen it. The attribute
 # columns can differ between two rows the key collapses (a bin holding duplicate
 # identical contigs is exactly that case), so carrying them through a DISTINCT
 # would emit one row per variant and hand the upsert the same target twice:
@@ -1469,38 +1472,14 @@ ASSEMBLY_MEMBERSHIP_JOIN_SQL = (
     "  FROM read_parquet(?) AS bm"
     "  JOIN read_parquet(?) AS m ON bm.read_id = m.read_id"
     "  JOIN read_parquet(?) AS fm ON m.sequence_hash = fm.sequence_hash"
-    "  GROUP BY ALL"
+    "  GROUP BY bm.kind, bm.bin_id, fm.feature_idx"
     ")"
     " SELECT mb.kind, mb.bin_id, mb.feature_idx,"
     "   a.raw_name AS raw_name, a.circularity AS circularity,"
-    "   CAST(a.depth AS DOUBLE) AS depth, CAST(a.mult AS DOUBLE) AS mult"
+    "   a.depth AS depth, a.mult AS mult"
     " FROM member mb"
     " LEFT JOIN contig_attribute a ON a.contig_id = mb.attr_contig_id"
 )
-
-
-def _register_contig_attributes(duck: Any, path: Path) -> None:
-    """Register the assemble step's per-contig attribute sidecar as
-    `contig_attribute`, which `ASSEMBLY_MEMBERSHIP_JOIN_SQL` LEFT JOINs.
-
-    An absent file registers the table EMPTY rather than changing the join, so the
-    statement has one shape. It is absent for any run whose assemble step predates
-    the sidecar — reachable by a resumed ticket, whose genomes_dir was written by
-    the old image — and every attribute is then NULL, which is what an unrecorded
-    value means.
-    """
-    if path.is_file():
-        duck.execute(
-            "CREATE TEMP TABLE contig_attribute AS"
-            " SELECT * FROM read_csv(?, delim='\t', header=true, auto_detect=true)",
-            [str(path)],
-        )
-        return
-    duck.execute(
-        "CREATE TEMP TABLE contig_attribute ("
-        "  contig_id VARCHAR, raw_name VARCHAR, circularity VARCHAR,"
-        "  depth DOUBLE, mult DOUBLE)"
-    )
 
 
 async def write_assembly_membership(
@@ -1522,9 +1501,13 @@ async def write_assembly_membership(
     `_CHUNK_SIZE` batches and bulk-inserted into qiita.assembly_membership with
     `(prep_sample_idx, processing_idx)` stamped from this run. Never materialises
     the whole mapping in Python — same streaming contract mint_features /
-    write_membership follow. DuckDB does hold the distinct set (the constant's
-    DISTINCT is a blocking operator), which is bounded by contig count rather than
+    write_membership follow. DuckDB does hold the grouped set (the constant's
+    GROUP BY is a blocking operator), which is bounded by contig count rather than
     read count and spills if it has to.
+
+    `genomes_dir` is the assemble step's output, read only for the per-contig
+    attribute sidecar beside the two FASTAs; the attributes are LEFT JOINed on, so
+    a run without one writes the same rows with NULLs.
 
     **The genome mint rides the same batch rather than taking a second pass**, which
     is what makes the row and its genome one INSERT: this loop already holds
@@ -1562,7 +1545,7 @@ async def write_assembly_membership(
     total_written = 0
     async with pool.acquire() as conn:
         with duckdb_connect() as duck:
-            _register_contig_attributes(duck, genomes_dir / CONTIG_ATTRIBUTES_FILE)
+            register_contig_attribute_table(duck, genomes_dir / CONTIG_ATTRIBUTES_FILE)
             reader = duck.execute(
                 ASSEMBLY_MEMBERSHIP_JOIN_SQL,
                 [str(bin_map_path), str(manifest_path), str(feature_map_path)],

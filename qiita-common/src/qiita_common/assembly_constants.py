@@ -12,6 +12,9 @@ column with no `CREATE TYPE` twin (the set is extensible — a future
 guard, not a DB CHECK. Adding a kind here needs no migration.
 """
 
+from pathlib import Path
+from typing import Any
+
 KIND_LCG = "LCG"  # a circular genome (large circular genome)
 KIND_MAG = "MAG"  # a refined metagenome-assembled bin
 KIND_UNBINNED = "UNBINNED"  # a noLCG contig that no refined bin claimed
@@ -35,17 +38,17 @@ ASSEMBLED_SEQUENCE_CHUNKS_TABLE = "assembled_sequence_chunks"
 
 # Per-contig attributes the assembler reported, one row per contig across BOTH
 # published FASTAs, keyed on the assembler's own contig id (`bin_map.contig_id`).
-# Raw values: the entrypoint normalizes the circularity call and nothing else, and
-# `assembly_load` does the parsing, so a column here is what the tool said rather
-# than a derived quantity. Written by both arms of assemble.sh; a run whose
-# assembler produced nothing writes no genomes_dir at all, so its absence is the
-# same signal as an absent circular.fa.
+# Written by both arms of assemble.sh, into the genomes_dir the assemble step
+# already publishes. The entrypoints normalize the circularity call and derive
+# myloasm's depth scalar; the rest is what the tool reported. The file is absent
+# for a run assembled before it existed — the directory itself is not a signal,
+# since assemble.sh creates it unconditionally — so both readers key on the file.
 CONTIG_ATTRIBUTES_FILE = "contig_attributes.tsv"
 
-# The attribute columns, in the order the entrypoints write them. `assembly_load`
-# reads the file by NAME (read_csv with a header), so this order is documentation
-# rather than a contract — but the two entrypoints must agree with each other, and
-# tests/test_long_read_assembly_entrypoint_pins.py pins them against this tuple.
+# The attribute columns, in the order the entrypoints write them. Both readers go
+# through `contig_attribute_table_sql` below, which names them, so the order is a
+# contract on the writers rather than on the parse; the two entrypoints must
+# agree with each other, and the workflow's entrypoint pins hold them to it.
 #
 #   contig_id    the assembler's own id; joins bin_map.contig_id
 #   raw_name     the full header (myloasm) or GFA segment name (hifiasm_meta),
@@ -62,3 +65,42 @@ CONTIG_ATTRIBUTES_FILE = "contig_attributes.tsv"
 #                no counterpart, and empty below 1 kb where myloasm reports 0.00
 #                for absence of signal rather than a measured zero.
 CONTIG_ATTRIBUTE_COLUMNS = ("contig_id", "raw_name", "circularity", "depth", "mult")
+
+# The two attribute columns DuckDB must not be left to sniff. Both are empty for
+# every row of a hifiasm_meta assembly (it reports no `mult`, and `depth` only
+# where the S-line carried a `dp:f` tag); an all-empty column auto-detects as
+# VARCHAR, so declaring them keeps the reader's output types the same for both
+# assemblers instead of varying with the data.
+_CONTIG_ATTRIBUTE_TYPES = {"depth": "DOUBLE", "mult": "DOUBLE"}
+
+
+def register_contig_attribute_table(conn: Any, path: Path) -> None:
+    """Register `path` as the TEMP TABLE `contig_attribute`, keyed on `contig_id`.
+
+    Both writers of `assembly_membership` LEFT JOIN this table — the control
+    plane's `write_assembly_membership` and the orchestrator's `assembly_load` —
+    and they are copies of one table, so they read the sidecar identically.
+
+    An absent file registers the table EMPTY rather than changing either join, so
+    each statement has one shape and a contig simply gets NULL attributes. Absent
+    is the normal state for a run whose assemble step predates the sidecar, which
+    a resumed ticket can still reach.
+    """
+    columns = ", ".join(
+        f"{name} {_CONTIG_ATTRIBUTE_TYPES.get(name, 'VARCHAR')}"
+        for name in CONTIG_ATTRIBUTE_COLUMNS
+    )
+    if not path.is_file():
+        conn.execute(f"CREATE TEMP TABLE contig_attribute ({columns})")
+        return
+    # `columns=` rather than auto_detect so an all-empty column still arrives as
+    # its declared type; the header is still required to match.
+    types = ", ".join(
+        f"'{name}': '{_CONTIG_ATTRIBUTE_TYPES.get(name, 'VARCHAR')}'"
+        for name in CONTIG_ATTRIBUTE_COLUMNS
+    )
+    conn.execute(
+        "CREATE TEMP TABLE contig_attribute AS SELECT * FROM read_csv(?,"
+        f" delim='\t', header=true, columns={{{types}}})",
+        [str(path)],
+    )

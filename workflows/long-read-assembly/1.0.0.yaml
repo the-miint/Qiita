@@ -225,6 +225,8 @@ steps:
   # and stamped with the run's processing_idx (minted before the loop because
   # assembly_load threads it via params). Idempotent: the write upserts on the
   # natural key, re-stamping each row's minted genome_idx rather than skipping it.
+  # `genomes_dir` is read for the per-contig attribute sidecar only -- same reason
+  # it is an input on assembly_load below, which states it.
   - action: write-assembly-membership
     inputs: [bin_map, manifest, feature_map, genomes_dir]
     outputs: []

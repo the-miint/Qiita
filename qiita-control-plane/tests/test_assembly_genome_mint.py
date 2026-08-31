@@ -69,9 +69,9 @@ _UNB = "CCAATTGGCCATTACGGTTAGCAT"
 # of them its own subject.
 #
 # `c5` REPEATS `c1`'s bytes inside `c1`'s own bin, which is the case
-# `ASSEMBLY_MEMBERSHIP_JOIN_SQL`'s DISTINCT exists for: `assembly_hash` composes
+# `ASSEMBLY_MEMBERSHIP_JOIN_SQL`'s GROUP BY exists for: `assembly_hash` composes
 # read_id as kind:bin_id:sequence_index, so duplicated bytes in one bin arrive as
-# two read_ids resolving to one feature_idx. Without that DISTINCT the write hands
+# two read_ids resolving to one feature_idx. Without that grouping the write hands
 # Postgres the same conflict target twice and `ON CONFLICT DO UPDATE` raises
 # `cardinality_violation` — so this row is what makes the suite fail if it is
 # dropped. It changes no count below: the pair collapses back to one row.
