@@ -33,6 +33,19 @@ _None yet._
 
 ### 5. Verify
 
+- **Record the rebuilt image's hifiasm_meta version.** (#516)
+
+  ```bash
+  apptainer exec "${PATH_DERIVED}/images/long-read-assembly-assemble-1.0.0.sif" \
+      micromamba run -n hifiasm_meta hifiasm_meta --version
+  ```
+
+  This deploy rebuilds the image (`assemble.sh` is in its `HASH_INPUTS`), and the rebuild
+  re-resolves the unpinned hifiasm_meta solve — so whatever ran before is replaced whether or
+  not anyone intended it. Capture the output in the deploy archive entry: it is the record of
+  what this deploy's default assembler actually is, and what the next rebuild has to compare
+  against.
+
 - **Run the assembly-genome backfill.** (#514)
 
   ```bash
@@ -77,6 +90,25 @@ _None yet._
 - **New scope `assembly:doget`, on every human role ceiling and on no service ceiling.** It is
   role-implied, so no token needs re-minting and no grant is needed — a PAT minted after the
   restart carries it automatically. (#515)
+
+- **`assemble` now keeps the assembler's whole output tree, so each attempt holds ~1 GB more
+  scratch.** (#516) Measured on 1.24 Gbp of masked reads — 12% of one real ticket's — the
+  retained tree is 1.44 GB for myloasm and 697 MB for hifiasm_meta. Assembly output does not
+  scale linearly with input and has not been measured at a second point, so that is a floor,
+  not a per-ticket figure. It lands in the step's own output directory under the per-attempt
+  ticket workspace; nothing new is written outside it and no step reads it. **That scratch is
+  not currently reclaimed.** `docs/architecture/storage.md` documents ephemeral per-ticket
+  directories as deleted 45 days past a ticket's terminal state, but nothing implements that
+  sweep, so ticket workspaces accumulate and these trees will accumulate with them — plan the
+  disk on that basis, not on the documented window.
+
+- **The `assemble` SIF rebuilds this deploy, and that re-resolves hifiasm_meta.** (#516)
+  `assemble.sh` is in the image's `HASH_INPUTS` (`sif-build.d/assemble.env`), so editing it
+  invalidates the build hash and forces a full rebuild. hifiasm_meta is **unpinned** in
+  `assemble.def`, so the rebuild re-solves it against whatever bioconda serves that day — the
+  default assembler's version can move on this deploy without anything else changing. myloasm
+  is pinned (0.6.0) and the build asserts it. Expect a slower-than-usual verify for this one
+  image.
 
 ---
 

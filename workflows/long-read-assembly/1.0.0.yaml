@@ -84,6 +84,16 @@ steps:
   # hifiasm_meta / myloasm assembly + circular-genome extraction. Reads run_config.json to
   # pick the assembler; emits genomes_dir/{circular.fa, noLCG.fa}. 0 contigs is a
   # terminal no-data outcome inside the container.
+  #
+  # The step also leaves the assembler's whole output tree under
+  # $QIITA_OUTPUT_PATH/assembler. That is deliberately NOT declared here: a
+  # declared output is bound on resume from a manifest an earlier attempt wrote,
+  # so adding one strands tickets already past this step.
+  #
+  # Undeclared means no step can consume it, not merely that none does — a
+  # container step is bind-mounted per declared input, so the directory is not
+  # visible to one at all. Anything derived from the tree has to be produced by
+  # this step and declared in its own right. assemble.sh carries what it costs.
   - step: assemble
     step_type: singleton
     container: long-read-assembly-assemble-1.0.0.sif
