@@ -70,12 +70,20 @@ FILE to a (kind, bin_id), so the subset is taken per RECORD instead: the `contig
 scan below reads both files whole, and the DELETE that follows it removes every
 UNBINNED row whose `sequence_hash` also appears under KIND_MAG.
 
-The match key is `canonical_sequence_hash_expr`'s hash, not the contig id. That a
-bin FASTA carries the assembler's contig ids through is measured for hifiasm_meta
-and unmeasured for myloasm, so the match keys on the bytes that are actually
-stored. The hash's strand folding carries into the exclusion: a bin holding a
-contig on the opposite strand still excludes its noLCG record. An id still labels
-the row, as the UNBINNED bin_id below — never something matched on.
+The match key for THIS exclusion is `canonical_sequence_hash_expr`'s hash, not the
+contig id. That a bin FASTA carries the assembler's contig ids through is measured
+for hifiasm_meta and unmeasured for myloasm, so the match keys on the bytes that
+are actually stored. The hash's strand folding carries into the exclusion: a bin
+holding a contig on the opposite strand still excludes its noLCG record.
+
+`contig_id` is a join key elsewhere, which is why that measurement matters beyond
+this scan: both writers of `qiita.assembly_membership` LEFT JOIN the assemble
+step's attribute sidecar on it. An LCG or UNBINNED row's `contig_id` comes
+straight off the published FASTA the sidecar was written from, so those match by
+construction. A MAG row's comes from the REFINED BIN FASTA, so it matches only
+where the binners carried the header through — where they do not, that row simply
+stores NULL attributes, which is the same shape as a run assembled before the
+sidecar existed.
 
 Two consequences of keying on content. Hash-equal noLCG records share a fate: a
 bin claiming either drops both. And the exclusion set is the KIND_MAG rows alone —

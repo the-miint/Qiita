@@ -38,7 +38,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   4+; a GFA where no segment carries it fails the step rather than storing a depth-less run. `mult` is NULL
   below 1 kb, where myloasm reports `0.00` for absence of signal rather than a measured zero.
   Attributes are NULL for every row written before this deploy and are not backfilled here:
-  they are read out of the assemble step's output, which for an older run is gone. `kind` still
+  they are read out of the assemble step's output, which for an older run is gone. A MAG row
+  carries them only where the binners kept the assembler's contig header, which is measured
+  for hifiasm_meta and unmeasured for myloasm; LCG and UNBINNED rows match by construction. `kind` still
   records the routing that was applied, so `circular-yes` stays recoverable from `kind`
   alone; what an older row cannot recover is the `possibly`/`no` split among the contigs
   that went to binning. `ensure_assembly_tables` widens an existing DuckLake

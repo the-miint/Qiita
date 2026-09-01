@@ -26,7 +26,9 @@ COMMENT ON COLUMN qiita.assembly_membership.raw_name IS
     'reader returns as a separate field), for hifiasm_meta the GFA segment name. '
     'Kept so the normalized circularity column can always be traced back to what '
     'the tool actually said. NULL for rows written before the attribute sidecar '
-    'existed.';
+    'existed. A MAG row carries these only where the binners kept the assembler''s '
+    'contig header; an LCG or UNBINNED row always does, since its id comes straight '
+    'off the published FASTA the values were read from.';
 
 COMMENT ON COLUMN qiita.assembly_membership.circularity IS
     'Normalized circularity call: ''yes'', ''possibly'', or ''no''. myloasm states '

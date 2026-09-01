@@ -252,33 +252,60 @@ def test_trailing_header_fields_do_not_reach_the_id(tmp_path: Path, staged_miint
 
 
 @pytest.mark.parametrize(
-    ("case", "fasta"),
+    ("case", "fasta", "expected"),
     [
         # A renamed/reordered field set — the exact drift a myloasm upgrade could
         # introduce, and the one that would otherwise pass silently with an empty
         # circular.fa.
-        ("unknown header shape", ">u1ctg_length-10_loop-yes mult=1.00\nACGT\n"),
+        (
+            "unknown header shape",
+            ">u1ctg_length-10_loop-yes mult=1.00\nACGT\n",
+            "do not match the probed myloasm shape",
+        ),
         # A fourth circularity value we have never probed must stop the step.
-        ("unknown circularity value", ">u1ctg_len-10_circular-maybe_depth-1-1-1\nACGT\n"),
-        # Two genomes collapsing onto one bin_id downstream.
-        ("duplicate contig id", ">x_len-10_circular-yes_d\nAC\n>x_len-99_circular-no_d\nGT\n"),
+        (
+            "unknown circularity value",
+            ">u1ctg_len-10_circular-maybe_depth-1-1-1\nACGT\n",
+            "do not match the probed myloasm shape",
+        ),
+        # Two genomes collapsing onto one bin_id downstream. The headers carry a
+        # well-formed _depth- field on purpose: without one the all-NULL depth
+        # guard fires FIRST and this case silently stops exercising the duplicate
+        # check it is named for, which is what the message assertion below pins.
+        (
+            "duplicate contig id",
+            ">x_len-10_circular-yes_depth-1-1-1_d\nAC\n>x_len-99_circular-no_depth-2-2-2_d\nGT\n",
+            "duplicate contig id(s)",
+        ),
+        # Every header parses, but none carries a depth — the grammar moved.
+        (
+            "no depth on any contig",
+            ">u1ctg_len-10_circular-yes_d\nACGT\n",
+            "no contig yielded a depth",
+        ),
     ],
 )
 def test_malformed_input_fails_loud(
-    tmp_path: Path, staged_miint: str, case: str, fasta: str
+    tmp_path: Path, staged_miint: str, case: str, fasta: str, expected: str
 ) -> None:
     """Every shape we cannot interpret exits 64 instead of producing a partial split.
 
     Silence is the dangerous outcome: an unrecognised header simply fails to match
     the circular pattern, so the step would exit 0 having classified every genome
     as linear. Fail-closed converts that into a step failure an operator sees.
+
+    Each case asserts WHICH guard fired, not just that one did. `_validate` runs
+    its checks in order, so a fixture that trips an earlier guard would otherwise
+    keep this test green while the guard it is named for went unexercised.
     """
     result = _split(tmp_path, fasta, staged_miint)
     assert result.returncode == _EXIT_CONTRACT_VIOLATION, (
         f"{case}: expected exit {_EXIT_CONTRACT_VIOLATION}, got {result.returncode}. "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert "myloasm_split" in result.stderr, f"{case}: nothing diagnostic: {result.stderr!r}"
+    assert expected in result.stderr, (
+        f"{case}: expected the {expected!r} guard to fire; got {result.stderr!r}"
+    )
 
 
 def test_missing_extension_directory_fails_loud(tmp_path: Path) -> None:
