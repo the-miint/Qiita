@@ -23,7 +23,15 @@ mkdir -p "${OUT}"
 # emits <contig>\t<bin id> and contig2bin_filter.awk decides which of those rows
 # are candidate bins — it carries the column measurement and the catch-all rule.
 # Labels are DAS_Tool's expected CONCOCT/MaxBin/MetaBAT.
-declare -a das_bins das_labels
+# `=()`, not a bare `declare -a`: a declared-but-never-assigned array is UNSET, so
+# `${#das_bins[@]}` further down trips the `set -u` from _lib.sh — "das_bins:
+# unbound variable", exit 1 — whenever no binner contributes a table, which is the
+# benign empty outcome that check exists to serve. Measured on the image's own base
+# (mambaorg/micromamba:1.5.8, bash 5.2.15). The filter below makes it reachable for
+# a binner whose only .fa files are catch-alls, on top of the empty-bins_dir case
+# binning.sh already hands over. macOS ships bash 3.2, where the bare form reads 0,
+# so this does not reproduce on a dev laptop.
+declare -a das_bins=() das_labels=()
 for binner in concoct maxbin2 metabat2; do
     d="${BINS_DIR}/${binner}_bins"
     [[ -d "${d}" ]] || continue

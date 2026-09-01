@@ -1499,6 +1499,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   carries the same projection at `5.DAS_Tools_prepare_batch3_test.sbatch:44`; the catch-all removal
   sitting above it there was not ported.
 
+- **`bin_refine` aborted instead of succeeding empty when no binner contributed a table (#519).**
+  `bin_refine.sh` declared its two accumulator arrays with a bare `declare -a`, which leaves them
+  UNSET rather than empty, so the `${#das_bins[@]}` that decides whether any binner produced
+  something tripped the `set -u` from `_lib.sh`: `das_bins: unbound variable`, exit 1, on exactly
+  the input the check exists to pass cleanly as an LCG-only success. Measured on the image's own
+  base (`mambaorg/micromamba:1.5.8`, bash 5.2.15); macOS ships bash 3.2, where the bare form reads
+  0, which is why it never showed up on a dev laptop. Reached whenever no binner contributes — an
+  empty `bins_dir`, which `binning.sh` hands over as a normal outcome, and now also a binner whose
+  only files are its catch-alls, which the filter above drops. Found by running the entrypoint
+  under the base image with `Fasta_to_Contig2Bin.sh` and `DAS_Tool` stubbed out.
+
 - **Two `library.py` docstrings pointed at a comment that does not carry the argument they cite
   (#519).** Both `upsert_genomes` and `upsert_genome_associations` said that the reference and
   assembly genome junctions "must stay apart" and referred the reader to
