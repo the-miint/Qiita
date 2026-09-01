@@ -46,11 +46,15 @@ _BIN_REFINE_ENV = _WORKFLOW_DIR / "sif-build.d" / "bin_refine.env"
 _METABAT2_CATCH_ALLS = ("bin.unbinned", "bin.tooShort", "bin.lowDepth")
 _CONCOCT_CATCH_ALL = "unbinned"
 
-pytestmark = pytest.mark.skipif(shutil.which("awk") is None, reason="awk not available")
-
 
 def _run(rows: list[tuple[str, ...]], tmp_path: Path) -> tuple[list[str], list[str]]:
-    """Run the shipped filter over `rows`; return (kept lines, rejected lines)."""
+    """Run the shipped filter over `rows`; return (kept lines, rejected lines).
+
+    The skip lives here rather than on the module, so the shape pins over
+    bin_refine.sh / .def / .env still run where no awk is installed.
+    """
+    if shutil.which("awk") is None:
+        pytest.skip("awk not available")
     stdin = "".join("\t".join(row) + "\n" for row in rows)
     rejects = tmp_path / "rejects"
     proc = subprocess.run(
@@ -171,16 +175,18 @@ def test_every_binner_goes_through_the_filter(tmp_path: Path) -> None:
     column change is one edit, and the table DAS_Tool reads is built the same way
     whichever binner produced it.
     """
-    code = [
+    # Unfolded, unlike the pins module's `_code_lines`: the pipe assertion below
+    # matches across the backslash continuation, which folding would remove.
+    unfolded = [
         ln
         for ln in _BIN_REFINE_SH.read_text().splitlines()
         if ln.strip() and not ln.lstrip().startswith("#")
     ]
     # `-i <dir>`: the invocation, not the error message that names the script.
-    calls = [ln for ln in code if "Fasta_to_Contig2Bin.sh -i" in ln]
+    calls = [ln for ln in unfolded if "Fasta_to_Contig2Bin.sh -i" in ln]
 
     assert len(calls) == 1, f"bin_refine.sh builds the contig2bin table {len(calls)} ways: {calls}"
-    piped = "\n".join(code)
+    piped = "\n".join(unfolded)
     assert re.search(
         r"Fasta_to_Contig2Bin\.sh[^\n]*\\\n\s*\|\s*awk[^\n]*-f /opt/qiita/contig2bin_filter\.awk",
         piped,
@@ -197,8 +203,10 @@ def test_bin_refine_fails_the_step_on_a_rejected_row() -> None:
     guard = re.search(r'if \[\[ -s "\$\{rejects\}" \]\]; then(.+?)\n    fi', body, re.DOTALL)
 
     assert guard is not None, "bin_refine.sh no longer guards on the rejects file"
-    assert re.search(r"^\s*exit [1-9]", guard.group(1), re.MULTILINE), (
-        f"the rejects guard does not fail the step: {guard.group(1)!r}"
+    # The exact code, not just non-zero: DEPLOY_CHECKLIST tells the operator to read
+    # 65 as this refusal, and the awk header names it as well.
+    assert re.search(r"^\s*exit 65\b", guard.group(1), re.MULTILINE), (
+        f"the rejects guard does not exit 65: {guard.group(1)!r}"
     )
 
 
@@ -227,7 +235,7 @@ def test_a_contig_id_holding_spaces_still_reaches_das_tool(tmp_path: Path) -> No
 
     `Fasta_to_Contig2Bin.sh` is `grep ">" | perl -pe "s/\\n/\\t$binname\\n/g" |
     perl -pe "s/>//g"` — read out of the shipped SIF — so it emits the entire header
-    line, not its first token. Under awk's default whitespace `FS` this row is five
+    line, not its first token. Under awk's default whitespace `FS` this row is four
     fields, `NF == 2` fails, and a legitimate bin is rejected: the step dies with
     exit 65 on data that is fine. Without this fixture nothing distinguishes the
     shipped program from one carrying no `FS` at all — every other row here is

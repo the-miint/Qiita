@@ -19,8 +19,9 @@
 # `FS` is a tab because the contig field can hold spaces. That script is
 # `grep ">" | perl -pe "s/\n/\t$binname\n/g" | perl -pe "s/>//g"` (read out of the
 # shipped SIF), so it emits the WHOLE FASTA header line, not its first token. Under
-# awk's default whitespace FS a header like `ctg2 len=500` splits into four fields
-# and the row is rejected, failing the step on data that is fine.
+# awk's default whitespace FS the row `ctg2 len=500<TAB>bin.2` is three fields,
+# `NF == 2` fails, and a legitimate bin is rejected — failing the step on data that
+# is fine.
 #
 # WHAT COUNTS AS A BIN
 # metaWRAP names every real bin `bin.<N>.fa`, in all three binners' dirs, and each

@@ -744,24 +744,20 @@ def test_bin_refine_initializes_its_binner_arrays_by_assignment() -> None:
     `bin_refine.sh` collects one contig2bin table per binner and then reads
     `${#das_bins[@]}` to decide whether any binner contributed. Declared without an
     assignment, that array is unset rather than empty, so the read aborts the step
-    with `das_bins: unbound variable` under the `set -euo pipefail` `_lib.sh`
-    applies -- on the exact input the check exists to pass cleanly. Measured on the
-    image's own base (mambaorg/micromamba:1.5.8, bash 5.2.15); macOS ships bash
-    3.2, where the bare form reads 0, so it cannot be reproduced by running the
-    script on a dev laptop, and is asserted on the spelling instead.
+    on the exact input the check exists to pass cleanly. That entrypoint's comment
+    at the declaration carries the bash versions it was measured on and why the
+    failure cannot be reproduced by running the script on a mac.
 
-    Reachable whenever no binner contributes: an empty `bins_dir`, which
-    `binning.sh` hands over as a normal outcome, and -- since the catch-all filter
-    -- a binner whose only files are its unbinned/tooShort/lowDepth catch-alls.
+    Asserted on the spelling for that same reason. The first mention of each array
+    has to be its assignment, rather than the `declare` line specifically, so
+    dropping `declare` for a bare `das_bins=()` stays green.
     """
-    declarations = [line for line in _code_lines(_BIN_REFINE_SH) if line.startswith("declare ")]
+    code = _code_lines(_BIN_REFINE_SH)
 
-    assert declarations, "bin_refine.sh no longer declares its binner arrays"
-    for line in declarations:
-        names = [token for token in line.split()[1:] if not token.startswith("-")]
-        assert names, f"a declare with no name: {line!r}"
-        for token in names:
-            assert "=" in token, (
-                f"bin_refine.sh declares {token} without assigning it: {line!r}. "
-                f"`${{#{token}[@]}}` then trips set -u instead of reading 0."
-            )
+    for name in ("das_bins", "das_labels"):
+        first = next((line for line in code if name in line), None)
+        assert first is not None, f"bin_refine.sh no longer mentions {name}"
+        assert re.search(rf"\b{name}=\(", first), (
+            f"{name} is introduced without an assignment: {first!r}. "
+            f"`${{#{name}[@]}}` then trips set -u instead of reading 0."
+        )

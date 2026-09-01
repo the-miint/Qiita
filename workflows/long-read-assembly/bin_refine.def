@@ -92,13 +92,19 @@ From: mambaorg/micromamba:1.5.8
     grep -q 'micromamba run -n dastool DAS_Tool' /opt/qiita/bin_refine.sh
     # The row filter (contig2bin_filter.awk carries what it keeps and why) is
     # %files-copied, so it can go missing independently of the entrypoint that runs
-    # it, and it is awk, so a syntax error surfaces only when it runs. Execute it:
-    # one numbered bin through, one catch-all dropped, nothing rejected.
+    # it, and it is awk, so a syntax error surfaces only when it runs. This is also
+    # the only place the IMAGE's awk runs the IMAGE's copy, so the rows discriminate:
+    # a numbered bin through, a catch-all dropped, a spaced contig id kept (it splits
+    # into three fields without the tab FS), and an unknown id rejected.
     grep -q 'contig2bin_filter\.awk' /opt/qiita/bin_refine.sh
-    printf 'c1\tbin.1\nc2\tunbinned\n' \
+    printf 'c1\tbin.1\nc2\tunbinned\nctg2 len=500\tbin.2\n' \
         | awk -v rejects="${HOME}/rejects" -f /opt/qiita/contig2bin_filter.awk > "${HOME}/kept"
-    [ "$(cat "${HOME}/kept")" = "$(printf 'c1\tbin.1')" ]
+    [ "$(cat "${HOME}/kept")" = "$(printf 'c1\tbin.1\nctg2 len=500\tbin.2')" ]
     [ ! -s "${HOME}/rejects" ]
+    printf 'c3\tbin.weird\n' \
+        | awk -v rejects="${HOME}/rejects2" -f /opt/qiita/contig2bin_filter.awk > "${HOME}/kept2"
+    [ ! -s "${HOME}/kept2" ]
+    [ -s "${HOME}/rejects2" ]
 
 %runscript
     echo "long-read-assembly-dastool image: invoke the step entrypoint, e.g." >&2

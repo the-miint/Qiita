@@ -29,8 +29,11 @@ mkdir -p "${OUT}"
 # benign empty outcome that check exists to serve. Measured on the image's own base
 # (mambaorg/micromamba:1.5.8, bash 5.2.15). The filter below makes it reachable for
 # a binner whose only .fa files are catch-alls, on top of the empty-bins_dir case
-# binning.sh already hands over. macOS ships bash 3.2, where the bare form reads 0,
-# so this does not reproduce on a dev laptop.
+# binning.sh already hands over. Measured on macOS's bash 3.2.57 too, where
+# `${#…[@]}` reads 0 for either spelling, so this does not reproduce on a dev
+# laptop — nor does the fix regress there. (bash 3.2 does refuse a `"${a[@]}"`
+# EXPANSION of an empty array, which is a different construct and not one this
+# script reaches with an empty one.)
 declare -a das_bins=() das_labels=()
 for binner in concoct maxbin2 metabat2; do
     d="${BINS_DIR}/${binner}_bins"
