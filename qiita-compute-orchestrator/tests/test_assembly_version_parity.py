@@ -2,22 +2,24 @@
 
 Why this exists
 ---------------
-1.0.1 exists only to be a DIFFERENT `processing_idx`. A run's identity is
+1.0.1 exists only to be a different `processing_idx`: a run's identity is
 `{workflow, version, mask_idx, assembler}` and does not cover the container
-images, so samples assembled before the `bin_refine` consensus fix hold a
-two-binner MAG set under a 1.0.0 identity that a corrected re-run would resolve
-straight back to. The version is the discriminator that makes the re-run a
-distinct run.
+images, so a sample assembled before the `bin_refine` consensus fix cannot be
+corrected under the identity it already has. `CHANGELOG.md` carries the rest of
+that argument, including what a same-identity re-run would do to the two stores.
 
-That only holds while the two files describe the same computation. If a step,
-resource or image drifts between them, a 1.0.1 re-run stops being comparable with
-the 1.0.0 result it supersedes — and nothing at runtime would say so, because both
-versions load and both run. So the parity is asserted here rather than trusted to
-the header that claims it.
+The version only serves that purpose while the two files describe the same
+computation. If a step, resource or image drifts between them, a 1.0.1 re-run
+stops being comparable with the 1.0.0 result it supersedes — and nothing at
+runtime would report it, because both versions load and both run.
 
-Everything below the header is compared: steps, resources, containers, modules,
-context_schema, audience. The header itself (version, description) is exactly what
-differs, so it is excluded by key rather than by line.
+What is compared, and what is not
+---------------------------------
+The two PARSED documents, minus `version` and `description`. That is weaker than
+byte equality in ways worth knowing: comments, whitespace and key order are
+invisible to `yaml.safe_load`, and the container assertion pins each SIF's
+filename, not its contents. `description` is excluded because it has to differ,
+which also means it is the one field here nothing checks.
 """
 
 from __future__ import annotations

@@ -126,44 +126,58 @@ _None yet._
 
 - **Re-run the two pre-fix assembly runs under `long-read-assembly` 1.0.1, then deprecate the
   1.0.0 runs.** (#522) The `bin_refine` consensus fix (#519) does not reach anything already
-  assembled: those samples hold a two-binner MAG set, their tickets are `completed` (terminal —
-  `/run` refuses), and a re-submit at 1.0.0 resolves to the SAME `processing_idx`, where the
-  DuckLake tables would supersede wholesale while Postgres kept the old MAG subjects. 1.0.1 is
-  the identity discriminator that makes the re-run a distinct run. Affected, both
-  `hifiasm_meta`:
+  assembled: those prep_samples hold a two-binner MAG set, their tickets are `completed`
+  (terminal — `/run` refuses), and a re-submit at 1.0.0 resolves to the same `processing_idx`.
+  1.0.1 is the identity discriminator that makes the re-run a distinct run; `CHANGELOG.md`
+  carries why that is necessary. Affected, both `hifiasm_meta`:
 
-  | processing_idx | mask_idx | samples |
+  | processing_idx | mask_idx | prep_samples |
   |---|---|---|
   | 1 | 9 | 26 |
   | 2 | 11 | 26 |
 
   ```bash
-  # 1. Re-submit each sample of the mask at the new version.
-  qiita ticket submit --action-id long-read-assembly --action-version 1.0.1 \
-      --prep-sample-idx <N> --context-json '{"mask_idx": 11, "assembler": "hifiasm_meta"}'
+  # Roster for a mask, one prep_sample_idx per line.
+  qiita mask samples 11
 
-  # 2. Once the new run has a processing_idx, retire the old one so no further
-  #    sample is assembled under the two-binner consensus.
+  # 1. Re-submit each prep_sample of the mask at the new version.
+  qiita ticket submit --action-id long-read-assembly --action-version 1.0.1 \
+      --prep-sample-idx <PREP_SAMPLE_IDX> \
+      --context-json '{"mask_idx": 11, "assembler": "hifiasm_meta"}'
+
+  # 2. Once a mask's re-run has minted its processing_idx, retire that mask's OLD
+  #    run. One PATCH per old run — mask 9 -> processing 1, mask 11 -> processing 2,
+  #    each pointing at the processing_idx its own re-run minted.
+  #    system_admin only (scope processing:lifecycle).
+  BASE=https://qiita-miint.ucsd.edu           # your host
+  QIITA_TOKEN=<a system_admin PAT>
   curl -sS -X PATCH -H "Authorization: Bearer $QIITA_TOKEN" \
       -H 'Content-Type: application/json' \
-      -d '{"status":"deprecated","superseded_by":<NEW_IDX>,
-           "deprecation_reason":"bin_refine gave DAS_Tool no MetaBAT bins; superseded by the 1.0.1 re-run"}' \
+      -d '{"status":"deprecated","superseded_by":<NEW_IDX_FOR_THIS_MASK>,
+           "reason":"bin_refine gave DAS_Tool no MetaBAT bins; superseded by the 1.0.1 re-run"}' \
       "$BASE/api/v1/processing/2/status"
   ```
 
-  Two different deprecations, and only the second is a manual step. The action-level one is
-  automatic: syncing 1.0.1 disables `long-read-assembly` **1.0.0** outright
-  (`sync_actions` auto-deprecates every other version of an action_id), so after the deploy no
-  sample can be submitted at 1.0.0 for ANY mask. The PATCH above is narrower and is about
-  `qiita.processing`, not `qiita.action`: it records WHY these two runs are void and what
-  replaced them, which the action-level disable does not. Nothing is deleted either way, and
-  what assembled under the old runs stays discoverable. **Cost, so this is scheduled and not
-  squeezed in:** only `bin_refine` onward changes (~60 min/sample), but partial re-runs do not
-  exist, so `assemble` is paid again in full — measured across the 59 completed steps at 415.3
-  min average, 1094.1 min peak, per sample. The assembly-genome backfill above is unaffected and
-  still applies to the 1.0.0 rows; `processing_idx` is in the genome identity tuple, so old and
-  new genomes never collide.
+  The body field is `reason`, not `deprecation_reason` — the latter is the response field, and
+  `ProcessingStatusUpdate` is `extra="forbid"`, so sending it 422s. `reason` is required when
+  deprecating. The PATCH is a whole-block replace: a later correction must re-supply
+  `superseded_by` or it clears.
 
+  Two different deprecations, and only this one is manual. The action-level one is automatic:
+  syncing 1.0.1 disables `long-read-assembly` **1.0.0** outright (`sync_actions` auto-deprecates
+  every other version of an action_id), so after the deploy no prep_sample can be submitted at
+  1.0.0 for any mask. The PATCH is narrower and is about `qiita.processing`, not `qiita.action`:
+  it records why these two runs are void and what replaced them, which the action-level disable
+  does not. Nothing is deleted either way, and what assembled under the old runs stays
+  discoverable.
+
+  **Cost, so this is scheduled and not squeezed in:** only `bin_refine` onward changes
+  (~60 min/prep_sample), but partial re-runs do not exist, so `assemble` is paid again in full —
+  measured across the 59 completed steps at 415.3 min average, 1094.1 min peak, per prep_sample.
+
+  The assembly-genome backfill above still applies to the 1.0.0 rows and is unaffected by this;
+  `processing_idx` is in the genome identity tuple, so old and new genomes never collide. The
+  1.0.1 rows need no backfill pass — assemblies run after this deploy mint their genomes inline.
 
 ### Notes (no host action)
 

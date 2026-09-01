@@ -1215,41 +1215,50 @@ def test_load_actions_long_read_assembly_finalizes_gate_after_register_files():
     from qiita_control_plane.actions import load_actions
 
     repo_root = Path(__file__).resolve().parents[2]
-    by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
-    names = [s.name for s in by_id["long-read-assembly"].steps]
+    # Keyed with the version, like `qiita.action`: `{a.action_id: a}` would resolve
+    # to whichever of the two long-read-assembly versions is yielded last, and pass
+    # on the collapsed key rather than on the version this names.
+    by_key = {(a.action_id, a.version): a for a in load_actions(repo_root / "workflows")}
+    names = [s.name for s in by_key[("long-read-assembly", "1.0.0")].steps]
 
     assert names[-1] == "finalize-assembly-sample"
     assert names[-2] == "register-files"
 
 
-def test_long_read_assembly_1_0_1_is_the_version_sync_leaves_enabled():
-    """`load_actions` must yield 1.0.1 AFTER 1.0.0, because sync is last-one-wins.
+def test_the_version_sync_leaves_enabled_is_the_highest_of_each_action():
+    """`load_actions` must yield each action_id's versions newest-last.
 
     `sync_actions` walks the list one action at a time, re-enabling the version it
     is syncing and running `_AUTO_DEPRECATE_OTHERS_SQL` over every other version of
     that action_id. So whichever version the loader yields LAST for an action_id is
-    the one left `enabled`, and the others end at
+    the one left enabled, and the rest end at
     `disabled_reason='auto-deprecate-sync'` — the state `fastq-to-parquet` 1.0.0
     through 1.2.0 are in on the deploy host today.
 
-    Nothing declares that order: it falls out of `sorted(rglob("*.yaml"))` over the
-    filenames. Inverted, the deploy would leave 1.0.1 disabled and every re-run
-    submission refused, with the catalog looking populated either way. 1.0.1 exists
-    to be submitted against, so the order it depends on is asserted rather than
-    assumed.
+    Nothing declares that order. `load_actions` returns `sorted(by_key.items())`
+    keyed on `(action_id, version)`, so it is a lexicographic compare of the version
+    STRING, not a semver one: `"1.10.0" < "1.9.0"`. The first minor bump past 9
+    would therefore ship the older version enabled and the new one disabled, with
+    the catalog looking populated either way and every submission at the new version
+    refused. Compared here against a real semver sort so the trap fails a test rather
+    than a deploy.
     """
     from pathlib import Path
 
     from qiita_control_plane.actions import load_actions
 
     repo_root = Path(__file__).resolve().parents[2]
-    versions = [
-        a.version
-        for a in load_actions(repo_root / "workflows")
-        if a.action_id == "long-read-assembly"
-    ]
+    by_action: dict[str, list[str]] = {}
+    for action in load_actions(repo_root / "workflows"):
+        by_action.setdefault(action.action_id, []).append(action.version)
 
-    assert versions == ["1.0.0", "1.0.1"], (
-        f"long-read-assembly versions load in the order {versions}; sync enables the "
-        "LAST one, so 1.0.1 must come after 1.0.0 or the re-run version ships disabled."
-    )
+    for action_id, versions in by_action.items():
+        semver = sorted(versions, key=lambda v: tuple(int(p) for p in v.split(".")))
+        assert versions == semver, (
+            f"{action_id} versions load as {versions} but sort semantically as "
+            f"{semver}; sync enables the LAST one, so the newest must come last."
+        )
+
+    # Named rather than left to the sweep: 1.0.1 exists to be submitted against, and
+    # it only reaches an operator if it is the version sync leaves enabled.
+    assert by_action["long-read-assembly"][-1] == "1.0.1", by_action["long-read-assembly"]

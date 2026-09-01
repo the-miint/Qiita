@@ -7,40 +7,30 @@ target_kind: prep_sample
 # masked-reads FASTQ the pipeline consumes (no intermediate Parquet).
 
 description: >
-  Re-run identity for long-read-assembly/1.0.0. The steps, resources and
-  container images are IDENTICAL to 1.0.0 — a test asserts the two files stay
-  byte-identical apart from this header — so a submit at either version runs the
-  same computation.
+  Per-sample metagenome assembly → MAG recovery for masked, ready-for-consumption
+  PacBio HiFi long reads — the same computation as long-read-assembly/1.0.0,
+  whose description carries the step-by-step detail. The steps, resources and
+  container images are identical: `test_assembly_version_parity` compares the two
+  parsed documents and fails on any difference outside `version` and this field
+  (comments and whitespace are invisible to it — it is not a byte comparison).
 
-  Syncing this file DISABLES 1.0.0. `sync_actions` re-enables the version it is
-  syncing and auto-deprecates every OTHER version of the same action_id, one
-  action at a time, so the last one it walks is the one left enabled
-  (`qiita.action.disabled_reason = 'auto-deprecate-sync'`). `load_actions` sorts
-  by path, which puts 1.0.1 after 1.0.0. That outcome is the wanted one here —
-  nothing further should assemble onto the pre-fix identity — but it means 1.0.0
-  stops accepting submissions at the deploy, not that the two coexist.
+  It is a separate version because a processing run's identity is
+  `{workflow, version, mask_idx, assembler}` and does not cover the container
+  images, so a sample assembled before the `bin_refine` consensus fix cannot be
+  corrected under the identity it already has. CHANGELOG.md carries why, and
+  DEPLOY_CHECKLIST.md what the operator does about it.
 
-  It exists because a processing run's identity is
-  `{workflow, version, mask_idx, assembler}` and does NOT cover the container
-  images. `bin_refine` was giving DAS_Tool metabat2's contig->bin table with every
-  bin id blanked, and offering each binner's unbinned catch-all as a candidate
-  bin, so no MetaBAT bin was ever selectable; the images are fixed, but the
-  samples already assembled hold a two-binner consensus under a 1.0.0 identity
-  that a corrected re-run would resolve straight back to. Re-submitting those at
-  1.0.0 would land the new bins on the SAME processing_idx, where the two stores
-  disagree: the DuckLake tables are replace-keyed on
-  `(prep_sample_idx, processing_idx)` and supersede wholesale, while Postgres
-  `assembly_membership` upserts and has no delete path — so the superseded MAG
-  subjects would survive in one store and not the other. This version is the
-  discriminator that makes the re-run a distinct run instead.
+  Syncing this file disables 1.0.0. `sync_actions` re-enables the version it is
+  syncing and auto-deprecates every other version of the same action_id, so the
+  version it walks last is the one left enabled
+  (`qiita.action.disabled_reason = 'auto-deprecate-sync'`). `load_actions` yields
+  them sorted on `(action_id, version)`, which puts 1.0.1 last — a lexicographic
+  compare of the version string, so a later bump past `.9` needs the ordering test
+  that guards it. The disable is the wanted outcome, but it means 1.0.0 stops
+  accepting submissions at the deploy rather than the two coexisting.
 
-  Operationally the superseded 1.0.0 runs are deprecated with `superseded_by`
-  pointing here, which stops `mint_processing` returning them while leaving what
-  assembled under them discoverable.
-
-  The SIF filenames stay `-1.0.0.sif`: they name the IMAGE, not the workflow
-  version, and the images this version runs are the same ones 1.0.0 runs.
-  Renaming them would force a rebuild of all four to no effect.
+  The SIF filenames stay `-1.0.0.sif`: they name the image, not the workflow
+  version, and the images are the same ones 1.0.0 runs.
 
 scopes: []
 
