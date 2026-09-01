@@ -9,7 +9,7 @@ the four things this awk actually decides are pinned here by RUNNING it:
 
   * the circular/linear call from the segment name,
   * `dp:f` found by TAG rather than by column position,
-  * a segment with no `dp:f` writing an empty field, and
+  * a segment with no `dp:f` writing an empty field and being REPORTED,
   * a name matching neither shape exiting 65 instead of being routed,
   * and a GFA where NO segment carries `dp:f` failing rather than storing a
     depth-less run.
@@ -120,12 +120,17 @@ def test_the_shipped_name_grammar_is_anchored_to_the_unitig_prefix() -> None:
 
 def test_the_awk_writes_one_row_per_segment_with_the_declared_columns(tmp_path: Path) -> None:
     """Circularity from the name; `dp:f` read by tag, at two different column
-    positions, with the tag-less segment writing an empty depth.
+    positions, with the tag-less segment writing an empty depth and being counted
+    onto stderr.
 
     The positions are the point: GFA does not fix the order of a segment's
     optional tags, so a reader keyed on `$5` would store `ts:B:I`'s value as
     depth on the second line here and nothing downstream could notice — a depth
     is a plausible number whatever it came from.
+
+    The stderr count is what keeps a partial absence out of the data alone: the
+    step tolerates it (see the no-tag-anywhere case below for why), so the log is
+    the only place it announces itself while it is still cheap to look into.
     """
     result, attrs = _run(
         tmp_path,
@@ -148,6 +153,7 @@ def test_the_awk_writes_one_row_per_segment_with_the_declared_columns(tmp_path: 
         # empty depth, not a zero: nothing was reported.
         ["s2.ctg000003c", "s2.ctg000003c", "yes", "", ""],
     ]
+    assert "1 of 3 GFA segment(s) carried no dp:f tag" in result.stderr
 
 
 def test_an_unrecognised_segment_name_exits_65_and_names_it(tmp_path: Path) -> None:
@@ -178,13 +184,15 @@ def test_a_bare_trailing_c_is_not_treated_as_circular(tmp_path: Path) -> None:
 def test_a_gfa_with_no_dp_tag_anywhere_fails_rather_than_storing_no_depth(
     tmp_path: Path,
 ) -> None:
-    """Every segment of the probed build carries `dp:f`, so none carrying it
-    means the tag moved — not that this assembly had no coverage to report.
+    """None carrying `dp:f` is the shape a renamed or moved tag produces, and the
+    only one this pass can tell apart from data.
 
     Left fail-open, `depth` would be NULL for every contig of every hifiasm run
     and read downstream as "not recorded", which is the same silent all-NULL
-    outcome `myloasm_split.py` refuses for its own depth field. The case above
-    covers ONE tag-less segment among tagged ones, which must still succeed.
+    outcome `myloasm_split.py` refuses for its own depth field. SOME segments
+    lacking the tag is not that shape and must still succeed (the case above):
+    each probe assembly behind this grammar produced one contig, so nothing
+    measured says every segment of a real metagenome carries one.
     """
     result, _ = _run(
         tmp_path,

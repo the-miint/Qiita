@@ -1,4 +1,4 @@
-"""Smoke-check the deploy shell scripts (deploy/*.sh).
+"""Smoke-check the deploy shell scripts (deploy/*.sh) and the workflow entrypoints.
 
 These run on the Linux deploy host, not in CI's Python env, so they have no
 unit-test harness of their own. This pure-unit guard (under `make test`) catches
@@ -6,6 +6,12 @@ the cheap-but-real failures — syntax errors and shellcheck warnings — before
 ship to a host where a broken deploy script is expensive. Mirrors the `bash -n`
 precedent in test_compute_readiness.py::test_probe_script_is_valid_bash and the
 repo-root reach in test_sif_build_spec.py.
+
+The workflow entrypoints get the `bash -n` half for the same reason and a sharper
+one: they run INSIDE a SIF, so a syntax error surfaces as a container step dying
+on a real ticket, after the image has been rebuilt and staged. Several embed a
+long single-quoted awk program, where an apostrophe in a comment closes the quote
+and breaks the script — the shape this gate is here to stop.
 
 shellcheck is optional: when it isn't installed the shellcheck assertion skips
 gracefully (same posture as the apptainer-optional workflow tests).
@@ -37,6 +43,11 @@ _SCRIPTS = ("preflight.sh", "verify.sh", "redeploy.sh", "build-sifs.sh")
 # scripts rely on, so it gets the same bash -n + shellcheck gate — but NOT the
 # executable-bit check below, since it's never run directly.
 _SOURCED = ("_common.sh",)
+
+# The per-step entrypoints and the shared helper they source. A glob, not a list:
+# a new workflow step ships a new .sh, and it wants this gate by default rather
+# than by remembering to register it.
+_WORKFLOW_SCRIPTS = sorted((_REPO_ROOT / "workflows").rglob("*.sh"))
 
 
 @pytest.mark.parametrize("name", _SCRIPTS)
@@ -1154,3 +1165,17 @@ def test_lake_gc_always_passes_older_than_explicitly() -> None:
     for call in calls:
         assert "older_than :=" in call, f"call without an explicit older_than: {call}"
         assert "dry_run :=" in call, f"call without an explicit dry_run: {call}"
+
+
+def test_workflow_scripts_were_found() -> None:
+    """Anti-vacuity guard: the parametrization below is a glob, so an empty or
+    moved `workflows/` tree would leave it silently exercising nothing."""
+    assert len(_WORKFLOW_SCRIPTS) >= 5
+
+
+@pytest.mark.parametrize("path", _WORKFLOW_SCRIPTS, ids=lambda p: p.name)
+def test_workflow_script_is_valid_bash(path: Path) -> None:
+    """`bash -n` parses without executing — the container never gets that chance
+    until a ticket is already running inside it."""
+    result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed for {path}:\n{result.stderr}"

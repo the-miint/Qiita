@@ -36,15 +36,21 @@ COMMENT ON COLUMN qiita.assembly_membership.circularity IS
     '''possibly'', so that value is myloasm-only. Deliberately TEXT, not an ENUM: '
     'the set is the producer''s, so adding an assembler that reports a fourth '
     'call is an entrypoint change rather than a migration. Both entrypoints '
-    'currently REJECT a value outside the three rather than store it.';
+    'currently REJECT a value outside the three rather than store it. '
+    '''possibly'' routes to binning, so where a refined bin claims such a contig '
+    'its MAG row is the only surviving record of the call -- and a MAG row carries '
+    'these attributes only under the condition stated on raw_name.';
 
 COMMENT ON COLUMN qiita.assembly_membership.depth IS
     'Per-contig read depth as the assembler reported it. myloasm: the mean of its '
     'header''s depth triple; per myloasm''s source that triple is min_read_depth_multi '
     'and the same function averages it into the avg_cov its circularity gate tests, '
     'which is read off the source rather than probed. hifiasm_meta: the GFA '
-    'S-line''s dp:f tag, probed present on every segment of the pinned build. The '
-    'two compute coverage differently, so compare across assemblers only with '
+    'S-line''s dp:f tag; the probe behind that read one contig, so a hifiasm_meta '
+    'row may carry a NULL depth where its segment had no tag. NULL beside a '
+    'non-NULL raw_name is that case; all four NULL is a run older than the '
+    'sidecar. The two compute coverage differently, so compare across assemblers '
+    'only with '
     'raw_name in hand; which assembler ran is on qiita.processing via '
     'processing_idx.';
 

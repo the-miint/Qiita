@@ -12,6 +12,9 @@ import pytest
 
 from qiita_common.assembly_constants import (
     CONTIG_ATTRIBUTE_COLUMNS,
+    CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
+    contig_attribute_join,
+    contig_attribute_projection,
     register_contig_attribute_table,
 )
 
@@ -130,3 +133,57 @@ def test_duckdb_would_not_have_caught_the_reordered_header(tmp_path):
     )
     # raw_name holds 'yes' and circularity holds 'rawA' — transposed, no error.
     assert row == ("s1", "yes", "rawA", 29.0, 1.5)
+
+
+def _joined(sidecar):
+    """The membership row shape both writers derive, over a two-contig assembly.
+
+    Neither writer's whole statement can live here — one joins Parquets and
+    streams, the other COPYs to Parquet — but the three shared fragments are the
+    part that decides what a row carries, so the join is assembled from those.
+    """
+    conn = duckdb.connect(":memory:")
+    conn.execute("CREATE TEMP TABLE bin_map(contig_id VARCHAR, kind VARCHAR, bin_id VARCHAR)")
+    conn.execute(
+        "INSERT INTO bin_map VALUES ('s0.ctg000001c', 'LCG', 's0.ctg000001c'),"
+        " ('s1.utg000002l', 'UNBINNED', 's1.utg000002l')"
+    )
+    register_contig_attribute_table(conn, sidecar)
+    return conn.execute(
+        "SELECT m.kind, "
+        + contig_attribute_projection("a")
+        + " FROM (SELECT bm.kind, "
+        + CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL
+        + " FROM bin_map bm GROUP BY bm.kind) m"
+        + contig_attribute_join("m")
+        + " ORDER BY m.kind"
+    ).fetchall()
+
+
+def test_a_missing_depth_is_distinguishable_from_a_missing_sidecar(tmp_path):
+    """`depth IS NULL` alone does not say which of two things happened, and the
+    entrypoints depend on it saying so.
+
+    assemble.sh's hifiasm arm fails a GFA where NO segment carries `dp:f` but
+    lets a single tag-less segment through, storing NULL depth for it. That
+    tolerance rests on the row still announcing that the assembler DID report on
+    this contig — raw_name and circularity populated, depth empty — where a run
+    assembled before the sidecar existed has all four NULL. Were the two shapes
+    to converge, a partial `dp:f` absence would become unreadable after the fact
+    and the arm would have to fail on any missing tag instead.
+    """
+    path = tmp_path / "contig_attributes.tsv"
+    path.write_text(
+        f"{_HEADER}\n"
+        "s0.ctg000001c\ts0.ctg000001c\tyes\t29\t\n"
+        "s1.utg000002l\ts1.utg000002l\tno\t\t\n"  # no dp:f on this segment
+    )
+    assert _joined(path) == [
+        ("LCG", "s0.ctg000001c", "yes", 29.0, None),
+        ("UNBINNED", "s1.utg000002l", "no", None, None),
+    ]
+    # The contrast that gives the row above its meaning: no sidecar at all.
+    assert _joined(tmp_path / "absent.tsv") == [
+        ("LCG", None, None, None, None),
+        ("UNBINNED", None, None, None, None),
+    ]

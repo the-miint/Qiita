@@ -33,14 +33,22 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   without re-assembling. Routing itself is unchanged: `circular-yes` is still the LCG rule and
   `circular-possibly` still goes to binning. myloasm's depth is the mean of its `depth-A-B-C`
   triple, which is the scalar myloasm itself derives from it (the `avg_cov` its own circularity
-  gate tests, per myloasm's own source); hifiasm_meta's is the S-line's `dp:f` tag, probed present on
-  every segment of the pinned build and previously discarded along with the rest of columns
-  4+; a GFA where no segment carries it fails the step rather than storing a depth-less run. `mult` is NULL
+  gate tests, per myloasm's own source); hifiasm_meta's is the S-line's `dp:f` tag, previously
+  discarded along with the rest of columns 4+. A GFA where NO segment carries that tag fails the
+  step rather than storing a depth-less run; some segments lacking it does not, because the
+  probe behind the tag read one contig per assembly and so says nothing about whether every
+  segment of a real metagenome carries one — those segments get a NULL depth and a count on
+  stderr, and stay distinguishable from a pre-sidecar run by their non-NULL `raw_name`. `mult` is NULL
   below 1 kb, where myloasm reports `0.00` for absence of signal rather than a measured zero.
   Attributes are NULL for every row written before this deploy and are not backfilled here:
   they are read out of the assemble step's output, which for an older run is gone. A MAG row
   carries them only where the binners kept the assembler's contig header, which is measured
-  for hifiasm_meta and unmeasured for myloasm; LCG and UNBINNED rows match by construction. `kind` still
+  for hifiasm_meta and unmeasured for myloasm; LCG and UNBINNED rows match by construction. That
+  unmeasured half has a specific cost, on the myloasm arm only: `circular-possibly` routes to
+  binning, so where a refined bin claims such a contig the residue subtraction drops its
+  UNBINNED row and the MAG row becomes the call's only record — which then depends on the
+  passthrough nobody has measured. Running the full workflow on myloasm once settles it.
+  `kind` still
   records the routing that was applied, so `circular-yes` stays recoverable from `kind`
   alone; what an older row cannot recover is the `possibly`/`no` split among the contigs
   that went to binning. `ensure_assembly_tables` widens an existing DuckLake

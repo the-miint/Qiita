@@ -167,6 +167,11 @@ case "${ASSEMBLER}" in
             # order and reading $5 would silently store `ts:B:I`'s value the day
             # it moves. `mult` is empty for every row — hifiasm_meta has no
             # counterpart to myloasm's k-mer multiplicity.
+            #
+            # Scope of that probe: each assembly produced ONE contig. It fixes the
+            # tag's spelling and where it sits; it does not establish that every
+            # segment of a many-contig metagenome carries one. The END block below
+            # is written to that limit.
             awk -v attrs="${OUT}/contig_attributes.tsv" -v circ="${CIRC_RE}" -v lin="${LIN_RE}" '
                 BEGIN { OFS = "\t"; print "contig_id", "raw_name", "circularity", "depth", "mult" > attrs }
                 $1 != "S" { next }
@@ -190,15 +195,29 @@ case "${ASSEMBLER}" in
                         printf "          re-probe hifiasm_meta name grammar against the version pinned in assemble.def\n" > "/dev/stderr"
                         exit 65
                     }
-                    # Every segment of the probed build carries dp:f, so NONE
-                    # carrying it means the tag moved, not that this assembly had
-                    # no coverage to report. Fail rather than store a depth-less
-                    # run that reads downstream as "not recorded" — the same
+                    # NONE carrying dp:f is the shape a renamed or moved tag
+                    # produces, and it is the only shape this pass can tell apart
+                    # from data: fail rather than store a depth-less run, the same
                     # fail-closed rule myloasm_split.py applies to its own depth.
                     if (seen && !with_dp) {
                         printf "assemble: none of %d GFA segment(s) carried a dp:f tag\n", seen > "/dev/stderr"
                         printf "          re-probe hifiasm_meta depth tag against the version pinned in assemble.def\n" > "/dev/stderr"
                         exit 65
+                    }
+                    # SOME carrying it is not treated the same way, and the
+                    # asymmetry is what the probe above can support: one contig per
+                    # assembly establishes the tag, not that every segment of a
+                    # real metagenome has one, so failing on a single tag-less
+                    # segment would stake a whole assembly on something unmeasured.
+                    # Nor is such a segment lost — its row still carries raw_name
+                    # and circularity, so a NULL depth beside a non-NULL raw_name
+                    # reads as "this segment reported none", where a run assembled
+                    # before the sidecar existed has all four NULL (pinned in
+                    # test_assembly_constants.py in qiita-common). Counted onto
+                    # stderr so a partial absence shows in the step log at all,
+                    # which is what a decision to fail on it would rest on.
+                    if (seen && with_dp < seen) {
+                        printf "assemble: %d of %d GFA segment(s) carried no dp:f tag; depth stored NULL for those\n", seen - with_dp, seen > "/dev/stderr"
                     }
                 }' "${GFA}"
 
