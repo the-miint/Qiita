@@ -145,12 +145,12 @@ def require_non_empty_fasta(prog: str, path: str) -> None:
 def reject_duplicate_contig_ids(prog: str, con: duckdb.DuckDBPyConnection) -> None:
     """Raise if the TEMP TABLE `contig` repeats a `contig_id`.
 
-    Both splitters build that table and both are broken by a repeat, for reasons that
-    differ in mechanism and agree in consequence: two distinct genomes end up under
-    one `assembly_membership` subject, because an LCG's bin_id IS its contig id
-    (`assembly_hash` COALESCEs it from the read_fastx record). In the per-contig split
-    the second `COPY` also overwrites the first, so CheckM scores one genome where the
-    lake holds two memberships.
+    Both splitters build that table and both are broken by a repeat, with one
+    consequence: two distinct genomes end up under one `assembly_membership` subject.
+    An LCG's bin_id IS its contig id and so is an UNBINNED contig's (`assembly_hash`
+    COALESCEs both from the read_fastx record), so the id is the subject. In the
+    per-contig split the second `COPY` also overwrites the first, leaving CheckM one
+    genome to score where the lake holds two memberships.
     """
     dupes = con.execute(
         "SELECT contig_id, count(*) AS n FROM contig GROUP BY 1 HAVING n > 1 ORDER BY 1 LIMIT 5"

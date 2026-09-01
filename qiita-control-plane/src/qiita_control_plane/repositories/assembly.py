@@ -445,17 +445,18 @@ async def fetch_assembly_sample_states(
 # nobody had considered here into every de novo feature table. A new kind has to be
 # added to this tuple to reach the map.
 #
-# The MINT is deliberately NOT filtered to match. `write_assembly_membership` still
-# mints a qiita.genome per (prep_sample_idx, processing_idx, kind, bin_id), UNBINNED
-# included, so those genome rows exist and simply are not admitted here — store
-# broadly, filter at the read. They are inert off the map because the assembly path
-# records its edge on `assembly_membership.genome_idx` and never on
-# `qiita.feature_genome`, so an assembly genome cannot reach the reference graph or
-# the global reference_exclusion blocklist that expands through that junction.
+# The mint is not filtered to match: `write_assembly_membership` still mints a
+# qiita.genome per (prep_sample_idx, processing_idx, kind, bin_id), UNBINNED included,
+# so those rows exist and are simply not admitted here — store broadly, filter at the
+# read. They are inert off the map: the assembly path records its edge on
+# `assembly_membership.genome_idx`, never on `qiita.feature_genome`, so an assembly
+# genome stays outside the reference graph and the global reference_exclusion
+# blocklist that expands through that junction —
+# `test_a_shared_contig_never_reaches_the_reference_graph` pins it.
 _ASSEMBLY_GENOME_MAP_FROM = " FROM qiita.assembly_membership am"
-_GENOME_MAP_KINDS = (KIND_MAG, KIND_LCG)
+_ASSEMBLY_GENOME_MAP_KINDS = (KIND_MAG, KIND_LCG)
 _ASSEMBLY_GENOME_MAP_KIND = (
-    " AND am.kind IN (" + ", ".join(f"'{k}'" for k in _GENOME_MAP_KINDS) + ")"
+    " AND am.kind IN (" + ", ".join(f"'{k}'" for k in _ASSEMBLY_GENOME_MAP_KINDS) + ")"
 )
 _ASSEMBLY_GENOME_MAP_WHERE = (
     " WHERE am.prep_sample_idx = ANY($1) AND am.processing_idx = $2"

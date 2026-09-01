@@ -515,7 +515,7 @@ async def test_a_reference_claimed_genome_blocks_the_pool_delete_before_it_purge
 
 
 async def test_the_genome_map_admits_mag_and_lcg_but_not_unbinned(postgres_pool, tmp_path):
-    """The de novo alignment map skips the residue, in both of its drivers.
+    """The de novo genome map skips the residue, in both of its drivers.
 
     UNBINNED is minted a genome like any other subject — that is what the mint test
     above pins — so it would otherwise flow into every de novo feature table. It is
@@ -635,6 +635,11 @@ async def test_a_kind_nobody_listed_does_not_reach_the_map(postgres_pool, tmp_pa
         )
         subjects = await _subjects(postgres_pool, prep)
         assert ("plasmid", "c4") in subjects, "the fixture no longer carries a novel kind"
-        assert subjects[("plasmid", "c4")][0] not in {r["genome_idx"] for r in rows}
+        novel_genome = subjects[("plasmid", "c4")][0]
+        # Non-NULL first: `None not in {...}` would pass this vacuously if the mint
+        # ever stopped stamping the residue, which is the case that makes the
+        # exclusion below meaningful.
+        assert novel_genome is not None
+        assert novel_genome not in {r["genome_idx"] for r in rows}
     finally:
         await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)

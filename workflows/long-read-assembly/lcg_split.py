@@ -64,10 +64,11 @@ PROG = "lcg_split"
 # well inside it (`s0.ctg000001c`, `u713ctg`).
 _SAFE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
-# Longest id that can still become `<id>.fa` under the 255-byte NAME_MAX both
-# Linux and macOS enforce. Bounded here so an over-long id is REJECTED with the
-# message below, like every other unusable one, rather than surfacing mid-loop as a
-# raw ENAMETOOLONG from DuckDB with some files already written.
+# Longest id that can still become `<id>.fa`. Measured on the deploy host, whose
+# ticket workspaces are lustre: a 252-character stem creates, 253 fails with
+# ENAMETOOLONG. Bounded here so an over-long id is rejected with the message below,
+# like every other unusable one, rather than failing part-way through the write loop
+# with some files already created.
 _MAX_ID_LENGTH = 255 - len(".fa")
 
 
@@ -86,8 +87,8 @@ def _load(con, src: str) -> None:
 def _validate(con) -> list[str]:
     """Reject an unusable id, then return every contig id in sorted order.
 
-    Duplicates first: the shared guard states why, and here the second COPY would also
-    overwrite the first, so CheckM would score one genome for two memberships.
+    Duplicates first — the shared guard states why, including what the overwrite in
+    this splitter costs.
     """
     reject_duplicate_contig_ids(PROG, con)
 

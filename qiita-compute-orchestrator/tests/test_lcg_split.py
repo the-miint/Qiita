@@ -186,9 +186,10 @@ def test_split_uses_miint_and_never_installs() -> None:
     set of staged-extension settings, free to drift from what the services run.
     """
     code = _SPLIT_PY.read_text()
-    # Anchored at a CALL, not a mention: this file's own docstring names both symbols,
-    # so a bare substring search stays green on a hand-rolled parser whose prose still
-    # credits miint — which is the substitution these two assertions exist to catch.
+    # Anchored at a CALL, not a mention: lcg_split's own docstring names `read_fastx`
+    # three times, so a bare substring search stayed green on a hand-rolled parser
+    # whose prose still credited miint. `FORMAT FASTA` appears only in the COPY, and
+    # is anchored the same way so the pair reads alike.
     assert re.search(r"FROM read_fastx\(", code), (
         "the split no longer reads with miint's read_fastx"
     )
@@ -223,19 +224,25 @@ def test_checkm_entrypoint_runs_the_split_and_scores_the_classes_apart() -> None
     )
     # Read off the run_checkm INVOCATIONS, not the file: checkm.sh's header comment
     # lists all four basenames, so searching the whole file passes with both calls
-    # deleted. Two calls is the assertion — one would mean a class went unscored.
+    # deleted. Two calls, because one would mean a class went unscored.
     calls = [ln.strip() for ln in sh.splitlines() if ln.strip().startswith("run_checkm ")]
     assert len(calls) == 2, calls
-    invoked = " ".join(calls)
-    for name in (
+    # Compared as a SET of basenames, not with `name in text`: "lineage.tsv" is a
+    # SUBSTRING of "lcg_lineage.tsv", so a containment check is satisfied by the LCG
+    # call alone and a renamed MAG pair would stay green while assembly_load read two
+    # files that no longer exist. Equality also catches a fifth output nobody read.
+    written = {
+        token.rsplit("/", 1)[-1].strip('"')
+        for call in calls
+        for token in call.split()
+        if token.endswith('.tsv"')
+    }
+    assert written == {
         _CHECKM_LINEAGE_TSV,
         _CHECKM_QA_TSV,
         _CHECKM_LCG_LINEAGE_TSV,
         _CHECKM_LCG_QA_TSV,
-    ):
-        assert name in invoked, (
-            f"checkm.sh no longer writes {name}, which assembly_load reads by that name"
-        )
+    }, f"checkm.sh writes {written}, which is not what assembly_load reads"
 
 
 def test_checkm_step_binds_miint_and_reads_the_genomes_dir() -> None:

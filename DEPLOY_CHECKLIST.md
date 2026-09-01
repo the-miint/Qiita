@@ -96,8 +96,10 @@ _None yet._
   ```
 
   Four files — `lineage.tsv`, `qa.tsv`, `lcg_lineage.tsv`, `lcg_qa.tsv` — means both CheckM runs
-  landed. Only the first pair, on a ticket that HAS circular contigs, means the LCG arm did not
-  run: check the step log for `lcg_split`. It exits 64 with the reason on stderr; a missing or
+  landed. The LCG arm cannot fail silently — `checkm.sh` runs under `set -euo pipefail`, so an
+  `lcg_split` failure aborts the step before it publishes anything and the TICKET fails. So only
+  the first pair, on a FAILED attempt whose ticket had circular contigs, is the shape to read:
+  check that step log for `lcg_split`, which exits 64 with the reason on stderr. A missing or
   mislocated `${PATH_DERIVED}/duckdb-ext` is the failure this step gained (see the note below).
   A ticket with an empty `circular.fa` legitimately writes only the first pair, so pick the
   ticket before reading the result.

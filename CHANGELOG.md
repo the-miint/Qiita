@@ -69,17 +69,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   on stderr. One real metagenome assembled on the pinned build carried `dp:f` on all 2,899 of
   its contigs (depth 1–145), with every name matching the circular/linear grammar and none
   unmatched; that is one assembly of one input, and the grammar had until now been exercised
-  only against synthetic single-contig assemblies. `mult` is NULL
-  below 1 kb, where myloasm reports `0.00` for absence of signal rather than a measured zero.
-  Attributes are NULL for every row written before this deploy and are not backfilled here:
-  they are read out of the assemble step's output, which for an older run is gone. A MAG row
-  carries them only where the binners kept the assembler's contig header, which is measured for
-  both id shapes — see the entry under `Changed` for the probe; LCG and UNBINNED rows match by
-  construction.
-  `kind` still
-  records the routing that was applied, so `circular-yes` stays recoverable from `kind`
-  alone; what an older row cannot recover is the `possibly`/`no` split among the contigs
-  that went to binning. `ensure_assembly_tables` widens an existing DuckLake
+  only against synthetic single-contig assemblies. `mult` is NULL below 1 kb, where myloasm
+  reports `0.00` for absence of signal rather than a measured zero. Attributes are NULL for every
+  row written before this deploy and are not backfilled here: they are read out of the assemble
+  step's output, which for an older run is gone. A MAG row reaches them through the binners,
+  which are measured to preserve both assemblers' contig id shapes (see the entry under
+  `Changed`), so the column comment states no condition; LCG and UNBINNED rows match by
+  construction. `kind` still records the routing that was applied, so `circular-yes` stays
+  recoverable from `kind` alone; what an older row cannot recover is the `possibly`/`no` split
+  among the contigs that went to binning. `ensure_assembly_tables` widens an existing DuckLake
   `assembly_membership` with `ADD COLUMN IF NOT EXISTS` on data-plane start, since
   `ducklake_add_data_files` rejects a Parquet whose columns differ from its target's in
   either direction. The
@@ -2925,7 +2923,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   queryable in `qiita.assembly_membership`. An allowlist rather than `<> 'UNBINNED'` because
   `assembly_constants` states the kind set is meant to extend without a migration, so a denylist
   would admit a future kind into every de novo feature table by default.
-  The MINT is deliberately unchanged: `write_assembly_membership` still mints a `qiita.genome`
+  The mint is unchanged: `write_assembly_membership` still mints a `qiita.genome`
   per `(prep_sample_idx, processing_idx, kind, bin_id)`, UNBINNED included, so those genome rows
   exist and are simply not admitted here — store broadly, filter at the read. They are inert off
   the map because the assembly path records its edge on `assembly_membership.genome_idx` and
