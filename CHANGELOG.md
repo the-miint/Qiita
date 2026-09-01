@@ -33,13 +33,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   without re-assembling. Routing itself is unchanged: `circular-yes` is still the LCG rule and
   `circular-possibly` still goes to binning. myloasm's depth is the mean of its `depth-A-B-C`
   triple, which is the scalar myloasm itself derives from it (the `avg_cov` its own circularity
-  gate tests, per myloasm's own source); hifiasm_meta's is the S-line's `dp:f` tag where the
-  segment carries one, previously discarded along with the rest of columns 4+. `mult` is NULL
+  gate tests, per myloasm's own source); hifiasm_meta's is the S-line's `dp:f` tag, probed present on
+  every segment of the pinned build and previously discarded along with the rest of columns
+  4+; a GFA where no segment carries it fails the step rather than storing a depth-less run. `mult` is NULL
   below 1 kb, where myloasm reports `0.00` for absence of signal rather than a measured zero.
   Attributes are NULL for every row written before this deploy and are not backfilled here:
   they are read out of the assemble step's output, which for an older run is gone. `kind` still
-  records the routing that was applied, so an LCG row's circularity is not lost, only its
-  `possibly`/`no` distinction. `ensure_assembly_tables` widens an existing DuckLake
+  records the routing that was applied, so `circular-yes` stays recoverable from `kind`
+  alone; what an older row cannot recover is the `possibly`/`no` split among the contigs
+  that went to binning. `ensure_assembly_tables` widens an existing DuckLake
   `assembly_membership` with `ADD COLUMN IF NOT EXISTS` on data-plane start, since
   `ducklake_add_data_files` rejects a Parquet carrying a column its target lacks. Both writers
   read the sidecar through one shared reader, which declares the two numeric columns rather

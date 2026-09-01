@@ -10,11 +10,21 @@ the four things this awk actually decides are pinned here by RUNNING it:
   * the circular/linear call from the segment name,
   * `dp:f` found by TAG rather than by column position,
   * a segment with no `dp:f` writing an empty field, and
-  * a name matching neither shape exiting 65 instead of being routed.
+  * a name matching neither shape exiting 65 instead of being routed,
+  * and a GFA where NO segment carries `dp:f` failing rather than storing a
+    depth-less run.
+
+The GFA fixtures reproduce the layout probed on the pinned build (hamtv0.3.5),
+whose `p_ctg.gfa` writes one S-line per contig as
+
+    S  s0.ctg000001c  <seq>  LN:i:60000  dp:f:98  ts:B:I,0
 
 Both the awk program and the two name patterns are extracted from the shipped
 `assemble.sh` rather than copied, so neither can drift from what the container
-runs while these tests go on passing.
+runs while these tests pass.
+
+One caveat: these run the HOST awk, not the image's gawk. They pin the program's
+logic, not a difference between awk implementations.
 """
 
 from __future__ import annotations
@@ -163,3 +173,23 @@ def test_a_bare_trailing_c_is_not_treated_as_circular(tmp_path: Path) -> None:
     result, _ = _run(tmp_path, "S\ts0.scaffold_arc\tACGT\tdp:f:9\n")
     assert result.returncode == 65, result.stderr
     assert "s0.scaffold_arc" in result.stderr
+
+
+def test_a_gfa_with_no_dp_tag_anywhere_fails_rather_than_storing_no_depth(
+    tmp_path: Path,
+) -> None:
+    """Every segment of the probed build carries `dp:f`, so none carrying it
+    means the tag moved — not that this assembly had no coverage to report.
+
+    Left fail-open, `depth` would be NULL for every contig of every hifiasm run
+    and read downstream as "not recorded", which is the same silent all-NULL
+    outcome `myloasm_split.py` refuses for its own depth field. The case above
+    covers ONE tag-less segment among tagged ones, which must still succeed.
+    """
+    result, _ = _run(
+        tmp_path,
+        "S\ts0.ctg000001c\tACGT\tLN:i:200000\tts:B:I,0\n"
+        "S\ts1.utg000002l\tTTTT\tLN:i:5000\tts:B:I,1\n",
+    )
+    assert result.returncode == 65, result.stderr
+    assert "dp:f" in result.stderr

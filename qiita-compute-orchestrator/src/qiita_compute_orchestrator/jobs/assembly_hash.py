@@ -137,7 +137,8 @@ _READ_ID_EXPR = (
 class Inputs(BaseModel):
     """Typed input contract for assembly_hash.
 
-    `genomes_dir` (holds `circular.fa` + `noLCG.fa`) and `refined_bins_dir` (MAG bins)
+    `genomes_dir` (holds `circular.fa` + `noLCG.fa`, plus the
+    attribute sidecar this job does not read) and `refined_bins_dir` (MAG bins)
     are the upstream container steps' outputs. `prep_sample_idx` / `work_ticket_idx` are
     framework-injected scope scalars, declared for an explicit contract: nothing this
     step writes is keyed on either, and sequences are run-agnostic, so it needs no

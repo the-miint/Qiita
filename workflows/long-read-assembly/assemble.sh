@@ -1,6 +1,6 @@
 #!/bin/bash
 # Assemble masked HiFi reads, then split circular genomes (LCG) from the linear
-# contigs (noLCG). Two outputs. `genomes_dir` =
+# contigs (noLCG). One output. `genomes_dir` =
 # $QIITA_OUTPUT_PATH/genomes:
 #   circular.fa   every circular contig, ANY size, as one multi-FASTA (ingested as
 #                 LCG; the >=512 kb "large complete genome" cut is a query-time
@@ -8,6 +8,10 @@
 #                 native assembly_hash step reads this with read_fastx, so there is
 #                 no per-contig split and bin_id is the contig id from the record.
 #   noLCG.fa      the non-circular contigs (input to binning + bin_refine)
+#   contig_attributes.tsv
+#                 one row per contig across both FASTAs — the assembler's own
+#                 per-contig report, joined onto qiita.assembly_membership by
+#                 both writers. Not read by any container step.
 # Zero contigs is left as an empty genomes_dir; downstream steps skip cleanly and
 # assembly_hash turns the all-empty result into StepNoData.
 #
@@ -114,9 +118,9 @@ mkdir -p "${OUT}" "${ASM_DIR}"
 # existence; a zero-row COPY still writes its file), so there is no pre-creation
 # step to keep in sync.
 #
-# The attribute sidecar beside them is on the other side of that rule: it is
-# created only where there is an assembly to describe, and its absence is how
-# both readers detect a run with no attributes (see
+# The attribute sidecar is written under that same guard, so it is present
+# whenever the two FASTAs are. Its ABSENCE therefore means a run assembled before
+# it existed, which is what both readers key on (see
 # qiita_common.assembly_constants.register_contig_attribute_table).
 case "${ASSEMBLER}" in
     hifiasm_meta)
@@ -150,12 +154,19 @@ case "${ASSEMBLER}" in
             CIRC_RE='tg[0-9]+c$'
             LIN_RE='tg[0-9]+l$'
 
-            # S-line -> one attribute row. `dp:f` is hifiasm_meta's depth tag,
-            # searched for by tag among fields 4+ rather than by position, since
-            # tag order is not part of the GFA contract. A segment with no `dp:f`
-            # writes an empty field, which the readers store as NULL. `mult` is
-            # empty for every row — hifiasm_meta has no counterpart to myloasm's
-            # k-mer multiplicity.
+            # S-line -> one attribute row. Probed against the pinned build
+            # (hamtv0.3.5) on a 60 kb synthetic replicon: `p_ctg.gfa` carries one
+            # S-line per contig as
+            #     S  s0.ctg000001c  <seq>  LN:i:60000  dp:f:98  ts:B:I,0
+            # with the circular/linear call in the name's trailing letter and the
+            # depth in `dp:f`. The control was the same generator with wrap-around
+            # removed, which produced `s0.ctg000001l` — so the suffix tracks
+            # topology rather than being incidental, and both classes carry the
+            # tag. `dp:f` is searched for BY TAG among fields 4+ rather than by
+            # position: it sits at $5 in that layout, but GFA does not fix tag
+            # order and reading $5 would silently store `ts:B:I`'s value the day
+            # it moves. `mult` is empty for every row — hifiasm_meta has no
+            # counterpart to myloasm's k-mer multiplicity.
             awk -v attrs="${OUT}/contig_attributes.tsv" -v circ="${CIRC_RE}" -v lin="${LIN_RE}" '
                 BEGIN { OFS = "\t"; print "contig_id", "raw_name", "circularity", "depth", "mult" > attrs }
                 $1 != "S" { next }
@@ -169,12 +180,24 @@ case "${ASSEMBLER}" in
                     }
                     dp = ""
                     for (i = 4; i <= NF; i++) { if ($i ~ /^dp:f:/) { dp = substr($i, 6) } }
+                    if (dp != "") { with_dp++ }
+                    seen++
                     print $2, $2, call, dp, "" > attrs
                 }
                 END {
                     if (bad) {
                         printf "assemble: %d GFA segment name(s) match neither the circular (tg<N>c) nor the linear (tg<N>l) shape, e.g.%s\n", bad, names > "/dev/stderr"
                         printf "          re-probe hifiasm_meta name grammar against the version pinned in assemble.def\n" > "/dev/stderr"
+                        exit 65
+                    }
+                    # Every segment of the probed build carries dp:f, so NONE
+                    # carrying it means the tag moved, not that this assembly had
+                    # no coverage to report. Fail rather than store a depth-less
+                    # run that reads downstream as "not recorded" — the same
+                    # fail-closed rule myloasm_split.py applies to its own depth.
+                    if (seen && !with_dp) {
+                        printf "assemble: none of %d GFA segment(s) carried a dp:f tag\n", seen > "/dev/stderr"
+                        printf "          re-probe hifiasm_meta depth tag against the version pinned in assemble.def\n" > "/dev/stderr"
                         exit 65
                     }
                 }' "${GFA}"

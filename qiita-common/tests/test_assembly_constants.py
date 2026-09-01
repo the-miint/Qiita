@@ -102,3 +102,31 @@ def test_a_repeated_contig_id_is_rejected(tmp_path):
     duplicated row in the DuckLake twin, which has no primary key to refuse it."""
     with pytest.raises(ValueError, match="repeats"):
         _read(tmp_path, f"{_HEADER}\ns1\tA\tyes\t1\t1\ns1\tB\tno\t2\t2\n")
+
+
+def test_duckdb_would_not_have_caught_the_reordered_header(tmp_path):
+    """The control for the rejection above: without the manual check, DuckDB
+    reads a permuted header without complaint.
+
+    `columns=` binds by position, so `raw_name` takes the circularity call and
+    `circularity` takes the name — five plausible values, every one misfiled,
+    landing in nullable columns nothing downstream cross-checks. This asserts the
+    guard is load-bearing rather than defensive: if a later DuckDB validated the
+    header itself, this test fails and the check can go.
+    """
+    path = tmp_path / "swapped.tsv"
+    path.write_text("contig_id\tcircularity\traw_name\tdepth\tmult\ns1\tyes\trawA\t29\t1.5\n")
+    types = ", ".join(
+        f"'{name}': '{'DOUBLE' if name in ('depth', 'mult') else 'VARCHAR'}'"
+        for name in CONTIG_ATTRIBUTE_COLUMNS
+    )
+    row = (
+        duckdb.connect(":memory:")
+        .execute(
+            f"SELECT * FROM read_csv(?, delim='\t', header=true, columns={{{types}}})",
+            [str(path)],
+        )
+        .fetchone()
+    )
+    # raw_name holds 'yes' and circularity holds 'rawA' — transposed, no error.
+    assert row == ("s1", "yes", "rawA", 29.0, 1.5)

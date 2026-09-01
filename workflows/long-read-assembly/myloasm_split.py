@@ -120,7 +120,9 @@ _CIRC_FIELD = "_circular-"
 _NUM = r"[0-9]+(?:\.[0-9]+)?"
 _DEPTH_RE = rf"_depth-({_NUM})-({_NUM})-({_NUM})_"
 # `mult=<f>` is written AFTER the space, so it is read_fastx's `comment`, never
-# part of `read_id` — verified against the extension.
+# part of `read_id` — verified against the extension. Anchored to the WHOLE
+# comment: every header in the 0.6.0 probe set ends at `mult=<f>`, so a trailing
+# field would be new grammar rather than something to skip past.
 _MULT_RE = rf"^mult=({_NUM})$"
 # myloasm reports `mult` as 0.00 below this length -- `kmer_multiplicity` returns
 # early, read off myloasm's source rather than probed, because every contig in the

@@ -16,7 +16,8 @@ From: mambaorg/micromamba:1.5.8
 #
 # Pinned invariant, and the two assemblers DISAGREE on it:
 #   hifiasm_meta  circularity is the trailing `[lc]` letter of the GFA segment
-#                 name (`…tg……c` = circular, `…l` = linear)
+#                 name (`…tg……c` = circular, `…l` = linear), probed on this
+#                 pinned build; depth is the S-line's `dp:f` tag
 #   myloasm       circularity is a field in the assembly_primary.fa HEADER
 #                 (`_circular-yes`); its GFA carries no such marker
 # assemble.sh branches per assembler for exactly this reason. Each arm normalizes
@@ -130,11 +131,11 @@ From: mambaorg/micromamba:1.5.8
     micromamba env list | grep -q myloasm
     # Both internal version strings. A solve that moved either fails the BUILD
     # rather than silently changing what the default assembler's circularity call
-    # means. Matched as substrings over both streams, unlike myloasm's whole-line
-    # assert below: which stream hifiasm_meta writes `--version` to, and whether
-    # the two versions share a line, were not probed — pinning the digits does the
-    # work here, and pinning a layout that was never observed would fail the build
-    # for the wrong reason.
+    # means. `2>&1` is load-bearing, not defensive: probed on the pinned solve,
+    # `hifiasm_meta --version` writes BOTH lines to stderr and nothing to stdout
+    #     ha base version: 0.13-r308
+    #     hamt version: 0.3-r079
+    # so a stdout-only pipeline greps an empty stream and fails every build.
     micromamba run -n hifiasm_meta hifiasm_meta --version 2>&1 | grep -Fq "0.13-r308"
     micromamba run -n hifiasm_meta hifiasm_meta --version 2>&1 | grep -Fq "0.3-r079"
     # myloasm's VERSION is asserted, not merely its presence. myloasm_split.py

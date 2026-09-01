@@ -82,7 +82,7 @@ steps:
       walltime: PT10M
 
   # hifiasm_meta / myloasm assembly + circular-genome extraction. Reads run_config.json to
-  # pick the assembler; emits genomes_dir/{circular.fa, noLCG.fa}. 0 contigs is a
+  # pick the assembler; emits genomes_dir/{circular.fa, noLCG.fa, contig_attributes.tsv}. 0 contigs is a
   # terminal no-data outcome inside the container.
   #
   # The step also leaves the assembler's whole output tree under

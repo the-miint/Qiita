@@ -1548,6 +1548,12 @@ async def write_assembly_membership(
     ]:
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
+    # The DIRECTORY must exist even though the sidecar inside it need not: an
+    # absent sidecar means "assembled before it existed" and stores NULLs, so
+    # without this a mis-bound genomes_dir would take that path silently and
+    # write a run's worth of NULL attributes with no signal.
+    if not genomes_dir.is_dir():
+        raise FileNotFoundError(f"genomes_dir not found: {genomes_dir}")
 
     total_written = 0
     async with pool.acquire() as conn:

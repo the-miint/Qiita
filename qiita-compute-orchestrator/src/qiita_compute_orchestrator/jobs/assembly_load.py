@@ -134,6 +134,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     ]:
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
+    # Checked as a directory, unlike the sidecar inside it: an absent sidecar is
+    # a run that predates it and stores NULLs, so a mis-bound genomes_dir would
+    # otherwise be indistinguishable from that and silently null a whole run.
+    if not inputs.genomes_dir.is_dir():
+        raise FileNotFoundError(f"genomes_dir not found: {inputs.genomes_dir}")
 
     workspace.mkdir(parents=True, exist_ok=True)
     staging = workspace / "assembly_staging"
