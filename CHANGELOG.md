@@ -2892,6 +2892,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **The binners are measured to preserve both assemblers' contig id shapes, so the attribute
+  join's caveat is dropped (#519).** `qiita.assembly_membership`'s four attribute columns reach a
+  MAG row through a LEFT JOIN on `contig_id`, whose left side comes from the refined bin FASTA —
+  sound only if the binners write the assembler's header through unchanged. That was measured for
+  hifiasm_meta and unmeasured for myloasm, whose ids have a different shape (`u<N>ctg`, no dot).
+  Measured now for both: a run carrying myloasm-shaped ids beside hifiasm-shaped ones as an in-run
+  control, through the deployed SIFs, returned every id verbatim from metabat2, maxbin2, concoct
+  and DAS_Tool, with no record renamed at any stage and every refined id present in the input.
+  The caveat comes off `assembly_hash`'s docstring and off the `raw_name` and `circularity` column
+  comments (a new migration — the one that shipped them is merged). One assembly and one binner
+  configuration, so this establishes that these tools preserve both shapes, not that a future
+  version must.
+
 - **`hifiasm_meta` is pinned, and an unrecognised GFA segment name now fails the `assemble`
   step (#517).** The pin is `hamtv0.3.5`, with both of the binary's internal version strings
   asserted at build time, matching how myloasm is pinned — unpinned, every rebuild re-resolved
