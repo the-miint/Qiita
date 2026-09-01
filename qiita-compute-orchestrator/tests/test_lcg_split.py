@@ -149,8 +149,9 @@ def test_one_contig_is_one_genome_not_one_directory(tmp_path, staged_miint) -> N
         (">dup\nACGT\n>dup\nTTTT\n", "duplicate contig id"),
         (">has/slash\nACGT\n", "cannot be used as a filename stem"),
         (">-leading-dash\nACGT\n", "cannot be used as a filename stem"),
+        (f">{'x' * 253}\nACGT\n", "cannot be used as a filename stem"),
     ],
-    ids=["duplicate-id", "path-separator", "leading-dash"],
+    ids=["duplicate-id", "path-separator", "leading-dash", "over-name-max"],
 )
 def test_an_unusable_id_stops_the_step(tmp_path, staged_miint, fasta, expected) -> None:
     """Rejected, never sanitized or overwritten.

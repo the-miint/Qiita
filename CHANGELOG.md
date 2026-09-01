@@ -2912,8 +2912,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
-- **The unbinned residue no longer rolls up to a genome, so a de novo feature table reports
-  assembled genomes rather than single fragments.** `ASSEMBLY_GENOME_MAP_PAIRS_SQL` — the row
+- **The unbinned residue is no longer admitted to the de novo genome map, so a feature table
+  reports assembled genomes rather than single fragments.** `ASSEMBLY_GENOME_MAP_PAIRS_SQL` — the row
   set shared verbatim by the REST contig→genome map and the cohort Parquet
   `estimate-feature-table` reads — is now an allowlist, `kind IN ('MAG', 'LCG')`. An unbinned
   contig is what no refined bin claimed, and for that kind `bin_id` is the contig id, so the
@@ -2925,6 +2925,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   queryable in `qiita.assembly_membership`. An allowlist rather than `<> 'UNBINNED'` because
   `assembly_constants` states the kind set is meant to extend without a migration, so a denylist
   would admit a future kind into every de novo feature table by default.
+  The MINT is deliberately unchanged: `write_assembly_membership` still mints a `qiita.genome`
+  per `(prep_sample_idx, processing_idx, kind, bin_id)`, UNBINNED included, so those genome rows
+  exist and are simply not admitted here — store broadly, filter at the read. They are inert off
+  the map because the assembly path records its edge on `assembly_membership.genome_idx` and
+  never on `qiita.feature_genome`, so an assembly genome cannot reach the reference graph or the
+  global `reference_exclusion` blocklist that expands through that junction.
   `count_assembly_membership_without_genome`, the completeness guard a caller refuses on, takes
   the same filter so an unminted UNBINNED row cannot refuse a cohort over a gap the map never
   reads. No stored result changes: the de novo arm has never run on the deploy host, whose

@@ -64,6 +64,12 @@ PROG = "lcg_split"
 # well inside it (`s0.ctg000001c`, `u713ctg`).
 _SAFE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
+# Longest id that can still become `<id>.fa` under the 255-byte NAME_MAX both
+# Linux and macOS enforce. Bounded here so an over-long id is REJECTED with the
+# message below, like every other unusable one, rather than surfacing mid-loop as a
+# raw ENAMETOOLONG from DuckDB with some files already written.
+_MAX_ID_LENGTH = 255 - len(".fa")
+
 
 def _load(con, src: str) -> None:
     """Parse `circular.fa` once into a temp table keyed on the read_fastx record id.
@@ -89,13 +95,18 @@ def _validate(con) -> list[str]:
         row[0]
         for row in con.execute("SELECT contig_id FROM contig ORDER BY 1").fetchall()
     ]
-    bad = [cid for cid in ids if not _SAFE_ID_RE.match(cid)][:3]
+    bad = [
+        cid
+        for cid in ids
+        if not _SAFE_ID_RE.match(cid) or len(cid.encode()) > _MAX_ID_LENGTH
+    ][:3]
     if bad:
         die(
             PROG,
             f"contig id(s) cannot be used as a filename stem: {bad}. CheckM keys its "
             "output on the stem and assembly_load joins that to "
-            "assembly_membership.bin_id, so the id is written verbatim or not at all",
+            "assembly_membership.bin_id, so the id is written verbatim or not at all; "
+            f"it must match {_SAFE_ID_RE.pattern} and be at most {_MAX_ID_LENGTH} bytes",
         )
     return ids
 

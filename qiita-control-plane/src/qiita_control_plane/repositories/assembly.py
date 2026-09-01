@@ -444,6 +444,14 @@ async def fetch_assembly_sample_states(
 # kind set is meant to extend without a migration, so a denylist would admit a kind
 # nobody had considered here into every de novo feature table. A new kind has to be
 # added to this tuple to reach the map.
+#
+# The MINT is deliberately NOT filtered to match. `write_assembly_membership` still
+# mints a qiita.genome per (prep_sample_idx, processing_idx, kind, bin_id), UNBINNED
+# included, so those genome rows exist and simply are not admitted here — store
+# broadly, filter at the read. They are inert off the map because the assembly path
+# records its edge on `assembly_membership.genome_idx` and never on
+# `qiita.feature_genome`, so an assembly genome cannot reach the reference graph or
+# the global reference_exclusion blocklist that expands through that junction.
 _ASSEMBLY_GENOME_MAP_FROM = " FROM qiita.assembly_membership am"
 _GENOME_MAP_KINDS = (KIND_MAG, KIND_LCG)
 _ASSEMBLY_GENOME_MAP_KIND = (
