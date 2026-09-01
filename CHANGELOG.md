@@ -1476,6 +1476,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Two `library.py` docstrings pointed at a comment that does not carry the argument they cite
+  (#519).** Both `upsert_genomes` and `upsert_genome_associations` said that the reference and
+  assembly genome junctions "must stay apart" and referred the reader to
+  `assembly_membership.genome_idx`'s column comment for why. That comment states the mint's scope
+  and what a NULL means, and explicitly defers the completeness point to the table's comment, but
+  it never states the junction argument — nor does the table comment. The only place that does is
+  `test_assembly_genome_mint`, whose module docstring gives the reason (an assembly edge in
+  `qiita.feature_genome` would put sample-derived genomes inside every reference map sharing a
+  contig, and inside the reach of the global `reference_exclusion` blocklist that expands through
+  that junction) and whose `test_a_shared_contig_never_reaches_the_reference_graph` pins it. Both
+  pointers now name that, matching the third one added beside the de novo genome map's kind
+  filter.
+
 - **`assemble` kept only the two FASTAs it published and deleted the rest of the
   assembler's output (#516).** The step ran each assembler into a `mktemp -d` it removed
   on EXIT, read one file back out (`assembly_primary.fa` for myloasm, `asm.p_ctg.gfa` for
