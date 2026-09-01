@@ -43,7 +43,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   alone; what an older row cannot recover is the `possibly`/`no` split among the contigs
   that went to binning. `ensure_assembly_tables` widens an existing DuckLake
   `assembly_membership` with `ADD COLUMN IF NOT EXISTS` on data-plane start, since
-  `ducklake_add_data_files` rejects a Parquet carrying a column its target lacks. The
+  `ducklake_add_data_files` rejects a Parquet whose columns differ from its target's in
+  either direction. The
   attribute half of the membership join (the representative-contig aggregate, the four-column
   projection, the LEFT JOIN) is shared by both writers rather than written twice. Both writers
   read the sidecar through one shared reader, which declares the two numeric columns rather

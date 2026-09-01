@@ -121,9 +121,13 @@ _None yet._
   plane's next start.** (#517) `ensure_assembly_tables` runs `ALTER TABLE … ADD COLUMN IF NOT
   EXISTS` on every DP boot, so the existing lake table widens itself — no operator step.
   Without it `ducklake_add_data_files` would reject every membership Parquet the new
-  `assembly_load` writes, since the file would carry columns the table lacks. The normal
-  restart ordering covers this; it only matters if the DP is left on the old binary while
-  assembly tickets run.
+  `assembly_load` writes, since the file would carry columns the table lacks. It refuses the
+  other direction too (probed: a Parquet MISSING a column the table has is rejected with
+  `Set allow_missing => true`), so a ticket whose `assembly_load` ran on the pre-deploy
+  orchestrator and registers after the DP restart fails its register-files step. Both skews
+  are narrow — the deploy restarts the DP and the CO together — and a failed register-files
+  is a retryable step, not lost data: re-running the ticket's tail after the deploy writes a
+  nine-column file. Nothing to do in advance; this is here so the failure is recognisable.
 
 ---
 
