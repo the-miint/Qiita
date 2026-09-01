@@ -44,8 +44,9 @@ for binner in concoct maxbin2 metabat2; do
         echo "bin_refine: ${binner}'s contig2bin table holds row(s) that are neither a" >&2
         echo "            numbered bin nor a known catch-all — contig2bin_filter.awk" >&2
         echo "            lists both shapes. First few, distinct:" >&2
-        # awk, not `sort -u | head`: head closing the pipe would SIGPIPE sort, and
-        # under pipefail that aborts the script before the exit below.
+        # First five distinct rejected rows. One awk, not a `sort -u | head`
+        # pipeline: under the `pipefail` _lib.sh sets, a SIGPIPEd `sort` can abort
+        # the script before the exit below.
         awk '!seen[$0]++ && ++n <= 5' "${rejects}" >&2
         echo "            Either Fasta_to_Contig2Bin.sh's columns or the binner's output" >&2
         echo "            naming has moved; both decide which contigs DAS_Tool scores." >&2

@@ -90,12 +90,10 @@ From: mambaorg/micromamba:1.5.8
     grep -q 'python3 /opt/qiita/manifest_writer\.py' /opt/qiita/_lib.sh
     # Guard the entrypoint stays wired to its env.
     grep -q 'micromamba run -n dastool DAS_Tool' /opt/qiita/bin_refine.sh
-    # The row filter is what keeps a binner's unbinned catch-all from reaching
-    # DAS_Tool as a candidate bin, and what reads the bin id out of the column
-    # Fasta_to_Contig2Bin.sh actually writes it in. It is %files-copied, so it can
-    # go missing independently of the entrypoint that runs it, and it is awk, so a
-    # syntax error surfaces only when it runs. Execute it: one numbered bin
-    # through, one catch-all dropped, nothing rejected.
+    # The row filter (contig2bin_filter.awk carries what it keeps and why) is
+    # %files-copied, so it can go missing independently of the entrypoint that runs
+    # it, and it is awk, so a syntax error surfaces only when it runs. Execute it:
+    # one numbered bin through, one catch-all dropped, nothing rejected.
     grep -q 'contig2bin_filter\.awk' /opt/qiita/bin_refine.sh
     printf 'c1\tbin.1\nc2\tunbinned\n' \
         | awk -v rejects="${HOME}/rejects" -f /opt/qiita/contig2bin_filter.awk > "${HOME}/kept"

@@ -4,30 +4,32 @@ Why this exists
 ---------------
 `bin_refine.sh` hands DAS_Tool one contig->bin table per binner, built by piping
 `Fasta_to_Contig2Bin.sh` through `contig2bin_filter.awk`. Two things about that
-table decide what the consensus can select, and both were wrong:
-
-* The bin id was read from `$4` of a table that has two columns, so every
-  metabat2 row carried the empty string as its bin id. DAS_Tool saw one unnamed
-  bin holding the whole assembly and scored it out — across 60 production runs it
-  selected 6,023 MaxBin and 201 CONCOCT bins and 0 MetaBAT, while every ticket
-  paid metabat2's compute.
-* Each binner's catch-all file (the contigs it did NOT place) was passed on as a
-  candidate bin. On the measured run concoct's held 3,326 of 4,910 contigs.
+table decide what the consensus can select, and both were wrong: the bin id was
+read from a column the table does not have, so every metabat2 row named the empty
+bin; and each binner's catch-all file — the contigs it did NOT place — was passed
+on as a candidate bin. `contig2bin_filter.awk`'s header carries the measurements.
 
 Neither is visible in a green run: the first shows up as a binner that quietly
 contributes nothing, the second as a candidate DAS_Tool happens to reject. So the
-filter is pinned by EXECUTION here — the tests below run the real awk program the
-image ships, not a transcription of it.
+filter is pinned by EXECUTION here, against the program the image ships.
 
-Fixtures use the shapes measured on the deploy host against the shipped
-`long-read-assembly-dastool-1.0.0.sif`: real bins are `bin.<N>` in all three
-binners' dirs; metabat2's catch-alls are `bin.unbinned` / `bin.tooShort` /
-`bin.lowDepth`, concoct's is `unbinned`, maxbin2 has none.
+One caveat, the same one `test_assemble_hifiasm_awk.py` carries: these run the HOST
+awk. The image's is gawk — `/opt/conda/bin/awk` is a symlink to `gawk` and
+`/opt/conda/bin` leads `PATH`, read off the shipped
+`long-read-assembly-dastool-1.0.0.sif` — and the program's output was compared
+byte-for-byte across gawk, mawk, busybox awk, BWK awk and macOS's BSD awk before
+these were written. What they pin is the program's logic, not that agreement.
+
+Fixtures use the shapes measured on the deploy host against that SIF: real bins are
+`bin.<N>` in all three binners' dirs, numbered from 0; metabat2's catch-alls are
+`bin.unbinned` / `bin.tooShort` / `bin.lowDepth`, concoct's is `unbinned`, maxbin2
+has none.
 """
 
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -43,6 +45,8 @@ _BIN_REFINE_ENV = _WORKFLOW_DIR / "sif-build.d" / "bin_refine.env"
 # The catch-all a binner writes for the contigs it did not place, by binner.
 _METABAT2_CATCH_ALLS = ("bin.unbinned", "bin.tooShort", "bin.lowDepth")
 _CONCOCT_CATCH_ALL = "unbinned"
+
+pytestmark = pytest.mark.skipif(shutil.which("awk") is None, reason="awk not available")
 
 
 def _run(rows: list[tuple[str, ...]], tmp_path: Path) -> tuple[list[str], list[str]]:
@@ -152,7 +156,10 @@ def test_the_filter_refuses_to_run_without_a_rejects_path(tmp_path: Path) -> Non
         text=True,
     )
 
-    assert proc.returncode != 0, proc.stdout
+    # The exact code, like the sibling `assemble.sh` awk test: `_lib.sh` uses 64 for
+    # a usage error, and pinning it separates this guard firing from awk dying for
+    # some other reason.
+    assert proc.returncode == 64, proc.stdout
     assert "rejects" in proc.stderr
 
 
@@ -213,3 +220,20 @@ def test_the_filter_ships_in_the_image_and_scopes_its_rebuild() -> None:
         f"contig2bin_filter.awk is missing from HASH_INPUTS ({hash_inputs.group(1)!r}); "
         "editing it would not rebuild the SIF."
     )
+
+
+def test_a_contig_id_holding_spaces_still_reaches_das_tool(tmp_path: Path) -> None:
+    """The separator is a tab, and the contig field is a whole FASTA header.
+
+    `Fasta_to_Contig2Bin.sh` is `grep ">" | perl -pe "s/\\n/\\t$binname\\n/g" |
+    perl -pe "s/>//g"` — read out of the shipped SIF — so it emits the entire header
+    line, not its first token. Under awk's default whitespace `FS` this row is five
+    fields, `NF == 2` fails, and a legitimate bin is rejected: the step dies with
+    exit 65 on data that is fine. Without this fixture nothing distinguishes the
+    shipped program from one carrying no `FS` at all — every other row here is
+    single-token, where whitespace and tab splitting agree.
+    """
+    kept, rejected = _run([("ctg2 length=500 depth=3.1", "bin.2")], tmp_path)
+
+    assert kept == ["ctg2 length=500 depth=3.1\tbin.2"]
+    assert rejected == []

@@ -109,16 +109,18 @@ _None yet._
   ```bash
   # The first ticket assembled AFTER this deploy whose bin_refine produced bins.
   T=<work_ticket_idx>
-  cut -f2 "${PATH_SCRATCH}/ticket/${T}"/bin_refine/attempt-*/output/refined_bins/das_tool_summary.tsv \
-      | tail -n +2 | sort | uniq -c
+  awk -F'\t' 'FNR==1{c=0; for(i=1;i<=NF;i++) if($i=="bin_set") c=i; next} c{print $c}' \
+      "${PATH_SCRATCH}/ticket/${T}"/bin_refine/attempt-*/output/refined_bins/das_tool_summary.tsv \
+      | sort | uniq -c
   ```
 
-  `bin_set` is column 2 of DAS_Tool's summary. Before this deploy that count could only read
-  MaxBin and CONCOCT: metabat2's contig→bin table reached DAS_Tool with every bin id blanked, so
-  no MetaBAT bin was selectable — 0 across 60 production runs. A MetaBAT line means the corrected
-  table landed. Its absence on one ticket is not a failed deploy — a sample can legitimately yield
-  no MetaBAT bin — so read it across the first few, and confirm the step exited 0 rather than 65,
-  the new refusal described in the notes below.
+  Keyed on the `bin_set` header rather than a column position, the way `assembly_load`
+  reads this same file, and re-read per file (`FNR==1`) so a retried ticket's second
+  `attempt-*` does not leak its header row into the counts. A `MetaBAT` line means the
+  corrected contig→bin table landed; the note below says what that count could read
+  before. Its absence on one ticket is not a failed deploy — a sample can legitimately
+  yield no MetaBAT bin — so read it across the first few, and confirm the step exited 0
+  rather than 65, the new refusal described in that note.
 
 ### 6. After the deploy verifies green
 
