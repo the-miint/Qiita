@@ -259,7 +259,13 @@ def _load(con: duckdb.DuckDBPyConnection, src: str) -> None:
 
 
 def _validate(con: duckdb.DuckDBPyConnection) -> None:
-    """Reject a header shape we have not probed, and duplicate contig ids.
+    """Reject a header shape we have not probed, a run with no depth anywhere, and
+    duplicate contig ids -- in that ORDER.
+
+    The order is load-bearing for the tests: a fixture missing a `_depth-` field
+    trips the depth guard before reaching the duplicate check, so each case in
+    `test_malformed_input_fails_loud` asserts which guard fired rather than that
+    one did.
 
     Fail-closed on purpose. An unrecognised header does not error on its own — it
     simply carries no circularity we recognise, so a lenient split would exit 0
