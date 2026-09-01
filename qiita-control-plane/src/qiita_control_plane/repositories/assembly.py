@@ -19,6 +19,7 @@ Its contract lives on `fetch_assembly_sample_state` below.
 
 import asyncpg
 from qiita_common.api_paths import URL_PROCESSING_SAMPLE_STATUS
+from qiita_common.assembly_constants import KIND_LCG, KIND_MAG
 from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import AssemblySampleState
 
@@ -427,9 +428,39 @@ async def fetch_assembly_sample_states(
 # `count_assembly_membership_without_genome` exists beside it: a NULL is a run whose
 # memberships predate the genome mint, and silently dropping those contigs would
 # give their genomes a short denominator rather than an error.
+#
+# `_ASSEMBLY_GENOME_MAP_KIND` is the other filter, and it is a design decision
+# rather than a completeness one. An UNBINNED contig is what no refined bin claimed,
+# and for that kind `bin_id` is the contig id itself, so the genome mint gives every
+# residue contig a genome of its own: on the deploy host, 820,094 of the 1,002,979
+# membership rows, five single-fragment genomes for every assembled one. Off the map,
+# their alignments no longer roll up to a reported genome. They are NOT removed from
+# the alignment itself — the assembly DoGet scopes on (prep_sample_idx,
+# processing_idx) with no kind predicate, so those contigs are still streamed and
+# still aligned against — and they stay queryable in qiita.assembly_membership.
+# checkm.sh declines to SCORE them for the matching reason.
+#
+# An ALLOWLIST, not `<> UNBINNED`: `qiita_common.assembly_constants` states that the
+# kind set is meant to extend without a migration, so a denylist would admit a kind
+# nobody had considered here into every de novo feature table. A new kind has to be
+# added to this tuple to reach the map.
+#
+# The mint is not filtered to match: `write_assembly_membership` still mints a
+# qiita.genome per (prep_sample_idx, processing_idx, kind, bin_id), UNBINNED included,
+# so those rows exist and are simply not admitted here — store broadly, filter at the
+# read. They are inert off the map: the assembly path records its edge on
+# `assembly_membership.genome_idx`, never on `qiita.feature_genome`, so an assembly
+# genome stays outside the reference graph and the global reference_exclusion
+# blocklist that expands through that junction —
+# `test_a_shared_contig_never_reaches_the_reference_graph` pins it.
 _ASSEMBLY_GENOME_MAP_FROM = " FROM qiita.assembly_membership am"
+_ASSEMBLY_GENOME_MAP_KINDS = (KIND_MAG, KIND_LCG)
+_ASSEMBLY_GENOME_MAP_KIND = (
+    " AND am.kind IN (" + ", ".join(f"'{k}'" for k in _ASSEMBLY_GENOME_MAP_KINDS) + ")"
+)
 _ASSEMBLY_GENOME_MAP_WHERE = (
-    " WHERE am.prep_sample_idx = ANY($1) AND am.processing_idx = $2 AND am.genome_idx IS NOT NULL"
+    " WHERE am.prep_sample_idx = ANY($1) AND am.processing_idx = $2"
+    " AND am.genome_idx IS NOT NULL" + _ASSEMBLY_GENOME_MAP_KIND
 )
 ASSEMBLY_GENOME_MAP_PAIRS_SQL = _ASSEMBLY_GENOME_MAP_FROM + _ASSEMBLY_GENOME_MAP_WHERE
 
@@ -504,11 +535,18 @@ async def count_assembly_membership_without_genome(
     Cohort-shaped like the two reads above, so a caller checking a whole cohort
     makes one round trip and its refusal can name every offender rather than the
     first.
+
+    Filtered to the same kinds the map admits, so it counts only rows the map would
+    otherwise have used. Counting an UNBINNED row here would refuse a cohort over a
+    gap that cannot reach the table.
     """
     rows = await db.fetch(
-        "SELECT prep_sample_idx, count(*) AS n FROM qiita.assembly_membership"
-        " WHERE prep_sample_idx = ANY($1) AND processing_idx = $2 AND genome_idx IS NULL"
-        " GROUP BY prep_sample_idx ORDER BY prep_sample_idx",
+        "SELECT am.prep_sample_idx, count(*) AS n"
+        + _ASSEMBLY_GENOME_MAP_FROM
+        + " WHERE am.prep_sample_idx = ANY($1) AND am.processing_idx = $2"
+        " AND am.genome_idx IS NULL"
+        + _ASSEMBLY_GENOME_MAP_KIND
+        + " GROUP BY am.prep_sample_idx ORDER BY am.prep_sample_idx",
         prep_sample_idx,
         processing_idx,
     )

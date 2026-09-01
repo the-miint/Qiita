@@ -164,8 +164,9 @@ def _strip_comment(line: str) -> str:
         (_ASSEMBLE_SH, "OUT", {LCG_FILE, NOLCG_FILE, CONTIG_ATTRIBUTES_FILE}),
         (_BINNING_SH, "GENOMES_DIR", {NOLCG_FILE}),
         (_BIN_REFINE_SH, "GENOMES_DIR", {NOLCG_FILE}),
+        (_CHECKM_SH, "GENOMES_DIR", {LCG_FILE}),
     ],
-    ids=["assemble", "binning", "bin_refine"],
+    ids=["assemble", "binning", "bin_refine", "checkm"],
 )
 def test_genomes_dir_basenames_match_the_python_constants(
     path: Path, dir_var: str, expected: set[str]
@@ -173,17 +174,18 @@ def test_genomes_dir_basenames_match_the_python_constants(
     """The genomes_dir basenames are spelled the same in the shell and in Python.
 
     `assemble.sh` writes both files into its output genomes_dir; `binning.sh` and
-    `bin_refine.sh` read noLCG back out of the one they are handed. The native jobs
-    reach the same files through `_assembly.LCG_FILE` / `NOLCG_FILE`, and nothing
-    joins the two spellings at runtime. `assembly_hash._file_meta` looks genomes_dir
-    up by exact name, not by glob, so renaming one side alone drops the circular and
-    unbinned contigs from the run with no error; a sample with no refined bin either
-    becomes the terminal StepNoData "no contigs to hash", discarded with no retry.
+    `bin_refine.sh` read noLCG back out of the one they are handed, and `checkm.sh`
+    reads circular.fa out of it. The native jobs reach the same files through
+    `_assembly.LCG_FILE` / `NOLCG_FILE`, and nothing joins the two spellings at
+    runtime. `assembly_hash._file_meta` looks genomes_dir up by exact name, not by
+    glob, so renaming one side alone drops the circular and unbinned contigs from the
+    run with no error; a sample with no refined bin either becomes the terminal
+    StepNoData "no contigs to hash", discarded with no retry.
 
     Set equality, not membership: a new file under genomes_dir has to be added here
     and given a constant, rather than reaching the native jobs unnamed. `dir_var` is
     per script because `${OUT}` is genomes_dir only in `assemble.sh` -- in the other
-    two it is the bins output.
+    three it names the dir each is handed.
     """
     code = "\n".join(_code_lines(path))
     found = set(re.findall(rf"\$\{{{dir_var}\}}/([^\s\"']+)", code))
@@ -733,4 +735,31 @@ def test_image_pins_are_asserted_at_build_time() -> None:
             f"asserts that version, so a solve that drifted would build and ship "
             f"green. Add it to the PINNED map there (keyed by the binary the "
             f"package provides -- metabat2's is jgi_summarize_bam_contig_depths)."
+        )
+
+
+def test_bin_refine_initializes_its_binner_arrays_by_assignment() -> None:
+    """A bare `declare -a` leaves the array UNSET, which `set -u` refuses.
+
+    `bin_refine.sh` collects one contig2bin table per binner and then reads
+    `${#das_bins[@]}` to decide whether any binner contributed. Declared without an
+    assignment, that array is unset rather than empty, so the read aborts the step
+    on the exact input the check exists to pass cleanly. That entrypoint's comment
+    at the declaration carries the bash versions it was measured on and why the
+    failure cannot be reproduced by running the script on a mac.
+
+    Asserted on the spelling for that same reason. What has to be an assignment is
+    the first NON-COMMENT line naming each array — `_code_lines` drops the comment
+    above the declaration, which names them both — rather than a `declare` line
+    specifically, so dropping `declare` for a bare `das_bins=()` stays green while
+    deleting the initialization outright does not (the first hit becomes the `+=`).
+    """
+    code = _code_lines(_BIN_REFINE_SH)
+
+    for name in ("das_bins", "das_labels"):
+        first = next((line for line in code if name in line), None)
+        assert first is not None, f"bin_refine.sh no longer mentions {name}"
+        assert re.search(rf"\b{name}=\(", first), (
+            f"{name} is introduced without an assignment: {first!r}. "
+            f"`${{#{name}[@]}}` then trips set -u instead of reading 0."
         )

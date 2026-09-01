@@ -71,30 +71,22 @@ scan below reads both files whole, and the DELETE that follows it removes every
 UNBINNED row whose `sequence_hash` also appears under KIND_MAG.
 
 The match key for THIS exclusion is `canonical_sequence_hash_expr`'s hash, not the
-contig id. That a bin FASTA carries the assembler's contig ids through is measured
-for hifiasm_meta -- one deploy-host assembly put all 3810 contigs of its 98 refined
-bins back in the assembler's own output, verbatim, through metabat2/maxbin2/concoct
-and DAS_Tool -- and unmeasured for myloasm, whose ids have a different shape. So the
-match keys on the bytes that are actually stored. The hash's strand folding carries
-into the exclusion: a bin holding a contig on the opposite strand still excludes
-its noLCG record.
+contig id, so it holds whatever the bin FASTA calls a record. The hash's strand
+folding carries into the exclusion: a bin holding a contig on the opposite strand
+still excludes its noLCG record.
 
-`contig_id` is a join key elsewhere, which is why that measurement matters beyond
-this scan: both writers of `qiita.assembly_membership` LEFT JOIN the assemble
-step's attribute sidecar on it. An LCG or UNBINNED row's `contig_id` comes
-straight off the published FASTA the sidecar was written from, so those match by
-construction. A MAG row's comes from the REFINED BIN FASTA, so it matches only
-where the binners carried the header through.
-
-What the unmeasured half costs, concretely, is a myloasm `circular-possibly`
-contig. Only `circular-yes` bypasses binning (`myloasm_split.py`), so `possibly`
-goes to noLCG, and if a refined bin then claims it the DELETE below drops its
-UNBINNED row — leaving the MAG row as the contig's only row. That row carries the
-`possibly` call solely where the binners kept the id. Where they did not, the
-call is not one of two rows gone NULL; it is the whole record of it, and such a
-row's NULLs are indistinguishable from a run assembled before the sidecar
-existed. hifiasm_meta emits no `possibly` and is the arm whose passthrough was
-measured, so this rests entirely on the arm that was not.
+`contig_id` is a join key elsewhere: both writers of `qiita.assembly_membership`
+LEFT JOIN the assemble step's attribute sidecar on it. An LCG or UNBINNED row's
+`contig_id` comes straight off the published FASTA the sidecar was written from,
+so those match by construction. A MAG row's comes from the REFINED BIN FASTA, so
+it matches only where the binners carried the header through — measured, for both
+id shapes the two assemblers produce. On a deploy-host assembly all 3810 contigs
+of its 98 refined bins were present verbatim in the assembler's own output; and a
+run carrying myloasm-shaped ids (`u<N>ctg`) beside hifiasm-shaped ones as an
+in-run control returned both verbatim through metabat2, maxbin2, concoct and
+DAS_Tool, with no record renamed at any stage. One assembly and one binner
+configuration each, so this says these tools preserve both shapes, not that a
+future version must.
 
 Two consequences of keying on content. Hash-equal noLCG records share a fate: a
 bin claiming either drops both. And the exclusion set is the KIND_MAG rows alone —

@@ -657,8 +657,9 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// `assembly_membership` records which features a prep_sample's assembly contains
 /// and in which bin — the DuckLake copy of `qiita.assembly_membership`, for bulk
 /// joins against the sequences.
-/// `bin_quality` is per-MAG CheckM, joined to its contigs via assembly_membership
-/// on (prep_sample_idx, kind, bin_id).
+/// `bin_quality` is per-genome CheckM — one row per refined bin and per circular
+/// genome, never for the unbinned residue. The DDL below carries its join key and
+/// column provenance.
 ///
 /// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
 /// (the CP mints feature_idx/dedups on sequence_hash, the orchestrator verifies
@@ -720,7 +721,10 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             mult DOUBLE
         );
 
-        -- Per-MAG CheckM quality. Joins to its contigs via assembly_membership on
+        -- Per-genome CheckM quality: one row per refined bin (kind MAG) and per
+        -- circular genome (kind LCG), from the two runs checkm.sh scores separately.
+        -- The unbinned residue is stored in assembly_membership but never scored, so
+        -- it has no row here. Joins to its contigs via assembly_membership on
         -- (prep_sample_idx, processing_idx, kind, bin_id). completeness /
         -- contamination / strain_heterogeneity + marker_lineage from `checkm
         -- lineage_wf --tab_table`; genome_size / n_contigs from `checkm qa -o 2`;

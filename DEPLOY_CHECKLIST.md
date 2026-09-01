@@ -86,6 +86,42 @@ _None yet._
   is what is printed: a body-only check reads the same whether the route answered or the token
   expired.
 
+- **Check the circular genomes (LCGs — large circular genomes, the contigs that bypass binning)
+  came back scored.** (#519)
+
+  ```bash
+  # A ticket whose assemble step produced a non-empty circular.fa.
+  T=<work_ticket_idx>
+  ls "${PATH_SCRATCH}/ticket/${T}"/checkm/attempt-*/output/checkm/
+  ```
+
+  Four files — `lineage.tsv`, `qa.tsv`, `lcg_lineage.tsv`, `lcg_qa.tsv` — means both CheckM runs
+  landed. The LCG arm cannot fail silently — `checkm.sh` runs under `set -euo pipefail`, so an
+  `lcg_split` failure aborts the step before it publishes anything and the TICKET fails. So only
+  the first pair, on a FAILED attempt whose ticket had circular contigs, is the shape to read:
+  check that step log for `lcg_split`, which exits 64 with the reason on stderr. A missing or
+  mislocated `${PATH_DERIVED}/duckdb-ext` is the failure this step gained (see the note below).
+  A ticket with an empty `circular.fa` legitimately writes only the first pair, so pick the
+  ticket before reading the result.
+
+- **Check DAS_Tool now selects MetaBAT bins.** (#519)
+
+  ```bash
+  # The first ticket assembled AFTER this deploy whose bin_refine produced bins.
+  T=<work_ticket_idx>
+  awk -F'\t' 'FNR==1{c=0; for(i=1;i<=NF;i++) if($i=="bin_set") c=i; next} c{print $c}' \
+      "${PATH_SCRATCH}/ticket/${T}"/bin_refine/attempt-*/output/refined_bins/das_tool_summary.tsv \
+      | sort | uniq -c
+  ```
+
+  Keyed on the `bin_set` header rather than a column position, the way `assembly_load`
+  reads this same file, and re-read per file (`FNR==1`) so a retried ticket's second
+  `attempt-*` does not leak its header row into the counts. A `MetaBAT` line means the
+  corrected contig→bin table landed; the note below says what that count could read
+  before. Its absence on one ticket is not a failed deploy — a sample can legitimately
+  yield no MetaBAT bin — so read it across the first few, and confirm the step exited 0
+  rather than 65, the new refusal described in that note.
+
 ### 6. After the deploy verifies green
 
 _None yet._
@@ -129,6 +165,39 @@ _None yet._
   are narrow — the deploy restarts the DP and the CO together — and a failed register-files
   is a retryable step, not lost data: re-running the ticket's tail after the deploy writes a
   nine-column file. Nothing to do in advance; this is here so the failure is recognisable.
+
+- **The `checkm` step now binds the deploy-staged miint extension, and its SIF rebuilds.** (#519)
+  `checkm.sh` splits `circular.fa` into per-contig FASTAs with miint's `read_fastx` /
+  `COPY … FORMAT FASTA`, so the step gained `derived_inputs: MIINT_EXTENSION_DIRECTORY:
+  duckdb-ext` — resolved against `PATH_DERIVED` exactly as the `assemble` step's already is. The
+  bind is **unconditional**: the backend emits it for every `derived_inputs` entry, so a missing
+  or mislocated `${PATH_DERIVED}/duckdb-ext` fails apptainer for the whole step, not just the LCG
+  arm, including for a sample with no circular contig. Nothing new to stage — it is the same
+  directory the assemble step already requires — but this is a second step that now depends on
+  it. The image also rebuilds (`checkm.sh`, `lcg_split.py` and `miint_connect.py` are in its
+  `HASH_INPUTS`) and gains `python-duckdb`, pinned in lockstep with the orchestrator's resolved
+  DuckDB, so expect a slower-than-usual verify for this image too.
+
+- **`bin_quality` gains LCG rows; nothing existing changes.** (#519) The table now carries one row
+  per circular genome beside the per-refined-bin rows, tagged by `kind`. Rows written by earlier
+  deploys are untouched and are not backfilled — the values come from a CheckM run that did not
+  happen, so an assembly stored before this deploy keeps MAG rows only. Re-running the workflow
+  for a sample is what produces its LCG rows. The unbinned residue is still never scored.
+
+- **The `bin_refine` SIF rebuilds, and MAG composition changes for assemblies run after this
+  deploy.** (#519) `bin_refine.sh` and the new `contig2bin_filter.awk` are both in the image's
+  `HASH_INPUTS`, so the dastool image rebuilds. The behaviour change is in what DAS_Tool is asked
+  to score: metabat2's contig→bin table reached it with every bin id blanked (the id was read from
+  a column the table does not have), so no MetaBAT bin was ever selectable — 0 across 60 production
+  runs — while each binner's unbinned catch-all WAS offered as a candidate bin. The two are fixed
+  together, because correcting the column alone would newly offer metabat2's three catch-alls as
+  MetaBAT bins. Re-measured end to end on 150k masked reads from a production ticket, same input
+  and same images: 20 bins → 21, MetaBAT 0 → 4, mean redundancy 3.8 → 1.9. Stored assemblies are
+  neither re-run nor backfilled — they keep the bins they were produced with, and comparing a MAG
+  set from before this deploy with one from after compares two different consensus inputs. New
+  failure mode: a contig2bin row that is neither a numbered bin (`bin.<N>`) nor a known binner
+  catch-all exits the step **65** with the offending rows on stderr rather than guessing which it
+  is; that is what a metaWRAP output-naming change would look like.
 
 ---
 

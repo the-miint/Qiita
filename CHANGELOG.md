@@ -21,6 +21,32 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **CheckM now scores the circular genomes too, so completeness and contamination cover every
+  kind the workflow stores except the residue it deliberately does not score.** `checkm.sh`
+  splits the assemble step's `circular.fa` into one FASTA per contig (miint `read_fastx` +
+  `COPY … FORMAT FASTA`, in the new `lcg_split.py`) and runs `lineage_wf` + `qa -o 2` over them
+  in a SECOND CheckM run, publishing `lcg_lineage.tsv` / `lcg_qa.tsv` beside the refined-bin
+  pair. `assembly_load` reads both pairs and tags each row with the kind of the run it came
+  from, so `bin_quality` now holds LCG rows beside MAG rows. Two runs rather than one merged
+  directory because CheckM reports only a `"Bin Id"` — the filename stem — so merged, a row's
+  `kind` would have to be recovered by prefixing every stem and parsing the prefix back off
+  before the row could join `assembly_membership.bin_id`; scored apart, the file a row came
+  from IS its kind and every stem reaches the lake unmodified. An LCG bypasses binning
+  entirely, so before this the class most likely to be a complete genome was the only one
+  stored with no quality at all. UNBINNED is still not scored: an unbinned contig is what no
+  refined bin claimed, so a completeness figure against a marker set describes nothing. The
+  step's `baseline_resources` are unchanged and now fitted rather than assumed — across 59
+  completed `checkm` steps on the deploy host the elapsed averaged 27.5 min and peaked at
+  58.9 min against a PT4H cap, and the second run scores a comparable genome set (~104 refined
+  bins beside ~98 circular contigs per ticket), so a doubled peak still sits under half the
+  cap. The `checkm` step gains `genomes_dir` as an input and the deploy-staged miint extension
+  as a `derived_inputs` bind; `checkm.def` gains `python-duckdb`, pinned in lockstep with the
+  orchestrator's resolved DuckDB for the reason `assemble.def` states. CheckM keying its
+  `"Bin Id"` on the stem with only the final extension removed is measured, not assumed: on the
+  deploy host `CONCOCT_bin.13_sub.fa` came back as `CONCOCT_bin.13_sub`, which is what lets a
+  dotted hifiasm contig id (`s0.ctg000001c`) round-trip as its own `bin_id`. An id that cannot
+  be a filename stem stops the step rather than being sanitized into one that joins nothing (#519).
+
 - **The assembler's per-contig report is stored, so circularity can become a query-time
   predicate instead of a routing decision baked into the entrypoint (#517).** Both arms of
   `assemble.sh` now emit a `contig_attributes.tsv` beside the two published FASTAs, carrying
@@ -43,23 +69,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   on stderr. One real metagenome assembled on the pinned build carried `dp:f` on all 2,899 of
   its contigs (depth 1–145), with every name matching the circular/linear grammar and none
   unmatched; that is one assembly of one input, and the grammar had until now been exercised
-  only against synthetic single-contig assemblies. `mult` is NULL
-  below 1 kb, where myloasm reports `0.00` for absence of signal rather than a measured zero.
-  Attributes are NULL for every row written before this deploy and are not backfilled here:
-  they are read out of the assemble step's output, which for an older run is gone. A MAG row
-  carries them only where the binners kept the assembler's contig header. Measured for
-  hifiasm_meta — one deploy-host assembly put all 3,810 contigs of its 98 refined bins back in
-  the assembler's own output verbatim, through metabat2/maxbin2/concoct and DAS_Tool — and
-  unmeasured for myloasm, whose contig ids have a different shape; LCG and UNBINNED rows match
-  by construction. That
-  unmeasured half has a specific cost, on the myloasm arm only: `circular-possibly` routes to
-  binning, so where a refined bin claims such a contig the residue subtraction drops its
-  UNBINNED row and the MAG row becomes the call's only record — which then depends on the
-  passthrough nobody has measured.
-  `kind` still
-  records the routing that was applied, so `circular-yes` stays recoverable from `kind`
-  alone; what an older row cannot recover is the `possibly`/`no` split among the contigs
-  that went to binning. `ensure_assembly_tables` widens an existing DuckLake
+  only against synthetic single-contig assemblies. `mult` is NULL below 1 kb, where myloasm
+  reports `0.00` for absence of signal rather than a measured zero. Attributes are NULL for every
+  row written before this deploy and are not backfilled here: they are read out of the assemble
+  step's output, which for an older run is gone. A MAG row reaches them through the binners,
+  which are measured to preserve both assemblers' contig id shapes (see the entry under
+  `Changed`), so the column comment states no condition; LCG and UNBINNED rows match by
+  construction. `kind` still records the routing that was applied, so `circular-yes` stays
+  recoverable from `kind` alone; what an older row cannot recover is the `possibly`/`no` split
+  among the contigs that went to binning. `ensure_assembly_tables` widens an existing DuckLake
   `assembly_membership` with `ADD COLUMN IF NOT EXISTS` on data-plane start, since
   `ducklake_add_data_files` rejects a Parquet whose columns differ from its target's in
   either direction. The
@@ -1457,6 +1475,53 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **`bin_refine` discarded every MetaBAT bin id, and offered each binner's unbinned catch-all as a
+  candidate bin (#519).** `Fasta_to_Contig2Bin.sh -e fa` writes two tab-separated fields,
+  `<contig>\t<filename minus ".fa">` — measured against the shipped
+  `long-read-assembly-dastool-1.0.0.sif` over all three binners' output: 4,910 concoct + 4,910
+  metabat2 + 2,930 maxbin2 rows, every one `NF == 2`. metabat2's table was projected
+  `{print $1,$4}`, so every row carried the empty string as its bin id and DAS_Tool saw one unnamed
+  bin holding the whole assembly. Across 60 production runs it selected 6,023 MaxBin and 201
+  CONCOCT bins and 0 MetaBAT, while every ticket paid metabat2's compute. Separately,
+  `bin_refine.sh` globbed `*.fa` and so passed on the file each binner writes for the contigs it
+  did NOT place — metabat2's `bin.unbinned.fa` / `bin.tooShort.fa` / `bin.lowDepth.fa`, concoct's
+  `unbinned.fa`; concoct's held 3,326 of 4,910 contigs on the measured run. The two interact: the
+  metabat2 catch-alls were unreachable only because the projection nulled that binner, so `$4` →
+  `$2` alone would newly offer three of them as MetaBAT bins. All three binners now take one path,
+  through a new `contig2bin_filter.awk` that keeps `bin.<N>` (metaWRAP's name for a real bin in
+  every binner's dir), drops the four catch-alls, and writes anything else to a rejects file the
+  step fails on. Measured on 150k masked reads from a production ticket, re-run through the shipped
+  binning and dastool images with only the table changed: 20 bins → 21, MetaBAT 0 → 4 (DAS_Tool
+  replaced 3 MaxBin bins with MetaBAT ones it scored higher, 19 → 16), mean redundancy 3.8 → 1.9,
+  bins at medium quality or better 18 → 21. Stored assemblies are unaffected — they were produced
+  without MetaBAT and stay that way unless re-run. `bin_refine.sh` was ported from qp-pacbio, which
+  carries the same projection at `5.DAS_Tools_prepare_batch3_test.sbatch:44`; the catch-all removal
+  sitting above it there was not ported.
+
+- **`bin_refine` aborted instead of succeeding empty when no binner contributed a table (#519).**
+  `bin_refine.sh` declared its two accumulator arrays with a bare `declare -a`, which leaves them
+  UNSET rather than empty, so the `${#das_bins[@]}` that decides whether any binner produced
+  something tripped the `set -u` from `_lib.sh`: `das_bins: unbound variable`, exit 1, on exactly
+  the input the check exists to pass cleanly as an LCG-only success. Measured on the image's own
+  base (`mambaorg/micromamba:1.5.8`, bash 5.2.15); macOS ships bash 3.2, where the bare form reads
+  0, which is why it never showed up on a dev laptop. Reached whenever no binner contributes — an
+  empty `bins_dir`, which `binning.sh` hands over as a normal outcome, and now also a binner whose
+  only files are its catch-alls, which the filter above drops. Found by running the entrypoint
+  under the base image with `Fasta_to_Contig2Bin.sh` and `DAS_Tool` stubbed out.
+
+- **Two `library.py` docstrings pointed at a comment that does not carry the argument they cite
+  (#519).** Both `upsert_genomes` and `upsert_genome_associations` said that the reference and
+  assembly genome junctions "must stay apart" and referred the reader to
+  `assembly_membership.genome_idx`'s column comment for why. That comment states the mint's scope
+  and what a NULL means, and explicitly defers the completeness point to the table's comment, but
+  it never states the junction argument — nor does the table comment. The only place that does is
+  `test_assembly_genome_mint`, whose module docstring gives the reason (an assembly edge in
+  `qiita.feature_genome` would put sample-derived genomes inside every reference map sharing a
+  contig, and inside the reach of the global `reference_exclusion` blocklist that expands through
+  that junction) and whose `test_a_shared_contig_never_reaches_the_reference_graph` pins it. Both
+  pointers now name that, matching the third one added beside the de novo genome map's kind
+  filter.
 
 - **`assemble` kept only the two FASTAs it published and deleted the rest of the
   assembler's output (#516).** The step ran each assembler into a `mktemp -d` it removed
@@ -2891,6 +2956,44 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **The unbinned residue is no longer admitted to the de novo genome map, so a feature table
+  reports assembled genomes rather than single fragments.** `ASSEMBLY_GENOME_MAP_PAIRS_SQL` — the row
+  set shared verbatim by the REST contig→genome map and the cohort Parquet
+  `estimate-feature-table` reads — is now an allowlist, `kind IN ('MAG', 'LCG')`. An unbinned
+  contig is what no refined bin claimed, and for that kind `bin_id` is the contig id, so the
+  genome mint gives each one a genome of a single fragment: on the deploy host that is 820,094 of
+  the 1,002,979 membership rows, five single-fragment genomes for every assembled one. Those
+  contigs are NOT removed from the alignment — the assembly DoGet scopes on `(prep_sample_idx,
+  processing_idx)` with no `kind` predicate, so they are still streamed and still aligned against;
+  what changes is that their alignments no longer roll up to a reported genome. They stay
+  queryable in `qiita.assembly_membership`. An allowlist rather than `<> 'UNBINNED'` because
+  `assembly_constants` states the kind set is meant to extend without a migration, so a denylist
+  would admit a future kind into every de novo feature table by default.
+  The mint is unchanged: `write_assembly_membership` still mints a `qiita.genome`
+  per `(prep_sample_idx, processing_idx, kind, bin_id)`, UNBINNED included, so those genome rows
+  exist and are simply not admitted here — store broadly, filter at the read. They are inert off
+  the map because the assembly path records its edge on `assembly_membership.genome_idx` and
+  never on `qiita.feature_genome`, so an assembly genome cannot reach the reference graph or the
+  global `reference_exclusion` blocklist that expands through that junction.
+  `count_assembly_membership_without_genome`, the completeness guard a caller refuses on, takes
+  the same filter so an unminted UNBINNED row cannot refuse a cohort over a gap the map never
+  reads. No stored result changes: the de novo arm has never run on the deploy host, whose
+  `assembly_membership` has no `genome_idx` column yet (last applied migration
+  `20260827010000`) (#519).
+
+- **The binners are measured to preserve both assemblers' contig id shapes, so the attribute
+  join's caveat is dropped (#519).** `qiita.assembly_membership`'s four attribute columns reach a
+  MAG row through a LEFT JOIN on `contig_id`, whose left side comes from the refined bin FASTA —
+  sound only if the binners write the assembler's header through unchanged. That was measured for
+  hifiasm_meta and unmeasured for myloasm, whose ids have a different shape (`u<N>ctg`, no dot).
+  Measured now for both: a run carrying myloasm-shaped ids beside hifiasm-shaped ones as an in-run
+  control, through the deployed SIFs, returned every id verbatim from metabat2, maxbin2, concoct
+  and DAS_Tool, with no record renamed at any stage and every refined id present in the input.
+  The caveat comes off `assembly_hash`'s docstring and off the `raw_name` and `circularity` column
+  comments (a new migration — the one that shipped them is merged). One assembly and one binner
+  configuration, so this establishes that these tools preserve both shapes, not that a future
+  version must.
 
 - **`hifiasm_meta` is pinned, and an unrecognised GFA segment name now fails the `assemble`
   step (#517).** The pin is `hamtv0.3.5`, with both of the binary's internal version strings

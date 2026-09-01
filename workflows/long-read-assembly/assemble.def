@@ -42,6 +42,10 @@ From: mambaorg/micromamba:1.5.8
     # own file (not inlined in assemble.sh) so the unit test can execute the real
     # program against real myloasm headers.
     myloasm_split.py /opt/qiita/myloasm_split.py
+    # The staged-miint connection the splitter imports. Its own module because
+    # checkm.def copies the same file for lcg_split.py, and the connect config has
+    # to stay identical to what the three services run.
+    miint_connect.py /opt/qiita/miint_connect.py
 
 %environment
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -179,12 +183,15 @@ From: mambaorg/micromamba:1.5.8
     # and would also write a `__pycache__` into the read-only image filesystem
     # this %test runs against.
     test -s /opt/qiita/myloasm_split.py
+    test -s /opt/qiita/miint_connect.py
     python3 -c "import importlib.util as u; s=u.spec_from_file_location('ms','/opt/qiita/myloasm_split.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
-    # It must stay LOAD-only: an INSTALL would need the team mirror reachable from
-    # every compute node and a writable $HOME, the footgun the staged dir replaced.
-    # Anchored at a string-literal quote so the splitter's own prose explaining why
-    # it does NOT install cannot fail the build.
-    ! grep -qE "[\"']\s*INSTALL\b" /opt/qiita/myloasm_split.py
+    # The connect module must stay LOAD-only: an INSTALL would need the team mirror
+    # reachable from every compute node and a writable $HOME, the footgun the staged
+    # dir replaced. Both files, because the LOAD lives in miint_connect.py and the
+    # splitter must not open a connection of its own beside it.
+    # Anchored at a string-literal quote so the prose explaining why we do NOT
+    # install cannot fail the build.
+    ! grep -qE "[\"']\s*INSTALL\b" /opt/qiita/miint_connect.py /opt/qiita/myloasm_split.py
 
 %runscript
     echo "long-read-assembly-assemble image: invoke the step entrypoint, e.g." >&2

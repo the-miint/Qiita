@@ -194,8 +194,8 @@ async def upsert_genomes(
     `write_assembly_membership` — because the dedupe below is subtle and having it
     twice is how the two would drift. What is NOT shared is where the resulting
     edge is written: the reference load writes `qiita.feature_genome`, the assembly
-    path writes `assembly_membership.genome_idx`, and those two must stay apart (see
-    that column's comment).
+    path writes `assembly_membership.genome_idx`, and those two must stay apart —
+    `test_assembly_genome_mint` states why and pins it.
     """
     if not sources:
         return []
@@ -243,8 +243,8 @@ async def _write_genome_associations(
 
     **The reference-load path, and the only writer of qiita.feature_genome.** The
     assembly path mints genomes through the same `upsert_genomes` but records its
-    edge on `assembly_membership.genome_idx` instead; that column's comment says
-    why the two cannot share this junction.
+    edge on `assembly_membership.genome_idx` instead. Why the two cannot share this
+    junction is stated and pinned in `test_assembly_genome_mint`.
     """
     if not feat_idxs:
         return
@@ -1275,9 +1275,13 @@ async def export_assembly_member_genome(
 
     The row set is `ASSEMBLY_GENOME_MAP_PAIRS_SQL`, shared verbatim with the REST map
     the client-side recipe reads, so the two drivers cannot disagree about which
-    contigs have a genome. An empty result still writes a valid three-column Parquet
-    — a cohort whose samples all assembled nothing is a legitimate combined table
-    that degrades to the reference arm.
+    contigs have a genome. That row set admits MAG and LCG rows only, so a contig can
+    be absent from this map and present in `qiita.assembly_membership`.
+
+    An empty result still writes a valid three-column Parquet, and it now has two
+    causes rather than one: a cohort that assembled nothing, and a cohort whose
+    contigs are all UNBINNED (no circular contig, and no refined bin clearing
+    DAS_Tool's threshold — a legitimate success). Both degrade to the reference arm.
     """
     schema = pa.schema(
         [
