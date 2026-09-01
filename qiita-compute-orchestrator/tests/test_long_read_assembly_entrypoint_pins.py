@@ -748,9 +748,11 @@ def test_bin_refine_initializes_its_binner_arrays_by_assignment() -> None:
     at the declaration carries the bash versions it was measured on and why the
     failure cannot be reproduced by running the script on a mac.
 
-    Asserted on the spelling for that same reason. The first mention of each array
-    has to be its assignment, rather than the `declare` line specifically, so
-    dropping `declare` for a bare `das_bins=()` stays green.
+    Asserted on the spelling for that same reason. What has to be an assignment is
+    the first NON-COMMENT line naming each array — `_code_lines` drops the comment
+    above the declaration, which names them both — rather than a `declare` line
+    specifically, so dropping `declare` for a bare `das_bins=()` stays green while
+    deleting the initialization outright does not (the first hit becomes the `+=`).
     """
     code = _code_lines(_BIN_REFINE_SH)
 

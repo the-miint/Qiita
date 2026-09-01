@@ -47,23 +47,30 @@ _METABAT2_CATCH_ALLS = ("bin.unbinned", "bin.tooShort", "bin.lowDepth")
 _CONCOCT_CATCH_ALL = "unbinned"
 
 
-def _run(rows: list[tuple[str, ...]], tmp_path: Path) -> tuple[list[str], list[str]]:
-    """Run the shipped filter over `rows`; return (kept lines, rejected lines).
+def _awk(args: list[str], stdin: str) -> subprocess.CompletedProcess[str]:
+    """Run the shipped filter under the host awk.
 
-    The skip lives here rather than on the module, so the shape pins over
-    bin_refine.sh / .def / .env still run where no awk is installed.
+    EVERY awk invocation in this module goes through here, so the one skip covers
+    them all and the shape pins over bin_refine.sh / .def / .env — which run no awk
+    — still run on a host without one. A test shelling out directly would carry no
+    guard, which is what this exists to prevent.
     """
     if shutil.which("awk") is None:
         pytest.skip("awk not available")
-    stdin = "".join("\t".join(row) + "\n" for row in rows)
-    rejects = tmp_path / "rejects"
-    proc = subprocess.run(
-        ["awk", "-v", f"rejects={rejects}", "-f", str(_FILTER_AWK)],
+    return subprocess.run(
+        ["awk", *args, "-f", str(_FILTER_AWK)],
         input=stdin,
         capture_output=True,
         text=True,
-        check=True,
     )
+
+
+def _run(rows: list[tuple[str, ...]], tmp_path: Path) -> tuple[list[str], list[str]]:
+    """Run the filter over `rows`; return (kept lines, rejected lines)."""
+    stdin = "".join("\t".join(row) + "\n" for row in rows)
+    rejects = tmp_path / "rejects"
+    proc = _awk(["-v", f"rejects={rejects}"], stdin)
+    proc.check_returncode()
     rejected = rejects.read_text().splitlines() if rejects.exists() else []
     return proc.stdout.splitlines(), rejected
 
@@ -150,15 +157,10 @@ def test_a_mixed_table_keeps_only_the_bins(tmp_path: Path) -> None:
     assert rejected == []
 
 
-def test_the_filter_refuses_to_run_without_a_rejects_path(tmp_path: Path) -> None:
+def test_the_filter_refuses_to_run_without_a_rejects_path() -> None:
     """Without it a rejected row would be silently discarded — the failure mode
     the rejects file exists to end."""
-    proc = subprocess.run(
-        ["awk", "-f", str(_FILTER_AWK)],
-        input="c1\tbin.weird\n",
-        capture_output=True,
-        text=True,
-    )
+    proc = _awk([], "c1\tbin.weird\n")
 
     # The exact code, like the sibling `assemble.sh` awk test: `_lib.sh` uses 64 for
     # a usage error, and pinning it separates this guard firing from awk dying for
@@ -167,7 +169,7 @@ def test_the_filter_refuses_to_run_without_a_rejects_path(tmp_path: Path) -> Non
     assert "rejects" in proc.stderr
 
 
-def test_every_binner_goes_through_the_filter(tmp_path: Path) -> None:
+def test_every_binner_goes_through_the_filter() -> None:
     """One `Fasta_to_Contig2Bin.sh` call, piped into the filter, for all three.
 
     The per-binner branch is what let metabat2 carry a projection nobody
@@ -204,7 +206,7 @@ def test_bin_refine_fails_the_step_on_a_rejected_row() -> None:
 
     assert guard is not None, "bin_refine.sh no longer guards on the rejects file"
     # The exact code, not just non-zero: DEPLOY_CHECKLIST tells the operator to read
-    # 65 as this refusal, and the awk header names it as well.
+    # 65 as this refusal.
     assert re.search(r"^\s*exit 65\b", guard.group(1), re.MULTILINE), (
         f"the rejects guard does not exit 65: {guard.group(1)!r}"
     )
