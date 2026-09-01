@@ -72,9 +72,12 @@ UNBINNED row whose `sequence_hash` also appears under KIND_MAG.
 
 The match key for THIS exclusion is `canonical_sequence_hash_expr`'s hash, not the
 contig id. That a bin FASTA carries the assembler's contig ids through is measured
-for hifiasm_meta and unmeasured for myloasm, so the match keys on the bytes that
-are actually stored. The hash's strand folding carries into the exclusion: a bin
-holding a contig on the opposite strand still excludes its noLCG record.
+for hifiasm_meta -- one deploy-host assembly put all 3810 contigs of its 98 refined
+bins back in the assembler's own output, verbatim, through metabat2/maxbin2/concoct
+and DAS_Tool -- and unmeasured for myloasm, whose ids have a different shape. So the
+match keys on the bytes that are actually stored. The hash's strand folding carries
+into the exclusion: a bin holding a contig on the opposite strand still excludes
+its noLCG record.
 
 `contig_id` is a join key elsewhere, which is why that measurement matters beyond
 this scan: both writers of `qiita.assembly_membership` LEFT JOIN the assemble

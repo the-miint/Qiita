@@ -47,8 +47,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   below 1 kb, where myloasm reports `0.00` for absence of signal rather than a measured zero.
   Attributes are NULL for every row written before this deploy and are not backfilled here:
   they are read out of the assemble step's output, which for an older run is gone. A MAG row
-  carries them only where the binners kept the assembler's contig header, which is measured
-  for hifiasm_meta and unmeasured for myloasm; LCG and UNBINNED rows match by construction. That
+  carries them only where the binners kept the assembler's contig header. Measured for
+  hifiasm_meta — one deploy-host assembly put all 3,810 contigs of its 98 refined bins back in
+  the assembler's own output verbatim, through metabat2/maxbin2/concoct and DAS_Tool — and
+  unmeasured for myloasm, whose contig ids have a different shape; LCG and UNBINNED rows match
+  by construction. That
   unmeasured half has a specific cost, on the myloasm arm only: `circular-possibly` routes to
   binning, so where a refined bin claims such a contig the residue subtraction drops its
   UNBINNED row and the MAG row becomes the call's only record — which then depends on the
