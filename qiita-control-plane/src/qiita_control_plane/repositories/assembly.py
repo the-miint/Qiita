@@ -19,7 +19,7 @@ Its contract lives on `fetch_assembly_sample_state` below.
 
 import asyncpg
 from qiita_common.api_paths import URL_PROCESSING_SAMPLE_STATUS
-from qiita_common.assembly_constants import KIND_UNBINNED
+from qiita_common.assembly_constants import KIND_LCG, KIND_MAG
 from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import AssemblySampleState
 
@@ -430,15 +430,25 @@ async def fetch_assembly_sample_states(
 # give their genomes a short denominator rather than an error.
 #
 # `_ASSEMBLY_GENOME_MAP_KIND` is the other filter, and it is a design decision
-# rather than a completeness one: an UNBINNED contig is what no refined bin claimed,
+# rather than a completeness one. An UNBINNED contig is what no refined bin claimed,
 # and for that kind `bin_id` is the contig id itself, so the genome mint gives every
-# residue contig a genome of its own. On the deploy host that is 820,094 of the
-# 1,002,979 membership rows — a map carrying them describes five fragments for every
-# assembled genome, and a table built over it aligns against them. They stay in
-# qiita.assembly_membership and are queryable there; they are not alignment subjects.
-# checkm.sh declines to score them for the matching reason.
+# residue contig a genome of its own: on the deploy host, 820,094 of the 1,002,979
+# membership rows, five single-fragment genomes for every assembled one. Off the map,
+# their alignments no longer roll up to a reported genome. They are NOT removed from
+# the alignment itself — the assembly DoGet scopes on (prep_sample_idx,
+# processing_idx) with no kind predicate, so those contigs are still streamed and
+# still aligned against — and they stay queryable in qiita.assembly_membership.
+# checkm.sh declines to SCORE them for the matching reason.
+#
+# An ALLOWLIST, not `<> UNBINNED`: `qiita_common.assembly_constants` states that the
+# kind set is meant to extend without a migration, so a denylist would admit a kind
+# nobody had considered here into every de novo feature table. A new kind has to be
+# added to this tuple to reach the map.
 _ASSEMBLY_GENOME_MAP_FROM = " FROM qiita.assembly_membership am"
-_ASSEMBLY_GENOME_MAP_KIND = f" AND am.kind <> '{KIND_UNBINNED}'"
+_GENOME_MAP_KINDS = (KIND_MAG, KIND_LCG)
+_ASSEMBLY_GENOME_MAP_KIND = (
+    " AND am.kind IN (" + ", ".join(f"'{k}'" for k in _GENOME_MAP_KINDS) + ")"
+)
 _ASSEMBLY_GENOME_MAP_WHERE = (
     " WHERE am.prep_sample_idx = ANY($1) AND am.processing_idx = $2"
     " AND am.genome_idx IS NOT NULL" + _ASSEMBLY_GENOME_MAP_KIND

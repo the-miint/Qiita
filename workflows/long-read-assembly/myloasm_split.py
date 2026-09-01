@@ -94,7 +94,13 @@ import duckdb
 # insert is for assemble.def's %test, which loads this module by spec and does not.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from miint_connect import connect, die, sql_path  # noqa: E402
+from miint_connect import (  # noqa: E402
+    connect,
+    die,
+    reject_duplicate_contig_ids,
+    require_non_empty_fasta,
+    sql_path,
+)
 
 PROG = "myloasm_split"
 
@@ -219,16 +225,10 @@ def _validate(con: duckdb.DuckDBPyConnection) -> None:
             "against the myloasm version pinned in assemble.def",
         )
 
-    # An LCG's bin_id IS its contig id (assembly_hash COALESCEs it from the
-    # record), so a duplicate id puts two distinct genomes under one
-    # `assembly_membership` subject downstream.
-    dupes = con.execute(
-        "SELECT contig_id, count(*) AS n FROM contig GROUP BY 1 HAVING n > 1 ORDER BY 1 LIMIT 5"
-    ).fetchall()
-    if dupes:
-        die(
-            PROG, f"duplicate contig id(s) after cutting the _len-… decoration: {dupes}"
-        )
+    # The ids checked here are the CUT form, so a duplicate can be produced by the
+    # truncation itself rather than by the assembler. The shared guard states the
+    # consequence.
+    reject_duplicate_contig_ids(PROG, con)
 
 
 def _write(con: duckdb.DuckDBPyConnection, out: str, *, circular: bool) -> int:
@@ -286,17 +286,7 @@ def main(argv: list[str]) -> int:
         )
     primary, circ_out, nolcg_out, attrs_out = argv[1], argv[2], argv[3], argv[4]
 
-    # `read_fastx` RAISES on a zero-record input ("Error Empty file: …") rather
-    # than returning no rows — the same trap `qiita_common.duckdb_miint`'s
-    # `is_empty_sequence_file` exists for on the native side. assemble.sh already
-    # skips this script when the primary FASTA is empty; this is the second gate,
-    # so a direct invocation gets our message instead of a DuckDB traceback.
-    try:
-        size = Path(primary).stat().st_size
-    except OSError as exc:
-        die(PROG, f"cannot stat {primary!r}: {exc}")
-    if size == 0:
-        die(PROG, f"{primary} is empty; read_fastx raises on a zero-record input")
+    require_non_empty_fasta(PROG, primary)
 
     src = sql_path(PROG, primary)
     con = connect(PROG, temp_subdir="duckdb-myloasm-split")

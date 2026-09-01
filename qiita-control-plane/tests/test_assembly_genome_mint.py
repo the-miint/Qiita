@@ -607,3 +607,34 @@ async def test_an_unminted_unbinned_row_does_not_refuse_the_cohort(postgres_pool
         ) == {prep: 1}
     finally:
         await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)
+
+
+async def test_a_kind_nobody_listed_does_not_reach_the_map(postgres_pool, tmp_path):
+    """The filter is an allowlist, so an unanticipated kind stays out.
+
+    `qiita_common.assembly_constants` states the kind set is meant to extend without
+    a migration — a 'plasmid'/'small_circular' kind is named there as intended — and
+    `kind` is plain TEXT with no CHECK, so a new producer can write one before anyone
+    revisits this query. Under `kind <> 'UNBINNED'` such a row would land in every de
+    novo feature table by default; this is the case that tells the two spellings
+    apart, since asserting MAG in and UNBINNED out passes under either.
+    """
+    principal_idx, prep, proc, ref, feats, paths = await _setup(
+        postgres_pool, tmp_path, label="agm-newkind"
+    )
+    try:
+        await lib.write_assembly_membership(postgres_pool, prep, proc, *paths)
+        await postgres_pool.execute(
+            "UPDATE qiita.assembly_membership SET kind = 'plasmid'"
+            " WHERE prep_sample_idx = $1 AND kind = $2",
+            prep,
+            KIND_UNBINNED,
+        )
+        rows = await fetch_assembly_genome_map(
+            postgres_pool, prep_sample_idx=prep, processing_idx=proc, limit=100
+        )
+        subjects = await _subjects(postgres_pool, prep)
+        assert ("plasmid", "c4") in subjects, "the fixture no longer carries a novel kind"
+        assert subjects[("plasmid", "c4")][0] not in {r["genome_idx"] for r in rows}
+    finally:
+        await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)

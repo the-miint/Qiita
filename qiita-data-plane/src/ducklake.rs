@@ -658,8 +658,8 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// and in which bin — the DuckLake copy of `qiita.assembly_membership`, for bulk
 /// joins against the sequences.
 /// `bin_quality` is per-genome CheckM — one row per refined bin and per circular
-/// genome, never for the unbinned residue — joined to its contigs via assembly_membership
-/// on (prep_sample_idx, kind, bin_id).
+/// genome, never for the unbinned residue. The DDL below carries its join key and
+/// column provenance.
 ///
 /// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
 /// (the CP mints feature_idx/dedups on sequence_hash, the orchestrator verifies

@@ -123,3 +123,37 @@ def connect(prog: str, *, temp_subdir: str) -> duckdb.DuckDBPyConnection:
             "between this image and the orchestrator that staged the extension.",
         )
     return con
+
+
+def require_non_empty_fasta(prog: str, path: str) -> None:
+    """Reject a zero-byte input before `read_fastx` sees it.
+
+    `read_fastx` RAISES on a zero-record input ("Error Empty file: …") rather than
+    returning no rows — the same trap `qiita_common.duckdb_miint`'s
+    `is_empty_sequence_file` exists for on the native side. Each entrypoint already
+    skips its splitter when the FASTA is empty; this is the second gate, so a direct
+    invocation gets the caller's message instead of a DuckDB traceback.
+    """
+    try:
+        size = Path(path).stat().st_size
+    except OSError as exc:
+        die(prog, f"cannot stat {path!r}: {exc}")
+    if size == 0:
+        die(prog, f"{path} is empty; read_fastx raises on a zero-record input")
+
+
+def reject_duplicate_contig_ids(prog: str, con: duckdb.DuckDBPyConnection) -> None:
+    """Raise if the TEMP TABLE `contig` repeats a `contig_id`.
+
+    Both splitters build that table and both are broken by a repeat, for reasons that
+    differ in mechanism and agree in consequence: two distinct genomes end up under
+    one `assembly_membership` subject, because an LCG's bin_id IS its contig id
+    (`assembly_hash` COALESCEs it from the read_fastx record). In the per-contig split
+    the second `COPY` also overwrites the first, so CheckM scores one genome where the
+    lake holds two memberships.
+    """
+    dupes = con.execute(
+        "SELECT contig_id, count(*) AS n FROM contig GROUP BY 1 HAVING n > 1 ORDER BY 1 LIMIT 5"
+    ).fetchall()
+    if dupes:
+        die(prog, f"duplicate contig id(s): {dupes}")

@@ -1,13 +1,10 @@
 -- migrate:up
 
--- The raw_name comment shipped with a caveat that a MAG row carries the attribute
--- columns only where the binners kept the assembler's contig header, because that
--- passthrough was measured for hifiasm_meta and unmeasured for myloasm. It has
--- since been measured for both id shapes: a run carrying myloasm-shaped ids
--- (u<N>ctg) beside hifiasm-shaped ones as an in-run control returned both verbatim
--- through metabat2, maxbin2, concoct and DAS_Tool, with no record renamed at any
--- stage. The condition is dropped rather than softened; assembly_hash's module
--- docstring carries the measurement and its scope.
+-- Drops the binner-passthrough condition from raw_name's comment. That condition
+-- narrowed the four attribute columns on a MAG row to the case where the binners kept
+-- the assembler's contig header; the passthrough is measured for both contig-id shapes
+-- the two assemblers produce, so it is dropped rather than softened. assembly_hash's
+-- module docstring carries the measurement and its scope.
 COMMENT ON COLUMN qiita.assembly_membership.raw_name IS
     'The assembler''s own record name, verbatim: for myloasm the FASTA header''s '
     'first token (NOT the whole line -- it writes mult= after a space, which the '

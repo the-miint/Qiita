@@ -292,9 +292,9 @@ def _write_bin_quality(
     `bin_quality` shape, built entirely in DuckDB from the container's RAW tool
     output (never a Python csv parser).
 
-    checkm.sh scores the two classes in SEPARATE CheckM runs and publishes a table
-    pair for each, so the FILE a row came from IS its `kind` — nothing parses a stem
-    or strips a prefix. Each pair is joined on the verbatim `"Bin Id"` column:
+    One table pair per class, so `kind` is which pair a row was in — the constants
+    above name the two and checkm.sh states why they are scored apart. Each pair is
+    joined on the verbatim `"Bin Id"` column:
     `lineage_wf` carries marker lineage + completeness/contamination/strain
     heterogeneity, `qa -o 2` adds genome size / # contigs. `bin_id` is that same
     `"Bin Id"`, which CheckM sets from the filename stem — a refined-bin FASTA's
@@ -307,9 +307,8 @@ def _write_bin_quality(
     and never sees a circular contig, so an LCG row's provenance columns are NULL
     rather than missing a join.
 
-    UNBINNED gets no row: checkm.sh scores neither, so there is nothing to read.
-    The residue is stored so it can be queried, not scored — a contig no bin claimed
-    is a fragment, and completeness against a marker set describes a genome.
+    UNBINNED gets no row: checkm.sh does not score the residue, so there is nothing
+    to read. The module docstring states why.
 
     Either class may be absent (a sample with no refined bin, or none circular), and
     with both absent — including the case where the CheckM DB was missing — this

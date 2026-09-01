@@ -167,7 +167,7 @@ steps:
     baseline_resources:
       cpu: 16
       mem_gb: 100
-      walltime: PT4H
+      walltime: PT8H
 
   # DAS_Tool consensus refinement over the three binners' output. "No bins >0.5"
   # → empty refined_bins_dir (exit 0); a real DAS_Tool crash fails the step.
@@ -214,12 +214,13 @@ steps:
       QIITA_CHECKM_DB: checkm_data
       MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [checkm_dir]
-    # Unchanged, and fitted rather than assumed: across 59 completed checkm steps on
-    # the deploy host the elapsed (submit -> terminal, so queue wait included)
-    # averaged 27.5 min and peaked at 58.9 min against this PT4H cap. The LCG arm
-    # adds a SECOND, sequential lineage_wf over a comparable genome set — ~104
-    # refined bins beside ~98 circular contigs per ticket — so a doubled peak still
-    # sits under half the cap.
+    # Unchanged, against a measurement. Across 59 completed checkm steps on the
+    # deploy host, submit -> terminal averaged 27.5 min and peaked at 58.9 min. That
+    # quantity INCLUDES queue wait, which a SLURM walltime cap does not count, so it
+    # bounds the run time from above rather than stating it. The LCG arm adds a
+    # second, sequential lineage_wf over a comparable genome set — ~104 refined bins
+    # beside ~98 circular contigs per ticket — so twice the observed peak is 118 min
+    # against a 240 min cap.
     #
     # cpu and mem_gb are unchanged because the runs are sequential: peak memory is one
     # run at a time, and one run scores about as many genomes as the step already did.

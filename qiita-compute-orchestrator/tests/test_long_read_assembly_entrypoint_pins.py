@@ -164,8 +164,9 @@ def _strip_comment(line: str) -> str:
         (_ASSEMBLE_SH, "OUT", {LCG_FILE, NOLCG_FILE, CONTIG_ATTRIBUTES_FILE}),
         (_BINNING_SH, "GENOMES_DIR", {NOLCG_FILE}),
         (_BIN_REFINE_SH, "GENOMES_DIR", {NOLCG_FILE}),
+        (_CHECKM_SH, "GENOMES_DIR", {LCG_FILE}),
     ],
-    ids=["assemble", "binning", "bin_refine"],
+    ids=["assemble", "binning", "bin_refine", "checkm"],
 )
 def test_genomes_dir_basenames_match_the_python_constants(
     path: Path, dir_var: str, expected: set[str]

@@ -61,6 +61,7 @@ _SPLIT_PY = _WORKFLOW_DIR / "myloasm_split.py"
 _MIINT_CONNECT_PY = _WORKFLOW_DIR / "miint_connect.py"
 _ASSEMBLE_SH = _WORKFLOW_DIR / "assemble.sh"
 _ASSEMBLE_DEF = _WORKFLOW_DIR / "assemble.def"
+_CHECKM_DEF = _WORKFLOW_DIR / "checkm.def"
 _ASSEMBLE_ENV = _WORKFLOW_DIR / "sif-build.d" / "assemble.env"
 _WORKFLOW_YAML = _WORKFLOW_DIR / "1.0.0.yaml"
 _CO_LOCK = _REPO_ROOT / "qiita-compute-orchestrator" / "uv.lock"
@@ -403,8 +404,15 @@ def test_splitter_uses_miint_and_never_installs() -> None:
     drift from what the three services run.
     """
     code = _SPLIT_PY.read_text()
-    assert "read_fastx" in code, "the splitter no longer reads with miint's read_fastx"
-    assert "FORMAT FASTA" in code, "the splitter no longer writes with miint's FASTA writer"
+    # Anchored at a CALL, not a mention: the splitter's own docstring names both
+    # symbols, so a bare substring search stays green on a hand-rolled parser whose
+    # prose still credits miint — the substitution these assertions exist to catch.
+    assert re.search(r"FROM read_fastx\(", code), (
+        "the splitter no longer reads with miint's read_fastx"
+    )
+    assert re.search(r"\(FORMAT FASTA\)\"", code), (
+        "the splitter no longer writes with miint's FASTA writer"
+    )
     assert "from miint_connect import" in code, (
         "the splitter no longer connects through miint_connect, so the staged-miint "
         "LOAD asserted below is not the connection it actually opens"
@@ -516,37 +524,41 @@ def test_image_pins_myloasm_and_asserts_the_pin_at_build_time() -> None:
     )
 
 
-def test_container_duckdb_matches_the_orchestrator_lock() -> None:
-    """The image's DuckDB equals the orchestrator's resolved DuckDB.
+@pytest.mark.parametrize("def_path", [_ASSEMBLE_DEF, _CHECKM_DEF], ids=["assemble", "checkm"])
+def test_container_duckdb_matches_the_orchestrator_lock(def_path: Path) -> None:
+    """Every image running a splitter has the DuckDB the orchestrator resolved.
 
-    This is a genuine lockstep, not tidiness. The split LOADs the extension the
+    This is a genuine lockstep, not tidiness. A split LOADs the extension the
     deploy staged, and `stage-miint-extension.sh` stages with the ORCHESTRATOR's
     venv python — while DuckDB namespaces the extension directory by engine
     version + platform. A container on a different DuckDB finds no extension for
-    its version and every myloasm assembly dies at LOAD, after doing all its work.
-    A `uv lock` bump must therefore move the def's pin too, and this fails the unit
-    suite when it doesn't.
+    its version and dies at LOAD, after doing all its work. A `uv lock` bump must
+    therefore move each def's pin too, and this fails the unit suite when it doesn't.
+
+    Both defs, because both now ship a splitter: covering assemble.def alone would
+    let a bump fail CI there and leave checkm.def stale, which surfaces as that same
+    LOAD failure on the cluster after CheckM has scored the MAGs.
     """
     lock = tomllib.loads(_CO_LOCK.read_text())
     locked = {p["name"]: p["version"] for p in lock["package"]}
     orchestrator_duckdb = locked.get("duckdb")
     assert orchestrator_duckdb, "duckdb is not in qiita-compute-orchestrator/uv.lock"
 
-    defsrc = _ASSEMBLE_DEF.read_text()
+    defsrc = def_path.read_text()
     pin = re.search(r"\bpython-duckdb=([0-9][^\s\"']*)", defsrc)
     assert pin is not None, (
-        "assemble.def does not pin python-duckdb. An unpinned solve can land on a "
-        "DuckDB whose version has no staged miint extension."
+        f"{def_path.name} does not pin python-duckdb. An unpinned solve can land on "
+        "a DuckDB whose version has no staged miint extension."
     )
     assert pin.group(1) == orchestrator_duckdb, (
-        f"assemble.def pins python-duckdb={pin.group(1)} but the orchestrator "
+        f"{def_path.name} pins python-duckdb={pin.group(1)} but the orchestrator "
         f"resolves duckdb=={orchestrator_duckdb}. DuckDB namespaces the staged "
         "extension directory by engine version, so the container would LOAD from a "
         "version directory the deploy never staged."
     )
     assert re.search(rf"duckdb.__version__ == '{re.escape(orchestrator_duckdb)}'", defsrc), (
-        "assemble.def's %test no longer asserts the resolved DuckDB version, so a "
-        "drifted solve would build green and fail at LOAD on the cluster."
+        f"{def_path.name}'s %test no longer asserts the resolved DuckDB version, so "
+        "a drifted solve would build green and fail at LOAD on the cluster."
     )
 
 

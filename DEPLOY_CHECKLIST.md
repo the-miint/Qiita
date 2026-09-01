@@ -86,7 +86,8 @@ _None yet._
   is what is printed: a body-only check reads the same whether the route answered or the token
   expired.
 
-- **Check the circular genomes came back scored.** (#519)
+- **Check the circular genomes (LCGs — large circular genomes, the contigs that bypass binning)
+  came back scored.** (#519)
 
   ```bash
   # A ticket whose assemble step produced a non-empty circular.fa.
@@ -96,10 +97,10 @@ _None yet._
 
   Four files — `lineage.tsv`, `qa.tsv`, `lcg_lineage.tsv`, `lcg_qa.tsv` — means both CheckM runs
   landed. Only the first pair, on a ticket that HAS circular contigs, means the LCG arm did not
-  run: check the step log for `lcg_split`, whose usual failure is a missing or mislocated
-  `${PATH_DERIVED}/duckdb-ext` (the bind is new on this step, see the note below). A ticket with
-  an empty `circular.fa` legitimately writes only the first pair, so pick the ticket before
-  reading the result.
+  run: check the step log for `lcg_split`. It exits 64 with the reason on stderr; a missing or
+  mislocated `${PATH_DERIVED}/duckdb-ext` is the failure this step gained (see the note below).
+  A ticket with an empty `circular.fa` legitimately writes only the first pair, so pick the
+  ticket before reading the result.
 
 ### 6. After the deploy verifies green
 

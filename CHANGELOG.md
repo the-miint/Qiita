@@ -73,15 +73,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   below 1 kb, where myloasm reports `0.00` for absence of signal rather than a measured zero.
   Attributes are NULL for every row written before this deploy and are not backfilled here:
   they are read out of the assemble step's output, which for an older run is gone. A MAG row
-  carries them only where the binners kept the assembler's contig header. Measured for
-  hifiasm_meta — one deploy-host assembly put all 3,810 contigs of its 98 refined bins back in
-  the assembler's own output verbatim, through metabat2/maxbin2/concoct and DAS_Tool — and
-  unmeasured for myloasm, whose contig ids have a different shape; LCG and UNBINNED rows match
-  by construction. That
-  unmeasured half has a specific cost, on the myloasm arm only: `circular-possibly` routes to
-  binning, so where a refined bin claims such a contig the residue subtraction drops its
-  UNBINNED row and the MAG row becomes the call's only record — which then depends on the
-  passthrough nobody has measured.
+  carries them only where the binners kept the assembler's contig header, which is measured for
+  both id shapes — see the entry under `Changed` for the probe; LCG and UNBINNED rows match by
+  construction.
   `kind` still
   records the routing that was applied, so `circular-yes` stays recoverable from `kind`
   alone; what an older row cannot recover is the `possibly`/`no` split among the contigs
@@ -2918,18 +2912,24 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
-- **The de novo genome map no longer carries the unbinned residue, so a de novo feature table
-  aligns against assembled genomes rather than fragments.** `ASSEMBLY_GENOME_MAP_PAIRS_SQL` —
-  the row set shared verbatim by the REST contig→genome map and the cohort Parquet
-  `estimate-feature-table` reads — now excludes `kind = 'UNBINNED'`. An unbinned contig is what
-  no refined bin claimed, and for that kind `bin_id` is the contig id, so the genome mint gives
-  each one a genome of a single fragment: on the deploy host that is 820,094 of the 1,002,979
-  membership rows, five fragments for every assembled genome. They stay in
-  `qiita.assembly_membership` and remain queryable there. `count_assembly_membership_without_genome`,
-  the completeness guard a caller refuses on, takes the same filter so an unminted UNBINNED row
-  cannot refuse a cohort over a gap the map never reads. No stored result changes: the de novo
-  arm has never run on the deploy host, whose `assembly_membership` has no `genome_idx` column
-  yet (last applied migration `20260827010000`) (#519).
+- **The unbinned residue no longer rolls up to a genome, so a de novo feature table reports
+  assembled genomes rather than single fragments.** `ASSEMBLY_GENOME_MAP_PAIRS_SQL` — the row
+  set shared verbatim by the REST contig→genome map and the cohort Parquet
+  `estimate-feature-table` reads — is now an allowlist, `kind IN ('MAG', 'LCG')`. An unbinned
+  contig is what no refined bin claimed, and for that kind `bin_id` is the contig id, so the
+  genome mint gives each one a genome of a single fragment: on the deploy host that is 820,094 of
+  the 1,002,979 membership rows, five single-fragment genomes for every assembled one. Those
+  contigs are NOT removed from the alignment — the assembly DoGet scopes on `(prep_sample_idx,
+  processing_idx)` with no `kind` predicate, so they are still streamed and still aligned against;
+  what changes is that their alignments no longer roll up to a reported genome. They stay
+  queryable in `qiita.assembly_membership`. An allowlist rather than `<> 'UNBINNED'` because
+  `assembly_constants` states the kind set is meant to extend without a migration, so a denylist
+  would admit a future kind into every de novo feature table by default.
+  `count_assembly_membership_without_genome`, the completeness guard a caller refuses on, takes
+  the same filter so an unminted UNBINNED row cannot refuse a cohort over a gap the map never
+  reads. No stored result changes: the de novo arm has never run on the deploy host, whose
+  `assembly_membership` has no `genome_idx` column yet (last applied migration
+  `20260827010000`) (#519).
 
 - **The binners are measured to preserve both assemblers' contig id shapes, so the attribute
   join's caveat is dropped (#519).** `qiita.assembly_membership`'s four attribute columns reach a

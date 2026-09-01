@@ -48,7 +48,13 @@ from pathlib import Path
 # insert is for the `.def` %test, which loads this module by spec and does not.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from miint_connect import connect, die, sql_path  # noqa: E402
+from miint_connect import (  # noqa: E402
+    connect,
+    die,
+    reject_duplicate_contig_ids,
+    require_non_empty_fasta,
+    sql_path,
+)
 
 PROG = "lcg_split"
 
@@ -74,15 +80,10 @@ def _load(con, src: str) -> None:
 def _validate(con) -> list[str]:
     """Reject an unusable id, then return every contig id in sorted order.
 
-    Duplicates first: two records under one id would have the second COPY overwrite
-    the first, so CheckM would score one genome and assembly_load would join its row
-    to two membership subjects.
+    Duplicates first: the shared guard states why, and here the second COPY would also
+    overwrite the first, so CheckM would score one genome for two memberships.
     """
-    dupes = con.execute(
-        "SELECT contig_id, count(*) AS n FROM contig GROUP BY 1 HAVING n > 1 ORDER BY 1 LIMIT 5"
-    ).fetchall()
-    if dupes:
-        die(PROG, f"duplicate contig id(s) in the circular FASTA: {dupes}")
+    reject_duplicate_contig_ids(PROG, con)
 
     ids = [
         row[0]
@@ -104,17 +105,7 @@ def main(argv: list[str]) -> int:
         die(PROG, f"usage: {argv[0]} <circular.fa> <out_dir>")
     circular, out_dir = argv[1], Path(argv[2])
 
-    # `read_fastx` RAISES on a zero-record input ("Error Empty file: …") rather than
-    # returning no rows — the same trap `qiita_common.duckdb_miint`'s
-    # `is_empty_sequence_file` exists for on the native side. checkm.sh already skips
-    # this script when circular.fa is empty; this is the second gate, so a direct
-    # invocation gets our message instead of a DuckDB traceback.
-    try:
-        size = Path(circular).stat().st_size
-    except OSError as exc:
-        die(PROG, f"cannot stat {circular!r}: {exc}")
-    if size == 0:
-        die(PROG, f"{circular} is empty; read_fastx raises on a zero-record input")
+    require_non_empty_fasta(PROG, circular)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     con = connect(PROG, temp_subdir="duckdb-lcg-split")

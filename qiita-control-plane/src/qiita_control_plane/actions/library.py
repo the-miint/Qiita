@@ -1275,9 +1275,13 @@ async def export_assembly_member_genome(
 
     The row set is `ASSEMBLY_GENOME_MAP_PAIRS_SQL`, shared verbatim with the REST map
     the client-side recipe reads, so the two drivers cannot disagree about which
-    contigs have a genome. An empty result still writes a valid three-column Parquet
-    — a cohort whose samples all assembled nothing is a legitimate combined table
-    that degrades to the reference arm.
+    contigs have a genome. That row set admits MAG and LCG rows only, so a contig can
+    be absent from this map and present in `qiita.assembly_membership`.
+
+    An empty result still writes a valid three-column Parquet, and it now has two
+    causes rather than one: a cohort that assembled nothing, and a cohort whose
+    contigs are all UNBINNED (no circular contig, and no refined bin clearing
+    DAS_Tool's threshold — a legitimate success). Both degrade to the reference arm.
     """
     schema = pa.schema(
         [

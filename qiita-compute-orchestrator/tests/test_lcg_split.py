@@ -48,6 +48,16 @@ _WORKFLOW_YAML = _WORKFLOW_DIR / "1.0.0.yaml"
 
 _EXIT_CONTRACT_VIOLATION = 64
 
+# Imported, not retyped: these four basenames are the producer/consumer contract
+# between checkm.sh and assembly_load, so a rename must not be able to leave this
+# pin green.
+from qiita_compute_orchestrator.jobs.assembly_load import (  # noqa: E402
+    _CHECKM_LCG_LINEAGE_TSV,
+    _CHECKM_LCG_QA_TSV,
+    _CHECKM_LINEAGE_TSV,
+    _CHECKM_QA_TSV,
+)
+
 # Real contig ids from the two assemblers, and both are load-bearing shapes: the
 # hifiasm one carries a DOT, which is what makes "CheckM strips one extension"
 # something to hold rather than assume.
@@ -175,8 +185,15 @@ def test_split_uses_miint_and_never_installs() -> None:
     set of staged-extension settings, free to drift from what the services run.
     """
     code = _SPLIT_PY.read_text()
-    assert "read_fastx" in code, "the split no longer reads with miint's read_fastx"
-    assert "FORMAT FASTA" in code, "the split no longer writes with miint's FASTA writer"
+    # Anchored at a CALL, not a mention: this file's own docstring names both symbols,
+    # so a bare substring search stays green on a hand-rolled parser whose prose still
+    # credits miint — which is the substitution these two assertions exist to catch.
+    assert re.search(r"FROM read_fastx\(", code), (
+        "the split no longer reads with miint's read_fastx"
+    )
+    assert re.search(r"\(FORMAT FASTA\)\"", code), (
+        "the split no longer writes with miint's FASTA writer"
+    )
     assert "from miint_connect import" in code, (
         "the split no longer connects through miint_connect, so the staged-miint "
         "LOAD asserted in test_myloasm_split is not the connection it opens"
@@ -203,8 +220,21 @@ def test_checkm_entrypoint_runs_the_split_and_scores_the_classes_apart() -> None
         "checkm.sh no longer runs the splitter, so lineage_wf would read the whole "
         "circular multi-FASTA as one genome"
     )
-    for name in ("lineage.tsv", "qa.tsv", "lcg_lineage.tsv", "lcg_qa.tsv"):
-        assert name in sh, f"checkm.sh no longer writes {name}, which assembly_load reads"
+    # Read off the run_checkm INVOCATIONS, not the file: checkm.sh's header comment
+    # lists all four basenames, so searching the whole file passes with both calls
+    # deleted. Two calls is the assertion — one would mean a class went unscored.
+    calls = [ln.strip() for ln in sh.splitlines() if ln.strip().startswith("run_checkm ")]
+    assert len(calls) == 2, calls
+    invoked = " ".join(calls)
+    for name in (
+        _CHECKM_LINEAGE_TSV,
+        _CHECKM_QA_TSV,
+        _CHECKM_LCG_LINEAGE_TSV,
+        _CHECKM_LCG_QA_TSV,
+    ):
+        assert name in invoked, (
+            f"checkm.sh no longer writes {name}, which assembly_load reads by that name"
+        )
 
 
 def test_checkm_step_binds_miint_and_reads_the_genomes_dir() -> None:
