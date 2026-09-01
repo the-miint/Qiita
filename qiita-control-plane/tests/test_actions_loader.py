@@ -1253,6 +1253,14 @@ def test_the_version_sync_leaves_enabled_is_the_highest_of_each_action():
         by_action.setdefault(action.action_id, []).append(action.version)
 
     for action_id, versions in by_action.items():
+        # Dotted integers only. A version this cannot parse is refused with a
+        # message rather than raising ValueError out of the key function, where it
+        # would surface as an error in whatever PR happened to add the version.
+        for version in versions:
+            assert all(part.isdigit() for part in version.split(".")), (
+                f"{action_id} {version!r} is not dotted integers; this test orders "
+                "versions numerically and needs extending before such a version lands."
+            )
         semver = sorted(versions, key=lambda v: tuple(int(p) for p in v.split(".")))
         assert versions == semver, (
             f"{action_id} versions load as {versions} but sort semantically as "
