@@ -9,9 +9,16 @@ target_kind: prep_sample
 description: >
   Re-run identity for long-read-assembly/1.0.0. The steps, resources and
   container images are IDENTICAL to 1.0.0 — a test asserts the two files stay
-  byte-identical apart from this header — and a submit at either version runs the
-  same computation. 1.0.0 stays available unchanged; submitters choose the
-  version.
+  byte-identical apart from this header — so a submit at either version runs the
+  same computation.
+
+  Syncing this file DISABLES 1.0.0. `sync_actions` re-enables the version it is
+  syncing and auto-deprecates every OTHER version of the same action_id, one
+  action at a time, so the last one it walks is the one left enabled
+  (`qiita.action.disabled_reason = 'auto-deprecate-sync'`). `load_actions` sorts
+  by path, which puts 1.0.1 after 1.0.0. That outcome is the wanted one here —
+  nothing further should assemble onto the pre-fix identity — but it means 1.0.0
+  stops accepting submissions at the deploy, not that the two coexist.
 
   It exists because a processing run's identity is
   `{workflow, version, mask_idx, assembler}` and does NOT cover the container

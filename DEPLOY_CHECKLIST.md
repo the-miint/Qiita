@@ -151,13 +151,18 @@ _None yet._
       "$BASE/api/v1/processing/2/status"
   ```
 
-  Deprecating stops `mint_processing` returning the old config while leaving what assembled under
-  it discoverable — it does not judge the individual runs, and nothing is deleted. **Cost, so this
-  is scheduled and not squeezed in:** only `bin_refine` onward changes (~60 min/sample), but
-  partial re-runs do not exist, so `assemble` is paid again in full — measured across the 59
-  completed steps at 415.3 min average, 1094.1 min peak, per sample. The assembly-genome backfill
-  above is unaffected and still applies to the 1.0.0 rows; `processing_idx` is in the genome
-  identity tuple, so old and new genomes never collide.
+  Two different deprecations, and only the second is a manual step. The action-level one is
+  automatic: syncing 1.0.1 disables `long-read-assembly` **1.0.0** outright
+  (`sync_actions` auto-deprecates every other version of an action_id), so after the deploy no
+  sample can be submitted at 1.0.0 for ANY mask. The PATCH above is narrower and is about
+  `qiita.processing`, not `qiita.action`: it records WHY these two runs are void and what
+  replaced them, which the action-level disable does not. Nothing is deleted either way, and
+  what assembled under the old runs stays discoverable. **Cost, so this is scheduled and not
+  squeezed in:** only `bin_refine` onward changes (~60 min/sample), but partial re-runs do not
+  exist, so `assemble` is paid again in full — measured across the 59 completed steps at 415.3
+  min average, 1094.1 min peak, per sample. The assembly-genome backfill above is unaffected and
+  still applies to the 1.0.0 rows; `processing_idx` is in the genome identity tuple, so old and
+  new genomes never collide.
 
 
 ### Notes (no host action)

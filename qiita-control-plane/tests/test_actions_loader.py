@@ -1220,3 +1220,36 @@ def test_load_actions_long_read_assembly_finalizes_gate_after_register_files():
 
     assert names[-1] == "finalize-assembly-sample"
     assert names[-2] == "register-files"
+
+
+def test_long_read_assembly_1_0_1_is_the_version_sync_leaves_enabled():
+    """`load_actions` must yield 1.0.1 AFTER 1.0.0, because sync is last-one-wins.
+
+    `sync_actions` walks the list one action at a time, re-enabling the version it
+    is syncing and running `_AUTO_DEPRECATE_OTHERS_SQL` over every other version of
+    that action_id. So whichever version the loader yields LAST for an action_id is
+    the one left `enabled`, and the others end at
+    `disabled_reason='auto-deprecate-sync'` — the state `fastq-to-parquet` 1.0.0
+    through 1.2.0 are in on the deploy host today.
+
+    Nothing declares that order: it falls out of `sorted(rglob("*.yaml"))` over the
+    filenames. Inverted, the deploy would leave 1.0.1 disabled and every re-run
+    submission refused, with the catalog looking populated either way. 1.0.1 exists
+    to be submitted against, so the order it depends on is asserted rather than
+    assumed.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    versions = [
+        a.version
+        for a in load_actions(repo_root / "workflows")
+        if a.action_id == "long-read-assembly"
+    ]
+
+    assert versions == ["1.0.0", "1.0.1"], (
+        f"long-read-assembly versions load in the order {versions}; sync enables the "
+        "LAST one, so 1.0.1 must come after 1.0.0 or the re-run version ships disabled."
+    )

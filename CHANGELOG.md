@@ -37,7 +37,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   two cannot drift. The SIF filenames stay `-1.0.0.sif` — they name the image, not the workflow
   version, and the images are unchanged. `test_load_actions_loads_on_disk_long_read_assembly_yaml`
   now keys on `(action_id, version)` as `qiita.action` does, rather than on `action_id` alone,
-  which collapsed the two onto whichever sorted last.
+  which collapsed the two onto whichever sorted last. Syncing 1.0.1 also DISABLES 1.0.0 —
+  `sync_actions` auto-deprecates every other version of an action_id and is last-one-wins over
+  the loader's path-sorted list, which is the state `fastq-to-parquet` 1.0.0 through 1.2.0 are
+  already in. That is the wanted outcome, and `test_long_read_assembly_1_0_1_is_the_version_sync_leaves_enabled`
+  pins the ordering it rests on: inverted, the deploy would ship the re-run version disabled and
+  refuse every submission.
 
 - **CheckM now scores the circular genomes too, so completeness and contamination cover every
   kind the workflow stores except the residue it deliberately does not score.** `checkm.sh`
