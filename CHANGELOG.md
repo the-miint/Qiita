@@ -21,6 +21,32 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **CheckM now scores the circular genomes too, so completeness and contamination cover every
+  kind the workflow stores except the residue it deliberately does not score.** `checkm.sh`
+  splits the assemble step's `circular.fa` into one FASTA per contig (miint `read_fastx` +
+  `COPY … FORMAT FASTA`, in the new `lcg_split.py`) and runs `lineage_wf` + `qa -o 2` over them
+  in a SECOND CheckM run, publishing `lcg_lineage.tsv` / `lcg_qa.tsv` beside the refined-bin
+  pair. `assembly_load` reads both pairs and tags each row with the kind of the run it came
+  from, so `bin_quality` now holds LCG rows beside MAG rows. Two runs rather than one merged
+  directory because CheckM reports only a `"Bin Id"` — the filename stem — so merged, a row's
+  `kind` would have to be recovered by prefixing every stem and parsing the prefix back off
+  before the row could join `assembly_membership.bin_id`; scored apart, the file a row came
+  from IS its kind and every stem reaches the lake unmodified. An LCG bypasses binning
+  entirely, so before this the class most likely to be a complete genome was the only one
+  stored with no quality at all. UNBINNED is still not scored: an unbinned contig is what no
+  refined bin claimed, so a completeness figure against a marker set describes nothing. The
+  step's `baseline_resources` are unchanged and now fitted rather than assumed — across 59
+  completed `checkm` steps on the deploy host the elapsed averaged 27.5 min and peaked at
+  58.9 min against a PT4H cap, and the second run scores a comparable genome set (~104 refined
+  bins beside ~98 circular contigs per ticket), so a doubled peak still sits under half the
+  cap. The `checkm` step gains `genomes_dir` as an input and the deploy-staged miint extension
+  as a `derived_inputs` bind; `checkm.def` gains `python-duckdb`, pinned in lockstep with the
+  orchestrator's resolved DuckDB for the reason `assemble.def` states. CheckM keying its
+  `"Bin Id"` on the stem with only the final extension removed is measured, not assumed: on the
+  deploy host `CONCOCT_bin.13_sub.fa` came back as `CONCOCT_bin.13_sub`, which is what lets a
+  dotted hifiasm contig id (`s0.ctg000001c`) round-trip as its own `bin_id`. An id that cannot
+  be a filename stem stops the step rather than being sanitized into one that joins nothing (#519).
+
 - **The assembler's per-contig report is stored, so circularity can become a query-time
   predicate instead of a routing decision baked into the entrypoint (#517).** Both arms of
   `assemble.sh` now emit a `contig_attributes.tsv` beside the two published FASTAs, carrying
@@ -2891,6 +2917,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **The de novo genome map no longer carries the unbinned residue, so a de novo feature table
+  aligns against assembled genomes rather than fragments.** `ASSEMBLY_GENOME_MAP_PAIRS_SQL` —
+  the row set shared verbatim by the REST contig→genome map and the cohort Parquet
+  `estimate-feature-table` reads — now excludes `kind = 'UNBINNED'`. An unbinned contig is what
+  no refined bin claimed, and for that kind `bin_id` is the contig id, so the genome mint gives
+  each one a genome of a single fragment: on the deploy host that is 820,094 of the 1,002,979
+  membership rows, five fragments for every assembled genome. They stay in
+  `qiita.assembly_membership` and remain queryable there. `count_assembly_membership_without_genome`,
+  the completeness guard a caller refuses on, takes the same filter so an unminted UNBINNED row
+  cannot refuse a cohort over a gap the map never reads. No stored result changes: the de novo
+  arm has never run on the deploy host, whose `assembly_membership` has no `genome_idx` column
+  yet (last applied migration `20260827010000`) (#519).
 
 - **The binners are measured to preserve both assemblers' contig id shapes, so the attribute
   join's caveat is dropped (#519).** `qiita.assembly_membership`'s four attribute columns reach a

@@ -10,7 +10,7 @@ identical. The four staging outputs (basename == DuckLake table name):
   - `assembled_sequence.parquet`        (feature_idx, sequence_hash, sequence_length_bp)
   - `assembled_sequence_chunks/part_*.parquet` (feature_idx, chunk_index, chunk_data)
   - `assembly_membership.parquet`       (prep_sample_idx, processing_idx, kind, bin_id, feature_idx)
-  - `bin_quality.parquet`               per-MAG CheckM (+ DAS_Tool provenance)
+  - `bin_quality.parquet`               per-genome CheckM (+ DAS_Tool provenance)
 
 The first two come straight from the shared `_feature_load.write_feature_sequences` /
 `write_feature_sequence_chunks` (fed by `build_feature_id_map`). The membership
@@ -23,14 +23,16 @@ containers emit CheckM's / DAS_Tool's tables verbatim (a plain `cp`, no awk/pyth
 normalization), so DuckDB is the ONE csv framework in this path (never a Python
 csv parser, never a shell transform on the tool tables).
 
-Empty/partial semantics: a sample with contigs but no MAG — circular genomes,
-unbinned residue, or both — is a SUCCESS; `bin_quality` is written empty
+Empty/partial semantics: a sample with contigs but nothing CheckM scored — no
+refined bin and nothing circular — is a SUCCESS; `bin_quality` is written empty
 (register-files still finds all four tables with the right schema). Zero contigs
 never reaches here (assembly_hash raised StepNoData upstream).
 
-`bin_quality` is built from CheckM's tables, which cover only the refined bins, so
-it holds MAG rows alone: an LCG or unbinned membership row has no counterpart to
-join, and gets none by construction rather than by filter.
+`bin_quality` holds MAG and LCG rows, one per genome CheckM scored, tagged with the
+`kind` of the checkm.sh run that produced it. UNBINNED rows are absent: the residue
+is stored in `assembly_membership` so it can be queried, but a contig no bin claimed
+is a fragment and is not scored against a marker set. So an unbinned membership row
+has no `bin_quality` counterpart by construction rather than by filter.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ from pydantic import BaseModel
 from qiita_common.assembly_constants import (
     CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
     CONTIG_ATTRIBUTES_FILE,
+    KIND_LCG,
     KIND_MAG,
     contig_attribute_join,
     contig_attribute_projection,
@@ -72,6 +75,11 @@ YAML_STEP_NAME = "assembly_load"
 # DAS_Tool 1.1.x (`_DASTool_summary.tsv`).
 _CHECKM_LINEAGE_TSV = "lineage.tsv"  # `checkm lineage_wf --tab_table`
 _CHECKM_QA_TSV = "qa.tsv"  # `checkm qa -o 2 --tab_table`
+# The same two tables from checkm.sh's second run, over the circular genomes. A
+# separate pair rather than more rows in the first, because the file a row came from
+# is what carries its `kind` — checkm.sh states why.
+_CHECKM_LCG_LINEAGE_TSV = "lcg_lineage.tsv"
+_CHECKM_LCG_QA_TSV = "lcg_qa.tsv"
 _DAS_SUMMARY_TSV = "das_tool_summary.tsv"  # DAS_Tool `*_DASTool_summary.tsv`
 
 # DuckDB resource caps. Off-SLURM fallback; under SLURM the limit tracks the real
@@ -193,8 +201,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             _write_bin_quality(
                 conn,
-                lineage_tsv=inputs.checkm_dir / _CHECKM_LINEAGE_TSV,
-                qa_tsv=inputs.checkm_dir / _CHECKM_QA_TSV,
+                checkm_dir=inputs.checkm_dir,
                 das_tsv=inputs.refined_bins_dir / _DAS_SUMMARY_TSV,
                 prep_sample_idx=inputs.prep_sample_idx,
                 processing_idx=inputs.processing_idx,
@@ -275,27 +282,75 @@ def _write_assembly_membership(
 def _write_bin_quality(
     conn: duckdb.DuckDBPyConnection,
     *,
-    lineage_tsv: Path,
-    qa_tsv: Path,
+    checkm_dir: Path,
     das_tsv: Path,
     prep_sample_idx: int,
     processing_idx: int,
     out: str,
 ) -> None:
-    """Per-MAG CheckM quality (+ optional DAS_Tool provenance) -> the DuckLake
-    `bin_quality` shape, built entirely in DuckDB from the containers' RAW tool
-    output (never a Python csv parser). CheckM's two `--tab_table` tables are read
-    and joined on the verbatim `"Bin Id"` column: `lineage_wf` carries marker
-    lineage + completeness/contamination/strain heterogeneity, `qa -o 2` adds
-    genome size / # contigs. `kind` is 'MAG'; `bin_id` is CheckM's `"Bin Id"` (the
-    MAG FASTA stem). DAS_Tool's summary is LEFT-joined on its `bin` column (== the
-    same MAG stem) when present, pulling `bin_score` / `bin_set`, else NULL.
+    """Per-genome CheckM quality (+ DAS_Tool provenance for MAGs) -> the DuckLake
+    `bin_quality` shape, built entirely in DuckDB from the container's RAW tool
+    output (never a Python csv parser).
 
-    A sample with no CheckM tables (no refined bin, or the CheckM DB was absent)
+    checkm.sh scores the two classes in SEPARATE CheckM runs and publishes a table
+    pair for each, so the FILE a row came from IS its `kind` — nothing parses a stem
+    or strips a prefix. Each pair is joined on the verbatim `"Bin Id"` column:
+    `lineage_wf` carries marker lineage + completeness/contamination/strain
+    heterogeneity, `qa -o 2` adds genome size / # contigs. `bin_id` is that same
+    `"Bin Id"`, which CheckM sets from the filename stem — a refined-bin FASTA's
+    stem for a MAG, a contig id for an LCG — matching what `assembly_hash` wrote
+    into `bin_map` for each kind, so both join `assembly_membership` on
+    (prep_sample_idx, processing_idx, kind, bin_id).
+
+    DAS_Tool's summary is LEFT-joined on its `bin` column (== the MAG stem) when
+    present. It is MAG-only by construction: DAS_Tool consumes the binners' output
+    and never sees a circular contig, so an LCG row's provenance columns are NULL
+    rather than missing a join.
+
+    UNBINNED gets no row: checkm.sh scores neither, so there is nothing to read.
+    The residue is stored so it can be queried, not scored — a contig no bin claimed
+    is a fragment, and completeness against a marker set describes a genome.
+
+    Either class may be absent (a sample with no refined bin, or none circular), and
+    with both absent — including the case where the CheckM DB was missing — this
     writes a valid EMPTY Parquet with the right schema so register-files always
-    finds the table. Column names are pinned to CheckM 1.x / DAS_Tool 1.1.x (see
-    the module constants)."""
-    if not (lineage_tsv.is_file() and qa_tsv.is_file()):
+    finds the table. Column names are pinned to CheckM 1.x / DAS_Tool 1.1.x (see the
+    module constants)."""
+    # CheckM headers are verbatim (spaces / parens / '#'), so they are double-quoted.
+    arms: list[str] = []
+    params: list[str] = []
+    for kind, lineage_name, qa_name, with_das in (
+        (KIND_MAG, _CHECKM_LINEAGE_TSV, _CHECKM_QA_TSV, das_tsv.is_file()),
+        (KIND_LCG, _CHECKM_LCG_LINEAGE_TSV, _CHECKM_LCG_QA_TSV, False),
+    ):
+        lineage_tsv = checkm_dir / lineage_name
+        qa_tsv = checkm_dir / qa_name
+        if not (lineage_tsv.is_file() and qa_tsv.is_file()):
+            continue
+        projection = _BIN_QUALITY_SELECT.format(
+            ps=prep_sample_idx,
+            proc=processing_idx,
+            kind=f"'{kind}'",
+            bin_id='lin."Bin Id"',
+            marker='lin."Marker lineage"',
+            completeness='lin."Completeness"',
+            contamination='lin."Contamination"',
+            strain='lin."Strain heterogeneity"',
+            genome_size='qa."Genome size (bp)"',
+            n_contigs='qa."# contigs"',
+            das_score='das."bin_score"' if with_das else "NULL",
+            das_binner='das."bin_set"' if with_das else "NULL",
+        )
+        source = f'  FROM {_READ_TSV} lin  JOIN {_READ_TSV} qa ON lin."Bin Id" = qa."Bin Id"'
+        # `?` binds positionally across the whole statement, so each arm's paths are
+        # appended in the order its own read_csv calls appear.
+        params.extend([str(lineage_tsv), str(qa_tsv)])
+        if with_das:
+            source += f'  LEFT JOIN {_READ_TSV} das ON lin."Bin Id" = das."bin"'
+            params.append(str(das_tsv))
+        arms.append(f"SELECT {projection} {source}")
+
+    if not arms:
         # Empty write — every placeholder NULL, no FROM, WHERE FALSE.
         projection = _BIN_QUALITY_SELECT.format(
             ps="NULL",
@@ -314,28 +369,6 @@ def _write_bin_quality(
         conn.execute(f"COPY (SELECT {projection} WHERE FALSE) TO '{out}' ({PARQUET_OPTS})")
         return
 
-    # Populated write. CheckM headers are verbatim (spaces / parens / '#'), so they
-    # are double-quoted. DAS_Tool provenance is optional: LEFT JOIN its summary on
-    # `bin` == CheckM "Bin Id" when present, else the das columns are literal NULLs.
-    has_das = das_tsv.is_file()
-    projection = _BIN_QUALITY_SELECT.format(
-        ps=prep_sample_idx,
-        proc=processing_idx,
-        kind=f"'{KIND_MAG}'",
-        bin_id='lin."Bin Id"',
-        marker='lin."Marker lineage"',
-        completeness='lin."Completeness"',
-        contamination='lin."Contamination"',
-        strain='lin."Strain heterogeneity"',
-        genome_size='qa."Genome size (bp)"',
-        n_contigs='qa."# contigs"',
-        das_score='das."bin_score"' if has_das else "NULL",
-        das_binner='das."bin_set"' if has_das else "NULL",
-    )
-    source = f'  FROM {_READ_TSV} lin  JOIN {_READ_TSV} qa ON lin."Bin Id" = qa."Bin Id"'
-    params = [str(lineage_tsv), str(qa_tsv)]
-    if has_das:
-        source += f'  LEFT JOIN {_READ_TSV} das ON lin."Bin Id" = das."bin"'
-        params.append(str(das_tsv))
-
-    conn.execute(f"COPY (SELECT {projection} {source}) TO '{out}' ({PARQUET_OPTS})", params)
+    # UNION ALL, not UNION: the two arms are disjoint by `kind` and a dedupe here
+    # would only cost a sort over every column.
+    conn.execute(f"COPY ({' UNION ALL '.join(arms)}) TO '{out}' ({PARQUET_OPTS})", params)

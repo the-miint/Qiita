@@ -27,9 +27,9 @@ from qiita_common.chunking import reassemble_chunks_expr
 # Three contigs across two bins, one circular genome, and one unbinned-residue
 # contig, keyed by assembly_hash's synthetic `kind:bin_id:sequence_index`. bin.1 has
 # two contigs; bin.2's contig shares bin.1's first contig's bytes (same hash -> same
-# feature_idx) to exercise the distinct-membership / dedup path. The UNBINNED row
-# carries its own contig id as bin_id, the shape assembly_hash emits, and has no
-# CheckM counterpart — bin_quality holds MAG rows alone.
+# feature_idx) to exercise the distinct-membership / dedup path. The LCG and UNBINNED
+# rows carry their own contig id as bin_id, the shape assembly_hash emits. CheckM
+# scores the LCG (its own table pair) and never the UNBINNED residue.
 _SEQUENCES = {
     "LCG:circ1:1": ("AAAACCCCGGGGTTTT", 100),
     "MAG:bin.1:1": ("ACGTACGTACGTACGT", 200),
@@ -124,7 +124,28 @@ def _tsv(path: Path, header: list[str], rows: list[tuple]) -> None:
     )
 
 
-def _inputs(tmp_path, staging_inputs, *, checkm_rows=None, das_rows=None, attr_rows=None):
+def _checkm_pair(checkm_dir, prefix, rows):
+    """One CheckM run’s two RAW --tab_table outputs, exactly as checkm.sh emits them.
+
+    `prefix` is "" for the refined-bin run and "lcg_" for the circular-genome one.
+    lineage.tsv (lineage_wf) carries the quality columns, qa.tsv (qa -o 2) the genome
+    stats. Headers are CheckM 1.x’s verbatim spaced/parenthesized names.
+    """
+    _tsv(
+        checkm_dir / f"{prefix}lineage.tsv",
+        ["Bin Id", "Marker lineage", "Completeness", "Contamination", "Strain heterogeneity"],
+        [(r[0], r[1], r[2], r[3], r[4]) for r in rows],
+    )
+    _tsv(
+        checkm_dir / f"{prefix}qa.tsv",
+        ["Bin Id", "Genome size (bp)", "# contigs"],
+        [(r[0], r[5], r[6]) for r in rows],
+    )
+
+
+def _inputs(
+    tmp_path, staging_inputs, *, checkm_rows=None, lcg_rows=None, das_rows=None, attr_rows=None
+):
     from qiita_compute_orchestrator.jobs.assembly_load import Inputs
 
     genomes_dir = tmp_path / "genomes"
@@ -142,22 +163,14 @@ def _inputs(tmp_path, staging_inputs, *, checkm_rows=None, das_rows=None, attr_r
     refined_dir = tmp_path / "refined"
     checkm_dir.mkdir(exist_ok=True)
     refined_dir.mkdir(exist_ok=True)
-    # checkm_rows is a 7-tuple (bin_id, marker, completeness, contamination,
-    # strain, genome_size, n_contigs). It is split across CheckM's two RAW
-    # --tab_table outputs, exactly as the checkm.sh container now emits them:
-    # lineage.tsv (lineage_wf) carries the quality columns, qa.tsv (qa -o 2) the
-    # genome stats. Headers are CheckM 1.x's verbatim spaced/parenthesized names.
+    # checkm_rows / lcg_rows are 7-tuples (bin_id, marker, completeness,
+    # contamination, strain, genome_size, n_contigs), one list per CheckM RUN.
+    # checkm.sh scores the refined bins and the circular genomes separately and
+    # publishes a table pair for each, so which pair a row is in IS its kind.
     if checkm_rows is not None:
-        _tsv(
-            checkm_dir / "lineage.tsv",
-            ["Bin Id", "Marker lineage", "Completeness", "Contamination", "Strain heterogeneity"],
-            [(r[0], r[1], r[2], r[3], r[4]) for r in checkm_rows],
-        )
-        _tsv(
-            checkm_dir / "qa.tsv",
-            ["Bin Id", "Genome size (bp)", "# contigs"],
-            [(r[0], r[5], r[6]) for r in checkm_rows],
-        )
+        _checkm_pair(checkm_dir, "", checkm_rows)
+    if lcg_rows is not None:
+        _checkm_pair(checkm_dir, "lcg_", lcg_rows)
     # das_rows is a 3-tuple (bin, bin_score, bin_set) written as DAS_Tool's RAW
     # summary columns (DAS_Tool 1.1.x names).
     if das_rows is not None:
@@ -400,10 +413,11 @@ def test_a_hifiasm_shaped_sidecar_lands_empty_cells_as_null_doubles(tmp_path, st
 
 
 def test_bin_quality_joins_checkm_and_das(tmp_path, staging_inputs):
-    """CheckM x DAS_Tool -> one row per refined bin, and per refined bin only.
+    """CheckM x DAS_Tool -> one row per refined bin.
 
-    The fixture's LCG and UNBINNED memberships have no CheckM row, so the
-    exact-equality assertion below pins that bin_quality holds MAG rows alone.
+    Only the refined-bin table pair is written here, so the fixture's LCG and
+    UNBINNED memberships get no row — which is what the exact-equality assertion
+    below pins, alongside the join.
     """
     inputs = _inputs(
         tmp_path,
@@ -470,3 +484,79 @@ def test_missing_manifest_raises_file_not_found(tmp_path, staging_inputs):
     si["manifest"] = tmp_path / "nope.parquet"
     with pytest.raises(FileNotFoundError):
         _run(_inputs(tmp_path, si), tmp_path / "ws")
+
+
+def test_bin_quality_carries_lcg_rows_beside_mag_rows(tmp_path, staging_inputs):
+    """Both CheckM runs land, each row tagged by the pair it came from.
+
+    An LCG bypasses binning, so DAS_Tool never sees it: its provenance columns are
+    NULL even though this sample HAS a das_tool_summary.tsv, and the MAG row beside
+    it is scored from the same file. That is the discriminating case — a fixture with
+    no DAS_Tool table would show NULL for both and prove nothing about which arm the
+    LEFT JOIN is attached to.
+
+    The `bin_id` values also differ in shape by kind: a MAG's is a refined-bin FASTA
+    stem, an LCG's is the contig id, which is what `assembly_hash` wrote into
+    `bin_map` for each. Both must survive unmodified or the row joins no membership.
+    """
+    inputs = _inputs(
+        tmp_path,
+        staging_inputs,
+        checkm_rows=[("bin.1", "k__Bacteria", 95.5, 1.2, 0.0, 10000, 2)],
+        lcg_rows=[("circ1", "k__Bacteria", 99.1, 0.4, 0.0, 1800000, 1)],
+        das_rows=[("bin.1", 0.87, "metabat2")],
+    )
+    out = _run(inputs, tmp_path / "ws")
+    pq = out["staging_dir"] / "bin_quality.parquet"
+    rows = _rows(
+        pq,
+        "kind, bin_id, completeness, contamination, genome_size, n_contigs, "
+        "das_tool_score, source_binner",
+        "kind, bin_id",
+    )
+    assert rows == [
+        ("LCG", "circ1", 99.1, 0.4, 1800000, 1, None, None),
+        ("MAG", "bin.1", 95.5, 1.2, 10000, 2, 0.87, "metabat2"),
+    ]
+
+
+def test_bin_quality_holds_lcg_rows_with_no_refined_bin(tmp_path, staging_inputs):
+    """A sample whose assembly closed genomes but produced no refined bin.
+
+    Before the LCG arm this wrote bin_quality EMPTY, so the one class most likely to
+    be a complete genome was the only one stored with no completeness at all. The
+    two pairs are read independently, so the absent refined-bin pair costs nothing.
+    """
+    inputs = _inputs(
+        tmp_path,
+        staging_inputs,
+        checkm_rows=None,  # no refined bin -> checkm.sh writes no lineage.tsv/qa.tsv
+        lcg_rows=[("circ1", "k__Bacteria", 99.1, 0.4, 0.0, 1800000, 1)],
+    )
+    out = _run(inputs, tmp_path / "ws")
+    pq = out["staging_dir"] / "bin_quality.parquet"
+    assert _rows(pq, "kind, bin_id, completeness", "bin_id") == [("LCG", "circ1", 99.1)]
+
+
+def test_unbinned_membership_is_never_scored(tmp_path, staging_inputs):
+    """The residue is stored and queryable, but carries no quality row.
+
+    checkm.sh scores neither UNBINNED file, so nothing here can produce such a row —
+    the point of asserting it is that the fixture's UNBINNED membership row DOES
+    reach assembly_membership, so the two tables deliberately disagree on which
+    kinds they cover.
+    """
+    inputs = _inputs(
+        tmp_path,
+        staging_inputs,
+        checkm_rows=[("bin.1", "k__Bacteria", 95.5, 1.2, 0.0, 10000, 2)],
+        lcg_rows=[("circ1", "k__Bacteria", 99.1, 0.4, 0.0, 1800000, 1)],
+    )
+    out = _run(inputs, tmp_path / "ws")
+    staging = out["staging_dir"]
+    quality_kinds = {r[0] for r in _rows(staging / "bin_quality.parquet", "kind", "kind")}
+    membership_kinds = {
+        r[0] for r in _rows(staging / "assembly_membership.parquet", "kind", "kind")
+    }
+    assert quality_kinds == {"LCG", "MAG"}
+    assert "UNBINNED" in membership_kinds

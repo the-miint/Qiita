@@ -32,7 +32,12 @@ from qiita_control_plane.backfill.assembly_genome import (
     apply_backfill,
     plan_backfill,
 )
-from qiita_control_plane.repositories.assembly import assembly_genome_source_id
+from qiita_control_plane.repositories.assembly import (
+    assembly_genome_source_id,
+    count_assembly_genome_map,
+    count_assembly_membership_without_genome,
+    fetch_assembly_genome_map,
+)
 from qiita_control_plane.repositories.processing import mint_processing
 from qiita_control_plane.repositories.reference_exclusion import (
     RESOLVE_EXCLUDED_FEATURES_SQL,
@@ -506,4 +511,99 @@ async def test_a_reference_claimed_genome_blocks_the_pool_delete_before_it_purge
         await postgres_pool.execute(
             "DELETE FROM qiita.sequencing_run WHERE created_by_idx = $1", principal_idx
         )
+        await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)
+
+
+async def test_the_genome_map_admits_mag_and_lcg_but_not_unbinned(postgres_pool, tmp_path):
+    """The de novo alignment map skips the residue, in both of its drivers.
+
+    UNBINNED is minted a genome like any other subject — that is what the mint test
+    above pins — so it would otherwise flow into every de novo feature table. It is
+    excluded because an unbinned contig is what no refined bin claimed, and its
+    bin_id is the contig id, so each one becomes a genome of a single fragment.
+
+    Asserted through both readers, because they share one SQL fragment and the
+    reason it is shared is that they must not disagree: the REST map a client reads
+    and the cohort Parquet the compute job reads. A filter applied to one only would
+    make the two describe different tables.
+    """
+    principal_idx, prep, proc, ref, feats, paths = await _setup(
+        postgres_pool, tmp_path, label="agm-mapkinds"
+    )
+    try:
+        await lib.write_assembly_membership(postgres_pool, prep, proc, *paths)
+        subjects = await _subjects(postgres_pool, prep)
+        unbinned_genome = subjects[(KIND_UNBINNED, "c4")][0]
+        admitted = {subjects[(KIND_MAG, "bin.1")][0], subjects[(KIND_LCG, "c3")][0]}
+
+        rest = await fetch_assembly_genome_map(
+            postgres_pool, prep_sample_idx=prep, processing_idx=proc, limit=100
+        )
+        assert {r["genome_idx"] for r in rest} == admitted
+        assert unbinned_genome not in {r["genome_idx"] for r in rest}
+        assert await count_assembly_genome_map(
+            postgres_pool, prep_sample_idx=prep, processing_idx=proc
+        ) == len(rest)
+
+        out = tmp_path / "denovo_genome_map.parquet"
+        await lib.export_assembly_member_genome(
+            postgres_pool, prep_sample_idx=[prep], processing_idx=proc, out_path=out
+        )
+        with duckdb.connect(":memory:") as con:
+            exported = {
+                r[0]
+                for r in con.execute(
+                    f"SELECT DISTINCT genome_idx FROM read_parquet('{out}')"
+                ).fetchall()
+            }
+        assert exported == admitted
+    finally:
+        await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)
+
+
+async def test_an_unminted_unbinned_row_does_not_refuse_the_cohort(postgres_pool, tmp_path):
+    """The completeness counter tracks the map's kinds, not every membership row.
+
+    A caller staging the de novo map refuses on a non-empty count, because a NULL
+    genome_idx silently shortens a genome's length denominator. That reasoning only
+    reaches rows the map reads — so a NULL on an UNBINNED row, which the map skips
+    anyway, must not refuse a cohort whose MAG and LCG rows are all minted.
+    """
+    principal_idx, prep, proc, ref, feats, paths = await _setup(
+        postgres_pool, tmp_path, label="agm-mapcount"
+    )
+    try:
+        await lib.write_assembly_membership(postgres_pool, prep, proc, *paths)
+        assert (
+            await count_assembly_membership_without_genome(
+                postgres_pool, prep_sample_idx=[prep], processing_idx=proc
+            )
+            == {}
+        )
+
+        await postgres_pool.execute(
+            "UPDATE qiita.assembly_membership SET genome_idx = NULL"
+            " WHERE prep_sample_idx = $1 AND kind = $2",
+            prep,
+            KIND_UNBINNED,
+        )
+        assert (
+            await count_assembly_membership_without_genome(
+                postgres_pool, prep_sample_idx=[prep], processing_idx=proc
+            )
+            == {}
+        ), "an unminted UNBINNED row refused a cohort the map never reads it for"
+
+        # The control: the same NULL on a kind the map DOES read is still reported,
+        # so the check above is a scoped filter and not a disabled guard.
+        await postgres_pool.execute(
+            "UPDATE qiita.assembly_membership SET genome_idx = NULL"
+            " WHERE prep_sample_idx = $1 AND kind = $2",
+            prep,
+            KIND_LCG,
+        )
+        assert await count_assembly_membership_without_genome(
+            postgres_pool, prep_sample_idx=[prep], processing_idx=proc
+        ) == {prep: 1}
+    finally:
         await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)

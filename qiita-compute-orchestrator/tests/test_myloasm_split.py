@@ -58,6 +58,7 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WORKFLOW_DIR = _REPO_ROOT / "workflows" / "long-read-assembly"
 _SPLIT_PY = _WORKFLOW_DIR / "myloasm_split.py"
+_MIINT_CONNECT_PY = _WORKFLOW_DIR / "miint_connect.py"
 _ASSEMBLE_SH = _WORKFLOW_DIR / "assemble.sh"
 _ASSEMBLE_DEF = _WORKFLOW_DIR / "assemble.def"
 _ASSEMBLE_ENV = _WORKFLOW_DIR / "sif-build.d" / "assemble.env"
@@ -394,18 +395,34 @@ def test_splitter_uses_miint_and_never_installs() -> None:
 
     Hand-rolling a FASTA reader/writer where miint has one is the repo's named
     review smell; a per-job INSTALL is the footgun the staged directory replaced.
+
+    The connection itself lives in `miint_connect.py`, which checkm.def copies too
+    for lcg_split.py. So the LOAD-only half is asserted there, and the splitter is
+    asserted to USE it rather than to open a connection of its own — a second
+    connect config would be a second copy of the staged-extension settings, free to
+    drift from what the three services run.
     """
     code = _SPLIT_PY.read_text()
     assert "read_fastx" in code, "the splitter no longer reads with miint's read_fastx"
     assert "FORMAT FASTA" in code, "the splitter no longer writes with miint's FASTA writer"
-    assert "LOAD miint" in code, "the splitter no longer LOADs miint"
+    assert "from miint_connect import" in code, (
+        "the splitter no longer connects through miint_connect, so the staged-miint "
+        "LOAD asserted below is not the connection it actually opens"
+    )
+    assert "duckdb.connect" not in code, (
+        "the splitter opens its own DuckDB connection beside miint_connect.connect"
+    )
+
+    connect_code = _MIINT_CONNECT_PY.read_text()
+    assert "LOAD miint" in connect_code, "miint_connect no longer LOADs miint"
     # Anchored at a string-literal opening quote so the word INSTALL in the prose
     # explaining WHY we don't install cannot satisfy — or break — this.
-    assert re.search(r"""["']\s*INSTALL\b""", code) is None, (
-        "the splitter issues an INSTALL statement. Service-side connects are "
-        "LOAD-only: an INSTALL needs the mirror reachable from every compute node "
-        "and a writable $HOME."
-    )
+    for path in (_MIINT_CONNECT_PY, _SPLIT_PY):
+        assert re.search(r"""["']\s*INSTALL\b""", path.read_text()) is None, (
+            f"{path.name} issues an INSTALL statement. Service-side connects are "
+            "LOAD-only: an INSTALL needs the mirror reachable from every compute "
+            "node and a writable $HOME."
+        )
 
 
 def test_assemble_step_binds_where_the_stager_actually_stages() -> None:

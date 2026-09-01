@@ -86,6 +86,21 @@ _None yet._
   is what is printed: a body-only check reads the same whether the route answered or the token
   expired.
 
+- **Check the circular genomes came back scored.** (#519)
+
+  ```bash
+  # A ticket whose assemble step produced a non-empty circular.fa.
+  T=<work_ticket_idx>
+  ls "${PATH_SCRATCH}/ticket/${T}"/checkm/attempt-*/output/checkm/
+  ```
+
+  Four files — `lineage.tsv`, `qa.tsv`, `lcg_lineage.tsv`, `lcg_qa.tsv` — means both CheckM runs
+  landed. Only the first pair, on a ticket that HAS circular contigs, means the LCG arm did not
+  run: check the step log for `lcg_split`, whose usual failure is a missing or mislocated
+  `${PATH_DERIVED}/duckdb-ext` (the bind is new on this step, see the note below). A ticket with
+  an empty `circular.fa` legitimately writes only the first pair, so pick the ticket before
+  reading the result.
+
 ### 6. After the deploy verifies green
 
 _None yet._
@@ -129,6 +144,24 @@ _None yet._
   are narrow — the deploy restarts the DP and the CO together — and a failed register-files
   is a retryable step, not lost data: re-running the ticket's tail after the deploy writes a
   nine-column file. Nothing to do in advance; this is here so the failure is recognisable.
+
+- **The `checkm` step now binds the deploy-staged miint extension, and its SIF rebuilds.** (#519)
+  `checkm.sh` splits `circular.fa` into per-contig FASTAs with miint's `read_fastx` /
+  `COPY … FORMAT FASTA`, so the step gained `derived_inputs: MIINT_EXTENSION_DIRECTORY:
+  duckdb-ext` — resolved against `PATH_DERIVED` exactly as the `assemble` step's already is. The
+  bind is **unconditional**: the backend emits it for every `derived_inputs` entry, so a missing
+  or mislocated `${PATH_DERIVED}/duckdb-ext` fails apptainer for the whole step, not just the LCG
+  arm, including for a sample with no circular contig. Nothing new to stage — it is the same
+  directory the assemble step already requires — but this is a second step that now depends on
+  it. The image also rebuilds (`checkm.sh`, `lcg_split.py` and `miint_connect.py` are in its
+  `HASH_INPUTS`) and gains `python-duckdb`, pinned in lockstep with the orchestrator's resolved
+  DuckDB, so expect a slower-than-usual verify for this image too.
+
+- **`bin_quality` gains LCG rows; nothing existing changes.** (#519) The table now carries one row
+  per circular genome beside the per-refined-bin rows, tagged by `kind`. Rows written by earlier
+  deploys are untouched and are not backfilled — the values come from a CheckM run that did not
+  happen, so an assembly stored before this deploy keeps MAG rows only. Re-running the workflow
+  for a sample is what produces its LCG rows. The unbinned residue is still never scored.
 
 ---
 

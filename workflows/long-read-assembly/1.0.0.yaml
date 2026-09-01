@@ -17,7 +17,8 @@ description: >
   tools —
   `assemble` (hifiasm_meta or myloasm → circular LCG genomes + noLCG contigs), `binning`
   (metawrap: metabat2/maxbin2/concoct), `bin_refine` (DAS_Tool consensus bins),
-  and `checkm` (per-MAG completeness/contamination). The storage tail REUSES the
+  and `checkm` (completeness/contamination per refined bin and per circular genome,
+  in two runs so the class a row came from carries its kind). The storage tail REUSES the
   reference-add machinery: `assembly_hash` hashes the LCG contigs, the MAG
   contigs, and the unbinned noLCG residue — the contigs no refined bin claimed,
   which can be valid sequence such as DNA viruses — under the shared canonical
@@ -166,7 +167,7 @@ steps:
     baseline_resources:
       cpu: 16
       mem_gb: 100
-      walltime: PT8H
+      walltime: PT4H
 
   # DAS_Tool consensus refinement over the three binners' output. "No bins >0.5"
   # → empty refined_bins_dir (exit 0); a real DAS_Tool crash fails the step.
@@ -181,20 +182,47 @@ steps:
       mem_gb: 32
       walltime: PT4H
 
-  # CheckM lineage_wf + qa -o 2 over the refined MAGs → raw lineage.tsv + qa.tsv
-  # (assembly_load joins them in DuckDB). Empty input → empty checkm_dir (exit 0).
+  # CheckM lineage_wf + qa -o 2, run once over the refined MAGs and once over the
+  # circular genomes → raw lineage.tsv + qa.tsv and lcg_lineage.tsv + lcg_qa.tsv
+  # (assembly_load joins each pair in DuckDB). The two classes are scored
+  # SEPARATELY because the file a row came from is what gives it a `kind`; checkm.sh
+  # carries why that beats one merged directory. Nothing to score → empty
+  # checkm_dir (exit 0). An LCG bypasses binning, so without this arm a circular
+  # genome — the class most likely to be a complete one — is the only kind stored
+  # with no completeness or contamination at all.
   - step: checkm
     step_type: singleton
     container: long-read-assembly-checkm-1.0.0.sif
     entrypoint: /opt/qiita/checkm.sh
-    inputs: [refined_bins_dir]
+    # `genomes_dir` is read for circular.fa alone; the refined bins arrive as their
+    # own input. It is an INPUT rather than a new output on assemble for the reason
+    # assembly_load below states: a declared output is re-bound on resume from a
+    # manifest an earlier attempt wrote, while an input resolves from a binding
+    # already produced, so adding one here strands nothing.
+    inputs: [refined_bins_dir, genomes_dir]
     # CheckM's ~1.4 GB reference DB is operator-provisioned under PATH_DERIVED,
     # deliberately NOT baked into the SIF. Bind it in and point checkm.sh at it:
     # the entrypoint reads QIITA_CHECKM_DB (falling back to an /opt/checkm_data
     # that does not exist in the image, so an unbound DB exits 78).
+    #
+    # The deploy-staged miint extension is bind-mounted read-only for lcg_split.py,
+    # which reads circular.fa with read_fastx and writes the per-contig FASTAs with
+    # COPY (FORMAT FASTA). Same var, same staged build and same UNCONDITIONAL bind
+    # as the assemble step — see that step for what a missing PATH_DERIVED/duckdb-ext
+    # costs.
     derived_inputs:
       QIITA_CHECKM_DB: checkm_data
+      MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [checkm_dir]
+    # Unchanged, and fitted rather than assumed: across 59 completed checkm steps on
+    # the deploy host the elapsed (submit -> terminal, so queue wait included)
+    # averaged 27.5 min and peaked at 58.9 min against this PT4H cap. The LCG arm
+    # adds a SECOND, sequential lineage_wf over a comparable genome set — ~104
+    # refined bins beside ~98 circular contigs per ticket — so a doubled peak still
+    # sits under half the cap.
+    #
+    # cpu and mem_gb are unchanged because the runs are sequential: peak memory is one
+    # run at a time, and one run scores about as many genomes as the step already did.
     baseline_resources:
       cpu: 8
       mem_gb: 40

@@ -37,20 +37,9 @@ is real work, expressed in SQL rather than a hand-written scanner.
 
 WHICH miint — THE DEPLOY-STAGED ONE
 -----------------------------------
-This LOADs the extension the deploy already staged, bind-mounted into the
-container read-only via the step's `derived_inputs`. It is the SAME build the
-control plane, the compute orchestrator and the data plane run, which is the
-point: a copy baked into this image would be a fourth miint that `make
-preflight`'s byte-identity check does not compare, free to drift from the other
-three.
-
-LOAD-only, never INSTALL — the standing service-side rule. A per-job INSTALL would
-need the mirror reachable from every compute node and a writable `$HOME`.
-
-DuckDB namespaces the staged directory by **engine version + platform**, so this
-container's DuckDB must be the version the orchestrator staged with. assemble.def
-pins it and asserts it at build time; a mismatch surfaces here as an explicit LOAD
-failure rather than a wrong answer.
+`miint_connect.connect` LOADs the extension the deploy staged and bind-mounted into
+this container. That module carries why it is the staged build and not a baked-in
+copy, and what a DuckDB version skew looks like from here.
 
 WHAT COUNTS AS CIRCULAR
 -----------------------
@@ -95,16 +84,19 @@ way.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 import duckdb
 
-# 64 = EX_USAGE, for a contract violation this step cannot proceed past.
-EXIT_CONTRACT_VIOLATION = 64
+# `miint_connect` sits beside this file, both in the repo and at /opt/qiita in the
+# image. Running the script directly puts that directory on sys.path already; the
+# insert is for assemble.def's %test, which loads this module by spec and does not.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-MIINT_EXTENSION_DIRECTORY_VAR = "MIINT_EXTENSION_DIRECTORY"
+from miint_connect import connect, die, sql_path  # noqa: E402
+
+PROG = "myloasm_split"
 
 # myloasm's header grammar, defined ONCE. The circularity VALUE is extracted
 # rather than matched against a list of alternatives, which is what makes the two
@@ -141,81 +133,6 @@ _DECORATION_RE = rf"{_LEN_FIELD}{_CIRC_FIELD}.*$"
 # than being guessed at.
 _KNOWN_CIRCULARITY = ("yes", "no", "possibly")
 _CIRCULAR = "yes"
-
-
-def _die(msg: str) -> None:
-    print(f"myloasm_split: {msg}", file=sys.stderr)
-    raise SystemExit(EXIT_CONTRACT_VIOLATION)
-
-
-def _sql_path(path: str) -> str:
-    """A path safe to interpolate into a DuckDB SQL string literal.
-
-    `COPY … TO`'s target is a string literal and cannot be parameter-bound, so it
-    is interpolated — and REJECTED rather than escaped when it holds a quote,
-    backslash or control character, matching `qiita_common.parquet`'s
-    `validate_parquet_path`. Fail-fast beats a clever escape: no workspace path
-    the entrypoint builds contains these, so one that does means something is
-    already wrong.
-    """
-    if "'" in path or "\\" in path or any(ord(c) < 0x20 for c in path):
-        _die(f"path contains characters unsafe to interpolate into SQL: {path!r}")
-    return f"'{path}'"
-
-
-def _connect() -> duckdb.DuckDBPyConnection:
-    """A miint connection over the DEPLOY-STAGED extension directory, bounded by
-    the step's own allocation.
-
-    The connect config (LOAD-only, `allow_unsigned_extensions`, the staged
-    `extension_directory`) mirrors what `qiita_common.duckdb_miint` produces for
-    the Python services. It is duplicated rather than imported because
-    `qiita-common` is not installed in this container; the Rust data plane carries
-    the same duplication for the same reason. A change to the canonical config
-    belongs here too.
-
-    `memory_limit` / `threads` / `temp_directory` come from the step's resolved
-    allocation, which `_shared/_lib.sh` exports as MEM_MB and THREADS (TMPDIR is
-    pointed at the workspace by the SLURM payload). Without them DuckDB sizes
-    itself from what it detects on the NODE, not from this step's cgroup, and a
-    deep metagenome gets OOM-killed instead of spilling — the posture every native
-    sibling takes via `apply_duckdb_settings`.
-    """
-    ext_dir = os.environ.get(MIINT_EXTENSION_DIRECTORY_VAR)
-    if not ext_dir:
-        _die(
-            f"{MIINT_EXTENSION_DIRECTORY_VAR} is not set. The assemble step must "
-            "declare it in the workflow YAML's `derived_inputs` so the deploy-staged "
-            "miint extension is bind-mounted into this container."
-        )
-    if not Path(ext_dir).is_dir():
-        _die(f"{MIINT_EXTENSION_DIRECTORY_VAR}={ext_dir!r} is not a directory")
-
-    config = {"allow_unsigned_extensions": "true", "extension_directory": ext_dir}
-    # Leave headroom under the cgroup ceiling: DuckDB's limit governs its own
-    # buffers, not the whole process, and the reader holds contig bytes outside it.
-    mem_mb = os.environ.get("MEM_MB")
-    if mem_mb and mem_mb.isdigit() and int(mem_mb) > 0:
-        config["memory_limit"] = f"{max(1, (int(mem_mb) * 3) // 4)}MB"
-    threads = os.environ.get("THREADS")
-    if threads and threads.isdigit() and int(threads) > 0:
-        config["threads"] = threads
-    tmpdir = os.environ.get("TMPDIR")
-    if tmpdir and Path(tmpdir).is_dir():
-        config["temp_directory"] = str(Path(tmpdir) / "duckdb-myloasm-split")
-
-    con = duckdb.connect(config=config)
-    try:
-        # LOAD-only, never INSTALL — see the module docstring.
-        con.execute("LOAD miint")
-    except duckdb.Error as exc:
-        _die(
-            f"LOAD miint failed from {ext_dir!r}: {exc}. DuckDB namespaces that "
-            f"directory by engine version + platform (this container runs DuckDB "
-            f"{duckdb.__version__}), so the usual cause is a DuckDB version skew "
-            "between this image and the orchestrator that staged the extension."
-        )
-    return con
 
 
 def _load(con: duckdb.DuckDBPyConnection, src: str) -> None:
@@ -277,11 +194,12 @@ def _validate(con: duckdb.DuckDBPyConnection) -> None:
         [list(_KNOWN_CIRCULARITY)],
     ).fetchall()
     if bad:
-        _die(
+        die(
+            PROG,
             f"header(s) do not match the probed myloasm shape "
             f"<id>_len-<N>_circular-<{'|'.join(_KNOWN_CIRCULARITY)}>_… "
             f"(e.g. {bad[0][0]!r}) — re-probe the header format against the myloasm "
-            "version pinned in assemble.def before trusting this split"
+            "version pinned in assemble.def before trusting this split",
         )
 
     # `depth` gets the same fail-closed treatment as circularity, and for the same
@@ -294,21 +212,23 @@ def _validate(con: duckdb.DuckDBPyConnection) -> None:
         "SELECT count(*), count(depth) FROM contig"
     ).fetchone()
     if n_rows and not n_depth:
-        _die(
+        die(
+            PROG,
             "no contig yielded a depth: every header parsed for circularity but "
             "none matched the _depth-A-B-C field — re-probe the header format "
-            "against the myloasm version pinned in assemble.def"
+            "against the myloasm version pinned in assemble.def",
         )
 
     # An LCG's bin_id IS its contig id (assembly_hash COALESCEs it from the
     # record), so a duplicate id puts two distinct genomes under one
     # `assembly_membership` subject downstream.
     dupes = con.execute(
-        "SELECT contig_id, count(*) AS n FROM contig GROUP BY 1 HAVING n > 1"
-        " ORDER BY 1 LIMIT 5"
+        "SELECT contig_id, count(*) AS n FROM contig GROUP BY 1 HAVING n > 1 ORDER BY 1 LIMIT 5"
     ).fetchall()
     if dupes:
-        _die(f"duplicate contig id(s) after cutting the _len-… decoration: {dupes}")
+        die(
+            PROG, f"duplicate contig id(s) after cutting the _len-… decoration: {dupes}"
+        )
 
 
 def _write(con: duckdb.DuckDBPyConnection, out: str, *, circular: bool) -> int:
@@ -325,7 +245,7 @@ def _write(con: duckdb.DuckDBPyConnection, out: str, *, circular: bool) -> int:
         "COPY ("
         "  SELECT contig_id AS read_id, sequence1 FROM contig"
         f"  WHERE circularity {op} ?"
-        f") TO {_sql_path(out)} (FORMAT FASTA)",
+        f") TO {sql_path(PROG, out)} (FORMAT FASTA)",
         [_CIRCULAR],
     ).fetchone()
     return count
@@ -352,16 +272,17 @@ def _write_attributes(con: duckdb.DuckDBPyConnection, out: str) -> int:
         "COPY ("
         "  SELECT contig_id, header AS raw_name, circularity, depth, mult"
         "  FROM contig ORDER BY contig_id"
-        f") TO {_sql_path(out)} (FORMAT CSV, DELIMITER '\t', HEADER)"
+        f") TO {sql_path(PROG, out)} (FORMAT CSV, DELIMITER '\t', HEADER)"
     ).fetchone()
     return count
 
 
 def main(argv: list[str]) -> int:
     if len(argv) != 5:
-        _die(
+        die(
+            PROG,
             f"usage: {argv[0]} <assembly_primary.fa> <circular.fa> <noLCG.fa>"
-            " <contig_attributes.tsv>"
+            " <contig_attributes.tsv>",
         )
     primary, circ_out, nolcg_out, attrs_out = argv[1], argv[2], argv[3], argv[4]
 
@@ -373,12 +294,12 @@ def main(argv: list[str]) -> int:
     try:
         size = Path(primary).stat().st_size
     except OSError as exc:
-        _die(f"cannot stat {primary!r}: {exc}")
+        die(PROG, f"cannot stat {primary!r}: {exc}")
     if size == 0:
-        _die(f"{primary} is empty; read_fastx raises on a zero-record input")
+        die(PROG, f"{primary} is empty; read_fastx raises on a zero-record input")
 
-    src = _sql_path(primary)
-    con = _connect()
+    src = sql_path(PROG, primary)
+    con = connect(PROG, temp_subdir="duckdb-myloasm-split")
     try:
         _load(con, src)
         _validate(con)
@@ -393,7 +314,10 @@ def main(argv: list[str]) -> int:
         con.close()
 
     if n_circ + n_lin != total:
-        _die(f"split lost records: {n_circ} circular + {n_lin} linear != {total} input")
+        die(
+            PROG,
+            f"split lost records: {n_circ} circular + {n_lin} linear != {total} input",
+        )
     # The attributes cover BOTH classes, so this is the input count, not either
     # class. A shortfall means a contig reaches the lake with no stored call while
     # its FASTA record is loaded normally — invisible downstream, since the join
@@ -404,11 +328,10 @@ def main(argv: list[str]) -> int:
     # `contig_id` a usable join key downstream; a future filter added to either
     # side is what it is here to catch.
     if n_attrs != total:
-        _die(f"attributes lost records: {n_attrs} rows != {total} input contigs")
+        die(PROG, f"attributes lost records: {n_attrs} rows != {total} input contigs")
 
     print(
-        f"myloasm_split: {n_circ} circular (LCG), {n_lin} linear (noLCG),"
-        f" {n_attrs} attribute rows"
+        f"myloasm_split: {n_circ} circular (LCG), {n_lin} linear (noLCG), {n_attrs} attribute rows"
     )
     return 0
 

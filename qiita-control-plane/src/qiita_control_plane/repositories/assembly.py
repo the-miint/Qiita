@@ -19,6 +19,7 @@ Its contract lives on `fetch_assembly_sample_state` below.
 
 import asyncpg
 from qiita_common.api_paths import URL_PROCESSING_SAMPLE_STATUS
+from qiita_common.assembly_constants import KIND_UNBINNED
 from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import AssemblySampleState
 
@@ -427,9 +428,20 @@ async def fetch_assembly_sample_states(
 # `count_assembly_membership_without_genome` exists beside it: a NULL is a run whose
 # memberships predate the genome mint, and silently dropping those contigs would
 # give their genomes a short denominator rather than an error.
+#
+# `_ASSEMBLY_GENOME_MAP_KIND` is the other filter, and it is a design decision
+# rather than a completeness one: an UNBINNED contig is what no refined bin claimed,
+# and for that kind `bin_id` is the contig id itself, so the genome mint gives every
+# residue contig a genome of its own. On the deploy host that is 820,094 of the
+# 1,002,979 membership rows — a map carrying them describes five fragments for every
+# assembled genome, and a table built over it aligns against them. They stay in
+# qiita.assembly_membership and are queryable there; they are not alignment subjects.
+# checkm.sh declines to score them for the matching reason.
 _ASSEMBLY_GENOME_MAP_FROM = " FROM qiita.assembly_membership am"
+_ASSEMBLY_GENOME_MAP_KIND = f" AND am.kind <> '{KIND_UNBINNED}'"
 _ASSEMBLY_GENOME_MAP_WHERE = (
-    " WHERE am.prep_sample_idx = ANY($1) AND am.processing_idx = $2 AND am.genome_idx IS NOT NULL"
+    " WHERE am.prep_sample_idx = ANY($1) AND am.processing_idx = $2"
+    " AND am.genome_idx IS NOT NULL" + _ASSEMBLY_GENOME_MAP_KIND
 )
 ASSEMBLY_GENOME_MAP_PAIRS_SQL = _ASSEMBLY_GENOME_MAP_FROM + _ASSEMBLY_GENOME_MAP_WHERE
 
@@ -504,11 +516,18 @@ async def count_assembly_membership_without_genome(
     Cohort-shaped like the two reads above, so a caller checking a whole cohort
     makes one round trip and its refusal can name every offender rather than the
     first.
+
+    Filtered to the same kinds the map admits, so it counts only rows the map would
+    otherwise have used. Counting an UNBINNED row here would refuse a cohort over a
+    gap that cannot reach the table.
     """
     rows = await db.fetch(
-        "SELECT prep_sample_idx, count(*) AS n FROM qiita.assembly_membership"
-        " WHERE prep_sample_idx = ANY($1) AND processing_idx = $2 AND genome_idx IS NULL"
-        " GROUP BY prep_sample_idx ORDER BY prep_sample_idx",
+        "SELECT am.prep_sample_idx, count(*) AS n"
+        + _ASSEMBLY_GENOME_MAP_FROM
+        + " WHERE am.prep_sample_idx = ANY($1) AND am.processing_idx = $2"
+        " AND am.genome_idx IS NULL"
+        + _ASSEMBLY_GENOME_MAP_KIND
+        + " GROUP BY am.prep_sample_idx ORDER BY am.prep_sample_idx",
         prep_sample_idx,
         processing_idx,
     )
