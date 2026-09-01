@@ -9,7 +9,7 @@ the four things this awk actually decides are pinned here by RUNNING it:
 
   * the circular/linear call from the segment name,
   * `dp:f` found by TAG rather than by column position,
-  * a segment with no `dp:f` writing an empty field and being REPORTED,
+  * a segment with no `dp:f` writing an empty field and being counted,
   * a name matching neither shape exiting 65 instead of being routed,
   * and a GFA where NO segment carries `dp:f` failing rather than storing a
     depth-less run.
@@ -128,9 +128,9 @@ def test_the_awk_writes_one_row_per_segment_with_the_declared_columns(tmp_path: 
     depth on the second line here and nothing downstream could notice — a depth
     is a plausible number whatever it came from.
 
-    The stderr count is what keeps a partial absence out of the data alone: the
-    step tolerates it (see the no-tag-anywhere case below for why), so the log is
-    the only place it announces itself while it is still cheap to look into.
+    The stderr count is the only record a partial absence gets: the step
+    tolerates it (see the no-tag-anywhere case below for why), and nothing folds
+    a successful step's stderr into the ticket.
     """
     result, attrs = _run(
         tmp_path,
@@ -190,12 +190,9 @@ def test_a_gfa_with_no_dp_tag_anywhere_fails_rather_than_storing_no_depth(
     Left fail-open, `depth` would be NULL for every contig of every hifiasm run
     and read downstream as "not recorded", which is the same silent all-NULL
     outcome `myloasm_split.py` refuses for its own depth field. SOME segments
-    lacking the tag is not that shape and must still succeed (the case above) --
-    not because the reach of the tag is in doubt, which `assemble.sh` records a
-    real-assembly measurement for, but because such a row stays readable after
-    the fact: a NULL depth beside a non-NULL raw_name means the assembler
-    reported on that contig without a depth, where an absent sidecar leaves all
-    four NULL.
+    lacking the tag is not that shape and must still succeed (the case above),
+    because a partial absence is consistent both with a moved tag and with an
+    assembly the tool reported less about — `assemble.sh` carries the argument.
     """
     result, _ = _run(
         tmp_path,

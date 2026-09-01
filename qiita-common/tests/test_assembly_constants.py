@@ -136,11 +136,14 @@ def test_duckdb_would_not_have_caught_the_reordered_header(tmp_path):
 
 
 def _joined(sidecar):
-    """The membership row shape both writers derive, over a two-contig assembly.
+    """What the three shared join fragments make a membership row carry.
 
     Neither writer's whole statement can live here — one joins Parquets and
-    streams, the other COPYs to Parquet — but the three shared fragments are the
-    part that decides what a row carries, so the join is assembled from those.
+    streams, the other COPYs to Parquet — so this is the fragments over a
+    two-contig assembly, not either writer. It groups on `(kind, bin_id)`
+    because that is the part of the real conflict target these fragments see:
+    grouping on `kind` alone would collapse two bins into one row on any fixture
+    that grew a second MAG contig, a shape neither writer can produce.
     """
     conn = duckdb.connect(":memory:")
     conn.execute("CREATE TEMP TABLE bin_map(contig_id VARCHAR, kind VARCHAR, bin_id VARCHAR)")
@@ -152,25 +155,26 @@ def _joined(sidecar):
     return conn.execute(
         "SELECT m.kind, "
         + contig_attribute_projection("a")
-        + " FROM (SELECT bm.kind, "
+        + " FROM (SELECT bm.kind, bm.bin_id, "
         + CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL
-        + " FROM bin_map bm GROUP BY bm.kind) m"
+        + " FROM bin_map bm GROUP BY bm.kind, bm.bin_id) m"
         + contig_attribute_join("m")
         + " ORDER BY m.kind"
     ).fetchall()
 
 
 def test_a_missing_depth_is_distinguishable_from_a_missing_sidecar(tmp_path):
-    """`depth IS NULL` alone does not say which of two things happened, and the
-    entrypoints depend on it saying so.
+    """`depth IS NULL` alone does not say which of two things happened.
 
-    assemble.sh's hifiasm arm fails a GFA where NO segment carries `dp:f` but
-    lets a single tag-less segment through, storing NULL depth for it. That
-    tolerance rests on the row still announcing that the assembler DID report on
-    this contig — raw_name and circularity populated, depth empty — where a run
-    assembled before the sidecar existed has all four NULL. Were the two shapes
-    to converge, a partial `dp:f` absence would become unreadable after the fact
-    and the arm would have to fail on any missing tag instead.
+    A contig the assembler reported on without a depth keeps its raw_name and
+    circularity; a run assembled before the sidecar existed has all four NULL.
+    Both `assemble.sh` and the `depth` column comment lean on that separation
+    when they say a NULL depth is readable after the fact, so it is pinned here
+    — at the join, which is where the two shapes actually become rows.
+
+    This pins the join, not the entrypoint's pass/fail posture: nothing here
+    goes red if the hifiasm arm changed its mind about tolerating a partial
+    `dp:f` absence.
     """
     path = tmp_path / "contig_attributes.tsv"
     path.write_text(

@@ -46,15 +46,11 @@ COMMENT ON COLUMN qiita.assembly_membership.depth IS
     'header''s depth triple; per myloasm''s source that triple is min_read_depth_multi '
     'and the same function averages it into the avg_cov its circularity gate tests, '
     'which is read off the source rather than probed. hifiasm_meta: the GFA '
-    'S-line''s dp:f tag, which a 2899-contig real assembly on the pinned build '
-    'carried on every contig (depth 1-145). The step still tolerates a row whose '
-    'segment had no such tag, because that case stays readable after the fact: a '
-    'NULL depth beside a non-NULL raw_name means the assembler reported on the '
-    'contig without a depth, where all four NULL is a run older than the sidecar. '
-    'The two compute coverage differently, so compare across assemblers '
-    'only with '
-    'raw_name in hand; which assembler ran is on qiita.processing via '
-    'processing_idx.';
+    'S-line''s dp:f tag; a row may carry NULL where its segment had none, which '
+    'reads apart from a pre-sidecar run by its non-NULL raw_name (the hifiasm arm '
+    'of assemble.sh carries the measurement and the rule). The two compute '
+    'coverage differently, so compare across assemblers only with raw_name in '
+    'hand; which assembler ran is on qiita.processing via processing_idx.';
 
 COMMENT ON COLUMN qiita.assembly_membership.mult IS
     'myloasm''s k-mer multiplicity. NULL for hifiasm_meta, which has no counterpart, '

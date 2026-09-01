@@ -86,13 +86,12 @@ where the binners carried the header through.
 What the unmeasured half costs, concretely, is a myloasm `circular-possibly`
 contig. Only `circular-yes` bypasses binning (`myloasm_split.py`), so `possibly`
 goes to noLCG, and if a refined bin then claims it the DELETE below drops its
-UNBINNED row — leaving the MAG row as the contig's ONLY row. That row carries the
+UNBINNED row — leaving the MAG row as the contig's only row. That row carries the
 `possibly` call solely where the binners kept the id. Where they did not, the
-call is not one of two rows gone NULL; it is the whole record of it. hifiasm_meta
-emits no `possibly` and is the arm whose passthrough was measured, so this lands
-entirely on the arm that was not: running the full workflow on myloasm once
-settles it, and until then a myloasm MAG's NULL attributes are indistinguishable
-from a run assembled before the sidecar existed.
+call is not one of two rows gone NULL; it is the whole record of it, and such a
+row's NULLs are indistinguishable from a run assembled before the sidecar
+existed. hifiasm_meta emits no `possibly` and is the arm whose passthrough was
+measured, so this rests entirely on the arm that was not.
 
 Two consequences of keying on content. Hash-equal noLCG records share a fate: a
 bin claiming either drops both. And the exclusion set is the KIND_MAG rows alone —

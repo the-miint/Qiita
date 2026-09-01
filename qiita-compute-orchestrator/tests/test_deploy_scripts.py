@@ -8,7 +8,7 @@ precedent in test_compute_readiness.py::test_probe_script_is_valid_bash and the
 repo-root reach in test_sif_build_spec.py.
 
 The workflow entrypoints get the `bash -n` half for the same reason and a sharper
-one: they run INSIDE a SIF, so a syntax error surfaces as a container step dying
+one: they run inside a SIF, so a syntax error surfaces as a container step dying
 on a real ticket, after the image has been rebuilt and staged. Several embed a
 long single-quoted awk program, where an apostrophe in a comment closes the quote
 and breaks the script — the shape this gate is here to stop.
@@ -1169,8 +1169,14 @@ def test_lake_gc_always_passes_older_than_explicitly() -> None:
 
 def test_workflow_scripts_were_found() -> None:
     """Anti-vacuity guard: the parametrization below is a glob, so an empty or
-    moved `workflows/` tree would leave it silently exercising nothing."""
-    assert len(_WORKFLOW_SCRIPTS) >= 5
+    moved `workflows/` tree would leave it silently exercising nothing.
+
+    Named rather than counted — a floor would still pass if the glob stopped
+    reaching a whole workflow's directory. These four are the shared helper and
+    one entrypoint from each workflow that ships them.
+    """
+    found = {p.name for p in _WORKFLOW_SCRIPTS}
+    assert {"_lib.sh", "assemble.sh", "entrypoint.sh", "lima.sh"} <= found, found
 
 
 @pytest.mark.parametrize("path", _WORKFLOW_SCRIPTS, ids=lambda p: p.name)

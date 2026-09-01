@@ -35,13 +35,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   triple, which is the scalar myloasm itself derives from it (the `avg_cov` its own circularity
   gate tests, per myloasm's own source); hifiasm_meta's is the S-line's `dp:f` tag, previously
   discarded along with the rest of columns 4+. A GFA where NO segment carries that tag fails the
-  step rather than storing a depth-less run; some segments lacking it does not. That tolerance is
-  not a hedge against the tag being patchy — a 2,899-contig real metagenome assembled on the
-  pinned build carried `dp:f` on every contig (depth 1–145), with every name matching the
-  circular/linear grammar and none unmatched — but rests on such a row staying readable after
-  the fact: a NULL depth beside a non-NULL `raw_name` means the assembler reported on that
-  contig without a depth, where a pre-sidecar run leaves all four NULL. Those segments also get
-  a count on stderr. `mult` is NULL
+  step rather than storing a depth-less run; some segments lacking it does not, since a partial
+  absence is consistent both with a moved tag and with an assembly the tool reported less about,
+  and failing on it would discard a finished assembly to distinguish nothing. Such a row also
+  stays readable — a NULL depth beside a non-NULL `raw_name` means the assembler reported on
+  that contig without a depth, where a pre-sidecar run leaves all four NULL — and gets a count
+  on stderr. One real metagenome assembled on the pinned build carried `dp:f` on all 2,899 of
+  its contigs (depth 1–145), with every name matching the circular/linear grammar and none
+  unmatched; that is one assembly of one input, and the grammar had until now been exercised
+  only against synthetic single-contig assemblies. `mult` is NULL
   below 1 kb, where myloasm reports `0.00` for absence of signal rather than a measured zero.
   Attributes are NULL for every row written before this deploy and are not backfilled here:
   they are read out of the assemble step's output, which for an older run is gone. A MAG row
@@ -50,7 +52,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   unmeasured half has a specific cost, on the myloasm arm only: `circular-possibly` routes to
   binning, so where a refined bin claims such a contig the residue subtraction drops its
   UNBINNED row and the MAG row becomes the call's only record — which then depends on the
-  passthrough nobody has measured. Running the full workflow on myloasm once settles it.
+  passthrough nobody has measured.
   `kind` still
   records the routing that was applied, so `circular-yes` stays recoverable from `kind`
   alone; what an older row cannot recover is the `possibly`/`no` split among the contigs

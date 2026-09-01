@@ -168,15 +168,14 @@ case "${ASSEMBLER}" in
             # it moves. `mult` is empty for every row — hifiasm_meta has no
             # counterpart to myloasm's k-mer multiplicity.
             #
-            # Re-measured on a real metagenome assembled with the same pinned
-            # build (host qm, ~antoniog/claude-probe/run_real; the binary reports
-            # 0.13-r308 / 0.3-r079, which is what assemble.def's %test asserts):
-            # 2899 contigs, EVERY one carrying dp:f, depth 1-145, and every name
-            # matching the grammar above -- 1 circular, 2898 linear, 0 unmatched.
-            # All 2899 S-lines carry exactly LN:i dp:f ts:B. That is what makes
-            # the tag's absence, rather than its position, the thing worth
-            # guarding; the search is still by TAG because GFA does not fix the
-            # order and the cost of not assuming it is one loop.
+            # Re-measured on one real metagenome assembled with 0.13-r308 /
+            # 0.3-r079: 2899 contigs, all 2899 carrying dp:f, depth 1-145, all
+            # 2899 S-lines carrying exactly LN:i dp:f ts:B, and every name
+            # matching the grammar above (1 circular, 2898 linear, 0 unmatched).
+            # That is one assembly of one input, so it says the tag is emitted
+            # for every contig of that run, not what a low-coverage input or a
+            # different mode does. The search stays by TAG regardless: GFA does
+            # not fix the order, and not assuming it costs one loop.
             awk -v attrs="${OUT}/contig_attributes.tsv" -v circ="${CIRC_RE}" -v lin="${LIN_RE}" '
                 BEGIN { OFS = "\t"; print "contig_id", "raw_name", "circularity", "depth", "mult" > attrs }
                 $1 != "S" { next }
@@ -209,18 +208,22 @@ case "${ASSEMBLER}" in
                         printf "          re-probe hifiasm_meta depth tag against the version pinned in assemble.def\n" > "/dev/stderr"
                         exit 65
                     }
-                    # SOME carrying it is tolerated, and NOT because the reach of
-                    # the tag is in doubt -- the run above puts it on 2899 of 2899.
-                    # It is tolerated because such a segment stays readable after
-                    # the fact: its row still carries raw_name and circularity, so
-                    # a NULL depth beside a non-NULL raw_name reads as "this
-                    # segment reported none", where a run assembled before the
-                    # sidecar existed has all four NULL. Probed, and pinned in
-                    # test_assembly_constants.py in qiita-common, since that
-                    # property is what this tolerance rests on. Counted onto
-                    # stderr so it shows in the step log as well as in the data.
+                    # SOME carrying it is tolerated for the converse of the
+                    # reason above: a partial absence is not diagnostic of
+                    # anything. It is the one shape consistent both with a moved
+                    # tag and with an assembly the tool simply reported less about,
+                    # so failing on it would discard a finished assembly to
+                    # distinguish nothing. Such a row is also not lost -- it keeps
+                    # raw_name and circularity, so a NULL depth beside a non-NULL
+                    # raw_name reads as "this segment reported none" where a
+                    # pre-sidecar run has all four NULL (pinned in
+                    # test_assembly_constants.py in qiita-common) -- but that
+                    # holds of the failing case too, so it is what makes the
+                    # tolerance harmless rather than what makes it right.
+                    # Counted to stderr because nothing else records it.
                     if (seen && with_dp < seen) {
                         printf "assemble: %d of %d GFA segment(s) carried no dp:f tag; depth stored NULL for those\n", seen - with_dp, seen > "/dev/stderr"
+                        printf "          expected 0; if this is most of them, re-probe the depth tag against the version pinned in assemble.def\n" > "/dev/stderr"
                     }
                 }' "${GFA}"
 
