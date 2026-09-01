@@ -20,11 +20,11 @@ model, RNG seed) EXCEPT wrap-around, then assembled in two separate runs:
     reads sampled WITHOUT wrap      -> u278ctg_len-577882_circular-no_…
 
 Topology was the only variable, and the control reproduced the negative case, so
-the `circular-` field does track real circularity. `circular-possibly` is
-documented by myloasm but was NOT reproduced (runs starved to 1-3x depth still
-reported `circular-no`); it is therefore accepted as a well-formed value and
-routed to noLCG, which is both the safe direction and what the assay owner does
-by hand.
+the `circular-` field does track real circularity. `circular-possibly` was not reproduced by
+starving depth (runs at 1-3x still reported `circular-no`), but it does occur:
+six contigs across one sample's real masked reads carried it. It is accepted as
+a well-formed value and routed to noLCG, which is both the safe direction and
+what the assay owner does by hand.
 
 Three further behaviours were probed and are relied on below:
   * myloasm is DETERMINISTIC — two runs over the same reads gave byte-identical
@@ -112,6 +112,7 @@ def _split(tmp_path: Path, fasta: str, staged: str | None) -> subprocess.Complet
             str(primary),
             str(tmp_path / "circular.fa"),
             str(tmp_path / "noLCG.fa"),
+            str(tmp_path / "contig_attributes.tsv"),
         ],
         capture_output=True,
         text=True,
@@ -186,6 +187,55 @@ def test_circular_possibly_is_not_treated_as_circular(tmp_path: Path, staged_mii
     assert _ids(tmp_path / "noLCG.fa") == ["u9ctg"]
 
 
+def test_sidecar_carries_the_depth_mean_and_the_mult_length_gate(
+    tmp_path: Path, staged_miint: str
+) -> None:
+    """The attribute values, not just the file's presence.
+
+    Three records discriminate the two derivations the splitter performs:
+      * a >=1 kb contig with a SKEWED depth triple, so the stored value can only
+        be the mean (4+5+9)/3 == 6.0 -- a min, max or median would each differ;
+      * a <1 kb contig, where myloasm reports `mult=0.00` for absence of signal
+        rather than a measured zero, so `mult` must be NULL while `depth` is
+        still read;
+      * a contig whose `_len-` field DISAGREES with the sequence it carries, to
+        pin which of the two drives the gate. Its header says 5000 while the
+        sequence is 200 bp, so a gate reading the header would keep its `mult`
+        and a gate reading `length(sequence1)` -- the one this code uses --
+        nulls it. Nothing else in the file distinguishes them, because myloasm's
+        own headers always agree with their sequence.
+    """
+    long_seq = "ACGT" * 300  # 1200 bp, over the gate
+    short_seq = "ACGT" * 50  # 200 bp, under the gate
+    fasta = (
+        f">u1ctg_len-1200_circular-yes_depth-4-5-9_duplicated-no mult=1.75\n{long_seq}\n"
+        f">u2ctg_len-200_circular-no_depth-7-7-7_duplicated-no mult=0.00\n{short_seq}\n"
+        f">u3ctg_len-5000_circular-no_depth-2-2-2_duplicated-no mult=3.50\n{short_seq}\n"
+    )
+    result = _split(tmp_path, fasta, staged_miint)
+    assert result.returncode == 0, result.stderr
+
+    rows = (tmp_path / "contig_attributes.tsv").read_text().splitlines()
+    assert rows[0] == "contig_id\traw_name\tcircularity\tdepth\tmult"
+    parsed = {r.split("\t")[0]: r.split("\t") for r in rows[1:]}
+    assert set(parsed) == {"u1ctg", "u2ctg", "u3ctg"}
+
+    assert parsed["u1ctg"][2] == "yes"
+    assert float(parsed["u1ctg"][3]) == 6.0, "depth must be the MEAN of the triple"
+    assert float(parsed["u1ctg"][4]) == 1.75
+    # raw_name is the header's first token, which is what bin_map.contig_id is
+    # keyed on before the id is cut.
+    assert parsed["u1ctg"][1] == "u1ctg_len-1200_circular-yes_depth-4-5-9_duplicated-no"
+
+    assert float(parsed["u2ctg"][3]) == 7.0
+    assert parsed["u2ctg"][4] == "", "mult is NULL below the length gate"
+
+    # Header says 5000, sequence is 200 bp: the gate reads the SEQUENCE, so this
+    # is NULL. A gate keyed on the header's `_len-` field would keep 3.50 here.
+    assert parsed["u3ctg"][4] == "", "the gate must read length(sequence1), not the _len- field"
+    assert float(parsed["u3ctg"][3]) == 2.0, "depth is still read for a short contig"
+
+
 def test_trailing_header_fields_do_not_reach_the_id(tmp_path: Path, staged_miint: str) -> None:
     """The decoration and the space-separated `mult=…` tail are both stripped.
 
@@ -202,33 +252,60 @@ def test_trailing_header_fields_do_not_reach_the_id(tmp_path: Path, staged_miint
 
 
 @pytest.mark.parametrize(
-    ("case", "fasta"),
+    ("case", "fasta", "expected"),
     [
         # A renamed/reordered field set — the exact drift a myloasm upgrade could
         # introduce, and the one that would otherwise pass silently with an empty
         # circular.fa.
-        ("unknown header shape", ">u1ctg_length-10_loop-yes mult=1.00\nACGT\n"),
+        (
+            "unknown header shape",
+            ">u1ctg_length-10_loop-yes mult=1.00\nACGT\n",
+            "do not match the probed myloasm shape",
+        ),
         # A fourth circularity value we have never probed must stop the step.
-        ("unknown circularity value", ">u1ctg_len-10_circular-maybe_depth-1-1-1\nACGT\n"),
-        # Two genomes collapsing onto one bin_id downstream.
-        ("duplicate contig id", ">x_len-10_circular-yes_d\nAC\n>x_len-99_circular-no_d\nGT\n"),
+        (
+            "unknown circularity value",
+            ">u1ctg_len-10_circular-maybe_depth-1-1-1\nACGT\n",
+            "do not match the probed myloasm shape",
+        ),
+        # Two genomes collapsing onto one bin_id downstream. The headers carry a
+        # well-formed _depth- field on purpose: without one the all-NULL depth
+        # guard fires FIRST and this case silently stops exercising the duplicate
+        # check it is named for, which is what the message assertion below pins.
+        (
+            "duplicate contig id",
+            ">x_len-10_circular-yes_depth-1-1-1_d\nAC\n>x_len-99_circular-no_depth-2-2-2_d\nGT\n",
+            "duplicate contig id(s)",
+        ),
+        # Every header parses, but none carries a depth — the grammar moved.
+        (
+            "no depth on any contig",
+            ">u1ctg_len-10_circular-yes_d\nACGT\n",
+            "no contig yielded a depth",
+        ),
     ],
 )
 def test_malformed_input_fails_loud(
-    tmp_path: Path, staged_miint: str, case: str, fasta: str
+    tmp_path: Path, staged_miint: str, case: str, fasta: str, expected: str
 ) -> None:
     """Every shape we cannot interpret exits 64 instead of producing a partial split.
 
     Silence is the dangerous outcome: an unrecognised header simply fails to match
     the circular pattern, so the step would exit 0 having classified every genome
     as linear. Fail-closed converts that into a step failure an operator sees.
+
+    Each case asserts WHICH guard fired, not just that one did. `_validate` runs
+    its checks in order, so a fixture that trips an earlier guard would otherwise
+    keep this test green while the guard it is named for went unexercised.
     """
     result = _split(tmp_path, fasta, staged_miint)
     assert result.returncode == _EXIT_CONTRACT_VIOLATION, (
         f"{case}: expected exit {_EXIT_CONTRACT_VIOLATION}, got {result.returncode}. "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert "myloasm_split" in result.stderr, f"{case}: nothing diagnostic: {result.stderr!r}"
+    assert expected in result.stderr, (
+        f"{case}: expected the {expected!r} guard to fire; got {result.stderr!r}"
+    )
 
 
 def test_missing_extension_directory_fails_loud(tmp_path: Path) -> None:

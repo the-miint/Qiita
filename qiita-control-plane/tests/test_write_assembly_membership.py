@@ -13,6 +13,10 @@ import uuid
 
 import duckdb
 import pytest
+from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTE_COLUMNS,
+    CONTIG_ATTRIBUTES_FILE,
+)
 
 from qiita_control_plane.actions import library as lib
 from qiita_control_plane.repositories.processing import mint_processing
@@ -29,6 +33,17 @@ pytestmark = pytest.mark.db
 # applies. `_SOLO` is the control that must NOT collapse.
 _CONTIG = "acgtTGCAAGGTCCATTGCA"
 _SOLO = "TTTTGGGGCCCCAAAATTTT"
+
+# A myloasm header for _SOLO, whose `_len-` agrees with the 20 bp it describes.
+_RAW_NAME = "u1ctg_len-20_circular-possibly_depth-4-5-6_duplicated-no"
+
+
+def _write_sidecar(genomes_dir, rows) -> None:
+    """The sidecar as the entrypoints write it, spelled from the shared constants
+    so a column rename cannot leave this fixture behind."""
+    (genomes_dir / CONTIG_ATTRIBUTES_FILE).write_text(
+        "\t".join(CONTIG_ATTRIBUTE_COLUMNS) + "\n" + "".join("\t".join(r) + "\n" for r in rows)
+    )
 
 
 def _revcomp(sequence: str) -> str:
@@ -87,6 +102,11 @@ async def test_write_assembly_membership_reports_a_contig_collapse(postgres_pool
     bin_map = tmp_path / "bin_map.parquet"
     manifest = tmp_path / "manifest.parquet"
     feature_map = tmp_path / "feature_map.parquet"
+    # No sidecar written: this test is about the bin/feature join and the collapse
+    # warning, and an absent sidecar is what a run assembled before it existed
+    # hands the primitive. The attributes have their own case below.
+    genomes_dir = tmp_path / "genomes"
+    genomes_dir.mkdir()
     _write(
         bin_map,
         "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR, contig_id VARCHAR",
@@ -120,12 +140,13 @@ async def test_write_assembly_membership_reports_a_contig_collapse(postgres_pool
                 bin_map,
                 manifest,
                 feature_map,
+                genomes_dir,
             )
 
         # One feature in two bins plus the control: the join is per (bin, feature)
         # placement, which is exactly why the report cannot read its row count as a
-        # feature count. The DISTINCT in ASSEMBLY_MEMBERSHIP_JOIN_SQL collapses a
-        # repeat WITHIN one bin, which is not this fixture — the pair is split across
+        # feature count. ASSEMBLY_MEMBERSHIP_JOIN_SQL's GROUP BY collapses a repeat
+        # WITHIN one bin, which is not this fixture — the pair is split across
         # b1 and b2 on purpose, so all three placements survive.
         assert written == 3
 
@@ -146,4 +167,159 @@ async def test_write_assembly_membership_reports_a_contig_collapse(postgres_pool
         await postgres_pool.execute(
             "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])",
             [feat_pair, feat_solo],
+        )
+
+
+async def test_membership_stores_the_assembler_contig_attributes(postgres_pool, tmp_path):
+    """The sidecar's values reach qiita.assembly_membership, and a contig it does
+    not mention still gets its row.
+
+    The Postgres and DuckLake copies of this table are written by different
+    components — this primitive and `assembly_load` — so both carry the columns or
+    they diverge. This is the Postgres half; the DuckLake half is
+    `tests/jobs/test_assembly_load.py::test_membership_carries_the_assembler_attributes`.
+    """
+    suffix = secrets.token_hex(4)
+    principal_idx = await seed_user_principal(
+        postgres_pool, prefix="assembly-attrs-test", suffix=suffix
+    )
+    _bs, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=principal_idx
+    )
+    version = f"v-{uuid.uuid4()}"
+    async with postgres_pool.acquire() as conn:
+        row = await mint_processing(
+            conn,
+            workflow="long-read-assembly",
+            version=version,
+            params={"workflow": "long-read-assembly", "version": version, "assembler": "myloasm"},
+        )
+    processing_idx = row["processing_idx"]
+
+    (h_solo,) = canonical_sequence_hashes([_SOLO])
+    (h_other,) = canonical_sequence_hashes([_CONTIG])
+    feat_solo = await postgres_pool.fetchval(
+        "INSERT INTO qiita.feature (sequence_hash) VALUES ($1) RETURNING feature_idx", h_solo
+    )
+    feat_other = await postgres_pool.fetchval(
+        "INSERT INTO qiita.feature (sequence_hash) VALUES ($1) RETURNING feature_idx", h_other
+    )
+
+    bin_map = tmp_path / "bin_map.parquet"
+    manifest = tmp_path / "manifest.parquet"
+    feature_map = tmp_path / "feature_map.parquet"
+    _write(
+        bin_map,
+        "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR, contig_id VARCHAR",
+        [("LCG:c1:0", "LCG", "c1", "u1ctg"), ("LCG:c2:0", "LCG", "c2", "u2ctg")],
+    )
+    _write(
+        manifest,
+        "read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT",
+        [("LCG:c1:0", str(h_solo), len(_SOLO)), ("LCG:c2:0", str(h_other), len(_CONTIG))],
+    )
+    _write(
+        feature_map,
+        "sequence_hash UUID, feature_idx BIGINT",
+        [(str(h_solo), feat_solo), (str(h_other), feat_other)],
+    )
+
+    genomes_dir = tmp_path / "genomes"
+    genomes_dir.mkdir()
+    # u2ctg is deliberately absent: its membership row must still be written, with
+    # NULL attributes, which is the state a MAG contig renamed by its bin FASTA is
+    # in and the state of every run assembled before the sidecar existed.
+    _write_sidecar(
+        genomes_dir,
+        [("u1ctg", _RAW_NAME, "possibly", "5.0", "1.25")],
+    )
+
+    bare = tmp_path / "bare"
+    bare.mkdir()
+
+    try:
+        # FIRST write the run with no sidecar at all, so its rows exist with NULL
+        # attributes — the state every run assembled before the sidecar is in.
+        assert (
+            await lib.write_assembly_membership(
+                postgres_pool,
+                prep_sample_idx,
+                processing_idx,
+                bin_map,
+                manifest,
+                feature_map,
+                bare,
+            )
+            == 2
+        )
+        assert [
+            tuple(r)
+            for r in await postgres_pool.fetch(
+                "SELECT raw_name, circularity, depth, mult"
+                " FROM qiita.assembly_membership WHERE prep_sample_idx = $1",
+                prep_sample_idx,
+            )
+        ] == [(None, None, None, None), (None, None, None, None)]
+
+        # Now replay WITH the sidecar. The upsert must stamp the attributes onto
+        # rows that already exist, not skip them: without the four `SET` clauses
+        # this pass leaves the NULLs above in place.
+        written = await lib.write_assembly_membership(
+            postgres_pool,
+            prep_sample_idx,
+            processing_idx,
+            bin_map,
+            manifest,
+            feature_map,
+            genomes_dir,
+        )
+        assert written == 2, "the attribute join must not add or drop a membership row"
+
+        rows = await postgres_pool.fetch(
+            "SELECT bin_id, raw_name, circularity, depth, mult"
+            " FROM qiita.assembly_membership WHERE prep_sample_idx = $1 ORDER BY bin_id",
+            prep_sample_idx,
+        )
+        assert [tuple(r) for r in rows] == [
+            (
+                "c1",
+                _RAW_NAME,
+                "possibly",
+                5.0,
+                1.25,
+            ),
+            ("c2", None, None, None, None),
+        ]
+
+        # And replay once more with no sidecar. The upsert COALESCEs, so what was
+        # recorded survives; a plain `SET raw_name = EXCLUDED.raw_name` would null
+        # all four here. Together with the first pass this pins BOTH directions:
+        # NULL converges to a value, a value is not erased by a NULL.
+        assert (
+            await lib.write_assembly_membership(
+                postgres_pool,
+                prep_sample_idx,
+                processing_idx,
+                bin_map,
+                manifest,
+                feature_map,
+                bare,
+            )
+            == 2
+        )
+        again = await postgres_pool.fetch(
+            "SELECT bin_id, raw_name, circularity, depth, mult"
+            " FROM qiita.assembly_membership WHERE prep_sample_idx = $1 ORDER BY bin_id",
+            prep_sample_idx,
+        )
+        assert [tuple(r) for r in again] == [tuple(r) for r in rows], (
+            "a replay with no sidecar must not erase attributes an earlier pass stored"
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.assembly_membership WHERE prep_sample_idx = $1", prep_sample_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])",
+            [feat_solo, feat_other],
         )

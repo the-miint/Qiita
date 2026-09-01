@@ -72,13 +72,20 @@ async def insert_assembly_membership_rows(
     bin_ids: list[str],
     feature_idxs: list[int],
     genome_idxs: list[int],
+    raw_names: list[str | None],
+    circularities: list[str | None],
+    depths: list[float | None],
+    mults: list[float | None],
 ) -> int:
     """Bulk-insert one chunk of assembly_membership rows; return the count of rows
     written or re-stamped.
 
-    The four lists are positionally aligned: row i links
+    The lists are positionally aligned: row i links
     ``(prep_sample_idx, processing_idx, kinds[i], bin_ids[i], feature_idxs[i])`` to
-    ``genome_idxs[i]``, the genome its subject was minted as.
+    ``genome_idxs[i]``, the genome its subject was minted as, and carries that
+    contig's ``raw_names[i]`` / ``circularities[i]`` / ``depths[i]`` / ``mults[i]``
+    — the assembler's own report, any of which may be None. Their meaning is on the
+    columns themselves; do not restate it here.
 
     ``DO UPDATE`` on the natural PK. The conflict fires on a workflow retried from
     the start and on any run over rows a backfill already created; under
@@ -88,8 +95,8 @@ async def insert_assembly_membership_rows(
 
     **The caller must not hand this a duplicated key.** Postgres refuses to let one
     ``ON CONFLICT DO UPDATE`` touch a conflict target twice, which the ``DO NOTHING``
-    form tolerated; `ASSEMBLY_MEMBERSHIP_JOIN_SQL` carries the ``DISTINCT`` that
-    guarantees it. Caught below rather than left to leak: it arrives as SQLSTATE
+    form tolerated; `ASSEMBLY_MEMBERSHIP_JOIN_SQL` groups on exactly this key, which
+    is what guarantees it. Caught below rather than left to leak: it arrives as SQLSTATE
     21000 (qiita-probed), which is outside `IntegrityConstraintViolationError`
     entirely, so the FK arm cannot cover it.
 
@@ -109,12 +116,27 @@ async def insert_assembly_membership_rows(
     try:
         rows = await conn.fetch(
             "INSERT INTO qiita.assembly_membership"
-            " (prep_sample_idx, processing_idx, kind, bin_id, feature_idx, genome_idx)"
-            " SELECT $1, $2, k, b, f, g"
-            " FROM unnest($3::text[], $4::text[], $5::bigint[], $6::bigint[])"
-            "      AS t(k, b, f, g)"
+            " (prep_sample_idx, processing_idx, kind, bin_id, feature_idx, genome_idx,"
+            "  raw_name, circularity, depth, mult)"
+            " SELECT $1, $2, k, b, f, g, rn, c, d, m"
+            " FROM unnest($3::text[], $4::text[], $5::bigint[], $6::bigint[],"
+            "             $7::text[], $8::text[], $9::double precision[],"
+            "             $10::double precision[])"
+            "      AS t(k, b, f, g, rn, c, d, m)"
             " ON CONFLICT (prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
-            " DO UPDATE SET genome_idx = EXCLUDED.genome_idx"
+            # The attributes re-stamp alongside genome_idx so a replay over rows
+            # written before the sidecar existed converges rather than keeping
+            # their NULLs. COALESCE, unlike genome_idx's plain assignment, because
+            # genome_idx is recomputed on every run while an attribute can be
+            # absent: they describe one finished assembly, so an incoming NULL
+            # means "this run did not report it", never "it became nothing", and
+            # must not erase a value an earlier pass recorded.
+            " DO UPDATE SET genome_idx = EXCLUDED.genome_idx,"
+            "   raw_name = COALESCE(EXCLUDED.raw_name, qiita.assembly_membership.raw_name),"
+            "   circularity = COALESCE(EXCLUDED.circularity,"
+            "     qiita.assembly_membership.circularity),"
+            "   depth = COALESCE(EXCLUDED.depth, qiita.assembly_membership.depth),"
+            "   mult = COALESCE(EXCLUDED.mult, qiita.assembly_membership.mult)"
             " RETURNING feature_idx",
             prep_sample_idx,
             processing_idx,
@@ -122,6 +144,10 @@ async def insert_assembly_membership_rows(
             bin_ids,
             feature_idxs,
             genome_idxs,
+            raw_names,
+            circularities,
+            depths,
+            mults,
         )
     except asyncpg.ForeignKeyViolationError as exc:
         raise ValueError(
@@ -131,8 +157,8 @@ async def insert_assembly_membership_rows(
     except asyncpg.CardinalityViolationError as exc:
         raise ValueError(
             "the same (kind, bin_id, feature_idx) was submitted twice in one chunk, "
-            "which this upsert cannot resolve — the caller's query is missing its "
-            "DISTINCT (see ASSEMBLY_MEMBERSHIP_JOIN_SQL)"
+            "which this upsert cannot resolve — the caller's query must group on "
+            "that key (see ASSEMBLY_MEMBERSHIP_JOIN_SQL)"
         ) from exc
     return len(rows)
 

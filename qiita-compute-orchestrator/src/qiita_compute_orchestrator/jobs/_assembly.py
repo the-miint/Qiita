@@ -3,7 +3,9 @@
 The `kind` value set those jobs also share lives in the contract layer,
 `qiita_common.assembly_constants` — these basenames do not, because they are
 written by a container entrypoint in this repo's `workflows/` tree and no other
-component resolves them.
+component resolves them. `CONTIG_ATTRIBUTES_FILE` is the exception and lives in
+the contract layer for exactly that reason: the control plane resolves it too,
+against the same genomes_dir, when it writes the Postgres membership rows.
 
 A private shared helper, not a dispatchable native job: it exports neither
 `Inputs` nor `execute`, and its leading-underscore name exempts it from the

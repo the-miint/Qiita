@@ -69,9 +69,9 @@ _UNB = "CCAATTGGCCATTACGGTTAGCAT"
 # of them its own subject.
 #
 # `c5` REPEATS `c1`'s bytes inside `c1`'s own bin, which is the case
-# `ASSEMBLY_MEMBERSHIP_JOIN_SQL`'s DISTINCT exists for: `assembly_hash` composes
+# `ASSEMBLY_MEMBERSHIP_JOIN_SQL`'s GROUP BY exists for: `assembly_hash` composes
 # read_id as kind:bin_id:sequence_index, so duplicated bytes in one bin arrive as
-# two read_ids resolving to one feature_idx. Without that DISTINCT the write hands
+# two read_ids resolving to one feature_idx. Without that grouping the write hands
 # Postgres the same conflict target twice and `ON CONFLICT DO UPDATE` raises
 # `cardinality_violation` — so this row is what makes the suite fail if it is
 # dropped. It changes no count below: the pair collapses back to one row.
@@ -104,7 +104,13 @@ def _contig_hashes():
 
 async def _stage_assembly(pool, tmp_path, feature_idxs):
     """Write the three Parquets `write_assembly_membership` joins, for `_CONTIGS`
-    against already-minted features. Returns the three paths."""
+    against already-minted features, plus the genomes_dir it reads the per-contig
+    attribute sidecar from. Returns the four paths in call order.
+
+    The genomes_dir is left EMPTY: these tests are about the genome mint, and an
+    absent sidecar is the state every run assembled before it existed is in, so
+    they exercise that path while `test_write_assembly_membership.py` covers the
+    attributes themselves."""
     hashes = _contig_hashes()
     bin_map, manifest, feature_map = (
         tmp_path / "bin_map.parquet",
@@ -113,8 +119,8 @@ async def _stage_assembly(pool, tmp_path, feature_idxs):
     )
     _write(
         bin_map,
-        "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR",
-        [(rid, kind, bid) for rid, kind, bid, _ in _CONTIGS],
+        "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR, contig_id VARCHAR",
+        [(rid, kind, bid, f"ctg_{rid}") for rid, kind, bid, _ in _CONTIGS],
     )
     _write(
         manifest,
@@ -130,7 +136,9 @@ async def _stage_assembly(pool, tmp_path, feature_idxs):
         "sequence_hash UUID, feature_idx BIGINT",
         [(str(h), f) for h, f in by_hash.items()],
     )
-    return bin_map, manifest, feature_map
+    genomes_dir = tmp_path / "genomes"
+    genomes_dir.mkdir(exist_ok=True)
+    return bin_map, manifest, feature_map, genomes_dir
 
 
 async def _setup(postgres_pool, tmp_path, *, label):

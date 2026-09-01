@@ -40,7 +40,14 @@ from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
-from qiita_common.assembly_constants import KIND_MAG
+from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
+    CONTIG_ATTRIBUTES_FILE,
+    KIND_MAG,
+    contig_attribute_join,
+    contig_attribute_projection,
+    register_contig_attribute_table,
+)
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -101,7 +108,9 @@ class Inputs(BaseModel):
     `manifest` / `feature_map` / `assembly_chunks` / `bin_map` are the upstream
     outputs (assembly_hash + mint-features). `checkm_dir` / `refined_bins_dir` are
     container-step outputs holding CheckM's raw `lineage.tsv` + `qa.tsv` and
-    DAS_Tool's raw `das_tool_summary.tsv`. `processing_idx` is
+    DAS_Tool's raw `das_tool_summary.tsv`. `genomes_dir` is the assemble step's
+    output, read here only for the per-contig attribute sidecar the entrypoint
+    wrote beside the two FASTAs. `processing_idx` is
     threaded via the step's `params:` (so the runner mints the run identity before
     the loop); `prep_sample_idx` / `work_ticket_idx` are framework-injected scope
     scalars.
@@ -111,6 +120,7 @@ class Inputs(BaseModel):
     feature_map: Path
     assembly_chunks: Path
     bin_map: Path
+    genomes_dir: Path
     checkm_dir: Path
     refined_bins_dir: Path
     processing_idx: int
@@ -127,6 +137,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     ]:
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
+    # Checked as a directory, unlike the sidecar inside it: an absent sidecar is
+    # a run that predates it and stores NULLs, so a mis-bound genomes_dir would
+    # otherwise be indistinguishable from that and silently null a whole run.
+    if not inputs.genomes_dir.is_dir():
+        raise FileNotFoundError(f"genomes_dir not found: {inputs.genomes_dir}")
 
     workspace.mkdir(parents=True, exist_ok=True)
     staging = workspace / "assembly_staging"
@@ -161,6 +176,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
             build_feature_id_map(conn, inputs.manifest)
 
+            register_contig_attribute_table(conn, inputs.genomes_dir / CONTIG_ATTRIBUTES_FILE)
+
             # Reused verbatim from _feature_load — the shared feature space means
             # the sequence + chunk writers are identical to the reference path.
             write_feature_sequences(conn, sequences_out)
@@ -184,6 +201,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 out=bin_quality_out,
             )
 
+            conn.execute("DROP TABLE contig_attribute")
             conn.execute("DROP TABLE id_map")
             conn.execute("DROP TABLE feature_map")
         success = True
@@ -196,6 +214,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     return {"staging_dir": staging}
 
 
+# DuckDB read_csv over a tab-delimited tool table with verbatim (spaced /
+# parenthesized / '#'-prefixed) headers. header=true keeps the raw column names so
+# they are addressed by name below; auto_detect infers types (the projection CASTs
+# regardless). No Python/awk ever touches these files — DuckDB is the sole parser.
+_READ_TSV = "read_csv(?, delim='\t', header=true, auto_detect=true)"
+
+
 def _write_assembly_membership(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -206,30 +231,45 @@ def _write_assembly_membership(
 ) -> None:
     """DuckLake copy of qiita.assembly_membership: one row per
     (prep_sample, processing, kind, bin_id, feature_idx). Joins `bin_map`
-    (read_id -> kind, bin_id) against the `id_map` TEMP TABLE (read_id ->
-    feature_idx) and stamps the run scalars. DISTINCT so a bin's duplicate
-    (identical) contigs collapse to one row — matching the Postgres membership
-    write, whose own DISTINCT is what keeps its upsert from touching one conflict
-    target twice."""
+    (read_id -> kind, bin_id, contig_id) against the `id_map` TEMP TABLE (read_id ->
+    feature_idx), stamps the run scalars, and carries the assembler's per-contig
+    attributes.
+
+    GROUP BY, not DISTINCT. The key is unchanged, but attribute columns can differ
+    between two rows the key collapses — a bin holding duplicate (identical)
+    contigs is exactly that case, and it is why the DISTINCT was here. Adding the
+    columns to a DISTINCT would emit one row per attribute variant and so break
+    the primary key the Postgres write upserts on. Aggregating to ONE representative
+    contig id first, then joining the attributes to it, keeps all four values from
+    the SAME contig rather than mixing them across rows, which a per-column
+    aggregate would do.
+
+    The attribute join is LEFT: a contig with no row in the sidecar stores NULLs,
+    which is the state of every run that predates the sidecar.
+
+    This table is replace-keyed on (prep_sample_idx, processing_idx)
+    (flight_service::REPLACE_KEY_TABLES), so a re-run supersedes the run's rows
+    wholesale -- unlike the Postgres twin, which upserts and COALESCEs the four
+    attributes. A replay with no sidecar therefore keeps them in Postgres and
+    clears them here; Postgres is the authority for these columns."""
     conn.execute(
         "COPY ("
-        "  SELECT DISTINCT"
-        f"    CAST({prep_sample_idx} AS BIGINT) AS prep_sample_idx,"
-        f"    CAST({processing_idx} AS BIGINT) AS processing_idx,"
-        "    bm.kind AS kind, bm.bin_id AS bin_id, im.feature_idx AS feature_idx"
-        "  FROM read_parquet(?) bm"
-        "  JOIN id_map im ON bm.read_id = im.read_id"
-        "  ORDER BY feature_idx"
+        "  WITH member AS ("
+        "    SELECT"
+        f"      CAST({prep_sample_idx} AS BIGINT) AS prep_sample_idx,"
+        f"      CAST({processing_idx} AS BIGINT) AS processing_idx,"
+        "      bm.kind AS kind, bm.bin_id AS bin_id, im.feature_idx AS feature_idx,"
+        f"      {CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL}"
+        "    FROM read_parquet(?) bm"
+        "    JOIN id_map im ON bm.read_id = im.read_id"
+        "    GROUP BY bm.kind, bm.bin_id, im.feature_idx"
+        "  )"
+        "  SELECT m.prep_sample_idx, m.processing_idx, m.kind, m.bin_id, m.feature_idx,"
+        f"    {contig_attribute_projection('a')}"
+        "  FROM member m" + contig_attribute_join("m") + "  ORDER BY m.feature_idx"
         f") TO '{out}' ({PARQUET_OPTS})",
         [str(bin_map_path)],
     )
-
-
-# DuckDB read_csv over a tab-delimited tool table with verbatim (spaced /
-# parenthesized / '#'-prefixed) headers. header=true keeps the raw column names so
-# they are addressed by name below; auto_detect infers types (the projection CASTs
-# regardless). No Python/awk ever touches these files — DuckDB is the sole parser.
-_READ_TSV = "read_csv(?, delim='\t', header=true, auto_detect=true)"
 
 
 def _write_bin_quality(

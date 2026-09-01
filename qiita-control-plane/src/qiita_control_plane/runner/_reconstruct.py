@@ -442,14 +442,15 @@ async def _run_action_primitive(
         # assembly-run contigs to qiita.assembly_membership, tagged by
         # (kind, bin_id). Inputs are resolved by their fixed binding names — not
         # positionally — so a YAML reorder can't silently swap them. bin_map +
-        # manifest come from assembly_hash; feature_map from mint-features.
+        # manifest come from assembly_hash; feature_map from mint-features;
+        # genomes_dir from the assemble step, for its per-contig attribute sidecar.
         # prep_sample_idx from the scope target; processing_idx from `bound` (the
         # runner minted it before the step loop because assembly_load threads it
         # via params — mirrors how the reference dispatch reads reference_idx).
-        if set(entry.inputs) != {"bin_map", "manifest", "feature_map"}:
+        if set(entry.inputs) != {"bin_map", "manifest", "feature_map", "genomes_dir"}:
             raise RuntimeError(
                 "write-assembly-membership expects inputs "
-                f"[bin_map, manifest, feature_map]; got {entry.inputs!r}"
+                f"[bin_map, manifest, feature_map, genomes_dir]; got {entry.inputs!r}"
             )
         await LIBRARY[LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP](
             pool,
@@ -458,6 +459,7 @@ async def _run_action_primitive(
             Path(bound["bin_map"]),
             Path(bound["manifest"]),
             Path(bound["feature_map"]),
+            Path(bound["genomes_dir"]),
         )
         return {}
 

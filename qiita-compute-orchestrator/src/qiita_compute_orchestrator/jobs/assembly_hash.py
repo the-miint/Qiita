@@ -18,8 +18,9 @@ downstream (mint-features -> write-assembly-membership -> assembly_load):
     exactly like `hash_sequences`.
   - `bin_map.parquet` — `(read_id, kind, bin_id, contig_id)`, the per-contig bin
     membership `write-assembly-membership` / `assembly_load` join against.
-    `contig_id` is the assembler's own id for the record. No consumer joins on it;
-    it is carried so a workspace under investigation can say which assembled
+    `contig_id` is the assembler's own id for the record. Both membership writers
+    join the assemble step's per-contig attribute sidecar on it, and it also lets
+    a workspace under investigation say which assembled
     contig became which `feature_idx` — the name the assembler, DAS_Tool and
     CheckM all use. Nothing else records it: for a MAG the `bin_id` is the FASTA's
     stem and the `read_id`'s last component is the record's ordinal, and
@@ -69,12 +70,31 @@ FILE to a (kind, bin_id), so the subset is taken per RECORD instead: the `contig
 scan below reads both files whole, and the DELETE that follows it removes every
 UNBINNED row whose `sequence_hash` also appears under KIND_MAG.
 
-The match key is `canonical_sequence_hash_expr`'s hash, not the contig id. That a
-bin FASTA carries the assembler's contig ids through is measured for hifiasm_meta
-and unmeasured for myloasm, so the match keys on the bytes that are actually
-stored. The hash's strand folding carries into the exclusion: a bin holding a
-contig on the opposite strand still excludes its noLCG record. An id still labels
-the row, as the UNBINNED bin_id below — never something matched on.
+The match key for THIS exclusion is `canonical_sequence_hash_expr`'s hash, not the
+contig id. That a bin FASTA carries the assembler's contig ids through is measured
+for hifiasm_meta -- one deploy-host assembly put all 3810 contigs of its 98 refined
+bins back in the assembler's own output, verbatim, through metabat2/maxbin2/concoct
+and DAS_Tool -- and unmeasured for myloasm, whose ids have a different shape. So the
+match keys on the bytes that are actually stored. The hash's strand folding carries
+into the exclusion: a bin holding a contig on the opposite strand still excludes
+its noLCG record.
+
+`contig_id` is a join key elsewhere, which is why that measurement matters beyond
+this scan: both writers of `qiita.assembly_membership` LEFT JOIN the assemble
+step's attribute sidecar on it. An LCG or UNBINNED row's `contig_id` comes
+straight off the published FASTA the sidecar was written from, so those match by
+construction. A MAG row's comes from the REFINED BIN FASTA, so it matches only
+where the binners carried the header through.
+
+What the unmeasured half costs, concretely, is a myloasm `circular-possibly`
+contig. Only `circular-yes` bypasses binning (`myloasm_split.py`), so `possibly`
+goes to noLCG, and if a refined bin then claims it the DELETE below drops its
+UNBINNED row — leaving the MAG row as the contig's only row. That row carries the
+`possibly` call solely where the binners kept the id. Where they did not, the
+call is not one of two rows gone NULL; it is the whole record of it, and such a
+row's NULLs are indistinguishable from a run assembled before the sidecar
+existed. hifiasm_meta emits no `possibly` and is the arm whose passthrough was
+measured, so this rests entirely on the arm that was not.
 
 Two consequences of keying on content. Hash-equal noLCG records share a fate: a
 bin claiming either drops both. And the exclusion set is the KIND_MAG rows alone —
@@ -136,7 +156,8 @@ _READ_ID_EXPR = (
 class Inputs(BaseModel):
     """Typed input contract for assembly_hash.
 
-    `genomes_dir` (holds `circular.fa` + `noLCG.fa`) and `refined_bins_dir` (MAG bins)
+    `genomes_dir` (holds `circular.fa` + `noLCG.fa`, plus the
+    attribute sidecar this job does not read) and `refined_bins_dir` (MAG bins)
     are the upstream container steps' outputs. `prep_sample_idx` / `work_ticket_idx` are
     framework-injected scope scalars, declared for an explicit contract: nothing this
     step writes is keyed on either, and sequences are run-agnostic, so it needs no

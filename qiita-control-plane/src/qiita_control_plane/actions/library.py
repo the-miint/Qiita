@@ -33,6 +33,13 @@ import pyarrow as pa
 import pyarrow.flight as _flight
 import pyarrow.parquet as pq
 from qiita_common.api_paths import LibraryPrimitive
+from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
+    CONTIG_ATTRIBUTES_FILE,
+    contig_attribute_join,
+    contig_attribute_projection,
+    register_contig_attribute_table,
+)
 from qiita_common.models import (
     INDEX_TYPE_RYPE_ROUTER,
     FeatureHashEntry,
@@ -1440,19 +1447,46 @@ async def plan_shards(
 # (both from the same assembly_hash scan) and every manifest hash was minted by
 # mint-features, so no contig is dropped. Exposed as a module constant so the join
 # is unit-testable against Parquet fixtures without a Postgres pool.
-# DISTINCT because the synthetic read_id is `kind:bin_id:sequence_index`
+# The synthetic read_id is `kind:bin_id:sequence_index`
 # (`assembly_hash._READ_ID_EXPR`), so two IDENTICAL contigs at different positions in
 # ONE bin arrive as two read_ids resolving to one feature_idx — the same
 # `(kind, bin_id, feature_idx)` twice. `insert_assembly_membership_rows` upserts with
 # DO UPDATE, and Postgres refuses to let one statement touch a conflict target twice
-# (`cardinality_violation`), where the earlier DO NOTHING form silently tolerated it.
-# `assembly_load._write_assembly_membership` already carries this DISTINCT and
-# describes it as matching what this write does; now it does.
+# (`cardinality_violation`).
+#
+# So: GROUP BY, spelled as the conflict target itself rather than `ALL`, because
+# that is what `insert_assembly_membership_rows` requires of its caller and a
+# widened SELECT list must not silently widen it. The attribute
+# columns can differ between two rows the key collapses (a bin holding duplicate
+# identical contigs is exactly that case), so carrying them through a DISTINCT
+# would emit one row per variant and hand the upsert the same target twice:
+# SQLSTATE 21000, the failure that function's docstring names. Aggregating to one
+# representative contig id and joining the attributes onto THAT keeps all four
+# values from the same contig, where a per-column aggregate would mix them.
+#
+# The attribute join is LEFT: a contig absent from the sidecar stores NULLs. The
+# same row shape is written on the DuckLake side by
+# `qiita_compute_orchestrator.jobs.assembly_load._write_assembly_membership`, and
+# the two must produce the same rows from the same inputs.
+#
+# They do NOT converge the same way on a re-run. This side upserts and COALESCEs,
+# so a replay whose genomes_dir has no sidecar keeps the attributes an earlier
+# pass stored; the lake side is replace-keyed on (prep_sample_idx,
+# processing_idx) in `flight_service::REPLACE_KEY_TABLES`, so the same replay
+# supersedes that run's lake rows with the NULLs it just computed. Postgres is
+# the authority for these four columns; the lake copy reflects the LAST run.
 ASSEMBLY_MEMBERSHIP_JOIN_SQL = (
-    "SELECT DISTINCT bm.kind, bm.bin_id, fm.feature_idx"
-    " FROM read_parquet(?) AS bm"
-    " JOIN read_parquet(?) AS m ON bm.read_id = m.read_id"
-    " JOIN read_parquet(?) AS fm ON m.sequence_hash = fm.sequence_hash"
+    "WITH member AS ("
+    "  SELECT bm.kind AS kind, bm.bin_id AS bin_id, fm.feature_idx AS feature_idx,"
+    f"    {CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL}"
+    "  FROM read_parquet(?) AS bm"
+    "  JOIN read_parquet(?) AS m ON bm.read_id = m.read_id"
+    "  JOIN read_parquet(?) AS fm ON m.sequence_hash = fm.sequence_hash"
+    "  GROUP BY bm.kind, bm.bin_id, fm.feature_idx"
+    ")"
+    " SELECT mb.kind, mb.bin_id, mb.feature_idx,"
+    f"   {contig_attribute_projection('a')}"
+    " FROM member mb" + contig_attribute_join("mb")
 )
 
 
@@ -1463,6 +1497,7 @@ async def write_assembly_membership(
     bin_map_path: Path,
     manifest_path: Path,
     feature_map_path: Path,
+    genomes_dir: Path,
 ) -> int:
     """Link a prep_sample's assembly-run contigs to qiita.assembly_membership, and
     mint the qiita.genome each of their subjects is.
@@ -1474,9 +1509,13 @@ async def write_assembly_membership(
     `_CHUNK_SIZE` batches and bulk-inserted into qiita.assembly_membership with
     `(prep_sample_idx, processing_idx)` stamped from this run. Never materialises
     the whole mapping in Python — same streaming contract mint_features /
-    write_membership follow. DuckDB does hold the distinct set (the constant's
-    DISTINCT is a blocking operator), which is bounded by contig count rather than
+    write_membership follow. DuckDB does hold the grouped set (the constant's
+    GROUP BY is a blocking operator), which is bounded by contig count rather than
     read count and spills if it has to.
+
+    `genomes_dir` is the assemble step's output, read only for the per-contig
+    attribute sidecar beside the two FASTAs; the attributes are LEFT JOINed on, so
+    a run without one writes the same rows with NULLs.
 
     **The genome mint rides the same batch rather than taking a second pass**, which
     is what makes the row and its genome one INSERT: this loop already holds
@@ -1510,10 +1549,17 @@ async def write_assembly_membership(
     ]:
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
+    # The DIRECTORY must exist even though the sidecar inside it need not: an
+    # absent sidecar means "assembled before it existed" and stores NULLs, so
+    # without this a mis-bound genomes_dir would take that path silently and
+    # write a run's worth of NULL attributes with no signal.
+    if not genomes_dir.is_dir():
+        raise FileNotFoundError(f"genomes_dir not found: {genomes_dir}")
 
     total_written = 0
     async with pool.acquire() as conn:
         with duckdb_connect() as duck:
+            register_contig_attribute_table(duck, genomes_dir / CONTIG_ATTRIBUTES_FILE)
             reader = duck.execute(
                 ASSEMBLY_MEMBERSHIP_JOIN_SQL,
                 [str(bin_map_path), str(manifest_path), str(feature_map_path)],
@@ -1551,6 +1597,10 @@ async def write_assembly_membership(
                         bin_ids=bin_ids,
                         feature_idxs=feature_idxs,
                         genome_idxs=genome_idxs,
+                        raw_names=batch.column("raw_name").to_pylist(),
+                        circularities=batch.column("circularity").to_pylist(),
+                        depths=batch.column("depth").to_pylist(),
+                        mults=batch.column("mult").to_pylist(),
                     )
                 total_written += written
     await asyncio.to_thread(

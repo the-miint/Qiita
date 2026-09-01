@@ -23,6 +23,12 @@ _None yet._
 
 ### 3. Migrations
 
+- **`20260901000000_assembly_membership_contig_attributes.sql`** — adds four nullable columns
+  to `qiita.assembly_membership` (`raw_name`, `circularity`, `depth`, `mult`). `make migrate`
+  applies it; no out-of-band setup. **Not backfilled**: the values are read out of the
+  assemble step's output, so every existing row keeps NULL and only runs assembled after this
+  deploy carry them. (#517)
+
 - **`20260831000000_assembly_membership_genome.sql`** — adds `qiita.assembly_membership.genome_idx`
   (nullable, bare FK to `qiita.genome`, plus an index). `make migrate` applies it; no out-of-band
   setup. (#514)
@@ -33,18 +39,20 @@ _None yet._
 
 ### 5. Verify
 
-- **Record the rebuilt image's hifiasm_meta version.** (#516)
+- **Record the rebuilt image's hifiasm_meta version.** (#516, #517)
 
   ```bash
   apptainer exec "${PATH_DERIVED}/images/long-read-assembly-assemble-1.0.0.sif" \
-      micromamba run -n hifiasm_meta hifiasm_meta --version
+      micromamba run -n hifiasm_meta hifiasm_meta --version 2>&1
   ```
 
-  This deploy rebuilds the image (`assemble.sh` is in its `HASH_INPUTS`), and the rebuild
-  re-resolves the unpinned hifiasm_meta solve — so whatever ran before is replaced whether or
-  not anyone intended it. Capture the output in the deploy archive entry: it is the record of
-  what this deploy's default assembler actually is, and what the next rebuild has to compare
-  against.
+  This deploy rebuilds the image (`assemble.sh` is in its `HASH_INPUTS`). #517 pins
+  hifiasm_meta to `hamtv0.3.5` and asserts its two internal versions in the def's `%test`, so
+  the build itself now fails on a moved solve rather than shipping one quietly — this step
+  records what that pin resolved to on this host for the archive entry (the versions go to
+  stderr, which is why the command redirects). The gate itself is earlier:
+  `deploy/build-sifs.sh` runs the def's `%test` during the image rebuild, and a failure there
+  aborts `activate.sh` before any service restarts.
 
 - **Run the assembly-genome backfill.** (#514)
 
@@ -102,13 +110,25 @@ _None yet._
   sweep, so ticket workspaces accumulate and these trees will accumulate with them — plan the
   disk on that basis, not on the documented window.
 
-- **The `assemble` SIF rebuilds this deploy, and that re-resolves hifiasm_meta.** (#516)
+- **The `assemble` SIF rebuilds this deploy, and hifiasm_meta is now pinned.** (#516, #517)
   `assemble.sh` is in the image's `HASH_INPUTS` (`sif-build.d/assemble.env`), so editing it
-  invalidates the build hash and forces a full rebuild. hifiasm_meta is **unpinned** in
-  `assemble.def`, so the rebuild re-solves it against whatever bioconda serves that day — the
-  default assembler's version can move on this deploy without anything else changing. myloasm
-  is pinned (0.6.0) and the build asserts it. Expect a slower-than-usual verify for this one
-  image.
+  invalidates the build hash and forces a full rebuild. #517 pins `hifiasm_meta=hamtv0.3.5`
+  and asserts its two internal version strings in `%test`, alongside myloasm's existing 0.6.0
+  pin — so this rebuild resolves both assemblers to a fixed version instead of re-solving the
+  default one against whatever bioconda serves that day, and a moved solve fails the build.
+  Expect a slower-than-usual verify for this one image.
+
+- **The DuckLake `assembly_membership` table gains the four attribute columns on the data
+  plane's next start.** (#517) `ensure_assembly_tables` runs `ALTER TABLE … ADD COLUMN IF NOT
+  EXISTS` on every DP boot, so the existing lake table widens itself — no operator step.
+  Without it `ducklake_add_data_files` would reject every membership Parquet the new
+  `assembly_load` writes, since the file would carry columns the table lacks. It refuses the
+  other direction too (probed: a Parquet MISSING a column the table has is rejected with
+  `Set allow_missing => true`), so a ticket whose `assembly_load` ran on the pre-deploy
+  orchestrator and registers after the DP restart fails its register-files step. Both skews
+  are narrow — the deploy restarts the DP and the CO together — and a failed register-files
+  is a retryable step, not lost data: re-running the ticket's tail after the deploy writes a
+  nine-column file. Nothing to do in advance; this is here so the failure is recognisable.
 
 ---
 

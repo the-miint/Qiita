@@ -21,6 +21,57 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **The assembler's per-contig report is stored, so circularity can become a query-time
+  predicate instead of a routing decision baked into the entrypoint (#517).** Both arms of
+  `assemble.sh` now emit a `contig_attributes.tsv` beside the two published FASTAs, carrying
+  the raw header or GFA segment name, a normalized `yes`/`possibly`/`no` circularity call,
+  depth, and myloasm's k-mer multiplicity. `assembly_load` and the control plane's membership
+  write both join it onto `assembly_membership`, in Postgres and in DuckLake. The two
+  assemblers disagree on the same molecule — one sample's identical 27 kb sequence is
+  `circular-yes` to hifiasm_meta and `circular-possibly` to myloasm — so today which one
+  bypasses binning as an LCG depends on which assembler ran; stored, that can be re-asked
+  without re-assembling. Routing itself is unchanged: `circular-yes` is still the LCG rule and
+  `circular-possibly` still goes to binning. myloasm's depth is the mean of its `depth-A-B-C`
+  triple, which is the scalar myloasm itself derives from it (the `avg_cov` its own circularity
+  gate tests, per myloasm's own source); hifiasm_meta's is the S-line's `dp:f` tag, previously
+  discarded along with the rest of columns 4+. A GFA where NO segment carries that tag fails the
+  step rather than storing a depth-less run; some segments lacking it does not, since a partial
+  absence is consistent both with a moved tag and with an assembly the tool reported less about,
+  and failing on it would discard a finished assembly to distinguish nothing. Such a row also
+  stays readable — a NULL depth beside a non-NULL `raw_name` means the assembler reported on
+  that contig without a depth, where a pre-sidecar run leaves all four NULL — and gets a count
+  on stderr. One real metagenome assembled on the pinned build carried `dp:f` on all 2,899 of
+  its contigs (depth 1–145), with every name matching the circular/linear grammar and none
+  unmatched; that is one assembly of one input, and the grammar had until now been exercised
+  only against synthetic single-contig assemblies. `mult` is NULL
+  below 1 kb, where myloasm reports `0.00` for absence of signal rather than a measured zero.
+  Attributes are NULL for every row written before this deploy and are not backfilled here:
+  they are read out of the assemble step's output, which for an older run is gone. A MAG row
+  carries them only where the binners kept the assembler's contig header. Measured for
+  hifiasm_meta — one deploy-host assembly put all 3,810 contigs of its 98 refined bins back in
+  the assembler's own output verbatim, through metabat2/maxbin2/concoct and DAS_Tool — and
+  unmeasured for myloasm, whose contig ids have a different shape; LCG and UNBINNED rows match
+  by construction. That
+  unmeasured half has a specific cost, on the myloasm arm only: `circular-possibly` routes to
+  binning, so where a refined bin claims such a contig the residue subtraction drops its
+  UNBINNED row and the MAG row becomes the call's only record — which then depends on the
+  passthrough nobody has measured.
+  `kind` still
+  records the routing that was applied, so `circular-yes` stays recoverable from `kind`
+  alone; what an older row cannot recover is the `possibly`/`no` split among the contigs
+  that went to binning. `ensure_assembly_tables` widens an existing DuckLake
+  `assembly_membership` with `ADD COLUMN IF NOT EXISTS` on data-plane start, since
+  `ducklake_add_data_files` rejects a Parquet whose columns differ from its target's in
+  either direction. The
+  attribute half of the membership join (the representative-contig aggregate, the four-column
+  projection, the LEFT JOIN) is shared by both writers rather than written twice. Both writers
+  read the sidecar through one shared reader, which declares the two numeric columns rather
+  than sniffing them (hifiasm_meta leaves `mult` empty on every row), verifies the header
+  against the expected column order (`read_csv(columns=)` binds by POSITION and does not check
+  it, so a reordered sidecar would silently transpose values), and rejects a repeated
+  `contig_id`. Postgres COALESCEs the four columns on a re-run so a replay without a sidecar
+  cannot erase them; the DuckLake copy is replace-keyed per run, so it reflects the LAST run.
+
 - **Combined (inverted open reference) feature table: `estimate-feature-table` and `qiita
   feature-table build` can estimate over two alignment arms at once (#515).** Passing a second
   alignment — the cohort aligned against its OWN assembled contigs — builds one table over both:
@@ -2840,6 +2891,16 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **`hifiasm_meta` is pinned, and an unrecognised GFA segment name now fails the `assemble`
+  step (#517).** The pin is `hamtv0.3.5`, with both of the binary's internal version strings
+  asserted at build time, matching how myloasm is pinned — unpinned, every rebuild re-resolved
+  the solve against whatever bioconda had that day, and editing anything in the image's
+  `HASH_INPUTS` forces a rebuild, so the DEFAULT assembler could move on a change that had
+  nothing to do with it. The fail-loud follows from the same PR storing the circularity call: a
+  name matching neither the circular nor the linear shape used to cost a misroute to binning,
+  and would now also write a call into the lake for a contig nothing classified. A missing GFA
+  is still an empty assembly, not a violation.
 
 - **Reference chunk bytes stay on the submitted strand, and a `--gff` load now says so (#502).**
   `normalized_sequence_expr` normalizes case and deliberately does not normalize strand; its

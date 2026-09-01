@@ -82,7 +82,7 @@ steps:
       walltime: PT10M
 
   # hifiasm_meta / myloasm assembly + circular-genome extraction. Reads run_config.json to
-  # pick the assembler; emits genomes_dir/{circular.fa, noLCG.fa}. 0 contigs is a
+  # pick the assembler; emits genomes_dir/{circular.fa, noLCG.fa, contig_attributes.tsv}. 0 contigs is a
   # terminal no-data outcome inside the container.
   #
   # The step also leaves the assembler's whole output tree under
@@ -225,18 +225,25 @@ steps:
   # and stamped with the run's processing_idx (minted before the loop because
   # assembly_load threads it via params). Idempotent: the write upserts on the
   # natural key, re-stamping each row's minted genome_idx rather than skipping it.
+  # `genomes_dir` is read for the per-contig attribute sidecar only -- same reason
+  # it is an input on assembly_load below, which states it.
   - action: write-assembly-membership
-    inputs: [bin_map, manifest, feature_map]
+    inputs: [bin_map, manifest, feature_map, genomes_dir]
     outputs: []
 
   # Re-key the contigs to feature_idx (REUSED reference_load writers) and read the
   # CheckM/DAS_Tool metrics → the four DuckLake-shape staging Parquets. Threads
   # processing_idx via params: (signals the runner to mint the run identity before
   # the step loop). A sample with no refined bin writes bin_quality empty (a success).
+  # `genomes_dir` is read for the per-contig attribute sidecar only; the contig
+  # SEQUENCES still arrive hash-keyed via assembly_chunks. It is an INPUT rather
+  # than a new output on assemble because a step's declared outputs are re-bound
+  # on resume from a manifest an earlier attempt wrote, while an input resolves
+  # from a binding already produced — so adding one here strands nothing.
   - step: assembly_load
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.assembly_load
-    inputs: [manifest, feature_map, assembly_chunks, bin_map, checkm_dir, refined_bins_dir]
+    inputs: [manifest, feature_map, assembly_chunks, bin_map, genomes_dir, checkm_dir, refined_bins_dir]
     params: {processing_idx: processing_idx}
     outputs: [staging_dir]
     baseline_resources:

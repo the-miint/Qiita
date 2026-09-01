@@ -2204,12 +2204,18 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
 
     // One run's rows, byte-identical across both of its registrations —
     // exactly what a re-run under the same processing_idx re-derives.
+    // Nine columns: `ducklake_add_data_files` refuses a Parquet missing a column
+    // the target table has, just as it refuses an extra one, so these fixtures
+    // carry the assembler attribute columns `ensure_assembly_tables` adds.
     let membership_values = |sample: i64, run: i64| {
         format!(
             "SELECT * FROM (VALUES \
-                 ({sample}::BIGINT, {run}::BIGINT, 'LCG', 'circular_1', {feature_a}::BIGINT), \
-                 ({sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', {feature_b}::BIGINT)) \
-                 t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
+                 ({sample}::BIGINT, {run}::BIGINT, 'LCG', 'circular_1', {feature_a}::BIGINT, \
+                  'circular_1'::VARCHAR, 'yes'::VARCHAR, 30.5::DOUBLE, 1.02::DOUBLE), \
+                 ({sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', {feature_b}::BIGINT, \
+                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE)) \
+                 t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx, \
+                   raw_name, circularity, depth, mult)"
         )
     };
     let quality_values = |sample: i64, run: i64| {
@@ -2374,8 +2380,10 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
     let membership_values = |kind: &str, bin_id: &str| {
         format!(
             "SELECT * FROM (VALUES \
-                 ({sample}::BIGINT, {run}::BIGINT, '{kind}', '{bin_id}', {feature}::BIGINT)) \
-                 t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx)"
+                 ({sample}::BIGINT, {run}::BIGINT, '{kind}', '{bin_id}', {feature}::BIGINT, \
+                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE)) \
+                 t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx, \
+                   raw_name, circularity, depth, mult)"
         )
     };
     let quality_values = |suffix: &str| {

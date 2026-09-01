@@ -1,6 +1,6 @@
 #!/bin/bash
 # Assemble masked HiFi reads, then split circular genomes (LCG) from the linear
-# contigs (noLCG). Two outputs. `genomes_dir` =
+# contigs (noLCG). One output. `genomes_dir` =
 # $QIITA_OUTPUT_PATH/genomes:
 #   circular.fa   every circular contig, ANY size, as one multi-FASTA (ingested as
 #                 LCG; the >=512 kb "large complete genome" cut is a query-time
@@ -8,6 +8,10 @@
 #                 native assembly_hash step reads this with read_fastx, so there is
 #                 no per-contig split and bin_id is the contig id from the record.
 #   noLCG.fa      the non-circular contigs (input to binning + bin_refine)
+#   contig_attributes.tsv
+#                 one row per contig across both FASTAs — the assembler's own
+#                 per-contig report, joined onto qiita.assembly_membership by
+#                 both writers. Not read by any container step.
 # Zero contigs is left as an empty genomes_dir; downstream steps skip cleanly and
 # assembly_hash turns the all-empty result into StepNoData.
 #
@@ -25,10 +29,11 @@
 # listed nor verified. `test_assemble_runs_the_assembler_into_its_own_output`
 # is what holds it.
 #
-# Nothing here names a file the assembler produces, which is what lets one
+# Nothing here names a file inside the RETAINED tree, which is what lets one
 # directory hold both arms' layouts and survive a release that renames one — a
-# rename changes this directory's contents instead of needing a change here.
-# hifiasm_meta is unpinned (assemble.def), so that is not a hypothetical.
+# rename changes this directory's contents instead of needing a change here. The
+# two files each arm reads back to build its published output are named below,
+# and a moved name fails the step there rather than silently emptying it.
 #
 # It is not free. On a 1.24 Gbp masked read set — 12% of one real ticket's reads
 # — the tree is 1.44 GB for myloasm and 697 MB for hifiasm_meta, against the
@@ -103,7 +108,7 @@ for d in "${OUT}" "${ASM_DIR}"; do
 done
 mkdir -p "${OUT}" "${ASM_DIR}"
 
-# Both arms create BOTH files whenever the assembler produced anything, and
+# Both arms create BOTH FASTAs whenever the assembler produced anything, and
 # neither when it didn't — so an empty CLASS is an empty file while an empty
 # ASSEMBLY is an empty genomes_dir. Downstream depends on that distinction:
 # assembly_coverage treats a missing OR zero-byte noLCG.fa as "nothing to bin",
@@ -112,29 +117,118 @@ mkdir -p "${OUT}" "${ASM_DIR}"
 # Each arm gets this for free from its writer (a shell `>` redirect truncates into
 # existence; a zero-row COPY still writes its file), so there is no pre-creation
 # step to keep in sync.
+#
+# The attribute sidecar is written under that same guard, so it is present
+# whenever the two FASTAs are. Its ABSENCE therefore means a run assembled before
+# it existed, which is what both readers key on (see
+# qiita_common.assembly_constants.register_contig_attribute_table).
 case "${ASSEMBLER}" in
     hifiasm_meta)
         micromamba run -n hifiasm_meta hifiasm_meta -t "${THREADS}" -o "${ASM_DIR}/asm" "${READS_FASTQ}"
         GFA="${ASM_DIR}/asm.p_ctg.gfa"
 
         # GFA S-line -> FASTA. hifiasm-meta's documented contig-name shape is
-        # `s[0-9]+\.[uc]tg[0-9]{6}[lc]` where the trailing letter is `c` (circular) or `l`
-        # (linear) — e.g. `s1.utg000001c` vs `s1.utg000001l` (hifiasm-meta man page /
-        # README). We anchor the match to `tg[0-9]+c$` rather than a bare `c$` so only a
-        # well-formed circular segment name matches (a bare `c$` would also catch any
-        # non-canonical name ending in 'c'); a name that doesn't match the circular shape
-        # falls through to noLCG (binned), which is the safe default.
+        # `s[0-9]+\.[uc]tg[0-9]{6}[lc]` where the trailing letter is `c` (circular)
+        # or `l` (linear) — e.g. `s1.utg000001c` vs `s1.utg000001l` (hifiasm-meta
+        # man page / README). Both letters are matched as `tg[0-9]+[cl]$` rather
+        # than a bare `[cl]$`, so only a well-formed name matches: a bare `c$`
+        # would also catch any non-canonical name ending in 'c'.
         #
-        # This arm is deliberately left as it was, INCLUDING two behaviours the
-        # myloasm arm below does not share: a missing GFA is treated as an empty
-        # assembly rather than a contract violation, and an unrecognised segment
-        # name is routed to noLCG rather than failing the step. Both are the same
-        # fail-open shape, and both are worth revisiting — but changing the
-        # DEFAULT assembler's behaviour is not this change's business, so it is a
-        # follow-up rather than a silent ride-along.
+        # A name matching NEITHER shape fails the step. The circularity call is
+        # stored per contig, so an unclassified name would otherwise be routed to
+        # noLCG and ALSO write a `no` into the lake for a contig nobody
+        # classified. The myloasm arm fails on an unparseable header for the same
+        # reason, and this arm's version is pinned (assemble.def), so a name
+        # outside the documented shape means the grammar moved. A missing GFA is
+        # an empty assembly, not a violation.
+        #
+        # The attribute pass runs FIRST so a bad name stops the step before any
+        # FASTA is written. The two FASTA writers keep their own `>` redirects,
+        # which is what holds the "empty CLASS is an empty FILE" invariant above:
+        # the shell truncates each into existence whether or not the awk matches,
+        # where awk's own redirection would create a file only on first write.
         if [[ -s "${GFA}" ]]; then
-            awk '$1=="S" && $2 ~ /tg[0-9]+c$/  {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/circular.fa"
-            awk '$1=="S" && $2 !~ /tg[0-9]+c$/ {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/noLCG.fa"
+            # One grammar, defined once and shared by the attribute pass and both
+            # FASTA writers, so the three cannot drift into disagreeing about
+            # which names are circular.
+            CIRC_RE='tg[0-9]+c$'
+            LIN_RE='tg[0-9]+l$'
+
+            # S-line -> one attribute row. Probed against the pinned build
+            # (hamtv0.3.5) on a 60 kb synthetic replicon: `p_ctg.gfa` carries one
+            # S-line per contig as
+            #     S  s0.ctg000001c  <seq>  LN:i:60000  dp:f:98  ts:B:I,0
+            # with the circular/linear call in the name's trailing letter and the
+            # depth in `dp:f`. The control was the same generator with wrap-around
+            # removed, which produced `s0.ctg000001l` — so the suffix tracks
+            # topology rather than being incidental, and both classes carry the
+            # tag. `dp:f` is searched for BY TAG among fields 4+ rather than by
+            # position: it sits at $5 in that layout, but GFA does not fix tag
+            # order and reading $5 would silently store `ts:B:I`'s value the day
+            # it moves. `mult` is empty for every row — hifiasm_meta has no
+            # counterpart to myloasm's k-mer multiplicity.
+            #
+            # Re-measured on one real metagenome assembled with 0.13-r308 /
+            # 0.3-r079: 2899 contigs, all 2899 carrying dp:f, depth 1-145, all
+            # 2899 S-lines carrying exactly LN:i dp:f ts:B, and every name
+            # matching the grammar above (1 circular, 2898 linear, 0 unmatched).
+            # That is one assembly of one input, so it says the tag is emitted
+            # for every contig of that run, not what a low-coverage input or a
+            # different mode does. The search stays by TAG regardless: GFA does
+            # not fix the order, and not assuming it costs one loop.
+            awk -v attrs="${OUT}/contig_attributes.tsv" -v circ="${CIRC_RE}" -v lin="${LIN_RE}" '
+                BEGIN { OFS = "\t"; print "contig_id", "raw_name", "circularity", "depth", "mult" > attrs }
+                $1 != "S" { next }
+                {
+                    if ($2 ~ circ)     { call = "yes" }
+                    else if ($2 ~ lin) { call = "no" }
+                    else {
+                        bad++
+                        if (bad <= 3) { names = names " " $2 }
+                        next
+                    }
+                    dp = ""
+                    for (i = 4; i <= NF; i++) { if ($i ~ /^dp:f:/) { dp = substr($i, 6) } }
+                    if (dp != "") { with_dp++ }
+                    seen++
+                    print $2, $2, call, dp, "" > attrs
+                }
+                END {
+                    if (bad) {
+                        printf "assemble: %d GFA segment name(s) match neither the circular (tg<N>c) nor the linear (tg<N>l) shape, e.g.%s\n", bad, names > "/dev/stderr"
+                        printf "          re-probe hifiasm_meta name grammar against the version pinned in assemble.def\n" > "/dev/stderr"
+                        exit 65
+                    }
+                    # NONE carrying dp:f is the shape a renamed or moved tag
+                    # produces, and it is the only shape this pass can tell apart
+                    # from data: fail rather than store a depth-less run, the same
+                    # fail-closed rule myloasm_split.py applies to its own depth.
+                    if (seen && !with_dp) {
+                        printf "assemble: none of %d GFA segment(s) carried a dp:f tag\n", seen > "/dev/stderr"
+                        printf "          re-probe hifiasm_meta depth tag against the version pinned in assemble.def\n" > "/dev/stderr"
+                        exit 65
+                    }
+                    # SOME carrying it is tolerated for the converse of the
+                    # reason above: a partial absence is not diagnostic of
+                    # anything. It is the one shape consistent both with a moved
+                    # tag and with an assembly the tool simply reported less about,
+                    # so failing on it would discard a finished assembly to
+                    # distinguish nothing. Such a row is also not lost -- it keeps
+                    # raw_name and circularity, so a NULL depth beside a non-NULL
+                    # raw_name reads as "this segment reported none" where a
+                    # pre-sidecar run has all four NULL (pinned in
+                    # test_assembly_constants.py in qiita-common) -- but that
+                    # holds of the failing case too, so it is what makes the
+                    # tolerance harmless rather than what makes it right.
+                    # Counted to stderr because nothing else records it.
+                    if (seen && with_dp < seen) {
+                        printf "assemble: %d of %d GFA segment(s) carried no dp:f tag; depth stored NULL for those\n", seen - with_dp, seen > "/dev/stderr"
+                        printf "          expected 0; if this is most of them, re-probe the depth tag against the version pinned in assemble.def\n" > "/dev/stderr"
+                    }
+                }' "${GFA}"
+
+            awk -v re="${CIRC_RE}" '$1=="S" && $2 ~ re {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/circular.fa"
+            awk -v re="${CIRC_RE}" '$1=="S" && $2 !~ re {printf ">%s\n%s\n", $2, $3}' "${GFA}" > "${OUT}/noLCG.fa"
         fi
         ;;
     myloasm)
@@ -173,7 +267,8 @@ case "${ASSEMBLER}" in
         # step's `derived_inputs: MIINT_EXTENSION_DIRECTORY`.
         if [[ -s "${PRIMARY}" ]]; then
             python3 /opt/qiita/myloasm_split.py \
-                "${PRIMARY}" "${OUT}/circular.fa" "${OUT}/noLCG.fa"
+                "${PRIMARY}" "${OUT}/circular.fa" "${OUT}/noLCG.fa" \
+                "${OUT}/contig_attributes.tsv"
         fi
         ;;
     *)
