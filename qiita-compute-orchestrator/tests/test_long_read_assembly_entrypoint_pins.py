@@ -63,6 +63,15 @@ _BIN_REFINE_DEF = _WORKFLOW_DIR / "bin_refine.def"
 _CHECKM_SH = _WORKFLOW_DIR / "checkm.sh"
 _ASSEMBLE_DEF = _WORKFLOW_DIR / "assemble.def"
 
+# What each assembler's `%test` must grep its `--version` output for. myloasm
+# reports its conda version verbatim; hifiasm_meta reports two internal versions
+# that its conda string (`hamtv0.3.5`) does not contain, so neither can be derived
+# from the pin and both are written out here.
+_ASSERTED_VERSIONS = {
+    "hifiasm_meta": ("0.13-r308", "0.3-r079"),
+    "myloasm": ("0.6.0",),
+}
+
 
 @pytest.mark.parametrize(
     "path",
@@ -376,8 +385,11 @@ def test_assemble_def_pins_and_asserts_both_assemblers() -> None:
     assert set(pinned) == {"hifiasm_meta", "myloasm"}, (
         f"expected both assemblers `=`-pinned on their create lines; got {pinned}"
     )
-    joined = "\n".join(lines)
-    for package, version in pinned.items():
+    assert pinned == {"hifiasm_meta": "hamtv0.3.5", "myloasm": "0.6.0"}, (
+        f"the assembler pins moved; got {pinned}. Update _ASSERTED_VERSIONS below "
+        "in the same change, or the %test greps go on checking the old build"
+    )
+    for package, expected in _ASSERTED_VERSIONS.items():
         # The invocation alone is not the assertion: `<tool> --version` on its own
         # line satisfies a search for it while checking nothing. Require the output
         # to reach a grep, so the %test line has to compare against something.
@@ -388,17 +400,17 @@ def test_assemble_def_pins_and_asserts_both_assemblers() -> None:
             f"{package} is pinned but its --version output is never compared in "
             "%test, so a drifted solve would build green"
         )
-        # And what it compares against has to be tied to the pin. The conda
-        # version string is enough for myloasm, whose binary reports it verbatim;
-        # hifiasm_meta reports two internal versions instead, so its own digits
-        # are what the greps carry.
-        digits = re.findall(r"[0-9]+(?:\.[0-9]+)*(?:-r[0-9]+)?", version)
-        tied = any(any(d in ln for d in digits) or re.search(r"-r[0-9]+", ln) for ln in asserted)
-        assert tied, (
-            f"{package}'s %test grep does not name a version -- it would pass "
-            f"against any build (pinned at {version})"
-        )
-    assert "hifiasm_meta" in joined and "myloasm" in joined
+        # And each grep must name the version it is checking for. Spelled out
+        # rather than derived from the conda pin: hifiasm_meta's conda string
+        # (`hamtv0.3.5`) appears in none of them, because the binary reports two
+        # internal versions instead -- so a derived check would have to accept any
+        # version-shaped token, and would pass with the pin bumped and the greps
+        # left behind.
+        for token in expected:
+            assert any(token in ln for ln in asserted), (
+                f"{package}'s %test never greps for {token!r}; the pin and the "
+                "build-time assertion have drifted apart"
+            )
 
 
 def test_binning_stages_the_coverage_bam_unrewritten() -> None:

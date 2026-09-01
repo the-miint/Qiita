@@ -98,14 +98,14 @@ From: mambaorg/micromamba:1.5.8
     #    the same version against different upstream sources, which is why both
     #    are checked.
     micromamba create -y -n hifiasm_meta -c bioconda -c conda-forge hifiasm_meta=hamtv0.3.5
-    #  - myloasm: PINNED, and the pin is load-bearing in a way hifiasm's absence of
-    #    one is not. myloasm's circularity contract is a STRING in its FASTA header,
+    #  - myloasm: PINNED. Its circularity contract is a STRING in its FASTA header,
     #    probed on exactly this version (0.6.0). A drifted solve that RENAMED or
-    #    reordered those fields is caught — myloasm_split.py fails the step on a
-    #    header it cannot parse. What no runtime check can catch is a release that
-    #    KEEPS the `_len-<N>_circular-<yes|no|possibly>_` shape and changes what the
-    #    values mean; that is what the pin, and the %test asserting it below, are
-    #    for.
+    #    reordered the `_circular-` or `_depth-` fields is caught — myloasm_split.py
+    #    fails the step on a header it cannot parse, and on a run where no contig
+    #    yielded a depth. What no runtime check can catch is a release that KEEPS
+    #    the `_len-<N>_circular-<yes|no|possibly>_depth-<A>-<B>-<C>_` shape and
+    #    changes what the values mean; that is what the pin, and the %test asserting
+    #    it below, are for.
     micromamba create -y -n myloasm -c bioconda -c conda-forge myloasm=0.6.0
 
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/assemble.sh
@@ -138,10 +138,10 @@ From: mambaorg/micromamba:1.5.8
     micromamba run -n hifiasm_meta hifiasm_meta --version 2>&1 | grep -Fq "0.13-r308"
     micromamba run -n hifiasm_meta hifiasm_meta --version 2>&1 | grep -Fq "0.3-r079"
     # myloasm's VERSION is asserted, not merely its presence. myloasm_split.py
-    # reads circularity out of a header string probed against 0.6.0. A release that
-    # renamed those fields would be caught at run time by myloasm_split.py; one
-    # that KEPT the shape and changed the meaning would not be, and this pin is the
-    # only thing standing in front of it.
+    # reads circularity and depth out of a header string probed against 0.6.0, and
+    # fails the step if either field stops matching. A release that KEPT both
+    # shapes and changed their meaning would not be caught there, and this pin is
+    # the only thing standing in front of it.
     micromamba run -n myloasm myloasm --version | grep -Fxq "myloasm 0.6.0"
     # Base utilities the entrypoints actually invoke — assert each one, since the
     # whole point of this %test is to fail the BUILD on a missing runtime dep

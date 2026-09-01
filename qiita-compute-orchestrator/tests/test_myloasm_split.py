@@ -198,16 +198,19 @@ def test_sidecar_carries_the_depth_mean_and_the_mult_length_gate(
       * a <1 kb contig, where myloasm reports `mult=0.00` for absence of signal
         rather than a measured zero, so `mult` must be NULL while `depth` is
         still read;
-      * a lowercase >=1 kb contig, since `length(sequence1)` drives the gate and
-        the fixtures elsewhere are uppercase.
+      * a contig whose `_len-` field DISAGREES with the sequence it carries, to
+        pin which of the two drives the gate. Its header says 5000 while the
+        sequence is 200 bp, so a gate reading the header would keep its `mult`
+        and a gate reading `length(sequence1)` -- the one this code uses --
+        nulls it. Nothing else in the file distinguishes them, because myloasm's
+        own headers always agree with their sequence.
     """
     long_seq = "ACGT" * 300  # 1200 bp, over the gate
-    low_seq = "acgt" * 300  # 1200 bp, lowercase
     short_seq = "ACGT" * 50  # 200 bp, under the gate
     fasta = (
         f">u1ctg_len-1200_circular-yes_depth-4-5-9_duplicated-no mult=1.75\n{long_seq}\n"
         f">u2ctg_len-200_circular-no_depth-7-7-7_duplicated-no mult=0.00\n{short_seq}\n"
-        f">u3ctg_len-1200_circular-no_depth-2-2-2_duplicated-no mult=3.50\n{low_seq}\n"
+        f">u3ctg_len-5000_circular-no_depth-2-2-2_duplicated-no mult=3.50\n{short_seq}\n"
     )
     result = _split(tmp_path, fasta, staged_miint)
     assert result.returncode == 0, result.stderr
@@ -227,7 +230,10 @@ def test_sidecar_carries_the_depth_mean_and_the_mult_length_gate(
     assert float(parsed["u2ctg"][3]) == 7.0
     assert parsed["u2ctg"][4] == "", "mult is NULL below the length gate"
 
-    assert float(parsed["u3ctg"][4]) == 3.50, "the gate reads length, not case"
+    # Header says 5000, sequence is 200 bp: the gate reads the SEQUENCE, so this
+    # is NULL. A gate keyed on the header's `_len-` field would keep 3.50 here.
+    assert parsed["u3ctg"][4] == "", "the gate must read length(sequence1), not the _len- field"
+    assert float(parsed["u3ctg"][3]) == 2.0, "depth is still read for a short contig"
 
 
 def test_trailing_header_fields_do_not_reach_the_id(tmp_path: Path, staged_miint: str) -> None:

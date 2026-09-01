@@ -235,9 +235,14 @@ def _write_assembly_membership(
     the SAME contig rather than mixing them across rows, which a per-column
     aggregate would do.
 
-    The attribute join is LEFT: a contig with no row in the sidecar stores NULLs.
-    That is the normal state for a MAG contig whose bin FASTA renamed it, and for
-    every run that predates the sidecar."""
+    The attribute join is LEFT: a contig with no row in the sidecar stores NULLs,
+    which is the state of every run that predates the sidecar.
+
+    This table is replace-keyed on (prep_sample_idx, processing_idx)
+    (flight_service::REPLACE_KEY_TABLES), so a re-run supersedes the run's rows
+    wholesale -- unlike the Postgres twin, which upserts and COALESCEs the four
+    attributes. A replay with no sidecar therefore keeps them in Postgres and
+    clears them here; Postgres is the authority for these columns."""
     conn.execute(
         "COPY ("
         "  WITH member AS ("

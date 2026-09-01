@@ -41,7 +41,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   records the routing that was applied, so an LCG row's circularity is not lost, only its
   `possibly`/`no` distinction. `ensure_assembly_tables` widens an existing DuckLake
   `assembly_membership` with `ADD COLUMN IF NOT EXISTS` on data-plane start, since
-  `ducklake_add_data_files` rejects a Parquet carrying a column its target lacks.
+  `ducklake_add_data_files` rejects a Parquet carrying a column its target lacks. Both writers
+  read the sidecar through one shared reader, which declares the two numeric columns rather
+  than sniffing them (hifiasm_meta leaves `mult` empty on every row), verifies the header
+  against the expected column order (`read_csv(columns=)` binds by POSITION and does not check
+  it, so a reordered sidecar would silently transpose values), and rejects a repeated
+  `contig_id`. Postgres COALESCEs the four columns on a re-run so a replay without a sidecar
+  cannot erase them; the DuckLake copy is replace-keyed per run, so it reflects the LAST run.
 
 - **Combined (inverted open reference) feature table: `estimate-feature-table` and `qiita
   feature-table build` can estimate over two alignment arms at once (#515).** Passing a second

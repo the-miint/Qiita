@@ -746,8 +746,13 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     // `ducklake_add_data_files` refuses a Parquet carrying a column the target
     // lacks ("Column ... exists in file ... but was not found in table"), so
     // without this every assembly registration into an existing lake fails.
-    // Evolving here rather than in a one-shot operator step keeps this function
-    // the single definition of the lake schema.
+    // Evolving here rather than in a one-shot operator step keeps the boot path
+    // the only place the lake schema is defined. The column list is stated twice
+    // inside this function -- once in the CREATE for a fresh lake, once here for
+    // an existing one -- and a column added to only one of them leaves a deployed
+    // lake narrow, which surfaces at the next registration rather than at boot.
+    // ensure_assembly_tables_is_idempotent asserts the full nine-column shape, so
+    // it fails on the CREATE half; the widening test covers the ALTER half.
     conn.execute_batch(
         "ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS raw_name VARCHAR;
          ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS circularity VARCHAR;

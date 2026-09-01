@@ -18,6 +18,10 @@ from uuid import UUID
 
 import duckdb
 import pytest
+from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTE_COLUMNS,
+    CONTIG_ATTRIBUTES_FILE,
+)
 from qiita_common.chunking import reassemble_chunks_expr
 
 # Three contigs across two bins, one circular genome, and one unbinned-residue
@@ -130,8 +134,8 @@ def _inputs(tmp_path, staging_inputs, *, checkm_rows=None, das_rows=None, attr_r
     # what a run assembled before the sidecar existed hands this job.
     if attr_rows is not None:
         _tsv(
-            genomes_dir / "contig_attributes.tsv",
-            ["contig_id", "raw_name", "circularity", "depth", "mult"],
+            genomes_dir / CONTIG_ATTRIBUTES_FILE,
+            list(CONTIG_ATTRIBUTE_COLUMNS),
             list(attr_rows),
         )
     checkm_dir = tmp_path / "checkm"
@@ -360,6 +364,38 @@ def test_membership_carries_the_assembler_attributes(tmp_path, staging_inputs):
         ("MAG", "bin.1", 300, None, None, None, None),
         ("MAG", "bin.2", 200, None, None, None, None),
         ("UNBINNED", "ctgU", 400, None, None, None, None),
+    ]
+
+
+def test_a_hifiasm_shaped_sidecar_lands_empty_cells_as_null_doubles(tmp_path, staging_inputs):
+    """The shape the DEFAULT assembler always writes reaches the lake correctly.
+
+    hifiasm_meta emits `mult` empty on EVERY row and `depth` empty for any S-line
+    with no `dp:f` tag, so the sidecar's two numeric columns can be entirely or
+    partly blank. Left to `auto_detect` an all-empty column reads as VARCHAR and
+    the Parquet's type would depend on which assembler ran — which is what the
+    declared types in `register_contig_attribute_table` prevent. Empty strings,
+    not `None`, because `_tsv` stringifies and would write the literal "None".
+    """
+    inputs = _inputs(
+        tmp_path,
+        staging_inputs,
+        attr_rows=[
+            ("ctg_LCG:circ1:1", "s0.ctg000001c", "yes", 29, ""),
+            ("ctg_MAG:bin.1:1", "s1.utg000002l", "no", "", ""),
+        ],
+    )
+    out = _run(inputs, tmp_path / "ws")
+    pq = out["staging_dir"] / "assembly_membership.parquet"
+    assert _schema(pq)["depth"] == "DOUBLE"
+    assert _schema(pq)["mult"] == "DOUBLE"
+    assert _rows(pq, "bin_id, feature_idx, circularity, depth, mult", "bin_id, feature_idx") == [
+        # depth read, mult blank — the tag-carrying hifiasm segment.
+        ("bin.1", 200, "no", None, None),
+        ("bin.1", 300, None, None, None),
+        ("bin.2", 200, None, None, None),
+        ("circ1", 100, "yes", 29.0, None),
+        ("ctgU", 400, None, None, None),
     ]
 
 

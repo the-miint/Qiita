@@ -25,9 +25,11 @@
 # listed nor verified. `test_assemble_runs_the_assembler_into_its_own_output`
 # is what holds it.
 #
-# Nothing here names a file the assembler produces, which is what lets one
+# Nothing here names a file inside the RETAINED tree, which is what lets one
 # directory hold both arms' layouts and survive a release that renames one — a
-# rename changes this directory's contents instead of needing a change here.
+# rename changes this directory's contents instead of needing a change here. The
+# two files each arm reads back to build its published output are named below,
+# and a moved name fails the step there rather than silently emptying it.
 #
 # It is not free. On a 1.24 Gbp masked read set — 12% of one real ticket's reads
 # — the tree is 1.44 GB for myloasm and 697 MB for hifiasm_meta, against the

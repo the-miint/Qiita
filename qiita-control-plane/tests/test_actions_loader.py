@@ -582,59 +582,44 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
     assert _REFERENCE_ADD_ACTION_VERSION == local_host.version == "1.0.0"
 
 
-def test_every_write_membership_step_declares_the_runner_contract_inputs():
-    """Every on-disk `write-membership` action must declare `inputs:` exactly
-    {manifest, feature_map} — the runner's `_run_action_primitive` dispatch arm
-    hard-asserts that set and raises (failing the whole ticket) on any other
-    shape. This guards against the drift that a per-workflow-shape unit test can't
-    see: when `write-membership` gained its second input (`manifest`, for the
-    persisted accession), a workflow left on the old single-input form crashes at
-    runtime, not at load. Enumerating the real YAML here catches it at build time.
-    Same guard-by-enumeration applies to any future primitive-contract change."""
+@pytest.mark.parametrize(
+    ("primitive", "required"),
+    [
+        ("WRITE_MEMBERSHIP", {"manifest", "feature_map"}),
+        (
+            "WRITE_ASSEMBLY_MEMBERSHIP",
+            {"bin_map", "manifest", "feature_map", "genomes_dir"},
+        ),
+    ],
+    ids=["write-membership", "write-assembly-membership"],
+)
+def test_every_library_primitive_step_declares_the_runner_contract_inputs(primitive, required):
+    """Every on-disk step for these primitives must declare `inputs:` exactly the
+    set the runner's `_run_action_primitive` dispatch arm hard-asserts, which
+    raises and fails the whole ticket on any other shape.
+
+    This catches the drift a per-workflow-shape unit test cannot see: when
+    `write-membership` gained its second input (`manifest`, for the persisted
+    accession), a workflow left on the old single-input form crashed at runtime
+    rather than at load. `write-assembly-membership` gaining `genomes_dir` is the
+    same change, so both are enumerated here against the real YAML.
+    """
     from pathlib import Path
 
     from qiita_common.api_paths import LibraryPrimitive
 
     from qiita_control_plane.actions import load_actions
 
+    name = getattr(LibraryPrimitive, primitive)
     actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
-    offenders = {
-        f"{a.action_id}:{s.name}": s.inputs
-        for a in actions
-        for s in a.steps
-        if s.name == LibraryPrimitive.WRITE_MEMBERSHIP
-        and set(s.inputs) != {"manifest", "feature_map"}
-    }
+    steps = [(a, s) for a in actions for s in a.steps if s.name == name]
+    # Without this the filter below is vacuous: a renamed primitive, or a workflow
+    # that stopped loading, leaves `offenders` empty and greens the guard.
+    assert steps, f"no on-disk step declares {name}; this guard would pass unchecked"
+    offenders = {f"{a.action_id}:{s.name}": s.inputs for a, s in steps if set(s.inputs) != required}
     assert not offenders, (
-        "these write-membership steps don't match the runner's required "
-        f"[manifest, feature_map] contract and will crash at dispatch: {offenders}"
-    )
-
-
-def test_every_write_assembly_membership_step_declares_the_runner_contract_inputs():
-    """The assembly twin of the guard above, for the same reason.
-
-    `_reconstruct._run_action_primitive` hard-asserts this set, so a workflow left
-    on the pre-`genomes_dir` three-input form fails at dispatch rather than at
-    load. That is exactly the drift the sibling docstring names as the case its
-    enumeration exists to catch, and adding `genomes_dir` is that change."""
-    from pathlib import Path
-
-    from qiita_common.api_paths import LibraryPrimitive
-
-    from qiita_control_plane.actions import load_actions
-
-    required = {"bin_map", "manifest", "feature_map", "genomes_dir"}
-    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
-    offenders = {
-        f"{a.action_id}:{s.name}": s.inputs
-        for a in actions
-        for s in a.steps
-        if s.name == LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP and set(s.inputs) != required
-    }
-    assert not offenders, (
-        "these write-assembly-membership steps don't match the runner's required "
-        f"{sorted(required)} contract and will crash at dispatch: {offenders}"
+        f"these {name} steps don't match the runner's required {sorted(required)} "
+        f"contract and will crash at dispatch: {offenders}"
     )
 
 

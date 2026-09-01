@@ -1462,9 +1462,16 @@ async def plan_shards(
 # values from the same contig, where a per-column aggregate would mix them.
 #
 # The attribute join is LEFT: a contig absent from the sidecar stores NULLs. The
-# same shape is written on the DuckLake side by
-# `qiita_compute_orchestrator.jobs.assembly_load._write_assembly_membership`; the
-# two are copies of one table and must stay in step.
+# same row shape is written on the DuckLake side by
+# `qiita_compute_orchestrator.jobs.assembly_load._write_assembly_membership`, and
+# the two must produce the same rows from the same inputs.
+#
+# They do NOT converge the same way on a re-run. This side upserts and COALESCEs,
+# so a replay whose genomes_dir has no sidecar keeps the attributes an earlier
+# pass stored; the lake side is replace-keyed on (prep_sample_idx,
+# processing_idx) in `flight_service::REPLACE_KEY_TABLES`, so the same replay
+# supersedes that run's lake rows with the NULLs it just computed. Postgres is
+# the authority for these four columns; the lake copy reflects the LAST run.
 ASSEMBLY_MEMBERSHIP_JOIN_SQL = (
     "WITH member AS ("
     "  SELECT bm.kind AS kind, bm.bin_id AS bin_id, fm.feature_idx AS feature_idx,"

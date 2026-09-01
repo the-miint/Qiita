@@ -65,8 +65,10 @@ is what the assay owner does by hand today.
 
 The call is also STORED per contig now, not only routed on, so the decision is
 recoverable at query time without re-running the assembler: `contig_attributes.tsv`
-carries the three-state value beside `raw_name`, the header's first token, which
-is the id the FASTAs and `bin_map.contig_id` are keyed on before truncation.
+carries the three-state value beside `raw_name` -- the header's first token, i.e.
+the id BEFORE the truncation below, so the fields the cut discards stay readable.
+The join key is `contig_id`, the cut form, which is what the FASTAs carry and so
+what reaches `bin_map.contig_id`.
 
 WHY THE ID IS TRUNCATED AT `_len-`
 ----------------------------------
@@ -120,12 +122,13 @@ _DEPTH_RE = rf"_depth-({_NUM})-({_NUM})-({_NUM})_"
 # `mult=<f>` is written AFTER the space, so it is read_fastx's `comment`, never
 # part of `read_id` — verified against the extension.
 _MULT_RE = rf"^mult=({_NUM})$"
-# myloasm reports `mult` as 0.00 below this length (kmer_multiplicity returns
-# early), which is absence of signal rather than a measured zero, so it is stored
-# NULL. Keyed on the sequence actually written rather than on the value being 0,
-# so a genuine 0.00 from a longer contig would still be stored as 0. A NULL mult
-# therefore means "not reported" from either cause -- this gate, or a header with
-# no `mult=` field at all.
+# myloasm reports `mult` as 0.00 below this length -- `kmer_multiplicity` returns
+# early, read off myloasm's source rather than probed, because every contig in the
+# probe set is well over it. That is absence of signal rather than a measured
+# zero, so it is stored NULL. Keyed on the sequence actually written rather than
+# on the value being 0, so a genuine 0.00 from a longer contig is still stored as
+# 0. A NULL mult therefore means "not reported" from either cause -- this gate, or
+# a header with no `mult=` field at all.
 _MULT_MIN_LENGTH_BP = 1000
 # Capture group 1 is the circularity value. A header that doesn't match at all
 # yields '' — which `_validate` rejects, so an unparseable header stops the step.
@@ -273,6 +276,22 @@ def _validate(con: duckdb.DuckDBPyConnection) -> None:
             "version pinned in assemble.def before trusting this split"
         )
 
+    # `depth` gets the same fail-closed treatment as circularity, and for the same
+    # reason: a renamed `_depth-` field matches nothing, TRY_CAST yields NULL, and
+    # the step would exit 0 having stored no depth for any contig of any run.
+    # Checked as "every row" rather than per row — a single NULL is a malformed
+    # header, which the circularity check above already catches, whereas ALL NULL
+    # is the grammar having moved.
+    (n_rows, n_depth) = con.execute(
+        "SELECT count(*), count(depth) FROM contig"
+    ).fetchone()
+    if n_rows and not n_depth:
+        _die(
+            "no contig yielded a depth: every header parsed for circularity but "
+            "none matched the _depth-A-B-C field — re-probe the header format "
+            "against the myloasm version pinned in assemble.def"
+        )
+
     # An LCG's bin_id IS its contig id (assembly_hash COALESCEs it from the
     # record), so a duplicate id puts two distinct genomes under one
     # `assembly_membership` subject downstream.
@@ -316,7 +335,9 @@ def _write_attributes(con: duckdb.DuckDBPyConnection, out: str) -> int:
     hand. Unlike checkm.sh and bin_refine.sh, which publish their tool's table
     byte-for-byte, myloasm emits no per-contig table — this one is composed here,
     from the header fields, because the header is where myloasm states them.
-    `HEADER` because the reader selects by name. ORDER BY contig_id so a re-run
+    `HEADER` so the reader can verify the column order it then binds positionally
+    (qiita_common.assembly_constants.register_contig_attribute_table).
+    ORDER BY contig_id so a re-run
     over identical input produces an identical file.
     """
     (count,) = con.execute(
@@ -369,6 +390,11 @@ def main(argv: list[str]) -> int:
     # class. A shortfall means a contig reaches the lake with no stored call while
     # its FASTA record is loaded normally — invisible downstream, since the join
     # is a LEFT JOIN that renders a missing row as NULL.
+    # Unlike the class-count check above, this cannot fail on a predicate -- the
+    # attribute COPY has none. It holds the weaker property that the sidecar and
+    # the two FASTAs were built from the SAME `contig` table, which is what makes
+    # `contig_id` a usable join key downstream; a future filter added to either
+    # side is what it is here to catch.
     if n_attrs != total:
         _die(f"attributes lost records: {n_attrs} rows != {total} input contigs")
 

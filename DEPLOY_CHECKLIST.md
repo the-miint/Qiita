@@ -49,8 +49,9 @@ _None yet._
   This deploy rebuilds the image (`assemble.sh` is in its `HASH_INPUTS`). #517 pins
   hifiasm_meta to `hamtv0.3.5` and asserts its two internal versions in the def's `%test`, so
   the build itself now fails on a moved solve rather than shipping one quietly — this step
-  records what that pin resolved to on this host for the archive entry. A `%test` failure here
-  aborts the deploy before any service restart.
+  records what that pin resolved to on this host for the archive entry. The gate itself is
+  earlier: the SIF build in bucket 4 runs the def's `%test`, and a failure there aborts the
+  deploy before any service restarts.
 
 - **Run the assembly-genome backfill.** (#514)
 

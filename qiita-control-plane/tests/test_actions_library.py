@@ -459,8 +459,11 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
     attrs.write_text(
         "contig_id\traw_name\tcircularity\tdepth\tmult\n"
         "u1ctg\tu1ctg_len-10_circular-yes\tyes\t30.0\t1.02\n"
-        "u2ctg\tu2ctg_len-20_circular-no\tno\t11.0\t1.00\n"
-        "u3ctg\tu3ctg_len-20_circular-possibly\tpossibly\t99.0\t9.99\n"
+        # u2ctg is the representative (lex-smallest id) AND carries the LARGER
+        # depth/mult and the later-sorting circularity, so a per-column min()
+        # would differ from it on three of the four columns.
+        "u2ctg\tu2ctg_len-20_circular-yes\tyes\t99.0\t9.99\n"
+        "u3ctg\tu3ctg_len-20_circular-no\tno\t11.0\t1.00\n"
     )
 
     with duckdb.connect(":memory:") as c:
@@ -481,7 +484,7 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
     assert sorted(rows) == sorted(
         [
             ("LCG", "circ1", 100, "u1ctg_len-10_circular-yes", "yes", 30.0, 1.02),
-            ("MAG", "bin.1", 200, "u2ctg_len-20_circular-no", "no", 11.0, 1.00),
+            ("MAG", "bin.1", 200, "u2ctg_len-20_circular-yes", "yes", 99.0, 9.99),
             ("MAG", "bin.2", 200, None, None, None, None),
         ]
     )

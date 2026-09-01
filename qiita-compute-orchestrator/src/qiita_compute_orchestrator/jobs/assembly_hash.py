@@ -18,8 +18,9 @@ downstream (mint-features -> write-assembly-membership -> assembly_load):
     exactly like `hash_sequences`.
   - `bin_map.parquet` — `(read_id, kind, bin_id, contig_id)`, the per-contig bin
     membership `write-assembly-membership` / `assembly_load` join against.
-    `contig_id` is the assembler's own id for the record. No consumer joins on it;
-    it is carried so a workspace under investigation can say which assembled
+    `contig_id` is the assembler's own id for the record. Both membership writers
+    join the assemble step's per-contig attribute sidecar on it, and it also lets
+    a workspace under investigation say which assembled
     contig became which `feature_idx` — the name the assembler, DAS_Tool and
     CheckM all use. Nothing else records it: for a MAG the `bin_id` is the FASTA's
     stem and the `read_id`'s last component is the record's ordinal, and

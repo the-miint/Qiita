@@ -13,6 +13,10 @@ import uuid
 
 import duckdb
 import pytest
+from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTE_COLUMNS,
+    CONTIG_ATTRIBUTES_FILE,
+)
 
 from qiita_control_plane.actions import library as lib
 from qiita_control_plane.repositories.processing import mint_processing
@@ -29,6 +33,17 @@ pytestmark = pytest.mark.db
 # applies. `_SOLO` is the control that must NOT collapse.
 _CONTIG = "acgtTGCAAGGTCCATTGCA"
 _SOLO = "TTTTGGGGCCCCAAAATTTT"
+
+# A myloasm header for _SOLO, whose `_len-` agrees with the 20 bp it describes.
+_RAW_NAME = "u1ctg_len-20_circular-possibly_depth-4-5-6_duplicated-no"
+
+
+def _write_sidecar(genomes_dir, rows) -> None:
+    """The sidecar as the entrypoints write it, spelled from the shared constants
+    so a column rename cannot leave this fixture behind."""
+    (genomes_dir / CONTIG_ATTRIBUTES_FILE).write_text(
+        "\t".join(CONTIG_ATTRIBUTE_COLUMNS) + "\n" + "".join("\t".join(r) + "\n" for r in rows)
+    )
 
 
 def _revcomp(sequence: str) -> str:
@@ -214,12 +229,41 @@ async def test_membership_stores_the_assembler_contig_attributes(postgres_pool, 
     # u2ctg is deliberately absent: its membership row must still be written, with
     # NULL attributes, which is the state a MAG contig renamed by its bin FASTA is
     # in and the state of every run assembled before the sidecar existed.
-    (genomes_dir / "contig_attributes.tsv").write_text(
-        "contig_id\traw_name\tcircularity\tdepth\tmult\n"
-        "u1ctg\tu1ctg_len-9_circular-possibly_depth-4-5-6_duplicated-no\tpossibly\t5.0\t1.25\n"
+    _write_sidecar(
+        genomes_dir,
+        [("u1ctg", _RAW_NAME, "possibly", "5.0", "1.25")],
     )
 
+    bare = tmp_path / "bare"
+    bare.mkdir()
+
     try:
+        # FIRST write the run with no sidecar at all, so its rows exist with NULL
+        # attributes — the state every run assembled before the sidecar is in.
+        assert (
+            await lib.write_assembly_membership(
+                postgres_pool,
+                prep_sample_idx,
+                processing_idx,
+                bin_map,
+                manifest,
+                feature_map,
+                bare,
+            )
+            == 2
+        )
+        assert [
+            tuple(r)
+            for r in await postgres_pool.fetch(
+                "SELECT raw_name, circularity, depth, mult"
+                " FROM qiita.assembly_membership WHERE prep_sample_idx = $1",
+                prep_sample_idx,
+            )
+        ] == [(None, None, None, None), (None, None, None, None)]
+
+        # Now replay WITH the sidecar. The upsert must stamp the attributes onto
+        # rows that already exist, not skip them: without the four `SET` clauses
+        # this pass leaves the NULLs above in place.
         written = await lib.write_assembly_membership(
             postgres_pool,
             prep_sample_idx,
@@ -239,7 +283,7 @@ async def test_membership_stores_the_assembler_contig_attributes(postgres_pool, 
         assert [tuple(r) for r in rows] == [
             (
                 "c1",
-                "u1ctg_len-9_circular-possibly_depth-4-5-6_duplicated-no",
+                _RAW_NAME,
                 "possibly",
                 5.0,
                 1.25,
@@ -247,12 +291,10 @@ async def test_membership_stores_the_assembler_contig_attributes(postgres_pool, 
             ("c2", None, None, None, None),
         ]
 
-        # Replay the SAME run against a genomes_dir with no sidecar — the state a
-        # resumed ticket whose assemble step predates the sidecar hands this. The
-        # upsert COALESCEs, so what was recorded survives; a plain
-        # `SET raw_name = EXCLUDED.raw_name` would null all four here.
-        bare = tmp_path / "bare"
-        bare.mkdir()
+        # And replay once more with no sidecar. The upsert COALESCEs, so what was
+        # recorded survives; a plain `SET raw_name = EXCLUDED.raw_name` would null
+        # all four here. Together with the first pass this pins BOTH directions:
+        # NULL converges to a value, a value is not erased by a NULL.
         assert (
             await lib.write_assembly_membership(
                 postgres_pool,

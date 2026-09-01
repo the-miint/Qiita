@@ -22,7 +22,7 @@ ALTER TABLE qiita.assembly_membership
 
 COMMENT ON COLUMN qiita.assembly_membership.raw_name IS
     'The assembler''s own record name, verbatim: myloasm''s full FASTA header, or '
-    'hifiasm_meta''s GFA segment name. Kept so a normalized column below can always '
+    'hifiasm_meta''s GFA segment name. Kept so the normalized circularity column can always '
     'be traced back to what the tool actually said. NULL for rows written before '
     'the attribute sidecar existed.';
 
