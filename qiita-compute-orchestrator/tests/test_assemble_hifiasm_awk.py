@@ -190,9 +190,12 @@ def test_a_gfa_with_no_dp_tag_anywhere_fails_rather_than_storing_no_depth(
     Left fail-open, `depth` would be NULL for every contig of every hifiasm run
     and read downstream as "not recorded", which is the same silent all-NULL
     outcome `myloasm_split.py` refuses for its own depth field. SOME segments
-    lacking the tag is not that shape and must still succeed (the case above):
-    each probe assembly behind this grammar produced one contig, so nothing
-    measured says every segment of a real metagenome carries one.
+    lacking the tag is not that shape and must still succeed (the case above) --
+    not because the reach of the tag is in doubt, which `assemble.sh` records a
+    real-assembly measurement for, but because such a row stays readable after
+    the fact: a NULL depth beside a non-NULL raw_name means the assembler
+    reported on that contig without a depth, where an absent sidecar leaves all
+    four NULL.
     """
     result, _ = _run(
         tmp_path,

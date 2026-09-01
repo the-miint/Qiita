@@ -35,10 +35,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   triple, which is the scalar myloasm itself derives from it (the `avg_cov` its own circularity
   gate tests, per myloasm's own source); hifiasm_meta's is the S-line's `dp:f` tag, previously
   discarded along with the rest of columns 4+. A GFA where NO segment carries that tag fails the
-  step rather than storing a depth-less run; some segments lacking it does not, because the
-  probe behind the tag read one contig per assembly and so says nothing about whether every
-  segment of a real metagenome carries one — those segments get a NULL depth and a count on
-  stderr, and stay distinguishable from a pre-sidecar run by their non-NULL `raw_name`. `mult` is NULL
+  step rather than storing a depth-less run; some segments lacking it does not. That tolerance is
+  not a hedge against the tag being patchy — a 2,899-contig real metagenome assembled on the
+  pinned build carried `dp:f` on every contig (depth 1–145), with every name matching the
+  circular/linear grammar and none unmatched — but rests on such a row staying readable after
+  the fact: a NULL depth beside a non-NULL `raw_name` means the assembler reported on that
+  contig without a depth, where a pre-sidecar run leaves all four NULL. Those segments also get
+  a count on stderr. `mult` is NULL
   below 1 kb, where myloasm reports `0.00` for absence of signal rather than a measured zero.
   Attributes are NULL for every row written before this deploy and are not backfilled here:
   they are read out of the assemble step's output, which for an older run is gone. A MAG row
