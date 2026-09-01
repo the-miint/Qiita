@@ -146,3 +146,42 @@ def register_contig_attribute_table(conn: Any, path: Path) -> None:
             f"{path} repeats {repeated} contig_id(s); the attribute join would "
             "duplicate a membership row the write upserts on"
         )
+
+
+# The attribute half of the membership join, shared by the two writers of
+# qiita.assembly_membership. They cannot share the whole statement — the control
+# plane joins three Parquets and streams rows back, the orchestrator joins a TEMP
+# TABLE and COPYs to Parquet with the run scalars stamped in — but these three
+# fragments carry the part that must agree, and a previous round found the two
+# copies had already diverged on how they converge.
+#
+# `min(...)` picks ONE representative contig per membership key rather than
+# aggregating each attribute separately: a per-column aggregate could return one
+# contig's circularity beside another's depth, describing a contig that does not
+# exist. Which contig wins is lexicographic and therefore arbitrary — it matters
+# only when a bin holds duplicate (identical) contigs whose reports disagree.
+CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL = "min(bm.contig_id) AS attr_contig_id"
+
+
+def contig_attribute_projection(alias: str) -> str:
+    """The four attribute columns, selected off `contig_attribute` alias `a`.
+
+    Named rather than `a.*` so the projection's column ORDER is fixed here: the
+    orchestrator COPYs this straight to a Parquet whose column order must match
+    the DuckLake table (`ducklake.rs::ensure_assembly_tables`).
+    """
+    return ", ".join(f"{alias}.{name} AS {name}" for name in CONTIG_ATTRIBUTE_COLUMNS[1:])
+
+
+def contig_attribute_join(member_alias: str, attr_alias: str = "a") -> str:
+    """LEFT JOIN of the registered `contig_attribute` table onto the representative.
+
+    LEFT so a contig absent from the sidecar keeps its membership row with NULL
+    attributes, which is the state of every run assembled before the sidecar
+    existed. `register_contig_attribute_table` rejects a repeated `contig_id`, so
+    this join cannot re-multiply a row the caller's GROUP BY just collapsed.
+    """
+    return (
+        f" LEFT JOIN contig_attribute {attr_alias}"
+        f" ON {attr_alias}.contig_id = {member_alias}.attr_contig_id"
+    )

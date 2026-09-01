@@ -34,7 +34,10 @@ import pyarrow.flight as _flight
 import pyarrow.parquet as pq
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
     CONTIG_ATTRIBUTES_FILE,
+    contig_attribute_join,
+    contig_attribute_projection,
     register_contig_attribute_table,
 )
 from qiita_common.models import (
@@ -1475,17 +1478,15 @@ async def plan_shards(
 ASSEMBLY_MEMBERSHIP_JOIN_SQL = (
     "WITH member AS ("
     "  SELECT bm.kind AS kind, bm.bin_id AS bin_id, fm.feature_idx AS feature_idx,"
-    "    min(bm.contig_id) AS attr_contig_id"
+    f"    {CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL}"
     "  FROM read_parquet(?) AS bm"
     "  JOIN read_parquet(?) AS m ON bm.read_id = m.read_id"
     "  JOIN read_parquet(?) AS fm ON m.sequence_hash = fm.sequence_hash"
     "  GROUP BY bm.kind, bm.bin_id, fm.feature_idx"
     ")"
     " SELECT mb.kind, mb.bin_id, mb.feature_idx,"
-    "   a.raw_name AS raw_name, a.circularity AS circularity,"
-    "   a.depth AS depth, a.mult AS mult"
-    " FROM member mb"
-    " LEFT JOIN contig_attribute a ON a.contig_id = mb.attr_contig_id"
+    f"   {contig_attribute_projection('a')}"
+    " FROM member mb" + contig_attribute_join("mb")
 )
 
 

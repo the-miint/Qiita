@@ -41,8 +41,11 @@ from pathlib import Path
 import duckdb
 from pydantic import BaseModel
 from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
     CONTIG_ATTRIBUTES_FILE,
     KIND_MAG,
+    contig_attribute_join,
+    contig_attribute_projection,
     register_contig_attribute_table,
 )
 from qiita_common.parquet import validate_parquet_path
@@ -255,17 +258,14 @@ def _write_assembly_membership(
         f"      CAST({prep_sample_idx} AS BIGINT) AS prep_sample_idx,"
         f"      CAST({processing_idx} AS BIGINT) AS processing_idx,"
         "      bm.kind AS kind, bm.bin_id AS bin_id, im.feature_idx AS feature_idx,"
-        "      min(bm.contig_id) AS attr_contig_id"
+        f"      {CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL}"
         "    FROM read_parquet(?) bm"
         "    JOIN id_map im ON bm.read_id = im.read_id"
         "    GROUP BY bm.kind, bm.bin_id, im.feature_idx"
         "  )"
         "  SELECT m.prep_sample_idx, m.processing_idx, m.kind, m.bin_id, m.feature_idx,"
-        "    a.raw_name AS raw_name, a.circularity AS circularity,"
-        "    a.depth AS depth, a.mult AS mult"
-        "  FROM member m"
-        "  LEFT JOIN contig_attribute a ON a.contig_id = m.attr_contig_id"
-        "  ORDER BY m.feature_idx"
+        f"    {contig_attribute_projection('a')}"
+        "  FROM member m" + contig_attribute_join("m") + "  ORDER BY m.feature_idx"
         f") TO '{out}' ({PARQUET_OPTS})",
         [str(bin_map_path)],
     )
