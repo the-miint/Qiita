@@ -19,20 +19,29 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "${OUT}"
 
-# Per-binner contig->bin tables. metabat2's Fasta_to_Contig2Bin output needs the
-# `$1,$4` projection; concoct/maxbin2 use the raw output (qp-pacbio's special
-# case). Labels are DAS_Tool's expected CONCOCT/MaxBin/MetaBAT.
+# Per-binner contig->bin tables. One path for all three: `Fasta_to_Contig2Bin.sh`
+# emits <contig>\t<bin id> and contig2bin_filter.awk decides which of those rows
+# are candidate bins — it carries the column measurement and the catch-all rule.
+# Labels are DAS_Tool's expected CONCOCT/MaxBin/MetaBAT.
 declare -a das_bins das_labels
 for binner in concoct maxbin2 metabat2; do
     d="${BINS_DIR}/${binner}_bins"
     [[ -d "${d}" ]] || continue
     ls "${d}"/*.fa >/dev/null 2>&1 || continue
     tsv="${WORK}/${binner}.tsv"
-    if [[ "${binner}" == "metabat2" ]]; then
-        micromamba run -n dastool Fasta_to_Contig2Bin.sh -i "${d}" -e fa \
-            | awk 'BEGIN{FS=OFS="\t"}{print $1,$4}' > "${tsv}"
-    else
-        micromamba run -n dastool Fasta_to_Contig2Bin.sh -i "${d}" -e fa > "${tsv}"
+    rejects="${WORK}/${binner}.rejects"
+    micromamba run -n dastool Fasta_to_Contig2Bin.sh -i "${d}" -e fa \
+        | awk -v rejects="${rejects}" -f /opt/qiita/contig2bin_filter.awk > "${tsv}"
+    if [[ -s "${rejects}" ]]; then
+        echo "bin_refine: ${binner}'s contig2bin table holds row(s) that are neither a" >&2
+        echo "            numbered bin nor a known catch-all — contig2bin_filter.awk" >&2
+        echo "            lists both shapes. First few, distinct:" >&2
+        # awk, not `sort -u | head`: head closing the pipe would SIGPIPE sort, and
+        # under pipefail that aborts the script before the exit below.
+        awk '!seen[$0]++ && ++n <= 5' "${rejects}" >&2
+        echo "            Either Fasta_to_Contig2Bin.sh's columns or the binner's output" >&2
+        echo "            naming has moved; both decide which contigs DAS_Tool scores." >&2
+        exit 65
     fi
     [[ -s "${tsv}" ]] || continue
     das_bins+=("${tsv}")

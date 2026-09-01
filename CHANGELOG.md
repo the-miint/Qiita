@@ -1476,6 +1476,29 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **`bin_refine` discarded every MetaBAT bin id, and offered each binner's unbinned catch-all as a
+  candidate bin (#519).** `Fasta_to_Contig2Bin.sh -e fa` writes two tab-separated fields,
+  `<contig>\t<filename minus ".fa">` — measured against the shipped
+  `long-read-assembly-dastool-1.0.0.sif` over all three binners' output: 4,910 concoct + 4,910
+  metabat2 + 2,930 maxbin2 rows, every one `NF == 2`. metabat2's table was projected
+  `{print $1,$4}`, so every row carried the empty string as its bin id and DAS_Tool saw one unnamed
+  bin holding the whole assembly. Across 60 production runs it selected 6,023 MaxBin and 201
+  CONCOCT bins and 0 MetaBAT, while every ticket paid metabat2's compute. Separately,
+  `bin_refine.sh` globbed `*.fa` and so passed on the file each binner writes for the contigs it
+  did NOT place — metabat2's `bin.unbinned.fa` / `bin.tooShort.fa` / `bin.lowDepth.fa`, concoct's
+  `unbinned.fa`; concoct's held 3,326 of 4,910 contigs on the measured run. The two interact: the
+  metabat2 catch-alls were unreachable only because the projection nulled that binner, so `$4` →
+  `$2` alone would newly offer three of them as MetaBAT bins. All three binners now take one path,
+  through a new `contig2bin_filter.awk` that keeps `bin.<N>` (metaWRAP's name for a real bin in
+  every binner's dir), drops the four catch-alls, and writes anything else to a rejects file the
+  step fails on. Measured on 150k masked reads from a production ticket, re-run through the shipped
+  binning and dastool images with only the table changed: 20 bins → 21, MetaBAT 0 → 4 (DAS_Tool
+  replaced 3 MaxBin bins with MetaBAT ones it scored higher, 19 → 16), mean redundancy 3.8 → 1.9,
+  bins at medium quality or better 18 → 21. Stored assemblies are unaffected — they were produced
+  without MetaBAT and stay that way unless re-run. `bin_refine.sh` was ported from qp-pacbio, which
+  carries the same projection at `5.DAS_Tools_prepare_batch3_test.sbatch:44`; the catch-all removal
+  sitting above it there was not ported.
+
 - **Two `library.py` docstrings pointed at a comment that does not carry the argument they cite
   (#519).** Both `upsert_genomes` and `upsert_genome_associations` said that the reference and
   assembly genome junctions "must stay apart" and referred the reader to

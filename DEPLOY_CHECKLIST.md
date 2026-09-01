@@ -104,6 +104,22 @@ _None yet._
   A ticket with an empty `circular.fa` legitimately writes only the first pair, so pick the
   ticket before reading the result.
 
+- **Check DAS_Tool now selects MetaBAT bins.** (#519)
+
+  ```bash
+  # The first ticket assembled AFTER this deploy whose bin_refine produced bins.
+  T=<work_ticket_idx>
+  cut -f2 "${PATH_SCRATCH}/ticket/${T}"/bin_refine/attempt-*/output/refined_bins/das_tool_summary.tsv \
+      | tail -n +2 | sort | uniq -c
+  ```
+
+  `bin_set` is column 2 of DAS_Tool's summary. Before this deploy that count could only read
+  MaxBin and CONCOCT: metabat2's contig→bin table reached DAS_Tool with every bin id blanked, so
+  no MetaBAT bin was selectable — 0 across 60 production runs. A MetaBAT line means the corrected
+  table landed. Its absence on one ticket is not a failed deploy — a sample can legitimately yield
+  no MetaBAT bin — so read it across the first few, and confirm the step exited 0 rather than 65,
+  the new refusal described in the notes below.
+
 ### 6. After the deploy verifies green
 
 _None yet._
@@ -165,6 +181,21 @@ _None yet._
   deploys are untouched and are not backfilled — the values come from a CheckM run that did not
   happen, so an assembly stored before this deploy keeps MAG rows only. Re-running the workflow
   for a sample is what produces its LCG rows. The unbinned residue is still never scored.
+
+- **The `bin_refine` SIF rebuilds, and MAG composition changes for assemblies run after this
+  deploy.** (#519) `bin_refine.sh` and the new `contig2bin_filter.awk` are both in the image's
+  `HASH_INPUTS`, so the dastool image rebuilds. The behaviour change is in what DAS_Tool is asked
+  to score: metabat2's contig→bin table reached it with every bin id blanked (the id was read from
+  a column the table does not have), so no MetaBAT bin was ever selectable — 0 across 60 production
+  runs — while each binner's unbinned catch-all WAS offered as a candidate bin. The two are fixed
+  together, because correcting the column alone would newly offer metabat2's three catch-alls as
+  MetaBAT bins. Re-measured end to end on 150k masked reads from a production ticket, same input
+  and same images: 20 bins → 21, MetaBAT 0 → 4, mean redundancy 3.8 → 1.9. Stored assemblies are
+  neither re-run nor backfilled — they keep the bins they were produced with, and comparing a MAG
+  set from before this deploy with one from after compares two different consensus inputs. New
+  failure mode: a contig2bin row that is neither a numbered bin (`bin.<N>`) nor a known binner
+  catch-all exits the step **65** with the offending rows on stderr rather than guessing which it
+  is; that is what a metaWRAP output-naming change would look like.
 
 ---
 
