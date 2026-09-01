@@ -124,7 +124,41 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-_None yet._
+- **Re-run the two pre-fix assembly runs under `long-read-assembly` 1.0.1, then deprecate the
+  1.0.0 runs.** (#522) The `bin_refine` consensus fix (#519) does not reach anything already
+  assembled: those samples hold a two-binner MAG set, their tickets are `completed` (terminal —
+  `/run` refuses), and a re-submit at 1.0.0 resolves to the SAME `processing_idx`, where the
+  DuckLake tables would supersede wholesale while Postgres kept the old MAG subjects. 1.0.1 is
+  the identity discriminator that makes the re-run a distinct run. Affected, both
+  `hifiasm_meta`:
+
+  | processing_idx | mask_idx | samples |
+  |---|---|---|
+  | 1 | 9 | 26 |
+  | 2 | 11 | 26 |
+
+  ```bash
+  # 1. Re-submit each sample of the mask at the new version.
+  qiita ticket submit --action-id long-read-assembly --action-version 1.0.1 \
+      --prep-sample-idx <N> --context-json '{"mask_idx": 11, "assembler": "hifiasm_meta"}'
+
+  # 2. Once the new run has a processing_idx, retire the old one so no further
+  #    sample is assembled under the two-binner consensus.
+  curl -sS -X PATCH -H "Authorization: Bearer $QIITA_TOKEN" \
+      -H 'Content-Type: application/json' \
+      -d '{"status":"deprecated","superseded_by":<NEW_IDX>,
+           "deprecation_reason":"bin_refine gave DAS_Tool no MetaBAT bins; superseded by the 1.0.1 re-run"}' \
+      "$BASE/api/v1/processing/2/status"
+  ```
+
+  Deprecating stops `mint_processing` returning the old config while leaving what assembled under
+  it discoverable — it does not judge the individual runs, and nothing is deleted. **Cost, so this
+  is scheduled and not squeezed in:** only `bin_refine` onward changes (~60 min/sample), but
+  partial re-runs do not exist, so `assemble` is paid again in full — measured across the 59
+  completed steps at 415.3 min average, 1094.1 min peak, per sample. The assembly-genome backfill
+  above is unaffected and still applies to the 1.0.0 rows; `processing_idx` is in the genome
+  identity tuple, so old and new genomes never collide.
+
 
 ### Notes (no host action)
 

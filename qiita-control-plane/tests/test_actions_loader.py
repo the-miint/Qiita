@@ -180,8 +180,9 @@ def test_load_actions_loads_on_disk_reference_add_yaml():
     assert _REFERENCE_ADD_ACTION_VERSION == ref_add.version == "1.0.0"
 
 
-def test_load_actions_loads_on_disk_long_read_assembly_yaml():
-    """The on-disk `workflows/long-read-assembly/1.0.0.yaml` loads as a valid
+@pytest.mark.parametrize("version", ["1.0.0", "1.0.1"])
+def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
+    """Each on-disk `workflows/long-read-assembly/<version>.yaml` loads as a valid
     ActionDefinition with the per-sample assembly→MAG shape:
 
       * target_kind prep_sample; context_schema REQUIRES mask_idx (the selector
@@ -198,6 +199,12 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
       * assembly_run_config threads the `assembler` scalar and assembly_load
         threads `processing_idx` via params (a container step can't take a scalar
         param — the runner treats it as a bind path).
+
+    Keyed on `(action_id, version)`, as `qiita.action` is: keying on action_id
+    alone collapses the two versions onto whichever sorts last, which is how this
+    test read before 1.0.1 existed. 1.0.1 is the same computation under a distinct
+    processing identity (`test_assembly_version_parity`), so the shape asserted
+    here has to hold for both.
     """
     from pathlib import Path
 
@@ -207,12 +214,13 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
 
     repo_root = Path(__file__).resolve().parents[2]
     actions = load_actions(repo_root / "workflows")
-    by_id = {a.action_id: a for a in actions}
-    assert "long-read-assembly" in by_id, "workflows/long-read-assembly/1.0.0.yaml must load"
-    assembly = by_id["long-read-assembly"]
+    by_key = {(a.action_id, a.version): a for a in actions}
+    key = ("long-read-assembly", version)
+    assert key in by_key, f"workflows/long-read-assembly/{version}.yaml must load"
+    assembly = by_key[key]
 
     assert assembly.target_kind == ScopeTargetKind.PREP_SAMPLE
-    assert assembly.version == "1.0.0"
+    assert assembly.version == version
     assert assembly.context_schema["required"] == ["mask_idx"]
 
     assert [s.name for s in assembly.steps] == [

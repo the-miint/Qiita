@@ -21,6 +21,24 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`long-read-assembly` 1.0.1, so the corrected consensus can be re-run for samples already
+  assembled (#522).** A processing run's identity is `{workflow, version, mask_idx, assembler}`
+  and does not cover the container images, so the samples assembled before the `bin_refine` fix
+  (#519) hold a two-binner MAG set under a 1.0.0 identity that a corrected re-submit would resolve
+  straight back to. Landing the new bins on that same `processing_idx` would split the stores: the
+  DuckLake `assembly_membership` / `bin_quality` tables are replace-keyed on
+  `(prep_sample_idx, processing_idx)` and supersede wholesale, while Postgres
+  `assembly_membership` is `INSERT … ON CONFLICT DO UPDATE` with no delete path, so the superseded
+  MAG subjects would survive in Postgres and not in the lake. Re-driving the existing tickets is
+  not an option either — they are `completed`, which `/run` refuses as terminal, and the step
+  fast-forward only skips completed steps inside a FAILED/CANCELLED redrive. 1.0.1 is therefore a
+  pure identity discriminator: byte-identical to 1.0.0 apart from `version` and `description`,
+  running the same steps, resources and images, with `test_assembly_version_parity` asserting the
+  two cannot drift. The SIF filenames stay `-1.0.0.sif` — they name the image, not the workflow
+  version, and the images are unchanged. `test_load_actions_loads_on_disk_long_read_assembly_yaml`
+  now keys on `(action_id, version)` as `qiita.action` does, rather than on `action_id` alone,
+  which collapsed the two onto whichever sorted last.
+
 - **CheckM now scores the circular genomes too, so completeness and contamination cover every
   kind the workflow stores except the residue it deliberately does not score.** `checkm.sh`
   splits the assemble step's `circular.fa` into one FASTA per contig (miint `read_fastx` +
