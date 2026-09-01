@@ -159,7 +159,10 @@ async def seeded(postgres_pool, data_plane, genome):
             + _chunks(_DECOY_CONTIG, genome["decoy"])
         )
         conn.execute(
-            "INSERT INTO qiita_lake.assembly_membership VALUES "
+            # Explicit column list, for the reason test_doget.py states: the
+            # data plane owns this table and it has gained nullable columns.
+            "INSERT INTO qiita_lake.assembly_membership"
+            " (prep_sample_idx, processing_idx, kind, bin_id, feature_idx) VALUES "
             f"({prep_sample_idx}, {processing_idx}, 'LCG', 'contig_1', {_CONTIG}), "
             f"({prep_sample_idx}, {other_run['processing_idx']}, 'LCG', 'contig_1', "
             f"{_DECOY_CONTIG})"

@@ -201,6 +201,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 out=bin_quality_out,
             )
 
+            conn.execute("DROP TABLE contig_attribute")
             conn.execute("DROP TABLE id_map")
             conn.execute("DROP TABLE feature_map")
         success = True

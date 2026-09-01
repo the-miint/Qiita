@@ -160,15 +160,19 @@ def register_contig_attribute_table(conn: Any, path: Path) -> None:
 # contig's circularity beside another's depth, describing a contig that does not
 # exist. Which contig wins is lexicographic and therefore arbitrary — it matters
 # only when a bin holds duplicate (identical) contigs whose reports disagree.
+# The caller must alias bin_map `bm`; unlike `contig_attribute_join` below this
+# one carries the alias rather than taking it, because both callers already do.
 CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL = "min(bm.contig_id) AS attr_contig_id"
 
 
 def contig_attribute_projection(alias: str) -> str:
     """The four attribute columns, selected off `contig_attribute` alias `a`.
 
-    Named rather than `a.*` so the projection's column ORDER is fixed here: the
-    orchestrator COPYs this straight to a Parquet whose column order must match
-    the DuckLake table (`ducklake.rs::ensure_assembly_tables`).
+    Named rather than `a.*` so the projection is a fixed list: the orchestrator
+    COPYs this straight to a Parquet that `ducklake_add_data_files` refuses if its
+    columns differ from the target table's in either direction (probed), so the
+    set has to track `ducklake.rs::ensure_assembly_tables`. `a.*` would track
+    whatever the sidecar happened to carry.
     """
     return ", ".join(f"{alias}.{name} AS {name}" for name in CONTIG_ATTRIBUTE_COLUMNS[1:])
 

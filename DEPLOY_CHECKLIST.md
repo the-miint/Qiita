@@ -43,15 +43,16 @@ _None yet._
 
   ```bash
   apptainer exec "${PATH_DERIVED}/images/long-read-assembly-assemble-1.0.0.sif" \
-      micromamba run -n hifiasm_meta hifiasm_meta --version
+      micromamba run -n hifiasm_meta hifiasm_meta --version 2>&1
   ```
 
   This deploy rebuilds the image (`assemble.sh` is in its `HASH_INPUTS`). #517 pins
   hifiasm_meta to `hamtv0.3.5` and asserts its two internal versions in the def's `%test`, so
   the build itself now fails on a moved solve rather than shipping one quietly — this step
-  records what that pin resolved to on this host for the archive entry. The gate itself is
-  earlier: the SIF build in bucket 4 runs the def's `%test`, and a failure there aborts the
-  deploy before any service restarts.
+  records what that pin resolved to on this host for the archive entry (the versions go to
+  stderr, which is why the command redirects). The gate itself is earlier:
+  `deploy/build-sifs.sh` runs the def's `%test` during the image rebuild, and a failure there
+  aborts `activate.sh` before any service restarts.
 
 - **Run the assembly-genome backfill.** (#514)
 
