@@ -4,8 +4,8 @@ Why this exists
 ---------------
 1.0.1 exists only to be a different `processing_idx`: a run's identity is
 `{workflow, version, mask_idx, assembler}` and does not cover the container
-images, so a sample assembled before the `bin_refine` consensus fix cannot be
-corrected under the identity it already has. `CHANGELOG.md` carries the rest of
+images, so a prep_sample assembled before the `bin_refine` consensus fix cannot
+be corrected under the identity it already has. `CHANGELOG.md` carries the rest of
 that argument, including what a same-identity re-run would do to the two stores.
 
 The version only serves that purpose while the two files describe the same

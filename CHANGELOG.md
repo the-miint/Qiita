@@ -32,10 +32,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   MAG subjects would survive in Postgres and not in the lake. Re-driving the existing tickets is
   not an option either — they are `completed`, which `/run` refuses as terminal, and the step
   fast-forward only skips completed steps inside a FAILED/CANCELLED redrive. 1.0.1 is therefore a
-  pure identity discriminator: byte-identical to 1.0.0 apart from `version` and `description`,
-  running the same steps, resources and images, with `test_assembly_version_parity` asserting the
-  two cannot drift. The SIF filenames stay `-1.0.0.sif` — they name the image, not the workflow
-  version, and the images are unchanged. `test_load_actions_loads_on_disk_long_read_assembly_yaml`
+  pure identity discriminator, running the same steps, resources and images.
+  `test_assembly_version_parity` compares the two PARSED documents and fails on any difference
+  outside `version` and `description` — weaker than byte equality, since comments and whitespace
+  are invisible to it, and the container assertion pins each SIF filename rather than its
+  contents. The SIF filenames stay `-1.0.0.sif` — they name the image, not the workflow version,
+  and the images are unchanged. `test_load_actions_loads_on_disk_long_read_assembly_yaml`
   now keys on `(action_id, version)` as `qiita.action` does, rather than on `action_id` alone,
   which collapsed the two onto whichever sorted last. Syncing 1.0.1 also **disables 1.0.0** —
   `sync_actions` auto-deprecates every other version of an action_id and is last-one-wins over

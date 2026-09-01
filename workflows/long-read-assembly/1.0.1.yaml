@@ -16,7 +16,7 @@ description: >
 
   It is a separate version because a processing run's identity is
   `{workflow, version, mask_idx, assembler}` and does not cover the container
-  images, so a sample assembled before the `bin_refine` consensus fix cannot be
+  images, so a prep_sample assembled before the `bin_refine` consensus fix cannot be
   corrected under the identity it already has. CHANGELOG.md carries why, and
   DEPLOY_CHECKLIST.md what the operator does about it.
 

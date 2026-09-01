@@ -91,7 +91,7 @@ _None yet._
 
   ```bash
   # A ticket whose assemble step produced a non-empty circular.fa.
-  T=<work_ticket_idx>
+  T='<work_ticket_idx>'
   ls "${PATH_SCRATCH}/ticket/${T}"/checkm/attempt-*/output/checkm/
   ```
 
@@ -108,7 +108,7 @@ _None yet._
 
   ```bash
   # The first ticket assembled AFTER this deploy whose bin_refine produced bins.
-  T=<work_ticket_idx>
+  T='<work_ticket_idx>'
   awk -F'\t' 'FNR==1{c=0; for(i=1;i<=NF;i++) if($i=="bin_set") c=i; next} c{print $c}' \
       "${PATH_SCRATCH}/ticket/${T}"/bin_refine/attempt-*/output/refined_bins/das_tool_summary.tsv \
       | sort | uniq -c
@@ -137,25 +137,32 @@ _None yet._
   | 2 | 11 | 26 |
 
   ```bash
-  # Roster for a mask, one prep_sample_idx per line.
-  qiita mask samples 11
+  BASE=https://qiita-miint.ucsd.edu            # your host
+  read -rsp 'system_admin PAT: ' QIITA_TOKEN; echo
 
-  # 1. Re-submit each prep_sample of the mask at the new version.
+  # Do one mask at a time. Both rows of the table above go through this same block.
+  MASK_IDX=11        # then repeat for 9
+  OLD_IDX=2          # the row above for this mask; 9 -> 1
+
+  # 1. The mask's roster. One JSON row per prep_sample with its masking state —
+  #    take the prep_sample_idx of the `completed` ones.
+  qiita mask samples --mask-idx "${MASK_IDX}"
+
+  # 2. Re-submit each of those prep_samples at the new version, one PREP_SAMPLE_IDX
+  #    at a time.
   qiita ticket submit --action-id long-read-assembly --action-version 1.0.1 \
-      --prep-sample-idx <PREP_SAMPLE_IDX> \
-      --context-json '{"mask_idx": 11, "assembler": "hifiasm_meta"}'
+      --prep-sample-idx "${PREP_SAMPLE_IDX}" \
+      --context-json "{\"mask_idx\": ${MASK_IDX}, \"assembler\": \"hifiasm_meta\"}"
 
-  # 2. Once a mask's re-run has minted its processing_idx, retire that mask's OLD
-  #    run. One PATCH per old run — mask 9 -> processing 1, mask 11 -> processing 2,
-  #    each pointing at the processing_idx its own re-run minted.
-  #    system_admin only (scope processing:lifecycle).
-  BASE=https://qiita-miint.ucsd.edu           # your host
-  QIITA_TOKEN=<a system_admin PAT>
-  curl -sS -X PATCH -H "Authorization: Bearer $QIITA_TOKEN" \
+  # 3. Once this mask's re-run has minted its processing_idx, retire the old run.
+  #    NEW_IDX is that new processing_idx — different per mask, so this step waits
+  #    for step 2. system_admin only (scope processing:lifecycle).
+  NEW_IDX='<the processing_idx step 2 minted for this mask>'
+  curl -sS -X PATCH -H "Authorization: Bearer ${QIITA_TOKEN}" \
       -H 'Content-Type: application/json' \
-      -d '{"status":"deprecated","superseded_by":<NEW_IDX_FOR_THIS_MASK>,
-           "reason":"bin_refine gave DAS_Tool no MetaBAT bins; superseded by the 1.0.1 re-run"}' \
-      "$BASE/api/v1/processing/2/status"
+      -d "{\"status\":\"deprecated\",\"superseded_by\":${NEW_IDX},
+           \"reason\":\"bin_refine gave DAS_Tool no MetaBAT bins; superseded by the 1.0.1 re-run\"}" \
+      "${BASE}/api/v1/processing/${OLD_IDX}/status"
   ```
 
   The body field is `reason`, not `deprecation_reason` — the latter is the response field, and
@@ -166,7 +173,9 @@ _None yet._
   Two different deprecations, and only this one is manual. The action-level one is automatic:
   syncing 1.0.1 disables `long-read-assembly` **1.0.0** outright (`sync_actions` auto-deprecates
   every other version of an action_id), so after the deploy no prep_sample can be submitted at
-  1.0.0 for any mask. The PATCH is narrower and is about `qiita.processing`, not `qiita.action`:
+  1.0.0 for any mask. It also stops the 52 existing 1.0.0 tickets being redriven: `/run`
+  409s whenever the ticket's action row is not enabled, so a failed one cannot be restarted
+  after this. Nothing already stored is affected. The PATCH is narrower and is about `qiita.processing`, not `qiita.action`:
   it records why these two runs are void and what replaced them, which the action-level disable
   does not. Nothing is deleted either way, and what assembled under the old runs stays
   discoverable.

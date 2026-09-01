@@ -1257,7 +1257,7 @@ def test_the_version_sync_leaves_enabled_is_the_highest_of_each_action():
         # message rather than raising ValueError out of the key function, where it
         # would surface as an error in whatever PR happened to add the version.
         for version in versions:
-            assert all(part.isdigit() for part in version.split(".")), (
+            assert all(part.isdecimal() for part in version.split(".")), (
                 f"{action_id} {version!r} is not dotted integers; this test orders "
                 "versions numerically and needs extending before such a version lands."
             )
