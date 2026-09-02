@@ -16,7 +16,9 @@ From: mambaorg/micromamba:1.5.8
 %labels
     workflow long-read-assembly
     tool checkm
-    version 1.0.0
+    # Tracks the version in sif-build.d/checkm.env's SIF_FILENAME; the two are the
+    # same image's version and disagreed once already.
+    version 1.0.1
 
 %files
     # Workflow-agnostic output-dir → manifest.json walker, copied from _shared
@@ -31,6 +33,16 @@ From: mambaorg/micromamba:1.5.8
     # checkm.sh, so the unit test can execute the real program.
     lcg_split.py /opt/qiita/lcg_split.py
     miint_connect.py /opt/qiita/miint_connect.py
+    # The per-contig splitter for the large unbinned contigs, and the canonical
+    # sequence-hash expression it subtracts the binned contigs with. `chunking.py` is
+    # qiita-common's own file, declared in this image's HASH_INPUTS and staged beside
+    # the def by build-sif.sh — the SAME file assembly_hash imports, so the two agree
+    # on which residue contigs exist by construction rather than by convention.
+    residue_split.py /opt/qiita/residue_split.py
+    chunking.py /opt/qiita/chunking.py
+    # qiita-common's `is_empty_sequence_file`, staged the same way: residue_split
+    # drops an empty bin with it before `read_fastx` is handed the path.
+    duckdb_miint.py /opt/qiita/duckdb_miint.py
 
 %environment
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -50,7 +62,8 @@ From: mambaorg/micromamba:1.5.8
     # moves the interpreter major version under manifest_writer.py.
     micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils python=3.11
 
-    # python-duckdb, for lcg_split.py's miint read_fastx + FORMAT FASTA split.
+    # python-duckdb, for the miint read_fastx + FORMAT FASTA splits both
+    # lcg_split.py and residue_split.py run.
     # PINNED, and the pin is a LOCKSTEP with the compute orchestrator — assemble.def
     # carries why, and a unit test asserts both defs against
     # qiita-compute-orchestrator/uv.lock.
@@ -69,7 +82,9 @@ From: mambaorg/micromamba:1.5.8
     micromamba create -y -n checkm -c bioconda -c conda-forge checkm-genome pplacer hmmer prodigal
 
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/checkm.sh
-    chmod 0644 /opt/qiita/manifest_writer.py /opt/qiita/lcg_split.py /opt/qiita/miint_connect.py
+    chmod 0644 /opt/qiita/manifest_writer.py /opt/qiita/lcg_split.py \
+        /opt/qiita/residue_split.py /opt/qiita/miint_connect.py /opt/qiita/chunking.py \
+        /opt/qiita/duckdb_miint.py
 
     micromamba clean -a -y
 
@@ -136,11 +151,43 @@ From: mambaorg/micromamba:1.5.8
     # base env by a separate `micromamba install`.
     test -s /opt/qiita/lcg_split.py
     test -s /opt/qiita/miint_connect.py
+    test -s /opt/qiita/residue_split.py
+    test -s /opt/qiita/chunking.py
+    test -s /opt/qiita/duckdb_miint.py
     python3 -c "import importlib.util as u; s=u.spec_from_file_location('ls','/opt/qiita/lcg_split.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('rs','/opt/qiita/residue_split.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    # The hash expression residue_split builds its anti-join from. Executed, not just
+    # imported: it is plain SQL text with no duckdb import, so a `chunking.py` that
+    # arrived truncated or from the wrong place still imports and would only fail at
+    # run time, on a ticket, as a residue set that silently disagrees with
+    # assembly_hash's. Asserting the miint scalar it names is what ties the built
+    # image to the expression this workflow depends on.
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('ck','/opt/qiita/chunking.py'); m=u.module_from_spec(s); s.loader.exec_module(m); e=m.canonical_sequence_hash_expr('x'); assert 'sequence_dna_reverse_complement' in e and 'LEAST' in e, e"
+    # `is_empty_sequence_file`, exercised rather than imported for chunking.py's
+    # reason: it is stdlib-only, so a wrong or truncated file still imports. The
+    # fixture is the one a size-check rewrite fails; the rule itself is stated on the
+    # function's own docstring in qiita-common. Written under the mktemp'd HOME set
+    # above, not bare /tmp, for the reason given there.
+    python3 -c "import gzip,os,pathlib,importlib.util as u; s=u.spec_from_file_location('dm','/opt/qiita/duckdb_miint.py'); m=u.module_from_spec(s); s.loader.exec_module(m); p=pathlib.Path(os.environ['HOME'])/'empty.fa.gz'; gzip.open(p,'wb').close(); assert p.stat().st_size > 0 and m.is_empty_sequence_file(p)"
     # LOAD-only, never INSTALL — an INSTALL would need the team mirror reachable from
     # every compute node and a writable $HOME. Anchored at a string-literal quote so
     # the prose explaining why we do NOT install cannot fail the build.
-    ! grep -qE "[\"']\s*INSTALL\b" /opt/qiita/miint_connect.py /opt/qiita/lcg_split.py
+    #
+    # Every staged .py except duckdb_miint.py, which is qiita-common's whole miint
+    # module and so carries `miint_install_sql` itself. Excepting one file by name
+    # rather than listing the files to check keeps this fail-closed: a helper staged
+    # beside these later is covered without anyone remembering to extend the list,
+    # and the modules that import from duckdb_miint are all inside it.
+    # `if ... exit 1` rather than `! grep`: bash exempts a `!`-inverted command from
+    # `set -e`, so inside a loop that form cannot fail the build. The single-file
+    # version this replaces only worked by being the last command in %test.
+    for f in /opt/qiita/*.py; do
+        case "${f}" in */duckdb_miint.py) continue ;; esac
+        if grep -qE "[\"']\s*INSTALL\b" "${f}"; then
+            echo "${f} carries an INSTALL literal; this image only LOADs the deploy-staged extension" >&2
+            exit 1
+        fi
+    done
 
 %runscript
     echo "long-read-assembly-checkm image: invoke the step entrypoint, e.g." >&2

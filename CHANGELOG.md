@@ -21,6 +21,66 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`long-read-assembly` 1.0.1 scores the large unbinned contigs, so completeness and
+  contamination now cover every class the workflow stores (#522).** The `checkm` step gains a
+  THIRD CheckM run, over each unbinned contig at or above 300 kb, beside the existing MAG and LCG
+  runs. An unbinned contig is what no refined bin claimed, which is not the same as "not a
+  genome" — a large one can be a near-complete genome the binners failed to recover, and it was
+  the one class stored with nothing to judge it by. `bin_quality` therefore gains UNBINNED rows,
+  a SUBSET of the UNBINNED memberships: a contig under the cut keeps its membership row and has
+  no quality row, so the two are read with a LEFT join. The cut is where it is because a
+  marker-set completeness for a short fragment describes nothing while CheckM's cost is per
+  genome; the whole policy lives on `residue_split.py`.
+  **The residue is subtracted on the canonical sequence hash, not the contig id.** `noLCG.fa`
+  still contains the contigs a refined bin went on to claim, and `assembly_hash` drops those from
+  its UNBINNED rows keyed on `canonical_sequence_hash_expr`. Matching ids here instead would keep
+  any contig whose BYTES duplicate a binned one under another name, and CheckM would return a
+  `"Bin Id"` joining no membership row at all. `residue_split.py` imports that expression from
+  `qiita_common.chunking` — the same file `assembly_hash` imports, staged into the image by
+  `build-sif.sh` and declared in the checkm image's `HASH_INPUTS`, rather than re-implemented.
+  It takes `is_empty_sequence_file` from `qiita_common.duckdb_miint` the same way, so the rule
+  that drops an empty refined bin before `read_fastx` is handed it is also one implementation
+  rather than two: a zero-record `.fa.gz` is ~20 bytes on disk, so a size check calls it
+  non-empty, and `read_fastx` then raises `Empty file:` and aborts the scan for every other bin.
+  `test_residue_split.py` executes the shipped splitter against real miint on fixtures that
+  isolate each way the rule can be got wrong: a duplicate under a different id, a reverse
+  complement, a soft-masked copy, and both sides of the length boundary.
+  **This is why it is a version and not a rebuild.** A run's identity is
+  `{workflow, version, mask_idx, assembler}`; the result changes, so the version changes. It is
+  also the version the pre-`bin_refine`-fix (#519) assemblies are re-run under: those hold a
+  two-binner MAG set, their tickets are `completed` (which `/run` refuses as terminal), and
+  because the identity does not cover container images a re-submit at 1.0.0 would resolve
+  straight back to the run that already exists. Landing new bins on that same `processing_idx`
+  would split the stores — the DuckLake `assembly_membership` / `bin_quality` tables are
+  replace-keyed on `(prep_sample_idx, processing_idx)` and supersede wholesale, while Postgres
+  `assembly_membership` is `INSERT … ON CONFLICT DO UPDATE` with no delete path, so the
+  superseded MAG subjects would survive in Postgres and not in the lake.
+  The three unchanged images keep their `-1.0.0.sif` names — a SIF name is the IMAGE's, not the
+  workflow's — but the checkm image is the one that changed and is now built as
+  `long-read-assembly-checkm-1.0.1.sif`. That is not cosmetic: `sync_actions` RE-ENABLES a version
+  it previously auto-deprecated as soon as its YAML is synced again, so a plain revert of
+  `1.0.1.yaml` would put 1.0.0 back in service, and a checkm image rebuilt in place would have had
+  those runs writing residue quality rows under the 1.0.0 `processing_idx` that already exists.
+  The consequence, stated plainly: **no spec builds `-checkm-1.0.0.sif` any more**, so
+  `long-read-assembly` 1.0.0 is retired rather than reproducible — the image it names exists only
+  as the copy already on the deploy host, which the operator must not delete, and cannot be
+  rebuilt from this tree at all.
+  There is deliberately no test asserting 1.0.1 is 1.0.0's computation under a new identity: that
+  is no longer what 1.0.1 is, and a green test making that claim would be worse than none.
+  The step's walltime is **not** re-fitted — three sequential runs over ~338 genomes per
+  ticket, against a measured predecessor that scored ~104 in a single run, has never been run end
+  to end, so the `PT4H` cap is carried over
+  and DEPLOY_CHECKLIST.md bucket 5 records the first real elapsed.
+  `test_load_actions_loads_on_disk_long_read_assembly_yaml`
+  now keys on `(action_id, version)` as `qiita.action` does, rather than on `action_id` alone,
+  which collapsed the two onto whichever sorted last. Syncing 1.0.1 also **disables 1.0.0** —
+  `sync_actions` auto-deprecates every other version of an action_id and is last-one-wins over
+  the loader's output, which is the state `fastq-to-parquet` 1.0.0 through 1.2.0 are already in
+  on the deploy host. That is the wanted outcome here. The three `fastq-to-parquet` headers that
+  claimed the opposite ("stay available unchanged; submitters choose the version") now state the
+  rule instead, and state it without naming a version: a sync is directory-wide, so no header can
+  say which file "wins" without going stale at the next bump.
+
 - **CheckM now scores the circular genomes too, so completeness and contamination cover every
   kind the workflow stores except the residue it deliberately does not score.** `checkm.sh`
   splits the assemble step's `circular.fa` into one FASTA per contig (miint `read_fastx` +
@@ -33,12 +93,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   before the row could join `assembly_membership.bin_id`; scored apart, the file a row came
   from IS its kind and every stem reaches the lake unmodified. An LCG bypasses binning
   entirely, so before this the class most likely to be a complete genome was the only one
-  stored with no quality at all. UNBINNED is still not scored: an unbinned contig is what no
+  stored with no quality at all. UNBINNED is still not scored under 1.0.0 (superseded by the
+  1.0.1 entry above, which scores the residue above a length cut): an unbinned contig is what no
   refined bin claimed, so a completeness figure against a marker set describes nothing. The
   step's `baseline_resources` are unchanged and now fitted rather than assumed — across 59
   completed `checkm` steps on the deploy host the elapsed averaged 27.5 min and peaked at
   58.9 min against a PT4H cap, and the second run scores a comparable genome set (~104 refined
-  bins beside ~98 circular contigs per ticket), so a doubled peak still sits under half the
+  bins beside ~98 circular contigs per ticket — a figure the 1.0.1 entry above disagrees
+  with at ~86, unsettled until the pilot counts it), so a doubled peak still sits under half the
   cap. The `checkm` step gains `genomes_dir` as an input and the deploy-staged miint extension
   as a `derived_inputs` bind; `checkm.def` gains `python-duckdb`, pinned in lockstep with the
   orchestrator's resolved DuckDB for the reason `assemble.def` states. CheckM keying its
@@ -1475,6 +1537,30 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **The `baseline_resources.cpu` pins read one hardcoded `1.0.0.yaml`, so the version that
+  actually runs went unpinned (#522).** `test_assembly_coverage_cpu_pins_duckdb_threads` asserts
+  a step's `cpu:` equals its job's `_DUCKDB_THREADS`, because the aligner's parallelism IS that
+  pool and a drift between them costs cores or oversubscribes them without failing anything.
+  `long-read-assembly` is the first workflow whose SECOND on-disk version is the one that runs
+  (`fastq-to-parquet` has carried four for months), and the pin named `1.0.0.yaml` — the retired
+  one — leaving `1.0.1.yaml` free to drift. The three pins
+  (`align`, `align-denovo`, `assembly_coverage`) now go through
+  `_baseline_cpu_every_version`, which globs `workflows/<workflow>/*.yaml`, so a new version
+  file is covered the moment it lands instead of when someone remembers the test.
+- **`load_actions` ordered versions as strings, so the tenth minor bump of any action would have
+  deployed disabled (#522).** `sync_actions` re-enables the version it is syncing and
+  auto-deprecates every other version of that `action_id`, so whichever version the loader yields
+  LAST is the one a deploy leaves submittable. The order came from `sorted(by_key.items())` on
+  `(action_id, version)` — a compare of the version STRING, which puts `"1.10.0"` before
+  `"1.9.0"`. An action reaching a two-digit minor would therefore have shipped its newest version
+  disabled and refused every submission naming it, with the catalog still listing both. Each
+  dotted component now compares as a number when it is one (`loader._version_sort_key`), and the
+  key stays total over the free-form `version` string rather than raising on a shape it cannot
+  parse: a non-numeric component sorts BEFORE every numeric one in the same position,
+  which puts an unparseable version where being wrong is cheapest — last is what stays
+  enabled, so a stray `"latest"` gets disabled rather than winning the deploy. No
+  workflow on disk has a two-digit component yet, so nothing deployed was affected.
 
 - **`bin_refine` discarded every MetaBAT bin id, and offered each binner's unbinned catch-all as a
   candidate bin (#519).** `Fasta_to_Contig2Bin.sh -e fa` writes two tab-separated fields,

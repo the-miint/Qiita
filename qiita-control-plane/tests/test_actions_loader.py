@@ -180,8 +180,9 @@ def test_load_actions_loads_on_disk_reference_add_yaml():
     assert _REFERENCE_ADD_ACTION_VERSION == ref_add.version == "1.0.0"
 
 
-def test_load_actions_loads_on_disk_long_read_assembly_yaml():
-    """The on-disk `workflows/long-read-assembly/1.0.0.yaml` loads as a valid
+@pytest.mark.parametrize("version", ["1.0.0", "1.0.1"])
+def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
+    """Each on-disk `workflows/long-read-assembly/<version>.yaml` loads as a valid
     ActionDefinition with the per-sample assembly→MAG shape:
 
       * target_kind prep_sample; context_schema REQUIRES mask_idx (the selector
@@ -198,6 +199,12 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
       * assembly_run_config threads the `assembler` scalar and assembly_load
         threads `processing_idx` via params (a container step can't take a scalar
         param — the runner treats it as a bind path).
+
+    Keyed on `(action_id, version)`, as `qiita.action` is: keying on action_id alone
+    collapses the two versions onto whichever sorts last. The two differ only in the
+    checkm image — 1.0.1 scores the unbinned residue and 1.0.0 does not — so the step
+    chain, the modules and the params asserted here hold for both, and the container
+    set is the one thing parametrized.
     """
     from pathlib import Path
 
@@ -207,12 +214,13 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
 
     repo_root = Path(__file__).resolve().parents[2]
     actions = load_actions(repo_root / "workflows")
-    by_id = {a.action_id: a for a in actions}
-    assert "long-read-assembly" in by_id, "workflows/long-read-assembly/1.0.0.yaml must load"
-    assembly = by_id["long-read-assembly"]
+    by_key = {(a.action_id, a.version): a for a in actions}
+    key = ("long-read-assembly", version)
+    assert key in by_key, f"workflows/long-read-assembly/{version}.yaml must load"
+    assembly = by_key[key]
 
     assert assembly.target_kind == ScopeTargetKind.PREP_SAMPLE
-    assert assembly.version == "1.0.0"
+    assert assembly.version == version
     assert assembly.context_schema["required"] == ["mask_idx"]
 
     assert [s.name for s in assembly.steps] == [
@@ -254,11 +262,15 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
     # checkm), each with its own SIF + entrypoint — the multi-SIF packaging.
     container_steps = [s for s in assembly.steps if getattr(s, "container", None)]
     assert len(container_steps) == 4
+    # checkm is per-version: 1.0.1 scores the unbinned residue and 1.0.0 does not, so
+    # the two run DIFFERENT images and the filenames say so. The other three are the
+    # same image for both versions, which is what a SIF name is for.
+    checkm_sif = f"long-read-assembly-checkm-{version}.sif"
     assert {s.container for s in container_steps} == {
         "long-read-assembly-assemble-1.0.0.sif",
         "long-read-assembly-binning-1.0.0.sif",
         "long-read-assembly-dastool-1.0.0.sif",
-        "long-read-assembly-checkm-1.0.0.sif",
+        checkm_sif,
     }
     assert len({s.entrypoint for s in container_steps}) == 4
 
@@ -1207,8 +1219,77 @@ def test_load_actions_long_read_assembly_finalizes_gate_after_register_files():
     from qiita_control_plane.actions import load_actions
 
     repo_root = Path(__file__).resolve().parents[2]
-    by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
-    names = [s.name for s in by_id["long-read-assembly"].steps]
+    # Keyed with the version, like `qiita.action`: `{a.action_id: a}` would resolve
+    # to whichever of the two long-read-assembly versions is yielded last, and pass
+    # on the collapsed key rather than on the version this names.
+    by_key = {(a.action_id, a.version): a for a in load_actions(repo_root / "workflows")}
+    names = [s.name for s in by_key[("long-read-assembly", "1.0.0")].steps]
 
     assert names[-1] == "finalize-assembly-sample"
     assert names[-2] == "register-files"
+
+
+def test_the_version_sync_leaves_enabled_is_the_highest_of_each_action():
+    """`load_actions` must yield each action_id's versions newest-last.
+
+    `sync_actions` walks this list in order, re-enabling each version it syncs and
+    auto-deprecating every other version of that action_id, so whichever version the
+    loader yields LAST for an action_id is the one a deploy leaves submittable. That
+    makes the ordering the thing that decides it, and this the test that pins it.
+
+    `loader._version_sort_key` is what produces that order, comparing each dotted
+    component numerically. Checked here against a semver sort written independently
+    of it, over the versions actually on disk: reusing the loader's own key would
+    make this compare the implementation with itself and pass whatever it did.
+    `test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one` covers the
+    case no on-disk version reaches yet.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_action: dict[str, list[str]] = {}
+    for action in load_actions(repo_root / "workflows"):
+        by_action.setdefault(action.action_id, []).append(action.version)
+
+    for action_id, versions in by_action.items():
+        # Dotted integers only. The loader orders a non-numeric component too, but
+        # the oracle below does not, so such a version is refused with a message
+        # rather than raising ValueError out of this comparator, where it would
+        # surface as an error in whatever PR happened to add the version.
+        for version in versions:
+            assert all(part.isdecimal() for part in version.split(".")), (
+                f"{action_id} {version!r} is not dotted integers; this test orders "
+                "versions numerically and needs extending before such a version lands."
+            )
+        semver = sorted(versions, key=lambda v: tuple(int(p) for p in v.split(".")))
+        assert versions == semver, (
+            f"{action_id} versions load as {versions} but sort semantically as "
+            f"{semver}; sync enables the LAST one, so the newest must come last."
+        )
+
+    # Named rather than left to the sweep: 1.0.1 exists to be submitted against, and
+    # it only reaches an operator if it is the version sync leaves enabled.
+    assert by_action["long-read-assembly"][-1] == "1.0.1", by_action["long-read-assembly"]
+
+
+def test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one(tmp_path):
+    """1.10.0 loads after 1.9.0, so a tenth minor bump stays the enabled version.
+
+    The case the on-disk sweep above cannot reach — no action has a two-digit
+    component yet — and the one a string compare gets wrong, since `"1.10.0"` sorts
+    before `"1.9.0"`. Sync enables whichever version comes last, so under a string
+    compare the tenth minor bump of any action would deploy disabled while 1.9.0
+    stayed live, and every submission naming the new version would be refused.
+    """
+    from qiita_control_plane.actions import load_actions
+
+    for version in ("1.9.0", "1.10.0"):
+        doc = yaml.safe_load(_REFERENCE_ADD_YAML)
+        doc["version"] = version
+        _write(tmp_path, f"reference-add/{version}.yaml", yaml.safe_dump(doc))
+
+    versions = [a.version for a in load_actions(tmp_path)]
+
+    assert versions == ["1.9.0", "1.10.0"], versions

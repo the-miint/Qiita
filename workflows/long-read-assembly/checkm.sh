@@ -1,5 +1,6 @@
 #!/bin/bash
-# CheckM quality assessment of the refined MAGs and of the circular genomes (LCGs).
+# CheckM quality assessment of the refined MAGs, the circular genomes (LCGs) and the
+# large unbinned contigs.
 # Output `checkm_dir` = $QIITA_OUTPUT_PATH/checkm holding CheckM's RAW --tab_table
 # output verbatim (the container does NO column normalization — one CSV framework,
 # DuckDB, owns all parsing in assembly_load):
@@ -9,13 +10,21 @@
 #                     size (bp), # contigs, ... (the extended stats not in lineage_wf)
 #   lcg_lineage.tsv   the same two tables over the circular genomes, one CheckM run
 #   lcg_qa.tsv        per class rather than one over both
-# assembly_load reads all four with DuckDB read_csv and joins each pair by "Bin Id".
-# Either class may be absent (its two files simply are not written); with neither,
+#   unbinned_lineage.tsv  the same two over the large unbinned contigs — the residue
+#   unbinned_qa.tsv       after removing what a refined bin claims, above a length cut
+# assembly_load reads all six with DuckDB read_csv and joins each pair by "Bin Id".
+# Any class may be absent (its two files simply are not written); with none,
 # checkm_dir is empty and assembly_load writes bin_quality empty. CheckM is not run
 # on an empty dir.
 #
-# WHY TWO RUNS AND NOT ONE MERGED DIRECTORY
-# A quality row's `kind` is what tells a MAG from an LCG downstream, and CheckM
+# WHY THE RESIDUE IS SCORED AT ALL
+# An unbinned contig is what no refined bin claimed, which is not the same as
+# "not a genome" — a large one can be a near-complete genome the binners failed to
+# recover. Leaving the class unscored made that indistinguishable from a fragment.
+# The cut and the residue rule live in residue_split.py.
+#
+# WHY THREE RUNS AND NOT ONE MERGED DIRECTORY
+# A quality row's `kind` is what tells the three classes apart downstream, and CheckM
 # reports only a "Bin Id" — the filename stem. Merged, `kind` would have to be
 # recovered by prefixing the stems and parsing the prefix back off, and the prefix
 # would then have to be stripped before the row could join
@@ -37,6 +46,7 @@ source /opt/qiita/_lib.sh
 REFINED_DIR="$(qiita_input refined_bins_dir)"
 GENOMES_DIR="$(qiita_input genomes_dir)"
 CIRCULAR="${GENOMES_DIR}/circular.fa"
+NOLCG="${GENOMES_DIR}/noLCG.fa"
 OUT="${QIITA_OUTPUT_PATH}/checkm"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -50,9 +60,13 @@ ls "${REFINED_DIR}"/*.fa >/dev/null 2>&1 && HAVE_MAG=1
 # zero-record input.
 HAVE_LCG=0
 [[ -s "${CIRCULAR}" ]] && HAVE_LCG=1
+# Same -s reasoning as circular.fa: assemble.sh writes noLCG.fa unconditionally and
+# a zero-byte one is an all-circular assembly, which is nothing to score.
+HAVE_RESIDUE=0
+[[ -s "${NOLCG}" ]] && HAVE_RESIDUE=1
 
 # Nothing to assess -> empty checkm_dir (assembly_load writes bin_quality empty).
-if [[ "${HAVE_MAG}" -eq 0 && "${HAVE_LCG}" -eq 0 ]]; then
+if [[ "${HAVE_MAG}" -eq 0 && "${HAVE_LCG}" -eq 0 && "${HAVE_RESIDUE}" -eq 0 ]]; then
     qiita_finish checkm_dir=checkm
     exit 0
 fi
@@ -113,6 +127,27 @@ if [[ "${HAVE_LCG}" -eq 1 ]]; then
     # one genome. lcg_split.py states why the stem is the id verbatim.
     python3 /opt/qiita/lcg_split.py "${CIRCULAR}" "${WORK}/lcg"
     run_checkm "${WORK}/lcg" lcg_out "${OUT}/lcg_lineage.tsv" "${OUT}/lcg_qa.tsv"
+fi
+
+if [[ "${HAVE_RESIDUE}" -eq 1 ]]; then
+    # The large unbinned contigs, split the same way and for the same reason.
+    # residue_split.py subtracts the contigs a refined bin already claims — matched
+    # on the canonical sequence hash, the way assembly_hash reduces its UNBINNED
+    # rows — and applies the length cut, so what CheckM scores here is a subset of
+    # what the lake stores as UNBINNED for this run.
+    #
+    # It writes an EMPTY directory when nothing survives (every residue contig short
+    # or already binned), which is a normal assembly outcome and not a failure. That
+    # is why the run is guarded on the split's output rather than on noLCG.fa alone:
+    # lineage_wf on an empty directory is the error case CheckM does not handle
+    # gracefully.
+    python3 /opt/qiita/residue_split.py "${NOLCG}" "${REFINED_DIR}" "${WORK}/residue"
+    if ls "${WORK}/residue"/*.fa >/dev/null 2>&1; then
+        # One line, like the two calls above: test_lcg_split reads the run_checkm
+        # INVOCATIONS to check every basename assembly_load opens is written, and a
+        # continuation would hide this one from it.
+        run_checkm "${WORK}/residue" residue_out "${OUT}/unbinned_lineage.tsv" "${OUT}/unbinned_qa.tsv"
+    fi
 fi
 
 qiita_finish checkm_dir=checkm

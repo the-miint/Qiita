@@ -29,7 +29,9 @@ from qiita_common.chunking import reassemble_chunks_expr
 # two contigs; bin.2's contig shares bin.1's first contig's bytes (same hash -> same
 # feature_idx) to exercise the distinct-membership / dedup path. The LCG and UNBINNED
 # rows carry their own contig id as bin_id, the shape assembly_hash emits. CheckM
-# scores the LCG (its own table pair) and never the UNBINNED residue.
+# scores each class in its own table pair, and the UNBINNED pair covers only the
+# residue above the length cut — so a fixture may carry an UNBINNED membership with
+# no quality row, which is the production shape.
 _SEQUENCES = {
     "LCG:circ1:1": ("AAAACCCCGGGGTTTT", 100),
     "MAG:bin.1:1": ("ACGTACGTACGTACGT", 200),
@@ -127,7 +129,8 @@ def _tsv(path: Path, header: list[str], rows: list[tuple]) -> None:
 def _checkm_pair(checkm_dir, prefix, rows):
     """One CheckM run’s two RAW --tab_table outputs, exactly as checkm.sh emits them.
 
-    `prefix` is "" for the refined-bin run and "lcg_" for the circular-genome one.
+    `prefix` is "" for the refined-bin run, "lcg_" for the circular-contig one and
+    "unbinned_" for the residue one.
     lineage.tsv (lineage_wf) carries the quality columns, qa.tsv (qa -o 2) the genome
     stats. Headers are CheckM 1.x’s verbatim spaced/parenthesized names.
     """
@@ -144,7 +147,14 @@ def _checkm_pair(checkm_dir, prefix, rows):
 
 
 def _inputs(
-    tmp_path, staging_inputs, *, checkm_rows=None, lcg_rows=None, das_rows=None, attr_rows=None
+    tmp_path,
+    staging_inputs,
+    *,
+    checkm_rows=None,
+    lcg_rows=None,
+    unbinned_rows=None,
+    das_rows=None,
+    attr_rows=None,
 ):
     from qiita_compute_orchestrator.jobs.assembly_load import Inputs
 
@@ -165,12 +175,15 @@ def _inputs(
     refined_dir.mkdir(exist_ok=True)
     # checkm_rows / lcg_rows are 7-tuples (bin_id, marker, completeness,
     # contamination, strain, genome_size, n_contigs), one list per CheckM RUN.
-    # checkm.sh scores the refined bins and the circular genomes separately and
-    # publishes a table pair for each, so which pair a row is in IS its kind.
+    # checkm.sh scores the refined bins, the circular contigs and the unbinned
+    # residue separately and publishes a table pair for each, so which pair a row is
+    # in IS its kind.
     if checkm_rows is not None:
         _checkm_pair(checkm_dir, "", checkm_rows)
     if lcg_rows is not None:
         _checkm_pair(checkm_dir, "lcg_", lcg_rows)
+    if unbinned_rows is not None:
+        _checkm_pair(checkm_dir, "unbinned_", unbinned_rows)
     # das_rows is a 3-tuple (bin, bin_score, bin_set) written as DAS_Tool's RAW
     # summary columns (DAS_Tool 1.1.x names).
     if das_rows is not None:
@@ -190,9 +203,12 @@ def _inputs(
     )
 
 
-def _rows(pq, cols, order):
+def _rows(pq, cols, order, where=None):
+    filt = f" WHERE {where}" if where else ""
     with duckdb.connect(":memory:") as con:
-        return con.execute(f"SELECT {cols} FROM read_parquet('{pq}') ORDER BY {order}").fetchall()
+        return con.execute(
+            f"SELECT {cols} FROM read_parquet('{pq}'){filt} ORDER BY {order}"
+        ).fetchall()
 
 
 def _schema(pq):
@@ -538,13 +554,45 @@ def test_bin_quality_holds_lcg_rows_with_no_refined_bin(tmp_path, staging_inputs
     assert _rows(pq, "kind, bin_id, completeness", "bin_id") == [("LCG", "circ1", 99.1)]
 
 
-def test_unbinned_membership_is_never_scored(tmp_path, staging_inputs):
-    """The residue is stored and queryable, but carries no quality row.
+def test_the_unbinned_pair_becomes_unbinned_quality_rows(tmp_path, staging_inputs):
+    """checkm.sh's third table pair lands as UNBINNED, tagged by which pair it was in.
 
-    checkm.sh scores neither UNBINNED file, so nothing here can produce such a row —
-    the point of asserting it is that the fixture's UNBINNED membership row DOES
-    reach assembly_membership, so the two tables deliberately disagree on which
-    kinds they cover.
+    The arm's `kind`, its CheckM header contract and its `"Bin Id"` join all run here
+    and nowhere else — without this the residue path is exercised by no test at all.
+    """
+    inputs = _inputs(
+        tmp_path,
+        staging_inputs,
+        checkm_rows=[("bin.1", "k__Bacteria", 95.5, 1.2, 0.0, 10000, 2)],
+        lcg_rows=[("circ1", "k__Bacteria", 99.1, 0.4, 0.0, 1800000, 1)],
+        unbinned_rows=[("ctg7", "k__Bacteria", 42.0, 0.9, 0.0, 410000, 1)],
+    )
+    out = _run(inputs, tmp_path / "ws")
+    staging = out["staging_dir"]
+
+    assert _rows(staging / "bin_quality.parquet", "kind, bin_id, completeness", "bin_id") == [
+        ("MAG", "bin.1", 95.5),
+        ("LCG", "circ1", 99.1),
+        ("UNBINNED", "ctg7", 42.0),
+    ]
+    # MAG-only provenance: DAS_Tool never sees a residue contig, so the columns are
+    # NULL by construction rather than by a missing join.
+    unbinned = _rows(
+        staging / "bin_quality.parquet",
+        "bin_id, das_tool_score, source_binner",
+        "bin_id",
+        where="kind = 'UNBINNED'",
+    )
+    assert unbinned == [("ctg7", None, None)], unbinned
+
+
+def test_a_run_with_no_unbinned_pair_still_stores_unbinned_memberships(tmp_path, staging_inputs):
+    """No `unbinned_*` pair is a legitimate outcome, not a missing file.
+
+    A run where nothing in the residue clears the length cut writes no third pair at
+    all, and `assembly_load` must still store the UNBINNED memberships. That is the
+    same asymmetry the cut produces per-contig, in its whole-run form: `bin_quality`
+    is a SUBSET of the UNBINNED memberships, so the two join LEFT.
     """
     inputs = _inputs(
         tmp_path,
