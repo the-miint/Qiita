@@ -38,6 +38,9 @@ From: mambaorg/micromamba:1.5.8
     # on which residue contigs exist by construction rather than by convention.
     residue_split.py /opt/qiita/residue_split.py
     chunking.py /opt/qiita/chunking.py
+    # qiita-common's `is_empty_sequence_file`, staged the same way: residue_split
+    # drops an empty bin with it before `read_fastx` is handed the path.
+    duckdb_miint.py /opt/qiita/duckdb_miint.py
 
 %environment
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -147,6 +150,7 @@ From: mambaorg/micromamba:1.5.8
     test -s /opt/qiita/miint_connect.py
     test -s /opt/qiita/residue_split.py
     test -s /opt/qiita/chunking.py
+    test -s /opt/qiita/duckdb_miint.py
     python3 -c "import importlib.util as u; s=u.spec_from_file_location('ls','/opt/qiita/lcg_split.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
     python3 -c "import importlib.util as u; s=u.spec_from_file_location('rs','/opt/qiita/residue_split.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
     # The hash expression residue_split builds its anti-join from. Executed, not just
@@ -156,9 +160,21 @@ From: mambaorg/micromamba:1.5.8
     # assembly_hash's. Asserting the miint scalar it names is what ties the built
     # image to the expression this workflow depends on.
     python3 -c "import importlib.util as u; s=u.spec_from_file_location('ck','/opt/qiita/chunking.py'); m=u.module_from_spec(s); s.loader.exec_module(m); e=m.canonical_sequence_hash_expr('x'); assert 'sequence_dna_reverse_complement' in e and 'LEAST' in e, e"
+    # `is_empty_sequence_file`, exercised rather than imported for chunking.py's
+    # reason: it is stdlib-only, so a wrong or truncated file still imports. The
+    # assertion is the one a `st_size == 0` rewrite fails — an empty gzip member is
+    # ~20 bytes on disk and must still report empty, and that is the realistic input
+    # (a bin_refine pass that produced no bin).
+    python3 -c "import gzip,pathlib,importlib.util as u; s=u.spec_from_file_location('dm','/opt/qiita/duckdb_miint.py'); m=u.module_from_spec(s); s.loader.exec_module(m); p=pathlib.Path('/tmp/e.fa.gz'); gzip.open(p,'wb').close(); assert p.stat().st_size > 0 and m.is_empty_sequence_file(p)"
     # LOAD-only, never INSTALL — an INSTALL would need the team mirror reachable from
     # every compute node and a writable $HOME. Anchored at a string-literal quote so
     # the prose explaining why we do NOT install cannot fail the build.
+    #
+    # The list is the files that RUN, and it excludes /opt/qiita/duckdb_miint.py by
+    # necessity: that is qiita-common's whole miint module, so it carries
+    # `miint_install_sql` and hence the literal. What holds the rule there instead is
+    # the import — residue_split takes `is_empty_sequence_file` and nothing else, and
+    # the connect every entrypoint reaches is miint_connect's, which is in the list.
     ! grep -qE "[\"']\s*INSTALL\b" /opt/qiita/miint_connect.py /opt/qiita/lcg_split.py /opt/qiita/residue_split.py
 
 %runscript

@@ -34,6 +34,7 @@ re-implement a production expression as the oracle.
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import os
 import random
@@ -312,25 +313,27 @@ def test_checkm_runs_the_residue_pass_and_names_the_files_assembly_load_reads() 
     assert _CHECKM_UNBINNED_QA_TSV in body, f"checkm.sh does not write {_CHECKM_UNBINNED_QA_TSV}"
 
 
-def test_the_splitter_and_its_hash_source_ship_in_the_image() -> None:
+def test_the_splitter_and_its_qiita_common_sources_ship_in_the_image() -> None:
     """%files-copied and named in HASH_INPUTS.
 
-    `chunking.py` is qiita-common's file, so the image carries the SAME expression
-    `assembly_hash` uses rather than a copy. Omitting either from HASH_INPUTS leaves
-    the two-gate idempotency check green on an edited splitter, so the deploy would
-    keep serving the old SIF while the repo says the residue is scored.
+    `chunking.py` and `duckdb_miint.py` are qiita-common's files, so the image carries
+    the SAME hash expression `assembly_hash` uses and the SAME emptiness rule, rather
+    than copies. Omitting any of the three from HASH_INPUTS leaves the two-gate
+    idempotency check green on an edited splitter, so the deploy would keep serving
+    the old SIF while the repo says the residue is scored.
     """
     def_body = _CHECKM_DEF.read_text()
     assert "residue_split.py /opt/qiita/residue_split.py" in def_body
     assert "chunking.py /opt/qiita/chunking.py" in def_body
+    assert "duckdb_miint.py /opt/qiita/duckdb_miint.py" in def_body
 
     hash_inputs = _CHECKM_ENV.read_text()
     declared = next(line for line in hash_inputs.splitlines() if line.startswith("HASH_INPUTS="))
     assert "residue_split.py" in declared, declared
-    assert "chunking.py" in declared, declared
-    # The path, not just the basename: the entry has to resolve to qiita-common's
+    # The path, not just the basename: each entry has to resolve to qiita-common's
     # file for the single-sourcing above to hold.
-    assert "qiita-common/src/qiita_common/chunking.py" in declared, declared
+    for staged in ("chunking.py", "duckdb_miint.py"):
+        assert f"qiita-common/src/qiita_common/{staged}" in declared, declared
 
 
 def _assembly_hash_residue(fixture_dir: Path, tmp_path: Path) -> set[str]:
@@ -462,37 +465,48 @@ def test_the_bin_globs_match_assembly_hashs(split_module) -> None:
     )
 
 
-def test_the_emptiness_check_matches_qiita_commons(split_module) -> None:
-    """An empty `.gz` bin is empty to both, and a non-empty one to neither.
+def test_the_splitter_imports_qiita_commons_emptiness_check(split_module) -> None:
+    """`residue_split.is_empty_sequence_file` IS `qiita_common`'s, not a copy of it.
 
-    `residue_split` cannot import `qiita_common.duckdb_miint` (no qiita-common in the
-    image), so it carries the same rule; a size check would call an empty gzip member
-    non-empty and hand `read_fastx` a file that raises, failing the whole step.
+    The image has no qiita-common, so the module falls back to the `duckdb_miint.py`
+    that `build-sif.sh` stages beside it from this same source file. Here, where
+    qiita-common IS importable, the first branch must be the one that binds — a
+    fallback that silently won.
     """
-    import gzip
-    import tempfile
-
     from qiita_common.duckdb_miint import is_empty_sequence_file
 
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d)
-        cases = {
-            "empty.fa": b"",
-            "full.fa": b">x\nACGT\n",
-        }
-        for name, payload in cases.items():
-            (base / name).write_bytes(payload)
-        with gzip.open(base / "empty.fa.gz", "wb") as fh:
-            fh.write(b"")
-        with gzip.open(base / "full.fa.gz", "wb") as fh:
-            fh.write(b">x\nACGT\n")
+    assert split_module.is_empty_sequence_file is is_empty_sequence_file
 
-        for name in ("empty.fa", "full.fa", "empty.fa.gz", "full.fa.gz"):
-            path = base / name
-            assert split_module._is_empty_sequence_file(path) == is_empty_sequence_file(path), name
-        # Anti-vacuity: the two answers must actually differ across the fixtures.
-        assert split_module._is_empty_sequence_file(base / "empty.fa.gz")
-        assert not split_module._is_empty_sequence_file(base / "full.fa.gz")
+
+def test_an_empty_gzipped_bin_does_not_abort_the_split(tmp_path, staged_miint) -> None:
+    """An empty `.fa.gz` beside a real bin is skipped, not handed to `read_fastx`.
+
+    A bin file with no records is ~20 bytes on disk once gzipped, so a size check
+    would call it non-empty; `read_fastx` raises on a zero-record input and one bad
+    path aborts the whole scan, failing the step for every OTHER bin too.
+
+    Two ways to be wrong, and this separates them: aborting shows up as a non-zero
+    exit, and dropping the whole bins glob shows up as the binned contig surviving
+    into the scored set.
+    """
+    binned = _seq(_MIN_BP, seed=11)
+    residue_only = _seq(_MIN_BP, seed=12)
+
+    bins_dir = tmp_path / "refined_bins"
+    bins_dir.mkdir()
+    empty_gz = bins_dir / "bin.2.fa.gz"
+    with gzip.open(empty_gz, "wb"):
+        pass
+    assert empty_gz.stat().st_size > 0, "fixture must not be zero bytes on disk"
+
+    proc, written = _split(
+        tmp_path,
+        residue=[("binned_one", binned), ("residue_one", residue_only)],
+        bins={"bin.1": [("binned_one", binned)]},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert written == {"residue_one"}
 
 
 def test_residue_split_uses_miint_and_never_installs() -> None:
@@ -523,6 +537,20 @@ def test_residue_split_uses_miint_and_never_installs() -> None:
     assert "canonical_sequence_hash_expr" in code, (
         "residue_split no longer imports the canonical hash expression; a local copy "
         "is the drift the single-sourcing exists to prevent"
+    )
+    # `duckdb_miint` is qiita-common's WHOLE miint module, so the copy staged into the
+    # image carries the installer as well as the one function wanted here. The image's
+    # `%test` guard is anchored at a quoted INSTALL and so cannot see an import of it;
+    # this is the check that can. Both import branches are asserted, since only the
+    # fallback one runs in the container.
+    names = {
+        m.split("#")[0].strip()
+        for m in re.findall(r"^\s*from (?:qiita_common\.)?duckdb_miint import (.+)$", code, re.M)
+    }
+    assert names == {"is_empty_sequence_file"}, (
+        f"residue_split imports {sorted(names)} from duckdb_miint; it may take only "
+        "is_empty_sequence_file — this image LOADs the deploy-staged extension and "
+        "never INSTALLs"
     )
 
 

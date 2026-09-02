@@ -38,6 +38,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `"Bin Id"` joining no membership row at all. `residue_split.py` imports that expression from
   `qiita_common.chunking` — the same file `assembly_hash` imports, staged into the image by
   `build-sif.sh` and declared in the checkm image's `HASH_INPUTS`, rather than re-implemented.
+  It takes `is_empty_sequence_file` from `qiita_common.duckdb_miint` the same way, so the rule
+  that drops an empty refined bin before `read_fastx` is handed it is also one implementation
+  rather than two: a zero-record `.fa.gz` is ~20 bytes on disk, so a size check calls it
+  non-empty, and `read_fastx` then raises `Empty file:` and aborts the scan for every other bin.
   `test_residue_split.py` executes the shipped splitter against real miint on fixtures that
   isolate each way the rule can be got wrong: a duplicate under a different id, a reverse
   complement, a soft-masked copy, and both sides of the length boundary.
@@ -1534,6 +1538,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **The `baseline_resources.cpu` pins read one hardcoded `1.0.0.yaml`, so the version that
+  actually runs went unpinned (#522).** `test_assembly_coverage_cpu_pins_duckdb_threads` asserts
+  a step's `cpu:` equals its job's `_DUCKDB_THREADS`, because the aligner's parallelism IS that
+  pool and a drift between them costs cores or oversubscribes them without failing anything.
+  `long-read-assembly` is the first workflow to carry two on-disk versions, and the pin named
+  `1.0.0.yaml` — the retired one — leaving `1.0.1.yaml` free to drift. The three pins
+  (`align`, `align-denovo`, `assembly_coverage`) now go through
+  `_baseline_cpu_every_version`, which globs `workflows/<workflow>/*.yaml`, so a new version
+  file is covered the moment it lands instead of when someone remembers the test.
 - **`load_actions` ordered versions as strings, so the tenth minor bump of any action would have
   deployed disabled (#522).** `sync_actions` re-enables the version it is syncing and
   auto-deprecates every other version of that `action_id`, so whichever version the loader yields

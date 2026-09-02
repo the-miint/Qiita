@@ -63,24 +63,25 @@ only if the stem is that id byte-for-byte. `reject_unusable_contig_ids` is the g
 
 from __future__ import annotations
 
-import gzip
 import sys
 from pathlib import Path
 
-# `miint_connect` and `chunking` sit beside this file, both in the repo and at
-# /opt/qiita in the image. Running the script directly puts that directory on
-# sys.path already; the insert is for the `.def` %test, which loads this module by
-# spec and does not.
+# `miint_connect`, `chunking` and `duckdb_miint` sit beside this file, both in the
+# repo and at /opt/qiita in the image. Running the script directly puts that
+# directory on sys.path already; the insert is for the `.def` %test, which loads
+# this module by spec and does not.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
     # Anywhere qiita-common is installed — the repo, the tests, the services.
     from qiita_common.chunking import canonical_sequence_hash_expr  # noqa: E402
+    from qiita_common.duckdb_miint import is_empty_sequence_file  # noqa: E402
 except ModuleNotFoundError:
     # The image, where qiita-common is not installed and build-sif.sh has staged
-    # that same file beside this one as /opt/qiita/chunking.py (declared in this
-    # image's HASH_INPUTS). Two paths to ONE file, not two copies of an expression.
+    # those same files beside this one as /opt/qiita/<name>.py (both declared in
+    # this image's HASH_INPUTS). Two paths to ONE file, not two copies.
     from chunking import canonical_sequence_hash_expr  # noqa: E402
+    from duckdb_miint import is_empty_sequence_file  # noqa: E402
 
 from miint_connect import (  # noqa: E402
     FASTA_SUFFIX,
@@ -110,27 +111,17 @@ _MIN_RESIDUE_LENGTH_BP = 300_000
 _BIN_GLOBS = ("*.fna", "*.fna.gz", "*.fa", "*.fa.gz", "*.fasta", "*.fasta.gz")
 
 
-def _is_empty_sequence_file(path: Path) -> bool:
-    """True iff `path` DECOMPRESSES to zero bytes.
-
-    Same rule as `qiita_common.duckdb_miint.is_empty_sequence_file`, which the image
-    has no qiita-common to import it from:
-    `read_fastx` raises on a zero-record input and one empty path aborts the whole
-    scan, so an empty bin has to be dropped before the read rather than caught after.
-    A size check alone is wrong for `.gz` — an empty gzip member is still ~20 bytes on
-    disk. `test_residue_split.py` pins this against the qiita-common original.
-    """
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rb") as fh:
-        return not fh.read(1)
-
-
 def _bin_files(bins_dir: Path) -> list[Path]:
-    """Every non-empty refined-bin FASTA directly under `bins_dir`, sorted."""
+    """Every non-empty refined-bin FASTA directly under `bins_dir`, sorted.
+
+    Empty is `is_empty_sequence_file`'s definition, not `st_size == 0`: `read_fastx`
+    raises on a zero-record input and one empty path aborts the whole scan, so an
+    empty bin has to be dropped before the read rather than caught after.
+    """
     found: list[Path] = []
     for pattern in _BIN_GLOBS:
         found.extend(bins_dir.glob(pattern))
-    return sorted(p for p in set(found) if not _is_empty_sequence_file(p))
+    return sorted(p for p in set(found) if not is_empty_sequence_file(p))
 
 
 def main(argv: list[str]) -> int:
