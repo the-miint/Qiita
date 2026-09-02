@@ -44,7 +44,7 @@ _MIINT_CONNECT_PY = _WORKFLOW_DIR / "miint_connect.py"
 _CHECKM_SH = _WORKFLOW_DIR / "checkm.sh"
 _CHECKM_DEF = _WORKFLOW_DIR / "checkm.def"
 _CHECKM_ENV = _WORKFLOW_DIR / "sif-build.d" / "checkm.env"
-_WORKFLOW_YAML = _WORKFLOW_DIR / "1.0.0.yaml"
+_WORKFLOW_YAML = _WORKFLOW_DIR / "1.0.1.yaml"
 
 _EXIT_CONTRACT_VIOLATION = 64
 
@@ -56,6 +56,8 @@ from qiita_compute_orchestrator.jobs.assembly_load import (  # noqa: E402
     _CHECKM_LCG_QA_TSV,
     _CHECKM_LINEAGE_TSV,
     _CHECKM_QA_TSV,
+    _CHECKM_UNBINNED_LINEAGE_TSV,
+    _CHECKM_UNBINNED_QA_TSV,
 )
 
 # Real contig ids from the two assemblers, and both are load-bearing shapes: the
@@ -193,8 +195,14 @@ def test_split_uses_miint_and_never_installs() -> None:
     assert re.search(r"FROM read_fastx\(", code), (
         "the split no longer reads with miint's read_fastx"
     )
-    assert re.search(r"\(FORMAT FASTA\)\"", code), (
-        "the split no longer writes with miint's FASTA writer"
+    # The WRITE lives in `miint_connect.split_contigs_to_fasta`, shared with
+    # residue_split — checked there rather than here, and checked that this file still
+    # routes through it, so neither half can be replaced by hand-rolled output.
+    assert "split_contigs_to_fasta" in code, (
+        "the split no longer writes through the shared per-contig FASTA writer"
+    )
+    assert re.search(r"\(FORMAT FASTA\)\"", _MIINT_CONNECT_PY.read_text()), (
+        "split_contigs_to_fasta no longer writes with miint's FASTA writer"
     )
     assert "from miint_connect import" in code, (
         "the split no longer connects through miint_connect, so the staged-miint "
@@ -223,14 +231,15 @@ def test_checkm_entrypoint_runs_the_split_and_scores_the_classes_apart() -> None
         "circular multi-FASTA as one genome"
     )
     # Read off the run_checkm INVOCATIONS, not the file: checkm.sh's header comment
-    # lists all four basenames, so searching the whole file passes with both calls
-    # deleted. Two calls, because one would mean a class went unscored.
+    # lists every basename, so searching the whole file passes with the calls
+    # deleted. Three calls, because one missing would mean a class went unscored.
     calls = [ln.strip() for ln in sh.splitlines() if ln.strip().startswith("run_checkm ")]
-    assert len(calls) == 2, calls
+    assert len(calls) == 3, calls
     # Compared as a SET of basenames, not with `name in text`: "lineage.tsv" is a
-    # SUBSTRING of "lcg_lineage.tsv", so a containment check is satisfied by the LCG
-    # call alone and a renamed MAG pair would stay green while assembly_load read two
-    # files that no longer exist. Equality also catches a fifth output nobody read.
+    # SUBSTRING of "lcg_lineage.tsv" and of "unbinned_lineage.tsv", so a containment
+    # check is satisfied by one call alone and a renamed MAG pair would stay green
+    # while assembly_load read two files that no longer exist. Equality also catches
+    # a seventh output nobody reads.
     written = {
         token.rsplit("/", 1)[-1].strip('"')
         for call in calls
@@ -242,6 +251,8 @@ def test_checkm_entrypoint_runs_the_split_and_scores_the_classes_apart() -> None
         _CHECKM_QA_TSV,
         _CHECKM_LCG_LINEAGE_TSV,
         _CHECKM_LCG_QA_TSV,
+        _CHECKM_UNBINNED_LINEAGE_TSV,
+        _CHECKM_UNBINNED_QA_TSV,
     }, f"checkm.sh writes {written}, which is not what assembly_load reads"
 
 

@@ -7,7 +7,11 @@ target_processing_kinds: [sequenced]
 description: >
   Additive successor to fastq-to-parquet/1.0.0: the same FASTQ→reads.parquet
   conversion (CP-minted sequence_idx) plus an OPTIONAL downstream host-depletion
-  step. 1.0.0 stays available unchanged; submitters choose the version.
+  step. A sync is directory-wide and leaves only the HIGHEST version of an action_id
+  enabled: a sync auto-deprecates every other version of an action_id
+  (`actions/sync.py`) and the loader yields them newest-last
+  (`actions/loader.py::_version_sort_key`) — the versions here do not coexist,
+  whichever one you are reading. Nothing already stored changes.
 
   The `fastq` step is identical to 1.0.0 — parse, count, mint a contiguous
   sequence_idx range, write reads.parquet. Minting happens here, before any

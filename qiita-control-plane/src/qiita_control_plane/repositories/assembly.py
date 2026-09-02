@@ -429,16 +429,34 @@ async def fetch_assembly_sample_states(
 # memberships predate the genome mint, and silently dropping those contigs would
 # give their genomes a short denominator rather than an error.
 #
-# `_ASSEMBLY_GENOME_MAP_KIND` is the other filter, and it is a design decision
-# rather than a completeness one. An UNBINNED contig is what no refined bin claimed,
-# and for that kind `bin_id` is the contig id itself, so the genome mint gives every
-# residue contig a genome of its own: on the deploy host, 820,094 of the 1,002,979
-# membership rows, five single-fragment genomes for every assembled one. Off the map,
-# their alignments no longer roll up to a reported genome. They are NOT removed from
-# the alignment itself — the assembly DoGet scopes on (prep_sample_idx,
-# processing_idx) with no kind predicate, so those contigs are still streamed and
-# still aligned against — and they stay queryable in qiita.assembly_membership.
-# checkm.sh declines to SCORE them for the matching reason.
+# `_ASSEMBLY_GENOME_MAP_KIND` is the other filter, and it is a design decision rather
+# than a completeness one. An UNBINNED contig is what no refined bin claimed, and for
+# that kind `bin_id` is the contig id itself, so the genome mint gives every residue
+# contig a genome of its own: on the deploy host, 820,094 of the 1,002,979 membership
+# rows, five single-fragment genomes for every assembled one. Off the map, their
+# alignments no longer roll up to a reported genome. They are NOT removed from the
+# alignment itself — the assembly DoGet scopes on (prep_sample_idx, processing_idx)
+# with no kind predicate, so those contigs are still streamed and still aligned
+# against — and they stay queryable in qiita.assembly_membership.
+#
+# EXCLUDED because an unbinned contig is a thing we cannot yet identify: if it did not
+# bin, we do not know what it is, and it may be real, noise, or something else. That is
+# the same reason the class IS stored — the lake keeps the question askable later, while
+# a feature table would assert an answer nobody has. Storing broadly and using narrowly
+# are the two halves of one decision.
+#
+# Scoring does not change it. checkm.sh scores the residue above a length cut, but a
+# completeness figure does not identify a contig; it is the evidence a revisit would
+# need in place of a guess. The decision is "not right now", not "never".
+#
+# Two things make a revisit non-casual. This predicate keys on `kind`, not on length or
+# on having a `bin_quality` row, so admitting a subset would change what KIND of
+# question it asks. And it sets the denominator of every de novo feature table — what
+# fraction of a sample's reads roll up to a reported genome — so it moves results, not
+# plumbing. The natural place for it is therefore not here: a quality gate at
+# estimate-feature-table (the `galah --min-completeness / --max-contamination` shape)
+# would admit on quality at QUERY time, where "which members of a class" is the ordinary
+# form of the question rather than an awkward one for a kind filter.
 #
 # An ALLOWLIST, not `<> UNBINNED`: `qiita_common.assembly_constants` states that the
 # kind set is meant to extend without a migration, so a denylist would admit a kind

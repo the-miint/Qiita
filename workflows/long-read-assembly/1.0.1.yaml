@@ -7,35 +7,50 @@ target_kind: prep_sample
 # masked-reads FASTQ the pipeline consumes (no intermediate Parquet).
 
 description: >
-  Per-sample metagenome assembly → MAG recovery for masked, ready-for-consumption
-  PacBio HiFi long reads — the same computation as long-read-assembly/1.0.0,
-  whose description carries the step-by-step detail. The steps, resources and
-  container images are identical: `test_assembly_version_parity` compares the two
-  parsed documents and fails on any difference outside `version` and this field
-  (comments and whitespace are invisible to it — it is not a byte comparison).
+  Per-prep_sample metagenome assembly → MAG recovery for masked, ready-for-consumption
+  PacBio HiFi long reads. 1.0.0's description carries the step-by-step detail; the
+  step chain, its resources and its inputs are unchanged from that version.
 
-  It is a separate version because a processing run's identity is
-  `{workflow, version, mask_idx, assembler}` and does not cover the container
-  images, so a prep_sample assembled before the `bin_refine` consensus fix cannot be
-  corrected under the identity it already has. CHANGELOG.md carries why, and
-  DEPLOY_CHECKLIST.md what the operator does about it.
+  WHAT IS DIFFERENT FROM 1.0.0, and why this is a version and not a rebuild: the
+  `checkm` step scores the unbinned residue, which no earlier version did. It runs
+  three passes — refined MAGs, circular contigs (LCGs), and each unbinned contig at
+  or above 300 kb, that last being the residue after removing the contigs a refined
+  bin already claims, matched on the canonical sequence hash exactly as
+  `assembly_hash` reduces its UNBINNED rows. `bin_quality` therefore gains UNBINNED
+  rows, a SUBSET of the UNBINNED memberships: a contig under the cut still has its
+  membership row and still has no quality row, so the two are read with a LEFT join.
 
-  Syncing this file disables 1.0.0. `sync_actions` re-enables the version it is
-  syncing and auto-deprecates every other version of the same action_id, so the
-  version it walks last is the one left enabled
-  (`qiita.action.disabled_reason = 'auto-deprecate-sync'`). `load_actions` yields
-  them sorted on `(action_id, version)`, which puts 1.0.1 last — a lexicographic
-  compare of the version string, so a later bump past `.9` needs the ordering test
-  that guards it. The disable is the wanted outcome, but it means 1.0.0 stops
-  accepting submissions at the deploy rather than the two coexisting.
+  An unbinned contig is what no refined bin claimed, which is not the same thing as
+  "not a genome" — a large one can be a near-complete genome the binners failed to
+  recover, and 1.0.0 stored the class most likely to be exactly that with nothing to
+  judge it by. The cut is where it is because a marker-set completeness for a short
+  fragment describes nothing and CheckM's cost is per subject scored; `residue_split.py`
+  owns both the cut and the residue rule.
 
-  The SIF filenames stay `-1.0.0.sif`: they name the image, not the workflow
-  version, and the images are the same ones 1.0.0 runs.
+  Because the result changes, a re-run under this version is a DIFFERENT run and not
+  a repeat — which is also what makes it the version the pre-fix assemblies are
+  re-run under. Those assemblies additionally predate the `bin_refine` consensus fix,
+  and a run's identity is `{workflow, version, mask_idx, assembler}` and does not
+  cover container images, so they could not have been corrected under the identity
+  they already have. CHANGELOG.md carries that; DEPLOY_CHECKLIST.md carries what the
+  operator does about it.
+
+  A sync is directory-wide and leaves only the HIGHEST version of an action_id
+  enabled: a sync auto-deprecates every other version of an action_id
+  (`actions/sync.py`) and the loader yields them newest-last
+  (`actions/loader.py::_version_sort_key`). So once this file is
+  synced 1.0.0 stops accepting submissions rather than the two coexisting, which is
+  what DEPLOY_CHECKLIST.md's re-run steps assume.
+
+  A SIF filename names the IMAGE, not the workflow version, so the three unchanged
+  images stay `-1.0.0.sif` and only checkm moves, to
+  `long-read-assembly-checkm-1.0.1.sif`. Why it moves rather than rebuilding in place,
+  and what that costs 1.0.0, is on `sif-build.d/checkm.env` beside the filename.
 
 scopes: []
 
 audience:
-  # A processing workflow over a sample's already-stored masked reads. Available
+  # A processing workflow over a prep_sample's already-stored masked reads. Available
   # to end users and above; no service-account (LIMS) submission today.
   service: false
   human_roles: [user, wet_lab_admin, system_admin]
@@ -181,20 +196,21 @@ steps:
       mem_gb: 32
       walltime: PT4H
 
-  # CheckM lineage_wf + qa -o 2, run once over the refined MAGs and once over the
-  # circular genomes → raw lineage.tsv + qa.tsv and lcg_lineage.tsv + lcg_qa.tsv
-  # (assembly_load joins each pair in DuckDB). The two classes are scored
+  # CheckM lineage_wf + qa -o 2, run THREE times — over the refined MAGs, over the
+  # circular contigs, and over the unbinned residue above the length cut → raw
+  # lineage.tsv + qa.tsv, lcg_lineage.tsv + lcg_qa.tsv, unbinned_lineage.tsv +
+  # unbinned_qa.tsv (assembly_load joins each pair in DuckDB). The classes are scored
   # SEPARATELY because the file a row came from is what gives it a `kind`; checkm.sh
   # carries why that beats one merged directory. Nothing to score → empty
-  # checkm_dir (exit 0). An LCG bypasses binning, so without this arm a circular
-  # genome — the class most likely to be a complete one — is the only kind stored
-  # with no completeness or contamination at all.
+  # checkm_dir (exit 0). The residue run is what 1.0.1 adds over 1.0.0; this file's
+  # description says what it is for.
   - step: checkm
     step_type: singleton
-    container: long-read-assembly-checkm-1.0.0.sif
+    container: long-read-assembly-checkm-1.0.1.sif
     entrypoint: /opt/qiita/checkm.sh
-    # `genomes_dir` is read for circular.fa alone; the refined bins arrive as their
-    # own input. It is an INPUT rather than a new output on assemble for the reason
+    # `genomes_dir` is read for circular.fa and noLCG.fa; the refined bins arrive as
+    # their own input (and the residue split subtracts them from noLCG.fa). It is an
+    # INPUT rather than a new output on assemble for the reason
     # assembly_load below states: a declared output is re-bound on resume from a
     # manifest an earlier attempt wrote, while an input resolves from a binding
     # already produced, so adding one here strands nothing.
@@ -204,25 +220,37 @@ steps:
     # the entrypoint reads QIITA_CHECKM_DB (falling back to an /opt/checkm_data
     # that does not exist in the image, so an unbound DB exits 78).
     #
-    # The deploy-staged miint extension is bind-mounted read-only for lcg_split.py,
-    # which reads circular.fa with read_fastx and writes the per-contig FASTAs with
-    # COPY (FORMAT FASTA). Same var, same staged build and same UNCONDITIONAL bind
+    # The deploy-staged miint extension is bind-mounted read-only for lcg_split.py and
+    # residue_split.py, which read circular.fa and noLCG.fa with read_fastx and write
+    # the per-contig FASTAs with COPY (FORMAT FASTA). Same var, same staged build and same UNCONDITIONAL bind
     # as the assemble step — see that step for what a missing PATH_DERIVED/duckdb-ext
     # costs.
     derived_inputs:
       QIITA_CHECKM_DB: checkm_data
       MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [checkm_dir]
-    # Unchanged, against a measurement. Across 59 completed checkm steps on the
-    # deploy host, submit -> terminal averaged 27.5 min and peaked at 58.9 min. That
-    # quantity INCLUDES queue wait, which a SLURM walltime cap does not count, so it
-    # bounds the run time from above rather than stating it. The LCG arm adds a
-    # second, sequential lineage_wf over a comparable genome set — ~104 refined bins
-    # beside ~98 circular contigs per ticket — so twice the observed peak is 118 min
-    # against a 240 min cap.
+    # NOT YET MEASURED FOR THREE PASSES. The step is now three sequential CheckM
+    # runs, and the new one is the largest: per ticket the counts are ~104 refined
+    # bins, ~86 circular contigs and ~148 residue contigs above the cut, so ~338
+    # subjects. Those three counts are carried from scoping rather than measured here,
+    # and the circular one is not agreed across the repo. DEPLOY_CHECKLIST.md bucket 5
+    # counts all three off the first real ticket; replace these with what it reports.
+    #
+    # The only measured figure is for ONE pass: a submit -> terminal average of
+    # 27.5 min and a peak of 58.9 min across 59 completed steps, all of which ran the
+    # image deployed at the time, which scored refined bins alone. So the measured
+    # predecessor is ~104 subjects in one run, not ~190 in two — this step is roughly
+    # three times that work, not half again. The figure also INCLUDES queue wait,
+    # which a SLURM walltime cap does not count, so it bounds run time from above and
+    # cannot be scaled into an estimate either way. Left at 4h rather than guessed
+    # upward: a TIMEOUT is
+    # retriable and re-submits at double this, clamped to the P2D action ceiling, and
+    # only this step re-runs. So an under-set baseline costs one attempt and one of
+    # the ticket's shared retries, where an over-set one costs queue time on every
+    # ticket. DEPLOY_CHECKLIST.md bucket 5 records the first real elapsed; put it here.
     #
     # cpu and mem_gb are unchanged because the runs are sequential: peak memory is one
-    # run at a time, and one run scores about as many genomes as the step already did.
+    # run at a time, and no single run scores more genomes than the step already did.
     baseline_resources:
       cpu: 8
       mem_gb: 40
@@ -262,7 +290,7 @@ steps:
   # Re-key the contigs to feature_idx (REUSED reference_load writers) and read the
   # CheckM/DAS_Tool metrics → the four DuckLake-shape staging Parquets. Threads
   # processing_idx via params: (signals the runner to mint the run identity before
-  # the step loop). A sample with no refined bin writes bin_quality empty (a success).
+  # the step loop). A prep_sample with no refined bin writes bin_quality empty (a success).
   # `genomes_dir` is read for the per-contig attribute sidecar only; the contig
   # SEQUENCES still arrive hash-keyed via assembly_chunks. It is an INPUT rather
   # than a new output on assemble because a step's declared outputs are re-bound

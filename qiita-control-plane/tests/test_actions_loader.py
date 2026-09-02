@@ -200,11 +200,11 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
         threads `processing_idx` via params (a container step can't take a scalar
         param — the runner treats it as a bind path).
 
-    Keyed on `(action_id, version)`, as `qiita.action` is: keying on action_id
-    alone collapses the two versions onto whichever sorts last, which is how this
-    test read before 1.0.1 existed. 1.0.1 is the same computation under a distinct
-    processing identity (`test_assembly_version_parity`), so the shape asserted
-    here has to hold for both.
+    Keyed on `(action_id, version)`, as `qiita.action` is: keying on action_id alone
+    collapses the two versions onto whichever sorts last. The two differ only in the
+    checkm image — 1.0.1 scores the unbinned residue and 1.0.0 does not — so the step
+    chain, the modules and the params asserted here hold for both, and the container
+    set is the one thing parametrized.
     """
     from pathlib import Path
 
@@ -262,11 +262,15 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
     # checkm), each with its own SIF + entrypoint — the multi-SIF packaging.
     container_steps = [s for s in assembly.steps if getattr(s, "container", None)]
     assert len(container_steps) == 4
+    # checkm is per-version: 1.0.1 scores the unbinned residue and 1.0.0 does not, so
+    # the two run DIFFERENT images and the filenames say so. The other three are the
+    # same image for both versions, which is what a SIF name is for.
+    checkm_sif = f"long-read-assembly-checkm-{version}.sif"
     assert {s.container for s in container_steps} == {
         "long-read-assembly-assemble-1.0.0.sif",
         "long-read-assembly-binning-1.0.0.sif",
         "long-read-assembly-dastool-1.0.0.sif",
-        "long-read-assembly-checkm-1.0.0.sif",
+        checkm_sif,
     }
     assert len({s.entrypoint for s in container_steps}) == 4
 
@@ -1228,20 +1232,17 @@ def test_load_actions_long_read_assembly_finalizes_gate_after_register_files():
 def test_the_version_sync_leaves_enabled_is_the_highest_of_each_action():
     """`load_actions` must yield each action_id's versions newest-last.
 
-    `sync_actions` walks the list one action at a time, re-enabling the version it
-    is syncing and running `_AUTO_DEPRECATE_OTHERS_SQL` over every other version of
-    that action_id. So whichever version the loader yields LAST for an action_id is
-    the one left enabled, and the rest end at
-    `disabled_reason='auto-deprecate-sync'` — the state `fastq-to-parquet` 1.0.0
-    through 1.2.0 are in on the deploy host today.
+    `sync_actions` walks this list in order, re-enabling each version it syncs and
+    auto-deprecating every other version of that action_id, so whichever version the
+    loader yields LAST for an action_id is the one a deploy leaves submittable. That
+    makes the ordering the thing that decides it, and this the test that pins it.
 
-    Nothing declares that order. `load_actions` returns `sorted(by_key.items())`
-    keyed on `(action_id, version)`, so it is a lexicographic compare of the version
-    STRING, not a semver one: `"1.10.0" < "1.9.0"`. The first minor bump past 9
-    would therefore ship the older version enabled and the new one disabled, with
-    the catalog looking populated either way and every submission at the new version
-    refused. Compared here against a real semver sort so the trap fails a test rather
-    than a deploy.
+    `loader._version_sort_key` is what produces that order, comparing each dotted
+    component numerically. Checked here against a semver sort written independently
+    of it, over the versions actually on disk: reusing the loader's own key would
+    make this compare the implementation with itself and pass whatever it did.
+    `test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one` covers the
+    case no on-disk version reaches yet.
     """
     from pathlib import Path
 
@@ -1253,9 +1254,10 @@ def test_the_version_sync_leaves_enabled_is_the_highest_of_each_action():
         by_action.setdefault(action.action_id, []).append(action.version)
 
     for action_id, versions in by_action.items():
-        # Dotted integers only. A version this cannot parse is refused with a
-        # message rather than raising ValueError out of the key function, where it
-        # would surface as an error in whatever PR happened to add the version.
+        # Dotted integers only. The loader orders a non-numeric component too, but
+        # the oracle below does not, so such a version is refused with a message
+        # rather than raising ValueError out of this comparator, where it would
+        # surface as an error in whatever PR happened to add the version.
         for version in versions:
             assert all(part.isdecimal() for part in version.split(".")), (
                 f"{action_id} {version!r} is not dotted integers; this test orders "
@@ -1270,3 +1272,24 @@ def test_the_version_sync_leaves_enabled_is_the_highest_of_each_action():
     # Named rather than left to the sweep: 1.0.1 exists to be submitted against, and
     # it only reaches an operator if it is the version sync leaves enabled.
     assert by_action["long-read-assembly"][-1] == "1.0.1", by_action["long-read-assembly"]
+
+
+def test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one(tmp_path):
+    """1.10.0 loads after 1.9.0, so a tenth minor bump stays the enabled version.
+
+    The case the on-disk sweep above cannot reach — no action has a two-digit
+    component yet — and the one a string compare gets wrong, since `"1.10.0"` sorts
+    before `"1.9.0"`. Sync enables whichever version comes last, so under a string
+    compare the tenth minor bump of any action would deploy disabled while 1.9.0
+    stayed live, and every submission naming the new version would be refused.
+    """
+    from qiita_control_plane.actions import load_actions
+
+    for version in ("1.9.0", "1.10.0"):
+        doc = yaml.safe_load(_REFERENCE_ADD_YAML)
+        doc["version"] = version
+        _write(tmp_path, f"reference-add/{version}.yaml", yaml.safe_dump(doc))
+
+    versions = [a.version for a in load_actions(tmp_path)]
+
+    assert versions == ["1.9.0", "1.10.0"], versions

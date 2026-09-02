@@ -8,8 +8,11 @@ description: >
   Mask-model successor to fastq-to-parquet/1.2.0: instead of physically dropping
   reads at qc/host_filter, it stores the FULL reads once in the DuckLake `read`
   table and records downstream filtering as a `read_mask` (one row per read:
-  survive/trim/why). 1.0.0–1.2.0 stay available unchanged; submitters choose the
-  version.
+  survive/trim/why). A sync is directory-wide and leaves only the HIGHEST version of
+  an action_id enabled: a sync auto-deprecates every other version of an action_id
+  (`actions/sync.py`) and the loader yields them newest-last
+  (`actions/loader.py::_version_sort_key`) — the versions here do not coexist,
+  whichever one you are reading. Nothing already stored changes.
 
   The `fastq` step parses, counts, mints a contiguous sequence_idx range, and
   writes read.parquet (with prep_sample_idx) — then a register-files step loads

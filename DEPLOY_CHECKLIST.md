@@ -86,28 +86,99 @@ _None yet._
   is what is printed: a body-only check reads the same whether the route answered or the token
   expired.
 
-- **Check the circular genomes (LCGs — large circular genomes, the contigs that bypass binning)
-  came back scored.** (#519)
+- **Submit one 1.0.1 assembly first — the three checks below have nothing to read without it.**
+  (#522)
 
   ```bash
-  # A ticket whose assemble step produced a non-empty circular.fa.
+  # EXPORTED, both of them: the `qiita` CLI reads the host from
+  # $QIITA_CONTROL_PLANE_URL and the PAT from $QIITA_TOKEN (cli/_common.py), so a
+  # plain shell assignment reaches curl but not the CLI — it would silently target
+  # localhost:8080 with no token.
+  export QIITA_CONTROL_PLANE_URL=https://qiita-miint.ucsd.edu   # your host
+  BASE="${QIITA_CONTROL_PLANE_URL}"                             # for the curl steps
+  read -rsp 'system_admin PAT: ' QIITA_TOKEN; export QIITA_TOKEN; echo
+
+  MASK_IDX=11                                  # the mask you are re-running; see bucket 6
+  qiita mask samples --mask-idx "${MASK_IDX}"  # one JSON row per prep_sample
+  PREP_SAMPLE_IDX='<one prep_sample_idx the line above reports as completed>'
+
+  qiita ticket submit --action-id long-read-assembly --action-version 1.0.1 \
+      --prep-sample-idx "${PREP_SAMPLE_IDX}" \
+      --context-json "{\"mask_idx\": ${MASK_IDX}, \"assembler\": \"hifiasm_meta\"}"
+  ```
+
+  The deploy starts no assembly of its own, so on a quiet host nothing has exercised the
+  rebuilt images since the restart. All three checks below need a ticket assembled AFTER
+  this deploy — the LCG and residue pairs because `lcg_split` and `residue_split` run only
+  in the new checkm image, the MetaBAT count because the corrected contig→bin table ships
+  in the new bin_refine one — and this submission produces all of them from one assembly.
+  An unperformable check is not a passed one.
+
+  Its compute is not spent twice: this is the first of bucket 6's re-runs, and bucket 6 picks
+  up the rest of the same mask's roster once these three checks read green. Expect to wait —
+  the cost figures are in bucket 6.
+
+- **Record the three-pass `checkm` step's elapsed time.** (#522)
+
+  ```bash
+  # The pilot ticket above.
+  T='<work_ticket_idx>'
+  ls -d "${PATH_SCRATCH}/ticket/${T}"/checkm/attempt-*/
+  ```
+
+  1.0.1 makes `checkm` three sequential CheckM runs, and the third (the unbinned
+  residue) is the largest at ~148 contigs, against ~104 refined bins and ~86 circular —
+  ~338 subjects per ticket. The image measured to date scored refined bins ALONE, one
+  run of ~104, so this is roughly three times the work that produced the figures below.
+  Count all three off this attempt while you are here. Those figures are carried from
+  scoping rather than measured, and the circular one disagrees with the ~98 that
+  `1.0.0.yaml` and `CHANGELOG.md` give for the same quantity — same count, two numbers,
+  and nothing in the repo can settle which. Count by `kind` in `assembly_membership`
+  for this run, or `ls` the three genome directories under the step workspace.
+
+  **The step itself has never been run end to end**, so its walltime is unmeasured:
+  the `PT4H` baseline in `1.0.1.yaml` is the old one, carried over rather than
+  fitted. Take the step's elapsed off this attempt. Both the counts and the elapsed go
+  in the comment on that step's `baseline_resources`, which says so.
+
+  Overrunning it is recoverable, not fatal: SLURM marks the job TIMEOUT, which the
+  runner treats as retriable and re-submits with walltime DOUBLED from the baseline
+  (`_escalated_walltime_after_timeout`), clamped to the action ceiling — `P2D` here, so
+  4h → 8h has room to climb. Only the `checkm` step re-runs; the assembly above it is
+  already stored and is not paid again. What an under-set baseline costs is one wasted
+  attempt of up to the cap plus one of the ticket's three shared retries, which is why
+  this is worth fitting before the fan-out rather than something to fear.
+
+- **Check the circular genomes (LCGs — the contigs the assembler closed, which bypass binning
+  at any length; the >=512 kb "large" cut is a query-time predicate, not a storage one)
+  and the unbinned residue came back scored.** (#519, #522)
+
+  ```bash
+  # The pilot ticket above — its assemble step must have produced a non-empty circular.fa.
   T='<work_ticket_idx>'
   ls "${PATH_SCRATCH}/ticket/${T}"/checkm/attempt-*/output/checkm/
   ```
 
-  Four files — `lineage.tsv`, `qa.tsv`, `lcg_lineage.tsv`, `lcg_qa.tsv` — means both CheckM runs
-  landed. The LCG arm cannot fail silently — `checkm.sh` runs under `set -euo pipefail`, so an
-  `lcg_split` failure aborts the step before it publishes anything and the TICKET fails. So only
-  the first pair, on a FAILED attempt whose ticket had circular contigs, is the shape to read:
-  check that step log for `lcg_split`, which exits 64 with the reason on stderr. A missing or
-  mislocated `${PATH_DERIVED}/duckdb-ext` is the failure this step gained (see the note below).
-  A ticket with an empty `circular.fa` legitimately writes only the first pair, so pick the
-  ticket before reading the result.
+  Six files — `lineage.tsv`, `qa.tsv`, `lcg_lineage.tsv`, `lcg_qa.tsv`, `unbinned_lineage.tsv`,
+  `unbinned_qa.tsv` — means all three CheckM runs landed. Neither added arm can fail silently:
+  `checkm.sh` runs under `set -euo pipefail`, so an `lcg_split` or `residue_split` failure aborts
+  the step before it publishes anything and the TICKET fails. So only the first pair, on a FAILED
+  attempt, is the shape to read: check that step log for `lcg_split` / `residue_split`, which exit
+  64 with the reason on stderr. A missing or mislocated `${PATH_DERIVED}/duckdb-ext` is the
+  failure both gained (see the note below). Two legitimate partial cases: an empty `circular.fa`
+  writes no `lcg_*` pair, and a residue where nothing clears the 300 kb cut writes no `unbinned_*`
+  pair — so pick the ticket before reading the result.
+
+  For the residue pair specifically, absence is NOT self-evidently benign: an
+  over-broad subtraction also writes nothing and exits 0. `residue_split` prints
+  `residue_split: N unbinned contig(s) >= 300000 bp written as one FASTA each` to the
+  step log — read N off it and expect roughly the count above, not merely that the
+  step passed.
 
 - **Check DAS_Tool now selects MetaBAT bins.** (#519)
 
   ```bash
-  # The first ticket assembled AFTER this deploy whose bin_refine produced bins.
+  # The pilot ticket above, whose bin_refine produced bins.
   T='<work_ticket_idx>'
   awk -F'\t' 'FNR==1{c=0; for(i=1;i<=NF;i++) if($i=="bin_set") c=i; next} c{print $c}' \
       "${PATH_SCRATCH}/ticket/${T}"/bin_refine/attempt-*/output/refined_bins/das_tool_summary.tsv \
@@ -120,44 +191,69 @@ _None yet._
   corrected contig→bin table landed; the note below says what that count could read
   before. Its absence on one ticket is not a failed deploy — a sample can legitimately
   yield no MetaBAT bin — so read it across the first few, and confirm the step exited 0
-  rather than 65, the new refusal described in that note.
+  rather than 65, the new refusal described in that note. On the pilot alone a missing
+  `MetaBAT` line is therefore not yet a verdict; bucket 6's fan-out gives the rest.
 
 ### 6. After the deploy verifies green
 
-- **Re-run the two pre-fix assembly runs under `long-read-assembly` 1.0.1, then deprecate the
-  1.0.0 runs.** (#522) The `bin_refine` consensus fix (#519) does not reach anything already
+- **Re-run mask 11's pre-fix assemblies under `long-read-assembly` 1.0.1, then deprecate that
+  1.0.0 run.** (#522) The `bin_refine` consensus fix (#519) does not reach anything already
   assembled: those prep_samples hold a two-binner MAG set, their tickets are `completed`
   (terminal — `/run` refuses), and a re-submit at 1.0.0 resolves to the same `processing_idx`.
-  1.0.1 is the identity discriminator that makes the re-run a distinct run; `CHANGELOG.md`
-  carries why that is necessary. Affected, both `hifiasm_meta`:
+  1.0.1 also scores the unbinned residue, so it is a different computation and a
+  distinct run rather than a repeat; `CHANGELOG.md` carries why that is necessary.
 
-  | processing_idx | mask_idx | prep_samples |
-  |---|---|---|
-  | 1 | 9 | 26 |
-  | 2 | 11 | 26 |
+  Two 1.0.0 runs exist, both `hifiasm_meta`, and only one is acted on:
+
+  | processing_idx | mask_idx | prep_samples | action |
+  |---|---|---|---|
+  | 1 | 9 | 26 | **none — leave exactly as it is** |
+  | 2 | 11 | 26 | re-run at 1.0.1, then deprecate |
+
+  **Mask 9 gets nothing: no re-run, and no deprecation either.** Its `processing_idx` 1 stays
+  `active` with its assembly results as they are. Do not "tidy it up" — a deprecation there
+  would be a judgement nobody made. Nothing in this bucket or bucket 5 touches it: every command
+  here is `MASK_IDX=11`.
+
+  **Mask 9 must not be re-assembled, and nothing in the system stops you.** The guard is that
+  you type `11`. Be plain about what each mechanism does and does not cover:
+
+  - The action-level disable is per `(action_id, version)`. It stops mask 9 **at 1.0.0** once
+    1.0.1 syncs. It stops nothing at 1.0.1, which is enabled and is the version the block below
+    submits with — `mask_idx` is a free integer in its context schema, so changing `MASK_IDX=11`
+    to `9` assembles all 26 mask-9 prep_samples at ~7 h each under a fresh `processing_idx`.
+    Nothing existing is superseded, but the compute is spent and the run should not exist.
+  - Deprecating `processing_idx` 1 WOULD make a mint against those params refuse. It is
+    deliberately not done, so that guard is not in play.
+  - The rollback reopens 1.0.0 as well: reverting `1.0.1.yaml` and re-syncing RE-ENABLES it
+    (`sync_actions` clears the disable it set). A mask-9 submit at 1.0.0 then recomputes those
+    assemblies and supersedes the stored rows on the DuckLake replace key.
 
   ```bash
-  BASE=https://qiita-miint.ucsd.edu            # your host
-  read -rsp 'system_admin PAT: ' QIITA_TOKEN; echo
+  # Exported for the same reason as bucket 5's block: the CLI reads both from the
+  # environment, and a plain assignment reaches curl but not `qiita`.
+  export QIITA_CONTROL_PLANE_URL=https://qiita-miint.ucsd.edu   # your host
+  BASE="${QIITA_CONTROL_PLANE_URL}"                             # for the curl step below
+  read -rsp 'system_admin PAT: ' QIITA_TOKEN; export QIITA_TOKEN; echo
 
-  # Do one mask at a time. Both rows of the table above go through this same block.
-  MASK_IDX=11        # then repeat for 9
-  OLD_IDX=2          # the row above for this mask; 9 -> 1
+  MASK_IDX=11        # mask 9 is deliberately not re-run; see the table above
+  OLD_IDX=2          # the 1.0.0 run for mask 11
 
   # 1. The mask's roster. One JSON row per prep_sample with its masking state —
   #    take the prep_sample_idx of the `completed` ones.
   qiita mask samples --mask-idx "${MASK_IDX}"
 
-  # 2. Re-submit each of those prep_samples at the new version, one PREP_SAMPLE_IDX
-  #    at a time.
+  # 2. The rest of that roster, one at a time — bucket 5's pilot already did the
+  #    first, and its three checks must have read green before this fans out.
+  PREP_SAMPLE_IDX='<the next prep_sample_idx from step 1>'
   qiita ticket submit --action-id long-read-assembly --action-version 1.0.1 \
       --prep-sample-idx "${PREP_SAMPLE_IDX}" \
       --context-json "{\"mask_idx\": ${MASK_IDX}, \"assembler\": \"hifiasm_meta\"}"
 
-  # 3. Once this mask's re-run has minted its processing_idx, retire the old run.
-  #    NEW_IDX is that new processing_idx — different per mask, so this step waits
-  #    for step 2. system_admin only (scope processing:lifecycle).
-  NEW_IDX='<the processing_idx step 2 minted for this mask>'
+  # 3. Once the roster has finished, retire the old run. NEW_IDX is the processing_idx
+  #    the re-runs minted — one for the whole mask, so this waits for step 2.
+  #    system_admin only (scope processing:lifecycle).
+  NEW_IDX='<the processing_idx the re-runs minted>'
   curl -sS -X PATCH -H "Authorization: Bearer ${QIITA_TOKEN}" \
       -H 'Content-Type: application/json' \
       -d "{\"status\":\"deprecated\",\"superseded_by\":${NEW_IDX},
@@ -170,19 +266,27 @@ _None yet._
   deprecating. The PATCH is a whole-block replace: a later correction must re-supply
   `superseded_by` or it clears.
 
-  Two different deprecations, and only this one is manual. The action-level one is automatic:
-  syncing 1.0.1 disables `long-read-assembly` **1.0.0** outright (`sync_actions` auto-deprecates
-  every other version of an action_id), so after the deploy no prep_sample can be submitted at
-  1.0.0 for any mask. It also stops the 52 existing 1.0.0 tickets being redriven: `/run`
-  409s whenever the ticket's action row is not enabled, so a failed one cannot be restarted
-  after this. Nothing already stored is affected. The PATCH is narrower and is about `qiita.processing`, not `qiita.action`:
-  it records why these two runs are void and what replaced them, which the action-level disable
-  does not. Nothing is deleted either way, and what assembled under the old runs stays
-  discoverable.
+  Two different deprecations, and only this one is manual. The action-level one is automatic: a
+  sync leaves only the highest version of an action_id enabled, so once 1.0.1 is synced
+  `long-read-assembly` **1.0.0** stops accepting submissions for any mask. It also blocks a
+  redrive of the 52 existing 1.0.0 tickets — `/run` 409s whenever the ticket's action row is not
+  enabled — though that is belt-and-braces today: all 52 are `completed`, which `/run` already
+  refuses as terminal before the enabled check runs. Nothing already stored is affected.
+
+  The PATCH is narrower and is about `qiita.processing`, not `qiita.action`: it records why mask
+  11's run is void and what replaced it, which the action-level disable does not. Nothing is
+  deleted either way, and what assembled under the old run stays discoverable. Mask 9's run is
+  touched by neither — the PATCH names mask 11's, and the auto-deprecation is on the
+  `qiita.action` row, not on any `qiita.processing` row.
 
   **Cost, so this is scheduled and not squeezed in:** only `bin_refine` onward changes
   (~60 min/prep_sample), but partial re-runs do not exist, so `assemble` is paid again in full —
-  measured across the 59 completed steps at 415.3 min average, 1094.1 min peak, per prep_sample.
+  measured across 59 completed `assemble` steps at 415.3 min average, 1094.1 min peak, per
+  prep_sample — a different step from the 59 completed `checkm` steps in bucket 5, which happen
+  to be the same count.
+  That cost is why bucket 5 submits one prep_sample and reads it before this fans out: at
+  ~7 h of assemble each, starting all 26 against an image whose fix has not been observed once
+  spends the whole re-run before anything could show it did not land.
 
   The assembly-genome backfill above still applies to the 1.0.0 rows and is unaffected by this;
   `processing_idx` is in the genome identity tuple, so old and new genomes never collide. The
@@ -228,23 +332,38 @@ _None yet._
   is a retryable step, not lost data: re-running the ticket's tail after the deploy writes a
   nine-column file. Nothing to do in advance; this is here so the failure is recognisable.
 
-- **The `checkm` step now binds the deploy-staged miint extension, and its SIF rebuilds.** (#519)
-  `checkm.sh` splits `circular.fa` into per-contig FASTAs with miint's `read_fastx` /
-  `COPY … FORMAT FASTA`, so the step gained `derived_inputs: MIINT_EXTENSION_DIRECTORY:
-  duckdb-ext` — resolved against `PATH_DERIVED` exactly as the `assemble` step's already is. The
-  bind is **unconditional**: the backend emits it for every `derived_inputs` entry, so a missing
-  or mislocated `${PATH_DERIVED}/duckdb-ext` fails apptainer for the whole step, not just the LCG
-  arm, including for a sample with no circular contig. Nothing new to stage — it is the same
-  directory the assemble step already requires — but this is a second step that now depends on
-  it. The image also rebuilds (`checkm.sh`, `lcg_split.py` and `miint_connect.py` are in its
-  `HASH_INPUTS`) and gains `python-duckdb`, pinned in lockstep with the orchestrator's resolved
-  DuckDB, so expect a slower-than-usual verify for this image too.
+- **The `checkm` step binds the deploy-staged miint extension, and its image lands under a NEW
+  filename.** (#519, #522) `checkm.sh` splits `circular.fa` and the unbinned residue into
+  per-contig FASTAs with miint's `read_fastx` / `COPY … FORMAT FASTA`, so the step gained
+  `derived_inputs: MIINT_EXTENSION_DIRECTORY: duckdb-ext` — resolved against `PATH_DERIVED`
+  exactly as the `assemble` step's already is. The bind is **unconditional**: the backend emits it
+  for every `derived_inputs` entry, so a missing or mislocated `${PATH_DERIVED}/duckdb-ext` fails
+  apptainer for the whole step, not just the split arms, including for a prep_sample with no
+  circular contig. Nothing new to stage — it is the same directory the assemble step already
+  requires — but this is a second step that now depends on it. The image also gains
+  `python-duckdb`, pinned in lockstep with the orchestrator's resolved DuckDB, so expect a
+  slower-than-usual verify for it.
+
+  **The build produces `long-read-assembly-checkm-1.0.1.sif`, not a rebuilt `-1.0.0.sif`**, so
+  roughly one image's worth of extra space lands under `${PATH_DERIVED}/images`. **Do not delete
+  `-checkm-1.0.0.sif`**: `1.0.0.yaml` still names it and no spec builds it any more. Note what that
+  image actually is — the copy already on this host, built BEFORE #519, which scores MAGs only. So
+  `long-read-assembly` 1.0.0 is retired rather than reproducible. Read its YAML with that in mind:
+  #519 edited it to describe an LCG arm, which was true of the image that file WOULD have got had
+  the rebuild kept the name, and is not true of the one it keeps. Nothing submits at 1.0.0 after
+  this deploy (the
+  sync disables it, and bucket 6 deprecates mask 11's run, which makes a re-mint against THOSE
+  params refuse outright — mask 9's run stays `active` by decision, so for it the disable is the
+  only thing standing between a re-synced 1.0.0 and a new assembly),
+  so this is a statement about the archive, not a live path.
 
 - **`bin_quality` gains LCG rows; nothing existing changes.** (#519) The table now carries one row
   per circular genome beside the per-refined-bin rows, tagged by `kind`. Rows written by earlier
   deploys are untouched and are not backfilled — the values come from a CheckM run that did not
   happen, so an assembly stored before this deploy keeps MAG rows only. Re-running the workflow
-  for a sample is what produces its LCG rows. The unbinned residue is still never scored.
+  for a prep_sample is what produces its LCG rows. Under 1.0.1 the unbinned residue
+  above the length cut is scored too; below it, a contig still has a membership row
+  and no quality row.
 
 - **The `bin_refine` SIF rebuilds, and MAG composition changes for assemblies run after this
   deploy.** (#519) `bin_refine.sh` and the new `contig2bin_filter.awk` are both in the image's

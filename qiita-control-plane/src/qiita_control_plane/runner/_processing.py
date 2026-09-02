@@ -74,8 +74,21 @@ def _build_processing_params(
         straight off `context_schema`, so the default literal lives in ONE place.
 
     As more result-affecting params are parameterized (min-contig-length, DAS_Tool
-    threshold, LCG cutoff) they are added here, and every processing_idx re-hashes
-    fleet-wide."""
+    threshold, LCG cutoff, `residue_split._MIN_RESIDUE_LENGTH_BP`) they are added
+    here, and every processing_idx re-hashes fleet-wide.
+
+    The container images are NOT in here. `version` is the workflow YAML's, so two
+    runs of the same version are one identity even when the images between them
+    changed — an edited entrypoint or def rebuilds the SIF (`HASH_INPUTS`, see
+    docs/container-images.md) without any of this moving. A fix that lives in an
+    image therefore does not reach runs that already exist; correcting those takes a
+    new workflow version, which re-hashes them as a distinct run.
+
+    Keying identity on the SIF build hash instead would re-mint on rebuilds that
+    change no output — a comment or a pinned-version bump is enough — orphaning the
+    artifacts stored against the old processing_idx. The granularity is also
+    per-image, so editing one tool's def would re-mint runs whose assembly is
+    byte-identical."""
     return {
         "workflow": action_id,
         "version": action_version,

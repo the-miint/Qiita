@@ -31,6 +31,13 @@ From: mambaorg/micromamba:1.5.8
     # checkm.sh, so the unit test can execute the real program.
     lcg_split.py /opt/qiita/lcg_split.py
     miint_connect.py /opt/qiita/miint_connect.py
+    # The per-contig splitter for the large unbinned contigs, and the canonical
+    # sequence-hash expression it subtracts the binned contigs with. `chunking.py` is
+    # qiita-common's own file, declared in this image's HASH_INPUTS and staged beside
+    # the def by build-sif.sh — the SAME file assembly_hash imports, so the two agree
+    # on which residue contigs exist by construction rather than by convention.
+    residue_split.py /opt/qiita/residue_split.py
+    chunking.py /opt/qiita/chunking.py
 
 %environment
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -50,7 +57,8 @@ From: mambaorg/micromamba:1.5.8
     # moves the interpreter major version under manifest_writer.py.
     micromamba install -y -n base -c conda-forge jq gawk pigz procps-ng findutils python=3.11
 
-    # python-duckdb, for lcg_split.py's miint read_fastx + FORMAT FASTA split.
+    # python-duckdb, for the miint read_fastx + FORMAT FASTA splits both
+    # lcg_split.py and residue_split.py run.
     # PINNED, and the pin is a LOCKSTEP with the compute orchestrator — assemble.def
     # carries why, and a unit test asserts both defs against
     # qiita-compute-orchestrator/uv.lock.
@@ -69,7 +77,8 @@ From: mambaorg/micromamba:1.5.8
     micromamba create -y -n checkm -c bioconda -c conda-forge checkm-genome pplacer hmmer prodigal
 
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/checkm.sh
-    chmod 0644 /opt/qiita/manifest_writer.py /opt/qiita/lcg_split.py /opt/qiita/miint_connect.py
+    chmod 0644 /opt/qiita/manifest_writer.py /opt/qiita/lcg_split.py \
+        /opt/qiita/residue_split.py /opt/qiita/miint_connect.py /opt/qiita/chunking.py
 
     micromamba clean -a -y
 
@@ -136,11 +145,21 @@ From: mambaorg/micromamba:1.5.8
     # base env by a separate `micromamba install`.
     test -s /opt/qiita/lcg_split.py
     test -s /opt/qiita/miint_connect.py
+    test -s /opt/qiita/residue_split.py
+    test -s /opt/qiita/chunking.py
     python3 -c "import importlib.util as u; s=u.spec_from_file_location('ls','/opt/qiita/lcg_split.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('rs','/opt/qiita/residue_split.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    # The hash expression residue_split builds its anti-join from. Executed, not just
+    # imported: it is plain SQL text with no duckdb import, so a `chunking.py` that
+    # arrived truncated or from the wrong place still imports and would only fail at
+    # run time, on a ticket, as a residue set that silently disagrees with
+    # assembly_hash's. Asserting the miint scalar it names is what ties the built
+    # image to the expression this workflow depends on.
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('ck','/opt/qiita/chunking.py'); m=u.module_from_spec(s); s.loader.exec_module(m); e=m.canonical_sequence_hash_expr('x'); assert 'sequence_dna_reverse_complement' in e and 'LEAST' in e, e"
     # LOAD-only, never INSTALL — an INSTALL would need the team mirror reachable from
     # every compute node and a writable $HOME. Anchored at a string-literal quote so
     # the prose explaining why we do NOT install cannot fail the build.
-    ! grep -qE "[\"']\s*INSTALL\b" /opt/qiita/miint_connect.py /opt/qiita/lcg_split.py
+    ! grep -qE "[\"']\s*INSTALL\b" /opt/qiita/miint_connect.py /opt/qiita/lcg_split.py /opt/qiita/residue_split.py
 
 %runscript
     echo "long-read-assembly-checkm image: invoke the step entrypoint, e.g." >&2

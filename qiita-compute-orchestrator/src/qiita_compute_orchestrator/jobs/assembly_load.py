@@ -23,16 +23,18 @@ containers emit CheckM's / DAS_Tool's tables verbatim (a plain `cp`, no awk/pyth
 normalization), so DuckDB is the ONE csv framework in this path (never a Python
 csv parser, never a shell transform on the tool tables).
 
-Empty/partial semantics: a sample with contigs but nothing CheckM scored — no
-refined bin and nothing circular — is a SUCCESS; `bin_quality` is written empty
-(register-files still finds all four tables with the right schema). Zero contigs
-never reaches here (assembly_hash raised StepNoData upstream).
+Empty/partial semantics: a prep_sample with contigs but nothing CheckM scored — no
+refined bin, nothing circular, and no residue contig clearing the length cut — is a
+SUCCESS; `bin_quality` is written empty (register-files still finds all four tables
+with the right schema). Zero contigs never reaches here (assembly_hash raised
+StepNoData upstream).
 
-`bin_quality` holds MAG and LCG rows, one per genome CheckM scored, tagged with the
-`kind` of the checkm.sh run that produced it. UNBINNED rows are absent: the residue
-is stored in `assembly_membership` so it can be queried, but a contig no bin claimed
-is a fragment and is not scored against a marker set. So an unbinned membership row
-has no `bin_quality` counterpart by construction rather than by filter.
+`bin_quality` holds MAG, LCG and UNBINNED rows, one per subject CheckM scored, tagged
+with the `kind` of the checkm.sh run that produced it. The UNBINNED rows are a SUBSET
+of the UNBINNED membership rows: `residue_split.py` scores only the contigs above its
+length cut, because completeness against a marker set describes nothing for a short
+fragment and CheckM's cost is per subject scored. A short unbinned contig therefore has a
+membership row and no quality row — read the two with a LEFT join, not an inner one.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from qiita_common.assembly_constants import (
     CONTIG_ATTRIBUTES_FILE,
     KIND_LCG,
     KIND_MAG,
+    KIND_UNBINNED,
     contig_attribute_join,
     contig_attribute_projection,
     register_contig_attribute_table,
@@ -80,6 +83,12 @@ _CHECKM_QA_TSV = "qa.tsv"  # `checkm qa -o 2 --tab_table`
 # is what carries its `kind` — checkm.sh states why.
 _CHECKM_LCG_LINEAGE_TSV = "lcg_lineage.tsv"
 _CHECKM_LCG_QA_TSV = "lcg_qa.tsv"
+# And from its third run, over the residue: the unbinned contigs no refined bin
+# claims, above the length cut `residue_split.py` applies. A subset of what this same
+# job stores as KIND_UNBINNED — the short ones keep their membership row and have no
+# quality row, which is what the whole class had before the third run existed.
+_CHECKM_UNBINNED_LINEAGE_TSV = "unbinned_lineage.tsv"
+_CHECKM_UNBINNED_QA_TSV = "unbinned_qa.tsv"
 _DAS_SUMMARY_TSV = "das_tool_summary.tsv"  # DAS_Tool `*_DASTool_summary.tsv`
 
 # DuckDB resource caps. Off-SLURM fallback; under SLURM the limit tracks the real
@@ -293,13 +302,14 @@ def _write_bin_quality(
     output (never a Python csv parser).
 
     One table pair per class, so `kind` is which pair a row was in — the constants
-    above name the two and checkm.sh states why they are scored apart. Each pair is
+    above name the three and checkm.sh states why they are scored apart. Each pair is
     joined on the verbatim `"Bin Id"` column:
     `lineage_wf` carries marker lineage + completeness/contamination/strain
     heterogeneity, `qa -o 2` adds genome size / # contigs. `bin_id` is that same
     `"Bin Id"`, which CheckM sets from the filename stem — a refined-bin FASTA's
-    stem for a MAG, a contig id for an LCG — matching what `assembly_hash` wrote
-    into `bin_map` for each kind, so both join `assembly_membership` on
+    stem for a MAG, a contig id for an LCG or an UNBINNED contig — matching what
+    `assembly_hash` wrote into `bin_map` for each kind, so all three join
+    `assembly_membership` on
     (prep_sample_idx, processing_idx, kind, bin_id).
 
     DAS_Tool's summary is LEFT-joined on its `bin` column (== the MAG stem) when
@@ -307,11 +317,15 @@ def _write_bin_quality(
     and never sees a circular contig, so an LCG row's provenance columns are NULL
     rather than missing a join.
 
-    UNBINNED gets no row: checkm.sh does not score the residue, so there is nothing
-    to read. The module docstring states why.
+    UNBINNED rows cover only the contigs checkm.sh scored — the residue above
+    `residue_split.py`'s length cut. A short unbinned contig keeps its
+    `assembly_membership` row and simply has no quality row, so `bin_quality` is a
+    subset of `assembly_membership` for this kind and a LEFT join is the way to read
+    the two together.
 
-    Either class may be absent (a sample with no refined bin, or none circular), and
-    with both absent — including the case where the CheckM DB was missing — this
+    Any class may be absent (a prep_sample with no refined bin, none circular, or no
+    residue clearing the cut), and with all absent — including the case where the
+    CheckM DB was missing — this
     writes a valid EMPTY Parquet with the right schema so register-files always
     finds the table. Column names are pinned to CheckM 1.x / DAS_Tool 1.1.x (see the
     module constants)."""
@@ -321,6 +335,7 @@ def _write_bin_quality(
     for kind, lineage_name, qa_name, with_das in (
         (KIND_MAG, _CHECKM_LINEAGE_TSV, _CHECKM_QA_TSV, das_tsv.is_file()),
         (KIND_LCG, _CHECKM_LCG_LINEAGE_TSV, _CHECKM_LCG_QA_TSV, False),
+        (KIND_UNBINNED, _CHECKM_UNBINNED_LINEAGE_TSV, _CHECKM_UNBINNED_QA_TSV, False),
     ):
         lineage_tsv = checkm_dir / lineage_name
         qa_tsv = checkm_dir / qa_name
@@ -368,6 +383,6 @@ def _write_bin_quality(
         conn.execute(f"COPY (SELECT {projection} WHERE FALSE) TO '{out}' ({PARQUET_OPTS})")
         return
 
-    # UNION ALL, not UNION: the two arms are disjoint by `kind` and a dedupe here
+    # UNION ALL, not UNION: the arms are disjoint by `kind` and a dedupe here
     # would only cost a sort over every column.
     conn.execute(f"COPY ({' UNION ALL '.join(arms)}) TO '{out}' ({PARQUET_OPTS})", params)
