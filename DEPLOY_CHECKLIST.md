@@ -42,7 +42,11 @@ _None yet._
 - **Record the rebuilt image's hifiasm_meta version.** (#516, #517)
 
   ```bash
-  apptainer exec "${PATH_DERIVED}/images/long-read-assembly-assemble-1.0.0.sif" \
+  # TMPDIR=/tmp because apptainer forwards YOUR shell's TMPDIR into the container. A
+  # TMPDIR on a path the container does not bind (an interactive account's scratch,
+  # say) makes libmamba abort before it runs anything:
+  #   critical libmamba filesystem error: temp_directory_path: No such file or directory
+  TMPDIR=/tmp apptainer exec "${PATH_DERIVED}/images/long-read-assembly-assemble-1.0.0.sif" \
       micromamba run -n hifiasm_meta hifiasm_meta --version 2>&1
   ```
 
@@ -58,7 +62,11 @@ _None yet._
 
   ```bash
   QA=/home/qiita/qiita-miint/qiita-control-plane/.venv/bin/qiita-admin
-  DB=$(sudo grep -oP '^DATABASE_URL=\K.*' /etc/qiita/control-plane.env)
+  # SOURCE the env file — redeploy.md §5's idiom, and the only one that is correct
+  # here. The value is QUOTED in control-plane.env, so grepping the line captures the
+  # quotes with it and the DSN parser reports `scheme is expected to be either
+  # "postgresql" or "postgres", got ''`. Sourcing lets the shell strip them.
+  set -a; . /etc/qiita/control-plane.env; set +a; DB="$DATABASE_URL"
   sudo -u qiita env DATABASE_URL="$DB" "$QA" backfill assembly-genome              # dry run
   sudo -u qiita env DATABASE_URL="$DB" "$QA" backfill assembly-genome --execute
   ```
@@ -75,7 +83,11 @@ _None yet._
 - **Check the combined feature table's two new routes answer.** (#515)
 
   ```bash
-  # A run known to be assembled and backfilled — pick one from the backfill's dry run.
+  # A run known to be assembled and backfilled. The backfill's dry run prints
+  # AGGREGATE counts only — no pairs — so take one from the table instead:
+  #   psql "$DB" -Atc "SELECT prep_sample_idx, processing_idx, count(*)
+  #                      FROM qiita.assembly_membership WHERE genome_idx IS NOT NULL
+  #                     GROUP BY 1,2 ORDER BY 3 DESC LIMIT 5;"
   curl -sS -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $QIITA_TOKEN" \
     "$BASE/api/v1/assembly/<prep_sample_idx>/<processing_idx>/genome-map"
   ```
@@ -213,6 +225,21 @@ _None yet._
   (terminal — `/run` refuses), and a re-submit at 1.0.0 resolves to the same `processing_idx`.
   1.0.1 also scores the unbinned residue, so it is a different computation and a
   distinct run rather than a repeat; `CHANGELOG.md` carries why that is necessary.
+
+  **The roster is `processing_idx = 2` — 26 prep_samples, 30438–30463 inclusive. Take it from
+  the membership table, never from the mask listing:**
+
+  ```bash
+  psql "$DB" -Atc "SELECT DISTINCT prep_sample_idx FROM qiita.assembly_membership
+                    WHERE processing_idx = 2 ORDER BY 1;"
+  ```
+
+  **`qiita mask samples --mask-idx 11` is the wrong source and the mistake is expensive.** It
+  lists every prep_sample ELIGIBLE to assemble — 82 of them — of which only the first 26 have a
+  pre-fix assembly. Submitting that list fires 26 legitimate re-runs plus **56 brand-new
+  assemblies at ~7 h each** that nobody decided to create. Nothing is superseded and nothing
+  corrupts, so it fails silently in the only way that matters: as spent compute and 56 runs
+  appearing in the system by accident.
 
   Two 1.0.0 runs exist, both `hifiasm_meta`, and only one is acted on:
 

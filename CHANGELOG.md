@@ -98,10 +98,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   refined bin claimed, so a completeness figure against a marker set describes nothing. The
   step's `baseline_resources` are unchanged and now fitted rather than assumed — across 59
   completed `checkm` steps on the deploy host the elapsed averaged 27.5 min and peaked at
-  58.9 min against a PT4H cap, and the second run scores a comparable genome set (~104 refined
-  bins beside ~98 circular contigs per ticket — a figure the 1.0.1 entry above disagrees
-  with at ~86, unsettled until the pilot counts it), so a doubled peak still sits under half the
-  cap. The `checkm` step gains `genomes_dir` as an input and the deploy-staged miint extension
+  58.9 min against a PT4H cap, and the second run scores a comparable genome set (102.5 refined
+  bins beside 85.2 circular contigs per ticket, both measured across the 52 stored runs), so a
+  doubled peak still sits under half the cap. The `checkm` step gains `genomes_dir` as an input and the deploy-staged miint extension
   as a `derived_inputs` bind; `checkm.def` gains `python-duckdb`, pinned in lockstep with the
   orchestrator's resolved DuckDB for the reason `assemble.def` states. CheckM keying its
   `"Bin Id"` on the stem with only the final extension removed is measured, not assumed: on the
@@ -1538,6 +1537,35 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Four `DEPLOY_CHECKLIST.md` commands did not run as written, found by running them during the
+  deploy of #514–#522.** Each was written but never executed, which is the one defect a checklist
+  review cannot catch. (1) The `hifiasm_meta` version check omitted `TMPDIR=/tmp`; apptainer
+  forwards the caller's `TMPDIR` into the container, and one pointing at an unbound path aborts
+  libmamba with `temp_directory_path: No such file or directory` before it runs anything.
+  (2) The assembly-genome backfill extracted `DATABASE_URL` with `grep -oP '^DATABASE_URL=\K.*'`,
+  which captures the surrounding quotes the file writes, so the DSN parser refused it with
+  `scheme is expected to be either "postgresql" or "postgres", got ''`. It now sources the env
+  file, which is what [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md) §5 already
+  prescribed — the checklist had simply diverged from it, so that section now states the rule for
+  every later step rather than leaving each one to invent an extraction. (3) The `genome-map`
+  check said to pick a `(prep_sample_idx, processing_idx)` pair "from the backfill's dry run",
+  which prints aggregate counts and no pairs; it now carries the query that yields one.
+  (4) The 1.0.1 re-run roster said "mask 11's pre-fix assemblies", which reads as the mask-11
+  sample list and is not: `qiita mask samples --mask-idx 11` returns the 82 prep_samples eligible
+  to assemble, while only the first 26 (30438–30463) have a pre-fix assembly. Driving the fan-out
+  off the CLI listing would have submitted 26 legitimate re-runs plus 56 brand-new assemblies at
+  ~7 h each — superseding nothing and corrupting nothing, which is precisely why it would not
+  have announced itself. The bucket now names `processing_idx = 2` and carries the roster query.
+- **`long-read-assembly`'s per-ticket subject counts were three estimates, one of which the repo
+  contradicted itself on.** `1.0.1.yaml` gave ~86 circular contigs per ticket where `1.0.0.yaml`
+  and this file gave ~98, with nothing to settle it. Measured over the 52 stored 1.0.0 runs in
+  `qiita.assembly_membership`: **5,328 MAG bins (102.5 per run)** and **4,433 LCG contigs
+  (85.2 per run over all 52; 92.4 over the 48 that closed any — 4 runs produced no circular
+  contig at all)**. So ~98 was the error and ~86 was the all-runs mean rounded. The LCG figure
+  carries forward to 1.0.1 because an LCG bypasses binning; the MAG figure does not, since
+  changing MAG composition is what 1.0.1 is for. The residue count above the 300 kb cut stays an
+  estimate — contig lengths live in the lake, not Postgres — so `~338 subjects` is now two
+  measurements and one guess, and says so.
 - **The `baseline_resources.cpu` pins read one hardcoded `1.0.0.yaml`, so the version that
   actually runs went unpinned (#522).** `test_assembly_coverage_cpu_pins_duckdb_threads` asserts
   a step's `cpu:` equals its job's `_DUCKDB_THREADS`, because the aligner's parallelism IS that

@@ -155,6 +155,13 @@ sudo make -C ~/qiita-miint preflight
 make -C ~/qiita-miint migrate
 ```
 
+**Any later step that needs `DATABASE_URL` in the shell — a `qiita-admin backfill`, a
+`psql` check in a `DEPLOY_CHECKLIST.md` verify bucket — uses the same
+`set -a; . /etc/qiita/control-plane.env; set +a` above.** Do not reach for
+`grep -oP '^DATABASE_URL=\K.*'`: the value is quoted in the file, so a line grep
+captures the quotes and the DSN parser refuses it with `scheme is expected to be
+either "postgresql" or "postgres", got ''`. Sourcing lets the shell strip them.
+
 `make migrate` runs `dbmate up` and is idempotent — already-applied
 migrations are skipped. **This is a separate step on purpose:**
 `local-deploy.sh` / `activate.sh` do not apply migrations (auto-applying

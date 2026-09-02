@@ -229,17 +229,21 @@ steps:
       QIITA_CHECKM_DB: checkm_data
       MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [checkm_dir]
-    # NOT YET MEASURED FOR THREE PASSES. The step is now three sequential CheckM
-    # runs, and the new one is the largest: per ticket the counts are ~104 refined
-    # bins, ~86 circular contigs and ~148 residue contigs above the cut, so ~338
-    # subjects. Those three counts are carried from scoping rather than measured here,
-    # and the circular one is not agreed across the repo. DEPLOY_CHECKLIST.md bucket 5
-    # counts all three off the first real ticket; replace these with what it reports.
+    # NOT YET MEASURED FOR THREE PASSES. The step is three sequential CheckM runs.
+    # Two of the three subject counts are measured, over the 52 stored 1.0.0 runs in
+    # qiita.assembly_membership: 5,328 MAG bins, 102.5 per run; 4,433 LCG contigs,
+    # 85.2 per run over all 52 and 92.4 over the 48 that produced any — 4 runs closed
+    # no contig at all. The LCG figure carries forward, since an LCG bypasses binning.
+    # The MAG figure does NOT: changing MAG composition is what this version is for.
+    # The residue count above the cut is still unmeasured — contig lengths live in the
+    # lake, not Postgres — and ~148 is the scoping estimate, so ~338 subjects is two
+    # measurements and one guess. DEPLOY_CHECKLIST.md bucket 5 counts the residue off
+    # the first real ticket; replace that figure with what it reports.
     #
     # The only measured figure is for ONE pass: a submit -> terminal average of
     # 27.5 min and a peak of 58.9 min across 59 completed steps, all of which ran the
     # image deployed at the time, which scored refined bins alone. So the measured
-    # predecessor is ~104 subjects in one run, not ~190 in two — this step is roughly
+    # predecessor is 102.5 subjects in one run, not ~190 in two — this step is roughly
     # three times that work, not half again. The figure also INCLUDES queue wait,
     # which a SLURM walltime cap does not count, so it bounds run time from above and
     # cannot be scaled into an estimate either way. Left at 4h rather than guessed
@@ -251,7 +255,7 @@ steps:
     #
     # cpu and mem_gb are unchanged, and mem_gb is the weaker of the two. The runs are
     # sequential, so peak memory is one run at a time rather than the sum — but the
-    # LARGEST single run grows from the measured ~104 refined bins to ~148 residue
+    # LARGEST single run grows from the measured 102.5 refined bins to ~148 residue
     # contigs, so "one at a time" is not on its own a reason 40 GB still fits. Whether
     # CheckM's peak RSS scales with subject count over that range is not measured, and
     # this step has never run end to end. DEPLOY_CHECKLIST.md bucket 5 records the
