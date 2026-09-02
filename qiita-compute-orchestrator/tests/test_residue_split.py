@@ -470,8 +470,8 @@ def test_the_splitter_imports_qiita_commons_emptiness_check(split_module) -> Non
 
     The image has no qiita-common, so the module falls back to the `duckdb_miint.py`
     that `build-sif.sh` stages beside it from this same source file. Here, where
-    qiita-common IS importable, the first branch must be the one that binds — a
-    fallback that silently won.
+    qiita-common IS importable, this is what fails if someone reintroduces a local
+    definition: the name would still resolve, and every other test would stay green.
     """
     from qiita_common.duckdb_miint import is_empty_sequence_file
 
@@ -481,13 +481,12 @@ def test_the_splitter_imports_qiita_commons_emptiness_check(split_module) -> Non
 def test_an_empty_gzipped_bin_does_not_abort_the_split(tmp_path, staged_miint) -> None:
     """An empty `.fa.gz` beside a real bin is skipped, not handed to `read_fastx`.
 
-    A bin file with no records is ~20 bytes on disk once gzipped, so a size check
-    would call it non-empty; `read_fastx` raises on a zero-record input and one bad
-    path aborts the whole scan, failing the step for every OTHER bin too.
+    `is_empty_sequence_file`'s own tests cover the rule; this covers `_bin_files`
+    applying it, where getting it wrong costs the step rather than one bin.
 
-    Two ways to be wrong, and this separates them: aborting shows up as a non-zero
-    exit, and dropping the whole bins glob shows up as the binned contig surviving
-    into the scored set.
+    Two ways to be wrong, and this separates them: aborting the scan shows up as a
+    non-zero exit, and dropping the whole bins glob shows up as the binned contig
+    surviving into the scored set.
     """
     binned = _seq(_MIN_BP, seed=11)
     residue_only = _seq(_MIN_BP, seed=12)
@@ -541,17 +540,26 @@ def test_residue_split_uses_miint_and_never_installs() -> None:
     # `duckdb_miint` is qiita-common's WHOLE miint module, so the copy staged into the
     # image carries the installer as well as the one function wanted here. The image's
     # `%test` guard is anchored at a quoted INSTALL and so cannot see an import of it;
-    # this is the check that can. Both import branches are asserted, since only the
-    # fallback one runs in the container.
-    names = {
-        m.split("#")[0].strip()
-        for m in re.findall(r"^\s*from (?:qiita_common\.)?duckdb_miint import (.+)$", code, re.M)
-    }
-    assert names == {"is_empty_sequence_file"}, (
-        f"residue_split imports {sorted(names)} from duckdb_miint; it may take only "
-        "is_empty_sequence_file — this image LOADs the deploy-staged extension and "
-        "never INSTALLs"
+    # this is the check that can.
+    #
+    # Both branches are matched separately and counted, not collected into a set: the
+    # two lines import the same name, so a set of them collapses to one element and
+    # DELETING either branch would leave the assertion green. Only the fallback runs
+    # in the container, so losing it is the half that fails at run time on a ticket.
+    imports = re.findall(r"^\s*from (qiita_common\.)?duckdb_miint import (.+)$", code, re.M)
+    qualified = [names for prefix, names in imports if prefix]
+    bare = [names for prefix, names in imports if not prefix]
+    assert len(qualified) == 1 and len(bare) == 1, (
+        f"residue_split must import from duckdb_miint on both branches — the "
+        f"qiita_common one for the repo and the bare one for the image; found "
+        f"{len(qualified)} qualified and {len(bare)} bare"
     )
+    for names in qualified + bare:
+        assert names.split("#")[0].strip() == "is_empty_sequence_file", (
+            f"residue_split imports {names!r} from duckdb_miint; it may take only "
+            "is_empty_sequence_file — this image LOADs the deploy-staged extension "
+            "and never INSTALLs"
+        )
 
 
 def test_without_the_staged_extension_the_residue_split_fails(tmp_path) -> None:

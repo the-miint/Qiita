@@ -249,8 +249,13 @@ steps:
     # the ticket's shared retries, where an over-set one costs queue time on every
     # ticket. DEPLOY_CHECKLIST.md bucket 5 records the first real elapsed; put it here.
     #
-    # cpu and mem_gb are unchanged because the runs are sequential: peak memory is one
-    # run at a time, and no single run scores more genomes than the step already did.
+    # cpu and mem_gb are unchanged, and mem_gb is the weaker of the two. The runs are
+    # sequential, so peak memory is one run at a time rather than the sum — but the
+    # LARGEST single run grows from the measured ~104 refined bins to ~148 residue
+    # contigs, so "one at a time" is not on its own a reason 40 GB still fits. Whether
+    # CheckM's peak RSS scales with subject count over that range is not measured, and
+    # this step has never run end to end. DEPLOY_CHECKLIST.md bucket 5 records the
+    # pilot's MaxRSS alongside its elapsed; set this from that rather than from here.
     baseline_resources:
       cpu: 8
       mem_gb: 40

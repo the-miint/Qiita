@@ -114,9 +114,9 @@ _BIN_GLOBS = ("*.fna", "*.fna.gz", "*.fa", "*.fa.gz", "*.fasta", "*.fasta.gz")
 def _bin_files(bins_dir: Path) -> list[Path]:
     """Every non-empty refined-bin FASTA directly under `bins_dir`, sorted.
 
-    Empty is `is_empty_sequence_file`'s definition, not `st_size == 0`: `read_fastx`
-    raises on a zero-record input and one empty path aborts the whole scan, so an
-    empty bin has to be dropped before the read rather than caught after.
+    Empty is `is_empty_sequence_file`'s definition; its docstring says why not
+    `st_size`. Dropped here rather than caught after the read because one empty path
+    aborts the whole multi-file scan below, not just its own bin.
     """
     found: list[Path] = []
     for pattern in _BIN_GLOBS:

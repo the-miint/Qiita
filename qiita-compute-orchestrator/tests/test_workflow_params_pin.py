@@ -44,7 +44,16 @@ def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[Path, in
 
     Globbed rather than naming one filename: a pin that reads `1.0.0.yaml` stops
     covering the workflow the moment a second version lands beside it, and the
-    version it keeps covering is the one nobody runs any more.
+    version it keeps covering is the one nobody runs any more. `fastq-to-parquet`
+    already carries four versions; `long-read-assembly` is the one whose second
+    version is the one that runs.
+
+    A version that does not declare `step` at all contributes nothing rather than
+    failing — dropping a step between versions is a legitimate shape change, and
+    there is no cpu to pin on a step that is not there. More than one instance in
+    a single file IS an error: the pin would then silently cover whichever came
+    first. The caller asserts the result is non-empty, so no workflow can lose its
+    pin entirely by having every version drop the step.
     """
     yaml_paths = sorted(_WORKFLOWS_DIR.glob(f"{workflow}/*.yaml"))
     assert yaml_paths, f"no workflow YAML under workflows/{workflow}/"
@@ -52,11 +61,15 @@ def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[Path, in
     for yaml_path in yaml_paths:
         data = yaml.safe_load(yaml_path.read_text())
         steps = [e for e in data["steps"] if e.get("step") == step]
-        assert len(steps) == 1, (
-            f"{yaml_path.relative_to(_REPO_ROOT)}: expected exactly one {step} step, "
+        assert len(steps) <= 1, (
+            f"{yaml_path.relative_to(_REPO_ROOT)}: expected at most one {step} step, "
             f"got {len(steps)}"
         )
-        found.append((yaml_path, steps[0]["baseline_resources"]["cpu"]))
+        if steps:
+            found.append((yaml_path, steps[0]["baseline_resources"]["cpu"]))
+    assert found, (
+        f"no version under workflows/{workflow}/ declares a {step} step, so this pin covers nothing"
+    )
     return found
 
 
@@ -152,9 +165,9 @@ def test_assembly_coverage_cpu_pins_duckdb_threads():
     GB request at the median. Pinned here so the two cannot drift apart again — the
     drift is invisible at runtime, since nothing fails.
 
-    This workflow is the one that carries more than one on-disk version, so it is
-    the one where reading a single filename would have left the running version
-    unpinned; `_baseline_cpu_every_version` covers each of them.
+    Read `1.0.0.yaml` by name until the 1.0.1 residue pass landed beside it, which
+    left the version that actually runs unpinned; `_baseline_cpu_every_version`
+    covers each of them.
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.assembly_coverage")
     versions = _baseline_cpu_every_version("long-read-assembly", "assembly_coverage")

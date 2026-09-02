@@ -65,9 +65,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `long-read-assembly` 1.0.0 is retired rather than reproducible — the image it names exists only
   as the copy already on the deploy host, which the operator must not delete, and cannot be
   rebuilt from this tree at all.
-  `test_assembly_version_parity` is REMOVED: it asserted 1.0.1 was 1.0.0's computation under a new
-  identity, which is no longer what 1.0.1 is, and a green test making that claim is worse than
-  none. The step's walltime is **not** re-fitted — three sequential runs over ~338 genomes per
+  There is deliberately no test asserting 1.0.1 is 1.0.0's computation under a new identity: that
+  is no longer what 1.0.1 is, and a green test making that claim would be worse than none.
+  The step's walltime is **not** re-fitted — three sequential runs over ~338 genomes per
   ticket, against a measured predecessor that scored ~104 in a single run, has never been run end
   to end, so the `PT4H` cap is carried over
   and DEPLOY_CHECKLIST.md bucket 5 records the first real elapsed.
@@ -1542,8 +1542,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   actually runs went unpinned (#522).** `test_assembly_coverage_cpu_pins_duckdb_threads` asserts
   a step's `cpu:` equals its job's `_DUCKDB_THREADS`, because the aligner's parallelism IS that
   pool and a drift between them costs cores or oversubscribes them without failing anything.
-  `long-read-assembly` is the first workflow to carry two on-disk versions, and the pin named
-  `1.0.0.yaml` — the retired one — leaving `1.0.1.yaml` free to drift. The three pins
+  `long-read-assembly` is the first workflow whose SECOND on-disk version is the one that runs
+  (`fastq-to-parquet` has carried four for months), and the pin named `1.0.0.yaml` — the retired
+  one — leaving `1.0.1.yaml` free to drift. The three pins
   (`align`, `align-denovo`, `assembly_coverage`) now go through
   `_baseline_cpu_every_version`, which globs `workflows/<workflow>/*.yaml`, so a new version
   file is covered the moment it lands instead of when someone remembers the test.

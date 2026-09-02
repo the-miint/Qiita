@@ -10,6 +10,7 @@ cluster runtime LOADs a pre-staged build rather than installing per job.
 from __future__ import annotations
 
 import fnmatch
+import gzip
 import os
 import tempfile
 
@@ -19,6 +20,7 @@ from qiita_common.duckdb_miint import (
     MIINT_EXTENSION_DIRECTORY_VAR,
     MIINT_MIRROR_URL,
     MIINT_REQUIRED_JOB_VARS,
+    is_empty_sequence_file,
     miint_connect_config,
     miint_install_sql,
     miint_job_env,
@@ -222,3 +224,33 @@ def test_setup_test_env_directories_match_the_documented_clearing_glob(monkeypat
     for worker in (None, "gw0", "gw11"):
         chosen = _resolve_test_ext_dir(monkeypatch, tmp_path, worker)
         assert fnmatch.fnmatch(os.path.basename(chosen), "qiita-*-duckdb-ext")
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "empty"),
+    [
+        ("empty.fa", b"", True),
+        ("full.fa", b">x\nACGT\n", False),
+        ("empty.fa.gz", None, True),
+        ("full.fa.gz", b">x\nACGT\n", False),
+    ],
+)
+def test_is_empty_sequence_file(tmp_path, name, payload, empty):
+    """The four cases the callers depend on, uncompressed and gzipped.
+
+    `.gz` is the pair that matters: an empty gzip member still occupies its framing
+    bytes on disk, so `st_size == 0` answers this question wrong in the direction
+    that costs — `read_fastx` raises on the file and one such path aborts a whole
+    multi-file scan.
+    """
+    path = tmp_path / name
+    if name.endswith(".gz"):
+        with gzip.open(path, "wb") as fh:
+            fh.write(payload or b"")
+    else:
+        path.write_bytes(payload or b"")
+
+    if name.endswith(".gz"):
+        assert path.stat().st_size > 0, "an empty gzip member is still bytes on disk"
+
+    assert is_empty_sequence_file(path) is empty

@@ -118,7 +118,7 @@ _None yet._
   up the rest of the same mask's roster once these three checks read green. Expect to wait —
   the cost figures are in bucket 6.
 
-- **Record the three-pass `checkm` step's elapsed time.** (#522)
+- **Record the three-pass `checkm` step's elapsed time AND its MaxRSS.** (#522)
 
   ```bash
   # The pilot ticket above.
@@ -140,6 +140,17 @@ _None yet._
   the `PT4H` baseline in `1.0.1.yaml` is the old one, carried over rather than
   fitted. Take the step's elapsed off this attempt. Both the counts and the elapsed go
   in the comment on that step's `baseline_resources`, which says so.
+
+  **Take `MaxRSS` too**, from `sacct -j <slurm_job_id> --format=JobID,MaxRSS,Elapsed`.
+  `mem_gb` is still 40, which was fitted when the step scored refined bins alone —
+  one run of ~104. The runs are sequential so they do not sum, but the LARGEST single
+  run is now ~148 subjects, and whether CheckM's peak RSS scales with subject count
+  over that range is not measured. An under-set `mem_gb` recovers the same way an
+  under-set walltime does — SLURM reports OUT_OF_MEMORY, the runner treats it as
+  retriable and re-submits with memory DOUBLED, clamped to the action's mem ceiling
+  (`_escalated_mem_floor_after_oom`) — so it costs an attempt and one of the ticket's
+  shared retries, not the ticket. If `MaxRSS` on this pilot is near 40 GB, raise
+  `mem_gb` in `1.0.1.yaml` before the fan-out and spend neither.
 
   Overrunning it is recoverable, not fatal: SLURM marks the job TIMEOUT, which the
   runner treats as retriable and re-submits with walltime DOUBLED from the baseline

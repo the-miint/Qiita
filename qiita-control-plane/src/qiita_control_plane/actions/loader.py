@@ -39,8 +39,11 @@ def _version_sort_key(version: str) -> tuple[tuple[tuple[int, int, str], ...], s
     no format check), so this stays total rather than raising on a component it
     cannot parse. A non-numeric component sorts BEFORE every numeric one in the same
     position, which puts the unparseable version where being wrong is cheapest: last
-    is what stays enabled, so a stray `"latest"` or a mistyped version gets disabled
-    rather than winning the deploy and disabling the real release. It also matches
+    is what stays enabled, so a version whose FIRST component is non-numeric — a
+    stray `"latest"` — gets disabled rather than winning the deploy and disabling the
+    real release. That only holds for the leading component: `"2.0.0-rc1"` still
+    sorts after `"1.9.0"` on the leading `2`, and would win. What refuses it is the
+    repo-scoped test named below, not this ordering. It also matches
     semver for the shape that matters here, where a prerelease precedes its release:
     `"1.0.0-rc1"` < `"1.0.0"` < `"1.0.1"` < `"1.9.0"` < `"1.10.0"`. It is NOT a semver
     comparator in general — a non-numeric component sorts ahead of every numeric one
