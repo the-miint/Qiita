@@ -8,7 +8,7 @@ audience includes a plain `user`, so the reads sit in this CLI rather than
 `qiita-admin` (which keeps the destructive `mask delete` / `purge-failed`).
 
 Thin clients: each verb is one GET, printed verbatim, so a new server-side field
-reaches the operator without a CLI change.
+reaches the user without a CLI change.
 """
 
 import argparse
