@@ -309,7 +309,7 @@ def plan(inputs: Inputs) -> JobPlan:
     Advisory, down-only (the CP applies it only below baseline); an under-estimate
     is still caught by OOM escalation. `plan()` runs at submit time in the
     orchestrator process and reads only the small roster (bp sum), not the chunk
-    data. Mirrors build_rype_index.plan()."""
+    data. Mirrors build_bowtie2_index.plan()."""
     if inputs.shard_id is None or inputs.shard_features is None:
         return JobPlan()
     with duckdb.connect(":memory:") as conn:

@@ -3,7 +3,8 @@
 Step 1 of the bcl-convert workflow: fetch the pool's run_preflight_blob
 from the CP, rehydrate it to a sample-sheet CSV in the workspace, read
 the BCL run folder's RunInfo.xml to derive the Illumina instrument model,
-and write the model to a sidecar file for the runner's A4 resource lookup.
+and write the model to a sidecar file for the bcl_convert step's lookup
+baseline_resources population.
 
 The downstream bcl_convert step (container:) consumes:
   - samplesheet: the CSV at workspace/samplesheet.csv
@@ -84,7 +85,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     # Read the instrument model from RunInfo.xml up-front so an
     # absent/malformed file fails before any CP round-trip. The runner's
-    # A4 resolution at dispatch of the bcl_convert step reads
+    # lookup-population resolution at dispatch of the bcl_convert step reads
     # instrument_model.txt; if we couldn't write a valid value, fail here
     # with the precise reason.
     instrument_model = read_instrument_run_info(inputs.bcl_input_dir).instrument_model

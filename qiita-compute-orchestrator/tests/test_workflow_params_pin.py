@@ -40,9 +40,10 @@ def _native_steps_with_params() -> list[tuple[str, str, dict[str, str]]]:
     return found
 
 
-def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[Path, int]]:
-    """`(yaml_path, baseline cpu)` for `step` in EVERY on-disk version of
-    `workflows/<workflow>/`.
+def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[str, int]]:
+    """`(where, baseline cpu)` for `step` in EVERY on-disk version of
+    `workflows/<workflow>/`, where `where` is a repo-relative label for the
+    assertion message.
 
     Globbed rather than naming one filename: a pin that reads `1.0.0.yaml` stops
     covering the workflow the moment a second version lands beside it, and the
@@ -56,6 +57,12 @@ def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[Path, in
     a single file IS an error: the pin would then silently cover whichever came
     first. The caller asserts the result is non-empty, so no workflow can lose its
     pin entirely by having every version drop the step.
+
+    Handles both `baseline_resources` populations. A flat one contributes its one
+    `cpu`; a `profiles:` lookup contributes one entry per profile, because every
+    profile is an allocation the step really runs at and each has to satisfy the
+    caller's pin. Reading `["cpu"]` off a lookup instead would raise a bare
+    `KeyError` naming neither the workflow nor the step.
     """
     yaml_paths = sorted(_WORKFLOWS_DIR.glob(f"{workflow}/*.yaml"))
     assert yaml_paths, f"no workflow YAML under workflows/{workflow}/"
@@ -68,11 +75,42 @@ def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[Path, in
             f"got {len(steps)}"
         )
         if steps:
-            found.append((yaml_path, steps[0]["baseline_resources"]["cpu"]))
+            where = str(yaml_path.relative_to(_REPO_ROOT))
+            baseline = steps[0]["baseline_resources"]
+            if "profiles" in baseline:
+                for key, profile in baseline["profiles"].items():
+                    found.append((f"{where} profile {key!r}", profile["cpu"]))
+            else:
+                found.append((where, baseline["cpu"]))
     assert found, (
         f"no version under workflows/{workflow}/ declares a {step} step, so this pin covers nothing"
     )
     return found
+
+
+def test_baseline_cpu_helper_reads_both_resource_populations():
+    """`_baseline_cpu_every_version` covers a `profiles:` lookup, not just a flat
+    `cpu:`.
+
+    The pins below all happen to sit on flat steps today, so the lookup branch has
+    no other caller and would rot unnoticed. `long-read-assembly` carries one of
+    each — 1.0.0's `assemble` is flat, 1.0.1's is a per-assembler lookup — so this
+    reads real workflow files rather than a fixture. Reading `["cpu"]` off the
+    lookup raises a bare `KeyError` naming neither workflow nor step, which is what
+    a pin newly placed on such a step used to hit.
+    """
+    flat = _baseline_cpu_every_version("long-read-assembly", "assembly_coverage")
+    assert flat and all("profile" not in where for where, _ in flat)
+
+    entries = _baseline_cpu_every_version("long-read-assembly", "assemble")
+    profiles = [(where, cpu) for where, cpu in entries if "profile" in where]
+    assert len(profiles) >= 2, (
+        f"expected the 1.0.1 assemble lookup to contribute one entry per profile, got {entries}"
+    )
+    # Each label locates the file AND the profile, so a failing pin says which.
+    for where, cpu in profiles:
+        assert where.startswith("workflows/long-read-assembly/") and "assembler" in where
+        assert isinstance(cpu, int)
 
 
 def test_workflows_dir_present():
@@ -129,9 +167,9 @@ def test_align_cpu_pins_duckdb_threads():
     legitimately differ must keep differing.
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.align_sharded")
-    for yaml_path, cpu in _baseline_cpu_every_version("align", "align_sharded"):
+    for where, cpu in _baseline_cpu_every_version("align", "align_sharded"):
         assert cpu == mod._DUCKDB_THREADS, (
-            f"{yaml_path.relative_to(_REPO_ROOT)} baseline cpu={cpu} but "
+            f"{where} baseline cpu={cpu} but "
             f"align_sharded._DUCKDB_THREADS={mod._DUCKDB_THREADS}; these size the same"
             " thing (miint's concurrent-shard count) and must be changed together"
         )
@@ -148,9 +186,9 @@ def test_align_denovo_cpu_pins_duckdb_threads():
     nothing uses, and one below it oversubscribes the aligner onto fewer.
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.align_denovo")
-    for yaml_path, cpu in _baseline_cpu_every_version("align-denovo", "align_denovo"):
+    for where, cpu in _baseline_cpu_every_version("align-denovo", "align_denovo"):
         assert cpu == mod._DUCKDB_THREADS, (
-            f"{yaml_path.relative_to(_REPO_ROOT)} baseline cpu={cpu} but "
+            f"{where} baseline cpu={cpu} but "
             f"align_denovo._DUCKDB_THREADS={mod._DUCKDB_THREADS}; the aligner's"
             " parallelism IS that pool, so these must be changed together"
         )
@@ -173,9 +211,9 @@ def test_assembly_coverage_cpu_pins_duckdb_threads():
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.assembly_coverage")
     versions = _baseline_cpu_every_version("long-read-assembly", "assembly_coverage")
-    for yaml_path, cpu in versions:
+    for where, cpu in versions:
         assert cpu == mod._DUCKDB_THREADS, (
-            f"{yaml_path.relative_to(_REPO_ROOT)} assembly_coverage baseline cpu={cpu}"
+            f"{where} assembly_coverage baseline cpu={cpu}"
             f" but assembly_coverage._DUCKDB_THREADS={mod._DUCKDB_THREADS}; the"
             " aligner's parallelism IS that pool, so these must be changed together"
         )
@@ -200,9 +238,9 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
     question is whether the measurement still holds.
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.build_minimap2_index")
-    for yaml_path, cpu in _baseline_cpu_every_version("build-shard-index", "build_minimap2_index"):
+    for where, cpu in _baseline_cpu_every_version("build-shard-index", "build_minimap2_index"):
         assert cpu == 1 and cpu < mod._DUCKDB_THREADS, (
-            f"{yaml_path.relative_to(_REPO_ROOT)}: build_minimap2_index cpu={cpu}, "
+            f"{where}: build_minimap2_index cpu={cpu}, "
             f"measured at 0.56 cores maximum average demand. It sits below "
             f"_DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — the step is blocked "
             f"on its data-plane stream, so cores matched to the pool go unused."

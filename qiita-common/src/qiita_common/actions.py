@@ -202,10 +202,9 @@ class FlatBaselineResources(BaseModel):
     """Flat resource declaration — cpu/mem_gb/walltime/gpu, all required.
 
     Used as the value type in `BaselineResources.profiles` (one profile per
-    instrument family, picked at dispatch by the runner's A4 resolution
-    branch) and as the shape `ActionCeiling` carries (the ceiling is always
-    a single upper bound, regardless of which baseline-resource population
-    the step uses).
+    instrument family, resolved at dispatch by the lookup population) and as
+    the shape `ActionCeiling` carries (the ceiling is always a single upper
+    bound, regardless of which baseline-resource population the step uses).
     """
 
     cpu: Annotated[int, Field(gt=0)]

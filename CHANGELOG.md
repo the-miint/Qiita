@@ -1633,6 +1633,38 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **`make test-workflows` ran apptainer on a host without it (#531).** The guard
+  `if ! command -v apptainer ...; exit 0; fi` sat on its own recipe line, and `exit 0`
+  ends only the line it is on — make moved to the next line and ran `apptainer build`
+  anyway, so a macOS run printed "apptainer not found — skipping workflow smoke tests"
+  and then failed with `make: apptainer: No such file or directory` (exit 2). CLAUDE.md
+  and `docs/testing.md` both describe this target as skipping gracefully off Linux. The
+  guard and everything it guards are now one recipe line; the second half needed it too,
+  since it reaches apptainer through `scripts/build-sif.sh`. `set -e` still propagates a
+  real build failure as the recipe's exit status.
+- **`_baseline_cpu_every_version` raised a bare `KeyError` on a `profiles:` step (#531).**
+  The workflow-param pin helper read `baseline_resources["cpu"]`, which exists only on the
+  flat population; a pin newly placed on a lookup step got `KeyError: 'cpu'`, naming
+  neither the workflow nor the step. It now contributes one entry per profile, so the pin
+  covers a lookup instead of failing on it — every profile is an allocation the step really
+  runs at, so each has to satisfy the same pin. A test reads both populations out of
+  `long-read-assembly` (1.0.0's `assemble` is flat, 1.0.1's is the per-assembler lookup),
+  which is what keeps the branch exercised while every pin still sits on a flat step.
+- **Stale comments corrected (#531).** `build_minimap2_index.plan()` said it mirrors
+  `build_rype_index.plan()`, which does not exist — the mutual reference is with
+  `build_bowtie2_index.plan()`, which points back at it. `shard_planner` called the
+  ingest-time wiring "a later milestone" when `actions.library.plan_shards` does exactly
+  the four things it lists. `_resolve_reference_index_path` said all `reference_index` rows
+  carry a NULL `shard_id` "so this is a no-op", and that shard-aware resolution "is a later
+  milestone and is deliberately NOT built here" — `actions.library.register_index` writes
+  rows with a `shard_id`, and `_resolve_sharded_align_indexes` sits in the same module.
+- **Development-plan vocabulary removed from comments (#531).** "A4" (five sites across
+  `actions.py`, `bcl-convert/1.0.0.yaml`, and `bcl_convert_prep.py`) and "Phase 5"
+  (`step_progress.py`, `slurm.py`) name planning documents that are not in the repo, which
+  CLAUDE.md forbids. The surrounding words already carried the meaning. The `Phase 1` /
+  `Phase 2` comments in `_feature_load.py` and `align_sharded.py` are left alone: they
+  number the stages of an algorithm inside one function, not a milestone.
+
 - **A paired-end read submission can no longer cross routes (#484).** The exactly-one
   constraint on `fastq-to-parquet` was per key, not per family: it stopped the forward read
   arriving twice and the reverse read arriving twice, but admitted `fastq_upload_idx` with

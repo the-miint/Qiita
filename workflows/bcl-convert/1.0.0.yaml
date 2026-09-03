@@ -41,7 +41,7 @@ context_schema:
     # The folder name MUST follow Illumina's convention,
     # <YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>, so the prep
     # step's run-folder parser can derive the instrument model for the
-    # A4 baseline_resources lookup. Folders that don't parse fail-fast
+    # baseline_resources lookup. Folders that don't parse fail-fast
     # at dispatch.
     bcl_input_dir:
       type: string
@@ -97,7 +97,7 @@ steps:
     inputs: [samplesheet, bcl_input_dir]
     outputs: [convert_dir]
     baseline_resources:
-      # A4 resource resolution: the runner reads
+      # The lookup population: the runner reads
       # `bound['instrument_model']` (the upstream output file's stripped
       # contents), looks up the matching profile here, clamps each axis
       # against the action_ceiling below, then constructs the

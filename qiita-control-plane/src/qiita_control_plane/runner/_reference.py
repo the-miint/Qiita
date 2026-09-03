@@ -56,9 +56,10 @@ async def _resolve_reference_index_path(
 
     This is the *whole-reference* (unsharded) lookup: it filters to
     `shard_id IS NULL` so a per-shard analysis-index row can never be served
-    here. All rows are NULL today, so this is a no-op now and forward-safe once
-    shard rows exist. Shard-aware resolution (routing a read to its shard) is a
-    later milestone and is deliberately NOT built here.
+    here. `actions.library.register_index` writes rows carrying a `shard_id`,
+    so the filter selects rather than merely being forward-safe. Shard-aware
+    resolution (routing a read to its shard) is `_resolve_sharded_align_indexes`
+    below.
 
     Raises:
       * ReferenceNotFound — the reference row doesn't exist.
