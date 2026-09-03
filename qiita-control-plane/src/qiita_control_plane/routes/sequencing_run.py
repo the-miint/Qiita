@@ -13,11 +13,32 @@ system_role gate (any USER may stand up a run); the pool POST
 additionally gates on caller-creator semantics against the path's run
 via `require_caller_owns_run()` (wet_lab_admin+ bypass). Both
 write handlers are find-or-create on their natural keys
-(instrument_run_id for the run; (run_idx, run_preflight_filename) for the
-pool) — a same-key + same-payload retry returns HTTP 200 with the
-existing idx; a same-key + different-payload retry returns 409 with a
-structured PayloadMismatch detail — a soft API-contract change downstream
+(instrument_run_id for the run; (run_idx, run_preflight_sha256) for the
+pool — the preflight CONTENT, not its filename) — a same-key + same-payload
+retry returns HTTP 200 with the existing idx; a same-key + different-payload
+retry returns 409 with a structured PayloadMismatch detail — a soft API-contract change downstream
 clients should be aware of.
+
+Read gating splits on what a response CARRIES, not on which resource it hangs
+off:
+
+  * The four AGGREGATE reads — run metadata, pool metadata, completion, work-ticket
+    summary — take `Scope.PREP_SAMPLE_READ` plus `require_caller_owns_run()`, the
+    guard the pool POST already used. Sums and bucket counts over a run the caller
+    stood up disclose nothing per-sample, so its creator reads them; wet_lab_admin+
+    bypasses ownership. The bypass returns without a DB lookup, so an admin still
+    gets `require_sequenced_pool_in_run`'s 404 / 422 unchanged.
+  * The two PER-SAMPLE reads — QC report and sequenced-sample exceptions — stay at a
+    wet_lab_admin floor. They return a row per sequenced_sample, unnarrowed, and a
+    pool spans studies, so the run's creator is not entitled to them by having
+    created the run. Each carries the reasoning at its own handler.
+  * The two pool-ALIGNMENT reads narrow to the caller's readable samples instead of
+    gating on the pool, so they answer for any pool the caller owns part of.
+
+Not covered by that split: `lookup-by-instrument-run-id` is a human read behind
+`Scope.PREP_SAMPLE_READ` alone; and of the mutating routes only preflight
+update-lane, block-mask plan and align plan carry a wet_lab_admin floor — the run
+and pool POSTs and the pool DELETE gate on scope and ownership instead.
 
 The preflight GET is SA-only via Scope.SEQUENCED_POOL_PREFLIGHT_READ,
 matching the existing CO→CP precedent (routes/sequence_range.py).
@@ -79,10 +100,12 @@ from qiita_common.models import (
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
     SequencedPoolDeleteResponse,
+    SequencedPoolListResponse,
     SequencedPoolPreflightResponse,
     SequencedPoolPreflightUpdateLaneRequest,
     SequencedPoolPreflightUpdateLaneResponse,
     SequencedPoolResponse,
+    SequencedPoolSummary,
     SequencedSampleException,
     SequencingRunCreateRequest,
     SequencingRunCreateResponse,
@@ -147,11 +170,17 @@ from ..repositories.sequencing_run import (
     fetch_sequencing_run_read_metrics,
     insert_sequenced_pool,
     insert_sequencing_run,
+    list_sequenced_pools,
     update_sequenced_pool_preflight_blob,
 )
-from ._helpers import GENERIC_FK_VIOLATION, resolve_idxs_by_natural_key
+from ._helpers import GENERIC_FK_VIOLATION, cap_rows, resolve_idxs_by_natural_key
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequencing-run"])
+
+# Hard cap on the pool listing. Bounded by how many pools one run carries — a
+# lane count in practice — so the cap is a backstop rather than a page size;
+# `truncated` says so rather than paginating.
+_SEQUENCED_POOL_LIST_HARD_CAP = 1_000
 
 
 def _host_filter_refusal_http(exc: block_planner.PoolHostFilterRefusal) -> HTTPException:
@@ -235,7 +264,7 @@ async def get_sequencing_run(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _owns_run: None = Depends(require_caller_owns_run()),
 ) -> SequencingRunResponse:
     """Read one sequencing_run's metadata by idx.
 
@@ -243,9 +272,12 @@ async def get_sequencing_run(
     notably `instrument_model` — the field `qiita submit-host-filter-pool` reads
     to forward QC's polyG gate per sample — plus `read_metrics`, the run-level
     twin of the pool rollup (the identical PoolReadMetrics shape summed across the
-    run's pools, compute-on-read). Same read gate as the pool roster route
-    (`list_sequenced_samples_in_pool`): a HumanUser with `Scope.PREP_SAMPLE_READ`
-    and system_role at least wet_lab_admin. 404 when the run does not exist.
+    run's pools, compute-on-read). Read gate: a HumanUser with
+    `Scope.PREP_SAMPLE_READ` who created the run, or any wet_lab_admin+
+    (`require_caller_owns_run()`'s bypass). 404 when the run does not exist. A
+    non-owner gets 403 on a run that exists and 404 on one that does not, so this
+    route does distinguish the two for them — the run's existence, not its
+    contents.
     """
     row = await fetch_sequencing_run(pool, sequencing_run_idx)
     if row is None:
@@ -328,6 +360,52 @@ async def create_sequenced_pool(
     if not created:
         response.status_code = status.HTTP_200_OK
     return SequencedPoolCreateResponse(sequenced_pool_idx=sequenced_pool_idx)
+
+
+@router.get(PATH_SEQUENCING_RUN_SEQUENCED_POOL)
+async def list_sequenced_pools_route(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _run_exists: None = Depends(require_sequencing_run_exists),
+    _owns_run: None = Depends(require_caller_owns_run()),
+) -> SequencedPoolListResponse:
+    """List the pools on one sequencing_run, ascending by `sequenced_pool_idx`.
+
+    The read that makes a `sequenced_pool_idx` obtainable. Every other pool-scoped
+    route takes one as a path segment or a query filter, and the POST on this same
+    path only returns the idx of the pool it just created-or-reused, so a caller who
+    did not perform the create had no way to name a pool at all.
+
+    Gated on the RUN's creator (`require_caller_owns_run()`, wet_lab_admin+ bypass),
+    as the POST on this path and the aggregate reads under it are. The two
+    per-sample reads (QC report, exceptions) stay at a wet_lab_admin floor; naming
+    a run's pools discloses nothing about whose samples are on them.
+
+    `require_sequencing_run_exists` fires the 404 before the guard, so a typo'd run
+    404s rather than reading as "no pools". An empty list on a real run means the run
+    has no pools yet.
+    """
+    rows, truncated = cap_rows(
+        await list_sequenced_pools(
+            pool, sequencing_run_idx, limit=_SEQUENCED_POOL_LIST_HARD_CAP + 1
+        ),
+        _SEQUENCED_POOL_LIST_HARD_CAP,
+    )
+    pools = []
+    for row in rows:
+        # asyncpg returns JSONB as text (no codec), as the single-pool read notes.
+        data = dict(row)
+        if isinstance(data["extra_metadata"], str):
+            data["extra_metadata"] = json.loads(data["extra_metadata"])
+        pools.append(SequencedPoolSummary.model_validate(data))
+    return SequencedPoolListResponse(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool=pools,
+        count=len(pools),
+        truncated=truncated,
+    )
 
 
 @router.get(PATH_SEQUENCED_POOL_PREFLIGHT)
@@ -539,7 +617,7 @@ async def get_sequenced_pool(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _owns_run: None = Depends(require_caller_owns_run()),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
 ) -> SequencedPoolResponse:
     """Read one sequenced_pool's metadata plus its compute-on-read read-metric
@@ -549,8 +627,8 @@ async def get_sequenced_pool(
 
     Nothing is stored at the pool level — the rollup is aggregated at request
     time, so it never drifts when a sample is re-processed or deleted. Same read
-    gate as `get_sequencing_run` / the pool roster: a HumanUser with
-    `Scope.PREP_SAMPLE_READ` and system_role at least wet_lab_admin.
+    gate as `get_sequencing_run`: a HumanUser with `Scope.PREP_SAMPLE_READ` who
+    created the RUN, or any wet_lab_admin+.
     `require_sequenced_pool_in_run` fronts 404 (no such pool) and 422 (pool not
     under this run); the rollup is always present (an unprocessed pool reads as
     NULL sums / 0 counts). The BYTEA `run_preflight_blob` is not surfaced — only
@@ -597,9 +675,16 @@ async def get_sequenced_pool_qc_report(
 
     Everything is compute-on-read — the merge runs at request time over the
     constituent sequenced_samples, so it never drifts when a sample is
-    re-processed or deleted. Same read gate as the pool metadata endpoint: a
-    HumanUser with `Scope.PREP_SAMPLE_READ` and system_role at least
-    wet_lab_admin. `require_sequenced_pool_in_run` fronts 404 (no such pool) /
+    re-processed or deleted. Read gate: a HumanUser with `Scope.PREP_SAMPLE_READ`
+    at system_role wet_lab_admin+ — NOT the run-creator gate the pool metadata and
+    completion reads use. `samples` carries one row per sequenced_sample with no
+    per-study narrowing, and a pool spans studies (the alignment reads below
+    narrow for exactly this reason), so admitting the run's creator here would
+    hand them QC blobs for samples in studies they hold nothing on. Narrowing this
+    to the caller's readable samples would change what `merged` and `sample_count`
+    aggregate over, so it is a separate decision — Qiita#529 carries it, along with
+    the gate move that depends on it.
+    `require_sequenced_pool_in_run` fronts 404 (no such pool) /
     422 (pool not under this run). A pool with no processed samples reads as an
     empty `samples` list and `merged.raw`/`merged.filtered` of None."""
     # Two sequential reads (rollup, then per-sample rows) on separate
@@ -674,8 +759,8 @@ async def list_sequenced_pool_alignments(
     pool spans studies, so 403ing it would make it undiscoverable to someone who
     legitimately owns part of it; narrowing is safe on a listing because no
     scientific result depends on it. The per-study `Tier.VIEWER` check is the
-    boundary, which is why this is open to role `user` where the sibling
-    completion rollup is wet_lab_admin-gated.
+    boundary, which is why this is open to role `user` on ANY pool, where the
+    sibling completion rollup admits role `user` only on a run they created.
 
     Both counts are over the caller's own samples (see `PoolAlignmentSummary`),
     so they agree with what the alignment DoGet mint will accept — that mint is
@@ -753,7 +838,7 @@ async def get_sequenced_pool_completion(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _owns_run: None = Depends(require_caller_owns_run()),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
     reference_idx: int | None = Query(
         default=None,
@@ -780,8 +865,11 @@ async def get_sequenced_pool_completion(
 
     Everything is compute-on-read, so it never drifts when a sample is
     re-processed, re-submitted, withdrawn, or deleted. Same read gate as the
-    pool metadata / QC-report endpoints: a HumanUser with `Scope.PREP_SAMPLE_READ`
-    and system_role at least wet_lab_admin. `require_sequenced_pool_in_run` fronts
+    QC report, and for the same reason: a HumanUser with `Scope.PREP_SAMPLE_READ` at
+    system_role wet_lab_admin+, NOT the run's creator. Every row carries a
+    `biosample_accession` and the ENA accessions, unnarrowed across the pool's
+    studies. Narrowing then admitting the run's creator is Qiita#529.
+    `require_sequenced_pool_in_run` fronts
     404 (no such pool) / 422 (pool not under this run); a pool with no non-retired
     samples reads as all-zero counts and `complete=False`."""
     row = await fetch_sequenced_pool_completion(
@@ -880,7 +968,7 @@ async def get_sequenced_pool_work_ticket_summary(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _owns_run: None = Depends(require_caller_owns_run()),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
 ) -> PoolWorkTicketSummary:
     """Read the pool's read-mask work-ticket rollup: coverage (samples with vs.

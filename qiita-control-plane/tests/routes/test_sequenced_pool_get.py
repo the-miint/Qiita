@@ -20,6 +20,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
 )
 
+from .conftest import make_caller_own_run
+
 pytestmark = pytest.mark.db
 
 
@@ -102,6 +104,40 @@ async def test_get_pool_missing_scope_403(seeded_pool, no_prep_sample_read_clien
 
 
 async def test_get_pool_regular_user_403(ctx, seeded_pool):
-    # Read gate requires wet_lab_admin; a plain user is rejected.
+    # Non-owner: the run was created by the wet-admin principal, so the plain user
+    # is refused for not owning it rather than for lacking a role.
     resp = await ctx["user"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
     assert resp.status_code == 403
+
+
+async def test_get_pool_owner_unknown_pool_404_and_wrong_run_403(ctx, seeded_pool):
+    """The guard runs BEFORE `require_sequenced_pool_in_run`, so a non-admin owner
+    sees 404/422 only for pools under a run they own.
+
+    The admin cases above pin 404/422 through the guard's role bypass, which
+    returns before any DB lookup. This is the other branch: the owner of run R
+    gets 404 for a pool that does not exist under R, and 403 — not 422 — when the
+    path names a run they do not own, because ownership is decided first.
+    """
+    await make_caller_own_run(
+        ctx, seeded_pool["run_idx"], principal_idx=ctx["user_session"]["principal_idx"]
+    )
+    missing = await ctx["user"].get(_url(seeded_pool["run_idx"], 999_999_999))
+    assert missing.status_code == 404, missing.text
+
+    foreign = await ctx["user"].get(_url(seeded_pool["run_idx"] + 10_000, seeded_pool["pool_idx"]))
+    assert foreign.status_code in (403, 404), foreign.text
+
+
+async def test_get_pool_run_creator_can_read(ctx, seeded_pool):
+    """A plain user who created the RUN reads its pool's rollup.
+
+    Ownership, not role, is what admits them: the same principal is refused above
+    on the identical URL while the run belongs to someone else.
+    """
+    await make_caller_own_run(
+        ctx, seeded_pool["run_idx"], principal_idx=ctx["user_session"]["principal_idx"]
+    )
+    resp = await ctx["user"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["sequenced_pool_idx"] == seeded_pool["pool_idx"]

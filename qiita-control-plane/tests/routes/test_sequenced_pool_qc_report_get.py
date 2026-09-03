@@ -21,6 +21,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
 )
 
+from .conftest import make_caller_own_run
+
 pytestmark = pytest.mark.db
 
 
@@ -199,5 +201,23 @@ async def test_get_qc_report_missing_scope_403(seeded_pool, no_prep_sample_read_
 
 
 async def test_get_qc_report_regular_user_403(ctx, seeded_pool):
+    # Non-owner: the run was created by the wet-admin principal, so the plain user
+    # is refused for not owning it rather than for lacking a role.
+    resp = await ctx["user"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
+    assert resp.status_code == 403
+
+
+async def test_get_qc_report_run_creator_still_403(ctx, seeded_pool):
+    """The run's creator is refused here, unlike the pool metadata and completion
+    reads, which admit them.
+
+    `samples` carries one row per sequenced_sample with no per-study narrowing, and
+    a pool spans studies, so the creator of a run the wet lab loaded other groups'
+    samples onto would read QC blobs for studies they hold nothing on. This test is
+    what stops that gate being widened by symmetry with its siblings.
+    """
+    await make_caller_own_run(
+        ctx, seeded_pool["run_idx"], principal_idx=ctx["user_session"]["principal_idx"]
+    )
     resp = await ctx["user"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
     assert resp.status_code == 403

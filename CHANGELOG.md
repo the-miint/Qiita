@@ -21,6 +21,25 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`GET /sequencing-run/{idx}/sequenced-pool` and `qiita sequenced-pool list` — a
+  `sequenced_pool_idx` can now be read out (#530).** Every pool-scoped surface takes a
+  `sequenced_pool_idx` — `alignment list`, `pool-completion`, `submit-align-pool`, the pool
+  QC and completion reads — and nothing returned one: the path was registered `POST`-only,
+  `GET /sequencing-run/{idx}` carries no pool list, and the create's find-or-create is keyed
+  on the preflight *content*, so recovering an idx meant replaying the create with the
+  original bytes. Holding only a run, an operator could not name any of its pools without
+  reading `qiita.sequenced_pool` over psql on the deploy host. The listing returns stored
+  columns only — no `read_metrics`, which aggregates every constituent sequenced_sample and
+  would cost a scan per row; the single-pool read still carries it for the one pool picked
+  out of the list. `run_preflight_filename` labels a pool rather than keying it: both of the
+  run's uniqueness indexes are partial (`WHERE ... IS NOT NULL`), so a non-NULL filename is
+  unique within its run while no-preflight pools are distinguishable only by idx.
+  Gated on the run's creator (`require_caller_owns_run()`, wet_lab_admin+ bypass), as the POST
+  on this path and the aggregate reads under it are — see the `Changed` entry below.
+  `SequencedPoolResponse` now extends the new `SequencedPoolSummary` so the shared fields
+  have one definition. No new path constant — the `PATH_`/`URL_` pair already existed for
+  the POST.
+
 - **`qiita processing list` / `show` / `samples` — assembly-run discovery without psql
   (#526).** `align-denovo` is submitted against a `processing_idx`, and until one has
   already run against a given assembly there was no way to read one out: `qiita alignment
@@ -3160,6 +3179,28 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **The AGGREGATE sequencing-run and sequenced-pool reads admit the run's creator, not just
+  wet_lab_admin (#530).** `GET /sequencing-run/{R}` and the pool metadata, completion rollup
+  and work-ticket summary reads under it were gated `require_role_at_least(WET_LAB_ADMIN)`, so
+  a plain `user` who stood a run up could not read the run or any metric under it though they
+  could create both. Those four now use the `require_caller_owns_run()` the pool POST on the
+  same path already used: the creator reads what is under their run, wet_lab_admin+ still
+  reads any run via the guard's bypass, and because that bypass returns before any DB lookup
+  an admin sees `require_sequenced_pool_in_run`'s 404 / 422 unchanged.
+
+  **The two PER-SAMPLE reads under the same prefix deliberately did not move.** The QC report
+  and the sequenced-sample exceptions return a row per sequenced_sample with no per-study
+  narrowing — the exceptions rows carry `biosample_accession` and the ENA accessions — and a
+  multiplexed pool spans studies, with the wet lab loading other groups' samples onto a run
+  through the wet_lab_admin bypass on pool create and sample import. Admitting the run's
+  creator there would disclose per-sample data for studies they hold nothing on, so both keep
+  the wet_lab_admin floor and each carries the reasoning at its handler. Narrowing them to the
+  caller's readable samples the way the pool-ALIGNMENT reads do would change what `merged` and
+  `sample_count` aggregate over, so it is left as a separate decision. The alignment reads
+  themselves are untouched, and the three POSTs that mutate or launch compute (preflight
+  update-lane, block-mask plan, align plan) keep the wet_lab_admin floor: running work is not
+  reading it.
 
 - **`long-read-assembly` memory re-sized at three steps, and `assemble` is now
   sized per assembler (#528).** `assembly_coverage` 64 → 96 GiB and `assembly_load`

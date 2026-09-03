@@ -280,6 +280,22 @@ async def no_study_read_client(make_pat_client):
     return await make_pat_client(label="no-study-read", scopes=[Scope.SELF_PROFILE])
 
 
+async def make_caller_own_run(ctx, run_idx: int, *, principal_idx: int) -> None:
+    """Reassign a seeded run's creator, so an ownership-gated read can be exercised
+    without re-seeding the whole run -> pool -> sample chain as that principal.
+
+    The reads under /sequencing-run gate on `require_caller_owns_run()`, whose
+    bypass admits wet_lab_admin+ — so a fixture seeded by the wet-admin client
+    tests only the bypass. Flipping created_by_idx is what reaches the ownership
+    branch. Function-scoped fixtures tear the run down, so the change cannot leak.
+    """
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequencing_run SET created_by_idx = $1 WHERE idx = $2",
+        principal_idx,
+        run_idx,
+    )
+
+
 async def _grant_study_access(ctx, *, study_idx, principal_idx, tier, granted_by_idx):
     """Insert a study_access row at the named tier; track for cleanup.
 
