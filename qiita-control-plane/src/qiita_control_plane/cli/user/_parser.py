@@ -88,6 +88,7 @@ from .sequencing import (
     _handle_prep_sample_retire,
     _handle_run_preflight_update_lane,
     _handle_sequenced_pool_create,
+    _handle_sequenced_pool_list,
     _handle_sequenced_sample_create,
     _handle_sequencing_run_create,
     _handle_sequencing_run_lookup,
@@ -476,6 +477,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_seqpool = sub.add_parser("sequenced-pool", help="Sequenced-pool operations")
     p_seqpool_sub = p_seqpool.add_subparsers(dest="sequenced_pool_cmd", required=True)
+
+    # The read that produces a sequenced_pool_idx. Every other pool-scoped verb
+    # takes one and, before this, nothing returned one.
+    p_seqpool_list = p_seqpool_sub.add_parser(
+        "list",
+        help="List a sequencing-run's pools (GET /sequencing-run/{idx}/sequenced-pool)",
+    )
+    p_seqpool_list.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_seqpool_list.set_defaults(handler=_handle_sequenced_pool_list)
     p_seqpool_create = p_seqpool_sub.add_parser(
         "create",
         help="Create a sequenced-pool on a run (POST /sequencing-run/{R}/sequenced-pool)",

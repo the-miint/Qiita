@@ -21,6 +21,24 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`GET /sequencing-run/{idx}/sequenced-pool` and `qiita sequenced-pool list` — a
+  `sequenced_pool_idx` can now be read out (#TBD).** Every pool-scoped surface takes a
+  `sequenced_pool_idx` — `alignment list`, `pool-completion`, `submit-align-pool`, the pool
+  QC and completion reads — and nothing returned one: the path was registered `POST`-only,
+  `GET /sequencing-run/{idx}` carries no pool list, and the create's find-or-create is keyed
+  on the preflight *content*, so recovering an idx meant replaying the create with the
+  original bytes. Holding only a run, an operator could not name any of its pools without
+  reading `qiita.sequenced_pool` over psql on the deploy host. The listing returns stored
+  columns only — no `read_metrics`, which aggregates every constituent sequenced_sample and
+  would cost a scan per row; the single-pool read still carries it for the one pool picked
+  out of the list. `run_preflight_filename` is what tells two pools of one run apart.
+  Gated on the run's creator (`require_caller_owns_run()`, wet_lab_admin+ bypass), matching
+  the POST on this path rather than the wet_lab_admin floor the single-pool read carries:
+  naming which pools exist is a different question from reading one's per-sample rollup.
+  `SequencedPoolResponse` now extends the new `SequencedPoolSummary` so the shared fields
+  have one definition. No new path constant — the `PATH_`/`URL_` pair already existed for
+  the POST.
+
 - **`qiita processing list` / `show` / `samples` — assembly-run discovery without psql
   (#526).** `align-denovo` is submitted against a `processing_idx`, and until one has
   already run against a given assembly there was no way to read one out: `qiita alignment

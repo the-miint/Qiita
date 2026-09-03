@@ -409,6 +409,35 @@ async def fetch_sequenced_pool(
     )
 
 
+async def list_sequenced_pools(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequencing_run_idx: int,
+    *,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """The pools of one run, ascending by idx, at most `limit` rows.
+
+    Stored columns only — no read-metric rollup. `fetch_sequenced_pool_read_metrics`
+    aggregates over every constituent sequenced_sample, so running it per row would
+    make a list of a run's pools cost a scan of the run's samples; the single-pool
+    read carries it for the one pool a caller picks out of this list.
+
+    The BYTEA `run_preflight_blob` is excluded, matching the single-pool read: only
+    the filename crosses the wire.
+
+    Unfiltered by caller — the route gates on the RUN (a caller who may see the run
+    may see which pools are on it), so there is no per-pool narrowing to apply here.
+    """
+    return await pool_or_conn.fetch(
+        "SELECT idx AS sequenced_pool_idx, sequencing_run_idx, run_preflight_filename,"
+        " extra_metadata, created_by_idx, created_at"
+        " FROM qiita.sequenced_pool WHERE sequencing_run_idx = $1"
+        " ORDER BY idx LIMIT $2",
+        sequencing_run_idx,
+        limit,
+    )
+
+
 # The compute-on-read read-metric aggregate column list — the SAME expressions
 # for the pool rollup and the run-level rollup, factored here so the two report an
 # IDENTICAL PoolReadMetrics shape and can never drift. Every aggregate references

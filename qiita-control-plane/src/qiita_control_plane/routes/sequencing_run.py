@@ -79,10 +79,12 @@ from qiita_common.models import (
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
     SequencedPoolDeleteResponse,
+    SequencedPoolListResponse,
     SequencedPoolPreflightResponse,
     SequencedPoolPreflightUpdateLaneRequest,
     SequencedPoolPreflightUpdateLaneResponse,
     SequencedPoolResponse,
+    SequencedPoolSummary,
     SequencedSampleException,
     SequencingRunCreateRequest,
     SequencingRunCreateResponse,
@@ -147,11 +149,17 @@ from ..repositories.sequencing_run import (
     fetch_sequencing_run_read_metrics,
     insert_sequenced_pool,
     insert_sequencing_run,
+    list_sequenced_pools,
     update_sequenced_pool_preflight_blob,
 )
-from ._helpers import GENERIC_FK_VIOLATION, resolve_idxs_by_natural_key
+from ._helpers import GENERIC_FK_VIOLATION, cap_rows, resolve_idxs_by_natural_key
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequencing-run"])
+
+# Hard cap on the pool listing. Bounded by how many pools one run carries — a
+# lane count in practice — so the cap is a backstop rather than a page size;
+# `truncated` says so rather than paginating.
+_SEQUENCED_POOL_LIST_HARD_CAP = 1_000
 
 
 def _host_filter_refusal_http(exc: block_planner.PoolHostFilterRefusal) -> HTTPException:
@@ -328,6 +336,54 @@ async def create_sequenced_pool(
     if not created:
         response.status_code = status.HTTP_200_OK
     return SequencedPoolCreateResponse(sequenced_pool_idx=sequenced_pool_idx)
+
+
+@router.get(PATH_SEQUENCING_RUN_SEQUENCED_POOL)
+async def list_sequenced_pools_route(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _run_exists: None = Depends(require_sequencing_run_exists),
+    _owns_run: None = Depends(require_caller_owns_run()),
+) -> SequencedPoolListResponse:
+    """List the pools on one sequencing_run, ascending by `sequenced_pool_idx`.
+
+    The read that makes a `sequenced_pool_idx` obtainable. Every other pool-scoped
+    route takes one as a path segment or a query filter, and the POST on this same
+    path only returns the idx of the pool it just created-or-reused, so a caller who
+    did not perform the create had no way to name a pool at all.
+
+    Gated on the RUN's creator (`require_caller_owns_run()`, wet_lab_admin+ bypass),
+    matching the POST on this path rather than the wet_lab_admin floor the
+    single-pool read and `get_sequencing_run` carry: a caller who stood a run up can
+    see which pools are on it. Reading one of those pools stays at the higher floor —
+    that read carries the per-sample metric rollup, which is a different question
+    from which pools exist.
+
+    `require_sequencing_run_exists` fires the 404 before the guard, so a typo'd run
+    404s rather than reading as "no pools". An empty list on a real run means the run
+    has no pools yet.
+    """
+    rows, truncated = cap_rows(
+        await list_sequenced_pools(
+            pool, sequencing_run_idx, limit=_SEQUENCED_POOL_LIST_HARD_CAP + 1
+        ),
+        _SEQUENCED_POOL_LIST_HARD_CAP,
+    )
+    pools = []
+    for row in rows:
+        # asyncpg returns JSONB as text (no codec), as the single-pool read notes.
+        data = dict(row)
+        if isinstance(data["extra_metadata"], str):
+            data["extra_metadata"] = json.loads(data["extra_metadata"])
+        pools.append(SequencedPoolSummary.model_validate(data))
+    return SequencedPoolListResponse(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool=pools,
+        count=len(pools),
+        truncated=truncated,
+    )
 
 
 @router.get(PATH_SEQUENCED_POOL_PREFLIGHT)

@@ -14,6 +14,7 @@ from qiita_common.api_paths import (
     PATH_PREP_SAMPLE_RETIRED,
     PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
     PATH_SEQUENCING_RUN_PREFIX,
+    PATH_SEQUENCING_RUN_SEQUENCED_POOL,
 )
 from qiita_common.models import (
     SequencedPoolCreateRequest,
@@ -45,6 +46,18 @@ def _post_sequenced_pool(base_url: str, token: str, run_idx: int, body: dict) ->
     return _common.call(
         "POST", base_url, token, f"/sequencing-run/{run_idx}/sequenced-pool", json=body
     )
+
+
+def _list_sequenced_pools(base_url: str, token: str, sequencing_run_idx: int) -> dict:
+    """GET /api/v1/sequencing-run/{sequencing_run_idx}/sequenced-pool. Returns the
+    run's pools with the preflight filename that tells them apart.
+
+    The read that produces a `sequenced_pool_idx`. Every other pool-scoped verb
+    takes one, and nothing else in this CLI returns one — `sequenced-pool create`
+    reports only the pool it just created-or-reused.
+    """
+    sub_path = PATH_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=sequencing_run_idx)
+    return _common.call("GET", base_url, token, f"{PATH_SEQUENCING_RUN_PREFIX}{sub_path}")
 
 
 def _post_preflight_update_lane(
@@ -99,6 +112,14 @@ def _handle_sequencing_run_lookup(args: argparse.Namespace, parser: argparse.Arg
     path = f"{PATH_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID}"
     return _common.run_http_subcommand(
         lambda t: _common.call("POST", args.base_url, t, path, json=body)
+    )
+
+
+def _handle_sequenced_pool_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """List a run's pools. The pool idx every other pool-scoped verb requires —
+    `alignment list`, `pool-completion`, `submit-align-pool` — comes from here."""
+    return _common.run_http_subcommand(
+        lambda t: _list_sequenced_pools(args.base_url, t, args.sequencing_run_idx)
     )
 
 
