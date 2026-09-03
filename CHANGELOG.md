@@ -36,7 +36,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   without a CLI change. The mask twin (`qiita mask list|show|samples`) is the shape, and
   the two now cover both identities an `align-denovo` submission names. `filter_params` moved
   from `cli/user/mask.py` to `cli/_common.py`, beside the `call` whose `params`
-  argument it builds, so the two verbs share one copy.
+  argument it builds, so the two modules share one copy.
 
 - **`POST /run-folder/inspect` lets a submit run from a machine that does not mount the
   cluster (#484).** `submit-bcl-convert` read `RunInfo.xml` and `submit-pacbio-ingest`

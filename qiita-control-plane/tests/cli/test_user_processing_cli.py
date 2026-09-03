@@ -95,8 +95,8 @@ def test_processing_list_sends_every_filter(monkeypatch):
 
 
 def test_processing_list_rejects_an_unknown_status(capsys):
-    """--status is closed over ProcessingStatus, so a typo exits 2 here rather
-    than reaching the server as an unfiltered list."""
+    """--status is closed over ProcessingStatus, so a typo exits 2 via argparse,
+    not as a server-side 422."""
     from qiita_control_plane.cli.user import main
 
     with pytest.raises(SystemExit) as exc_info:
