@@ -16,7 +16,6 @@ import argparse
 from qiita_common.api_paths import PATH_MASK_DEFINITION_PREFIX
 
 from .. import _common
-from ._helpers import _filter_params
 
 
 def _list_mask_definitions(
@@ -33,7 +32,7 @@ def _list_mask_definitions(
         base_url,
         token,
         PATH_MASK_DEFINITION_PREFIX,
-        params=_filter_params(
+        params=_common.filter_params(
             sequenced_pool_idx=sequenced_pool_idx, prep_sample_idx=prep_sample_idx
         ),
     )
@@ -60,7 +59,7 @@ def _list_mask_prep_samples(
         base_url,
         token,
         f"{PATH_MASK_DEFINITION_PREFIX}/{mask_idx}/prep-sample",
-        params=_filter_params(sequenced_pool_idx=sequenced_pool_idx),
+        params=_common.filter_params(sequenced_pool_idx=sequenced_pool_idx),
     )
 
 

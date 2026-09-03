@@ -5,12 +5,12 @@ assembly run is this, and are its samples ready to submit against?" — the
 questions that otherwise need a psql shell on the deploy host and DATABASE_URL.
 A `processing_idx` is a required input to `align-denovo` (the runner reads it as
 `assembly_processing_idx`), whose audience includes a plain `user`, so the reads
-sit in this CLI rather than `qiita-admin` (which keeps the lifecycle writes and
-the host-side backfills).
+sit in this CLI: they are credentialed API calls the server's own scope guard
+gates, which is the placement rule in `cli/user/__init__.py`.
 
-The mask twin of this module is `cli/user/mask.py`, and deliberately so: the two
-surfaces answer the same shape of question at the two identities a long-read
-assembly is submitted against.
+The mask twin of this module is `cli/user/mask.py`: the two surfaces answer the
+same shape of question at the two identities a long-read assembly is submitted
+against.
 
 Thin clients: each verb is one GET, printed verbatim, so a new server-side field
 reaches the operator without a CLI change.
@@ -26,7 +26,6 @@ from qiita_common.api_paths import (
 )
 
 from .. import _common
-from ._helpers import _filter_params
 
 
 def _list_processing(
@@ -45,7 +44,7 @@ def _list_processing(
         base_url,
         token,
         f"{PATH_PROCESSING_PREFIX}{PATH_PROCESSING_ROOT}",
-        params=_filter_params(
+        params=_common.filter_params(
             sequenced_pool_idx=sequenced_pool_idx,
             prep_sample_idx=prep_sample_idx,
             status=status,
@@ -76,7 +75,7 @@ def _list_processing_prep_samples(
         base_url,
         token,
         f"{PATH_PROCESSING_PREFIX}{sub_path}",
-        params=_filter_params(sequenced_pool_idx=sequenced_pool_idx),
+        params=_common.filter_params(sequenced_pool_idx=sequenced_pool_idx),
     )
 
 
@@ -105,9 +104,10 @@ def _handle_processing_show(args: argparse.Namespace, parser: argparse.ArgumentP
 
 
 def _handle_processing_samples(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """List the samples assembled under one run. `completed` and `no_data` are the
-    two states `align-denovo` admits — the first proceeds, the second ends the
-    ticket at NO_DATA; anything else is refused as bad input."""
+    """List the samples assembled under one run, each with its `assembly_sample`
+    gate state. What a submission does with each state is mapped in
+    `runner/_alignment.py`, over the contract on
+    `repositories.assembly.fetch_assembly_sample_state`."""
     return _common.run_http_subcommand(
         lambda t: _list_processing_prep_samples(
             args.base_url,

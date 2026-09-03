@@ -57,11 +57,6 @@ from .pool import (
     _read_preflight_rows,
     _resolved_decisions,
 )
-from .processing import (
-    _handle_processing_list,
-    _handle_processing_samples,
-    _handle_processing_show,
-)
 from .reference import (
     _handle_reference_list,
     _handle_reference_load,
@@ -127,9 +122,6 @@ __all__ = [
     "_handle_pool_completion",
     "_handle_prep_protocol_list",
     "_handle_prep_sample_retire",
-    "_handle_processing_list",
-    "_handle_processing_samples",
-    "_handle_processing_show",
     "_handle_profile_set",
     "_handle_read",
     "_handle_reference_list",

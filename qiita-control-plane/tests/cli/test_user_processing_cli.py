@@ -14,11 +14,22 @@ from qiita_common.api_paths import (
     URL_PROCESSING_PREFIX,
     URL_PROCESSING_PREP_SAMPLE,
 )
+from qiita_common.models import ProcessingListResponse, ProcessingPrepSampleListResponse
 
 from .test_user_cli import _BASE, _run
 
 _LIST_BODY = {"processing": [], "count": 0, "truncated": False}
 _ROSTER_BODY = {"processing_idx": 42, "samples": [], "count": 0, "truncated": False}
+
+
+def test_stub_bodies_are_valid_server_responses():
+    """The stubs above stand in for the two list routes, and nothing else in
+    this file would notice if they stopped resembling them. Validating each
+    against its wire model makes a server-side rename fail here rather than
+    leave the rest of the file asserting against a shape the server never
+    sends."""
+    ProcessingListResponse.model_validate(_LIST_BODY)
+    ProcessingPrepSampleListResponse.model_validate(_ROSTER_BODY)
 
 
 def test_processing_list_gets_the_prefix_with_no_params(monkeypatch):

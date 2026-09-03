@@ -764,9 +764,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mask_samples.set_defaults(handler=_handle_mask_samples)
 
     # `processing list` / `show` / `samples` — the mask twin, at the other identity
-    # a long-read assembly is submitted against. An `align-denovo` submission names
-    # a processing_idx (`assembly_processing_idx`) and a mask_idx; without these the
-    # first is only reachable by reading qiita.processing over psql on the host.
+    # an `align-denovo` submission names. See `cli/user/processing.py`.
     p_processing = sub.add_parser("processing", help="Assembly-run discovery (read-only)")
     p_processing_sub = p_processing.add_subparsers(dest="processing_cmd", required=True)
     p_processing_list = p_processing_sub.add_parser(
@@ -786,11 +784,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_processing_list.add_argument(
         "--status",
         choices=[s.value for s in ProcessingStatus],
-        help=(
-            "Only runs with this config lifecycle status; omit to list both."
-            " A deprecated run stays discoverable so what assembled published"
-            " contigs remains answerable."
-        ),
+        help="Only runs with this config lifecycle status; omit to list both",
     )
     p_processing_list.set_defaults(handler=_handle_processing_list)
 

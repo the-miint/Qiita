@@ -22,8 +22,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Added
 
 - **`qiita processing list` / `show` / `samples` — assembly-run discovery without psql
-  (#TBD).** `align-denovo` is submitted against a `processing_idx`, and nothing in either
-  CLI could produce one: finding it meant `SELECT processing_idx, params->>'assembler',
+  (#TBD).** `align-denovo` is submitted against a `processing_idx`, and until one has
+  already run against a given assembly there was no way to read one out: `qiita alignment
+  list` reports a de novo alignment's `processing_idx` in its `params`, but the FIRST
+  submission against a run had to find it with `SELECT processing_idx, params->>'assembler',
   params->>'mask_idx' FROM qiita.processing` over a psql shell on the deploy host, which
   needs `DATABASE_URL` and therefore an operator. The three GETs behind it already existed
   at `Scope.PREP_SAMPLE_READ` (`routes/processing.py`); these are the client verbs over
