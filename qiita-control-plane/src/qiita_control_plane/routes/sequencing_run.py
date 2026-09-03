@@ -682,7 +682,8 @@ async def get_sequenced_pool_qc_report(
     narrow for exactly this reason), so admitting the run's creator here would
     hand them QC blobs for samples in studies they hold nothing on. Narrowing this
     to the caller's readable samples would change what `merged` and `sample_count`
-    aggregate over, so it is a separate decision.
+    aggregate over, so it is a separate decision — Qiita#529 carries it, along with
+    the gate move that depends on it.
     `require_sequenced_pool_in_run` fronts 404 (no such pool) /
     422 (pool not under this run). A pool with no processed samples reads as an
     empty `samples` list and `merged.raw`/`merged.filtered` of None."""
@@ -867,7 +868,8 @@ async def get_sequenced_pool_completion(
     QC report, and for the same reason: a HumanUser with `Scope.PREP_SAMPLE_READ` at
     system_role wet_lab_admin+, NOT the run's creator. Every row carries a
     `biosample_accession` and the ENA accessions, unnarrowed across the pool's
-    studies. `require_sequenced_pool_in_run` fronts
+    studies. Narrowing then admitting the run's creator is Qiita#529.
+    `require_sequenced_pool_in_run` fronts
     404 (no such pool) / 422 (pool not under this run); a pool with no non-retired
     samples reads as all-zero counts and `complete=False`."""
     row = await fetch_sequenced_pool_completion(
