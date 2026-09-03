@@ -4,12 +4,10 @@ This is the read that makes a `sequenced_pool_idx` obtainable, so the cases that
 matter are the gate and the scoping: who may list a run's pools, and that a
 listing returns that run's pools and no others.
 
-The gate is deliberately NOT the wet_lab_admin floor its siblings carry
-(`get_sequencing_run`, `get_sequenced_pool`). It is `require_caller_owns_run()`,
-matching the POST on this same path — a caller who stood a run up can see which
-pools are on it. `test_list_pools_creator_user_can_read` is what pins that
-choice; without it the route would pass every other test here at the stricter
-gate.
+The gate is `require_caller_owns_run()`, as it is on the POST on this path and on
+the aggregate reads under it. `test_list_pools_creator_user_can_read` is what pins
+that choice; without it the route would pass every other test here at a
+wet_lab_admin floor.
 
 Uses the shared `ctx` (role-keyed clients + db pool) fixture from
 tests/routes/conftest.py.
@@ -132,9 +130,8 @@ async def test_list_pools_omits_the_preflight_blob_and_read_metrics(ctx, wet_run
 async def test_list_pools_creator_user_can_read(ctx, user_run):
     """The gate choice: a plain `user` who CREATED the run may list its pools.
 
-    This is what separates this route from `get_sequenced_pool` /
-    `get_sequencing_run`, which are wet_lab_admin+. Reading a pool from this list
-    still requires that higher floor; naming one does not.
+    The per-sample reads (QC report, exceptions) still require wet_lab_admin —
+    naming a run's pools discloses nothing about whose samples are on them.
     """
     resp = await ctx["user"].get(_url(user_run["run_idx"]))
     assert resp.status_code == 200, resp.text

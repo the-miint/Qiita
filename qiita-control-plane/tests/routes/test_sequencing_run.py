@@ -25,7 +25,7 @@ from qiita_common.auth_constants import API_PREFIX
 
 from qiita_control_plane.main import app
 
-from .conftest import delete_idxs, unique_instrument_id
+from .conftest import delete_idxs, make_caller_own_run, unique_instrument_id
 
 pytestmark = pytest.mark.db
 
@@ -443,11 +443,7 @@ async def test_get_sequencing_run_creator_can_read(ctx):
     client is what makes the test above a 403, and the two together are what pin
     ownership rather than role as the gate."""
     idx = await _create_run(ctx)
-    await ctx["pool"].execute(
-        "UPDATE qiita.sequencing_run SET created_by_idx = $1 WHERE idx = $2",
-        ctx["user_session"]["principal_idx"],
-        idx,
-    )
+    await make_caller_own_run(ctx, idx, principal_idx=ctx["user_session"]["principal_idx"])
     resp = await ctx["user"].get(f"{_ROUTE}/{idx}")
     assert resp.status_code == 200, resp.text
     assert resp.json()["sequencing_run_idx"] == idx

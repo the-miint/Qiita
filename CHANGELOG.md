@@ -31,10 +31,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   reading `qiita.sequenced_pool` over psql on the deploy host. The listing returns stored
   columns only — no `read_metrics`, which aggregates every constituent sequenced_sample and
   would cost a scan per row; the single-pool read still carries it for the one pool picked
-  out of the list. `run_preflight_filename` is what tells two pools of one run apart.
-  Gated on the run's creator (`require_caller_owns_run()`, wet_lab_admin+ bypass), matching
-  the POST on this path rather than the wet_lab_admin floor the single-pool read carries:
-  naming which pools exist is a different question from reading one's per-sample rollup.
+  out of the list. `run_preflight_filename` labels a pool rather than keying it: both of the
+  run's uniqueness indexes are partial (`WHERE ... IS NOT NULL`), so a non-NULL filename is
+  unique within its run while no-preflight pools are distinguishable only by idx.
+  Gated on the run's creator (`require_caller_owns_run()`, wet_lab_admin+ bypass), as the POST
+  on this path and the aggregate reads under it are — see the `Changed` entry below.
   `SequencedPoolResponse` now extends the new `SequencedPoolSummary` so the shared fields
   have one definition. No new path constant — the `PATH_`/`URL_` pair already existed for
   the POST.
@@ -3179,19 +3180,27 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
-- **The sequencing-run and sequenced-pool reads admit the run's creator, not just
-  wet_lab_admin (#TBD).** `GET /sequencing-run/{R}`, and the pool metadata, QC report,
-  completion rollup, sample exceptions and work-ticket summary reads under it, were gated
-  `require_role_at_least(WET_LAB_ADMIN)` — so a plain `user` who stood a run up could not
-  read the run or any metric under it, though they could create both. All six now use the
-  `require_caller_owns_run()` the pool POST on the same path already used: the creator
-  reads what is under their run, and wet_lab_admin+ still reads any run via the guard's
-  bypass. Because that bypass returns before any DB lookup, an admin sees
-  `require_sequenced_pool_in_run`'s 404 / 422 unchanged, and a non-owner is still refused
-  without learning whether the pool exists. The two pool-ALIGNMENT reads are untouched —
-  they narrow to the caller's readable samples rather than gating on the pool. The three
-  POSTs that mutate or launch compute (preflight update-lane, block-mask plan, align plan)
-  keep the wet_lab_admin floor: running work is not reading it.
+- **The AGGREGATE sequencing-run and sequenced-pool reads admit the run's creator, not just
+  wet_lab_admin (#TBD).** `GET /sequencing-run/{R}` and the pool metadata, completion rollup
+  and work-ticket summary reads under it were gated `require_role_at_least(WET_LAB_ADMIN)`, so
+  a plain `user` who stood a run up could not read the run or any metric under it though they
+  could create both. Those four now use the `require_caller_owns_run()` the pool POST on the
+  same path already used: the creator reads what is under their run, wet_lab_admin+ still
+  reads any run via the guard's bypass, and because that bypass returns before any DB lookup
+  an admin sees `require_sequenced_pool_in_run`'s 404 / 422 unchanged.
+
+  **The two PER-SAMPLE reads under the same prefix deliberately did not move.** The QC report
+  and the sequenced-sample exceptions return a row per sequenced_sample with no per-study
+  narrowing — the exceptions rows carry `biosample_accession` and the ENA accessions — and a
+  multiplexed pool spans studies, with the wet lab loading other groups' samples onto a run
+  through the wet_lab_admin bypass on pool create and sample import. Admitting the run's
+  creator there would disclose per-sample data for studies they hold nothing on, so both keep
+  the wet_lab_admin floor and each carries the reasoning at its handler. Narrowing them to the
+  caller's readable samples the way the pool-ALIGNMENT reads do would change what `merged` and
+  `sample_count` aggregate over, so it is left as a separate decision. The alignment reads
+  themselves are untouched, and the three POSTs that mutate or launch compute (preflight
+  update-lane, block-mask plan, align plan) keep the wet_lab_admin floor: running work is not
+  reading it.
 
 - **`ticket:doput` is now on the USER role ceiling (#484).** It was on the two admin
   ceilings and service accounts only, dating from when reference loading was the sole

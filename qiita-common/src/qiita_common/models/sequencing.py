@@ -213,11 +213,12 @@ class SequencedPoolSummary(BaseModel):
 
     The pool's stored metadata and nothing computed. The BYTEA
     `run_preflight_blob` is omitted here as it is on the single-pool read; only
-    `run_preflight_filename` is surfaced, and it is what tells two pools of one
-    run apart — the pair is co-populated or both NULL
-    (`sequenced_pool_run_preflight_pair_consistent`), and a run's pools are
-    unique on both preflight content and filename, so a non-NULL filename is a
-    stable label.
+    `run_preflight_filename` is surfaced. It labels a pool rather than keying it:
+    the run's uniqueness indexes on filename and on preflight content are both
+    PARTIAL (`WHERE ... IS NOT NULL`), and the pair is co-populated or both NULL
+    (`sequenced_pool_run_preflight_pair_consistent`), so a non-NULL filename is
+    unique within its run while a run may hold any number of no-preflight pools
+    this field cannot tell apart. Those are distinguishable only by idx.
 
     No `read_metrics`: that rollup aggregates every constituent sequenced_sample
     at request time, and a list would pay it per row. The single-pool read

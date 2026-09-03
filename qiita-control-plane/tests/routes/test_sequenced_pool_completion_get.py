@@ -25,6 +25,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
 )
 
+from .conftest import make_caller_own_run
+
 pytestmark = pytest.mark.db
 
 
@@ -472,19 +474,16 @@ async def test_get_completion_missing_scope_403(seeded_pool, no_prep_sample_read
 
 
 async def test_get_completion_regular_user_403(ctx, seeded_pool):
-    # Non-owner: the gate is `require_caller_owns_run()`, and this run was created
-    # by the wet-admin principal. A plain user is refused for not owning it, not
-    # for lacking a role — the twin below is the owner case.
+    # Non-owner: the run was created by the wet-admin principal, so the plain user
+    # is refused for not owning it rather than for lacking a role.
     resp = await ctx["user"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
     assert resp.status_code == 403
 
 
 async def test_get_completion_run_creator_can_read(ctx, seeded_pool):
     """A plain user who created the RUN reads its pool's completion rollup."""
-    await ctx["pool"].execute(
-        "UPDATE qiita.sequencing_run SET created_by_idx = $1 WHERE idx = $2",
-        ctx["user_session"]["principal_idx"],
-        seeded_pool["run_idx"],
+    await make_caller_own_run(
+        ctx, seeded_pool["run_idx"], principal_idx=ctx["user_session"]["principal_idx"]
     )
     resp = await ctx["user"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
     assert resp.status_code == 200, resp.text

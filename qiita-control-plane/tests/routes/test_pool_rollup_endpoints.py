@@ -27,6 +27,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
 )
 
+from .conftest import make_caller_own_run
+
 pytestmark = pytest.mark.db
 
 
@@ -208,22 +210,24 @@ async def test_exceptions_anonymous_401(ctx, seeded):
 
 
 async def test_exceptions_regular_user_403(ctx, seeded):
-    # Non-owner: the gate is `require_caller_owns_run()`, and this run was created
-    # by the wet-admin principal. A plain user is refused for not owning it, not
-    # for lacking a role — the twin below is the owner case.
+    # Non-owner: the run was created by the wet-admin principal, so the plain user
+    # is refused for not owning it rather than for lacking a role.
     resp = await ctx["user"].get(_exc_url(seeded["run_idx"], seeded["pool_idx"]))
     assert resp.status_code == 403
 
 
-async def test_exceptions_run_creator_can_read(ctx, seeded):
-    """A plain user who created the RUN reads its pool's sample exceptions."""
-    await ctx["pool"].execute(
-        "UPDATE qiita.sequencing_run SET created_by_idx = $1 WHERE idx = $2",
-        ctx["user_session"]["principal_idx"],
-        seeded["run_idx"],
+async def test_exceptions_run_creator_still_403(ctx, seeded):
+    """The run's creator is refused here, unlike the work-ticket summary below.
+
+    Every row carries a `biosample_accession` and the ENA accessions for a sample,
+    unnarrowed across the pool's studies. Same reasoning as the QC report; this test
+    is what stops the gate being widened by symmetry with its siblings.
+    """
+    await make_caller_own_run(
+        ctx, seeded["run_idx"], principal_idx=ctx["user_session"]["principal_idx"]
     )
     resp = await ctx["user"].get(_exc_url(seeded["run_idx"], seeded["pool_idx"]))
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 403
 
 
 # --------------------------------------------------------------------------- #
@@ -255,19 +259,16 @@ async def test_work_ticket_summary_coverage_and_state_counts(ctx, seeded):
 
 
 async def test_work_ticket_summary_regular_user_403(ctx, seeded):
-    # Non-owner: the gate is `require_caller_owns_run()`, and this run was created
-    # by the wet-admin principal. A plain user is refused for not owning it, not
-    # for lacking a role — the twin below is the owner case.
+    # Non-owner: the run was created by the wet-admin principal, so the plain user
+    # is refused for not owning it rather than for lacking a role.
     resp = await ctx["user"].get(_wt_url(seeded["run_idx"], seeded["pool_idx"]))
     assert resp.status_code == 403
 
 
 async def test_work_ticket_summary_run_creator_can_read(ctx, seeded):
     """A plain user who created the RUN reads its pool's work-ticket summary."""
-    await ctx["pool"].execute(
-        "UPDATE qiita.sequencing_run SET created_by_idx = $1 WHERE idx = $2",
-        ctx["user_session"]["principal_idx"],
-        seeded["run_idx"],
+    await make_caller_own_run(
+        ctx, seeded["run_idx"], principal_idx=ctx["user_session"]["principal_idx"]
     )
     resp = await ctx["user"].get(_wt_url(seeded["run_idx"], seeded["pool_idx"]))
     assert resp.status_code == 200, resp.text

@@ -52,9 +52,10 @@ def _list_sequenced_pools(base_url: str, token: str, sequencing_run_idx: int) ->
     """GET /api/v1/sequencing-run/{sequencing_run_idx}/sequenced-pool. Returns the
     run's pools with the preflight filename that tells them apart.
 
-    The read that produces a `sequenced_pool_idx`. Every other pool-scoped verb
-    takes one, and nothing else in this CLI returns one — `sequenced-pool create`
-    reports only the pool it just created-or-reused.
+    The read that produces a `sequenced_pool_idx` from a run. The other two
+    surfaces that report one require already holding it or having just written it:
+    `sequenced-pool create` returns the pool it created-or-reused, and a
+    pool-scoped `ticket status` echoes its scope target.
     """
     sub_path = PATH_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=sequencing_run_idx)
     return _common.call("GET", base_url, token, f"{PATH_SEQUENCING_RUN_PREFIX}{sub_path}")
