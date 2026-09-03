@@ -13,6 +13,16 @@ from qiita_common.models import Platform, RunFolderInspectRequest, RunFolderInsp
 from .. import _common
 
 
+def _filter_params(**filters: int | str | None) -> dict[str, str]:
+    """Stringify the supplied query filters, dropping the unset ones, so an
+    omitted flag stays off the wire and the server's own default applies.
+
+    Shared by the read-only discovery verbs (`mask`, `processing`), whose
+    optional filters are all scalars the server re-echoes.
+    """
+    return {name: str(value) for name, value in filters.items() if value is not None}
+
+
 def _inspect_run_folder(
     base_url: str, token: str, run_folder: Path, platform: Platform
 ) -> RunFolderInspectResponse:

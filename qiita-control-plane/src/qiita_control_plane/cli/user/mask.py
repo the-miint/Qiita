@@ -16,12 +16,7 @@ import argparse
 from qiita_common.api_paths import PATH_MASK_DEFINITION_PREFIX
 
 from .. import _common
-
-
-def _filter_params(**filters: int | None) -> dict[str, str]:
-    """Stringify the supplied filters, dropping the unset ones, so an omitted
-    flag stays off the wire and the server's own default applies."""
-    return {name: str(value) for name, value in filters.items() if value is not None}
+from ._helpers import _filter_params
 
 
 def _list_mask_definitions(
