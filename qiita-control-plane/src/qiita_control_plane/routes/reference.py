@@ -107,7 +107,11 @@ from ..shard_orchestration import (
     BUILD_SHARD_INDEX_ACTION_ID,
     expected_shard_index_types,
 )
-from ._helpers import REFERENCE_NOT_FOUND_DETAIL, require_reference_exists
+from ._helpers import (
+    GENOME_MAP_HARD_CAP,
+    REFERENCE_NOT_FOUND_DETAIL,
+    require_reference_exists,
+)
 
 router = APIRouter(prefix=PATH_REFERENCE_PREFIX, tags=["reference"])
 
@@ -121,15 +125,6 @@ _REFERENCE_RETURNING = REFERENCE_RETURNING
 # worst-case payload and is caller-overridable via ?limit=.
 _DEFAULT_LIST_LIMIT = 1000
 _MAX_LIST_LIMIT = 5000
-
-# Hard cap on the genome map, and the one place in the codebase where exceeding a
-# cap is a refusal rather than a truncation — see get_reference_genome_map. Sized
-# from a response-body budget rather than by borrowing another route's number: an
-# entry serializes to roughly 90 bytes of JSON, so this is a ~22 MB worst case,
-# large but deliverable in one body and far above any genome-bearing reference we
-# roll up today. The reference that first trips it is the signal to build the
-# streamed form, not to raise this.
-_GENOME_MAP_HARD_CAP = 250_000
 
 
 @router.post(PATH_REFERENCE_ROOT, status_code=201)
@@ -382,14 +377,14 @@ async def get_reference_genome_map(
     # Over-fetch by one to detect the overflow; only the refusal path pays for
     # counting the true size, which is what tells a caller whether they are barely
     # over or hopelessly over.
-    rows = await fetch_genome_map(pool, reference_idx, limit=_GENOME_MAP_HARD_CAP + 1)
-    if len(rows) > _GENOME_MAP_HARD_CAP:
+    rows = await fetch_genome_map(pool, reference_idx, limit=GENOME_MAP_HARD_CAP + 1)
+    if len(rows) > GENOME_MAP_HARD_CAP:
         total = await count_genome_map(pool, reference_idx)
         raise HTTPException(
             status_code=413,
             detail=(
                 f"Genome map for reference {reference_idx} has {total} entries,"
-                f" over the {_GENOME_MAP_HARD_CAP} maximum this endpoint serves."
+                f" over the {GENOME_MAP_HARD_CAP} maximum this endpoint serves."
             ),
         )
     return GenomeMapResponse(

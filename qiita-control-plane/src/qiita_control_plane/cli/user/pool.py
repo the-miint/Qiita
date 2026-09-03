@@ -1489,9 +1489,11 @@ def _render_pool_completion(body: dict | list) -> None:
         f"pool {body.get('sequenced_pool_idx')}: {verdict}"
         f" — demux {body.get('demux_state')};"
         f" host-masking {body.get('samples_completed')}/{body.get('sample_count')} completed,"
+        f" {body.get('samples_invalidated')} withdrawn samples,"
         f" {body.get('samples_no_data')} no-data,"
         f" {body.get('samples_in_flight')} in-flight,"
         f" {body.get('samples_failed')} failed,"
+        f" {body.get('samples_cancelled')} cancelled,"
         f" {body.get('samples_not_submitted')} never-submitted",
         file=sys.stderr,
     )

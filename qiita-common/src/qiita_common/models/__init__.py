@@ -52,6 +52,7 @@ from qiita_common.models._base import (
     StudyPrepScopeTarget,
     check_derived_inputs,
     check_exactly_one_runtime,
+    check_withdrawal_reason,
 )
 from qiita_common.models.auth import (
     ApiTokenMintRequest,
@@ -131,6 +132,18 @@ from qiita_common.models.prep_sample import (
     PrepSampleStudyFieldCreateRequest,
     PrepSampleStudyFieldResponse,
 )
+from qiita_common.models.processing import (
+    AssemblySampleState,
+    AssemblySampleStatusUpdate,
+    AssemblySampleStatusUpdateResponse,
+    Processing,
+    ProcessingListResponse,
+    ProcessingPrepSample,
+    ProcessingPrepSampleListResponse,
+    ProcessingStatus,
+    ProcessingStatusUpdate,
+    ProcessingSummary,
+)
 from qiita_common.models.reference import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
@@ -141,6 +154,7 @@ from qiita_common.models.reference import (
     MAX_EXPORTED_FEATURE_ENTITIES,
     READ_MASK_BUCKET,
     VALID_STATUS_TRANSITIONS,
+    AssemblyGenomeMapResponse,
     ExportedFeature,
     ExportedFeatureRequest,
     ExportedFeatureResponse,
@@ -248,6 +262,7 @@ from qiita_common.models.step import (
     AlignmentCohortDoGetTicketRequest,
     AlignmentDoGetTicketRequest,
     AssemblyDoGetTicketRequest,
+    AssemblyRunDoGetTicketRequest,
     DoGetTicketRequest,
     DoGetTicketResponse,
     FoundJobWire,
@@ -397,6 +412,7 @@ __all__ = [
     "StudyPrepScopeTarget",
     "check_derived_inputs",
     "check_exactly_one_runtime",
+    "check_withdrawal_reason",
     # Health.
     "HealthResponse",
     "HealthStatus",
@@ -411,6 +427,7 @@ __all__ = [
     "ExportedFeature",
     "ExportedFeatureRequest",
     "ExportedFeatureResponse",
+    "AssemblyGenomeMapResponse",
     "GenomeMapEntry",
     "GenomeMapResponse",
     "GenomeSource",
@@ -449,6 +466,7 @@ __all__ = [
     "AlignmentCohortDoGetTicketRequest",
     "AlignmentDoGetTicketRequest",
     "AssemblyDoGetTicketRequest",
+    "AssemblyRunDoGetTicketRequest",
     "ReadDoGetTicketRequest",
     "DoGetTicketRequest",
     "DoGetTicketResponse",
@@ -605,6 +623,18 @@ __all__ = [
     "MaskSampleStatusUpdate",
     "MaskSampleStatusUpdateResponse",
     "MaskStateSource",
+    # Processing-run identity and its lifecycle (the assembly twin of the mask
+    # lifecycle names above).
+    "AssemblySampleState",
+    "AssemblySampleStatusUpdate",
+    "AssemblySampleStatusUpdateResponse",
+    "Processing",
+    "ProcessingListResponse",
+    "ProcessingPrepSample",
+    "ProcessingPrepSampleListResponse",
+    "ProcessingStatus",
+    "ProcessingStatusUpdate",
+    "ProcessingSummary",
     "MateQCAggregate",
     "MergedQCAggregate",
     "PointQCAggregate",

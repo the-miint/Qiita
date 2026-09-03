@@ -85,7 +85,8 @@ fi
 # VERIFY_MATCH. Optional: SOURCES (space-separated licensed/vendored artifacts
 # staged from images/sources next to the def); DEF_FILE (the def to build,
 # relative to the workflow dir — defaults to Apptainer.def, the legacy name);
-# HASH_INPUTS (space-separated workflow-relative files that are THIS image's
+# HASH_INPUTS (space-separated files, workflow-relative unless they escape the
+# workflow dir — see below — that are THIS image's
 # build inputs — set by multi-image specs to scope the idempotency hash).
 # shellcheck source=/dev/null
 source "${SPEC}"
@@ -151,11 +152,19 @@ HASH_PATH="${SIF_PATH}.buildhash"
 # def/entrypoint/manifest changes it and so triggers a rebuild below, while a
 # re-vendored SOURCES (deliberately excluded) does not.
 #
-# A multi-image spec declares HASH_INPUTS (its own def + entrypoint(s), workflow-
+# A multi-image spec declares HASH_INPUTS (its own def + entrypoint(s), usually
 # relative; NOT _shared/, which every hash covers wholesale) so the hash is scoped to
 # THIS image — an edit to a sibling tool's def then leaves this image's stamp
 # unchanged and skips its rebuild. Without HASH_INPUTS (the legacy single-image
 # case) the whole workflow dir is hashed, exactly as before.
+#
+# An entry may point OUTSIDE the workflow directory (`../../qiita-common/...`),
+# which is how an image takes a first-party module the services also import rather
+# than carrying its own copy. Those are collected here and staged beside the def
+# below, because the build root mirrors only <workflow>/ and _shared/ — the def
+# %files-copies such an entry by BASENAME, not by the path written here.
+declare -a EXTERNAL_INPUTS=()
+WORKFLOW_DIR_REAL="$(cd "${WORKFLOW_DIR}" && pwd -P)"
 if [[ -n "${HASH_INPUTS:-}" ]]; then
     hash_files=("${DEF}")
     for rel in ${HASH_INPUTS}; do
@@ -163,6 +172,17 @@ if [[ -n "${HASH_INPUTS:-}" ]]; then
         if [[ ! -f "${f}" ]]; then
             echo "${SPEC} lists HASH_INPUTS entry '${rel}' but ${f} does not exist" >&2
             exit 64
+        fi
+        # Canonicalize both sides before asking "is this inside the workflow dir?" —
+        # `${rel}` carries `../` segments that a plain string compare would not see
+        # through. `pwd -P` rather than realpath: not on macOS by default.
+        f_dir="$(cd "$(dirname "${f}")" && pwd -P)"
+        # A PREFIX test, not directory equality: an entry in a workflow SUBdirectory
+        # is already staged by the tree copy below, and flattening it to the build
+        # root would put a second copy beside the def under a name the collision
+        # check cannot see. Only a path that leaves the workflow tree is staged.
+        if [[ "${f_dir}" != "${WORKFLOW_DIR_REAL}" && "${f_dir}" != "${WORKFLOW_DIR_REAL}"/* ]]; then
+            EXTERNAL_INPUTS+=("${f_dir}/$(basename "${f}")")
         fi
         hash_files+=("${f}")
     done
@@ -223,6 +243,20 @@ for f in "${WORKFLOW_DIR}"/*; do
     cp -R "${f}" "${BUILD_WF_DIR}/${base}"
 done
 
+# Stage the HASH_INPUTS entries that live outside the workflow dir, beside the def
+# under their bare basename (which is how the def %files-copies them). Refused on a
+# collision rather than overwriting: the file the def would then copy is not the one
+# whose bytes went into the hash, so the stamp would certify the wrong content.
+for ext in ${EXTERNAL_INPUTS+"${EXTERNAL_INPUTS[@]}"}; do
+    base="$(basename "${ext}")"
+    if [[ -e "${BUILD_WF_DIR}/${base}" ]]; then
+        echo "HASH_INPUTS entry '${ext}' collides with ${WORKFLOW}/${base}" >&2
+        echo "Rename one: the def copies it by basename, so the build cannot tell them apart." >&2
+        exit 64
+    fi
+    cp "${ext}" "${BUILD_WF_DIR}/${base}"
+done
+
 # Stage each vendored source artifact from images/sources next to the def
 # (the def's %files references them by bare filename).
 for src in ${SOURCES:-}; do
@@ -231,6 +265,12 @@ for src in ${SOURCES:-}; do
         echo "Expected vendored source not found at:" >&2
         echo "  ${src_path}" >&2
         echo "Place it there before building; see DEPLOY_CHECKLIST.md for the recipe." >&2
+        exit 64
+    fi
+    if [[ -e "${BUILD_WF_DIR}/${src}" ]]; then
+        echo "Vendored source '${src}' collides with a file already staged for this build" >&2
+        echo "(a workflow file or a HASH_INPUTS entry). The def copies by basename, so" >&2
+        echo "the build cannot tell them apart — rename one." >&2
         exit 64
     fi
     cp "${src_path}" "${BUILD_WF_DIR}/${src}"

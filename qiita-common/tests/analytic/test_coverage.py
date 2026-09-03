@@ -141,3 +141,33 @@ def test_the_rollup_warning_names_the_share_and_what_is_missing():
     assert "40 of 100" in warning
     assert "40.0%" in warning
     assert "7 features" in warning
+
+
+@pytest.mark.parametrize("scope", list(ft.CoverageScope))
+@pytest.mark.parametrize("combined", [False, True])
+def test_survivor_parameters_matches_the_placeholders_its_statement_carries(scope, combined):
+    """The threshold appears once per ARM, so the combined statement binds it twice.
+
+    Pinned the way `gated_alignment_parameters` is: a caller that passed the wrong
+    count gets a bind error, but only after the arms had been written — and the two
+    are built by separate functions, so nothing but this holds them together.
+    """
+    sql = ft.survivor_table_sql(scope, combined=combined)
+    parameters = ft.survivor_parameters(0.01, combined=combined)
+    assert sql.count("?") == len(parameters)
+    assert parameters == [0.01] * (2 if combined else 1)
+
+
+@pytest.mark.parametrize("scope", list(ft.CoverageScope))
+def test_the_combined_survivor_set_unions_both_arms_into_one_relation(scope):
+    """One relation covering both arms, not two. `ogu_input_table_sql` joins the
+    survivors once per arm, and two relations would let a genome survive in one join
+    and not the other — a table whose filter and whose counts disagree about what it
+    contains.
+    """
+    combined = ft.survivor_table_sql(scope, combined=True)
+    assert " UNION " in combined
+    assert ft.DENOVO_MAP_TABLE in combined
+    assert combined.count(f"CREATE TABLE {ft.survivor_table_name(scope)}") == 1
+    # And the uncombined form mentions the de novo arm nowhere at all.
+    assert ft.DENOVO_MAP_TABLE not in ft.survivor_table_sql(scope)

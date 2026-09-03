@@ -335,7 +335,8 @@ def feature_topology_view_sql() -> str:
     `coverage`, `identity` and `mixed_strand`, the three this gate reads, are computed
     identically either way. So the claim is the one under which the gap column would
     mean "wrap distance", and nothing else; qiita records real circularity only for
-    assembled contigs (`assembly_membership.kind`), never for a reference's features.
+    assembled contigs (`assembly_membership.circularity`, and `kind` for the
+    routing it drove), never for a reference's features.
     """
     return (
         f"CREATE VIEW {FEATURE_TOPOLOGY_VIEW} AS "

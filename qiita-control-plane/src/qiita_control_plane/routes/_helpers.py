@@ -10,6 +10,7 @@ from typing import NoReturn
 
 import asyncpg
 from fastapi import HTTPException
+from qiita_common.auth_constants import SystemRole
 from qiita_common.models import (
     GLOBAL_FIELD_IDX_ATTR,
     STUDY_FIELD_IDX_ATTR,
@@ -31,7 +32,7 @@ from ..auth.guards import (
     PrepSampleReadAccess,
     filter_prep_samples_caller_can_read,
 )
-from ..auth.principal import Principal
+from ..auth.principal import HumanUser, Principal
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
@@ -79,6 +80,20 @@ async def require_reference_exists(pool: asyncpg.Pool, reference_idx: int) -> No
 # of one condition is a difference a client can accidentally depend on, and the delete
 # route had its own until they were converged.
 ALIGNMENT_NOT_FOUND_DETAIL = "alignment not found"
+
+
+# Hard cap on a genome map, and the one place in the codebase where exceeding a cap
+# is a refusal rather than a truncation — see `get_reference_genome_map`. Sized from
+# a response-body budget rather than by borrowing another route's number: an entry
+# serializes to roughly 90 bytes of JSON, so this is a ~22 MB worst case, large but
+# deliverable in one body and far above any genome-bearing reference we roll up
+# today. The map that first trips it is the signal to build the streamed form, not
+# to raise this.
+#
+# Shared by the reference map and the assembly-run map, which are the same read over
+# two feature spaces: two numbers here would let one route refuse what the other
+# serves for no reason a caller could see.
+GENOME_MAP_HARD_CAP = 250_000
 
 
 async def authorize_completed_alignment_cohort(
@@ -910,6 +925,24 @@ async def resolve_idxs_by_natural_key(
     resolved = await fetcher(dedup_ordered)
     missing = [v for v in dedup_ordered if v not in resolved]
     return resolved, missing
+
+
+def gate_roster_narrowing_idx(caller: HumanUser) -> int | None:
+    """The principal_idx a gate-roster read narrows its sample set to, or None for
+    a caller who sees every sample.
+
+    wet_lab_admin and above bypass the per-study check on the submission side
+    (`_check_prep_sample_study_access`), and bypass it here on the same threshold,
+    so a caller who can submit against a sample can also discover the mask that
+    filtered it and the run that assembled it.
+
+    Shared by every roster over a per-(identity, prep_sample) gate — the mask
+    reads and the processing reads — because two thresholds over the same sample
+    set would be two answers to "may I see this sample".
+    """
+    if caller.has_role_at_least(SystemRole.WET_LAB_ADMIN):
+        return None
+    return caller.principal_idx
 
 
 def cap_rows[T](rows: list[T], cap: int) -> tuple[list[T], bool]:

@@ -84,7 +84,11 @@ def _seed_assembly_rows(data_plane):
             "(700014, 0, 'TTTTAAAA'), (700015, 0, 'CCCCGGGG')"
         )
         conn.execute(
-            "INSERT INTO qiita_lake.assembly_membership VALUES "
+            # Explicit column list: the data plane owns this table's schema and
+            # has since gained the assembler attribute columns, so a positional
+            # VALUES list would have to grow with it. These rows leave them NULL.
+            "INSERT INTO qiita_lake.assembly_membership"
+            " (prep_sample_idx, processing_idx, kind, bin_id, feature_idx) VALUES "
             f"({ASSEMBLY_SAMPLE}, {ASSEMBLY_RUN}, 'LCG', 'contig_1', 700011), "
             f"({ASSEMBLY_SAMPLE}, {ASSEMBLY_RUN}, 'MAG', 'bin.1', 700013), "
             # Same contig, second bin of the SAME run — one output row, not two.

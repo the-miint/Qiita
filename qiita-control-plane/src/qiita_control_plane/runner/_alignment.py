@@ -26,9 +26,10 @@ from qiita_common.actions import (
     context_schema_default,
 )
 from qiita_common.analytic import MAX_SECONDARY
-from qiita_common.api_paths import LibraryPrimitive
+from qiita_common.api_paths import URL_PROCESSING_SAMPLE_STATUS, LibraryPrimitive
 from qiita_common.backend_failure import StepNoData
 
+from ..feature_table import SUBJECT_ASSEMBLY
 from ..repositories.alignment_definition import (
     ParamsDoNotSurviveStorageError,
     fetch_alignment_definition_by_idx,
@@ -73,8 +74,6 @@ _KNOB_TYPES = {
     MIN_QUERY_COVERAGE_BINDING: float,
 }
 
-# What the reads are aligned AGAINST, as an identity term: the sample's own contigs.
-_SUBJECT_ASSEMBLY = "assembly"
 
 # The aligner, as an identity term. Fixed rather than a knob: the de novo subject is a
 # long-read assembly and `align_denovo` calls minimap2. It is hashed anyway so that
@@ -156,7 +155,7 @@ def _build_denovo_alignment_params(
             "fall back on"
         )
     return {
-        "subject": _SUBJECT_ASSEMBLY,
+        "subject": SUBJECT_ASSEMBLY,
         "workflow": action_id,
         "version": action_version,
         "aligner": _ALIGNER,
@@ -210,6 +209,13 @@ async def _require_assembly_subject(
     terminal-but-not-a-failure `StepNoData` (the run assembled nothing, so this sample
     has no subject), and everything else is bad input.
 
+    'invalidated' gets its own message rather than falling into the catch-all. It is
+    already refused there — the gate contract admits 'completed' alone, which is what
+    makes withdrawal hold without this function growing a second check — but "gate
+    reads 'invalidated'" would send the operator looking for a stalled run, when what
+    happened is that someone withdrew a run that DID assemble. The remedy is a person's
+    decision, not a resubmit.
+
     Absence gets its own message rather than falling into the catch-all, because it is
     reachable for a sample that really did assemble: this is the first consumer to read
     the gate, and runs that finished before it existed wrote no row (see the
@@ -236,6 +242,16 @@ async def _require_assembly_subject(
                 f"assembly run {processing_idx} produced no contigs for prep_sample "
                 f"{prep_sample_idx}; there is nothing to align against"
             ),
+        )
+    if state == "invalidated":
+        raise _submission_bad_input(
+            f"assembly run {processing_idx} for prep_sample {prep_sample_idx} was "
+            "invalidated: it assembled contigs and someone withdrew them, so they are "
+            "not to be consumed. Aligning against them would carry the withdrawn "
+            "assembly into this run's output. Read the invalidation_reason on "
+            "qiita.assembly_sample; the contigs become alignable again only if the "
+            "pair is restored via PATCH "
+            f"{URL_PROCESSING_SAMPLE_STATUS.format(processing_idx=processing_idx)}"
         )
     raise _submission_bad_input(
         f"assembly run {processing_idx} for prep_sample {prep_sample_idx} is not "

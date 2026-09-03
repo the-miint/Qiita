@@ -1,4 +1,5 @@
-"""The three input streams, staged into the relations the rest of the analytic reads.
+"""The reference arm's input streams, staged into the relations the rest of the
+analytic reads.
 
 | Relation | Columns | Source |
 |---|---|---|
@@ -8,6 +9,10 @@
 
 The map's source must be keyed `(feature_idx, genome_idx)`; `map_table_sql` does
 the rename to the column names `genome_coverage` requires.
+
+A combined table stages a second arm alongside these, from `reconcile`. The arms
+have their own alignment slices and their own maps; they share the per-genome length
+denominators and, downstream, one survivor set and one woltka input.
 
 Every `source` here is interpolated verbatim — see the package docstring for what
 that obliges of a caller.

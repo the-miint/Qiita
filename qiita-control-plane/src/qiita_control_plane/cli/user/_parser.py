@@ -810,6 +810,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="From `qiita alignment list`; its params say which reference it used.",
     )
     p_ft_build.add_argument(
+        "--denovo-alignment-idx",
+        type=int,
+        help=(
+            "Also read this alignment — the cohort against its OWN assembled contigs —"
+            " and build a COMBINED (inverted open reference) table. Each read is counted"
+            " once: against its own contig where the de novo arm placed it, against the"
+            " reference otherwise. Reference genomes therefore lose the reads the de novo"
+            " arm wins, so one that clears --coverage-threshold without this flag can drop"
+            " out with it. From `qiita alignment list`; its params must name the same"
+            " mask_idx as --alignment-idx. Cannot be combined with --circular-gate."
+            " A prep_sample in the cohort that assembled nothing simply has no de novo"
+            " arm and stays reference-only; it is not an error."
+        ),
+    )
+    p_ft_build.add_argument(
         "--prep-sample-idx",
         type=int,
         action="append",
@@ -1876,16 +1891,21 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "GET the pool's completion status. Reports the pool-scoped demux"
             " (bcl-convert) `demux_state`, then classifies each non-retired"
-            " sequenced_sample by the state of its read-mask (host-masking) work"
-            " tickets (completed / in-flight / no-data / failed / not-submitted)"
-            " into pool-level counts, with a `complete` flag set when every sample"
-            " reached a terminal-accounted state (COMPLETED or NO_DATA) and a"
+            " sequenced_sample into pool-level counts (completed / invalidated /"
+            " in-flight / no-data / cancelled / failed / not-submitted), with a"
+            " `complete` flag set when every sequenced_sample reached a usable or"
+            " terminal-accounted state (masked, or NO_DATA) and a"
             " `fully_processed` flag set when demux COMPLETED and host-masking is"
-            " complete. It tells the operator whether the per-sample fan-out from"
-            " submit-host-filter-pool has finished — including samples a partial"
-            " fan-out never submitted (`samples_not_submitted`). Compute-on-read"
-            " over the work tickets — it never drifts when a sample is re-processed"
-            " or deleted."
+            " complete. It tells the operator whether host-masking has finished,"
+            " by either path — the per-sample read-mask fan-out from"
+            " submit-host-filter-pool, or a block-mask plan —"
+            " including sequenced_samples a partial fan-out never submitted"
+            " (`samples_not_submitted`) and masking runs withdrawn after the fact"
+            " (`samples_invalidated`), which are counted but are not usable."
+            " Whether a sequenced_sample counts as masked is read primarily from"
+            " the same gate the masked-read pull reads. Compute-on-read — it never"
+            " drifts when a sequenced_sample is re-processed, withdrawn, or"
+            " deleted."
         ),
     )
     p_pool_completion.add_argument(

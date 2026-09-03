@@ -45,6 +45,10 @@ import re
 from pathlib import Path
 
 import pytest
+from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTE_COLUMNS,
+    CONTIG_ATTRIBUTES_FILE,
+)
 
 from qiita_compute_orchestrator.jobs._assembly import LCG_FILE, NOLCG_FILE
 
@@ -57,12 +61,23 @@ _BINNING_VERIFY = _WORKFLOW_DIR / "binning-verify.sh"
 _BIN_REFINE_SH = _WORKFLOW_DIR / "bin_refine.sh"
 _BIN_REFINE_DEF = _WORKFLOW_DIR / "bin_refine.def"
 _CHECKM_SH = _WORKFLOW_DIR / "checkm.sh"
+_ASSEMBLE_DEF = _WORKFLOW_DIR / "assemble.def"
+
+# What each assembler's `%test` must grep its `--version` output for. myloasm
+# reports its conda version verbatim; hifiasm_meta reports two internal versions
+# that its conda string (`hamtv0.3.5`) does not contain, so neither can be derived
+# from the pin and both are written out here.
+_ASSERTED_VERSIONS = {
+    "hifiasm_meta": ("0.13-r308", "0.3-r079"),
+    "myloasm": ("0.6.0",),
+}
 
 
 @pytest.mark.parametrize(
     "path",
     [
         _ASSEMBLE_SH,
+        _ASSEMBLE_DEF,
         _BINNING_SH,
         _BINNING_DEF,
         _BINNING_VERIFY,
@@ -75,7 +90,7 @@ def test_source_file_is_present_and_parses(path: Path) -> None:
     """Anti-vacuity guard, matching the sibling static pins.
 
     Every assertion below reads one of these files through `_code_lines` — all
-    seven, which is why all seven are listed here rather than the three `binning`
+    eight, which is why all eight are listed here rather than the three `binning`
     ones. A moved file or a `_REPO_ROOT` that stopped resolving would make the
     absence-shaped pins pass for the wrong reason, so fail loudly here first.
     """
@@ -146,11 +161,12 @@ def _strip_comment(line: str) -> str:
 @pytest.mark.parametrize(
     ("path", "dir_var", "expected"),
     [
-        (_ASSEMBLE_SH, "OUT", {LCG_FILE, NOLCG_FILE}),
+        (_ASSEMBLE_SH, "OUT", {LCG_FILE, NOLCG_FILE, CONTIG_ATTRIBUTES_FILE}),
         (_BINNING_SH, "GENOMES_DIR", {NOLCG_FILE}),
         (_BIN_REFINE_SH, "GENOMES_DIR", {NOLCG_FILE}),
+        (_CHECKM_SH, "GENOMES_DIR", {LCG_FILE, NOLCG_FILE}),
     ],
-    ids=["assemble", "binning", "bin_refine"],
+    ids=["assemble", "binning", "bin_refine", "checkm"],
 )
 def test_genomes_dir_basenames_match_the_python_constants(
     path: Path, dir_var: str, expected: set[str]
@@ -158,17 +174,21 @@ def test_genomes_dir_basenames_match_the_python_constants(
     """The genomes_dir basenames are spelled the same in the shell and in Python.
 
     `assemble.sh` writes both files into its output genomes_dir; `binning.sh` and
-    `bin_refine.sh` read noLCG back out of the one they are handed. The native jobs
-    reach the same files through `_assembly.LCG_FILE` / `NOLCG_FILE`, and nothing
-    joins the two spellings at runtime. `assembly_hash._file_meta` looks genomes_dir
-    up by exact name, not by glob, so renaming one side alone drops the circular and
-    unbinned contigs from the run with no error; a sample with no refined bin either
-    becomes the terminal StepNoData "no contigs to hash", discarded with no retry.
+    `bin_refine.sh` read noLCG back out of the one they are handed, and `checkm.sh`
+    reads both — circular.fa for the LCG run, noLCG.fa for the residue run whose
+    splitter subtracts the binned contigs from it. The native jobs reach the same
+    files through
+    `_assembly.LCG_FILE` / `NOLCG_FILE`, and nothing joins the two spellings at
+    runtime. `assembly_hash._file_meta` looks genomes_dir up by exact name, not by
+    glob, so renaming one side alone drops the circular and unbinned contigs from the
+    run with no error; a sample with no refined bin either becomes the terminal
+    StepNoData "no contigs to hash", discarded with no retry.
 
     Set equality, not membership: a new file under genomes_dir has to be added here
     and given a constant, rather than reaching the native jobs unnamed. `dir_var` is
-    per script because `${OUT}` is genomes_dir only in `assemble.sh` -- in the other
-    two it is the bins output.
+    per script because genomes_dir is `${OUT}` only in `assemble.sh`, which WRITES
+    it; the other three are handed it as `${GENOMES_DIR}` and use `${OUT}` for the
+    directory each writes instead.
     """
     code = "\n".join(_code_lines(path))
     found = set(re.findall(rf"\$\{{{dir_var}\}}/([^\s\"']+)", code))
@@ -178,6 +198,224 @@ def test_genomes_dir_basenames_match_the_python_constants(
         "here because nothing checks them at runtime -- a rename on one side leaves "
         "assembly_hash scanning for a file the entrypoint no longer writes."
     )
+
+
+def test_assemble_runs_the_assembler_into_its_own_output() -> None:
+    """Both arms point the assembler's `-o` at ${ASM_DIR}, under $QIITA_OUTPUT_PATH.
+
+    That is the whole mechanism: the assembler's tree is retained because it is
+    written where the step's output already lives, not copied there afterwards.
+    An `-o` pointed anywhere else -- a mktemp dir, $TMPDIR, the workspace --
+    discards everything the arm does not read back, and does it silently, since
+    the two published FASTAs are unaffected.
+    """
+    lines = _code_lines(_ASSEMBLE_SH)
+    code = "\n".join(lines)
+    assert 'ASM_DIR="${QIITA_OUTPUT_PATH}/assembler"' in code, (
+        "ASM_DIR is not defined as ${QIITA_OUTPUT_PATH}/assembler. It is not a "
+        "declared output, so nothing at run time checks where it points -- a path "
+        "outside the output root is neither listed in the manifest nor verified, "
+        "and the assembler's tree would be discarded exactly as it was before."
+    )
+    dasho = re.findall(r'-o "([^"]+)"', code)
+    assert dasho, "assemble.sh passes no -o at all -- neither arm names an output dir"
+    assert all(t.startswith("${ASM_DIR}") for t in dasho), (
+        f"assemble.sh runs an assembler with -o {dasho} -- every arm must write into "
+        "${ASM_DIR} so its tree lands under $QIITA_OUTPUT_PATH"
+    )
+    assert len(dasho) == 2, f"expected one -o per assembler arm, found {len(dasho)}: {dasho}"
+
+
+def test_assemble_deletes_nothing_on_exit() -> None:
+    """No `trap ... EXIT` and no mktemp in assemble.sh.
+
+    The three sibling entrypoints each stage working files through a `mktemp -d`
+    they delete on exit. This one must not: everything the assembler writes is an
+    output of the step, and the arms read their one file back out of that same
+    tree. A trap reintroduced here removes it after the manifest is written, so
+    the verifier's `files` list would name paths that no longer exist -- gate 2,
+    a permanent CONTRACT_VIOLATION -- rather than failing quietly.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert "mktemp" not in code, (
+        "assemble.sh calls mktemp; the assembler's tree is a step output and "
+        "belongs under $QIITA_OUTPUT_PATH"
+    )
+    assert not re.search(r"\btrap\b", code), (
+        "assemble.sh installs a trap; an EXIT handler here deletes files the "
+        "manifest already declared"
+    )
+
+
+def test_assemble_restores_write_before_clearing_its_output_dirs() -> None:
+    """Both output dirs are chmod'd writable, then removed, then re-created.
+
+    `qiita_finish` leaves directories 0550 and files 0440. A directory without
+    its write bit does not give up its entries, so `rm -rf` over such a tree
+    exits 1 -- and under `set -e` that aborts the step rather than clearing it.
+    The chmod is what makes the clear work, so it is pinned with it, in order.
+
+    Both dirs, not just the assembler tree: the awk redirect into circular.fa
+    cannot truncate a 0440 file either. The CP gives an ordinary retry a fresh
+    attempt dir; a SLURM-side requeue re-enters this one.
+    """
+    code = _code_lines(_ASSEMBLE_SH)
+    chmod = next((i for i, ln in enumerate(code) if ln.startswith("chmod -R u+w")), None)
+    clear = next((i for i, ln in enumerate(code) if ln.startswith("rm -rf")), None)
+    mkdir = next((i for i, ln in enumerate(code) if ln.startswith("mkdir -p")), None)
+    assert chmod is not None, (
+        "assemble.sh does not restore write before clearing; `rm -rf` over a tree "
+        "qiita_finish left at 0550/0440 exits 1"
+    )
+    assert clear is not None, "nothing in assemble.sh clears its output dirs"
+    assert mkdir is not None, "assemble.sh never creates its output dirs"
+    assert chmod < clear < mkdir, (
+        f"assemble.sh orders chmod/rm/mkdir at {chmod}/{clear}/{mkdir}; the chmod "
+        "must precede the rm (or the rm fails) and both must precede the mkdir "
+        "(or the clear undoes it)"
+    )
+    loop = next((i for i, ln in enumerate(code) if ln.startswith("for d in ")), None)
+    assert loop is not None, "the clear is not a loop over the output dirs"
+    assert "${OUT}" in code[loop] and "${ASM_DIR}" in code[loop], (
+        f"the clear covers {code[loop]!r}; both ${{OUT}} and ${{ASM_DIR}} carry "
+        "0440 files from a previous attempt"
+    )
+    done = next((i for i, ln in enumerate(code) if ln == "done" and i > loop), None)
+    assert done is not None, "the clear loop is never closed"
+    # Both must act on the loop VARIABLE and sit inside the loop. `chmod -R u+w
+    # "${OUT}"` in the body would pass an order-only check while leaving
+    # ${ASM_DIR} at 0550, so its `rm -rf` exits 1 and aborts the step -- the exact
+    # failure this pin is for, on the one directory the order says nothing about.
+    assert loop < chmod < done and loop < clear < done, (
+        f"chmod at {chmod} and rm at {clear} are not both inside the clear loop ({loop}..{done})"
+    )
+    assert '"${d}"' in code[chmod] and '"${d}"' in code[clear], (
+        f"the loop body chmods {code[chmod]!r} and removes {code[clear]!r}; both "
+        'must act on "${d}" or an iteration operates on the wrong directory'
+    )
+
+
+def test_both_arms_emit_the_contig_attribute_sidecar() -> None:
+    """Each assembler arm writes the sidecar, with the same columns.
+
+    Two producers, two consumers: `assembly_load` and the control plane's
+    membership write both read this file by column NAME, so the arms must agree
+    with each other and with `CONTIG_ATTRIBUTE_COLUMNS`. They agree on nothing
+    else -- one is an awk over a GFA, the other a DuckDB COPY -- so nothing but
+    this checks it.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert code.count(CONTIG_ATTRIBUTES_FILE) == 2, (
+        f"expected both arms to name {CONTIG_ATTRIBUTES_FILE}; found "
+        f"{code.count(CONTIG_ATTRIBUTES_FILE)} mention(s)"
+    )
+    # The hifiasm arm's header row, written literally in the awk BEGIN block.
+    header = ", ".join(f'"{c}"' for c in CONTIG_ATTRIBUTE_COLUMNS)
+    assert header in code, (
+        f"the hifiasm_meta arm's sidecar header is not {header} -- the two arms "
+        "and the Python constant must spell the columns identically"
+    )
+    # The hifiasm arm's DATA row, which must carry the same five fields in the
+    # same order as the header above -- a reordered `print` would leave the header
+    # correct and every value under the wrong column.
+    assert 'print $2, $2, call, dp, "" > attrs' in code, (
+        "the hifiasm_meta arm's sidecar data row no longer writes "
+        f"{list(CONTIG_ATTRIBUTE_COLUMNS)} in header order"
+    )
+    # The myloasm arm's projection, in myloasm_split.py's COPY.
+    split = "\n".join(_code_lines(_WORKFLOW_DIR / "myloasm_split.py"))
+    assert "SELECT contig_id, header AS raw_name, circularity, depth, mult" in split, (
+        "myloasm_split.py's attribute projection no longer matches "
+        f"{list(CONTIG_ATTRIBUTE_COLUMNS)}"
+    )
+
+
+def test_hifiasm_arm_fails_on_an_unrecognised_segment_name() -> None:
+    """A GFA segment name matching neither shape stops the step.
+
+    The call is stored per contig, so a name matching neither shape would write a
+    circularity into the lake for a contig nothing classified -- and hifiasm_meta
+    is pinned, so a name outside the documented shape means the grammar moved
+    rather than that the assembler produced something unusual.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert "LIN_RE='tg[0-9]+l$'" in code, (
+        "the hifiasm_meta arm no longer recognises the LINEAR name shape, so every "
+        "linear contig would be counted as unrecognised"
+    )
+    # One grammar for the attribute pass and both FASTA writers: the circular
+    # pattern is defined once and every user reads that variable, so the router
+    # and the stored call cannot disagree about which names are circular.
+    assert "CIRC_RE='tg[0-9]+c$'" in code, (
+        "the circular name shape is no longer defined once in assemble.sh"
+    )
+    assert "tg[0-9]+c$/" not in code, (
+        "a literal circular pattern is back alongside ${CIRC_RE}; the attribute "
+        "pass and the FASTA writers can now drift apart"
+    )
+    assert re.search(r"exit 65", code), (
+        "nothing in assemble.sh exits non-zero for an unrecognised segment name; "
+        "a fall-through stores a circularity nobody determined"
+    )
+
+
+def test_hifiasm_arm_reads_depth_by_tag_not_by_position() -> None:
+    """`dp:f` is found by scanning the optional fields, not by column index.
+
+    GFA does not fix the order of a segment's optional tags. Reading $5 would
+    silently store `LN:i`'s or `ts:B:I`'s value as depth the day the order
+    changes, which no downstream check could catch -- a depth is a plausible
+    number whatever it came from.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert "for (i = 4; i <= NF; i++)" in code and "$i ~ /^dp:f:/" in code, (
+        "the hifiasm_meta arm no longer searches fields 4+ for the dp:f tag"
+    )
+
+
+def test_assemble_def_pins_and_asserts_both_assemblers() -> None:
+    """Both assemblers are `=`-pinned in the def AND version-asserted in %test.
+
+    A pin binds the solver only. Nothing about it is observable in the built
+    image, and a rebuild of the same conda version against different upstream
+    sources satisfies the pin while moving the tool -- so the pin without the
+    assertion is the gap that lets a drifted image ship green. This is the
+    assemble image's counterpart to the binning-verify.sh check below.
+    """
+    lines = _code_lines(_ASSEMBLE_DEF)
+    creates = [ln for ln in lines if "micromamba create" in ln]
+    pinned = {}
+    for line in creates:
+        pinned.update(dict(re.findall(r"\b([A-Za-z0-9_.-]+)=([A-Za-z0-9][^\s\"\']*)", line)))
+    assert set(pinned) == {"hifiasm_meta", "myloasm"}, (
+        f"expected both assemblers `=`-pinned on their create lines; got {pinned}"
+    )
+    assert pinned == {"hifiasm_meta": "hamtv0.3.5", "myloasm": "0.6.0"}, (
+        f"the assembler pins moved; got {pinned}. Update _ASSERTED_VERSIONS below "
+        "in the same change, or the %test greps go on checking the old build"
+    )
+    for package, expected in _ASSERTED_VERSIONS.items():
+        # The invocation alone is not the assertion: `<tool> --version` on its own
+        # line satisfies a search for it while checking nothing. Require the output
+        # to reach a grep, so the %test line has to compare against something.
+        asserted = [
+            ln for ln in lines if re.search(rf"{re.escape(package)} --version", ln) and "grep" in ln
+        ]
+        assert asserted, (
+            f"{package} is pinned but its --version output is never compared in "
+            "%test, so a drifted solve would build green"
+        )
+        # And each grep must name the version it is checking for. Spelled out
+        # rather than derived from the conda pin: hifiasm_meta's conda string
+        # (`hamtv0.3.5`) appears in none of them, because the binary reports two
+        # internal versions instead -- so a derived check would have to accept any
+        # version-shaped token, and would pass with the pin bumped and the greps
+        # left behind.
+        for token in expected:
+            assert any(token in ln for ln in asserted), (
+                f"{package}'s %test never greps for {token!r}; the pin and the "
+                "build-time assertion have drifted apart"
+            )
 
 
 def test_binning_stages_the_coverage_bam_unrewritten() -> None:
@@ -500,4 +738,31 @@ def test_image_pins_are_asserted_at_build_time() -> None:
             f"asserts that version, so a solve that drifted would build and ship "
             f"green. Add it to the PINNED map there (keyed by the binary the "
             f"package provides -- metabat2's is jgi_summarize_bam_contig_depths)."
+        )
+
+
+def test_bin_refine_initializes_its_binner_arrays_by_assignment() -> None:
+    """A bare `declare -a` leaves the array UNSET, which `set -u` refuses.
+
+    `bin_refine.sh` collects one contig2bin table per binner and then reads
+    `${#das_bins[@]}` to decide whether any binner contributed. Declared without an
+    assignment, that array is unset rather than empty, so the read aborts the step
+    on the exact input the check exists to pass cleanly. That entrypoint's comment
+    at the declaration carries the bash versions it was measured on and why the
+    failure cannot be reproduced by running the script on a mac.
+
+    Asserted on the spelling for that same reason. What has to be an assignment is
+    the first NON-COMMENT line naming each array — `_code_lines` drops the comment
+    above the declaration, which names them both — rather than a `declare` line
+    specifically, so dropping `declare` for a bare `das_bins=()` stays green while
+    deleting the initialization outright does not (the first hit becomes the `+=`).
+    """
+    code = _code_lines(_BIN_REFINE_SH)
+
+    for name in ("das_bins", "das_labels"):
+        first = next((line for line in code if name in line), None)
+        assert first is not None, f"bin_refine.sh no longer mentions {name}"
+        assert re.search(rf"\b{name}=\(", first), (
+            f"{name} is introduced without an assignment: {first!r}. "
+            f"`${{#{name}[@]}}` then trips set -u instead of reading 0."
         )

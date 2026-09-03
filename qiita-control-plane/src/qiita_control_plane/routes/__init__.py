@@ -18,6 +18,7 @@ from .prep_protocol import router as prep_protocol_router
 from .prep_sample import global_field_router as prep_sample_global_field_router
 from .prep_sample import router as prep_sample_router
 from .prep_sample import study_scoped_router as prep_sample_study_router
+from .processing import processing_router
 from .read import read_router
 from .read_masked import mask_definition_router, read_masked_router
 from .reference import router as reference_router
@@ -53,6 +54,7 @@ api_router.include_router(read_router)
 api_router.include_router(alignment_definition_router)
 api_router.include_router(alignment_router)
 api_router.include_router(assembly_router)
+api_router.include_router(processing_router)
 api_router.include_router(prep_protocol_router)
 api_router.include_router(prep_sample_router)
 api_router.include_router(prep_sample_study_router)

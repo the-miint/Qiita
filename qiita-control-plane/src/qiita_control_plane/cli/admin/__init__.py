@@ -41,6 +41,9 @@ import httpx
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
+from ...backfill.assembly_genome import BackfillPlan as GenomeBackfillPlan
+from ...backfill.assembly_genome import apply_backfill as apply_assembly_genome_backfill
+from ...backfill.assembly_genome import plan_backfill as plan_assembly_genome_backfill
 from ...backfill.host_taxon import (
     BackfillPlan,
     HostTaxonSource,
@@ -498,6 +501,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Write the re-keyed rows (default: dry-run, report only, no writes).",
     )
     p_backfill_mask.set_defaults(handler=_handle_backfill_mask_adapter_hash)
+
+    p_backfill_genome = p_backfill_sub.add_parser(
+        "assembly-genome",
+        help="Mint qiita.genome rows for assembly runs that predate the inline mint",
+        description=(
+            "Mint one qiita-origin genome per assembled subject — per refined bin, per"
+            " LCG contig, per unbinned contig — and stamp it onto"
+            " qiita.assembly_membership.genome_idx, for runs that completed before the"
+            " mint became part of write-assembly-membership. A pure Postgres replay:"
+            " the identity is a hash of columns already on the row, so nothing"
+            " re-assembles and nothing is re-read from the data plane. Run it before a"
+            " feature-table build that rolls de novo contigs up to genomes; no consumer"
+            " reads this column yet, so today it is a prerequisite rather than a"
+            " correction. Idempotent; dry-run by default. Needs DATABASE_URL."
+        ),
+    )
+    p_backfill_genome.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write the genomes and stamps (default: dry-run, report only, no writes).",
+    )
+    p_backfill_genome.set_defaults(handler=_handle_backfill_assembly_genome)
 
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
@@ -1232,6 +1257,58 @@ def _handle_backfill_mask_adapter_hash(
     return 0
 
 
+async def _backfill_assembly_genome(
+    database_url: str, *, execute: bool
+) -> tuple[GenomeBackfillPlan, int]:
+    """Plan, report, and (with `execute`) apply the assembly-genome backfill.
+
+    Returns `(plan, stamped)`; `stamped` is 0 on a dry run. Unlike the mask re-key
+    there is no blocked state: a subject's identity is a hash of its own columns, so
+    every un-minted subject is writable and there is nothing to attribute.
+    """
+    pool = await open_admin_pool(database_url)
+    try:
+        plan = await plan_assembly_genome_backfill(pool)
+        if not execute:
+            return plan, 0
+        return plan, await apply_assembly_genome_backfill(pool, plan)
+    finally:
+        await pool.close()
+
+
+def _handle_backfill_assembly_genome(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+
+    try:
+        plan, stamped = asyncio.run(_backfill_assembly_genome(database_url, execute=args.execute))
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"subjects without a genome : {plan.genomes_to_mint}")
+    print(f"rows they cover           : {plan.rows_to_stamp}")
+    print(f"rows already stamped      : {plan.already_stamped_rows}")
+
+    if not plan.subjects:
+        # The empty plan IS the completeness signal a feature-table build wants.
+        print("\nnothing to do — every assembly_membership row carries a genome_idx.")
+        return 0
+
+    if args.execute:
+        print(f"\nminted {plan.genomes_to_mint} genome(s), stamped {stamped} row(s)")
+    else:
+        print(
+            f"\nDRY RUN — nothing written. Pass --execute to mint"
+            f" {plan.genomes_to_mint} genome(s) and stamp {plan.rows_to_stamp} row(s)."
+        )
+    return 0
+
+
 __all__ = [
     "_DB_CONNECT_TIMEOUT_SECONDS",
     "_DEFAULT_ORCHESTRATOR_VENV",
@@ -1262,8 +1339,10 @@ __all__ = [
     "_handle_compute_readiness",
     "_handle_login",
     "_handle_mask_delete",
+    "_backfill_assembly_genome",
     "_backfill_host_taxon_id",
     "_backfill_mask_adapter_hash",
+    "_handle_backfill_assembly_genome",
     "_handle_backfill_host_taxon_id",
     "_handle_backfill_mask_adapter_hash",
     "_handle_mask_purge_failed",

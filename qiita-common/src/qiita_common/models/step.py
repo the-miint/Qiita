@@ -304,6 +304,16 @@ class AlignmentDoGetTicketRequest(BaseModel):
     # Omitted ⇒ no projection rides the ticket, byte-identical to the historical
     # shape. See ProjectionColumns for what a present list means.
     columns: ProjectionColumns | None = None
+    # Which of the ticket's two alignment runs to sign. A COMBINED feature table
+    # estimates over two — the cohort against a reference, and each sample against
+    # its own contigs — and the job needs a ticket for each, so one call names one.
+    #
+    # Default False keeps a body written before the de novo arm existed meaning
+    # exactly what it meant then. True is refused when the ticket carries no
+    # `denovo_alignment_idx`, rather than falling back to the reference arm: a job
+    # that asked for the second arm and silently got the first would stage the same
+    # slice twice and reconcile it against itself.
+    denovo: bool = False
 
 
 class AlignmentCohortDoGetTicketRequest(BaseModel):
@@ -354,6 +364,25 @@ class AssemblyDoGetTicketRequest(BaseModel):
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     processing_idx: Annotated[int, Field(gt=0)]
+    table: str = Field(min_length=1, max_length=MAX_TABLE_NAME_LENGTH)
+
+
+class AssemblyRunDoGetTicketRequest(BaseModel):
+    """Body for POST /api/v1/assembly/{prep_sample_idx}/{processing_idx}/ticket/doget.
+
+    The scientist-facing counterpart of ``AssemblyDoGetTicketRequest``: the run is
+    named in the PATH, so the only thing left for the body is which surface to
+    read. Same closed ``table`` set, same signed filter, same data-plane
+    resolution — the two routes differ in who may ask and how the run is
+    authorized, never in what a ticket returns (``Scope.ASSEMBLY_DOGET``).
+
+    Deliberately not a subclass of its twin: the identifiers moving from body to
+    path is the whole difference, and inheriting the pair back in would let a
+    caller name a second run in the body of a request for the first.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     table: str = Field(min_length=1, max_length=MAX_TABLE_NAME_LENGTH)
 
 

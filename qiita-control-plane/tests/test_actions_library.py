@@ -398,10 +398,18 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
     synthetic read_id through bin_map (kind, bin_id) and manifest -> feature_map
     (sequence_hash -> feature_idx) to one (kind, bin_id, feature_idx) row per
     contig. Two contigs that collapse to the same feature_idx (identical bytes)
-    stay distinct rows because their bin/kind differ."""
+    stay distinct rows because their bin/kind differ.
+
+    Also pins the per-contig attributes riding the same join: they must not add
+    rows. The two identical contigs inside bin.1 carry DIFFERENT attributes here,
+    which is the case that would break the Postgres upsert if the join emitted one
+    row per attribute variant — `insert_assembly_membership_rows` refuses a
+    duplicated conflict target. One representative contig is chosen, and all four
+    of its values travel together rather than being mixed across the two rows."""
     import uuid
 
     import duckdb
+    from qiita_common.assembly_constants import register_contig_attribute_table
 
     from qiita_control_plane.actions.library import ASSEMBLY_MEMBERSHIP_JOIN_SQL
 
@@ -419,11 +427,15 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
     feature_map = tmp_path / "feature_map.parquet"
     _write(
         bin_map,
-        "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR",
+        "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR, contig_id VARCHAR",
         [
-            ("LCG:circ1:1", "LCG", "circ1"),
-            ("MAG:bin.1:1", "MAG", "bin.1"),
-            ("MAG:bin.2:1", "MAG", "bin.2"),
+            ("LCG:circ1:1", "LCG", "circ1", "u1ctg"),
+            ("MAG:bin.1:1", "MAG", "bin.1", "u2ctg"),
+            # A SECOND identical contig in the SAME bin. `assembly_hash` composes
+            # read_id as kind:bin_id:sequence_index, so duplicated bytes inside one
+            # bin arrive as two read_ids resolving to one feature_idx.
+            ("MAG:bin.1:2", "MAG", "bin.1", "u3ctg"),
+            ("MAG:bin.2:1", "MAG", "bin.2", "u4ctg"),
         ],
     )
     _write(
@@ -432,18 +444,49 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
         [
             ("LCG:circ1:1", str(h1), 10),
             ("MAG:bin.1:1", str(h2), 20),
+            ("MAG:bin.1:2", str(h2), 20),
             # bin.2 shares bytes with bin.1 -> same hash -> same feature_idx.
             ("MAG:bin.2:1", str(h2), 20),
         ],
     )
     _write(feature_map, "sequence_hash UUID, feature_idx BIGINT", [(str(h1), 100), (str(h2), 200)])
 
+    # The two bin.1 contigs disagree on every attribute, so a join that let them
+    # through separately would be visible as an extra row below. u4ctg is absent
+    # on purpose: a contig with no sidecar row must still produce its membership
+    # row, with NULLs.
+    attrs = tmp_path / "contig_attributes.tsv"
+    attrs.write_text(
+        "contig_id\traw_name\tcircularity\tdepth\tmult\n"
+        "u1ctg\tu1ctg_len-10_circular-yes\tyes\t30.0\t1.02\n"
+        # u2ctg is the representative (lex-smallest id) AND carries the LARGER
+        # depth/mult and the later-sorting circularity, so a per-column min()
+        # would differ from it on three of the four columns.
+        "u2ctg\tu2ctg_len-20_circular-yes\tyes\t99.0\t9.99\n"
+        "u3ctg\tu3ctg_len-20_circular-no\tno\t11.0\t1.00\n"
+    )
+
     with duckdb.connect(":memory:") as c:
+        register_contig_attribute_table(c, attrs)
         rows = c.execute(
             ASSEMBLY_MEMBERSHIP_JOIN_SQL, [str(bin_map), str(manifest), str(feature_map)]
         ).fetchall()
+    # THREE rows, not four. The duplicate WITHIN bin.1 collapses (the constant's
+    # GROUP BY); the same feature under a DIFFERENT bin does not, because
+    # (kind, bin_id, feature_idx) still differs. Without that collapse this returns
+    # four rows and the Postgres write raises `cardinality_violation` — ON CONFLICT
+    # DO UPDATE refuses to touch one conflict target twice.
+    #
+    # bin.1 takes u2ctg's attributes, not u3ctg's, and takes ALL FOUR from it:
+    # `min(contig_id)` picks the representative and the attributes join onto that
+    # one row. A per-column aggregate would be free to return u2ctg's circularity
+    # beside u3ctg's depth, describing a contig that does not exist.
     assert sorted(rows) == sorted(
-        [("LCG", "circ1", 100), ("MAG", "bin.1", 200), ("MAG", "bin.2", 200)]
+        [
+            ("LCG", "circ1", 100, "u1ctg_len-10_circular-yes", "yes", 30.0, 1.02),
+            ("MAG", "bin.1", 200, "u2ctg_len-20_circular-yes", "yes", 99.0, 9.99),
+            ("MAG", "bin.2", 200, None, None, None, None),
+        ]
     )
 
 

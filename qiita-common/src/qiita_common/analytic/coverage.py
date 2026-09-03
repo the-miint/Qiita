@@ -19,9 +19,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from .reconcile import denovo_map_join
 from .relations import (
     ALIGNMENT_TABLE,
     COVERAGE_ALIGNMENTS_VIEW,
+    DENOVO_COVERAGE_ALIGNMENTS_VIEW,
+    DENOVO_MAP_TABLE,
     GENOME_LENGTHS_TABLE,
     MAP_TABLE,
 )
@@ -118,10 +121,98 @@ def coverage_alignments_view_sql() -> str:
     )
 
 
-def survivor_table_sql(scope: CoverageScope) -> str:
+def _hand_rolled_ctes(
+    *, prefix: str, alignments: str, map_relation: str, map_join: str, by_sample: bool
+) -> str:
+    """`genome_coverage`'s own method, spelled out: `compress_intervals` per contig,
+    summed to the genome, over the full-length denominator the final SELECT divides
+    by. Returns the CTE definitions; `_hand_rolled_select` reads the last of them.
+
+    One copy, reached from three places — the reference arm's per-sample scope and
+    the de novo arm's two. What each caller varies is where the intervals come from
+    (`alignments`), how the contig resolves to its genome (`map_relation` +
+    `map_join`), and whether the sample is a key of the result (`by_sample`).
+    `prefix` keeps two instantiations in one statement from colliding.
+
+    **`per_contig` groups by the sample in every case, `by_sample` or not.**
+    `compress_intervals` merges within one coordinate space; grouping without the
+    sample would merge two samples' intervals on a contig they share as though they
+    were one sample's, overstating coverage. `by_sample` decides only whether the
+    sample survives the roll-up to the genome — and for the de novo arm it makes no
+    difference to the numbers either way, a qiita genome belonging to exactly one
+    prep_sample.
+
+    The per-contig merge precedes the genome roll-up for the same reason: grouping
+    straight to the genome would merge intervals from DIFFERENT contigs as though
+    they shared coordinates and understate every multi-contig genome.
+    """
+    sample_col = "p.prep_sample_idx, " if by_sample else ""
+    sample_key = "prep_sample_idx, " if by_sample else ""
+    return (
+        f"{prefix}per_contig AS ("
+        f"SELECT prep_sample_idx, reference, "
+        f"UNNEST(compress_intervals(position, stop_position)) AS ci "
+        f"FROM {alignments} GROUP BY prep_sample_idx, reference"
+        f"), {prefix}per_contig_genome AS ("
+        f"SELECT {sample_col}m.genome_id, "
+        f"SUM(p.ci.stop - p.ci.start) AS covered_internal "
+        f"FROM {prefix}per_contig p JOIN {map_relation} m "
+        f"ON p.reference = m.contig_id{map_join} "
+        f"GROUP BY {sample_col}m.genome_id, p.reference"
+        f"), {prefix}covered AS ("
+        f"SELECT {sample_key}genome_id, SUM(covered_internal) AS covered "
+        f"FROM {prefix}per_contig_genome GROUP BY {sample_key}genome_id"
+        f")"
+    )
+
+
+def _hand_rolled_select(*, prefix: str, by_sample: bool) -> str:
+    """The threshold test over `_hand_rolled_ctes`' last CTE, shaped to the scope.
+
+    Divides by the same `GENOME_LENGTHS_TABLE` full length and takes the same
+    `CAST(... AS DOUBLE)` the macro does internally — otherwise one threshold would
+    mean two different things depending on which branch produced a genome.
+    """
+    sample_col = "c.prep_sample_idx, " if by_sample else ""
+    return (
+        f"SELECT {sample_col}c.genome_id FROM {prefix}covered c "
+        f"JOIN {GENOME_LENGTHS_TABLE} l USING (genome_id) "
+        f"WHERE CAST(c.covered AS DOUBLE) / l.total_length >= ?"
+    )
+
+
+def _denovo_survivor_parts(scope: CoverageScope) -> tuple[str, str]:
+    """The de novo arm's `(ctes, select)` for `scope`.
+
+    Hand-rolled at BOTH scopes, where the reference arm hand-rolls only per-sample,
+    and not collapsible into `genome_coverage_per_sample` the way that one is: both
+    macros reduce their map to `SELECT DISTINCT contig_id, genome_id` and join on the
+    contig alone, so a map keyed on the sample as well cannot be expressed through
+    either. That is what the de novo arm needs — a content-addressed contig belongs
+    to a different genome in each sample that assembled it — so the grouping is not
+    the blocker here, the map's shape is.
+
+    Lives in `coverage` rather than `reconcile`, which otherwise owns the de novo
+    arm, because it needs `_hand_rolled_ctes` and `coverage` already imports
+    `reconcile` — moving it would close the cycle.
+    """
+    return (
+        _hand_rolled_ctes(
+            prefix="dn_",
+            alignments=DENOVO_COVERAGE_ALIGNMENTS_VIEW,
+            map_relation=DENOVO_MAP_TABLE,
+            map_join=denovo_map_join("p"),
+            by_sample=scope is CoverageScope.PER_SAMPLE,
+        ),
+        _hand_rolled_select(prefix="dn_", by_sample=scope is CoverageScope.PER_SAMPLE),
+    )
+
+
+def survivor_table_sql(scope: CoverageScope, *, combined: bool = False) -> str:
     """The survivor set for `scope`: what clears the breadth-of-coverage threshold.
-    Requires `COVERAGE_ALIGNMENTS_VIEW` and `GENOME_LENGTHS_TABLE`. The threshold is
-    a bound parameter — execute with `[coverage_threshold]`.
+    Requires `COVERAGE_ALIGNMENTS_VIEW` and `GENOME_LENGTHS_TABLE`, plus the de novo
+    arm's own two when `combined`. The threshold is a bound parameter — execute with
+    `survivor_parameters(...)`, which knows how many the statement takes.
 
     Creates `survivor_table_name(scope)`, whose shape differs per scope —
     `(genome_id)` for pooled, `(prep_sample_idx, genome_id)` for per-sample. That is
@@ -129,43 +220,64 @@ def survivor_table_sql(scope: CoverageScope) -> str:
 
     `POOLED` delegates to the `genome_coverage` macro. `PER_SAMPLE` cannot: the
     macro has no sample key. It instead reproduces the macro's own method with one
-    more `GROUP BY` key — `compress_intervals` per contig, summed to the genome,
-    over the same full-length denominator and the same `CAST(... AS DOUBLE)`
-    division, so a single threshold means the same thing under either scope. This
-    is what upstream means by the per-sample dimension being "already expressible
-    today" (duckdb-miint#217); if `genome_coverage_per_sample` lands
-    (duckdb-miint#220, an open PR) this branch collapses to one call.
+    more `GROUP BY` key (`_hand_rolled_ctes`), so a single threshold means the same
+    thing under either scope. This is what upstream means by the per-sample
+    dimension being "already expressible today" (duckdb-miint#217). Upstream's
+    `genome_coverage_per_sample` now exists and would collapse THIS branch to one
+    call; removal is tracked at the-miint/Qiita#454.
 
-    The per-contig merge before the genome roll-up is not incidental:
-    `compress_intervals` merges within one coordinate space, so grouping straight
-    to the genome would merge intervals from DIFFERENT contigs as though they
-    shared coordinates and understate every multi-contig genome.
+    It would not collapse the de novo branches, which hand-roll for a different
+    reason — see `_denovo_survivor_parts`.
+
+    **`combined` adds the de novo arm as a UNION, one survivor set covering both.**
+    Not two sets: `ogu_input_table_sql` joins the survivors once per arm, and two
+    relations would let a genome survive in one join and not the other.
+
+    `UNION`, not `UNION ALL`, and the difference from `ogu_input_table_sql`'s choice
+    is what this relation is FOR: it is joined, so a genome appearing twice fans out
+    every alignment row that matches it and doubles that genome's counts. The arms do
+    contribute disjoint genomes today — a reference genome and a qiita genome are
+    different `qiita.genome` rows — so the distinct removes nothing; it is the
+    cheap guard on a set whose duplicates would be silent.
     """
     if scope is CoverageScope.POOLED:
-        return (
-            f"CREATE TABLE {survivor_table_name(scope)} AS SELECT genome_id "
+        reference = (
+            f"SELECT genome_id "
             f"FROM genome_coverage("
             f"{COVERAGE_ALIGNMENTS_VIEW}, {GENOME_LENGTHS_TABLE}, {MAP_TABLE}) "
             f"WHERE proportion_covered >= ?"
         )
-    return (
-        f"CREATE TABLE {survivor_table_name(scope)} AS "
-        f"WITH per_contig AS ("
-        f"SELECT prep_sample_idx, reference, "
-        f"UNNEST(compress_intervals(position, stop_position)) AS ci "
-        f"FROM {COVERAGE_ALIGNMENTS_VIEW} GROUP BY prep_sample_idx, reference"
-        f"), per_contig_genome AS ("
-        f"SELECT p.prep_sample_idx, m.genome_id, "
-        f"SUM(p.ci.stop - p.ci.start) AS covered_internal "
-        f"FROM per_contig p JOIN {MAP_TABLE} m ON p.reference = m.contig_id "
-        f"GROUP BY p.prep_sample_idx, m.genome_id, p.reference"
-        f"), covered AS ("
-        f"SELECT prep_sample_idx, genome_id, SUM(covered_internal) AS covered "
-        f"FROM per_contig_genome GROUP BY prep_sample_idx, genome_id"
-        f") SELECT c.prep_sample_idx, c.genome_id FROM covered c "
-        f"JOIN {GENOME_LENGTHS_TABLE} l USING (genome_id) "
-        f"WHERE CAST(c.covered AS DOUBLE) / l.total_length >= ?"
-    )
+        reference_ctes = ""
+    else:
+        reference = _hand_rolled_select(prefix="", by_sample=True)
+        reference_ctes = _hand_rolled_ctes(
+            prefix="",
+            alignments=COVERAGE_ALIGNMENTS_VIEW,
+            map_relation=MAP_TABLE,
+            map_join="",
+            by_sample=True,
+        )
+
+    if not combined:
+        head = f"WITH {reference_ctes} " if reference_ctes else ""
+        return f"CREATE TABLE {survivor_table_name(scope)} AS {head}{reference}"
+
+    # One WITH at the head of the statement, covering both UNION arms: SQL admits no
+    # second WITH after a set operator, and the pooled branch has no reference CTEs
+    # of its own to attach one to.
+    denovo_ctes, denovo = _denovo_survivor_parts(scope)
+    ctes = f"{reference_ctes}, {denovo_ctes}" if reference_ctes else denovo_ctes
+    return f"CREATE TABLE {survivor_table_name(scope)} AS WITH {ctes} {reference} UNION {denovo}"
+
+
+def survivor_parameters(coverage_threshold: float, *, combined: bool = False) -> list[float]:
+    """The bound parameters `survivor_table_sql(..., combined=...)` takes.
+
+    The threshold appears once per arm, because each arm tests its own quotient.
+    Paired with `survivor_table_sql` so the count has one home; passing the wrong
+    one is a bind error raised after the arms are already written.
+    """
+    return [coverage_threshold, coverage_threshold] if combined else [coverage_threshold]
 
 
 @dataclass(frozen=True)
@@ -204,6 +316,10 @@ def rollup_coverage_diagnostics_sql() -> str:
     for it: the map holds one row per `(feature, genome)` pair, so a feature belonging to
     several genomes multiplies its rows — which inflated only the denominator, and
     reported a share that was too low.
+
+    **Reads `ALIGNMENT_TABLE` and `MAP_TABLE` only**, so for a combined table this
+    counts the reference arm, and counts it AFTER precedence has taken the reads the
+    de novo arm won. The de novo arm's own unmappable rows are not in this number.
     """
     return (
         f"WITH per_feature AS ("

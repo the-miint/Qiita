@@ -28,9 +28,10 @@ from ..repositories.assembly import (
     create_assembly_sample_pending,
     upsert_assembly_sample_no_data,
 )
-from ..repositories.processing import mint_processing
+from ..repositories.processing import ProcessingDeprecated, mint_processing
 from ._base import _log
 from ._mask import MASK_IDX_BINDING
+from ._upload import _submission_bad_input
 
 # action_context key naming the step-1 assembler. Its default is single-sourced
 # from the action's context_schema (see `_mint_processing_idx`), never hardcoded
@@ -73,8 +74,21 @@ def _build_processing_params(
         straight off `context_schema`, so the default literal lives in ONE place.
 
     As more result-affecting params are parameterized (min-contig-length, DAS_Tool
-    threshold, LCG cutoff) they are added here, and every processing_idx re-hashes
-    fleet-wide."""
+    threshold, LCG cutoff, `residue_split._MIN_RESIDUE_LENGTH_BP`) they are added
+    here, and every processing_idx re-hashes fleet-wide.
+
+    The container images are NOT in here. `version` is the workflow YAML's, so two
+    runs of the same version are one identity even when the images between them
+    changed — an edited entrypoint or def rebuilds the SIF (`HASH_INPUTS`, see
+    docs/container-images.md) without any of this moving. A fix that lives in an
+    image therefore does not reach runs that already exist; correcting those takes a
+    new workflow version, which re-hashes them as a distinct run.
+
+    Keying identity on the SIF build hash instead would re-mint on rebuilds that
+    change no output — a comment or a pinned-version bump is enough — orphaning the
+    artifacts stored against the old processing_idx. The granularity is also
+    per-image, so editing one tool's def would re-mint runs whose assembly is
+    byte-identical."""
     return {
         "workflow": action_id,
         "version": action_version,
@@ -95,7 +109,11 @@ async def _mint_processing_idx(
 
     Run before the step loop when `_workflow_needs_processing`.
     `mint_processing` hashes the canonical params (canonical JSON) and upserts on
-    it, so the same params resolve to the same processing_idx fleet-wide.
+    it, so the same params resolve to the same processing_idx fleet-wide — unless
+    the row it resolves to has been deprecated, which is refused as bad submission
+    input. That is the guard that stops a run built from a pass-set judged unsound
+    from assembling further samples: the params are the identity, so a re-submit
+    under the same ones IS the deprecated run.
 
     Also binds the RESOLVED assembler back into `bound`, so the native step that
     writes run_config.json (and thus the container that assembles) runs exactly the
@@ -106,8 +124,17 @@ async def _mint_processing_idx(
     params = _build_processing_params(
         action_id, action_version, bound, assembler_default=assembler_default
     )
-    async with pool.acquire() as conn:
-        row = await mint_processing(conn, workflow=action_id, version=action_version, params=params)
+    try:
+        async with pool.acquire() as conn:
+            row = await mint_processing(
+                conn, workflow=action_id, version=action_version, params=params
+            )
+    except ProcessingDeprecated as exc:
+        # The ticket named a run config that cannot be minted against, which is bad
+        # input rather than a fault to retry. Left unhandled it reaches
+        # run_workflow's catch-all and is recorded as UNKNOWN_PERMANENT, which tells
+        # the operator nothing. Same shape as the mask twin in `_mask.py`.
+        raise _submission_bad_input(exc.detail) from exc
     bindings: dict[str, Any] = {PROCESSING_IDX_BINDING: row["processing_idx"]}
     if params["assembler"] is not None:
         bindings[ASSEMBLER_BINDING] = params["assembler"]
@@ -160,20 +187,19 @@ async def _record_assembly_gate_no_data(
     including `finalize-assembly-sample` — so without this write the row would sit
     at 'pending' for a run that has ended and will never move again.
 
-    The write's guard leaves a standing 'completed' row from an earlier run of the
-    same identity alone (reasoning on
-    `repositories.assembly.upsert_assembly_sample_no_data`); this logs when that
-    happens.
+    The write's guard leaves a standing 'completed' or 'invalidated' row alone
+    (reasoning on `repositories.assembly.upsert_assembly_sample_no_data`); this
+    logs which one held when that happens.
     """
     async with pool.acquire() as conn, conn.transaction():
-        written = await upsert_assembly_sample_no_data(
+        standing = await upsert_assembly_sample_no_data(
             conn, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
         )
-    if not written:
+    if standing is not None:
         _log.warning(
-            "assembly_sample gate (processing %d, prep_sample %d) stays 'completed':"
-            " an earlier run of this identity assembled contigs, so this run's"
-            " 'no_data' is not written",
+            "assembly_sample gate (processing %d, prep_sample %d) stays %r, so this"
+            " run's 'no_data' is not written",
             processing_idx,
             prep_sample_idx,
+            standing,
         )

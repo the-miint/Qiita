@@ -18,8 +18,9 @@ downstream (mint-features -> write-assembly-membership -> assembly_load):
     exactly like `hash_sequences`.
   - `bin_map.parquet` — `(read_id, kind, bin_id, contig_id)`, the per-contig bin
     membership `write-assembly-membership` / `assembly_load` join against.
-    `contig_id` is the assembler's own id for the record. No consumer joins on it;
-    it is carried so a workspace under investigation can say which assembled
+    `contig_id` is the assembler's own id for the record. Both membership writers
+    join the assemble step's per-contig attribute sidecar on it, and it also lets
+    a workspace under investigation say which assembled
     contig became which `feature_idx` — the name the assembler, DAS_Tool and
     CheckM all use. Nothing else records it: for a MAG the `bin_id` is the FASTA's
     stem and the `read_id`'s last component is the record's ordinal, and
@@ -69,12 +70,23 @@ FILE to a (kind, bin_id), so the subset is taken per RECORD instead: the `contig
 scan below reads both files whole, and the DELETE that follows it removes every
 UNBINNED row whose `sequence_hash` also appears under KIND_MAG.
 
-The match key is `canonical_sequence_hash_expr`'s hash, not the contig id. That a
-bin FASTA carries the assembler's contig ids through is measured for hifiasm_meta
-and unmeasured for myloasm, so the match keys on the bytes that are actually
-stored. The hash's strand folding carries into the exclusion: a bin holding a
-contig on the opposite strand still excludes its noLCG record. An id still labels
-the row, as the UNBINNED bin_id below — never something matched on.
+The match key for THIS exclusion is `canonical_sequence_hash_expr`'s hash, not the
+contig id, so it holds whatever the bin FASTA calls a record. The hash's strand
+folding carries into the exclusion: a bin holding a contig on the opposite strand
+still excludes its noLCG record.
+
+`contig_id` is a join key elsewhere: both writers of `qiita.assembly_membership`
+LEFT JOIN the assemble step's attribute sidecar on it. An LCG or UNBINNED row's
+`contig_id` comes straight off the published FASTA the sidecar was written from,
+so those match by construction. A MAG row's comes from the REFINED BIN FASTA, so
+it matches only where the binners carried the header through — measured, for both
+id shapes the two assemblers produce. On a deploy-host assembly all 3810 contigs
+of its 98 refined bins were present verbatim in the assembler's own output; and a
+run carrying myloasm-shaped ids (`u<N>ctg`) beside hifiasm-shaped ones as an
+in-run control returned both verbatim through metabat2, maxbin2, concoct and
+DAS_Tool, with no record renamed at any stage. One assembly and one binner
+configuration each, so this says these tools preserve both shapes, not that a
+future version must.
 
 Two consequences of keying on content. Hash-equal noLCG records share a fate: a
 bin claiming either drops both. And the exclusion set is the KIND_MAG rows alone —
@@ -136,7 +148,8 @@ _READ_ID_EXPR = (
 class Inputs(BaseModel):
     """Typed input contract for assembly_hash.
 
-    `genomes_dir` (holds `circular.fa` + `noLCG.fa`) and `refined_bins_dir` (MAG bins)
+    `genomes_dir` (holds `circular.fa` + `noLCG.fa`, plus the
+    attribute sidecar this job does not read) and `refined_bins_dir` (MAG bins)
     are the upstream container steps' outputs. `prep_sample_idx` / `work_ticket_idx` are
     framework-injected scope scalars, declared for an explicit contract: nothing this
     step writes is keyed on either, and sequences are run-agnostic, so it needs no

@@ -157,6 +157,33 @@ def check_exactly_one_runtime(
         )
 
 
+def check_withdrawal_reason(
+    *,
+    withdrawing: bool,
+    reason: str | None,
+    field: str,
+    value: str,
+) -> None:
+    """Shared reason-gating check for the lifecycle PATCH bodies — the two config
+    deprecations and the two per-run invalidations. Raises ValueError when the
+    shape is wrong.
+
+    A reason is MANDATORY on the withdrawing transition and REFUSED on its
+    reverse. Mandatory because it is what a reader who finds a withdrawn row
+    behind published data has to go on; refused on the reverse because the
+    repository clears the provenance columns there, so a reason supplied with a
+    restore would be accepted and silently dropped.
+
+    `field` / `value` name the discriminator in the message ("status",
+    "deprecated"), so one implementation produces each body's own wording.
+    """
+    if withdrawing:
+        if reason is None or not reason.strip():
+            raise ValueError(f"reason is required when {field} is {value!r}")
+    elif reason is not None:
+        raise ValueError(f"reason is only accepted when {field} is {value!r}")
+
+
 def check_derived_inputs(
     derived_inputs: dict[str, str],
     *,

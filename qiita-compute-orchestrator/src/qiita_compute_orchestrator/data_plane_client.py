@@ -38,7 +38,10 @@ from qiita_common.api_paths import (
     URL_READ_MASKED_DOGET,
     URL_REFERENCE_DOGET,
 )
-from qiita_common.assembly_constants import ASSEMBLED_SEQUENCE_CHUNKS_TABLE
+from qiita_common.assembly_constants import (
+    ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+    ASSEMBLED_SEQUENCE_TABLE,
+)
 
 from .config import get_settings
 from .cp_client import make_cp_client
@@ -364,6 +367,7 @@ async def fetch_alignment_doget_ticket(
     http: httpx.AsyncClient,
     work_ticket_idx: int,
     columns: Sequence[str],
+    denovo: bool = False,
 ) -> bytes:
     """POST /alignment/ticket/doget and return the raw signed ticket bytes.
 
@@ -380,6 +384,11 @@ async def fetch_alignment_doget_ticket(
     it will bind. The CP validates them against a per-table allowlist and signs
     them; the DP then streams exactly those, in that order.
 
+    `denovo` names WHICH of the ticket's alignment runs to sign. A combined
+    feature table's two arms are two runs on one ticket, so the job mints twice;
+    the CP 422s `denovo=True` against a ticket that carries no de novo arm rather
+    than falling back to the reference one.
+
     `http` is the authed httpx client (Bearer with the compute SA PAT, base_url =
     the CP) from `cp_client.make_cp_client()`. The CP returns the ticket
     base64-encoded; this decodes it to the raw bytes `open_doget_stream` wraps in a
@@ -389,7 +398,11 @@ async def fetch_alignment_doget_ticket(
     """
     resp = await http.post(
         URL_ALIGNMENT_DOGET,
-        json={"work_ticket_idx": work_ticket_idx, "columns": list(columns)},
+        json={
+            "work_ticket_idx": work_ticket_idx,
+            "columns": list(columns),
+            "denovo": denovo,
+        },
     )
     resp.raise_for_status()
     return base64.b64decode(resp.json()["ticket"])
@@ -402,6 +415,7 @@ async def open_alignment_stream(
     work_ticket_idx: int,
     columns: Sequence[str],
     relation: str = "alignment",
+    denovo: bool = False,
 ) -> AsyncIterator[str]:
     """Mint a work-ticket-scoped `alignment` DoGet ticket (CO→CP) and stream that
     alignment run's rows (CO→DP Flight) into `conn` as `relation`, yielding the
@@ -419,6 +433,10 @@ async def open_alignment_stream(
     there; see docs/duckdb-miint.md), which also drains the stream so the Flight
     client can close before the compute.
 
+    `denovo` picks which of the ticket's two alignment runs to stream — a combined
+    feature table estimates over both, and one mint returns one. The cohort is the
+    ticket's either way.
+
     Rides the shared `_open_ticket_stream`, so (like `open_reference_chunk_stream`)
     the CP client is closed as soon as the ticket is minted; only the Flight
     client/stream stays open for the body's duration. `data_plane_url` resolves from
@@ -427,7 +445,43 @@ async def open_alignment_stream(
 
     async def _mint(http: httpx.AsyncClient) -> bytes:
         return await fetch_alignment_doget_ticket(
-            http=http, work_ticket_idx=work_ticket_idx, columns=columns
+            http=http, work_ticket_idx=work_ticket_idx, columns=columns, denovo=denovo
+        )
+
+    async with _open_ticket_stream(conn, mint=_mint, relation=relation) as rel:
+        yield rel
+
+
+@asynccontextmanager
+async def open_assembled_sequence_stream(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    prep_sample_idx: int,
+    processing_idx: int,
+    relation: str = "assembled_lengths",
+) -> AsyncIterator[str]:
+    """Mint a run-scoped DoGet ticket (CO→CP) and stream that assembly run's
+    `assembled_sequence` rows — `(feature_idx, sequence_hash, sequence_length_bp)`,
+    one per contig — into `conn` as `relation`.
+
+    The de novo arm's lengths source, and the assembly twin of
+    `open_reference_sequences_stream`. Two differences follow from the ticket being
+    run-scoped where that one is reference-scoped: a cohort needs N of these rather
+    than one, and each is single-consumption, so the caller appends them all into
+    one relation before anything reads them twice.
+
+    Whole-run, like its reference twin and for the same reason — the coverage
+    denominator is the genome's full length, including contigs nothing aligned to.
+    The data plane refuses a `feature_idx` filter on this table outright, so there
+    is no narrowed form to reach for by mistake.
+    """
+
+    async def _mint(http: httpx.AsyncClient) -> bytes:
+        return await fetch_assembly_doget_ticket(
+            http=http,
+            prep_sample_idx=prep_sample_idx,
+            processing_idx=processing_idx,
+            table=ASSEMBLED_SEQUENCE_TABLE,
         )
 
     async with _open_ticket_stream(conn, mint=_mint, relation=relation) as rel:

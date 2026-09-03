@@ -195,6 +195,15 @@ _None yet._
   (`grpc+tls://<fqdn>:443`). (#484)
 
 ---
+- **`long-read-assembly` `checkm` now asks for 48 GiB, not 40** — a `baseline_resources`
+  change only. No host action: nothing to write, no migration, and the deploy's own
+  actions-sync applies it. The sync precedes the control-plane restart and startup redrives
+  every non-terminal ticket, so in-flight tickets pick the new value up too — except a
+  `checkm` attempt already submitted to SLURM, running or still queued, which the redrive
+  adopts by job id rather than re-submitting (`runner/_dispatch.py`), so that attempt runs on
+  40 GiB; a retry of it re-submits from the new baseline. Operational consequence: during the
+  transition the same ticket can show both values, and a queued `checkm` step now needs 8 GiB
+  more free on a node than before. `CHANGELOG.md` and the step's own comment carry why. (#525)
 
 ## Deployed history
 
