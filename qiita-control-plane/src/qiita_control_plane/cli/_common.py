@@ -293,6 +293,16 @@ def _request(
     return resp
 
 
+def filter_params(**filters: int | str | None) -> dict[str, str]:
+    """Stringify the supplied query filters, dropping the unset ones, so an
+    omitted flag stays off the wire and the server's own default applies.
+
+    Builds the `params` argument of `call` below, and sits beside it for that
+    reason.
+    """
+    return {name: str(value) for name, value in filters.items() if value is not None}
+
+
 def call(
     method: str,
     base_url: str,

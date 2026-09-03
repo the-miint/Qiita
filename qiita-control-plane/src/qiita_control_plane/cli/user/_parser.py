@@ -39,6 +39,7 @@ from qiita_common.models import (
     FieldDataType,
     Platform,
     PrepSampleStudyFieldCreateRequest,
+    ProcessingStatus,
     SequencedSamplePatchRequest,
     StudyPatchRequest,
     Tier,
@@ -69,6 +70,11 @@ from .pool import (
     _handle_submit_bcl_convert,
     _handle_submit_block_mask_pool,
     _handle_submit_host_filter_pool,
+)
+from .processing import (
+    _handle_processing_list,
+    _handle_processing_samples,
+    _handle_processing_show,
 )
 from .reads import _handle_submit_reads
 from .reference import (
@@ -756,6 +762,53 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Only samples on this sequenced_pool",
     )
     p_mask_samples.set_defaults(handler=_handle_mask_samples)
+
+    # `processing list` / `show` / `samples` — the mask twin. See
+    # `cli/user/processing.py` for which identity these discover and why.
+    p_processing = sub.add_parser("processing", help="Assembly-run discovery (read-only)")
+    p_processing_sub = p_processing.add_subparsers(dest="processing_cmd", required=True)
+    p_processing_list = p_processing_sub.add_parser(
+        "list",
+        help="List assembly runs with their per-run sample tallies (GET /processing)",
+    )
+    p_processing_list.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help="Only runs with at least one sample on this sequenced_pool",
+    )
+    p_processing_list.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        help="Only runs this prep_sample was assembled under",
+    )
+    p_processing_list.add_argument(
+        "--status",
+        choices=[s.value for s in ProcessingStatus],
+        help="Only runs with this config lifecycle status; omit to list both",
+    )
+    p_processing_list.set_defaults(handler=_handle_processing_list)
+
+    p_processing_show = p_processing_sub.add_parser(
+        "show",
+        help="Print one run's assembly config (GET /processing/{processing_idx})",
+    )
+    p_processing_show.add_argument("--processing-idx", type=int, required=True)
+    p_processing_show.set_defaults(handler=_handle_processing_show)
+
+    p_processing_samples = p_processing_sub.add_parser(
+        "samples",
+        help=(
+            "List the samples assembled under one run, with their assembly state"
+            " (GET /processing/{processing_idx}/prep-sample)"
+        ),
+    )
+    p_processing_samples.add_argument("--processing-idx", type=int, required=True)
+    p_processing_samples.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help="Only samples on this sequenced_pool",
+    )
+    p_processing_samples.set_defaults(handler=_handle_processing_samples)
 
     # `alignment list` / `cohort` — the discovery a user needs before building a
     # feature table: an --alignment-idx is otherwise unobtainable, and the cohort is

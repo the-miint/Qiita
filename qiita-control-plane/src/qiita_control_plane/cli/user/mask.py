@@ -8,7 +8,7 @@ audience includes a plain `user`, so the reads sit in this CLI rather than
 `qiita-admin` (which keeps the destructive `mask delete` / `purge-failed`).
 
 Thin clients: each verb is one GET, printed verbatim, so a new server-side field
-reaches the operator without a CLI change.
+reaches the user without a CLI change.
 """
 
 import argparse
@@ -16,12 +16,6 @@ import argparse
 from qiita_common.api_paths import PATH_MASK_DEFINITION_PREFIX
 
 from .. import _common
-
-
-def _filter_params(**filters: int | None) -> dict[str, str]:
-    """Stringify the supplied filters, dropping the unset ones, so an omitted
-    flag stays off the wire and the server's own default applies."""
-    return {name: str(value) for name, value in filters.items() if value is not None}
 
 
 def _list_mask_definitions(
@@ -38,7 +32,7 @@ def _list_mask_definitions(
         base_url,
         token,
         PATH_MASK_DEFINITION_PREFIX,
-        params=_filter_params(
+        params=_common.filter_params(
             sequenced_pool_idx=sequenced_pool_idx, prep_sample_idx=prep_sample_idx
         ),
     )
@@ -65,7 +59,7 @@ def _list_mask_prep_samples(
         base_url,
         token,
         f"{PATH_MASK_DEFINITION_PREFIX}/{mask_idx}/prep-sample",
-        params=_filter_params(sequenced_pool_idx=sequenced_pool_idx),
+        params=_common.filter_params(sequenced_pool_idx=sequenced_pool_idx),
     )
 
 

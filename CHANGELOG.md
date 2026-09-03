@@ -21,6 +21,29 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`qiita processing list` / `show` / `samples` — assembly-run discovery without psql
+  (#526).** `align-denovo` is submitted against a `processing_idx`, and until one has
+  already run against a given assembly there was no way to read one out: `qiita alignment
+  list` reports a de novo alignment's `processing_idx` in its `params`, but the FIRST
+  submission against a run had to find it with `SELECT processing_idx, params->>'assembler',
+  params->>'mask_idx' FROM qiita.processing` over a psql shell on the deploy host, which
+  needs `DATABASE_URL` and therefore an operator. The three GETs behind it already existed
+  at `Scope.PREP_SAMPLE_READ` (`routes/processing.py`); these are the client verbs over
+  them. `list` carries each run's `params` (which mask's pass-set, which assembler) and its
+  completed / pending / no_data / invalidated tally, which is the state `align-denovo`
+  admits or refuses a submission on; `samples` is the same gate per prep_sample. Thin
+  clients — one GET each, printed verbatim — so a new server field reaches the user
+  without a CLI change. The mask twin (`qiita mask list|show|samples`) is the shape, and
+  the two now cover both identities an `align-denovo` submission names.
+  `align-denovo`'s refusal for an absent selector now names the read that produces each
+  identity (`qiita processing list` / `qiita mask list`), so the verbs are found at the
+  moment the identity is wrong rather than only by knowing they exist — the shape
+  `qiita alignment list` already has in `cli/user/alignment.py`. The named commands are
+  fed to the CLI's own parser by the test, so a rename cannot leave the message and the
+  test agreeing on a verb that no longer exists. `filter_params` moved
+  from `cli/user/mask.py` to `cli/_common.py`, beside the `call` whose `params`
+  argument it builds, so the two modules share one copy.
+
 - **`POST /run-folder/inspect` lets a submit run from a machine that does not mount the
   cluster (#484).** `submit-bcl-convert` read `RunInfo.xml` and `submit-pacbio-ingest`
   globbed `*/hifi_reads/*.bam`, both on the submitting machine — which is why submitting

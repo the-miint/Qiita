@@ -152,7 +152,7 @@ def _build_denovo_alignment_params(
             f"de novo alignment selectors are incomplete: {absent} absent from "
             "action_context. Each names an identity this workflow consumes — which "
             "assembly run's contigs, which mask's reads — and neither has a default to "
-            "fall back on"
+            "fall back on. `qiita processing list` and `qiita mask list` report them"
         )
     return {
         "subject": SUBJECT_ASSEMBLY,
