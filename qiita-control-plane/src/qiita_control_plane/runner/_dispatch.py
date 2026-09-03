@@ -280,8 +280,9 @@ def _resolve_baseline_for_step(
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=entry.name,
                 reason=(
-                    f"baseline_resources lookup: instrument {key!r} has no"
-                    f" resource profile; known profiles: {sorted(br.profiles)}"
+                    f"baseline_resources lookup: key {key!r} (the stripped contents"
+                    f" of the {br.from_step_output!r} output) has no resource profile;"
+                    f" known profiles: {sorted(br.profiles)}"
                 ),
             )
         resolved = br.profiles[key]

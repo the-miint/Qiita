@@ -79,8 +79,42 @@ steps:
     params: {minimap2_preset: preset, shard_id: shard_id}
     when: build_minimap2
     outputs: [minimap2_index_meta]
+    # cpu from the reference-18 build. Over a 68-run sample, CPU efficiency
+    # TotalCPU/(Elapsed x AllocCPUS) was p50 2.1%, max 13.9% — at 4 CPUs a maximum
+    # average demand of 0.56 cores, which one covers. The step spends its wall time
+    # blocked on the data-plane chunk stream rather than computing.
+    #
+    # This does not touch DuckDB's pool: the job takes its thread count from its own
+    # `_DUCKDB_THREADS`, so four threads now time-share one core instead of four.
+    # `test_build_shard_index_cpu_is_below_duckdb_threads` pins this to the measured 1
+    # and asserts it stays under the pool.
+    #
+    # Whether it buys more of this step per node depends on the shard, and standard
+    # nodes are 514000 MB / 64 cores. At the full mem_gb 32, memory caps concurrency
+    # at floor(514000/32768) = 15, already below the old cpu cap of 64/4 = 16, so
+    # nothing changes. `plan()` sizes a shard to 28 + ceil(bp/1e9) GiB, so one at or
+    # under 1 Gbp lands at 29, where floor(514000/29696) = 17 exceeds that cpu cap and
+    # the cut does add a slot; above 1 Gbp it lands at 30 or more, floor(514000/30720)
+    # = 16, and the gain is gone. The shard-size distribution of this reference was
+    # not measured, so how often it applies is unknown. Either way the cores it stops
+    # reserving are available to other work on the node.
+    #
+    # The elapsed tail is the part this does not bound. Elapsed over all 987 shards
+    # was p50 14.5, p90 30.7, p99 65.2 and max 92.3 min against the PT2H limit, with
+    # zero timeouts — but the 68-run CPU sample need not contain that worst shard, so
+    # 0.56 cores does not describe it. Whether serialising its bursts onto one core
+    # moves it past PT2H is unmeasured; a TIMEOUT escalates to the PT4H action
+    # ceiling, which is what makes that recoverable rather than fatal. walltime
+    # therefore stays PT2H.
+    #
+    # The same step runs at cpu:4 in host-reference-add and local-host-reference-add,
+    # unchanged: those build a whole reference rather than a shard, and no efficiency
+    # measurement was taken there.
+    #
+    # mem_gb stays 32: memory was never binding on demand here (p50 5.9 GiB, max 11.0
+    # GiB), and `plan()` already sizes a shard build down from this baseline by bp.
     baseline_resources:
-      cpu: 4
+      cpu: 1
       mem_gb: 32
       walltime: PT2H
 

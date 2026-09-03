@@ -14,7 +14,9 @@ loader test pins the YAML `params` VALUES, so the two ends are locked together.
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
+from typing import get_args
 
 import pytest
 import yaml
@@ -161,8 +163,8 @@ def test_assembly_coverage_cpu_pins_duckdb_threads():
     This step made the same non-sharded `align_minimap2` call at threads 8 against
     `cpu: 16`, reserving cores it could not use. The gap was closed by lowering the
     request, not by raising the pool: on this step the thread count is also a memory
-    multiplier for the unspillable extension side, which `sacct` puts at 87% of the 64
-    GB request at the median. Pinned here so the two cannot drift apart again — the
+    multiplier for the unspillable extension side, which `sacct` put at 87% of the
+    then-64 GiB request at the median. Pinned here so the two cannot drift apart again — the
     drift is invisible at runtime, since nothing fails.
 
     Read `1.0.0.yaml` by name until the 1.0.1 residue pass landed beside it, which
@@ -177,3 +179,68 @@ def test_assembly_coverage_cpu_pins_duckdb_threads():
             f" but assembly_coverage._DUCKDB_THREADS={mod._DUCKDB_THREADS}; the"
             " aligner's parallelism IS that pool, so these must be changed together"
         )
+
+
+def test_build_shard_index_cpu_is_below_duckdb_threads():
+    """`build-shard-index`'s `build_minimap2_index` step: baseline `cpu:` is 1, below
+    `build_minimap2_index._DUCKDB_THREADS`, where the three pins above assert equality.
+
+    Those pins exist because a job drawing its parallelism from DuckDB's pool wastes
+    any core the pool cannot use. This step is the opposite case: `sacct` over a 68-run
+    sample put its CPU efficiency at p50 2.1% and max 13.9% of four cores — a maximum
+    average demand of 0.56 cores — because it runs blocked on the data-plane chunk
+    stream rather than computing. The cores were the waste, so `cpu` dropped to the
+    measured 1 while the pool stayed at 4.
+
+    Pinned for the same reason the others are: nothing fails at runtime when these
+    drift, so a later edit raising `cpu` to match the pool would silently undo a
+    measured change. It asserts the measured value, not merely the inequality, so an
+    intermediate `cpu: 2` does not pass unnoticed; it also asserts the value stays
+    under the pool, so lowering `_DUCKDB_THREADS` to 1 fires it too. If it fires, the
+    question is whether the measurement still holds.
+    """
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.build_minimap2_index")
+    for yaml_path, cpu in _baseline_cpu_every_version("build-shard-index", "build_minimap2_index"):
+        assert cpu == 1 and cpu < mod._DUCKDB_THREADS, (
+            f"{yaml_path.relative_to(_REPO_ROOT)}: build_minimap2_index cpu={cpu}, "
+            f"measured at 0.56 cores maximum average demand. It sits below "
+            f"_DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — the step is blocked "
+            f"on its data-plane stream, so cores matched to the pool go unused."
+        )
+
+
+def test_assemble_profiles_cover_every_assembler():
+    """`long-read-assembly`'s `assemble` step sizes memory per assembler through a
+    `profiles:` lookup. Each profile key is the serialized `run_config.json` for one
+    assembler, so the assemblers those keys NAME must be exactly the members of that
+    job's `Inputs.assembler` Literal, in every workflow version using the lookup.
+
+    The lookup has no default: a key absent from `profiles` fails at dispatch with
+    `CONTRACT_VIOLATION`, rather than sizing an unknown assembler from another one's
+    measurement. That turns "add a third assembler to the Literal" into a step that
+    breaks on a ticket rather than here, so this pins it both ways: a member without a
+    profile, or a profile without a member, fails in CI instead.
+    """
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.assembly_run_config")
+    literal = set(get_args(mod.Inputs.model_fields["assembler"].annotation))
+    assert literal, "assembly_run_config.Inputs.assembler is no longer a Literal"
+
+    checked = 0
+    for yaml_path in sorted(_WORKFLOWS_DIR.glob("long-read-assembly/*.yaml")):
+        data = yaml.safe_load(yaml_path.read_text())
+        steps = [e for e in data["steps"] if e.get("step") == "assemble"]
+        assert len(steps) <= 1, f"{yaml_path}: more than one `assemble` step"
+        if not steps:
+            continue
+        profiles = steps[0]["baseline_resources"].get("profiles")
+        if profiles is None:
+            continue  # a version still on a flat baseline
+        # The keys are `run_config.json`'s stripped bytes, not bare names — see that
+        # step's comment for why the lookup keys on the pre-existing output.
+        named = {json.loads(k)["assembler"] for k in profiles}
+        assert named == literal, (
+            f"{yaml_path.relative_to(_REPO_ROOT)}: assemble profiles cover "
+            f"{sorted(named)} != assembly_run_config assemblers {sorted(literal)}"
+        )
+        checked += 1
+    assert checked, "no long-read-assembly version uses the assemble profiles lookup"
