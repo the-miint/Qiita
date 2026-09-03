@@ -22,7 +22,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Added
 
 - **`qiita processing list` / `show` / `samples` — assembly-run discovery without psql
-  (#TBD).** `align-denovo` is submitted against a `processing_idx`, and until one has
+  (#526).** `align-denovo` is submitted against a `processing_idx`, and until one has
   already run against a given assembly there was no way to read one out: `qiita alignment
   list` reports a de novo alignment's `processing_idx` in its `params`, but the FIRST
   submission against a run had to find it with `SELECT processing_idx, params->>'assembler',
