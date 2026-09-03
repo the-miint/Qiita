@@ -51,9 +51,8 @@ _None yet._
     500. Passing the floor still works, and still lifts every other step in the ticket.
   - **`assemble` is now sized per assembler:** hifiasm_meta 250 GiB, myloasm 128, so a
     myloasm ticket no longer holds an allocation sized for the other assembler. It
-    resolves from a `profiles:` lookup rather than a flat number. **No drain is
-    needed** — the lookup keys on an output the step already declared, so in-flight
-    tickets resume unchanged.
+    resolves from a `profiles:` lookup rather than a flat number; tickets in flight at
+    the restart resume unchanged.
   - **Work already submitted to SLURM keeps its old allocation.** The dispatcher adopts
     any attempt that already carries a `slurm_job_id` instead of re-submitting, and
     that is per *step attempt*, not per ticket — a ticket mid-flight at the restart
