@@ -42,8 +42,8 @@ import httpx
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
+    REDRIVABLE_WORK_TICKET_STATES,
     WorkTicketFailureStage,
-    WorkTicketState,
 )
 
 from .sequence_range import (
@@ -68,14 +68,6 @@ CP_RETRY_BACKOFF_BASE_S = 0.5
 # completed") would let a work_ticket_state added later fall through to the permissive
 # path by default; with a silent failure mode, the default must be refusal.
 _REUSABLE_MINTER_STATES: frozenset[str] = frozenset(NON_TERMINAL_WORK_TICKET_STATES)
-
-# Terminal minter states `qiita ticket run` will put back in flight, so the
-# refusal below can name that instead of telling the operator to delete. Mirrors
-# the redrive half of _RUN_APPLICABLE_STATES in the CP's work_ticket routes; a
-# state outside it takes the fall-through arm, which advises no redrive.
-_REDRIVABLE_MINTER_STATES: frozenset[str] = frozenset(
-    {WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value}
-)
 
 
 def _is_transient_status(status: int) -> bool:
@@ -269,9 +261,9 @@ async def mint_or_reuse_sequence_range(
                     f"{owner_detail}, not by this one (ticket {work_ticket_idx}). "
                     "Loading them again would store every read twice, so this step "
                     "stopped without writing anything. To load them again on purpose, "
-                    "delete the prep_sample first — its read numbering goes with it — "
-                    "or delete the whole pool with `qiita delete-sequenced-pool`, then "
-                    "submit again"
+                    "the prep_sample's pool has to be removed first — its read "
+                    "numbering goes with it — with `qiita delete-sequenced-pool "
+                    "--force`, which needs system_admin; then submit again"
                 ),
             ) from exc
         if existing.minted_by_work_ticket_state not in _REUSABLE_MINTER_STATES:
@@ -288,7 +280,7 @@ async def mint_or_reuse_sequence_range(
             # that is gone (state=None). So the three-way is not cosmetic: the
             # fall-through arm exists because a fail-closed allowlist must land an
             # UNANTICIPATED state on advice that works, not on advice that bounces.
-            if state in _REDRIVABLE_MINTER_STATES:
+            if state in REDRIVABLE_WORK_TICKET_STATES:
                 recovery = (
                     f"re-drive this ticket with `qiita ticket run {work_ticket_idx}`, "
                     "which returns it to flight and makes its own range reusable"
@@ -296,8 +288,9 @@ async def mint_or_reuse_sequence_range(
             else:
                 # COMPLETED (reads registered), or a state with no in-place redrive.
                 recovery = (
-                    "there is no way to resume from this state — delete the prep_sample "
-                    "(its read numbering goes with it) and submit again"
+                    "there is no way to resume from this state — the prep_sample's pool "
+                    "has to be removed (`qiita delete-sequenced-pool --force`, which "
+                    "needs system_admin), then submitted again"
                 )
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
@@ -328,8 +321,9 @@ async def mint_or_reuse_sequence_range(
                     f"({existing.sequence_idx_start}..{existing.sequence_idx_stop}), but "
                     f"the input now has {count} — the numbering has to cover exactly "
                     "as many reads as before, so the input is not the one that was "
-                    "numbered. "
-                    "Delete the prep_sample and submit again"
+                    "numbered. Remove the prep_sample's pool "
+                    "(`qiita delete-sequenced-pool --force`, which needs system_admin) "
+                    "and submit again"
                 ),
             ) from exc
         return existing.sequence_idx_start

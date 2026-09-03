@@ -46,7 +46,7 @@ two steps.
 POOL_IDX=$(qiita sequenced-pool create --run-idx "$RUN_IDX" | jq -r .sequenced_pool_idx)
 ```
 
-A pool is a subset of the prepped samples in the sequencing run that all
+A pool is a subset of the prep_samples in the sequencing run that all
 share the same preparation info (run preflight). A real run has at least one.
 You may add one because you created the run in step 1 (wet-lab admins may add
 one to anybody's run).
@@ -120,7 +120,7 @@ refused — install the `qiita` that matches your deploy.
 - **An unaligned BAM** — pass `--bam` instead of `--fastq`, with no reverse
   file. It has to be a basecaller uBAM: the loader is told the reads are
   unaligned and takes that on trust, so an aligned BAM is loaded rather than
-  refused, with every reverse-strand read stored back-to-front.
+  refused, with every reverse-strand read stored as its reverse complement.
 
 **The filename rule.** Each FASTQ's *filename* must start with the
 `--pool-item-id` from step 3 — here `filename_prefix` — followed by `_` or `.`.

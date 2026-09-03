@@ -142,6 +142,16 @@ NON_TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = tuple(
     state.value for state in WorkTicketState if state.value not in TERMINAL_WORK_TICKET_STATES
 )
 
+# The terminal states `POST /work-ticket/{idx}/run` puts back in flight by
+# resetting to PENDING. Shared because both components answer questions that
+# have to agree: the control plane admits the redrive, and the orchestrator's
+# sequence-range refusal decides whether to name `qiita ticket run` as the
+# recovery or send the operator to remove the pool. A state that stops being
+# redrivable must move here, not in one consumer.
+REDRIVABLE_WORK_TICKET_STATES: frozenset[str] = frozenset(
+    {WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value}
+)
+
 
 class FailureType(StrEnum):
     """Discriminates retriable from permanent work-ticket failures.

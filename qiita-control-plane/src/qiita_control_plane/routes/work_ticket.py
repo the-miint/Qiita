@@ -72,6 +72,7 @@ from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.log_tail import read_text_tail
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
+    REDRIVABLE_WORK_TICKET_STATES,
     FanoutCohortKind,
     FanoutListResponse,
     FanoutOverrideRequest,
@@ -148,8 +149,9 @@ _RUN_APPLICABLE_STATES = frozenset(
     }
 )
 # The two terminal states /run redrives by resetting to PENDING (vs. PENDING, which
-# just dispatches).
-_RUN_REDRIVE_STATES = frozenset({WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value})
+# just dispatches). Shared with the orchestrator, whose sequence-range refusal
+# names `qiita ticket run` only for a state this admits.
+_RUN_REDRIVE_STATES = REDRIVABLE_WORK_TICKET_STATES
 _RUN_NOT_APPLICABLE_STATES = tuple(
     state.value for state in WorkTicketState if state.value not in _RUN_APPLICABLE_STATES
 )

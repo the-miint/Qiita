@@ -22,9 +22,10 @@ both Python services depend on.
 FORCE_RESUBMIT_EXPLANATION = (
     "The re-run stores the pool's reads a second time rather than replacing"
     " them: the read-storage step finds each prep_sample's staged copy from the"
-    " first run already in place, registers it again, and the lake does not"
-    " deduplicate — so both copies remain. To load a pool's reads again"
-    " cleanly, delete the pool (`qiita delete-sequenced-pool`, which removes"
-    " its tickets too) and submit fresh. Requires wet_lab_admin or"
-    " system_admin."
+    " first run already in place and registers it again, and nothing removes"
+    " the duplicate. Loading a pool's reads afresh means removing the pool"
+    " first, which is a system_admin gesture — `qiita delete-sequenced-pool"
+    " --force`, forced because the COMPLETED ticket behind this refusal blocks"
+    " the delete as well — and then submitting again. Passing force here"
+    " requires wet_lab_admin or system_admin."
 )

@@ -3370,10 +3370,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   one — the detail that says which call failed. The `force` explanation now lives in
   `qiita_common.work_ticket_constants` and is consumed by the CLI flags, the 409 body and
   the wire model's field description, because four copies had to be edited to fix it once.
-  In the strings this PR touches, objects are named by kind — `biosample` or `prep_sample`,
-  never a bare "sample" — outside the control-plane code that is deliberately generic over
-  both; the rest of the user CLI's `--help` still says bare "sample" in ~40 places and wants
-  its own sweep.
+  In the CLI help, error bodies and failure reasons this PR touches, objects are named by kind
+  — `biosample` or `prep_sample`, never a bare "sample" — outside the control-plane code that
+  is deliberately generic over both; the rest of the user CLI's `--help` still says bare
+  "sample" in roughly forty places and wants its own sweep.
 
 - **`--force` says what it costs, which is the opposite of what an earlier draft of this
   branch claimed (#461).** The draft told the operator a forced re-run cannot duplicate reads
@@ -3386,7 +3386,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `REPLACE_KEY_TABLES`, so the following `register-files` appends. A forced re-run therefore
   stores the pool's reads a second time, which is what the message now says. The PacBio
   `--force` help keeps its own text, since neither the refusal nor the duplication reaches a
-  prep_sample-scoped ticket.
+  prep_sample-scoped ticket. All four of these strings also named a remedy their own reader
+  cannot run: `sequenced_pool:delete` is on the system_admin ceiling only, and the COMPLETED
+  ticket that triggers the 409 blocks the delete too unless that is forced as well — so they
+  now say `qiita delete-sequenced-pool --force` and name the account it needs. The
+  read-numbering refusals told the operator to delete the prep_sample, and no such gesture
+  exists (there is no prep_sample DELETE route); they name the pool instead.
 
 - **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`,
   `manual-sample-walkthrough.md` and `pacbio-ingest.md` are what a person with samples reads, so

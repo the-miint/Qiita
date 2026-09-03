@@ -1414,8 +1414,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help=(
-            "Qiita prep_protocol_idx to FK every per-prep_sample row to. Applied"
-            " uniformly across the pool."
+            "Qiita prep_protocol_idx to record on every prep_sample this"
+            " submission creates. Applied uniformly across the pool."
         ),
     )
     p_submit_bcl.add_argument(
@@ -1586,8 +1586,10 @@ def _build_parser() -> argparse.ArgumentParser:
             " prep_sample-scoped ticket per prep_sample. A re-submit over an"
             " already-loaded prep_sample is admitted with or without it, and"
             " stops at the read-numbering step either way, before anything is"
-            " stored. To load a prep_sample's reads again, delete it (or the"
-            " whole pool with `qiita delete-sequenced-pool`) and submit fresh."
+            " stored. Loading a prep_sample's reads again means removing its"
+            " pool first (`qiita delete-sequenced-pool --force`, a system_admin"
+            " gesture) and submitting again — there is no per-prep_sample"
+            " delete."
         ),
     )
     p_submit_pacbio.set_defaults(handler=_handle_submit_pacbio_ingest)

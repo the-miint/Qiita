@@ -422,14 +422,14 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         # A 409 is NOT a failure — it means the prep_sample already has a ticket
         # in flight (PENDING/QUEUED/PROCESSING), so this submit is a duplicate of
         # work already running. Recorded as SKIPPED and NOT counted toward the
-        # non-zero exit, so re-running to retry one sample does not report the
+        # non-zero exit, so re-running to retry one prep_sample does not report the
         # running ones as failures.
         #
         # A COMPLETED ticket does NOT land here: the prep_sample arm of
         # _check_disallow_without_delete binds NON_TERMINAL states only, so an
         # already-loaded prep_sample is admitted (202) and then fails at the
         # read-numbering step, which refuses a range another ticket reserved.
-        # A FAILED sample's ticket is reset by the route and re-submitted, so it
+        # A FAILED prep_sample's ticket is reset by the route and re-submitted, so it
         # converges without a skip.
         failures: list[dict] = []
         skipped: list[dict] = []

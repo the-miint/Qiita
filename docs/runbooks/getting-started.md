@@ -121,7 +121,7 @@ access.
 
 A biosample is the physical sample itself, independent of any sequencing. One
 command per biosample — there is no bulk import yet, so for a plate this is a
-loop over your sample list.
+loop over the biosamples on it.
 
 ```bash
 BIOSAMPLE_IDX=$(qiita biosample create \
@@ -134,8 +134,8 @@ BIOSAMPLE_IDX=$(qiita biosample create \
 
 `--biosample-accession` does for the biosample what `--bioproject-accession` did
 for the study: it is the only thing the pre-flight file can match on. Register the
-sample with NCBI BioSample and use the accession it issues — same rule as above,
-do not invent one. Leave it out and the biosample exists but no pre-flight row can
+biosample with NCBI BioSample and use the accession it issues — same rule as
+above, do not invent one. Leave it out and the biosample exists but no pre-flight row can
 reach it.
 
 `--metadata "host taxon id=…"` is **required**. It takes an NCBI taxonomy id — the
@@ -340,14 +340,17 @@ there. It needs a `wet_lab_admin` account either way.
 
 **On Illumina, forcing stores the run's reads a second time.** The re-run finds
 each prep_sample's reads already staged from the first run and files them again;
-nothing removes the first copy, and nothing merges them. If what you want is to
-load the run's reads afresh, delete the pool with `qiita delete-sequenced-pool`
-— which removes its jobs too — and submit again.
+nothing removes the first copy, and nothing merges them. So if what you want is
+to load the run's reads afresh, `--force` is the wrong tool — the pool has to go
+first. That is `qiita delete-sequenced-pool --force`, which needs a
+`system_admin` account, so it is a request you make rather than a command you
+run: forced twice over, because the finished job that refused your submission
+blocks the delete as well.
 
 On PacBio a re-submit stops instead: each prep_sample's reads are numbered once
 when they are first loaded, and the second attempt finds those numbers taken and
-stops before storing anything. That is the failed-looking job the retry note
-above tells you to expect.
+stops before storing anything. Nothing is stored twice, but the job shows as
+failed — expect that rather than chasing it.
 
 ## 6. Watch it run
 
