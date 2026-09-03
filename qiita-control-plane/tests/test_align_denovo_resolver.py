@@ -120,10 +120,14 @@ async def test_a_completed_assembly_is_the_only_state_that_admits_the_ticket(sam
     pool, processing_idx = sample["pool"], sample["processing_idx"]
     prep_sample_idx = sample["prep_sample_idx"]
 
-    with pytest.raises(Exception, match="no assembly_sample gate row exists"):
+    with pytest.raises(Exception, match="no assembly_sample gate row exists") as no_row:
         await _require_assembly_subject(
             pool, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
         )
+    # The two ways to reach this message are told apart by the run's roster, so it
+    # names the read that shows one. Pinned for the same reason as the twin in
+    # test_align_denovo_submit.py.
+    assert f"qiita processing samples --processing-idx {processing_idx}" in str(no_row.value)
 
     async with pool.acquire() as conn, conn.transaction():
         await create_assembly_sample_pending(

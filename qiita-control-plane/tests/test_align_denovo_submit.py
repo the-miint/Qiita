@@ -206,10 +206,17 @@ def test_a_selector_absent_from_action_context_is_refused():
     """Unlike a knob, neither consumed identity has a context_schema default, so an
     absent one has nothing to collapse onto. Hashing it as null would mint a real
     alignment_idx keyed on "no assembly run"."""
-    with pytest.raises(Exception, match="selectors are incomplete"):
+    with pytest.raises(Exception, match="selectors are incomplete") as absent_run:
         _params({ASSEMBLY_PROCESSING_IDX_BINDING: 88})
     with pytest.raises(Exception, match="selectors are incomplete"):
         _params({ALIGN_MASK_IDX_BINDING: 99})
+
+    # The refusal names the read that produces each identity, so a submitter who
+    # got one wrong is not left to find the verb themselves. Pinned because the
+    # spelling is a CLI surface this module cannot see: rename the verb and this
+    # message goes stale silently.
+    assert "qiita processing list" in str(absent_run.value)
+    assert "qiita mask list" in str(absent_run.value)
 
 
 def test_a_supplied_knob_overrides_the_action_default():
