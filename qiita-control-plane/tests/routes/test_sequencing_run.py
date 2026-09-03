@@ -430,11 +430,27 @@ async def test_get_sequencing_run_anonymous_401(ctx):
 
 
 async def test_get_sequencing_run_regular_user_403(ctx):
-    # The read gate requires wet_lab_admin (mirrors the pool roster route): a
-    # plain user is rejected, even though a user MAY create a run.
+    # `_create_run` creates as the wet-admin, so the plain user is a NON-owner.
+    # The gate is `require_caller_owns_run()`: they are refused for not owning the
+    # run, not for lacking a role — the twin below is the owner case.
     idx = await _create_run(ctx)
     resp = await ctx["user"].get(f"{_ROUTE}/{idx}")
     assert resp.status_code == 403
+
+
+async def test_get_sequencing_run_creator_can_read(ctx):
+    """A plain user reads a run they created — the reason `_create_run`'s wet-admin
+    client is what makes the test above a 403, and the two together are what pin
+    ownership rather than role as the gate."""
+    idx = await _create_run(ctx)
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequencing_run SET created_by_idx = $1 WHERE idx = $2",
+        ctx["user_session"]["principal_idx"],
+        idx,
+    )
+    resp = await ctx["user"].get(f"{_ROUTE}/{idx}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["sequencing_run_idx"] == idx
 
 
 # ===========================================================================

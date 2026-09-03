@@ -3179,6 +3179,20 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **The sequencing-run and sequenced-pool reads admit the run's creator, not just
+  wet_lab_admin (#TBD).** `GET /sequencing-run/{R}`, and the pool metadata, QC report,
+  completion rollup, sample exceptions and work-ticket summary reads under it, were gated
+  `require_role_at_least(WET_LAB_ADMIN)` — so a plain `user` who stood a run up could not
+  read the run or any metric under it, though they could create both. All six now use the
+  `require_caller_owns_run()` the pool POST on the same path already used: the creator
+  reads what is under their run, and wet_lab_admin+ still reads any run via the guard's
+  bypass. Because that bypass returns before any DB lookup, an admin sees
+  `require_sequenced_pool_in_run`'s 404 / 422 unchanged, and a non-owner is still refused
+  without learning whether the pool exists. The two pool-ALIGNMENT reads are untouched —
+  they narrow to the caller's readable samples rather than gating on the pool. The three
+  POSTs that mutate or launch compute (preflight update-lane, block-mask plan, align plan)
+  keep the wet_lab_admin floor: running work is not reading it.
+
 - **`ticket:doput` is now on the USER role ceiling (#484).** It was on the two admin
   ceilings and service accounts only, dating from when reference loading was the sole
   upload consumer. With host paths in `action_context` restricted to wet_lab_admin+, an

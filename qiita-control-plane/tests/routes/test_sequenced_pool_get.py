@@ -102,6 +102,24 @@ async def test_get_pool_missing_scope_403(seeded_pool, no_prep_sample_read_clien
 
 
 async def test_get_pool_regular_user_403(ctx, seeded_pool):
-    # Read gate requires wet_lab_admin; a plain user is rejected.
+    # Non-owner: the gate is `require_caller_owns_run()`, and this run was created
+    # by the wet-admin principal. A plain user is refused for not owning it, not
+    # for lacking a role — the twin below is the owner case.
     resp = await ctx["user"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
     assert resp.status_code == 403
+
+
+async def test_get_pool_run_creator_can_read(ctx, seeded_pool):
+    """A plain user who created the RUN reads its pool's rollup.
+
+    Ownership, not role, is what admits them: the same principal is refused above
+    on the identical URL while the run belongs to someone else.
+    """
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequencing_run SET created_by_idx = $1 WHERE idx = $2",
+        ctx["user_session"]["principal_idx"],
+        seeded_pool["run_idx"],
+    )
+    resp = await ctx["user"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["sequenced_pool_idx"] == seeded_pool["pool_idx"]

@@ -208,8 +208,22 @@ async def test_exceptions_anonymous_401(ctx, seeded):
 
 
 async def test_exceptions_regular_user_403(ctx, seeded):
+    # Non-owner: the gate is `require_caller_owns_run()`, and this run was created
+    # by the wet-admin principal. A plain user is refused for not owning it, not
+    # for lacking a role — the twin below is the owner case.
     resp = await ctx["user"].get(_exc_url(seeded["run_idx"], seeded["pool_idx"]))
     assert resp.status_code == 403
+
+
+async def test_exceptions_run_creator_can_read(ctx, seeded):
+    """A plain user who created the RUN reads its pool's sample exceptions."""
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequencing_run SET created_by_idx = $1 WHERE idx = $2",
+        ctx["user_session"]["principal_idx"],
+        seeded["run_idx"],
+    )
+    resp = await ctx["user"].get(_exc_url(seeded["run_idx"], seeded["pool_idx"]))
+    assert resp.status_code == 200, resp.text
 
 
 # --------------------------------------------------------------------------- #
@@ -241,5 +255,19 @@ async def test_work_ticket_summary_coverage_and_state_counts(ctx, seeded):
 
 
 async def test_work_ticket_summary_regular_user_403(ctx, seeded):
+    # Non-owner: the gate is `require_caller_owns_run()`, and this run was created
+    # by the wet-admin principal. A plain user is refused for not owning it, not
+    # for lacking a role — the twin below is the owner case.
     resp = await ctx["user"].get(_wt_url(seeded["run_idx"], seeded["pool_idx"]))
     assert resp.status_code == 403
+
+
+async def test_work_ticket_summary_run_creator_can_read(ctx, seeded):
+    """A plain user who created the RUN reads its pool's work-ticket summary."""
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequencing_run SET created_by_idx = $1 WHERE idx = $2",
+        ctx["user_session"]["principal_idx"],
+        seeded["run_idx"],
+    )
+    resp = await ctx["user"].get(_wt_url(seeded["run_idx"], seeded["pool_idx"]))
+    assert resp.status_code == 200, resp.text
