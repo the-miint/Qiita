@@ -90,7 +90,11 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.assembly_run_config
     params: {assembler: assembler}
-    outputs: [run_config]
+    # `run_config` is the container's copy (JSON, read with jq); `assembler` is the
+    # runner's, a bare name it reads at dispatch to key `assemble`'s profile lookup
+    # below. Two files because the lookup's key is an output's stripped contents, so
+    # it cannot be a field inside the JSON.
+    outputs: [run_config, assembler]
     baseline_resources:
       cpu: 1
       mem_gb: 2
@@ -134,22 +138,25 @@ steps:
     # mem_gb measured on the 1.0.1 re-run cohort (2026-09-02 to 09-03, qiita
     # partition), MaxRSS off each job's `.batch` row, GiB throughout.
     #
-    # This number is sized for hifiasm_meta. Splitting the 42 completions by the
-    # assembler the ticket asked for:
+    # mem_gb is per-assembler, because the demand is. Measured on the 1.0.1 re-run
+    # cohort (2026-09-02 to 09-03, qiita partition), MaxRSS off each job's `.batch`
+    # row, GiB throughout, split by the assembler the ticket asked for:
     #
     #   assembler       n     min     p50     max
     #   hifiasm_meta   26   17.67  201.12  246.03
     #   myloasm        16    2.78   53.35   94.58
     #
-    # All 5 of the OUT_OF_MEMORY first attempts at 192 were hifiasm_meta; no myloasm
-    # run has exceeded 94.58. So 250 is ~2.6x what myloasm has ever needed, and every
-    # myloasm ticket reserves it. Sizing the two separately needs a `profiles:` lookup
-    # keyed on `from_step_output`, which would mean a new declared output on
-    # assembly_run_config — and a new declared output is re-bound on resume from a
-    # manifest an earlier attempt wrote, so adding one strands tickets already past
-    # that step. Not done here for that reason.
+    # All 5 OUT_OF_MEMORY first attempts at the old flat 192 were hifiasm_meta; no
+    # myloasm run has exceeded 94.58. A single number has to cover hifiasm_meta, and
+    # then every myloasm ticket reserves ~2.6x what that assembler has ever used.
     #
-    # The hifiasm_meta figures are demand rather than a cgroup being filled: its
+    # The lookup keys on `assembly_run_config`'s `assembler` output — the runner reads
+    # that file's stripped contents at dispatch. `Inputs.assembler` is a Literal, and
+    # `test_assemble_profiles_cover_every_assembler` pins these keys to its members,
+    # so a third assembler cannot be added without a profile: the lookup fails at
+    # dispatch on an unknown key rather than silently picking a default.
+    #
+    # hifiasm_meta 250. Its figures are demand rather than a cgroup being filled — the
     # largest is 246.03 of a 384 GiB allocation, 64% and nowhere near pegged. Every
     # completed run, by the allocation it ran at:
     #
@@ -166,24 +173,33 @@ steps:
     # 251 x 1024 x 2 = 514048 MB against RealMemory=514000. cpu:32 on 64-core nodes
     # caps the step at two per node regardless, so memory only matters where it
     # admits fewer. The partition is 14 nodes at 514000 MB and 2 highmem at
-    # 1546528 MB, where the same cliff sits at 755.
+    # 1546528 MB, where the same cliff sits at 755. That slot was not observed and
+    # the cap is not what prevented it: 41 of 56 assemble jobs went to the two
+    # highmem nodes, those on a standard node ran strictly back-to-back, and at probe
+    # time every node reported 0 idle CPUs with 60-354 GiB free. 250 preserves the
+    # slot rather than demonstrating one, and stops 3.97 GiB above the cohort max
+    # while an earlier cohort recorded 259.3 GiB — a sample there still escalates.
     #
-    # That two-per-node slot was not observed, and the cap is not what prevented it:
-    # 41 of 56 assemble jobs went to the two highmem nodes, those on a standard node
-    # ran strictly back-to-back, and at probe time every node in the partition
-    # reported 0 idle CPUs with 60-354 GiB free. Whole-node contention gated
-    # placement, not this baseline. 250 preserves the slot rather than demonstrating
-    # one, and it stops 3.97 GiB above the cohort max while an earlier cohort
-    # recorded 259.3 GiB — a sample in that range still OOMs and escalates.
+    # myloasm 128, 1.35x its observed max with 33.4 GiB of margin. It does not raise
+    # this step's own concurrency (cpu:32 already caps that at two per node); what it
+    # does is stop holding 122 GiB per myloasm ticket that nothing on the node can
+    # use.
     #
-    # Escalation doubles and clamps to `action_ceiling.mem_gb`: from 250 that is one
-    # attempt at 500 where from 192 it was two (384, then 500). Against a
-    # ticket-wide `max_retries` that is a shorter ladder in both senses — one less
-    # rung to climb, and one less retry spent climbing it.
+    # Escalation doubles and clamps to `action_ceiling.mem_gb`: 250 -> 500 is one
+    # rung, 128 -> 256 -> 500 is two. Against a ticket-wide `max_retries` a shorter
+    # ladder is both one less rung to climb and one less retry spent climbing it,
+    # which is the cost myloasm takes on for the smaller reservation.
     baseline_resources:
-      cpu: 32
-      mem_gb: 250
-      walltime: PT16H
+      from_step_output: assembler
+      profiles:
+        hifiasm_meta:
+          cpu: 32
+          mem_gb: 250
+          walltime: PT16H
+        myloasm:
+          cpu: 32
+          mem_gb: 128
+          walltime: PT16H
 
   # Align the masked HiFi reads back to the noLCG contigs with miint's embedded
   # minimap2 (`map-hifi`), emitting the coordinate-sorted BAM the binning step

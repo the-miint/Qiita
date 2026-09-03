@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
+from typing import get_args
 
 import pytest
 import yaml
@@ -205,3 +206,38 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
             f"_DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — the step is blocked "
             f"on its data-plane stream, so cores matched to the pool go unused."
         )
+
+
+def test_assemble_profiles_cover_every_assembler():
+    """`long-read-assembly`'s `assemble` step sizes memory per assembler through a
+    `profiles:` lookup keyed on `assembly_run_config`'s `assembler` output. The
+    profile keys must be exactly the members of that job's `Inputs.assembler`
+    Literal, in every workflow version that uses the lookup.
+
+    The lookup has no default: a key absent from `profiles` fails at dispatch with
+    `CONTRACT_VIOLATION`. That is the right failure — silently sizing an unknown
+    assembler from some other one's measurement is worse — but it turns "add a third
+    assembler to the Literal" into a step that breaks the workflow at run time, on a
+    ticket, rather than here. Pinned both ways so adding a member without a profile,
+    or a profile without a member, fails in CI instead.
+    """
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.assembly_run_config")
+    literal = set(get_args(mod.Inputs.model_fields["assembler"].annotation))
+    assert literal, "assembly_run_config.Inputs.assembler is no longer a Literal"
+
+    checked = 0
+    for yaml_path in sorted(_WORKFLOWS_DIR.glob("long-read-assembly/*.yaml")):
+        data = yaml.safe_load(yaml_path.read_text())
+        steps = [e for e in data["steps"] if e.get("step") == "assemble"]
+        assert len(steps) <= 1, f"{yaml_path}: more than one `assemble` step"
+        if not steps:
+            continue
+        profiles = steps[0]["baseline_resources"].get("profiles")
+        if profiles is None:
+            continue  # a version still on a flat baseline
+        assert set(profiles) == literal, (
+            f"{yaml_path.relative_to(_REPO_ROOT)}: assemble profiles "
+            f"{sorted(profiles)} != assembly_run_config assemblers {sorted(literal)}"
+        )
+        checked += 1
+    assert checked, "no long-read-assembly version uses the assemble profiles lookup"

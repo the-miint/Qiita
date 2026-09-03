@@ -3150,12 +3150,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `OutOfMemoryException` while its process held 9.39 GiB of a 16 GiB allocation,
   because `resolve_duckdb_memory_gb` subtracts an additive headroom that costs a
   quarter of a small step (#288). Each step's own comment carries its table and
-  its sizing argument. `assemble`'s 250 is sized for hifiasm_meta: split by
-  assembler, its 26 completions run p50 201.12 / max 246.03 GiB against myloasm's
-  p50 53.35 / max 94.58, and all five OOMs were hifiasm_meta — so a myloasm ticket
-  now reserves ~2.6x what that assembler has ever used. Sizing them separately
-  needs a `profiles:` lookup keyed on a new `assembly_run_config` output, and a new
-  declared output strands tickets already past that step.
+  its sizing argument. `assemble` is sized **per assembler** rather than by one
+  number, because the demand is: its 26 hifiasm_meta completions run p50 201.12 /
+  max 246.03 GiB against myloasm's p50 53.35 / max 94.58, and all five OOMs were
+  hifiasm_meta. It now resolves through a `profiles:` lookup (hifiasm_meta 250,
+  myloasm 128) keyed on a new bare-string `assembler` output of
+  `assembly_run_config`, the same mechanism `bcl-convert` uses for instrument
+  model. A ticket that completed `assembly_run_config` under the old spec has no
+  such output, so the deploy carries a drain step.
 - **Reference-workflow resources corrected from the reference-18 build (#526).**
   `build-shard-index`'s `build_minimap2_index` drops `cpu: 4` → `1` (CPU
   efficiency p50 2.1%, max 13.9% over 68 shard builds — a maximum average demand
