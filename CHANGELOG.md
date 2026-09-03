@@ -22,7 +22,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Added
 
 - **`GET /sequencing-run/{idx}/sequenced-pool` and `qiita sequenced-pool list` — a
-  `sequenced_pool_idx` can now be read out (#TBD).** Every pool-scoped surface takes a
+  `sequenced_pool_idx` can now be read out (#530).** Every pool-scoped surface takes a
   `sequenced_pool_idx` — `alignment list`, `pool-completion`, `submit-align-pool`, the pool
   QC and completion reads — and nothing returned one: the path was registered `POST`-only,
   `GET /sequencing-run/{idx}` carries no pool list, and the create's find-or-create is keyed
@@ -3181,7 +3181,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Changed
 
 - **The AGGREGATE sequencing-run and sequenced-pool reads admit the run's creator, not just
-  wet_lab_admin (#TBD).** `GET /sequencing-run/{R}` and the pool metadata, completion rollup
+  wet_lab_admin (#530).** `GET /sequencing-run/{R}` and the pool metadata, completion rollup
   and work-ticket summary reads under it were gated `require_role_at_least(WET_LAB_ADMIN)`, so
   a plain `user` who stood a run up could not read the run or any metric under it though they
   could create both. Those four now use the `require_caller_owns_run()` the pool POST on the
