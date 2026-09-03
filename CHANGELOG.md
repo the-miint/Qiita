@@ -3150,6 +3150,16 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   of a small step (#288). Each step's own comment carries its table and the
   sizing argument; `assemble` is 250 rather than higher because 251 GiB is where
   a second concurrent assemble stops fitting on a 502 GiB node.
+- **Reference-workflow resources corrected from the reference-18 build (#526).**
+  `build-shard-index`'s `build_minimap2_index` drops `cpu: 4` → `1` (CPU
+  efficiency p50 2.1%, max 13.9% over 68 shard builds — a maximum average demand
+  of 0.56 cores; the step is blocked on its data-plane stream, and its DuckDB
+  pool is a module constant this number never controlled). In
+  `local-reference-add`, `load` goes `PT24H` → `PT36H` (the completing attempt
+  ran 22:25:50, leaving 1h34) and `build_routing_index` goes `PT24H` → `PT12H`
+  (7:34:02 and 8:04:07 are the only two runs; the 24h request also had SLURM's
+  backfill estimating a five-day start). Memory is untouched everywhere here —
+  RSS was pegged at ReqMem, which measures no demand.
 - **`ticket:doput` is now on the USER role ceiling (#484).** It was on the two admin
   ceilings and service accounts only, dating from when reference loading was the sole
   upload consumer. With host paths in `action_context` restricted to wet_lab_admin+, an

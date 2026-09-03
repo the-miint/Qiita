@@ -150,10 +150,21 @@ steps:
              annotation_manifest, annotation_map]
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
+    # walltime measured on the reference-18 build (196,062 genomes): the completing
+    # attempt ran 22:25:50, which leaves 1h34 against PT24H. PT36H is 1.6× that run
+    # and keeps one TIMEOUT escalation in reserve (doubling, clamped to the PT48H
+    # action ceiling) where PT24H doubling would land straight on the ceiling.
+    #
+    # 22:25:50 is a duration, not a near-miss: that job ran under a 48h SLURM limit
+    # whose origin is not recoverable from the ticket (no walltime override
+    # recorded), so it was not itself close to timing out.
+    #
+    # mem_gb is deliberately untouched. RSS pegged at ReqMem in all three attempts
+    # of that build, which bounds the allocation from below and measures no demand.
     baseline_resources:
       cpu: 8
       mem_gb: 32
-      walltime: PT24H
+      walltime: PT36H
 
   - action: register-files
     inputs: [staging_dir]
@@ -183,10 +194,18 @@ steps:
     # Whole-reference rype build (sized like local-host-reference-add's
     # build_rype_index — the local path allows a long walltime for genome-scale
     # references); an OOM retry doubles mem to the 128 GB action ceiling.
+    #
+    # walltime measured over the only two runs there are: 7:34:02 (reference 16) and
+    # 8:04:07 (reference 18, 196,062 genomes), +6.6% for the larger. PT12H is 1.49×
+    # the longer; a TIMEOUT doubles to PT24H and then the PT48H ceiling.
+    #
+    # The reduction is a scheduling change as much as a sizing one: at a 24h request
+    # SLURM's StartTime estimate for the reference-18 run was five days out in this
+    # PriorityTier=1 partition, and backfill then placed it 70 min after submit.
     baseline_resources:
       cpu: 4
       mem_gb: 64
-      walltime: PT24H
+      walltime: PT12H
 
   - action: register-index
     when: router_pending
