@@ -720,7 +720,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   is the SHA-256 of the blob's bytes and both gestures read those bytes before `open_db_file`
   patches the file in place, so an unpatched submit followed by a re-run sends different bytes
   under the same filename and is refused by `sequenced_pool_one_per_run_and_filename` — the
-  retry does not converge, on either platform.
+  retry does not converge, on either platform. That 409 tells the caller to rename the
+  pre-flight, which is right for the case it was written for (two distinct pools colliding on
+  a name) and wrong for this one, where renaming mints the second pool the caller was trying
+  to avoid; the runbook says so.
 
 - **A published feature table's rows can now be labelled without our identifiers (#448).**
   `POST /exported-feature` mints the public handle for a feature-axis entity, the way

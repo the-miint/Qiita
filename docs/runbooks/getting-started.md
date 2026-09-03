@@ -253,8 +253,13 @@ it, and the submit reads those bytes *before* opening it. Submit a file that has
 never been opened, then re-run to retry, and the second submit sends the
 now-upgraded bytes — a different file as far as Qiita is concerned. Your retry is
 refused: the run already has a pool under that filename, and the contents no
-longer match it. Open the file once yourself first and the bytes stop changing,
-so a retry is a retry:
+longer match it.
+
+**That refusal tells you to rename the pre-flight. Do not.** Renaming is the
+right answer when two genuinely different pools collide on a filename; here
+there is only one pool, whose bytes moved under you. Renaming would give you a
+second pool for the same run, and removing that needs an operator. Open the file
+once yourself first, and the bytes stop changing, so a retry is a retry:
 
 ```bash
 SHARED_PF=/qmounts/qiita_data/working_dir/RunPreflight.db   # the lab's copy
