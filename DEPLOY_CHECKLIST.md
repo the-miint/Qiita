@@ -27,29 +27,7 @@ _None yet._
 
 ### 4. Deploy
 
-- **[operator] Before restarting, drain `long-read-assembly` (#526).** `assemble` now
-  sizes memory from a `profiles:` lookup keyed on a NEW `assembler` output of
-  `assembly_run_config`. A ticket that completed `assembly_run_config` under the old
-  spec has no such output in its manifest, and a resume rebuilds a completed step's
-  bindings from that manifest — so if `assemble` is dispatched for it after the
-  restart, the lookup fails with `CONTRACT_VIOLATION` naming the missing key. Tickets
-  already past `assemble` are unaffected: a fast-forwarded step never re-resolves its
-  baseline.
-
-  Check for exposure, and wait for it to reach zero (or accept that those tickets fail
-  and need resubmission, not a `/run` redrive — a redrive fast-forwards the same stale
-  manifest):
-  ```sql
-  SELECT wt.work_ticket_idx, wt.state
-    FROM qiita.work_ticket wt
-   WHERE wt.action_id = 'long-read-assembly'
-     AND wt.state IN ('pending', 'queued', 'processing')
-     AND NOT EXISTS (
-           SELECT 1 FROM qiita.work_ticket_step s
-            WHERE s.work_ticket_idx = wt.work_ticket_idx
-              AND s.step_name = 'assemble'
-              AND s.state = 'completed');
-  ```
+_None yet._
 
 ### 5. Verify
 
@@ -64,17 +42,18 @@ _None yet._
 - **`long-read-assembly` baseline resources rose at three steps (#526):** `assemble`
   192 → 250 GiB, `assembly_coverage` 64 → 96, `assembly_load` 16 → 32. The action
   sync in the deploy picks these up; there is no separate step. The measurements and
-  the reasoning are at each step in `workflows/long-read-assembly/1.0.1.yaml`. Two
-  consequences before the next submission batch:
+  the reasoning are at each step in `workflows/long-read-assembly/1.0.1.yaml`. Three
+  things worth knowing:
   - **A routine hifiasm_meta submission no longer needs the `--mem-gb 384` floor.** It
     was covering that assembler's demand, which this cohort measured to a 246.03 GiB
     max and 250 covers from the baseline. It is not full coverage: an earlier cohort
     recorded a 259.3 GiB peak, and a sample in that range still OOMs and escalates to
     500. Passing the floor still works, and still lifts every other step in the ticket.
-  - **`assemble` is now sized per assembler:** hifiasm_meta 250 GiB, myloasm 128. The
-    two differ by measurement — hifiasm_meta p50 201.12 / max 246.03 against myloasm
-    p50 53.35 / max 94.58 — so a myloasm ticket no longer holds 250. This is what the
-    bucket-4 drain step above exists for.
+  - **`assemble` is now sized per assembler:** hifiasm_meta 250 GiB, myloasm 128, so a
+    myloasm ticket no longer holds an allocation sized for the other assembler. It
+    resolves from a `profiles:` lookup rather than a flat number. **No drain is
+    needed** — the lookup keys on an output the step already declared, so in-flight
+    tickets resume unchanged.
   - **Work already submitted to SLURM keeps its old allocation.** The dispatcher adopts
     any attempt that already carries a `slurm_job_id` instead of re-submitting, and
     that is per *step attempt*, not per ticket — a ticket mid-flight at the restart

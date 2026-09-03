@@ -85,10 +85,11 @@ steps:
     # blocked on the data-plane chunk stream rather than computing.
     #
     # This does not touch DuckDB's pool: the job takes its thread count from its own
-    # `_DUCKDB_THREADS`, so four threads now time-share one core instead of four. The
-    # inequality is pinned by `test_build_shard_index_cpu_is_below_duckdb_threads`.
+    # `_DUCKDB_THREADS`, so four threads now time-share one core instead of four.
+    # `test_build_shard_index_cpu_is_below_duckdb_threads` pins this to the measured 1
+    # and asserts it stays under the pool.
     #
-    # What it does NOT buy is more of this step per node. At mem_gb 32 memory already
+    # What it does not buy is more of this step per node. At mem_gb 32 memory already
     # caps concurrency at floor(514000/32768) = 15, below the old cpu cap of 16, and
     # 15 is still the cap now. The cores it stops reserving go to other work on the
     # node, not to more shards.

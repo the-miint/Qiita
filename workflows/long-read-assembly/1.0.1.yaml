@@ -90,11 +90,11 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.assembly_run_config
     params: {assembler: assembler}
-    # `run_config` is the container's copy (JSON, read with jq); `assembler` is the
-    # runner's, a bare name it reads at dispatch to key `assemble`'s profile lookup
-    # below. Two files because the lookup's key is an output's stripped contents, so
-    # it cannot be a field inside the JSON.
-    outputs: [run_config, assembler]
+    # `run_config` has two readers: the `assemble` container reads `.assembler` from
+    # it with jq, and the runner reads the whole file, stripped, as the key of that
+    # step's `profiles:` lookup below. Its serialized bytes are therefore a contract —
+    # `test_run_config_bytes_are_the_resource_profile_keys` pins them to those keys.
+    outputs: [run_config]
     baseline_resources:
       cpu: 1
       mem_gb: 2
@@ -135,9 +135,6 @@ steps:
     derived_inputs:
       MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [genomes_dir]
-    # mem_gb measured on the 1.0.1 re-run cohort (2026-09-02 to 09-03, qiita
-    # partition), MaxRSS off each job's `.batch` row, GiB throughout.
-    #
     # mem_gb is per-assembler, because the demand is. Measured on the 1.0.1 re-run
     # cohort (2026-09-02 to 09-03, qiita partition), MaxRSS off each job's `.batch`
     # row, GiB throughout, split by the assembler the ticket asked for:
@@ -150,31 +147,42 @@ steps:
     # myloasm run has exceeded 94.58. A single number has to cover hifiasm_meta, and
     # then every myloasm ticket reserves ~2.6x what that assembler has ever used.
     #
-    # The lookup keys on `assembly_run_config`'s `assembler` output — the runner reads
-    # that file's stripped contents at dispatch. `Inputs.assembler` is a Literal, and
-    # `test_assemble_profiles_cover_every_assembler` pins these keys to its members,
-    # so a third assembler cannot be added without a profile: the lookup fails at
-    # dispatch on an unknown key rather than silently picking a default.
+    # The lookup keys on `assembly_run_config`'s EXISTING `run_config` output, whose
+    # stripped bytes the runner reads at dispatch — hence the JSON-shaped keys below.
+    # A dedicated bare-name output would read better and is not worth it: a completed
+    # step's bindings are rebuilt on resume as `{name: manifest[name] for name in
+    # entry.outputs}` against the CURRENT spec, so declaring a new output raises for
+    # every in-flight ticket that already completed this step. Keying on a file that
+    # is already declared costs nothing at deploy.
+    #
+    # Two pins hold the seam: `test_run_config_bytes_are_the_resource_profile_keys`
+    # ties these keys to what the job actually writes, and
+    # `test_assemble_profiles_cover_every_assembler` ties them to `Inputs.assembler`'s
+    # Literal members. The lookup has no default — an unmatched key fails the step at
+    # dispatch rather than silently sizing from another assembler's measurement.
     #
     # hifiasm_meta 250. Its figures are demand rather than a cgroup being filled — the
     # largest is 246.03 of a 384 GiB allocation, 64% and nowhere near pegged. Every
     # completed run, by the allocation it ran at:
     #
     #   ran at   n     p50      max   what the rows are
+    #   103      1    8.01     8.01   myloasm canary
     #   192     19   53.75   114.86   15 myloasm, 4 hifiasm_meta
     #   192      3  191.07   192.00   hifiasm_meta; the largest pegged at 192.00
     #   384     14  209.17   246.03   hifiasm_meta, ticket-wide --mem-gb 384
     #   384      5  202.74   241.17   hifiasm_meta, escalated retries of the 5 OOMs
     #
-    # (54 assemble jobs in the window: those 41 completions, the 5 OOMs, 7 still in
-    # flight at 192, and one myloasm canary at 103.)
+    # That is all 42 completions; the window held 54 assemble jobs in total, the rest
+    # being the 5 OUT_OF_MEMORY first attempts and 7 still in flight at 192. Three of
+    # the 26 hifiasm_meta rows are censored at 192, so its p50 of 201.12 is a mixed
+    # statistic; the max of 246.03, measured at 384, is not, and is what 250 answers.
     #
     # 250 keeps a standard node able to hold two of these and 251 does not:
     # 251 x 1024 x 2 = 514048 MB against RealMemory=514000. cpu:32 on 64-core nodes
     # caps the step at two per node regardless, so memory only matters where it
     # admits fewer. The partition is 14 nodes at 514000 MB and 2 highmem at
     # 1546528 MB, where the same cliff sits at 755. That slot was not observed and
-    # the cap is not what prevented it: 41 of 56 assemble jobs went to the two
+    # the cap is not what prevented it: 40 of those 54 jobs went to the two
     # highmem nodes, those on a standard node ran strictly back-to-back, and at probe
     # time every node reported 0 idle CPUs with 60-354 GiB free. 250 preserves the
     # slot rather than demonstrating one, and stops 3.97 GiB above the cohort max
@@ -190,13 +198,13 @@ steps:
     # ladder is both one less rung to climb and one less retry spent climbing it,
     # which is the cost myloasm takes on for the smaller reservation.
     baseline_resources:
-      from_step_output: assembler
+      from_step_output: run_config
       profiles:
-        hifiasm_meta:
+        '{"assembler": "hifiasm_meta"}':
           cpu: 32
           mem_gb: 250
           walltime: PT16H
-        myloasm:
+        '{"assembler": "myloasm"}':
           cpu: 32
           mem_gb: 128
           walltime: PT16H
@@ -410,9 +418,11 @@ steps:
     # shows this was not a cgroup kill is the RSS, not the state: process RSS at
     # failure was 9.39 / 6.09 / 6.19 GiB inside a 16 GiB cgroup. The state does not
     # discriminate — a step-level cgroup kill also surfaces through slurmrestd as a
-    # job-level FAILED (see `log_tail.py`). The retries were automatic: the exception
-    # text matches `_OOM_SIGNATURES` there, so the classifier reached OOM_KILLED and
-    # escalated without an operator.
+    # job-level FAILED (see `log_tail.py`). The retries were automatic even so: the
+    # message DuckDB raises begins "Out of Memory Error:", which the classifier's
+    # signature list matches, so it reached OOM_KILLED without an operator. That is
+    # third-party formatting, probed and pinned by
+    # `test_duckdb_out_of_memory_text_is_classified_as_oom`.
     #
     # What bound was DuckDB's own limit. `resolve_duckdb_memory_gb` subtracts
     # `duckdb_headroom_gb(4)` = 4 from the allocation, so a 16 GiB step ran DuckDB at

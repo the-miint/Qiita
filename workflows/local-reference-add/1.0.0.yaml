@@ -151,10 +151,10 @@ steps:
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
     # walltime sized from the one completing attempt of the reference-18 build
-    # (196,062 genomes), which ran 22:25:50. Nothing here has been observed hitting a
-    # limit: that attempt ran under a 48h SLURM limit whose origin the ticket does not
-    # record, and the other two attempts of the build failed on memory at 00:06:50 and
-    # 01:39:03. So this sizes a 22h26 duration against a 24h baseline, on n=1.
+    # (196,062 genomes), which ran 22:25:50. No attempt was observed hitting a WALLTIME
+    # limit: that one ran under a 48h SLURM limit whose origin the ticket does not
+    # record, and the other two failed on memory at 00:06:50 and 01:39:03. So this
+    # sizes a 22h26 duration against a 24h baseline, on n=1.
     #
     # PT36H is 1.6x that duration. It buys no extra escalation step — a TIMEOUT
     # doubles and clamps to the PT48H action ceiling, so PT24H and PT36H both give
@@ -194,8 +194,9 @@ steps:
     inputs: [shard_mapping]
     outputs: [routing_index_meta]
     # Whole-reference rype build; an OOM retry doubles mem to the 128 GB action
-    # ceiling. Memory is still sized like local-host-reference-add's
-    # build_rype_index, but the walltime no longer matches that sibling — see below.
+    # ceiling. Memory is still sized like local-host-reference-add's build_rype_index;
+    # the walltime no longer matches that sibling, for the reason in the next
+    # paragraph.
     #
     # walltime sized over the only two runs there are: 7:34:02 (reference 16) and
     # 8:04:07 (reference 18, 196,062 genomes), +6.6% for the larger. PT12H is 1.49x

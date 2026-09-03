@@ -96,3 +96,36 @@ class TestResolveDuckdbMemoryGb:
         # A tiny cgroup minus headroom/reserve must still yield a usable ≥1 GB.
         monkeypatch.setenv("SLURM_MEM_PER_NODE", str(2 * 1024))
         assert resolve_duckdb_memory_gb(8, threads=4, reserve_gb=16) == 1
+
+
+def test_duckdb_out_of_memory_text_is_classified_as_oom():
+    """DuckDB's `OutOfMemoryException` message must match `_OOM_SIGNATURES`, because
+    that is the whole of the retry path for a native job that exhausts its DuckDB
+    `memory_limit`.
+
+    Such a job is not cgroup-killed — SLURM records it FAILED, and the classifier's
+    only route to `OOM_KILLED` (and so to the escalated retry) is finding an OOM
+    signature in the stderr tail. `assembly_load` relies on this: three first
+    attempts at 16 GiB raised here and escalated to 32 without an operator.
+
+    Probed rather than assumed: the match comes from DuckDB prefixing the message
+    with "Out of Memory Error:", which is third-party formatting. A release that
+    reworded it would silently turn these into permanent failures, so this pins it.
+    """
+    import duckdb
+    from qiita_common.log_tail import contains_oom_signature
+
+    conn = duckdb.connect(":memory:")
+    conn.execute("SET memory_limit='20MB'")
+    conn.execute("SET threads=1")
+    with pytest.raises(duckdb.OutOfMemoryException) as exc:
+        conn.execute(
+            "SELECT count(*) FROM ("
+            "  SELECT range AS a, repeat(md5(range::VARCHAR), 300) AS b"
+            "  FROM range(400000) ORDER BY b)"
+        ).fetchall()
+    assert contains_oom_signature(str(exc.value)), (
+        f"DuckDB's OOM message no longer matches an OOM signature, so a native job "
+        f"that exhausts memory_limit would fail permanently instead of escalating: "
+        f"{str(exc.value)[:200]!r}"
+    )

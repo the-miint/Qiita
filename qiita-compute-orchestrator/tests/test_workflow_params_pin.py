@@ -14,6 +14,7 @@ loader test pins the YAML `params` VALUES, so the two ends are locked together.
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 from typing import get_args
 
@@ -200,7 +201,7 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.build_minimap2_index")
     for yaml_path, cpu in _baseline_cpu_every_version("build-shard-index", "build_minimap2_index"):
-        assert cpu == 1, (
+        assert cpu == 1 and cpu < mod._DUCKDB_THREADS, (
             f"{yaml_path.relative_to(_REPO_ROOT)}: build_minimap2_index cpu={cpu}, "
             f"measured at 0.56 cores maximum average demand. It sits below "
             f"_DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — the step is blocked "
@@ -235,9 +236,12 @@ def test_assemble_profiles_cover_every_assembler():
         profiles = steps[0]["baseline_resources"].get("profiles")
         if profiles is None:
             continue  # a version still on a flat baseline
-        assert set(profiles) == literal, (
-            f"{yaml_path.relative_to(_REPO_ROOT)}: assemble profiles "
-            f"{sorted(profiles)} != assembly_run_config assemblers {sorted(literal)}"
+        # The keys are `run_config.json`'s stripped bytes, not bare names — see that
+        # step's comment for why the lookup keys on the pre-existing output.
+        named = {json.loads(k)["assembler"] for k in profiles}
+        assert named == literal, (
+            f"{yaml_path.relative_to(_REPO_ROOT)}: assemble profiles cover "
+            f"{sorted(named)} != assembly_run_config assemblers {sorted(literal)}"
         )
         checked += 1
     assert checked, "no long-read-assembly version uses the assemble profiles lookup"

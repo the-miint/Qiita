@@ -3154,10 +3154,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   number, because the demand is: its 26 hifiasm_meta completions run p50 201.12 /
   max 246.03 GiB against myloasm's p50 53.35 / max 94.58, and all five OOMs were
   hifiasm_meta. It now resolves through a `profiles:` lookup (hifiasm_meta 250,
-  myloasm 128) keyed on a new bare-string `assembler` output of
-  `assembly_run_config`, the same mechanism `bcl-convert` uses for instrument
-  model. A ticket that completed `assembly_run_config` under the old spec has no
-  such output, so the deploy carries a drain step.
+  myloasm 128), the same mechanism `bcl-convert` uses for instrument model. The
+  lookup keys on `assembly_run_config`'s existing `run_config` output rather than a
+  new one: a completed step's bindings are rebuilt on resume from its manifest
+  against the current spec, so a newly declared output would raise for every
+  in-flight ticket that had passed that step. That makes `run_config.json`'s
+  serialized bytes a contract, pinned by a test in both directions.
 - **Reference-workflow resources corrected from the reference-18 build (#526).**
   `build-shard-index`'s `build_minimap2_index` drops `cpu: 4` → `1` (CPU
   efficiency p50 2.1%, max 13.9% over 68 shard builds — a maximum average demand
