@@ -145,10 +145,13 @@ steps:
     # allocation 16 of 22 completed runs peaked under 60 GiB, so the assembler does
     # not expand to what it is given.
     #
-    # 250 rather than a value clearing the upper mode with margin: nodes on this
-    # partition carry 514000 MB (~502 GiB) and 64 CPU, and cpu:32 already holds this
-    # step to two per node. 250 × 2 = 500 keeps that; 251 and above drops every
-    # sample to one per node, the small mode included.
+    # 250 rather than a value clearing the upper mode with margin, to keep every
+    # node able to run two of these. cpu:32 against 64-core nodes already caps the
+    # step at two per node, so memory only bites when it admits fewer than two. The
+    # partition is 16 nodes: 14 at 514000 MB (~502 GiB), where the cliff is 251, and
+    # 2 highmem at 1546528 MB (~1510 GiB), where it is 755. At 250 all 16 nodes take
+    # two; above 251 the 14 drop to one and the work concentrates on the highmem
+    # pair.
     #
     # What 250 does not cover: an earlier cohort recorded a 259.3 GiB peak, and a
     # sample in that range still OOMs and escalates. Escalation doubles and clamps

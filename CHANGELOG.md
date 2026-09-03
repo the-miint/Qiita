@@ -3148,8 +3148,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   while using 9.39 GiB of its 16 GiB allocation, because
   `resolve_duckdb_memory_gb` subtracts an additive headroom that costs a quarter
   of a small step (#288). Each step's own comment carries its table and the
-  sizing argument; `assemble` is 250 rather than higher because 251 GiB is where
-  a second concurrent assemble stops fitting on a 502 GiB node.
+  sizing argument; `assemble` is 250 rather than higher to keep all 16 partition
+  nodes able to run two concurrently.
 - **Reference-workflow resources corrected from the reference-18 build (#526).**
   `build-shard-index`'s `build_minimap2_index` drops `cpu: 4` → `1` (CPU
   efficiency p50 2.1%, max 13.9% over 68 shard builds — a maximum average demand

@@ -51,9 +51,10 @@ _None yet._
     or still queued: the dispatcher adopts any attempt that already has a
     `slurm_job_id` rather than re-submitting it. Only steps dispatched after the
     restart get the new numbers.
-- **`assemble` still fits two per node at 250 GiB** on 514000 MB nodes (250 × 2 = 500).
-  A future raise past 251 would drop it to one per node — the reason 250 was chosen
-  over a value with more margin is recorded at the step in the workflow YAML.
+- **`assemble` still fits two per node at 250 GiB on all 16 partition nodes** — the
+  14 at 514000 MB (cliff at 251) and the 2 highmem at 1546528 MB. A future raise past
+  251 would drop the 14 to one each and concentrate the step on the highmem pair; the
+  reasoning is recorded at the step in the workflow YAML.
 - **Reference-workflow resources also changed (#526):** `build-shard-index`'s
   `build_minimap2_index` `cpu: 4` → `1`; `local-reference-add`'s `load` `PT24H` →
   `PT36H` and `build_routing_index` `PT24H` → `PT12H`. Picked up by the same action
