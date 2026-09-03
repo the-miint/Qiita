@@ -141,6 +141,9 @@ steps:
     # hash_sequences binding was sequence_hash-keyed); build_rype_index below
     # consumes that re-keyed form.
     outputs: [staging_dir, reference_sequence_chunks]
+    # Sized independently of local-reference-add's `load`, which runs the same module
+    # against a whole reference catalogue; this path loads a single host genome. No run
+    # of this step was measured, so this is the original estimate.
     baseline_resources:
       cpu: 8
       mem_gb: 32

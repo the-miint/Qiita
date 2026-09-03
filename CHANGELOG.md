@@ -3202,6 +3202,40 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   update-lane, block-mask plan, align plan) keep the wet_lab_admin floor: running work is not
   reading it.
 
+- **`long-read-assembly` memory re-sized at three steps, and `assemble` is now
+  sized per assembler (#528).** `assembly_coverage` 64 → 96 GiB and `assembly_load`
+  16 → 32 rise off first-attempt failures; `assemble` splits into 250 GiB for
+  hifiasm_meta and 128 for myloasm — a reduction for the latter, whose peak RSS
+  across 16 completions never reached 94.58 where hifiasm_meta reaches 246.03.
+  Measured on the 1.0.1 re-run cohort (2026-09-02 to 09-03) from MaxRSS, counting
+  first-attempt failures only where a job actually ran at the YAML baseline. Each
+  step's comment carries its table and its sizing argument.
+
+  `assemble` resolves through a `profiles:` lookup, the mechanism `bcl-convert`
+  already uses for instrument model. It keys on `assembly_run_config`'s existing
+  `run_config` output rather than a new one, because a completed step's bindings
+  are rebuilt on resume from its manifest against the spec in force then — so a
+  newly declared output would raise for any in-flight ticket past that step. That
+  makes `run_config.json`'s serialized bytes a contract, pinned from both sides.
+
+  `assembly_load`'s failures were not cgroup kills: it raised a DuckDB
+  `OutOfMemoryException` holding 9.39 GiB of a 16 GiB allocation, against a limit
+  set to the allocation less an additive headroom that takes a quarter of a 16 GiB
+  step. Issue #288 tracks re-sizing that helper, which is what would let this come
+  back down.
+
+- **Reference-workflow resources corrected from the reference-18 build (#528).**
+  `build-shard-index`'s `build_minimap2_index` drops `cpu: 4` → `1` (CPU
+  efficiency p50 2.1%, max 13.9% over 68 shard builds — a maximum average demand
+  of 0.56 cores; the step is blocked on its data-plane stream, and its DuckDB
+  pool is a module constant this number never controlled). In
+  `local-reference-add`, `load` goes `PT24H` → `PT36H` (its one completing attempt
+  ran 22:25:50; no attempt of that build was observed hitting a walltime limit) and
+  `build_routing_index` goes `PT24H` → `PT12H` (7:34:02 and 8:04:07 are the only
+  two runs, at the cost of one more escalation rung above 24h). Memory is untouched
+  in all three: pegged at ReqMem on `load`, which bounds demand from below without
+  measuring it; never binding on `build_minimap2_index`; and unmeasured on
+  `build_routing_index`, which this only re-times.
 - **`ticket:doput` is now on the USER role ceiling (#484).** It was on the two admin
   ceilings and service accounts only, dating from when reference loading was the sole
   upload consumer. With host paths in `action_context` restricted to wet_lab_admin+, an

@@ -90,6 +90,10 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.assembly_run_config
     params: {assembler: assembler}
+    # `run_config` has two readers: the `assemble` container reads `.assembler` from
+    # it with jq, and the runner reads the whole file, stripped, as the key of that
+    # step's `profiles:` lookup below. Its serialized bytes are therefore a contract —
+    # `test_run_config_bytes_are_the_resource_profile_keys` pins them to those keys.
     outputs: [run_config]
     baseline_resources:
       cpu: 1
@@ -131,10 +135,87 @@ steps:
     derived_inputs:
       MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [genomes_dir]
+    # mem_gb is per-assembler, because the demand is. Measured on the 1.0.1 re-run
+    # cohort (2026-09-02 to 09-03, qiita partition), MaxRSS off each job's `.batch`
+    # row, GiB throughout, split by the assembler the ticket asked for:
+    #
+    #   assembler       n     min     p50     max
+    #   hifiasm_meta   26   17.67  201.12  246.03
+    #   myloasm        16    2.78   53.35   94.58
+    #
+    # All 5 OUT_OF_MEMORY first attempts at the old flat 192 were hifiasm_meta; no
+    # myloasm run has exceeded 94.58. A single number has to cover hifiasm_meta, and
+    # then every myloasm ticket reserves ~2.6x what that assembler has ever used.
+    #
+    # The lookup keys on `assembly_run_config`'s existing `run_config` output, whose
+    # stripped bytes the runner reads at dispatch — hence the JSON-shaped keys below.
+    # A dedicated bare-name output would read better and is not worth it: a completed
+    # step's bindings are rebuilt on resume as `{name: manifest[name] for name in
+    # entry.outputs}` against the spec in force at resume, so a new output raises for
+    # every in-flight ticket that already completed this step. Keying on a file that
+    # is already declared costs nothing at deploy.
+    #
+    # Two pins hold the seam: `test_run_config_bytes_are_the_resource_profile_keys`
+    # ties these keys to what the job actually writes, and
+    # `test_assemble_profiles_cover_every_assembler` ties them to `Inputs.assembler`'s
+    # Literal members. The lookup has no default — an unmatched key fails the step at
+    # dispatch rather than silently sizing from another assembler's measurement.
+    #
+    # Every figure below is MaxRSS — what a run used, not what it asked for. The
+    # allocation matters only for whether that usage was free to grow: a peak pinned
+    # at its allocation is censored and bounds demand from below, everything else is
+    # a demand measurement whatever was requested. Rows are split at 120 GiB, which
+    # is where the two assemblers separate:
+    #
+    #   ran at   n     p50      max   what the rows are
+    #   103      1    8.01     8.01   myloasm; request set out of band on the ticket
+    #                                 to shorten its queue wait, peak far below it
+    #   192     19   53.75   114.86   15 myloasm, 4 hifiasm_meta
+    #   192      3  191.07   192.00   hifiasm_meta; one of the three pegged at 192.00
+    #   384     14  209.17   246.03   hifiasm_meta, ticket-wide --mem-gb 384
+    #   384      5  202.74   241.17   hifiasm_meta, escalated retries of the 5 OOMs
+    #
+    # That is all 42 completions; the window held 54 assemble jobs in total, the rest
+    # being the 5 OUT_OF_MEMORY first attempts and 7 still in flight at 192.
+    #
+    # hifiasm_meta 250. Exactly one of its 26 rows is censored (the 192.00 above), so
+    # its p50 of 201.12 carries one pinned value; the 246.03 max grew freely inside a
+    # 384 GiB allocation, 64% of it, and is what 250 answers. None of the 16 myloasm
+    # rows is censored, so its 94.58 max is demand outright.
+    #
+    # 250 keeps a standard node able to hold two of these and 251 does not:
+    # 251 x 1024 x 2 = 514048 MB against RealMemory=514000. cpu:32 on 64-core nodes
+    # caps the step at two per node regardless, so memory only matters where it
+    # admits fewer. The partition is 14 nodes at 514000 MB and 2 highmem at
+    # 1546528 MB, where the same cliff sits at 755. That slot was not observed and
+    # the cap is not what prevented it: 40 of those 54 jobs went to the two
+    # highmem nodes, those on a standard node ran strictly back-to-back, and at probe
+    # time every node reported 0 idle CPUs with 60-354 GiB free. 250 preserves the
+    # slot rather than demonstrating one, and stops 3.97 GiB above this cohort's max.
+    # An earlier and larger cohort — 59 first attempts at 192, of which 30 OOMed —
+    # peaked at 259.3 GiB on its 384 GiB retries, so a sample in that class still
+    # escalates here.
+    #
+    # myloasm 128, 1.35x its observed max with 33.4 GiB of margin. It does not raise
+    # this step's own concurrency (cpu:32 already caps that at two per node); what it
+    # does is stop holding 122 GiB per myloasm ticket that nothing on the node can
+    # use.
+    #
+    # Escalation doubles and clamps to `action_ceiling.mem_gb`: 250 -> 500 is one
+    # rung, 128 -> 256 -> 500 is two. Against a ticket-wide `max_retries` a shorter
+    # ladder is both one less rung to climb and one less retry spent climbing it,
+    # which is the cost myloasm takes on for the smaller reservation.
     baseline_resources:
-      cpu: 32
-      mem_gb: 192
-      walltime: PT16H
+      from_step_output: run_config
+      profiles:
+        '{"assembler": "hifiasm_meta"}':
+          cpu: 32
+          mem_gb: 250
+          walltime: PT16H
+        '{"assembler": "myloasm"}':
+          cpu: 32
+          mem_gb: 128
+          walltime: PT16H
 
   # Align the masked HiFi reads back to the noLCG contigs with miint's embedded
   # minimap2 (`map-hifi`), emitting the coordinate-sorted BAM the binning step
@@ -159,9 +240,22 @@ steps:
     #
     # The wall-clock cost of 8 rather than 16 is slack this step has: measured p50 10.4
     # min and max 15.4 min against the PT4H limit below, i.e. 6% of it.
+    #
+    # mem_gb measured on the same cohort. At 64, 2 of 24 first attempts were
+    # OUT_OF_MEMORY pegged at 63.99 GiB, and both completed on the 128 GiB retry at
+    # 73.15 and 73.82 GiB. Runs that fit 64 peaked at p50 52.43, max 59.01 (n=22) —
+    # the tail is what 64 missed, not the median. 96 clears the 73.82 observed max
+    # by 22.18 GiB. An earlier cohort saw ten escalations of this same shape.
+    #
+    # The whole increment reaches the side that binds: DuckDB is held to
+    # `_DUCKDB_CAP_GB` whatever the allocation, so the cgroup remainder — minimap2's
+    # index and the writer's SEQUENCE_DATA lookup, neither of which spills — takes
+    # every added GiB. Per node, memory already held this step to 7 concurrent at 64
+    # GiB (8 x 64 GiB exceeds RealMemory=514000); 96 GiB lowers that to 5. cpu:8 was
+    # never the binding limit.
     baseline_resources:
       cpu: 8
-      mem_gb: 64
+      mem_gb: 96
       walltime: PT4H
 
   # metawrap binning (metabat2 + maxbin2 + concoct) over the noLCG contigs +
@@ -326,9 +420,34 @@ steps:
     inputs: [manifest, feature_map, assembly_chunks, bin_map, genomes_dir, checkm_dir, refined_bins_dir]
     params: {processing_idx: processing_idx}
     outputs: [staging_dir]
+    # mem_gb measured on the same cohort: 3 of 15 first attempts at 16 failed with a
+    # DuckDB OutOfMemoryException in write_feature_sequence_chunks' per-part ORDER BY
+    # ("failed to allocate data of size 432.0 MiB (10.3 GiB/11.1 GiB used)"). What
+    # shows this was not a cgroup kill is the RSS, not the state: process RSS at
+    # failure was 9.39 / 6.09 / 6.19 GiB inside a 16 GiB cgroup. The state does not
+    # discriminate — a step-level cgroup kill also surfaces through slurmrestd as a
+    # job-level FAILED (see `log_tail.py`). The retries were automatic even so: the
+    # message DuckDB raises begins "Out of Memory Error:", which the classifier's
+    # signature list matches, so it reached OOM_KILLED without an operator. That is
+    # third-party formatting, probed and pinned by
+    # `test_duckdb_out_of_memory_text_is_classified_as_oom`.
+    #
+    # What bound was DuckDB's own limit. `resolve_duckdb_memory_gb` subtracts
+    # `duckdb_headroom_gb(4)` = 4 from the allocation, so a 16 GiB step ran DuckDB at
+    # 12 GB (11.18 GiB); the headroom is additive, so it costs a quarter of a 16 GiB
+    # step and a sixteenth of a 64 GiB one. All three completed on the 32 GiB retry
+    # at 8.83 / 6.31 / 6.62 GiB RSS, so what the step wanted was a higher DuckDB
+    # limit, not more resident memory. 32 is the value measured to pass; nothing
+    # between 16 and 32 was tried, and the step now reserves headroom it has never
+    # touched. What was measured is the pair of endpoints: the sort failed against an
+    # 11.18 GiB limit and passed against 26.07. Whether it would pass at 14.9 — the
+    # same 16 GiB allocation without the headroom subtracted — was not tried, so the
+    # headroom's share is a candidate for the fix rather than an established cause.
+    # Re-sizing that helper against real MaxRSS is the route back down. Runs take
+    # 2-23 s, so the allocation is held briefly.
     baseline_resources:
       cpu: 4
-      mem_gb: 16
+      mem_gb: 32
       walltime: PT2H
 
   # Load the staging Parquets → the `assembled_sequence`, `assembled_sequence_chunks`,
