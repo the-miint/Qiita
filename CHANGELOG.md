@@ -34,8 +34,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   admits or refuses a submission on; `samples` is the same gate per prep_sample. Thin
   clients — one GET each, printed verbatim — so a new server field reaches the operator
   without a CLI change. The mask twin (`qiita mask list|show|samples`) is the shape, and
-  the two now cover both identities an assembly submission names. `_filter_params` moved
-  from `cli/user/mask.py` to `cli/user/_helpers.py` so the two share one copy.
+  the two now cover both identities an assembly submission names. `filter_params` moved
+  from `cli/user/mask.py` to `cli/_common.py`, beside the `call` whose `params`
+  argument it builds, so the two verbs share one copy.
 
 - **`POST /run-folder/inspect` lets a submit run from a machine that does not mount the
   cluster (#484).** `submit-bcl-convert` read `RunInfo.xml` and `submit-pacbio-ingest`

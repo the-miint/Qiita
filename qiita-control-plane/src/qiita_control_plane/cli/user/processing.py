@@ -9,8 +9,7 @@ sit in this CLI: they are credentialed API calls the server's own scope guard
 gates, which is the placement rule in `cli/user/__init__.py`.
 
 The mask twin of this module is `cli/user/mask.py`: the two surfaces answer the
-same shape of question at the two identities a long-read assembly is submitted
-against.
+same shape of question at the two identities an `align-denovo` submission names.
 
 Thin clients: each verb is one GET, printed verbatim, so a new server-side field
 reaches the operator without a CLI change.
