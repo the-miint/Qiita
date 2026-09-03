@@ -3150,7 +3150,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   cgroup kill; `assembly_load` does not — it raised a DuckDB
   `OutOfMemoryException` while its process held 9.39 GiB of a 16 GiB allocation,
   because `resolve_duckdb_memory_gb` subtracts an additive headroom that costs a
-  quarter of a small step (#288). Each step's own comment carries its table and
+  quarter of a small step; issue #288 tracks reshaping that helper. Each step's own comment carries its table and
   its sizing argument. `assemble` is sized **per assembler** rather than by one
   number, because the demand is: its 26 hifiasm_meta completions run p50 201.12 /
   max 246.03 GiB against myloasm's p50 53.35 / max 94.58, and all five OOMs were

@@ -81,9 +81,9 @@ not put them in the file, and the resulting error is silent.
 SIZING. The unspillable SEQUENCE_DATA lookup pushes the largest samples past the
 baseline, and escalation recovers them. Two cohorts have now measured it at a 64 GiB
 baseline and both reached the allocation, which is what settled the question of
-whether to re-size; the current number and the cohort behind it are recorded at the
-`assembly_coverage` step in `workflows/long-read-assembly/1.0.1.yaml`, which is the
-one place that changes when the allocation does.
+whether to re-size; the current number and the cohort behind it are recorded on this
+step in the workflow YAML that declares it. Each version declares its own — an older
+version keeps the allocation it ran with, since a version's spec is its identity.
 
 Re-measure the same way: `sacct --user=qiita-job` from a host that can reach slurmdbd,
 job names `qiita-wt{idx}-assembly_coverage-a{n}`, MaxRSS read off the `.0` sub-step and
@@ -142,7 +142,7 @@ _MM2_PRESET = "map-hifi"
 # allocation less DuckDB's cap below — the baseline on a first attempt, more once
 # escalation has raised it. Where that ceiling falls in reads is still not measured.
 # The peak RSS a real cohort reached, and the allocation sized from it, are recorded
-# at the step in `workflows/long-read-assembly/1.0.1.yaml`.
+# on this step in the workflow YAML that declares it.
 # Equal to this step's `baseline_resources.cpu`, and it must stay equal — but the
 # binding reason is MEMORY, not cores. `align_minimap2` draws its parallelism from
 # DuckDB's thread pool (measured near-linear at 1/2/4/8), so this number is also the
@@ -153,8 +153,7 @@ _MM2_PRESET = "map-hifi"
 # 2026-01-01 onward, threads=8): across 49 completions at the then-64 GiB baseline,
 # peak RSS sat at ~56 GiB — 87% of the allocation — at the median, with 35 of the 49
 # above 80%, and ten further attempts pegged at the allocation and died
-# `OUT_OF_MEMORY`. (Those figures were recorded in GB and are GiB: the peg sits at the
-# 64 GiB allocation.) So raising this number buys wall time the step does not need
+# `OUT_OF_MEMORY`. So raising this number buys wall time the step does not need
 # (p50 10.4 min against a PT4H limit) against memory that is already the binding
 # side.
 #

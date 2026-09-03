@@ -92,10 +92,11 @@ _CHECKM_UNBINNED_QA_TSV = "unbinned_qa.tsv"
 _DAS_SUMMARY_TSV = "das_tool_summary.tsv"  # DAS_Tool `*_DASTool_summary.tsv`
 
 # DuckDB resource caps. Off-SLURM fallback; under SLURM the limit tracks the real
-# cgroup via `resolve_duckdb_memory_gb()`. The per-batch sort it has to fit is
-# `CHUNK_BUDGET_PER_BATCH` chunks, ~3.2 GB raw — but an 11.18 GiB limit was not enough
-# for it on real assemblies, which is why the step's YAML baseline is 32 GiB rather
-# than 16. See that step's comment.
+# cgroup via `resolve_duckdb_memory_gb()`, so the literal below binds only off SLURM
+# (local backend and tests) and is dev-box sized, not cluster sized. The per-batch sort
+# it has to fit is `CHUNK_BUDGET_PER_BATCH` chunks, ~3.2 GB raw — under SLURM an
+# 11.18 GiB limit was not enough for it on real assemblies, which is why the step's
+# YAML baseline is 32 GiB rather than 16. See that step's comment.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 

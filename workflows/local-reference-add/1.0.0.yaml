@@ -207,9 +207,9 @@ steps:
     # PT24H reached it in one — and `max_retries` is spent ticket-wide. Nothing in the
     # n=2 population is near that, which is the whole of the argument for lowering.
     #
-    # Not part of the argument: a 24h request in this PriorityTier=1 partition had
-    # SLURM's StartTime estimate five days out, but backfill then placed the job 70
-    # min after submit, so the queueing cost measured was 70 minutes.
+    # A 24h request in this PriorityTier=1 partition had SLURM's StartTime estimate
+    # five days out, but backfill placed the job 70 min after submit — so the queueing
+    # cost of the longer request measured 70 minutes, and is not why this changed.
     baseline_resources:
       cpu: 4
       mem_gb: 64
