@@ -79,19 +79,21 @@ are tempted to drop it because "the aligner already knows the sequences": it doe
 not put them in the file, and the resulting error is silent.
 
 SIZING, measured 2026-08-24 against real tickets on the deploy host (`sacct`, 69
-attempts). At the 64 GB baseline 49 completed, peak RSS p50 55.5 GB / max 63.6, with 35
-of them above 80% of the allocation; 10 died OUT_OF_MEMORY at exactly 64.0 GB and each
-completed on the escalated 128 GB retry at 63.8-75.2 GB. So the unspillable
-SEQUENCE_DATA lookup does push the largest samples past the baseline — but escalation
-DOES fix it, which is the half the earlier note here feared it would not.
+attempts). At the then-64 GiB baseline 49 completed, peak RSS p50 55.5 / max 63.6, with
+35 of them above 80% of the allocation; 10 died OUT_OF_MEMORY pegged at the allocation
+and each completed on the escalated 128 GiB retry. So the unspillable SEQUENCE_DATA
+lookup does push the largest samples past the baseline — but escalation does fix it,
+which is the half the earlier note here feared it would not.
 
-Raising the baseline to 128 GB would retire that retry, at the cost of doubling the
-request for every sample including the median that fits in 56. Not done: 69 attempts
-is too small a sample to re-size a production allocation on, and the samples
-behind them are not known to span what this workflow will see. Revisit with more runs —
-`sacct --user=qiita-job` from a host that can reach slurmdbd, job names
-`qiita-wt{idx}-assembly_coverage-a{n}`, MaxRSS read off the `.0` sub-step and not the
-parent. See the memory-split note at `_DUCKDB_CAP_GB`.
+That note declined to re-size on 69 attempts, wanting more runs first. A second,
+independent cohort has since reproduced the same OOM at the same allocation, which is
+what settled it: the baseline is no longer 64. The current number, the cohort behind
+it, and what the increment buys are recorded at the `assembly_coverage` step in
+`workflows/long-read-assembly/1.0.1.yaml` — one home, because the step's allocation is
+the thing that changes. Re-measure the same way: `sacct --user=qiita-job` from a host
+that can reach slurmdbd, job names `qiita-wt{idx}-assembly_coverage-a{n}`, MaxRSS read
+off the `.0` sub-step and not the parent. See the memory-split note at
+`_DUCKDB_CAP_GB`.
 """
 
 from __future__ import annotations
@@ -142,11 +144,11 @@ _MM2_PRESET = "map-hifi"
 # OOM could never be escalated out of.
 #
 # CEILING: for a read set whose sequence bytes * ~1.6 exceed the cgroup remainder,
-# no escalation helps (the lookup is unspillable). The remainder is the ATTEMPT's
+# no escalation helps (the lookup is unspillable). The remainder is the attempt's
 # allocation less DuckDB's cap below — the baseline on a first attempt, more once
-# escalation has raised it. Where that ceiling falls in reads is still not measured;
-# what IS measured is the peak RSS a real cohort reached, and the allocation sized
-# from it, both recorded at the step in the workflow YAML.
+# escalation has raised it. Where that ceiling falls in reads is still not measured.
+# The peak RSS a real cohort reached, and the allocation sized from it, are recorded
+# at the step in `workflows/long-read-assembly/1.0.1.yaml`.
 # Equal to this step's `baseline_resources.cpu`, and it must stay equal — but the
 # binding reason is MEMORY, not cores. `align_minimap2` draws its parallelism from
 # DuckDB's thread pool (measured near-linear at 1/2/4/8), so this number is also the
@@ -154,13 +156,13 @@ _MM2_PRESET = "map-hifi"
 # in the cgroup remainder — the side that cannot spill.
 #
 # That remainder is already the constraint, measured on the deploy host (`sacct`,
-# threads=8): across 49 completions at the then-64 GiB baseline, peak RSS sat at 87%
-# of the allocation at the median, with 35 of the 49 above 80%, and ten further
-# attempts died `OUT_OF_MEMORY` pegged at the allocation. The baseline has since been
-# raised; the current figure and the cohort behind it live at the step in the
-# workflow YAML. So raising this number buys wall time the step does not need
-# (p50 10.4 min against a PT4H limit) against memory that is already the binding
-# side.
+# 2026-01-01 onward, threads=8): across 49 completions at the then-64 GiB baseline,
+# peak RSS sat at ~56 GiB, 87% of the allocation, at the median, with 35 of the 49
+# above 80%, and ten further attempts died `OUT_OF_MEMORY` pegged at the allocation.
+# The baseline has since been raised — see the step in
+# `workflows/long-read-assembly/1.0.1.yaml` for the current figure and its cohort. So
+# raising this number buys wall time the step does not need (p50 10.4 min against a
+# PT4H limit) against memory that is already the binding side.
 #
 # `_DUCKDB_CAP_GB` is NOT what bounds this step: DuckDB sits at 16 GB and spills. The
 # ~56 GB is the extension side — the SEQUENCE_DATA lookup above plus the minimap2

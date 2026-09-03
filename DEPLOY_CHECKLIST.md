@@ -44,11 +44,14 @@ _None yet._
   sync in the deploy picks these up; there is no separate step. The measurements and
   the reasoning are at each step in `workflows/long-read-assembly/1.0.1.yaml`. Two
   consequences before the next submission batch:
-  - **A routine submission no longer needs the `--mem-gb 384` floor.** It was covering
-    `assemble`'s upper demand mode (measured 189.39–246.03 GiB), which 250 covers from
-    the baseline. It is not full coverage: an earlier cohort recorded a 259.3 GiB peak,
-    and a sample in that range still OOMs and escalates to 500. Passing the floor still
-    works, and still lifts every other step in the ticket with it.
+  - **A routine hifiasm_meta submission no longer needs the `--mem-gb 384` floor.** It
+    was covering that assembler's demand, which this cohort measured to a 246.03 GiB
+    max and 250 covers from the baseline. It is not full coverage: an earlier cohort
+    recorded a 259.3 GiB peak, and a sample in that range still OOMs and escalates to
+    500. Passing the floor still works, and still lifts every other step in the ticket.
+  - **myloasm tickets now reserve 250 GiB too, and have never needed more than 94.58.**
+    The baseline is one number for both assemblers; sizing them apart needs a workflow
+    change, not an operator one.
   - **Work already submitted to SLURM keeps its old allocation.** The dispatcher adopts
     any attempt that already carries a `slurm_job_id` instead of re-submitting, and
     that is per *step attempt*, not per ticket — a ticket mid-flight at the restart
@@ -57,9 +60,10 @@ _None yet._
 - **Reference-workflow resources also changed (#526):** `build-shard-index`'s
   `build_minimap2_index` `cpu: 4` → `1`; `local-reference-add`'s `load` `PT24H` →
   `PT36H` (an increase) and `build_routing_index` `PT24H` → `PT12H` (a reduction).
-  Same action sync, no separate step. Both walltime changes are on the *local*
-  reference path only — `reference-add`, `host-reference-add` and
-  `local-host-reference-add` are untouched and keep their existing limits.
+  Same action sync, no separate step. Both walltime changes are in
+  `local-reference-add` only: `reference-add`, `host-reference-add` and
+  `local-host-reference-add` are untouched and keep their existing limits, including
+  the same `build_minimap2_index` step at `cpu: 4` in the latter two.
 
 ## Deployed history
 

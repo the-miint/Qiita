@@ -3150,17 +3150,24 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `OutOfMemoryException` while its process held 9.39 GiB of a 16 GiB allocation,
   because `resolve_duckdb_memory_gb` subtracts an additive headroom that costs a
   quarter of a small step (#288). Each step's own comment carries its table and
-  its sizing argument.
+  its sizing argument. `assemble`'s 250 is sized for hifiasm_meta: split by
+  assembler, its 26 completions run p50 201.12 / max 246.03 GiB against myloasm's
+  p50 53.35 / max 94.58, and all five OOMs were hifiasm_meta — so a myloasm ticket
+  now reserves ~2.6x what that assembler has ever used. Sizing them separately
+  needs a `profiles:` lookup keyed on a new `assembly_run_config` output, and a new
+  declared output strands tickets already past that step.
 - **Reference-workflow resources corrected from the reference-18 build (#526).**
   `build-shard-index`'s `build_minimap2_index` drops `cpu: 4` → `1` (CPU
   efficiency p50 2.1%, max 13.9% over 68 shard builds — a maximum average demand
   of 0.56 cores; the step is blocked on its data-plane stream, and its DuckDB
   pool is a module constant this number never controlled). In
-  `local-reference-add`, `load` goes `PT24H` → `PT36H` (the one completing
-  attempt ran 22:25:50, leaving 1h34) and `build_routing_index` goes `PT24H` →
-  `PT12H` (7:34:02 and 8:04:07 are the only two runs). Memory is untouched in all
-  three: on `load` it was pegged at ReqMem, which bounds demand from below without
-  measuring it, and on `build_minimap2_index` it was simply never binding.
+  `local-reference-add`, `load` goes `PT24H` → `PT36H` (its one completing attempt
+  ran 22:25:50; no attempt of that build was observed hitting a limit) and
+  `build_routing_index` goes `PT24H` → `PT12H` (7:34:02 and 8:04:07 are the only
+  two runs, at the cost of one more escalation rung above 24h). Memory is untouched
+  in all three: pegged at ReqMem on `load`, which bounds demand from below without
+  measuring it; never binding on `build_minimap2_index`; and unmeasured on
+  `build_routing_index`, which this only re-times.
 - **`ticket:doput` is now on the USER role ceiling (#484).** It was on the two admin
   ceilings and service accounts only, dating from when reference loading was the sole
   upload consumer. With host paths in `action_context` restricted to wet_lab_admin+, an

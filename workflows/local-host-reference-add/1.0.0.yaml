@@ -141,9 +141,9 @@ steps:
     # hash_sequences binding was sequence_hash-keyed); build_rype_index below
     # consumes that re-keyed form.
     outputs: [staging_dir, reference_sequence_chunks]
-    # PT24H where local-reference-add's `load` is now PT36H. That raise was sized on
-    # a 196,062-genome reference; this path loads a single host genome, and no run
-    # here has approached PT24H.
+    # PT24H where local-reference-add's `load` is now PT36H: that raise was sized on
+    # a 196,062-genome reference, and this path loads a single host genome. No run of
+    # this step was measured.
     baseline_resources:
       cpu: 8
       mem_gb: 32

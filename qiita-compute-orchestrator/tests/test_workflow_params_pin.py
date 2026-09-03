@@ -179,32 +179,29 @@ def test_assembly_coverage_cpu_pins_duckdb_threads():
         )
 
 
-def test_build_shard_index_cpu_is_intentionally_below_duckdb_threads():
-    """`build-shard-index`'s `build_minimap2_index` step: baseline `cpu:` is
-    deliberately BELOW `build_minimap2_index._DUCKDB_THREADS`, unlike the three
-    pins above which assert equality.
+def test_build_shard_index_cpu_is_below_duckdb_threads():
+    """`build-shard-index`'s `build_minimap2_index` step: baseline `cpu:` is 1, below
+    `build_minimap2_index._DUCKDB_THREADS`, where the three pins above assert equality.
 
-    Those pins exist because a job drawing its parallelism from DuckDB's pool
-    wastes any core the pool cannot use. This step is the opposite case: `sacct`
-    over a 68-run sample put its CPU efficiency at p50 2.1% and max 13.9% of four
-    cores — a maximum average demand of 0.56 cores — because it runs blocked on
-    the data-plane chunk stream rather than computing. The cores were the waste,
-    so `cpu` dropped to 1 while the pool stayed at 4 and its threads now
-    time-share one core.
+    Those pins exist because a job drawing its parallelism from DuckDB's pool wastes
+    any core the pool cannot use. This step is the opposite case: `sacct` over a 68-run
+    sample put its CPU efficiency at p50 2.1% and max 13.9% of four cores — a maximum
+    average demand of 0.56 cores — because it runs blocked on the data-plane chunk
+    stream rather than computing. The cores were the waste, so `cpu` dropped to the
+    measured 1 while the pool stayed at 4.
 
-    Pinned as an INEQUALITY for the same reason the others are pinned as an
-    equality: nothing fails at runtime when these drift, so a later edit raising
-    `cpu` back to `_DUCKDB_THREADS` to "fix the mismatch" would silently undo a
-    measured change. If this assertion fires, the question is whether the
-    measurement still holds, not whether the numbers should be made equal.
+    Pinned for the same reason the others are: nothing fails at runtime when these
+    drift, so a later edit raising `cpu` to match the pool would silently undo a
+    measured change. The assertion is on the measured value rather than on the
+    inequality, so that changing `_DUCKDB_THREADS` for an unrelated reason does not
+    fire here, and so that an intermediate `cpu: 2` does not pass unnoticed. If it
+    fires, the question is whether the measurement still holds.
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.build_minimap2_index")
-    versions = _baseline_cpu_every_version("build-shard-index", "build_minimap2_index")
-    assert versions, "no build-shard-index version declares build_minimap2_index"
-    for yaml_path, cpu in versions:
-        assert cpu < mod._DUCKDB_THREADS, (
-            f"{yaml_path}: build_minimap2_index cpu={cpu} is no longer below "
-            f"_DUCKDB_THREADS={mod._DUCKDB_THREADS}; the step is stream-blocked "
-            f"(measured 0.56 cores max average demand), so raising cpu to match the "
-            f"pool reserves cores it cannot use."
+    for yaml_path, cpu in _baseline_cpu_every_version("build-shard-index", "build_minimap2_index"):
+        assert cpu == 1, (
+            f"{yaml_path.relative_to(_REPO_ROOT)}: build_minimap2_index cpu={cpu}, "
+            f"measured at 0.56 cores maximum average demand. It sits below "
+            f"_DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — the step is blocked "
+            f"on its data-plane stream, so cores matched to the pool go unused."
         )

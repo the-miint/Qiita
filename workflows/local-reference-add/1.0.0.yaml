@@ -150,17 +150,16 @@ steps:
              annotation_manifest, annotation_map]
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
-    # walltime sized from the reference-18 build (196,062 genomes), where the one
-    # completing attempt ran 22:25:50 — 1h34 short of PT24H. PT36H is 1.6x that run.
-    # It does not buy an extra escalation step: a TIMEOUT doubles and clamps to the
-    # PT48H action ceiling, so PT24H and PT36H both give exactly one retry at PT48H.
-    # What it buys is a smaller chance of needing that retry.
+    # walltime sized from the one completing attempt of the reference-18 build
+    # (196,062 genomes), which ran 22:25:50. Nothing here has been observed hitting a
+    # limit: that attempt ran under a 48h SLURM limit whose origin the ticket does not
+    # record, and the other two attempts of the build failed on memory at 00:06:50 and
+    # 01:39:03. So this sizes a 22h26 duration against a 24h baseline, on n=1.
     #
-    # Two caveats on the one measurement. 22:25:50 is a duration, not a near-miss:
-    # that job in fact ran under a 48h SLURM limit whose origin the ticket does not
-    # record (no walltime override is stored against it). And the other two attempts
-    # of that build failed on memory at 00:06:50 and 01:39:03, not on time, so
-    # nothing here shows PT24H being hit.
+    # PT36H is 1.6x that duration. It buys no extra escalation step — a TIMEOUT
+    # doubles and clamps to the PT48H action ceiling, so PT24H and PT36H both give
+    # exactly one retry at PT48H. What it buys is a smaller chance of needing it,
+    # which matters because `max_retries` is spent ticket-wide.
     #
     # mem_gb is untouched: RSS pegged at ReqMem in all three attempts, which bounds
     # demand from below without measuring it.
@@ -200,13 +199,16 @@ steps:
     #
     # walltime sized over the only two runs there are: 7:34:02 (reference 16) and
     # 8:04:07 (reference 18, 196,062 genomes), +6.6% for the larger. PT12H is 1.49x
-    # the longer of the two, and a TIMEOUT doubles to PT24H and then the PT48H
-    # ceiling, so the old headroom remains reachable on demand.
+    # the longer of the two.
     #
-    # A 24h request in this PriorityTier=1 partition had SLURM's StartTime estimate
-    # for the reference-18 run five days out. That estimate cost little in practice
-    # — backfill placed the job 70 min after submit — so this is a sizing change
-    # against an n=2 population, not a fix for a measured queueing delay.
+    # The cost is one more rung: a build genuinely needing >24h now burns a timed-out
+    # 12h attempt and a timed-out 24h attempt before reaching the PT48H ceiling, where
+    # PT24H reached it in one — and `max_retries` is spent ticket-wide. Nothing in the
+    # n=2 population is near that, which is the whole of the argument for lowering.
+    #
+    # Not part of the argument: a 24h request in this PriorityTier=1 partition had
+    # SLURM's StartTime estimate five days out, but backfill then placed the job 70
+    # min after submit, so the queueing cost measured was 70 minutes.
     baseline_resources:
       cpu: 4
       mem_gb: 64

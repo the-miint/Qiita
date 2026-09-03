@@ -134,19 +134,33 @@ steps:
     # mem_gb measured on the 1.0.1 re-run cohort (2026-09-02 to 09-03, qiita
     # partition), MaxRSS off each job's `.batch` row, GiB throughout.
     #
-    # Demand is bimodal and 192 sat inside the upper mode: 5 of 27 first attempts
-    # at 192 were OUT_OF_MEMORY. Every completed run, by the allocation it ran at:
+    # This number is sized for hifiasm_meta. Splitting the 42 completions by the
+    # assembler the ticket asked for:
+    #
+    #   assembler       n     min     p50     max
+    #   hifiasm_meta   26   17.67  201.12  246.03
+    #   myloasm        16    2.78   53.35   94.58
+    #
+    # All 5 of the OUT_OF_MEMORY first attempts at 192 were hifiasm_meta; no myloasm
+    # run has exceeded 94.58. So 250 is ~2.6x what myloasm has ever needed, and every
+    # myloasm ticket reserves it. Sizing the two separately needs a `profiles:` lookup
+    # keyed on `from_step_output`, which would mean a new declared output on
+    # assembly_run_config — and a new declared output is re-bound on resume from a
+    # manifest an earlier attempt wrote, so adding one strands tickets already past
+    # that step. Not done here for that reason.
+    #
+    # The hifiasm_meta figures are demand rather than a cgroup being filled: its
+    # largest is 246.03 of a 384 GiB allocation, 64% and nowhere near pegged. Every
+    # completed run, by the allocation it ran at:
     #
     #   ran at   n     p50      max   what the rows are
-    #   192     19   53.75   114.86   small mode
-    #   192      3  191.07   192.00   upper mode; the largest pegged at 192.00
-    #   384     14  209.17   246.03   submitted with a ticket-wide --mem-gb 384
-    #   384      5  202.74   241.17   escalated retries of the five that OOMed
+    #   192     19   53.75   114.86   15 myloasm, 4 hifiasm_meta
+    #   192      3  191.07   192.00   hifiasm_meta; the largest pegged at 192.00
+    #   384     14  209.17   246.03   hifiasm_meta, ticket-wide --mem-gb 384
+    #   384      5  202.74   241.17   hifiasm_meta, escalated retries of the 5 OOMs
     #
-    # The 384 rows are demand rather than a cgroup being filled: the largest is
-    # 246.03 of 384, 64% of the allocation and nowhere near pegged. The same holds
-    # at the other end — 16 of the 22 completions at 192 peaked under 60 GiB, so the
-    # assembler does not expand into what it is given.
+    # (54 assemble jobs in the window: those 41 completions, the 5 OOMs, 7 still in
+    # flight at 192, and one myloasm canary at 103.)
     #
     # 250 keeps a standard node able to hold two of these and 251 does not:
     # 251 x 1024 x 2 = 514048 MB against RealMemory=514000. cpu:32 on 64-core nodes
@@ -154,16 +168,18 @@ steps:
     # admits fewer. The partition is 14 nodes at 514000 MB and 2 highmem at
     # 1546528 MB, where the same cliff sits at 755.
     #
-    # That two-per-node slot was NOT observed. In this cohort assembles on a
-    # standard node ran strictly back-to-back, never co-resident, and 40 of 54 went
-    # to the highmem pair — those nodes are shared with other partitions (AllocMem
-    # 491520 of 514000 when probed), so free memory rather than this baseline gated
-    # placement. 250 preserves the slot; it does not demonstrate it.
+    # That two-per-node slot was not observed, and the cap is not what prevented it:
+    # 41 of 56 assemble jobs went to the two highmem nodes, those on a standard node
+    # ran strictly back-to-back, and at probe time every node in the partition
+    # reported 0 idle CPUs with 60-354 GiB free. Whole-node contention gated
+    # placement, not this baseline. 250 preserves the slot rather than demonstrating
+    # one, and it stops 3.97 GiB above the cohort max while an earlier cohort
+    # recorded 259.3 GiB — a sample in that range still OOMs and escalates.
     #
-    # What 250 does not cover: an earlier cohort recorded a 259.3 GiB peak, and a
-    # sample in that range still OOMs and escalates. Escalation doubles and clamps
-    # to `action_ceiling.mem_gb`: from 250 that is one attempt at 500, where from
-    # 192 it was two (384, then 500).
+    # Escalation doubles and clamps to `action_ceiling.mem_gb`: from 250 that is one
+    # attempt at 500 where from 192 it was two (384, then 500). Against a
+    # ticket-wide `max_retries` that is a shorter ladder in both senses — one less
+    # rung to climb, and one less retry spent climbing it.
     baseline_resources:
       cpu: 32
       mem_gb: 250
@@ -374,9 +390,13 @@ steps:
     outputs: [staging_dir]
     # mem_gb measured on the same cohort: 3 of 15 first attempts at 16 failed with a
     # DuckDB OutOfMemoryException in write_feature_sequence_chunks' per-part ORDER BY
-    # ("failed to allocate data of size 432.0 MiB (10.3 GiB/11.1 GiB used)"). Not a
-    # cgroup kill — the sub-step state is FAILED rather than OUT_OF_MEMORY, and
-    # process RSS at failure was 9.39 / 6.09 / 6.19 GiB, inside the 16 GiB cgroup.
+    # ("failed to allocate data of size 432.0 MiB (10.3 GiB/11.1 GiB used)"). What
+    # shows this was not a cgroup kill is the RSS, not the state: process RSS at
+    # failure was 9.39 / 6.09 / 6.19 GiB inside a 16 GiB cgroup. The state does not
+    # discriminate — a step-level cgroup kill also surfaces through slurmrestd as a
+    # job-level FAILED (see `log_tail.py`). The retries were automatic: the exception
+    # text matches `_OOM_SIGNATURES` there, so the classifier reached OOM_KILLED and
+    # escalated without an operator.
     #
     # What bound was DuckDB's own limit. `resolve_duckdb_memory_gb` subtracts
     # `duckdb_headroom_gb(4)` = 4 from the allocation, so a 16 GiB step ran DuckDB at
