@@ -39,7 +39,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- **`long-read-assembly` baseline resources changed at three steps (#526):**
+- **`long-read-assembly` baseline resources changed at three steps (#528):**
   `assembly_coverage` 64 → 96 GiB and `assembly_load` 16 → 32 both rise; `assemble`
   becomes per-assembler, 192 → 250 for hifiasm_meta but 192 → **128 for myloasm**,
   which is a reduction. The action
@@ -61,7 +61,7 @@ _None yet._
     that is per *step attempt*, not per ticket — a ticket mid-flight at the restart
     finishes its in-flight step at the old numbers and picks up the new ones for the
     steps dispatched after it.
-- **Reference-workflow resources also changed (#526):** `build-shard-index`'s
+- **Reference-workflow resources also changed (#528):** `build-shard-index`'s
   `build_minimap2_index` `cpu: 4` → `1`; `local-reference-add`'s `load` `PT24H` →
   `PT36H` (an increase) and `build_routing_index` `PT24H` → `PT12H` (a reduction).
   Same action sync, no separate step. Both walltime changes are in

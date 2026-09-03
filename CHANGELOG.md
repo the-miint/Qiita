@@ -3139,7 +3139,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Changed
 
 - **`long-read-assembly` memory re-sized at three steps, and `assemble` is now
-  sized per assembler (#526).** `assembly_coverage` 64 → 96 GiB and `assembly_load`
+  sized per assembler (#528).** `assembly_coverage` 64 → 96 GiB and `assembly_load`
   16 → 32 rise off first-attempt failures; `assemble` splits into 250 GiB for
   hifiasm_meta and 128 for myloasm — a reduction for the latter, whose peak RSS
   across 16 completions never reached 94.58 where hifiasm_meta reaches 246.03.
@@ -3160,7 +3160,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   step. Issue #288 tracks re-sizing that helper, which is what would let this come
   back down.
 
-- **Reference-workflow resources corrected from the reference-18 build (#526).**
+- **Reference-workflow resources corrected from the reference-18 build (#528).**
   `build-shard-index`'s `build_minimap2_index` drops `cpu: 4` → `1` (CPU
   efficiency p50 2.1%, max 13.9% over 68 shard builds — a maximum average demand
   of 0.56 cores; the step is blocked on its data-plane stream, and its DuckDB
