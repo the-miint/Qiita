@@ -5,10 +5,25 @@ before the first PacBio run at your site — the things below catch people out.
 Not needed for Illumina.
 
 This covers only what is different about PacBio. Everything the two platforms
-share — where to run the command, working from a remote machine, the studies and
-biosamples the pre-flight file has to match, building that file and opening it once
-first, how to retry, and why not to use `--force` — is in
-[`getting-started.md`](getting-started.md), which these examples carry on from.
+share — where to run the command, what privileges the submit needs, working from
+a remote machine, the studies and biosamples the pre-flight file has to match,
+building that file and opening it once first, how to retry, and why not to use
+`--force` — is in [`getting-started.md`](getting-started.md), which these
+examples carry on from.
+
+Paths and protocol numbers below are from the `qiita-miint.ucsd.edu` deploy;
+substitute your own site's.
+
+## The run folder has to be readable by Qiita itself
+
+You do not need to be on a machine that mounts the cluster: Qiita opens the run
+folder itself to find each barcode's BAM. But it opens it as its own account,
+which sees less of the filesystem than the account that later runs the jobs, and
+on this deploy the PacBio drop needs a grant that the Illumina one does not.
+
+If the submit comes back **403** on `/run-folder/inspect`, that grant is missing
+for the tree you named. Ask your operator (the step is in `DEPLOY_CHECKLIST.md`);
+until it is in place, submit from a node that mounts the run folder.
 
 ## Submit
 

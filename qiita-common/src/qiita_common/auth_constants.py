@@ -52,11 +52,13 @@ class Scope(StrEnum):
     REFERENCE_EXCLUSION_WRITE = "reference:exclusion:write"
     REFERENCE_REGISTER_FILES = "reference:register_files"
     FEATURE_MINT = "feature:mint"
-    # Sign DoGet tickets for the data plane's reference-data surfaces AND the
+    # Sign DoGet tickets for the data plane's reference-data surfaces, the
     # per-sample `alignment` slice (host-depleted derived data, the feature-table
-    # OGU job's input — see routes/alignment.py). Deliberately NOT split out the way
-    # READ_MASKED_DOGET is below: alignment is not raw human/host reads, so it rides
-    # the generic scope rather than a privacy-sensitive one.
+    # OGU job's input — see routes/alignment.py), and one assembly run's contig
+    # sequences (routes/assembly.py, which carries what that reuse grants).
+    # Deliberately NOT split out the way READ_MASKED_DOGET is below: neither
+    # alignment nor an assembled contig is raw human/host reads, so both ride the
+    # generic scope rather than a privacy-sensitive one.
     TICKET_DOGET = "ticket:doget"
     # Mint an alignment DoGet ticket as a HUMAN, naming the cohort directly.
     #
@@ -82,12 +84,30 @@ class Scope(StrEnum):
     # worker holding both would be two ways into one surface with two different
     # validation paths.
     ALIGNMENT_DOGET = "alignment:doget"
+    # Mint an assembly-run DoGet ticket as a HUMAN, naming the run directly.
+    #
+    # Split from TICKET_DOGET on exactly the argument ALIGNMENT_DOGET above makes,
+    # and reached by the same route shape: the work-ticket mint signs a run the
+    # control plane read out of a validated action_context, this one resolves and
+    # authorizes the run the caller named (Tier.VIEWER on every study its
+    # prep_sample links to). The two ceilings follow from that and not from the
+    # data — this is on every human role ceiling and NOT on
+    # SERVICE_ACCOUNT_SCOPE_CEILING, so a worker keeps the other route and one
+    # surface never has two validation paths.
+    #
+    # What it opens to a human PAT is `assembled_sequence` /
+    # `assembled_sequence_chunks`: contigs assembled from the `read_masked`
+    # pass-set, which TICKET_DOGET already classes as not raw human/host reads —
+    # so this widens WHO may ask for an assembly, never WHAT an assembly ticket
+    # returns. The privacy-sensitive neighbours (READ_MASKED_DOGET, READ_DOGET)
+    # are for the read surfaces and are untouched by it.
+    ASSEMBLY_DOGET = "assembly:doget"
     # DoGet against the data plane's masked-read surface (`read_masked`).
-    # Deliberately distinct from the generic TICKET_DOGET (which signs reference-data
-    # and alignment tickets): masked reads are privacy-sensitive (the lake
-    # retains human/host reads, excluded only by the read_masked macro), so the
-    # capability to pull them is granted separately — to service accounts that
-    # drive the masked-read consumer path, never piggybacking on reference reads.
+    # Deliberately distinct from the generic TICKET_DOGET above: masked reads are
+    # privacy-sensitive (the lake retains human/host reads, excluded only by the
+    # read_masked macro), so the capability to pull them is granted separately —
+    # to service accounts that drive the masked-read consumer path, never
+    # piggybacking on the surfaces TICKET_DOGET already opens.
     READ_MASKED_DOGET = "read_masked:doget"
     # DoGet against the data plane's BLOCK-read selectors (`read_block` /
     # `read_masked_block`) — one block's `(prep_sample_idx, sequence_idx
@@ -96,10 +116,10 @@ class Scope(StrEnum):
     # Distinct from BOTH neighbours, and strictly the most privileged of the
     # three. `read_block` streams RAW `read` rows: host/human sequence that the
     # `read_masked` macro exists to exclude, so it is a strict superset of what
-    # READ_MASKED_DOGET covers. Riding TICKET_DOGET (reference data + the derived
-    # `alignment` slice) would let any service account minting reference tickets
-    # pull raw reads — an inversion of the model the two scopes above establish.
-    # Granted only to the service account that drives block compute.
+    # READ_MASKED_DOGET covers. Riding TICKET_DOGET would let any service account
+    # minting reference tickets pull raw reads — an inversion of the model the
+    # two scopes above establish. Granted only to the service account that drives
+    # block compute.
     READ_DOGET = "read:doget"
     # Full purge of a mask (the mask_definition row + its DuckLake read_mask
     # rows). Deliberately distinct from the mask-minting capability: deletion
@@ -115,6 +135,14 @@ class Scope(StrEnum):
     # service account that mints masks must not be able to void them. system_admin
     # only, in ROLE_IMPLIED_SCOPES.
     MASK_DEFINITION_LIFECYCLE = "mask_definition:lifecycle"
+    # Processing-run LIFECYCLE: deprecate a qiita.processing config, and withdraw
+    # individual (run, sample) pairs of a sound one. Separate from
+    # MASK_DEFINITION_LIFECYCLE because the two name different identities — a mask
+    # can be sound while an assembly built from it is not, and vice versa. There is
+    # no matching :delete scope, because there is no delete path to gate: the
+    # `assembly_sample.processing_idx` FK is ON DELETE RESTRICT. system_admin only,
+    # in ROLE_IMPLIED_SCOPES.
+    PROCESSING_LIFECYCLE = "processing:lifecycle"
     # Full purge of an alignment (the alignment_definition row + its DuckLake
     # alignment rows; the alignment_sample gate cascade-deletes). Deliberately
     # distinct from the align-submitting capability (PREP_SAMPLE_WRITE): deletion
@@ -123,8 +151,11 @@ class Scope(StrEnum):
     # MASK_DEFINITION_DELETE; it is the disallow-without-delete escape hatch.
     ALIGNMENT_DEFINITION_DELETE = "alignment_definition:delete"
     # Generic upload domain. Gates the slot-minting + DoPut path; not
-    # reference-specific. Carried by admins (humans uploading via qiita-admin)
-    # and service accounts (workers driving import flows).
+    # reference-specific. On every role ceiling and on service accounts: it
+    # buys a numbered staging slot the caller owns and nothing else, so what
+    # an upload may then FEED is gated separately (reference-add needs
+    # `reference:write`; a work_ticket naming another principal's upload_idx
+    # is refused at dispatch).
     TICKET_DOPUT = "ticket:doput"
 
     # Biosample data

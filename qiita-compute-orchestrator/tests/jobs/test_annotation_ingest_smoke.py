@@ -22,6 +22,7 @@ claim every consumer depends on.
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 from pathlib import Path
 
@@ -310,6 +311,42 @@ def test_no_gff_yields_a_typed_empty_manifest(tmp_path):
         ).fetchall()
         empty_types = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()
     assert [(c[0], c[1]) for c in empty_types] == [(c[0], c[1]) for c in populated_types]
+
+
+def test_a_gff_load_warns_that_the_parent_bytes_keep_their_orientation(tmp_path, caplog):
+    """Pins the gate on the job side: a GFF warns, no GFF is silent. The text is
+    `ANNOTATION_STRAND_WARNING`, which carries why; the CLI front-end emits the same
+    object, so the two cannot word one hazard differently."""
+    from qiita_common.chunking import ANNOTATION_STRAND_WARNING
+
+    gff = _standard_gff(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        _run(tmp_path / "with_gff", gff=gff)
+    assert [r.msg for r in caplog.records if r.msg is ANNOTATION_STRAND_WARNING] == [
+        ANNOTATION_STRAND_WARNING
+    ]
+
+    # The REMOTE shape: a --gff ridden in as an upload arrives as a chunked-BLOB
+    # Parquet, which `resolve_blob_input` stitches into the workspace before
+    # `read_gff` sees it. The warning must survive that unwrap — the two input
+    # shapes are the reason the text names no file.
+    caplog.clear()
+    blob = tmp_path / "gff_upload.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            f"COPY (SELECT 0 AS chunk_index, ?::BLOB AS chunk_data) TO '{blob}' (FORMAT PARQUET)",
+            [gff.read_bytes()],
+        )
+    with caplog.at_level(logging.WARNING):
+        _run(tmp_path / "blob_gff", gff=blob)
+    assert [r.msg for r in caplog.records if r.msg is ANNOTATION_STRAND_WARNING] == [
+        ANNOTATION_STRAND_WARNING
+    ]
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _run(tmp_path / "without_gff", gff=None)
+    assert not [r for r in caplog.records if r.msg is ANNOTATION_STRAND_WARNING]
 
 
 @pytest.mark.parametrize(

@@ -25,12 +25,13 @@ union keyed on `kind` for the WorkflowStep / WorkflowAction Pydantic arms.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import timedelta
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.auth_constants import (
     MAX_NAME_LENGTH,
     MAX_VERSION_LENGTH,
@@ -53,6 +54,23 @@ from qiita_common.models import (
 # belongs at the layers that actually import / dispatch.
 NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 
+# The runner binding name the minted processing_idx travels under. A step names it
+# as the value side of a `params:` pair (`processing_idx: processing_idx` ->
+# <job>.Inputs.processing_idx), which both signals the runner to mint the run
+# identity before the step loop and carries the value into the step. Read through
+# `action_threads_processing_idx` below, the one predicate that tests for it.
+PROCESSING_IDX_BINDING = "processing_idx"
+
+# The runner binding name an alignment run's alignment_idx travels under. A step names
+# it on BOTH sides of a `params:` pair (the key is the action_context key the runner
+# binds from, the value is the job's Inputs field), which carries the value into the
+# step so every row it emits is keyed by it. Where the value COMES from differs by scope, which
+# is why this is not a mint signal the way PROCESSING_IDX_BINDING is: a block ticket
+# carries it on `work_ticket.alignment_idx` from plan time, and a prep_sample one has
+# it minted by the runner off the terminal `finalize-alignment-sample` action. Read
+# through `_alignment_gate_threads_its_identity` below, and by the runner.
+ALIGNMENT_IDX_BINDING = "alignment_idx"
+
 
 # action_context property keys that name a fastq file path. The
 # fastq-to-parquet action declares them in its context_schema (see
@@ -65,6 +83,25 @@ NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 # basename is prefixed by the prep_sample's sequenced_pool_item_id (see
 # docs/runbooks/manual-sample-walkthrough.md).
 FASTQ_PATH_CONTEXT_KEYS: tuple[str, str] = ("fastq_path", "reverse_fastq_path")
+
+
+# Suffix that marks an `action_context` key as an upload handle rather than a
+# literal value, and the suffix it resolves to. The runner rewrites every
+# `{prefix}_upload_idx` into a `{prefix}_path` binding pointing at the staged
+# file before any step runs (`runner._resolve_upload_handles`), which is how a
+# workflow step reads an uploaded file and a host-path file through the same
+# input name. Defined here so the runner, the work_ticket submit gate, and the
+# CLI that mints the handles share one spelling.
+UPLOAD_IDX_SUFFIX = "_upload_idx"
+PATH_SUFFIX = "_path"
+
+
+# Key-name suffixes that mark an `action_context` value, or a `context_schema`
+# property, as a host path. Two sites read this from opposite ends: the submit
+# gate checks a value under such a key whatever the schema declares, and the
+# workflow-YAML loader guard makes a property with such a name declare
+# `pattern: "^/"`. One definition, so the two cannot cover different sets.
+HOST_PATH_KEY_SUFFIXES: tuple[str, ...] = (PATH_SUFFIX, "_dir", "_folder")
 
 
 # The per-sample read-mask action's bare id (its YAML lives at
@@ -138,6 +175,12 @@ ALIGN_ACTION_ID = "align"
 # its action_context `mask_idx` — so a reader asking "which tickets depend on a mask
 # they did not create" keys on it.
 LONG_READ_ASSEMBLY_ACTION_ID = "long-read-assembly"
+
+# The de novo alignment action's bare id (workflows/align-denovo/<version>.yaml).
+# The second action that CONSUMES a read mask rather than minting one — it aligns the
+# `read_masked` pass-set named by its action_context `align_mask_idx` — so the same
+# readers that key on the constant above key on this one.
+ALIGN_DENOVO_ACTION_ID = "align-denovo"
 
 
 class Audience(BaseModel):
@@ -415,6 +458,39 @@ WorkflowEntry = Annotated[
 ]
 
 
+def context_schema_default(context_schema: dict[str, Any], key: str) -> Any:
+    """The declared default for one `context_schema` knob, or None if it declares none.
+
+    The submit path and the identity hash must read the same literal: a knob the
+    submitter left unset is hashed at its declared default, and the job is bound the
+    same value."""
+    return context_schema.get("properties", {}).get(key, {}).get("default")
+
+
+def action_threads_processing_idx(steps: Iterable[WorkflowEntry]) -> bool:
+    """True iff some entry threads PROCESSING_IDX_BINDING through its `params:`.
+
+    The single statement of the rule, for the two sites that have to agree on
+    it: `ActionDefinition._assembly_gate_declares_a_processing_identity` below
+    refuses an action declaring the terminal `finalize-assembly-sample` entry
+    without it, and the control-plane runner mints the run identity before its
+    step loop when it holds (`runner._processing._workflow_needs_processing`).
+    A second implementation drifts in one of two directions. Stricter here than
+    in the runner, the validator refuses an action the runner would have run —
+    and `load_actions` propagates the ValidationError, so that fails the whole
+    `workflows/` sweep rather than the one action. Looser here, the runner stops
+    minting under a gate that still declares itself.
+
+    Only `step:` entries can thread anything — `WorkflowAction` carries no
+    `params` field.
+    """
+    return any(
+        PROCESSING_IDX_BINDING in entry.params.values()
+        for entry in steps
+        if isinstance(entry, WorkflowStep)
+    )
+
+
 class ActionDefinition(BaseModel):
     """Top-level action definition. YAML is source-of-truth; the sync routine
     upserts the YAML-authoritative columns into qiita.action.
@@ -542,6 +618,57 @@ class ActionDefinition(BaseModel):
                 f"duplicate step name(s) {dupes}: `step:` entry names must be unique "
                 "within an action — SLURM job naming and job adoption key on the "
                 "name. (`action:` entries run in-process and may repeat.)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _assembly_gate_declares_a_processing_identity(self) -> ActionDefinition:
+        # The qiita.assembly_sample gate row is keyed on (processing_idx,
+        # prep_sample), and the runner mints that processing_idx only when some
+        # entry threads PROCESSING_IDX_BINDING through its `params:`. An action
+        # that declares the terminal gate action without that thread has no key
+        # to write the row under, so every ticket it accepts assembles behind a
+        # gate no write ever materializes. Both halves are static properties of
+        # `steps`, so reject the pair here: the load sweep the test suite runs
+        # over `workflows/` fails on a YAML mistake, and `_fetch_action`'s
+        # model_validate applies the same refusal to a qiita.action row. The
+        # runner repeats the check per ticket; this site owns the argument.
+        declares_gate = any(
+            isinstance(e, WorkflowAction) and e.name == LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE
+            for e in self.steps
+        )
+        if declares_gate and not action_threads_processing_idx(self.steps):
+            raise ValueError(
+                f"an action declaring the {LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE} "
+                f"entry must thread {PROCESSING_IDX_BINDING!r} through some step's "
+                "`params:` — the gate row is keyed on the processing_idx that "
+                "threading mints"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _alignment_gate_threads_its_identity(self) -> ActionDefinition:
+        # The qiita.alignment_sample gate row is keyed on (alignment_idx,
+        # prep_sample), and the same alignment_idx must be stamped onto every row the
+        # workflow registers — otherwise the gate says a sample is aligned under an
+        # identity whose rows carry a different one. The runner mints it off the
+        # terminal gate action itself, so what needs asserting here is the other half:
+        # that some step is handed it. Same shape, and the same reason, as
+        # `_assembly_gate_declares_a_processing_identity` above.
+        declares_gate = any(
+            isinstance(e, WorkflowAction) and e.name == LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE
+            for e in self.steps
+        )
+        threads_identity = any(
+            isinstance(e, WorkflowStep) and ALIGNMENT_IDX_BINDING in e.params.values()
+            for e in self.steps
+        )
+        if declares_gate and not threads_identity:
+            raise ValueError(
+                f"an action declaring the {LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE} "
+                f"entry must thread {ALIGNMENT_IDX_BINDING!r} through some step's "
+                "`params:` — the gate row and the rows it gates must carry the same "
+                "alignment identity"
             )
         return self
 

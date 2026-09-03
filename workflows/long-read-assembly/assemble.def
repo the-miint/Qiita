@@ -4,7 +4,7 @@ From: mambaorg/micromamba:1.5.8
 # Per-STEP image for the long-read-assembly `assemble` step. It carries the two
 # `assembler` enum values — hifiasm_meta and myloasm — in SEPARATE micromamba envs
 # (see %post): the step runs one or the other per ticket, and separate envs keep
-# an unpinned hifiasm solve from being able to break the pinned myloasm one.
+# one assembler's solve from being able to break the other's.
 #
 # One of four per-step images the workflow ships (assemble / binning / bin_refine /
 # checkm), each built from its own def + sif-build.d/ spec so a change to one
@@ -16,12 +16,14 @@ From: mambaorg/micromamba:1.5.8
 #
 # Pinned invariant, and the two assemblers DISAGREE on it:
 #   hifiasm_meta  circularity is the trailing `[lc]` letter of the GFA segment
-#                 name (`…tg……c` = circular, `…l` = linear)
+#                 name (`…tg……c` = circular, `…l` = linear), probed on this
+#                 pinned build; depth is the S-line's `dp:f` tag
 #   myloasm       circularity is a field in the assembly_primary.fa HEADER
 #                 (`_circular-yes`); its GFA carries no such marker
-# assemble.sh branches per assembler for exactly this reason. The entrypoint emits
-# the tool's RAW output verbatim (no column normalization); downstream parsing is
-# DuckDB's.
+# assemble.sh branches per assembler for exactly this reason. Each arm normalizes
+# that one call to a shared vocabulary (yes|possibly|no) and derives myloasm's
+# depth scalar; every other attribute it emits is the tool's own value, and the
+# raw name is carried alongside so the normalization stays traceable.
 
 %labels
     workflow long-read-assembly
@@ -40,6 +42,10 @@ From: mambaorg/micromamba:1.5.8
     # own file (not inlined in assemble.sh) so the unit test can execute the real
     # program against real myloasm headers.
     myloasm_split.py /opt/qiita/myloasm_split.py
+    # The staged-miint connection the splitter imports. Its own module because
+    # checkm.def copies the same file for lcg_split.py, and the connect config has
+    # to stay identical to what the three services run.
+    miint_connect.py /opt/qiita/miint_connect.py
 
 %environment
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -75,10 +81,9 @@ From: mambaorg/micromamba:1.5.8
     micromamba install -y -n base -c conda-forge python-duckdb=1.5.4
 
     # ONE ENV PER ASSEMBLER, deliberately, even though only one runs per step. A
-    # single shared solve couples them: hifiasm_meta is unpinned, so a future
-    # release of it with a conflicting dependency would either make the myloasm pin
+    # single shared solve couples them: bumping either pin could make the other
     # unsatisfiable — taking BOTH assemblers down on a routine rebuild — or quietly
-    # move a shared transitive dep underneath myloasm. Separate envs cost only disk
+    # move a shared transitive dep underneath it. Separate envs cost only disk
     # in an image that is already tool-sized.
     #
     # Each arm splits circular from linear its own way (hifiasm's GFA segment name
@@ -86,25 +91,26 @@ From: mambaorg/micromamba:1.5.8
     # circular contigs as ONE multi-FASTA — no per-contig split tool — so the native
     # assembly_hash step reads them with miint read_fastx.
     #
-    #  - hifiasm_meta: unpinned, as it has been — but note the exposure has GROWN,
-    #    because myloasm_split.py is now in this image's HASH_INPUTS. An edit to
-    #    the myloasm splitter invalidates the build hash, forcing a full rebuild,
-    #    which re-resolves this unpinned solve against whatever bioconda has that
-    #    day — so hifiasm_meta can move on a change that had nothing to do with it,
-    #    and %test asserts only that it runs, not which version. Pinning it is the
-    #    fix, deliberately NOT done here: nothing in this repo records the version
-    #    the live deploy is running, so a pin would have to be guessed, and getting
-    #    it wrong changes the DEFAULT assembler's behaviour. Read the deployed
-    #    image's version first, then pin to it.
-    micromamba create -y -n hifiasm_meta -c bioconda -c conda-forge hifiasm_meta
-    #  - myloasm: PINNED, and the pin is load-bearing in a way hifiasm's absence of
-    #    one is not. myloasm's circularity contract is a STRING in its FASTA header,
+    #  - hifiasm_meta: PINNED, because the circularity call it produces is stored
+    #    per contig rather than only routed on. Without a pin, every edit to this
+    #    image's HASH_INPUTS forces a rebuild that re-resolves the solve against
+    #    whatever bioconda has that day, so the DEFAULT assembler can move on a
+    #    change that had nothing to do with it.
+    #
+    #    `hamtv0.3.5` is bioconda's version string; the binary reports its own two
+    #    internal versions (`ha base 0.13-r308` / `hamt 0.3-r079`), which is what
+    #    %test asserts below. The conda version alone would not catch a rebuild of
+    #    the same version against different upstream sources, which is why both
+    #    are checked.
+    micromamba create -y -n hifiasm_meta -c bioconda -c conda-forge hifiasm_meta=hamtv0.3.5
+    #  - myloasm: PINNED. Its circularity contract is a STRING in its FASTA header,
     #    probed on exactly this version (0.6.0). A drifted solve that RENAMED or
-    #    reordered those fields is caught — myloasm_split.py fails the step on a
-    #    header it cannot parse. What no runtime check can catch is a release that
-    #    KEEPS the `_len-<N>_circular-<yes|no|possibly>_` shape and changes what the
-    #    values mean; that is what the pin, and the %test asserting it below, are
-    #    for.
+    #    reordered the `_circular-` or `_depth-` fields is caught — myloasm_split.py
+    #    fails the step on a header it cannot parse, and on a run where no contig
+    #    yielded a depth. What no runtime check can catch is a release that KEEPS
+    #    the `_len-<N>_circular-<yes|no|possibly>_depth-<A>-<B>-<C>_` shape and
+    #    changes what the values mean; that is what the pin, and the %test asserting
+    #    it below, are for.
     micromamba create -y -n myloasm -c bioconda -c conda-forge myloasm=0.6.0
 
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/assemble.sh
@@ -127,12 +133,20 @@ From: mambaorg/micromamba:1.5.8
     export HOME="$(mktemp -d)"
     micromamba env list | grep -q hifiasm_meta
     micromamba env list | grep -q myloasm
-    micromamba run -n hifiasm_meta hifiasm_meta --version
+    # Both internal version strings. A solve that moved either fails the BUILD
+    # rather than silently changing what the default assembler's circularity call
+    # means. `2>&1` is load-bearing, not defensive: probed on the pinned solve,
+    # `hifiasm_meta --version` writes BOTH lines to stderr and nothing to stdout
+    #     ha base version: 0.13-r308
+    #     hamt version: 0.3-r079
+    # so a stdout-only pipeline greps an empty stream and fails every build.
+    micromamba run -n hifiasm_meta hifiasm_meta --version 2>&1 | grep -Fq "0.13-r308"
+    micromamba run -n hifiasm_meta hifiasm_meta --version 2>&1 | grep -Fq "0.3-r079"
     # myloasm's VERSION is asserted, not merely its presence. myloasm_split.py
-    # reads circularity out of a header string probed against 0.6.0. A release that
-    # renamed those fields would be caught at run time by myloasm_split.py; one
-    # that KEPT the shape and changed the meaning would not be, and this pin is the
-    # only thing standing in front of it.
+    # reads circularity and depth out of a header string probed against 0.6.0, and
+    # fails the step if either field stops matching. A release that KEPT both
+    # shapes and changed their meaning would not be caught there, and this pin is
+    # the only thing standing in front of it.
     micromamba run -n myloasm myloasm --version | grep -Fxq "myloasm 0.6.0"
     # Base utilities the entrypoints actually invoke — assert each one, since the
     # whole point of this %test is to fail the BUILD on a missing runtime dep
@@ -169,12 +183,15 @@ From: mambaorg/micromamba:1.5.8
     # and would also write a `__pycache__` into the read-only image filesystem
     # this %test runs against.
     test -s /opt/qiita/myloasm_split.py
+    test -s /opt/qiita/miint_connect.py
     python3 -c "import importlib.util as u; s=u.spec_from_file_location('ms','/opt/qiita/myloasm_split.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
-    # It must stay LOAD-only: an INSTALL would need the team mirror reachable from
-    # every compute node and a writable $HOME, the footgun the staged dir replaced.
-    # Anchored at a string-literal quote so the splitter's own prose explaining why
-    # it does NOT install cannot fail the build.
-    ! grep -qE "[\"']\s*INSTALL\b" /opt/qiita/myloasm_split.py
+    # The connect module must stay LOAD-only: an INSTALL would need the team mirror
+    # reachable from every compute node and a writable $HOME, the footgun the staged
+    # dir replaced. Both files, because the LOAD lives in miint_connect.py and the
+    # splitter must not open a connection of its own beside it.
+    # Anchored at a string-literal quote so the prose explaining why we do NOT
+    # install cannot fail the build.
+    ! grep -qE "[\"']\s*INSTALL\b" /opt/qiita/miint_connect.py /opt/qiita/myloasm_split.py
 
 %runscript
     echo "long-read-assembly-assemble image: invoke the step entrypoint, e.g." >&2

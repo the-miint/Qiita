@@ -34,9 +34,19 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
-            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
-            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            # Mint an upload slot and stream into it. On the USER ceiling
+            # because a user who may not name a host path in action_context
+            # (wet_lab_admin+) has this as their only route for their own
+            # reads. It confers no destination choice: the signed ticket
+            # carries `{"action": "doput", "upload_idx": N}` and the data
+            # plane derives the path. Reference-add still needs
+            # `reference:write`, which stays admin-only.
+            Scope.TICKET_DOPUT,
+            # Human-callable alignment / assembly DoGet mints. On every ceiling,
+            # and NOT on the service-account ceiling; Scope.ALIGNMENT_DOGET
+            # carries why, and Scope.ASSEMBLY_DOGET rests on the same argument.
             Scope.ALIGNMENT_DOGET,
+            Scope.ASSEMBLY_DOGET,
         }
     ),
     SystemRole.WET_LAB_ADMIN: frozenset(
@@ -51,9 +61,11 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
-            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
-            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            # Human-callable alignment / assembly DoGet mints. On every ceiling,
+            # and NOT on the service-account ceiling; Scope.ALIGNMENT_DOGET
+            # carries why, and Scope.ASSEMBLY_DOGET rests on the same argument.
             Scope.ALIGNMENT_DOGET,
+            Scope.ASSEMBLY_DOGET,
             # Upload slots — needed to drive reference data ingest via the
             # qiita-admin CLI, whose reference-add audience includes
             # wet_lab_admin.
@@ -92,6 +104,11 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # a filter we no longer stand behind. Non-destructive, but not a
             # judgement a service account or wet_lab_admin makes.
             Scope.MASK_DEFINITION_LIFECYCLE,
+            # Deprecating an assembly run / withdrawing its per-sample results is
+            # system_admin-only for the same reason as the mask twin above: it
+            # decides that published contigs were produced by a run we no longer
+            # stand behind.
+            Scope.PROCESSING_LIFECYCLE,
             # Full alignment purge is system_admin-only, same as
             # MASK_DEFINITION_DELETE: deleting an alignment drops its
             # alignment_definition row (cascading the alignment_sample gate) and
@@ -100,9 +117,11 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.ALIGNMENT_DEFINITION_DELETE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
-            # Human-callable alignment DoGet mint. On every ceiling, and NOT on
-            # the service-account ceiling; Scope.ALIGNMENT_DOGET carries why.
+            # Human-callable alignment / assembly DoGet mints. On every ceiling,
+            # and NOT on the service-account ceiling; Scope.ALIGNMENT_DOGET
+            # carries why, and Scope.ASSEMBLY_DOGET rests on the same argument.
             Scope.ALIGNMENT_DOGET,
+            Scope.ASSEMBLY_DOGET,
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,

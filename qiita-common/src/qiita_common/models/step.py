@@ -243,7 +243,7 @@ class StepCancelResponse(BaseModel):
 # shard is ~hundreds/thousands of features; the cap guards ticket/query size
 # (the list rides the signed ticket payload and becomes a `feature_idx IN (...)`
 # on the data plane) without constraining any realistic shard roster.
-_MAX_DOGET_FEATURE_IDX = 100_000
+MAX_DOGET_FEATURE_IDX = 100_000
 
 
 class DoGetTicketRequest(BaseModel):
@@ -259,7 +259,7 @@ class DoGetTicketRequest(BaseModel):
     # sign_ticket (which rejects one). Whole-reference is expressed by *omitting*
     # the field, never by an empty list.
     feature_idx: list[Annotated[int, Field(gt=0)]] | None = Field(
-        default=None, min_length=1, max_length=_MAX_DOGET_FEATURE_IDX
+        default=None, min_length=1, max_length=MAX_DOGET_FEATURE_IDX
     )
     model_config = ConfigDict(extra="forbid")
 
@@ -304,6 +304,16 @@ class AlignmentDoGetTicketRequest(BaseModel):
     # Omitted ⇒ no projection rides the ticket, byte-identical to the historical
     # shape. See ProjectionColumns for what a present list means.
     columns: ProjectionColumns | None = None
+    # Which of the ticket's two alignment runs to sign. A COMBINED feature table
+    # estimates over two — the cohort against a reference, and each sample against
+    # its own contigs — and the job needs a ticket for each, so one call names one.
+    #
+    # Default False keeps a body written before the de novo arm existed meaning
+    # exactly what it meant then. True is refused when the ticket carries no
+    # `denovo_alignment_idx`, rather than falling back to the reference arm: a job
+    # that asked for the second arm and silently got the first would stage the same
+    # slice twice and reconcile it against itself.
+    denovo: bool = False
 
 
 class AlignmentCohortDoGetTicketRequest(BaseModel):
@@ -331,6 +341,49 @@ class AlignmentCohortDoGetTicketRequest(BaseModel):
     prep_sample_idx: PrepSampleCohort
     # Required here, unlike its optional twin above — see the class docstring.
     columns: ProjectionColumns
+
+
+class AssemblyDoGetTicketRequest(BaseModel):
+    """Body for POST /api/v1/assembly/ticket/doget.
+
+    Names one assembly RUN — a ``(prep_sample_idx, processing_idx)`` pair — whose
+    contig sequences the caller wants to stream. Both identifiers are signed onto
+    the ticket verbatim and the data plane resolves the run's contigs itself,
+    through the lake's ``assembly_membership``; the route
+    (``routes/assembly.py``) carries why that resolution lives there.
+
+    ``table`` picks which surface the ticket reads: ``assembled_sequence`` (one
+    row per contig: hash + length) or ``assembled_sequence_chunks`` (the bytes,
+    reassembled with ``string_agg(chunk_data, '' ORDER BY chunk_index)``). Both
+    resolve the same roster; they differ only in what a row carries. The route
+    holds the closed set — spelled as a plain string here, like every other
+    ticket body's ``table``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    processing_idx: Annotated[int, Field(gt=0)]
+    table: str = Field(min_length=1, max_length=MAX_TABLE_NAME_LENGTH)
+
+
+class AssemblyRunDoGetTicketRequest(BaseModel):
+    """Body for POST /api/v1/assembly/{prep_sample_idx}/{processing_idx}/ticket/doget.
+
+    The scientist-facing counterpart of ``AssemblyDoGetTicketRequest``: the run is
+    named in the PATH, so the only thing left for the body is which surface to
+    read. Same closed ``table`` set, same signed filter, same data-plane
+    resolution — the two routes differ in who may ask and how the run is
+    authorized, never in what a ticket returns (``Scope.ASSEMBLY_DOGET``).
+
+    Deliberately not a subclass of its twin: the identifiers moving from body to
+    path is the whole difference, and inheriting the pair back in would let a
+    caller name a second run in the body of a request for the first.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    table: str = Field(min_length=1, max_length=MAX_TABLE_NAME_LENGTH)
 
 
 class ReadDoGetTicketRequest(BaseModel):

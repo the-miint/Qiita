@@ -126,3 +126,22 @@ async def update_row(
         *values,
         row_idx,
     )
+
+
+def gate_state_literal(value: str, declared: object) -> str:
+    """Assert `value` is a member of the `declared` gate-state Literal and return it.
+
+    A membership check, not a lookup: the string is still written at the call
+    site, because it is the string that goes into SQL. What it buys is that a
+    renamed or removed member fails at import instead of silently matching no
+    rows — the failure mode a gate query has, where a typo returns an empty
+    result rather than an error.
+
+    Shared by every repository module that binds gate states as query
+    parameters (`mask_definition`, `processing`), so the two cannot drift into
+    two spellings of the same assertion.
+    """
+    members = get_args(declared)
+    if value not in members:
+        raise ValueError(f"{value!r} is not a member of {declared}; have {members}")
+    return value

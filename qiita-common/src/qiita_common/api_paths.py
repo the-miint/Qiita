@@ -176,6 +176,13 @@ class LibraryPrimitive(StrEnum):
     # fresh block it deletes 0 rows. See
     # qiita_control_plane.actions.library.delete_alignment_block.
     DELETE_ALIGNMENT_BLOCK = "delete-alignment-block"
+    # Per-sample (align): idempotent sample replace, the per-sample twin of
+    # delete-alignment-block. Its slot is the one that twin occupies — immediately
+    # BEFORE register-files, on a prep_sample-scoped ticket — deleting the
+    # (alignment_idx, prep_sample_idx) pair's rows so a re-run deletes-then-
+    # re-registers without double-counting. See
+    # qiita_control_plane.actions.library.delete_alignment_sample.
+    DELETE_ALIGNMENT_SAMPLE = "delete-alignment-sample"
     # Block-compute (align): the `align` workflow's terminal step, the alignment
     # twin of reconcile-block. Marks the block completed, then finalizes each
     # covered sample's alignment_sample gate once ALL its covering blocks are done.
@@ -198,6 +205,18 @@ class LibraryPrimitive(StrEnum):
     # Runs AFTER register-files so the gate never reads 'completed' before the masked
     # reads are in DuckLake. See qiita_control_plane.actions.library.finalize_mask_sample_gate.
     FINALIZE_MASK_SAMPLE = "finalize-mask-sample"
+    # Per-sample assembly completion: the terminal step of the long-read-assembly
+    # workflow. Writes 'completed' into the qiita.assembly_sample gate for this
+    # ticket's (processing_idx, prep_sample). See
+    # qiita_control_plane.actions.library.finalize_assembly_sample_gate.
+    FINALIZE_ASSEMBLY_SAMPLE = "finalize-assembly-sample"
+    # Per-sample alignment completion: the terminal step of a prep_sample-scoped
+    # alignment workflow (align-denovo). Writes 'completed' into the
+    # qiita.alignment_sample gate for this ticket's (alignment_idx, prep_sample) — the
+    # per-sample twin of reconcile-alignment-block's gate flip, and the signal the
+    # runner keys its de novo alignment resolver off. See
+    # qiita_control_plane.actions.library.finalize_alignment_sample_gate.
+    FINALIZE_ALIGNMENT_SAMPLE = "finalize-alignment-sample"
 
 
 # =============================================================================
@@ -208,7 +227,7 @@ class LibraryPrimitive(StrEnum):
 # trio: submit returns a handle immediately, the CP runner polls status until
 # terminal, then asks for the verified result — so the runner can drive a long
 # SLURM job without holding a connection open. find-by-name closes the
-# write-ahead idempotency gap. See docs/architecture.md "Compute Orchestrator".
+# write-ahead idempotency gap. See docs/architecture/processing.md "Compute Orchestrator".
 
 PATH_STEP_PREFIX = "/step"
 PATH_STEP_SUBMIT = "/submit"
@@ -484,9 +503,10 @@ URL_READ_MASKED_DOGET = f"{URL_READ_MASKED_PREFIX}{PATH_READ_MASKED_DOGET}"
 # Signs a DoGet ticket scoped to ONE block's `(prep_sample_idx, sequence_idx
 # sub-range)` members, so a block-scoped compute job streams its reads from the
 # data plane instead of reading a Parquet the control plane materialized onto
-# shared scratch. POST is service-account-only (Scope.TICKET_DOGET) — the job
-# mints it at runtime (short TTL; a SLURM queue can outlive a submit-time
-# ticket), the same shape as /alignment/ticket/doget.
+# shared scratch. POST is service-account-only (Scope.READ_DOGET — its own scope,
+# not the generic ticket:doget; routes/read.py carries why) — the job mints it at
+# runtime (short TTL; a SLURM queue can outlive a submit-time ticket), the same
+# shape as /alignment/ticket/doget.
 #
 # The body carries only work_ticket_idx. The route reads the block's members
 # from qiita.block_member (keeping a large member list CP-side, off the wire)
@@ -499,6 +519,73 @@ PATH_READ_DOGET = "/ticket/doget"
 
 URL_READ_PREFIX = f"{API_PREFIX}{PATH_READ_PREFIX}"
 URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
+
+# =============================================================================
+# /assembly/* — one assembly run's contigs, and its feature -> genome map
+# =============================================================================
+# The two DoGet routes sign the same ticket for the same data plane surfaces
+# (`assembled_sequence` / `assembled_sequence_chunks`), scoped to ONE assembly
+# run — a `(prep_sample_idx, processing_idx)` pair — and differ only in who may
+# ask and how the pair is authorized. The split mirrors /alignment's exactly, for
+# the reason Scope.ALIGNMENT_DOGET states there.
+#
+#   PATH_ASSEMBLY_DOGET      service-account-only (Scope.TICKET_DOGET). The job
+#                            mints it at runtime; the pair rides the body.
+#   PATH_ASSEMBLY_RUN_DOGET  human-callable (Scope.ASSEMBLY_DOGET). The caller
+#                            names the run in the path, so the route authorizes
+#                            that prep_sample against the caller's studies before
+#                            signing.
+#
+# Either way the pair is what is signed; the data plane resolves that run's
+# contigs through the lake's own assembly_membership. Why the resolution lives
+# there is at the route (routes/assembly.py).
+#
+# PATH_ASSEMBLY_GENOME_MAP is not a ticket at all — `genome_idx` exists only in
+# Postgres, so it is a control-plane read, the assembly twin of
+# PATH_REFERENCE_GENOME_MAP.
+
+PATH_ASSEMBLY_PREFIX = "/assembly"
+PATH_ASSEMBLY_DOGET = "/ticket/doget"
+PATH_ASSEMBLY_RUN_DOGET = "/{prep_sample_idx}/{processing_idx}/ticket/doget"
+PATH_ASSEMBLY_GENOME_MAP = "/{prep_sample_idx}/{processing_idx}/genome-map"
+
+URL_ASSEMBLY_PREFIX = f"{API_PREFIX}{PATH_ASSEMBLY_PREFIX}"
+URL_ASSEMBLY_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_DOGET}"
+URL_ASSEMBLY_RUN_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_RUN_DOGET}"
+URL_ASSEMBLY_GENOME_MAP = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP}"
+
+
+# =============================================================================
+# /processing/* — assembly run identity and its lifecycle
+# =============================================================================
+# A processing_idx is minted by the runner, not by a route: it is the
+# canonical-params hash over {workflow, version, mask_idx, assembler}, and there
+# is nothing to key on at HTTP submit. So this surface has no POST — only the
+# reads and the two lifecycle PATCHes.
+#
+# The three GETs are the human read surface, at Scope.PREP_SAMPLE_READ and
+# narrowed per study for a plain user, matching /mask-definition; the two PATCHes
+# sit at Scope.PROCESSING_LIFECYCLE. Contig bytes stay on the assembly DoGet
+# ticket (POST /assembly/ticket/doget, service-account-only). routes/processing.py
+# carries what each gating rests on.
+
+PATH_PROCESSING_PREFIX = "/processing"
+PATH_PROCESSING_ROOT = ""  # GET (list) against the prefix itself
+PATH_PROCESSING_BY_IDX = "/{processing_idx}"
+PATH_PROCESSING_PREP_SAMPLE = "/{processing_idx}/prep-sample"  # GET the per-sample roster
+# PATCH the run CONFIG's lifecycle (active <-> deprecated). Mirrors
+# PATH_MASK_DEFINITION_STATUS; a deprecated run cannot be minted against.
+PATH_PROCESSING_STATUS = "/{processing_idx}/status"
+# PATCH specific RUNS of the config (completed <-> invalidated), naming the
+# prep_samples in the body. Bulk because the judgement is made per cohort, not
+# per sample. Distinct from the route above, which is the CONFIG's lifecycle.
+PATH_PROCESSING_SAMPLE_STATUS = "/{processing_idx}/sample-status"
+
+URL_PROCESSING_PREFIX = f"{API_PREFIX}{PATH_PROCESSING_PREFIX}"
+URL_PROCESSING_BY_IDX = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_BY_IDX}"
+URL_PROCESSING_PREP_SAMPLE = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_PREP_SAMPLE}"
+URL_PROCESSING_STATUS = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_STATUS}"
+URL_PROCESSING_SAMPLE_STATUS = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_SAMPLE_STATUS}"
 
 
 # =============================================================================
@@ -596,6 +683,24 @@ URL_STUDY_LOOKUP_BY_ACCESSION = f"{URL_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESS
 
 
 # =============================================================================
+# /run-folder/* — read-only inspection of a sequencing run folder on the cluster
+# =============================================================================
+# The bundled submit gestures need two facts that only exist on the filesystem:
+# an Illumina run's instrument_run_id / model (from RunInfo.xml) and a PacBio
+# run's barcode -> HiFi BAM index. Reading them server-side is what lets a
+# submit run from a machine that does not mount the cluster.
+#
+# Not a resource under /sequencing-run: no run row exists yet at inspect time —
+# the gesture inspects the folder in order to mint one.
+
+PATH_RUN_FOLDER_PREFIX = "/run-folder"
+# POST, not GET: the body carries an absolute path, and a path in a querystring
+# lands in access logs and proxy caches. `inspect` is a verb, which the naming
+# rule allows as a path segment.
+PATH_RUN_FOLDER_INSPECT = "/inspect"
+
+
+# =============================================================================
 # /sequencing-run/* — run CRUD + sequenced-pool POST + sequenced-sample
 # =============================================================================
 # Like /study, this prefix is shared. The sequenced-sample router with
@@ -679,6 +784,9 @@ PATH_SEQUENCED_SAMPLE_EXCEPTIONS = (
 PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/work-ticket/summary"
 )
+
+URL_RUN_FOLDER_PREFIX = f"{API_PREFIX}{PATH_RUN_FOLDER_PREFIX}"
+URL_RUN_FOLDER_INSPECT = f"{URL_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}"
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
@@ -870,3 +978,26 @@ URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
 URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"
 URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"
+
+
+# =============================================================================
+# /biosample-global-field, /prep-sample-global-field — the global field registries
+# =============================================================================
+# A registry is global, so it hangs off its own prefix rather than a segment
+# under /biosample: a literal GET sub-path there is shadowed by that router's
+# GET /{biosample_idx}, which coerces the segment to int and 422s unless it is
+# registered first. Having its own prefix removes any ordering constraint.
+
+PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX = "/biosample-global-field"
+PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT = ""  # list against the prefix itself
+PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX = "/prep-sample-global-field"
+PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT = ""  # list against the prefix itself
+
+URL_BIOSAMPLE_GLOBAL_FIELD_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX}"
+URL_BIOSAMPLE_GLOBAL_FIELD_LIST = (
+    f"{URL_BIOSAMPLE_GLOBAL_FIELD_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT}"
+)
+URL_PREP_SAMPLE_GLOBAL_FIELD_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX}"
+URL_PREP_SAMPLE_GLOBAL_FIELD_LIST = (
+    f"{URL_PREP_SAMPLE_GLOBAL_FIELD_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT}"
+)

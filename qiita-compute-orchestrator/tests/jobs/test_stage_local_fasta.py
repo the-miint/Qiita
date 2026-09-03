@@ -2,19 +2,25 @@
 
 `stage_local_fasta` is the local-ingest front-end: it reads a manifest of
 absolute FASTA paths (one per line), parses every file with miint's `read_fastx`
-and chunks in DuckDB, and writes ONE combined chunked Parquet —
+and chunks in DuckDB, and writes a DIRECTORY of chunked Parquet parts —
 `(read_id VARCHAR, chunk_index INTEGER, chunk_data VARCHAR)`, exactly the shape
-`hash_sequences` already consumes — so the rest of the reference-add pipeline
-runs unchanged.
+`hash_sequences` already consumes (it reads the directory with `read_parquet`)
+— so the rest of the reference-add pipeline runs unchanged.
 
 These tests call `execute()` directly (not through LocalBackend /
 run_native_job) so failures point at the manifest-parse / chunk / dup-check
-logic, not framework wiring. The combined output Parquet is synthesized and
-read back with DuckDB so tests don't depend on the Rust data plane or pyarrow.
+logic, not framework wiring. The output parts are synthesized and read back with
+DuckDB so tests don't depend on the Rust data plane or pyarrow.
 
 Coverage:
-  - Happy path: 3-file manifest → one `fasta.parquet`, correct schema, every
-    read_id present, chunks reassemble.
+  - Happy path: 3-file manifest → a `fasta_chunks/` directory, correct schema,
+    every read_id present, chunks reassemble.
+  - A manifest longer than `_MANIFEST_BATCH_FILES` writes one part per batch and
+    loses no reads, and BOTH passes hand `read_fastx` no more than one batch at a
+    time — the manifest is batched because a single call holds every path open
+    (duckdb-miint#260).
+  - A pass-2 failure after earlier parts are on disk removes the whole parts
+    directory, so a partial set is never promoted as the step's output.
   - Dup read_id (the global genome_map join key) across files AND within a
     single file → ValueError (run_native_job maps to BAD_INPUT).
   - Empty file in the manifest is skipped (contributes no rows, no error).
@@ -28,6 +34,7 @@ Coverage:
 from __future__ import annotations
 
 import gzip
+import logging
 from pathlib import Path
 
 import duckdb
@@ -64,11 +71,70 @@ def _write_manifest(path: Path, lines: list[str]) -> Path:
 
 
 def _read_combined(path: Path) -> list[tuple[str, int, str]]:
+    """Read the step's whole output. `path` is the parts DIRECTORY — the same
+    value hash_sequences hands to `read_parquet`, which reads a directory of
+    Parquet files as one relation."""
     with duckdb.connect(":memory:") as conn:
         return conn.execute(
             "SELECT read_id, chunk_index, chunk_data "
             f"FROM read_parquet('{path}') ORDER BY read_id, chunk_index"
         ).fetchall()
+
+
+def _parts(path: Path) -> list[Path]:
+    return sorted(path.glob("part_*.parquet"))
+
+
+class _SpyConn:
+    """Records every `execute` the job issues, and can fail a chosen `COPY`.
+
+    The batching is invisible in the output of pass 1 — an unbatched pass 1
+    builds the identical `read_sanity` table — so the only way to pin it is to
+    watch the path lists actually handed to `read_fastx`. `fail_on_copy` drives
+    the partial-parts cleanup, which needs a failure AFTER a part is on disk.
+    """
+
+    def __init__(self, inner, fail_on_copy: int | None = None):
+        self._inner = inner
+        self._fail_on_copy = fail_on_copy
+        self._copies = 0
+        self.read_fastx_batch_sizes: list[int] = []
+
+    def __enter__(self):
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._inner.__exit__(*exc)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def execute(self, sql, parameters=None):
+        if "read_fastx" in sql and parameters:
+            self.read_fastx_batch_sizes.append(len(parameters[0]))
+        if sql.lstrip().startswith("COPY"):
+            self._copies += 1
+            if self._fail_on_copy is not None and self._copies > self._fail_on_copy:
+                raise RuntimeError("probe: COPY failed mid-run")
+        return self._inner.execute(sql, parameters) if parameters else self._inner.execute(sql)
+
+
+def _spy_conn(monkeypatch, *, fail_on_copy: int | None = None) -> list[_SpyConn]:
+    """Install a `_SpyConn` around `open_miint_conn` and return the list it
+    appends each opened connection to."""
+    from qiita_compute_orchestrator.jobs import stage_local_fasta
+
+    opened: list[_SpyConn] = []
+    real = stage_local_fasta.open_miint_conn
+
+    def _open():
+        spy = _SpyConn(real(), fail_on_copy=fail_on_copy)
+        opened.append(spy)
+        return spy
+
+    monkeypatch.setattr(stage_local_fasta, "open_miint_conn", _open)
+    return opened
 
 
 def _inputs(*, manifest_path: Path):
@@ -121,9 +187,9 @@ def test_inputs_rejects_missing_scope_scalar():
 # --------------------------------------------------------------------------
 
 
-async def test_three_files_combined_into_one_parquet(tmp_path):
-    """A manifest of three small FASTA files produces ONE combined parquet
-    keyed `fasta_path`, with every read_id present and reassembling."""
+async def test_three_files_combined_into_parts_directory(tmp_path):
+    """A manifest of three small FASTA files produces a parts DIRECTORY keyed
+    `fasta_path`, with every read_id present and reassembling."""
     fa1 = _write_fasta(tmp_path / "a.fa", [("g1", "ACGT"), ("g2", "TTTT")])
     fa2 = _write_fasta(tmp_path / "b.fa", [("g3", "GGGGCCCC")])
     fa3 = _write_fasta(tmp_path / "c.fa", [("g4", "AATTCCGG")])
@@ -132,14 +198,118 @@ async def test_three_files_combined_into_one_parquet(tmp_path):
     outputs = await _run(manifest, tmp_path / "ws")
 
     assert set(outputs) == {"fasta_path"}
-    assert outputs["fasta_path"].exists()
-    assert outputs["fasta_path"].suffix == ".parquet"
+    assert outputs["fasta_path"].is_dir()
+    # One batch, so one part — the batching is exercised in its own test below.
+    assert [p.name for p in _parts(outputs["fasta_path"])] == ["part_00000.parquet"]
 
     rows = _read_combined(outputs["fasta_path"])
     by_read = {rid: data for rid, _idx, data in rows}
     assert set(by_read) == {"g1", "g2", "g3", "g4"}
     assert by_read["g3"] == "GGGGCCCC"
     assert by_read["g4"] == "AATTCCGG"
+
+
+async def test_manifest_longer_than_batch_writes_a_part_per_batch(tmp_path, monkeypatch):
+    """The manifest is fed to `read_fastx` in `_MANIFEST_BATCH_FILES`-sized
+    slices because one call holds every listed path open for its whole life
+    (duckdb-miint#260). Pass 2 writes a part per batch; pass 1 accumulates into
+    one temp table, so the cross-file dup check still spans every batch."""
+    from qiita_compute_orchestrator.jobs import stage_local_fasta
+
+    monkeypatch.setattr(stage_local_fasta, "_MANIFEST_BATCH_FILES", 2)
+    files = [_write_fasta(tmp_path / f"g{i}.fa", [(f"g{i}", "ACGT" * (i + 1))]) for i in range(5)]
+    manifest = _write_manifest(tmp_path / "m.txt", [str(f) for f in files])
+
+    outputs = await _run(manifest, tmp_path / "ws")
+
+    # 5 paths at 2 per batch -> 3 parts, the last one short.
+    assert [p.name for p in _parts(outputs["fasta_path"])] == [
+        "part_00000.parquet",
+        "part_00001.parquet",
+        "part_00002.parquet",
+    ]
+    by_read = {rid: data for rid, _idx, data in _read_combined(outputs["fasta_path"])}
+    assert by_read == {f"g{i}": "ACGT" * (i + 1) for i in range(5)}
+
+
+async def test_both_passes_hand_read_fastx_one_batch_at_a_time(tmp_path, monkeypatch):
+    """Neither pass may pass the whole manifest to `read_fastx` — that is the
+    defect, and the part count alone does not catch it: an unbatched pass 1
+    builds the identical `read_sanity` table and would still emit one part per
+    pass-2 batch. Watch the path lists instead."""
+    from qiita_compute_orchestrator.jobs import stage_local_fasta
+
+    monkeypatch.setattr(stage_local_fasta, "_MANIFEST_BATCH_FILES", 2)
+    opened = _spy_conn(monkeypatch)
+    files = [_write_fasta(tmp_path / f"g{i}.fa", [(f"g{i}", "ACGT")]) for i in range(5)]
+    manifest = _write_manifest(tmp_path / "m.txt", [str(f) for f in files])
+
+    await _run(manifest, tmp_path / "ws")
+
+    # 5 paths, 2 per batch, two passes -> 3 + 3 calls, none over the batch size.
+    sizes = opened[0].read_fastx_batch_sizes
+    assert sizes == [2, 2, 1, 2, 2, 1]
+    assert max(sizes) <= stage_local_fasta._MANIFEST_BATCH_FILES
+
+
+async def test_pass_two_failure_removes_every_part_written_so_far(tmp_path, monkeypatch):
+    """A batched pass 2 can fail with earlier parts already on disk. The launcher's
+    manifest walker runs after execute() and lists whatever it finds, so a partial
+    set must not survive the failure."""
+    from qiita_compute_orchestrator.jobs import stage_local_fasta
+
+    monkeypatch.setattr(stage_local_fasta, "_MANIFEST_BATCH_FILES", 1)
+    _spy_conn(monkeypatch, fail_on_copy=2)
+    files = [_write_fasta(tmp_path / f"g{i}.fa", [(f"g{i}", "ACGT")]) for i in range(4)]
+    manifest = _write_manifest(tmp_path / "m.txt", [str(f) for f in files])
+
+    workspace = tmp_path / "ws"
+    with pytest.raises(RuntimeError, match="COPY failed"):
+        await _run(manifest, workspace)
+    # Parts 0 and 1 were written before the third COPY raised.
+    assert not (workspace / "fasta_chunks").exists()
+
+
+async def test_duplicate_read_id_in_a_later_batch_still_raises(tmp_path, monkeypatch):
+    """The dup check reads the accumulated temp table, not one batch, so a
+    read_id repeated across a batch boundary is still caught — and the failure
+    leaves no parts directory for the launcher's manifest walker to promote."""
+    from qiita_compute_orchestrator.jobs import stage_local_fasta
+
+    monkeypatch.setattr(stage_local_fasta, "_MANIFEST_BATCH_FILES", 1)
+    fa1 = _write_fasta(tmp_path / "a.fa", [("dup", "ACGT")])
+    fa2 = _write_fasta(tmp_path / "b.fa", [("g1", "TTTT")])
+    fa3 = _write_fasta(tmp_path / "c.fa", [("dup", "GGGG")])
+    manifest = _write_manifest(tmp_path / "m.txt", [str(fa1), str(fa2), str(fa3)])
+
+    workspace = tmp_path / "ws"
+    with pytest.raises(ValueError, match="dup"):
+        await _run(manifest, workspace)
+    assert not (workspace / "fasta_chunks").exists()
+
+
+async def test_soft_masked_input_warns_and_stores_upper(tmp_path, caplog):
+    """A soft-masked record warns and is stored upper case; an all-uppercase
+    manifest warns not at all. `--local` reaches the same split as the remote
+    DoPut path, so it discards case the same way and must say so too."""
+    fa = _write_fasta(tmp_path / "masked.fa", [("g1", "ACGTacgtTTGA")])
+    manifest = _write_manifest(tmp_path / "m.txt", [str(fa)])
+    logger = "qiita_compute_orchestrator.jobs.stage_local_fasta"
+
+    with caplog.at_level(logging.WARNING, logger=logger):
+        outputs = await _run(manifest, tmp_path / "ws")
+
+    assert "soft-masked" in caplog.text
+    assert str(fa) in caplog.text
+    by_read = {rid: data for rid, _idx, data in _read_combined(outputs["fasta_path"])}
+    assert by_read["g1"] == "ACGTACGTTTGA"
+
+    caplog.clear()
+    plain = _write_fasta(tmp_path / "plain.fa", [("g2", "ACGTACGTTTGA")])
+    manifest2 = _write_manifest(tmp_path / "m2.txt", [str(plain)])
+    with caplog.at_level(logging.WARNING, logger=logger):
+        await _run(manifest2, tmp_path / "ws2")
+    assert "soft-masked" not in caplog.text
 
 
 async def test_output_schema_shape(tmp_path):

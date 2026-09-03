@@ -68,6 +68,7 @@ from ..config import (
     ORCHESTRATOR_ENV_PATH,
     Settings,
 )
+from ..native_import_check import MAX_DETAIL
 from ..slurm.client import (
     SlurmrestdClient,
     SlurmrestdError,
@@ -258,10 +259,28 @@ else
     echo "{_PROBE_LINE_PREFIX} native-python-on-compute=fail path=$PYTHON"
 fi
 
-if "$PYTHON" -c 'import qiita_compute_orchestrator.jobs' 2>/dev/null; then
+# The SAME check redeploy.sh runs on the head node after `uv sync`, invoked as a
+# module so neither side can drift into its own idea of "imports cleanly" — see
+# qiita_compute_orchestrator.native_import_check for what it covers and why it is
+# anchored on the job modules rather than on qiita_common. Same capture shape as
+# the miint probes below: the check prints one collapsed line naming the module
+# and the error, and that line is the operator's whole diagnosis — a bare `=fail`
+# leaves nothing to act on, and _parse_probe_log keeps only prefixed lines.
+# -P keeps the cwd off sys.path so a probe launched from inside a source tree
+# cannot shadow the installed package it is there to check.
+#
+# 2>&1, because a failure BEFORE the module's own try block writes to stderr and
+# leaves stdout empty: `No module named ...` on a venv that predates the module is
+# the case the deploy checklist says to expect first. The collapse runs in the
+# else branch rather than on the capture, because a pipeline's status is the LAST
+# command's — `if VAR="$(python ... | tr ...)"` reads tr's 0 and reports ok on
+# every failure.
+NATIVE_IMPORT_MOD=qiita_compute_orchestrator.native_import_check
+if NATIVE_IMPORT_ERR="$("$PYTHON" -P -m "$NATIVE_IMPORT_MOD" 2>&1)"; then
     echo "{_PROBE_LINE_PREFIX} native-import=ok"
 else
-    echo "{_PROBE_LINE_PREFIX} native-import=fail"
+    NATIVE_IMPORT_ERR="$(printf '%s' "$NATIVE_IMPORT_ERR" | tr -s '[:space:]' ' ')"
+    echo "{_PROBE_LINE_PREFIX} native-import=fail err=$NATIVE_IMPORT_ERR"
 fi
 
 # miint must LOAD on the compute node from the deploy-staged
@@ -296,7 +315,7 @@ except Exception as exc:
     # chr(10)/chr(13) (not a backslash escape) keeps this clear of the enclosing
     # f-string's newline expansion.
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
-    print(msg[:500])
+    print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
 # Capture the probe's stdout (the one-line error above on failure); drop stderr
@@ -328,7 +347,7 @@ try:
     assert len(rows) == 2, rows
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
-    print(msg[:500])
+    print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
 if MIINT_ERR="$("$PYTHON" "$MIINT_SPLIT_PROBE" 2>/dev/null)"; then
@@ -366,7 +385,7 @@ try:
     assert not missing, "missing miint host-filter functions: " + ", ".join(missing)
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
-    print(msg[:500])
+    print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
 if MIINT_ERR="$("$PYTHON" "$MIINT_HOSTFILTER_PROBE" 2>/dev/null)"; then
@@ -404,7 +423,7 @@ try:
     assert rows == [(1, 3, 3), (2, None, None)], "infer_trim contract drift: " + str(rows)
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
-    print(msg[:500])
+    print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
 if MIINT_ERR="$("$PYTHON" "$MIINT_INFERTRIM_PROBE" 2>/dev/null)"; then
@@ -445,7 +464,7 @@ try:
         assert row is not None and row[0], "save_bowtie2_index did not report success"
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
-    print(msg[:500])
+    print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
 if MIINT_ERR="$("$PYTHON" "$MIINT_BOUNDARY_PROBE" 2>/dev/null)"; then

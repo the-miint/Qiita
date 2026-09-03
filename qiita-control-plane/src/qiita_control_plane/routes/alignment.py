@@ -47,7 +47,7 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
-from ..feature_table import parse_feature_table_scope
+from ..feature_table import parse_feature_table_denovo, parse_feature_table_scope
 from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort
 
 # The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
@@ -159,6 +159,18 @@ async def create_alignment_doget_ticket(
     single-``alignment_idx`` + non-empty-filter guards are never even reached with
     a bad scope — an unscoped alignment ticket is never signed here.
 
+    ``denovo`` picks WHICH of the ticket's alignment runs to sign. A combined
+    (inverted open reference) feature table estimates over two — the cohort against
+    a reference, and each sample against its own assembled contigs — and one call
+    signs one, so the job asks twice. The cohort is the same for both: it is the
+    ticket's, and ``denovo_alignment_idx`` addresses a run whose hashed params carry
+    no ``prep_sample_idx``, so one de novo alignment covers the whole cohort.
+
+    ``denovo=true`` against a ticket carrying no ``denovo_alignment_idx`` is 422,
+    never a quiet fall back to the reference arm: the job would then stage one slice
+    into both arms and reconcile it against itself, which removes every read from
+    the reference side and returns a de-novo-only table under the combined name.
+
     Cohort completeness is NOT re-checked here. That every ``prep_sample_idx`` is a
     member of this alignment and its ``qiita.alignment_sample`` gate is
     ``'completed'`` is validated at SUBMIT time by the feature-table runner
@@ -200,8 +212,19 @@ async def create_alignment_doget_ticket(
     # (parse_feature_table_scope), each boundary translating to its own error type.
     try:
         alignment_idx, prep_sample_idx = parse_feature_table_scope(ctx)
+        denovo_alignment_idx = parse_feature_table_denovo(ctx)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if body.denovo:
+        if denovo_alignment_idx is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"work ticket {body.work_ticket_idx} carries no denovo_alignment_idx,"
+                    " so there is no de novo arm to sign"
+                ),
+            )
+        alignment_idx = denovo_alignment_idx
     return _sign_alignment_ticket(
         alignment_idx=alignment_idx,
         prep_sample_idx=prep_sample_idx,

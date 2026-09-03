@@ -74,6 +74,38 @@ _DEFAULT_NOTIFY_MAX_ATTEMPTS = 5
 _DEFAULT_NOTIFY_MAX_ROWS_PER_SWEEP = 5000
 
 
+def _parse_ingest_roots(raw: str) -> tuple[Path, ...]:
+    """Parse PATH_INGEST_ROOTS — a colon-separated list of absolute
+    directories — into a deduplicated, sorted tuple.
+
+    Each entry is normalized lexically (`os.path.normpath`) so a trailing
+    slash or an interior `.` does not produce a root that a later
+    `is_relative_to` containment test would miss. Symlinks are NOT resolved:
+    the roots name the mount as the operator wrote it, and the containment
+    check resolves the submitted path the same way (see
+    `ingest_path.resolve_ingest_path`).
+
+    Raises RuntimeError naming the offending entry on an empty list, a
+    relative entry, or `/` itself — `/` as a root admits every absolute
+    path, which is the state the variable exists to end.
+    """
+    entries = [part for part in raw.split(":") if part]
+    if not entries:
+        raise RuntimeError(f"PATH_INGEST_ROOTS must name at least one directory, got {raw!r}")
+    roots: set[Path] = set()
+    for entry in entries:
+        root = Path(os.path.normpath(entry))
+        if not root.is_absolute():
+            raise RuntimeError(f"PATH_INGEST_ROOTS entries must be absolute, got {entry!r}")
+        if root == Path("/"):
+            raise RuntimeError(
+                "PATH_INGEST_ROOTS may not contain '/' — every absolute path would"
+                " be admitted, which is what the variable bounds"
+            )
+        roots.add(root)
+    return tuple(sorted(roots))
+
+
 def _parse_positive_int_env(var: str, default: int) -> int:
     """Read `var` from the environment as a positive int, or fall back to
     `default`. Raises RuntimeError naming the variable on a non-int value
@@ -191,6 +223,14 @@ class Settings:
     # required-but-Optional shape as path_scratch_ticket for the same
     # reasons; dispatch._run_and_log raises if None reaches use-time.
     path_scratch_staging: Path | None = None
+    # Roots a work_ticket's action_context may name a host path under
+    # (PATH_INGEST_ROOTS, colon-separated absolute dirs). Every host-path
+    # key in a submitted action_context must resolve under one of these;
+    # `ingest_path.resolve_ingest_path` is the gate. Empty tuple in the
+    # dataclass so tests construct Settings without it; from_env() requires
+    # PATH_INGEST_ROOTS so a production boot without it fails fast rather
+    # than admitting an arbitrary absolute path.
+    path_ingest_roots: tuple[Path, ...] = ()
     # Contact email rendered on the public landing page (`GET /`) as the
     # destination for both the "request access" and "need help" mailto
     # links. Required at boot so the landing page never ships with a
@@ -297,6 +337,10 @@ class Settings:
         ws_root = scratch / "ticket"
         upload_root = scratch / "staging"
 
+        # Colon-separated roots a submitter may name a host path under.
+        # Required, for the reason `_parse_ingest_roots` gives when refusing '/'.
+        ingest_roots = _parse_ingest_roots(require_env("PATH_INGEST_ROOTS"))
+
         contact_email = require_env("CONTACT_EMAIL")
         # Minimal shape check — exactly one `@`, non-empty local part,
         # domain with at least one dot, no whitespace. Not a full RFC-5322
@@ -366,6 +410,7 @@ class Settings:
             ),
             path_scratch_ticket=ws_root,
             path_scratch_staging=upload_root,
+            path_ingest_roots=ingest_roots,
             contact_email=contact_email,
             build_sha=os.environ.get("BUILD_SHA") or None,
             build_version=os.environ.get("BUILD_VERSION") or None,

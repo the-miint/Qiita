@@ -78,11 +78,20 @@ produces, to every printed digit, and silences jgi's per-record warnings. If you
 are tempted to drop it because "the aligner already knows the sequences": it does
 not put them in the file, and the resulting error is silent.
 
-TODO(sizing): the SEQUENCE_DATA lookup is unspillable and holds ~1.5-1.7x the raw
-read-sequence bytes (probed). `baseline_resources` in the workflow YAML has not
-been validated against a real per-sample masked HiFi read volume — do that against
-a real ticket's MaxRSS (`sacct`) and adjust, or the largest samples OOM in a way
-escalation cannot fix. See the memory-split note at `_DUCKDB_CAP_GB`.
+SIZING, measured 2026-08-24 against real tickets on the deploy host (`sacct`, 69
+attempts). At the 64 GB baseline 49 completed, peak RSS p50 55.5 GB / max 63.6, with 35
+of them above 80% of the allocation; 10 died OUT_OF_MEMORY at exactly 64.0 GB and each
+completed on the escalated 128 GB retry at 63.8-75.2 GB. So the unspillable
+SEQUENCE_DATA lookup does push the largest samples past the baseline — but escalation
+DOES fix it, which is the half the earlier note here feared it would not.
+
+Raising the baseline to 128 GB would retire that retry, at the cost of doubling the
+request for every sample including the median that fits in 56. Not done: 69 attempts
+is too small a sample to re-size a production allocation on, and the samples
+behind them are not known to span what this workflow will see. Revisit with more runs —
+`sacct --user=qiita-job` from a host that can reach slurmdbd, job names
+`qiita-wt{idx}-assembly_coverage-a{n}`, MaxRSS read off the `.0` sub-step and not the
+parent. See the memory-split note at `_DUCKDB_CAP_GB`.
 """
 
 from __future__ import annotations
@@ -135,7 +144,25 @@ _MM2_PRESET = "map-hifi"
 # CEILING, NOT YET SETTLED: for a read set whose sequence bytes * ~1.6 exceed the
 # cgroup remainder, no escalation helps (the lookup is unspillable). Whether one
 # sample's masked HiFi read set fits `baseline_resources` is a sizing question for
-# a real sample — see the module TODO.
+# a real sample: the first production ticket's `sacct` MaxRSS is what settles it.
+# Equal to this step's `baseline_resources.cpu`, and it must stay equal — but the
+# binding reason is MEMORY, not cores. `align_minimap2` draws its parallelism from
+# DuckDB's thread pool (measured near-linear at 1/2/4/8), so this number is also the
+# aligner's concurrency, and therefore a multiplier on the per-thread state it holds
+# in the cgroup remainder — the side that cannot spill.
+#
+# That remainder is already the constraint, measured on the deploy host (`sacct`,
+# 2026-01-01 onward, threads=8). Of 49 attempts that COMPLETED at the 64 GB baseline:
+# peak RSS p50 55.5 GB, p90 59.4, max 63.6 — 87% of the allocation at the median, with
+# 35 of the 49 above 80%. Ten further attempts died `OUT_OF_MEMORY` at exactly 64.0 GB,
+# and each completed on the escalated 128 GB retry at 63.8-75.2 GB. So raising this
+# number buys wall time the step does not need (p50 10.4 min against a PT4H limit)
+# against memory it does not have.
+#
+# `_DUCKDB_CAP_GB` is NOT what bounds this step: DuckDB sits at 16 GB and spills. The
+# ~56 GB is the extension side — the SEQUENCE_DATA lookup above plus the minimap2
+# index. `test_assembly_coverage_cpu_pins_duckdb_threads` keeps the YAML's `cpu:` on
+# this number so the two cannot drift.
 _DUCKDB_THREADS = 8
 # DuckDB's cap under SLURM — modest on purpose: it spills beyond this, and the
 # memory that matters is the extension's. Off SLURM (local/dev), the resolver

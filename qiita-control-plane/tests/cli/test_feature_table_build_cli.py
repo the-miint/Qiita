@@ -2,7 +2,7 @@
 and both Flight streams faked — real miint, real analytic, real writers.
 
 The pieces this wires are pinned elsewhere: the analytic against real miint in
-`tests/test_feature_table_analytic.py`, the maps / relabel / bundle in
+`qiita-common`'s `tests/analytic/test_behaviour_miint.py`, the maps / relabel / bundle in
 `tests/cli/test_feature_table_cli.py`, the BIOM writer's own behaviours in
 `tests/test_biom_writer_contract.py`. **What is only testable here is the wiring**:
 which columns ride the ticket, which scope reaches the survivor set, whether the
@@ -22,10 +22,11 @@ import json
 import httpx
 import pyarrow as pa
 import pytest
-from qiita_common import feature_table as ft
+from qiita_common import analytic as ft
 from qiita_common.hashing import canonical_params_hash
 
 from qiita_control_plane.cli.user import feature_table as ftc
+from qiita_control_plane.cli.user._helpers import _UNSET
 from qiita_control_plane.miint import connect_with_miint
 
 # One 1000 bp genome fully covered in sample 1, and one 10 000 bp genome each sample
@@ -124,16 +125,23 @@ def _alignment_reader(columns: list[str], rows: list[tuple]) -> pa.RecordBatchRe
     return table.to_reader()
 
 
-def _lengths_reader() -> pa.RecordBatchReader:
-    """`reference_sequences` as the whole-reference ticket streams it — `sequence_hash`
-    rides along unused, which is what the analytic's projection has to tolerate."""
+def _lengths_reader_rows(rows: list[tuple[int, int]]) -> pa.RecordBatchReader:
+    """`reference_sequences` / `assembled_sequence` as their tickets stream them —
+    `sequence_hash` rides along unused on both, which is what the analytic's
+    projection has to tolerate. One reader for the two because the two surfaces have
+    the same shape; only their scope differs, and that is the ticket's business."""
     return pa.table(
         {
-            "feature_idx": pa.array([f for f, _ in _LENGTHS], pa.int64()),
-            "sequence_hash": pa.array([None] * len(_LENGTHS), pa.string()),
-            "sequence_length_bp": pa.array([n for _, n in _LENGTHS], pa.int64()),
+            "feature_idx": pa.array([f for f, _ in rows], pa.int64()),
+            "sequence_hash": pa.array([None] * len(rows), pa.string()),
+            "sequence_length_bp": pa.array([n for _, n in rows], pa.int64()),
         }
     ).to_reader()
+
+
+def _lengths_reader() -> pa.RecordBatchReader:
+    """The whole reference's lengths — the default every reference-only test uses."""
+    return _lengths_reader_rows(_LENGTHS)
 
 
 def _taxonomy_reader(rows) -> pa.RecordBatchReader:
@@ -216,12 +224,18 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
         "sequencing_run_idx": 4,
         "sequenced_pool_idx": 5,
         "alignment_idx": 3,
+        # Reference-only by default: the combined arm is opt-in, and every existing
+        # test here is about the analytic the reference arm alone produces.
+        "denovo_alignment_idx": None,
         "prep_sample_idx": None,
         "coverage_scope": ft.CoverageScope.POOLED.value,
         "coverage_threshold": 0.01,
         "min_identity": None,
         "min_query_coverage": None,
         "unpaired_gate": False,
+        "circular_gate": False,
+        "circular_min_coverage": _UNSET,
+        "circular_min_identity": _UNSET,
         "format": ftc.DEFAULT_TABLE_FORMAT,
         "taxonomy": False,
         "tree": False,
@@ -457,6 +471,144 @@ def test_the_gate_pools_mates_by_default(monkeypatch, tmp_path):
     )
     ftc._handle_feature_table_build(unpaired, parser=None)
     assert "mate_position" not in rec["columns"]
+
+
+def test_a_circular_gate_counts_a_read_the_reference_origin_split(monkeypatch, tmp_path):
+    """The mode end to end. Feature 20 is 10 kb and read 2 crosses its origin: two
+    records covering half the read each, which the per-record gate at 0.9 discards and
+    the pooled one keeps. The two records are one read, so the table counts it once."""
+    split = [
+        (1, 1, 10, 0, 0, 500, "500="),
+        (1, 2, 20, 0, 9_000, 10_000, "1000=1000S"),
+        (1, 2, 20, 2048, 0, 1_000, "1000H1000="),
+    ]
+    rec = _patched(monkeypatch, alignment=split)
+    args = _namespace(tmp_path, circular_gate=True, coverage_threshold=0.0)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    # `mate_position` does not ride: the circular axis tells mates apart by the read1 bit.
+    assert rec["columns"] == [*ft.ALIGNMENT_COLUMNS, "cigar"]
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0), ("QM1", "GCF_200", 1.0)]
+
+    per_record = _patched(monkeypatch, alignment=split)
+    dropped = _namespace(
+        tmp_path,
+        min_query_coverage=ft.CIRCULAR_MIN_COVERAGE,
+        coverage_threshold=0.0,
+        output=tmp_path / "b.parquet",
+    )
+    assert ftc._handle_feature_table_build(dropped, parser=None) == 0
+    assert _table_rows(dropped.output) == [("QM1", "GCF_100", 1.0)]
+    assert per_record["columns"] != rec["columns"]
+
+
+def test_a_circular_gate_streams_the_lengths_even_with_no_coverage_filter(monkeypatch, tmp_path):
+    """It asks how much of a read one contig explains, so it needs a length per feature —
+    a whole-reference read the ungated path skips entirely at threshold 0."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=0.0)
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["lengths_minted"] == 0
+
+    rec = _patched(monkeypatch)
+    circular = _namespace(
+        tmp_path, circular_gate=True, coverage_threshold=0.0, output=tmp_path / "b.parquet"
+    )
+    assert ftc._handle_feature_table_build(circular, parser=None) == 0
+    assert rec["lengths_minted"] == 1
+
+
+def test_the_circular_thresholds_reach_the_predicate(monkeypatch, tmp_path):
+    """They are parameters, so a caller can move them: the same slice keeps the split
+    read at the default 0.90 coverage floor and loses it when the floor is raised past
+    what the read explains."""
+    partial = [
+        (1, 1, 10, 0, 0, 500, "500="),
+        (1, 2, 20, 0, 9_000, 10_000, "1000=1000S"),  # half the read, alone
+    ]
+    _patched(monkeypatch, alignment=partial)
+    strict = _namespace(tmp_path, circular_gate=True, coverage_threshold=0.0)
+    assert ftc._handle_feature_table_build(strict, parser=None) == 0
+    assert _table_rows(strict.output) == [("QM1", "GCF_100", 1.0)]
+
+    _patched(monkeypatch, alignment=partial)
+    lax = _namespace(
+        tmp_path,
+        circular_gate=True,
+        circular_min_coverage=0.4,
+        coverage_threshold=0.0,
+        output=tmp_path / "b.parquet",
+    )
+    assert ftc._handle_feature_table_build(lax, parser=None) == 0
+    assert _table_rows(lax.output) == [("QM1", "GCF_100", 1.0), ("QM1", "GCF_200", 1.0)]
+
+
+def test_a_circular_threshold_without_the_mode_is_refused_not_ignored(
+    monkeypatch, tmp_path, capsys
+):
+    """A flag that only says HOW to judge does nothing on its own — the same shape as
+    `--unpaired-gate` alone, and the same refusal. Silently building an UNGATED table
+    from a command that named a threshold is the failure this closes."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_min_coverage=0.5)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "--circular-min-coverage" in err and "--circular-gate" in err
+    assert "alignments_fetched" not in rec
+    assert not args.output.exists()
+
+
+def test_the_circular_thresholds_default_only_when_omitted(monkeypatch, tmp_path):
+    """Given, they are used; omitted, the shared constants are. The namespace cannot
+    tell those apart from the value alone, which is why the flags default to a
+    sentinel."""
+    _patched(monkeypatch)
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True))
+    assert (gate.circular_min_coverage, gate.circular_min_identity) == (
+        ft.CIRCULAR_MIN_COVERAGE,
+        ft.CIRCULAR_MIN_IDENTITY,
+    )
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True, circular_min_coverage=0.5))
+    assert (gate.circular_min_coverage, gate.circular_min_identity) == (
+        0.5,
+        ft.CIRCULAR_MIN_IDENTITY,
+    )
+
+
+def test_the_identity_term_can_be_dropped_for_an_alignment_that_cannot_be_scored(
+    monkeypatch, tmp_path
+):
+    """`--circular-min-identity none` is the documented escape hatch: pooled identity is
+    NULL on a legacy-`M` CIGAR and `NULL >= 0` is NULL too, so a threshold of 0 does not
+    express it. Reaching the dataclass's `None` is the whole point."""
+    _patched(monkeypatch)
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True, circular_min_identity=None))
+    assert gate.circular_min_identity is None
+    assert gate.circular_min_coverage == ft.CIRCULAR_MIN_COVERAGE
+
+
+def test_a_circular_gate_with_a_cigar_threshold_is_refused_before_any_round_trip(
+    monkeypatch, tmp_path, capsys
+):
+    """Two different questions, and combining them drops exactly the split records the
+    pooling exists to rescue. Refused from the flags alone, before the first REST call."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, min_query_coverage=0.9)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "--circular-min-identity" in capsys.readouterr().err
+    assert "alignments_fetched" not in rec
+
+
+def test_a_circular_gate_with_the_unpaired_flag_is_refused(monkeypatch, tmp_path, capsys):
+    """`--unpaired-gate` says how to pool a placement's mates, which the circular axis
+    does not do — so together they say nothing coherent."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, unpaired_gate=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "--unpaired-gate" in capsys.readouterr().err
 
 
 def test_an_unpaired_gate_over_paired_reads_is_refused(monkeypatch, tmp_path, capsys):
@@ -696,6 +848,28 @@ def test_parser_wires_the_build_with_parquet_and_pooled_as_defaults():
     assert args.prep_sample_idx is None  # omitted -> resolved from the pool
     assert args.min_identity is None and args.min_query_coverage is None
     assert args.unpaired_gate is False
+    assert args.circular_gate is False
+    # Omitted is a sentinel, not the threshold: passing one without --circular-gate has
+    # to be distinguishable from not passing it at all.
+    assert args.circular_min_coverage is _UNSET
+    assert args.circular_min_identity is _UNSET
+
+
+def test_parser_takes_the_circular_mode_and_its_two_thresholds():
+    """Both are settable on the command, which is the point of them being parameters."""
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    args = _build_parser().parse_args(
+        _build_argv(circular_min_coverage="0.8", circular_min_identity="0.99") + ["--circular-gate"]
+    )
+    assert args.circular_gate is True
+    assert (args.circular_min_coverage, args.circular_min_identity) == (0.8, 0.99)
+
+    # `none` drops the identity term, the way `--lane none` spells a NULL lane.
+    dropped = _build_parser().parse_args(
+        _build_argv(circular_min_identity="none") + ["--circular-gate"]
+    )
+    assert dropped.circular_min_identity is None
 
 
 def test_parser_takes_a_repeated_cohort_and_the_per_sample_scope():
@@ -1105,6 +1279,19 @@ def test_the_manifest_records_the_gate_that_filtered_the_table(monkeypatch, tmp_
     }
 
 
+def test_the_manifest_records_the_circular_gates_own_thresholds(monkeypatch, tmp_path):
+    """The other axis has other keys, and reporting it under the CIGAR ones would record
+    a build with two thresholds as one with none."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, circular_min_identity=0.99)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _manifest(tmp_path)["table"]["gate"] == {
+        "circular_min_coverage": ft.CIRCULAR_MIN_COVERAGE,
+        "circular_min_identity": 0.99,
+    }
+
+
 def test_the_manifest_lists_every_file_in_the_bundle_including_itself(monkeypatch, tmp_path):
     """Basenames, so the record does not describe the machine that built it — and the
     list is derived from the same targets the writer uses, not a second guess at them."""
@@ -1236,3 +1423,307 @@ def test_an_unresolvable_miint_version_is_a_string_not_a_json_null(miint_row):
     tools = ftc._tool_versions(_VersionCatalog(miint_row))
     assert tools["miint"] == "unknown"
     assert all(isinstance(value, str) for value in tools.values())
+
+
+# ---------------------------------------------------------------------------
+# The combined (inverted open reference) build: --denovo-alignment-idx.
+#
+# The analytic's rules are pinned against real miint in qiita-common; what is
+# pinned here is this driver's own wiring — the second alignment's summary comes
+# from the SAME verified pool listing, the map is fetched per sample and keyed by
+# it, the lengths are fetched only for the samples the map named, and the
+# reference-only path is untouched.
+# ---------------------------------------------------------------------------
+
+_DENOVO_PARAMS = {
+    "subject": "assembly",
+    "aligner": "minimap2",
+    # Same mask as the reference arm's `_PARAMS`; the pairing rule refuses otherwise.
+    "mask_idx": 2,
+    "processing_idx": 11,
+}
+_DENOVO_TICKET = b"denovo-alignment-ticket"
+_DENOVO_LENGTHS_TICKET = b"denovo-lengths-ticket"
+
+# Sample 1 assembled contig 50; sample 2 assembled the same content-addressed
+# contig, under its own genome. Read 2 is placed by BOTH arms — it is the reference
+# arm's row on contig 20 — so precedence has something to decide.
+_DENOVO_MAP = {
+    1: [{"feature_idx": 50, "genome_idx": 900, "source": "qiita", "source_id": "qiita-900"}],
+    2: [{"feature_idx": 50, "genome_idx": 901, "source": "qiita", "source_id": "qiita-901"}],
+}
+_DENOVO_ALIGNMENT = [
+    (1, 2, 50, 0, 0, 500, "500="),  # read 2, also placed by the reference arm
+    (2, 9, 50, 0, 0, 500, "500="),  # sample 2's own, on the same contig
+]
+_DENOVO_LENGTHS = [(50, 1000)]
+
+
+def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None):
+    """`_patched`, plus the three de novo seams. Returns the same recorder, with
+    `denovo_map_samples`, `denovo_lengths_samples` and `arm_tickets` added."""
+    # The exported-feature mint has to answer for BOTH arms' genomes: a qiita genome
+    # is minted a handle exactly as a reference one is, which is the point of the two
+    # arms sharing one `qiita.genome` space.
+    rec = _patched(
+        monkeypatch,
+        feature_handles={100: "GCF_100", 200: "GCF_200", 900: "qiita-900", 901: "qiita-901"},
+    )
+    rec["denovo_map_samples"] = []
+    rec["denovo_lengths_samples"] = []
+    rec["arm_tickets"] = []
+
+    body = {
+        "alignments": [
+            *_ALIGNMENTS_BODY["alignments"],
+            {
+                "alignment_idx": 4,
+                "params": _DENOVO_PARAMS,
+                "params_hash": canonical_params_hash(_DENOVO_PARAMS).hex(),
+                "samples_completed": 2,
+                "samples_total": 2,
+            },
+        ]
+    }
+    monkeypatch.setattr(ftc, "_fetch_pool_alignments", lambda *a, **k: body)
+
+    the_map = _DENOVO_MAP if denovo_map is None else denovo_map
+
+    def _assembly_map(base_url, token, *, prep_sample_idx, processing_idx):
+        rec["denovo_map_samples"].append(prep_sample_idx)
+        rec["denovo_map_processing_idx"] = processing_idx
+        if prep_sample_idx not in the_map:
+            # What the route returns for a sample that assembled nothing, which the
+            # recipe reads as "no de novo arm" rather than as an error.
+            raise httpx.HTTPStatusError(
+                "no contigs",
+                request=httpx.Request("GET", "http://cp"),
+                response=httpx.Response(404),
+            )
+        return the_map[prep_sample_idx]
+
+    monkeypatch.setattr(ftc, "_fetch_assembly_genome_map", _assembly_map)
+
+    def _assembly_ticket(base_url, token, *, prep_sample_idx, processing_idx, table):
+        rec["denovo_lengths_samples"].append(prep_sample_idx)
+        rec["denovo_lengths_table"] = table
+        return _DENOVO_LENGTHS_TICKET
+
+    monkeypatch.setattr(ftc, "_create_assembly_run_doget_ticket", _assembly_ticket)
+
+    # The alignment mint is ONE helper for both arms, dispatching on alignment_idx —
+    # exactly as the human cohort route does, which is subject-agnostic.
+    #
+    # **This fake enforces what the real route enforces**, which the rest of this
+    # module's fakes do not need to: `authorize_completed_alignment_cohort` refuses
+    # a cohort member with no `alignment_sample` row for that alignment, and a
+    # sample that assembled nothing has none — `align-denovo` ends NO_DATA for it
+    # before a gate row exists. A fake that signed any cohort would let the driver
+    # ask for the whole build's samples and still go green, which is exactly the
+    # difference between the two drivers this module exists to catch.
+    def _alignment_ticket(base_url, token, *, alignment_idx, prep_sample_idx, columns):
+        rec["arm_tickets"].append(alignment_idx)
+        rec["columns"] = list(columns)
+        rec["ticket_cohort"] = list(prep_sample_idx)
+        if alignment_idx == 4:
+            rec["denovo_ticket_cohort"] = list(prep_sample_idx)
+            unaligned = sorted(set(prep_sample_idx) - set(the_map))
+            if unaligned:
+                raise httpx.HTTPStatusError(
+                    f"{len(unaligned)} prep_sample(s) not completed for alignment 4",
+                    request=httpx.Request("POST", "http://cp"),
+                    response=httpx.Response(422),
+                )
+            return _DENOVO_TICKET
+        return _ALIGNMENT_TICKET
+
+    monkeypatch.setattr(ftc, "_create_alignment_doget_ticket", _alignment_ticket)
+
+    denovo_rows = _DENOVO_ALIGNMENT if denovo_alignment is None else denovo_alignment
+    readers = {
+        _ALIGNMENT_TICKET: lambda: _alignment_reader(
+            rec["columns"], [r for r in _ALIGNMENT if r[0] in rec["ticket_cohort"]]
+        ),
+        _DENOVO_TICKET: lambda: _alignment_reader(
+            rec["columns"], [r for r in denovo_rows if r[0] in rec["ticket_cohort"]]
+        ),
+        _LENGTHS_TICKET: _lengths_reader,
+        _DENOVO_LENGTHS_TICKET: lambda: _lengths_reader_rows(_DENOVO_LENGTHS),
+        _TAXONOMY_TICKET: lambda: _taxonomy_reader(_TAXONOMY),
+        _PHYLOGENY_TICKET: lambda: _phylogeny_reader(_PHYLOGENY),
+    }
+    monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
+    return rec
+
+
+def test_a_combined_build_counts_each_read_on_one_arm(monkeypatch, tmp_path):
+    """Read 2 is placed by BOTH arms and is counted once, on the de novo side.
+
+    **The discriminator is the 1.0, not the genome.** Without precedence read 2 would
+    sit in both arms, and `woltka_ogu` splits a read across the distinct genomes it
+    sees — so it would come back as 0.5 against `qiita-900` and 0.5 against
+    `GCF_200`, a plausible pair of numbers rather than an error. Asserting the whole
+    value is what tells the two apart.
+
+    Sample 2's read 9 is the second arm's own contribution, on the same
+    content-addressed contig under its own genome: 1.0 there proves the map join
+    carried `prep_sample_idx`, since the contig-only join would have split it too.
+    """
+    rec = _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["arm_tickets"] == [3, 4], "the reference arm first, then the de novo one"
+    rows = _table_rows(args.output)
+    assert ("QM1", "qiita-900", 1.0) in rows
+    assert ("QM2", "qiita-901", 1.0) in rows
+
+
+def test_a_combined_build_keys_the_map_and_the_lengths_by_sample(monkeypatch, tmp_path):
+    """One map fetch and one lengths mint per cohort sample, both at the assembly run
+    the de novo alignment's own params named — never a caller-supplied one. The
+    lengths read the contig surface, which carries hash and length and no bytes."""
+    rec = _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_map_samples"] == [1, 2]
+    assert rec["denovo_map_processing_idx"] == 11
+    assert rec["denovo_lengths_samples"] == [1, 2]
+    assert rec["denovo_lengths_table"] == "assembled_sequence"
+
+
+def test_a_sample_that_assembled_nothing_stays_reference_only(monkeypatch, tmp_path):
+    """The 404 on that sample's map is the design's graceful path, not an error: the
+    build succeeds and the sample keeps its reference placement.
+
+    Run at threshold 0 so breadth of coverage does not confound the point — at 1% it
+    does, and that is the subject of the test below rather than of this one.
+    """
+    rec = _patched_combined(monkeypatch, denovo_map={1: _DENOVO_MAP[1]})
+    args = _namespace(tmp_path, denovo_alignment_idx=4, coverage_threshold=0.0)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_map_samples"] == [1, 2], "both were asked; only one had a run"
+    # **The de novo mint got only the assembled sample.** The real route refuses a
+    # cohort member with no `alignment_sample` row, so passing the whole cohort here
+    # 422s the entire build — turning the graceful path into a hard failure.
+    assert rec["denovo_ticket_cohort"] == [1]
+    rows = _table_rows(args.output)
+    assert ("QM2", "GCF_200", 1.0) in rows, "sample 2 is still on the reference arm"
+    assert not [r for r in rows if r[0] == "QM2" and r[1].startswith("qiita-")], (
+        "and it has no de novo genome, having assembled nothing"
+    )
+
+
+def test_a_sample_with_no_run_is_never_asked_for_its_lengths(monkeypatch, tmp_path):
+    """The lengths cohort comes from the STAGED MAP, not from the requested one: a
+    sample whose map 404'd has no assembly run, and the DoGet mint for it would 404
+    too. Asserted separately from the fallback above because it needs a threshold
+    that actually opens the lengths streams."""
+    rec = _patched_combined(monkeypatch, denovo_map={1: _DENOVO_MAP[1]})
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_lengths_samples"] == [1]
+
+
+def test_the_reference_arm_can_lose_a_genome_to_the_coverage_filter(monkeypatch, tmp_path):
+    """**The consequence of precedence that looks like a result, not an error.**
+
+    G200 clears the 1% threshold in the reference-only build of this same fixture,
+    on the two samples' extending intervals pooled (0.6% + 0.6%). The combined build
+    gives sample 1's read to the de novo arm, so only sample 2's 0.6% is left and
+    G200 drops out entirely — for BOTH samples, pooled scope keeping or dropping a
+    genome cohort-wide.
+
+    `test_a_pooled_build_writes_the_public_table_and_its_map` is the control: it is
+    this fixture with no de novo arm, and G200 is in it twice.
+    """
+    _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert not [r for r in _table_rows(args.output) if r[1] == "GCF_200"]
+
+
+def test_a_reference_alignment_cannot_be_passed_as_the_de_novo_arm(monkeypatch, tmp_path, capsys):
+    """Passing the same alignment twice is refused on `params.subject`, by the rule
+    the server-side resolver applies. Unchecked it is not an error: precedence would
+    reconcile the reference arm against itself and empty it.
+
+    The handler turns the ValueError into a non-zero exit and a message, as it does
+    every other bad-flag refusal — so this asserts the exit code and the wording
+    rather than the exception.
+    """
+    _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=3)
+
+    assert ftc._handle_feature_table_build(args, parser=None) != 0
+    assert "not a de novo alignment" in capsys.readouterr().err
+
+
+def test_the_circular_gate_is_refused_alongside_the_de_novo_arm(monkeypatch, tmp_path):
+    """`--circular-gate` would re-judge both arms against thresholds their producers
+    never aligned at — redundant for the de novo arm, which align_denovo already
+    gated, and wrong for the reference arm, which align_sharded scored per record."""
+    args = _namespace(tmp_path, denovo_alignment_idx=4, circular_gate=True)
+    with pytest.raises(ValueError, match="without it"):
+        ftc._gate_from_args(args)
+
+
+def test_a_cohort_where_nothing_assembled_degrades_to_a_reference_only_build(
+    monkeypatch, tmp_path, capsys
+):
+    """Every sample 404s on its map, so there is no second arm at all. The build must
+    fall back to reference-only rather than sign an unscoped de novo ticket (which the
+    mint refuses) or bind against a de novo slice nothing staged.
+
+    The boundary case of the graceful path, and the one where "skip the samples the
+    map did not name" leaves nothing to skip TO.
+    """
+    rec = _patched_combined(monkeypatch, denovo_map={})
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["arm_tickets"] == [3], "no de novo ticket was minted"
+    assert rec["denovo_lengths_samples"] == []
+    assert _table_rows(args.output) == [
+        ("QM1", "GCF_100", 1.0),
+        ("QM1", "GCF_200", 1.0),
+        ("QM2", "GCF_200", 1.0),
+    ], "the counts are the reference-only build's"
+    # **But the bundle is not.** The table matching a reference-only build is exactly
+    # why the request has to be recorded: without it a combined ask and a
+    # reference-only ask leave no distinguishable trace, and the caller has no way to
+    # tell a degraded build from the one they asked for.
+    denovo = json.loads((tmp_path / "table.manifest.json").read_text())["table"]["denovo"]
+    assert denovo["requested_alignment_idx"] == 4
+    assert denovo["applied"] is False
+    assert denovo["prep_samples_with_a_de_novo_arm"] == 0
+    assert "reference-only table" in capsys.readouterr().err
+
+
+def test_a_partly_assembled_cohort_says_how_many_samples_had_no_arm(monkeypatch, tmp_path, capsys):
+    """A build where SOME samples degrade is the case a caller is least likely to
+    notice: the table is populated, the exit code is 0, and the missing arm shows up
+    only as counts that are lower than expected. Say it on stderr and record it."""
+    _patched_combined(monkeypatch, denovo_map={1: _DENOVO_MAP[1]})
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert "1 of 2 prep_sample(s) have no contigs" in capsys.readouterr().err
+    denovo = json.loads((tmp_path / "table.manifest.json").read_text())["table"]["denovo"]
+    assert denovo["applied"] is True
+    assert denovo["processing_idx"] == 11
+    assert denovo["prep_samples_with_a_de_novo_arm"] == 1
+
+
+def test_a_reference_only_build_records_no_denovo_block(monkeypatch, tmp_path):
+    """The key is absent, not null: a build that never asked for a second arm should
+    read exactly as it did before the arm existed."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert "denovo" not in json.loads((tmp_path / "table.manifest.json").read_text())["table"]

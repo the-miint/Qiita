@@ -117,12 +117,17 @@ def test_sequence_range_mint_is_workers_only():
         )
 
 
-def test_ticket_doput_in_admin_role_ceilings_not_user():
-    """ticket:doput gates the generic upload-slot endpoint. Reference loading
-    (the first consumer) is admin-only — the reference-add workflow's
-    audience is `[wet_lab_admin, system_admin]` — so the scope must be in
-    both admin ceilings but NOT in the USER ceiling. Service accounts also
-    get it for future worker-driven uploads (sequencing-run import, etc.)."""
+def test_ticket_doput_on_every_role_ceiling():
+    """ticket:doput gates the generic upload-slot endpoint, and is on every
+    ceiling including USER.
+
+    A user may not name a host path in `action_context` (wet_lab_admin+), so
+    an upload is their only route for their own reads; withholding this would
+    leave them unable to ingest at all. The scope buys a numbered staging slot
+    the caller owns: the signed ticket carries only `{"action": "doput",
+    "upload_idx": N}` and the data plane derives the path. What the upload may
+    then feed is gated separately — reference-add needs `reference:write`,
+    which a USER does not have."""
     from qiita_control_plane.auth.scopes import (
         ROLE_IMPLIED_SCOPES,
         SERVICE_ACCOUNT_SCOPE_CEILING,
@@ -130,8 +135,10 @@ def test_ticket_doput_in_admin_role_ceilings_not_user():
 
     assert Scope.TICKET_DOPUT in ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
     assert Scope.TICKET_DOPUT in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
-    assert Scope.TICKET_DOPUT not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
+    assert Scope.TICKET_DOPUT in ROLE_IMPLIED_SCOPES[SystemRole.USER]
     assert Scope.TICKET_DOPUT in SERVICE_ACCOUNT_SCOPE_CEILING
+    # The grant is the slot, not what it feeds.
+    assert Scope.REFERENCE_WRITE not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
 
 
 def test_mask_definition_delete_is_system_admin_only():

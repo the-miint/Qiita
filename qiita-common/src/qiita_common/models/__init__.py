@@ -52,6 +52,7 @@ from qiita_common.models._base import (
     StudyPrepScopeTarget,
     check_derived_inputs,
     check_exactly_one_runtime,
+    check_withdrawal_reason,
 )
 from qiita_common.models.auth import (
     ApiTokenMintRequest,
@@ -84,6 +85,7 @@ from qiita_common.models.biosample import (
     NCBI_TAXONOMY_NAME,
     TERMINOLOGY_TERM_VALUE_COLUMN,
     BiosampleAccessionField,
+    BiosampleGlobalFieldResponse,
     BiosampleImportRequest,
     BiosampleImportResponse,
     BiosampleLookupByAccessionRequest,
@@ -126,8 +128,21 @@ from qiita_common.models.host_filter_profile import (
 from qiita_common.models.prep_sample import (
     PREP_SAMPLE_GLOBAL_FIELD_IDX_WIRE,
     PREP_SAMPLE_STUDY_FIELD_IDX_WIRE,
+    PrepSampleGlobalFieldResponse,
     PrepSampleStudyFieldCreateRequest,
     PrepSampleStudyFieldResponse,
+)
+from qiita_common.models.processing import (
+    AssemblySampleState,
+    AssemblySampleStatusUpdate,
+    AssemblySampleStatusUpdateResponse,
+    Processing,
+    ProcessingListResponse,
+    ProcessingPrepSample,
+    ProcessingPrepSampleListResponse,
+    ProcessingStatus,
+    ProcessingStatusUpdate,
+    ProcessingSummary,
 )
 from qiita_common.models.reference import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
@@ -139,6 +154,7 @@ from qiita_common.models.reference import (
     MAX_EXPORTED_FEATURE_ENTITIES,
     READ_MASK_BUCKET,
     VALID_STATUS_TRANSITIONS,
+    AssemblyGenomeMapResponse,
     ExportedFeature,
     ExportedFeatureRequest,
     ExportedFeatureResponse,
@@ -168,9 +184,16 @@ from qiita_common.models.reference import (
     Tier,
     read_mask_reason_sql_list,
 )
+from qiita_common.models.run_folder import (
+    IlluminaRunInfo,
+    PacbioRunIndex,
+    RunFolderInspectRequest,
+    RunFolderInspectResponse,
+)
 from qiita_common.models.sample_field import (
     GLOBAL_FIELD_IDX_ATTR,
     STUDY_FIELD_IDX_ATTR,
+    SampleGlobalFieldResponse,
     SampleStudyFieldCreateRequest,
     SampleStudyFieldResponse,
     field_wire_name,
@@ -238,6 +261,8 @@ from qiita_common.models.sequencing import (
 from qiita_common.models.step import (
     AlignmentCohortDoGetTicketRequest,
     AlignmentDoGetTicketRequest,
+    AssemblyDoGetTicketRequest,
+    AssemblyRunDoGetTicketRequest,
     DoGetTicketRequest,
     DoGetTicketResponse,
     FoundJobWire,
@@ -387,6 +412,7 @@ __all__ = [
     "StudyPrepScopeTarget",
     "check_derived_inputs",
     "check_exactly_one_runtime",
+    "check_withdrawal_reason",
     # Health.
     "HealthResponse",
     "HealthStatus",
@@ -401,6 +427,7 @@ __all__ = [
     "ExportedFeature",
     "ExportedFeatureRequest",
     "ExportedFeatureResponse",
+    "AssemblyGenomeMapResponse",
     "GenomeMapEntry",
     "GenomeMapResponse",
     "GenomeSource",
@@ -438,6 +465,8 @@ __all__ = [
     # Step wire contract.
     "AlignmentCohortDoGetTicketRequest",
     "AlignmentDoGetTicketRequest",
+    "AssemblyDoGetTicketRequest",
+    "AssemblyRunDoGetTicketRequest",
     "ReadDoGetTicketRequest",
     "DoGetTicketRequest",
     "DoGetTicketResponse",
@@ -461,6 +490,10 @@ __all__ = [
     "UploadCreateRequest",
     "UploadCreateResponse",
     "UploadDoneRequest",
+    "IlluminaRunInfo",
+    "PacbioRunIndex",
+    "RunFolderInspectRequest",
+    "RunFolderInspectResponse",
     "UploadResponse",
     "UploadStatus",
     # User.
@@ -469,6 +502,7 @@ __all__ = [
     "UserUpdate",
     # Biosample.
     "BiosampleAccessionField",
+    "BiosampleGlobalFieldResponse",
     "BiosampleImportRequest",
     "BiosampleImportResponse",
     "BiosampleLookupByAccessionRequest",
@@ -490,6 +524,7 @@ __all__ = [
     "MissingReasonRef",
     "OwnerBiosampleIdExportResponse",
     "OwnerBiosampleIdRow",
+    "SampleGlobalFieldResponse",
     "SampleMetadataValue",
     "SampleMetadataWriteRequest",
     "SampleMetadataWriteResponse",
@@ -564,6 +599,7 @@ __all__ = [
     "AlignPlanRequest",
     "AlignPlanResponse",
     # Prep sample (the processing-kind supertype of sequenced_sample).
+    "PrepSampleGlobalFieldResponse",
     "PrepSampleStudyFieldCreateRequest",
     "PrepSampleStudyFieldResponse",
     # Sequencing-run / sequenced-pool / sequenced-sample.
@@ -587,6 +623,18 @@ __all__ = [
     "MaskSampleStatusUpdate",
     "MaskSampleStatusUpdateResponse",
     "MaskStateSource",
+    # Processing-run identity and its lifecycle (the assembly twin of the mask
+    # lifecycle names above).
+    "AssemblySampleState",
+    "AssemblySampleStatusUpdate",
+    "AssemblySampleStatusUpdateResponse",
+    "Processing",
+    "ProcessingListResponse",
+    "ProcessingPrepSample",
+    "ProcessingPrepSampleListResponse",
+    "ProcessingStatus",
+    "ProcessingStatusUpdate",
+    "ProcessingSummary",
     "MateQCAggregate",
     "MergedQCAggregate",
     "PointQCAggregate",

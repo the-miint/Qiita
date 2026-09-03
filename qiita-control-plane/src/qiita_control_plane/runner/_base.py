@@ -6,6 +6,7 @@ import asyncio
 import logging
 
 import asyncpg
+from qiita_common.actions import PATH_SUFFIX, UPLOAD_IDX_SUFFIX
 from qiita_common.backend_failure import FailureKind
 from qiita_common.models import (
     TERMINAL_WORK_TICKET_STATES,
@@ -15,11 +16,10 @@ import qiita_control_plane.runner as _runner_pkg
 
 _log = logging.getLogger("qiita_control_plane.runner")
 
-# Suffix that marks an action_context key as a DoPut upload handle. The
-# runner resolves every `{prefix}_upload_idx` entry to the canonical
-# staging path under `{prefix}_path` before invoking workflow steps.
-_UPLOAD_IDX_SUFFIX = "_upload_idx"
-_PATH_SUFFIX = "_path"
+# Re-exported under the runner's private spelling; the contract and its
+# rationale live on the definitions in `qiita_common.actions`.
+_UPLOAD_IDX_SUFFIX = UPLOAD_IDX_SUFFIX
+_PATH_SUFFIX = PATH_SUFFIX
 
 # How long the runner sleeps between status polls of a submitted step. The
 # control plane owns the poll loop now (the orchestrator is a stateless

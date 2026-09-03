@@ -5,10 +5,10 @@ with the run's reads stored in Qiita and a job you can watch — one for the who
 run on Illumina, one per prep_sample on PacBio. Read masking (host-filtering and
 the rest), alignment and feature tables come after this and are covered elsewhere.
 
-Steps 0 through 4 need nothing but your own account. Step 5 depends on the
-platform: submitting a PacBio run needs no extra privileges either, but
-submitting an Illumina run needs a `wet_lab_admin` account, so if you do not have
-one, hand that last step to someone who does.
+Steps 0 through 4 need nothing but your own account. Step 5 needs a
+`wet_lab_admin` account whichever platform you are on — it names a folder on the
+sequencer's filesystem, and naming one is reserved — so if you do not have that
+account, hand the last step to someone who does.
 
 **Do the steps in order.** The submit reads a **pre-flight file** — the sheet
 describing your run — and for every row in it looks up a biosample and a study that
@@ -264,10 +264,17 @@ byte for byte.
 
 ## 5. Submit the run
 
-Run this from a machine that sees the same files as the cluster. The path you give
-is stored as you typed it and re-opened later on a compute node, so it must be the
-path to the files *as the cluster sees them* — your laptop can talk to Qiita but
-cannot see the data.
+Both commands need a `wet_lab_admin` account. Run either from anywhere that can
+reach Qiita: Qiita opens the run folder itself to read what it needs, so your own
+machine does not have to see it. What you type is the path *as the cluster sees
+it* — it is stored as given and re-opened on a compute node later.
+
+Your site allows run folders only under certain directories. A path outside them
+is refused at your terminal, listing the ones that are allowed, instead of being
+accepted and failing inside a job hours later. Ask your operator which they are.
+The pre-flight file is the exception: `--preflight-blob` is read off the machine
+you are typing on and sent with the request, so that one does have to be local
+(step 4).
 
 Choose the protocol for the run. It is applied to every prep_sample and **nothing
 checks it against the platform**, so a wrong number here silently mislabels the
@@ -278,9 +285,6 @@ qiita prep-protocol list
 ```
 
 ### Illumina
-
-Needs a `wet_lab_admin` account — this one reads a path on the sequencer's
-filesystem directly, so it is not open to everybody.
 
 ```bash
 qiita submit-bcl-convert \
@@ -345,8 +349,9 @@ read-loading failures is in
 
 ## Not covered here
 
-- **One sample at a time, with no pre-flight file** — registering a run, pool and
-  sample by hand and processing FASTQs you already hold:
+- **One prep_sample at a time, with no pre-flight file** — registering a run, a
+  pool and a prep_sample by hand and loading reads you already hold, from the
+  machine you are typing on (`qiita submit-reads`) or from the cluster:
   [`manual-sample-walkthrough.md`](manual-sample-walkthrough.md).
 - **What happens to the reads next** — read masking (host-filtering among it),
   alignment and feature tables: `qiita submit-host-filter-pool`, `submit-block-mask-pool`,

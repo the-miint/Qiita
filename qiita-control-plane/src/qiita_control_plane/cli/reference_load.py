@@ -7,7 +7,9 @@ What the subcommand does, in order, against a running CP + DP:
      optional):
        a. Open an Arrow RecordBatch stream over the source file (see
           "Arrow streaming" below). No intermediate Parquet is written
-          to local disk; batches go straight to DoPut.
+          to local disk; batches go straight to DoPut. A FASTA carrying
+          soft-masked (lower case) bases warns here: the split stores
+          upper case, so the masking does not survive the load.
        b. POST /upload to mint an upload slot — returns upload_idx +
           signed DoPut Flight ticket.
        c. pyarrow.flight do_put — streams the Arrow batches to the data
@@ -88,7 +90,14 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_PREFIX,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
-from qiita_common.chunking import CHUNK_ROW_GROUP_SIZE, CHUNK_SIZE, sequence_split_expr
+from qiita_common.chunking import (
+    ANNOTATION_STRAND_WARNING,
+    CHUNK_ROW_GROUP_SIZE,
+    CHUNK_SIZE,
+    SOFT_MASK_WARNING,
+    sequence_split_expr,
+    soft_masked_expr,
+)
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
 if TYPE_CHECKING:
@@ -210,6 +219,16 @@ def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
 
     conn = connect_with_miint()
     try:
+        # A second read of the FASTA, bounded by LIMIT 1 — `stage_local_fasta` warns
+        # on the same predicate for the --local path, where it rides an existing scan
+        # instead. What the masking costs is on `SOFT_MASK_WARNING`.
+        if conn.execute(
+            "SELECT 1 FROM read_fastx(?, max_batch_bytes:='"
+            f"{_READ_FASTX_MAX_BATCH_BYTES}') "
+            f"WHERE {soft_masked_expr('sequence1')} LIMIT 1",
+            [str(fasta_path)],
+        ).fetchone():
+            _log.warning(SOFT_MASK_WARNING, fasta_path)
         # miint's native `sequence_split` is the shared chunker (one definition
         # for both the CLI and the orchestrator's stage_local_fasta; see
         # qiita_common.chunking).
@@ -228,16 +247,38 @@ def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
 @contextlib.contextmanager
 def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
     """Opaque binary file → `(chunk_index INT, chunk_data BLOB)` chunked
-    stream. Reads `src` in 64 KB blocks and emits one Arrow batch per
+    stream, inflating a `.gz` source as it goes.
+
+    Reads `src` in 64 KB blocks and emits one Arrow batch per
     `_CHUNK_ROWS_PER_BATCH` chunks. Bounded memory even on GG2-scale
     inputs (407 MB phylogeny, multi-GB jplace). Server side stitches
     chunks back into a temp file via `_blob_input.resolve_blob_input`.
 
-    Reads gzipped (`.gz`) inputs transparently — chunk_data carries the
-    decompressed bytes. The server's stitched temp file is then valid
-    plaintext for miint's `read_newick` / `read_jplace`, which only
-    accept on-disk text/JSON. Mirrors the FASTA streamer's treatment of
-    `.gz` for the same reason."""
+    Inflating is what makes the stitched temp file valid plaintext for miint's
+    `read_newick` / `read_jplace`, which only accept on-disk text/JSON.
+    """
+    with _chunked_upload_stream(src, inflate_gz=True) as stream:
+        yield stream
+
+
+@contextlib.contextmanager
+def _raw_blob_upload_stream(src: Path) -> Iterator[UploadStream]:
+    """The same envelope, byte-exact: a `.gz` source is NOT decompressed.
+
+    Reads have no plaintext constraint — `read_fastx` reads gzip directly — and
+    a FASTQ is the input where sending inflated bytes actually costs something.
+    The server names the stitched file from these bytes' own gzip magic
+    (`jobs._blob_input.resolve_reads_blob_input`), since miint detects
+    compression from the extension.
+    """
+    with _chunked_upload_stream(src, inflate_gz=False) as stream:
+        yield stream
+
+
+@contextlib.contextmanager
+def _chunked_upload_stream(src: Path, *, inflate_gz: bool) -> Iterator[UploadStream]:
+    """Shared body of the two blob streamers above; `inflate_gz` is their only
+    difference."""
     import gzip
 
     import pyarrow as pa
@@ -249,7 +290,7 @@ def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
         ]
     )
 
-    opener = gzip.open if src.suffix == ".gz" else open
+    opener = gzip.open if (inflate_gz and src.suffix == ".gz") else open
 
     def _iter_batches() -> Iterator[Any]:
         indices: list[int] = []
@@ -296,6 +337,10 @@ _ROLE_STREAMERS: dict[str, Callable[[Path], Any]] = {
     "taxonomy": _passthrough_parquet_stream,
     "tree": _blob_upload_stream,
     "jplace": _blob_upload_stream,
+    # A sample's reads (FASTQ / BAM) — byte-exact, compression preserved. See
+    # `_raw_blob_upload_stream` for why this is not the `_blob_upload_stream`
+    # entry above.
+    "reads": _raw_blob_upload_stream,
     "genome_map": _passthrough_parquet_stream,
     # A GFF3 is raw text like Newick/jplace — same chunked-BLOB envelope. The
     # server unwraps it with _blob_input.resolve_blob_input and hands the file
@@ -397,7 +442,13 @@ async def upload_file(
     metadata the caller stitches into `action_context`."""
     import asyncio
 
-    create_body = {"description": description or f"{role}: {file_path.name}"}
+    # `source_filename` is the client's own basename. The work_ticket submit
+    # gate reads it to apply the fastq filename-prefix rule to an upload-fed
+    # submission, which has no path to take a basename from.
+    create_body = {
+        "description": description or f"{role}: {file_path.name}",
+        "source_filename": file_path.name,
+    }
     create = await _post(http, token, URL_UPLOAD_PREFIX, body=create_body, expected_status=(201,))
     upload_idx = create["upload_idx"]
     ticket_bytes = base64.b64decode(create["doput_ticket"])
@@ -687,6 +738,12 @@ async def do_reference_load(
             raise ValueError("--fasta is required (or use --local with --fasta-manifest)")
         if flight_client is None:
             raise ValueError("a Flight client is required for the remote (DoPut) ingest path")
+
+    # Before any network call, so the submitter sees it whatever the load does next.
+    # `hash_sequences` warns again from the job, so a CLI load is told twice — the price
+    # of also covering a submission that posts the work ticket directly.
+    if gff_path is not None:
+        _log.warning(ANNOTATION_STRAND_WARNING)
 
     if reference_idx is None:
         create = await _post(

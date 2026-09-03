@@ -17,7 +17,9 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
+    URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
     URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope
@@ -43,8 +45,50 @@ from qiita_control_plane.testing.db_seeds import (
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 
+@pytest.fixture(scope="session")
+def ingest_root(tmp_path_factory):
+    """The one directory route tests may name a host path under.
+
+    `submit_work_ticket` refuses an action_context host path that falls outside
+    `Settings.path_ingest_roots`, so a test submitting one needs a root that
+    exists on the machine running the suite. Session-scoped: the directory is
+    shared, the files under it are per-test (`ingest_file`).
+    """
+    return tmp_path_factory.mktemp("ingest-root")
+
+
+@pytest.fixture
+def ingest_file(ingest_root):
+    """Create a file under `ingest_root` and return its absolute path as a str.
+
+    The submit gate also refuses a path it can prove absent, so a test that
+    wants a submission to reach the *next* gate has to put a real file there.
+    """
+
+    def _make(name: str) -> str:
+        path = ingest_root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        return str(path)
+
+    return _make
+
+
+@pytest.fixture
+def ingest_dir(ingest_root):
+    """`ingest_file`'s directory twin — for the run-folder-shaped context keys
+    (`bcl_input_dir`) the gate resolves the same way."""
+
+    def _make(name: str) -> str:
+        path = ingest_root / name
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    return _make
+
+
 @pytest.fixture(autouse=True)
-def _route_settings():
+def _route_settings(ingest_root):
     """Stash a route-sufficient Settings on the app before every route test.
 
     `qiita_control_plane.main.app` is a module-level SINGLETON, and the route
@@ -69,6 +113,7 @@ def _route_settings():
         database_url="unused",
         flight_signing_key=b"\x00" * 32,
         data_plane_url="unused",
+        path_ingest_roots=(ingest_root,),
     )
     try:
         yield
@@ -271,32 +316,41 @@ async def _seed_study(ctx, *, owner_idx: int, suffix: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Study-local field create: per-entity bindings and shared matrix drivers
+# Study-local fields: per-entity bindings and shared matrix drivers
 # ---------------------------------------------------------------------------
-# Every study-local field create route carries the same gate — require_scope,
-# require_study_exists, and require_study_access at ADMIN with a wet_lab_admin
-# bypass — and the same conflict semantics, so each entity supplies its
-# bindings once and drives both matrices through the shared helpers below.
+# Every study-local field route carries the same gate — require_scope,
+# require_study_exists, and require_study_access with a wet_lab_admin bypass —
+# differing only in the tier floor (create at ADMIN, list at VIEWER) and, for
+# create, the conflict semantics. The global-field registry read drops the two
+# study gates and keeps only the scope. Each entity supplies its bindings once
+# and drives every matrix through the shared helpers below.
 
 
-class StudyFieldCreateSurface(NamedTuple):
-    """One entity's bindings for its study-local field create route.
+class SampleFieldSurface(NamedTuple):
+    """One entity's bindings for its field routes, study-local and global."""
 
-    `global_fk_key` is the request/response key naming the global-field link,
-    `idx_key` the response key naming the created row, and the two
-    `*_created_key` names the ctx cleanup buckets the created rows belong in.
-    """
-
-    url_template: str
-    idx_key: str
-    created_key: str
-    global_fk_key: str
+    url_template: str  # create and list share this study-scoped path
+    idx_key: str  # response key naming the study-local row
+    created_key: str  # ctx cleanup bucket for created study-local rows
+    global_fk_key: str  # request/response key naming the global-field link
     seed_global_field: Callable[..., Awaitable[int]]
-    global_created_key: str
+    global_created_key: str  # ctx cleanup bucket for created global rows
     global_field_table: str
+    global_field_url: str  # the registry read; no path parameter
+    read_scope: Scope  # what the registry read requires
+
+    @property
+    def global_idx_key(self) -> str:
+        """The response key naming a registry row's own idx.
+
+        The same spelling as the study-local row's link to it: both models
+        alias one per-entity wire constant, so there is a single string here
+        rather than two that could drift apart.
+        """
+        return self.global_fk_key
 
 
-BIOSAMPLE_FIELD_SURFACE = StudyFieldCreateSurface(
+BIOSAMPLE_FIELD_SURFACE = SampleFieldSurface(
     url_template=URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     idx_key="biosample_study_field_idx",
     created_key="biosample_study_field",
@@ -304,8 +358,10 @@ BIOSAMPLE_FIELD_SURFACE = StudyFieldCreateSurface(
     seed_global_field=seed_biosample_global_field,
     global_created_key="biosample_global_field",
     global_field_table="qiita.biosample_global_field",
+    global_field_url=URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
+    read_scope=Scope.BIOSAMPLE_READ,
 )
-PREP_SAMPLE_FIELD_SURFACE = StudyFieldCreateSurface(
+PREP_SAMPLE_FIELD_SURFACE = SampleFieldSurface(
     url_template=URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     idx_key="prep_sample_study_field_idx",
     created_key="prep_sample_study_field",
@@ -313,12 +369,20 @@ PREP_SAMPLE_FIELD_SURFACE = StudyFieldCreateSurface(
     seed_global_field=seed_prep_sample_global_field,
     global_created_key="prep_sample_global_field",
     global_field_table="qiita.prep_sample_global_field",
+    global_field_url=URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
+    read_scope=Scope.PREP_SAMPLE_READ,
 )
+SAMPLE_FIELD_SURFACES = (BIOSAMPLE_FIELD_SURFACE, PREP_SAMPLE_FIELD_SURFACE)
 
 
-async def post_study_field(
-    ctx, *, surface: StudyFieldCreateSurface, client, study_idx: int, **body
-):
+def sibling_field_surface(surface: SampleFieldSurface) -> SampleFieldSurface:
+    """Return the other entity's field surface, for a case that must show one
+    entity's binding does not satisfy the other's."""
+    (sibling,) = [other for other in SAMPLE_FIELD_SURFACES if other is not surface]
+    return sibling
+
+
+async def post_study_field(ctx, *, surface: SampleFieldSurface, client, study_idx: int, **body):
     """POST one entity's create-field route and, on 201, track the created row."""
     resp = await client.post(surface.url_template.format(study_idx=study_idx), json=body)
     if resp.status_code == 201:
@@ -326,7 +390,7 @@ async def post_study_field(
     return resp
 
 
-async def _seed_field_global(ctx, *, surface: StudyFieldCreateSurface, label: str) -> int:
+async def _seed_field_global(ctx, *, surface: SampleFieldSurface, label: str) -> int:
     """Seed one global field for `surface`'s entity and track it for cleanup."""
     suffix = secrets.token_hex(4)
     global_idx = await surface.seed_global_field(
@@ -355,11 +419,39 @@ _STUDY_FIELD_CREATE_AUTHZ: dict[str, tuple[str | None, str | None, str, int]] = 
 STUDY_FIELD_CREATE_AUTHZ_CASES = tuple(_STUDY_FIELD_CREATE_AUTHZ)
 
 
+async def _seed_authz_case_study(ctx, *, owner_key: str | None, grant_tier, case: str) -> int:
+    """Seed the study one access case needs and return the idx to put in the path.
+
+    A None owner_key seeds nothing and returns an idx above every existing
+    study, so the caller exercises the missing-study 404. Otherwise the study is
+    owned by ctx[f'{owner_key}_session'] and, when grant_tier is given, the
+    regular user gets a study_access row at that tier.
+    """
+    if owner_key is None:
+        max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
+        return max_idx + 100_000
+
+    study_idx = await _seed_study(
+        ctx,
+        owner_idx=ctx[f"{owner_key}_session"]["principal_idx"],
+        suffix=f"authz-{case}",
+    )
+    if grant_tier is not None:
+        await _grant_study_access(
+            ctx,
+            study_idx=study_idx,
+            principal_idx=ctx["user_session"]["principal_idx"],
+            tier=grant_tier,
+            granted_by_idx=ctx["wet_session"]["principal_idx"],
+        )
+    return study_idx
+
+
 async def assert_study_field_create_authz(
     ctx,
     *,
     case: str,
-    surface: StudyFieldCreateSurface,
+    surface: SampleFieldSurface,
     no_scope_client,
 ) -> None:
     """Drive one access case of a study-local field create and assert its status.
@@ -370,26 +462,9 @@ async def assert_study_field_create_authz(
     """
     owner_key, grant_tier, client_key, expected_status = _STUDY_FIELD_CREATE_AUTHZ[case]
     client = {"user": ctx["user"], "wet": ctx["wet"], "no_scope": no_scope_client}[client_key]
-
-    # A None owner exercises the missing-study 404, so no study is seeded and
-    # the path carries an idx above every existing one.
-    if owner_key is None:
-        max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
-        study_idx = max_idx + 100_000
-    else:
-        study_idx = await _seed_study(
-            ctx,
-            owner_idx=ctx[f"{owner_key}_session"]["principal_idx"],
-            suffix=f"authz-{case}",
-        )
-        if grant_tier is not None:
-            await _grant_study_access(
-                ctx,
-                study_idx=study_idx,
-                principal_idx=ctx["user_session"]["principal_idx"],
-                tier=grant_tier,
-                granted_by_idx=ctx["wet_session"]["principal_idx"],
-            )
+    study_idx = await _seed_authz_case_study(
+        ctx, owner_key=owner_key, grant_tier=grant_tier, case=case
+    )
 
     resp = await post_study_field(
         ctx,
@@ -399,6 +474,45 @@ async def assert_study_field_create_authz(
         display_name=unique_field_name("Authz"),
         data_type="text",
     )
+    assert resp.status_code == expected_status, resp.text
+
+
+# case -> (study owner, tier granted to the regular user, calling client,
+# expected status) for the list route. Mirrors the create matrix but at the
+# VIEWER floor, so a member grant must succeed here; that pair is what
+# pins the two routes to different tiers.
+_STUDY_FIELD_LIST_AUTHZ: dict[str, tuple[str | None, str | None, str, int]] = {
+    "owner": ("user", None, "user", 200),
+    "viewer_grant": ("wet", "viewer", "user", 200),
+    "member_grant": ("wet", "member", "user", 200),
+    "admin_grant": ("wet", "admin", "user", 200),
+    "wet_lab_admin_bypass": ("user", None, "wet", 200),
+    "no_access": ("wet", None, "user", 403),
+    "missing_scope": ("user", None, "no_scope", 403),
+    "nonexistent_study": (None, None, "wet", 404),
+}
+STUDY_FIELD_LIST_AUTHZ_CASES = tuple(_STUDY_FIELD_LIST_AUTHZ)
+
+
+async def assert_study_field_list_authz(
+    ctx,
+    *,
+    case: str,
+    surface: SampleFieldSurface,
+    no_scope_client,
+) -> None:
+    """Drive one access case of a study-local field list and assert its status.
+
+    `case` names a row of the list access matrix. `no_scope_client` is a PAT
+    client lacking the route's read scope.
+    """
+    owner_key, grant_tier, client_key, expected_status = _STUDY_FIELD_LIST_AUTHZ[case]
+    client = {"user": ctx["user"], "wet": ctx["wet"], "no_scope": no_scope_client}[client_key]
+    study_idx = await _seed_authz_case_study(
+        ctx, owner_key=owner_key, grant_tier=grant_tier, case=case
+    )
+
+    resp = await client.get(surface.url_template.format(study_idx=study_idx))
     assert resp.status_code == expected_status, resp.text
 
 
@@ -415,7 +529,7 @@ async def assert_study_field_create_conflict(
     ctx,
     *,
     case: str,
-    surface: StudyFieldCreateSurface,
+    surface: SampleFieldSurface,
 ) -> None:
     """Drive one conflict case of a study-local field create and assert its status.
 

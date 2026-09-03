@@ -103,6 +103,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import duckdb
 from pydantic import BaseModel
 from qiita_common.backend_failure import StepNoData
 from qiita_common.duckdb_miint import is_empty_sequence_file
@@ -119,6 +120,7 @@ from ..miint import (
 )
 from ..read_count import write_read_count
 from ..sequence_range_retry import mint_or_reuse_sequence_range
+from ._blob_input import resolve_reads_blob_input
 
 # YAML step name this module implements. Hard-coded here because
 # execute() raises BackendFailures itself (the dispatcher only wraps
@@ -183,24 +185,79 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     if inputs.reverse_fastq_path is not None and not inputs.reverse_fastq_path.exists():
         raise FileNotFoundError(f"reverse FASTQ file not found: {inputs.reverse_fastq_path}")
 
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    # Two front-ends reach this step. A wet-lab admin names a host path under
+    # PATH_INGEST_ROOTS and the value here IS the FASTQ; a regular user DoPuts
+    # the file and the runner resolves `fastq_upload_idx` to a chunked-BLOB
+    # upload Parquet under the same `fastq_path` binding. Stitch the second
+    # shape back into a FASTQ before anything reads it; the first is returned
+    # untouched. Plain DuckDB — the sniff and the stitch are `read_parquet`,
+    # no miint function is involved.
+    #
+    # `duckdb_tmp_dir` + `apply_duckdb_settings` for the same reason every other
+    # DuckDB block in this file uses them: the stitch's `ORDER BY chunk_index`
+    # runs over the whole upload, and an unconfigured connection would sort it
+    # under the default memory limit and spill outside the workspace.
+    with duckdb_tmp_dir(workspace) as staging_tmp, duckdb.connect() as staging_conn:
+        apply_duckdb_settings(
+            staging_conn,
+            staging_tmp,
+            memory_gb=_DUCKDB_MEMORY_GB,
+            threads=_DUCKDB_THREADS,
+        )
+        fastq_path = resolve_reads_blob_input(
+            staging_conn,
+            path=inputs.fastq_path,
+            out_dir=workspace,
+            stem="R1",
+            gzipped_suffix=".fastq.gz",
+            plain_suffix=".fastq",
+        )
+        reverse_fastq_path = (
+            resolve_reads_blob_input(
+                staging_conn,
+                path=inputs.reverse_fastq_path,
+                out_dir=workspace,
+                stem="R2",
+                gzipped_suffix=".fastq.gz",
+                plain_suffix=".fastq",
+            )
+            if inputs.reverse_fastq_path is not None
+            else None
+        )
+
+    # A stitched upload is an input the step materialized, not an output. It sits
+    # in the workspace, which the launcher's manifest walker rglobs after
+    # execute() returns — so it is removed in the same `finally` as the
+    # intermediate Parquet below. `is not` because a host-path submission binds
+    # the caller's own file here, which this step must never delete.
+    stitched = [
+        p
+        for p, given in (
+            (fastq_path, inputs.fastq_path),
+            (reverse_fastq_path, inputs.reverse_fastq_path),
+        )
+        if p is not None and str(p) != str(given)
+    ]
+
     # Empty-input check via a Python decompressed-stream peek (handles
     # plain and .gz). An empty well is a terminal no-data outcome, NOT a
     # failure: raise StepNoData before any DuckDB work — no Parquet is
     # written and no sequence-range is minted. Detecting it here also
     # sidesteps miint's exception wording. A non-empty R1 paired with an
     # empty R2 is equally no-data (the pair has no reads to write).
-    if is_empty_sequence_file(inputs.fastq_path):
+    if is_empty_sequence_file(fastq_path):
         raise StepNoData(
             step_name=YAML_STEP_NAME,
-            reason=f"FASTQ file contains no records: {inputs.fastq_path}",
+            reason=f"FASTQ file contains no records: {fastq_path}",
         )
-    if inputs.reverse_fastq_path is not None and is_empty_sequence_file(inputs.reverse_fastq_path):
+    if reverse_fastq_path is not None and is_empty_sequence_file(reverse_fastq_path):
         raise StepNoData(
             step_name=YAML_STEP_NAME,
-            reason=f"reverse FASTQ file contains no records: {inputs.reverse_fastq_path}",
+            reason=f"reverse FASTQ file contains no records: {reverse_fastq_path}",
         )
 
-    workspace.mkdir(parents=True, exist_ok=True)
     intermediate = workspace / "_intermediate_reads.parquet"
     # Output basename is the DuckLake table name: a downstream register-files
     # step maps `read.parquet` -> the `read` table.
@@ -213,15 +270,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # read_pe` calls `check_ids` per pair, so mate-id parity is asserted
     # at parse time. Unpaired: sequence2/quality2 come back NULL from
     # miint, so the same SELECT works for both shapes.
-    if inputs.reverse_fastq_path is not None:
+    if reverse_fastq_path is not None:
         read_fastx_clause = "read_fastx(?, sequence2:=?)"
         read_fastx_args: list[str] = [
-            str(inputs.fastq_path),
-            str(inputs.reverse_fastq_path),
+            str(fastq_path),
+            str(reverse_fastq_path),
         ]
     else:
         read_fastx_clause = "read_fastx(?)"
-        read_fastx_args = [str(inputs.fastq_path)]
+        read_fastx_args = [str(fastq_path)]
 
     try:
         # FASTQ -> intermediate Parquet. Empty inputs exited via StepNoData
@@ -331,6 +388,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # attempt-N+1 dir on retry so it doesn't cascade. (The DuckDB spill dir
         # is torn down by each `duckdb_tmp_dir` block above.)
         intermediate.unlink(missing_ok=True)
+        for stitched_path in stitched:
+            stitched_path.unlink(missing_ok=True)
 
     # `reads` is the read.parquet path the downstream qc/host_filter steps
     # consume; `read_staging_dir` is the workspace a register-files step loads

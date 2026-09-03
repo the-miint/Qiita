@@ -27,14 +27,19 @@ import sys
 import uuid
 from pathlib import Path
 
+import httpx
 import pytest
+from qiita_common.api_paths import URL_UPLOAD_PREFIX
 from qiita_common.models import WorkTicketState
 
+# 1.3.0, not 1.0.0: this smoke submits UPLOAD HANDLES (a USER may not name a
+# host path), and `fastq_upload_idx` only exists in the widened schema.
+_FASTQ_TO_PARQUET_VERSION = "1.3.0"
 _FASTQ_TO_PARQUET_YAML_PATH = (
     Path(__file__).parent.parent.parent
     / "workflows"
     / "fastq-to-parquet"
-    / "1.0.0.yaml"
+    / f"{_FASTQ_TO_PARQUET_VERSION}.yaml"
 )
 
 # The ticket-status assertion accepts any WorkTicketState value because
@@ -57,8 +62,10 @@ async def synced_fastq_to_parquet_action(postgres_pool, tmp_path):
     workflows_dir.mkdir(parents=True)
     yaml_text = _FASTQ_TO_PARQUET_YAML_PATH.read_text()
     test_version = f"smoke-{uuid.uuid4()}"
-    yaml_text = yaml_text.replace("version: 1.0.0", f"version: {test_version}")
-    (workflows_dir / "1.0.0.yaml").write_text(yaml_text)
+    yaml_text = yaml_text.replace(
+        f"version: {_FASTQ_TO_PARQUET_VERSION}", f"version: {test_version}"
+    )
+    (workflows_dir / f"{_FASTQ_TO_PARQUET_VERSION}.yaml").write_text(yaml_text)
 
     actions = load_actions(tmp_path / "workflows")
     assert len(actions) == 1
@@ -96,6 +103,23 @@ def _invoke_cli(base_url: str, token: str, *args: str) -> subprocess.CompletedPr
         text=True,
         timeout=30,
     )
+
+
+def _create_upload_slot(base_url: str, token: str, source_filename: str) -> int:
+    """Mint an upload slot over HTTP and return its `upload_idx`.
+
+    The one non-CLI step in this smoke: `qiita submit-reads` is the CLI that
+    mints a slot, and it streams over Flight to a data plane this fixture does
+    not run. The slot alone is what the submit gate reads.
+    """
+    resp = httpx.post(
+        f"{base_url}{URL_UPLOAD_PREFIX}",
+        json={"source_filename": source_filename},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["upload_idx"]
 
 
 def _run_cli(base_url: str, token: str, *args: str) -> dict:
@@ -259,11 +283,22 @@ async def test_user_authoring_smoke_via_cli(
 
         # 6. ticket submit — fastq-to-parquet, prep_sample-scoped. The
         #    audience admits USER; the per-study ADMIN check passes via
-        #    owner-bypass. Both fastq basenames start with the
-        #    --pool-item-id from step 5, so the work-ticket POST route's
-        #    filename-prefix gate admits the submission.
-        fastq_fwd = f"/scratch/{pool_item_id}_R1.fastq"
-        fastq_rev = f"/scratch/{pool_item_id}_R2.fastq"
+        #    owner-bypass.
+        #
+        #    A USER submits UPLOAD HANDLES, not host paths: naming a
+        #    `fastq_path` is wet_lab_admin+. Minting the two slots needs
+        #    `ticket:doput`, which is on the USER ceiling for exactly this
+        #    reason. No DoPut follows — the slots stay `pending` and the
+        #    dispatch dies against the dead orchestrator, which this test
+        #    already tolerates; what is under test here is the submit gate.
+        #    Each source_filename starts with the --pool-item-id from step 5,
+        #    so the route's filename-prefix gate admits the submission.
+        fwd_upload = _create_upload_slot(
+            cp_server, user_token, f"{pool_item_id}_R1.fastq"
+        )
+        rev_upload = _create_upload_slot(
+            cp_server, user_token, f"{pool_item_id}_R2.fastq"
+        )
         ticket = _run_cli(
             cp_server,
             user_token,
@@ -276,7 +311,12 @@ async def test_user_authoring_smoke_via_cli(
             "--prep-sample-idx",
             str(prep_sample_idx),
             "--context-json",
-            json.dumps({"fastq_path": fastq_fwd, "reverse_fastq_path": fastq_rev}),
+            json.dumps(
+                {
+                    "fastq_upload_idx": fwd_upload,
+                    "reverse_fastq_upload_idx": rev_upload,
+                }
+            ),
         )
         ticket_idx = ticket["work_ticket_idx"]
         created_ticket_idxs.append(ticket_idx)
@@ -297,9 +337,11 @@ async def test_user_authoring_smoke_via_cli(
             "kind": "prep_sample",
             "prep_sample_idx": prep_sample_idx,
         }
+        # Stored verbatim as submitted — the runner rewrites the handles into
+        # `fastq_path` bindings at dispatch, not at submit.
         assert status["action_context"] == {
-            "fastq_path": fastq_fwd,
-            "reverse_fastq_path": fastq_rev,
+            "fastq_upload_idx": fwd_upload,
+            "reverse_fastq_upload_idx": rev_upload,
         }
         # State may have advanced (or FAILED) as the background dispatch
         # raced against the dead orchestrator — assert only that it is a

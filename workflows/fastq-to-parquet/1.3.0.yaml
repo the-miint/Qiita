@@ -8,8 +8,11 @@ description: >
   Mask-model successor to fastq-to-parquet/1.2.0: instead of physically dropping
   reads at qc/host_filter, it stores the FULL reads once in the DuckLake `read`
   table and records downstream filtering as a `read_mask` (one row per read:
-  survive/trim/why). 1.0.0–1.2.0 stay available unchanged; submitters choose the
-  version.
+  survive/trim/why). A sync is directory-wide and leaves only the HIGHEST version of
+  an action_id enabled: a sync auto-deprecates every other version of an action_id
+  (`actions/sync.py`) and the loader yields them newest-last
+  (`actions/loader.py::_version_sort_key`) — the versions here do not coexist,
+  whichever one you are reading. Nothing already stored changes.
 
   The `fastq` step parses, counts, mints a contiguous sequence_idx range, and
   writes read.parquet (with prep_sample_idx) — then a register-files step loads
@@ -65,8 +68,20 @@ audience:
 
 context_schema:
   type: object
-  required: [fastq_path]
   properties:
+    # The reads arrive by one of two routes, and the `fastq` step reads both
+    # through the same `fastq_path` binding.
+    #
+    #   *_path       — an absolute host path under PATH_INGEST_ROOTS. Naming
+    #                  one is wet_lab_admin+ — rule and reason in
+    #                  routes/work_ticket.py's _check_ingest_paths.
+    #   *_upload_idx — a DoPut handle. The runner rewrites it to the matching
+    #                  `*_path` binding pointing at the staged upload
+    #                  (runner._resolve_upload_handles), and the step stitches
+    #                  the chunked BLOB back into a FASTQ
+    #                  (jobs._blob_input.resolve_reads_blob_input). This is the
+    #                  route a `user` takes — their reads are on their own
+    #                  machine, which the cluster cannot see.
     fastq_path:
       type: string
       minLength: 1
@@ -75,6 +90,8 @@ context_schema:
       type: string
       minLength: 1
       pattern: "^/"
+    fastq_upload_idx: {type: integer, minimum: 1}
+    reverse_fastq_upload_idx: {type: integer, minimum: 1}
     # Sequencing instrument model (e.g. "NextSeq 550"), forwarded per sample from
     # qiita.sequencing_run. The qc step gates polyG trimming on a 2-color model
     # (NextSeq/NovaSeq/MiniSeq); absent/unknown → polyG OFF. Passed to the qc job
@@ -97,6 +114,25 @@ context_schema:
     host_minimap2_reference_idx:
       type: integer
       minimum: 1
+  # Exactly one route, and BOTH mates take it. Each branch requires its own
+  # forward key and excludes the other family outright, so neither-present,
+  # both-present, and a crossed pair (`fastq_upload_idx` with
+  # `reverse_fastq_path`, or the mirror) all leave zero branches matching and
+  # `oneOf` fails. A crossed pair would otherwise run: the runner rewrites the
+  # handle and leaves the path alone, and both halves are gated. It is refused
+  # because R1 and R2 of one sample coming from two provenances is a submit
+  # slip, and a mis-paired mate is silent in the output.
+  oneOf:
+    - required: [fastq_path]
+      not:
+        anyOf:
+          - required: [fastq_upload_idx]
+          - required: [reverse_fastq_upload_idx]
+    - required: [fastq_upload_idx]
+      not:
+        anyOf:
+          - required: [fastq_path]
+          - required: [reverse_fastq_path]
 
 steps:
   - step: fastq

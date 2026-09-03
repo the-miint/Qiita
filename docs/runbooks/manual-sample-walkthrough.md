@@ -1,8 +1,8 @@
 # Manual sample walkthrough
 
-> Registering **one prep_sample by hand** — no pre-flight file — and
-> processing FASTQs you already hold. Everything here you can do with an
-> ordinary account; no admin is involved at any point.
+> Registering **one prep_sample by hand** — no pre-flight file — and loading
+> reads you already hold from your own machine. Everything here you can do with
+> an ordinary account; no admin is involved at any point.
 
 **This is not how you bring in real data**, and it is not the quickstart —
 [`getting-started.md`](getting-started.md) is. There are two reasons to walk
@@ -17,7 +17,9 @@ file — that is the path to use.
 You need the `qiita` CLI installed and reachable on your `$PATH`, a token, a
 filled-in profile, and a study with a biosample in it that you own — steps 0
 through 3 of [`getting-started.md`](getting-started.md). They leave you with
-the `$STUDY_IDX` and `$BIOSAMPLE_IDX` used below.
+the `$STUDY_IDX` and `$BIOSAMPLE_IDX` used below. You also need a FASTQ or an
+unaligned BAM on the machine you are working from, and your site's data-plane
+URL for step 4.
 
 Nothing here needs an admin to grant you anything. Each step is allowed
 because of something you did in the step before: you created the run, so you
@@ -83,40 +85,53 @@ To attach the prep_sample to further studies, repeat `--secondary-study-idx`
 
 The reply gives you two numbers. `prep_sample_idx` is the one step 4 wants.
 
-## 4. Submit the FASTQs
+## 4. Submit the reads
+
+`qiita submit-reads` sends the files from the machine you are typing on:
 
 ```bash
-qiita ticket submit \
-    --action-id fastq-to-parquet \
-    --action-version 1.3.0 \
+qiita submit-reads \
     --prep-sample-idx $PREP_SAMPLE_IDX \
-    --context-json '{"fastq_path": "/scratch/filename_prefix_R1.fastq", "reverse_fastq_path": "/scratch/filename_prefix_R2.fastq"}'
+    --fastq ./filename_prefix_R1.fastq \
+    --reverse-fastq ./filename_prefix_R2.fastq \
+    --data-plane-url grpc+tls://qiita-miint.ucsd.edu:443
 ```
 
-The paths must be absolute, and must be readable from the cluster — not
-just from your laptop.
+Each file is streamed to Qiita byte for byte — a `.gz` is sent compressed and
+stays that way — and the job is then submitted against what arrived. So the
+reads only have to be readable by *you*: nothing here needs them to sit on a
+filesystem the cluster mounts. `--data-plane-url` is where they are streamed
+to; ask your operator for your site's, and use the `grpc+tls://` form from
+anywhere but the deploy host itself.
 
-`--action-version` has to name the version your site is currently running,
-exactly. Several versions of `fastq-to-parquet` exist, but a deploy enables
-only the newest one it syncs and retires the rest, so naming an older one is
-refused. `1.3.0` is the newest at the time of writing — ask your operator if
-that is not what your site has. You have to type it even though only one
-value is ever accepted, because the job records the exact version it ran
-under; that the CLI does not just fill in the enabled one for you is a rough
-edge, not a safeguard.
+The command waits for the job and prints it when it finishes; `--no-watch`
+returns as soon as it is submitted.
 
-You get back a job number and a starting state of `pending`.
+You do not name a workflow or a version. `--fastq` means `fastq-to-parquet`
+and `--bam` means `bam-to-parquet`, at whatever version your site has enabled.
 
-**The filename rule.** Every FASTQ filename you pass must start with the
-`--pool-item-id` from step 3 — here `filename_prefix`. A name that does not
-is refused outright, before the job is queued.
+- **Paired-end** — pass `--fastq` and `--reverse-fastq`.
+- **Single-end** — pass `--fastq` alone. Forward-only is fully supported.
+- **An unaligned BAM** — pass `--bam` instead of `--fastq`, with no reverse
+  file. An aligned BAM is refused by the loader.
 
-- **Paired-end** — pass `fastq_path` and `reverse_fastq_path`; both names
-  are checked.
-- **Single-end** — pass `fastq_path` only. Forward-only is fully
-  supported.
+**The filename rule.** Each FASTQ's *filename* must start with the
+`--pool-item-id` from step 3 — here `filename_prefix` — followed by `_` or `.`.
+The name is checked after the upload, since it is the prep_sample's own
+identifier that it is checked against, so a mismatch costs you the transfer and
+comes back as a refusal rather than a job. The rule does not apply to a `--bam`:
+a demultiplexed BAM is named for its movie and barcode and carries no pool item
+id.
+
+If your reads are already on the cluster, a `wet_lab_admin` can name their path
+directly instead — `qiita ticket submit --context-json '{"fastq_path": …}'` —
+under the directories the site allows. An ordinary account is refused, and the
+refusal names the upload route above.
 
 ## 5. Watch it
+
+Step 4 already waited for the job and printed it. To look again later — its
+number is `work_ticket.work_ticket_idx` in that output:
 
 ```bash
 qiita ticket status $WORK_TICKET_IDX

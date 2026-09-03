@@ -33,6 +33,13 @@ import pyarrow as pa
 import pyarrow.flight as _flight
 import pyarrow.parquet as pq
 from qiita_common.api_paths import LibraryPrimitive
+from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
+    CONTIG_ATTRIBUTES_FILE,
+    contig_attribute_join,
+    contig_attribute_projection,
+    register_contig_attribute_table,
+)
 from qiita_common.models import (
     INDEX_TYPE_RYPE_ROUTER,
     FeatureHashEntry,
@@ -47,7 +54,12 @@ from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_s
 
 from ..auth.tickets import sign_action, sign_ticket
 from ..miint import duckdb_connect
-from ..repositories.assembly import insert_assembly_membership_rows
+from ..repositories.assembly import (
+    ASSEMBLY_GENOME_MAP_PAIRS_SQL,
+    assembly_genome_source_id,
+    insert_assembly_membership_rows,
+    upsert_assembly_sample_completed,
+)
 from ..repositories.block import (
     MaskSampleInvalidated,
     fetch_block_members,
@@ -73,6 +85,11 @@ _log = logging.getLogger(__name__)
 # transaction duration. 10K is a pragmatic default for the expected
 # feature batch sizes.
 _CHUNK_SIZE = 10_000
+
+# How many collapsed record groups the membership warning names before it says it
+# cut the list. Same name and value as runner/_reference.py and
+# runner/_feature_table.py, which cap their own reports.
+_MAX_REPORTED = 20
 
 # Deterministic basename `mint_features` writes its feature-map Parquet under.
 # Single-sourced because the runner's restart path (`_reconstruct_action_outputs`)
@@ -156,6 +173,62 @@ async def _mint_chunk(
     return mapping, len(new_map), len(existing_map) + concurrent_reused
 
 
+async def upsert_genomes(
+    conn: asyncpg.Connection,
+    sources: list[str],
+    source_ids: list[str],
+    prep_sample_idxs: list[int | None],
+) -> list[int]:
+    """Upsert one batch of qiita.genome rows; return their genome_idx, positionally
+    aligned with the input lists (so a caller can stamp them straight onto whatever
+    it is linking).
+
+    Row i is `(sources[i], source_ids[i])` originating at `prep_sample_idxs[i]` —
+    NULL for external genomes, the qiita-origin sample for `source='qiita'`, which
+    `genome_qiita_origin_check` enforces as a biconditional. DO UPDATE guarantees
+    RETURNING fires for every row even when the genome already exists, and keeps
+    prep_sample_idx current on re-ingest.
+
+    Shared by the two producers of qiita.genome rows — the reference load's
+    `_write_genome_associations` and the assembly mint in
+    `write_assembly_membership` — because the dedupe below is subtle and having it
+    twice is how the two would drift. What is NOT shared is where the resulting
+    edge is written: the reference load writes `qiita.feature_genome`, the assembly
+    path writes `assembly_membership.genome_idx`, and those two must stay apart —
+    `test_assembly_genome_mint` states why and pins it.
+    """
+    if not sources:
+        return []
+
+    # Dedupe to one row per (source, source_id) before the upsert. A genome (a
+    # binned MAG or a circular isolate) maps to many features — its contigs — all
+    # sharing that genome's source_id, and a single sample's assembly can yield MANY
+    # such genomes (each bin its own (source, source_id)). So a given (source,
+    # source_id) recurs across the batch once per contig of that genome, and
+    # Postgres refuses to let one INSERT ... ON CONFLICT DO UPDATE touch the same
+    # conflict target twice ("cannot affect row a second time"). The dict keeps the
+    # last prep_sample_idx per key (consistent for valid input — a genome has one
+    # origin sample, already vetted by _validate_genome_map on the reference path
+    # and true by construction on the assembly one).
+    genome_prep = {
+        (s, sid): prep for s, sid, prep in zip(sources, source_ids, prep_sample_idxs, strict=True)
+    }
+
+    genome_rows = await conn.fetch(
+        "INSERT INTO qiita.genome (source, source_id, prep_sample_idx)"
+        " SELECT unnest($1::text[]), unnest($2::text[]), unnest($3::bigint[])"
+        " ON CONFLICT (source, source_id)"
+        " DO UPDATE SET source = EXCLUDED.source,"
+        "               prep_sample_idx = EXCLUDED.prep_sample_idx"
+        " RETURNING genome_idx, source, source_id",
+        [s for s, _ in genome_prep],
+        [sid for _, sid in genome_prep],
+        list(genome_prep.values()),
+    )
+    genome_map = {(row["source"], row["source_id"]): row["genome_idx"] for row in genome_rows}
+    return [genome_map[(s, sid)] for s, sid in zip(sources, source_ids, strict=True)]
+
+
 async def _write_genome_associations(
     conn: asyncpg.Connection,
     feat_idxs: list[int],
@@ -166,44 +239,17 @@ async def _write_genome_associations(
     """Batch upsert genomes and write feature_genome junction rows.
 
     All four lists are positionally aligned: row i links feat_idxs[i] to
-    (sources[i], source_ids[i]) with originating prep_sample_idxs[i] (NULL for
-    external genomes; the qiita-origin sample for source='qiita'). DO UPDATE on
-    the genome upsert guarantees RETURNING fires for every row even when the
-    genome already exists, and keeps prep_sample_idx current on re-ingest.
+    (sources[i], source_ids[i]) with originating prep_sample_idxs[i].
+
+    **The reference-load path, and the only writer of qiita.feature_genome.** The
+    assembly path mints genomes through the same `upsert_genomes` but records its
+    edge on `assembly_membership.genome_idx` instead. Why the two cannot share this
+    junction is stated and pinned in `test_assembly_genome_mint`.
     """
     if not feat_idxs:
         return
 
-    # Dedupe to one row per (source, source_id) before the upsert. A genome (a
-    # binned MAG or a circular isolate) maps to many features — its contigs — all
-    # sharing that genome's source_id, and a single sample's assembly can yield MANY
-    # such genomes (each bin its own (source, source_id)). So a given (source,
-    # source_id) recurs across the batch once per contig of that genome, and
-    # Postgres refuses to let one INSERT ... ON CONFLICT DO UPDATE touch the same
-    # conflict target twice ("cannot affect row a second time"). The dict keeps the
-    # last prep_sample_idx per key (consistent for valid input — a genome has one
-    # origin sample, already vetted by _validate_genome_map).
-    genome_prep = {
-        (s, sid): prep for s, sid, prep in zip(sources, source_ids, prep_sample_idxs, strict=True)
-    }
-    uniq_sources = [s for s, _ in genome_prep]
-    uniq_source_ids = [sid for _, sid in genome_prep]
-    uniq_preps = list(genome_prep.values())
-
-    genome_rows = await conn.fetch(
-        "INSERT INTO qiita.genome (source, source_id, prep_sample_idx)"
-        " SELECT unnest($1::text[]), unnest($2::text[]), unnest($3::bigint[])"
-        " ON CONFLICT (source, source_id)"
-        " DO UPDATE SET source = EXCLUDED.source,"
-        "               prep_sample_idx = EXCLUDED.prep_sample_idx"
-        " RETURNING genome_idx, source, source_id",
-        uniq_sources,
-        uniq_source_ids,
-        uniq_preps,
-    )
-    genome_map = {(row["source"], row["source_id"]): row["genome_idx"] for row in genome_rows}
-
-    genome_idxs = [genome_map[(s, sid)] for s, sid in zip(sources, source_ids, strict=True)]
+    genome_idxs = await upsert_genomes(conn, sources, source_ids, prep_sample_idxs)
     await conn.execute(
         "INSERT INTO qiita.feature_genome (feature_idx, genome_idx)"
         " SELECT unnest($1::bigint[]), unnest($2::bigint[])"
@@ -924,6 +970,86 @@ MEMBERSHIP_ACCESSION_JOIN_SQL = (
     " GROUP BY fm.feature_idx"
 )
 
+# The two numbers the collapse report compares, from ONE scan of one narrow
+# column. Manifest-only on purpose: it is the only form both callers can answer.
+# `write_membership`'s join count would do for a reference, but
+# `write_assembly_membership`'s is one row per (contig, bin) placement rather
+# than per feature, so a shared helper cannot take a caller's count and mean the
+# same thing by it.
+MANIFEST_COLLAPSE_COUNTS_SQL = (
+    "SELECT count(*) AS records, count(DISTINCT sequence_hash) AS features FROM read_parquet(?)"
+)
+
+# The manifest read_ids sharing one canonical hash, most-collapsed first — the
+# diagnostic behind the collapse warning, run only once the counts disagree. The
+# tiebreaker reads the list's own first element rather than adding a
+# `min(read_id)` aggregate: `list(... ORDER BY read_id)` has already put it
+# there, and every group ties at two members when the collapse is strand pairs.
+MANIFEST_COLLAPSED_RECORDS_SQL = (
+    "SELECT list(read_id ORDER BY read_id) AS read_ids"
+    " FROM read_parquet(?)"
+    " GROUP BY sequence_hash HAVING count(*) > 1"
+    " ORDER BY count(*) DESC, read_ids[1]"
+    " LIMIT ?"
+)
+
+
+def _warn_on_collapsed_records(scope: str, manifest_path: Path) -> int:
+    """Warn when a manifest holds more records than it does distinct canonical
+    hashes; return how many records were absorbed. `scope` names the thing being
+    loaded, and leads the message.
+
+    `canonical_sequence_hash_expr` folds case and strand, so two records that are
+    one sequence in two cases, or exact reverse complements, mint a single
+    feature_idx and only one of them is stored — `hash_sequences` and
+    `assembly_hash` both keep the lex-smallest read_id via `DISTINCT ON
+    (sequence_hash)`. The absorbed record leaves no other trace: the manifest is
+    a workflow artifact and the dropped bytes never reach the lake.
+
+    Reports that records share a hash, not why: the manifest carries
+    `(read_id, sequence_hash, sequence_length_bp)` and no sequence, and an exact
+    duplicate and a reverse-complement pair agree on both hash and length.
+    Reading the submitted sequences is what separates them. For an assembly that
+    also covers one contig placed in several bins, which repeats a hash under
+    several synthetic read_ids and loses nothing (measured 0 across the deploy's
+    assemblies, 2026-08-26). It warns rather than raising for the same reason:
+    every one of those shapes is a valid submission.
+
+    Blocking, and opens its own connection — the caller runs it off the event
+    loop, after releasing its pooled one. `count(DISTINCT sequence_hash)` is the
+    class of hash build `mint_annotation_features` measured at ~1 GB of RSS at
+    20M features, so the connection gets a spill directory rather than relying on
+    the aggregate staying small.
+    """
+    with duckdb_connect() as duck:
+        duck.execute(f"SET temp_directory='{validate_parquet_path(manifest_path.parent)}'")
+        records, features = duck.execute(
+            MANIFEST_COLLAPSE_COUNTS_SQL, [str(manifest_path)]
+        ).fetchone()
+        collapsed = records - features
+        if collapsed == 0:
+            return 0
+        # One past the cap, so a group beyond it is what marks the list truncated —
+        # the record count alone cannot say, since a group of three contributes two
+        # to `collapsed`.
+        groups = duck.execute(
+            MANIFEST_COLLAPSED_RECORDS_SQL,
+            [str(manifest_path), _MAX_REPORTED + 1],
+        ).fetchall()
+    elided = " (truncated)" if len(groups) > _MAX_REPORTED else ""
+    listed = "; ".join(", ".join(read_ids) for (read_ids,) in groups[:_MAX_REPORTED])
+    _log.warning(
+        "%s: %s submitted record(s) collapsed to %s feature(s) — %s record(s) are absent. "
+        "Records sharing a canonical hash: %s%s",
+        scope,
+        records,
+        features,
+        collapsed,
+        listed,
+        elided,
+    )
+    return collapsed
+
 
 async def write_membership(
     pool: asyncpg.Pool,
@@ -945,6 +1071,14 @@ async def write_membership(
     Returns (linked, already_linked). Idempotent. Raises ValueError if any
     feature_idx is missing from qiita.feature (FK violation surfaced as a
     structured error).
+
+    Reports a canonical-hash collapse (`_warn_on_collapsed_records`) from the
+    manifest it already holds: one row per distinct read_id — `hash_sequences`
+    groups by it, and `stage_local_fasta` rejects a repeated FASTA header, so one
+    row is one submitted record on that path. `hash_sequences` is where the drop
+    happens and would report it from its own SLURM allocation; reporting here
+    instead puts the warning in the control plane's journal beside the rest of
+    the load, and gives it a reference to name.
     """
     for label, path in [("manifest", manifest_path), ("feature_map", feature_map_path)]:
         if not path.exists():
@@ -969,6 +1103,10 @@ async def write_membership(
                     )
                 total_linked += chunk_linked
                 total_seen += len(feature_idxs)
+    # Outside the pool and the reader: a report-only aggregate has no claim on a
+    # pooled connection, and `mint_features` sets the precedent for keeping a
+    # blocking DuckDB step off the loop the CP also serves its API from.
+    await asyncio.to_thread(_warn_on_collapsed_records, f"reference {reference_idx}", manifest_path)
     return total_linked, total_seen - total_linked
 
 
@@ -1114,6 +1252,67 @@ async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path:
         writer.close()
 
 
+async def export_assembly_member_genome(
+    pool: asyncpg.Pool,
+    *,
+    prep_sample_idx: list[int],
+    processing_idx: int,
+    out_path: Path,
+) -> None:
+    """Stream one assembly run's `(prep_sample_idx, feature_idx, genome_idx)` triples
+    for a whole cohort from Postgres to a Parquet at `out_path`, in `_CHUNK_SIZE`
+    batches. The de novo arm's counterpart to `export_member_genome`.
+
+    **Three columns, where the reference map has two.** A contig is content-addressed,
+    so two cohort samples that assembled byte-identical contigs share one
+    `feature_idx` under two genomes; the sample is what tells those rows apart, and a
+    consumer joins on the pair. `qiita_common.analytic.reconcile` carries what goes
+    wrong without it.
+
+    DISTINCT for the reason `fetch_assembly_genome_map` is, and with the same limit:
+    it collapses exact repeats, not a contig that legitimately belongs to two genomes
+    of one run.
+
+    The row set is `ASSEMBLY_GENOME_MAP_PAIRS_SQL`, shared verbatim with the REST map
+    the client-side recipe reads, so the two drivers cannot disagree about which
+    contigs have a genome. That row set admits MAG and LCG rows only, so a contig can
+    be absent from this map and present in `qiita.assembly_membership`.
+
+    An empty result still writes a valid three-column Parquet, and it now has two
+    causes rather than one: a cohort that assembled nothing, and a cohort whose
+    contigs are all UNBINNED (no circular contig, and no refined bin clearing
+    DAS_Tool's threshold — a legitimate success). Both degrade to the reference arm.
+    """
+    schema = pa.schema(
+        [
+            ("prep_sample_idx", pa.int64()),
+            ("feature_idx", pa.int64()),
+            ("genome_idx", pa.int64()),
+        ]
+    )
+    writer = pq.ParquetWriter(str(out_path), schema, compression="snappy")
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            cursor = await conn.cursor(
+                "SELECT DISTINCT am.prep_sample_idx, am.feature_idx, am.genome_idx"
+                + ASSEMBLY_GENOME_MAP_PAIRS_SQL,
+                prep_sample_idx,
+                processing_idx,
+            )
+            while batch := await cursor.fetch(_CHUNK_SIZE):
+                writer.write_table(
+                    pa.table(
+                        {
+                            name: pa.array([r[name] for r in batch], pa.int64())
+                            for name in ("prep_sample_idx", "feature_idx", "genome_idx")
+                        },
+                        schema=schema,
+                    )
+                )
+    finally:
+        writer.close()
+
+
 def _genome_lineages(con: duckdb.DuckDBPyConnection) -> list[LineageItem]:
     """Reduce the DuckDB `member_genome` (feature_idx, genome_idx) + `taxonomy`
     relations to one LineageItem per genome, using the shared reduction in
@@ -1252,11 +1451,46 @@ async def plan_shards(
 # (both from the same assembly_hash scan) and every manifest hash was minted by
 # mint-features, so no contig is dropped. Exposed as a module constant so the join
 # is unit-testable against Parquet fixtures without a Postgres pool.
+# The synthetic read_id is `kind:bin_id:sequence_index`
+# (`assembly_hash._READ_ID_EXPR`), so two IDENTICAL contigs at different positions in
+# ONE bin arrive as two read_ids resolving to one feature_idx — the same
+# `(kind, bin_id, feature_idx)` twice. `insert_assembly_membership_rows` upserts with
+# DO UPDATE, and Postgres refuses to let one statement touch a conflict target twice
+# (`cardinality_violation`).
+#
+# So: GROUP BY, spelled as the conflict target itself rather than `ALL`, because
+# that is what `insert_assembly_membership_rows` requires of its caller and a
+# widened SELECT list must not silently widen it. The attribute
+# columns can differ between two rows the key collapses (a bin holding duplicate
+# identical contigs is exactly that case), so carrying them through a DISTINCT
+# would emit one row per variant and hand the upsert the same target twice:
+# SQLSTATE 21000, the failure that function's docstring names. Aggregating to one
+# representative contig id and joining the attributes onto THAT keeps all four
+# values from the same contig, where a per-column aggregate would mix them.
+#
+# The attribute join is LEFT: a contig absent from the sidecar stores NULLs. The
+# same row shape is written on the DuckLake side by
+# `qiita_compute_orchestrator.jobs.assembly_load._write_assembly_membership`, and
+# the two must produce the same rows from the same inputs.
+#
+# They do NOT converge the same way on a re-run. This side upserts and COALESCEs,
+# so a replay whose genomes_dir has no sidecar keeps the attributes an earlier
+# pass stored; the lake side is replace-keyed on (prep_sample_idx,
+# processing_idx) in `flight_service::REPLACE_KEY_TABLES`, so the same replay
+# supersedes that run's lake rows with the NULLs it just computed. Postgres is
+# the authority for these four columns; the lake copy reflects the LAST run.
 ASSEMBLY_MEMBERSHIP_JOIN_SQL = (
-    "SELECT bm.kind, bm.bin_id, fm.feature_idx"
-    " FROM read_parquet(?) AS bm"
-    " JOIN read_parquet(?) AS m ON bm.read_id = m.read_id"
-    " JOIN read_parquet(?) AS fm ON m.sequence_hash = fm.sequence_hash"
+    "WITH member AS ("
+    "  SELECT bm.kind AS kind, bm.bin_id AS bin_id, fm.feature_idx AS feature_idx,"
+    f"    {CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL}"
+    "  FROM read_parquet(?) AS bm"
+    "  JOIN read_parquet(?) AS m ON bm.read_id = m.read_id"
+    "  JOIN read_parquet(?) AS fm ON m.sequence_hash = fm.sequence_hash"
+    "  GROUP BY bm.kind, bm.bin_id, fm.feature_idx"
+    ")"
+    " SELECT mb.kind, mb.bin_id, mb.feature_idx,"
+    f"   {contig_attribute_projection('a')}"
+    " FROM member mb" + contig_attribute_join("mb")
 )
 
 
@@ -1267,8 +1501,10 @@ async def write_assembly_membership(
     bin_map_path: Path,
     manifest_path: Path,
     feature_map_path: Path,
-) -> tuple[int, int]:
-    """Link a prep_sample's assembly-run contigs to qiita.assembly_membership.
+    genomes_dir: Path,
+) -> int:
+    """Link a prep_sample's assembly-run contigs to qiita.assembly_membership, and
+    mint the qiita.genome each of their subjects is.
 
     The assembly analogue of `write_membership`. DuckDB JOINs `bin_map`
     (read_id -> kind, bin_id) against `manifest` (read_id -> sequence_hash) and
@@ -1277,12 +1513,38 @@ async def write_assembly_membership(
     `_CHUNK_SIZE` batches and bulk-inserted into qiita.assembly_membership with
     `(prep_sample_idx, processing_idx)` stamped from this run. Never materialises
     the whole mapping in Python — same streaming contract mint_features /
-    write_membership follow.
+    write_membership follow. DuckDB does hold the grouped set (the constant's
+    GROUP BY is a blocking operator), which is bounded by contig count rather than
+    read count and spills if it has to.
 
-    Returns `(linked, already_linked)`. Idempotent (ON CONFLICT DO NOTHING on the
-    natural PK): a workflow retried from the start re-links nothing new. Raises
-    ValueError (FK violation surfaced structured) if any feature_idx is missing
-    from qiita.feature.
+    `genomes_dir` is the assemble step's output, read only for the per-contig
+    attribute sidecar beside the two FASTAs; the attributes are LEFT JOINed on, so
+    a run without one writes the same rows with NULLs.
+
+    **The genome mint rides the same batch rather than taking a second pass**, which
+    is what makes the row and its genome one INSERT: this loop already holds
+    `(kind, bin_id)` per contig, and that plus the run IS the genome's identity
+    (`assembly_genome_source_id`). One genome per refined bin, per LCG contig, per
+    unbinned contig. A bin's contigs can span batches; the upsert re-resolves the
+    same `(source, source_id)` and returns the same genome_idx, so that is a
+    no-op rather than a duplicate.
+
+    Returns the number of rows written or re-stamped — NOT a novelty count. The
+    insert DO UPDATEs the genome (a replay over rows a backfill created must not
+    leave them NULL), so `RETURNING` fires for a conflicting row too and a
+    from-the-start retry reports its full row count rather than zero. The collapse
+    report below reads the manifest, not this. Raises ValueError (a violation
+    surfaced structured) if any feature_idx or genome_idx is missing.
+
+    Reports a canonical-hash collapse through the same helper `write_membership`
+    uses: `assembly_hash` writes this manifest in the same
+    `(read_id, sequence_hash, sequence_length_bp)` shape and drops the losing
+    contig's bytes with the same `DISTINCT ON (sequence_hash)`. The helper reads
+    the manifest rather than this stream's row count because the stream is one
+    row per (contig, bin) placement, not per feature — so a contig in several
+    bins repeats a hash here under several synthetic read_ids and is counted as a
+    collapse, having lost nothing. Measured 0 across the deploy's assemblies,
+    2026-08-26.
     """
     for label, path in [
         ("bin_map", bin_map_path),
@@ -1291,11 +1553,17 @@ async def write_assembly_membership(
     ]:
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
+    # The DIRECTORY must exist even though the sidecar inside it need not: an
+    # absent sidecar means "assembled before it existed" and stores NULLs, so
+    # without this a mis-bound genomes_dir would take that path silently and
+    # write a run's worth of NULL attributes with no signal.
+    if not genomes_dir.is_dir():
+        raise FileNotFoundError(f"genomes_dir not found: {genomes_dir}")
 
-    total_linked = 0
-    total_seen = 0
+    total_written = 0
     async with pool.acquire() as conn:
         with duckdb_connect() as duck:
+            register_contig_attribute_table(duck, genomes_dir / CONTIG_ATTRIBUTES_FILE)
             reader = duck.execute(
                 ASSEMBLY_MEMBERSHIP_JOIN_SQL,
                 [str(bin_map_path), str(manifest_path), str(feature_map_path)],
@@ -1306,18 +1574,45 @@ async def write_assembly_membership(
                     continue
                 bin_ids = batch.column("bin_id").to_pylist()
                 feature_idxs = batch.column("feature_idx").to_pylist()
+                source_ids = [
+                    assembly_genome_source_id(
+                        prep_sample_idx=prep_sample_idx,
+                        processing_idx=processing_idx,
+                        kind=kind,
+                        bin_id=bin_id,
+                    )
+                    for kind, bin_id in zip(kinds, bin_ids, strict=True)
+                ]
+                # One transaction over both writes: a genome with no row pointing at
+                # it is unreachable (nothing else records which run minted it), and a
+                # row whose genome vanished is the NULL the column comment warns about.
                 async with conn.transaction():
-                    linked = await insert_assembly_membership_rows(
+                    genome_idxs = await upsert_genomes(
+                        conn,
+                        [GenomeSource.QIITA.value] * len(source_ids),
+                        source_ids,
+                        [prep_sample_idx] * len(source_ids),
+                    )
+                    written = await insert_assembly_membership_rows(
                         conn,
                         prep_sample_idx=prep_sample_idx,
                         processing_idx=processing_idx,
                         kinds=kinds,
                         bin_ids=bin_ids,
                         feature_idxs=feature_idxs,
+                        genome_idxs=genome_idxs,
+                        raw_names=batch.column("raw_name").to_pylist(),
+                        circularities=batch.column("circularity").to_pylist(),
+                        depths=batch.column("depth").to_pylist(),
+                        mults=batch.column("mult").to_pylist(),
                     )
-                total_linked += linked
-                total_seen += len(feature_idxs)
-    return total_linked, total_seen - total_linked
+                total_written += written
+    await asyncio.to_thread(
+        _warn_on_collapsed_records,
+        f"assembly run (prep_sample {prep_sample_idx}, processing {processing_idx})",
+        manifest_path,
+    )
+    return total_written
 
 
 async def register_index(
@@ -2058,6 +2353,35 @@ async def delete_alignment_block_data(
     return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
 
 
+async def delete_alignment_sample_data(
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> int:
+    """Delete one `(alignment_idx, prep_sample_idx)` pair's alignment rows via the
+    `delete_alignment_sample` DoAction, returning the rows-deleted count. The
+    per-sample twin of `delete_alignment_block_data`.
+
+    Signs an action token carrying that pair and nothing else — the data plane's
+    payload rejects any extra field. What the pair selects, and why it rather than
+    the block or the whole alignment, is on the Rust `delete_alignment_sample`.
+    Idempotent: a fresh sample (no rows yet) deletes 0 and still succeeds. Raises
+    pyarrow.flight.FlightError on transport / data-plane failure."""
+    token = sign_action(
+        action="delete_alignment_sample",
+        payload={"alignment_idx": alignment_idx, "prep_sample_idx": prep_sample_idx},
+        secret=signing_key,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action, "delete_alignment_sample", data_plane_url, token
+    )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
+
+
 async def delete_alignment_data(
     *,
     alignment_idx: int,
@@ -2323,6 +2647,73 @@ async def finalize_mask_sample_gate(
     return {"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx}
 
 
+async def finalize_assembly_sample_gate(
+    pool: asyncpg.Pool,
+    *,
+    processing_idx: int,
+    prep_sample_idx: int,
+) -> dict[str, int]:
+    """Terminal step of the long-read-assembly workflow: record this sample's
+    assembly as completed in the qiita.assembly_sample gate.
+
+    The row is already 'pending' — the runner materialized it when it minted this
+    run's processing_idx — and the write is an idempotent upsert, so a workflow
+    retried from the start re-affirms 'completed'. The exception is a pair someone
+    withdrew mid-run: `upsert_assembly_sample_completed` raises
+    `AssemblySampleInvalidated` rather than re-completing it, and the dispatch arm
+    in `runner/_reconstruct.py` turns that into a BAD_INPUT step failure. Where the
+    entry sits in the step list, and why, is on the workflow YAML entry that
+    declares it; the gate's state contract lives on
+    `repositories.assembly.fetch_assembly_sample_state`.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        await upsert_assembly_sample_completed(
+            conn, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
+        )
+    return {"processing_idx": processing_idx, "prep_sample_idx": prep_sample_idx}
+
+
+async def finalize_alignment_sample_gate(
+    pool: asyncpg.Pool,
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+) -> dict[str, int]:
+    """Terminal step of a prep_sample-scoped alignment workflow (align-denovo):
+    record this sample's alignment as completed in the qiita.alignment_sample gate.
+
+    The per-sample twin of `reconcile_alignment_block`'s gate flip, and it needs none
+    of that primitive's block bookkeeping: one ticket aligns the whole sample, so
+    there is no covering set to wait on and no count to reconcile. The row is already
+    'pending' — the runner materialized it when it minted this run's alignment_idx —
+    and a workflow retried from the start re-affirms 'completed'. Runs AFTER
+    register-files so the gate never reads 'completed' before the rows are in DuckLake.
+
+    Unlike the mask gate's per-sample twin there is no cross-path refusal to make: the
+    two mints hash disjoint key sets (see `_build_denovo_alignment_params` in
+    `runner/_alignment.py`), so no block can hold this identity's gate row and there is
+    nothing for this write to stomp.
+
+    Takes the row's FOR UPDATE lock across the check-and-flip, which is what
+    `finalize_alignment_sample` requires of its caller. A missing row is a bug in the
+    submit path, not a state to create here: the gate is keyed on an identity that
+    only the pre-loop resolver mints."""
+    async with pool.acquire() as conn, conn.transaction():
+        state = await lock_alignment_sample(
+            conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+        )
+        if state is None:
+            raise RuntimeError(
+                f"alignment_sample gate row missing for (alignment={alignment_idx}, "
+                f"prep_sample={prep_sample_idx}); it must be materialized PENDING when "
+                "the runner mints the alignment identity, before any step runs"
+            )
+        await finalize_alignment_sample(
+            conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+        )
+    return {"alignment_idx": alignment_idx, "prep_sample_idx": prep_sample_idx}
+
+
 async def delete_alignment_block(
     pool: asyncpg.Pool,
     *,
@@ -2370,6 +2761,33 @@ async def delete_alignment_block(
         data_plane_url=data_plane_url,
     )
     return {"block_idx": block_idx, "rows_deleted": rows_deleted}
+
+
+async def delete_alignment_sample(
+    *,
+    alignment_idx: int,
+    prep_sample_idx: int,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> dict[str, Any]:
+    """Idempotent sample replace: run before register-files re-writes this
+    sample's alignment rows, so a re-run never double-counts. The per-sample twin
+    of `delete_alignment_block`.
+
+    Takes no `pool`: the caller supplies both identifiers, so unlike the block
+    twin there is no `block_member` lookup to do. Like it, this touches only
+    DuckLake — the Postgres `alignment_sample` gate row is the terminal step's to
+    flip, and clearing a gate is `DELETE /alignment-definition/{idx}` (which
+    CASCADEs it), not a mid-workflow replace.
+
+    Returns the rows-deleted count for the workflow log."""
+    rows_deleted = await delete_alignment_sample_data(
+        alignment_idx=alignment_idx,
+        prep_sample_idx=prep_sample_idx,
+        signing_key=signing_key,
+        data_plane_url=data_plane_url,
+    )
+    return {"prep_sample_idx": prep_sample_idx, "rows_deleted": rows_deleted}
 
 
 async def reconcile_alignment_block(
@@ -2465,7 +2883,10 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
     LibraryPrimitive.FINALIZE_MASK_SAMPLE: finalize_mask_sample_gate,
+    LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE: finalize_assembly_sample_gate,
+    LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE: finalize_alignment_sample_gate,
     LibraryPrimitive.DELETE_ALIGNMENT_BLOCK: delete_alignment_block,
+    LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE: delete_alignment_sample,
     LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,
     LibraryPrimitive.SYNC_REFERENCE_EXCLUSION: sync_reference_exclusion,
 }

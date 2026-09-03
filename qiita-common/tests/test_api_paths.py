@@ -176,6 +176,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_STUDY_PREFIX",
         "PATH_STUDY_LOOKUP_BY_ACCESSION",
     ),
+    # /run-folder
+    (
+        "URL_RUN_FOLDER_INSPECT",
+        "PATH_RUN_FOLDER_PREFIX",
+        "PATH_RUN_FOLDER_INSPECT",
+    ),
     # /sequencing-run
     (
         "URL_SEQUENCING_RUN_BY_IDX",
@@ -355,10 +361,26 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_STUDY_PREFIX",
         "PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY",
     ),
+    # /biosample-global-field, /prep-sample-global-field
+    (
+        "URL_BIOSAMPLE_GLOBAL_FIELD_LIST",
+        "PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX",
+        "PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT",
+    ),
+    (
+        "URL_PREP_SAMPLE_GLOBAL_FIELD_LIST",
+        "PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX",
+        "PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT",
+    ),
     # /read-masked
     ("URL_READ_MASKED_DOGET", "PATH_READ_MASKED_PREFIX", "PATH_READ_MASKED_DOGET"),
     # /read (Flight DoGet ticket for a block's reads)
     ("URL_READ_DOGET", "PATH_READ_PREFIX", "PATH_READ_DOGET"),
+    # /assembly (Flight DoGet ticket for one assembly run's contigs, and that
+    # run's contig -> genome map)
+    ("URL_ASSEMBLY_DOGET", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_DOGET"),
+    ("URL_ASSEMBLY_RUN_DOGET", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_RUN_DOGET"),
+    ("URL_ASSEMBLY_GENOME_MAP", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_GENOME_MAP"),
     # /mask-definition
     (
         "URL_MASK_DEFINITION_BY_IDX",
@@ -379,6 +401,27 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_MASK_DEFINITION_SAMPLE_STATUS",
         "PATH_MASK_DEFINITION_PREFIX",
         "PATH_MASK_DEFINITION_SAMPLE_STATUS",
+    ),
+    # /processing (assembly run identity + its lifecycle)
+    (
+        "URL_PROCESSING_BY_IDX",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_BY_IDX",
+    ),
+    (
+        "URL_PROCESSING_PREP_SAMPLE",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_PREP_SAMPLE",
+    ),
+    (
+        "URL_PROCESSING_STATUS",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_STATUS",
+    ),
+    (
+        "URL_PROCESSING_SAMPLE_STATUS",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_SAMPLE_STATUS",
     ),
     # /alignment-definition
     (

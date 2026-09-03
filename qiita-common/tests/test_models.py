@@ -754,8 +754,10 @@ def test_pool_completion_status_complete_flag():
         demux_state="completed",
         sample_count=3,
         samples_completed=3,
+        samples_invalidated=0,
         samples_in_flight=0,
         samples_no_data=0,
+        samples_cancelled=0,
         samples_failed=0,
         samples_not_submitted=0,
     )
@@ -769,8 +771,10 @@ def test_pool_completion_status_complete_flag():
         demux_state="completed",
         sample_count=3,
         samples_completed=2,
+        samples_invalidated=0,
         samples_in_flight=0,
         samples_no_data=1,
+        samples_cancelled=0,
         samples_failed=0,
         samples_not_submitted=0,
     )
@@ -783,12 +787,32 @@ def test_pool_completion_status_complete_flag():
         demux_state="completed",
         sample_count=3,
         samples_completed=2,
+        samples_invalidated=0,
         samples_in_flight=0,
         samples_no_data=0,
+        samples_cancelled=0,
         samples_failed=1,
         samples_not_submitted=0,
     )
     assert with_failure.complete is False
+
+    # A withdrawn run is neither usable nor still coming, so it holds `complete`
+    # False.
+    with_withdrawn = PoolCompletionStatus(
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        demux_state="completed",
+        sample_count=3,
+        samples_completed=2,
+        samples_invalidated=1,
+        samples_in_flight=0,
+        samples_no_data=0,
+        samples_cancelled=0,
+        samples_failed=0,
+        samples_not_submitted=0,
+    )
+    assert with_withdrawn.complete is False
+    assert with_withdrawn.fully_processed is False
 
     partial = PoolCompletionStatus(
         sequenced_pool_idx=1,
@@ -796,8 +820,10 @@ def test_pool_completion_status_complete_flag():
         demux_state="completed",
         sample_count=3,
         samples_completed=2,
+        samples_invalidated=0,
         samples_in_flight=1,
         samples_no_data=0,
+        samples_cancelled=0,
         samples_failed=0,
         samples_not_submitted=0,
     )
@@ -809,8 +835,10 @@ def test_pool_completion_status_complete_flag():
         demux_state="completed",
         sample_count=0,
         samples_completed=0,
+        samples_invalidated=0,
         samples_in_flight=0,
         samples_no_data=0,
+        samples_cancelled=0,
         samples_failed=0,
         samples_not_submitted=0,
     )
@@ -830,8 +858,10 @@ def test_pool_completion_status_fully_processed_flag():
             demux_state=demux_state,
             sample_count=sample_count,
             samples_completed=samples_completed,
+            samples_invalidated=0,
             samples_in_flight=sample_count - samples_completed,
             samples_no_data=0,
+            samples_cancelled=0,
             samples_failed=0,
             samples_not_submitted=0,
         )

@@ -23,6 +23,10 @@ From: mambaorg/micromamba:1.5.8
     ../_shared/_lib.sh /opt/qiita/_lib.sh
     # This image's per-step entrypoint.
     bin_refine.sh /opt/qiita/bin_refine.sh
+    # The contig2bin row filter it pipes Fasta_to_Contig2Bin.sh through. Its own
+    # file, not inlined in bin_refine.sh, so the unit test can execute the real
+    # program.
+    contig2bin_filter.awk /opt/qiita/contig2bin_filter.awk
 
 %environment
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -53,7 +57,7 @@ From: mambaorg/micromamba:1.5.8
     micromamba create -y -n dastool -c bioconda -c conda-forge das_tool=1.1.7 diamond
 
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/bin_refine.sh
-    chmod 0644 /opt/qiita/manifest_writer.py
+    chmod 0644 /opt/qiita/manifest_writer.py /opt/qiita/contig2bin_filter.awk
 
     micromamba clean -a -y
 
@@ -86,6 +90,21 @@ From: mambaorg/micromamba:1.5.8
     grep -q 'python3 /opt/qiita/manifest_writer\.py' /opt/qiita/_lib.sh
     # Guard the entrypoint stays wired to its env.
     grep -q 'micromamba run -n dastool DAS_Tool' /opt/qiita/bin_refine.sh
+    # The row filter (contig2bin_filter.awk carries what it keeps and why) is
+    # %files-copied, so it can go missing independently of the entrypoint that runs
+    # it, and it is awk, so a syntax error surfaces only when it runs. It is also the
+    # only place the image's own awk runs the image's own copy, so the rows
+    # discriminate: a numbered bin through, a catch-all dropped, a spaced contig id
+    # kept (three fields without the tab FS), and an unknown id rejected by content.
+    grep -q 'contig2bin_filter\.awk' /opt/qiita/bin_refine.sh
+    printf 'c1\tbin.1\nc2\tunbinned\nctg2 len=500\tbin.2\n' \
+        | awk -v rejects="${HOME}/rejects" -f /opt/qiita/contig2bin_filter.awk > "${HOME}/kept"
+    [ "$(cat "${HOME}/kept")" = "$(printf 'c1\tbin.1\nctg2 len=500\tbin.2')" ]
+    [ ! -s "${HOME}/rejects" ]
+    printf 'c3\tbin.weird\n' \
+        | awk -v rejects="${HOME}/rejects2" -f /opt/qiita/contig2bin_filter.awk > "${HOME}/kept2"
+    [ ! -s "${HOME}/kept2" ]
+    [ "$(cat "${HOME}/rejects2")" = "$(printf 'c3\tbin.weird')" ]
 
 %runscript
     echo "long-read-assembly-dastool image: invoke the step entrypoint, e.g." >&2

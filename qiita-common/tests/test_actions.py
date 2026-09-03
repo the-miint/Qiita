@@ -122,6 +122,80 @@ def test_duplicate_step_names_rejected():
     assert "duplicate step name" in str(exc_info.value)
 
 
+def test_assembly_gate_without_a_threaded_processing_idx_rejected():
+    """An action declaring `finalize-assembly-sample` must thread `processing_idx`
+    through some step's `params:`; without it the runner mints no run identity and
+    the gate row has no key. Rejected at construction, which covers both the YAML
+    load and the qiita.action reconstruction."""
+    from qiita_common.actions import ActionDefinition
+
+    step = {
+        "step_type": StepType.SINGLETON,
+        "container": "img:1",
+        "entrypoint": "/opt/qiita/x.sh",
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    }
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"] = [
+        {"step": "assemble", **step},
+        {"action": "finalize-assembly-sample"},
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "processing_idx" in str(exc_info.value)
+
+    kwargs["steps"] = [
+        {"step": "assemble", "params": {"processing_idx": "processing_idx"}, **step},
+        {"action": "finalize-assembly-sample"},
+    ]
+    threaded = ActionDefinition(**kwargs)
+    assert threaded.steps[-1].name == "finalize-assembly-sample"
+
+    # The requirement rides on the gate entry, not on the workflow: an action with
+    # neither is untouched.
+    kwargs["steps"] = [{"step": "assemble", **step}]
+    assert ActionDefinition(**kwargs).steps[0].name == "assemble"
+
+
+def test_alignment_gate_without_a_threaded_alignment_idx_rejected():
+    """An action declaring `finalize-alignment-sample` must thread `alignment_idx`
+    through some step's `params:`. Unlike the assembly twin above, what is missing
+    without it is not the KEY — the runner mints that off the gate entry itself — but
+    the stamp: nothing would carry the identity onto the rows, so the gate would
+    report a sample aligned under an identity none of its rows claim."""
+    from qiita_common.actions import ActionDefinition
+
+    step = {
+        "step_type": StepType.SINGLETON,
+        "container": "img:1",
+        "entrypoint": "/opt/qiita/x.sh",
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    }
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"] = [
+        {"step": "align", **step},
+        {"action": "finalize-alignment-sample"},
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "alignment_idx" in str(exc_info.value)
+
+    kwargs["steps"] = [
+        {"step": "align", "params": {"alignment_idx": "alignment_idx"}, **step},
+        {"action": "finalize-alignment-sample"},
+    ]
+    threaded = ActionDefinition(**kwargs)
+    assert threaded.steps[-1].name == "finalize-alignment-sample"
+
+    # The `align` block workflow threads the same binding without declaring this gate
+    # (it reconciles per block instead), so the requirement must not fire on it.
+    kwargs["steps"] = [
+        {"step": "align", "params": {"alignment_idx": "alignment_idx"}, **step},
+        {"action": "reconcile-alignment-block"},
+    ]
+    assert ActionDefinition(**kwargs).steps[-1].name == "reconcile-alignment-block"
+
+
 def test_duplicate_action_names_allowed():
     """Two `action:` entries may share a name — they run in-process keyed on the
     step index, not the name (e.g. two `register-index` actions in the

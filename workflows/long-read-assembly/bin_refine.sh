@@ -19,20 +19,41 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "${OUT}"
 
-# Per-binner contig->bin tables. metabat2's Fasta_to_Contig2Bin output needs the
-# `$1,$4` projection; concoct/maxbin2 use the raw output (qp-pacbio's special
-# case). Labels are DAS_Tool's expected CONCOCT/MaxBin/MetaBAT.
-declare -a das_bins das_labels
+# Per-binner contig->bin tables. One path for all three: `Fasta_to_Contig2Bin.sh`
+# emits <contig>\t<bin id> and contig2bin_filter.awk decides which of those rows
+# are candidate bins — it carries the column measurement and the catch-all rule.
+# Labels are DAS_Tool's expected CONCOCT/MaxBin/MetaBAT.
+# `=()`, not a bare `declare -a`: a declared-but-never-assigned array is UNSET, so
+# `${#das_bins[@]}` further down trips the `set -u` from _lib.sh — "das_bins:
+# unbound variable", exit 1 — whenever no binner contributes a table, which is the
+# benign empty outcome that check exists to serve. Measured on the image's own base
+# (mambaorg/micromamba:1.5.8, bash 5.2.15). The filter below makes it reachable for
+# a binner whose only .fa files are catch-alls, on top of the empty-bins_dir case
+# binning.sh already hands over. Measured on macOS's bash 3.2.57 too, where
+# `${#…[@]}` reads 0 for either spelling, so this does not reproduce on a dev
+# laptop — nor does the fix regress there. (bash 3.2 does refuse a `"${a[@]}"`
+# EXPANSION of an empty array, which is a different construct and not one this
+# script reaches with an empty one.)
+declare -a das_bins=() das_labels=()
 for binner in concoct maxbin2 metabat2; do
     d="${BINS_DIR}/${binner}_bins"
     [[ -d "${d}" ]] || continue
     ls "${d}"/*.fa >/dev/null 2>&1 || continue
     tsv="${WORK}/${binner}.tsv"
-    if [[ "${binner}" == "metabat2" ]]; then
-        micromamba run -n dastool Fasta_to_Contig2Bin.sh -i "${d}" -e fa \
-            | awk 'BEGIN{FS=OFS="\t"}{print $1,$4}' > "${tsv}"
-    else
-        micromamba run -n dastool Fasta_to_Contig2Bin.sh -i "${d}" -e fa > "${tsv}"
+    rejects="${WORK}/${binner}.rejects"
+    micromamba run -n dastool Fasta_to_Contig2Bin.sh -i "${d}" -e fa \
+        | awk -v rejects="${rejects}" -f /opt/qiita/contig2bin_filter.awk > "${tsv}"
+    if [[ -s "${rejects}" ]]; then
+        echo "bin_refine: ${binner}'s contig2bin table holds row(s) that are neither a" >&2
+        echo "            numbered bin nor a known catch-all — contig2bin_filter.awk" >&2
+        echo "            lists both shapes. First few, distinct:" >&2
+        # First five distinct rejected rows. One awk, not a `sort -u | head`
+        # pipeline: under the `pipefail` _lib.sh sets, a SIGPIPEd `sort` can abort
+        # the script before the exit below.
+        awk '!seen[$0]++ && ++n <= 5' "${rejects}" >&2
+        echo "            Either Fasta_to_Contig2Bin.sh's columns or the binner's output" >&2
+        echo "            naming has moved; both decide which contigs DAS_Tool scores." >&2
+        exit 65
     fi
     [[ -s "${tsv}" ]] || continue
     das_bins+=("${tsv}")

@@ -530,9 +530,9 @@ def test_align_sharded_query_view_is_what_routing_and_the_probe_read(tmp_path, m
     pass still read a VIEW, and the copy does not exist yet when they run.
 
     Both would be actively worse off against a table: the probe is answered from the
-    Parquet's row-group statistics without touching the sequence columns, and rype
-    materializes its own corpus copy internally, so building ours first would hold two
-    copies of the block at once."""
+    Parquet's row-group statistics without touching the sequence columns, and rype holds
+    its accumulated reads plus its minimizer structures for the length of the classify,
+    so building ours first would stack a full copy of the block on top of that peak."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
     _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", "TTGG")])
@@ -559,7 +559,7 @@ def test_align_sharded_query_view_is_what_routing_and_the_probe_read(tmp_path, m
     )
     asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
 
-    assert routed_query_tables == [align_sharded._ROUTING_QUERY]
+    assert routed_query_tables == [align_sharded._QUERY]
     probe = _sole_index(sql_log, "count(sequence2), count(*)", what="SE/PE probe")
     created = _sole_index(
         sql_log, f"CREATE TABLE {align_sharded._QUERY_MATERIALIZED}", what="materialize"
@@ -567,32 +567,20 @@ def test_align_sharded_query_view_is_what_routing_and_the_probe_read(tmp_path, m
     assert probe < created
 
 
-@pytest.mark.parametrize(
-    ("sequence2", "routing_cols"),
-    [
-        (None, ["read_id", "sequence1"]),
-        ("TTGG", ["read_id", "sequence1", "sequence2"]),
-    ],
-    ids=["single-end", "paired-end"],
-)
-def test_align_sharded_routing_query_drops_an_all_null_mate(
-    tmp_path, monkeypatch, sequence2, routing_cols
-):
-    """A single-end block hands the rype routing pass `sequence1` ALONE; a paired-end one
-    keeps both mates. The ALIGNER keeps both mates either way.
+@pytest.mark.parametrize("sequence2", [None, "TTGG"], ids=["single-end", "paired-end"])
+def test_align_sharded_routes_from_a_view_carrying_both_mates(tmp_path, monkeypatch, sequence2):
+    """The routing pass reads the full `_QUERY`, and reads it as a VIEW.
 
-    This is a batch-SIZING property, not a projection tidy-up, and it is invisible in the
-    output — which is why it needs pinning here. miint derives rype's `is_paired` from the
-    PRESENCE of a `sequence2` column and never from its values (duckdb-miint#199), and rype
-    then assumes a query twice as long, halving its Arrow batch size. Since
-    `rype_classify_arrow` reloads the whole index once per batch, an all-NULL `sequence2`
-    doubles the number of full router-index reads — measured at ~54 min each against the
-    193 GB w=20 WoL3 router. Nothing about the alignments produced would change, so only
-    an assertion on the relation's COLUMN LIST can catch a regression here.
+    Both properties are invisible in the output. A TABLE here would stack a second copy of
+    the block's sequences (~15 GB long-read) on top of rype's own peak, so only
+    `table_type` can pin it.
+
+    The parametrize is the assertion on the column list: the same three columns for either
+    read shape is what says the relation handed to rype is UNCONDITIONAL.
 
     The aligner assertion is the other half: `sequence2` must survive into
     `_QUERY_MATERIALIZED`, because both sharded aligners need it to align a pair natively.
-    Narrowing that relation instead of this one would silently turn PE alignment into SE."""
+    Narrowing that relation would silently turn PE alignment into SE."""
     from qiita_compute_orchestrator.jobs import align_sharded
 
     _write_reads_parquet(tmp_path / "reads.parquet", [(10, 1, "ACGT", sequence2)])
@@ -618,9 +606,9 @@ def test_align_sharded_routing_query_drops_an_all_null_mate(
             [d[0] for d in conn.execute(f"SELECT * FROM {query_table} LIMIT 0").description]
         )
         # The KIND matters as much as the columns: a TABLE here would hold a second
-        # copy of the block's sequences (~15 GB long-read) concurrently with the
-        # corpus copy rype makes internally — the hazard docs/duckdb-miint.md
-        # documents, and the reason this is a view over a view.
+        # copy of the block's sequences (~15 GB long-read) on top of rype's own peak,
+        # which is why routing reads the lazy Parquet scan. See the note at the
+        # _QUERY_MATERIALIZED create.
         seen_routing_kinds.append(
             conn.execute(
                 "SELECT table_type FROM information_schema.tables WHERE table_name = ?",
@@ -642,7 +630,7 @@ def test_align_sharded_routing_query_drops_an_all_null_mate(
     )
     asyncio.run(align_sharded.execute(inputs, tmp_path / "ws"))
 
-    assert seen_routing_cols == [routing_cols]
+    assert seen_routing_cols == [["read_id", "sequence1", "sequence2"]]
     assert seen_routing_kinds == ["VIEW"]
     assert calls[0]["cols"] == ["read_id", "sequence1", "sequence2"]
 
@@ -1111,6 +1099,113 @@ def test_pooled_cigar_scoring_is_permutation_invariant():
     # And a sanity floor: the probe must actually be scoring, not returning NULL for
     # every permutation (which would make the invariance assertions vacuous).
     assert identities != {None} and coverages != {None}
+
+
+def test_origin_spanning_read_splits_into_one_record_per_side():
+    """CONTRACT (duckdb-miint): minimap2 reports a read that crosses a circular
+    contig's origin as one SAM record per side of it, each covering only its own
+    share of the query, so a per-record coverage floor drops the read outright.
+    Upstream documents this and ships the aggregate that pools it back together:
+    https://the-miint.github.io/duckdb-miint/alignment_analysis/#circular-query-coverage
+
+    What this test adds is the tie to OUR floor, and the two pooled forms' split.
+    Measured on miint `9fc4d12` (minimap2 `0477498`), 20 kb contig, 6 kb read built
+    as `contig[17000:] + contig[:3000]`: 2 records, each `cigar_query_coverage` 0.5
+    at `cigar_sequence_identity` 1.0, under `map-hifi`, `map-ont` and the default
+    preset. Over that pair `string_agg(cigar, '')` scores coverage 0.5 but identity
+    1.0 — a clip consumes query length without being an aligned column — while
+    `circular_query_coverage` returns coverage 1.0 over 2 fragments.
+
+    The control is a read of the same length taken from the middle of the same
+    contig: one record at coverage 1.0. Without it, the split could be a property
+    of the read length or of the fixture rather than of the origin.
+
+    Two things rest on this, and both are asserted rather than left to the prose.
+    `_MIN_QUERY_COVERAGE_MINIMAP2` drops both records, since the phase-1 filter
+    scores one record at a time — which is why the sharded reference aligner cannot
+    be the producer for the DuckLake `alignment_origin_spanning` side table (see
+    its DDL in the data plane), and why long reads crossing a circular contig's
+    origin do not reach `alignment` today. And the pooled form the repo already has
+    cannot be widened to cover the read, because the concatenation scores no better
+    than a fragment does; the interval-pooled form is the one that clears the
+    floor, and it is what that table's `pooled_coverage` / `pooled_identity`
+    columns are declared against."""
+    import random
+
+    from qiita_compute_orchestrator.jobs import align_sharded
+
+    rng = random.Random(20260819)
+    contig = "".join(rng.choice("ACGT") for _ in range(20_000))
+    spanning = contig[17_000:] + contig[:3_000]
+    control = contig[5_000:11_000]
+    assert len(spanning) == len(control) == 6_000
+
+    with open_miint_conn() as conn:
+        conn.execute("CREATE TABLE subject (read_id BIGINT, sequence1 VARCHAR)")
+        conn.execute("INSERT INTO subject VALUES (777, ?)", [contig])
+        conn.execute("CREATE TABLE query (read_id BIGINT, sequence1 VARCHAR)")
+        conn.execute("INSERT INTO query VALUES (1, ?), (2, ?)", [spanning, control])
+
+        # `subject_table` is a named-only argument; `eqx` is what makes the CIGAR
+        # =/X so `cigar_sequence_identity` scores rather than returning NULL.
+        for preset in ("map-hifi", "map-ont", None):
+            opts = "" if preset is None else f", preset := '{preset}'"
+            rows = conn.execute(
+                "SELECT read_id, count(*), "
+                "  min(cigar_query_coverage(cigar)), max(cigar_query_coverage(cigar)), "
+                "  min(cigar_sequence_identity(cigar)), "
+                "  cigar_query_coverage(string_agg(cigar, '')), "
+                "  cigar_sequence_identity(string_agg(cigar, '')) "
+                f"FROM align_minimap2('query', subject_table := 'subject', eqx := true{opts}) "
+                "GROUP BY read_id ORDER BY read_id"
+            ).fetchall()
+            assert rows == [
+                (1, 2, 0.5, 0.5, 1.0, 0.5, 1.0),
+                (2, 1, 1.0, 1.0, 1.0, 1.0, 1.0),
+            ], f"preset={preset!r} placed the reads differently: {rows}"
+
+            # Tie the measurement to the floor it is measured against, so lowering
+            # the floor for long reads turns this red instead of silently making
+            # the side table's DDL scope paragraph and the changelog wrong. Both
+            # the per-record score and the concatenated pooled one are below it;
+            # the control is above.
+            spanning_row, control_row = rows
+            assert spanning_row[2] < align_sharded._MIN_QUERY_COVERAGE_MINIMAP2, (
+                "an origin-spanning fragment now clears the phase-1 coverage floor, "
+                "so align_sharded persists it and can be the side table's producer"
+            )
+            assert spanning_row[5] < align_sharded._MIN_QUERY_COVERAGE_MINIMAP2, (
+                "the concatenated pooled score now clears the floor, so widening "
+                "the phase-2 QUALIFY to the single-end arm would admit the read"
+            )
+            assert control_row[2] >= align_sharded._MIN_QUERY_COVERAGE_MINIMAP2, (
+                "the control read no longer clears the floor, so the comparison "
+                "above says nothing about the origin"
+            )
+
+        # The pooling that DOES clear the floor, and the definition the DuckLake
+        # `alignment_origin_spanning` columns are declared against. Both arguments
+        # are relations, not table-name strings, and `is_circular` is required —
+        # nothing in an alignment records whether a reference is circular.
+        conn.execute(
+            "CREATE TABLE algn AS SELECT * FROM align_minimap2("
+            "'query', subject_table := 'subject', eqx := true, preset := 'map-hifi')"
+        )
+        conn.execute(
+            "CREATE TABLE ref_len AS "
+            "SELECT '777' AS reference, 20000::BIGINT AS length, true AS is_circular"
+        )
+        pooled = conn.execute(
+            "SELECT read_id, n_fragments, coverage, identity "
+            "FROM circular_query_coverage(algn, ref_len) ORDER BY read_id"
+        ).fetchall()
+        assert pooled == [(1, 2, 1.0, 1.0), (2, 1, 1.0, 1.0)], (
+            f"circular_query_coverage no longer recovers the split read: {pooled}"
+        )
+        assert pooled[0][2] >= align_sharded._MIN_QUERY_COVERAGE_MINIMAP2, (
+            "interval-pooled coverage no longer clears the floor the per-record "
+            "score fails, so the side table's scope paragraph names no viable gate"
+        )
 
 
 def test_align_sharded_se_placements_sharing_a_start_are_scored_separately(tmp_path, monkeypatch):

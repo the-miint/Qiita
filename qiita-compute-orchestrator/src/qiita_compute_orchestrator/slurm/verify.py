@@ -4,7 +4,7 @@ Precondition (checked by the caller, not here): the SLURM job exited 0.
 A non-zero exit jumps straight to a different failure path and never
 reaches the verifier.
 
-Per docs/architecture.md "Container contract", every workflow container
+Per docs/architecture/processing.md "Container contract", every workflow container
 must also produce on success:
 
   1. `$QIITA_OUTPUT_PATH/manifest.json`, written as the container's

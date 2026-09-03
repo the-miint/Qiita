@@ -37,12 +37,9 @@ _None yet._
 
 _None yet._
 
-
 ### Notes (no host action)
 
 _None yet._
-
----
 
 ## Deployed history
 

@@ -6,11 +6,20 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 import argparse
 from pathlib import Path
 
+from qiita_common.analytic import (
+    CIRCULAR_MIN_COVERAGE,
+    CIRCULAR_MIN_IDENTITY,
+    CoverageScope,
+)
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
+    PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX,
+    PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_PREFIX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX,
+    PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT,
     PATH_PREP_SAMPLE_PREFIX,
     PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_PREP_SAMPLE_STUDY_LIST,
@@ -22,7 +31,6 @@ from qiita_common.api_paths import (
     PATH_STUDY_BY_IDX,
     PATH_STUDY_PREFIX,
 )
-from qiita_common.feature_table import CoverageScope
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
@@ -41,11 +49,13 @@ from qiita_common.work_ticket_constants import FORCE_RESUBMIT_EXPLANATION
 from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
 from ._helpers import (
+    _UNSET,
     _handle_patch,
     _handle_read,
     _handle_study_field_create,
     _lane_arg,
     _proportion_arg,
+    _proportion_or_none_arg,
 )
 from .alignment import _handle_alignment_cohort, _handle_alignment_list
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
@@ -61,6 +71,7 @@ from .pool import (
     _handle_submit_block_mask_pool,
     _handle_submit_host_filter_pool,
 )
+from .reads import _handle_submit_reads
 from .reference import (
     _EXPORT_FORMATS,
     _handle_reference_genome_export,
@@ -128,6 +139,41 @@ def _add_study_field_create_args(subparser: argparse.ArgumentParser, *, entity_n
         "--tier-override",
         choices=tuple(t.value for t in Tier),
         help="visibility tier override; local-mode only",
+    )
+
+
+def _add_field_list_subcommands(
+    entity_sub,
+    *,
+    entity_noun: str,
+    study_field_path: str,
+    global_field_path: str,
+) -> None:
+    """Declare one entity's two field-listing subcommands.
+
+    `entity_noun` names the entity in help text.
+    """
+    hyphenated = entity_noun.replace("_", "-")
+
+    p_list_fields = entity_sub.add_parser(
+        "list-fields",
+        help=f"List a study's {hyphenated} field definitions",
+    )
+    p_list_fields.add_argument("--study-idx", type=int, required=True)
+    p_list_fields.set_defaults(
+        handler=_handle_read,
+        read_path=study_field_path,
+        read_idx_arg="study_idx",
+    )
+
+    p_list_global_fields = entity_sub.add_parser(
+        "list-global-fields",
+        help=f"List the global {hyphenated} field definitions",
+    )
+    p_list_global_fields.set_defaults(
+        handler=_handle_read,
+        read_path=global_field_path,
+        read_idx_arg=None,
     )
 
 
@@ -203,6 +249,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_study_create.set_defaults(handler=_handle_study_create)
 
+    study_by_idx_path = f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}"
+
     p_study_get = p_study_sub.add_parser(
         "get",
         help="Fetch a study by idx (GET /study/{study_idx})",
@@ -210,7 +258,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_get.add_argument("--study-idx", type=int, required=True)
     p_study_get.set_defaults(
         handler=_handle_read,
-        read_path=f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}",
+        read_path=study_by_idx_path,
         read_idx_arg="study_idx",
     )
 
@@ -232,7 +280,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_patch.set_defaults(
         handler=_handle_patch,
         patch_model=StudyPatchRequest,
-        patch_path=f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}",
+        patch_path=study_by_idx_path,
         patch_idx_arg="study_idx",
         patch_json_fields=("extra_metadata",),
     )
@@ -297,6 +345,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
 
+    biosample_study_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
+
     p_biosample_create_field = p_biosample_sub.add_parser(
         "create-field",
         help="Create a study-local biosample field (POST /study/{S}/biosample-field)",
@@ -305,8 +355,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_biosample_create_field.set_defaults(
         handler=_handle_study_field_create,
         study_field_model=BiosampleStudyFieldCreateRequest,
-        study_field_path=f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}",
+        study_field_path=biosample_study_field_path,
     )
+
+    _add_field_list_subcommands(
+        p_biosample_sub,
+        entity_noun="biosample",
+        study_field_path=biosample_study_field_path,
+        global_field_path=(
+            f"{PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT}"
+        ),
+    )
+
+    biosample_by_idx_path = f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 
     p_biosample_get = p_biosample_sub.add_parser(
         "get",
@@ -315,7 +376,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_biosample_get.add_argument("--biosample-idx", type=int, required=True)
     p_biosample_get.set_defaults(
         handler=_handle_read,
-        read_path=f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}",
+        read_path=biosample_by_idx_path,
         read_idx_arg="biosample_idx",
     )
 
@@ -346,7 +407,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_biosample_patch.set_defaults(
         handler=_handle_patch,
         patch_model=BiosamplePatchRequest,
-        patch_path=f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}",
+        patch_path=biosample_by_idx_path,
         patch_idx_arg="biosample_idx",
         patch_json_fields=(),
     )
@@ -608,6 +669,8 @@ def _build_parser() -> argparse.ArgumentParser:
         read_idx_arg="prep_sample_idx",
     )
 
+    prep_sample_study_field_path = f"{PATH_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"
+
     p_prepsample_create_field = p_prepsample_sub.add_parser(
         "create-field",
         help="Create a study-local prep-sample field (POST /study/{S}/prep-sample-field)",
@@ -616,7 +679,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_prepsample_create_field.set_defaults(
         handler=_handle_study_field_create,
         study_field_model=PrepSampleStudyFieldCreateRequest,
-        study_field_path=f"{PATH_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}",
+        study_field_path=prep_sample_study_field_path,
+    )
+
+    _add_field_list_subcommands(
+        p_prepsample_sub,
+        entity_noun="prep_sample",
+        study_field_path=prep_sample_study_field_path,
+        global_field_path=(
+            f"{PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT}"
+        ),
     )
 
     p_prepsample_retire = p_prepsample_sub.add_parser(
@@ -739,6 +811,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="From `qiita alignment list`; its params say which reference it used.",
     )
     p_ft_build.add_argument(
+        "--denovo-alignment-idx",
+        type=int,
+        help=(
+            "Also read this alignment — the cohort against its OWN assembled contigs —"
+            " and build a COMBINED (inverted open reference) table. Each read is counted"
+            " once: against its own contig where the de novo arm placed it, against the"
+            " reference otherwise. Reference genomes therefore lose the reads the de novo"
+            " arm wins, so one that clears --coverage-threshold without this flag can drop"
+            " out with it. From `qiita alignment list`; its params must name the same"
+            " mask_idx as --alignment-idx. Cannot be combined with --circular-gate."
+            " A prep_sample in the cohort that assembled nothing simply has no de novo"
+            " arm and stays reference-only; it is not an error."
+        ),
+    )
+    p_ft_build.add_argument(
         "--prep-sample-idx",
         type=int,
         action="append",
@@ -813,6 +900,41 @@ def _build_parser() -> argparse.ArgumentParser:
             "Score each alignment row on its own CIGAR instead of pooling a placement's"
             " mates. Only for a slice whose mates did not both map, which cannot be"
             " pooled; pooling is the default and is correct for single-end data too."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--circular-gate",
+        action="store_true",
+        help=(
+            "Judge each read against each reference with every record the aligner split"
+            " it into pooled, instead of scoring records one at a time. A read crossing"
+            " the origin of a circular reference is emitted as two records covering half"
+            " of it each, which a per-record coverage floor discards; pooled, it scores"
+            " what it is. Replaces --min-identity / --min-query-coverage, and single-end"
+            " only — mates are different molecules and are never pooled together."
+        ),
+    )
+    # Both default to `_UNSET`, not to the threshold, so "omitted" is distinguishable
+    # from "given" — passing either without --circular-gate is refused rather than
+    # silently ignored.
+    p_ft_build.add_argument(
+        "--circular-min-coverage",
+        type=_proportion_arg,
+        default=_UNSET,
+        help=(
+            "Minimum proportion of a read that one reference must explain, pooled over"
+            f" the read's records, under --circular-gate (default {CIRCULAR_MIN_COVERAGE})."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--circular-min-identity",
+        type=_proportion_or_none_arg,
+        default=_UNSET,
+        help=(
+            "Minimum pooled sequence identity a read must clear against a reference under"
+            f" --circular-gate (default {CIRCULAR_MIN_IDENTITY}), or 'none' to gate on"
+            " coverage and strand alone. Needs an eqx (=/X) CIGAR; the build refuses"
+            " rather than silently drop reads it cannot score."
         ),
     )
     p_ft_build.add_argument(
@@ -1303,6 +1425,78 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
 
+    p_submit_reads = sub.add_parser(
+        "submit-reads",
+        help=(
+            "Load one sample's reads from THIS machine: upload the FASTQ(s) or BAM"
+            " to the data plane, then submit the ingest work-ticket against them."
+        ),
+        description=(
+            "For reads that live on the machine you are typing on rather than on"
+            " the cluster's filesystem. The file is streamed to the data plane over"
+            " Flight, byte-exact and without decompressing a .gz, and the ticket"
+            " names the resulting upload handle instead of a path. Naming a host"
+            " path directly requires wet_lab_admin or system_admin, so this is the"
+            " route for a regular user — and the only route for anyone whose reads"
+            " are not on a filesystem the cluster mounts."
+            " FASTQ goes to fastq-to-parquet, BAM to bam-to-parquet."
+            " The uploaded basename must be the sequenced-sample's --pool-item-id"
+            " followed by '_' or '.', the same rule a path-named submission obeys."
+        ),
+    )
+    p_submit_reads.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        required=True,
+        help="The prep_sample these reads belong to.",
+    )
+    reads_source = p_submit_reads.add_mutually_exclusive_group(required=True)
+    reads_source.add_argument(
+        "--fastq",
+        type=Path,
+        help="Forward (R1) FASTQ on this machine. Plain or .gz.",
+    )
+    reads_source.add_argument(
+        "--bam",
+        type=Path,
+        help=(
+            "Unaligned basecaller uBAM (PacBio HiFi / ONT) on this machine."
+            " An aligned BAM is rejected by the loader."
+        ),
+    )
+    p_submit_reads.add_argument(
+        "--reverse-fastq",
+        type=Path,
+        help="Reverse (R2) FASTQ for paired-end input. Not valid with --bam.",
+    )
+    p_submit_reads.add_argument(
+        "--data-plane-url",
+        help=(
+            "gRPC URL of the data plane the reads are streamed to. From off the"
+            " deploy host use the public TLS edge (e.g."
+            " grpc+tls://qiita.example.com:443); grpc://<host>:50051 is the"
+            " direct/on-host form."
+        ),
+    )
+    p_submit_reads.add_argument(
+        "--no-watch",
+        action="store_true",
+        help="Submit the work_ticket and exit without polling. Default polls until terminal.",
+    )
+    p_submit_reads.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds between work_ticket polls under --watch (default: 2.0)",
+    )
+    p_submit_reads.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=24 * 3600,
+        help="Max seconds to wait for the work_ticket under --watch (default: 86400)",
+    )
+    p_submit_reads.set_defaults(handler=_handle_submit_reads)
+
     p_submit_pacbio = sub.add_parser(
         "submit-pacbio-ingest",
         help=(
@@ -1692,16 +1886,21 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "GET the pool's completion status. Reports the pool-scoped demux"
             " (bcl-convert) `demux_state`, then classifies each non-retired"
-            " sequenced_sample by the state of its read-mask (host-masking) work"
-            " tickets (completed / in-flight / no-data / failed / not-submitted)"
-            " into pool-level counts, with a `complete` flag set when every sample"
-            " reached a terminal-accounted state (COMPLETED or NO_DATA) and a"
+            " sequenced_sample into pool-level counts (completed / invalidated /"
+            " in-flight / no-data / cancelled / failed / not-submitted), with a"
+            " `complete` flag set when every sequenced_sample reached a usable or"
+            " terminal-accounted state (masked, or NO_DATA) and a"
             " `fully_processed` flag set when demux COMPLETED and host-masking is"
-            " complete. It tells the operator whether the per-sample fan-out from"
-            " submit-host-filter-pool has finished — including samples a partial"
-            " fan-out never submitted (`samples_not_submitted`). Compute-on-read"
-            " over the work tickets — it never drifts when a sample is re-processed"
-            " or deleted."
+            " complete. It tells the operator whether host-masking has finished,"
+            " by either path — the per-sample read-mask fan-out from"
+            " submit-host-filter-pool, or a block-mask plan —"
+            " including sequenced_samples a partial fan-out never submitted"
+            " (`samples_not_submitted`) and masking runs withdrawn after the fact"
+            " (`samples_invalidated`), which are counted but are not usable."
+            " Whether a sequenced_sample counts as masked is read primarily from"
+            " the same gate the masked-read pull reads. Compute-on-read — it never"
+            " drifts when a sequenced_sample is re-processed, withdrawn, or"
+            " deleted."
         ),
     )
     p_pool_completion.add_argument(

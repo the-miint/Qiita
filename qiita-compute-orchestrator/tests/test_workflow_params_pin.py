@@ -38,6 +38,41 @@ def _native_steps_with_params() -> list[tuple[str, str, dict[str, str]]]:
     return found
 
 
+def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[Path, int]]:
+    """`(yaml_path, baseline cpu)` for `step` in EVERY on-disk version of
+    `workflows/<workflow>/`.
+
+    Globbed rather than naming one filename: a pin that reads `1.0.0.yaml` stops
+    covering the workflow the moment a second version lands beside it, and the
+    version it keeps covering is the one nobody runs any more. `fastq-to-parquet`
+    already carries four versions; `long-read-assembly` is the one whose second
+    version is the one that runs.
+
+    A version that does not declare `step` at all contributes nothing rather than
+    failing — dropping a step between versions is a legitimate shape change, and
+    there is no cpu to pin on a step that is not there. More than one instance in
+    a single file IS an error: the pin would then silently cover whichever came
+    first. The caller asserts the result is non-empty, so no workflow can lose its
+    pin entirely by having every version drop the step.
+    """
+    yaml_paths = sorted(_WORKFLOWS_DIR.glob(f"{workflow}/*.yaml"))
+    assert yaml_paths, f"no workflow YAML under workflows/{workflow}/"
+    found: list[tuple[Path, int]] = []
+    for yaml_path in yaml_paths:
+        data = yaml.safe_load(yaml_path.read_text())
+        steps = [e for e in data["steps"] if e.get("step") == step]
+        assert len(steps) <= 1, (
+            f"{yaml_path.relative_to(_REPO_ROOT)}: expected at most one {step} step, "
+            f"got {len(steps)}"
+        )
+        if steps:
+            found.append((yaml_path, steps[0]["baseline_resources"]["cpu"]))
+    assert found, (
+        f"no version under workflows/{workflow}/ declares a {step} step, so this pin covers nothing"
+    )
+    return found
+
+
 def test_workflows_dir_present():
     """Guard against a wrong _REPO_ROOT (the glob would silently match nothing
     and make the param pin below vacuously pass)."""
@@ -80,22 +115,65 @@ def test_align_cpu_pins_duckdb_threads():
     fails; the job just runs at the wrong size, which is exactly the class of defect
     the sizing work was about.
 
-    Deliberately scoped to `align` rather than asserted repo-wide: most native jobs
-    pick threads for DuckDB's per-thread operator memory (sort / HASH_AGG state) and
-    legitimately differ from their `cpu:` — at the time of writing nine steps do,
-    e.g. `hash_sequences` (cpu 4 / threads 8) and `assembly_coverage` (cpu 16 /
-    threads 8, capping DuckDB so the extension work gets the rest). Generalizing this
-    pin would fail all of them for no reason.
-    """
-    align_yaml = _WORKFLOWS_DIR / "align" / "1.0.0.yaml"
-    data = yaml.safe_load(align_yaml.read_text())
-    steps = [e for e in data["steps"] if e.get("step") == "align_sharded"]
-    assert len(steps) == 1, f"expected exactly one align_sharded step, got {len(steps)}"
-    cpu = steps[0]["baseline_resources"]["cpu"]
+    Scoped to this step rather than asserted repo-wide: most native jobs pick threads
+    for DuckDB's per-thread operator memory (sort / HASH_AGG state) and legitimately
+    differ from their `cpu:` — `hash_sequences` (cpu 4 / threads 8) among them.
+    Generalizing this pin would fail those for no reason.
 
+    `align_denovo` and `assembly_coverage` carry the same pin below for a different
+    mechanism — both make one non-sharded `align_minimap2` call, whose parallelism is
+    the DuckDB pool directly rather than a shard count. Three pins side by side rather
+    than one repo-wide rule, because the reason differs per job and the jobs that
+    legitimately differ must keep differing.
+    """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.align_sharded")
-    assert cpu == mod._DUCKDB_THREADS, (
-        f"{align_yaml.name} baseline cpu={cpu} but align_sharded._DUCKDB_THREADS="
-        f"{mod._DUCKDB_THREADS}; these size the same thing (miint's concurrent-shard"
-        " count) and must be changed together"
-    )
+    for yaml_path, cpu in _baseline_cpu_every_version("align", "align_sharded"):
+        assert cpu == mod._DUCKDB_THREADS, (
+            f"{yaml_path.relative_to(_REPO_ROOT)} baseline cpu={cpu} but "
+            f"align_sharded._DUCKDB_THREADS={mod._DUCKDB_THREADS}; these size the same"
+            " thing (miint's concurrent-shard count) and must be changed together"
+        )
+
+
+def test_align_denovo_cpu_pins_duckdb_threads():
+    """`align-denovo`'s baseline `cpu:` must equal `align_denovo._DUCKDB_THREADS`.
+
+    Same pin as `align`'s above, different mechanism. There the DuckDB pool is miint's
+    concurrent-SHARD count; here the job makes one non-sharded `align_minimap2` call,
+    and that call draws its parallelism from the pool directly — measured on the staged
+    build at 1/2/4/8 threads (17.72 / 8.91 / 4.76 / 2.40 s over 60k x 2 kb reads), with
+    `MaxThreads()` tracking `SET threads`. So a `cpu:` above the literal allocates cores
+    nothing uses, and one below it oversubscribes the aligner onto fewer.
+    """
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.align_denovo")
+    for yaml_path, cpu in _baseline_cpu_every_version("align-denovo", "align_denovo"):
+        assert cpu == mod._DUCKDB_THREADS, (
+            f"{yaml_path.relative_to(_REPO_ROOT)} baseline cpu={cpu} but "
+            f"align_denovo._DUCKDB_THREADS={mod._DUCKDB_THREADS}; the aligner's"
+            " parallelism IS that pool, so these must be changed together"
+        )
+
+
+def test_assembly_coverage_cpu_pins_duckdb_threads():
+    """`long-read-assembly`'s `assembly_coverage` step: baseline `cpu:` must equal
+    `assembly_coverage._DUCKDB_THREADS`, for the reason stated on `align_denovo`'s pin.
+
+    This step made the same non-sharded `align_minimap2` call at threads 8 against
+    `cpu: 16`, reserving cores it could not use. The gap was closed by lowering the
+    request, not by raising the pool: on this step the thread count is also a memory
+    multiplier for the unspillable extension side, which `sacct` puts at 87% of the 64
+    GB request at the median. Pinned here so the two cannot drift apart again — the
+    drift is invisible at runtime, since nothing fails.
+
+    Read `1.0.0.yaml` by name until the 1.0.1 residue pass landed beside it, which
+    left the version that actually runs unpinned; `_baseline_cpu_every_version`
+    covers each of them.
+    """
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.assembly_coverage")
+    versions = _baseline_cpu_every_version("long-read-assembly", "assembly_coverage")
+    for yaml_path, cpu in versions:
+        assert cpu == mod._DUCKDB_THREADS, (
+            f"{yaml_path.relative_to(_REPO_ROOT)} assembly_coverage baseline cpu={cpu}"
+            f" but assembly_coverage._DUCKDB_THREADS={mod._DUCKDB_THREADS}; the"
+            " aligner's parallelism IS that pool, so these must be changed together"
+        )

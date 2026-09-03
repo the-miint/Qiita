@@ -1,10 +1,11 @@
-"""Behavioural tests for `qiita_common.feature_table` against REAL duckdb-miint.
+"""Behavioural tests for `qiita_common.analytic` against REAL duckdb-miint.
 
-The builders return SQL text and open no connection, so `qiita-common`'s own tests
-assert on strings; the analytic's behaviour is pinned here and in the orchestrator's
-`test_estimate_feature_table.py`. This module is the client-side half's home and
-carries the properties that suite cannot: **the per-sample coverage scope**, which
-no server-side caller uses.
+The builders return SQL text and open no connection, so the sibling modules here
+assert on strings; the analytic's behaviour is pinned in this one and in the
+orchestrator's `test_estimate_feature_table.py`. The division: this module owns what
+the analytic COMPUTES — including the per-sample coverage scope, which no server-side
+caller uses, and the combined table's reconciliation; that one owns how its driver
+feeds it.
 
 Every test drives the shared builders end to end — the staging renames, the
 lengths roll-up, the survivor set, the pre-woltka join, and `woltka_ogu` itself —
@@ -23,9 +24,19 @@ import contextlib
 
 import duckdb
 import pytest
-from qiita_common import feature_table as ft
 
-from qiita_control_plane.miint import connect_with_miint_staged
+from qiita_common import analytic as ft
+from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+
+
+def _miint_conn() -> duckdb.DuckDBPyConnection:
+    """An in-memory connection with miint LOADed from the extension directory the
+    conftest stages. LOAD-only, like every service-side connect: the INSTALL happens
+    once per session there, not once per test."""
+    conn = duckdb.connect(":memory:", config=miint_connect_config())
+    conn.execute(miint_load_sql())
+    return conn
+
 
 # ---------------------------------------------------------------------------
 # Fixture vocabulary. Contigs are `feature_idx`, genomes `genome_idx`.
@@ -109,16 +120,18 @@ def _stage(conn, *, alignment, mapping, lengths, threshold, gate=None):
     if gate is None:
         conn.execute(ft.alignment_table_sql("_align_projected"))
     else:
+        if gate.circular:
+            # A circular gate reads a length per feature, so the lengths stream is
+            # drained into the per-feature table and the roll-up below reads that —
+            # exactly what the client-side recipe does when both are wanted.
+            conn.execute(ft.feature_lengths_table_sql("_len_src"))
         conn.execute(ft.streamed_alignment_table_sql("_align_projected", gate=gate))
-        total, scorable, unpoolable, paired_rows = conn.execute(
-            ft.gate_diagnostics_sql(gate)
-        ).fetchone()
+        cursor = conn.execute(ft.gate_diagnostics_sql(gate))
+        names = [column[0] for column in cursor.description]
+        # By NAME, as both consumers do — a renamed count is a TypeError here rather
+        # than one number silently arriving as another's argument.
         clearance = ft.check_gate_diagnostics(
-            gate,
-            total_rows=total,
-            scorable_rows=scorable,
-            unpoolable_partitions=unpoolable,
-            paired_rows=paired_rows,
+            gate, **dict(zip(names, cursor.fetchone(), strict=True))
         )
         # The clearance carries the rest of the protocol in order — the gate and the
         # release of the streamed copy holding `cigar`.
@@ -126,6 +139,8 @@ def _stage(conn, *, alignment, mapping, lengths, threshold, gate=None):
             conn.execute(sql, params)
     conn.execute(ft.map_table_sql("_map_src"))
     if ft.coverage_filter_applies(threshold):
+        # `feature_lengths` is gone by now — the clearance releases it — so the roll-up
+        # reads the stream, as it does on every path that has no circular gate.
         conn.execute(ft.genome_lengths_table_sql("_len_src"))
 
 
@@ -150,7 +165,7 @@ def _table(
     """Run the whole analytic for `scope` at `threshold` and return the feature
     table, sorted — keyed by our own identifiers, as the server-side consumer leaves
     it."""
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(
             conn, scope, threshold, alignment=alignment, mapping=mapping, lengths=lengths, gate=gate
         )
@@ -215,7 +230,7 @@ def test_joining_the_wrong_scopes_survivor_set_is_a_bind_error():
     genome survived in, inflating its counts. This asserts the mismatch cannot get
     that far.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(conn, alignment=_ALIGNMENT, mapping=_MAP, lengths=_LENGTHS, threshold=0.01)
         conn.execute(ft.coverage_alignments_view_sql())
         conn.execute(ft.survivor_table_sql(ft.CoverageScope.PER_SAMPLE), [0.01])
@@ -310,7 +325,7 @@ def test_empty_and_populated_paths_agree_on_column_types():
     types; this is what checks the declaration against what woltka actually
     returns.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(conn, alignment=_ALIGNMENT, mapping=_MAP, lengths=_LENGTHS, threshold=0.0)
         conn.execute(ft.ogu_input_table_sql(survivor_scope=None))
 
@@ -502,7 +517,7 @@ def test_cigar_does_not_reach_the_gated_relation():
     """The wide column stops at the gate. Downstream reads `ALIGNMENT_TABLE`, which
     carries exactly `ALIGNMENT_COLUMNS` — so the coverage view and woltka's input
     never pay for it, and the streamed copy that held it is dropped."""
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(
             conn,
             alignment=[(1, 1, 10, 0, 0, 150, "150=", None)],
@@ -604,7 +619,7 @@ def test_the_analytic_releases_the_relations_it_finishes_with():
     relations in the pipeline, and they would otherwise live until the connection closes.
     """
     scope = ft.CoverageScope.POOLED
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(conn, scope, 0.01)
         surviving = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
         assert ft.OGU_INPUT_TABLE in surviving
@@ -638,6 +653,258 @@ def test_a_paired_gate_with_both_thresholds_scores_the_pooled_cigar():
         gate=ft.AlignmentGate(min_identity=0.5, min_query_coverage=0.95, paired=True),
     )
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# The circular gate, against real miint
+#
+# The fixture is one 30 kb contig (feature 10, genome 100) and a 6 kb read the
+# linearisation cut in two: `3000=3000S` ending where the contig does, `3000H3000=`
+# starting at its origin. Each record explains half the read; together they explain all
+# of it. `_INTERIOR_READ` is the same read placed away from the origin, in one record.
+# ---------------------------------------------------------------------------
+
+_CIRCULAR_LENGTHS = [(10, 30_000)]
+_CIRCULAR_MAP = [(10, 100)]
+_JUNCTION_READ = [
+    (1, 1, 10, 0, 27_000, 30_000, "3000=3000S", None),
+    (1, 1, 10, 2048, 0, 3_000, "3000H3000=", None),
+]
+_INTERIOR_READ = [(1, 2, 10, 0, 10_000, 16_000, "6000=", None)]
+
+
+def _gated_reads(alignment, *, gate) -> list[tuple]:
+    """The `(sequence_idx, position)` the gate left in `ALIGNMENT_TABLE`."""
+    with _miint_conn() as conn:
+        _stage(
+            conn,
+            alignment=alignment,
+            mapping=_CIRCULAR_MAP,
+            lengths=_CIRCULAR_LENGTHS,
+            threshold=0.0,
+            gate=gate,
+        )
+        return conn.execute(
+            f"SELECT sequence_idx, position FROM {ft.ALIGNMENT_TABLE} ORDER BY 1, 2"
+        ).fetchall()
+
+
+def test_the_circular_gate_keeps_the_split_read_a_per_record_gate_drops():
+    """The whole point of the mode, on one fixture: at the same 0.90 coverage floor, the
+    per-record gate discards both halves of the junction read — each explains 0.5 of it —
+    while the circular gate keeps both, because the read is fully explained by the
+    reference it came from. The interior read survives either way."""
+    per_record = ft.AlignmentGate(min_query_coverage=0.90, paired=True)
+    circular = ft.AlignmentGate(circular=True, circular_min_identity=None)
+    reads = _JUNCTION_READ + _INTERIOR_READ
+
+    assert _gated_reads(reads, gate=per_record) == [(2, 10_000)]
+    assert _gated_reads(reads, gate=circular) == [(1, 0), (1, 27_000), (2, 10_000)]
+
+
+def test_the_circular_gate_keeps_or_drops_a_read_whole():
+    """It judges the read, so every record of a cleared group survives and none of a
+    failing one does. Half a junction read is not a placement, and leaving one fragment
+    behind would count the read on evidence the gate rejected."""
+    half = [_JUNCTION_READ[0]]  # one 3 kb record of the 6 kb read: coverage 0.5
+    assert (
+        _gated_reads(half, gate=ft.AlignmentGate(circular=True, circular_min_identity=None)) == []
+    )
+
+
+def test_the_circular_gate_scores_identity_pooled_over_the_records():
+    """One mismatch in 6000 aligned columns clears 0.95 and even 0.999; a record scored
+    on its own would put the mismatch in a 3000-column denominator. The threshold is a
+    parameter, so this asserts the number that is actually compared, not just a side."""
+    with_mismatch = [
+        _JUNCTION_READ[0],
+        (1, 1, 10, 2048, 0, 3_000, "3000H2999=1X", None),
+    ]
+    kept = ft.AlignmentGate(circular=True, circular_min_identity=0.999)
+    dropped = ft.AlignmentGate(circular=True, circular_min_identity=0.9999)
+    assert _gated_reads(with_mismatch, gate=kept) == [(1, 0), (1, 27_000)]
+    assert _gated_reads(with_mismatch, gate=dropped) == []
+
+
+def test_the_circular_gate_drops_fragments_on_opposite_strands():
+    """Same coverage, same identity, not a wrap: an inverted repeat or a chimera the
+    aligner split. `NOT mixed_strand` is what separates them, and it is not a threshold
+    a caller can lower."""
+    inverted = [_JUNCTION_READ[0], (1, 1, 10, 2064, 0, 3_000, "3000=3000S", None)]
+    assert _gated_reads(inverted, gate=ft.AlignmentGate(circular=True)) == []
+
+
+def test_a_read_whose_records_disagree_about_the_cigar_encoding_is_refused():
+    """The diagnostic has to ask the question the gate asks. Pooled identity is NULL when
+    a read's records mix `M` with `=`/`X`, so that read is dropped WHOLE — including the
+    record that did score. Counted per record, three of these four rows are scorable and
+    nothing refuses; counted per read, one group has no identity and this raises.
+    """
+    mixed = [
+        (1, 1, 10, 0, 27_000, 30_000, "3000=3000S", None),
+        (1, 1, 10, 2048, 0, 3_000, "3000H3000=", None),
+        (1, 2, 10, 0, 20_000, 23_000, "3000=3000S", None),  # scorable on its own
+        (1, 2, 10, 2048, 10_000, 13_000, "3000H3000M", None),  # legacy M poisons the read
+    ]
+    with pytest.raises(ValueError, match="poolable sequence identity"):
+        _gated_reads(mixed, gate=ft.AlignmentGate(circular=True))
+
+    # Without the identity term there is nothing to be unscorable about, and both reads
+    # are judged on coverage and strand alone.
+    no_identity = ft.AlignmentGate(circular=True, circular_min_identity=None)
+    assert _gated_reads(mixed, gate=no_identity) == [
+        (1, 0),
+        (1, 27_000),
+        (2, 10_000),
+        (2, 20_000),
+    ]
+
+
+def test_the_circular_diagnostics_count_reads_not_records():
+    """The count the refusal above reads. One read scorable, one not — as READS; the
+    per-record count would say 3 of 4 rows can be scored and clear the slice."""
+    mixed = [
+        (1, 1, 10, 0, 27_000, 30_000, "3000=3000S", None),
+        (1, 1, 10, 2048, 0, 3_000, "3000H3000=", None),
+        (1, 2, 10, 0, 20_000, 23_000, "3000=3000S", None),
+        (1, 2, 10, 2048, 10_000, 13_000, "3000H3000M", None),
+    ]
+    gate = ft.AlignmentGate(circular=True)
+    with _miint_conn() as conn:
+        conn.execute(
+            "CREATE TABLE _src AS "
+            + _values(
+                mixed,
+                'prep_sample_idx, sequence_idx, feature_idx, flags, "position",'
+                " stop_position, cigar, mate_position",
+                "?::BIGINT, ?::BIGINT, ?::BIGINT, ?::USMALLINT, ?::BIGINT, ?::BIGINT,"
+                " ?::VARCHAR, ?::BIGINT",
+            ),
+            [x for r in mixed for x in r],
+        )
+        conn.execute(ft.streamed_alignment_table_sql("_src", gate=gate))
+        cursor = conn.execute(ft.gate_diagnostics_sql(gate))
+        row = dict(zip([c[0] for c in cursor.description], cursor.fetchone(), strict=True))
+    assert row["total_rows"] == 4
+    assert row["unscorable_groups"] == 1
+    # The per-record figure is not what this axis asks, so it is not reported at all.
+    assert row["scorable_rows"] is None
+
+
+def test_a_circular_gate_scores_a_secondary_on_its_own_cigar():
+    """`circular_query_coverage` never sees a secondary record, so the circular gate
+    judges it on the CIGAR axis instead of refusing the slice. A secondary is how a read
+    says it also placed elsewhere, which is what woltka splits a count across.
+
+    Both directions, on one fixture: the full-length secondary clears the same
+    thresholds on its own span and is kept; the clipped one explains a third of its read
+    and is dropped. Neither outcome is reachable through the pooled arm — the macro
+    emits no group for either.
+
+    Sequences 3 and 4 are secondary-ONLY groups, which is what makes this test cover the
+    diagnostics' `poolable > 0` filter as well: without it their pooled identity is NULL,
+    they count as unscorable groups, and the slice is refused before any of the above."""
+    full_length = (1, 3, 10, 256, 20_000, 26_000, "6000=", None)
+    clipped = (1, 4, 10, 256, 40_000, 42_000, "2000=4000S", None)
+    assert _gated_reads(
+        _INTERIOR_READ + [full_length, clipped], gate=ft.AlignmentGate(circular=True)
+    ) == [(2, 10_000), (3, 20_000)]
+
+
+def test_a_clearing_secondary_on_its_primarys_contig_is_kept_exactly_once():
+    """The case both arms could claim: a secondary sharing `(read, is_read1, reference)`
+    with a cleared primary, which also clears on its own CIGAR. Arm 1 would take it for
+    its primary's clearance and arm 2 for its own score, so the arms have to partition
+    the slice rather than merely both be correct. List equality, so a duplicate fails —
+    a read counted twice reaches coverage and woltka as two placements."""
+    same_key_and_clears = (1, 2, 10, 256, 20_000, 26_000, "6000=", None)
+    assert _gated_reads(
+        _INTERIOR_READ + [same_key_and_clears], gate=ft.AlignmentGate(circular=True)
+    ) == [(2, 10_000), (2, 20_000)]
+
+
+def test_a_secondary_that_is_also_unmapped_is_refused_not_scored():
+    """`SCORABLE_SECONDARY_ROW` promises a row the CIGAR axis can judge, and an unmapped
+    record is not one whatever its secondary bit says — there is no aligned span. The
+    fatal class wins, so the slice is refused rather than the row silently dropped."""
+    secondary_and_unmapped = (1, 3, 10, 0x104, None, None, "6000=", None)
+    with pytest.raises(ValueError, match="neither axis"):
+        _gated_reads(
+            _INTERIOR_READ + [secondary_and_unmapped], gate=ft.AlignmentGate(circular=True)
+        )
+
+
+def test_a_secondary_does_not_ride_in_on_its_primarys_clearance():
+    """The pooled arm keys on `(read, is_read1, reference)`, which a secondary placed
+    elsewhere on the SAME contig shares with its primary — a tandem repeat, a collapsed
+    element. Without an explicit exclusion it would be kept because its primary cleared,
+    never having been scored at all. Here the primary clears and the secondary's own
+    CIGAR explains a third of the read, so only the primary survives."""
+    same_read_same_contig = (1, 2, 10, 256, 30_000, 32_000, "2000=4000S", None)
+    assert _gated_reads(
+        _INTERIOR_READ + [same_read_same_contig], gate=ft.AlignmentGate(circular=True)
+    ) == [(2, 10_000)]
+
+
+def test_a_circular_gate_over_paired_data_is_refused():
+    """Mates are different molecules and the macro keeps them apart, so a circular gate
+    judges a placement's halves independently — the same orphaning the paired gate
+    exists to prevent. The refusal names the axis to use instead."""
+    with pytest.raises(ValueError, match="paired"):
+        _gated_reads(
+            [
+                (1, 1, 10, 99, 100, 250, "150=", 200),
+                (1, 1, 10, 147, 200, 350, "150=", 100),
+            ],
+            gate=ft.AlignmentGate(circular=True),
+        )
+
+
+def test_an_all_non_eqx_slice_is_refused_under_the_circular_gate_too():
+    """Pooled identity is NULL on a legacy-`M` CIGAR and `NULL >= threshold` drops the
+    row, so an identity term over such a slice would empty the table and look like a
+    result. Dropping the term is the documented way to gate that data on coverage."""
+    legacy = [
+        (1, 1, 10, 0, 27_000, 30_000, "3000M3000S", None),
+        (1, 1, 10, 2048, 0, 3_000, "3000H3000M", None),
+    ]
+    with pytest.raises(ValueError, match="eqx|identity"):
+        _gated_reads(legacy, gate=ft.AlignmentGate(circular=True))
+    assert _gated_reads(
+        legacy, gate=ft.AlignmentGate(circular=True, circular_min_identity=None)
+    ) == [
+        (1, 0),
+        (1, 27_000),
+    ]
+
+
+def test_the_circular_gate_releases_every_relation_it_staged():
+    """The two rename views and the per-feature lengths are the circular gate's own, and
+    the clearance is what lets go of them — on a client the lengths are a whole
+    reference's worth of rows held for one gate."""
+    with _miint_conn() as conn:
+        _stage(
+            conn,
+            alignment=_JUNCTION_READ,
+            mapping=_CIRCULAR_MAP,
+            lengths=_CIRCULAR_LENGTHS,
+            threshold=0.0,
+            gate=ft.AlignmentGate(circular=True),
+        )
+        live = {
+            name
+            for (name,) in conn.execute(
+                "SELECT table_name FROM duckdb_tables() "
+                "UNION ALL SELECT view_name FROM duckdb_views()"
+            ).fetchall()
+        }
+        for relation in (
+            ft.CIRCULAR_ALIGNMENTS_VIEW,
+            ft.FEATURE_TOPOLOGY_VIEW,
+            ft.FEATURE_LENGTHS_TABLE,
+            ft.STREAMED_ALIGNMENT_TABLE,
+        ):
+            assert relation not in live, relation
 
 
 # ---------------------------------------------------------------------------
@@ -719,7 +986,7 @@ def _public_table(
     which is what the client achieves by minting FROM the roll-up's own output; a test
     that wants the two to DISAGREE passes it explicitly.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(
             conn, scope, threshold, alignment=alignment, mapping=mapping, lengths=lengths, gate=gate
         )
@@ -751,7 +1018,7 @@ def test_no_internal_identifier_survives_into_the_public_table():
     that keeps `prep_sample_idx` and `genome_idx` out of a file somebody publishes,
     and the writers downstream inherit it from this table alone.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(conn, ft.CoverageScope.POOLED, 0.01)
         conn.execute(ft.ogu_output_table_sql(populated=populated))
         _stage_labels(conn, feature_handles=_feature_handles(_MAP), handles=_HANDLES)
@@ -839,7 +1106,7 @@ def test_an_empty_cohort_relabels_to_the_same_columns_and_types():
     short-circuit — and must still land in the public table with the same schema a
     populated cohort produces. This is the path a caller exercises least.
     """
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(conn, ft.CoverageScope.POOLED, 1.0)
         assert not populated
         conn.execute(ft.ogu_output_table_sql(populated=populated))
@@ -930,7 +1197,7 @@ def _shear(conn) -> ft.TreeClearance:
 def _labelled(*, mapping=_MAP, lengths=_LENGTHS, threshold=0.01):
     """A connection carrying everything the shear needs: the roll-up done, the labels
     minted from its own output, and the relabel run — the client's order exactly."""
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         populated = _ogu_input(
             conn, ft.CoverageScope.POOLED, threshold, mapping=mapping, lengths=lengths
         )
@@ -1111,7 +1378,7 @@ def test_the_rollup_report_counts_a_shared_features_alignment_row_once():
     shared_map = [*_MAP, (10, 500)]
     unmapped_row = (1, 7, 77, 0, 0, 100)
     alignment = [*_ALIGNMENT, unmapped_row]
-    with connect_with_miint_staged() as conn:
+    with _miint_conn() as conn:
         _stage(conn, alignment=alignment, mapping=shared_map, lengths=_LENGTHS, threshold=0.01)
         cursor = conn.execute(ft.rollup_coverage_diagnostics_sql())
         names = [d[0] for d in cursor.description]
@@ -1150,3 +1417,323 @@ def test_a_tip_shared_with_an_UNPUBLISHED_genome_still_shears_cleanly(tmp_path):
     assert "GCF_000000500" not in published, "G500 must be unpublished for this to test anything"
     assert clearance.tips == 3
     assert {name for _, name, _, _, _, is_tip in rows if is_tip} == published
+
+
+# ---------------------------------------------------------------------------
+# The combined (inverted open reference) table: two arms, one woltka pass.
+#
+# The fixture is built so that every rule the reconciliation depends on has a
+# fixture element only IT explains, and c50 carries three of them at once — it is
+# a reference sequence AND a contig both samples assembled, which is the whole
+# reason `feature_idx` being content-addressed is a hazard here.
+#
+#   reference   R100: c10          R200: c20          R300: c50
+#   de novo     Q900 (sample 1): c50, c51             Q901 (sample 2): c50, c52
+#
+# All five contigs are 1000 bp, so a genome's denominator is a count of contigs
+# and every proportion below is readable without arithmetic.
+# ---------------------------------------------------------------------------
+
+_R_MAP = [(10, 100), (20, 200), (50, 300)]
+_R_LENGTHS = [(10, 1000), (20, 1000), (50, 1000)]
+
+# (prep_sample_idx, feature_idx, genome_idx) — scoped to ONE assembly run.
+_D_MAP = [(1, 50, 900), (1, 51, 900), (2, 50, 901), (2, 52, 901)]
+# One stream per cohort sample, as the assembly read-back is scoped. c50 is in both.
+_D_LENGTHS = {1: [(50, 1000), (51, 1000)], 2: [(50, 1000), (52, 1000)]}
+
+_R_ALIGNMENT = [
+    # (prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position)
+    (1, 1, 10, 0, 0, 500),  # R100, only the reference arm places it
+    (1, 2, 20, 0, 0, 500),  # R200, the remainder case
+    (1, 3, 50, 0, 0, 500),  # R300 — superseded: read 3 is placed de novo too
+    (2, 4, 10, 0, 0, 500),  # R100 again, from the other sample
+]
+_D_ALIGNMENT = [
+    (1, 3, 50, 0, 0, 500),  # Q900, and the read that supersedes its reference row
+    (1, 5, 51, 0, 0, 500),  # Q900's second contig
+    (2, 6, 50, 0, 0, 500),  # Q901 — the SAME contig as read 3, in the other sample
+]
+
+
+def _stage_combined(
+    conn, *, threshold, denovo_map=_D_MAP, denovo_lengths=None, denovo_alignment=None
+):
+    """Stage both arms through the shared builders, in the order both drivers use.
+
+    Deliberately not a branch inside `_stage`: the reference-only path is what that
+    helper pins, and threading a second arm through it would let a change to the
+    combined path alter what every reference-only test above exercises.
+    """
+    denovo_lengths = _D_LENGTHS if denovo_lengths is None else denovo_lengths
+    conn.execute(
+        "CREATE TABLE _r_map AS "
+        + _values(_R_MAP, "feature_idx, genome_idx", "?::BIGINT, ?::BIGINT"),
+        [x for r in _R_MAP for x in r],
+    )
+    conn.execute(
+        "CREATE TABLE _d_map AS "
+        + _values(
+            denovo_map,
+            "prep_sample_idx, feature_idx, genome_idx",
+            "?::BIGINT, ?::BIGINT, ?::BIGINT",
+        ),
+        [x for r in denovo_map for x in r],
+    )
+    conn.execute(
+        "CREATE TABLE _r_len AS "
+        + _values(_R_LENGTHS, "feature_idx, sequence_length_bp", "?::BIGINT, ?::BIGINT"),
+        [x for r in _R_LENGTHS for x in r],
+    )
+    conn.execute(ft.map_table_sql("_r_map"))
+    conn.execute(ft.denovo_map_table_sql("_d_map"))
+
+    if ft.coverage_filter_applies(threshold):
+        conn.execute(ft.genome_lengths_table_sql("_r_len"))
+        conn.execute(ft.denovo_contig_lengths_table_sql())
+        # One INSERT per cohort sample, which is what the per-run assembly DoGet
+        # forces and what the dedupe in the roll-up exists to survive.
+        for sample, rows in sorted(denovo_lengths.items()):
+            conn.execute(
+                f"CREATE OR REPLACE TABLE _d_len_{sample} AS "
+                + _values(rows, "feature_idx, sequence_length_bp", "?::BIGINT, ?::BIGINT"),
+                [x for r in rows for x in r],
+            )
+            conn.execute(ft.denovo_contig_lengths_insert_sql(f"_d_len_{sample}"))
+        conn.execute(ft.denovo_genome_lengths_insert_sql())
+
+    denovo_rows = _D_ALIGNMENT if denovo_alignment is None else denovo_alignment
+    for name, rows in (("_r_align", _R_ALIGNMENT), ("_d_align", denovo_rows)):
+        conn.execute(
+            f"CREATE TABLE {name} AS "
+            + _values(
+                rows,
+                'prep_sample_idx, sequence_idx, feature_idx, flags, "position", stop_position',
+                "?::BIGINT, ?::BIGINT, ?::BIGINT, ?::USMALLINT, ?::BIGINT, ?::BIGINT",
+            ),
+            [x for r in rows for x in r],
+        )
+    conn.execute(ft.alignment_table_sql("_r_align"))
+    for sql in ft.denovo_alignment_statements("_d_align"):
+        conn.execute(sql)
+
+
+def _combined_table(
+    scope=ft.CoverageScope.POOLED,
+    threshold=0.01,
+    *,
+    denovo_map=_D_MAP,
+    denovo_lengths=None,
+    denovo_alignment=None,
+) -> list[tuple]:
+    """The whole combined analytic, sorted. Same shape as `_table`, one arm wider."""
+    with _miint_conn() as conn:
+        _stage_combined(
+            conn,
+            threshold=threshold,
+            denovo_map=denovo_map,
+            denovo_lengths=denovo_lengths,
+            denovo_alignment=denovo_alignment,
+        )
+        for sql, parameters in ft.ogu_input_statements(
+            scope=scope, coverage_threshold=threshold, combined=True
+        ):
+            conn.execute(sql, parameters)
+        populated = conn.execute(ft.ogu_input_count_sql()).fetchone()[0] > 0
+        select = ft.woltka_ogu_select_sql() if populated else ft.empty_ogu_select_sql()
+        return conn.execute(f"SELECT * FROM ({select}) ORDER BY 1, 2").fetchall()
+
+
+def _reference_only_table(threshold=0.01) -> list[tuple]:
+    """The same reference arm with no de novo arm at all — the control every
+    assertion about the combined table is read against."""
+    return _table(
+        ft.CoverageScope.POOLED,
+        threshold,
+        alignment=_R_ALIGNMENT,
+        mapping=_R_MAP,
+        lengths=_R_LENGTHS,
+    )
+
+
+def test_combined_table_places_each_read_on_exactly_one_arm():
+    """The whole reconciliation in one assertion, and every row of it is a rule:
+
+    * read 3 is placed by BOTH arms and lands only on the de novo side (Q900),
+      contributing 1.0 there and nothing to R300 — precedence;
+    * read 2 is placed only by the reference arm and stays there — the remainder;
+    * reads 3 and 6 are on the SAME contig c50 in different samples, and each is
+      whole against its own sample's genome rather than split across both;
+    * R300 is gone: c50 was its only aligned contig and precedence took its only
+      read, so a genome that survives the reference-only control drops out here.
+    """
+    assert _combined_table() == [
+        (1, 100, 1.0),  # read 1
+        (1, 200, 1.0),  # read 2 — the remainder
+        (1, 900, 2.0),  # reads 3 and 5, both whole
+        (2, 100, 1.0),  # read 4
+        (2, 901, 1.0),  # read 6, whole against ITS sample's genome
+    ]
+
+
+def test_the_reference_only_control_keeps_the_genome_the_combined_table_drops():
+    """R300 clears the threshold on the same cohort when there is no de novo arm to
+    take its read. Without this the row missing above is not evidence of precedence
+    — it is indistinguishable from a fixture that never covered R300."""
+    assert _reference_only_table() == [
+        (1, 100, 1.0),
+        (1, 200, 1.0),
+        (1, 300, 1.0),  # read 3, which the combined table gives to Q900 instead
+        (2, 100, 1.0),
+    ]
+
+
+@pytest.mark.parametrize("denovo_map", [_D_MAP, [row for row in _D_MAP if row[:2] != (1, 50)]])
+def test_no_read_is_lost_by_the_reconciliation(denovo_map):
+    """Conservation: every read that reached either arm is still counted, so the
+    table's values sum to the number of distinct reads staged.
+
+    Only the losing direction — a read counted twice cannot show up here, because
+    woltka normalizes a read across the genomes it sees and 0.5 + 0.5 is also 1.0.
+    Precedence's failure to the OTHER side is what
+    `test_combined_table_places_each_read_on_exactly_one_arm` reads.
+
+    The second parameter is the case that makes this discriminate at all: with no
+    genome for c50 in sample 1, a DELETE that superseded on the raw de novo slice
+    rather than through the map would take read 3's reference placement away without
+    giving it a de novo one, and the sum would come back 5.
+    """
+    staged = {row[1] for row in _R_ALIGNMENT} | {row[1] for row in _D_ALIGNMENT}
+    table = _combined_table(denovo_map=denovo_map)
+    assert sum(value for _, _, value in table) == pytest.approx(len(staged))
+
+
+def test_a_contig_two_samples_assembled_is_not_credited_across_them():
+    """c50 is one content-addressed `feature_idx` under Q900 and Q901, so the de novo
+    map holds two rows for it. Joined on the contig alone both match every read on
+    c50, and woltka splits each across the two genomes — 0.5 to the sample that did
+    not produce the read. The join carries `prep_sample_idx` for exactly this.
+
+    Asserted as whole numbers rather than a shape, because the failure is a plausible
+    half rather than an error.
+    """
+    values = {(sample, genome): value for sample, genome, value in _combined_table()}
+    assert values[(1, 900)] == 2.0
+    assert values[(2, 901)] == 1.0
+    assert (1, 901) not in values and (2, 900) not in values
+
+
+def test_a_contig_two_samples_assembled_is_counted_once_in_each_denominator():
+    """c50 arrives on both samples' length streams, so the roll-up sees it twice.
+    Deduplicated, Q901 is 2000 bp and its one 500 bp read is 25% of it; summed raw it
+    is 3000 bp and the same read is 16.7%, so a threshold between the two is what
+    tells the fix from a coincidence.
+
+    Q900 is the control: at 33% undeduplicated it clears 20% either way, so a failure
+    here is specifically the denominator and not the threshold.
+    """
+    assert _combined_table(threshold=0.20) == [
+        (1, 100, 1.0),
+        (1, 200, 1.0),
+        (1, 900, 2.0),
+        (2, 100, 1.0),
+        (2, 901, 1.0),  # 500/2000 = 25% — present only if c50 was counted once
+    ]
+
+
+def test_a_de_novo_placement_with_no_genome_leaves_the_read_to_the_reference_arm():
+    """Precedence is over rollable placements: the DELETE reads the de novo slice
+    THROUGH the map, so a run whose membership carries no genome for a contig falls
+    back to that read's reference placement instead of dropping it from both arms.
+
+    Dropping Q900's c50 row from the map removes read 3 from the de novo arm; it must
+    reappear on R300, which the reference-only control shows is where it would have
+    been all along.
+    """
+    without_c50 = [row for row in _D_MAP if row[:2] != (1, 50)]
+    values = {(s, g): v for s, g, v in _combined_table(denovo_map=without_c50)}
+    assert values[(1, 300)] == 1.0, "read 3 falls back to its reference placement"
+    assert values[(1, 900)] == 1.0, "only read 5 is left on Q900"
+
+
+def test_per_sample_scope_reaches_both_arms():
+    """The per-sample survivor set is built from two hand-rolled branches in one
+    statement, where pooled has the macro on one side; this is the shape that would
+    fail to parse or bind rather than answer wrongly. Every genome here clears 1% in
+    the sample that carries it, so the table is the pooled one.
+    """
+    assert _combined_table(scope=ft.CoverageScope.PER_SAMPLE) == _combined_table()
+
+
+def test_an_unfiltered_combined_table_still_reconciles():
+    """At threshold 0 there is no survivor set, no coverage view and no lengths at
+    all — so precedence is the only thing left standing between the two arms, and it
+    still has to hold. R300 keeps its zero rows; Q900 keeps read 3.
+    """
+    values = {(s, g): v for s, g, v in _combined_table(threshold=0.0)}
+    assert (1, 300) not in values
+    assert values[(1, 900)] == 2.0
+
+
+def test_a_read_the_denovo_arm_won_can_fall_out_of_the_table_entirely():
+    """The third consequence of precedence, and the one most easily misread as a
+    result: precedence runs at staging, the breadth filter runs after it, and both
+    arms inner-join the survivor set. So a read the de novo arm won, on a qiita
+    genome that then fails `coverage_threshold`, is gone from the de novo arm by the
+    filter and from the reference arm by precedence.
+
+    Q900's contigs are inflated to 100 kb here so 1000 covered bases is 1%, under the
+    2% threshold. Read 3 was ALSO placed on R300 by the reference arm, and R300
+    survives on sample 2's own read — so the read's reference home is still in the
+    table and it still is not counted there.
+    """
+    fat = {1: [(50, 50_000), (51, 50_000)], 2: [(50, 1000), (52, 1000)]}
+    extra_reference = [*_R_ALIGNMENT, (2, 7, 50, 0, 0, 900)]
+    with _miint_conn() as conn:
+        _stage_combined(conn, threshold=0.02, denovo_lengths=fat)
+        # The reference arm keeps a second read on c50 so R300 clears the threshold
+        # on its own; without it R300's absence would be ambiguous.
+        conn.execute(
+            "INSERT INTO alignment_slice "
+            + _values(
+                [(2, 7, 50, 0, 0, 900)],
+                'prep_sample_idx, sequence_idx, feature_idx, flags, "position", stop_position',
+                "?::BIGINT, ?::BIGINT, ?::BIGINT, ?::USMALLINT, ?::BIGINT, ?::BIGINT",
+            ),
+            [2, 7, 50, 0, 0, 900],
+        )
+        for sql, parameters in ft.ogu_input_statements(
+            scope=ft.CoverageScope.POOLED, coverage_threshold=0.02, combined=True
+        ):
+            conn.execute(sql, parameters)
+        populated = conn.execute(ft.ogu_input_count_sql()).fetchone()[0] > 0
+        select = ft.woltka_ogu_select_sql() if populated else ft.empty_ogu_select_sql()
+        rows = conn.execute(f"SELECT * FROM ({select}) ORDER BY 1, 2").fetchall()
+
+    values = {(s, g): v for s, g, v in rows}
+    assert (1, 900) not in values, "Q900 failed the breadth filter"
+    assert (1, 300) not in values, "and precedence had already taken read 3 off R300"
+    assert (2, 300) in values, (
+        "R300 survives on the read the de novo arm never touched — without this the "
+        "row above is just a genome nothing covered"
+    )
+    staged = {row[1] for row in extra_reference} | {row[1] for row in _D_ALIGNMENT}
+    assert sum(values.values()) < len(staged), (
+        "so the table counts fewer reads than were staged — the documented consequence"
+    )
+
+
+def test_several_rows_of_one_read_within_an_arm_still_count_once():
+    """`reconcile`'s module docstring makes "what is counted is unchanged by any of
+    this" load-bearing for the whole precedence design, and nothing exercised the
+    de novo arm's half of it.
+
+    Read 5 gets a secondary placement on the same contig — two rows, one genome. It
+    must contribute what one read contributes, not two: `woltka_ogu` splits across
+    DISTINCT `reference` values, and both rows share one. (This says nothing about
+    the arms' UNION ALL: within-arm multiplicity flows through one side of it either
+    way.)
+    """
+    with_secondary = [*_D_ALIGNMENT, (1, 5, 51, 256, 100, 600)]
+    values = {(s, g): v for s, g, v in _combined_table(denovo_alignment=with_secondary)}
+    assert values[(1, 900)] == 2.0, "reads 3 and 5, the secondary adding nothing"

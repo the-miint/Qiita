@@ -26,12 +26,14 @@ import asyncio
 
 import duckdb
 import pytest
+from helpers import write_chunked_blob_upload
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES, WorkTicketState
 
 import qiita_compute_orchestrator.jobs.bam_to_parquet as bam_module
 from qiita_compute_orchestrator import sequence_range_retry
 from qiita_compute_orchestrator.jobs.bam_to_parquet import YAML_STEP_NAME, Inputs, execute
+from qiita_compute_orchestrator.miint import open_miint_conn
 from qiita_compute_orchestrator.sequence_range import (
     MintedSequenceRange,
     SequenceRangeAlreadyExists,
@@ -122,6 +124,55 @@ def test_execute_writes_read_parquet(fake_mint, tmp_path):
         (42, 1000, "r1", "ACGT", [40, 40, 40, 40], None, None),
         (42, 1001, "r2", "TTTT", [30, 30, 30, 30], None, None),
     ]
+
+
+def test_execute_reads_an_uploaded_sam(fake_mint, tmp_path):
+    """The user route: `bam_path` is bound to a chunked-BLOB upload rather than
+    to an alignment file, because the runner resolved a `bam_upload_idx` handle.
+    The step stitches it back — as `.sam` here, since the payload is not
+    compressed — and produces the rows the host-path route does."""
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+    upload = write_chunked_blob_upload(tmp_path / "upload.parquet", sam.read_bytes())
+
+    outputs = _run(
+        Inputs(bam_path=upload, prep_sample_idx=42, work_ticket_idx=1),
+        tmp_path / "ws",
+    )
+
+    assert fake_mint == [(42, 2)]
+    assert _read_parquet(tmp_path / "ws" / "read") == [
+        (42, 1000, "r1", "ACGT", [40, 40, 40, 40], None, None),
+        (42, 1001, "r2", "TTTT", [30, 30, 30, 30], None, None),
+    ]
+    # Which suffix the stitch picks is pinned in tests/jobs/test_blob_input.py;
+    # here the point is that neither spelling survives into the outputs.
+    assert not list((tmp_path / "ws").glob("reads.*"))
+    assert outputs["read_staging_dir"] == tmp_path / "ws"
+
+
+def test_execute_reads_an_uploaded_bam(fake_mint, tmp_path):
+    """A real BAM through the same route. The payload is BGZF, so the stitched
+    file is named `.bam` — hand the binary container to the reader under a
+    `.sam` name and it parses nothing."""
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+    bam = tmp_path / "in.bam"
+    with open_miint_conn() as conn:
+        # UBAM, not BAM: this loader takes unaligned basecaller uBAMs, and
+        # `FORMAT BAM` requires REFERENCE_LENGTHS, which an unaligned file has
+        # no references to supply.
+        conn.execute(f"COPY (SELECT * FROM read_sequences_sam('{sam}')) TO '{bam}' (FORMAT UBAM)")
+    upload = write_chunked_blob_upload(tmp_path / "upload.parquet", bam.read_bytes())
+
+    _run(Inputs(bam_path=upload, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert fake_mint == [(42, 2)]
+    assert [r[2] for r in _read_parquet(tmp_path / "ws" / "read")] == ["r1", "r2"]
+    # The stitched upload is an input the step materialized, not an output: the
+    # launcher's manifest walker rglobs this workspace, so leaving it here would
+    # publish the submitter's whole BAM as a job result.
+    assert not (tmp_path / "ws" / "reads.bam").exists()
 
 
 def test_header_only_sam_raises_stepnodata(fake_mint, tmp_path):

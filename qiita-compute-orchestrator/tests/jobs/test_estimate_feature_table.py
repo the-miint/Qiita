@@ -32,7 +32,7 @@ from pathlib import Path
 import duckdb
 import pyarrow.parquet as pq
 import pytest
-from qiita_common import feature_table
+from qiita_common import analytic
 
 # ---------------------------------------------------------------------------
 # Parquet writers (correctly-typed to mirror the real DuckLake / resolver output)
@@ -199,7 +199,7 @@ def test_execute_streams_scopes_writes_and_schema(tmp_path, monkeypatch):
 
     assert captured["work_ticket_idx"] == 42
     assert captured["reference_idx"] == 7
-    assert captured["columns"] == list(feature_table.ALIGNMENT_COLUMNS)
+    assert captured["columns"] == list(analytic.ALIGNMENT_COLUMNS)
 
     out_path = out["ogu_table"]
     assert out_path == tmp_path / "ws" / "ogu_table.parquet"
@@ -382,7 +382,7 @@ def test_partial_output_removed_on_failure(tmp_path, monkeypatch):
     map_pq = _write_map_parquet(tmp_path / "map.parquet", [(20, 200)])
     _install_fakes(m, monkeypatch, alignment_parquet=align_pq, lengths_parquet=lengths_pq)
 
-    def boom(conn, *, coverage_threshold, out_path):
+    def boom(conn, *, coverage_threshold, out_path, combined):
         out_path.write_bytes(b"partial")  # a half-written COPY output
         raise RuntimeError("compute blew up")
 
@@ -515,7 +515,265 @@ def test_job_asks_for_exactly_the_columns_it_binds(tmp_path, monkeypatch):
         threshold=0.01,
     )
 
-    assert captured["columns"] == list(feature_table.ALIGNMENT_COLUMNS)
+    assert captured["columns"] == list(analytic.ALIGNMENT_COLUMNS)
     # This recipe never reads `cigar`, and leaving it out is most of what the
     # projection buys — the one regression a future edit is likeliest to add.
     assert "cigar" not in captured["columns"]
+
+
+# ---------------------------------------------------------------------------
+# The combined (inverted open reference) path: two arms, one woltka pass.
+#
+# What is pinned HERE is this driver's WIRING — that both arms' inputs are fetched
+# with the right scope and handed to the shared analytic in the right order, and
+# that absent a de novo map nothing about the reference-only job changes. The
+# analytic's own rules (precedence, the sample-keyed map join, the length dedupe)
+# are pinned against real miint in
+# `qiita-common/tests/analytic/test_behaviour_miint.py`; re-asserting them here
+# would be a second copy that drifts.
+# ---------------------------------------------------------------------------
+
+
+def _write_denovo_map_parquet(path: Path, rows: list[tuple[int, int, int]]) -> Path:
+    """The resolver-staged de novo map: (prep_sample_idx, feature_idx, genome_idx),
+    as `export_assembly_member_genome` writes it — three columns, because the sample
+    is part of the join key on this arm."""
+    with duckdb.connect(":memory:") as conn:
+        values = ", ".join(
+            "(CAST(? AS BIGINT), CAST(? AS BIGINT), CAST(? AS BIGINT))" for _ in rows
+        )
+        conn.execute(
+            f"COPY (SELECT * FROM (VALUES {values}) "
+            f"AS t(prep_sample_idx, feature_idx, genome_idx)) TO '{path}' (FORMAT PARQUET)",
+            [x for r in rows for x in r],
+        )
+    return path
+
+
+def _fake_two_arm_alignment_stream(reference_parquet: Path, denovo_parquet: Path, captured: dict):
+    """The alignment seam for a combined run: ONE mint route, asked twice, with the
+    `denovo` flag picking the arm.
+
+    Records the flags in call order, so a driver that minted the reference arm twice
+    — the mistake the CP's own 422 exists to prevent — surfaces as `[False, False]`
+    rather than as a table that merely looks small.
+    """
+
+    @asynccontextmanager
+    async def fake(conn, *, work_ticket_idx, columns, relation="alignment", denovo=False):
+        captured.setdefault("arms", []).append(denovo)
+        captured["work_ticket_idx"] = work_ticket_idx
+        table = pq.read_table(str(denovo_parquet if denovo else reference_parquet))
+        conn.register(relation, table.select(list(columns)).to_reader())
+        try:
+            yield relation
+        finally:
+            conn.unregister(relation)
+
+    return fake
+
+
+def _fake_assembled_sequence_stream(per_sample: dict[int, Path], captured: dict):
+    """The de novo lengths seam: run-scoped, so ONE call per cohort sample.
+
+    Records which samples it was asked for, which is the property that matters here
+    — the job derives that list from the staged map rather than from a second input,
+    so a sample the map never named must not be asked for at all (the data plane
+    would 404 on a run that legitimately produced nothing).
+    """
+
+    @asynccontextmanager
+    async def fake(conn, *, prep_sample_idx, processing_idx, relation="assembled_lengths"):
+        captured.setdefault("lengths_samples", []).append(prep_sample_idx)
+        captured["lengths_processing_idx"] = processing_idx
+        conn.register(relation, pq.read_table(str(per_sample[prep_sample_idx])).to_reader())
+        try:
+            yield relation
+        finally:
+            conn.unregister(relation)
+
+    return fake
+
+
+def _run_combined(m, *, tmp_path, monkeypatch, threshold=0.01, denovo_map=None):
+    """Run `execute` over a two-arm fixture and return (output_map, captured).
+
+    Contig 50 is BOTH a reference sequence of genome 300 and a contig each sample
+    assembled — the shared-feature case the content-addressed `feature_idx` creates,
+    and the one that makes the arms' maps disagree about which genome it belongs to.
+    Read 3 is placed by both arms; read 6 is sample 2's own placement on the same
+    contig.
+    """
+    reference_pq = _write_alignment_parquet(
+        tmp_path / "ref_align.parquet",
+        [
+            (1, 1, 10, 0, 0, 500),
+            (1, 3, 50, 0, 0, 500),
+            (2, 4, 10, 0, 0, 500),
+        ],
+    )
+    denovo_pq = _write_alignment_parquet(
+        tmp_path / "dn_align.parquet",
+        [(1, 3, 50, 0, 0, 500), (2, 6, 50, 0, 0, 500)],
+    )
+    ref_lengths_pq = _write_lengths_parquet(tmp_path / "ref_len.parquet", [(10, 1000), (50, 1000)])
+    map_pq = _write_map_parquet(tmp_path / "map.parquet", [(10, 100), (50, 300)])
+    denovo_map_pq = _write_denovo_map_parquet(
+        tmp_path / "dn_map.parquet",
+        [(1, 50, 900), (2, 50, 901)] if denovo_map is None else denovo_map,
+    )
+    # Contig 50 is on BOTH samples' length streams — one content-addressed feature,
+    # streamed once per sample, which is what the roll-up's dedupe exists for.
+    per_sample = {
+        1: _write_lengths_parquet(tmp_path / "dn_len_1.parquet", [(50, 1000)]),
+        2: _write_lengths_parquet(tmp_path / "dn_len_2.parquet", [(50, 1000)]),
+    }
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        m,
+        "open_alignment_stream",
+        _fake_two_arm_alignment_stream(reference_pq, denovo_pq, captured),
+    )
+    monkeypatch.setattr(
+        m, "open_reference_sequences_stream", _fake_lengths_stream(ref_lengths_pq, captured)
+    )
+    monkeypatch.setattr(
+        m, "open_assembled_sequence_stream", _fake_assembled_sequence_stream(per_sample, captured)
+    )
+    inputs = m.Inputs(
+        reference_idx=7,
+        work_ticket_idx=42,
+        coverage_threshold=threshold,
+        genome_map_path=map_pq,
+        denovo_genome_map_path=denovo_map_pq,
+        denovo_processing_idx=11,
+    )
+    out = asyncio.run(m.execute(inputs, tmp_path / "ws"))
+    return out, captured
+
+
+def test_combined_run_mints_both_arms_and_counts_each_read_once(tmp_path, monkeypatch):
+    """The driver's whole job in one assertion. Read 3 is placed by both arms and
+    lands on the de novo side; reads 1 and 4 are reference-only remainders; read 6 is
+    sample 2's own. Genome 300 is absent — contig 50 was its only aligned contig and
+    precedence took its only read.
+
+    The counts themselves come from the shared analytic, so what this pins is that
+    the job fed it two arms rather than one twice.
+    """
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    out, captured = _run_combined(m, tmp_path=tmp_path, monkeypatch=monkeypatch)
+    assert captured["arms"] == [False, True], "the reference arm first, then the de novo one"
+    assert _read_ogu(out["ogu_table"]) == [
+        (1, 100, 1.0),  # read 1
+        (1, 900, 1.0),  # read 3, won from the reference arm
+        (2, 100, 1.0),  # read 4
+        (2, 901, 1.0),  # read 6, against ITS sample's genome
+    ]
+
+
+def test_combined_run_reads_lengths_only_for_the_samples_the_map_named(tmp_path, monkeypatch):
+    """The cohort for the lengths comes from the STAGED MAP, not from a second
+    input. A sample that assembled nothing is absent from the map, and asking the
+    data plane for its contigs would 404 on a run that legitimately produced none —
+    so the map is the only list, read at the run the resolver derived.
+    """
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    _out, captured = _run_combined(
+        m, tmp_path=tmp_path, monkeypatch=monkeypatch, denovo_map=[(1, 50, 900)]
+    )
+    assert captured["lengths_samples"] == [1], "sample 2 is not in the map, so it is not asked for"
+    assert captured["lengths_processing_idx"] == 11
+
+
+def test_a_zero_threshold_skips_both_arms_lengths(tmp_path, monkeypatch):
+    """The lengths feed only the coverage calc, on both arms alike. At 0 there is no
+    survivor set to build, so neither stream is opened — and precedence still has to
+    hold without them, being the only thing left standing between the arms."""
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    out, captured = _run_combined(m, tmp_path=tmp_path, monkeypatch=monkeypatch, threshold=0.0)
+    assert "reference_idx" not in captured, "the reference lengths stream stayed shut"
+    assert "lengths_samples" not in captured, "and so did every de novo one"
+    values = {(s, g): v for s, g, v in _read_ogu(out["ogu_table"])}
+    assert (1, 300) not in values, "read 3 still went to the de novo arm"
+    assert values[(1, 900)] == 1.0
+
+
+def test_a_reference_only_run_asks_for_no_denovo_arm(tmp_path, monkeypatch):
+    """The control. Without `denovo_genome_map_path` the job mints ONE alignment
+    ticket, on the reference arm, and never reaches the assembly seam — so a
+    reference-only ticket is dispatched exactly as it was before the arm existed."""
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    captured: dict = {}
+    align_pq = _write_alignment_parquet(tmp_path / "alignment.parquet", [(1, 1, 10, 0, 0, 500)])
+    lengths_pq = _write_lengths_parquet(tmp_path / "lengths.parquet", [(10, 1000)])
+    map_pq = _write_map_parquet(tmp_path / "map.parquet", [(10, 100)])
+    monkeypatch.setattr(
+        m, "open_alignment_stream", _fake_two_arm_alignment_stream(align_pq, align_pq, captured)
+    )
+    monkeypatch.setattr(
+        m, "open_reference_sequences_stream", _fake_lengths_stream(lengths_pq, captured)
+    )
+    monkeypatch.setattr(
+        m, "open_assembled_sequence_stream", _fake_assembled_sequence_stream({}, captured)
+    )
+    out = asyncio.run(
+        m.execute(
+            m.Inputs(
+                reference_idx=7,
+                work_ticket_idx=42,
+                coverage_threshold=0.01,
+                genome_map_path=map_pq,
+            ),
+            tmp_path / "ws",
+        )
+    )
+    assert captured["arms"] == [False]
+    assert "lengths_samples" not in captured
+    assert _read_ogu(out["ogu_table"]) == [(1, 100, 1.0)]
+
+
+@pytest.mark.parametrize("threshold", [0.01, 0.0])
+def test_a_denovo_map_without_its_run_fails_loudly(tmp_path, monkeypatch, threshold):
+    """The two de novo fields are separately optional on the wire but are one fact —
+    the resolver binds both or neither. Skipping the lengths instead of raising does
+    not fail either: it leaves every qiita genome with no denominator, drops them all
+    at the coverage filter, and returns a reference-only table under the combined
+    name.
+
+    Parametrized over the threshold because the check's one USE is behind the
+    coverage-filter branch: at 0 the lengths are never staged, so a guard placed at
+    that use would let the broken binding through in exactly the case that needs no
+    lengths — and still produce a table.
+    """
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    align_pq = _write_alignment_parquet(tmp_path / "alignment.parquet", [(1, 1, 10, 0, 0, 500)])
+    lengths_pq = _write_lengths_parquet(tmp_path / "lengths.parquet", [(10, 1000)])
+    map_pq = _write_map_parquet(tmp_path / "map.parquet", [(10, 100)])
+    denovo_map_pq = _write_denovo_map_parquet(tmp_path / "dn_map.parquet", [(1, 50, 900)])
+    captured: dict = {}
+    monkeypatch.setattr(
+        m, "open_alignment_stream", _fake_two_arm_alignment_stream(align_pq, align_pq, captured)
+    )
+    monkeypatch.setattr(
+        m, "open_reference_sequences_stream", _fake_lengths_stream(lengths_pq, captured)
+    )
+    with pytest.raises(ValueError, match="denovo_processing_idx"):
+        asyncio.run(
+            m.execute(
+                m.Inputs(
+                    reference_idx=7,
+                    work_ticket_idx=42,
+                    coverage_threshold=threshold,
+                    genome_map_path=map_pq,
+                    denovo_genome_map_path=denovo_map_pq,
+                ),
+                tmp_path / "ws",
+            )
+        )
