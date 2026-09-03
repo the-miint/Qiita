@@ -4,8 +4,7 @@ Each verb is one GET, so what these lock in is the wiring: the path each verb
 dials, that optional filters travel as query params only when supplied, and that
 the required flags are enforced by argparse rather than by the server.
 
-The mask twin is `test_user_mask_cli.py`; these cover the second identity an
-`align-denovo` submission names.
+The mask twin is `test_user_mask_cli.py`.
 """
 
 import pytest

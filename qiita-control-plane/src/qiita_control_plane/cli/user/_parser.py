@@ -763,8 +763,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_mask_samples.set_defaults(handler=_handle_mask_samples)
 
-    # `processing list` / `show` / `samples` — the mask twin, at the other identity
-    # an `align-denovo` submission names. See `cli/user/processing.py`.
+    # `processing list` / `show` / `samples` — the mask twin. See
+    # `cli/user/processing.py` for which identity these discover and why.
     p_processing = sub.add_parser("processing", help="Assembly-run discovery (read-only)")
     p_processing_sub = p_processing.add_subparsers(dest="processing_cmd", required=True)
     p_processing_list = p_processing_sub.add_parser(

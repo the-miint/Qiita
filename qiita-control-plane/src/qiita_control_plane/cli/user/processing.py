@@ -13,7 +13,7 @@ The mask twin of this module is `cli/user/mask.py`: the two surfaces answer the
 same shape of question at the two identities an `align-denovo` submission names.
 
 Thin clients: each verb is one GET, printed verbatim, so a new server-side field
-reaches the operator without a CLI change.
+reaches the user without a CLI change.
 """
 
 import argparse
