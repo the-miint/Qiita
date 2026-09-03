@@ -731,6 +731,23 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   depend on, and the Postgres and DuckLake `assembly_membership` comments name it instead of
   enumerating members (a comment-only migration).
 
+- **A getting-started runbook for bringing a run in (#461).** `docs/runbooks/getting-started.md`
+  walks the path the bundled ingest gestures actually require: create the study with a
+  `bioproject_accession`, create its biosamples with `biosample_accession`s, build the
+  kl-run-preflight file outside Qiita naming both, then `submit-bcl-convert` or
+  `submit-pacbio-ingest`. That order is forced: `_provision_run_pool_roster` resolves every
+  pre-flight row against existing Qiita rows keyed on those two accessions and exits without
+  side effects when either lookup misses, so a study minted without an accession cannot be
+  reached from a sheet at all. No runbook stated that prerequisite. The runbook also
+  generalizes the pre-flight pre-patching trap that was filed under PacBio: pool identity
+  is the SHA-256 of the blob's bytes and both gestures read those bytes before `open_db_file`
+  patches the file in place, so an unpatched submit followed by a re-run sends different bytes
+  under the same filename and is refused by `sequenced_pool_one_per_run_and_filename` — the
+  retry does not converge, on either platform. That 409 tells the caller to rename the
+  pre-flight, which is right for the case it was written for (two distinct pools colliding on
+  a name) and wrong for this one, where renaming mints the second pool the caller was trying
+  to avoid; the runbook says so.
+
 - **A published feature table's rows can now be labelled without our identifiers (#448).**
   `POST /exported-feature` mints the public handle for a feature-axis entity, the way
   `/exported-identifier` already does for the sample axis — so a table, its taxonomy sidecar
@@ -2137,6 +2154,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   unmoved. One happy-path fixture is no longer a reverse-complement palindrome, so its
   `_hash` comparison exercises the fold instead of the identity.
 
+- **`submit-bcl-convert --help` named a pre-flight column that does not exist (#461).** The
+  `--prep-protocol-idx` help told operators the per-row `study_idx` "comes out of the file"
+  via `project.qiita_id`. The pinned kl-run-preflight schema has no such column; the study is
+  resolved from `project.bioproject_accession` through `/study/lookup-by-accession`. The help
+  now says that, and drops the speculation about a future pre-flight column.
+
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
   (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
   carry ONE feature across every producer — but each load still wrote that feature's rows in
@@ -3363,6 +3386,68 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   header's first token. Producer-chosen either way, and two headers in one file can share a
   first token, which is why the key scopes `bin_id` rather than treating it as globally
   unique or as one contig per row. None of that is recoverable from the bare `TEXT` column.
+
+- **The messages a user hits at the terminal say what happened, not how we store it (#461).**
+  The 409 for re-submitting a finished pool, the `--force` help on both submit commands, and the
+  read-loading failures a `qiita ticket status` reports asked the reader to know about the lake,
+  DuckLake's lack of uniqueness, and `ON DELETE CASCADE` in order to act. They now name what
+  happened to the reader's data and which command to run, keeping the identifiers, roles,
+  recovery commands and — since `failure_reason` is an ops-triage surface as much as a user
+  one — the detail that says which call failed. The `force` explanation now lives in
+  `qiita_common.work_ticket_constants` and is consumed by the CLI flags, the 409 body and
+  the wire model's field description, because four copies had to be edited to fix it once.
+  In the CLI help, error bodies and failure reasons this PR touches, objects are named by kind
+  — `biosample` or `prep_sample`, never a bare "sample" — outside the control-plane code that
+  is deliberately generic over both; the rest of the user CLI's `--help` still says bare
+  "sample" in roughly forty places and wants its own sweep.
+
+- **`--force` says what it costs, which is the opposite of what an earlier draft of this
+  branch claimed (#461).** The draft told the operator a forced re-run cannot duplicate reads
+  because the read-numbering step refuses a range another ticket reserved. That holds for
+  `fastq-to-parquet` and `bam-to-parquet`, but not for the one action the gate offering
+  `--force` actually covers: `bcl-convert` is the only `target_kind: sequenced_pool` workflow,
+  and its `ingest_reads` step short-circuits on the durable per-prep_sample staging copy
+  (`compute_reads_staging_path`, keyed on `prep_sample_idx` alone) before it ever reaches the
+  mint — it re-creates the register hardlink and returns. `read` is not in the data plane's
+  `REPLACE_KEY_TABLES`, so the following `register-files` appends. A forced re-run therefore
+  stores the pool's reads a second time, which is what the message now says. The PacBio
+  `--force` help keeps its own text, since neither the refusal nor the duplication reaches a
+  prep_sample-scoped ticket. All four of these strings also named a remedy their own reader
+  cannot run: `sequenced_pool:delete` is on the system_admin ceiling only, and the COMPLETED
+  ticket that triggers the 409 blocks the delete too unless that is forced as well — so they
+  now say `qiita delete-sequenced-pool --force` and name the account it needs. The
+  read-numbering refusals told the operator to delete the prep_sample, and no such gesture
+  exists (there is no prep_sample DELETE route); they name the pool instead, through one
+  `POOL_REMOVAL_RECOVERY` constant that also states what else the delete takes. A pure-unit
+  Rust test pins the fact the `--force` text rests on — `read` is absent from
+  `REPLACE_KEY_TABLES`, so a second registration appends — and fails by name if that changes.
+  `fastq-to-parquet-retry-recovery.md` quoted two of the rewritten failure reasons verbatim
+  and gave the prep_sample-delete recovery; it now quotes the current text and names the
+  three things about `delete-sequenced-pool` that catch people out.
+
+- **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`,
+  `manual-sample-walkthrough.md` and `pacbio-ingest.md` are what a person with samples reads, so
+  no longer explain themselves in route paths, guard-function names, column constraints and HTTP
+  status codes. What a reader has to *do* differently is unchanged and every mechanism that
+  changes an outcome is still stated — in terms of what they will see. Identifiers they type or
+  read back (CLI flags, ticket states, pre-flight column names, `skipped`) stay verbatim.
+
+- **`user-cli-quickstart.md` becomes `manual-sample-walkthrough.md`, the by-hand path only, and
+  the landing page points at the new runbook (#461).** The old name claimed to be the quickstart
+  for a procedure nobody should run on a live system; it exists to prove a deploy works and to
+  learn the CLI, and `getting-started.md` is the quickstart. Pre-opening the pre-flight file is
+  the one manual step the new runbook still has to document, tracked for removal in #470; the
+  other one it was written against — needing a machine that mounts the cluster — was removed by
+  #484 while this branch was open, so the runbook now states the ingest-root bound and the
+  `wet_lab_admin` requirement instead. It kept a full copy of login, profile, study and biosample
+  creation, which the getting-started runbook now owns; what remains is what is unique to it —
+  minting a run, pool and sequenced-sample yourself and loading reads you already hold with
+  `qiita submit-reads`, which is the route an ordinary account now takes since naming a host path
+  became `wet_lab_admin`-or-higher. `pacbio-ingest.md` likewise drops where-to-run-the-CLI,
+  the pre-flight
+  writability trap and the `--force` rule, keeping only what has no Illumina counterpart. The
+  `study_access` grant mechanism moves to `docs/auth.md`, which owns the auth surface, and both
+  runbooks point at it rather than spelling out the INSERT.
 
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that

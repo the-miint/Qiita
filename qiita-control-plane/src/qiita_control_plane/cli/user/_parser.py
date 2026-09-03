@@ -45,6 +45,10 @@ from qiita_common.models import (
     Tier,
     WorkTicketState,
 )
+from qiita_common.work_ticket_constants import (
+    FORCE_RESUBMIT_EXPLANATION,
+    POOL_REMOVAL_RECOVERY,
+)
 
 from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
@@ -1466,23 +1470,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help=(
-            "Qiita prep_protocol_idx to FK every per-sample row to. Today"
-            " applied uniformly across the whole pool because the preflight"
-            " does not carry a Qiita prep_protocol identifier; a future"
-            " preflight column may let this flag come out of the file like"
-            " the per-row study_idx already does (project.qiita_id)."
+            "Qiita prep_protocol_idx to record on every prep_sample this"
+            " submission creates. Applied uniformly across the pool."
         ),
     )
     p_submit_bcl.add_argument(
         "--force",
         action="store_true",
         help=(
-            "Re-submit even when a COMPLETED bcl-convert ticket already exists"
-            " for this pool. Without it the submission is refused, because a"
-            " re-run re-registers the pool's reads into the lake (duplicate"
-            " rows — DuckLake has no uniqueness). Requires wet_lab_admin or"
-            " system_admin. The non-force recovery is delete-sequenced-pool"
-            " then resubmit."
+            "Submit anyway when a COMPLETED bcl-convert ticket already exists"
+            f" for this pool, instead of being refused. {FORCE_RESUBMIT_EXPLANATION}"
         ),
     )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
@@ -1490,7 +1487,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_submit_reads = sub.add_parser(
         "submit-reads",
         help=(
-            "Load one sample's reads from THIS machine: upload the FASTQ(s) or BAM"
+            "Load one prep_sample's reads from THIS machine: upload the FASTQ(s) or BAM"
             " to the data plane, then submit the ingest work-ticket against them."
         ),
         description=(
@@ -1523,7 +1520,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "Unaligned basecaller uBAM (PacBio HiFi / ONT) on this machine."
-            " An aligned BAM is rejected by the loader."
+            " Declared unaligned to the loader, which trusts the declaration"
+            " rather than checking it — an aligned BAM is loaded, not refused."
         ),
     )
     p_submit_reads.add_argument(
@@ -1626,21 +1624,27 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help=(
-            "Qiita prep_protocol_idx to FK every per-sample row to. Applied"
-            " uniformly across the pool (the preflight carries no Qiita"
-            " prep_protocol identifier), mirroring submit-bcl-convert. NOT"
-            " validated against the platform — passing a non-PacBio/short-read"
-            " protocol here silently mislabels every sample, so double-check it is"
-            " the intended long-read protocol."
+            "Qiita prep_protocol_idx to record on every prep_sample this"
+            " submission creates. Applied uniformly across the pool (the preflight"
+            " carries no Qiita prep_protocol identifier), mirroring"
+            " submit-bcl-convert. NOT validated against the platform — passing a"
+            " non-PacBio/short-read protocol here silently mislabels every"
+            " prep_sample in the run, so double-check it is the intended long-read"
+            " protocol."
         ),
     )
     p_submit_pacbio.add_argument(
         "--force",
         action="store_true",
         help=(
-            "Re-submit each sample's bam-to-parquet ticket even when a COMPLETED"
-            " one already exists (a re-run re-registers reads into the lake —"
-            " DuckLake has no uniqueness). Requires wet_lab_admin or system_admin."
+            "Requires wet_lab_admin or system_admin, and changes nothing else"
+            " here: the COMPLETED-ticket refusal this waives is scoped to"
+            " sequenced_pool actions, and PacBio ingest submits one"
+            " prep_sample-scoped ticket per prep_sample. A re-submit over an"
+            " already-loaded prep_sample is admitted with or without it, and"
+            " stops at the read-numbering step either way, before anything is"
+            " stored. Loading a prep_sample's reads again means removing its pool:"
+            f" {POOL_REMOVAL_RECOVERY}."
         ),
     )
     p_submit_pacbio.set_defaults(handler=_handle_submit_pacbio_ingest)

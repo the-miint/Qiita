@@ -1103,12 +1103,19 @@ End-to-end execution runs through the end-user `qiita` CLI
 (`qiita login` / `qiita study create` / `qiita biosample create` /
 `qiita sequencing-run create` / `qiita sequenced-pool create` /
 `qiita sequenced-sample create` / `qiita ticket submit` /
-`qiita ticket status`). The walkthrough lives at
-[`docs/runbooks/user-cli-quickstart.md`](user-cli-quickstart.md).
+`qiita ticket status`). Steps 0-3 of
+[`docs/runbooks/getting-started.md`](getting-started.md) cover login through
+the biosample; [`docs/runbooks/manual-sample-walkthrough.md`](manual-sample-walkthrough.md)
+carries it from there to a `COMPLETED` ticket.
 
-The walkthrough drives the smoke from a fresh user PAT through to a
+Together the two drive the smoke from a fresh user PAT through to a
 `COMPLETED` ticket and a `reads.parquet` artifact, with verification
-commands at each layer. Compute service-account provisioning per
+commands at each layer. Most of that walk also runs unattended as
+`tests/integration/test_user_authoring_smoke.py` (`make test-integration`),
+which stands up a control plane and shells out to the real `qiita` CLI, so the
+flags the runbooks document are pinned against argparse drift. It stops short
+of the upload itself — streaming reads needs a data plane the fixture does not
+run, so it submits against upload slots minted directly. Compute service-account provisioning per
 [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md)
 is the one prerequisite that remains operator-side after step 10 —
 `qiita-admin actions sync` is now run automatically by

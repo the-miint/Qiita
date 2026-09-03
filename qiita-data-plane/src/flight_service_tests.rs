@@ -1417,6 +1417,28 @@ fn replace_key_tables_names_each_table_once() {
     }
 }
 
+/// `read` is deliberately NOT replace-keyed, so a second registration of a
+/// prep_sample's reads APPENDS rather than superseding.
+///
+/// Pinned because three user-facing strings rest on it — the `--force` help on
+/// `submit-bcl-convert`, the 409 body that offers `force=true`, and the
+/// `force` field's OpenAPI description all state that a forced re-run stores
+/// the pool's reads a second time. That is only true while `read` is absent
+/// here: `ingest_reads` short-circuits on the durable per-prep_sample staging
+/// copy before it reaches the sequence-range mint, so nothing upstream stops
+/// the second registration either. Adding `read` to `REPLACE_KEY_TABLES` would
+/// make those three strings wrong, and this is what says so.
+#[test]
+fn read_is_not_replace_keyed_so_a_forced_rerun_appends() {
+    assert!(
+        !REPLACE_KEY_TABLES
+            .iter()
+            .any(|entry| entry.table == "read" || entry.key_source == "read"),
+        "`read` became replace-keyed — FORCE_RESUBMIT_EXPLANATION and the 409 that \
+         carries it now overstate the damage; update them together"
+    );
+}
+
 /// Every `key_source` is itself a registered table carrying the same key.
 /// The borrowing delete SELECTs this entry's key columns out of the source's
 /// Parquet, so a source keyed on anything else would name a column that file

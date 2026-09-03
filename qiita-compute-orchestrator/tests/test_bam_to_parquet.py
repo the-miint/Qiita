@@ -28,7 +28,11 @@ import duckdb
 import pytest
 from helpers import write_chunked_blob_upload
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
-from qiita_common.models import TERMINAL_WORK_TICKET_STATES, WorkTicketState
+from qiita_common.models import (
+    REDRIVABLE_WORK_TICKET_STATES,
+    TERMINAL_WORK_TICKET_STATES,
+    WorkTicketState,
+)
 
 import qiita_compute_orchestrator.jobs.bam_to_parquet as bam_module
 from qiita_compute_orchestrator import sequence_range_retry
@@ -302,7 +306,7 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
 
     assert ei.value.kind is FailureKind.BAD_INPUT
     assert ei.value.step_name == YAML_STEP_NAME
-    assert "must match the prior mint count exactly" in ei.value.reason
+    assert "has to cover exactly as many reads as before" in ei.value.reason
 
 
 def test_duckdb_memory_limit_tracks_the_slurm_cgroup(fake_mint, monkeypatch, tmp_path):
@@ -368,7 +372,7 @@ def test_execute_refuses_a_range_minted_by_a_different_ticket(monkeypatch, tmp_p
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert ei.value.step_name == YAML_STEP_NAME
-    assert "work_ticket 999" in ei.value.reason
+    assert "ticket 999" in ei.value.reason
     assert "already loaded" in ei.value.reason
     # Nothing was written: the refusal happens before the durable rewrite.
     assert not (tmp_path / "ws" / "read").exists()
@@ -400,7 +404,7 @@ def test_execute_refuses_a_range_with_unknown_provenance(monkeypatch, tmp_path):
         _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert "unknown work_ticket" in ei.value.reason
+    assert "cannot identify" in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()
 
 
@@ -447,19 +451,22 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
         _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert "no longer in flight" in ei.value.reason
+    assert "no longer running" in ei.value.reason
     assert terminal_state in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()
 
-    # The refusal must name a recovery the CP will actually ACCEPT. `/run` takes a
-    # ticket in PENDING or FAILED only, so `failed` gets the redrive and every other
-    # terminal state gets delete-then-resubmit; pointing `completed` or `no_data` at
-    # `ticket run` would send the operator to a 409.
-    if terminal_state == WorkTicketState.FAILED.value:
+    # The refusal must name a recovery the CP will actually ACCEPT. `/run` redrives a
+    # FAILED or CANCELLED ticket, so those two get the redrive and every other terminal
+    # state gets delete-then-resubmit; pointing `completed` or `no_data` at `ticket run`
+    # would send the operator to a 409.
+    if terminal_state in REDRIVABLE_WORK_TICKET_STATES:
         assert f"qiita ticket run {1}" in ei.value.reason
-        assert "DELETE the prep_sample" not in ei.value.reason
+        assert "delete-sequenced-pool" not in ei.value.reason
     else:
-        assert "DELETE the prep_sample" in ei.value.reason
+        # The recovery has to be a gesture that exists: there is no prep_sample
+        # DELETE route, so the pool is what gets removed, and the COMPLETED
+        # ticket blocks that too unless it is forced.
+        assert "qiita delete-sequenced-pool --force" in ei.value.reason
         assert "ticket run" not in ei.value.reason
 
 
@@ -544,8 +551,9 @@ def test_execute_refuses_when_the_minter_state_is_unknown(monkeypatch, tmp_path)
         _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert "no longer in flight" in ei.value.reason
-    # No ticket row to redrive — `/run` would 404. Delete-first is the only recovery.
-    assert "DELETE the prep_sample" in ei.value.reason
+    assert "no longer running" in ei.value.reason
+    # No ticket row to redrive — `/run` would 404. Removing the pool is the only
+    # recovery, and it needs its own --force past the terminal ticket.
+    assert "qiita delete-sequenced-pool --force" in ei.value.reason
     assert "ticket run" not in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()

@@ -28,6 +28,7 @@ from qiita_common.models._base import (
     ReadCounts,
     ScopeTarget,
 )
+from qiita_common.work_ticket_constants import FORCE_RESUBMIT_EXPLANATION
 
 
 class StepType(StrEnum):
@@ -139,6 +140,16 @@ TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = (
 
 NON_TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = tuple(
     state.value for state in WorkTicketState if state.value not in TERMINAL_WORK_TICKET_STATES
+)
+
+# The terminal states `POST /work-ticket/{idx}/run` puts back in flight by
+# resetting to PENDING. Shared because both components answer questions that
+# have to agree: the control plane admits the redrive, and the orchestrator's
+# sequence-range refusal decides whether to name `qiita ticket run` as the
+# recovery or send the operator to remove the pool. A state that stops being
+# redrivable must move here, not in one consumer.
+REDRIVABLE_WORK_TICKET_STATES: frozenset[str] = frozenset(
+    {WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value}
 )
 
 
@@ -313,23 +324,29 @@ class WorkTicketCreateRequest(BaseModel):
     to wet_lab_admin / system_admin and bounded by the action's ceiling.
 
     `force` re-submits a sequenced_pool action even when a COMPLETED ticket
-    already exists for the same `(pool, action, version)`. Default-refused
-    because a re-run re-registers the pool's reads into the lake (DuckLake has
-    no uniqueness — duplicate rows result); the intended recovery for a stored
-    result is `delete-sequenced-pool` then resubmit. It is privileged regardless
-    of scope: setting `force=true` requires wet_lab_admin / system_admin (403
-    otherwise) for ANY action. It only *changes submission behavior* for the
-    sequenced_pool COMPLETED gate, though — for other scopes, or when no
-    COMPLETED ticket exists, an authorized `force=true` is simply a no-op. It
-    never relaxes the in-flight gate (a PENDING/QUEUED/PROCESSING ticket still
-    blocks)."""
+    already exists for the same `(pool, action, version)`. What it then does to
+    the pool's data is stated once in
+    `qiita_common.work_ticket_constants.FORCE_RESUBMIT_EXPLANATION`, which this
+    field's description carries. What follows is the wire semantics an operator
+    does not see. It is privileged regardless of scope: setting `force=true`
+    requires wet_lab_admin / system_admin (403 otherwise) for ANY action. It
+    only *changes submission behavior* for the sequenced_pool COMPLETED gate,
+    though — for other scopes, or when no COMPLETED ticket exists, an
+    authorized `force=true` is simply a no-op. It never relaxes the in-flight
+    gate (a PENDING/QUEUED/PROCESSING ticket still blocks)."""
 
     action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
     scope_target: ScopeTarget
     action_context: dict[str, Any] = Field(default_factory=dict)
     resource_override: ResourceOverride | None = None
-    force: bool = False
+    force: bool = Field(
+        default=False,
+        description=(
+            "Submit anyway when a COMPLETED ticket already exists for this"
+            f" sequenced_pool and action. {FORCE_RESUBMIT_EXPLANATION}"
+        ),
+    )
 
 
 class WorkTicketResponse(BaseModel):

@@ -343,6 +343,14 @@ The system principal (`idx=1`) is rejected by every mutation endpoint above (`di
 | `/api/v1/user/me` | GET | Returns the authenticated user's profile. `require_human` (rejects service-kind 403). |
 | `/api/v1/user/me` | PATCH | Updates profile fields (`affiliation`, `address`, `phone`, `orcid`, `receive_processing_emails`). Requires `self:profile`. `email` and status fields are absent from `UserUpdate` and are silently dropped — email-change requires re-verification via OIDC, status is admin-only. |
 
+What a user cannot self-serve is **access to someone else's study**. Creating
+a biosample, a prep_sample, or a sequenced_sample under a study you do not own
+requires an `ADMIN`-tier `qiita.study_access` row on it, and no route issues
+one: the owner's own row is auto-granted at study create
+(`repositories/study.py`), and every other row is inserted out-of-band by an
+operator (`INSERT INTO qiita.study_access (study_idx, principal_idx,
+access_tier, granted_by_idx)`).
+
 ### Reference exclusion (curation)
 
 The curated global blocklist that masks bad genomes/features from downstream products (architecture: [Reference exclusion](architecture/reference-data.md#reference-exclusion-curated-blocklist)). Not under `/admin/*`, but the two mutations and the force-resync are `system_admin`-only by scope. Each mutation, after the atomic Postgres write, **synchronously re-materializes** the DuckLake `reference_exclusion` mirror via the `sync_reference_exclusion` DoAction (a 502 if the data plane is unreachable; the Postgres row persists, so a retry converges).

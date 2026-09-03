@@ -72,6 +72,7 @@ from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.log_tail import read_text_tail
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
+    REDRIVABLE_WORK_TICKET_STATES,
     FanoutCohortKind,
     FanoutListResponse,
     FanoutOverrideRequest,
@@ -91,6 +92,7 @@ from qiita_common.models import (
     WorkTicketStepLogs,
     WorkTicketSummary,
 )
+from qiita_common.work_ticket_constants import FORCE_RESUBMIT_EXPLANATION
 
 from ..actions.context_validator import validate_context
 from ..actions.reference import (
@@ -147,8 +149,9 @@ _RUN_APPLICABLE_STATES = frozenset(
     }
 )
 # The two terminal states /run redrives by resetting to PENDING (vs. PENDING, which
-# just dispatches).
-_RUN_REDRIVE_STATES = frozenset({WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value})
+# just dispatches). Shared with the orchestrator, whose sequence-range refusal
+# names `qiita ticket run` only for a state this admits.
+_RUN_REDRIVE_STATES = REDRIVABLE_WORK_TICKET_STATES
 _RUN_NOT_APPLICABLE_STATES = tuple(
     state.value for state in WorkTicketState if state.value not in _RUN_APPLICABLE_STATES
 )
@@ -318,8 +321,9 @@ async def _check_disallow_without_delete(
     uniqueness — a naive re-run double-registers them. There is no
     result-deletion gate for a pool (the result is lake rows, not a single
     minted row), so this check itself refuses a re-submit over a COMPLETED pool
-    ticket unless `force=True` (gated to wet_lab_admin+ at the route). The
-    intended non-force recovery is `delete-sequenced-pool` then resubmit.
+    ticket unless `force=True` (gated to wet_lab_admin+ at the route). What
+    forcing costs, and the recovery that avoids it, are stated once in
+    `FORCE_RESUBMIT_EXPLANATION`, which the 409 below carries.
 
     Best-effort fast path. The atomic gate is the unique partial indexes
     `work_ticket_one_in_flight_per_{reference,study_prep,prep_sample,sequenced_pool}`;
@@ -433,10 +437,10 @@ async def _check_disallow_without_delete(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
                     "reason": (
-                        "a COMPLETED ticket already exists for this (sequenced_pool, "
-                        "action); re-running re-registers the pool's reads into the "
-                        "lake. Delete the pool (delete-sequenced-pool) and resubmit, "
-                        "or pass force=true (wet_lab_admin+) to intentionally re-run."
+                        "a ticket for this pool and action has already COMPLETED, so "
+                        "the pool's reads are already stored. Pass force=true "
+                        "(--force in the CLI) to submit anyway. "
+                        f"{FORCE_RESUBMIT_EXPLANATION}"
                     ),
                     "blocking_work_ticket_idx": completed,
                 },

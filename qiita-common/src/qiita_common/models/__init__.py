@@ -308,6 +308,7 @@ from qiita_common.models.work_ticket import (
     LIVE_STEP_PROGRESS_STATES,
     MAX_FANOUT_OVERRIDE,
     NON_TERMINAL_WORK_TICKET_STATES,
+    REDRIVABLE_WORK_TICKET_STATES,
     TERMINAL_STEP_PROGRESS_STATES,
     TERMINAL_WORK_TICKET_STATES,
     AlignPlanBlock,
@@ -562,6 +563,7 @@ __all__ = [
     "WhoAmIServiceResponse",
     # Work tickets / actions.
     "NON_TERMINAL_WORK_TICKET_STATES",
+    "REDRIVABLE_WORK_TICKET_STATES",
     "TERMINAL_WORK_TICKET_STATES",
     "FailureType",
     "ProcessingKind",
