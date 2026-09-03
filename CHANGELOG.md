@@ -3138,36 +3138,35 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
-- **`long-read-assembly` baseline memory re-sized at three steps from measured
-  runs (#526).** `assembly_coverage` 64 → 96 GiB and `assembly_load` 16 → 32 rise
-  off first-attempt failures; `assemble` becomes per-assembler — 250 for
-  hifiasm_meta, but 128 for myloasm, a reduction derived from its successes. Measured on the 1.0.1 re-run cohort
-  (2026-09-02 to 09-03) with the confounded rows excluded — only jobs that ran at
-  the YAML baseline count, not the ones an operator pre-floored with `--mem-gb`.
-  At those baselines 5 of 27, 2 of 24, and 3 of 15 first attempts failed. The
-  pre-floored runs are excluded from those denominators but are still used as
-  demand measurements, which is what they are. Two of the three steps fail by
-  cgroup kill; `assembly_load` does not — it raised a DuckDB
-  `OutOfMemoryException` while its process held 9.39 GiB of a 16 GiB allocation,
-  because `resolve_duckdb_memory_gb` subtracts an additive headroom that costs a
-  quarter of a small step; issue #288 tracks reshaping that helper. Each step's own comment carries its table and
-  its sizing argument. `assemble` is sized **per assembler** rather than by one
-  number, because the demand is: its 26 hifiasm_meta completions run p50 201.12 /
-  max 246.03 GiB against myloasm's p50 53.35 / max 94.58, and all five OOMs were
-  hifiasm_meta. It now resolves through a `profiles:` lookup (hifiasm_meta 250,
-  myloasm 128), the same mechanism `bcl-convert` uses for instrument model. The
-  lookup keys on `assembly_run_config`'s existing `run_config` output rather than a
-  new one: a completed step's bindings are rebuilt on resume from its manifest
-  against the current spec, so a newly declared output would raise for every
-  in-flight ticket that had passed that step. That makes `run_config.json`'s
-  serialized bytes a contract, pinned by a test in both directions.
+- **`long-read-assembly` memory re-sized at three steps, and `assemble` is now
+  sized per assembler (#526).** `assembly_coverage` 64 → 96 GiB and `assembly_load`
+  16 → 32 rise off first-attempt failures; `assemble` splits into 250 GiB for
+  hifiasm_meta and 128 for myloasm — a reduction for the latter, whose peak RSS
+  across 16 completions never reached 94.58 where hifiasm_meta reaches 246.03.
+  Measured on the 1.0.1 re-run cohort (2026-09-02 to 09-03) from MaxRSS, counting
+  first-attempt failures only where a job actually ran at the YAML baseline. Each
+  step's comment carries its table and its sizing argument.
+
+  `assemble` resolves through a `profiles:` lookup, the mechanism `bcl-convert`
+  already uses for instrument model. It keys on `assembly_run_config`'s existing
+  `run_config` output rather than a new one, because a completed step's bindings
+  are rebuilt on resume from its manifest against the spec in force then — so a
+  newly declared output would raise for any in-flight ticket past that step. That
+  makes `run_config.json`'s serialized bytes a contract, pinned from both sides.
+
+  `assembly_load`'s failures were not cgroup kills: it raised a DuckDB
+  `OutOfMemoryException` holding 9.39 GiB of a 16 GiB allocation, against a limit
+  set to the allocation less an additive headroom that takes a quarter of a 16 GiB
+  step. Issue #288 tracks re-sizing that helper, which is what would let this come
+  back down.
+
 - **Reference-workflow resources corrected from the reference-18 build (#526).**
   `build-shard-index`'s `build_minimap2_index` drops `cpu: 4` → `1` (CPU
   efficiency p50 2.1%, max 13.9% over 68 shard builds — a maximum average demand
   of 0.56 cores; the step is blocked on its data-plane stream, and its DuckDB
   pool is a module constant this number never controlled). In
   `local-reference-add`, `load` goes `PT24H` → `PT36H` (its one completing attempt
-  ran 22:25:50; no attempt of that build was observed hitting a limit) and
+  ran 22:25:50; no attempt of that build was observed hitting a walltime limit) and
   `build_routing_index` goes `PT24H` → `PT12H` (7:34:02 and 8:04:07 are the only
   two runs, at the cost of one more escalation rung above 24h). Memory is untouched
   in all three: pegged at ReqMem on `load`, which bounds demand from below without
