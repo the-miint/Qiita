@@ -417,7 +417,7 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
 
         # Fan out one bam-to-parquet ingest ticket per sample. Per-sample
         # resilient: a single ticket's failure is recorded and the loop CONTINUES,
-        # so one bad sample never strands the rest (mirrors submit-host-filter-pool).
+        # so one bad prep_sample never strands the rest (mirrors submit-host-filter-pool).
         #
         # A 409 is NOT a failure — it means the prep_sample already has a ticket
         # in flight (PENDING/QUEUED/PROCESSING), so this submit is a duplicate of

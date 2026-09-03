@@ -342,10 +342,11 @@ there. It needs a `wet_lab_admin` account either way.
 each prep_sample's reads already staged from the first run and files them again;
 nothing removes the first copy, and nothing merges them. So if what you want is
 to load the run's reads afresh, `--force` is the wrong tool — the pool has to go
-first. That is `qiita delete-sequenced-pool --force`, which needs a
-`system_admin` account, so it is a request you make rather than a command you
-run: forced twice over, because the finished job that refused your submission
-blocks the delete as well.
+first. That is `qiita delete-sequenced-pool --force`, which needs a `system_admin`
+account, so it is a request you make rather than a command you run. It carries its
+own `--force` for a separate reason: the finished job that refused your submission
+blocks the delete too. And it takes the whole pool with it — every prep_sample,
+their stored reads, and their study links.
 
 On PacBio a re-submit stops instead: each prep_sample's reads are numbered once
 when they are first loaded, and the second attempt finds those numbers taken and
@@ -367,9 +368,12 @@ are possible. `no_data` means the job ran fine and there was nothing to store �
 ordinary at plate scale, where a blank, a no-template control or a well that
 failed to yield gives no reads — and you can resubmit it later if that was a
 surprise. `cancelled` means somebody stopped it; `qiita ticket run` restarts it.
-`failed` comes with the reason and the step it failed at; recovery for the
-read-loading failures is in
-[`fastq-to-parquet-retry-recovery.md`](fastq-to-parquet-retry-recovery.md).
+`failed` comes with the reason and the step it failed at, and the reason says what
+to do next. Most read-loading failures recover on their own or with
+`qiita ticket run`. The ones that do not end in removing the pool, which only an
+operator can do — so take the reason to yours;
+[`fastq-to-parquet-retry-recovery.md`](fastq-to-parquet-retry-recovery.md) is the
+page they will work from.
 
 ## Not covered here
 

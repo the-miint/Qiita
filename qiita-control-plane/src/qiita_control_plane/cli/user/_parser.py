@@ -44,7 +44,10 @@ from qiita_common.models import (
     Tier,
     WorkTicketState,
 )
-from qiita_common.work_ticket_constants import FORCE_RESUBMIT_EXPLANATION
+from qiita_common.work_ticket_constants import (
+    FORCE_RESUBMIT_EXPLANATION,
+    POOL_REMOVAL_RECOVERY,
+)
 
 from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
@@ -1568,12 +1571,13 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help=(
-            "Qiita prep_protocol_idx to FK every per-sample row to. Applied"
-            " uniformly across the pool (the preflight carries no Qiita"
-            " prep_protocol identifier), mirroring submit-bcl-convert. NOT"
-            " validated against the platform — passing a non-PacBio/short-read"
-            " protocol here silently mislabels every sample, so double-check it is"
-            " the intended long-read protocol."
+            "Qiita prep_protocol_idx to record on every prep_sample this"
+            " submission creates. Applied uniformly across the pool (the preflight"
+            " carries no Qiita prep_protocol identifier), mirroring"
+            " submit-bcl-convert. NOT validated against the platform — passing a"
+            " non-PacBio/short-read protocol here silently mislabels every"
+            " prep_sample in the run, so double-check it is the intended long-read"
+            " protocol."
         ),
     )
     p_submit_pacbio.add_argument(
@@ -1586,10 +1590,8 @@ def _build_parser() -> argparse.ArgumentParser:
             " prep_sample-scoped ticket per prep_sample. A re-submit over an"
             " already-loaded prep_sample is admitted with or without it, and"
             " stops at the read-numbering step either way, before anything is"
-            " stored. Loading a prep_sample's reads again means removing its"
-            " pool first (`qiita delete-sequenced-pool --force`, a system_admin"
-            " gesture) and submitting again — there is no per-prep_sample"
-            " delete."
+            " stored. Loading a prep_sample's reads again means removing its pool:"
+            f" {POOL_REMOVAL_RECOVERY}."
         ),
     )
     p_submit_pacbio.set_defaults(handler=_handle_submit_pacbio_ingest)

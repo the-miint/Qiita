@@ -2,7 +2,7 @@
 
 A reads job mints a `sequence_range` and **then** does its heavy durable write. The
 window between the two is exactly where an OOM or walltime kill lands, which leaves an
-orphaned range: the reads never reached the lake, but the sample's one-shot mint is
+orphaned range: the reads never reached the lake, but the prep_sample's one-shot mint is
 spent.
 
 **This recovers itself now — there is almost nothing for an operator to do.**
@@ -25,27 +25,36 @@ nothing could set it — the step binder drops unknown `action_context` keys.)
 
 ## The refusal you might see, and what it means
 
-> `prep_sample N already has a sequence_range minted by work_ticket M, not by this one
-> (work_ticket K) — its reads are already loaded, and re-ingesting would duplicate them`
+> `prep_sample N's reads were already loaded by ticket M, not by this one (ticket K).
+> Loading them again would store every read twice, so this step stopped without writing
+> anything.`
 
 Reuse is deliberately restricted to the **minting** ticket. A range minted by a
-*different* ticket means the sample's reads are **already registered in the lake**, and
+*different* ticket means the prep_sample's reads are **already registered in the lake**, and
 reusing the range would register them a second time. DuckLake has no uniqueness, so that
 duplication would be silent and permanent — hence a hard, permanent refusal.
 
 The same refusal fires when the minter is **unknown** (`minted_by_work_ticket_idx IS
-NULL` — a row the migration's backfill could not attribute unambiguously). Read it the
-same way: assume the sample is already loaded.
+NULL` — a row the migration's backfill could not attribute unambiguously); it names "a
+ticket Qiita cannot identify" instead of a number. Read it the same way: assume the
+prep_sample is already loaded.
 
-**If you see this, the sample is already ingested. Do not force it through.** A
-deliberate re-ingest means destroying what is there first:
+**If you see this, the prep_sample is already ingested. Do not force it through.** A
+deliberate re-ingest means destroying what is there first, and the pool is the only unit
+that can be destroyed: `qiita delete-sequenced-pool --force`, then resubmit.
 
-- one sample → `DELETE` the `prep_sample` (its `sequence_range` goes with it via
-  `ON DELETE CASCADE`), then resubmit;
-- a whole pool → `qiita delete-sequenced-pool`, then resubmit.
+Three things about that command are easy to get wrong:
 
-Deleting the `prep_sample` is the **only** thing that clears a `sequence_range` — no CLI
-or route deletes one on its own.
+- It needs **`system_admin`** (`sequenced_pool:delete` is on that ceiling alone), so a
+  `wet_lab_admin` who can submit cannot run it.
+- It needs its own **`--force`**, because the terminal ticket that produced this refusal
+  blocks the delete as well.
+- It takes the **whole pool** — every prep_sample under it, their stored reads and their
+  study links, which on a PacBio run is the whole run.
+
+There is no per-prep_sample delete: the control plane exposes four DELETE routes and none
+of them is one, and `PATCH /prep-sample/{idx}/retired` is reversible and leaves the
+numbering in place.
 
 Confirm what you're about to destroy first:
 
@@ -60,13 +69,15 @@ SELECT sr.prep_sample_idx,
 
 ## The other manual case: a width mismatch
 
-> `… but its input now has N reads — the range must match the prior mint count exactly`
+> `… but the input now has N — the numbering has to cover exactly as many reads as
+> before, so the input is not the one that was numbered.`
 
 The range's width no longer matches the input's read count, which means the **input file
 changed between attempts**. That is a data-integrity problem, not a retry problem:
 inputs are required to be immutable between work_ticket submission and step execution.
 Establish which file is correct before doing anything else; if the new file is the
-intended one, delete the prep_sample so a fresh mint sizes correctly.
+intended one, the pool has to go (same command and same three caveats as above) so a
+fresh mint sizes correctly.
 
 ## Force-failing a stuck ticket
 

@@ -3391,7 +3391,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   ticket that triggers the 409 blocks the delete too unless that is forced as well — so they
   now say `qiita delete-sequenced-pool --force` and name the account it needs. The
   read-numbering refusals told the operator to delete the prep_sample, and no such gesture
-  exists (there is no prep_sample DELETE route); they name the pool instead.
+  exists (there is no prep_sample DELETE route); they name the pool instead, through one
+  `POOL_REMOVAL_RECOVERY` constant that also states what else the delete takes. A pure-unit
+  Rust test pins the fact the `--force` text rests on — `read` is absent from
+  `REPLACE_KEY_TABLES`, so a second registration appends — and fails by name if that changes.
+  `fastq-to-parquet-retry-recovery.md` quoted two of the rewritten failure reasons verbatim
+  and gave the prep_sample-delete recovery; it now quotes the current text and names the
+  three things about `delete-sequenced-pool` that catch people out.
 
 - **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`,
   `manual-sample-walkthrough.md` and `pacbio-ingest.md` are what a person with samples reads, so

@@ -45,6 +45,7 @@ from qiita_common.models import (
     REDRIVABLE_WORK_TICKET_STATES,
     WorkTicketFailureStage,
 )
+from qiita_common.work_ticket_constants import POOL_REMOVAL_RECOVERY
 
 from .sequence_range import (
     PrepSampleNotEligibleForSequenceRange,
@@ -261,9 +262,8 @@ async def mint_or_reuse_sequence_range(
                     f"{owner_detail}, not by this one (ticket {work_ticket_idx}). "
                     "Loading them again would store every read twice, so this step "
                     "stopped without writing anything. To load them again on purpose, "
-                    "the prep_sample's pool has to be removed first — its read "
-                    "numbering goes with it — with `qiita delete-sequenced-pool "
-                    "--force`, which needs system_admin; then submit again"
+                    "that means removing the prep_sample's pool: "
+                    f"{POOL_REMOVAL_RECOVERY}. Then submit again"
                 ),
             ) from exc
         if existing.minted_by_work_ticket_state not in _REUSABLE_MINTER_STATES:
@@ -288,9 +288,8 @@ async def mint_or_reuse_sequence_range(
             else:
                 # COMPLETED (reads registered), or a state with no in-place redrive.
                 recovery = (
-                    "there is no way to resume from this state — the prep_sample's pool "
-                    "has to be removed (`qiita delete-sequenced-pool --force`, which "
-                    "needs system_admin), then submitted again"
+                    "there is no way to resume from this state; starting over means "
+                    f"removing the prep_sample's pool: {POOL_REMOVAL_RECOVERY}"
                 )
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
@@ -321,9 +320,9 @@ async def mint_or_reuse_sequence_range(
                     f"({existing.sequence_idx_start}..{existing.sequence_idx_stop}), but "
                     f"the input now has {count} — the numbering has to cover exactly "
                     "as many reads as before, so the input is not the one that was "
-                    "numbered. Remove the prep_sample's pool "
-                    "(`qiita delete-sequenced-pool --force`, which needs system_admin) "
-                    "and submit again"
+                    "numbered. Work out which input is the right one before destroying "
+                    "anything. If the new one is right, loading it means removing the "
+                    f"prep_sample's pool: {POOL_REMOVAL_RECOVERY}"
                 ),
             ) from exc
         return existing.sequence_idx_start

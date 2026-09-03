@@ -321,8 +321,9 @@ async def _check_disallow_without_delete(
     uniqueness — a naive re-run double-registers them. There is no
     result-deletion gate for a pool (the result is lake rows, not a single
     minted row), so this check itself refuses a re-submit over a COMPLETED pool
-    ticket unless `force=True` (gated to wet_lab_admin+ at the route). The
-    intended non-force recovery is `delete-sequenced-pool` then resubmit.
+    ticket unless `force=True` (gated to wet_lab_admin+ at the route). What
+    forcing costs, and the recovery that avoids it, are stated once in
+    `FORCE_RESUBMIT_EXPLANATION`, which the 409 below carries.
 
     Best-effort fast path. The atomic gate is the unique partial indexes
     `work_ticket_one_in_flight_per_{reference,study_prep,prep_sample,sequenced_pool}`;
