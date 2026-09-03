@@ -135,28 +135,35 @@ steps:
     # partition), MaxRSS off each job's `.batch` row, GiB throughout.
     #
     # Demand is bimodal and 192 sat inside the upper mode: 5 of 27 first attempts
-    # were OUT_OF_MEMORY there.
+    # at 192 were OUT_OF_MEMORY. Every completed run, by the allocation it ran at:
     #
-    #   mode    n     p50      max    measured at
-    #   small  19   53.75   114.86    192 GiB allocation
-    #   upper  19  207.18   246.03    384 GiB allocation
+    #   ran at   n     p50      max   what the rows are
+    #   192     19   53.75   114.86   small mode
+    #   192      3  191.07   192.00   upper mode; the largest pegged at 192.00
+    #   384     14  209.17   246.03   submitted with a ticket-wide --mem-gb 384
+    #   384      5  202.74   241.17   escalated retries of the five that OOMed
     #
-    # The upper figures are demand rather than a cgroup being filled: at a 192 GiB
-    # allocation 16 of 22 completed runs peaked under 60 GiB, so the assembler does
-    # not expand to what it is given.
+    # The 384 rows are demand rather than a cgroup being filled: the largest is
+    # 246.03 of 384, 64% of the allocation and nowhere near pegged. The same holds
+    # at the other end — 16 of the 22 completions at 192 peaked under 60 GiB, so the
+    # assembler does not expand into what it is given.
     #
-    # 250 rather than a value clearing the upper mode with margin, to keep every
-    # node able to run two of these. cpu:32 against 64-core nodes already caps the
-    # step at two per node, so memory only bites when it admits fewer than two. The
-    # partition is 16 nodes: 14 at 514000 MB (~502 GiB), where the cliff is 251, and
-    # 2 highmem at 1546528 MB (~1510 GiB), where it is 755. At 250 all 16 nodes take
-    # two; above 251 the 14 drop to one and the work concentrates on the highmem
-    # pair.
+    # 250 keeps a standard node able to hold two of these and 251 does not:
+    # 251 x 1024 x 2 = 514048 MB against RealMemory=514000. cpu:32 on 64-core nodes
+    # caps the step at two per node regardless, so memory only matters where it
+    # admits fewer. The partition is 14 nodes at 514000 MB and 2 highmem at
+    # 1546528 MB, where the same cliff sits at 755.
+    #
+    # That two-per-node slot was NOT observed. In this cohort assembles on a
+    # standard node ran strictly back-to-back, never co-resident, and 40 of 54 went
+    # to the highmem pair — those nodes are shared with other partitions (AllocMem
+    # 491520 of 514000 when probed), so free memory rather than this baseline gated
+    # placement. 250 preserves the slot; it does not demonstrate it.
     #
     # What 250 does not cover: an earlier cohort recorded a 259.3 GiB peak, and a
     # sample in that range still OOMs and escalates. Escalation doubles and clamps
-    # to `action_ceiling.mem_gb`, so from 250 there is one escalated attempt (500)
-    # where from 192 there were two (384, then 500).
+    # to `action_ceiling.mem_gb`: from 250 that is one attempt at 500, where from
+    # 192 it was two (384, then 500).
     baseline_resources:
       cpu: 32
       mem_gb: 250
@@ -188,14 +195,16 @@ steps:
     #
     # mem_gb measured on the same cohort. At 64, 2 of 24 first attempts were
     # OUT_OF_MEMORY pegged at 63.99 GiB, and both completed on the 128 GiB retry at
-    # 73.15 and 73.82 GiB; an earlier cohort's escalated retries completed across
-    # 63.8-75.2 GiB. Runs that fit 64 peaked at p50 52.43, max 59.01 (n=22) — the
-    # tail is what 64 missed, not the median. 96 clears 75.2 by 20.8 GiB.
+    # 73.15 and 73.82 GiB. Runs that fit 64 peaked at p50 52.43, max 59.01 (n=22) —
+    # the tail is what 64 missed, not the median. 96 clears the 73.82 observed max
+    # by 22.18 GiB. An earlier cohort saw ten escalations of this same shape.
     #
     # The whole increment reaches the side that binds: DuckDB is held to
     # `_DUCKDB_CAP_GB` whatever the allocation, so the cgroup remainder — minimap2's
     # index and the writer's SEQUENCE_DATA lookup, neither of which spills — takes
-    # every added GiB. cpu:8 allows 8 of these per node; 96 GiB lowers that to 5.
+    # every added GiB. Per node, memory already held this step to 7 concurrent at 64
+    # GiB (8 x 64 GiB exceeds RealMemory=514000); 96 GiB lowers that to 5. cpu:8 was
+    # never the binding limit.
     baseline_resources:
       cpu: 8
       mem_gb: 96
@@ -375,8 +384,10 @@ steps:
     # step and a sixteenth of a 64 GiB one. All three completed on the 32 GiB retry
     # at 8.83 / 6.31 / 6.62 GiB RSS, so what the step wanted was a higher DuckDB
     # limit, not more resident memory. 32 is the value measured to pass; nothing
-    # between 16 and 32 was tried. Runs take 2-23 s, so the allocation is held
-    # briefly.
+    # between 16 and 32 was tried, and the step now reserves headroom it has never
+    # touched. The underlying cause is the shape of `duckdb_headroom_gb` rather than
+    # this step's appetite; sizing that helper against real MaxRSS would let this
+    # come back down. Runs take 2-23 s, so the allocation is held briefly.
     baseline_resources:
       cpu: 4
       mem_gb: 32

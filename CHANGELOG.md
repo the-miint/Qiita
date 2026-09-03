@@ -3143,23 +3143,24 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   64 → 96, `assembly_load` 16 → 32. Measured on the 1.0.1 re-run cohort
   (2026-09-02 to 09-03) with the confounded rows excluded — only jobs that ran at
   the YAML baseline count, not the ones an operator pre-floored with `--mem-gb`.
-  At those baselines 5 of 27, 2 of 24, and 3 of 15 first attempts failed. Two are
-  cgroup kills; `assembly_load` is not — it raised a DuckDB `OutOfMemoryException`
-  while using 9.39 GiB of its 16 GiB allocation, because
-  `resolve_duckdb_memory_gb` subtracts an additive headroom that costs a quarter
-  of a small step (#288). Each step's own comment carries its table and the
-  sizing argument; `assemble` is 250 rather than higher to keep all 16 partition
-  nodes able to run two concurrently.
+  At those baselines 5 of 27, 2 of 24, and 3 of 15 first attempts failed. The
+  pre-floored runs are excluded from those denominators but are still used as
+  demand measurements, which is what they are. Two of the three steps fail by
+  cgroup kill; `assembly_load` does not — it raised a DuckDB
+  `OutOfMemoryException` while its process held 9.39 GiB of a 16 GiB allocation,
+  because `resolve_duckdb_memory_gb` subtracts an additive headroom that costs a
+  quarter of a small step (#288). Each step's own comment carries its table and
+  its sizing argument.
 - **Reference-workflow resources corrected from the reference-18 build (#526).**
   `build-shard-index`'s `build_minimap2_index` drops `cpu: 4` → `1` (CPU
   efficiency p50 2.1%, max 13.9% over 68 shard builds — a maximum average demand
   of 0.56 cores; the step is blocked on its data-plane stream, and its DuckDB
   pool is a module constant this number never controlled). In
-  `local-reference-add`, `load` goes `PT24H` → `PT36H` (the completing attempt
-  ran 22:25:50, leaving 1h34) and `build_routing_index` goes `PT24H` → `PT12H`
-  (7:34:02 and 8:04:07 are the only two runs; the 24h request also had SLURM's
-  backfill estimating a five-day start). Memory is untouched everywhere here —
-  RSS was pegged at ReqMem, which measures no demand.
+  `local-reference-add`, `load` goes `PT24H` → `PT36H` (the one completing
+  attempt ran 22:25:50, leaving 1h34) and `build_routing_index` goes `PT24H` →
+  `PT12H` (7:34:02 and 8:04:07 are the only two runs). Memory is untouched in all
+  three: on `load` it was pegged at ReqMem, which bounds demand from below without
+  measuring it, and on `build_minimap2_index` it was simply never binding.
 - **`ticket:doput` is now on the USER role ceiling (#484).** It was on the two admin
   ceilings and service accounts only, dating from when reference loading was the sole
   upload consumer. With host paths in `action_context` restricted to wet_lab_admin+, an

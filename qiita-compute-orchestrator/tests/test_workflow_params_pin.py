@@ -161,8 +161,8 @@ def test_assembly_coverage_cpu_pins_duckdb_threads():
     This step made the same non-sharded `align_minimap2` call at threads 8 against
     `cpu: 16`, reserving cores it could not use. The gap was closed by lowering the
     request, not by raising the pool: on this step the thread count is also a memory
-    multiplier for the unspillable extension side, which `sacct` puts at 87% of the 64
-    GB request at the median. Pinned here so the two cannot drift apart again — the
+    multiplier for the unspillable extension side, which `sacct` put at 87% of the
+    then-64 GiB request at the median. Pinned here so the two cannot drift apart again — the
     drift is invisible at runtime, since nothing fails.
 
     Read `1.0.0.yaml` by name until the 1.0.1 residue pass landed beside it, which
@@ -176,4 +176,35 @@ def test_assembly_coverage_cpu_pins_duckdb_threads():
             f"{yaml_path.relative_to(_REPO_ROOT)} assembly_coverage baseline cpu={cpu}"
             f" but assembly_coverage._DUCKDB_THREADS={mod._DUCKDB_THREADS}; the"
             " aligner's parallelism IS that pool, so these must be changed together"
+        )
+
+
+def test_build_shard_index_cpu_is_intentionally_below_duckdb_threads():
+    """`build-shard-index`'s `build_minimap2_index` step: baseline `cpu:` is
+    deliberately BELOW `build_minimap2_index._DUCKDB_THREADS`, unlike the three
+    pins above which assert equality.
+
+    Those pins exist because a job drawing its parallelism from DuckDB's pool
+    wastes any core the pool cannot use. This step is the opposite case: `sacct`
+    over a 68-run sample put its CPU efficiency at p50 2.1% and max 13.9% of four
+    cores — a maximum average demand of 0.56 cores — because it runs blocked on
+    the data-plane chunk stream rather than computing. The cores were the waste,
+    so `cpu` dropped to 1 while the pool stayed at 4 and its threads now
+    time-share one core.
+
+    Pinned as an INEQUALITY for the same reason the others are pinned as an
+    equality: nothing fails at runtime when these drift, so a later edit raising
+    `cpu` back to `_DUCKDB_THREADS` to "fix the mismatch" would silently undo a
+    measured change. If this assertion fires, the question is whether the
+    measurement still holds, not whether the numbers should be made equal.
+    """
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.build_minimap2_index")
+    versions = _baseline_cpu_every_version("build-shard-index", "build_minimap2_index")
+    assert versions, "no build-shard-index version declares build_minimap2_index"
+    for yaml_path, cpu in versions:
+        assert cpu < mod._DUCKDB_THREADS, (
+            f"{yaml_path}: build_minimap2_index cpu={cpu} is no longer below "
+            f"_DUCKDB_THREADS={mod._DUCKDB_THREADS}; the step is stream-blocked "
+            f"(measured 0.56 cores max average demand), so raising cpu to match the "
+            f"pool reserves cores it cannot use."
         )

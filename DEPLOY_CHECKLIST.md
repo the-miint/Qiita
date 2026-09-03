@@ -39,28 +39,27 @@ _None yet._
 
 ### Notes (no host action)
 
-- **`long-read-assembly` baseline memory rose at three steps (#526):** `assemble`
+- **`long-read-assembly` baseline resources rose at three steps (#526):** `assemble`
   192 → 250 GiB, `assembly_coverage` 64 → 96, `assembly_load` 16 → 32. The action
-  sync in the deploy picks these up; there is no separate step. Two consequences
-  worth knowing before the next submission batch:
-  - **The `--mem-gb 384` floor is no longer needed for a routine `long-read-assembly`
-    submission.** It was covering `assemble`'s upper demand mode (measured 189-246
-    GiB), which 250 now covers from the baseline. Passing it still works — it is a
-    ticket-wide floor, so it also lifts every other step in the ticket.
-  - **Tickets already submitted to SLURM keep their old allocation**, whether running
-    or still queued: the dispatcher adopts any attempt that already has a
-    `slurm_job_id` rather than re-submitting it. Only steps dispatched after the
-    restart get the new numbers.
-- **`assemble` still fits two per node at 250 GiB on all 16 partition nodes** — the
-  14 at 514000 MB (cliff at 251) and the 2 highmem at 1546528 MB. A future raise past
-  251 would drop the 14 to one each and concentrate the step on the highmem pair; the
-  reasoning is recorded at the step in the workflow YAML.
+  sync in the deploy picks these up; there is no separate step. The measurements and
+  the reasoning are at each step in `workflows/long-read-assembly/1.0.1.yaml`. Two
+  consequences before the next submission batch:
+  - **A routine submission no longer needs the `--mem-gb 384` floor.** It was covering
+    `assemble`'s upper demand mode (measured 189.39–246.03 GiB), which 250 covers from
+    the baseline. It is not full coverage: an earlier cohort recorded a 259.3 GiB peak,
+    and a sample in that range still OOMs and escalates to 500. Passing the floor still
+    works, and still lifts every other step in the ticket with it.
+  - **Work already submitted to SLURM keeps its old allocation.** The dispatcher adopts
+    any attempt that already carries a `slurm_job_id` instead of re-submitting, and
+    that is per *step attempt*, not per ticket — a ticket mid-flight at the restart
+    finishes its in-flight step at the old numbers and picks up the new ones for the
+    steps dispatched after it.
 - **Reference-workflow resources also changed (#526):** `build-shard-index`'s
   `build_minimap2_index` `cpu: 4` → `1`; `local-reference-add`'s `load` `PT24H` →
-  `PT36H` and `build_routing_index` `PT24H` → `PT12H`. Picked up by the same action
-  sync, no separate step. Two are walltime reductions on the *local* reference path
-  only — the `reference-add` / `host-reference-add` variants are untouched, so a
-  reference loaded through those still uses their existing limits.
+  `PT36H` (an increase) and `build_routing_index` `PT24H` → `PT12H` (a reduction).
+  Same action sync, no separate step. Both walltime changes are on the *local*
+  reference path only — `reference-add`, `host-reference-add` and
+  `local-host-reference-add` are untouched and keep their existing limits.
 
 ## Deployed history
 

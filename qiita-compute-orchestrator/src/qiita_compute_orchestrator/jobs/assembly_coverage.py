@@ -142,9 +142,11 @@ _MM2_PRESET = "map-hifi"
 # OOM could never be escalated out of.
 #
 # CEILING: for a read set whose sequence bytes * ~1.6 exceed the cgroup remainder,
-# no escalation helps (the lookup is unspillable). The remainder is the step's
-# `baseline_resources.mem_gb` less DuckDB's cap below; the cohort measurement that
-# sized that number is recorded at the step in the workflow YAML.
+# no escalation helps (the lookup is unspillable). The remainder is the ATTEMPT's
+# allocation less DuckDB's cap below — the baseline on a first attempt, more once
+# escalation has raised it. Where that ceiling falls in reads is still not measured;
+# what IS measured is the peak RSS a real cohort reached, and the allocation sized
+# from it, both recorded at the step in the workflow YAML.
 # Equal to this step's `baseline_resources.cpu`, and it must stay equal — but the
 # binding reason is MEMORY, not cores. `align_minimap2` draws its parallelism from
 # DuckDB's thread pool (measured near-linear at 1/2/4/8), so this number is also the
@@ -152,12 +154,13 @@ _MM2_PRESET = "map-hifi"
 # in the cgroup remainder — the side that cannot spill.
 #
 # That remainder is already the constraint, measured on the deploy host (`sacct`,
-# 2026-01-01 onward, threads=8). Of 49 attempts that COMPLETED at the 64 GB baseline:
-# peak RSS p50 55.5 GB, p90 59.4, max 63.6 — 87% of the allocation at the median, with
-# 35 of the 49 above 80%. Ten further attempts died `OUT_OF_MEMORY` at exactly 64.0 GB,
-# and each completed on the escalated 128 GB retry at 63.8-75.2 GB. So raising this
-# number buys wall time the step does not need (p50 10.4 min against a PT4H limit)
-# against memory it does not have.
+# threads=8): across 49 completions at the then-64 GiB baseline, peak RSS sat at 87%
+# of the allocation at the median, with 35 of the 49 above 80%, and ten further
+# attempts died `OUT_OF_MEMORY` pegged at the allocation. The baseline has since been
+# raised; the current figure and the cohort behind it live at the step in the
+# workflow YAML. So raising this number buys wall time the step does not need
+# (p50 10.4 min against a PT4H limit) against memory that is already the binding
+# side.
 #
 # `_DUCKDB_CAP_GB` is NOT what bounds this step: DuckDB sits at 16 GB and spills. The
 # ~56 GB is the extension side — the SEQUENCE_DATA lookup above plus the minimap2

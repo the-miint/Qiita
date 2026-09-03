@@ -79,18 +79,23 @@ steps:
     params: {minimap2_preset: preset, shard_id: shard_id}
     when: build_minimap2
     outputs: [minimap2_index_meta]
-    # cpu measured over 68 shard builds of reference 18. CPU efficiency
-    # TotalCPU/(Elapsed × AllocCPUS) was p50 2.1%, max 13.9% — at 4 CPUs that is a
-    # maximum AVERAGE demand of 0.56 cores, which one covers. The step spends its
-    # wall time blocked on the data-plane chunk stream rather than computing.
+    # cpu from the reference-18 build. Over a 68-run sample, CPU efficiency
+    # TotalCPU/(Elapsed x AllocCPUS) was p50 2.1%, max 13.9% — at 4 CPUs a maximum
+    # AVERAGE demand of 0.56 cores, which one covers. The step spends its wall time
+    # blocked on the data-plane chunk stream rather than computing.
     #
-    # This does not change DuckDB's pool: the job takes its thread count from its
-    # own `_DUCKDB_THREADS`, not from this number, so four threads time-share one
-    # core instead of four. The average above says they fit; whether serialising
-    # short bursts moves the elapsed TAIL is not measured, which is why walltime
-    # stays PT2H — the worst of 987 shards took 92.3 min of the 120 min limit
-    # (p50 14.5, p90 30.7, p99 65.2 min) with zero timeouts, and a TIMEOUT
-    # escalates to the PT4H action ceiling.
+    # This does not touch DuckDB's pool: the job takes its thread count from its own
+    # `_DUCKDB_THREADS`, so four threads now time-share one core instead of four.
+    # The inequality is intentional and pinned by
+    # `test_build_shard_index_cpu_is_intentionally_below_duckdb_threads`.
+    #
+    # The elapsed TAIL is the part this does not bound. Elapsed over all 987 shards
+    # was p50 14.5, p90 30.7, p99 65.2 and max 92.3 min against the PT2H limit, with
+    # zero timeouts — but the 68-run CPU sample need not contain that worst shard,
+    # so 0.56 cores does not describe it. Whether serialising its bursts onto one
+    # core moves it past PT2H is unmeasured; a TIMEOUT escalates to the PT4H action
+    # ceiling, which is what makes that recoverable rather than fatal. walltime
+    # therefore stays PT2H.
     #
     # mem_gb stays 32: memory was never binding here (p50 5.9 GiB, max 11.0 GiB),
     # and `plan()` already sizes a shard build down from this baseline by shard bp.

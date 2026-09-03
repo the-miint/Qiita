@@ -150,17 +150,20 @@ steps:
              annotation_manifest, annotation_map]
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
-    # walltime measured on the reference-18 build (196,062 genomes): the completing
-    # attempt ran 22:25:50, which leaves 1h34 against PT24H. PT36H is 1.6× that run
-    # and keeps one TIMEOUT escalation in reserve (doubling, clamped to the PT48H
-    # action ceiling) where PT24H doubling would land straight on the ceiling.
+    # walltime sized from the reference-18 build (196,062 genomes), where the one
+    # completing attempt ran 22:25:50 — 1h34 short of PT24H. PT36H is 1.6x that run.
+    # It does not buy an extra escalation step: a TIMEOUT doubles and clamps to the
+    # PT48H action ceiling, so PT24H and PT36H both give exactly one retry at PT48H.
+    # What it buys is a smaller chance of needing that retry.
     #
-    # 22:25:50 is a duration, not a near-miss: that job ran under a 48h SLURM limit
-    # whose origin is not recoverable from the ticket (no walltime override
-    # recorded), so it was not itself close to timing out.
+    # Two caveats on the one measurement. 22:25:50 is a duration, not a near-miss:
+    # that job in fact ran under a 48h SLURM limit whose origin the ticket does not
+    # record (no walltime override is stored against it). And the other two attempts
+    # of that build failed on memory at 00:06:50 and 01:39:03, not on time, so
+    # nothing here shows PT24H being hit.
     #
-    # mem_gb is deliberately untouched. RSS pegged at ReqMem in all three attempts
-    # of that build, which bounds the allocation from below and measures no demand.
+    # mem_gb is untouched: RSS pegged at ReqMem in all three attempts, which bounds
+    # demand from below without measuring it.
     baseline_resources:
       cpu: 8
       mem_gb: 32
@@ -191,17 +194,19 @@ steps:
     when: router_pending
     inputs: [shard_mapping]
     outputs: [routing_index_meta]
-    # Whole-reference rype build (sized like local-host-reference-add's
-    # build_rype_index — the local path allows a long walltime for genome-scale
-    # references); an OOM retry doubles mem to the 128 GB action ceiling.
+    # Whole-reference rype build; an OOM retry doubles mem to the 128 GB action
+    # ceiling. Memory is still sized like local-host-reference-add's
+    # build_rype_index, but the walltime no longer matches that sibling — see below.
     #
-    # walltime measured over the only two runs there are: 7:34:02 (reference 16) and
-    # 8:04:07 (reference 18, 196,062 genomes), +6.6% for the larger. PT12H is 1.49×
-    # the longer; a TIMEOUT doubles to PT24H and then the PT48H ceiling.
+    # walltime sized over the only two runs there are: 7:34:02 (reference 16) and
+    # 8:04:07 (reference 18, 196,062 genomes), +6.6% for the larger. PT12H is 1.49x
+    # the longer of the two, and a TIMEOUT doubles to PT24H and then the PT48H
+    # ceiling, so the old headroom remains reachable on demand.
     #
-    # The reduction is a scheduling change as much as a sizing one: at a 24h request
-    # SLURM's StartTime estimate for the reference-18 run was five days out in this
-    # PriorityTier=1 partition, and backfill then placed it 70 min after submit.
+    # A 24h request in this PriorityTier=1 partition had SLURM's StartTime estimate
+    # for the reference-18 run five days out. That estimate cost little in practice
+    # — backfill placed the job 70 min after submit — so this is a sizing change
+    # against an n=2 population, not a fix for a measured queueing delay.
     baseline_resources:
       cpu: 4
       mem_gb: 64
