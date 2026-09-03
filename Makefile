@@ -136,6 +136,10 @@ test-compute-orchestrator: build-compute-orchestrator
 # make level, because make joins the continuations into a single shell line and a
 # `#` there would swallow the rest of the recipe.
 #
+# One recipe line means one `@`, so `set -x` restores the per-command trace make
+# used to print by echoing each line — CI reads it to see which command failed.
+# It is set after the guard so the skip path stays quiet.
+#
 # Second half: exercise scripts/build-sif.sh end-to-end against real apptainer via
 # the _sif-build-smoke sentinel (no licensed artifact). Uses a throwaway
 # PATH_DERIVED so the built SIF lands in a temp images/ dir. The trap removes it on
@@ -146,7 +150,7 @@ test-workflows:
 		echo "apptainer not found — skipping workflow smoke tests"; \
 		exit 0; \
 	fi; \
-	set -e; \
+	set -ex; \
 	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def; \
 	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"; \
 	rm -f /tmp/qiita-workflow-smoke.sif; \

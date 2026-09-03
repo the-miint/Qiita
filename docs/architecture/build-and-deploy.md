@@ -145,7 +145,7 @@ qiita/
 
 ## Build System (Makefile)
 
-The unified build entry point lives in [`Makefile`](../../Makefile). The recipes below mirror the public-API targets verbatim; the test in [`qiita-common/tests/test_makefile_doc_sync.py`](../../qiita-common/tests/test_makefile_doc_sync.py) asserts they stay in sync and is part of `make test`. Internal helpers (`$(DBMATE_BIN)` / `$(GRPCURL_BIN)` auto-fetch, the `UNAME_S/UNAME_M` arch detection, the verbose `dev-setup` install hints) live in `Makefile` only.
+The unified build entry point lives in [`Makefile`](../../Makefile). The recipes below mirror the public-API targets verbatim; the test in [`qiita-common/tests/test_makefile_doc_sync.py`](../../qiita-common/tests/test_makefile_doc_sync.py) asserts they stay in sync and is part of `make test`. Internal helpers (`$(DBMATE_BIN)` / `$(GRPCURL_BIN)` auto-fetch, the `UNAME_S/UNAME_M` arch detection, the verbose `dev-setup` install hints) live in `Makefile` only, as do the make-level comments — the sync test compares recipe bodies, so read `Makefile` for why a recipe is shaped the way it is (`test-workflows`' single-line apptainer guard and its `_sif-build-smoke` half are the ones that need it).
 
 <!-- KEEP IN SYNC WITH ../Makefile; qiita-common/tests/test_makefile_doc_sync.py enforces this -->
 ```makefile
@@ -214,7 +214,7 @@ test-workflows:
 		echo "apptainer not found — skipping workflow smoke tests"; \
 		exit 0; \
 	fi; \
-	set -e; \
+	set -ex; \
 	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def; \
 	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"; \
 	rm -f /tmp/qiita-workflow-smoke.sif; \

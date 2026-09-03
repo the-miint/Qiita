@@ -202,9 +202,11 @@ class FlatBaselineResources(BaseModel):
     """Flat resource declaration — cpu/mem_gb/walltime/gpu, all required.
 
     Used as the value type in `BaselineResources.profiles` (one profile per
-    instrument family, resolved at dispatch by the lookup population) and as
-    the shape `ActionCeiling` carries (the ceiling is always a single upper
-    bound, regardless of which baseline-resource population the step uses).
+    value of the key an upstream step's output carries — an instrument family
+    for bcl-convert, an assembler for long-read-assembly — resolved at dispatch
+    by `runner._dispatch`) and as the shape `ActionCeiling` carries (the ceiling
+    is always a single upper bound, regardless of which baseline-resource
+    population the step uses).
     """
 
     cpu: Annotated[int, Field(gt=0)]
@@ -677,8 +679,8 @@ class ActionDefinition(BaseModel):
         A flat population contributes one pair under the step's own name; a
         lookup population contributes one per profile, labelled
         ``name[profile]``, because a lookup step can be correctly sized on one
-        instrument profile and mis-sized on another — collapsing them would hide
-        exactly the case that matters. `action:` entries declare no resources and
+        profile and mis-sized on another — collapsing them would hide exactly the
+        case that matters. `action:` entries declare no resources and
         contribute nothing.
         """
         pairs: list[tuple[str, FlatBaselineResources]] = []

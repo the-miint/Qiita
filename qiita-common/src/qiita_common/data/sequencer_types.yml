@@ -1,6 +1,6 @@
 # Illumina + PacBio sequencer-type table consumed by the bcl-convert prep
 # step to map an instrument-serial prefix to the model_name string the
-# runner's A4 baseline_resources.profiles lookup uses.
+# runner's baseline_resources.profiles lookup uses.
 #
 # One-time snapshot of biocore/kl-metapool's metapool/config/sequencer_types.yml.
 # Source SHA: 87991af25cf5a2ab433c3dc03e03f77e6a68d7dd

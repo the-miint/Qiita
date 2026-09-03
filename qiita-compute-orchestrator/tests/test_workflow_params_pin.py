@@ -66,7 +66,7 @@ def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[str, int
     """
     yaml_paths = sorted(_WORKFLOWS_DIR.glob(f"{workflow}/*.yaml"))
     assert yaml_paths, f"no workflow YAML under workflows/{workflow}/"
-    found: list[tuple[Path, int]] = []
+    found: list[tuple[str, int]] = []
     for yaml_path in yaml_paths:
         data = yaml.safe_load(yaml_path.read_text())
         steps = [e for e in data["steps"] if e.get("step") == step]
@@ -93,24 +93,29 @@ def test_baseline_cpu_helper_reads_both_resource_populations():
     `cpu:`.
 
     The pins below all happen to sit on flat steps today, so the lookup branch has
-    no other caller and would rot unnoticed. `long-read-assembly` carries one of
-    each — 1.0.0's `assemble` is flat, 1.0.1's is a per-assembler lookup — so this
-    reads real workflow files rather than a fixture. Reading `["cpu"]` off the
-    lookup raises a bare `KeyError` naming neither workflow nor step, which is what
-    a pin newly placed on such a step used to hit.
-    """
-    flat = _baseline_cpu_every_version("long-read-assembly", "assembly_coverage")
-    assert flat and all("profile" not in where for where, _ in flat)
+    no other caller and would rot unnoticed. `long-read-assembly`'s `assemble`
+    carries one of each across its versions — 1.0.0 flat, 1.0.1 a per-assembler
+    lookup — so both branches are read out of real workflow files rather than a
+    fixture. Reading `["cpu"]` off the lookup would raise a bare `KeyError` naming
+    neither workflow nor step.
 
+    Asserted on the SHAPE of the result, not on what the profile keys say: the keys
+    are the upstream output's contents, and pinning their spelling here would make
+    this fail for an unrelated reason the day that format changes.
+    """
     entries = _baseline_cpu_every_version("long-read-assembly", "assemble")
-    profiles = [(where, cpu) for where, cpu in entries if "profile" in where]
+    flat = [(where, cpu) for where, cpu in entries if " profile " not in where]
+    profiles = [(where, cpu) for where, cpu in entries if " profile " in where]
+
+    assert flat, f"expected 1.0.0's flat assemble to contribute one entry, got {entries}"
     assert len(profiles) >= 2, (
-        f"expected the 1.0.1 assemble lookup to contribute one entry per profile, got {entries}"
+        f"expected 1.0.1's assemble lookup to contribute one entry per profile, got {entries}"
     )
-    # Each label locates the file AND the profile, so a failing pin says which.
-    for where, cpu in profiles:
-        assert where.startswith("workflows/long-read-assembly/") and "assembler" in where
-        assert isinstance(cpu, int)
+    # A label locates the file, and the per-profile labels are distinct, so a
+    # failing pin names which version and which profile it fired on.
+    assert all(where.startswith("workflows/long-read-assembly/") for where, _ in entries)
+    assert len({where for where, _ in entries}) == len(entries)
+    assert all(isinstance(cpu, int) for _, cpu in entries)
 
 
 def test_workflows_dir_present():

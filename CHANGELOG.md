@@ -1638,14 +1638,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   ends only the line it is on — make moved to the next line and ran `apptainer build`
   anyway, so a macOS run printed "apptainer not found — skipping workflow smoke tests"
   and then failed with `make: apptainer: No such file or directory` (exit 2). CLAUDE.md
-  and `docs/testing.md` both describe this target as skipping gracefully off Linux. The
-  guard and everything it guards are now one recipe line; the second half needed it too,
-  since it reaches apptainer through `scripts/build-sif.sh`. `set -e` still propagates a
-  real build failure as the recipe's exit status.
-- **`_baseline_cpu_every_version` raised a bare `KeyError` on a `profiles:` step (#531).**
-  The workflow-param pin helper read `baseline_resources["cpu"]`, which exists only on the
-  flat population; a pin newly placed on a lookup step got `KeyError: 'cpu'`, naming
-  neither the workflow nor the step. It now contributes one entry per profile, so the pin
+  and `docs/container-images.md` both describe this target as skipping gracefully off
+  Linux. The guard and everything it guards are now one recipe line; the second half
+  needed it too, since it reaches apptainer through `scripts/build-sif.sh`. `set -e` still
+  propagates a real build failure as the recipe's exit status (the `EXIT` trap's `rm -rf`
+  does not clobber it — checked under `/bin/sh`, which is the shell make uses here, against
+  a trap-free control). One recipe line means one `@`, which would have dropped the
+  per-command trace make printed by echoing each line, so the recipe now sets `-x` after
+  the guard: the skip path stays quiet and CI still shows which command failed.
+- **`_baseline_cpu_every_version` would raise a bare `KeyError` on a `profiles:` step
+  (#531).** The workflow-param pin helper read `baseline_resources["cpu"]`, which exists
+  only on the flat population, so a pin newly placed on a lookup step would get
+  `KeyError: 'cpu'`, naming neither the workflow nor the step. Every pin sits on a flat
+  step today, so this had not fired. It now contributes one entry per profile, so the pin
   covers a lookup instead of failing on it — every profile is an allocation the step really
   runs at, so each has to satisfy the same pin. A test reads both populations out of
   `long-read-assembly` (1.0.0's `assemble` is flat, 1.0.1's is the per-assembler lookup),
@@ -1658,12 +1663,20 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   carry a NULL `shard_id` "so this is a no-op", and that shard-aware resolution "is a later
   milestone and is deliberately NOT built here" — `actions.library.register_index` writes
   rows with a `shard_id`, and `_resolve_sharded_align_indexes` sits in the same module.
-- **Development-plan vocabulary removed from comments (#531).** "A4" (five sites across
-  `actions.py`, `bcl-convert/1.0.0.yaml`, and `bcl_convert_prep.py`) and "Phase 5"
-  (`step_progress.py`, `slurm.py`) name planning documents that are not in the repo, which
-  CLAUDE.md forbids. The surrounding words already carried the meaning. The `Phase 1` /
-  `Phase 2` comments in `_feature_load.py` and `align_sharded.py` are left alone: they
-  number the stages of an algorithm inside one function, not a milestone.
+  `test_shard_planner.py` and `test_shard_assignment.py` carried the same "later milestone"
+  sentence and are corrected with it. `FlatBaselineResources` said `profiles` holds "one
+  profile per instrument family", which `long-read-assembly` 1.0.1 contradicts — its
+  profiles are per assembler — so it now names the mechanism instead of one workflow's
+  key.
+- **Development-plan vocabulary removed from comments (#531).** "A4" (ten sites across
+  `actions.py`, `bcl-convert/1.0.0.yaml`, `bcl_convert_prep.py`, `entrypoint.sh`,
+  `sequencer_types.yml`, `test_runner_baseline.py` and `test_actions_loader.py`), "Phase 5"
+  (`step_progress.py`, `slurm.py`) and "Phase 2" (`test_qc_miint_contract.py`) name
+  planning documents that are not in the repo, which CLAUDE.md forbids — including in test
+  docstrings, which that rule names explicitly. The surrounding words already carried the
+  meaning. The `Phase 1` / `Phase 2` comments in `_feature_load.py`, `align_sharded.py` and
+  `test_align_sharded.py` are left alone: they number the stages of an algorithm, not a
+  milestone.
 
 - **A paired-end read submission can no longer cross routes (#484).** The exactly-one
   constraint on `fastq-to-parquet` was per key, not per family: it stopped the forward read

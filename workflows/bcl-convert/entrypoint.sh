@@ -36,7 +36,7 @@ CONVERT_DIR="${QIITA_OUTPUT_PATH}/ConvertJob"
 mkdir -p "${CONVERT_DIR}"
 
 # bcl-convert thread counts track the CPUs allocated to this step rather than a
-# hardcoded constant, so they can't drift from the resolved A4 profile. QIITA_CPUS
+# hardcoded constant, so they can't drift from the resolved profile. QIITA_CPUS
 # is the step's resolved baseline_resources.cpu, forwarded into the container by
 # slurm/payload.py, so a future profile in workflows/bcl-convert/1.0.0.yaml with a
 # different cpu needs no entrypoint change. SLURM_CPUS_PER_TASK is a second choice

@@ -1001,7 +1001,7 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     Illumina families); and action_ceiling leaves escalation headroom
     above the largest profile.
 
-    Locks the YAML shape so the runner's A4 resolution branch (the
+    Locks the YAML shape so the runner's lookup-population resolution (the
     lookup vs flat split in qiita_control_plane.runner._dispatch_step)
     is exercised end-to-end the first time sync drops bcl-convert into
     qiita.action.
@@ -1050,7 +1050,7 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     assert convert.module is None
     # Lookup-population baseline_resources: from_step_output names the
     # upstream output file that carries the instrument key, and profiles
-    # covers exactly the three A4-supported Illumina families.
+    # covers exactly the three supported Illumina families.
     br = convert.baseline_resources
     assert br.from_step_output == "instrument_model"
     assert br.profiles is not None
