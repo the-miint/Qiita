@@ -302,7 +302,7 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
 
     assert ei.value.kind is FailureKind.BAD_INPUT
     assert ei.value.step_name == YAML_STEP_NAME
-    assert "must match the prior mint count exactly" in ei.value.reason
+    assert "has to cover exactly as many reads as before" in ei.value.reason
 
 
 def test_duckdb_memory_limit_tracks_the_slurm_cgroup(fake_mint, monkeypatch, tmp_path):
@@ -451,11 +451,11 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
     assert terminal_state in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()
 
-    # The refusal must name a recovery the CP will actually ACCEPT. `/run` takes a
-    # ticket in PENDING or FAILED only, so `failed` gets the redrive and every other
-    # terminal state gets delete-then-resubmit; pointing `completed` or `no_data` at
-    # `ticket run` would send the operator to a 409.
-    if terminal_state == WorkTicketState.FAILED.value:
+    # The refusal must name a recovery the CP will actually ACCEPT. `/run` redrives a
+    # FAILED or CANCELLED ticket, so those two get the redrive and every other terminal
+    # state gets delete-then-resubmit; pointing `completed` or `no_data` at `ticket run`
+    # would send the operator to a 409.
+    if terminal_state in sequence_range_retry._REDRIVABLE_MINTER_STATES:
         assert f"qiita ticket run {1}" in ei.value.reason
         assert "delete the prep_sample" not in ei.value.reason
     else:

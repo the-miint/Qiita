@@ -574,7 +574,7 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
 
     assert ei.value.kind is FailureKind.BAD_INPUT
     assert ei.value.step_name == YAML_STEP_NAME
-    assert "must match the prior mint count exactly" in ei.value.reason
+    assert "has to cover exactly as many reads as before" in ei.value.reason
 
 
 def test_execute_maps_not_eligible_to_bad_input(monkeypatch, tmp_path):

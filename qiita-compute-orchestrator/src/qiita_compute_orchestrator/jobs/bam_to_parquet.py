@@ -106,7 +106,8 @@ class Inputs(BaseModel):
     flows through here). `expect_unaligned` is the caller's alignment-state
     declaration (threaded from action_context via the step's `params:`; the
     sequence-load step sets it True). Defaults True — a hand-submitted ticket that
-    omits it still gets the unaligned verification. `prep_sample_idx` and
+    omits it is taken to be declaring an unaligned input, which this job trusts
+    (see the module docstring); it is not checked. `prep_sample_idx` and
     `work_ticket_idx` are framework-injected scope scalars; `prep_sample_idx` is
     also the key the CP's sequence-range allocator uses, and `work_ticket_idx` is
     what proves an orphaned range belongs to THIS step before it is reused.

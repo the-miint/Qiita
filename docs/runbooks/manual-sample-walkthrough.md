@@ -1,4 +1,4 @@
-# Manual sample walkthrough
+# Manual prep_sample walkthrough
 
 > Registering **one prep_sample by hand** — no pre-flight file — and loading
 > reads you already hold from your own machine. Everything here you can do with
@@ -32,9 +32,9 @@ The run stands for the instrument's output as a whole. Any user account may
 create one.
 
 ```bash
-qiita sequencing-run create \
+RUN_IDX=$(qiita sequencing-run create \
     --instrument-run-id "MISEQ-RUN-2026-05-20-001" \
-    --platform illumina
+    --platform illumina | jq -r .sequencing_run_idx)
 ```
 
 Qiita records you as the run's creator, which is what lets you do the next
@@ -43,28 +43,29 @@ two steps.
 ## 2. Add a pool to the run
 
 ```bash
-qiita sequenced-pool create --run-idx $RUN_IDX
+POOL_IDX=$(qiita sequenced-pool create --run-idx "$RUN_IDX" | jq -r .sequenced_pool_idx)
 ```
 
 A pool is a subset of the prepped samples in the sequencing run that all
-share the same preparation info (run preflight). Every run has at least one
-pool. You may add one because you created the run in step 1 (wet-lab admins
-may add one to anybody's run).
+share the same preparation info (run preflight). A real run has at least one.
+You may add one because you created the run in step 1 (wet-lab admins may add
+one to anybody's run).
 
-There is a `--run-preflight-blob` flag for attaching a run's pre-flight
-file, which you do not need here — the whole-run commands in
-[`getting-started.md`](getting-started.md) pass it themselves.
+The preparation info is attached with `--run-preflight-blob`, which the
+whole-run commands in [`getting-started.md`](getting-started.md) pass
+themselves. Here you leave it off — the pool this walkthrough makes stands for
+one prep_sample you are registering by hand, so there is no sheet to attach.
 
 ## 3. Add your prep_sample to the pool
 
 ```bash
-qiita sequenced-sample create \
-    --run-idx $RUN_IDX \
-    --pool-idx $POOL_IDX \
-    --biosample-idx $BIOSAMPLE_IDX \
-    --prep-protocol-idx $PROTOCOL_IDX \
+PREP_SAMPLE_IDX=$(qiita sequenced-sample create \
+    --run-idx "$RUN_IDX" \
+    --pool-idx "$POOL_IDX" \
+    --biosample-idx "$BIOSAMPLE_IDX" \
+    --prep-protocol-idx "$PROTOCOL_IDX" \
     --pool-item-id filename_prefix \
-    --primary-study-idx $STUDY_IDX
+    --primary-study-idx "$STUDY_IDX" | jq -r .prep_sample_idx)
 ```
 
 `--pool-item-id` uniquely identifies this prep_sample within the pool. **It
@@ -78,12 +79,14 @@ pre-flight file, not out of your head — see
 
 `--prep-protocol-idx` says how the library was prepared; `qiita
 prep-protocol list` shows the numbers your site has, and
-`short_read_metagenomics` is the one that ships by default.
+`short_read_metagenomics` is the one that ships by default. Set
+`PROTOCOL_IDX` to the number you find there before running the command above.
 
 To attach the prep_sample to further studies, repeat `--secondary-study-idx`
 — you need admin access on each one, which you have on studies you own.
 
-The reply gives you two numbers. `prep_sample_idx` is the one step 4 wants.
+The reply carries both `sequenced_sample_idx` and `prep_sample_idx`; step 4
+wants `prep_sample_idx`, which is what the command above captures.
 
 ## 4. Submit the reads
 
@@ -91,7 +94,7 @@ The reply gives you two numbers. `prep_sample_idx` is the one step 4 wants.
 
 ```bash
 qiita submit-reads \
-    --prep-sample-idx $PREP_SAMPLE_IDX \
+    --prep-sample-idx "$PREP_SAMPLE_IDX" \
     --fastq ./filename_prefix_R1.fastq \
     --reverse-fastq ./filename_prefix_R2.fastq \
     --data-plane-url grpc+tls://qiita-miint.ucsd.edu:443
@@ -107,13 +110,17 @@ anywhere but the deploy host itself.
 The command waits for the job and prints it when it finishes; `--no-watch`
 returns as soon as it is submitted.
 
-You do not name a workflow or a version. `--fastq` means `fastq-to-parquet`
-and `--bam` means `bam-to-parquet`, at whatever version your site has enabled.
+You do not name a workflow or a version: `--fastq` means `fastq-to-parquet` and
+`--bam` means `bam-to-parquet`, each at a version the command carries. If your
+site has moved on to a version this `qiita` does not know about, the submit is
+refused — install the `qiita` that matches your deploy.
 
 - **Paired-end** — pass `--fastq` and `--reverse-fastq`.
 - **Single-end** — pass `--fastq` alone. Forward-only is fully supported.
 - **An unaligned BAM** — pass `--bam` instead of `--fastq`, with no reverse
-  file. An aligned BAM is refused by the loader.
+  file. It has to be a basecaller uBAM: the loader is told the reads are
+  unaligned and takes that on trust, so an aligned BAM is loaded rather than
+  refused, with every reverse-strand read stored back-to-front.
 
 **The filename rule.** Each FASTQ's *filename* must start with the
 `--pool-item-id` from step 3 — here `filename_prefix` — followed by `_` or `.`.
@@ -124,17 +131,28 @@ a demultiplexed BAM is named for its movie and barcode and carries no pool item
 id.
 
 If your reads are already on the cluster, a `wet_lab_admin` can name their path
-directly instead — `qiita ticket submit --context-json '{"fastq_path": …}'` —
-under the directories the site allows. An ordinary account is refused, and the
-refusal names the upload route above.
+directly instead, under the directories the site allows:
+
+```bash
+qiita ticket submit \
+    --action-id fastq-to-parquet --action-version 1.3.0 \
+    --prep-sample-idx $PREP_SAMPLE_IDX \
+    --context-json '{"fastq_path": "/sequencing/…/filename_prefix_R1.fastq"}'
+```
+
+`--action-version` must name the version your site has enabled — a deploy
+enables only the newest it syncs and retires the rest. An ordinary account is
+refused with a 403 that names the offending key (`fastq_path`) and the upload
+handle to use instead (`fastq_upload_idx`); `qiita submit-reads` is what fills
+that handle in for you.
 
 ## 5. Watch it
 
-Step 4 already waited for the job and printed it. To look again later — its
-number is `work_ticket.work_ticket_idx` in that output:
+Step 4 already waited for the job and printed it. To look again later, using
+the ticket number from `work_ticket.work_ticket_idx` in that output:
 
 ```bash
-qiita ticket status $WORK_TICKET_IDX
+qiita ticket status "$WORK_TICKET_IDX"
 ```
 
 This shows the job's state, what it was asked to do, how many times it has

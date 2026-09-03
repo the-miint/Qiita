@@ -54,6 +54,10 @@ saves your token but not the address of the site, and with no address the comman
 talks to your own machine instead — where nothing is listening. The examples
 below assume you have set it.
 
+Tokens expire, and are revocable. If a command that worked yesterday comes back
+`401`, that is what happened: run `qiita login` again (or re-copy the token, if
+you are working from a remote machine).
+
 ### Working on a remote machine
 
 Log in once where you do have a browser, then carry the token across:
@@ -71,9 +75,10 @@ qiita whoami          # no login needed here
 The token is what identifies you, whatever Unix account you are using — so
 `sudo -u qiita env QIITA_TOKEN=… qiita …` still acts as you.
 
-Commands print their result as JSON, so you can pull out an identifier with
-`| jq -r .study_idx` and similar. The exception is `qiita ticket logs`, which
-prints a job's output as-is so it stays readable.
+Most commands print their result as JSON, so you can pull out an identifier with
+`| jq -r .study_idx` and similar. A few print for reading instead of parsing —
+`qiita ticket logs` prints a job's output as-is, and so do `feature-table build`
+and `reference export`.
 
 ## 1. Fill in your profile (once)
 
@@ -182,28 +187,36 @@ snippets below are short Python.
 |---|---|
 | each row's `biosample_accession` | a biosample you created in step 3 |
 | each row's project `bioproject_accession` | a study you created in step 2 |
-| any extra projects on the plate (controls only) | further studies that biosample belongs to |
+| any extra projects on the plate (controls only) | further studies to link that row to |
 
 A row's project is the one set on the row itself, or, if it has none, its plate's
 main project.
 
 Qiita refuses the file outright — before creating anything — if:
 
-- A row of the standard sample type has no project, or a non-standard one (an
-  extraction blank) has one. Extraction blanks take their project from the plate,
-  which is why they must not carry one of their own; project-specific controls are
-  a different sample type and do carry theirs. This is checked before the
-  accessions, so it is the only error you see until it is fixed.
+- The file does not describe exactly one run — zero runs is refused as well as
+  two. This is checked first.
+- A row of the standard sample type has no project, or a control row has one.
+  The pre-flight file's two control types — an extraction blank and a
+  KatharoSeq positive control — both take their project from the plate, which is
+  why neither may carry one of its own. This is checked before the accessions,
+  so it is the only error you see until it is fixed.
 - Any `biosample_accession` or `bioproject_accession` it needs is still empty.
   The pre-flight format allows them to be empty, so a file that is perfectly
   valid otherwise can still be unusable here. This is the common one.
-- The file describes more than one run.
 - There are no usable rows left — rows marked `do_not_use` do not count.
+
+Those are the checks on the file's *contents*. A file Qiita cannot read at all
+— not a regular file, empty, or not a pre-flight database — is refused before
+any of them.
 
 ### Filling in the accessions
 
-Build the file from the run's samplesheet CSV, then set the two accessions so
-they match what you created in steps 2 and 3:
+Build the file from the run's samplesheet CSV — the one describing the whole
+run, with its plates, projects and per-row detail, which is what
+`migrate_legacy_csv_to_db_file` reads. It is not `SampleSheet.csv`, the narrow
+file bcl-convert consumes; run_preflight *emits* that one. Then set the two
+accessions so they match what you created in steps 2 and 3:
 
 ```python
 from run_preflight import (
@@ -238,9 +251,10 @@ database`. Copy it somewhere you own.
 More important: Qiita identifies a pool by the exact bytes of the file you hand
 it, and the submit reads those bytes *before* opening it. Submit a file that has
 never been opened, then re-run to retry, and the second submit sends the
-now-upgraded bytes — a different file as far as Qiita is concerned, so you get a
-second pool instead of the retry you wanted. Open it once yourself first, and the
-bytes stop changing:
+now-upgraded bytes — a different file as far as Qiita is concerned. Your retry is
+refused: the run already has a pool under that filename, and the contents no
+longer match it. Open the file once yourself first and the bytes stop changing,
+so a retry is a retry:
 
 ```bash
 SHARED_PF=/qmounts/qiita_data/working_dir/RunPreflight.db   # the lab's copy
@@ -316,17 +330,24 @@ covers the flags Illumina does not have, which protocol to choose, and why
 **To retry either command, run it again unchanged.** Both pick up where they left
 off.
 
-`--force` is not how you retry. All it does is get a submission past one refusal:
-on Illumina, submitting again over a run whose demultiplexing already completed is
-refused, and `--force` waives that. On PacBio nothing refuses you in the first
-place, so it changes nothing at all there. It needs a `wet_lab_admin` account
-either way.
+`--force` is not how you retry, and on Illumina it is the one thing here that can
+damage what you already have.
 
-What it will not do is re-load the reads. Each prep_sample's reads are numbered
-once when they are first loaded; a later submit finds those numbers already taken
-and stops, telling you to delete first. So if what you want is to load the run's
-reads again, `--force` is the wrong tool: delete the pool with
-`qiita delete-sequenced-pool` — which removes its jobs too — and submit fresh.
+It gets a submission past a single refusal: on Illumina, submitting again over a
+run whose demultiplexing already completed is refused, and `--force` waives that.
+On PacBio nothing refuses you in the first place, so it changes nothing at all
+there. It needs a `wet_lab_admin` account either way.
+
+**On Illumina, forcing stores the run's reads a second time.** The re-run finds
+each prep_sample's reads already staged from the first run and files them again;
+nothing removes the first copy, and nothing merges them. If what you want is to
+load the run's reads afresh, delete the pool with `qiita delete-sequenced-pool`
+— which removes its jobs too — and submit again.
+
+On PacBio a re-submit stops instead: each prep_sample's reads are numbered once
+when they are first loaded, and the second attempt finds those numbers taken and
+stops before storing anything. That is the failed-looking job the retry note
+above tells you to expect.
 
 ## 6. Watch it run
 
@@ -334,7 +355,7 @@ reads again, `--force` is the wrong tool: delete the pool with
 qiita ticket list --active
 qiita ticket status <idx>
 qiita ticket logs <idx> --step-index 0
-qiita ticket run <idx>        # start a failed job over from the beginning
+qiita ticket run <idx>        # re-dispatch a failed job, resuming at the first unfinished step
 qiita pool-completion --sequencing-run-idx <run> --sequenced-pool-idx <pool>
 ```
 

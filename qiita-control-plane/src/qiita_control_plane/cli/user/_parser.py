@@ -1414,21 +1414,24 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help=(
-            "Qiita prep_protocol_idx to FK every per-sample row to. Applied"
+            "Qiita prep_protocol_idx to FK every per-prep_sample row to. Applied"
             " uniformly across the pool."
         ),
     )
     p_submit_bcl.add_argument(
         "--force",
         action="store_true",
-        help=(FORCE_RESUBMIT_EXPLANATION),
+        help=(
+            "Submit anyway when a COMPLETED bcl-convert ticket already exists"
+            f" for this pool, instead of being refused. {FORCE_RESUBMIT_EXPLANATION}"
+        ),
     )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
 
     p_submit_reads = sub.add_parser(
         "submit-reads",
         help=(
-            "Load one sample's reads from THIS machine: upload the FASTQ(s) or BAM"
+            "Load one prep_sample's reads from THIS machine: upload the FASTQ(s) or BAM"
             " to the data plane, then submit the ingest work-ticket against them."
         ),
         description=(
@@ -1461,7 +1464,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "Unaligned basecaller uBAM (PacBio HiFi / ONT) on this machine."
-            " An aligned BAM is rejected by the loader."
+            " Declared unaligned to the loader, which trusts the declaration"
+            " rather than checking it — an aligned BAM is loaded, not refused."
         ),
     )
     p_submit_reads.add_argument(
@@ -1579,10 +1583,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "Requires wet_lab_admin or system_admin, and changes nothing else"
             " here: the COMPLETED-ticket refusal this waives is scoped to"
             " sequenced_pool actions, and PacBio ingest submits one"
-            " prep_sample-scoped ticket per sample. A re-submit over an"
+            " prep_sample-scoped ticket per prep_sample. A re-submit over an"
             " already-loaded prep_sample is admitted with or without it, and"
-            " stops at the read-loading step either way. To load a pool's reads"
-            " again, delete the pool and submit fresh."
+            " stops at the read-numbering step either way, before anything is"
+            " stored. To load a prep_sample's reads again, delete it (or the"
+            " whole pool with `qiita delete-sequenced-pool`) and submit fresh."
         ),
     )
     p_submit_pacbio.set_defaults(handler=_handle_submit_pacbio_ingest)

@@ -718,8 +718,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   reached from a sheet at all. No runbook stated that prerequisite. The runbook also
   generalizes the pre-flight pre-patching trap that was filed under PacBio: pool identity
   is the SHA-256 of the blob's bytes and both gestures read those bytes before `open_db_file`
-  patches the file in place, so an unpatched submit followed by a re-run mints a second pool on
-  either platform.
+  patches the file in place, so an unpatched submit followed by a re-run sends different bytes
+  under the same filename and is refused by `sequenced_pool_one_per_run_and_filename` — the
+  retry does not converge, on either platform.
 
 - **A published feature table's rows can now be labelled without our identifiers (#448).**
   `POST /exported-feature` mints the public handle for a feature-axis entity, the way
@@ -3369,10 +3370,23 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   one — the detail that says which call failed. The `force` explanation now lives in
   `qiita_common.work_ticket_constants` and is consumed by the CLI flags, the 409 body and
   the wire model's field description, because four copies had to be edited to fix it once.
-  Objects are named by kind throughout — `biosample` or `prep_sample`, never a bare
-  "sample" — outside the control-plane code that is deliberately generic over both. They also stop implying that forcing a re-run duplicates
-  reads: the read-numbering step refuses a range another ticket reserved, before anything is
-  written, so a forced re-run stops there instead — which is what the messages now say.
+  In the strings this PR touches, objects are named by kind — `biosample` or `prep_sample`,
+  never a bare "sample" — outside the control-plane code that is deliberately generic over
+  both; the rest of the user CLI's `--help` still says bare "sample" in ~40 places and wants
+  its own sweep.
+
+- **`--force` says what it costs, which is the opposite of what an earlier draft of this
+  branch claimed (#461).** The draft told the operator a forced re-run cannot duplicate reads
+  because the read-numbering step refuses a range another ticket reserved. That holds for
+  `fastq-to-parquet` and `bam-to-parquet`, but not for the one action the gate offering
+  `--force` actually covers: `bcl-convert` is the only `target_kind: sequenced_pool` workflow,
+  and its `ingest_reads` step short-circuits on the durable per-prep_sample staging copy
+  (`compute_reads_staging_path`, keyed on `prep_sample_idx` alone) before it ever reaches the
+  mint — it re-creates the register hardlink and returns. `read` is not in the data plane's
+  `REPLACE_KEY_TABLES`, so the following `register-files` appends. A forced re-run therefore
+  stores the pool's reads a second time, which is what the message now says. The PacBio
+  `--force` help keeps its own text, since neither the refusal nor the duplication reaches a
+  prep_sample-scoped ticket.
 
 - **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`,
   `manual-sample-walkthrough.md` and `pacbio-ingest.md` are what a person with samples reads, so
@@ -3392,7 +3406,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   creation, which the getting-started runbook now owns; what remains is what is unique to it —
   minting a run, pool and sequenced-sample yourself and loading reads you already hold with
   `qiita submit-reads`, which is the route an ordinary account now takes since naming a host path
-  became `wet_lab_admin`-or-higher. `pacbio-ingest.md` likewise drops where-to-run-the-CLI, the pre-flight
+  became `wet_lab_admin`-or-higher. `pacbio-ingest.md` likewise drops where-to-run-the-CLI,
+  the pre-flight
   writability trap and the `--force` rule, keeping only what has no Illumina counterpart. The
   `study_access` grant mechanism moves to `docs/auth.md`, which owns the auth surface, and both
   runbooks point at it rather than spelling out the INSERT.

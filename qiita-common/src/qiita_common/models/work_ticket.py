@@ -313,9 +313,11 @@ class WorkTicketCreateRequest(BaseModel):
     `resource_override` is an optional per-run resource bump, gated server-side
     to wet_lab_admin / system_admin and bounded by the action's ceiling.
 
-    `force` is described once, for every surface that offers it, in
-    `qiita_common.work_ticket_constants.FORCE_RESUBMIT_EXPLANATION` — which is
-    this field's description. What follows is the wire semantics an operator
+    `force` re-submits a sequenced_pool action even when a COMPLETED ticket
+    already exists for the same `(pool, action, version)`. What it then does to
+    the pool's data is stated once in
+    `qiita_common.work_ticket_constants.FORCE_RESUBMIT_EXPLANATION`, which this
+    field's description carries. What follows is the wire semantics an operator
     does not see. It is privileged regardless of scope: setting `force=true`
     requires wet_lab_admin / system_admin (403 otherwise) for ANY action. It
     only *changes submission behavior* for the sequenced_pool COMPLETED gate,
@@ -328,7 +330,13 @@ class WorkTicketCreateRequest(BaseModel):
     scope_target: ScopeTarget
     action_context: dict[str, Any] = Field(default_factory=dict)
     resource_override: ResourceOverride | None = None
-    force: bool = Field(default=False, description=FORCE_RESUBMIT_EXPLANATION)
+    force: bool = Field(
+        default=False,
+        description=(
+            "Submit anyway when a COMPLETED ticket already exists for this"
+            f" sequenced_pool and action. {FORCE_RESUBMIT_EXPLANATION}"
+        ),
+    )
 
 
 class WorkTicketResponse(BaseModel):

@@ -69,6 +69,14 @@ CP_RETRY_BACKOFF_BASE_S = 0.5
 # path by default; with a silent failure mode, the default must be refusal.
 _REUSABLE_MINTER_STATES: frozenset[str] = frozenset(NON_TERMINAL_WORK_TICKET_STATES)
 
+# Terminal minter states `qiita ticket run` will put back in flight, so the
+# refusal below can name that instead of telling the operator to delete. Mirrors
+# the redrive half of _RUN_APPLICABLE_STATES in the CP's work_ticket routes; a
+# state outside it takes the fall-through arm, which advises no redrive.
+_REDRIVABLE_MINTER_STATES: frozenset[str] = frozenset(
+    {WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value}
+)
+
 
 def _is_transient_status(status: int) -> bool:
     """True for an HTTP status from the CP callback that a retry can self-heal:
@@ -275,11 +283,12 @@ async def mint_or_reuse_sequence_range(
             state = existing.minted_by_work_ticket_state
             # The recovery differs by state, so name it rather than just refusing —
             # and only offer a redrive where the CP will actually accept one. `/run`
-            # takes a ticket in PENDING or FAILED; it 409s on `no_data` and 404s on a
-            # ticket row that is gone (state=None). So the three-way is not cosmetic:
-            # the fall-through arm exists because a fail-closed allowlist must land an
+            # takes a ticket in PENDING, FAILED or CANCELLED (_RUN_APPLICABLE_STATES
+            # in routes/work_ticket.py); it 409s on `no_data` and 404s on a ticket row
+            # that is gone (state=None). So the three-way is not cosmetic: the
+            # fall-through arm exists because a fail-closed allowlist must land an
             # UNANTICIPATED state on advice that works, not on advice that bounces.
-            if state == WorkTicketState.FAILED.value:
+            if state in _REDRIVABLE_MINTER_STATES:
                 recovery = (
                     f"re-drive this ticket with `qiita ticket run {work_ticket_idx}`, "
                     "which returns it to flight and makes its own range reusable"
@@ -317,8 +326,9 @@ async def mint_or_reuse_sequence_range(
                     f"prep_sample {prep_sample_idx} already has read numbering for "
                     f"{recovered_count} reads "
                     f"({existing.sequence_idx_start}..{existing.sequence_idx_stop}), but "
-                    f"the input now has {count} — the range must match the prior mint "
-                    "count exactly, so the input is not the one that was numbered. "
+                    f"the input now has {count} — the numbering has to cover exactly "
+                    "as many reads as before, so the input is not the one that was "
+                    "numbered. "
                     "Delete the prep_sample and submit again"
                 ),
             ) from exc

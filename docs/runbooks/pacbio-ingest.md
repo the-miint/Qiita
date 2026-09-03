@@ -21,9 +21,15 @@ folder itself to find each barcode's BAM. But it opens it as its own account,
 which sees less of the filesystem than the account that later runs the jobs, and
 on this deploy the PacBio drop needs a grant that the Illumina one does not.
 
-If the submit comes back **403** on `/run-folder/inspect`, that grant is missing
-for the tree you named. Ask your operator (the step is in `DEPLOY_CHECKLIST.md`);
-until it is in place, submit from a node that mounts the run folder.
+If the submit fails at `/run-folder/inspect`, read which failure it is:
+
+- A **403 saying the control plane cannot read this run folder**, naming the
+  account: the grant is missing for the tree you named. Ask your operator to add
+  it; until it is in place, submit from a node that mounts the run folder.
+- A **403 about your own role**: `/run-folder/inspect` is `wet_lab_admin` and
+  above, like the submit itself.
+- A **422**: the path is outside the directories the site allows, or nothing is
+  there. Check the path before asking for a grant.
 
 ## Submit
 
@@ -42,12 +48,13 @@ qiita submit-pacbio-ingest \
 - **You have to supply `--instrument-run-id` yourself.** Illumina run folders
   carry the run's name in a file Qiita reads; PacBio's do not. Nothing checks
   what you type, so use the run folder's own name.
-- **The protocol is always `long_read_metagenomics`.** This command only takes
-  the two PacBio sheet types and both are metagenomics, so it is never the
-  amplicon protocol, whatever the sheet is called. Look the number up on your own
-  site with `qiita prep-protocol list` rather than copying one from anywhere —
-  nothing will catch a wrong number for you, and a wrong one mislabels every
-  prep_sample in the run.
+- **Which protocol to pick is a wet-lab call, and nothing here checks it.** The
+  command accepts only the two PacBio sheet types, and the convention at this
+  site is that both are metagenomics — so `long_read_metagenomics`, not the
+  amplicon protocol, whatever the sheet is called. Confirm that with whoever
+  prepped the run rather than reading it off this page, then look the number up
+  on your own site with `qiita prep-protocol list`. Qiita stores whatever number
+  you give it, and a wrong one mislabels every prep_sample in the run.
 - **Re-running the identical command is the retry**, but it is not free. The run
   and pool are reused and missing prep_samples are added, and any whose job is
   still running are reported `skipped`. A prep_sample whose reads already loaded
