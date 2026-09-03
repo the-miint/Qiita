@@ -3071,6 +3071,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **`long-read-assembly` `checkm` baseline memory 40 → 48 GiB, set from nine measured runs (#525).**
+  The heaviest run peaked at 38.88 GiB against a 40 GiB allocation. No OOMs were observed in
+  any of the nine — this was margin, not a repair for a failure. The step's own
+  `baseline_resources` comment carries the table, what the control does and does not cover,
+  and the reasoning. Resources are not part of a run's processing identity, so this needs no
+  version bump. `walltime` is unchanged.
+
 - **The unbinned residue is no longer admitted to the de novo genome map, so a feature table
   reports assembled genomes rather than single fragments.** `ASSEMBLY_GENOME_MAP_PAIRS_SQL` — the row
   set shared verbatim by the REST contig→genome map and the cohort Parquet

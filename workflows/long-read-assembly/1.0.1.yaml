@@ -229,40 +229,55 @@ steps:
       QIITA_CHECKM_DB: checkm_data
       MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [checkm_dir]
-    # NOT YET MEASURED FOR THREE PASSES. The step is three sequential CheckM runs.
-    # Two of the three subject counts are measured, over the 52 stored 1.0.0 runs in
-    # qiita.assembly_membership: 5,328 MAG bins, 102.5 per run; 4,433 LCG contigs,
-    # 85.2 per run over all 52 and 92.4 over the 48 that produced any — 4 runs closed
-    # no contig at all. The LCG figure carries forward, since an LCG bypasses binning.
-    # The MAG figure does NOT: changing MAG composition is what this version is for.
-    # The residue count above the cut is still unmeasured — contig lengths live in the
-    # lake, not Postgres — and ~148 is the scoping estimate, so ~338 subjects is two
-    # measurements and one guess. DEPLOY_CHECKLIST.md bucket 5 counts the residue off
-    # the first real ticket; replace that figure with what it reports.
+    # Measured on this version's first cohort: nine runs, each scoring whichever of the
+    # three passes (refined MAGs, circular contigs (LCGs), unbinned residue >=300 kb)
+    # its assembly had subjects for. Subject counts are the row counts of the three
+    # per-pass lineage TSVs named above. MaxRSS and Elapsed are `sacct` on the `.batch`
+    # row, where a container step's figure lands; Elapsed is job runtime, so unlike a
+    # submit-to-terminal average it excludes queue wait.
     #
-    # The only measured figure is for ONE pass: a submit -> terminal average of
-    # 27.5 min and a peak of 58.9 min across 59 completed steps, all of which ran the
-    # image deployed at the time, which scored refined bins alone. So the measured
-    # predecessor is 102.5 subjects in one run, not ~190 in two — this step is roughly
-    # three times that work, not half again. The figure also INCLUDES queue wait,
-    # which a SLURM walltime cap does not count, so it bounds run time from above and
-    # cannot be scaled into an estimate either way. Left at 4h rather than guessed
-    # upward: a TIMEOUT is
-    # retriable and re-submits at double this, clamped to the P2D action ceiling, and
-    # only this step re-runs. So an under-set baseline costs one attempt and one of
-    # the ticket's shared retries, where an over-set one costs queue time on every
-    # ticket. DEPLOY_CHECKLIST.md bucket 5 records the first real elapsed; put it here.
+    # `mem_gb` is spelled GB but the runner emits MiB (`slurm/payload.py` sends
+    # mem_gb * 1024), so an allocation of 40 is 40 GiB and every figure here is GiB.
     #
-    # cpu and mem_gb are unchanged, and mem_gb is the weaker of the two. The runs are
-    # sequential, so peak memory is one run at a time rather than the sum — but the
-    # LARGEST single run grows from the measured 102.5 refined bins to ~148 residue
-    # contigs, so "one at a time" is not on its own a reason 40 GB still fits. Whether
-    # CheckM's peak RSS scales with subject count over that range is not measured, and
-    # this step has never run end to end. DEPLOY_CHECKLIST.md bucket 5 records the
-    # pilot's MaxRSS alongside its elapsed; set this from that rather than from here.
+    #   MAG   LCG   residue   total   elapsed   MaxRSS   ReqMem
+    #     1     0         0       1   04:28      31.78       40
+    #     4     0         0       4   04:10      35.20       40
+    #    19    28         5      52   19:16      35.98      103
+    #    17    35         4      56   17:14      35.95       40
+    #    80    37         8     125   26:39      36.11       40
+    #   200    88        48     336   1:10:54    37.02       40
+    #   248   123        22     393   1:14:54    38.04       40
+    #   259   159        27     445   1:21:51    38.63       40
+    #   290   111        44     445   1:36:41    38.88       40
+    #
+    # The 103 row carried a ticket-wide resource_override of {"mem_gb": 103} set at
+    # submission. Nothing escalated it, and no run in this set OOMed.
+    #
+    # mem_gb 40 -> 48, for roughly 20% margin over the measured peak. The run with the
+    # most MAG bins (290) is also the one with the most subjects (445) and it peaked at
+    # 38.88 GiB, so that is the peak of the heaviest workload seen rather than of an
+    # arbitrarily chosen run. MAG count and total subjects are rank-collinear across
+    # these nine — they disagree only on the 52/56 pair — so which of the two drives
+    # RSS is not separable here. 38.88 left 1.12 GiB, 2.8% of the 40 GiB allocation;
+    # 48 GiB sits 23.5% above the peak, leaving 9.12 GiB clear.
+    #
+    # What the 103 row controls for, and what it does not: 56 subjects at 40 GiB used
+    # 35.95 and 52 subjects at 103 GiB used 35.98 — comparable workloads, 2.6x the
+    # allocation, 0.03 GiB apart, so at ~36 GiB of demand a 40 GiB cap is not binding.
+    # There is no run above 40 GiB at 445 subjects, so whether 38.88 is demand or a cap
+    # effect at that size is not established by this table.
+    #
+    # 1 subject cost 31.78 GiB and 445 cost 38.88 — a large fixed floor plus a small
+    # sublinear term. That floor is why the margin is sized as headroom over a measured
+    # peak rather than as a scaling allowance; how RSS behaves past 445 is unmeasured.
+    # (`jobs/assembly_coverage.py` declines to re-size on a larger sample for the
+    # opposite reason: there the question was the shape of a distribution, not headroom
+    # over a peak.)
+    #
+    # walltime stays PT4H; the worst run used 40% of it.
     baseline_resources:
       cpu: 8
-      mem_gb: 40
+      mem_gb: 48
       walltime: PT4H
 
   # Hash the LCG contigs, the MAG contigs, and the unbinned noLCG residue into the
