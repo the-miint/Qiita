@@ -34,7 +34,6 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
-
             # Mint an upload slot and stream into it. On the USER ceiling
             # because a user who may not name a host path in action_context
             # (wet_lab_admin+) has this as their only route for their own
