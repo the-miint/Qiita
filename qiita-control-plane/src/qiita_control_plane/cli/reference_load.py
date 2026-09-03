@@ -247,16 +247,38 @@ def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
 @contextlib.contextmanager
 def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
     """Opaque binary file → `(chunk_index INT, chunk_data BLOB)` chunked
-    stream. Reads `src` in 64 KB blocks and emits one Arrow batch per
+    stream, inflating a `.gz` source as it goes.
+
+    Reads `src` in 64 KB blocks and emits one Arrow batch per
     `_CHUNK_ROWS_PER_BATCH` chunks. Bounded memory even on GG2-scale
     inputs (407 MB phylogeny, multi-GB jplace). Server side stitches
     chunks back into a temp file via `_blob_input.resolve_blob_input`.
 
-    Reads gzipped (`.gz`) inputs transparently — chunk_data carries the
-    decompressed bytes. The server's stitched temp file is then valid
-    plaintext for miint's `read_newick` / `read_jplace`, which only
-    accept on-disk text/JSON. Mirrors the FASTA streamer's treatment of
-    `.gz` for the same reason."""
+    Inflating is what makes the stitched temp file valid plaintext for miint's
+    `read_newick` / `read_jplace`, which only accept on-disk text/JSON.
+    """
+    with _chunked_upload_stream(src, inflate_gz=True) as stream:
+        yield stream
+
+
+@contextlib.contextmanager
+def _raw_blob_upload_stream(src: Path) -> Iterator[UploadStream]:
+    """The same envelope, byte-exact: a `.gz` source is NOT decompressed.
+
+    Reads have no plaintext constraint — `read_fastx` reads gzip directly — and
+    a FASTQ is the input where sending inflated bytes actually costs something.
+    The server names the stitched file from these bytes' own gzip magic
+    (`jobs._blob_input.resolve_reads_blob_input`), since miint detects
+    compression from the extension.
+    """
+    with _chunked_upload_stream(src, inflate_gz=False) as stream:
+        yield stream
+
+
+@contextlib.contextmanager
+def _chunked_upload_stream(src: Path, *, inflate_gz: bool) -> Iterator[UploadStream]:
+    """Shared body of the two blob streamers above; `inflate_gz` is their only
+    difference."""
     import gzip
 
     import pyarrow as pa
@@ -268,7 +290,7 @@ def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
         ]
     )
 
-    opener = gzip.open if src.suffix == ".gz" else open
+    opener = gzip.open if (inflate_gz and src.suffix == ".gz") else open
 
     def _iter_batches() -> Iterator[Any]:
         indices: list[int] = []
@@ -315,6 +337,10 @@ _ROLE_STREAMERS: dict[str, Callable[[Path], Any]] = {
     "taxonomy": _passthrough_parquet_stream,
     "tree": _blob_upload_stream,
     "jplace": _blob_upload_stream,
+    # A sample's reads (FASTQ / BAM) — byte-exact, compression preserved. See
+    # `_raw_blob_upload_stream` for why this is not the `_blob_upload_stream`
+    # entry above.
+    "reads": _raw_blob_upload_stream,
     "genome_map": _passthrough_parquet_stream,
     # A GFF3 is raw text like Newick/jplace — same chunked-BLOB envelope. The
     # server unwraps it with _blob_input.resolve_blob_input and hands the file
@@ -416,7 +442,13 @@ async def upload_file(
     metadata the caller stitches into `action_context`."""
     import asyncio
 
-    create_body = {"description": description or f"{role}: {file_path.name}"}
+    # `source_filename` is the client's own basename. The work_ticket submit
+    # gate reads it to apply the fastq filename-prefix rule to an upload-fed
+    # submission, which has no path to take a basename from.
+    create_body = {
+        "description": description or f"{role}: {file_path.name}",
+        "source_filename": file_path.name,
+    }
     create = await _post(http, token, URL_UPLOAD_PREFIX, body=create_body, expected_status=(201,))
     upload_idx = create["upload_idx"]
     ticket_bytes = base64.b64decode(create["doput_ticket"])

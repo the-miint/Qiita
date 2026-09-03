@@ -35,7 +35,6 @@ from .biosample import _handle_biosample_create, _post_biosample
 from .feature_table import _handle_feature_table_build
 from .pacbio import (
     _handle_submit_pacbio_ingest,
-    _index_run_bams,
     _PacbioPreflightRow,
     _read_pacbio_preflight_rows,
     _resolve_sample_bams,
@@ -143,7 +142,6 @@ __all__ = [
     "_handle_ticket_status",
     "_handle_ticket_submit",
     "_handle_whoami",
-    "_index_run_bams",
     "_lane_arg",
     "_list_work_tickets",
     "_lookup_accessions",

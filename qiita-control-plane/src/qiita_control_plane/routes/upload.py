@@ -43,8 +43,8 @@ router = APIRouter(prefix=PATH_UPLOAD_PREFIX, tags=["upload"])
 # Single projection used by every read path so a future column add doesn't
 # silently shift positional access.
 _UPLOAD_RETURNING = (
-    "upload_idx, status, description, sha256, row_count, bytes_received, "
-    "created_by_idx, created_at, completed_at"
+    "upload_idx, status, description, source_filename, sha256, row_count, "
+    "bytes_received, created_by_idx, created_at, completed_at"
 )
 
 
@@ -53,6 +53,7 @@ def _record_to_response(row: asyncpg.Record) -> UploadResponse:
         upload_idx=row["upload_idx"],
         status=row["status"],
         description=row["description"],
+        source_filename=row["source_filename"],
         sha256=row["sha256"],
         row_count=row["row_count"],
         bytes_received=row["bytes_received"],
@@ -85,10 +86,11 @@ async def create_upload(
     """
     try:
         row = await pool.fetchrow(
-            "INSERT INTO qiita.upload (description, created_by_idx)"
-            " VALUES ($1, $2)"
+            "INSERT INTO qiita.upload (description, source_filename, created_by_idx)"
+            " VALUES ($1, $2, $3)"
             f" RETURNING {_UPLOAD_RETURNING}",
             body.description,
+            body.source_filename,
             principal.principal_idx,
         )
     except asyncpg.PostgresError as exc:

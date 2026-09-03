@@ -21,6 +21,60 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`POST /run-folder/inspect` lets a submit run from a machine that does not mount the
+  cluster (#484).** `submit-bcl-convert` read `RunInfo.xml` and `submit-pacbio-ingest`
+  globbed `*/hifi_reads/*.bam`, both on the submitting machine — which is why submitting
+  required a machine that sees the cluster's filesystem, even though the path is only ever
+  re-opened on a compute node. Both reads moved to the control plane. The route is
+  read-only, wet_lab_admin+ (matching who may name a host path at submit), bounded by the
+  same `PATH_INGEST_ROOTS` gate, and returns facts rather than bytes: an Illumina run's
+  `instrument_run_id` / `instrument_model`, or a PacBio run's barcode → HiFi BAM index.
+  The PacBio pairing stays client-side — the glob needs the folder, the pairing needs the
+  pre-flight roster, and only one of those two leaves the submitter's machine. The
+  `index_run_bams` glob moved to `qiita_common.pacbio` so client and server share one
+  implementation. A 403 (rather than a 404) reports the case the account split makes real:
+  the control plane runs as `qiita-api` and cannot always read what `qiita-job` can, and
+  "you cannot read this" must not look like "this is not there".
+
+- **A work_ticket's `action_context` host paths are bounded to configured ingest roots,
+  and a regular user loads reads by upload instead (#484).** An `action_context` could
+  name any absolute path, recorded verbatim and re-opened much later on a compute node.
+  Nothing checked it at submit, so a path that resolved on the submitting machine and
+  nowhere else was accepted and failed inside the job — and any absolute path the
+  orchestrator could open was nameable through the API by any role the action's audience
+  admitted. Two rules now run at submit (`ingest_path`, wired into `POST /work-ticket`):
+  naming a host path at all requires wet_lab_admin or system_admin, and the path must
+  resolve under one of `PATH_INGEST_ROOTS` (new required control-plane env var) and, where
+  the control plane can tell, exist. The existence check is deliberately conditional — the
+  control plane runs as `qiita-api` and SLURM steps as `qiita-job`, two accounts with
+  different group membership, so EACCES is treated as "cannot tell" and admits while ENOENT
+  is definitive and rejects. Which context keys are host paths comes from the action's own
+  `context_schema` plus the `*_path` / `*_dir` naming convention, so an action that adds one
+  is covered without a route change; a new `test_actions_loader` guard makes a `*_path` /
+  `*_dir` / `*_folder` string property declare `pattern: "^/"` so the YAML and the route
+  agree on which fields are paths. What the roots must cover is therefore wider than the
+  sequencing mount: `qiita reference load --local` names its manifest and companions as
+  `*_path` keys under the reference staging root, so a value covering only sequencing
+  refuses every local reference add.
+- **`qiita submit-reads` loads one sample's reads from the machine you are typing on (#484).**
+  The other half of the same change: a `user` can no longer name a host path, and their
+  reads were never on a filesystem the cluster mounts anyway. The gesture validates the
+  local file, streams it to the data plane over Flight DoPut, and submits the ingest ticket
+  naming the resulting `*_upload_idx` handle — which the runner already rewrites into the
+  same `*_path` binding a host path produces, so both routes run the identical workflow.
+  `fastq-to-parquet` and `bam-to-parquet` accept either spelling and exactly one of them
+  (`oneOf`). The upload is byte-exact: unlike the companion-file streamer, which inflates a
+  `.gz` because miint's `read_newick` / `read_jplace` only take plaintext, a FASTQ keeps its
+  compression on the wire. miint detects compression *and* format from the extension
+  (<https://the-miint.github.io/duckdb-miint/reading/>), so `resolve_reads_blob_input` names
+  the stitched file from the payload's own gzip magic rather than from anything the client
+  claimed — `.fastq.gz`/`.fastq` for reads, `.bam`/`.sam` for alignments, since BGZF is gzip
+  and a plaintext payload under those suffixes is text SAM.
+- **`upload.source_filename` records the client's basename (#484).** The submit gate requires
+  a fastq's basename to be the prep_sample's `sequenced_pool_item_id` followed by `_` or `.`,
+  which ties the R1/R2 pair to the sequenced_sample row. An upload-fed submission has no path
+  to take a basename from, so the rule went vacuous exactly on the route a regular user takes;
+  the column gives it something to read. Descriptive, like `sha256` — nothing opens it.
 - **`long-read-assembly` 1.0.1 scores the large unbinned contigs, so completeness and
   contamination now cover every class the workflow stores (#522).** The `checkm` step gains a
   THIRD CheckM run, over each unbinned contig at or above 300 kb, beside the existing MAG and LCG
@@ -1537,6 +1591,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **A paired-end read submission can no longer cross routes (#484).** The exactly-one
+  constraint on `fastq-to-parquet` was per key, not per family: it stopped the forward read
+  arriving twice and the reverse read arriving twice, but admitted `fastq_upload_idx` with
+  `reverse_fastq_path` (and the mirror). Such a submission would run — the runner rewrites
+  the handle and leaves the path alone — so this is a submit-slip guard, not a safety one:
+  one sample's mates having two provenances is a mistake, and a mis-paired mate is silent
+  in the output. Now a `oneOf` of two whole-family branches.
+- **`upload.source_filename` rejects newlines and over-length values (#484).** The pattern
+  was `^[^/]+$`, and in pydantic's regex engine `$` also matches before a trailing newline
+  while `[^/]` matches a newline outright — so `"R1.fastq\n"` and `"na\nme.fastq"` both
+  validated, and the value is echoed back in the submit gate's 422. Now `\A[^/\r\n]+\z`,
+  with the length bound exercised on both sides. The model is deliberately stricter than
+  the DB CHECK, which tests only non-empty and slash-free.
 - **Four `DEPLOY_CHECKLIST.md` commands did not run as written, found by running them during the
   deploy of #514–#522.** Each was written but never executed, which is the one defect a checklist
   review cannot catch. (1) The `hifiasm_meta` version check omitted `TMPDIR=/tmp`; apptainer
@@ -3071,6 +3138,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **`ticket:doput` is now on the USER role ceiling (#484).** It was on the two admin
+  ceilings and service accounts only, dating from when reference loading was the sole
+  upload consumer. With host paths in `action_context` restricted to wet_lab_admin+, an
+  upload is a regular user's only route for their own reads, and withholding the scope
+  left them unable to ingest at all. The grant is the staging slot and nothing more: the
+  signed ticket carries `{"action": "doput", "upload_idx": N}`, the data plane derives the
+  path, and `/upload/{idx}/done` and `GET /upload/{idx}` still gate on
+  `created_by_idx == principal`. What an upload may feed is gated separately —
+  reference-add needs `reference:write`, which a USER does not have.
 - **`long-read-assembly` `checkm` baseline memory 40 → 48 GiB, set from nine measured runs (#525).**
   The heaviest run peaked at 38.88 GiB against a 40 GiB allocation. No OOMs were observed in
   any of the nine — this was margin, not a repair for a failure. The step's own

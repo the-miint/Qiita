@@ -683,6 +683,24 @@ URL_STUDY_LOOKUP_BY_ACCESSION = f"{URL_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESS
 
 
 # =============================================================================
+# /run-folder/* — read-only inspection of a sequencing run folder on the cluster
+# =============================================================================
+# The bundled submit gestures need two facts that only exist on the filesystem:
+# an Illumina run's instrument_run_id / model (from RunInfo.xml) and a PacBio
+# run's barcode -> HiFi BAM index. Reading them server-side is what lets a
+# submit run from a machine that does not mount the cluster.
+#
+# Not a resource under /sequencing-run: no run row exists yet at inspect time —
+# the gesture inspects the folder in order to mint one.
+
+PATH_RUN_FOLDER_PREFIX = "/run-folder"
+# POST, not GET: the body carries an absolute path, and a path in a querystring
+# lands in access logs and proxy caches. `inspect` is a verb, which the naming
+# rule allows as a path segment.
+PATH_RUN_FOLDER_INSPECT = "/inspect"
+
+
+# =============================================================================
 # /sequencing-run/* — run CRUD + sequenced-pool POST + sequenced-sample
 # =============================================================================
 # Like /study, this prefix is shared. The sequenced-sample router with
@@ -766,6 +784,9 @@ PATH_SEQUENCED_SAMPLE_EXCEPTIONS = (
 PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/work-ticket/summary"
 )
+
+URL_RUN_FOLDER_PREFIX = f"{API_PREFIX}{PATH_RUN_FOLDER_PREFIX}"
+URL_RUN_FOLDER_INSPECT = f"{URL_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}"
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"

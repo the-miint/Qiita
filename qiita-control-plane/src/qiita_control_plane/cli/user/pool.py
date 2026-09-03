@@ -39,7 +39,6 @@ from qiita_common.host_filter_plan import (
     SampleHostFilter,
     plan_pool_host_filter,
 )
-from qiita_common.illumina import read_instrument_run_info
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
@@ -59,6 +58,7 @@ from qiita_common.models import (
 
 from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
 from .. import _common
+from ._helpers import _inspect_run_folder
 
 # action_id + version for the bundled bcl-convert submission flow. Pinned
 # here so the CLI does not drift from the workflow YAML the operator's
@@ -520,23 +520,18 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     All calls share one PAT (one ``run_http_subcommand`` invocation,
     one ``read_token``) so retries use the same credential.
     """
+    # The path is checked SERVER-side (POST /run-folder/inspect, below), not
+    # here: it names the folder as the CLUSTER sees it, and a check against this
+    # machine's filesystem proves nothing about that — passing on a laptop where
+    # the same path happens to exist is the failure mode, not just a missed
+    # catch. Only the shape is worth asserting locally.
     if not args.bcl_input_dir.is_absolute():
         parser.error(f"--bcl-input-dir must be absolute, got {args.bcl_input_dir}")
-    if not args.bcl_input_dir.is_dir():
-        parser.error(
-            f"--bcl-input-dir {args.bcl_input_dir} is not a directory; the workflow"
-            " requires the on-disk Illumina BCL run folder"
-        )
     if not args.preflight_blob.is_file():
         parser.error(f"--preflight-blob {args.preflight_blob} is not a regular file")
     blob_bytes = args.preflight_blob.read_bytes()
     if not blob_bytes:
         parser.error(f"--preflight-blob {args.preflight_blob} is empty")
-
-    try:
-        instrument_run_id, instrument_model = read_instrument_run_info(args.bcl_input_dir)
-    except ValueError as exc:
-        parser.error(str(exc))
 
     # Open the preflight SQLite locally and pull the per-sample rows
     # before any network call. Errors here are operator-actionable and
@@ -548,17 +543,28 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     # metadata at submit-host-filter-pool, so intake carries no host-filter intent
     # to echo.
 
-    run_body = SequencingRunCreateRequest(
-        instrument_run_id=instrument_run_id,
-        platform=Platform.ILLUMINA,
-        instrument_model=instrument_model,
-    ).model_dump(exclude_unset=True, mode="json")
     pool_body = SequencedPoolCreateRequest(
         run_preflight_blob=base64.b64encode(blob_bytes).decode("ascii"),
         run_preflight_filename=args.preflight_blob.name,
     ).model_dump(exclude_unset=True, mode="json")
 
     def _run(token: str) -> dict:
+        # Step 0: read RunInfo.xml on the control plane. This is what lets the
+        # gesture run from a machine that does not mount the cluster — the run
+        # folder is opened where it exists, and only the parsed instrument
+        # identity comes back. The route also applies the PATH_INGEST_ROOTS
+        # gate, so a path the eventual work-ticket submit would reject fails
+        # here instead, before any row is minted.
+        inspected = _inspect_run_folder(args.base_url, token, args.bcl_input_dir, Platform.ILLUMINA)
+        assert inspected.illumina is not None  # platform=illumina always populates it
+        instrument_run_id = inspected.illumina.instrument_run_id
+        instrument_model = inspected.illumina.instrument_model
+        run_body = SequencingRunCreateRequest(
+            instrument_run_id=instrument_run_id,
+            platform=Platform.ILLUMINA,
+            instrument_model=instrument_model,
+        ).model_dump(exclude_unset=True, mode="json")
+
         # Shared run → pool → roster provisioning (create-missing; fails fast on an
         # unresolved accession). Illumina keys the pool-item-id on illumina_sample_idx.
         provision = _provision_run_pool_roster(
@@ -609,7 +615,10 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                 "sequencing_run_idx": sequencing_run_idx,
             },
             action_context={
-                "bcl_input_dir": str(args.bcl_input_dir),
+                # The normalized form the inspect gate resolved, not the raw
+                # argument — the submit gate normalizes too, so storing the
+                # resolved value keeps the two spellings from diverging.
+                "bcl_input_dir": inspected.path,
                 "sample_map": sample_map,
             },
             force=args.force,

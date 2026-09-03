@@ -20,11 +20,23 @@ host's checkout path, mounts, and `prep_protocol` indices.
   **directly** — do *not* wrap it in `uv run`, which tries to sync the project and
   will fail (or half-succeed) against the qiita-owned checkout when you are another
   user.
-- **Run it from a node that mounts both `/qmounts` and `/sequencing`** and can reach
-  the control plane. A laptop can reach the control plane but cannot see the data,
-  and run-folder paths are recorded on the ticket and re-resolved on a compute node
-  later — so they must be the *cluster's* paths, not your laptop's. Workers have no
-  `sudo`.
+- **`--run-folder` is a path on the CLUSTER, not on the machine you are typing on.**
+  It is recorded on the ticket and re-opened on a compute node later, so it must name
+  the folder as the cluster sees it, under a directory the deploy configured in
+  `PATH_INGEST_ROOTS` (`/sequencing` here). The control plane checks that at submit
+  and refuses a path outside those roots, naming them — so a wrong path is an error at
+  your terminal rather than a job that fails hours later.
+- **The run folder need not be visible from the machine you type on.** The barcode → BAM
+  glob runs on the control plane (`POST /run-folder/inspect`), which opens the folder
+  as `qiita-api`, an account with a narrower filesystem view than the `qiita-job` that
+  runs the steps. The deploy grants it read on `/sequencing/gcore_runs/**`
+  (`DEPLOY_CHECKLIST.md`, one-time host setup). A **403** from the route means that grant is
+  missing on the tree you named; until it is in place, submit from a node that mounts
+  `/sequencing`.
+- **The pre-flight `.db` still has to be a local file.** `--preflight-blob` is read on the
+  machine running the CLI and base64'd into the request, so off the cluster copy it over
+  first — it is the one input that does not resolve server-side.
+- Workers have no `sudo`.
 - The PAT identifies the Qiita principal regardless of the Unix account, so
   `sudo -u qiita env QIITA_TOKEN=… qiita …` still acts as the token's owner.
 

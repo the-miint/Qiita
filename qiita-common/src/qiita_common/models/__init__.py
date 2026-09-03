@@ -184,6 +184,12 @@ from qiita_common.models.reference import (
     Tier,
     read_mask_reason_sql_list,
 )
+from qiita_common.models.run_folder import (
+    IlluminaRunInfo,
+    PacbioRunIndex,
+    RunFolderInspectRequest,
+    RunFolderInspectResponse,
+)
 from qiita_common.models.sample_field import (
     GLOBAL_FIELD_IDX_ATTR,
     STUDY_FIELD_IDX_ATTR,
@@ -484,6 +490,10 @@ __all__ = [
     "UploadCreateRequest",
     "UploadCreateResponse",
     "UploadDoneRequest",
+    "IlluminaRunInfo",
+    "PacbioRunIndex",
+    "RunFolderInspectRequest",
+    "RunFolderInspectResponse",
     "UploadResponse",
     "UploadStatus",
     # User.

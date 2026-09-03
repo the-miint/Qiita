@@ -3,6 +3,7 @@
 import pytest
 import yaml
 from pydantic import ValidationError
+from qiita_common.actions import HOST_PATH_KEY_SUFFIXES
 
 _REFERENCE_ADD_YAML = """
 action_id: reference-add
@@ -669,6 +670,115 @@ _ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
 # silently leave its suppression behind. Nothing is added here except alongside
 # the work to remove it.
 _ESCALATION_PENDING_RESIZE: dict[str, dict[str, tuple[str, ...]]] = {}
+
+
+# (action_id, version, action_context, accepted?) — the exactly-one rule the
+# read-ingest workflows use to admit reads by either route.
+_READ_INGEST_ROUTE_CASES = [
+    ("fastq-to-parquet", "1.3.0", {"fastq_path": "/seq/a_R1.fastq"}, True),
+    ("fastq-to-parquet", "1.3.0", {"fastq_upload_idx": 4}, True),
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {"fastq_path": "/seq/a_R1.fastq", "reverse_fastq_path": "/seq/a_R2.fastq"},
+        True,
+    ),
+    ("fastq-to-parquet", "1.3.0", {"fastq_upload_idx": 4, "reverse_fastq_upload_idx": 5}, True),
+    # Both routes for the forward read: ambiguous, and `oneOf` catches it
+    # because BOTH branches match.
+    ("fastq-to-parquet", "1.3.0", {"fastq_path": "/seq/a_R1.fastq", "fastq_upload_idx": 4}, False),
+    # Neither route: no reads to load.
+    ("fastq-to-parquet", "1.3.0", {}, False),
+    # Both routes for the reverse read.
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {
+            "fastq_upload_idx": 4,
+            "reverse_fastq_path": "/seq/a_R2.fastq",
+            "reverse_fastq_upload_idx": 5,
+        },
+        False,
+    ),
+    # A CROSSED pair: the mates arrive by different routes. Both spellings
+    # resolve to the same step inputs, so this would run — it is refused
+    # because one sample's R1 and R2 having two provenances is a submit slip,
+    # and a mis-paired mate is silent in the output.
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {"fastq_upload_idx": 4, "reverse_fastq_path": "/seq/a_R2.fastq"},
+        False,
+    ),
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {"fastq_path": "/seq/a_R1.fastq", "reverse_fastq_upload_idx": 5},
+        False,
+    ),
+    ("bam-to-parquet", "1.0.0", {"bam_path": "/seq/a.bam"}, True),
+    ("bam-to-parquet", "1.0.0", {"bam_upload_idx": 2}, True),
+    ("bam-to-parquet", "1.0.0", {"bam_path": "/seq/a.bam", "bam_upload_idx": 2}, False),
+    ("bam-to-parquet", "1.0.0", {}, False),
+]
+
+
+@pytest.mark.parametrize(("action_id", "version", "context", "accepted"), _READ_INGEST_ROUTE_CASES)
+def test_read_ingest_accepts_exactly_one_route(action_id, version, context, accepted):
+    """A sample's reads reach the ingest workflows by a host path or by an
+    upload handle, never both and never neither — and for paired-end, both
+    mates take the same route.
+
+    Both spellings resolve to the same step input — the runner rewrites
+    `{prefix}_upload_idx` into the `{prefix}_path` binding — so a context
+    carrying both would leave which file the step reads decided by resolution
+    order rather than by the submitter.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+    from qiita_control_plane.actions.context_validator import validate_context
+
+    actions = {
+        (a.action_id, a.version): a
+        for a in load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    }
+    schema = actions[(action_id, version)].context_schema
+    errors = validate_context(schema, context)
+    assert (not errors) is accepted, errors
+
+
+def test_every_shipped_host_path_property_is_pinned_absolute():
+    """A `*_path` / `*_dir` / `*_folder` string property in a shipped workflow's
+    `context_schema` must declare `pattern: "^/"`.
+
+    Two things read that pattern. `SlurmBackend._resolve_input_binds` turns the
+    value into an apptainer `--bind`, and a relative path there resolves against
+    whatever CWD the launcher started in. The work_ticket submit gate reads it
+    to decide which context keys to bound against `PATH_INGEST_ROOTS`
+    (`ingest_path.host_path_keys`); a property that omits the pattern is still
+    caught by the gate's naming rule, but the YAML then no longer says what the
+    field is, and a reader has to know the route's conventions to find out.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    unpinned = {
+        f"{action.action_id}:{action.version}:{name}"
+        for action in actions
+        for name, spec in (action.context_schema.get("properties") or {}).items()
+        if name.endswith(HOST_PATH_KEY_SUFFIXES)
+        and isinstance(spec, dict)
+        and spec.get("type") == "string"
+        and spec.get("pattern") != "^/"
+    }
+    assert not unpinned, (
+        'context_schema host-path properties missing `pattern: "^/"` — add it,'
+        " or rename the property if it does not name a host path: "
+        f"{sorted(unpinned)}"
+    )
 
 
 def test_every_shipped_step_can_escalate_on_both_retry_axes():

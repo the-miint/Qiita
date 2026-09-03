@@ -45,6 +45,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import duckdb
 from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import WorkTicketFailureStage
@@ -61,6 +62,7 @@ from ..miint import (
     resolve_duckdb_memory_gb,
 )
 from ..sequence_range_retry import mint_or_reuse_sequence_range
+from ._blob_input import resolve_reads_blob_input
 
 # YAML step name this module implements. Hard-coded because execute() raises
 # BackendFailures itself (which need a step_name); the integration smoke asserts
@@ -227,6 +229,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     if not inputs.bam_path.exists():
         raise FileNotFoundError(f"BAM file not found: {inputs.bam_path}")
 
+    workspace.mkdir(parents=True, exist_ok=True)
     # The caller must declare an unaligned BAM. An aligned BAM would store
     # reverse-strand reads mis-oriented (see module docstring) — not supported yet.
     if not inputs.expect_unaligned:
@@ -241,12 +244,45 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             ),
         )
 
+    # Two front-ends reach this step. A wet-lab admin names a host path under
+    # PATH_INGEST_ROOTS and the value here IS the BAM; a regular user DoPuts the
+    # file and the runner resolves `bam_upload_idx` to a chunked-BLOB upload
+    # Parquet under the same `bam_path` binding. This loader accepts SAM as well
+    # as BAM, and BGZF is gzip, so the stitched name comes from whether the
+    # payload is compressed: binary container -> `.bam`, text -> `.sam`.
+    #
+    # `duckdb_tmp_dir` + `apply_duckdb_settings` for the same reason every other
+    # DuckDB block in this file uses them: the stitch's `ORDER BY chunk_index`
+    # runs over the whole upload, and an unconfigured connection would sort it
+    # under the default memory limit and spill outside the workspace.
+    with duckdb_tmp_dir(workspace) as staging_tmp, duckdb.connect() as staging_conn:
+        apply_duckdb_settings(
+            staging_conn,
+            staging_tmp,
+            memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
+            threads=_DUCKDB_THREADS,
+        )
+        bam_path = resolve_reads_blob_input(
+            staging_conn,
+            path=inputs.bam_path,
+            out_dir=workspace,
+            stem="reads",
+            gzipped_suffix=".bam",
+            plain_suffix=".sam",
+        )
+
+    # A stitched upload is an input the step materialized, not an output; the
+    # launcher's manifest walker rglobs the workspace after execute() returns, so
+    # it is removed in the same `finally` as the intermediate below. `!=` because
+    # a host-path submission binds the caller's own file here, which this step
+    # must never delete.
+    stitched_bam = bam_path if str(bam_path) != str(inputs.bam_path) else None
+
     # Track the real cgroup, so a `--mem-gb` override and the runner's OOM
     # escalation both actually reach DuckDB's memory_limit (a literal here would
     # cap the escalated retry at the same limit that OOM'd the first attempt).
     memory_gb = resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS)
 
-    workspace.mkdir(parents=True, exist_ok=True)
     intermediate = workspace / "_intermediate_reads.parquet"
     # `read` is a DIRECTORY of part_*.parquet rather than a single read.parquet: the
     # final write is batched (see _write_read_parts). register-files already maps a
@@ -271,7 +307,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "COPY ( SELECT sequence_index, read_id, sequence1, qual1, sequence2, qual2 "
                 "FROM read_sequences_sam(?) ) "
                 f"TO '{intermediate}' ({PARQUET_OPTS_INTERMEDIATE})",
-                [str(inputs.bam_path)],
+                [str(bam_path)],
             )
 
         # Count + distinct read_id in one scan: the total sizes the mint; the
@@ -291,7 +327,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if count == 0:
             raise StepNoData(
                 step_name=YAML_STEP_NAME,
-                reason=f"BAM file contains no reads: {inputs.bam_path}",
+                reason=f"BAM file contains no reads: {bam_path}",
             )
 
         # One-record-per-read guard. read_sequences_sam emits every SAM record and
@@ -348,6 +384,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # Clean up the intermediate BEFORE returning so the SLURM launcher's
         # manifest walker (which runs after execute()) sees only the read/ parts.
         intermediate.unlink(missing_ok=True)
+        if stitched_bam is not None:
+            stitched_bam.unlink(missing_ok=True)
 
     # The workspace holds only read/part_*.parquet (intermediate unlinked above),
     # exposed as read_staging_dir so a register-files step loads the parts into the

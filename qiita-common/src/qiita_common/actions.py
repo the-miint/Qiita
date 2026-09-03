@@ -85,6 +85,25 @@ ALIGNMENT_IDX_BINDING = "alignment_idx"
 FASTQ_PATH_CONTEXT_KEYS: tuple[str, str] = ("fastq_path", "reverse_fastq_path")
 
 
+# Suffix that marks an `action_context` key as an upload handle rather than a
+# literal value, and the suffix it resolves to. The runner rewrites every
+# `{prefix}_upload_idx` into a `{prefix}_path` binding pointing at the staged
+# file before any step runs (`runner._resolve_upload_handles`), which is how a
+# workflow step reads an uploaded file and a host-path file through the same
+# input name. Defined here so the runner, the work_ticket submit gate, and the
+# CLI that mints the handles share one spelling.
+UPLOAD_IDX_SUFFIX = "_upload_idx"
+PATH_SUFFIX = "_path"
+
+
+# Key-name suffixes that mark an `action_context` value, or a `context_schema`
+# property, as a host path. Two sites read this from opposite ends: the submit
+# gate checks a value under such a key whatever the schema declares, and the
+# workflow-YAML loader guard makes a property with such a name declare
+# `pattern: "^/"`. One definition, so the two cannot cover different sets.
+HOST_PATH_KEY_SUFFIXES: tuple[str, ...] = (PATH_SUFFIX, "_dir", "_folder")
+
+
 # The per-sample read-mask action's bare id (its YAML lives at
 # workflows/read-mask/<version>.yaml). A sample's reads are stored once by the
 # bcl-convert workflow's ingest_reads step; processing a sample then means

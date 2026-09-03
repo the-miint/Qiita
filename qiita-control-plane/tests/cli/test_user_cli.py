@@ -2323,6 +2323,37 @@ def test_https_to_non_localhost_allowed(monkeypatch):
 # reuses one body across calls and is not enough here.
 
 
+def _bodies_for(captured: dict, url_suffix: str) -> list:
+    """Bodies of every captured request whose URL ends with `url_suffix`.
+
+    Named rather than counted. Positional indexing into `captured["requests"]`
+    reads fine until a leg is added anywhere upstream, at which point every
+    index in every test shifts by one and the failures point at the assertion
+    rather than at the change.
+    """
+    return [r["json"] for r in captured["requests"] if r["url"].endswith(url_suffix)]
+
+
+def _inspect_response(folder: Path, name: str | None = None) -> tuple[int, dict]:
+    """The `POST /run-folder/inspect` leg every submit-bcl-convert flow now
+    opens with. The control plane reads RunInfo.xml — that is what lets the
+    gesture run from a machine with no view of the cluster — so the CLI's first
+    call is this one, and the instrument identity arrives in its body."""
+    run_id = name or folder.name
+    return (
+        200,
+        {
+            "path": str(folder),
+            "platform": "illumina",
+            "illumina": {
+                "instrument_run_id": run_id,
+                "instrument_model": "Illumina NovaSeq 6000",
+            },
+            "pacbio": None,
+        },
+    )
+
+
 def _stub_multi_response(monkeypatch, captured: dict, *, responses):
     """Patch httpx.request to return canned ``(status, body)`` responses in
     the order supplied. `captured['requests']` collects every call so a
@@ -2459,6 +2490,8 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
         monkeypatch,
         captured,
         responses=[
+            # run-folder inspect (RunInfo.xml is read server-side now)
+            _inspect_response(folder),
             # whoami
             (200, {"kind": "human", "principal_idx": 99}),
             # biosample lookup-by-accession
@@ -2506,57 +2539,64 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     )
     assert rc == 0
     requests = captured["requests"]
-    # whoami + biosample-lookup + study-lookup + run + pool + roster-GET + 3 samples
-    # + ticket = 10 calls.
-    assert len(requests) == 10
+    # run-folder-inspect + whoami + biosample-lookup + study-lookup + run + pool
+    # + roster-GET + 3 samples + ticket = 11 calls.
+    assert len(requests) == 11
 
-    # Leg 1: whoami.
-    assert requests[0]["method"] == "GET"
-    assert requests[0]["url"].endswith("/auth/whoami")
+    # Leg 1: run-folder inspect. The CLI no longer opens the run folder itself,
+    # so this is the first call and the instrument identity comes back in its
+    # body — which is what lets the gesture run off the cluster.
+    assert requests[0]["method"] == "POST"
+    assert requests[0]["url"].endswith("/run-folder/inspect")
+    assert requests[0]["json"] == {"path": str(folder), "platform": "illumina"}
 
-    # Leg 2: biosample lookup-by-accession with the deduped preflight
+    # Leg 2: whoami.
+    assert requests[1]["method"] == "GET"
+    assert requests[1]["url"].endswith("/auth/whoami")
+
+    # Leg 3: biosample lookup-by-accession with the deduped preflight
     # accessions (here the same as row order since each is unique).
-    assert requests[1]["method"] == "POST"
-    assert requests[1]["url"].endswith("/biosample/lookup-by-accession")
-    assert requests[1]["json"] == {
+    assert requests[2]["method"] == "POST"
+    assert requests[2]["url"].endswith("/biosample/lookup-by-accession")
+    assert requests[2]["json"] == {
         "accessions": ["SAMN001", "SAMN002", "SAMN003"],
         "accession_field": "biosample_accession",
     }
 
-    # Leg 3: study lookup-by-accession with the order-preserving dedup
+    # Leg 4: study lookup-by-accession with the order-preserving dedup
     # of every row's primary + secondary project accessions. First
     # appearance order: row1 primary PRJ001, row2 secondary PRJ002,
     # row3 secondary PRJ003 (PRJ001 and PRJ002 already seen).
-    assert requests[2]["method"] == "POST"
-    assert requests[2]["url"].endswith("/study/lookup-by-accession")
-    assert requests[2]["json"] == {
+    assert requests[3]["method"] == "POST"
+    assert requests[3]["url"].endswith("/study/lookup-by-accession")
+    assert requests[3]["json"] == {
         "accessions": ["PRJ001", "PRJ002", "PRJ003"],
         "accession_field": "bioproject_accession",
     }
 
-    # Leg 4: POST /sequencing-run.
-    assert requests[3]["method"] == "POST"
-    assert requests[3]["url"] == f"https://q.example.test{URL_SEQUENCING_RUN_PREFIX}"
-    assert requests[3]["json"] == {
+    # Leg 5: POST /sequencing-run.
+    assert requests[4]["method"] == "POST"
+    assert requests[4]["url"] == f"https://q.example.test{URL_SEQUENCING_RUN_PREFIX}"
+    assert requests[4]["json"] == {
         "instrument_run_id": "230101_A00123_0001_BHXYZ",
         "platform": "illumina",
         "instrument_model": "Illumina NovaSeq 6000",
     }
 
-    # Leg 5: POST /sequencing-run/{R}/sequenced-pool. Blob round-trips
+    # Leg 6: POST /sequencing-run/{R}/sequenced-pool. Blob round-trips
     # byte-equal through base64.
-    assert requests[4]["method"] == "POST"
-    assert requests[4]["url"] == (
+    assert requests[5]["method"] == "POST"
+    assert requests[5]["url"] == (
         f"https://q.example.test{URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=12)}"
     )
-    pool_body = requests[4]["json"]
+    pool_body = requests[5]["json"]
     assert pool_body["run_preflight_filename"] == "preflight.db"
     assert _b64.b64decode(pool_body["run_preflight_blob"]) == blob.read_bytes()
 
-    # Leg 6: GET the pool roster (create-missing) — empty here, so all 3 samples
+    # Leg 7: GET the pool roster (create-missing) — empty here, so all 3 samples
     # are created next.
-    assert requests[5]["method"] == "GET"
-    assert requests[5]["url"].endswith("/sequencing-run/12/sequenced-pool/34/sequenced-sample/list")
+    assert requests[6]["method"] == "GET"
+    assert requests[6]["url"].endswith("/sequencing-run/12/sequenced-pool/34/sequenced-sample/list")
 
     # Legs 7..9: one sequenced-sample composer POST per preflight row.
     # secondary_study_idxs preserves the row's secondary order (after
@@ -2569,7 +2609,7 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     for offset, (illumina, biosample_idx, primary_study, secondary_studies) in enumerate(
         expected_per_sample
     ):
-        req = requests[6 + offset]
+        req = requests[7 + offset]
         assert req["method"] == "POST"
         assert req["url"].endswith("/sequencing-run/12/sequenced-pool/34/sequenced-sample")
         assert req["json"] == {
@@ -2581,10 +2621,10 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
             "secondary_study_idxs": secondary_studies,
         }
 
-    # Leg 10: POST /work-ticket.
-    assert requests[9]["method"] == "POST"
-    assert requests[9]["url"] == f"https://q.example.test{URL_WORK_TICKET_PREFIX}"
-    ticket_body = requests[9]["json"]
+    # Leg 11: POST /work-ticket.
+    assert requests[10]["method"] == "POST"
+    assert requests[10]["url"] == f"https://q.example.test{URL_WORK_TICKET_PREFIX}"
+    ticket_body = requests[10]["json"]
     assert ticket_body["action_id"] == "bcl-convert"
     assert ticket_body["action_version"] == "1.0.0"
     assert ticket_body["scope_target"] == {
@@ -2715,6 +2755,8 @@ def test_submit_bcl_convert_fails_fast_when_accessions_missing(
         monkeypatch,
         captured,
         responses=[
+            # run-folder inspect (RunInfo.xml is read server-side now)
+            _inspect_response(folder),
             (200, {"kind": "human", "principal_idx": 99}),
             (200, {"resolved": biosample_resolved, "missing": biosample_missing}),
             (200, {"resolved": study_resolved, "missing": study_missing}),
@@ -2738,7 +2780,8 @@ def test_submit_bcl_convert_fails_fast_when_accessions_missing(
     for fragment in expected_substrings:
         assert fragment in err, f"expected {fragment!r} in stderr; got:\n{err}"
     # No write-side legs ran — whoami + both lookups are the only calls.
-    assert len(captured["requests"]) == 3
+    # inspect + whoami + the two lookups; no side-effecting call was made.
+    assert len(captured["requests"]) == 4
 
 
 def test_submit_bcl_convert_rejects_preflight_without_illumina_samples(
@@ -2818,6 +2861,8 @@ def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
         monkeypatch,
         captured,
         responses=[
+            # run-folder inspect (RunInfo.xml is read server-side now)
+            _inspect_response(folder),
             (200, {"kind": "human", "principal_idx": 99}),
             (200, {"resolved": {"SAMN001": 41}, "missing": []}),
             (200, {"resolved": {"PRJ001": 7}, "missing": []}),
@@ -2843,17 +2888,15 @@ def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
     )
     assert rc == 0
     # Each lookup body carries its accession exactly once.
-    assert captured["requests"][1]["json"] == {
-        "accessions": ["SAMN001"],
-        "accession_field": "biosample_accession",
-    }
-    assert captured["requests"][2]["json"] == {
-        "accessions": ["PRJ001"],
-        "accession_field": "bioproject_accession",
-    }
+    assert _bodies_for(captured, "/biosample/lookup-by-accession") == [
+        {"accessions": ["SAMN001"], "accession_field": "biosample_accession"}
+    ]
+    assert _bodies_for(captured, "/study/lookup-by-accession") == [
+        {"accessions": ["PRJ001"], "accession_field": "bioproject_accession"}
+    ]
     # Both rows still produce a sequenced-sample composer POST with the
-    # row's distinct illumina_sample_idx (after the run/pool/roster-GET legs).
-    sample_bodies = [r["json"] for r in captured["requests"][6:8]]
+    # row's distinct illumina_sample_idx.
+    sample_bodies = _bodies_for(captured, "/sequenced-sample")
     assert sample_bodies[0]["sequenced_pool_item_id"] == "1"
     assert sample_bodies[1]["sequenced_pool_item_id"] == "2"
     # Both rows resolve to the same biosample_idx (replicate convention).
@@ -2881,6 +2924,8 @@ def test_submit_bcl_convert_reports_reused_when_run_post_returns_200(
         monkeypatch,
         captured,
         responses=[
+            # run-folder inspect (RunInfo.xml is read server-side now)
+            _inspect_response(folder),
             (200, {"kind": "human", "principal_idx": 99}),
             (200, {"resolved": {"SAMN001": 41}, "missing": []}),
             (200, {"resolved": {"PRJ001": 7}, "missing": []}),
@@ -2926,6 +2971,8 @@ def test_submit_bcl_convert_reuses_existing_roster_samples(
         monkeypatch,
         captured,
         responses=[
+            # run-folder inspect (RunInfo.xml is read server-side now)
+            _inspect_response(folder),
             (200, {"kind": "human", "principal_idx": 99}),
             (200, {"resolved": {"SAMN001": 41}, "missing": []}),
             (200, {"resolved": {"PRJ001": 7}, "missing": []}),
@@ -2999,26 +3046,30 @@ def test_submit_bcl_convert_rejects_relative_bcl_input_dir(capsys, preflight_stu
     assert "must be absolute" in capsys.readouterr().err
 
 
-def test_submit_bcl_convert_rejects_missing_bcl_input_dir(tmp_path, capsys, preflight_stub):
-    """A path that does not exist on disk cannot be the run folder."""
+def test_submit_bcl_convert_relative_bcl_input_dir_rejected_locally(tmp_path, capsys):
+    """The one run-folder check still worth making on this machine: shape.
+
+    Existence and readability moved to POST /run-folder/inspect, because they
+    are questions about the CLUSTER's filesystem and this machine's answer
+    proves nothing about it — a path that happens to exist locally is exactly
+    the failure this work removes. A relative path, though, is wrong for any
+    filesystem, and catching it here costs no round trip."""
     from qiita_control_plane.cli.user import main
 
-    blob = preflight_stub()
-    bogus = tmp_path / "does-not-exist"
     with pytest.raises(SystemExit) as exc_info:
         main(
             [
                 "submit-bcl-convert",
                 "--bcl-input-dir",
-                str(bogus),
+                "relative/run-folder",
                 "--preflight-blob",
-                str(blob),
+                str(tmp_path / "unused.db"),
                 "--prep-protocol-idx",
                 "7",
             ]
         )
     assert exc_info.value.code == 2
-    assert "is not a directory" in capsys.readouterr().err
+    assert "must be absolute" in capsys.readouterr().err
 
 
 def test_submit_bcl_convert_rejects_empty_preflight_blob(tmp_path, capsys):
@@ -3044,79 +3095,54 @@ def test_submit_bcl_convert_rejects_empty_preflight_blob(tmp_path, capsys):
     assert "is empty" in capsys.readouterr().err
 
 
-def test_submit_bcl_convert_rejects_missing_runinfo(tmp_path, capsys, preflight_stub):
-    """Tests the case where the run folder has no top-level RunInfo.xml;
-    the reader fails before any server round-trip."""
-    from qiita_control_plane.cli.user import main
-
-    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ", with_runinfo=False)
-    blob = preflight_stub()
-    with pytest.raises(SystemExit) as exc_info:
-        main(
-            [
-                "submit-bcl-convert",
-                "--bcl-input-dir",
-                str(folder),
-                "--preflight-blob",
-                str(blob),
-                "--prep-protocol-idx",
-                "7",
-            ]
-        )
-    assert exc_info.value.code == 2
-    assert "RunInfo.xml not found" in capsys.readouterr().err
-
-
-def test_submit_bcl_convert_rejects_unknown_instrument_prefix(tmp_path, capsys, preflight_stub):
-    """A serial number that does not start with any known Illumina prefix
-    surfaces the parser's "unknown instrument serial prefix" error.
-    Same path catches PacBio folders, because the parser filters
-    PacBio out at table-load time."""
-    from qiita_control_plane.cli.user import main
-
-    folder = _seed_bcl_folder(tmp_path, "230101_ZZZZZ999_0001_BHXYZ")
-    blob = preflight_stub()
-    with pytest.raises(SystemExit) as exc_info:
-        main(
-            [
-                "submit-bcl-convert",
-                "--bcl-input-dir",
-                str(folder),
-                "--preflight-blob",
-                str(blob),
-                "--prep-protocol-idx",
-                "7",
-            ]
-        )
-    assert exc_info.value.code == 2
-    assert "unknown instrument serial prefix" in capsys.readouterr().err
-
-
-def test_submit_bcl_convert_pacbio_folder_rejected_as_unknown_prefix(
-    tmp_path, capsys, preflight_stub
+@pytest.mark.parametrize(
+    ("label", "reason"),
+    [
+        ("missing run folder", "host path does not exist"),
+        ("outside the roots", "host path is outside every configured ingest root"),
+        ("no RunInfo.xml", "RunInfo.xml not found"),
+        ("unknown serial prefix", "unknown instrument serial prefix"),
+    ],
+)
+def test_submit_bcl_convert_surfaces_a_run_folder_rejection(
+    monkeypatch, tmp_path, capsys, preflight_stub, label, reason
 ):
-    """A PacBio Revio serial number starts with lowercase r. The parser filters
-    PacBio out at load time so this surfaces as the same
-    "unknown prefix" error a malformed Illumina serial number would — by design,
-    because bcl-convert is Illumina-only."""
+    """Every reason the run folder can be unusable now comes back from
+    POST /run-folder/inspect, and the CLI exits 1 with the server's message.
+
+    The reasons themselves are the route's to produce and are pinned there
+    (`tests/routes/test_run_folder.py`) against real folders; what this pins is
+    that the CLI makes that call FIRST and mints nothing when it fails. A
+    PacBio folder handed to bcl-convert lands in the `unknown serial prefix`
+    row — the vendored table filters PacBio out, by design, since bcl-convert
+    is Illumina-only."""
     from qiita_control_plane.cli.user import main
 
-    folder = _seed_bcl_folder(tmp_path, "230101_r00012_0001_BHXYZ")
-    blob = preflight_stub()
-    with pytest.raises(SystemExit) as exc_info:
-        main(
-            [
-                "submit-bcl-convert",
-                "--bcl-input-dir",
-                str(folder),
-                "--preflight-blob",
-                str(blob),
-                "--prep-protocol-idx",
-                "7",
-            ]
-        )
-    assert exc_info.value.code == 2
-    assert "unknown instrument serial prefix" in capsys.readouterr().err
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = preflight_stub(rows=[(1, "SAMN001", "PRJ001", [])])
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[(422, {"detail": {"reason": reason, "path": str(folder)}})],
+    )
+
+    rc = main(
+        [
+            "submit-bcl-convert",
+            "--bcl-input-dir",
+            str(folder),
+            "--preflight-blob",
+            str(blob),
+            "--prep-protocol-idx",
+            "7",
+        ]
+    )
+    assert rc == 1, label
+    assert reason in capsys.readouterr().err
+    # Inspect is the only call: nothing was minted before the folder was known
+    # to be usable.
+    assert [r["url"].split("/api/v1")[-1] for r in captured["requests"]] == ["/run-folder/inspect"]
 
 
 def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
@@ -3162,6 +3188,8 @@ def test_submit_bcl_convert_records_no_host_refs(monkeypatch, tmp_path, capsys, 
         monkeypatch,
         captured,
         responses=[
+            # run-folder inspect (RunInfo.xml is read server-side now)
+            _inspect_response(folder),
             (200, {"kind": "human", "principal_idx": 99}),  # whoami
             (200, {"resolved": {"SAMN001": 41, "SAMN002": 42}, "missing": []}),  # biosample
             (200, {"resolved": {"PRJ001": 70}, "missing": []}),  # study

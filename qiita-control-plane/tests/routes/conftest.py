@@ -45,8 +45,50 @@ from qiita_control_plane.testing.db_seeds import (
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 
+@pytest.fixture(scope="session")
+def ingest_root(tmp_path_factory):
+    """The one directory route tests may name a host path under.
+
+    `submit_work_ticket` refuses an action_context host path that falls outside
+    `Settings.path_ingest_roots`, so a test submitting one needs a root that
+    exists on the machine running the suite. Session-scoped: the directory is
+    shared, the files under it are per-test (`ingest_file`).
+    """
+    return tmp_path_factory.mktemp("ingest-root")
+
+
+@pytest.fixture
+def ingest_file(ingest_root):
+    """Create a file under `ingest_root` and return its absolute path as a str.
+
+    The submit gate also refuses a path it can prove absent, so a test that
+    wants a submission to reach the *next* gate has to put a real file there.
+    """
+
+    def _make(name: str) -> str:
+        path = ingest_root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        return str(path)
+
+    return _make
+
+
+@pytest.fixture
+def ingest_dir(ingest_root):
+    """`ingest_file`'s directory twin — for the run-folder-shaped context keys
+    (`bcl_input_dir`) the gate resolves the same way."""
+
+    def _make(name: str) -> str:
+        path = ingest_root / name
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    return _make
+
+
 @pytest.fixture(autouse=True)
-def _route_settings():
+def _route_settings(ingest_root):
     """Stash a route-sufficient Settings on the app before every route test.
 
     `qiita_control_plane.main.app` is a module-level SINGLETON, and the route
@@ -71,6 +113,7 @@ def _route_settings():
         database_url="unused",
         flight_signing_key=b"\x00" * 32,
         data_plane_url="unused",
+        path_ingest_roots=(ingest_root,),
     )
     try:
         yield

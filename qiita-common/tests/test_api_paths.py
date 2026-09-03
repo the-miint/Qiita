@@ -176,6 +176,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_STUDY_PREFIX",
         "PATH_STUDY_LOOKUP_BY_ACCESSION",
     ),
+    # /run-folder
+    (
+        "URL_RUN_FOLDER_INSPECT",
+        "PATH_RUN_FOLDER_PREFIX",
+        "PATH_RUN_FOLDER_INSPECT",
+    ),
     # /sequencing-run
     (
         "URL_SEQUENCING_RUN_BY_IDX",

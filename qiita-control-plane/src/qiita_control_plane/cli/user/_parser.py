@@ -70,6 +70,7 @@ from .pool import (
     _handle_submit_block_mask_pool,
     _handle_submit_host_filter_pool,
 )
+from .reads import _handle_submit_reads
 from .reference import (
     _EXPORT_FORMATS,
     _handle_reference_genome_export,
@@ -1432,6 +1433,78 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
+
+    p_submit_reads = sub.add_parser(
+        "submit-reads",
+        help=(
+            "Load one sample's reads from THIS machine: upload the FASTQ(s) or BAM"
+            " to the data plane, then submit the ingest work-ticket against them."
+        ),
+        description=(
+            "For reads that live on the machine you are typing on rather than on"
+            " the cluster's filesystem. The file is streamed to the data plane over"
+            " Flight, byte-exact and without decompressing a .gz, and the ticket"
+            " names the resulting upload handle instead of a path. Naming a host"
+            " path directly requires wet_lab_admin or system_admin, so this is the"
+            " route for a regular user — and the only route for anyone whose reads"
+            " are not on a filesystem the cluster mounts."
+            " FASTQ goes to fastq-to-parquet, BAM to bam-to-parquet."
+            " The uploaded basename must be the sequenced-sample's --pool-item-id"
+            " followed by '_' or '.', the same rule a path-named submission obeys."
+        ),
+    )
+    p_submit_reads.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        required=True,
+        help="The prep_sample these reads belong to.",
+    )
+    reads_source = p_submit_reads.add_mutually_exclusive_group(required=True)
+    reads_source.add_argument(
+        "--fastq",
+        type=Path,
+        help="Forward (R1) FASTQ on this machine. Plain or .gz.",
+    )
+    reads_source.add_argument(
+        "--bam",
+        type=Path,
+        help=(
+            "Unaligned basecaller uBAM (PacBio HiFi / ONT) on this machine."
+            " An aligned BAM is rejected by the loader."
+        ),
+    )
+    p_submit_reads.add_argument(
+        "--reverse-fastq",
+        type=Path,
+        help="Reverse (R2) FASTQ for paired-end input. Not valid with --bam.",
+    )
+    p_submit_reads.add_argument(
+        "--data-plane-url",
+        help=(
+            "gRPC URL of the data plane the reads are streamed to. From off the"
+            " deploy host use the public TLS edge (e.g."
+            " grpc+tls://qiita.example.com:443); grpc://<host>:50051 is the"
+            " direct/on-host form."
+        ),
+    )
+    p_submit_reads.add_argument(
+        "--no-watch",
+        action="store_true",
+        help="Submit the work_ticket and exit without polling. Default polls until terminal.",
+    )
+    p_submit_reads.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds between work_ticket polls under --watch (default: 2.0)",
+    )
+    p_submit_reads.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=24 * 3600,
+        help="Max seconds to wait for the work_ticket under --watch (default: 86400)",
+    )
+    p_submit_reads.set_defaults(handler=_handle_submit_reads)
 
     p_submit_pacbio = sub.add_parser(
         "submit-pacbio-ingest",
