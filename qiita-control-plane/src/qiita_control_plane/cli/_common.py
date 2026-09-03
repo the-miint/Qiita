@@ -298,8 +298,7 @@ def filter_params(**filters: int | str | None) -> dict[str, str]:
     omitted flag stays off the wire and the server's own default applies.
 
     Builds the `params` argument of `call` below, and sits beside it for that
-    reason; both callers today are user-CLI discovery verbs (`mask`,
-    `processing`).
+    reason.
     """
     return {name: str(value) for name, value in filters.items() if value is not None}
 

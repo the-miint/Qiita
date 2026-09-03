@@ -4,9 +4,10 @@
 assembly run is this, and are its samples ready to submit against?" — the
 questions that otherwise need a psql shell on the deploy host and DATABASE_URL.
 A `processing_idx` is a required input to `align-denovo` (the runner reads it as
-`assembly_processing_idx`), whose audience includes a plain `user`, so the reads
-sit in this CLI: they are credentialed API calls the server's own scope guard
-gates, which is the placement rule in `cli/user/__init__.py`.
+`assembly_processing_idx`). The reads sit in this CLI because they are
+credentialed API calls the server's own scope guard gates, which is the
+placement rule in `cli/user/__init__.py` — the three routes are
+`Scope.PREP_SAMPLE_READ`, below what submitting the workflow itself takes.
 
 The mask twin of this module is `cli/user/mask.py`: the two surfaces answer the
 same shape of question at the two identities an `align-denovo` submission names.
@@ -80,9 +81,8 @@ def _list_processing_prep_samples(
 
 def _handle_processing_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """List assembly runs with their sample tallies. Filter by
-    --sequenced-pool-idx to separate the identities one pool carries: `params`
-    distinguishes them by config (which mask, which assembler) and the tally says
-    which is submittable."""
+    --sequenced-pool-idx to separate the several identities one pool can carry;
+    `routes/processing.py` states what separates them."""
     return _common.run_http_subcommand(
         lambda t: _list_processing(
             args.base_url,
@@ -96,7 +96,7 @@ def _handle_processing_list(args: argparse.Namespace, parser: argparse.ArgumentP
 
 def _handle_processing_show(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Print one run's params, so what a set of contigs was assembled from is
-    quotable rather than read out of the orchestrator source."""
+    quotable without reading `qiita.processing` directly."""
     return _common.run_http_subcommand(
         lambda t: _get_processing(args.base_url, t, args.processing_idx)
     )

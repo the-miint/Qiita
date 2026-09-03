@@ -18,8 +18,36 @@ from qiita_common.models import ProcessingListResponse, ProcessingPrepSampleList
 
 from .test_user_cli import _BASE, _run
 
-_LIST_BODY = {"processing": [], "count": 0, "truncated": False}
-_ROSTER_BODY = {"processing_idx": 42, "samples": [], "count": 0, "truncated": False}
+# Each stub carries one populated row, not an empty collection: validating an
+# empty `processing` / `samples` list constructs no ProcessingSummary and no
+# ProcessingPrepSample, so it would pin the envelope and leave the row fields —
+# the tallies and the gate state this CLI exists to surface — unchecked.
+_LIST_BODY = {
+    "processing": [
+        {
+            "processing_idx": 42,
+            "workflow": "long-read-assembly",
+            "version": "1.0.1",
+            "params": {"mask_idx": 11, "assembler": "myloasm"},
+            "created_at": "2026-09-02T00:00:00Z",
+            "status": "active",
+            "samples_completed": 24,
+            "samples_pending": 0,
+            "samples_no_data": 2,
+            "samples_invalidated": 0,
+        }
+    ],
+    "count": 1,
+    "truncated": False,
+}
+_ROSTER_BODY = {
+    "processing_idx": 42,
+    "samples": [
+        {"prep_sample_idx": 7, "biosample_accession": "SAMN00000000", "assembly_state": "completed"}
+    ],
+    "count": 1,
+    "truncated": False,
+}
 
 
 def test_stub_bodies_are_valid_server_responses():

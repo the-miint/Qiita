@@ -34,7 +34,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   admits or refuses a submission on; `samples` is the same gate per prep_sample. Thin
   clients — one GET each, printed verbatim — so a new server field reaches the operator
   without a CLI change. The mask twin (`qiita mask list|show|samples`) is the shape, and
-  the two now cover both identities an assembly submission names. `filter_params` moved
+  the two now cover both identities an `align-denovo` submission names. `filter_params` moved
   from `cli/user/mask.py` to `cli/_common.py`, beside the `call` whose `params`
   argument it builds, so the two verbs share one copy.
 
