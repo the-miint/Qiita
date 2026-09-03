@@ -233,10 +233,8 @@ async def _require_assembly_subject(
             f"prep_sample {prep_sample_idx}. Absence is never 'assembled', so there is "
             "nothing to align against. Two ways to get here: the run never reached this "
             "sample, or it assembled before the gate existed and so wrote no row. "
-            "`qiita processing samples --processing-idx "
-            f"{processing_idx}` lists the samples it does hold a row for, which "
-            "separates them. Either way the remedy is the same — re-submit "
-            "long-read-assembly for this sample, which is admitted and writes the row."
+            "Either way the remedy is the same — re-submit long-read-assembly for this "
+            "sample, which is admitted and writes the row."
         )
     if state == "no_data":
         raise StepNoData(

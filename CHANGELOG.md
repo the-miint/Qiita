@@ -35,11 +35,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   clients — one GET each, printed verbatim — so a new server field reaches the user
   without a CLI change. The mask twin (`qiita mask list|show|samples`) is the shape, and
   the two now cover both identities an `align-denovo` submission names.
-  `align-denovo`'s own bad-input refusals now name the read that produces each identity
-  (`qiita processing list` / `qiita mask list` when a selector is absent, `qiita processing
-  samples` when no gate row exists), so the verbs are found at the moment the identity is
-  wrong rather than only by knowing they exist — the shape `qiita alignment list` already
-  has in `cli/user/alignment.py`. `filter_params` moved
+  `align-denovo`'s refusal for an absent selector now names the read that produces each
+  identity (`qiita processing list` / `qiita mask list`), so the verbs are found at the
+  moment the identity is wrong rather than only by knowing they exist — the shape
+  `qiita alignment list` already has in `cli/user/alignment.py`. The named commands are
+  fed to the CLI's own parser by the test, so a rename cannot leave the message and the
+  test agreeing on a verb that no longer exists. `filter_params` moved
   from `cli/user/mask.py` to `cli/_common.py`, beside the `call` whose `params`
   argument it builds, so the two modules share one copy.
 

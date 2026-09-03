@@ -18,6 +18,7 @@ from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.hashing import canonical_params_hash
 
 from qiita_control_plane.actions import load_actions
+from qiita_control_plane.cli.user._parser import _build_parser
 from qiita_control_plane.runner._alignment import (
     ALIGN_MASK_IDX_BINDING,
     ASSEMBLY_PROCESSING_IDX_BINDING,
@@ -211,12 +212,15 @@ def test_a_selector_absent_from_action_context_is_refused():
     with pytest.raises(Exception, match="selectors are incomplete"):
         _params({ALIGN_MASK_IDX_BINDING: 99})
 
-    # The refusal names the read that produces each identity, so a submitter who
-    # got one wrong is not left to find the verb themselves. Pinned because the
-    # spelling is a CLI surface this module cannot see: rename the verb and this
-    # message goes stale silently.
-    assert "qiita processing list" in str(absent_run.value)
-    assert "qiita mask list" in str(absent_run.value)
+    # The refusal names the read that produces each identity, so a submitter who got
+    # one wrong is not left to find the verb themselves. Each named command is then
+    # fed to the CLI's own parser: asserting the substring alone would let a rename
+    # leave the message and this test agreeing on a verb that no longer exists,
+    # since both sides would be reading the same literal typed here.
+    message = str(absent_run.value)
+    for argv in (["processing", "list"], ["mask", "list"]):
+        assert f"qiita {' '.join(argv)}" in message
+        _build_parser().parse_args(argv)
 
 
 def test_a_supplied_knob_overrides_the_action_default():
