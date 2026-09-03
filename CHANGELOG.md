@@ -3138,6 +3138,18 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **`long-read-assembly` baseline memory raised at three steps from measured
+  first-attempt failures (#526).** `assemble` 192 → 250 GiB, `assembly_coverage`
+  64 → 96, `assembly_load` 16 → 32. Measured on the 1.0.1 re-run cohort
+  (2026-09-02 to 09-03) with the confounded rows excluded — only jobs that ran at
+  the YAML baseline count, not the ones an operator pre-floored with `--mem-gb`.
+  At those baselines 5 of 27, 2 of 24, and 3 of 15 first attempts failed. Two are
+  cgroup kills; `assembly_load` is not — it raised a DuckDB `OutOfMemoryException`
+  while using 9.39 GiB of its 16 GiB allocation, because
+  `resolve_duckdb_memory_gb` subtracts an additive headroom that costs a quarter
+  of a small step (#288). Each step's own comment carries its table and the
+  sizing argument; `assemble` is 250 rather than higher because 251 GiB is where
+  a second concurrent assemble stops fitting on a 502 GiB node.
 - **`ticket:doput` is now on the USER role ceiling (#484).** It was on the two admin
   ceilings and service accounts only, dating from when reference loading was the sole
   upload consumer. With host paths in `action_context` restricted to wet_lab_admin+, an

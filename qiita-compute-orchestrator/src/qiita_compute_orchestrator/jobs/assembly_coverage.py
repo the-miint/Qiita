@@ -141,10 +141,10 @@ _MM2_PRESET = "map-hifi"
 # and sent every escalated GB to the side that can already spill — an SEQUENCE_DATA
 # OOM could never be escalated out of.
 #
-# CEILING, NOT YET SETTLED: for a read set whose sequence bytes * ~1.6 exceed the
-# cgroup remainder, no escalation helps (the lookup is unspillable). Whether one
-# sample's masked HiFi read set fits `baseline_resources` is a sizing question for
-# a real sample: the first production ticket's `sacct` MaxRSS is what settles it.
+# CEILING: for a read set whose sequence bytes * ~1.6 exceed the cgroup remainder,
+# no escalation helps (the lookup is unspillable). The remainder is the step's
+# `baseline_resources.mem_gb` less DuckDB's cap below; the cohort measurement that
+# sized that number is recorded at the step in the workflow YAML.
 # Equal to this step's `baseline_resources.cpu`, and it must stay equal — but the
 # binding reason is MEMORY, not cores. `align_minimap2` draws its parallelism from
 # DuckDB's thread pool (measured near-linear at 1/2/4/8), so this number is also the

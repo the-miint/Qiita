@@ -39,7 +39,21 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **`long-read-assembly` baseline memory rose at three steps (#526):** `assemble`
+  192 → 250 GiB, `assembly_coverage` 64 → 96, `assembly_load` 16 → 32. The action
+  sync in the deploy picks these up; there is no separate step. Two consequences
+  worth knowing before the next submission batch:
+  - **The `--mem-gb 384` floor is no longer needed for a routine `long-read-assembly`
+    submission.** It was covering `assemble`'s upper demand mode (measured 189-246
+    GiB), which 250 now covers from the baseline. Passing it still works — it is a
+    ticket-wide floor, so it also lifts every other step in the ticket.
+  - **Tickets already submitted to SLURM keep their old allocation**, whether running
+    or still queued: the dispatcher adopts any attempt that already has a
+    `slurm_job_id` rather than re-submitting it. Only steps dispatched after the
+    restart get the new numbers.
+- **`assemble` still fits two per node at 250 GiB** on 514000 MB nodes (250 × 2 = 500).
+  A future raise past 251 would drop it to one per node — the reason 250 was chosen
+  over a value with more margin is recorded at the step in the workflow YAML.
 
 ## Deployed history
 

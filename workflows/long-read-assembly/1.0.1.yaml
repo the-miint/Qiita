@@ -131,9 +131,32 @@ steps:
     derived_inputs:
       MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [genomes_dir]
+    # mem_gb measured on the 1.0.1 re-run cohort (2026-09-02 to 09-03, qiita
+    # partition), MaxRSS off each job's `.batch` row, GiB throughout.
+    #
+    # Demand is bimodal and 192 sat inside the upper mode: 5 of 27 first attempts
+    # were OUT_OF_MEMORY there.
+    #
+    #   mode    n     p50      max    measured at
+    #   small  19   53.75   114.86    192 GiB allocation
+    #   upper  19  207.18   246.03    384 GiB allocation
+    #
+    # The upper figures are demand rather than a cgroup being filled: at a 192 GiB
+    # allocation 16 of 22 completed runs peaked under 60 GiB, so the assembler does
+    # not expand to what it is given.
+    #
+    # 250 rather than a value clearing the upper mode with margin: nodes on this
+    # partition carry 514000 MB (~502 GiB) and 64 CPU, and cpu:32 already holds this
+    # step to two per node. 250 × 2 = 500 keeps that; 251 and above drops every
+    # sample to one per node, the small mode included.
+    #
+    # What 250 does not cover: an earlier cohort recorded a 259.3 GiB peak, and a
+    # sample in that range still OOMs and escalates. Escalation doubles and clamps
+    # to `action_ceiling.mem_gb`, so from 250 there is one escalated attempt (500)
+    # where from 192 there were two (384, then 500).
     baseline_resources:
       cpu: 32
-      mem_gb: 192
+      mem_gb: 250
       walltime: PT16H
 
   # Align the masked HiFi reads back to the noLCG contigs with miint's embedded
@@ -159,9 +182,20 @@ steps:
     #
     # The wall-clock cost of 8 rather than 16 is slack this step has: measured p50 10.4
     # min and max 15.4 min against the PT4H limit below, i.e. 6% of it.
+    #
+    # mem_gb measured on the same cohort. At 64, 2 of 24 first attempts were
+    # OUT_OF_MEMORY pegged at 63.99 GiB, and both completed on the 128 GiB retry at
+    # 73.15 and 73.82 GiB; an earlier cohort's escalated retries completed across
+    # 63.8-75.2 GiB. Runs that fit 64 peaked at p50 52.43, max 59.01 (n=22) — the
+    # tail is what 64 missed, not the median. 96 clears 75.2 by 20.8 GiB.
+    #
+    # The whole increment reaches the side that binds: DuckDB is held to
+    # `_DUCKDB_CAP_GB` whatever the allocation, so the cgroup remainder — minimap2's
+    # index and the writer's SEQUENCE_DATA lookup, neither of which spills — takes
+    # every added GiB. cpu:8 allows 8 of these per node; 96 GiB lowers that to 5.
     baseline_resources:
       cpu: 8
-      mem_gb: 64
+      mem_gb: 96
       walltime: PT4H
 
   # metawrap binning (metabat2 + maxbin2 + concoct) over the noLCG contigs +
@@ -326,9 +360,23 @@ steps:
     inputs: [manifest, feature_map, assembly_chunks, bin_map, genomes_dir, checkm_dir, refined_bins_dir]
     params: {processing_idx: processing_idx}
     outputs: [staging_dir]
+    # mem_gb measured on the same cohort: 3 of 15 first attempts at 16 failed with a
+    # DuckDB OutOfMemoryException in write_feature_sequence_chunks' per-part ORDER BY
+    # ("failed to allocate data of size 432.0 MiB (10.3 GiB/11.1 GiB used)"). Not a
+    # cgroup kill — the sub-step state is FAILED rather than OUT_OF_MEMORY, and
+    # process RSS at failure was 9.39 / 6.09 / 6.19 GiB, inside the 16 GiB cgroup.
+    #
+    # What bound was DuckDB's own limit. `resolve_duckdb_memory_gb` subtracts
+    # `duckdb_headroom_gb(4)` = 4 from the allocation, so a 16 GiB step ran DuckDB at
+    # 12 GB (11.18 GiB); the headroom is additive, so it costs a quarter of a 16 GiB
+    # step and a sixteenth of a 64 GiB one. All three completed on the 32 GiB retry
+    # at 8.83 / 6.31 / 6.62 GiB RSS, so what the step wanted was a higher DuckDB
+    # limit, not more resident memory. 32 is the value measured to pass; nothing
+    # between 16 and 32 was tried. Runs take 2-23 s, so the allocation is held
+    # briefly.
     baseline_resources:
       cpu: 4
-      mem_gb: 16
+      mem_gb: 32
       walltime: PT2H
 
   # Load the staging Parquets → the `assembled_sequence`, `assembled_sequence_chunks`,
