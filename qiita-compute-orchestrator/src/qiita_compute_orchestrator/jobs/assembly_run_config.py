@@ -9,12 +9,12 @@ profile keys in the workflow YAML. Keep `json.dumps` and its default separators;
 adding a field, reordering, or changing spacing changes the key and fails
 `assemble` at dispatch.
 
-Keying the lookup on this file rather than on a dedicated one is deliberate: the
-lookup needs SOME declared output of an upstream step, and adding a new declared
-output would break every in-flight ticket. A completed step's bindings are rebuilt
-on resume as `{name: manifest[name] for name in entry.outputs}`, against the
-CURRENT spec — so a name the old manifest lacks raises, for any ticket that
-completed this step, however far past it.
+The lookup needs a declared output of an upstream step, and this file is one that
+already exists. Adding a dedicated one instead would read better and would break
+tickets in flight: a completed step's bindings are rebuilt on resume as
+`{name: manifest[name] for name in entry.outputs}` against the spec in force at
+resume time, so a name the old manifest lacks raises, for any ticket that had
+completed this step however far past it.
 
 The assembler rides through a native step at all because a scalar can't ride a
 container step's inputs — the runner treats a container input as a bind-mount path.

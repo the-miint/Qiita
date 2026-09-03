@@ -165,10 +165,10 @@ def write_feature_sequence_chunks(
     in ascending order, so the parts collectively form one globally-
     sorted dataset readable via `read_parquet(dir/part_*.parquet)`.
     A batch holds ~3.2 GB of raw chunk bytes. That bounds the input to
-    the per-part sort, not the sort's working set — the assembly caller
-    raised `OutOfMemoryException` inside that `ORDER BY` against an
-    11.18 GiB DuckDB limit, so a limit a few times the raw batch is not
-    sufficient. The ratio between the two has not been measured.
+    the per-part sort, not the sort's working set: a caller has raised
+    `OutOfMemoryException` inside that `ORDER BY` against an 11.18 GiB
+    DuckDB limit, so a limit a few times the raw batch is not sufficient.
+    The ratio between the two has not been measured.
 
     **Memory safety.** The per-batch COPY joins a `feature_map` subset
     pre-filtered to the batch's hashes (the `fmb` CTE), not the full

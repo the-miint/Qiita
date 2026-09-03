@@ -89,10 +89,12 @@ steps:
     # `test_build_shard_index_cpu_is_below_duckdb_threads` pins this to the measured 1
     # and asserts it stays under the pool.
     #
-    # What it does not buy is more of this step per node. At mem_gb 32 memory already
-    # caps concurrency at floor(514000/32768) = 15, below the old cpu cap of 16, and
-    # 15 is still the cap now. The cores it stops reserving go to other work on the
-    # node, not to more shards.
+    # Whether it buys more of this step per node depends on the shard. At the full
+    # mem_gb 32 memory caps concurrency at floor(514000/32768) = 15, already below the
+    # old cpu cap of 16, so nothing changes. But `plan()` sizes a small shard down
+    # toward its 28 GiB floor, where floor(514000/28672) = 17 — above that cpu cap, so
+    # for those shards cpu:4 WAS the binding limit and dropping it does add a slot.
+    # Either way the cores it stops reserving are available to other work on the node.
     #
     # The elapsed tail is the part this does not bound. Elapsed over all 987 shards
     # was p50 14.5, p90 30.7, p99 65.2 and max 92.3 min against the PT2H limit, with

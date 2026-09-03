@@ -39,8 +39,10 @@ _None yet._
 
 ### Notes (no host action)
 
-- **`long-read-assembly` baseline resources rose at three steps (#526):** `assemble`
-  192 → 250 GiB, `assembly_coverage` 64 → 96, `assembly_load` 16 → 32. The action
+- **`long-read-assembly` baseline resources changed at three steps (#526):**
+  `assembly_coverage` 64 → 96 GiB and `assembly_load` 16 → 32 both rise; `assemble`
+  becomes per-assembler, 192 → 250 for hifiasm_meta but 192 → **128 for myloasm**,
+  which is a reduction. The action
   sync in the deploy picks these up; there is no separate step. The measurements and
   the reasoning are at each step in `workflows/long-read-assembly/1.0.1.yaml`. Three
   things worth knowing:

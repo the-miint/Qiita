@@ -194,10 +194,10 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
 
     Pinned for the same reason the others are: nothing fails at runtime when these
     drift, so a later edit raising `cpu` to match the pool would silently undo a
-    measured change. The assertion is on the measured value rather than on the
-    inequality, so that changing `_DUCKDB_THREADS` for an unrelated reason does not
-    fire here, and so that an intermediate `cpu: 2` does not pass unnoticed. If it
-    fires, the question is whether the measurement still holds.
+    measured change. It asserts the measured value, not merely the inequality, so an
+    intermediate `cpu: 2` does not pass unnoticed; it also asserts the value stays
+    under the pool, so lowering `_DUCKDB_THREADS` to 1 fires it too. If it fires, the
+    question is whether the measurement still holds.
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.build_minimap2_index")
     for yaml_path, cpu in _baseline_cpu_every_version("build-shard-index", "build_minimap2_index"):
@@ -211,16 +211,15 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
 
 def test_assemble_profiles_cover_every_assembler():
     """`long-read-assembly`'s `assemble` step sizes memory per assembler through a
-    `profiles:` lookup keyed on `assembly_run_config`'s `assembler` output. The
-    profile keys must be exactly the members of that job's `Inputs.assembler`
-    Literal, in every workflow version that uses the lookup.
+    `profiles:` lookup. Each profile key is the serialized `run_config.json` for one
+    assembler, so the assemblers those keys NAME must be exactly the members of that
+    job's `Inputs.assembler` Literal, in every workflow version using the lookup.
 
     The lookup has no default: a key absent from `profiles` fails at dispatch with
-    `CONTRACT_VIOLATION`. That is the right failure — silently sizing an unknown
-    assembler from some other one's measurement is worse — but it turns "add a third
-    assembler to the Literal" into a step that breaks the workflow at run time, on a
-    ticket, rather than here. Pinned both ways so adding a member without a profile,
-    or a profile without a member, fails in CI instead.
+    `CONTRACT_VIOLATION`, rather than sizing an unknown assembler from another one's
+    measurement. That turns "add a third assembler to the Literal" into a step that
+    breaks on a ticket rather than here, so this pins it both ways: a member without a
+    profile, or a profile without a member, fails in CI instead.
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.assembly_run_config")
     literal = set(get_args(mod.Inputs.model_fields["assembler"].annotation))

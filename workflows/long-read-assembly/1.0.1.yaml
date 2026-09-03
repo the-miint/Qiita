@@ -147,11 +147,11 @@ steps:
     # myloasm run has exceeded 94.58. A single number has to cover hifiasm_meta, and
     # then every myloasm ticket reserves ~2.6x what that assembler has ever used.
     #
-    # The lookup keys on `assembly_run_config`'s EXISTING `run_config` output, whose
+    # The lookup keys on `assembly_run_config`'s existing `run_config` output, whose
     # stripped bytes the runner reads at dispatch — hence the JSON-shaped keys below.
     # A dedicated bare-name output would read better and is not worth it: a completed
     # step's bindings are rebuilt on resume as `{name: manifest[name] for name in
-    # entry.outputs}` against the CURRENT spec, so declaring a new output raises for
+    # entry.outputs}` against the spec in force at resume, so a new output raises for
     # every in-flight ticket that already completed this step. Keying on a file that
     # is already declared costs nothing at deploy.
     #
@@ -165,8 +165,14 @@ steps:
     # largest is 246.03 of a 384 GiB allocation, 64% and nowhere near pegged. Every
     # completed run, by the allocation it ran at:
     #
+    # Every figure here is MaxRSS — what a run used, not what it asked for. The
+    # allocation a row ran at matters only for whether that usage was free to grow:
+    # a peak pinned at the allocation is censored and bounds demand from below, and
+    # everything else is a demand measurement whatever the request was.
+    #
     #   ran at   n     p50      max   what the rows are
-    #   103      1    8.01     8.01   myloasm canary
+    #   103      1    8.01     8.01   myloasm; request hand-set on the ticket to
+    #                                 shorten its queue wait, peak far below it
     #   192     19   53.75   114.86   15 myloasm, 4 hifiasm_meta
     #   192      3  191.07   192.00   hifiasm_meta; the largest pegged at 192.00
     #   384     14  209.17   246.03   hifiasm_meta, ticket-wide --mem-gb 384
@@ -175,7 +181,8 @@ steps:
     # That is all 42 completions; the window held 54 assemble jobs in total, the rest
     # being the 5 OUT_OF_MEMORY first attempts and 7 still in flight at 192. Three of
     # the 26 hifiasm_meta rows are censored at 192, so its p50 of 201.12 is a mixed
-    # statistic; the max of 246.03, measured at 384, is not, and is what 250 answers.
+    # statistic; the max of 246.03 grew freely inside 384 and is what 250 answers.
+    # None of the 16 myloasm rows is censored — its 94.58 max is demand outright.
     #
     # 250 keeps a standard node able to hold two of these and 251 does not:
     # 251 x 1024 x 2 = 514048 MB against RealMemory=514000. cpu:32 on 64-core nodes

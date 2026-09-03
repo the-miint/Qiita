@@ -39,15 +39,16 @@ def test_unknown_assembler_rejected():
 
 @pytest.mark.parametrize("assembler", ["hifiasm_meta", "myloasm"])
 def test_run_config_bytes_are_the_resource_profile_keys(tmp_path, assembler):
-    """`run_config.json`'s stripped bytes ARE the key of `assemble`'s `profiles:`
+    """`run_config.json`'s stripped bytes are the key of `assemble`'s `profiles:`
     lookup — the runner reads the whole file, strips it, and matches it against the
     keys in the workflow YAML (`runner/_dispatch.py`). No default: a key that does
     not match fails the step at dispatch.
 
-    So the serialization is a contract with the YAML, not a private detail. This
-    asserts the two agree, for every version that uses the lookup, in both
-    directions — adding a field to run_config.json, reordering, or changing
-    `json.dumps` separators breaks it here rather than on a ticket.
+    So the serialization is a contract with the YAML, not a private detail. This is
+    the producer side of it: adding a field to run_config.json, reordering, or
+    changing `json.dumps` separators breaks here rather than on a ticket. The
+    consumer side — that the YAML names every assembler and no others — is
+    `test_assemble_profiles_cover_every_assembler`.
     """
     out = _run(
         Inputs(assembler=assembler, prep_sample_idx=5, work_ticket_idx=9),

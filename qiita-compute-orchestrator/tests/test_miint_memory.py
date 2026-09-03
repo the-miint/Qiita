@@ -1,7 +1,8 @@
 """Unit tests for the SLURM-allocation-aware DuckDB memory sizing helpers.
 
-These are pure-Python (no DuckDB / no staged extension), so they run in the
-fast ``make test`` tier. They pin the behaviour that makes the per-run
+These are pure-Python apart from the last one, which opens an in-memory DuckDB
+to pin its out-of-memory message; none needs the staged extension, so they all
+run in the fast ``make test`` tier. They pin the behaviour that makes the per-run
 ``--mem-gb`` override actually reach a job's in-process memory caps:
 ``SLURM_MEM_PER_NODE`` (the real cgroup) wins over the YAML-baseline literal
 under SLURM, while off SLURM the literal fallback keeps the local backend /
@@ -111,6 +112,10 @@ def test_duckdb_out_of_memory_text_is_classified_as_oom():
     Probed rather than assumed: the match comes from DuckDB prefixing the message
     with "Out of Memory Error:", which is third-party formatting. A release that
     reworded it would silently turn these into permanent failures, so this pins it.
+
+    The exception's CLASS matters as much as its text. ``run_native_job`` maps
+    ``ValueError`` to ``BAD_INPUT``, which is permanent and never escalates, so an
+    OOM class inheriting ``ValueError`` would bypass the OOM path entirely.
     """
     import duckdb
     from qiita_common.log_tail import contains_oom_signature
@@ -124,6 +129,11 @@ def test_duckdb_out_of_memory_text_is_classified_as_oom():
             "  SELECT range AS a, repeat(md5(range::VARCHAR), 300) AS b"
             "  FROM range(400000) ORDER BY b)"
         ).fetchall()
+    assert not isinstance(exc.value, (ValueError, FileNotFoundError)), (
+        f"DuckDB's OOM class now inherits a type the native-job dispatcher maps to a "
+        f"permanent failure, so these would stop escalating: "
+        f"{type(exc.value).__mro__}"
+    )
     assert contains_oom_signature(str(exc.value)), (
         f"DuckDB's OOM message no longer matches an OOM signature, so a native job "
         f"that exhausts memory_limit would fail permanently instead of escalating: "

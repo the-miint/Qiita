@@ -3138,9 +3138,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
-- **`long-read-assembly` baseline memory raised at three steps from measured
-  first-attempt failures (#526).** `assemble` 192 → 250 GiB, `assembly_coverage`
-  64 → 96, `assembly_load` 16 → 32. Measured on the 1.0.1 re-run cohort
+- **`long-read-assembly` baseline memory re-sized at three steps from measured
+  runs (#526).** `assembly_coverage` 64 → 96 GiB and `assembly_load` 16 → 32 rise
+  off first-attempt failures; `assemble` becomes per-assembler — 250 for
+  hifiasm_meta, but 128 for myloasm, a reduction derived from its successes. Measured on the 1.0.1 re-run cohort
   (2026-09-02 to 09-03) with the confounded rows excluded — only jobs that ran at
   the YAML baseline count, not the ones an operator pre-floored with `--mem-gb`.
   At those baselines 5 of 27, 2 of 24, and 3 of 15 first attempts failed. The
