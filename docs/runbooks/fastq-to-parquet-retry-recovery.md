@@ -52,9 +52,8 @@ Three things about that command are easy to get wrong:
 - It takes the **whole pool** — every prep_sample under it, their stored reads and their
   study links, which on a PacBio run is the whole run.
 
-There is no per-prep_sample delete: the control plane exposes four DELETE routes and none
-of them is one, and `PATCH /prep-sample/{idx}/retired` is reversible and leaves the
-numbering in place.
+There is no per-prep_sample delete — no route deletes one, and
+`PATCH /prep-sample/{idx}/retired` is reversible and leaves the numbering in place.
 
 Confirm what you're about to destroy first:
 

@@ -11,9 +11,9 @@ both Python services depend on.
 # supplies its own lead, because the pool is "this pool" to a pool-scoped 409
 # and "the prep_sample's pool" to a per-prep_sample failure.
 #
-# There is no per-prep_sample delete — the control plane exposes four DELETE
-# routes and none of them is one, and `PATCH /prep-sample/{idx}/retired` is
-# reversible and leaves the numbering — so the pool is the unit. `--force` is
+# There is no per-prep_sample delete: no route deletes one, and
+# `PATCH /prep-sample/{idx}/retired` is reversible and leaves the numbering in
+# place — so the pool is the unit. `--force` is
 # required because a terminal ticket on the pool blocks the delete by itself,
 # which is exactly the state anything reading this message is in.
 POOL_REMOVAL_RECOVERY = (

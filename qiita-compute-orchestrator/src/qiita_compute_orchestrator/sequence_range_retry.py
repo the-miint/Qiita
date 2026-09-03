@@ -261,8 +261,8 @@ async def mint_or_reuse_sequence_range(
                     f"prep_sample {prep_sample_idx}'s reads were already loaded by "
                     f"{owner_detail}, not by this one (ticket {work_ticket_idx}). "
                     "Loading them again would store every read twice, so this step "
-                    "stopped without writing anything. To load them again on purpose, "
-                    "that means removing the prep_sample's pool: "
+                    "stopped without writing anything. Loading them again on purpose "
+                    "means removing the prep_sample's pool: "
                     f"{POOL_REMOVAL_RECOVERY}. Then submit again"
                 ),
             ) from exc
@@ -282,13 +282,13 @@ async def mint_or_reuse_sequence_range(
             # UNANTICIPATED state on advice that works, not on advice that bounces.
             if state in REDRIVABLE_WORK_TICKET_STATES:
                 recovery = (
-                    f"re-drive this ticket with `qiita ticket run {work_ticket_idx}`, "
+                    f"Re-drive this ticket with `qiita ticket run {work_ticket_idx}`, "
                     "which returns it to flight and makes its own range reusable"
                 )
             else:
                 # COMPLETED (reads registered), or a state with no in-place redrive.
                 recovery = (
-                    "there is no way to resume from this state; starting over means "
+                    "There is no way to resume from this state; starting over means "
                     f"removing the prep_sample's pool: {POOL_REMOVAL_RECOVERY}"
                 )
             raise BackendFailure(
