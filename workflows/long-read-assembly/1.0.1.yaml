@@ -195,9 +195,11 @@ steps:
     # slot rather than demonstrating one, and stops 3.97 GiB above this cohort's max.
     # An earlier and larger cohort — 59 first attempts at 192, of which 30 OOMed —
     # peaked at 259.3 GiB on its 384 GiB retries, so a sample in that range still
-    # escalates here. That peak is THIS profile's, not the other one's: all 59 ran
-    # under 1.0.0, whose `assembler` default is hifiasm_meta, and no 1.0.0 ticket
-    # recorded myloasm — its first run is 2026-09-02, under this version. Which
+    # escalates here. That peak is THIS profile's, not the other one's: `assembler`
+    # is a closed two-value enum, no 1.0.0 work ticket ever recorded myloasm (its
+    # first run is 2026-09-02, under this version), and the version's default is
+    # hifiasm_meta — so with the only alternative ruled out directly, every 1.0.0
+    # assemble ran hifiasm_meta whether the key was recorded or defaulted. Which
     # matters because the two are now sized separately: 259.3 constrains the
     # hifiasm_meta profile alone and says nothing about myloasm's 128.
     #

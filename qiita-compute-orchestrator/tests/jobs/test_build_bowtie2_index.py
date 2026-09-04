@@ -22,6 +22,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from helpers import shard_yaml_baseline_gb
 
 _BT2_SUFFIXES = ("1.bt2", "2.bt2", "3.bt2", "4.bt2", "rev.1.bt2", "rev.2.bt2")
 
@@ -43,33 +44,6 @@ def _write_chunks_parquet(path: Path, rows: list[tuple[int, int, str]]) -> Path:
             params,
         )
     return path
-
-
-# `_resolve_step_resources` applies the hint only when `hint < resolved < ceiling`
-# (runner/_dispatch.py) — the down-size needs escalation headroom, or a shrunk
-# attempt that OOMs would read as saturation. The clamp below drops that third
-# term because `build-shard-index` declares a 128 GiB ceiling against a 32 GiB
-# baseline, so the headroom condition is never the binding one. Closing that gap
-# in the YAML would make this clamp diverge from production without either side
-# failing, which is what the ceiling assertion here is for.
-def _shard_yaml_baseline_gb() -> int:
-    """`build-shard-index`'s declared `mem_gb` for the bowtie2 step. Read from the
-    workflow rather than restated: a baseline raised there has to move this clamp."""
-    import yaml
-
-    repo_root = Path(__file__).resolve().parents[3]
-    data = yaml.safe_load((repo_root / "workflows/build-shard-index/1.0.0.yaml").read_text())
-    for step in data["steps"]:
-        if step.get("step") == "build_bowtie2_index":
-            mem_gb = step["baseline_resources"]["mem_gb"]
-            ceiling = data["action_ceiling"]["mem_gb"]
-            assert mem_gb < ceiling, (
-                f"build-shard-index baseline mem_gb={mem_gb} has no headroom under "
-                f"ceiling={ceiling}; the down-size would not apply at all and the "
-                "clamp below no longer matches runner/_dispatch.py"
-            )
-            return mem_gb
-    raise AssertionError("build-shard-index declares no build_bowtie2_index step")
 
 
 def _write_roster(path: Path, rows: list[tuple[int, int]]) -> Path:
@@ -413,7 +387,7 @@ def test_build_bowtie2_index_shard_never_raises_duckdbs_limit(tmp_path, shard_gb
     from qiita_compute_orchestrator.jobs import build_bowtie2_index
     from qiita_compute_orchestrator.miint import resolve_duckdb_memory_gb
 
-    baseline = _shard_yaml_baseline_gb()
+    baseline = shard_yaml_baseline_gb("build_bowtie2_index")
     roster = _write_roster(tmp_path / "r.parquet", [(1, shard_gbp * 1_000_000_000)])
     inputs = build_bowtie2_index.Inputs(
         reference_idx=1, work_ticket_idx=1, shard_id=0, shard_features=roster

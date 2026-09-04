@@ -1729,9 +1729,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 - **The `assemble` 259.3 GiB peak is now attributed (#538).** The workflow comment placed
   it in the hifiasm_meta paragraph and said "a sample in that class", which the recorded
   figure did not support — it carried no assembler, input scale, or censoring status.
-  Settled against the deploy: every one of the 59 first attempts in that cohort ran under
-  `1.0.0`, whose `assembler` default is hifiasm_meta, and no `1.0.0` work ticket ever
-  recorded myloasm (its first run is 2026-09-02, under `1.0.1`). So the peak is
+  Settled against the deploy: `assembler` is a closed two-value enum defaulting to
+  hifiasm_meta, and no `1.0.0` work ticket ever recorded myloasm (its first run is
+  2026-09-02, under `1.0.1`) — so with the only alternative ruled out, every `1.0.0`
+  assemble ran hifiasm_meta whether the key was recorded or defaulted. So the peak is
   hifiasm_meta's and does bound the 250 GiB profile. That matters because `assemble` is
   now sized per assembler: 259.3 constrains the hifiasm_meta profile alone and says
   nothing about myloasm's 128. The comment states the trade it implies — 250 is knowingly

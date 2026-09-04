@@ -132,9 +132,17 @@ def test_chunk_reassembly_raises_rather_than_spilling(tmp_path: Path) -> None:
     `_BOWTIE2_SHARD_DUCKDB_CAP_GB`), and because this raises rather than degrading,
     a shard whose chunks exceed what that cap allows fails on the first attempt and
     on every retry — the cap is hard, so OOM escalation grows only the aligner's
-    side. Measured alongside this: the aggregate wants roughly 2.2x the chunk bytes
-    as `memory_limit` (3.6x at 0.25 GiB, 2.4x at 1 GiB, 2.2x at 4 GiB), which is
-    where the ~5 Gbp figure in those constants' comments comes from.
+    side. Measured alongside this, against the same DuckDB: the aggregate wants
+    roughly 2.2x the chunk bytes as `memory_limit`, falling with scale (3.6x at
+    0.25 GiB, 2.4x at 1 GiB, 2.2x at 4 GiB) and still 2.23x at the 12 GB the shard
+    caps sit at — 5.37 GiB of chunk bytes OOMs at 10 GB and completes at 12. That is
+    where the ~5 Gbp in those constants' comments comes from; it is the cap's own
+    operating point, not an extrapolation from the smaller fixtures.
+
+    This test deliberately runs a ~150 MB fixture instead: it pins the DIRECTION
+    (raise, not spill), which is what the caps' safety argument turns on and what a
+    DuckDB upgrade could silently change. The ratio is a sizing input, not a
+    contract, and a multi-GiB fixture does not belong in the unit tier.
 
     The control is the point of the test as much as the failure is: the identical
     fixture and query complete at a limit above the data, so the raise is the limit

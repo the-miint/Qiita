@@ -112,12 +112,13 @@ _MINIMAP2_SHARD_RESERVE_GB = 8
 # DuckDB's share there is bounded by window size rather than corpus size. Nothing
 # windows `stage_subject`: its `string_agg(chunk_data ORDER BY chunk_index) GROUP BY
 # feature_idx` grows with the shard, and it OOMs rather than spilling
-# (`test_duckdb_memory_behavior.py` pins that, measured at ~2.2x the chunk bytes as
-# `memory_limit`). So a 12 GB limit reassembles roughly 5 Gbp and no more, on the
-# first attempt and on every retry — the cap is hard, so OOM escalation grows only
-# minimap2's side. That ceiling is unchanged by this constant: the old arithmetic hit
-# the same 12 GB from a 4 Gbp shard upward. Windowing the shard feed the way rype's
-# is, is what would move it.
+# (`test_duckdb_memory_behavior.py` pins that). Probed at this cap's own scale against
+# the DuckDB this repo ships: 5.37 GiB of chunk bytes OOMs at a 10 GB limit and
+# completes at 12. So a 12 GB limit reassembles about 5 Gbp and no more, on the first
+# attempt and on every retry — the cap is hard, so OOM escalation grows only minimap2's
+# side. That ceiling is unchanged by this constant: the old arithmetic hit the same
+# 12 GB from a 4 Gbp shard upward. Windowing the shard feed the way rype's is, is what
+# would move it.
 #
 # HOST mode gets no cap: it reassembles genome-scale contigs from staging Parquet,
 # where a `--mem-gb` override is meant to grow DuckDB's reassembly headroom.

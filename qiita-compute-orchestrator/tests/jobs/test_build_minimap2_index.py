@@ -28,6 +28,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from helpers import shard_yaml_baseline_gb
 
 from qiita_compute_orchestrator.miint import duckdb_headroom_gb
 
@@ -539,30 +540,6 @@ def test_build_minimap2_index_reserve_differs_by_mode(tmp_path, monkeypatch):
 # the hint clamped at that baseline. Read from the workflow rather than restated:
 # a baseline raised in the YAML has to move this clamp, and a literal here would
 # keep passing against the old one.
-# `_resolve_step_resources` applies the hint only when `hint < resolved < ceiling`
-# (runner/_dispatch.py) — the down-size needs escalation headroom, or a shrunk
-# attempt that OOMs would read as saturation. The clamp below drops that third
-# term because `build-shard-index` declares a 128 GiB ceiling against a 32 GiB
-# baseline, so the headroom condition is never the binding one. Closing that gap
-# in the YAML would make this clamp diverge from production without either side
-# failing, which is what the ceiling assertion here is for.
-def _shard_yaml_baseline_gb() -> int:
-    """`build-shard-index`'s declared `mem_gb` for the minimap2 step."""
-    import yaml
-
-    repo_root = Path(__file__).resolve().parents[3]
-    data = yaml.safe_load((repo_root / "workflows/build-shard-index/1.0.0.yaml").read_text())
-    for step in data["steps"]:
-        if step.get("step") == "build_minimap2_index":
-            mem_gb = step["baseline_resources"]["mem_gb"]
-            ceiling = data["action_ceiling"]["mem_gb"]
-            assert mem_gb < ceiling, (
-                f"build-shard-index baseline mem_gb={mem_gb} has no headroom under "
-                f"ceiling={ceiling}; the down-size would not apply at all and the "
-                "clamp below no longer matches runner/_dispatch.py"
-            )
-            return mem_gb
-    raise AssertionError("build-shard-index declares no build_minimap2_index step")
 
 
 def _shard_allocation_gb(build_minimap2_index, roster) -> int:
@@ -572,7 +549,7 @@ def _shard_allocation_gb(build_minimap2_index, roster) -> int:
         reference_idx=1, work_ticket_idx=1, shard_id=0, shard_features=roster
     )
     hint = build_minimap2_index.plan(inputs).resources.mem_gb
-    baseline = _shard_yaml_baseline_gb()
+    baseline = shard_yaml_baseline_gb("build_minimap2_index")
     return hint if hint < baseline else baseline
 
 
@@ -619,7 +596,7 @@ def test_build_minimap2_index_shard_never_raises_duckdbs_limit(tmp_path, shard_g
         )
         # What the 16 GiB reserve produced for the same shard, at ITS floor of 28.
         before_hint = 28 + shard_gbp
-        baseline = _shard_yaml_baseline_gb()
+        baseline = shard_yaml_baseline_gb("build_minimap2_index")
         before_alloc = before_hint if before_hint < baseline else baseline
         before = _limit_at(before_alloc, 16, None, mp)
 
