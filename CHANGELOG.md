@@ -1700,7 +1700,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
-- **Three cross-references named things that do not exist (#PR).**
+- **Three cross-references named things that do not exist (#537).**
   `build_minimap2_index`'s module docstring said its two modes mirror `build_rype_index`,
   which is whole-reference only and has no shard mode; the comment above its shard `plan()`
   sizing, and `build_bowtie2_index`'s twin, both said they mirror `build_rype_index`, which
@@ -1711,13 +1711,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `test_masked_export_fastq_contract.py` cited upstream `docs/copy-formats.md`, which
   `docs/duckdb-miint.md` records as renamed in the 2026-07 reorg; the COPY writers are in
   `docs/writing.md`.
-- **Two workflow YAMLs stated a DuckDB cap that had been lowered under them (#PR).**
+- **Two workflow YAMLs stated a DuckDB cap that had been lowered under them (#537).**
   `host-reference-add` and `local-host-reference-add` both said `build_rype_index` "hard-caps
   DuckDB at 30 GB". The cap is `_DUCKDB_MEMORY_CAP_GB` = 8; 30 is `_RYPE_MAX_MEMORY_GB`,
   rype's floor. The commit that lowered the cap updated the module, changelog, checklist and
   test but not the YAMLs, and the module comment already called 30 "the old ~30 GB cap".
   Both now point at the constant instead of restating it.
-- **`build_bowtie2_index` and `build_rype_index` had no cpu pin (#PR).** Four steps pinned
+- **`build_bowtie2_index` and `build_rype_index` had no cpu pin (#537).** Four steps pinned
   their `cpu:` against the module's `_DUCKDB_THREADS`; these two did not, so the YAML and
   the thread pool could drift with nothing failing at runtime. bowtie2 takes the equality
   form the aligner pins use (4 == 4 today); rype takes a bound (`cpu <= _DUCKDB_THREADS`),
@@ -1725,12 +1725,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `local-host-reference-add` at 8 against a pool of 8 — and whether rype's build
   parallelism derives from that pool has not been probed, so there is no measurement to
   pin an equality to.
-- **The `assemble` 259.3 GiB peak is now recorded as unattributed (#PR).** The workflow
+- **The `assemble` 259.3 GiB peak is now recorded as unattributed (#537).** The workflow
   comment placed it in the hifiasm_meta paragraph and said "a sample in that class", but
   the figure was recorded with no assembler, no input scale, and no censoring status, and
   both assemblers were selectable in that window. Whether it bounds the 250 GiB profile or
   falls outside its population is stated as open, with the query that would settle it.
-- **`_baseline_cpu_every_version`'s docstring credited the wrong site for a guard (#PR).**
+- **`_baseline_cpu_every_version`'s docstring credited the wrong site for a guard (#537).**
   It said the caller asserts the result is non-empty; the helper raises on it itself, and
   no caller checked. The behaviour was right and the attribution wrong, which would have
   sent the next reader adding a guard that already exists.
@@ -3438,7 +3438,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Changed
 
 - **`build_minimap2_index` sizes its DuckDB reserve per mode, and a shard build now
-  asks for 21 GiB instead of 29 (#PR).** `_MINIMAP2_RESERVE_GB` was one constant applied
+  asks for 21 GiB instead of 29 (#537).** `_MINIMAP2_RESERVE_GB` was one constant applied
   in both modes, and it was sized for the host case that introduced it — a genome-scale
   human reference that OOMed in `stage_local_fasta`. Shard mode reused it a month later
   as its `plan()` floor, so every shard of a many-genome catalogue was allocated against a
@@ -3452,7 +3452,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   axis for this step's per-node concurrency, which rises from 15-17 to 23. Two tests pin
   it: the modes must resolve different DuckDB limits, and the reserve and floor must move
   together or the measurement stops transferring.
-- **A measured rationale is stated at one site, and the other copies point at it (#PR).**
+- **A measured rationale is stated at one site, and the other copies point at it (#537).**
   Twelve clusters restated the same resource fact in two to ten places each. The
   escalation-ceiling rule is now stated once at the test that enforces it
   (`test_every_shipped_step_can_escalate_on_both_retry_axes`) and pointed at from eight

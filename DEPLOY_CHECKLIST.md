@@ -142,7 +142,7 @@ _None yet._
     finishes its in-flight step at the old numbers and picks up the new ones for the
     steps dispatched after it.
 - **A `build-shard-index` minimap2 shard build now requests ~21 GiB instead of ~29
-  (#fix/shard-index-memory-and-rationale-sweep).** No YAML baseline changed — the step's
+  (#537).** No YAML baseline changed — the step's
   `mem_gb: 32` and the 128 GiB ceiling are untouched. What moved is the job's own
   `plan()` floor (28 → 20 GiB), the advisory the CP applies below baseline, so SLURM
   slots shrink for shard builds only. Host builds (`host-reference-add`,
