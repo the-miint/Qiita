@@ -65,6 +65,71 @@ _REAL_EXPIRED = "Flight returned unauthenticated error, with message: ticket exp
 _REAL_BAD_SIGNATURE = "Flight returned unauthenticated error, with message: invalid signature"
 
 
+# ---------------------------------------------------------------------------
+# pyarrow's SECOND rendering.
+#
+# The fixtures above are the message-prefix form ("Flight returned <status> error,
+# with message: …"). pyarrow also renders a status the server actually returned as
+# "<message>. Detail: <Status>. gRPC client debug context: …", with the error CLASS
+# NAME absent. Which form you get is not the error's kind — it is where the failure
+# happened: a client-side connect failure takes the first, a status the data plane
+# put on the wire takes the second.
+#
+# That second form is what a live data plane produces, so it is the one the deploy
+# actually sees. Captured verbatim from a pyarrow 23.0.1 FlightServerBase raising
+# each status (the version in uv.lock), with controls: the same message under a
+# different status renders a different Detail, and the same status with a different
+# message keeps the Detail — so each half of the expiry match discriminates.
+_SERVER_RETURNED_EXPIRED = (
+    "ticket expired. Detail: Unauthenticated. gRPC client debug context: "
+    "UNKNOWN:Error received from peer ipv4:127.0.0.1:50112 "
+    '{created_time:"2026-09-03T21:17:51.828988-06:00", grpc_status:16, '
+    'grpc_message:"ticket expired. Detail: Unauthenticated"}. Client context: '
+    "IOError: Server never sent a data message. Detail: Internal"
+)
+
+# A data plane that is UP but returning UNAVAILABLE — saturated by a fan-out, or
+# restarting during a deploy. No connect failure happened, so none of the
+# connect-shaped substrings appear.
+_SERVER_RETURNED_UNAVAILABLE = (
+    "data plane is shutting down. Detail: Unavailable. gRPC client debug context: "
+    "UNKNOWN:Error received from peer ipv4:127.0.0.1:50112 "
+    '{created_time:"2026-09-03T21:17:51.830074-06:00", grpc_status:14, '
+    'grpc_message:"data plane is shutting down. Detail: Unavailable"}'
+)
+
+
+def test_expiry_is_detected_in_both_pyarrow_renderings():
+    """The classifier must fire on the form a live data plane produces, not only on
+    the message-prefix form the other fixtures use."""
+    assert _is_dp_ticket_expired(Exception(_REAL_EXPIRED)) is True
+    assert _is_dp_ticket_expired(Exception(_SERVER_RETURNED_EXPIRED)) is True
+
+
+def test_a_data_plane_that_is_up_but_unavailable_is_retriable():
+    """A saturated or restarting DP returns UNAVAILABLE without any connect failure,
+    so the connect-shaped substrings never appear. This is the case
+    `_DP_UNAVAILABLE_SIGNATURES` names first, and it classified PERMANENT until
+    "detail: unavailable" was added — a redrive self-heals it like any other
+    UNAVAILABLE, so it must not land as a bad-input the operator has to resolve."""
+    assert _is_dp_unavailable(Exception(_SERVER_RETURNED_UNAVAILABLE)) is True
+    f = _submission_dp_fetch_failure("could not fetch ...", Exception(_SERVER_RETURNED_UNAVAILABLE))
+    assert f.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert f.transient is True
+
+
+def test_the_two_renderings_do_not_cross_contaminate():
+    """The controls that make the above discriminating: a different status under the
+    same message must not read as an expiry, and neither rendering of UNAVAILABLE
+    may read as one."""
+    same_message_other_status = _SERVER_RETURNED_EXPIRED.replace(
+        "Detail: Unauthenticated", "Detail: Internal"
+    )
+    assert _is_dp_ticket_expired(Exception(same_message_other_status)) is False
+    assert _is_dp_ticket_expired(Exception(_SERVER_RETURNED_UNAVAILABLE)) is False
+    assert _is_dp_unavailable(Exception(_SERVER_RETURNED_EXPIRED)) is False
+
+
 def test_serialization_conflict_is_detected():
     assert _is_dp_serialization_conflict(Exception(_REAL_40001)) is True
 

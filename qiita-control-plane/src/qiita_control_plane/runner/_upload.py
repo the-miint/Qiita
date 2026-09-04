@@ -57,13 +57,21 @@ _DP_SERIALIZATION_SIGNATURE = "could not serialize access due to concurrent upda
 # definition (gRPC's own retriable status): a redrive self-heals once the DP is
 # back, so it must NOT be filed as a permanent bad-input. Matched by message for
 # the same reason as the serialization signature (no typed exception at this
-# layer). Three overlapping substrings so a stringification variant still matches:
-# the pyarrow error CLASS name, its message PREFIX, and gRPC's canonical
-# connect-failure text — any one is sufficient.
+# layer); any one substring is sufficient.
+#
+# pyarrow renders a Flight error TWO ways, and the difference decides which
+# substrings can fire. A client-side failure (nothing listening) gives
+# "Flight returned unavailable error, with message: failed to connect to all
+# addresses…" — the first three match that. A status the server actually returned
+# gives "<message>. Detail: Unavailable. gRPC client debug context: …", with the
+# class name absent, so only the fourth matches. That second form is the
+# saturated / restarting DP this list names first, and without "detail: unavailable"
+# it classified permanent. Both forms are pinned in test_dp_fetch_classifier.py.
 _DP_UNAVAILABLE_SIGNATURES = (
     "flightunavailableerror",
     "flight returned unavailable",
     "failed to connect to all addresses",
+    "detail: unavailable",
 )
 
 # Expired-token signatures, BOTH required. A Flight token carries a TTL
@@ -75,7 +83,9 @@ _DP_UNAVAILABLE_SIGNATURES = (
 #
 # The expiry text alone is too loose — "ticket" names both a Flight ticket and a
 # work_ticket here, and "work ticket expired" contains it. The unauthenticated
-# marker is what makes it a Flight auth failure. The class name alone is too loose
+# marker is what makes it a Flight auth failure, and it survives both of pyarrow's
+# renderings: the message-prefix form spells "unauthenticated error", the
+# server-returned form appends "Detail: Unauthenticated". The class name alone is too loose
 # in the other direction: every AuthError variant maps to unauthenticated, and
 # `invalid signature` / `malformed payload` never self-heal. A test parses the data
 # plane's `AuthError` Display impl so a reword there fails rather than silently

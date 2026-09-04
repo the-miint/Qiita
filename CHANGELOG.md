@@ -1677,6 +1677,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   the other that all 14 `auth::verify_*` sites still map to `Status::unauthenticated`. An
   integration test asserts the string that actually crosses Rust → gRPC → pyarrow carries both
   markers, with a live-expiry control.
+- **A data plane that was up but returning UNAVAILABLE classified permanent (#532).** Found
+  probing what pyarrow 23.0.1 actually renders, which it does two ways: a client-side connect
+  failure gives `Flight returned unavailable error, with message: failed to connect to all
+  addresses…`, while a status the server put on the wire gives `<message>. Detail: Unavailable.
+  gRPC client debug context: …` with the error class name absent. All three existing
+  `_DP_UNAVAILABLE_SIGNATURES` match only the first form — so the case the constant's own
+  comment names first, "the DP momentarily saturated by a fan-out, restarting during a deploy",
+  was the one it missed, and those failures landed as a bad-input the operator had to resolve.
+  Pre-existing, unrelated to the TTL fix; found because the expiry match rests on the same
+  rendering. Adds `detail: unavailable`, and pins both renderings as fixtures captured verbatim
+  from a `FlightServerBase` raising each status, with controls: the same message under a
+  different status renders a different `Detail`, and the same status under a different message
+  keeps it, so each half of the expiry match is shown to discriminate.
 
 - **`make test-workflows` ran apptainer on a host without it (#531).** The guard
   `if ! command -v apptainer ...; exit 0; fi` sat on its own recipe line, and `exit 0`
