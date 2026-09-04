@@ -19,11 +19,69 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- **[DBA, as superuser] enable `btree_gist` in `qiita_miint`**, alongside `citext`
+  (#534). **On the DATABASE host, not the app host** —
+  Postgres is `qiita-miint-db.ucsd.edu:5432`, separate from `qiita-miint.ucsd.edu`:
+  ```bash
+  # on qiita-miint-db.ucsd.edu
+  sudo -u postgres psql -d qiita_miint -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+  ```
+  Or, without superuser, from the app host as the migration role itself:
+  ```bash
+  set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -c "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+  ```
+  Idempotent, sub-second, adds operator classes only — no table is locked, no rows
+  change. **Optional:** the bucket-3 migration self-installs it. Doing it here matches
+  how `citext` is handled and keeps the migration independent of the role's
+  privileges; that migration's own comment carries the measurements behind both
+  claims. Verify from the app host:
+  ```bash
+  set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -c "SELECT extname FROM pg_extension ORDER BY 1"
+  # expect: btree_gist, citext, plpgsql
+  ```
+  **Optional, and preferred rather than required.** Measured on the deploy
+  2026-09-04: `qiita_miint_rw` is not superuser but *does* hold `CREATE` on
+  `qiita_miint`, and `btree_gist` is TRUSTED, so the migration in bucket 3 installs it
+  unaided. Doing it here matches how `citext` is handled and makes the migration
+  independent of the role keeping that privilege — probed on PG 17, once the
+  extension exists `CREATE EXTENSION IF NOT EXISTS` is a no-op even for a role
+  without `CREATE`.
 
 ### 3. Migrations
 
-_None yet._
+- `20260904000000_assembly_membership_one_genome_per_subject.sql` — `CREATE EXTENSION
+  IF NOT EXISTS btree_gist` (a no-op if bucket 2 was done) plus an EXCLUDE constraint
+  asserting that one assembled subject carries one `genome_idx`
+  (#534).
+
+  **This migration takes minutes and holds ACCESS EXCLUSIVE on
+  `qiita.assembly_membership` for the whole build.** Measured against a synthetic
+  copy of the deploy's shape (2,351,862 rows / 1,798,120 subjects): **260 s** to add
+  the constraint, leaving a **397 MB** GiST index beside a 701 MB table. Row inserts
+  under the finished constraint are unaffected (10k rows in 0.35 s).
+
+  Migrations run *before* the restart, while the API is still up, and nothing can read
+  or write that table meanwhile — so pick a window with **no assembly ticket
+  mid-flight and no feature-table submission**, both of which touch it. They do not
+  simply wait: the CP pool's `command_timeout` is 10 s, so a submit during the build
+  fails after ten seconds rather than queueing behind the lock.
+
+  **Pre-check, already run against the deploy 2026-09-04 — 0 violating subjects.**
+  An EXCLUDE constraint cannot be added `NOT VALID`, so a violation aborts the
+  migration rather than deferring. Re-run it if anything has assembled since:
+  ```bash
+  set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -c "
+    SELECT prep_sample_idx, processing_idx, kind, bin_id, count(DISTINCT genome_idx)
+      FROM qiita.assembly_membership WHERE genome_idx IS NOT NULL
+     GROUP BY 1,2,3,4 HAVING count(DISTINCT genome_idx) > 1"
+  ```
+  Zero rows is expected: the mint upserts on a hash of those same four columns, so it
+  cannot produce a violation itself. If it returns rows, reconcile before migrating —
+  the constraint is checked per row, so the migration's own DEFERRABLE comment carries
+  how.
 
 ### 4. Deploy
 
@@ -38,6 +96,25 @@ _None yet._
 _None yet._
 
 ### Notes (no host action)
+
+- **The control plane and data plane must go out together (#534).**
+  The feature-table resolver now signs a `bin_quality` DoGet ticket, and `bin_quality`
+  joins the data plane's `ALLOWED_TABLES` in the same change. A CP restarted against a
+  data plane that predates it gets `unknown table: "bin_quality"` (the
+  `ALLOWED_TABLES` check in `flight_service.rs`) and every **combined**
+  (`denovo_alignment_idx`)
+  feature-table submission fails at submit; reference-only submissions are unaffected.
+  The standard `redeploy.md` restarts both, so this is an ordering fact rather than a
+  step — it matters only if the two are ever staged apart.
+
+- **`estimate-feature-table` 1.0.0 changes in place, with no version bump
+  (#534).** The step gains a second optional input
+  (`denovo_genome_quality_path`) beside `denovo_genome_map_path`. The action sync picks
+  it up; there is no separate step. Not a new version because this action mints no
+  identity and writes no DuckLake row — nothing resolves against `{workflow, version}`
+  here, so re-syncing 1.0.0 cannot split a stored run the way it would for
+  `long-read-assembly`. Assemblies already on the host need no re-run: the scores come
+  from the lake rows `assembly_load` already registered.
 
 - **A data-plane Flight failure at submission no longer reaches the originator's digest (#532).** An expired signing token now classifies `data_plane_transient` rather than `bad_input`, joining the DuckLake serialization conflict and the connect-failure rendering of gRPC UNAVAILABLE already classified that way (a server-returned UNAVAILABLE joins them in the same PR). `notify.sweeper`'s owed set is `failure_type IS DISTINCT FROM 'retriable'`, so these tickets are held for an operator redrive instead of being reported as a settled outcome — and an originator whose whole batch failed this way gets no digest at all, because digest groups are built only from owed rows. Nothing to run; this is a change in what the mail says. Redrive held tickets with `/run` as before.
 

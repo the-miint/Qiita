@@ -21,6 +21,73 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **One genome per assembled subject is now a database constraint
+  (#534).** `qiita.assembly_membership.genome_idx` is minted
+  per `(prep_sample_idx, processing_idx, kind, bin_id)` and stamped onto every contig
+  row of that subject, and nothing checked that the rows agreed — the column's own
+  comment said so, and every reader rolling contigs up to subjects carried a `DISTINCT`
+  as a stand-in. A violation is not a duplicate row: it is a join to per-subject data
+  fanning out to two rows for one genome, silently, which the `bin_quality` join added
+  in this PR is the first reader to be exposed to. `EXCLUDE USING gist` rather than a
+  unique index, because the invariant is "rows agreeing on the subject may not disagree
+  on the genome" — a `<>` comparison, outside what a unique index can express. NULL
+  stays unconstrained: it is what a pre-mint row carries and what the sequenced-pool
+  delete writes before dropping a genome.
+
+- **`bin_quality` is reachable from `estimate-feature-table`: the assembled genomes'
+  completeness and contamination now reach the de novo arm
+  (#534).** CheckM's per-subject scores had no reader —
+  written to DuckLake by `assembly_load`, replaced on its run key by `register-files`,
+  and read by nothing. A quality gate on the de novo feature table had no path to its
+  own input, by either the streamed or the staged route.
+
+  No store holds the join. The scores are keyed `(prep_sample_idx, processing_idx,
+  kind, bin_id)` — the subject CheckM scored, with no `feature_idx` — and a feature
+  table is keyed `genome_idx`, which exists only on the Postgres
+  `qiita.assembly_membership`. Joining the streamed rows through `feature_idx` instead
+  gives a wrong answer rather than a slower one: an assembler can emit one sequence as
+  both a circular LCG and a member of a refined bin, so one contig carries two genomes
+  of one run and the contig-keyed map cannot say which subject a score belongs to.
+
+  So the bridge is read from Postgres and the join happens control-plane side, at
+  submit. `bin_quality` joins `ALLOWED_TABLES`, refused by `build_bin_quality_query`
+  unless the filter is exactly one `processing_idx` over a non-empty cohort — either
+  half alone widens past the run. `fetch_assembly_genome_subject` reads the run's
+  `(prep_sample_idx, kind, bin_id, genome_idx)` subjects under the predicate the de
+  novo map already uses, so the two cannot disagree about which genomes exist. The
+  feature-table resolver signs its own ticket, DoGets the scores, LEFT-joins the two
+  in DuckDB and writes `denovo_genome_quality.parquet` beside the map it already
+  stages; the job reads it as `denovo_genome_quality_path` and stages
+  `DENOVO_GENOME_QUALITY_TABLE`.
+
+  **LEFT, and the scores stay nullable.** `bin_quality` is written empty-with-schema
+  when CheckM scored nothing, and its writer skips a class whose tool output is
+  absent, so a subject with no quality row is an ordinary outcome. An inner join would
+  shorten the genome set against the map it must agree with, and a COALESCE would turn
+  "nobody measured this" into "this measured zero". What a predicate does with an
+  unscored genome is left to the reader rather than settled here by omission.
+
+  No route mints a `bin_quality` ticket: it is on both allowlists and absent from
+  `ASSEMBLY_DOGET_TABLES`, so the resolver is the only path to the table. Nothing
+  gates on the scores yet. The source is the lake rather than a new Postgres twin, so
+  the scores of runs already assembled are reachable without anything being rebuilt.
+
+  Sized against the deploy (2026-09-04): the whole lake holds 23,027 `bin_quality`
+  rows, ~2.2 MB, largest single run 9,030 — so the resolver reads a cohort whole
+  rather than streaming it, and the UNBINNED rows it fetches and then drops are 5.6%
+  of that. Those 23,027 rows carry 23,027 distinct subject keys, so the one-row-per-
+  subject assumption the join rests on has never been violated in production.
+
+  Three things it cleaned up on the way past. The `bin_quality` staging Parquet's
+  twelve columns are now one ordered `(name, type)` constant in `qiita-common`, pinned
+  against the lake DDL by a test that reads the Rust — the writer and the schema it
+  writes into previously shared nothing but a comment saying they must agree. The two
+  near-identical `export_*_genome` Parquet writers now share
+  `_export_query_to_parquet`, differing only in SQL, params and schema. And the
+  `REPLACE_KEY_TABLES` note saying `bin_quality` borrows its delete key "because CheckM
+  covers refined bins only" was stale — CheckM scores three kinds in three passes; the
+  reason the borrow is needed is that ALL of them can be empty at once.
+
 - **`GET /sequencing-run/{idx}/sequenced-pool` and `qiita sequenced-pool list` — a
   `sequenced_pool_idx` can now be read out (#530).** Every pool-scoped surface takes a
   `sequenced_pool_idx` — `alignment list`, `pool-completion`, `submit-align-pool`, the pool

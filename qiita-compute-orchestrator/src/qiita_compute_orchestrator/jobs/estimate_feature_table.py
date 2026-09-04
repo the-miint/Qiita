@@ -19,16 +19,15 @@ de novo arm's placement of a read over the reference arm's. It is requested by
 always was. `qiita_common.analytic.reconcile` owns every rule about the second arm;
 what is here is where its three inputs come from.
 
-Three inputs, three sources:
+Inputs and their sources:
 
 * the **alignment slice** streams from the data plane over Arrow Flight
   (`open_alignment_stream`, minted by `work_ticket_idx`) — no disk;
 * the **per-feature lengths** stream from the data plane's `reference_sequences`
   (`open_reference_sequences_stream`) — no disk. **Whole-reference**, for the reason
   `analytic.genome_lengths_table_sql` gives;
-* the **feature -> genome map** is the one Postgres-only input, staged as a small
-  workspace Parquet by the CP runner resolver (`runner/_feature_table.py`) and
-  read here via `read_parquet`.
+* the **feature -> genome map** is staged as a small workspace Parquet by the CP
+  runner resolver (`runner/_feature_table.py`) and read here via `read_parquet`.
 
 The de novo arm draws on the same three, differently scoped: the alignment slice is
 a second mint on the same work ticket, the map is a second resolver-staged Parquet,
@@ -36,6 +35,11 @@ and the lengths come from the assembly read-back — which is scoped to ONE
 `(prep_sample_idx, processing_idx)` run, so a cohort is N single-consumption streams
 appended into one relation rather than the reference arm's single whole-reference
 one.
+
+It adds one the reference arm has no counterpart for: the assembled genomes' CheckM
+completeness / contamination, staged as a third Parquet by the same resolver pass
+and arriving already keyed by genome. Neither store holds it whole, which is why the
+resolver rather than this module does the join (`runner/_feature_table.py`).
 
 Each stream is drained inside its own `with`, by the CREATE that stages it, so the
 Flight client closes before the compute starts.
@@ -113,6 +117,9 @@ class Inputs(BaseModel):
     # cannot disagree about which assembly a de novo alignment used. Rides
     # `params:` because a scalar cannot ride `inputs:`.
     denovo_processing_idx: int | None = None
+    # Per-genome CheckM scores for the de novo arm, staged by the same resolver
+    # pass that stages the map above. Nullable scores; the resolver states why.
+    denovo_genome_quality_path: Path | None = None
 
 
 def _write_ogu_table(
@@ -142,6 +149,23 @@ def _write_ogu_table(
     n_rows = conn.execute(analytic.ogu_input_count_sql()).fetchone()[0]
     select_sql = analytic.woltka_ogu_select_sql() if n_rows else analytic.empty_ogu_select_sql()
     conn.execute(f"COPY ({select_sql}) TO '{out_sql}' ({PARQUET_OPTS})")
+
+
+def _require_denovo_genome_quality_path(inputs: Inputs) -> Path:
+    """The de novo arm's per-genome quality Parquet, or a loud failure.
+
+    Bound together with the map and the run by one resolver pass, so a combined
+    ticket reaching here without it is a broken binding. Raising rather than skipping
+    the relation, for the reason `_require_denovo_processing_idx` gives: skipping
+    does not fail either, it leaves every assembled genome looking unscored — which
+    is what a run CheckM legitimately scored nothing in also looks like.
+    """
+    if inputs.denovo_genome_quality_path is None:
+        raise ValueError(
+            "denovo_genome_map_path was bound without denovo_genome_quality_path, so "
+            "the assembled genomes' completeness/contamination are unavailable"
+        )
+    return inputs.denovo_genome_quality_path
 
 
 def _require_denovo_processing_idx(inputs: Inputs) -> int:
@@ -214,13 +238,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # not at all.
             denovo_processing_idx = _require_denovo_processing_idx(inputs) if combined else None
 
-            # The feature -> genome map: the one Postgres-only input, read from the
-            # resolver-staged Parquet. Inner-consistent BIGINT ids (int64 Parquet).
+            # The feature -> genome map, read from the resolver-staged Parquet.
+            # Inner-consistent BIGINT ids (int64 Parquet).
             map_sql = validate_parquet_path(inputs.genome_map_path)
             conn.execute(analytic.map_table_sql(f"read_parquet('{map_sql}')"))
             if combined:
                 denovo_map_sql = validate_parquet_path(inputs.denovo_genome_map_path)
                 conn.execute(analytic.denovo_map_table_sql(f"read_parquet('{denovo_map_sql}')"))
+                quality_sql = validate_parquet_path(_require_denovo_genome_quality_path(inputs))
+                conn.execute(
+                    analytic.denovo_genome_quality_table_sql(f"read_parquet('{quality_sql}')")
+                )
 
             # The lengths feed ONLY the coverage calc, so when that is skipped the
             # stream is skipped too — the point is to avoid the coverage calculation

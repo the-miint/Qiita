@@ -40,6 +40,7 @@ from qiita_common.api_paths import (
 from qiita_common.assembly_constants import (
     ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
     ASSEMBLED_SEQUENCE_TABLE,
+    BIN_QUALITY_TABLE,
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
@@ -773,6 +774,9 @@ _DOGET_ALLOWED_TABLES = frozenset(
         # constants for the same reason as the block-read pair above.
         ASSEMBLED_SEQUENCE_TABLE,
         ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+        # Per-subject assembly quality. The one entry here that no route signs —
+        # the exclusion below says what that rests on.
+        BIN_QUALITY_TABLE,
     }
 )
 
@@ -783,10 +787,17 @@ _DOGET_ALLOWED_TABLES = frozenset(
 # (alignment_idx + cohort), the block-read selectors via /read/ticket/doget
 # (a block's members), and the assembly surfaces via /assembly/ticket/doget (one
 # `(prep_sample_idx, processing_idx)` run — a reference_idx filter means nothing
-# to a table keyed on sample-derived contigs). The reference route restricts itself to the
-# reference_* tables whose membership it resolves — including
+# to a table keyed on sample-derived contigs). The reference route restricts itself
+# to the reference_* tables whose membership it resolves — including
 # `reference_taxonomy_visible`, so external taxonomy reads also go through the
 # exclusion view.
+#
+# `bin_quality` is excluded with no route behind it AT ALL: the feature-table
+# resolver mints its ticket in-process (`runner/_feature_table.py`), the way the
+# adapter and shard-roster resolvers mint theirs, and it is absent from
+# `ASSEMBLY_DOGET_TABLES` too. Excluding it here is therefore what leaves it
+# un-mintable over HTTP by anyone, which
+# `test_doget_bin_quality_not_signable_via_reference_route` pins.
 _REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
     {
         READ_MASKED_TABLE,
@@ -795,6 +806,7 @@ _REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
         READ_MASKED_BLOCK_TABLE,
         ASSEMBLED_SEQUENCE_TABLE,
         ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+        BIN_QUALITY_TABLE,
     }
 )
 

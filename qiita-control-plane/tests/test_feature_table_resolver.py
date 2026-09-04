@@ -1,12 +1,18 @@
 """DB-tier tests for the feature-table (OGU) runner resolver
 (`_resolve_feature_table_bindings`): derive/verify reference, gate cohort
 completeness, and stage the feature->genome map Parquet.
+
+The de novo arm additionally reads `bin_quality` from the data plane over Flight.
+That one call is stubbed by the autouse `bin_quality` fixture below — everything
+else here is real Postgres.
 """
 
 import uuid
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from qiita_common.assembly_constants import BIN_QUALITY_TABLE
 from qiita_common.backend_failure import BackendFailure, FailureKind
 
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
@@ -16,10 +22,12 @@ from qiita_control_plane.repositories.block import (
 )
 from qiita_control_plane.runner import (
     GENOME_MAP_PATH_BINDING,
+    _feature_table,
     _resolve_feature_table_bindings,
 )
 from qiita_control_plane.runner._feature_table import (
     DENOVO_GENOME_MAP_PATH_BINDING,
+    DENOVO_GENOME_QUALITY_PATH_BINDING,
     DENOVO_PROCESSING_IDX_BINDING,
 )
 from qiita_control_plane.testing.db_seeds import (
@@ -28,6 +36,55 @@ from qiita_control_plane.testing.db_seeds import (
 )
 
 pytestmark = pytest.mark.db
+
+# The resolver's two data-plane arguments. Only the de novo arm uses them, and the
+# one call they reach is stubbed below, so the values only have to be well-formed.
+_STUB_DP_URL = "grpc://stub:0"
+_STUB_SIGNING_KEY = b"\x00" * 32
+
+# The lake columns `bin_quality` actually carries, beyond the four the join needs.
+# Present in the stub so it is not narrower than the real stream: the resolver
+# projects to `completeness` / `contamination`, and a stub carrying only those
+# would pass whether or not it did.
+_BIN_QUALITY_EXTRA = {"marker_lineage": pa.string(), "strain_heterogeneity": pa.float64()}
+
+
+@pytest.fixture(autouse=True)
+def bin_quality(monkeypatch):
+    """Stub the `bin_quality` DoGet and capture the ticket scope it was signed with.
+
+    Autouse because every de novo test reaches it; `rows` starts empty, which is the
+    state a run CheckM scored nothing in — so a test that says nothing about quality
+    still exercises the unscored path rather than skipping it.
+
+    Set `state["rows"]` to `(prep_sample_idx, kind, bin_id, completeness,
+    contamination)` tuples before calling the resolver. `state["filters"]` collects
+    what each `sign_ticket` call was scoped to.
+    """
+    state = {"rows": [], "filters": []}
+
+    def _fake_do_get(data_plane_url, ticket_bytes):
+        assert data_plane_url == _STUB_DP_URL
+        cols = {
+            "prep_sample_idx": pa.array([r[0] for r in state["rows"]], pa.int64()),
+            "kind": pa.array([r[1] for r in state["rows"]], pa.string()),
+            "bin_id": pa.array([r[2] for r in state["rows"]], pa.string()),
+            "completeness": pa.array([r[3] for r in state["rows"]], pa.float64()),
+            "contamination": pa.array([r[4] for r in state["rows"]], pa.float64()),
+        }
+        for name, typ in _BIN_QUALITY_EXTRA.items():
+            cols[name] = pa.array([None] * len(state["rows"]), typ)
+        return pa.table(cols)
+
+    real_sign = _feature_table.sign_ticket
+
+    def _recording_sign(**kwargs):
+        state["filters"].append((kwargs["table"], kwargs["filter"]))
+        return real_sign(**kwargs)
+
+    monkeypatch.setattr(_feature_table, "_do_get_bin_quality", _fake_do_get)
+    monkeypatch.setattr(_feature_table, "sign_ticket", _recording_sign)
+    return state
 
 
 async def _seed_scenario(pool, *, n_features=2, n_samples=2, completed=2):
@@ -152,6 +209,8 @@ async def test_resolver_happy_path_stages_genome_map(postgres_pool, tmp_path):
             },
             reference_idx=s["reference_idx"],
             workspace=tmp_path,
+            data_plane_url=_STUB_DP_URL,
+            signing_key=_STUB_SIGNING_KEY,
         )
         path = result[GENOME_MAP_PATH_BINDING]
         assert path.exists()
@@ -176,6 +235,8 @@ async def test_resolver_incomplete_cohort_raises(postgres_pool, tmp_path):
                 },
                 reference_idx=s["reference_idx"],
                 workspace=tmp_path,
+                data_plane_url=_STUB_DP_URL,
+                signing_key=_STUB_SIGNING_KEY,
             )
         assert exc.value.kind == FailureKind.BAD_INPUT
     finally:
@@ -194,6 +255,8 @@ async def test_resolver_reference_mismatch_raises(postgres_pool, tmp_path):
                 },
                 reference_idx=s["reference_idx"] + 999_999,  # not the alignment's reference
                 workspace=tmp_path,
+                data_plane_url=_STUB_DP_URL,
+                signing_key=_STUB_SIGNING_KEY,
             )
         assert exc.value.kind == FailureKind.BAD_INPUT
     finally:
@@ -207,6 +270,8 @@ async def test_resolver_unknown_alignment_raises(postgres_pool, tmp_path):
             action_context={"alignment_idx": 999_999_999, "prep_sample_idx": [1]},
             reference_idx=1,
             workspace=tmp_path,
+            data_plane_url=_STUB_DP_URL,
+            signing_key=_STUB_SIGNING_KEY,
         )
     assert exc.value.kind == FailureKind.BAD_INPUT
 
@@ -226,6 +291,8 @@ async def test_resolver_cohort_member_with_no_gate_row_raises(postgres_pool, tmp
                 },
                 reference_idx=s["reference_idx"],
                 workspace=tmp_path,
+                data_plane_url=_STUB_DP_URL,
+                signing_key=_STUB_SIGNING_KEY,
             )
         assert exc.value.kind == FailureKind.BAD_INPUT
     finally:
@@ -251,6 +318,8 @@ async def test_resolver_bad_action_context_raises(postgres_pool, tmp_path, actio
             action_context=action_context,
             reference_idx=1,
             workspace=tmp_path,
+            data_plane_url=_STUB_DP_URL,
+            signing_key=_STUB_SIGNING_KEY,
         )
     assert exc.value.kind == FailureKind.BAD_INPUT
 
@@ -409,6 +478,8 @@ async def test_resolver_stages_the_denovo_map_keyed_by_sample(postgres_pool, tmp
             action_context=_context(s, d),
             reference_idx=s["reference_idx"],
             workspace=tmp_path,
+            data_plane_url=_STUB_DP_URL,
+            signing_key=_STUB_SIGNING_KEY,
         )
         path = result[DENOVO_GENOME_MAP_PATH_BINDING]
         table = pq.read_table(str(path))
@@ -426,6 +497,162 @@ async def test_resolver_stages_the_denovo_map_keyed_by_sample(postgres_pool, tmp
         await _cleanup(postgres_pool, s)
 
 
+def _quality_rows(path):
+    """The staged quality Parquet as `{genome_idx: (completeness, contamination)}`."""
+    table = pq.read_table(str(path))
+    assert table.column_names == [
+        "prep_sample_idx",
+        "genome_idx",
+        "completeness",
+        "contamination",
+    ]
+    return {
+        genome_idx: (comp, cont)
+        for genome_idx, comp, cont in zip(
+            table.column("genome_idx").to_pylist(),
+            table.column("completeness").to_pylist(),
+            table.column("contamination").to_pylist(),
+        )
+    }
+
+
+async def test_resolver_stages_quality_keyed_by_genome(postgres_pool, tmp_path, bin_quality):
+    """The scores arrive keyed by the SUBJECT CheckM scored and leave keyed by
+    genome. That re-key is the whole point of this staging pass: `bin_quality` has
+    no `genome_idx` (it is a lake table and the column is Postgres-only) and the
+    feature table is genome-keyed, so without the bridge the two never meet.
+    """
+    s = await _seed_scenario(postgres_pool, completed=2)
+    d = await _seed_denovo(postgres_pool, s)
+    # `_seed_denovo` gives each assembled sample one MAG named 'bin.1' — the same
+    # bin_id across samples, which is why the join carries prep_sample_idx.
+    scored = {ps: (90.0 + i, 1.5 + i) for i, ps in enumerate(s["prep_sample_idxs"])}
+    bin_quality["rows"] = [(ps, "MAG", "bin.1", c, x) for ps, (c, x) in scored.items()]
+    try:
+        result = await _resolve_feature_table_bindings(
+            postgres_pool,
+            action_context=_context(s, d),
+            reference_idx=s["reference_idx"],
+            workspace=tmp_path,
+            data_plane_url=_STUB_DP_URL,
+            signing_key=_STUB_SIGNING_KEY,
+        )
+        got = _quality_rows(result[DENOVO_GENOME_QUALITY_PATH_BINDING])
+        # One row per genome the de novo map admits, and no more: the map's genomes
+        # and the quality's are the same set by construction (one shared predicate).
+        assert set(got) == {genome_idx for _, genome_idx in d["contigs"]}
+        # Each sample's own scores landed on its own genome. Reading them back
+        # through the genome rather than the bin is what proves the bridge held:
+        # 'bin.1' alone is ambiguous across the cohort.
+        by_sample = {
+            ps: got[genome_idx] for ps, (_, genome_idx) in zip(s["prep_sample_idxs"], d["contigs"])
+        }
+        assert by_sample == scored
+    finally:
+        await _cleanup_denovo(postgres_pool, d)
+        await _cleanup(postgres_pool, s)
+
+
+async def test_a_genome_checkm_did_not_score_keeps_its_row_with_null_scores(
+    postgres_pool, tmp_path, bin_quality
+):
+    """Absence of a `bin_quality` row is a NORMAL state, not an error and not a
+    reason to drop the genome.
+
+    `bin_quality` is written empty-with-schema when CheckM scored nothing, and its
+    writer skips a class whose tool output is absent, so a MAG or LCG subject with no
+    quality row is an ordinary outcome. An INNER join would silently shorten the
+    genome set — the de novo map would carry a genome this file does not, and a
+    consumer comparing the two would see it missing with nothing saying why.
+    """
+    s = await _seed_scenario(postgres_pool, completed=2)
+    d = await _seed_denovo(postgres_pool, s)
+    scored_sample = s["prep_sample_idxs"][0]
+    bin_quality["rows"] = [(scored_sample, "MAG", "bin.1", 77.0, 2.0)]
+    try:
+        result = await _resolve_feature_table_bindings(
+            postgres_pool,
+            action_context=_context(s, d),
+            reference_idx=s["reference_idx"],
+            workspace=tmp_path,
+            data_plane_url=_STUB_DP_URL,
+            signing_key=_STUB_SIGNING_KEY,
+        )
+        got = _quality_rows(result[DENOVO_GENOME_QUALITY_PATH_BINDING])
+        # Both genomes present — the unscored one is a row, not a gap.
+        assert set(got) == {genome_idx for _, genome_idx in d["contigs"]}
+        scored_genome = d["contigs"][0][1]
+        unscored_genome = d["contigs"][1][1]
+        assert got[scored_genome] == (77.0, 2.0)
+        assert got[unscored_genome] == (None, None)
+        # NULL, not 0.0: a genome nobody measured must not read as a genome that
+        # measured zero, which is what a COALESCE here would have made it.
+        assert got[unscored_genome] != (0.0, 0.0)
+    finally:
+        await _cleanup_denovo(postgres_pool, d)
+        await _cleanup(postgres_pool, s)
+
+
+async def test_a_run_that_scored_nothing_stages_every_genome_unscored(
+    postgres_pool, tmp_path, bin_quality
+):
+    """The whole-run form of the case above: an empty `bin_quality` is a success
+    upstream, so it must not fail or empty the file here."""
+    s = await _seed_scenario(postgres_pool, completed=2)
+    d = await _seed_denovo(postgres_pool, s)
+    assert bin_quality["rows"] == []
+    try:
+        result = await _resolve_feature_table_bindings(
+            postgres_pool,
+            action_context=_context(s, d),
+            reference_idx=s["reference_idx"],
+            workspace=tmp_path,
+            data_plane_url=_STUB_DP_URL,
+            signing_key=_STUB_SIGNING_KEY,
+        )
+        got = _quality_rows(result[DENOVO_GENOME_QUALITY_PATH_BINDING])
+        assert set(got) == {genome_idx for _, genome_idx in d["contigs"]}
+        assert all(scores == (None, None) for scores in got.values())
+    finally:
+        await _cleanup_denovo(postgres_pool, d)
+        await _cleanup(postgres_pool, s)
+
+
+async def test_the_quality_ticket_is_scoped_to_the_run_and_the_cohort(
+    postgres_pool, tmp_path, bin_quality
+):
+    """The signed ticket names one assembly run over exactly the cohort asked for.
+
+    The data plane refuses anything else (`build_bin_quality_query`), so this is the
+    CP half of that pair: either half of the key alone widens past the run — one
+    `processing_idx` alone is every sample that run touched, the cohort alone is
+    every run those samples ever had.
+    """
+    s = await _seed_scenario(postgres_pool, completed=2)
+    d = await _seed_denovo(postgres_pool, s)
+    try:
+        await _resolve_feature_table_bindings(
+            postgres_pool,
+            action_context=_context(s, d),
+            reference_idx=s["reference_idx"],
+            workspace=tmp_path,
+            data_plane_url=_STUB_DP_URL,
+            signing_key=_STUB_SIGNING_KEY,
+        )
+        assert bin_quality["filters"] == [
+            (
+                BIN_QUALITY_TABLE,
+                {
+                    "prep_sample_idx": s["prep_sample_idxs"],
+                    "processing_idx": [d["processing_idx"]],
+                },
+            )
+        ]
+    finally:
+        await _cleanup_denovo(postgres_pool, d)
+        await _cleanup(postgres_pool, s)
+
+
 async def test_resolver_without_the_denovo_key_binds_nothing_extra(postgres_pool, tmp_path):
     """Absent `denovo_alignment_idx` the resolver is the reference-only one — no de
     novo bindings at all, so the step is dispatched exactly as it was before the arm
@@ -437,6 +664,8 @@ async def test_resolver_without_the_denovo_key_binds_nothing_extra(postgres_pool
             action_context=_context(s),
             reference_idx=s["reference_idx"],
             workspace=tmp_path,
+            data_plane_url=_STUB_DP_URL,
+            signing_key=_STUB_SIGNING_KEY,
         )
         assert set(result) == {GENOME_MAP_PATH_BINDING}
     finally:
@@ -456,6 +685,8 @@ async def test_resolver_refuses_a_reference_alignment_as_the_denovo_arm(postgres
                 action_context=_context(s, denovo_alignment_idx=s["alignment_idx"]),
                 reference_idx=s["reference_idx"],
                 workspace=tmp_path,
+                data_plane_url=_STUB_DP_URL,
+                signing_key=_STUB_SIGNING_KEY,
             )
         assert excinfo.value.kind is FailureKind.BAD_INPUT
         assert "not a de novo alignment" in str(excinfo.value)
@@ -476,6 +707,8 @@ async def test_resolver_refuses_arms_aligned_at_different_masks(postgres_pool, t
                 action_context=_context(s, d),
                 reference_idx=s["reference_idx"],
                 workspace=tmp_path,
+                data_plane_url=_STUB_DP_URL,
+                signing_key=_STUB_SIGNING_KEY,
             )
         assert excinfo.value.kind is FailureKind.BAD_INPUT
         assert "same masked pass-set" in str(excinfo.value)
@@ -502,6 +735,8 @@ async def test_a_sample_that_assembled_nothing_is_reference_only_not_a_refusal(
             action_context=_context(s, d),
             reference_idx=s["reference_idx"],
             workspace=tmp_path,
+            data_plane_url=_STUB_DP_URL,
+            signing_key=_STUB_SIGNING_KEY,
         )
         table = pq.read_table(str(result[DENOVO_GENOME_MAP_PATH_BINDING]))
         # Only the assembled sample is in the map; the other is simply absent, which
@@ -532,6 +767,8 @@ async def test_a_sample_whose_assembly_is_not_terminal_or_is_withdrawn_refuses(
                 action_context=_context(s, d),
                 reference_idx=s["reference_idx"],
                 workspace=tmp_path,
+                data_plane_url=_STUB_DP_URL,
+                signing_key=_STUB_SIGNING_KEY,
             )
         assert excinfo.value.kind is FailureKind.BAD_INPUT
         assert "neither 'completed' nor 'no_data'" in str(excinfo.value)
@@ -555,6 +792,8 @@ async def test_a_sample_the_assembly_run_never_reached_refuses(postgres_pool, tm
                 action_context=_context(s, d),
                 reference_idx=s["reference_idx"],
                 workspace=tmp_path,
+                data_plane_url=_STUB_DP_URL,
+                signing_key=_STUB_SIGNING_KEY,
             )
         assert excinfo.value.kind is FailureKind.BAD_INPUT
         assert "neither 'completed' nor 'no_data'" in str(excinfo.value)
@@ -578,6 +817,8 @@ async def test_an_assembled_sample_with_no_denovo_alignment_refuses(postgres_poo
                 action_context=_context(s, d),
                 reference_idx=s["reference_idx"],
                 workspace=tmp_path,
+                data_plane_url=_STUB_DP_URL,
+                signing_key=_STUB_SIGNING_KEY,
             )
         assert excinfo.value.kind is FailureKind.BAD_INPUT
         assert "should have had both arms" in str(excinfo.value)
@@ -599,6 +840,8 @@ async def test_a_run_with_an_unminted_membership_refuses(postgres_pool, tmp_path
                 action_context=_context(s, d),
                 reference_idx=s["reference_idx"],
                 workspace=tmp_path,
+                data_plane_url=_STUB_DP_URL,
+                signing_key=_STUB_SIGNING_KEY,
             )
         assert excinfo.value.kind is FailureKind.BAD_INPUT
         assert "assembly-genome backfill" in str(excinfo.value)

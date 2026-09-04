@@ -131,7 +131,7 @@ def _is_retriable_dp_error(exc: BaseException) -> bool:
 
 
 def _submission_dp_fetch_failure(reason: str, exc: BaseException) -> BackendFailure:
-    """A SUBMISSION failure for a data-plane Flight fetch (adapters, reads).
+    """A SUBMISSION failure for a data-plane Flight fetch by a pre-loop resolver.
 
     Wrapping buys a clean FAILED transition: a raw pyarrow FlightError reaching
     `run_workflow`'s bare `except Exception` records stage=STEP_RUN with

@@ -36,6 +36,85 @@ KIND_UNBINNED = "UNBINNED"  # a noLCG contig that no refined bin claimed
 ASSEMBLED_SEQUENCE_TABLE = "assembled_sequence"
 ASSEMBLED_SEQUENCE_CHUNKS_TABLE = "assembled_sequence_chunks"
 
+# Per-subject CheckM quality for one assembly run. On both DoGet allowlists but
+# behind no route — the feature-table resolver signs it in-process; the exclusion
+# comment in `routes/reference.py` states what that rests on, and the
+# `ALLOWED_TABLES` entry in `flight_service.rs` carries the privacy argument.
+BIN_QUALITY_TABLE = "bin_quality"
+
+# The two quality columns the feature-table arm reads. A named pair rather than a
+# `SELECT *` passthrough: the DoGet streams every column this table has, and which
+# ones reach a genome-keyed relation is a decision rather than a consequence of the
+# lake's schema. `marker_lineage` and the DAS_Tool provenance stay in the lake.
+BIN_QUALITY_SCORE_COLUMNS = ("completeness", "contamination")
+
+# The subject a `bin_quality` row describes, minus the run. `processing_idx` is not
+# here: a consumer has already scoped its read to one run, so what remains to join on
+# is the subject within it. Named because the resolver's join and the DDL pin in
+# `tests/test_assembly_constants.py` must agree on the spelling, and the lake DDL
+# they are checked against lives in another component's Rust.
+#
+# **A member ending `_idx` is an integer identifier; every other member is text.**
+# Both readers type these columns from that one rule rather than from a per-column
+# table of their own — the resolver into Arrow, the pin into the lake's SQL types —
+# so a member added here cannot get one type on one side and another on the other.
+BIN_QUALITY_SUBJECT_KEY = ("prep_sample_idx", "kind", "bin_id")
+
+# The lake table's full column list, in DDL ORDER with DDL TYPES. Both are
+# load-bearing: `assembly_load` writes the staging Parquet register-files hands to
+# `ducklake.rs::ensure_assembly_tables`, and a Parquet whose columns are ordered or
+# typed differently is a load error rather than a rename.
+#
+# Here rather than at the writer because the writer is one of two readers — the other
+# is `tests/test_assembly_constants.py`, which pins this list against that Rust DDL.
+# That pin is the only mechanical link between the two components; neither can import
+# the other.
+BIN_QUALITY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("prep_sample_idx", "BIGINT"),
+    ("processing_idx", "BIGINT"),
+    ("kind", "VARCHAR"),
+    ("bin_id", "VARCHAR"),
+    ("marker_lineage", "VARCHAR"),
+    ("completeness", "DOUBLE"),
+    ("contamination", "DOUBLE"),
+    ("strain_heterogeneity", "DOUBLE"),
+    ("genome_size", "BIGINT"),
+    ("n_contigs", "BIGINT"),
+    ("das_tool_score", "DOUBLE"),
+    ("source_binner", "VARCHAR"),
+)
+
+
+# The same list as names alone, for a caller that fills every column the same way and
+# for the exactness check in `bin_quality_projection`.
+BIN_QUALITY_COLUMN_NAMES: tuple[str, ...] = tuple(name for name, _ in BIN_QUALITY_COLUMNS)
+
+
+def bin_quality_projection(sources: dict[str, str]) -> str:
+    """The `bin_quality` SELECT list: every column of `BIN_QUALITY_COLUMNS`, in order,
+    as `CAST(<sources[column]> AS <type>) AS <column>`.
+
+    `sources` maps each column to the SQL expression that fills it — a tool-output
+    reference like `lin."Completeness"`, a run scalar, or the literal `NULL`. It must
+    name exactly these columns: a missing one would emit a narrow Parquet and a
+    stray one would be dropped in silence, so both raise here rather than surfacing
+    as a register-files column-count rejection at the end of an assembly.
+
+    **Every column is CAST**, which is what lets one projection serve the populated
+    and the empty write alike: a bare `NULL` would otherwise take an ambiguous type
+    in the empty Parquet and land a column the lake DDL cannot accept.
+    """
+    if set(sources) != set(BIN_QUALITY_COLUMN_NAMES):
+        raise KeyError(
+            f"bin_quality_projection needs exactly {sorted(BIN_QUALITY_COLUMN_NAMES)}; "
+            f"missing {sorted(set(BIN_QUALITY_COLUMN_NAMES) - set(sources))}, "
+            f"unexpected {sorted(set(sources) - set(BIN_QUALITY_COLUMN_NAMES))}"
+        )
+    return ", ".join(
+        f"CAST({sources[name]} AS {sqltype}) AS {name}" for name, sqltype in BIN_QUALITY_COLUMNS
+    )
+
+
 # Per-contig attributes the assembler reported, one row per contig across BOTH
 # published FASTAs, keyed on the assembler's own contig id (`bin_map.contig_id`).
 # Written by both arms of assemble.sh, into the genomes_dir the assemble step
