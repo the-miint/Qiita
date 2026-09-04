@@ -29,6 +29,10 @@ from typing import Any
 READ_BLOCK_TABLE = "read_block"
 READ_MASKED_BLOCK_TABLE = "read_masked_block"
 
+# The per-sample pass-set DoGet selector the block ones shard. Same contract:
+# signed into a ticket's `table`, matched against the data plane's own name.
+READ_MASKED_TABLE = "read_masked"
+
 
 def resolve_block_read_scope(
     *,

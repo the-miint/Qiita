@@ -52,20 +52,17 @@ _REAL_UNAVAILABLE = (
 # data plane's `AuthError::Expired` text, captured verbatim from a read-mask
 # failure_reason. The signing token aged out before the call reached the DP; the
 # next attempt mints a fresh one, so a redrive self-heals it.
-_REAL_EXPIRED = (
-    "could not materialize reads for prep_sample 30504 from the data plane: "
-    "FlightUnauthenticatedError: Flight returned unauthenticated error, with "
-    "message: ticket expired"
-)
+# NOTE the shape: this is `str(exc)` as the classifier receives it
+# (`_upload.py` passes the exception, not the composed failure_reason), so the
+# CP's own "FlightUnauthenticatedError: " prefix is deliberately absent. With the
+# prefix here, the `unauthenticated` half of the match would be satisfied by the
+# CP's own text and the fixture would stop testing pyarrow's rendering at all.
+_REAL_EXPIRED = "Flight returned unauthenticated error, with message: ticket expired"
 
 # The same gRPC status and the same pyarrow class, from `AuthError::InvalidSignature`
 # — a key mismatch between the CP and the DP, which no redrive fixes. This is why
 # the classifier keys off the expiry text and not the error class.
-_REAL_BAD_SIGNATURE = (
-    "could not materialize reads for prep_sample 30504 from the data plane: "
-    "FlightUnauthenticatedError: Flight returned unauthenticated error, with "
-    "message: invalid signature"
-)
+_REAL_BAD_SIGNATURE = "Flight returned unauthenticated error, with message: invalid signature"
 
 
 def test_serialization_conflict_is_detected():
@@ -101,8 +98,8 @@ def test_other_unauthenticated_errors_are_not_detected():
     assert (
         _is_dp_ticket_expired(
             Exception(
-                "FlightUnauthenticatedError: Flight returned unauthenticated error, "
-                "with message: ticket expiry too far in the future"
+                "Flight returned unauthenticated error, with message: "
+                "ticket expiry too far in the future"
             )
         )
         is False
@@ -133,9 +130,21 @@ def test_expiry_signatures_match_the_data_planes_wording():
         f"update _DP_TICKET_EXPIRED_SIGNATURES ({_DP_TICKET_EXPIRED_SIGNATURES!r}) "
         "or expired tokens silently classify permanent again"
     )
-    # Every AuthError variant reaches the caller as gRPC unauthenticated, which is
-    # the other half of the match — see the flight_service.rs `map_err` sites.
-    assert "unauthenticated" in _DP_TICKET_EXPIRED_SIGNATURES
+    # The other half of the match: every ticket verification maps its AuthError to
+    # gRPC unauthenticated, which is what puts that word in the client's error. A
+    # verify site mapped to any other Status would break the match, so read them
+    # out of the source rather than asserting the constant against itself.
+    service = (
+        Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "flight_service.rs"
+    ).read_text()
+    verify_calls = re.findall(
+        r"auth::verify_\w+\([^;]*?\.map_err\(\|e\| Status::(\w+)\(", service, flags=re.DOTALL
+    )
+    assert verify_calls, "no auth::verify_* -> Status mapping found in flight_service.rs"
+    assert set(verify_calls) == {"unauthenticated"}, (
+        f"a ticket verification now maps to {sorted(set(verify_calls))}; the classifier's "
+        f"{_DP_TICKET_EXPIRED_SIGNATURES!r} match assumes every one is unauthenticated"
+    )
 
 
 def test_serialization_conflict_classified_retriable():

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import struct
 from types import SimpleNamespace
 
 import duckdb
@@ -22,7 +21,7 @@ from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 from qiita_control_plane.auth import tickets
-from qiita_control_plane.auth.tickets import run_signed_flight_call
+from qiita_control_plane.auth.tickets import run_signed_flight_call, token_expiry
 from qiita_control_plane.runner import (
     SAMPLE_MAP_BINDING,
     STAGED_MASKED_READS_BINDING,
@@ -421,11 +420,6 @@ class _DelayedExecutor(concurrent.futures.ThreadPoolExecutor):
         return super().submit(fn, *args, **kwargs)
 
 
-def _token_expiry(token: bytes) -> int:
-    """The trailing uint64 of the signed-token wire format (`auth/tickets.py`)."""
-    return struct.unpack(">Q", token[-8:])[0]
-
-
 async def _with_delayed_executor(clock, delay, coro_fn):
     """Run `coro_fn()` with the loop's default executor delaying every submit."""
     executor = _DelayedExecutor(clock, delay)
@@ -457,7 +451,7 @@ def test_run_signed_flight_call_signs_after_the_queue_wait(monkeypatch):
             lambda: run_signed_flight_call(_sign, lambda t: t),
         )
     )
-    assert _token_expiry(token) == int(submitted_at + queue_wait) + tickets.DEFAULT_TTL_SECONDS
+    assert token_expiry(token) == int(submitted_at + queue_wait) + tickets.DEFAULT_TTL_SECONDS
 
 
 def test_resolve_staged_reads_token_survives_a_queue_wait_past_the_ttl(tmp_path, monkeypatch):
@@ -499,4 +493,4 @@ def test_resolve_staged_reads_token_survives_a_queue_wait_past_the_ttl(tmp_path,
     assert bound[STAGED_READS_BINDING] == dest
     # What the data plane checks on arrival: expiry still ahead of "now". Minting
     # before the executor hop would put it `queue_wait - TTL` seconds in the past.
-    assert _token_expiry(seen[0]) > clock.now
+    assert token_expiry(seen[0]) > clock.now

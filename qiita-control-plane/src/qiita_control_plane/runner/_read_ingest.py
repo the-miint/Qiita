@@ -17,6 +17,7 @@ from qiita_common.parquet import validate_parquet_path
 import qiita_control_plane.runner as _runner_pkg
 
 from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
+from ..block_read import READ_MASKED_TABLE
 from ..host_filter_resolver import is_control_sample
 from ..miint import connect_with_miint_staged
 from ..repositories.block import fetch_mask_sample_state
@@ -119,12 +120,10 @@ async def _stage_shard_roster(
     and write `<workspace>/shard_roster.parquet`. Binds `shard_features` (the
     roster path) and `shard_id` so the build steps' `Inputs` resolve.
 
-    Like the other pre-loop resolvers, a Flight failure is wrapped as a
-    SUBMISSION-attributed failure (via `_submission_dp_fetch_failure`: a DuckLake
-    `_submission_dp_fetch_failure` classifies it) so it lands in
-    the outer FAILED handler instead of escaping as an untyped exception (which
-    would violate the step-name CHECK). An empty membership shard is a
-    misconfiguration — fail loud rather than build an empty index."""
+    Like the other pre-loop resolvers, a Flight failure is wrapped by
+    `_submission_dp_fetch_failure` (see it for what wrapping buys and how the
+    cause is classified). An empty membership shard is a misconfiguration — fail
+    loud rather than build an empty index."""
     rows = await pool.fetch(
         "SELECT feature_idx FROM qiita.reference_membership"
         " WHERE reference_idx = $1 AND shard_id = $2",
@@ -408,10 +407,11 @@ async def _resolve_staged_reads(
     # data plane validates); the data plane writes it.
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "reads.parquet"
-    # A Flight failure is NOT a BackendFailure; wrap it as a SUBMISSION failure
-    # like the other pre-loop resolvers so the outer handler FAILs the ticket
-    # cleanly (step_name=None) rather than letting an untyped exception strand it
-    # in PROCESSING. `_submission_dp_fetch_failure` decides permanent vs retriable.
+    # Wrapped by `_submission_dp_fetch_failure` like the other pre-loop resolvers
+    # — see it for what that buys and how the cause is classified. Note what a
+    # retriable classification does NOT do here: a resolver runs before the step
+    # loop, so it never reaches `_run_entry_with_retry` and is never re-run in
+    # place. The label routes the ticket to an operator redrive.
     try:
         result = await run_signed_flight_call(
             lambda: sign_action(
@@ -507,16 +507,15 @@ async def _resolve_staged_masked_reads(
 
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "masked_reads.fastq.gz"
-    # Flight failure -> a SUBMISSION failure like the other pre-loop resolvers
-    # (step_name=None), so the outer handler FAILs the ticket cleanly rather than
-    # stranding it in PROCESSING; `_submission_dp_fetch_failure` decides permanent
-    # vs retriable. The ticket is the SAME read_masked DoGet ticket the admin export
+    # Flight failure -> wrapped by `_submission_dp_fetch_failure` like the other
+    # pre-loop resolvers. The blocking stream+COPY runs off the event loop. The
+    # ticket is the SAME read_masked DoGet ticket the admin export
     # mints — a generic ticket scoped to exactly (prep_sample_idx, mask_idx), no
     # bespoke action or payload type.
     try:
         count = await run_signed_flight_call(
             lambda: sign_ticket(
-                table="read_masked",
+                table=READ_MASKED_TABLE,
                 filter={"prep_sample_idx": [prep_sample_idx], "mask_idx": [mask_idx]},
                 secret=signing_key,
             ),

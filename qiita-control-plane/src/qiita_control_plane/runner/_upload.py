@@ -77,9 +77,9 @@ _DP_UNAVAILABLE_SIGNATURES = (
 # work_ticket here, and "work ticket expired" contains it. The unauthenticated
 # marker is what makes it a Flight auth failure. The class name alone is too loose
 # in the other direction: every AuthError variant maps to unauthenticated, and
-# `invalid signature` / `malformed payload` never self-heal. `test_auth.py` parses
-# the Rust source so a reword there fails a test rather than silently reverting
-# every expiry to permanent.
+# `invalid signature` / `malformed payload` never self-heal. A test parses the data
+# plane's `AuthError` Display impl so a reword there fails rather than silently
+# reverting every expiry to permanent.
 _DP_TICKET_EXPIRED_SIGNATURES = ("unauthenticated", "ticket expired")
 
 
@@ -117,13 +117,26 @@ def _is_retriable_dp_error(exc: BaseException) -> bool:
 def _submission_dp_fetch_failure(reason: str, exc: BaseException) -> BackendFailure:
     """A SUBMISSION failure for a data-plane Flight fetch (adapters, reads).
 
+    Wrapping buys a clean FAILED transition: a raw pyarrow FlightError reaching
+    `run_workflow`'s bare `except Exception` records stage=STEP_RUN with
+    step_name=None, which violates the work_ticket_failure_step_name_consistent
+    CHECK — the failure transition itself throws and strands the ticket in
+    PROCESSING. Same SUBMISSION/step_name=None shape whatever the cause, so it
+    stays a drop-in for the existing `except` translation.
+
     Classifies by cause: a transient serialization conflict (concurrent DuckLake
     attach), a transient DP-unreachable (gRPC UNAVAILABLE), or an expired signing
-    token is DATA_PLANE_TRANSIENT (retriable — a redrive self-heals); anything else keeps
-    the BAD_INPUT/permanent shape of `_submission_bad_input` (a genuine bad
-    reference or missing data an operator must resolve). Same SUBMISSION/
-    step_name=None shape either way, so it stays a drop-in for the existing
-    `except` translation in `run_workflow`."""
+    token is DATA_PLANE_TRANSIENT; anything else keeps the BAD_INPUT/permanent
+    shape of `_submission_bad_input` (a genuine bad reference or missing data an
+    operator must resolve).
+
+    **Retriable here does not mean retried.** Every caller is a pre-loop resolver,
+    which runs before the step loop and so never reaches `_run_entry_with_retry`:
+    nothing re-runs it, and `retry_count` stays 0. What the label changes is where
+    the ticket lands — `notify.sweeper`'s owed set is
+    `failure_type IS DISTINCT FROM 'retriable'`, so a retriable failure is held for
+    an operator redrive instead of reported as a settled outcome in the
+    originator's digest."""
     kind = (
         FailureKind.DATA_PLANE_TRANSIENT if _is_retriable_dp_error(exc) else FailureKind.BAD_INPUT
     )

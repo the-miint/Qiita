@@ -84,6 +84,7 @@ from ..actions.library import delete_mask_data
 from ..auth.guards import require_human, require_scope, require_service_with_scope
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
+from ..block_read import READ_MASKED_TABLE
 from ..deps import (
     TxConnFactory,
     get_data_plane_url,
@@ -118,7 +119,7 @@ _MASK_PREP_SAMPLE_HARD_CAP = 100_000
 # plane's ALLOWED_TABLES, which back the read_masked macro the ticket targets.
 # A constant rather than a free literal so the read-masked table name has one
 # definition the route signs against.
-_READ_MASKED_TABLE = "read_masked"
+_READ_MASKED_TABLE = READ_MASKED_TABLE
 
 mask_definition_router = APIRouter(prefix=PATH_MASK_DEFINITION_PREFIX, tags=["mask-definition"])
 read_masked_router = APIRouter(prefix=PATH_READ_MASKED_PREFIX, tags=["read-masked"])
