@@ -228,10 +228,11 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
 
     Those pins exist because a job drawing its parallelism from DuckDB's pool wastes
     any core the pool cannot use. This step is the opposite case: it runs blocked on
-    the data-plane chunk stream rather than computing, so `sacct` over the reference-18
-    build's 987 shard builds put its TotalCPU — the serial work one core must absorb —
-    at p50 0.44, p99 1.14, max 1.45 min, against a max elapsed of 23.9 min. The cores
-    were the waste, so `cpu` dropped to the measured 1 while the pool stayed at 4.
+    the data-plane chunk stream rather than computing, so the serial work one core must
+    absorb is small — the largest TotalCPU over the reference-18 build's 987 shard
+    builds is 1.45 min. The cores were the waste, so `cpu` dropped to the measured 1
+    while the pool stayed at 4. The step's `baseline_resources` in
+    `workflows/build-shard-index/1.0.0.yaml` carries the rest of that measurement.
 
     Pinned for the same reason the others are: nothing fails at runtime when these
     drift, so a later edit raising `cpu` to match the pool would silently undo a
@@ -244,9 +245,10 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
     for where, cpu in _baseline_cpu_every_version("build-shard-index", "build_minimap2_index"):
         assert cpu == 1 and cpu < mod._DUCKDB_THREADS, (
             f"{where}: build_minimap2_index cpu={cpu}, "
-            f"measured at 1.45 min TotalCPU worst case over 987 shard builds. It sits "
-            f"below _DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — the step is "
-            f"blocked on its data-plane stream, so cores matched to the pool go unused."
+            f"measured at a largest-observed TotalCPU of 1.45 min over 987 shard "
+            f"builds. It sits below _DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — "
+            f"the step is blocked on its data-plane stream, so cores matched to the "
+            f"pool go unused."
         )
 
 

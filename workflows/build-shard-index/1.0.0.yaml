@@ -85,15 +85,13 @@ steps:
     # max 1.45 min, against an elapsed of p50 2.5, p99 10.0, max 23.9 min. Worst case
     # at cpu:1 is elapsed + 0.75 x TotalCPU (the CPU portion perfectly parallel across
     # four cores, fully serialised onto one), which peaks at 24.7 min over all 987
-    # against the PT2H limit. walltime stays PT2H.
+    # against the PT2H limit.
     #
     # CPU efficiency TotalCPU/(Elapsed x AllocCPUS) is not the bound here: it peaks at
     # 28.0% — 1.12 average cores, above the one allocated — on a 0.58-min shard that
-    # projects to 1.07 min. The ratio runs opposite to elapsed, so it is largest where
-    # there is nothing to lose; the four longest shards sit at 0.9-1.1%.
-    #
-    # The p50 14.5 / p90 30.7 / p99 65.2 / max 92.3 min elapsed tail of this build is
-    # build_bowtie2_index's, the sibling step below, which stays at cpu:4.
+    # projects to 1.07 min. Efficiency falls as elapsed rises (pearson -0.60; mean
+    # efficiency by elapsed decile runs 13.7% down to 1.7%), so the shards where the
+    # ratio is high are the short ones.
     #
     # This does not touch DuckDB's pool: the job takes its thread count from its own
     # `_DUCKDB_THREADS`, so four threads now time-share one core instead of four.
@@ -106,7 +104,7 @@ steps:
     # nothing changes. `plan()` sizes a shard to 28 + ceil(bp/1e9) GiB, so one at or
     # under 1 Gbp lands at 29, where floor(514000/29696) = 17 exceeds that cpu cap and
     # the cut does add a slot; above 1 Gbp it lands at 30 or more, floor(514000/30720)
-    # = 16, and the gain is gone. 82% of this reference's 987 shards landed at 29.
+    # = 16, and the gain is gone. 82.2% of this reference's 987 shards landed at 29 GiB.
     # Either way the cores it stops reserving are available to other work on the node.
     #
     # The same step runs at cpu:4 in host-reference-add and local-host-reference-add,
@@ -133,6 +131,12 @@ steps:
     params: {shard_id: shard_id}
     when: build_bowtie2
     outputs: [bowtie2_index_meta]
+    # cpu from the same reference-18 build, 987 shard builds at cpu:4. Unlike
+    # build_minimap2_index above, this one spends its wall time computing: CPU
+    # efficiency TotalCPU/(Elapsed x AllocCPUS) is p50 65.5%, p90 75.7%, max 92.7%,
+    # so the four cores are used. It is also the long step of the pair — elapsed p50
+    # 14.5, p90 30.7, p99 65.2, max 92.3 min against the PT2H limit, where minimap2's
+    # max is 23.9.
     baseline_resources:
       cpu: 4
       mem_gb: 32
