@@ -4,7 +4,7 @@ These are pure-unit (no DB): they exercise the lineage-sorted, fixed-N even
 partition that turns a reference's sharding units (genomes for a genome
 reference) into shards. The ingest-time wiring — feeding the tiler real
 lineages, expanding genome→feature, and persisting via write_shard_assignment —
-is a later milestone and is covered elsewhere.
+lives in actions.library.plan_shards and is covered elsewhere.
 """
 
 import pytest

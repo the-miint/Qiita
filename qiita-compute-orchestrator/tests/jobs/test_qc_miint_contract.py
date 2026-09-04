@@ -1,5 +1,5 @@
 """Real-miint contract pins for the fastp-port QC functions the `qc` native job
-(Phase 2) builds on: `filter_read`, `trim_adapters` / `trim_adapters_pe`,
+builds on: `filter_read`, `trim_adapters` / `trim_adapters_pe`,
 `trim_polyg`.
 
 These run against the team-mirror miint build (staged by the session-autouse

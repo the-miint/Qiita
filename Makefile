@@ -129,22 +129,34 @@ test-compute-orchestrator: build-compute-orchestrator
 	cd qiita-compute-orchestrator && uv run pytest
 
 # Smoke-test workflow containers (requires apptainer; skips gracefully if absent)
+# The apptainer guard and everything it guards are ONE recipe line: `exit 0` ends
+# only the line it is on, so a guard on its own line skips nothing — make moves to
+# the next line and runs apptainer anyway. Both halves need the guard: the second
+# reaches apptainer through scripts/build-sif.sh. Comments stay out here at the
+# make level, because make joins the continuations into a single shell line and a
+# `#` there would swallow the rest of the recipe.
+#
+# One recipe line means one `@`, so `set -x` restores the per-command trace make
+# used to print by echoing each line — CI reads it to see which command failed.
+# It is set after the guard so the skip path stays quiet.
+#
+# Second half: exercise scripts/build-sif.sh end-to-end against real apptainer via
+# the _sif-build-smoke sentinel (no licensed artifact). Uses a throwaway
+# PATH_DERIVED so the built SIF lands in a temp images/ dir. The trap removes it on
+# success, failure, OR signal; set -e propagates a build failure as the recipe's
+# exit status (no trailing `exit` tripwire).
 test-workflows:
 	@if ! command -v apptainer > /dev/null 2>&1; then \
 		echo "apptainer not found — skipping workflow smoke tests"; \
 		exit 0; \
-	fi
-	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def
-	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"
-	rm -f /tmp/qiita-workflow-smoke.sif
-	# Exercise scripts/build-sif.sh end-to-end against real apptainer via the
-	# _sif-build-smoke sentinel (no licensed artifact). Uses a throwaway
-	# PATH_DERIVED so the built SIF lands in a temp images/ dir. The trap
-	# removes it on success, failure, OR signal; set -e propagates a build
-	# failure as the recipe's exit status (no trailing `exit` tripwire).
-	set -e; smoke_derived=$$(mktemp -d); trap 'rm -rf "$$smoke_derived"' EXIT; \
-		mkdir -p "$$smoke_derived/images"; \
-		PATH_DERIVED="$$smoke_derived" bash scripts/build-sif.sh _sif-build-smoke
+	fi; \
+	set -ex; \
+	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def; \
+	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"; \
+	rm -f /tmp/qiita-workflow-smoke.sif; \
+	smoke_derived=$$(mktemp -d); trap 'rm -rf "$$smoke_derived"' EXIT; \
+	mkdir -p "$$smoke_derived/images"; \
+	PATH_DERIVED="$$smoke_derived" bash scripts/build-sif.sh _sif-build-smoke
 
 # Run integration tests (requires Docker for Postgres, OR set
 # QIITA_USE_HOST_POSTGRES=1 to use a Postgres provisioned outside this Makefile
