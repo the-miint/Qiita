@@ -130,17 +130,17 @@ steps:
     params: {shard_id: shard_id}
     when: build_bowtie2
     outputs: [bowtie2_index_meta]
-    # cpu:4 predates the reference-18 build; that build's 987 shard runs corroborate
+    # cpu:4 predates the reference-18 build; that build's 987 shard builds corroborate
     # it rather than being where it came from. Unlike build_minimap2_index above, this
-    # step spends its wall time computing: CPU efficiency TotalCPU/(Elapsed x
-    # AllocCPUS) is p50 65.5%, p90 75.7%, max 92.7% — 2.6 of the four cores busy at the
-    # median, 3.7 at the maximum. Efficiency is read the opposite way here than in that
-    # block: a high ratio justifies KEEPING cores, where a high ratio on a short job
-    # says nothing about whether cutting them costs wall time.
+    # step spends its wall time computing: TotalCPU is p50 35.4, p90 84.7, max 269.0
+    # min, and 36 of the 987 want more CPU-time than the 120-min walltime allows — those
+    # fit inside PT2H only by running on more than one core. The heaviest finished in
+    # 92.3 min at 2.92 cores average.
     #
-    # This is the long step of the pair: elapsed p50 14.5, p90 30.7, p99 65.2, max 92.3
-    # min, so walltime PT2H is the binding one of the two. mem_gb 32 against a MaxRSS
-    # of p50 7.9, p90 13.3, max 21.9 GiB.
+    # This is also the longer step of the pair: elapsed p50 14.5, p90 30.7, p99 65.2,
+    # max 92.3 min against the same PT2H limit. mem_gb 32 is the whole-reference
+    # baseline; `plan()` sizes a shard down from it by bp, so those 987 ran at 29-31
+    # GiB, against a MaxRSS of p50 7.9, p90 13.3, max 21.9 GiB.
     baseline_resources:
       cpu: 4
       mem_gb: 32

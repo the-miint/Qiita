@@ -231,8 +231,8 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
     the data-plane chunk stream rather than computing, so the serial work one core must
     absorb is small — the largest TotalCPU over the reference-18 build's 987 shard
     builds is 1.45 min. The cores were the waste, so `cpu` dropped to the measured 1
-    while the pool stayed at 4. The step's `baseline_resources` in
-    `workflows/build-shard-index/1.0.0.yaml` carries the rest of that measurement.
+    while the pool stayed at 4. The step's `baseline_resources` comment in the workflow
+    YAML carries the rest of that measurement.
 
     Pinned for the same reason the others are: nothing fails at runtime when these
     drift, so a later edit raising `cpu` to match the pool would silently undo a
