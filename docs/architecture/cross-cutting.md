@@ -38,10 +38,18 @@ nginx terminates TLS and routes: `REST → :8080`, `gRPC → :50051` (load-balan
 **All uint64 identifiers are minted exclusively by the control plane.** The data plane treats every identifier as an opaque integer. The hierarchy is:
 
 ```
-study_idx → prep_idx → sample_idx → prep_sample_idx → processing_idx → processed_prep_sample_idx
+biosample_idx → prep_sample_idx
 ```
 
+`prep_sample.biosample_idx` is a direct FK to `qiita.biosample`. Not every CP-minted `*_idx` sits in a containment chain, so don't assume one: `study_idx` attaches through the many-to-many `prep_sample_to_study` junction, and `processing_idx` is a fleet-wide params-hash identity (`qiita.processing` keys on `params_hash UNIQUE`, with no FK to `prep_sample`), so one processing spans many prep_samples.
+
 `processing_idx` deduplicates on `SHA-256(canonical JSON parameters)` — same workflow + version + params always resolves to the same `processing_idx`.
+
+**Three names that look like levels of this chain are not.** Check here before writing code against any of them:
+
+- `sample_idx` — no such column in any migration, and no `qiita.sample` table. The level the name suggests is `biosample_idx`.
+- `processed_prep_sample_idx` — unbuilt. No column in any migration; the only migration mention is a comment in `20260712000000_alignment_definition.sql` recording the hierarchy below `processing_idx` as deferred.
+- `prep_idx` — a real `qiita.work_ticket` scope-target column, not an entity; [`data-model.md`](data-model.md) calls it vestigial and says not to build on it.
 
 Reference identifiers form a parallel hierarchy:
 
@@ -71,7 +79,11 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 **Ticket replay is an accepted risk, and every DoAction must stay replay-safe.** Flight tickets have no single-use ledger (the data plane is stateless by design), so a still-valid ticket can be replayed within its ~1h lifetime. We accept this because every DoAction variant is idempotent or otherwise replay-safe. This invariant is enforced: the `REPLAY_SAFE_ACTIONS` registry in `qiita-data-plane/src/flight_service.rs` gates the `do_action` dispatcher (an unlisted action is rejected), a test pins the registry to the dispatcher's arms, and an anchored `# replay:` comment sits at the dispatch. When you add a DoAction, make it idempotent/replay-safe and add it to the registry — or, if it can't be, add replay protection before shipping. See [`docs/auth.md#ticket-replay`](../auth.md).
 
-**Result file requirements**: Parquet files written by SLURM jobs must be mode `440` (verified before registration) and must contain the identifier columns sorted in this exact order: `study_idx, prep_idx, sample_idx, prep_sample_idx, processing_idx, processed_prep_sample_idx`. This sort order enables both DuckLake catalog-level file pruning and Parquet row-group predicate pushdown.
+**Result file requirements**: the SLURM backend runs three gates before registration, in `qiita-compute-orchestrator/src/qiita_compute_orchestrator/slurm/verify.py` — a well-formed manifest, every listed file present at its declared `size_bytes`, and mode `0o440` on everything under `$QIITA_OUTPUT_PATH`. A failure is a permanent `CONTRACT_VIOLATION`. `LocalBackend.result_step` runs none of them, so a job that passes locally has not been checked against this.
+
+Sorting a result Parquet by its identifier columns helps DuckLake prune and Parquet push predicates into row groups, and which columns a table has varies. **Nothing verifies the sort.**
+
+> Other docs state that sort as a `must` and as enforced, and list identifier columns this section calls unbuilt. Reconciling them is its own change; where they disagree with this section, this section is the one measured against the code.
 
 **Horizontal scaling**: each data plane instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog. DuckLake's snapshot isolation means instances never block each other. Add instances to `upstream qiita_data_plane` in nginx to scale.
 
@@ -79,7 +91,7 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 ### Compute orchestrator pattern
 
-The orchestrator is a passive, **stateless** HTTP service: the control-plane runner drives the decoupled `POST /api/v1/step/{submit,status,result}` trio (plus `POST /api/v1/step/find-by-name`), each dispatching to the configured `ComputeBackend`. `submit_step` `sbatch`es and returns a handle (SLURM job id + workspace paths) immediately; `status_step` is a single non-looping slurmrestd read; `result_step` verifies output (identifier integrity + file mode) and returns the paths. **The CP owns the poll loop** — the orchestrator holds no in-flight job state between calls, so a long job never holds the CP→CO connection open and a CP restart re-attaches from persisted `qiita.work_ticket_step` progress. SLURM jobs themselves remain dumb (read input, write output, exit).
+The orchestrator is a passive, **stateless** HTTP service: the control-plane runner drives the decoupled `POST /api/v1/step/{submit,status,result}` trio (plus `POST /api/v1/step/find-by-name`), each dispatching to the configured `ComputeBackend`. `submit_step` `sbatch`es and returns a handle (SLURM job id + workspace paths) immediately; `status_step` is a single non-looping slurmrestd read; `result_step` verifies output (the three gates above, on the SLURM backend) and returns the paths. **The CP owns the poll loop** — the orchestrator holds no in-flight job state between calls, so a long job never holds the CP→CO connection open and a CP restart re-attaches from persisted `qiita.work_ticket_step` progress. SLURM jobs themselves remain dumb (read input, write output, exit).
 
 **The orchestrator has no DB access** — workflow lifecycle and DB writes happen entirely on the control plane side. CO → CP callbacks exist today for `POST /sequence-range` (called by the native `fastq_to_parquet` step) and authenticate with the compute service-account PAT (site-chosen principal name; `compute` on the live deploy) installed at `/etc/qiita/co-to-cp.token` ([provisioning](../runbooks/compute-service-account-provisioning.md), [rotation](../runbooks/orchestrator-token-rotation.md)). SLURM-backend integration (cluster prereqs, identity model, the `qiita-job` JWT auto-refresh timer) lives in [`docs/runbooks/slurm-backend-setup.md`](../runbooks/slurm-backend-setup.md).
 

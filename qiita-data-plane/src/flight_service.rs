@@ -338,7 +338,7 @@ const ALLOWED_TABLES: &[&str] = &[
     // here, unlike every other table — and always scoped by alignment_idx +
     // prep_sample_idx (see build_query / ALIGNMENT_PROJECTION_COLUMNS).
     "alignment_visible",
-    // One assembly run's contigs — sample-derived sequence, where everything
+    // One assembly run's contigs — prep_sample-derived sequence, where everything
     // above is reference data or per-read derived output. Neither table has a
     // prep_sample_idx column; a ticket names the run by `(prep_sample_idx,
     // processing_idx)` and `build_assembly_run_query` resolves it through
@@ -567,7 +567,7 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   `auth::verify_ticket_raw`: 300s from
 ///   `qiita_control_plane.auth.tickets.sign_action`'s default, and
 ///   `MAX_TICKET_LIFETIME` refuses any token whose expiry is more than 3600s out.
-/// - `export_read` — re-materializes the same sample's bytes to the same ticket
+/// - `export_read` — re-materializes the same prep_sample's bytes to the same ticket
 ///   path via atomic publish; a replay reproduces identical output. (The block
 ///   exports that used to sit beside it are gone: block-scoped compute now
 ///   STREAMS its reads over the `read_block` / `read_masked_block` DoGet
@@ -1072,7 +1072,7 @@ impl FlightService for QiitaFlightService {
                 // inlined into a DuckDB `COPY ... TO` literal and written to.
                 let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
 
-                // `COPY` is synchronous and, for a whole sample, long-lived —
+                // `COPY` is synchronous and, for a whole prep_sample, long-lived —
                 // run it on the blocking pool so it never starves a tonic async
                 // worker. The closure opens and drops its own connection, so it
                 // is Send and crosses no await (mirrors `register_files`).
@@ -1608,7 +1608,7 @@ const EXPORT_READ_PARQUET_OPTS: &str =
     "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd', ROW_GROUP_SIZE_BYTES '64MB'";
 
 /// The read projection, in `read` / `read_masked` table order. Shared by the
-/// per-sample `export_read` DoAction (from `qiita_lake.read`) and by BOTH
+/// per-prep_sample `export_read` DoAction (from `qiita_lake.read`) and by BOTH
 /// block-read DoGet selectors (`read_block` from `qiita_lake.read`,
 /// `read_masked_block` from the `read_masked` MACRO), so every read payload the
 /// data plane hands a compute job has the identical column shape — the shape
@@ -1658,7 +1658,7 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
 /// inlined integers only) and materialize its rows into a Parquet at `dest`.
 /// Returns the row count.
 ///
-/// Machinery for the `export_read` DoAction — one whole sample from
+/// Machinery for the `export_read` DoAction — one whole prep_sample from
 /// `qiita_lake.read`. (Its block siblings are gone: a block's reads STREAM over
 /// the `read_block` / `read_masked_block` DoGet selectors.) The caller builds its
 /// own SELECT (same `EXPORT_READ_COLUMNS` projection so the output shape is
@@ -1779,7 +1779,7 @@ fn export_select_to_parquet(
 }
 
 /// Re-materialize one prep_sample's reads into a per-ticket `reads.parquet` a
-/// read-mask job consumes (the per-sample export). A sample with no stored reads
+/// read-mask job consumes (the per-prep_sample export). A prep_sample with no stored reads
 /// writes NO file and returns 0. `prep_sample_idx` is a signature-verified i64, safe
 /// to inline. See `export_select_to_parquet` for the shared write/publish.
 fn export_read_to_parquet(
@@ -1890,7 +1890,7 @@ fn i64_list_filter(filter: &auth::TicketFilter, col: &str) -> Result<Vec<i64>, S
         .collect()
 }
 
-/// The sorted, deduplicated sample set a block's members cover.
+/// The sorted, deduplicated prep_sample set a block's members cover.
 fn block_member_preps(members: &[auth::BlockReadMember]) -> Vec<i64> {
     let mut preps: Vec<i64> = members.iter().map(|m| m.prep_sample_idx).collect();
     preps.sort_unstable();
@@ -1898,7 +1898,7 @@ fn block_member_preps(members: &[auth::BlockReadMember]) -> Vec<i64> {
     preps
 }
 
-/// The `read_masked` table-macro call for one (mask, samples) scope.
+/// The `read_masked` table-macro call for one (mask, prep_samples) scope.
 ///
 /// `read_masked` is a MACRO, not a relation — it takes its scope as arguments;
 /// `ducklake.rs` carries why.
@@ -1915,7 +1915,7 @@ fn block_member_preps(members: &[auth::BlockReadMember]) -> Vec<i64> {
 fn read_masked_relation(mask_idx: i64, preps: &[i64]) -> String {
     debug_assert!(
         !preps.is_empty(),
-        "read_masked scope must name at least one sample; callers guard this"
+        "read_masked scope must name at least one prep_sample; callers guard this"
     );
     let csv = preps
         .iter()
@@ -1964,16 +1964,16 @@ fn count_masked_reads(
 const BIOLOGICAL_REASONS: &str = "'host_minimap2', 'host_rype', 'pass'";
 const SPIKEIN_REASONS: &str = "'spikein_syndna'";
 
-/// Aggregate a sample's `read_mask` rows for one mask into the per-stage read
+/// Aggregate a prep_sample's `read_mask` rows for one mask into the per-stage read
 /// counts the block reconcile primitive persists onto `sequenced_sample`.
 ///
-/// The counterpart of the per-sample read-mask's local-parquet rollup
+/// The counterpart of the per-prep_sample read-mask's local-parquet rollup
 /// (`qiita_control_plane.actions.library._read_mask_counts`), but read from the
-/// persisted DuckLake `read_mask` table because a block-masked sample's rows are
+/// persisted DuckLake `read_mask` table because a block-masked prep_sample's rows are
 /// written by SEVERAL blocks — any one block's local parquet covers only its
 /// slice. Returns the both-mates (`*_r1r2`) totals `sequenced_sample` stores plus
 /// `row_count` (one per read/pair) the reconcile count-assertion checks against
-/// the sample's `sequence_range`.
+/// the prep_sample's `sequence_range`.
 ///
 /// `right_trim2` is non-NULL for paired-end and NULL for single-end, so
 /// `count(right_trim2)` is the R2 count and `count(*) + count(right_trim2)` is the
@@ -2083,7 +2083,7 @@ fn mask_metrics_counts(
 /// that takes it — `register_files`' transaction.
 ///
 /// `assembly_membership` / `bin_quality` are keyed on `(prep_sample_idx,
-/// processing_idx)` instead. A second `long-read-assembly` run over a sample
+/// processing_idx)` instead. A second `long-read-assembly` run over a prep_sample
 /// resolves to the same `processing_idx` whenever the inputs
 /// `runner/_processing.py` hashes are unchanged — an edited workflow file
 /// included — and `routes/work_ticket.py` admits the submission. Appending
@@ -2883,7 +2883,7 @@ fn sync_reference_exclusion(
 /// returns zero counts. The `prep_sample_idxs` are `i64` parsed from the
 /// Ed25519-signed payload, so inlining them into the `IN (...)` list carries no
 /// injection surface and avoids per-row parameter binding for the large
-/// (hundreds of samples) pool case.
+/// (hundreds of prep_samples) pool case.
 fn delete_pool_reads(
     catalog_connstr: &str,
     data_path: &str,
@@ -2963,7 +2963,7 @@ fn delete_pool_reads(
 /// `mask_idx = ?`: `mask_idx = {m} AND prep_sample_idx IN (...) AND sequence_idx
 /// BETWEEN block_min AND block_max AND (per-member OR)`. The per-member OR
 /// residual makes it exact — a split member deletes ONLY its own sub-range, so a
-/// sibling block's rows for a shared sample survive (independent of tiling
+/// sibling block's rows for a shared prep_sample survive (independent of tiling
 /// order). The coarse `IN + BETWEEN` pair is a pushdown hint (see
 /// `block_read_where_clause`).
 ///
@@ -3142,7 +3142,7 @@ fn delete_alignment(
 /// The alignment twin of `delete_read_mask_block`: same exact-by-construction
 /// footprint selector (`block_read_where_clause`) scoped further by
 /// `alignment_idx = ?`. The per-member OR residual makes it exact — a split member
-/// deletes ONLY its own sub-range, so a sibling block's rows for a shared sample
+/// deletes ONLY its own sub-range, so a sibling block's rows for a shared prep_sample
 /// survive (independent of tiling order). The selector is on `(prep_sample_idx,
 /// sequence_idx)` and is feature_idx-agnostic, so it clears ALL of a read's
 /// alignment rows (a read produces multiple rows via cross-shard + PE
@@ -3191,7 +3191,7 @@ fn delete_alignment_block(
 }
 
 /// Delete one `(alignment_idx, prep_sample_idx)` pair's rows from every
-/// `ALIGNMENT_DELETE_TABLES` table — the idempotent-sample-replace primitive: run
+/// `ALIGNMENT_DELETE_TABLES` table — the idempotent-prep_sample-replace primitive: run
 /// immediately before `register-files` and a re-run deletes the prior run's rows
 /// before writing fresh ones, so it never double-counts.
 ///
@@ -3199,26 +3199,26 @@ fn delete_alignment_block(
 /// it:
 ///
 /// * `delete_alignment` keys on `alignment_idx` alone, so it takes every other
-///   sample's rows with it.
+///   prep_sample's rows with it.
 /// * `delete_alignment_block` needs a `block_member` cover-map, which a caller
 ///   holding one prep_sample has none of.
 /// * `REPLACE_KEY_TABLES` is matched on the destination TABLE name alone (see
 ///   `register_files`), so an `alignment` entry keyed on this pair would fire on
 ///   the block-scoped `align` workflow's registrations too. `tile_partition`
-///   splits a straddling sample across consecutive blocks and
+///   splits a straddling prep_sample across consecutive blocks and
 ///   `replace_key_delete_sql` deletes every lake row whose key tuple appears in
 ///   the incoming Parquet, so the second block's registration would delete the
-///   first's rows for the shared sample — `REPLACE_KEY_TABLES`' condition 1 (the
+///   first's rows for the shared prep_sample — `REPLACE_KEY_TABLES`' condition 1 (the
 ///   incoming files carry the complete row set for every key they mention)
 ///   failing.
 ///
 /// Both key columns are in the DDL of both tables
 /// (`ducklake::ensure_alignment_tables`), so the one clause applies to each. The
-/// predicate carries no `sequence_idx` bound — the sample is the unit — and is
+/// predicate carries no `sequence_idx` bound — the prep_sample is the unit — and is
 /// feature_idx-agnostic, so ALL of a read's alignment rows go.
 ///
 /// Transaction, lockstep and parquet lifecycle are `delete_lake_rows`', count
-/// reporting is `delete_alignment`'s. Idempotent: a sample with no rows yet
+/// reporting is `delete_alignment`'s. Idempotent: a prep_sample with no rows yet
 /// deletes 0 and still succeeds.
 fn delete_alignment_sample(
     catalog_connstr: &str,
@@ -3448,7 +3448,7 @@ fn build_query(
 
     let full_table = format!("qiita_lake.{table}");
 
-    // `read_masked` is a table macro whose (mask, samples) scope IS its argument
+    // `read_masked` is a table macro whose (mask, prep_samples) scope IS its argument
     // list, so it cannot be assembled by the generic WHERE-clause path below.
     if table == "read_masked" {
         return build_read_masked_query(filter);
@@ -3666,14 +3666,14 @@ fn build_assembly_run_query(
 ///
 /// One assembly RUN, over a cohort: exactly one `processing_idx`, a non-empty
 /// `prep_sample_idx` set, and nothing else. Both halves are required because
-/// either alone widens past the run — `processing_idx` alone is every sample that
-/// run touched, `prep_sample_idx` alone is every run those samples ever had — and
+/// either alone widens past the run — `processing_idx` alone is every prep_sample that
+/// run touched, `prep_sample_idx` alone is every run those prep_samples ever had — and
 /// the `filter.len()` check is what stops a third column from riding along
 /// unnoticed.
 ///
-/// A cohort where `build_assembly_run_query` takes one sample: this table's rows
+/// A cohort where `build_assembly_run_query` takes one prep_sample: this table's rows
 /// are per subject rather than per contig, so a whole cohort answers in one
-/// stream. The rows carry `prep_sample_idx`, so a sample that scored nothing is
+/// stream. The rows carry `prep_sample_idx`, so a prep_sample that scored nothing is
 /// absent from the result rather than merged into a neighbour's rows.
 fn build_bin_quality_query(filter: &auth::TicketFilter) -> Result<(String, String), Status> {
     let processing_idx = single_i64_filter(filter, "processing_idx")?;
@@ -3732,7 +3732,7 @@ fn build_block_read_query(
 
     // `read_masked` is a macro (scope-as-arguments); `read` is a plain relation.
     // The member clause stays an outer filter either way — it carries the
-    // per-sample sequence sub-ranges the macro's sample scope does not express,
+    // per-prep_sample sequence sub-ranges the macro's prep_sample scope does not express,
     // and it is the SAME selector the block DELETE path uses, so a block's read
     // footprint and its delete footprint cannot drift.
     let (relation, where_str) = if table == "read_masked_block" {
@@ -3743,7 +3743,7 @@ fn build_block_read_query(
                 filter.len()
             )));
         }
-        // `mask_idx` moves into the macro call; the members' samples scope its
+        // `mask_idx` moves into the macro call; the members' prep_samples scope its
         // `read`/`read_mask` inputs so DuckLake prunes to their files rather than
         // scanning the lake (see the measurements on the macro in ducklake.rs).
         let relation = read_masked_relation(mask_idx, &block_member_preps(members));
