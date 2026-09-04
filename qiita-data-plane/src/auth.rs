@@ -315,7 +315,7 @@ pub fn verify_delete_pool_reads(
 ///
 /// Wire shape pinned by `qiita_control_plane.runner._resolve_staged_reads`:
 /// `{"action": "export_read", "dest": "<abs path>", "prep_sample_idx": N}`.
-/// The data plane re-materializes one sample's reads from its DuckLake `read`
+/// The data plane re-materializes one prep_sample's reads from its DuckLake `read`
 /// table to `dest` on the shared filesystem (a per-ticket `reads.parquet` a
 /// read-mask job then consumes) — so the bulk read bytes never transit the
 /// control plane. No `work_ticket_idx`: the data plane keys nothing off it
@@ -348,8 +348,8 @@ pub fn verify_export_read(
 }
 
 /// One member of a block-read selector: a prep_sample and the inclusive
-/// `sequence_idx` sub-range of it this block covers. A whole sample is
-/// `[start, stop]` == its `qiita.sequence_range`; a sample split across blocks
+/// `sequence_idx` sub-range of it this block covers. A whole prep_sample is
+/// `[start, stop]` == its `qiita.sequence_range`; a prep_sample split across blocks
 /// contributes a sub-range to each. `deny_unknown_fields` pins the shape to
 /// exactly these three columns.
 ///
@@ -382,7 +382,7 @@ pub struct BlockReadMember {
 /// `read_mask` table — the rows for `mask_idx` whose `(prep_sample_idx,
 /// sequence_idx)` fall in the members' sub-ranges — so a block re-run can
 /// delete-then-re-register without double-counting or clobbering a sibling
-/// block's rows for a shared sample. The footprint is the SAME
+/// block's rows for a shared prep_sample. The footprint is the SAME
 /// `(prep_sample_idx, sub-range)` member list the `read_block` DoGet selector carries
 /// (reusing `BlockReadMember`); it is exact by construction (per-member
 /// OR residual), so a split member never deletes a sibling block's tail. The
@@ -425,7 +425,7 @@ pub fn verify_delete_read_mask_block(
 /// `alignment` table — the rows for `alignment_idx` whose `(prep_sample_idx,
 /// sequence_idx)` fall in the members' sub-ranges — so a block re-run can
 /// delete-then-re-register without double-counting or clobbering a sibling
-/// block's rows for a shared sample. The footprint is the SAME
+/// block's rows for a shared prep_sample. The footprint is the SAME
 /// `(prep_sample_idx, sub-range)` member list the `read_masked_block` DoGet selector carries
 /// (reusing `BlockReadMember`); it is exact by construction (per-member OR
 /// residual) and feature_idx-agnostic (all of a read's alignment rows go, since a
@@ -487,18 +487,18 @@ pub fn verify_delete_alignment(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
-/// Parsed payload for the `delete_alignment_sample` DoAction — the per-sample
+/// Parsed payload for the `delete_alignment_sample` DoAction — the per-prep_sample
 /// idempotent replace.
 ///
 /// Wire shape pinned by
 /// `qiita_control_plane.actions.library.delete_alignment_sample_data`:
 /// `{"action": "delete_alignment_sample", "alignment_idx": N,
-///   "prep_sample_idx": M}`. What the pair selects, and why the sample rather
+///   "prep_sample_idx": M}`. What the pair selects, and why the prep_sample rather
 /// than the block or the whole alignment is the unit, is on
 /// `flight_service::delete_alignment_sample`. `deny_unknown_fields` rejects any
 /// extra field rather than dropping it — a `members` list in particular, which
 /// a caller reaching for the block scope would send and which this delete would
-/// otherwise ignore while taking the whole sample.
+/// otherwise ignore while taking the whole prep_sample.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteAlignmentSamplePayload {
@@ -527,10 +527,10 @@ pub fn verify_delete_alignment_sample(
 /// `count_masked` (which reuses a `read_masked` DoGet ticket because the CLI
 /// already holds one), the block reconcile primitive runs control-plane-side and
 /// has no such ticket, so this is a first-class action token the CP signs. The
-/// data plane aggregates the sample's `read_mask` rows for the mask across ALL
-/// its blocks — the per-`(prep_sample, mask)` rollup a per-sample read-mask would
+/// data plane aggregates the prep_sample's `read_mask` rows for the mask across ALL
+/// its blocks — the per-`(prep_sample, mask)` rollup a per-prep_sample read-mask would
 /// have written from its single local parquet, now derived from the persisted
-/// DuckLake table because a block-masked sample's rows arrive from several blocks.
+/// DuckLake table because a block-masked prep_sample's rows arrive from several blocks.
 /// `deny_unknown_fields` keeps the contract tight: any extra field is a design
 /// slip surfaced loudly here.
 #[derive(Debug, serde::Deserialize)]
