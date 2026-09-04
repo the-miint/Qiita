@@ -128,8 +128,9 @@ _None yet._
   - **A routine hifiasm_meta submission no longer needs the `--mem-gb 384` floor.** It
     was covering that assembler's demand, which this cohort measured to a 246.03 GiB
     max and 250 covers from the baseline. It is not full coverage: an earlier cohort
-    recorded a 259.3 GiB peak (assembler unrecorded), and a sample in that range still
-    OOMs and escalates to 500. Passing the floor still works, and still lifts every
+    recorded a 259.3 GiB peak — also hifiasm_meta, the default for the 1.0.0 version
+    that whole cohort ran under — and a sample in that range still OOMs and escalates
+    to 500. Passing the floor still works, and still lifts every
     other step in the ticket.
   - **`assemble` is now sized per assembler:** hifiasm_meta 250 GiB, myloasm 128, so a
     myloasm ticket no longer holds an allocation sized for the other assembler. It

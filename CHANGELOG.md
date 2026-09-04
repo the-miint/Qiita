@@ -1726,11 +1726,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `local-host-reference-add` at 8 against a pool of 8 — and whether rype's build
   parallelism derives from that pool has not been probed, so there is no measurement to
   pin an equality to.
-- **The `assemble` 259.3 GiB peak is now recorded as unattributed (#537).** The workflow
-  comment placed it in the hifiasm_meta paragraph and said "a sample in that class", but
-  the figure was recorded with no assembler, no input scale, and no censoring status, and
-  both assemblers were selectable in that window. Whether it bounds the 250 GiB profile or
-  falls outside its population is stated as open, with the query that would settle it.
+- **The `assemble` 259.3 GiB peak is now attributed (#537).** The workflow comment placed
+  it in the hifiasm_meta paragraph and said "a sample in that class", which the recorded
+  figure did not support — it carried no assembler, input scale, or censoring status.
+  Settled against the deploy: every one of the 59 first attempts in that cohort ran under
+  `1.0.0`, whose `assembler` default is hifiasm_meta, and no `1.0.0` work ticket ever
+  recorded myloasm (its first run is 2026-09-02, under `1.0.1`). So the peak is
+  hifiasm_meta's and does bound the 250 GiB profile — the comment now says so, and says
+  what remains unrecoverable: the input scale behind it, whose `sacct` rows are gone.
 - **`_baseline_cpu_every_version`'s docstring credited the wrong site for a guard (#537).**
   It said the caller asserts the result is non-empty; the helper raises on it itself, and
   no caller checked. The behaviour was right and the attribution wrong, which would have
