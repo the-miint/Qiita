@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from pathlib import Path
@@ -17,7 +16,8 @@ from qiita_common.parquet import validate_parquet_path
 
 import qiita_control_plane.runner as _runner_pkg
 
-from ..auth.tickets import sign_action, sign_ticket
+from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
+from ..block_read import READ_MASKED_TABLE
 from ..host_filter_resolver import is_control_sample
 from ..miint import connect_with_miint_staged
 from ..repositories.block import fetch_mask_sample_state
@@ -120,12 +120,10 @@ async def _stage_shard_roster(
     and write `<workspace>/shard_roster.parquet`. Binds `shard_features` (the
     roster path) and `shard_id` so the build steps' `Inputs` resolve.
 
-    Like the other pre-loop resolvers, a Flight failure is wrapped as a
-    SUBMISSION-attributed failure (via `_submission_dp_fetch_failure`: a DuckLake
-    serialization conflict is retriable, everything else BAD_INPUT) so it lands in
-    the outer FAILED handler instead of escaping as an untyped exception (which
-    would violate the step-name CHECK). An empty membership shard is a
-    misconfiguration — fail loud rather than build an empty index."""
+    Like the other pre-loop resolvers, a Flight failure is wrapped by
+    `_submission_dp_fetch_failure` (see it for what wrapping buys and how the
+    cause is classified). An empty membership shard is a misconfiguration — fail
+    loud rather than build an empty index."""
     rows = await pool.fetch(
         "SELECT feature_idx FROM qiita.reference_membership"
         " WHERE reference_idx = $1 AND shard_id = $2",
@@ -138,20 +136,18 @@ async def _stage_shard_roster(
             f"shard {shard_id} of reference {reference_idx} has no member features "
             "(reference_membership.shard_id) — nothing to build"
         )
-    ticket = sign_ticket(
-        table=_REFERENCE_SEQUENCES_TABLE,
-        filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
-        secret=signing_key,
-    )
     workspace.mkdir(parents=True, exist_ok=True)
     roster_path = workspace / "shard_roster.parquet"
     try:
-        await asyncio.get_event_loop().run_in_executor(
-            None,
-            _runner_pkg._do_get_reference_sequences_roster,
-            data_plane_url,
-            ticket,
-            roster_path,
+        await run_signed_flight_call(
+            lambda: sign_ticket(
+                table=_REFERENCE_SEQUENCES_TABLE,
+                filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
+                secret=signing_key,
+            ),
+            lambda ticket: _runner_pkg._do_get_reference_sequences_roster(
+                data_plane_url, ticket, roster_path
+            ),
         )
     except Exception as exc:
         raise _submission_dp_fetch_failure(
@@ -411,19 +407,19 @@ async def _resolve_staged_reads(
     # data plane validates); the data plane writes it.
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "reads.parquet"
-    token = sign_action(
-        action="export_read",
-        payload={"prep_sample_idx": prep_sample_idx, "dest": str(dest)},
-        secret=signing_key,
-    )
-    # A Flight failure (data plane unreachable / errored) is NOT a BackendFailure;
-    # wrap it as a SUBMISSION BAD_INPUT like the other pre-loop resolvers so the
-    # outer handler FAILs the ticket cleanly (step_name=None) rather than letting
-    # an untyped exception strand it in PROCESSING. (Not retried in place: the
-    # operator resubmits if the data plane was down.)
+    # Wrapped by `_submission_dp_fetch_failure` like the other pre-loop resolvers
+    # — see it for what that buys and how the cause is classified. Note what a
+    # retriable classification does NOT do here: a resolver runs before the step
+    # loop, so it never reaches `_run_entry_with_retry` and is never re-run in
+    # place. The label routes the ticket to an operator redrive.
     try:
-        result = await asyncio.get_running_loop().run_in_executor(
-            None, _runner_pkg._do_action_export_read, data_plane_url, token
+        result = await run_signed_flight_call(
+            lambda: sign_action(
+                action="export_read",
+                payload={"prep_sample_idx": prep_sample_idx, "dest": str(dest)},
+                secret=signing_key,
+            ),
+            lambda token: _runner_pkg._do_action_export_read(data_plane_url, token),
         )
     except Exception as exc:
         raise _submission_dp_fetch_failure(
@@ -509,22 +505,21 @@ async def _resolve_staged_masked_reads(
             "completed."
         )
 
-    # The SAME read_masked DoGet ticket the admin masked-read export mints — a
-    # generic ticket scoped to exactly (prep_sample_idx, mask_idx), no bespoke
-    # action or payload type.
-    ticket = sign_ticket(
-        table="read_masked",
-        filter={"prep_sample_idx": [prep_sample_idx], "mask_idx": [mask_idx]},
-        secret=signing_key,
-    )
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "masked_reads.fastq.gz"
-    # Flight failure -> SUBMISSION BAD_INPUT like the other pre-loop resolvers
-    # (step_name=None), so the outer handler FAILs the ticket cleanly rather than
-    # stranding it in PROCESSING. The blocking stream+COPY runs off the event loop.
+    # Flight failure -> wrapped by `_submission_dp_fetch_failure` like the other
+    # pre-loop resolvers. The blocking stream+COPY runs off the event loop. The
+    # ticket is the SAME read_masked DoGet ticket the admin export
+    # mints — a generic ticket scoped to exactly (prep_sample_idx, mask_idx), no
+    # bespoke action or payload type.
     try:
-        count = await asyncio.get_running_loop().run_in_executor(
-            None, _runner_pkg._stream_masked_reads_to_fastq, data_plane_url, ticket, dest
+        count = await run_signed_flight_call(
+            lambda: sign_ticket(
+                table=READ_MASKED_TABLE,
+                filter={"prep_sample_idx": [prep_sample_idx], "mask_idx": [mask_idx]},
+                secret=signing_key,
+            ),
+            lambda ticket: _runner_pkg._stream_masked_reads_to_fastq(data_plane_url, ticket, dest),
         )
     except Exception as exc:
         raise _submission_dp_fetch_failure(

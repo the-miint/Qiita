@@ -1633,6 +1633,65 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Read materialization signed its `export_read` token before the executor hop, so a wide
+  fan-out expired its own tokens (#532).** `_resolve_staged_reads` minted the token and only
+  then handed the Flight call to `run_in_executor(None, ...)`; asyncio's default
+  ThreadPoolExecutor holds `min(32, process_cpu_count() + 4)` threads, so a fan-out wider
+  than that queues, and the wait was spent against the token's own 300 s TTL. A read-mask submission of 56
+  prep_samples across two PacBio pools failed 24 tickets with
+  `FlightUnauthenticatedError: ... ticket expired`, all stamped within the same second as the
+  queue drained onto tokens that had already died. Minting now happens on the worker, through
+  one `run_signed_flight_call` seam applied at **all 15** sites that had this shape — three in
+  `runner/_read_ingest.py` (the `export_read` action, the shard-roster DoGet, the masked-read
+  stream), one in `runner/_reference.py`, and eleven in `actions/library.py`. The read-ingest
+  fan-out is only the path that got wide first; the rest carried the same 300 s exposure. One
+  was worse: `sync_reference_exclusion_data` minted inside a held advisory lock, so lock-wait
+  and queue-wait both burned the TTL — its Flight timeout is preserved through the conversion.
+  The seam lives in `auth/tickets.py`, beside the `DEFAULT_TTL_SECONDS` it exists to protect
+  and below all three minting layers: `runner` imports `actions`, so a home in either would
+  invert that. Not converted: `cli/reference_load.py`'s DoPut ticket is minted by the *server*
+  over HTTP, so there is no local mint to move, and its uploads are sequential (one caller, no
+  `gather`) with nothing to queue behind. The call's own duration was never counted against the TTL either
+  way: the data plane verifies at handler entry, before the export or the stream runs, which
+  is the property `routes/admin.py` already states for its 3600 s export tickets. So the TTL
+  now spans mint to verify and nothing else, and `DEFAULT_TTL_SECONDS` is unchanged — raising
+  it would only move the width at which this reappears. A `ThreadPoolExecutor` subclass that
+  advances a fake `auth.tickets` clock past the TTL on submit pins it without a real wait.
+- **An expired Flight token classified `BAD_INPUT` (#532).** `_is_retriable_dp_error`
+  recognized only a DuckLake serialization conflict and gRPC UNAVAILABLE, so the 24 tickets
+  above landed permanent. The next attempt mints a fresh token, which is the same self-healing
+  test those two already pass, so an expired token now classifies `DATA_PLANE_TRANSIENT`.
+  **Retriable does not mean retried here**, and the `retry_count 0` in the incident was not the
+  classification's doing: every caller is a pre-loop resolver, which runs before the step loop
+  and so never reaches `_run_entry_with_retry` — the two already-retriable causes are not
+  re-run in place either. What the label moves is where the ticket lands.
+  `notify.sweeper`'s owed set is `failure_type IS DISTINCT FROM 'retriable'`, so these are held
+  for an operator redrive rather than reported as a settled outcome; see the
+  `DEPLOY_CHECKLIST.md` note, since an originator whose whole batch fails this way now gets no
+  digest. Whether a pre-loop resolver should retry in place at all is a separate question this
+  does not answer. The match requires the gRPC unauthenticated marker AND the data plane's
+  `ticket expired` text: the class alone is too loose (every `AuthError` variant maps to that
+  one status, and `invalid signature` / `malformed payload` never self-heal), and the text
+  alone is too loose the other way ("ticket" names a work_ticket here too, and "work ticket
+  expired" contains it). Two tests parse the Rust: one pins the `AuthError::Expired` wording,
+  the other that all 14 `auth::verify_*` sites still map to `Status::unauthenticated`. An
+  integration test asserts the string that actually crosses Rust → gRPC → pyarrow carries both
+  markers, with a live-expiry control.
+- **A server-returned gRPC UNAVAILABLE would have classified permanent (#532).** Found probing
+  what pyarrow 23.0.1 renders, which it does two ways: a client-side connect failure gives
+  `Flight returned unavailable error, with message: failed to connect to all addresses…`, while
+  a status the server puts on the wire gives `<message>. Detail: Unavailable. gRPC client debug
+  context: …` with the error class name absent. All three existing
+  `_DP_UNAVAILABLE_SIGNATURES` match only the first form. Adds `detail: unavailable`.
+  **This is defensive, not a fix for an observed failure**: the data plane emits no
+  `Status::unavailable` of its own, and both transport cases reproduced (nothing listening, a
+  server that has gone away) render the connect-shaped form the existing signatures already
+  match — so nothing on this path has been shown to produce the second rendering. It is added
+  because the rendering is real and gRPC defines the status as retriable, so it must not
+  classify permanent on a stringification detail. The same probe is what confirmed the expiry
+  match fires on the string a live client produces rather than only on the fixture shape; both
+  renderings are now pinned, with controls that show each half of that match discriminates.
+
 - **`make test-workflows` ran apptainer on a host without it (#531).** The guard
   `if ! command -v apptainer ...; exit 0; fi` sat on its own recipe line, and `exit 0`
   ends only the line it is on — make moved to the next line and ran `apptainer build`

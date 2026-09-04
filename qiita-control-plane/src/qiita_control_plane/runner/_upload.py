@@ -57,14 +57,46 @@ _DP_SERIALIZATION_SIGNATURE = "could not serialize access due to concurrent upda
 # definition (gRPC's own retriable status): a redrive self-heals once the DP is
 # back, so it must NOT be filed as a permanent bad-input. Matched by message for
 # the same reason as the serialization signature (no typed exception at this
-# layer). Three overlapping substrings so a stringification variant still matches:
-# the pyarrow error CLASS name, its message PREFIX, and gRPC's canonical
-# connect-failure text — any one is sufficient.
+# layer); any one substring is sufficient.
+#
+# pyarrow renders a Flight error TWO ways, and the difference decides which
+# substrings can fire. A client-side failure gives "Flight returned unavailable
+# error, with message: failed to connect to all addresses…" — the first three match
+# that, and it is the form every CP->DP failure reproduced so far takes (nothing
+# listening, and a server that has gone away). A status the server puts on the wire
+# gives "<message>. Detail: Unavailable. gRPC client debug context: …" with the class
+# name absent, which none of the first three match.
+#
+# The fourth signature covers that second form. It is not there for an observed
+# failure: the data plane emits no `Status::unavailable` of its own (grep it), so
+# nothing on this path has been shown to produce that rendering. It is there because
+# the rendering is real — pinned from a live pyarrow client in
+# test_dp_fetch_classifier.py — and a status gRPC defines as retriable must not
+# classify permanent on a stringification detail if anything ever does return it.
 _DP_UNAVAILABLE_SIGNATURES = (
     "flightunavailableerror",
     "flight returned unavailable",
     "failed to connect to all addresses",
+    "detail: unavailable",
 )
+
+# Expired-token signatures, BOTH required. A Flight token carries a TTL
+# (`auth/tickets.py` DEFAULT_TTL_SECONDS) that the data plane checks when the call
+# arrives, so a token that ages out in transit comes back as the data plane's
+# `AuthError::Expired` text under a gRPC unauthenticated status. The next attempt
+# mints a fresh token, so a redrive self-heals it exactly as the two signatures
+# above do.
+#
+# The expiry text alone is too loose — "ticket" names both a Flight ticket and a
+# work_ticket here, and "work ticket expired" contains it. The unauthenticated
+# marker is what makes it a Flight auth failure, and it survives both of pyarrow's
+# renderings: the message-prefix form spells "unauthenticated error", the
+# server-returned form appends "Detail: Unauthenticated". The class name alone is too loose
+# in the other direction: every AuthError variant maps to unauthenticated, and
+# `invalid signature` / `malformed payload` never self-heal. A test parses the data
+# plane's `AuthError` Display impl so a reword there fails rather than silently
+# reverting every expiry to permanent.
+_DP_TICKET_EXPIRED_SIGNATURES = ("unauthenticated", "ticket expired")
 
 
 def _is_dp_serialization_conflict(exc: BaseException) -> bool:
@@ -80,24 +112,47 @@ def _is_dp_unavailable(exc: BaseException) -> bool:
     return any(sig in text for sig in _DP_UNAVAILABLE_SIGNATURES)
 
 
+def _is_dp_ticket_expired(exc: BaseException) -> bool:
+    """True if a data-plane Flight failure is an expired signing token, rather than
+    a permanent auth failure (bad signature, malformed payload) or a bad input."""
+    text = str(exc).lower()
+    return all(sig in text for sig in _DP_TICKET_EXPIRED_SIGNATURES)
+
+
 def _is_retriable_dp_error(exc: BaseException) -> bool:
     """True if a data-plane Flight fetch failed for a transient, retriable reason —
-    a serialization conflict (concurrent DuckLake attach) or the DP being briefly
-    unreachable — either of which a redrive self-heals. Everything else is a
-    permanent bad-input an operator must resolve."""
-    return _is_dp_serialization_conflict(exc) or _is_dp_unavailable(exc)
+    a serialization conflict (concurrent DuckLake attach), the DP being briefly
+    unreachable, or a signing token that expired before the call reached the DP —
+    any of which a redrive self-heals. Everything else is a permanent bad-input an
+    operator must resolve."""
+    return (
+        _is_dp_serialization_conflict(exc) or _is_dp_unavailable(exc) or _is_dp_ticket_expired(exc)
+    )
 
 
 def _submission_dp_fetch_failure(reason: str, exc: BaseException) -> BackendFailure:
     """A SUBMISSION failure for a data-plane Flight fetch (adapters, reads).
 
+    Wrapping buys a clean FAILED transition: a raw pyarrow FlightError reaching
+    `run_workflow`'s bare `except Exception` records stage=STEP_RUN with
+    step_name=None, which violates the work_ticket_failure_step_name_consistent
+    CHECK — the failure transition itself throws and strands the ticket in
+    PROCESSING. Same SUBMISSION/step_name=None shape whatever the cause, so it
+    stays a drop-in for the existing `except` translation.
+
     Classifies by cause: a transient serialization conflict (concurrent DuckLake
-    attach) or a transient DP-unreachable (gRPC UNAVAILABLE) is
-    DATA_PLANE_TRANSIENT (retriable — a redrive self-heals); anything else keeps
-    the BAD_INPUT/permanent shape of `_submission_bad_input` (a genuine bad
-    reference or missing data an operator must resolve). Same SUBMISSION/
-    step_name=None shape either way, so it stays a drop-in for the existing
-    `except` translation in `run_workflow`."""
+    attach), a transient DP-unreachable (gRPC UNAVAILABLE), or an expired signing
+    token is DATA_PLANE_TRANSIENT; anything else keeps the BAD_INPUT/permanent
+    shape of `_submission_bad_input` (a genuine bad reference or missing data an
+    operator must resolve).
+
+    **Retriable here does not mean retried.** Every caller is a pre-loop resolver,
+    which runs before the step loop and so never reaches `_run_entry_with_retry`:
+    nothing re-runs it, and `retry_count` stays 0. What the label changes is where
+    the ticket lands — `notify.sweeper`'s owed set is
+    `failure_type IS DISTINCT FROM 'retriable'`, so a retriable failure is held for
+    an operator redrive instead of reported as a settled outcome in the
+    originator's digest."""
     kind = (
         FailureKind.DATA_PLANE_TRANSIENT if _is_retriable_dp_error(exc) else FailureKind.BAD_INPUT
     )

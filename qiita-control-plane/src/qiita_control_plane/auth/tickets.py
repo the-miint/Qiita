@@ -17,8 +17,10 @@ so a data-plane compromise cannot forge tickets. The version byte lets the wire
 format change without silently misverifying an older ticket.
 """
 
+import asyncio
 import struct
 import time
+from collections.abc import Callable
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -72,6 +74,7 @@ _PROJECTION_COLUMNS: dict[str, frozenset[str]] = {
 TICKET_VERSION = 2
 DEFAULT_TTL_SECONDS = 300
 SIGNATURE_SIZE = 64  # Ed25519
+EXPIRY_SIZE = 8  # uint64, big-endian
 
 
 def _sign_payload(
@@ -105,6 +108,50 @@ def _sign_payload(
     signature = Ed25519PrivateKey.from_private_bytes(secret).sign(signed_input)
 
     return version_byte + payload_len + payload + signature + expiry_bytes
+
+
+def token_expiry(token: bytes) -> int:
+    """The `expiry_epoch` out of a signed token, per the wire format above.
+
+    Resolved forward from the header rather than back from the end, so a token
+    whose `payload_len` disagrees with its actual length raises here instead of
+    returning eight plausible bytes. Exists so a caller asserting a TTL does not
+    re-spell the layout — the format has one definition, at the top of this module.
+    """
+    payload_len = struct.unpack(">I", token[1:5])[0]
+    expiry_start = 1 + 4 + payload_len + SIGNATURE_SIZE
+    expiry = token[expiry_start : expiry_start + EXPIRY_SIZE]
+    if len(expiry) != EXPIRY_SIZE:
+        raise ValueError(
+            f"token is {len(token)} bytes; its payload_len={payload_len} puts the "
+            f"{EXPIRY_SIZE}-byte expiry at {expiry_start}, past the end"
+        )
+    return struct.unpack(">Q", expiry)[0]
+
+
+async def run_signed_flight_call[T](sign: Callable[[], bytes], call: Callable[[bytes], T]) -> T:
+    """Run a blocking data-plane Flight call off the event loop, minting its signed
+    token inside the worker.
+
+    `run_in_executor(None, ...)` submits to asyncio's default ThreadPoolExecutor,
+    which holds `min(32, process_cpu_count() + 4)` threads, so a fan-out wider than
+    that queues — 56 concurrent prep_sample read-mask resolutions left 24 calls
+    waiting. Minting in the worker keeps that queue wait out of the token's TTL
+    (`DEFAULT_TTL_SECONDS` above), which then spans mint -> the data plane's verify
+    and nothing else. The data plane verifies before it does the work, so the call's
+    own duration is under no TTL either (see `routes.admin`, which states that
+    property where it acts on it by minting at the maximum lifetime).
+
+    Lives here rather than beside a caller because `runner`, `actions` and `routes`
+    all mint, and `runner` imports `actions` — a helper in either would invert that.
+
+    Caller precondition: validate whatever `sign` will reject BEFORE entering the
+    `try` that wraps this call. `sign_ticket` raises on a planning bug (empty filter
+    values, a members selector on the wrong table, a missing projection list), and
+    that raise happens on the worker, inside the caller's `except` — where a
+    data-plane error handler will label it as one.
+    """
+    return await asyncio.get_running_loop().run_in_executor(None, lambda: call(sign()))
 
 
 def sign_ticket(

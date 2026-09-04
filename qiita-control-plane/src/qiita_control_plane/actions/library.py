@@ -52,7 +52,7 @@ from qiita_common.models import (
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_sql
 
-from ..auth.tickets import sign_action, sign_ticket
+from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
 from ..miint import duckdb_connect
 from ..repositories.assembly import (
     ASSEMBLY_GENOME_MAP_PAIRS_SQL,
@@ -386,18 +386,19 @@ def _do_action(
     token: bytes,
     timeout_seconds: float | None = None,
 ) -> list:
-    """Synchronous gRPC DoAction against the data plane — runs in a thread
-    executor. Every CP-side DoAction primitive differs only by action name, so
-    they share this one client-open/call/collect body: the single place the
-    Flight client is constructed, hence the single place to add a timeout, TLS,
-    or error mapping later. `action_type` is positional so it forwards cleanly
-    through `run_in_executor(None, _do_action, name, url, token)`.
+    """Synchronous gRPC DoAction against the data plane. Every CP-side DoAction
+    primitive differs only by action name, so they share this one
+    client-open/call/collect body: the single place the Flight client is
+    constructed, hence the single place to add TLS or error mapping later.
 
-    `timeout_seconds` (optional, 4th positional so existing callers are
-    unaffected) bounds the Flight call: a hung-but-reachable data plane raises
-    FlightTimedOutError (a FlightError subclass) instead of blocking forever. The
-    exclusion sync passes it because it makes the untimed call load-bearing under
-    a global advisory lock — see sync_reference_exclusion_data."""
+    Blocking, so callers reach it off the event loop through
+    `auth.tickets.run_signed_flight_call`, which also mints the token on the
+    worker rather than before the hop.
+
+    `timeout_seconds` bounds the Flight call: a hung-but-reachable data plane
+    raises FlightTimedOutError (a FlightError subclass) instead of blocking
+    forever. The exclusion sync passes it because it makes the call load-bearing
+    under a global advisory lock — see sync_reference_exclusion_data."""
     options = (
         _flight.FlightCallOptions(timeout=timeout_seconds) if timeout_seconds is not None else None
     )
@@ -1418,13 +1419,13 @@ async def plan_shards(
 
     await export_member_genome(pool, reference_idx, member_parquet)
 
-    ticket = sign_ticket(
-        table=_REFERENCE_TAXONOMY_TABLE,
-        filter={"reference_idx": [reference_idx]},
-        secret=signing_key,
-    )
-    await asyncio.get_event_loop().run_in_executor(
-        None, _do_get_reference_taxonomy, data_plane_url, ticket, taxonomy_parquet
+    await run_signed_flight_call(
+        lambda: sign_ticket(
+            table=_REFERENCE_TAXONOMY_TABLE,
+            filter={"reference_idx": [reference_idx]},
+            secret=signing_key,
+        ),
+        lambda ticket: _do_get_reference_taxonomy(data_plane_url, ticket, taxonomy_parquet),
     )
 
     # Validate the inlined read paths (fail-fast escaping contract), consistent
@@ -1968,17 +1969,17 @@ async def register_files(
 
     Raises pyarrow.flight.FlightError on transport / data-plane failure.
     """
-    token = sign_action(
-        action="register_files",
-        payload={
-            "staging_dir": staging_dir,
-            "files": files,
-            "work_ticket_idx": work_ticket_idx,
-        },
-        secret=signing_key,
-    )
-    results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action, "register_files", data_plane_url, token
+    results = await run_signed_flight_call(
+        lambda: sign_action(
+            action="register_files",
+            payload={
+                "staging_dir": staging_dir,
+                "files": files,
+                "work_ticket_idx": work_ticket_idx,
+            },
+            secret=signing_key,
+        ),
+        lambda token: _do_action("register_files", data_plane_url, token),
     )
     if not results:
         return []
@@ -2008,13 +2009,13 @@ async def delete_reference_data(
 
     Idempotent: a reference whose data never loaded deletes zero rows. Raises
     pyarrow.flight.FlightError on transport / data-plane failure."""
-    token = sign_action(
-        action="delete_reference",
-        payload={"reference_idx": reference_idx},
-        secret=signing_key,
-    )
-    results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action, "delete_reference", data_plane_url, token
+    results = await run_signed_flight_call(
+        lambda: sign_action(
+            action="delete_reference",
+            payload={"reference_idx": reference_idx},
+            secret=signing_key,
+        ),
+        lambda token: _do_action("delete_reference", data_plane_url, token),
     )
     if not results:
         return {}
@@ -2041,13 +2042,13 @@ async def delete_pool_reads_data(
     pyarrow.flight.FlightError on transport / data-plane failure."""
     if not prep_sample_idxs:
         return {}
-    token = sign_action(
-        action="delete_pool_reads",
-        payload={"prep_sample_idxs": prep_sample_idxs},
-        secret=signing_key,
-    )
-    results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action, "delete_pool_reads", data_plane_url, token
+    results = await run_signed_flight_call(
+        lambda: sign_action(
+            action="delete_pool_reads",
+            payload={"prep_sample_idxs": prep_sample_idxs},
+            secret=signing_key,
+        ),
+        lambda token: _do_action("delete_pool_reads", data_plane_url, token),
     )
     if not results:
         return {}
@@ -2070,13 +2071,13 @@ async def delete_mask_data(
     Idempotent: a mask whose rows never registered (or were already deleted)
     deletes zero rows and still succeeds. Raises pyarrow.flight.FlightError on
     transport / data-plane failure."""
-    token = sign_action(
-        action="delete_mask",
-        payload={"mask_idx": mask_idx},
-        secret=signing_key,
-    )
-    results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action, "delete_mask", data_plane_url, token
+    results = await run_signed_flight_call(
+        lambda: sign_action(
+            action="delete_mask",
+            payload={"mask_idx": mask_idx},
+            secret=signing_key,
+        ),
+        lambda token: _do_action("delete_mask", data_plane_url, token),
     )
     if not results:
         return 0
@@ -2168,22 +2169,22 @@ async def sync_reference_exclusion_data(
         finally:
             writer.close()
 
-        token = sign_action(
-            action="sync_reference_exclusion",
-            payload={"dest": str(dest)},
-            secret=signing_key,
-        )
         # Held under the lock so the data plane's DELETE+INSERT commits in
         # lock-acquisition order (no stale snapshot can win the last write).
         # Bounded by a Flight timeout so a hung DP releases the lock instead of
         # wedging every subsequent sync.
-        results = await asyncio.get_event_loop().run_in_executor(
-            None,
-            _do_action,
-            "sync_reference_exclusion",
-            data_plane_url,
-            token,
-            _EXCLUSION_SYNC_DO_ACTION_TIMEOUT_S,
+        results = await run_signed_flight_call(
+            lambda: sign_action(
+                action="sync_reference_exclusion",
+                payload={"dest": str(dest)},
+                secret=signing_key,
+            ),
+            lambda token: _do_action(
+                "sync_reference_exclusion",
+                data_plane_url,
+                token,
+                _EXCLUSION_SYNC_DO_ACTION_TIMEOUT_S,
+            ),
         )
     if not results:
         return 0
@@ -2266,13 +2267,13 @@ async def mask_metrics_data(
     PERSISTED table because a block-masked sample's rows are written by several
     blocks. Raises pyarrow.flight.FlightError on transport / data-plane failure,
     RuntimeError on an empty result."""
-    token = sign_action(
-        action="mask_metrics",
-        payload={"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx},
-        secret=signing_key,
-    )
-    results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action, "mask_metrics", data_plane_url, token
+    results = await run_signed_flight_call(
+        lambda: sign_action(
+            action="mask_metrics",
+            payload={"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx},
+            secret=signing_key,
+        ),
+        lambda token: _do_action("mask_metrics", data_plane_url, token),
     )
     if not results:
         raise RuntimeError("mask_metrics DoAction returned no result")
@@ -2302,13 +2303,13 @@ async def delete_read_mask_block_data(
     pyarrow.flight.FlightError on transport / data-plane failure."""
     if not members:
         return 0
-    token = sign_action(
-        action="delete_read_mask_block",
-        payload={"mask_idx": mask_idx, "members": members},
-        secret=signing_key,
-    )
-    results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action, "delete_read_mask_block", data_plane_url, token
+    results = await run_signed_flight_call(
+        lambda: sign_action(
+            action="delete_read_mask_block",
+            payload={"mask_idx": mask_idx, "members": members},
+            secret=signing_key,
+        ),
+        lambda token: _do_action("delete_read_mask_block", data_plane_url, token),
     )
     if not results:
         return 0
@@ -2340,13 +2341,13 @@ async def delete_alignment_block_data(
     pyarrow.flight.FlightError on transport / data-plane failure."""
     if not members:
         return 0
-    token = sign_action(
-        action="delete_alignment_block",
-        payload={"alignment_idx": alignment_idx, "members": members},
-        secret=signing_key,
-    )
-    results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action, "delete_alignment_block", data_plane_url, token
+    results = await run_signed_flight_call(
+        lambda: sign_action(
+            action="delete_alignment_block",
+            payload={"alignment_idx": alignment_idx, "members": members},
+            secret=signing_key,
+        ),
+        lambda token: _do_action("delete_alignment_block", data_plane_url, token),
     )
     if not results:
         return 0
@@ -2369,13 +2370,13 @@ async def delete_alignment_sample_data(
     the block or the whole alignment, is on the Rust `delete_alignment_sample`.
     Idempotent: a fresh sample (no rows yet) deletes 0 and still succeeds. Raises
     pyarrow.flight.FlightError on transport / data-plane failure."""
-    token = sign_action(
-        action="delete_alignment_sample",
-        payload={"alignment_idx": alignment_idx, "prep_sample_idx": prep_sample_idx},
-        secret=signing_key,
-    )
-    results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action, "delete_alignment_sample", data_plane_url, token
+    results = await run_signed_flight_call(
+        lambda: sign_action(
+            action="delete_alignment_sample",
+            payload={"alignment_idx": alignment_idx, "prep_sample_idx": prep_sample_idx},
+            secret=signing_key,
+        ),
+        lambda token: _do_action("delete_alignment_sample", data_plane_url, token),
     )
     if not results:
         return 0
@@ -2399,13 +2400,13 @@ async def delete_alignment_data(
     `delete_mask`). Idempotent: an alignment whose rows never registered (or were
     already deleted) deletes zero rows and still succeeds. Raises
     pyarrow.flight.FlightError on transport / data-plane failure."""
-    token = sign_action(
-        action="delete_alignment",
-        payload={"alignment_idx": alignment_idx},
-        secret=signing_key,
-    )
-    results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action, "delete_alignment", data_plane_url, token
+    results = await run_signed_flight_call(
+        lambda: sign_action(
+            action="delete_alignment",
+            payload={"alignment_idx": alignment_idx},
+            secret=signing_key,
+        ),
+        lambda token: _do_action("delete_alignment", data_plane_url, token),
     )
     if not results:
         return 0

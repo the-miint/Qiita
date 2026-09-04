@@ -10,6 +10,8 @@ import time
 
 import pytest
 
+from qiita_control_plane.auth.tickets import token_expiry
+
 # A valid 32-byte Ed25519 private seed for tests.
 _TEST_SEED = b"\x01" * 32
 
@@ -83,10 +85,7 @@ def test_sign_doput_default_expiry_in_future():
     from qiita_control_plane.auth.tickets import sign_doput
 
     ticket = sign_doput(upload_idx=1, secret=_TEST_SEED)
-    payload_len = struct.unpack(">I", ticket[1:5])[0]
-    expiry_start = 1 + 4 + payload_len + 64
-    expiry = struct.unpack(">Q", ticket[expiry_start : expiry_start + 8])[0]
-    assert expiry > time.time()
+    assert token_expiry(ticket) > time.time()
 
 
 def test_sign_doput_rejects_nonpositive_ttl():
