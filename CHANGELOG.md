@@ -1650,11 +1650,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   (#531).** The workflow-param pin helper read `baseline_resources["cpu"]`, which exists
   only on the flat population, so a pin newly placed on a lookup step would get
   `KeyError: 'cpu'`, naming neither the workflow nor the step. Every pin sits on a flat
-  step today, so this had not fired. It now contributes one entry per profile, so the pin
-  covers a lookup instead of failing on it — every profile is an allocation the step really
-  runs at, so each has to satisfy the same pin. A test reads both populations out of
-  `long-read-assembly` (1.0.0's `assemble` is flat, 1.0.1's is the per-assembler lookup),
-  which is what keeps the branch exercised while every pin still sits on a flat step.
+  step today, so this had not fired. It now resolves through
+  `ActionDefinition._labelled_baselines()` — the model the runner dispatches on, which
+  already emits one pair for a flat population and one per profile for a lookup — rather
+  than carrying a second copy of that rule here, free to drift from it. A test reads both
+  populations out of `long-read-assembly` (1.0.0's `assemble` is flat, 1.0.1's is the
+  per-assembler lookup), which keeps the lookup branch exercised while every pin still sits
+  on a flat step. The helper's own duplicate-step assertion went with the rewrite:
+  `ActionDefinition` rejects duplicate step names itself, so it was unreachable.
 - **Stale comments corrected (#531).** `build_minimap2_index.plan()` said it mirrors
   `build_rype_index.plan()`, which does not exist — the mutual reference is with
   `build_bowtie2_index.plan()`, which points back at it. `shard_planner` called the
@@ -1668,15 +1671,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   profile per instrument family", which `long-read-assembly` 1.0.1 contradicts — its
   profiles are per assembler — so it now names the mechanism instead of one workflow's
   key.
-- **Development-plan vocabulary removed from comments (#531).** "A4" (ten sites across
-  `actions.py`, `bcl-convert/1.0.0.yaml`, `bcl_convert_prep.py`, `entrypoint.sh`,
+- **Development-plan vocabulary removed from comments (#531).** "A4" (nine sites across
+  `actions.py`, `bcl-convert/1.0.0.yaml`, `bcl_convert_prep.py`,
   `sequencer_types.yml`, `test_runner_baseline.py` and `test_actions_loader.py`), "Phase 5"
   (`step_progress.py`, `slurm.py`) and "Phase 2" (`test_qc_miint_contract.py`) name
   planning documents that are not in the repo, which CLAUDE.md forbids — including in test
   docstrings, which that rule names explicitly. The surrounding words already carried the
   meaning. The `Phase 1` / `Phase 2` comments in `_feature_load.py`, `align_sharded.py` and
   `test_align_sharded.py` are left alone: they number the stages of an algorithm, not a
-  milestone.
+  milestone. The tenth site, `bcl-convert/entrypoint.sh`, is left for a different reason:
+  it is a SIF build input (`qiita_sif_build_inputs_hash`), so editing the comment would
+  change the build hash and rebuild that image on the next deploy.
 
 - **A paired-end read submission can no longer cross routes (#484).** The exactly-one
   constraint on `fastq-to-parquet` was per key, not per family: it stopped the forward read

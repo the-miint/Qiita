@@ -20,7 +20,7 @@ from typing import get_args
 
 import pytest
 import yaml
-from qiita_common.actions import NATIVE_MODULE_PREFIX
+from qiita_common.actions import NATIVE_MODULE_PREFIX, ActionDefinition
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WORKFLOWS_DIR = _REPO_ROOT / "workflows"
@@ -53,35 +53,33 @@ def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[str, int
 
     A version that does not declare `step` at all contributes nothing rather than
     failing — dropping a step between versions is a legitimate shape change, and
-    there is no cpu to pin on a step that is not there. More than one instance in
-    a single file IS an error: the pin would then silently cover whichever came
-    first. The caller asserts the result is non-empty, so no workflow can lose its
-    pin entirely by having every version drop the step.
+    there is no cpu to pin on a step that is not there. The caller asserts the
+    result is non-empty, so no workflow can lose its pin entirely by having every
+    version drop the step. Two steps sharing a name — which would make the pin
+    silently cover whichever came first — is rejected by `ActionDefinition`
+    itself ("duplicate step name(s)"), so nothing is re-checked here.
 
-    Handles both `baseline_resources` populations. A flat one contributes its one
-    `cpu`; a `profiles:` lookup contributes one entry per profile, because every
-    profile is an allocation the step really runs at and each has to satisfy the
-    caller's pin. Reading `["cpu"]` off a lookup instead would raise a bare
-    `KeyError` naming neither the workflow nor the step.
+    Both `baseline_resources` populations resolve through
+    `ActionDefinition._labelled_baselines()` rather than being re-read out of the
+    raw YAML dict. That method already decides what each population means — a flat
+    one contributes a single pair under the step's name, a `profiles:` lookup one
+    pair per profile labelled ``name[profile]`` — and it is the model the runner
+    dispatches on. A second copy of that rule here would be free to drift from it,
+    and reading `["cpu"]` directly (which is what this did) raises a bare
+    `KeyError` on a lookup, naming neither the workflow nor the step.
     """
     yaml_paths = sorted(_WORKFLOWS_DIR.glob(f"{workflow}/*.yaml"))
     assert yaml_paths, f"no workflow YAML under workflows/{workflow}/"
     found: list[tuple[str, int]] = []
     for yaml_path in yaml_paths:
-        data = yaml.safe_load(yaml_path.read_text())
-        steps = [e for e in data["steps"] if e.get("step") == step]
-        assert len(steps) <= 1, (
-            f"{yaml_path.relative_to(_REPO_ROOT)}: expected at most one {step} step, "
-            f"got {len(steps)}"
-        )
-        if steps:
-            where = str(yaml_path.relative_to(_REPO_ROOT))
-            baseline = steps[0]["baseline_resources"]
-            if "profiles" in baseline:
-                for key, profile in baseline["profiles"].items():
-                    found.append((f"{where} profile {key!r}", profile["cpu"]))
-            else:
-                found.append((where, baseline["cpu"]))
+        action = ActionDefinition.model_validate(yaml.safe_load(yaml_path.read_text()))
+        pairs = [
+            (label, flat)
+            for label, flat in action._labelled_baselines()
+            if label == step or label.startswith(f"{step}[")
+        ]
+        where = str(yaml_path.relative_to(_REPO_ROOT))
+        found.extend((f"{where} {label}", flat.cpu) for label, flat in pairs)
     assert found, (
         f"no version under workflows/{workflow}/ declares a {step} step, so this pin covers nothing"
     )
@@ -104,8 +102,8 @@ def test_baseline_cpu_helper_reads_both_resource_populations():
     this fail for an unrelated reason the day that format changes.
     """
     entries = _baseline_cpu_every_version("long-read-assembly", "assemble")
-    flat = [(where, cpu) for where, cpu in entries if " profile " not in where]
-    profiles = [(where, cpu) for where, cpu in entries if " profile " in where]
+    flat = [(where, cpu) for where, cpu in entries if "[" not in where]
+    profiles = [(where, cpu) for where, cpu in entries if "[" in where]
 
     assert flat, f"expected 1.0.0's flat assemble to contribute one entry, got {entries}"
     assert len(profiles) >= 2, (
