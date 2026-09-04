@@ -22,6 +22,7 @@ from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 from qiita_control_plane.auth import tickets
+from qiita_control_plane.auth.tickets import run_signed_flight_call
 from qiita_control_plane.runner import (
     SAMPLE_MAP_BINDING,
     STAGED_MASKED_READS_BINDING,
@@ -29,7 +30,6 @@ from qiita_control_plane.runner import (
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
-    _run_signed_flight_call,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
@@ -454,7 +454,7 @@ def test_run_signed_flight_call_signs_after_the_queue_wait(monkeypatch):
         _with_delayed_executor(
             clock,
             queue_wait,
-            lambda: _run_signed_flight_call(_sign, lambda t: t),
+            lambda: run_signed_flight_call(_sign, lambda t: t),
         )
     )
     assert _token_expiry(token) == int(submitted_at + queue_wait) + tickets.DEFAULT_TTL_SECONDS

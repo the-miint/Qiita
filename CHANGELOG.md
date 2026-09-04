@@ -1641,12 +1641,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   prep_samples across two PacBio pools failed 24 tickets with
   `FlightUnauthenticatedError: ... ticket expired`, all stamped within the same second as the
   queue drained onto tokens that had already died. Minting now happens on the worker, through
-  one `_run_signed_flight_call` seam in `runner/_base.py`, applied to the three data-plane
-  calls in `runner/_read_ingest.py` that had this shape — the `export_read` action, the
-  shard-roster DoGet, and the masked-read stream. Twelve further mint-then-hop sites
-  (`runner/_reference.py`, `actions/library.py`) carry the same exposure and are left to a
-  follow-up; the seam lives in `_base.py` rather than the read-ingest module so they can adopt
-  it without importing one. The call's own duration was never under the TTL either
+  one `run_signed_flight_call` seam applied at **all 15** sites that had this shape — three in
+  `runner/_read_ingest.py` (the `export_read` action, the shard-roster DoGet, the masked-read
+  stream), one in `runner/_reference.py`, and eleven in `actions/library.py`. The read-ingest
+  fan-out is only the path that got wide first; the rest carried the same 300 s exposure. One
+  was worse: `sync_reference_exclusion_data` minted inside a held advisory lock, so lock-wait
+  and queue-wait both burned the TTL — its Flight timeout is preserved through the conversion.
+  The seam lives in `auth/tickets.py`, beside the `DEFAULT_TTL_SECONDS` it exists to protect
+  and below all three minting layers: `runner` imports `actions`, so a home in either would
+  invert that. Not converted: `cli/reference_load.py`'s DoPut ticket is minted by the *server*
+  over HTTP, so there is no local mint to move, and its uploads are sequential (one caller, no
+  `gather`) with nothing to queue behind. The call's own duration was never under the TTL either
   way: the data plane verifies at handler entry, before the export or the stream runs, which
   is the property `routes/admin.py` already states for its 3600 s export tickets. So the TTL
   now spans mint to verify and nothing else, and `DEFAULT_TTL_SECONDS` is unchanged — raising

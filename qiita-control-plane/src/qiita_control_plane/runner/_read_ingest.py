@@ -16,12 +16,11 @@ from qiita_common.parquet import validate_parquet_path
 
 import qiita_control_plane.runner as _runner_pkg
 
-from ..auth.tickets import sign_action, sign_ticket
+from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
 from ..host_filter_resolver import is_control_sample
 from ..miint import connect_with_miint_staged
 from ..repositories.block import fetch_mask_sample_state
 from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
-from ._base import _run_signed_flight_call
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
 _log = logging.getLogger(__name__)
@@ -141,7 +140,7 @@ async def _stage_shard_roster(
     workspace.mkdir(parents=True, exist_ok=True)
     roster_path = workspace / "shard_roster.parquet"
     try:
-        await _run_signed_flight_call(
+        await run_signed_flight_call(
             lambda: sign_ticket(
                 table=_REFERENCE_SEQUENCES_TABLE,
                 filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
@@ -414,7 +413,7 @@ async def _resolve_staged_reads(
     # cleanly (step_name=None) rather than letting an untyped exception strand it
     # in PROCESSING. `_submission_dp_fetch_failure` decides permanent vs retriable.
     try:
-        result = await _run_signed_flight_call(
+        result = await run_signed_flight_call(
             lambda: sign_action(
                 action="export_read",
                 payload={"prep_sample_idx": prep_sample_idx, "dest": str(dest)},
@@ -515,7 +514,7 @@ async def _resolve_staged_masked_reads(
     # mints — a generic ticket scoped to exactly (prep_sample_idx, mask_idx), no
     # bespoke action or payload type.
     try:
-        count = await _run_signed_flight_call(
+        count = await run_signed_flight_call(
             lambda: sign_ticket(
                 table="read_masked",
                 filter={"prep_sample_idx": [prep_sample_idx], "mask_idx": [mask_idx]},

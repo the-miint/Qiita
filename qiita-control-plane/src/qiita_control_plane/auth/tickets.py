@@ -17,8 +17,10 @@ so a data-plane compromise cannot forge tickets. The version byte lets the wire
 format change without silently misverifying an older ticket.
 """
 
+import asyncio
 import struct
 import time
+from collections.abc import Callable
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -105,6 +107,25 @@ def _sign_payload(
     signature = Ed25519PrivateKey.from_private_bytes(secret).sign(signed_input)
 
     return version_byte + payload_len + payload + signature + expiry_bytes
+
+
+async def run_signed_flight_call[T](sign: Callable[[], bytes], call: Callable[[bytes], T]) -> T:
+    """Run a blocking data-plane Flight call off the event loop, minting its signed
+    token inside the worker.
+
+    `run_in_executor(None, ...)` submits to asyncio's default ThreadPoolExecutor,
+    which holds `min(32, process_cpu_count() + 4)` threads, so a fan-out wider than
+    that queues — 56 concurrent prep_sample read-mask resolutions left 24 calls
+    waiting. Minting in the worker keeps that queue wait out of the token's TTL
+    (`DEFAULT_TTL_SECONDS` above), which then spans mint -> the data plane's verify
+    and nothing else. The data plane verifies before it does the work, so the call's
+    own duration is under no TTL either (see `routes.admin`, which states that
+    property where it acts on it by minting at the maximum lifetime).
+
+    Lives here rather than beside a caller because `runner`, `actions` and `routes`
+    all mint, and `runner` imports `actions` — a helper in either would invert that.
+    """
+    return await asyncio.get_running_loop().run_in_executor(None, lambda: call(sign()))
 
 
 def sign_ticket(
