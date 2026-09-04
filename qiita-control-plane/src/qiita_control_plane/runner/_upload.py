@@ -66,6 +66,16 @@ _DP_UNAVAILABLE_SIGNATURES = (
     "failed to connect to all addresses",
 )
 
+# Expired-token signature. A Flight token carries a TTL (`auth/tickets.py`
+# DEFAULT_TTL_SECONDS) that the data plane checks when the call arrives, so a
+# token that ages out between minting and arrival comes back as this text. The
+# next attempt mints a fresh token, so a redrive self-heals it exactly as the two
+# signatures above do. Matched on the expiry text alone and NOT on the
+# FlightUnauthenticatedError class name: the data plane returns that same gRPC
+# status for `invalid signature` and `malformed payload` (every AuthError variant
+# maps to unauthenticated), neither of which a redrive fixes.
+_DP_TICKET_EXPIRED_SIGNATURE = "ticket expired"
+
 
 def _is_dp_serialization_conflict(exc: BaseException) -> bool:
     """True if a data-plane Flight failure is a transient, retriable serialization
@@ -80,20 +90,29 @@ def _is_dp_unavailable(exc: BaseException) -> bool:
     return any(sig in text for sig in _DP_UNAVAILABLE_SIGNATURES)
 
 
+def _is_dp_ticket_expired(exc: BaseException) -> bool:
+    """True if a data-plane Flight failure is an expired signing token, rather than
+    a permanent auth failure (bad signature, malformed payload) or a bad input."""
+    return _DP_TICKET_EXPIRED_SIGNATURE in str(exc).lower()
+
+
 def _is_retriable_dp_error(exc: BaseException) -> bool:
     """True if a data-plane Flight fetch failed for a transient, retriable reason —
-    a serialization conflict (concurrent DuckLake attach) or the DP being briefly
-    unreachable — either of which a redrive self-heals. Everything else is a
-    permanent bad-input an operator must resolve."""
-    return _is_dp_serialization_conflict(exc) or _is_dp_unavailable(exc)
+    a serialization conflict (concurrent DuckLake attach), the DP being briefly
+    unreachable, or a signing token that expired before the call reached the DP —
+    any of which a redrive self-heals. Everything else is a permanent bad-input an
+    operator must resolve."""
+    return (
+        _is_dp_serialization_conflict(exc) or _is_dp_unavailable(exc) or _is_dp_ticket_expired(exc)
+    )
 
 
 def _submission_dp_fetch_failure(reason: str, exc: BaseException) -> BackendFailure:
     """A SUBMISSION failure for a data-plane Flight fetch (adapters, reads).
 
     Classifies by cause: a transient serialization conflict (concurrent DuckLake
-    attach) or a transient DP-unreachable (gRPC UNAVAILABLE) is
-    DATA_PLANE_TRANSIENT (retriable — a redrive self-heals); anything else keeps
+    attach), a transient DP-unreachable (gRPC UNAVAILABLE), or an expired signing
+    token is DATA_PLANE_TRANSIENT (retriable — a redrive self-heals); anything else keeps
     the BAD_INPUT/permanent shape of `_submission_bad_input` (a genuine bad
     reference or missing data an operator must resolve). Same SUBMISSION/
     step_name=None shape either way, so it stays a drop-in for the existing

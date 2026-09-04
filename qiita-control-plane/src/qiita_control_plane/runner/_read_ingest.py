@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +81,24 @@ ROUTER_PENDING_BINDING = "router_pending"
 SHARD_MAPPING_BINDING = "shard_mapping"
 
 
+async def _run_signed_flight_call[T](sign: Callable[[], bytes], call: Callable[[bytes], T]) -> T:
+    """Run a blocking data-plane Flight call off the event loop, minting its signed
+    token inside the worker.
+
+    `run_in_executor(None, ...)` submits to asyncio's default ThreadPoolExecutor,
+    which holds `min(32, process_cpu_count() + 4)` threads, so a fan-out wider than
+    that queues. Minting in the worker keeps that queue wait out of the token's TTL
+    (`auth.tickets.DEFAULT_TTL_SECONDS`), which then spans mint -> the data plane's
+    verify and nothing else. A 56-sample read-mask submission put 24 calls behind the
+    32 in flight; tokens minted ahead of the hop arrived already expired ("ticket
+    expired").
+
+    The call's own duration is under no TTL either way — the data plane verifies at
+    handler entry, before the export or the stream runs (`flight_service.rs`), the
+    same property `routes/admin.py` states for its export tickets."""
+    return await asyncio.get_running_loop().run_in_executor(None, lambda: call(sign()))
+
+
 def _do_get_reference_sequences_roster(
     data_plane_url: str, ticket_bytes: bytes, out_path: Path
 ) -> int:
@@ -138,20 +157,18 @@ async def _stage_shard_roster(
             f"shard {shard_id} of reference {reference_idx} has no member features "
             "(reference_membership.shard_id) — nothing to build"
         )
-    ticket = sign_ticket(
-        table=_REFERENCE_SEQUENCES_TABLE,
-        filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
-        secret=signing_key,
-    )
     workspace.mkdir(parents=True, exist_ok=True)
     roster_path = workspace / "shard_roster.parquet"
     try:
-        await asyncio.get_event_loop().run_in_executor(
-            None,
-            _runner_pkg._do_get_reference_sequences_roster,
-            data_plane_url,
-            ticket,
-            roster_path,
+        await _run_signed_flight_call(
+            lambda: sign_ticket(
+                table=_REFERENCE_SEQUENCES_TABLE,
+                filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
+                secret=signing_key,
+            ),
+            lambda ticket: _runner_pkg._do_get_reference_sequences_roster(
+                data_plane_url, ticket, roster_path
+            ),
         )
     except Exception as exc:
         raise _submission_dp_fetch_failure(
@@ -411,19 +428,19 @@ async def _resolve_staged_reads(
     # data plane validates); the data plane writes it.
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "reads.parquet"
-    token = sign_action(
-        action="export_read",
-        payload={"prep_sample_idx": prep_sample_idx, "dest": str(dest)},
-        secret=signing_key,
-    )
     # A Flight failure (data plane unreachable / errored) is NOT a BackendFailure;
     # wrap it as a SUBMISSION BAD_INPUT like the other pre-loop resolvers so the
     # outer handler FAILs the ticket cleanly (step_name=None) rather than letting
-    # an untyped exception strand it in PROCESSING. (Not retried in place: the
-    # operator resubmits if the data plane was down.)
+    # an untyped exception strand it in PROCESSING. `_submission_dp_fetch_failure`
+    # decides which causes are retriable rather than permanent.
     try:
-        result = await asyncio.get_running_loop().run_in_executor(
-            None, _runner_pkg._do_action_export_read, data_plane_url, token
+        result = await _run_signed_flight_call(
+            lambda: sign_action(
+                action="export_read",
+                payload={"prep_sample_idx": prep_sample_idx, "dest": str(dest)},
+                secret=signing_key,
+            ),
+            lambda token: _runner_pkg._do_action_export_read(data_plane_url, token),
         )
     except Exception as exc:
         raise _submission_dp_fetch_failure(
@@ -509,22 +526,22 @@ async def _resolve_staged_masked_reads(
             "completed."
         )
 
-    # The SAME read_masked DoGet ticket the admin masked-read export mints — a
-    # generic ticket scoped to exactly (prep_sample_idx, mask_idx), no bespoke
-    # action or payload type.
-    ticket = sign_ticket(
-        table="read_masked",
-        filter={"prep_sample_idx": [prep_sample_idx], "mask_idx": [mask_idx]},
-        secret=signing_key,
-    )
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "masked_reads.fastq.gz"
     # Flight failure -> SUBMISSION BAD_INPUT like the other pre-loop resolvers
     # (step_name=None), so the outer handler FAILs the ticket cleanly rather than
     # stranding it in PROCESSING. The blocking stream+COPY runs off the event loop.
+    # The ticket is the SAME read_masked DoGet ticket the admin masked-read export
+    # mints — a generic ticket scoped to exactly (prep_sample_idx, mask_idx), no
+    # bespoke action or payload type.
     try:
-        count = await asyncio.get_running_loop().run_in_executor(
-            None, _runner_pkg._stream_masked_reads_to_fastq, data_plane_url, ticket, dest
+        count = await _run_signed_flight_call(
+            lambda: sign_ticket(
+                table="read_masked",
+                filter={"prep_sample_idx": [prep_sample_idx], "mask_idx": [mask_idx]},
+                secret=signing_key,
+            ),
+            lambda ticket: _runner_pkg._stream_masked_reads_to_fastq(data_plane_url, ticket, dest),
         )
     except Exception as exc:
         raise _submission_dp_fetch_failure(

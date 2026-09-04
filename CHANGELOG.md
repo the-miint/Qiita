@@ -1633,6 +1633,31 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Read materialization signed its `export_read` token before the executor hop, so a wide
+  fan-out expired its own tokens (#532).** `_resolve_staged_reads` minted the token and only
+  then handed the Flight call to `run_in_executor(None, ...)`; asyncio's default
+  ThreadPoolExecutor holds `min(32, process_cpu_count() + 4)` threads, so a fan-out wider
+  than that queues, and the wait was spent against the token's own 300 s TTL. A 56-sample
+  read-mask submission across two PacBio pools failed 24 tickets with
+  `FlightUnauthenticatedError: ... ticket expired`, all stamped within the same second as the
+  queue drained onto tokens that had already died. Minting now happens on the worker, through
+  one `_run_signed_flight_call` seam shared by the three data-plane calls in
+  `runner/_read_ingest.py` that had this shape — the `export_read` action, the shard-roster
+  DoGet, and the masked-read stream. The call's own duration was never under the TTL either
+  way: the data plane verifies at handler entry, before the export or the stream runs, which
+  is the property `routes/admin.py` already states for its 3600 s export tickets. So the TTL
+  now spans mint to verify and nothing else, and `DEFAULT_TTL_SECONDS` is unchanged — raising
+  it would only move the width at which this reappears. A `ThreadPoolExecutor` subclass that
+  advances a fake `auth.tickets` clock past the TTL on submit pins it without a real wait.
+- **An expired Flight token classified `BAD_INPUT`, so every ticket it failed needed a hand
+  redrive (#532).** `_is_retriable_dp_error` recognized only a DuckLake serialization conflict
+  and gRPC UNAVAILABLE, so the 24 tickets above landed permanent at `retry_count 0` against
+  `max_retries 3`. The next attempt mints a fresh token, which is the same self-healing test
+  those two already pass, so an expired token now classifies `DATA_PLANE_TRANSIENT`. Matched
+  on the data plane's `ticket expired` text and not on the `FlightUnauthenticatedError` class:
+  every `AuthError` variant maps to that one gRPC status, and `invalid signature` /
+  `malformed payload` never self-heal.
+
 - **`make test-workflows` ran apptainer on a host without it (#531).** The guard
   `if ! command -v apptainer ...; exit 0; fi` sat on its own recipe line, and `exit 0`
   ends only the line it is on — make moved to the next line and ran `apptainer build`

@@ -12,6 +12,8 @@ read-storage-from-masking split added:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import struct
 from types import SimpleNamespace
 
 import duckdb
@@ -19,6 +21,7 @@ import pytest
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
+from qiita_control_plane.auth import tickets
 from qiita_control_plane.runner import (
     SAMPLE_MAP_BINDING,
     STAGED_MASKED_READS_BINDING,
@@ -30,6 +33,7 @@ from qiita_control_plane.runner import (
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
 )
+from qiita_control_plane.runner._read_ingest import _run_signed_flight_call
 
 
 def _step(**kw) -> SimpleNamespace:
@@ -381,3 +385,117 @@ def test_block_read_resolvers_are_gone():
         "_write_empty_reads_parquet",
     ):
         assert not hasattr(runner, name), f"{name} should have been removed"
+
+
+# =============================================================================
+# Token minting happens inside the executor worker
+# =============================================================================
+#
+# `auth.tickets` reads the wall clock through its module-level `time`, so
+# replacing that one reference gives these tests a clock they drive: an executor
+# that "queues" a call past DEFAULT_TTL_SECONDS costs no real wait.
+
+
+class _FakeClock:
+    """Stands in for the `time` module in `auth.tickets` — only `time()` is read."""
+
+    def __init__(self, start: float = 1_700_000_000.0):
+        self.now = start
+
+    def time(self) -> float:
+        return self.now
+
+
+class _DelayedExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Advances `clock` by `delay` on submit, then runs the call — the queue wait a
+    fan-out wider than the pool imposes, with no real one. The advance happens on
+    the submitting thread, before the worker runs, so the ordering is fixed."""
+
+    def __init__(self, clock: _FakeClock, delay: float):
+        super().__init__(max_workers=1)
+        self._clock = clock
+        self._delay = delay
+
+    def submit(self, fn, /, *args, **kwargs):
+        self._clock.now += self._delay
+        return super().submit(fn, *args, **kwargs)
+
+
+def _token_expiry(token: bytes) -> int:
+    """The trailing uint64 of the signed-token wire format (`auth/tickets.py`)."""
+    return struct.unpack(">Q", token[-8:])[0]
+
+
+async def _with_delayed_executor(clock, delay, coro_fn):
+    """Run `coro_fn()` with the loop's default executor delaying every submit."""
+    executor = _DelayedExecutor(clock, delay)
+    asyncio.get_running_loop().set_default_executor(executor)
+    try:
+        return await coro_fn()
+    finally:
+        executor.shutdown()
+
+
+def test_run_signed_flight_call_signs_after_the_queue_wait(monkeypatch):
+    """The seam every data-plane Flight call goes through: `sign` runs on the
+    worker, so a token minted for a queued call carries a TTL measured from when
+    the worker started, not from when the call was submitted."""
+    clock = _FakeClock()
+    monkeypatch.setattr(tickets, "time", clock)
+    queue_wait = 10 * 60  # comfortably past DEFAULT_TTL_SECONDS
+    submitted_at = clock.now
+
+    def _sign() -> bytes:
+        return tickets.sign_action(
+            action="export_read", payload={"prep_sample_idx": 1}, secret=b"x" * 32
+        )
+
+    token = asyncio.run(
+        _with_delayed_executor(
+            clock,
+            queue_wait,
+            lambda: _run_signed_flight_call(_sign, lambda t: t),
+        )
+    )
+    assert _token_expiry(token) == int(submitted_at + queue_wait) + tickets.DEFAULT_TTL_SECONDS
+
+
+def test_resolve_staged_reads_token_survives_a_queue_wait_past_the_ttl(tmp_path, monkeypatch):
+    """The reported failure: a read-mask fan-out wide enough to queue behind the
+    default executor expired its own export_read tokens, and the queued calls
+    reached the data plane already dead ("ticket expired"). The token the stub
+    receives is minted after the wait, so it is still valid on arrival."""
+    clock = _FakeClock()
+    monkeypatch.setattr(tickets, "time", clock)
+    queue_wait = 10 * 60
+
+    seen: list[bytes] = []
+    workspace = tmp_path / "ticket" / "804"
+    dest = workspace / "reads.parquet"
+
+    def _fake_export(_url, token):
+        seen.append(token)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("parquet-bytes")
+        return {"count": 5, "dest": str(dest)}
+
+    monkeypatch.setattr(_EXPORT_READ, _fake_export)
+
+    bound = asyncio.run(
+        _with_delayed_executor(
+            clock,
+            queue_wait,
+            lambda: _resolve_staged_reads(
+                _FAKE_POOL,
+                {"prep_sample_idx": 42},
+                tmp_path / "staging",
+                data_plane_url="grpc://unused",
+                signing_key=b"x" * 32,
+                workspace=workspace,
+            ),
+        )
+    )
+    assert bound[STAGED_READS_BINDING] == dest
+    # What the data plane checks on arrival: expiry still ahead of "now". Minting
+    # before the executor hop would put it `queue_wait - TTL` seconds in the past.
+    assert _token_expiry(seen[0]) > clock.now
