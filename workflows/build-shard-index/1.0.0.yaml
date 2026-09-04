@@ -130,12 +130,15 @@ steps:
     params: {shard_id: shard_id}
     when: build_bowtie2
     outputs: [bowtie2_index_meta]
-    # cpu:4 predates the reference-18 build; that build's 987 shard builds corroborate
-    # it rather than being where it came from. Unlike build_minimap2_index above, this
-    # step spends its wall time computing: TotalCPU is p50 35.4, p90 84.7, max 269.0
-    # min, and 36 of the 987 want more CPU-time than the 120-min walltime allows — those
-    # fit inside PT2H only by running on more than one core. The heaviest finished in
-    # 92.3 min at 2.92 cores average.
+    # cpu:4 predates the reference-18 build. That build's 987 shard builds show the
+    # cores being used, but they do not establish the number: fitting inside PT2H takes
+    # more than one core for 36 of them and more than two for three of those, so the
+    # measurement rules out cpu:1 and cpu:2 without separating 3 from 4.
+    #
+    # What it does show is that this step, unlike build_minimap2_index above, spends its
+    # wall time computing. TotalCPU is p50 35.4, p90 84.7, max 269.0 min, and the
+    # busiest run averaged 3.71 of the four cores over 37.4 min. There the extra cores
+    # were waste; here they are not.
     #
     # This is also the longer step of the pair: elapsed p50 14.5, p90 30.7, p99 65.2,
     # max 92.3 min against the same PT2H limit. mem_gb 32 is the whole-reference
