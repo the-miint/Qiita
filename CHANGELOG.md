@@ -1700,6 +1700,31 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **The documented identifier hierarchy named identifiers that do not exist (#535).**
+  `docs/architecture/cross-cutting.md` gave the chain as `study_idx -> prep_idx ->
+  sample_idx -> prep_sample_idx -> processing_idx -> processed_prep_sample_idx`. Of those,
+  `sample_idx` has no column in any migration and no `qiita.sample` table — the level it
+  names is `biosample_idx`, a direct FK from `prep_sample`; `processed_prep_sample_idx` is
+  unbuilt, the only migration mention being a comment recording it as deferred; and
+  `prep_idx` is a `qiita.work_ticket` scope column that `data-model.md` already calls
+  vestigial. `study_idx` and `processing_idx` are real but are not levels either — the
+  first attaches through a many-to-many junction, the second is a params-hash identity with
+  no FK to `prep_sample`. The section now states the one containment it can support and
+  names the rest as what they are.
+
+  The same section said result Parquets are verified for identifier sort order before
+  registration. Nothing verifies the sort: the gates in `slurm/verify.py` are a manifest,
+  per-file `size_bytes`, and mode `0o440`, and only the SLURM backend runs them —
+  `LocalBackend` runs none. Two sites that pointed at the retracted contract now match it:
+  `docs/writing-a-job.md`, which sent job authors here for "the canonical sort order", and
+  this file's own `result_step` line, which claimed identifier-integrity verification. The
+  `read` DDL comment in `ducklake.rs` no longer contrasts its sort against a canonical
+  order that no doc lists.
+
+  `data-model.md`, `processing.md` and the two component READMEs still carry the older
+  claims. Reconciling them is its own change, and `cross-cutting.md` says so rather than
+  leaving the disagreement silent.
+
 - **`build_minimap2_index`'s `cpu: 1` was justified from the first ~1.4 hours of the
   reference-18 build, and the figures characterising that step were wrong (#536).** The
   68-run slice behind it spans 09:41 to 11:07 of a build that ran to the next morning;
@@ -1716,10 +1741,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   representative: what one core must absorb is TotalCPU, which is p99 1.14 and max 1.45
   min. Worst case at `cpu: 1` is `elapsed + 0.75 x TotalCPU`, peaking at 24.7 min over all
   987 against the PT2H limit — none cross. Efficiency is the wrong axis because it falls
-  as elapsed rises — mean efficiency by elapsed decile drops monotonically from 13.7%
-  to 1.7% — so the high ratios are all on short shards. Comment
-  and test docstring rewritten on that basis, and the shard-size distribution the comment
-  called unmeasured was measured: 82.2% of shards at 29 GiB.
+  as elapsed rises — mean efficiency by elapsed decile drops monotonically from 13.7% to
+  1.7% — so the high ratios are all on short shards. Comment and test docstring rewritten
+  on that basis, and the shard-size distribution the comment called unmeasured was
+  measured: 82.2% of shards at 29 GiB.
 
 - **Read materialization signed its `export_read` token before the executor hop, so a wide
   fan-out expired its own tokens (#532).** `_resolve_staged_reads` minted the token and only
@@ -3376,6 +3401,36 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **The data plane's prose says `prep_sample` where it means one (#535).**
+  146 sites across `flight_service.rs`, `ducklake.rs`, `auth.rs`, `config.rs` and the Rust
+  test module used the bare word "sample" for the entity the code keys on — mostly
+  comments, plus test bindings and assertion messages. 145 now say `prep_sample`; the
+  remaining one is the `sequenced_sample` noted below. The snake_case identifiers whose own
+  prose had come to say `prep_sample` were renamed with them — two test names
+  (`export_read_writes_prep_sample_parquet`,
+  `..._passes_every_block_prep_sample_into_the_macro`) and three test-local bindings
+  (`prep_sample_a`, `prep_sample_b`, `n_prep_samples`). The `alignment_sample` family is
+  untouched for two reasons: `qiita.alignment_sample` is a real table, and
+  `delete_alignment_sample` is a DoAction discriminator matched as a literal on both sides
+  of the wire (`flight_service.rs` against `actions/library.py`), so it is not free to
+  follow a table rename. The bare word is
+  ambiguous because the schema carries several sample-shaped entities — `qiita.biosample`,
+  `qiita.sequenced_sample`, `qiita.prep_sample` and the `mask_sample` / `alignment_sample`
+  gate rows — so a reader arriving from the control plane had no way to tell which one a
+  data-plane comment meant. Inside the data plane there was never any doubt:
+  `prep_sample_idx` is the only sample-family identifier it uses at all (351 uses), which
+  is exactly what let the prose drift free of the code.
+  Several docstrings used both spellings for one thing — `export_read_to_parquet` opened
+  "one prep_sample's reads" and then said "a sample with no stored reads", and
+  `delete_pool_reads` said "prep_samples" twice before "hundreds of samples". Behaviour is
+  unchanged: the only non-comment edit in production Rust is a `debug_assert!` message, and
+  the `ducklake.rs` edits inside SQL string literals are `--` comments the database
+  discards.
+  `sequenced sample` is left alone where it appears, and backticked at its one site:
+  `qiita.sequenced_sample` is the 1:1 `processing_kind = 'sequenced'` subtype of
+  `prep_sample`. The test helper `sample_batch()` is likewise untouched: it builds an
+  example RecordBatch and has nothing to do with the entity.
 
 - **The AGGREGATE sequencing-run and sequenced-pool reads admit the run's creator, not just
   wet_lab_admin (#530).** `GET /sequencing-run/{R}` and the pool metadata, completion rollup

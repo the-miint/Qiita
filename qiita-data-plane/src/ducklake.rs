@@ -216,7 +216,7 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 
 /// Create the read + read_mask tables and the read_masked macro in DuckLake.
 ///
-/// These hold per-sample sequencing reads and the downstream masks that record,
+/// These hold per-prep_sample sequencing reads and the downstream masks that record,
 /// per read, whether it survives QC/host filtering and how it should be trimmed.
 /// The full reads are stored ONCE and never physically filtered; masks are
 /// downstream state keyed by the CP-minted `mask_idx` (filtering-config identity).
@@ -232,17 +232,18 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// read_mask, applies the recorded trims, and excludes every non-`pass` row
 /// (host/human hits + QC failures) via an unconditional `reason = 'pass'`. Human
 /// reads are therefore unreachable by construction, not by a scope check. What
-/// its required (mask, samples) parameters foreclose is on the macro itself,
+/// its required (mask, prep_samples) parameters foreclose is on the macro itself,
 /// below.
 pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
-        "-- Full reads, written ONCE per sequenced sample. Independent of any mask.
+        "-- Full reads, written ONCE per `sequenced_sample`, the 1:1
+        -- processing_kind = 'sequenced' subtype of prep_sample. Independent of
+        -- any mask.
         -- Keyed by prep_sample_idx + the globally-unique sequence_idx (the read
         -- join key). qual1/qual2 are PHRED scores as UTINYINT arrays; NULL for
         -- FASTA (qual1) or single-end (sequence2/qual2). The producer writes the
         -- Parquet sorted by (prep_sample_idx, sequence_idx) — the view's join
-        -- key — for row-group pruning; not the canonical six-column result sort
-        -- order (those identifier columns don't exist on reads).
+        -- key — for row-group pruning.
         CREATE TABLE IF NOT EXISTS qiita_lake.read (
             prep_sample_idx BIGINT NOT NULL,
             sequence_idx BIGINT NOT NULL,
@@ -277,7 +278,7 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         --
         -- A MACRO, not a view, and the parameters are the point. DuckDB derives a
         -- transitive predicate across a join equality for `col = const` but NOT for
-        -- `col IN (list)`, so a view can only ever receive a multi-sample scope on
+        -- `col IN (list)`, so a view can only ever receive a multi-prep_sample scope on
         -- ONE side of this join: the `read` scan got no filter at all, DuckLake
         -- pruned nothing, and every file in the lake was read. Taking the scope as
         -- a parameter puts it on BOTH inputs explicitly instead of hoping the
@@ -297,9 +298,9 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         -- to a range and DOES mirror — any reproducer must use a SPARSE list.
         --
         -- Measured on DuckDB 1.5.4 against a local DuckLake of 1,000,000 `read`
-        -- rows over 200 samples, one file per sample (the layout fastq_to_parquet
+        -- rows over 200 prep_samples, one file per prep_sample (the layout fastq_to_parquet
         -- writes), 10% of rows non-'pass'. Query is a realistic block — one partial
-        -- head sample, 18 complete, one partial tail — selecting 84,600 rows.
+        -- head prep_sample, 18 complete, one partial tail — selecting 84,600 rows.
         -- Figures are rows the scans actually produced (EXPLAIN ANALYZE):
         --
         --     view    948,999 read +  84,600 read_mask = 1,033,599
@@ -307,24 +308,24 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         --     floor    84,600 read +  84,600 read_mask =   169,200
         --
         -- The macro's `read` figure is 84,600/0.9 to the row, i.e. its entire
-        -- residual is the non-'pass' rate and the two partial end samples cost
+        -- residual is the non-'pass' rate and the two partial end prep_samples cost
         -- nothing. In production this shape fully scanned a ~20.7-billion-row
-        -- `read`; a single-sample equality scoped the same query to 5,356 rows in
+        -- `read`; a single-prep_sample equality scoped the same query to 5,356 rows in
         -- 0.147 s — which is why this went unnoticed. A one-element IN is rewritten
-        -- to `=`, so single-sample blocks (every long-read tile) were always fine.
+        -- to `=`, so single-prep_sample blocks (every long-read tile) were always fine.
         --
         -- Two rejected alternatives, both measured, so they are not re-proposed:
         -- passing the block's sequence_idx range as further parameters is identical
-        -- to the row (once the sample scope prunes to the right per-sample files the
-        -- block's global range spans them anyway), and pushing per-member
-        -- (sample, range) pairs down as an EXISTS is far WORSE than the view —
+        -- to the row (once the prep_sample scope prunes to the right per-prep_sample
+        -- files the block's global range spans them anyway), and pushing per-member
+        -- (prep_sample, range) pairs down as an EXISTS is far WORSE than the view —
         -- 1,900,000 rows, because it defeats file pruning entirely. Hence ONE macro,
         -- with `read_masked_block` reusing it and leaving its member terms an outer
         -- filter.
         --
         -- Required parameters also make an unscoped fleet-wide masked read
         -- UNREPRESENTABLE rather than merely refused — there is no argument list
-        -- that means `every sample`, so the macro has no whole-table form to
+        -- that means `every prep_sample`, so the macro has no whole-table form to
         -- construct. THIS IS THE ONE SITE THAT ENFORCES THAT, and every other
         -- comment on the subject points here. The control plane's mandatory-filter
         -- invariant (routes/read_masked.py) stays as defence in depth but is no
@@ -398,7 +399,7 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 /// consumer.
 ///
 /// One row per emitted alignment: the `align_sharded` native job aligns a block
-/// of a sample's HOST-DEPLETED reads against a sharded reference and register-files
+/// of a prep_sample's HOST-DEPLETED reads against a sharded reference and register-files
 /// lands its `alignment.parquet` here. The table is keyed by the CP-minted
 /// `alignment_idx` (the align config's params-hash identity: reference, aligner,
 /// mask, and shard-set), NOT by the deferred processing_idx / processed_prep_sample
@@ -507,7 +508,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- QUALIFY in its phase 2 runs on the paired-end arm alone.
         --
         -- The producer is `qiita_compute_orchestrator.jobs.align_denovo`, which
-        -- aligns a sample's masked reads against its OWN assembled contigs (where a
+        -- aligns a prep_sample's masked reads against its OWN assembled contigs (where a
         -- circular contig is a real, assembler-called thing rather than a claim about
         -- a reference). `register_files` loads its staging
         -- `alignment_origin_spanning.parquet` — the control plane derives the table
@@ -564,7 +565,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             -- needs the subject's length, which is not duplicated here: join
             -- `sequence_length_bp` on feature_idx in whichever table holds this
             -- producer's subjects — `reference_sequences` when they are reference
-            -- features, `assembled_sequence` when they are a sample's own contigs.
+            -- features, `assembled_sequence` when they are a prep_sample's own contigs.
             feature_start   BIGINT,
             feature_stop    BIGINT,
             -- Strand of the read relative to the contig — miint's
@@ -699,7 +700,7 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 
         -- Which features a (prep_sample, processing) assembly run contains, and in
         -- which bin. processing_idx disambiguates runs (bin_id reused across
-        -- samples AND runs); the `kind` value set is enumerated in
+        -- prep_samples AND runs); the `kind` value set is enumerated in
         -- qiita_common.assembly_constants. The DuckLake copy of
         -- qiita.assembly_membership for bulk joins with the sequences.
         --
