@@ -535,13 +535,6 @@ def test_build_minimap2_index_reserve_differs_by_mode(tmp_path, monkeypatch):
     )
 
 
-# `plan()` is applied by the CP as a down-size only while it is below the step's
-# YAML baseline (runner/_dispatch.py), so the allocation a shard actually gets is
-# the hint clamped at that baseline. Read from the workflow rather than restated:
-# a baseline raised in the YAML has to move this clamp, and a literal here would
-# keep passing against the old one.
-
-
 def _shard_allocation_gb(build_minimap2_index, roster) -> int:
     """The cgroup a shard build really lands in: `plan()`'s hint, clamped at the
     step's YAML baseline the way `_resolve_step_resources` clamps it."""
