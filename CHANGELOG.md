@@ -1701,7 +1701,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Fixed
 
 - **`build_minimap2_index`'s `cpu: 1` was justified from the first ~1.4 hours of the
-  reference-18 build, and the figures characterising that step were wrong (#TBD).** The
+  reference-18 build, and the figures characterising that step were wrong (#536).** The
   68-run slice behind it spans 09:41 to 11:07 of a build that ran to the next morning;
   re-pulled `sacct` for all 987 shard builds. CPU efficiency is p50 4.3% / max 28.0%, not
   p50 2.1% / max 13.9%, and 167 of the 987 exceed the figure given as the maximum. The
