@@ -1,6 +1,7 @@
 """Native job: build a minimap2 `.mmi` index for a reference.
 
-Two modes, mirroring `build_rype_index`:
+Two modes (the shape `build_bowtie2_index` also carries; `build_rype_index` is
+whole-reference only):
 
 * **Host / whole-reference mode** (no `shard_id`) — the second-pass aligner index
   `host_filter` consumes (`align_minimap2(index_path=<.mmi>, preset='sr')`),
@@ -66,7 +67,7 @@ YAML_STEP_NAME = "build_minimap2_index"
 # chunks) and hands the TABLE to minimap2, which does the heavy indexing
 # in-process from the cgroup remainder. `_DUCKDB_MEMORY_GB` is the OFF-SLURM
 # fallback (local backend / tests). Under SLURM the limit tracks the real cgroup
-# via `resolve_duckdb_memory_gb()` with `_MINIMAP2_RESERVE_GB` carved out for
+# via `resolve_duckdb_memory_gb()` with the mode's reserve carved out for
 # minimap2's in-process index — so a `--mem-gb` override grows both the
 # DuckDB reassembly headroom (genome-scale contigs are large) and minimap2's
 # index budget, instead of OOMing against a fixed 8 GB.
@@ -74,12 +75,54 @@ _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 # Cgroup reserved for minimap2's in-process index build — it is given no explicit
 # memory limit and allocates from whatever DuckDB's limit leaves under the cgroup.
-# Basis: a human-genome (~3.1 Gbp) `-x sr` minimap2 index is ~8 GB resident, and
-# the 'sr' preset's denser minimizers run heavier than the default preset; 16 GB
-# is a ~2x envelope over that. This is the number most likely to be wrong for the
-# genome-scale case that motivated this change — refine it against the first real
-# human-reference build's MaxRSS (sacct) and bump if the build still OOMs.
-_MINIMAP2_RESERVE_GB = 16
+# The reserve therefore bounds DUCKDB, not minimap2: it is the slack between
+# DuckDB's limit and the allocation. Host and shard mode index different things
+# and are sized separately.
+#
+# HOST mode — a whole reference, up to a human genome. Basis: a human-genome
+# (~3.1 Gbp) `-x sr` minimap2 index is ~8 GB resident, and the 'sr' preset's
+# denser minimizers run heavier than the default preset; 16 GB is a ~2x envelope
+# over that. No host build has been measured, so this stays an envelope — refine
+# it against the first real human-reference build's MaxRSS (sacct) and bump if
+# the build still OOMs.
+_MINIMAP2_HOST_RESERVE_GB = 16
+# SHARD mode — one shard of a many-genome catalogue, far smaller than a whole
+# reference. Measured on the reference-18 build (196,062 genomes): MaxRSS over
+# 987 shard builds was p50 6.2, p90 10.3, max 17.1 GiB. 82.2% of those shards
+# were at or under 1 Gbp and so ran at 29 GiB, where DuckDB's limit was
+# 29 - 4 - 16 = 9 GB. Halving the reserve holds that limit exactly for such a
+# shard (21 - 4 - 8 = 9), so DuckDB and minimap2 both behave as measured and only
+# the slack unused in that sample goes: the max lands 3.9 GiB under 21 GiB.
+# Refine against an uncensored shard build (one run with DuckDB's limit raised
+# above its observed peak, which would separate the two shares).
+_MINIMAP2_SHARD_RESERVE_GB = 8
+# Under-SLURM HARD ceiling for DuckDB's share in SHARD mode. It exists to keep the
+# reserve change above from being a raise anywhere: `plan()` is applied as
+# `min(hint, baseline)` (runner/_dispatch.py), so above the shard size where the
+# hint stops binding, a smaller reserve would hand DuckDB MORE inside an unchanged
+# 32 GiB cgroup — 20 GB rather than the 12 it had. 12 is exactly the largest limit
+# the old arithmetic ever produced (32 - 4 - 16), so every shard size now resolves
+# to the limit it resolved to before. Shards are planned by COUNT
+# (`shard_planner._SHARD_COUNT`), not by a bp budget, so shard size scales with the
+# catalogue and that band is reachable; reference-18 did not reach it (its shards
+# ran at 29-31 GiB, i.e. at most 3 Gbp).
+#
+# It does NOT bound the reassembly's working set, and this is not the safe-because-
+# windowed cap `build_rype_index` carries — `rype_index_create` windows its feed, so
+# DuckDB's share there is bounded by window size rather than corpus size. Nothing
+# windows `stage_subject`: its `string_agg(chunk_data ORDER BY chunk_index) GROUP BY
+# feature_idx` grows with the shard, and it OOMs rather than spilling
+# (`test_duckdb_memory_behavior.py` pins that). Probed at this cap's own scale against
+# the DuckDB this repo ships: 5.37 GiB of chunk bytes OOMs at a 10 GB limit and
+# completes at 12. So a 12 GB limit reassembles about 5 Gbp and no more, on the first
+# attempt and on every retry — the cap is hard, so OOM escalation grows only minimap2's
+# side. That ceiling is unchanged by this constant: the old arithmetic hit the same
+# 12 GB from a 4 Gbp shard upward. Windowing the shard feed the way rype's is, is what
+# would move it.
+#
+# HOST mode gets no cap: it reassembles genome-scale contigs from staging Parquet,
+# where a `--mem-gb` override is meant to grow DuckDB's reassembly headroom.
+_MINIMAP2_SHARD_DUCKDB_CAP_GB = 12
 
 # minimap2 preset default — 'sr' (short-read), the host-filter alignment mode
 # `host_filter` mirrors on the query side. Overridable via Inputs.
@@ -89,16 +132,16 @@ _DEFAULT_PRESET = "sr"
 # connection — must be non-temp; a TABLE because the reassembly is a blocking agg).
 _SUBJECT_RELATION = "minimap2_subject"
 
-# plan() memory sizing for SHARD mode (advisory, down-only), mirroring
-# build_rype_index. The FLOOR is the smallest allocation the runtime DuckDB +
-# minimap2 split stays consistent at: DuckDB's fallback share + minimap2's reserve
-# + the shared headroom. Above the floor, add a gentle per-bp term (the minimap2
-# index scales with the shard's total sequence). The CP applies this ONLY below
-# the step's YAML baseline (down-only composition), so a small shard runs in a
-# smaller SLURM slot while an over-estimate harmlessly stays at baseline; an
-# under-estimate is still caught by OOM escalation.
+# plan() memory sizing for SHARD mode (advisory, down-only). The FLOOR is the
+# smallest allocation the runtime DuckDB + minimap2 split stays consistent at:
+# DuckDB's fallback share + the shard reserve + the shared headroom. Above the
+# floor, add a gentle per-bp term (the minimap2 index scales with the shard's
+# total sequence). The CP applies this ONLY below the step's YAML baseline
+# (down-only composition), so a small shard runs in a smaller SLURM slot while an
+# over-estimate harmlessly stays at baseline; an under-estimate is still caught
+# by OOM escalation.
 _SHARD_PLAN_FLOOR_GB = (
-    _DUCKDB_MEMORY_GB + _MINIMAP2_RESERVE_GB + duckdb_headroom_gb(_DUCKDB_THREADS)
+    _DUCKDB_MEMORY_GB + _MINIMAP2_SHARD_RESERVE_GB + duckdb_headroom_gb(_DUCKDB_THREADS)
 )
 _SHARD_PLAN_BP_PER_GB = 1_000_000_000
 
@@ -216,7 +259,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             memory_gb=resolve_duckdb_memory_gb(
                 _DUCKDB_MEMORY_GB,
                 threads=_DUCKDB_THREADS,
-                reserve_gb=_MINIMAP2_RESERVE_GB,
+                reserve_gb=(_MINIMAP2_SHARD_RESERVE_GB if sharded else _MINIMAP2_HOST_RESERVE_GB),
+                cap_gb=_MINIMAP2_SHARD_DUCKDB_CAP_GB if sharded else None,
             ),
             threads=_DUCKDB_THREADS,
         )
@@ -304,12 +348,11 @@ def plan(inputs: Inputs) -> JobPlan:
     """Size a SHARD build's memory down from the whole-reference baseline.
 
     Host/unsharded mode → no opinion (empty `JobPlan` → keep the step's YAML
-    baseline). Shard mode → size `mem_gb` from the shard's total bp: the
-    runtime-consistent floor (`_SHARD_PLAN_FLOOR_GB`) plus a gentle per-bp term.
-    Advisory, down-only (the CP applies it only below baseline); an under-estimate
-    is still caught by OOM escalation. `plan()` runs at submit time in the
-    orchestrator process and reads only the small roster (bp sum), not the chunk
-    data. Mirrors build_bowtie2_index.plan()."""
+    baseline). Shard mode → `_SHARD_PLAN_FLOOR_GB` plus a per-bp term; see that
+    constant for the sizing and its composition rules. `plan()` runs at submit
+    time in the orchestrator process and reads only the small roster (bp sum),
+    not the chunk data. build_bowtie2_index.plan() has the same shape against its
+    own reserve."""
     if inputs.shard_id is None or inputs.shard_features is None:
         return JobPlan()
     with duckdb.connect(":memory:") as conn:

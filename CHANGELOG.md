@@ -1700,6 +1700,52 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Three cross-references named things that do not exist (#538).**
+  `build_minimap2_index`'s module docstring said its two modes mirror `build_rype_index`,
+  which is whole-reference only and has no shard mode; the comment above its shard `plan()`
+  sizing, and `build_bowtie2_index`'s twin, both said they mirror `build_rype_index`, which
+  defines no `plan()`. `jobs/_feature_load.py` cited
+  `miint-localdocs/sequence-chunking-assessment.md` for a benchmark — a path that is not in
+  this repo, its parent, or anywhere on the machine; the two measurements it was cited for
+  are stated in the same paragraph, so the dead pointer is dropped rather than replaced.
+  `test_masked_export_fastq_contract.py` cited upstream `docs/copy-formats.md`, which
+  `docs/duckdb-miint.md` lists among the files that reorg split up or renamed. Upstream's
+  rendered `writing/` page carries the FASTQ writer and the `read_id` / `sequence1` /
+  `qual1` column contract this test pins, so that is where the comment now links.
+- **Two workflow YAMLs stated a DuckDB cap that had been lowered under them (#538).**
+  `host-reference-add` and `local-host-reference-add` both said `build_rype_index` "hard-caps
+  DuckDB at 30 GB". The cap is `_DUCKDB_MEMORY_CAP_GB` = 8; 30 is `_RYPE_MAX_MEMORY_GB`,
+  rype's floor. The commit that lowered the cap updated the module, changelog, checklist and
+  test but not the YAMLs, and the module comment already called 30 "the old ~30 GB cap".
+  Both now point at the constant instead of restating it.
+- **`build_bowtie2_index` and `build_rype_index` had no cpu pin (#538).** Four steps pinned
+  their `cpu:` against the module's `_DUCKDB_THREADS`; these two did not, so the YAML and
+  the thread pool could drift with nothing failing at runtime. bowtie2 takes the equality
+  form the aligner pins use (4 == 4 today); rype takes a bound (`cpu <= _DUCKDB_THREADS`),
+  because its two workflows disagree — `host-reference-add` runs it at 4 and
+  `local-host-reference-add` at 8 against a pool of 8 — and whether rype's build
+  parallelism derives from that pool has not been probed, so there is no measurement to
+  pin an equality to.
+- **The `assemble` 259.3 GiB peak is now attributed (#538).** The workflow comment placed
+  it in the hifiasm_meta paragraph and said "a sample in that class", which the recorded
+  figure did not support — it carried no assembler, input scale, or censoring status.
+  Settled against the deploy: `assembler` is a closed two-value enum defaulting to
+  hifiasm_meta, and no `1.0.0` work ticket ever recorded myloasm (its first run is
+  2026-09-02, under `1.0.1`) — so with the only alternative ruled out, every `1.0.0`
+  assemble ran hifiasm_meta whether the key was recorded or defaulted. So the peak is
+  hifiasm_meta's and does bound the 250 GiB profile. That matters because `assemble` is
+  now sized per assembler: 259.3 constrains the hifiasm_meta profile alone and says
+  nothing about myloasm's 128. The comment states the trade it implies — 250 is knowingly
+  below a hifiasm_meta peak, and covering it would take 260, whose `260 * 1024 * 2`
+  exceeds the node, dropping the step from two per node to one; one escalation rung for
+  the tail is taken over halving occupancy for every sample that is not in it. It also
+  says what stays unrecoverable: the input scale behind the peak, whose `sacct` rows are
+  gone and which is not reachable from the orchestrator host in any case.
+- **`_baseline_cpu_every_version`'s docstring credited the wrong site for a guard (#538).**
+  It said the caller asserts the result is non-empty; the helper raises on it itself, and
+  no caller checked. The behaviour was right and the attribution wrong, which would have
+  sent the next reader adding a guard that already exists.
+
 - **The documented identifier hierarchy named identifiers that do not exist (#535).**
   `docs/architecture/cross-cutting.md` gave the chain as `study_idx -> prep_idx ->
   sample_idx -> prep_sample_idx -> processing_idx -> processed_prep_sample_idx`. Of those,
@@ -3401,6 +3447,61 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **`build_minimap2_index` sizes its DuckDB reserve per mode, and a shard build now
+  asks for 21 GiB instead of 29 (#538).** `_MINIMAP2_RESERVE_GB` was one constant applied
+  in both modes, and it was sized for the host case that introduced it — a genome-scale
+  human reference that OOMed in `stage_local_fasta`. Shard mode reused it a month later
+  as its `plan()` floor, so every shard of a many-genome catalogue was allocated against a
+  whole-human-genome envelope. It is now `_MINIMAP2_HOST_RESERVE_GB` (16, unchanged and
+  still unmeasured) and `_MINIMAP2_SHARD_RESERVE_GB` (8), selected by mode at the one
+  runtime site that carves it; the shard `plan()` floor drops 28 -> 20. The reserve bounds
+  DuckDB rather than minimap2 — it is the slack between DuckDB's limit and the allocation
+  — so lowering reserve and floor by the same 8 leaves a 1 Gbp shard's DuckDB limit at the
+  9 GB it had when the reference-18 MaxRSS was measured (p50 6.2, p90 10.3, max 17.1 GiB
+  over 987 builds); what goes is 8 GiB of slack neither side used. Memory is the binding
+  axis for this step's per-node concurrency, which rises from 15-17 to 21-23
+  depending on shard size. A shard build also gains a DuckDB cap
+  (`_MINIMAP2_SHARD_DUCKDB_CAP_GB` = 12, the largest limit the old arithmetic ever
+  produced), for the reason `build_rype_index` has one: `plan()` is applied as
+  `min(hint, baseline)`, so above the shard size where the hint stops binding a smaller
+  reserve would have handed DuckDB *more* inside an unchanged 32 GiB cgroup. Shards are
+  planned by count rather than by a bp budget, so that band is reachable as a catalogue
+  grows — reference-18 did not reach it. With the cap, DuckDB's limit is identical to
+  its previous value at every shard size and the allocation never rises; on an
+  OOM-escalated retry the added memory now reaches minimap2 rather than DuckDB's heap.
+  Host mode is uncapped, because there a `--mem-gb` override is meant to grow DuckDB's
+  genome-scale reassembly headroom. Two measurements these constants still owe — the
+  never-measured host reserve, and a shard build run with DuckDB's limit lifted so its
+  share and the index builder's can be told apart — are tracked in issue #537.
+
+  `build_bowtie2_index` takes the same treatment against its own measurement: reserve
+  16 -> 12, floor 28 -> 24, and the same cap. Its 987-build max was 21.9 GiB — 4.8 above
+  minimap2's — so a 1 Gbp shard lands at 25 GiB, 3.1 above that max, and its per-node
+  concurrency rises from 17 to 20.
+
+  What the cap does NOT do is bound the reassembly's working set, and it is not the
+  safe-because-windowed cap `build_rype_index` carries. `stage_subject`'s
+  `string_agg(chunk_data ORDER BY chunk_index) GROUP BY feature_idx` raises
+  `OutOfMemoryException` rather than spilling, probed against the DuckDB this repo
+  ships and pinned in `test_duckdb_memory_behavior.py` beside the two behaviours that
+  module already covers; it wants roughly 2.2x the chunk bytes as `memory_limit`
+  (3.6x at 0.25 GiB, 2.4x at 1 GiB, 2.2x at 4 GiB). So a 12 GB limit reassembles about
+  5 Gbp and no more, on the first attempt and on every retry. That ceiling is
+  pre-existing and unchanged: the old arithmetic reached the same 12 GB from a 4 Gbp
+  shard upward. Windowing the shard feed the way rype's is, is what would move it. Two tests pin
+  it: the modes must resolve different DuckDB limits, and the reserve and floor must move
+  together or the measurement stops transferring.
+- **A measured rationale is stated at one site, and the other copies point at it (#538).**
+  Twelve clusters restated the same resource fact in two to ten places each. The
+  escalation-ceiling rule is now stated once at the test that enforces it
+  (`test_every_shipped_step_can_escalate_on_both_retry_axes`) and pointed at from eight
+  workflow YAMLs; the node shape (`RealMemory=514000` MB / 64 cores, plus two highmem at
+  1546528) is stated once in `docs/runbooks/slurm-backend-setup.md` under a new **Node
+  shape** section, which the four sizing comments still needing it now point at;
+  `host_filter`'s measured 25.8 GiB peak moves to the module whose memory behaviour it
+  describes, replacing five copies in two framings. The per-workflow arithmetic each
+  comment actually computes stays where it is — only the shared fact moved.
 
 - **The data plane's prose says `prep_sample` where it means one (#535).**
   146 sites across `flight_service.rs`, `ducklake.rs`, `auth.rs`, `config.rs` and the Rust

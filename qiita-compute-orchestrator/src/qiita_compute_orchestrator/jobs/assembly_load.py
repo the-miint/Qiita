@@ -96,9 +96,11 @@ _DAS_SUMMARY_TSV = "das_tool_summary.tsv"  # DAS_Tool `*_DASTool_summary.tsv`
 # DuckDB resource caps. Off-SLURM fallback; under SLURM the limit tracks the real
 # cgroup via `resolve_duckdb_memory_gb()`, so the literal below binds only off SLURM
 # (local backend and tests) and is dev-box sized, not cluster sized. The per-batch sort
-# it has to fit is `CHUNK_BUDGET_PER_BATCH` chunks, ~3.2 GB raw — under SLURM an
-# 11.18 GiB limit was not enough for it on real assemblies, which is why the step's
-# YAML baseline is 32 GiB rather than 16. See that step's comment.
+# it has to fit is `CHUNK_BUDGET_PER_BATCH` chunks, ~3.2 GB raw — under SLURM that
+# sort is what drove the step's YAML baseline to 32 GiB rather than 16. The
+# measurement, and what it does not settle, are at that step's `baseline_resources`
+# in `workflows/long-read-assembly/1.0.1.yaml` — the version that carries it; 1.0.0
+# predates the re-size and still declares the 16 GiB this OOMed at.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 

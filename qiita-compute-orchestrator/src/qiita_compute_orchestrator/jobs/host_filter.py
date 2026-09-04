@@ -91,6 +91,11 @@ YAML_STEP_NAME = "host_filter"
 # and STARVE those out-of-heap indexes. The right lever for a genome-scale host
 # filter is the cgroup (YAML mem_gb / `--mem-gb`), which already reaches the
 # indexes with DuckDB held modest.
+#
+# Measured on read-mask/1.0.0, which carries essentially all host_filter traffic:
+# the step peaks at 25.8 GiB against a 32 GiB baseline. That is real demand for the
+# reason above — DuckDB is held at the cap below whatever the cgroup is, so the
+# peak is the out-of-heap indexes, not DuckDB growing into its limit.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 

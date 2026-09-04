@@ -172,8 +172,9 @@ steps:
     when: build_rype
     outputs: [rype_index_meta]
     # mem_gb 64 (not 32): a large host set (many human genomes) OOMed at 32.
-    # An OOM retry doubles this to the 128 GB action_ceiling; the job hard-caps
-    # DuckDB at 30 GB and hands the growing remainder to rype's `max_memory`.
+    # An OOM retry doubles this to the 128 GB action_ceiling; the job caps DuckDB
+    # and hands the growing remainder to rype's `max_memory`. The split and its
+    # sizing are stated once, at `_DUCKDB_MEMORY_CAP_GB` in build_rype_index.py.
     baseline_resources:
       cpu: 8
       mem_gb: 64

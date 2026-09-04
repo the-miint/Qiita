@@ -788,8 +788,10 @@ def test_every_shipped_step_can_escalate_on_both_retry_axes():
     A pinned axis silently disables retry: the runner grows the escalation floor
     by a fixed factor and clamps it to the ceiling, so an equal pair leaves the
     grown value unchanged, which the retry loop reads as saturation and fails the
-    ticket PERMANENTLY on attempt 0. That is invisible at author time, in the
-    per-workflow unit tests above, and at `qiita-admin actions sync` — it
+    ticket PERMANENTLY on attempt 0. The mechanism is in `runner/_dispatch.py`
+    (`_escalated_mem_floor_after_oom` and the saturation check beside it). That is
+    invisible at author time, in the per-workflow unit tests above, and at
+    `qiita-admin actions sync` — it
     surfaces only in production, as a work ticket dead at retry_count=0 with
     RESOURCE_CEILING_EXHAUSTED.
 

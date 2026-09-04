@@ -53,11 +53,12 @@ def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[str, int
 
     A version that does not declare `step` at all contributes nothing rather than
     failing — dropping a step between versions is a legitimate shape change, and
-    there is no cpu to pin on a step that is not there. The caller asserts the
-    result is non-empty, so no workflow can lose its pin entirely by having every
-    version drop the step. Two steps sharing a name — which would make the pin
-    silently cover whichever came first — is rejected by `ActionDefinition`
-    itself ("duplicate step name(s)"), so nothing is re-checked here.
+    there is no cpu to pin on a step that is not there. Every version dropping it
+    is the different case, and this function raises on it below, so no workflow
+    can lose its pin entirely by having its step renamed out from under one. Two
+    steps sharing a name — which would make the pin silently cover whichever came
+    first — is rejected by `ActionDefinition` itself ("duplicate step name(s)"),
+    so nothing is re-checked here.
 
     Both `baseline_resources` populations resolve through
     `ActionDefinition._labelled_baselines()` rather than being re-read out of the
@@ -183,10 +184,10 @@ def test_align_denovo_cpu_pins_duckdb_threads():
 
     Same pin as `align`'s above, different mechanism. There the DuckDB pool is miint's
     concurrent-SHARD count; here the job makes one non-sharded `align_minimap2` call,
-    and that call draws its parallelism from the pool directly — measured on the staged
-    build at 1/2/4/8 threads (17.72 / 8.91 / 4.76 / 2.40 s over 60k x 2 kb reads), with
-    `MaxThreads()` tracking `SET threads`. So a `cpu:` above the literal allocates cores
-    nothing uses, and one below it oversubscribes the aligner onto fewer.
+    and that call draws its parallelism from the pool directly. So a `cpu:` above the
+    literal allocates cores nothing uses, and one below it oversubscribes the aligner
+    onto fewer. The thread-scaling measurement behind that is stated once, on the
+    step's `baseline_resources` in `workflows/align-denovo/1.0.0.yaml`.
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.align_denovo")
     for where, cpu in _baseline_cpu_every_version("align-denovo", "align_denovo"):
@@ -204,9 +205,9 @@ def test_assembly_coverage_cpu_pins_duckdb_threads():
     This step made the same non-sharded `align_minimap2` call at threads 8 against
     `cpu: 16`, reserving cores it could not use. The gap was closed by lowering the
     request, not by raising the pool: on this step the thread count is also a memory
-    multiplier for the unspillable extension side, which `sacct` put at 87% of the
-    then-64 GiB request at the median. Pinned here so the two cannot drift apart again — the
-    drift is invisible at runtime, since nothing fails.
+    multiplier for the unspillable extension side, which `assembly_coverage`'s own
+    `_DUCKDB_THREADS` comment sizes against the measured MaxRSS. Pinned here so the two
+    cannot drift apart again — the drift is invisible at runtime, since nothing fails.
 
     Read `1.0.0.yaml` by name until the 1.0.1 residue pass landed beside it, which
     left the version that actually runs unpinned; `_baseline_cpu_every_version`
@@ -229,10 +230,9 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
     Those pins exist because a job drawing its parallelism from DuckDB's pool wastes
     any core the pool cannot use. This step is the opposite case: it runs blocked on
     the data-plane chunk stream rather than computing, so the serial work one core must
-    absorb is small — the largest TotalCPU over the reference-18 build's 987 shard
-    builds is 1.45 min. The cores were the waste, so `cpu` dropped to the measured 1
-    while the pool stayed at 4. The step's `baseline_resources` comment in the workflow
-    YAML carries the rest of that measurement.
+    absorb is small. The cores were the waste, so `cpu` dropped to the measured 1 while
+    the pool stayed at 4. The step's `baseline_resources` comment in the workflow YAML
+    states that measurement.
 
     Pinned for the same reason the others are: nothing fails at runtime when these
     drift, so a later edit raising `cpu` to match the pool would silently undo a
@@ -244,11 +244,74 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.build_minimap2_index")
     for where, cpu in _baseline_cpu_every_version("build-shard-index", "build_minimap2_index"):
         assert cpu == 1 and cpu < mod._DUCKDB_THREADS, (
-            f"{where}: build_minimap2_index cpu={cpu}. One core is enough because the "
-            f"largest TotalCPU over 987 shard builds is 1.45 min, so serialising the "
-            f"work onto it costs about a minute of a PT2H budget. It sits below "
-            f"_DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — the step is blocked on "
-            f"its data-plane stream, so cores matched to the pool go unused."
+            f"{where}: build_minimap2_index cpu={cpu}, expected the measured 1, below "
+            f"_DUCKDB_THREADS={mod._DUCKDB_THREADS} — the step is blocked on its "
+            f"data-plane stream, so cores matched to the pool go unused. The step's "
+            f"`baseline_resources` comment in that YAML carries the measurement; if "
+            f"this fires, the question is whether it still holds."
+        )
+
+
+def test_build_shard_index_bowtie2_cpu_pins_duckdb_threads():
+    """`build-shard-index`'s `build_bowtie2_index` step: baseline `cpu:` must equal
+    `build_bowtie2_index._DUCKDB_THREADS`.
+
+    The opposite case to its minimap2 sibling directly above, on the same 987 shard
+    builds: this step spends its wall time computing rather than blocked on the chunk
+    stream, so the cores it asks for are cores it uses. The step's `baseline_resources`
+    comment in the workflow YAML carries that measurement, including what it does and
+    does not settle about the number itself.
+
+    Equality, like the three aligner pins: the pin locks the pair so an edit to either
+    side has to touch the other. It is not a claim that 4 was measured against 3 — the
+    YAML says plainly that it was not. What drifting them silently costs is the same
+    either way, since nothing fails at runtime when they disagree.
+    """
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.build_bowtie2_index")
+    for where, cpu in _baseline_cpu_every_version("build-shard-index", "build_bowtie2_index"):
+        assert cpu == mod._DUCKDB_THREADS, (
+            f"{where} build_bowtie2_index baseline cpu={cpu} but "
+            f"build_bowtie2_index._DUCKDB_THREADS={mod._DUCKDB_THREADS}; this step "
+            "computes rather than waiting on its stream, so the pool and the cores it "
+            "runs on must be changed together"
+        )
+
+
+def test_build_rype_index_cpu_stays_within_duckdb_threads():
+    """`build_rype_index`'s baseline `cpu:` must not exceed its `_DUCKDB_THREADS`, in
+    every workflow that declares the step.
+
+    A BOUND, not the equality the pins above assert, because the two workflows
+    declaring this step disagree: `host-reference-add` runs it at cpu 4 and
+    `local-host-reference-add` at cpu 8, against a pool of 8.
+
+    Which of the two is right turns on whether `rype_index_create`'s build
+    parallelism comes from the DuckDB thread pool. miint's rendered docs and its
+    issue list (open and closed) were read first: duckdb-miint#182 enumerates the
+    nine table functions exposing a `threads` parameter and `rype_index_create` is
+    not among them, and it records that DuckDB's thread count is honoured with or
+    without that parameter — but it also separates functions that hand a count to an
+    embedded tool rather than to a DuckDB-scheduled loop, which is the class rype
+    falls in. So the question survives the docs and the issues, and nothing here
+    settles it.
+
+    An equality would therefore be a guess that changes one of the two workflows.
+    The bound is what holds under either answer.
+
+    What the bound does catch is the direction that is wrong under either answer: a
+    `cpu:` ABOVE the pool reserves cores no part of the job can reach, since the pool is
+    the only thread count this module sets.
+    """
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.build_rype_index")
+    sites = [
+        *_baseline_cpu_every_version("host-reference-add", "build_rype_index"),
+        *_baseline_cpu_every_version("local-host-reference-add", "build_rype_index"),
+    ]
+    for where, cpu in sites:
+        assert cpu <= mod._DUCKDB_THREADS, (
+            f"{where} build_rype_index baseline cpu={cpu} exceeds "
+            f"build_rype_index._DUCKDB_THREADS={mod._DUCKDB_THREADS}; the pool is the "
+            "only thread count this module sets, so cores above it are unreachable"
         )
 
 

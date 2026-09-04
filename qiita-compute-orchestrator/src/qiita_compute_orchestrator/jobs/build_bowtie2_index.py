@@ -79,18 +79,36 @@ _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 # Cgroup reserved for the gpl-boundary host's bowtie2 index build (bowtie2 runs
 # in that out-of-process host, fed Arrow over shm — NOT in the DuckDB process).
-# bowtie2's BWT build is lighter than a genome-scale minimap2 index, so 16 GB
-# (matching minimap2's reserve) is a conservative starting envelope — the tuning
-# knob to refine against a real genome-scale build's MaxRSS (sacct).
-_BOWTIE2_RESERVE_GB = 16
+# The reserve bounds DUCKDB, not bowtie2: it is the slack between DuckDB's limit
+# and the allocation. One value, not a host/shard pair as in build_minimap2_index
+# — every workflow step declaring this module is a shard build.
+#
+# Measured on the reference-18 build (196,062 genomes): MaxRSS over 987 shard
+# builds was p50 7.9, p90 13.3, max 21.9 GiB, run at 29-31 GiB with DuckDB limited
+# to 9-11 GB. Lowering the reserve by 4 and the floor by the same 4 holds that
+# limit exactly (25 - 4 - 12 = 9 for a 1 Gbp shard, as 29 - 4 - 16 was), so both
+# sides behave as measured and what goes is slack: a 1 Gbp shard now runs in 25 GiB,
+# 3.1 GiB above the observed max, and per-node concurrency rises from 17 to 20.
+#
+# Sized 4 higher than minimap2's shard reserve, not interchangeable with it: the
+# same 987 builds put this step's max 4.8 GiB above minimap2's (21.9 vs 17.1), and
+# it is the allocation that has to clear the max, not the reserve.
+_BOWTIE2_RESERVE_GB = 12
+# Under-SLURM HARD ceiling for DuckDB's share, for the reason
+# `build_minimap2_index` carries one — that comment states the mechanism (the
+# `min(hint, baseline)` clamp, and what this does NOT bound). Same value for the
+# same reason: 12 is the largest limit the old arithmetic ever produced here too
+# (32 - 4 - 16), so every shard size resolves to the limit it resolved to before.
+_BOWTIE2_SHARD_DUCKDB_CAP_GB = 12
 
 # In-DuckDB name handed to save_bowtie2_index (resolved by its separate
 # connection — must be non-temp; a TABLE because the reassembly is a blocking agg).
 _SUBJECT_RELATION = "bowtie2_subject"
 
-# plan() memory sizing for SHARD mode (advisory, down-only), mirroring
-# build_minimap2_index / build_rype_index. Floor = DuckDB's fallback share +
-# bowtie2's reserve + the shared headroom; per-bp term over-provisions gently.
+# plan() memory sizing for SHARD mode (advisory, down-only). Floor = DuckDB's
+# fallback share + bowtie2's reserve + the shared headroom; per-bp term
+# over-provisions gently. build_minimap2_index carries the same shape against
+# its own reserve.
 _SHARD_PLAN_FLOOR_GB = _DUCKDB_MEMORY_GB + _BOWTIE2_RESERVE_GB + duckdb_headroom_gb(_DUCKDB_THREADS)
 _SHARD_PLAN_BP_PER_GB = 1_000_000_000
 
@@ -211,6 +229,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 _DUCKDB_MEMORY_GB,
                 threads=_DUCKDB_THREADS,
                 reserve_gb=_BOWTIE2_RESERVE_GB,
+                cap_gb=_BOWTIE2_SHARD_DUCKDB_CAP_GB if sharded else None,
             ),
             threads=_DUCKDB_THREADS,
         )
@@ -301,10 +320,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 def plan(inputs: Inputs) -> JobPlan:
     """Size a SHARD build's memory down from the whole-reference baseline.
 
-    Host/unsharded mode → no opinion (empty `JobPlan`). Shard mode → size `mem_gb`
-    from the shard's total bp: the runtime-consistent floor (`_SHARD_PLAN_FLOOR_GB`)
-    plus a gentle per-bp term. Advisory, down-only; an under-estimate is still
-    caught by OOM escalation. Mirrors build_minimap2_index.plan()."""
+    Host/unsharded mode → no opinion (empty `JobPlan`). Shard mode →
+    `_SHARD_PLAN_FLOOR_GB` plus a per-bp term; see that constant for the sizing
+    and its composition rules. build_minimap2_index.plan() has the same shape
+    against its own reserve."""
     if inputs.shard_id is None or inputs.shard_features is None:
         return JobPlan()
     with duckdb.connect(":memory:") as conn:

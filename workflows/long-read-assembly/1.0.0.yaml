@@ -200,7 +200,7 @@ steps:
     # manifest an earlier attempt wrote, while an input resolves from a binding
     # already produced, so adding one here strands nothing.
     inputs: [refined_bins_dir, genomes_dir]
-    # CheckM's ~1.4 GB reference DB is operator-provisioned under PATH_DERIVED,
+    # CheckM's reference DB is operator-provisioned under PATH_DERIVED,
     # deliberately NOT baked into the SIF. Bind it in and point checkm.sh at it:
     # the entrypoint reads QIITA_CHECKM_DB (falling back to an /opt/checkm_data
     # that does not exist in the image, so an unbound DB exits 78).
@@ -300,26 +300,15 @@ steps:
     outputs: []
 
 # Per-step cap (the runner enforces resolved <= ceiling on every axis at
-# dispatch). The two ESCALATING axes — mem_gb (on OOM) and walltime (on
-# TIMEOUT) — must sit strictly ABOVE the heaviest step's baseline, or retry is
-# silently dead: the runner grows the floor by a fixed factor and clamps to the
-# ceiling, so an equal pair leaves the grown value unchanged, which reads as
-# saturation and fails the ticket permanently on attempt 0 rather than ever
-# retrying. `cpu` is deliberately left equal to assemble's baseline — nothing
-# escalates it. See the runner's escalation helpers for the mechanism.
+# dispatch). The two ESCALATING axes — mem_gb (on OOM) and walltime (on TIMEOUT)
+# — must sit strictly ABOVE the heaviest step's baseline; why, and what enforces
+# it for every shipped workflow, are stated at test_actions_loader.py's
+# `test_every_shipped_step_can_escalate_on_both_retry_axes`. `cpu` is left equal
+# to assemble's baseline — nothing escalates it.
 #
-# Sizing is measured, not guessed. `assemble` is the binding step, and its peak
-# scales with THREAD COUNT, so our 32-thread runs cost materially more than the
-# 16-thread reference the assay was validated on: that reference peaked at
-# 164.8 GiB across 26 samples, while our smallest input peaked at 182.3 GiB and
-# a mid-sized one blew past 192 GiB during minimizer counting. The reference's
-# slowest sample also ran 28h16m, which a PT16H cap cannot express. 500 GB fits
-# a qiita-partition node (RealMemory 514000 MB, no MemSpecLimit) with little to
-# spare, so an escalated retry effectively reserves a whole node.
-#
-# Both assemblers run on this step (hifiasm_meta and myloasm); the numbers above
-# are hifiasm_meta's. Note the retry budget is TICKET-wide, not per-step, so a
-# ticket that already spent retries earlier cannot count on reaching the top rung.
+# This version is superseded and its ceiling is unchanged from the one beside it;
+# the measurement it is sized against is stated at the version that carries the
+# `assemble` profiles lookup.
 action_ceiling:
   cpu: 32
   mem_gb: 500

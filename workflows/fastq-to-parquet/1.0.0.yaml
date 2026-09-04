@@ -90,11 +90,11 @@ steps:
     outputs: [reads]
     baseline_resources:
       cpu: 2
-      # 8 GB covers long-read inputs (~2.4 GB resident per thread:
-      # 2048 STANDARD_VECTOR_SIZE × 60 row_group_size × ~20 KB avg
-      # long-read record) with headroom. DuckDB's own memory_limit
-      # is set to mem_gb - 1 in the job module so Python + miint
-      # runtime keep ~1 GB of process headroom outside DuckDB.
+      # Sized for long-read inputs; the per-thread resident derivation, the
+      # mem_gb - 1 split leaving process headroom outside DuckDB, and the two known
+      # gaps in that sizing (the limit does not track the cgroup, and the final
+      # blocking COPY is the shape that OOMed on real long reads in bam_to_parquet)
+      # are all stated at fastq_to_parquet.py's DuckDB resource caps.
       mem_gb: 8
       walltime: PT30M
 
