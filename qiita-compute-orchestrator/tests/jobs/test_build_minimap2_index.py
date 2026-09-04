@@ -536,10 +536,19 @@ def test_build_minimap2_index_reserve_differs_by_mode(tmp_path, monkeypatch):
 
 # `plan()` is applied by the CP as a down-size only while it is below the step's
 # YAML baseline (runner/_dispatch.py), so the allocation a shard actually gets is
-# the hint clamped at that baseline. `build-shard-index` declares mem_gb 32 with a
-# 128 ceiling; both are read from the YAML by the pin tests in
-# tests/test_workflow_params_pin.py, and repeated here only as the clamp's inputs.
-_SHARD_YAML_BASELINE_GB = 32
+# the hint clamped at that baseline. Read from the workflow rather than restated:
+# a baseline raised in the YAML has to move this clamp, and a literal here would
+# keep passing against the old one.
+def _shard_yaml_baseline_gb() -> int:
+    """`build-shard-index`'s declared `mem_gb` for the minimap2 step."""
+    import yaml
+
+    repo_root = Path(__file__).resolve().parents[3]
+    data = yaml.safe_load((repo_root / "workflows/build-shard-index/1.0.0.yaml").read_text())
+    for step in data["steps"]:
+        if step.get("step") == "build_minimap2_index":
+            return step["baseline_resources"]["mem_gb"]
+    raise AssertionError("build-shard-index declares no build_minimap2_index step")
 
 
 def _shard_allocation_gb(build_minimap2_index, roster) -> int:
@@ -549,7 +558,8 @@ def _shard_allocation_gb(build_minimap2_index, roster) -> int:
         reference_idx=1, work_ticket_idx=1, shard_id=0, shard_features=roster
     )
     hint = build_minimap2_index.plan(inputs).resources.mem_gb
-    return hint if hint < _SHARD_YAML_BASELINE_GB else _SHARD_YAML_BASELINE_GB
+    baseline = _shard_yaml_baseline_gb()
+    return hint if hint < baseline else baseline
 
 
 @pytest.mark.parametrize("shard_gbp", [1, 2, 3, 4, 5, 12, 20])
@@ -595,9 +605,8 @@ def test_build_minimap2_index_shard_never_raises_duckdbs_limit(tmp_path, shard_g
         )
         # What the 16 GiB reserve produced for the same shard, at ITS floor of 28.
         before_hint = 28 + shard_gbp
-        before_alloc = (
-            before_hint if before_hint < _SHARD_YAML_BASELINE_GB else _SHARD_YAML_BASELINE_GB
-        )
+        baseline = _shard_yaml_baseline_gb()
+        before_alloc = before_hint if before_hint < baseline else baseline
         before = _limit_at(before_alloc, 16, None, mp)
 
     assert now <= before, (
