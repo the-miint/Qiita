@@ -142,7 +142,7 @@ _None yet._
     that is per *step attempt*, not per ticket — a ticket mid-flight at the restart
     finishes its in-flight step at the old numbers and picks up the new ones for the
     steps dispatched after it.
-- **`build-shard-index` shard builds request smaller SLURM slots (#537).** A 1 Gbp
+- **`build-shard-index` shard builds request smaller SLURM slots (#538).** A 1 Gbp
   shard now asks for ~21 GiB instead of ~29 for `build_minimap2_index`, and ~25 instead
   of ~29 for `build_bowtie2_index`. No YAML baseline changed — both steps keep
   `mem_gb: 32` and the 128 GiB ceiling. What moved is each job's own `plan()` floor
