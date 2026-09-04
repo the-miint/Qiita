@@ -97,14 +97,14 @@ steps:
     # `test_build_shard_index_cpu_is_below_duckdb_threads` pins this to the measured 1
     # and asserts it stays under the pool.
     #
-    # Whether it buys more of this step per node depends on the shard, and standard
-    # nodes are 514000 MB / 64 cores (docs/runbooks/slurm-backend-setup.md). At the
-    # full mem_gb 32, memory caps concurrency at floor(514000/32768) = 15, already
-    # below the old cpu cap of 64/4 = 16, so
-    # nothing changes. `plan()` sizes a shard to 20 + ceil(bp/1e9) GiB, so one at or
-    # under 1 Gbp lands at 21, where floor(514000/21504) = 23 exceeds that cpu cap and
-    # the cut does add slots. 82.2% of this reference's 987 shards landed in that band.
-    # Either way the cores it stops reserving are available to other work on the node.
+    # Whether it buys more of this step per node depends on the shard; the node
+    # shape it divides into is in docs/runbooks/slurm-backend-setup.md. At the full
+    # mem_gb 32, memory caps concurrency at floor(514000/32768) = 15, already below
+    # the old cpu cap of 64/4 = 16, so nothing changes. `plan()` sizes a shard to
+    # 20 + ceil(bp/1e9) GiB, so one at or under 1 Gbp lands at 21, where
+    # floor(514000/21504) = 23 exceeds that cpu cap and the cut does add slots;
+    # 82.2% of this reference's 987 shards landed in that band. Either way the cores
+    # it stops reserving are available to other work on the node.
     #
     # The same step runs at cpu:4 in host-reference-add and local-host-reference-add,
     # unchanged: those build a whole reference rather than a shard, and no measurement

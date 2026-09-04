@@ -1709,8 +1709,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   this repo, its parent, or anywhere on the machine; the two measurements it was cited for
   are stated in the same paragraph, so the dead pointer is dropped rather than replaced.
   `test_masked_export_fastq_contract.py` cited upstream `docs/copy-formats.md`, which
-  `docs/duckdb-miint.md` records as renamed in the 2026-07 reorg; the COPY writers are in
-  `docs/writing.md`.
+  `docs/duckdb-miint.md` lists among the files that reorg split up or renamed. Upstream's
+  rendered `writing/` page carries the FASTQ writer and the `read_id` / `sequence1` /
+  `qual1` column contract this test pins, so that is where the comment now links.
 - **Two workflow YAMLs stated a DuckDB cap that had been lowered under them (#537).**
   `host-reference-add` and `local-host-reference-add` both said `build_rype_index` "hard-caps
   DuckDB at 30 GB". The cap is `_DUCKDB_MEMORY_CAP_GB` = 8; 30 is `_RYPE_MAX_MEMORY_GB`,
@@ -3449,7 +3450,18 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   — so lowering reserve and floor by the same 8 leaves a 1 Gbp shard's DuckDB limit at the
   9 GB it had when the reference-18 MaxRSS was measured (p50 6.2, p90 10.3, max 17.1 GiB
   over 987 builds); what goes is 8 GiB of slack neither side used. Memory is the binding
-  axis for this step's per-node concurrency, which rises from 15-17 to 23. Two tests pin
+  axis for this step's per-node concurrency, which rises from 15-17 to 21-23
+  depending on shard size. A shard build also gains a DuckDB cap
+  (`_MINIMAP2_SHARD_DUCKDB_CAP_GB` = 12, the largest limit the old arithmetic ever
+  produced), for the reason `build_rype_index` has one: `plan()` is applied as
+  `min(hint, baseline)`, so above the shard size where the hint stops binding a smaller
+  reserve would have handed DuckDB *more* inside an unchanged 32 GiB cgroup. Shards are
+  planned by count rather than by a bp budget, so that band is reachable as a catalogue
+  grows — reference-18 did not reach it. With the cap, DuckDB's limit is identical to
+  its previous value at every shard size and the allocation never rises; on an
+  OOM-escalated retry the added memory now reaches minimap2 rather than DuckDB's heap.
+  Host mode is uncapped, because there a `--mem-gb` override is meant to grow DuckDB's
+  genome-scale reassembly headroom. Two tests pin
   it: the modes must resolve different DuckDB limits, and the reserve and floor must move
   together or the measurement stops transferring.
 - **A measured rationale is stated at one site, and the other copies point at it (#537).**
@@ -3458,9 +3470,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   (`test_every_shipped_step_can_escalate_on_both_retry_axes`) and pointed at from eight
   workflow YAMLs; the node shape (`RealMemory=514000` MB / 64 cores, plus two highmem at
   1546528) is stated once in `docs/runbooks/slurm-backend-setup.md` under a new **Node
-  shape** section and pointed at from the six sizing comments that had spelled it out;
+  shape** section, which the four sizing comments still needing it now point at;
   `host_filter`'s measured 25.8 GiB peak moves to the module whose memory behaviour it
-  describes, replacing four copies in two framings. The per-workflow arithmetic each
+  describes, replacing five copies in two framings. The per-workflow arithmetic each
   comment actually computes stays where it is — only the shared fact moved.
 
 - **The data plane's prose says `prep_sample` where it means one (#535).**

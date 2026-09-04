@@ -149,10 +149,9 @@ steps:
     outputs: []
 
 # Ceiling must stay strictly ABOVE every step baseline on the escalating axes
-# (mem_gb, walltime); why, and what enforces it for every shipped workflow, are
+# (mem_gb, walltime). Why, and what enforces it for every shipped workflow, are
 # stated at test_actions_loader.py's
-# `test_every_shipped_step_can_escalate_on_both_retry_axes`, which enforces it for
-# every shipped workflow. cpu/gpu never escalate.
+# `test_every_shipped_step_can_escalate_on_both_retry_axes`. cpu/gpu never escalate.
 #
 # Matches read-mask/1.0.0, whose qc -> host_filter chain this mirrors and which
 # carries the measured traffic; jobs/host_filter.py states the peak it is sized

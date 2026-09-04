@@ -38,10 +38,11 @@ sinfo -p qiita -o '%n %c %m'    # node, cores, RealMemory (MB)
 ```
 
 Two consequences the workflow YAMLs size against, which is why they point here
-instead of each restating the number: a step's `mem_gb` sets how many of it fit
-on one node (`floor(514000 / (mem_gb * 1024))`), and an allocation above 500 GB
-does not schedule at all. A step asking 251 GiB is the cliff worth knowing —
-`251 * 1024 * 2 = 514048` exceeds 514000, so two of them no longer share a node.
+instead of each restating the number: a step's `mem_gb` sets how many of it fit on
+one standard node (`floor(514000 / (mem_gb * 1024))`), and a step asking more than
+501 GiB does not schedule on one at all. Each sizing comment works its own case —
+`long-read-assembly`'s `assemble` is the one where a single GiB changes how many
+fit.
 
 ## Two identities — do not conflate
 

@@ -306,8 +306,9 @@ steps:
 # `test_every_shipped_step_can_escalate_on_both_retry_axes`. `cpu` is left equal
 # to assemble's baseline — nothing escalates it.
 #
-# Same ceiling as 1.0.1 for the same reason; that version states the measurement
-# it is sized against, and is the one that runs.
+# This version is superseded and its ceiling is unchanged from the one beside it;
+# the measurement it is sized against is stated at the version that carries the
+# `assemble` profiles lookup.
 action_ceiling:
   cpu: 32
   mem_gb: 500

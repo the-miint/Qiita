@@ -519,38 +519,129 @@ def test_build_minimap2_index_reserve_differs_by_mode(tmp_path, monkeypatch):
     )
 
     host_mem, shard_mem = seen
+    # Host mode is uncapped: the reserve is the whole of the split, so DuckDB's
+    # limit grows with the cgroup — which is what a `--mem-gb` override is for on a
+    # genome-scale reassembly.
     assert host_mem == alloc_gb - headroom - build_minimap2_index._MINIMAP2_HOST_RESERVE_GB
-    assert shard_mem == alloc_gb - headroom - build_minimap2_index._MINIMAP2_SHARD_RESERVE_GB
+    # Shard mode is capped, and at this allocation the cap is what binds (64 - 4 - 8
+    # would be 52). That is the point of the cap: a bigger cgroup reaches minimap2's
+    # index, not DuckDB's heap.
+    assert shard_mem == build_minimap2_index._MINIMAP2_SHARD_DUCKDB_CAP_GB
+    assert shard_mem < alloc_gb - headroom - build_minimap2_index._MINIMAP2_SHARD_RESERVE_GB
     assert host_mem != shard_mem, (
-        "host and shard mode resolved the same DuckDB limit — the per-mode reserve "
-        "has collapsed back to a single value"
+        "host and shard mode resolved the same DuckDB limit — the per-mode split "
+        "has collapsed back to a single behaviour"
     )
 
 
-def test_build_minimap2_index_shard_sizing_holds_the_measured_duckdb_limit():
-    """A typical shard still hands DuckDB what it had when the MaxRSS was measured.
+# `plan()` is applied by the CP as a down-size only while it is below the step's
+# YAML baseline (runner/_dispatch.py), so the allocation a shard actually gets is
+# the hint clamped at that baseline. `build-shard-index` declares mem_gb 32 with a
+# 128 ceiling; both are read from the YAML by the pin tests in
+# tests/test_workflow_params_pin.py, and repeated here only as the clamp's inputs.
+_SHARD_YAML_BASELINE_GB = 32
 
-    Those 987 builds ran at 29 GiB against a 16 GiB reserve. 82.2% of them were at
-    or under 1 Gbp, so the sizing that produced them was `floor + 1`. Dropping the
-    reserve by 8 and the floor by the same 8 leaves that shard's DuckDB limit
-    unchanged, which is what lets the measured peaks describe the smaller slot —
-    the allocation shrinks by 8 GiB of slack neither side was using.
 
-    Pins the PAIR: moving the reserve without the floor (or the reverse) changes
-    what DuckDB is handed, and the measurement stops transferring. Comparing at
-    `floor + 1` rather than at the floor on purpose — at the floor exactly, the
-    subtraction returns `_DUCKDB_MEMORY_GB` by construction and would pass for any
-    reserve at all.
+def _shard_allocation_gb(build_minimap2_index, roster) -> int:
+    """The cgroup a shard build really lands in: `plan()`'s hint, clamped at the
+    step's YAML baseline the way `_resolve_step_resources` clamps it."""
+    inputs = build_minimap2_index.Inputs(
+        reference_idx=1, work_ticket_idx=1, shard_id=0, shard_features=roster
+    )
+    hint = build_minimap2_index.plan(inputs).resources.mem_gb
+    return hint if hint < _SHARD_YAML_BASELINE_GB else _SHARD_YAML_BASELINE_GB
+
+
+@pytest.mark.parametrize("shard_gbp", [1, 2, 3, 4, 5, 12, 20])
+def test_build_minimap2_index_shard_never_raises_duckdbs_limit(tmp_path, shard_gbp):
+    """No shard size hands DuckDB MORE than the reserve it replaced would have.
+
+    The whole argument for halving the shard reserve is that it moves the floor by
+    the same 8, so DuckDB's limit is untouched and the reference-18 MaxRSS still
+    describes the smaller slot. That pairing only holds while `plan()` binds on BOTH
+    sides of the comparison: once the hint reaches the 32 GiB baseline the clamp
+    pins the allocation, and a smaller reserve would start handing DuckDB more
+    inside an unchanged cgroup — the one direction that is not conservative.
+    `_MINIMAP2_SHARD_DUCKDB_CAP_GB` is what closes that band, and this walks
+    across it.
+
+    Parametrized over shard sizes spanning the clamp (it engages at 4 Gbp under the
+    old floor and 12 under the new one), so the case that regresses without the cap
+    is covered rather than assumed. Goes through `plan()` and
+    `resolve_duckdb_memory_gb` rather than re-deriving the arithmetic, so it also
+    fails if either stops applying the reserve.
     """
     from qiita_compute_orchestrator.jobs import build_minimap2_index
+    from qiita_compute_orchestrator.miint import resolve_duckdb_memory_gb
 
-    headroom = duckdb_headroom_gb(build_minimap2_index._DUCKDB_THREADS)
-    typical = build_minimap2_index._SHARD_PLAN_FLOOR_GB + 1
+    roster = _write_roster(tmp_path / "r.parquet", [(1, shard_gbp * 1_000_000_000)])
+    alloc = _shard_allocation_gb(build_minimap2_index, roster)
 
-    now = typical - headroom - build_minimap2_index._MINIMAP2_SHARD_RESERVE_GB
-    as_measured = 29 - headroom - 16
-    assert now == as_measured, (
-        f"a 1 Gbp shard is sized to {typical} GiB and hands DuckDB {now} GB, but the "
+    def _limit_at(alloc_gb, reserve_gb, cap_gb, monkey):
+        monkey.setenv("SLURM_MEM_PER_NODE", str(alloc_gb * 1024))
+        return resolve_duckdb_memory_gb(
+            build_minimap2_index._DUCKDB_MEMORY_GB,
+            threads=build_minimap2_index._DUCKDB_THREADS,
+            reserve_gb=reserve_gb,
+            cap_gb=cap_gb,
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        now = _limit_at(
+            alloc,
+            build_minimap2_index._MINIMAP2_SHARD_RESERVE_GB,
+            build_minimap2_index._MINIMAP2_SHARD_DUCKDB_CAP_GB,
+            mp,
+        )
+        # What the 16 GiB reserve produced for the same shard, at ITS floor of 28.
+        before_hint = 28 + shard_gbp
+        before_alloc = (
+            before_hint if before_hint < _SHARD_YAML_BASELINE_GB else _SHARD_YAML_BASELINE_GB
+        )
+        before = _limit_at(before_alloc, 16, None, mp)
+
+    assert now <= before, (
+        f"a {shard_gbp} Gbp shard now runs in {alloc} GiB with DuckDB at {now} GB, "
+        f"above the {before} GB it got in {before_alloc} GiB before the reserve split"
+    )
+    assert alloc <= before_alloc, (
+        f"a {shard_gbp} Gbp shard now asks for {alloc} GiB, more than the "
+        f"{before_alloc} GiB it asked for before"
+    )
+
+
+def test_build_minimap2_index_shard_sizing_holds_the_measured_duckdb_limit(tmp_path):
+    """A 1 Gbp shard still hands DuckDB what it had when the MaxRSS was measured.
+
+    82.2% of the 987 builds were at or under 1 Gbp and ran at 29 GiB against a
+    16 GiB reserve, putting DuckDB at 9 GB. That is the allocation the measured
+    peaks describe, so it is the one the new sizing has to reproduce — otherwise
+    the numbers in `_MINIMAP2_SHARD_RESERVE_GB`'s comment describe a run that no
+    longer happens.
+
+    Goes through `plan()`, the baseline clamp and `resolve_duckdb_memory_gb`
+    rather than re-deriving the arithmetic over the constants: computed from the
+    constants alone, the subtraction returns `_DUCKDB_MEMORY_GB` by construction
+    and would pass for any reserve at all.
+    """
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+    from qiita_compute_orchestrator.miint import resolve_duckdb_memory_gb
+
+    roster = _write_roster(tmp_path / "r.parquet", [(1, 1_000_000_000)])
+    alloc = _shard_allocation_gb(build_minimap2_index, roster)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("SLURM_MEM_PER_NODE", str(alloc * 1024))
+        limit = resolve_duckdb_memory_gb(
+            build_minimap2_index._DUCKDB_MEMORY_GB,
+            threads=build_minimap2_index._DUCKDB_THREADS,
+            reserve_gb=build_minimap2_index._MINIMAP2_SHARD_RESERVE_GB,
+            cap_gb=build_minimap2_index._MINIMAP2_SHARD_DUCKDB_CAP_GB,
+        )
+
+    as_measured = 29 - duckdb_headroom_gb(build_minimap2_index._DUCKDB_THREADS) - 16
+    assert limit == as_measured, (
+        f"a 1 Gbp shard is sized to {alloc} GiB and hands DuckDB {limit} GB, but the "
         f"MaxRSS behind this sizing was measured with DuckDB at {as_measured} GB"
     )
 

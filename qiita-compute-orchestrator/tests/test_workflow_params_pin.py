@@ -283,10 +283,20 @@ def test_build_rype_index_cpu_stays_within_duckdb_threads():
 
     A BOUND, not the equality the pins above assert, because the two workflows
     declaring this step disagree: `host-reference-add` runs it at cpu 4 and
-    `local-host-reference-add` at cpu 8, against a pool of 8. Whether rype's own build
-    parallelism derives from the DuckDB pool has not been probed, so there is no
-    measurement here to pin an equality to, and forcing the two to agree would change a
-    workflow on a guess.
+    `local-host-reference-add` at cpu 8, against a pool of 8.
+
+    Which of the two is right turns on whether `rype_index_create`'s build
+    parallelism comes from the DuckDB thread pool. miint's rendered docs and its
+    issue list (open and closed) were read first: duckdb-miint#182 enumerates the
+    nine table functions exposing a `threads` parameter and `rype_index_create` is
+    not among them, and it records that DuckDB's thread count is honoured with or
+    without that parameter — but it also separates functions that hand a count to an
+    embedded tool rather than to a DuckDB-scheduled loop, which is the class rype
+    falls in. So the question survives the docs and the issues, and nothing here
+    settles it.
+
+    An equality would therefore be a guess that changes one of the two workflows.
+    The bound is what holds under either answer.
 
     What the bound does catch is the direction that is wrong under either answer: a
     `cpu:` ABOVE the pool reserves cores no part of the job can reach, since the pool is

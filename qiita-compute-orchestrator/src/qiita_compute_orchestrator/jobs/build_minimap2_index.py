@@ -88,13 +88,32 @@ _DUCKDB_THREADS = 4
 _MINIMAP2_HOST_RESERVE_GB = 16
 # SHARD mode — one shard of a many-genome catalogue, far smaller than a whole
 # reference. Measured on the reference-18 build (196,062 genomes): MaxRSS over
-# 987 shard builds was p50 6.2, p90 10.3, max 17.1 GiB, run at 29-30 GiB with
-# DuckDB limited to 29 - 4 - 16 = 9 GB. Halving the reserve holds that limit
-# exactly (21 - 4 - 8 = 9), so DuckDB and minimap2 both behave as measured and
-# only the unused slack goes: the max lands 3.9 GiB under a 1 Gbp shard's 21 GiB.
+# 987 shard builds was p50 6.2, p90 10.3, max 17.1 GiB. 82.2% of those shards
+# were at or under 1 Gbp and so ran at 29 GiB, where DuckDB's limit was
+# 29 - 4 - 16 = 9 GB. Halving the reserve holds that limit exactly for such a
+# shard (21 - 4 - 8 = 9), so DuckDB and minimap2 both behave as measured and only
+# the slack unused in that sample goes: the max lands 3.9 GiB under 21 GiB.
 # Refine against an uncensored shard build (one run with DuckDB's limit raised
 # above its observed peak, which would separate the two shares).
 _MINIMAP2_SHARD_RESERVE_GB = 8
+# Under-SLURM HARD ceiling for DuckDB's share in SHARD mode, mirroring the split
+# `build_rype_index` makes for the same reason: this job only reassembles a
+# roster's chunks, so a bigger cgroup should reach minimap2's index rather than
+# DuckDB's heap.
+#
+# It is also what keeps the reserve change above from being a raise. `plan()` is
+# applied as `min(hint, baseline)` (runner/_dispatch.py), so above the shard size
+# where the hint stops binding, a smaller reserve would hand DuckDB MORE inside an
+# unchanged 32 GiB cgroup — 20 GB rather than the 12 it had. 12 is exactly the
+# largest limit the old arithmetic ever produced (32 - 4 - 16), so capping here
+# leaves every allocation at or below what it was and removes that band. Shards are
+# planned by COUNT (`shard_planner._SHARD_COUNT`), not by a bp budget, so shard size
+# scales with the catalogue and that band is reachable — reference-18 did not reach
+# it (its shards ran at 29-31 GiB, i.e. at most 3 Gbp).
+#
+# HOST mode gets no cap: it reassembles genome-scale contigs from staging Parquet,
+# where a `--mem-gb` override is meant to grow DuckDB's reassembly headroom.
+_MINIMAP2_SHARD_DUCKDB_CAP_GB = 12
 
 # minimap2 preset default — 'sr' (short-read), the host-filter alignment mode
 # `host_filter` mirrors on the query side. Overridable via Inputs.
@@ -232,6 +251,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 _DUCKDB_MEMORY_GB,
                 threads=_DUCKDB_THREADS,
                 reserve_gb=(_MINIMAP2_SHARD_RESERVE_GB if sharded else _MINIMAP2_HOST_RESERVE_GB),
+                cap_gb=_MINIMAP2_SHARD_DUCKDB_CAP_GB if sharded else None,
             ),
             threads=_DUCKDB_THREADS,
         )

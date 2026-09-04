@@ -93,10 +93,9 @@ YAML_STEP_NAME = "host_filter"
 # indexes with DuckDB held modest.
 #
 # Measured on read-mask/1.0.0, which carries essentially all host_filter traffic:
-# the step peaks at 25.8 GB against a 32 GB baseline. That is real demand for the
+# the step peaks at 25.8 GiB against a 32 GiB baseline. That is real demand for the
 # reason above — DuckDB is held at the cap below whatever the cgroup is, so the
-# peak is the out-of-heap indexes, not DuckDB growing into its limit. Every
-# workflow shipping this step sizes its ceiling against that number.
+# peak is the out-of-heap indexes, not DuckDB growing into its limit.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 

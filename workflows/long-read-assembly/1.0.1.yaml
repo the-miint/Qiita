@@ -184,8 +184,8 @@ steps:
     # rows is censored, so its 94.58 max is demand outright.
     #
     # 250 keeps a standard node able to hold two of these and 251 does not:
-    # 251 x 1024 x 2 = 514048 MB against the node's RealMemory — the packing cliff
-    # docs/runbooks/slurm-backend-setup.md describes. cpu:32 on 64-core nodes
+    # 251 x 1024 x 2 = 514048 MB against the node's RealMemory, which
+    # docs/runbooks/slurm-backend-setup.md carries. cpu:32 on 64-core nodes
     # caps the step at two per node regardless, so memory only matters where it
     # admits fewer. On the two highmem nodes that same cliff sits at 755 (the
     # runbook above carries both node sizes). That slot was not observed and

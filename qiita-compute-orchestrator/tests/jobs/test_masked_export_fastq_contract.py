@@ -5,9 +5,9 @@ via this COPY).
 
 These run against the team-mirror miint build (staged by the session-autouse
 `_stage_miint_extension` fixture in tests/conftest.py; `open_miint_conn` is
-LOAD-only). They pin the facts the CLI's FASTQ path depends on that the upstream
-`docs/writing.md` summary does not spell out — verified empirically against
-the build, not paraphrased:
+LOAD-only). They pin the facts the CLI's FASTQ path depends on that upstream's
+writing summary — <https://the-miint.github.io/duckdb-miint/writing/> — does not
+spell out, verified empirically against the build rather than paraphrased:
 
   * The writer requires the **verbatim** `read_id`, `sequence1`, `qual1`
     columns (and `sequence2`, `qual2` for paired) — the exact column names the

@@ -167,8 +167,9 @@ def write_feature_sequence_chunks(
     the per-part sort, not the sort's working set: a caller has raised
     `OutOfMemoryException` inside that `ORDER BY` against a DuckDB limit
     several times the raw batch size, so that ratio is not sufficient.
-    `assembly_load`'s step baseline in `workflows/long-read-assembly/`
-    carries the measured endpoints. The ratio itself has not been measured.
+    `assembly_load`'s step baseline in
+    `workflows/long-read-assembly/1.0.1.yaml` carries the measured endpoints.
+    The ratio itself has not been measured.
 
     **Memory safety.** The per-batch COPY joins a `feature_map` subset
     pre-filtered to the batch's hashes (the `fmb` CTE), not the full
