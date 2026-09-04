@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +21,7 @@ from ..host_filter_resolver import is_control_sample
 from ..miint import connect_with_miint_staged
 from ..repositories.block import fetch_mask_sample_state
 from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
+from ._base import _run_signed_flight_call
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
 _log = logging.getLogger(__name__)
@@ -81,24 +80,6 @@ ROUTER_PENDING_BINDING = "router_pending"
 SHARD_MAPPING_BINDING = "shard_mapping"
 
 
-async def _run_signed_flight_call[T](sign: Callable[[], bytes], call: Callable[[bytes], T]) -> T:
-    """Run a blocking data-plane Flight call off the event loop, minting its signed
-    token inside the worker.
-
-    `run_in_executor(None, ...)` submits to asyncio's default ThreadPoolExecutor,
-    which holds `min(32, process_cpu_count() + 4)` threads, so a fan-out wider than
-    that queues. Minting in the worker keeps that queue wait out of the token's TTL
-    (`auth.tickets.DEFAULT_TTL_SECONDS`), which then spans mint -> the data plane's
-    verify and nothing else. A 56-sample read-mask submission put 24 calls behind the
-    32 in flight; tokens minted ahead of the hop arrived already expired ("ticket
-    expired").
-
-    The call's own duration is under no TTL either way — the data plane verifies at
-    handler entry, before the export or the stream runs (`flight_service.rs`), the
-    same property `routes/admin.py` states for its export tickets."""
-    return await asyncio.get_running_loop().run_in_executor(None, lambda: call(sign()))
-
-
 def _do_get_reference_sequences_roster(
     data_plane_url: str, ticket_bytes: bytes, out_path: Path
 ) -> int:
@@ -141,7 +122,7 @@ async def _stage_shard_roster(
 
     Like the other pre-loop resolvers, a Flight failure is wrapped as a
     SUBMISSION-attributed failure (via `_submission_dp_fetch_failure`: a DuckLake
-    serialization conflict is retriable, everything else BAD_INPUT) so it lands in
+    `_submission_dp_fetch_failure` classifies it) so it lands in
     the outer FAILED handler instead of escaping as an untyped exception (which
     would violate the step-name CHECK). An empty membership shard is a
     misconfiguration — fail loud rather than build an empty index."""
@@ -428,11 +409,10 @@ async def _resolve_staged_reads(
     # data plane validates); the data plane writes it.
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "reads.parquet"
-    # A Flight failure (data plane unreachable / errored) is NOT a BackendFailure;
-    # wrap it as a SUBMISSION BAD_INPUT like the other pre-loop resolvers so the
-    # outer handler FAILs the ticket cleanly (step_name=None) rather than letting
-    # an untyped exception strand it in PROCESSING. `_submission_dp_fetch_failure`
-    # decides which causes are retriable rather than permanent.
+    # A Flight failure is NOT a BackendFailure; wrap it as a SUBMISSION failure
+    # like the other pre-loop resolvers so the outer handler FAILs the ticket
+    # cleanly (step_name=None) rather than letting an untyped exception strand it
+    # in PROCESSING. `_submission_dp_fetch_failure` decides permanent vs retriable.
     try:
         result = await _run_signed_flight_call(
             lambda: sign_action(
@@ -528,10 +508,10 @@ async def _resolve_staged_masked_reads(
 
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "masked_reads.fastq.gz"
-    # Flight failure -> SUBMISSION BAD_INPUT like the other pre-loop resolvers
+    # Flight failure -> a SUBMISSION failure like the other pre-loop resolvers
     # (step_name=None), so the outer handler FAILs the ticket cleanly rather than
-    # stranding it in PROCESSING. The blocking stream+COPY runs off the event loop.
-    # The ticket is the SAME read_masked DoGet ticket the admin masked-read export
+    # stranding it in PROCESSING; `_submission_dp_fetch_failure` decides permanent
+    # vs retriable. The ticket is the SAME read_masked DoGet ticket the admin export
     # mints — a generic ticket scoped to exactly (prep_sample_idx, mask_idx), no
     # bespoke action or payload type.
     try:

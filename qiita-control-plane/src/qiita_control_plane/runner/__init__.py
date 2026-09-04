@@ -112,6 +112,7 @@ from ._base import (
     _log,
     _note_transient_retry,
     _raise_if_ticket_terminal,
+    _run_signed_flight_call,
 )
 from ._db import (
     _ACTION_COLS,
@@ -352,6 +353,7 @@ __all__: list[str] = [
     "_persist_mask_idx",
     "_poll_until_terminal",
     "_raise_if_ticket_terminal",
+    "_run_signed_flight_call",
     "_reconstruct_action_outputs",
     "_reconstruct_completed_outputs",
     "_resolve_baseline_for_step",

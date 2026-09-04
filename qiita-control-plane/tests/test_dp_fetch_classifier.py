@@ -17,6 +17,7 @@ from qiita_common.backend_failure import FailureKind
 from qiita_common.models import WorkTicketFailureStage
 
 from qiita_control_plane.runner._upload import (
+    _DP_TICKET_EXPIRED_SIGNATURES,
     _is_dp_serialization_conflict,
     _is_dp_ticket_expired,
     _is_dp_unavailable,
@@ -95,6 +96,46 @@ def test_other_unauthenticated_errors_are_not_detected():
     assert _is_dp_ticket_expired(Exception(_REAL_BAD_SIGNATURE)) is False
     assert _is_dp_ticket_expired(Exception(_REAL_40001)) is False
     assert _is_dp_ticket_expired(Exception("some other flight error")) is False
+    # `AuthError::ExpiryTooFar` — the nearest miss, and the variant a reword of the
+    # Rust `Display` impl is most likely to collide with.
+    assert (
+        _is_dp_ticket_expired(
+            Exception(
+                "FlightUnauthenticatedError: Flight returned unauthenticated error, "
+                "with message: ticket expiry too far in the future"
+            )
+        )
+        is False
+    )
+
+
+def test_an_expired_work_ticket_is_not_an_expired_flight_ticket():
+    """ "ticket" names both a Flight ticket and a work_ticket in this repo, and
+    "work ticket expired" contains the expiry text. The unauthenticated marker is
+    what separates them, so a non-Flight message must not classify retriable."""
+    assert _is_dp_ticket_expired(Exception("work ticket expired while queued")) is False
+
+
+def test_expiry_signatures_match_the_data_planes_wording():
+    """The classifier keys off text the Rust `Display` impl produces. Neither
+    language can import the other, so the const is parsed out of the source —
+    the same mechanism `tests/auth/test_auth.py` uses for the projection allowlist.
+    A reword in `auth.rs` fails HERE rather than silently reverting every expired
+    token to a permanent BAD_INPUT."""
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "auth.rs").read_text()
+    m = re.search(r'AuthError::Expired => write!\(f, "([^"]+)"\)', src)
+    assert m, "AuthError::Expired arm not found in auth.rs"
+    assert m.group(1) == "ticket expired", (
+        f"the data plane now renders an expired ticket as {m.group(1)!r}; "
+        f"update _DP_TICKET_EXPIRED_SIGNATURES ({_DP_TICKET_EXPIRED_SIGNATURES!r}) "
+        "or expired tokens silently classify permanent again"
+    )
+    # Every AuthError variant reaches the caller as gRPC unauthenticated, which is
+    # the other half of the match — see the flight_service.rs `map_err` sites.
+    assert "unauthenticated" in _DP_TICKET_EXPIRED_SIGNATURES
 
 
 def test_serialization_conflict_classified_retriable():

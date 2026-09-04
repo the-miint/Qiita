@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 
 import asyncpg
 from qiita_common.actions import PATH_SUFFIX, UPLOAD_IDX_SUFFIX
@@ -15,6 +16,23 @@ from qiita_common.models import (
 import qiita_control_plane.runner as _runner_pkg
 
 _log = logging.getLogger("qiita_control_plane.runner")
+
+
+async def _run_signed_flight_call[T](sign: Callable[[], bytes], call: Callable[[bytes], T]) -> T:
+    """Run a blocking data-plane Flight call off the event loop, minting its signed
+    token inside the worker.
+
+    `run_in_executor(None, ...)` submits to asyncio's default ThreadPoolExecutor,
+    which holds `min(32, process_cpu_count() + 4)` threads, so a fan-out wider than
+    that queues — 56 concurrent prep_sample read-mask resolutions left 24 calls
+    waiting. Minting in the worker keeps that queue wait out of the token's TTL
+    (`auth.tickets.DEFAULT_TTL_SECONDS`), which then spans mint -> the data plane's
+    verify and nothing else — and the data plane verifies before it does the work, so
+    the call's own duration is under no TTL either (see `routes.admin`, which states
+    that property where it acts on it by minting at the maximum lifetime).
+    """
+    return await asyncio.get_running_loop().run_in_executor(None, lambda: call(sign()))
+
 
 # Re-exported under the runner's private spelling; the contract and its
 # rationale live on the definitions in `qiita_common.actions`.

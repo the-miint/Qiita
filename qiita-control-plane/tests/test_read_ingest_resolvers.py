@@ -29,11 +29,11 @@ from qiita_control_plane.runner import (
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
+    _run_signed_flight_call,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
 )
-from qiita_control_plane.runner._read_ingest import _run_signed_flight_call
 
 
 def _step(**kw) -> SimpleNamespace:
@@ -437,7 +437,7 @@ async def _with_delayed_executor(clock, delay, coro_fn):
 
 
 def test_run_signed_flight_call_signs_after_the_queue_wait(monkeypatch):
-    """The seam every data-plane Flight call goes through: `sign` runs on the
+    """The shared seam the read-ingest resolvers call through: `sign` runs on the
     worker, so a token minted for a queued call carries a TTL measured from when
     the worker started, not from when the call was submitted."""
     clock = _FakeClock()
@@ -465,6 +465,7 @@ def test_resolve_staged_reads_token_survives_a_queue_wait_past_the_ttl(tmp_path,
     default executor expired its own export_read tokens, and the queued calls
     reached the data plane already dead ("ticket expired"). The token the stub
     receives is minted after the wait, so it is still valid on arrival."""
+
     clock = _FakeClock()
     monkeypatch.setattr(tickets, "time", clock)
     queue_wait = 10 * 60

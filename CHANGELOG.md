@@ -1637,13 +1637,16 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   fan-out expired its own tokens (#532).** `_resolve_staged_reads` minted the token and only
   then handed the Flight call to `run_in_executor(None, ...)`; asyncio's default
   ThreadPoolExecutor holds `min(32, process_cpu_count() + 4)` threads, so a fan-out wider
-  than that queues, and the wait was spent against the token's own 300 s TTL. A 56-sample
-  read-mask submission across two PacBio pools failed 24 tickets with
+  than that queues, and the wait was spent against the token's own 300 s TTL. A read-mask submission of 56
+  prep_samples across two PacBio pools failed 24 tickets with
   `FlightUnauthenticatedError: ... ticket expired`, all stamped within the same second as the
   queue drained onto tokens that had already died. Minting now happens on the worker, through
-  one `_run_signed_flight_call` seam shared by the three data-plane calls in
-  `runner/_read_ingest.py` that had this shape — the `export_read` action, the shard-roster
-  DoGet, and the masked-read stream. The call's own duration was never under the TTL either
+  one `_run_signed_flight_call` seam in `runner/_base.py`, applied to the three data-plane
+  calls in `runner/_read_ingest.py` that had this shape — the `export_read` action, the
+  shard-roster DoGet, and the masked-read stream. Twelve further mint-then-hop sites
+  (`runner/_reference.py`, `actions/library.py`) carry the same exposure and are left to a
+  follow-up; the seam lives in `_base.py` rather than the read-ingest module so they can adopt
+  it without importing one. The call's own duration was never under the TTL either
   way: the data plane verifies at handler entry, before the export or the stream runs, which
   is the property `routes/admin.py` already states for its 3600 s export tickets. So the TTL
   now spans mint to verify and nothing else, and `DEFAULT_TTL_SECONDS` is unchanged — raising
@@ -1653,10 +1656,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   redrive (#532).** `_is_retriable_dp_error` recognized only a DuckLake serialization conflict
   and gRPC UNAVAILABLE, so the 24 tickets above landed permanent at `retry_count 0` against
   `max_retries 3`. The next attempt mints a fresh token, which is the same self-healing test
-  those two already pass, so an expired token now classifies `DATA_PLANE_TRANSIENT`. Matched
-  on the data plane's `ticket expired` text and not on the `FlightUnauthenticatedError` class:
-  every `AuthError` variant maps to that one gRPC status, and `invalid signature` /
-  `malformed payload` never self-heal.
+  those two already pass, so an expired token now classifies `DATA_PLANE_TRANSIENT`. The match
+  requires the gRPC unauthenticated marker AND the data plane's `ticket expired` text: the
+  class alone is too loose (every `AuthError` variant maps to that one status, and `invalid
+  signature` / `malformed payload` never self-heal), and the text alone is too loose the other
+  way ("ticket" names a work_ticket here too, and "work ticket expired" contains it). A test
+  parses `auth.rs` for the `AuthError::Expired` wording, as `tests/auth/test_auth.py` already
+  does for the projection allowlist, so a reword there fails a test instead of silently
+  reverting every expiry to permanent. An integration test asserts the string that actually
+  crosses Rust → gRPC → pyarrow carries both markers, with a live-expiry control.
 
 - **`make test-workflows` ran apptainer on a host without it (#531).** The guard
   `if ! command -v apptainer ...; exit 0; fi` sat on its own recipe line, and `exit 0`

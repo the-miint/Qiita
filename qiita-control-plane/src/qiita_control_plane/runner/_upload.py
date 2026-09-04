@@ -66,15 +66,21 @@ _DP_UNAVAILABLE_SIGNATURES = (
     "failed to connect to all addresses",
 )
 
-# Expired-token signature. A Flight token carries a TTL (`auth/tickets.py`
-# DEFAULT_TTL_SECONDS) that the data plane checks when the call arrives, so a
-# token that ages out between minting and arrival comes back as this text. The
-# next attempt mints a fresh token, so a redrive self-heals it exactly as the two
-# signatures above do. Matched on the expiry text alone and NOT on the
-# FlightUnauthenticatedError class name: the data plane returns that same gRPC
-# status for `invalid signature` and `malformed payload` (every AuthError variant
-# maps to unauthenticated), neither of which a redrive fixes.
-_DP_TICKET_EXPIRED_SIGNATURE = "ticket expired"
+# Expired-token signatures, BOTH required. A Flight token carries a TTL
+# (`auth/tickets.py` DEFAULT_TTL_SECONDS) that the data plane checks when the call
+# arrives, so a token that ages out in transit comes back as the data plane's
+# `AuthError::Expired` text under a gRPC unauthenticated status. The next attempt
+# mints a fresh token, so a redrive self-heals it exactly as the two signatures
+# above do.
+#
+# The expiry text alone is too loose — "ticket" names both a Flight ticket and a
+# work_ticket here, and "work ticket expired" contains it. The unauthenticated
+# marker is what makes it a Flight auth failure. The class name alone is too loose
+# in the other direction: every AuthError variant maps to unauthenticated, and
+# `invalid signature` / `malformed payload` never self-heal. `test_auth.py` parses
+# the Rust source so a reword there fails a test rather than silently reverting
+# every expiry to permanent.
+_DP_TICKET_EXPIRED_SIGNATURES = ("unauthenticated", "ticket expired")
 
 
 def _is_dp_serialization_conflict(exc: BaseException) -> bool:
@@ -93,7 +99,8 @@ def _is_dp_unavailable(exc: BaseException) -> bool:
 def _is_dp_ticket_expired(exc: BaseException) -> bool:
     """True if a data-plane Flight failure is an expired signing token, rather than
     a permanent auth failure (bad signature, malformed payload) or a bad input."""
-    return _DP_TICKET_EXPIRED_SIGNATURE in str(exc).lower()
+    text = str(exc).lower()
+    return all(sig in text for sig in _DP_TICKET_EXPIRED_SIGNATURES)
 
 
 def _is_retriable_dp_error(exc: BaseException) -> bool:
