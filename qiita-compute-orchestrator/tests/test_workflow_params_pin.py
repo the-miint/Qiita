@@ -227,11 +227,12 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
     `build_minimap2_index._DUCKDB_THREADS`, where the three pins above assert equality.
 
     Those pins exist because a job drawing its parallelism from DuckDB's pool wastes
-    any core the pool cannot use. This step is the opposite case: `sacct` over a 68-run
-    sample put its CPU efficiency at p50 2.1% and max 13.9% of four cores — a maximum
-    average demand of 0.56 cores — because it runs blocked on the data-plane chunk
-    stream rather than computing. The cores were the waste, so `cpu` dropped to the
-    measured 1 while the pool stayed at 4.
+    any core the pool cannot use. This step is the opposite case: it runs blocked on
+    the data-plane chunk stream rather than computing, so the serial work one core must
+    absorb is small — the largest TotalCPU over the reference-18 build's 987 shard
+    builds is 1.45 min. The cores were the waste, so `cpu` dropped to the measured 1
+    while the pool stayed at 4. The step's `baseline_resources` comment in the workflow
+    YAML carries the rest of that measurement.
 
     Pinned for the same reason the others are: nothing fails at runtime when these
     drift, so a later edit raising `cpu` to match the pool would silently undo a
@@ -243,10 +244,11 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.build_minimap2_index")
     for where, cpu in _baseline_cpu_every_version("build-shard-index", "build_minimap2_index"):
         assert cpu == 1 and cpu < mod._DUCKDB_THREADS, (
-            f"{where}: build_minimap2_index cpu={cpu}, "
-            f"measured at 0.56 cores maximum average demand. It sits below "
-            f"_DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — the step is blocked "
-            f"on its data-plane stream, so cores matched to the pool go unused."
+            f"{where}: build_minimap2_index cpu={cpu}. One core is enough because the "
+            f"largest TotalCPU over 987 shard builds is 1.45 min, so serialising the "
+            f"work onto it costs about a minute of a PT2H budget. It sits below "
+            f"_DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — the step is blocked on "
+            f"its data-plane stream, so cores matched to the pool go unused."
         )
 
 

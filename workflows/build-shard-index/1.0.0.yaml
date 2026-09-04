@@ -79,10 +79,18 @@ steps:
     params: {minimap2_preset: preset, shard_id: shard_id}
     when: build_minimap2
     outputs: [minimap2_index_meta]
-    # cpu from the reference-18 build. Over a 68-run sample, CPU efficiency
-    # TotalCPU/(Elapsed x AllocCPUS) was p50 2.1%, max 13.9% — at 4 CPUs a maximum
-    # average demand of 0.56 cores, which one covers. The step spends its wall time
-    # blocked on the data-plane chunk stream rather than computing.
+    # cpu from the reference-18 build: 987 shard builds at cpu:4, all COMPLETED.
+    # The step runs blocked on the data-plane chunk stream rather than computing, so
+    # the serial work one core has to absorb is small — TotalCPU p50 0.44, p99 1.14,
+    # max 1.45 min, against an elapsed of p50 2.5, p99 10.0, max 23.9 min. Worst case
+    # at cpu:1 is elapsed + 0.75 x TotalCPU (the CPU portion perfectly parallel across
+    # four cores, fully serialised onto one), which peaks at 24.7 min over all 987
+    # against the PT2H limit.
+    #
+    # CPU efficiency TotalCPU/(Elapsed x AllocCPUS) is not the bound here: it peaks at
+    # 28.0% — 1.12 average cores, above the one allocated — on a 0.58-min shard that
+    # projects to 1.07 min. Mean efficiency by elapsed decile falls monotonically from
+    # 13.7% to 1.7%, so the shards where the ratio is high are the short ones.
     #
     # This does not touch DuckDB's pool: the job takes its thread count from its own
     # `_DUCKDB_THREADS`, so four threads now time-share one core instead of four.
@@ -95,24 +103,15 @@ steps:
     # nothing changes. `plan()` sizes a shard to 28 + ceil(bp/1e9) GiB, so one at or
     # under 1 Gbp lands at 29, where floor(514000/29696) = 17 exceeds that cpu cap and
     # the cut does add a slot; above 1 Gbp it lands at 30 or more, floor(514000/30720)
-    # = 16, and the gain is gone. The shard-size distribution of this reference was
-    # not measured, so how often it applies is unknown. Either way the cores it stops
-    # reserving are available to other work on the node.
-    #
-    # The elapsed tail is the part this does not bound. Elapsed over all 987 shards
-    # was p50 14.5, p90 30.7, p99 65.2 and max 92.3 min against the PT2H limit, with
-    # zero timeouts — but the 68-run CPU sample need not contain that worst shard, so
-    # 0.56 cores does not describe it. Whether serialising its bursts onto one core
-    # moves it past PT2H is unmeasured; a TIMEOUT escalates to the PT4H action
-    # ceiling, which is what makes that recoverable rather than fatal. walltime
-    # therefore stays PT2H.
+    # = 16, and the gain is gone. 82.2% of this reference's 987 shards landed at 29 GiB.
+    # Either way the cores it stops reserving are available to other work on the node.
     #
     # The same step runs at cpu:4 in host-reference-add and local-host-reference-add,
-    # unchanged: those build a whole reference rather than a shard, and no efficiency
-    # measurement was taken there.
+    # unchanged: those build a whole reference rather than a shard, and no measurement
+    # was taken there.
     #
-    # mem_gb stays 32: memory was never binding on demand here (p50 5.9 GiB, max 11.0
-    # GiB), and `plan()` already sizes a shard build down from this baseline by bp.
+    # mem_gb stays 32: MaxRSS over the same 987 was p50 6.2, p90 10.3, max 17.1 GiB,
+    # and `plan()` already sizes a shard build down from this baseline by bp.
     baseline_resources:
       cpu: 1
       mem_gb: 32
@@ -131,6 +130,20 @@ steps:
     params: {shard_id: shard_id}
     when: build_bowtie2
     outputs: [bowtie2_index_meta]
+    # cpu:4 predates the reference-18 build. That build's 987 shard builds show the
+    # cores being used, but they do not establish the number: fitting inside PT2H takes
+    # more than one core for 36 of them and more than two for three of those, so the
+    # measurement rules out cpu:1 and cpu:2 without separating 3 from 4.
+    #
+    # What it does show is that this step, unlike build_minimap2_index above, spends its
+    # wall time computing. TotalCPU is p50 35.4, p90 84.7, max 269.0 min, and the
+    # busiest run averaged 3.71 of the four cores over 37.4 min. There the extra cores
+    # were waste; here they are not.
+    #
+    # This is also the longer step of the pair: elapsed p50 14.5, p90 30.7, p99 65.2,
+    # max 92.3 min against the same PT2H limit. mem_gb 32 is the whole-reference
+    # baseline; `plan()` sizes a shard down from it by bp, so those 987 ran at 29-31
+    # GiB, against a MaxRSS of p50 7.9, p90 13.3, max 21.9 GiB.
     baseline_resources:
       cpu: 4
       mem_gb: 32

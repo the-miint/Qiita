@@ -1725,6 +1725,27 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   claims. Reconciling them is its own change, and `cross-cutting.md` says so rather than
   leaving the disagreement silent.
 
+- **`build_minimap2_index`'s `cpu: 1` was justified from the first ~1.4 hours of the
+  reference-18 build, and the figures characterising that step were wrong (#536).** The
+  68-run slice behind it spans 09:41 to 11:07 of a build that ran to the next morning;
+  re-pulled `sacct` for all 987 shard builds. CPU efficiency is p50 4.3% / max 28.0%, not
+  p50 2.1% / max 13.9%, and 167 of the 987 exceed the figure given as the maximum. The
+  derived "0.56 cores maximum average demand, which one covers" is 1.12 cores — above the
+  single core the step now gets. `MaxRSS` max is 17.1 GiB, not 11.0. The elapsed tail the
+  comment weighed against PT2H (p50 14.5, p90 30.7, p99 65.2, max 92.3 min) was itself
+  correct but belongs to `build_bowtie2_index`, the sibling step, which keeps `cpu: 4`;
+  this step's own elapsed is p50 2.5, p99 10.0, max 23.9 min. Those four figures moved
+  onto `build_bowtie2_index`'s `baseline_resources`, which carried no evidence at all.
+
+  The pin itself stands, on a bound that does not depend on the 68-run slice being
+  representative: what one core must absorb is TotalCPU, which is p99 1.14 and max 1.45
+  min. Worst case at `cpu: 1` is `elapsed + 0.75 x TotalCPU`, peaking at 24.7 min over all
+  987 against the PT2H limit — none cross. Efficiency is the wrong axis because it falls
+  as elapsed rises — mean efficiency by elapsed decile drops monotonically from 13.7% to
+  1.7% — so the high ratios are all on short shards. Comment and test docstring rewritten
+  on that basis, and the shard-size distribution the comment called unmeasured was
+  measured: 82.2% of shards at 29 GiB.
+
 - **Read materialization signed its `export_read` token before the executor hop, so a wide
   fan-out expired its own tokens (#532).** `_resolve_staged_reads` minted the token and only
   then handed the Flight call to `run_in_executor(None, ...)`; asyncio's default
