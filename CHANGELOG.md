@@ -1732,8 +1732,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   Settled against the deploy: every one of the 59 first attempts in that cohort ran under
   `1.0.0`, whose `assembler` default is hifiasm_meta, and no `1.0.0` work ticket ever
   recorded myloasm (its first run is 2026-09-02, under `1.0.1`). So the peak is
-  hifiasm_meta's and does bound the 250 GiB profile — the comment now says so, and says
-  what remains unrecoverable: the input scale behind it, whose `sacct` rows are gone.
+  hifiasm_meta's and does bound the 250 GiB profile. That matters because `assemble` is
+  now sized per assembler: 259.3 constrains the hifiasm_meta profile alone and says
+  nothing about myloasm's 128. The comment states the trade it implies — 250 is knowingly
+  below a hifiasm_meta peak, and covering it would take 260, whose `260 * 1024 * 2`
+  exceeds the node, dropping the step from two per node to one; one escalation rung for
+  the tail is taken over halving occupancy for every sample that is not in it. It also
+  says what stays unrecoverable: the input scale behind the peak, whose `sacct` rows are
+  gone and which is not reachable from the orchestrator host in any case.
 - **`_baseline_cpu_every_version`'s docstring credited the wrong site for a guard (#537).**
   It said the caller asserts the result is non-empty; the helper raises on it itself, and
   no caller checked. The behaviour was right and the attribution wrong, which would have

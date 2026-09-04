@@ -195,13 +195,19 @@ steps:
     # slot rather than demonstrating one, and stops 3.97 GiB above this cohort's max.
     # An earlier and larger cohort — 59 first attempts at 192, of which 30 OOMed —
     # peaked at 259.3 GiB on its 384 GiB retries, so a sample in that range still
-    # escalates here. That peak is THIS profile's: all 59 ran under 1.0.0, whose
-    # `assembler` default is hifiasm_meta, and no 1.0.0 ticket recorded myloasm —
-    # its first run is 2026-09-02, under this version. So 250 does not cover the
-    # worst hifiasm_meta sample seen; it covers the current cohort's uncensored
-    # max, and the escalation to 500 is what carries the rest. The input scale
-    # behind that peak was not recorded and its sacct rows are gone, so it cannot
-    # be re-sized against directly.
+    # escalates here. That peak is THIS profile's, not the other one's: all 59 ran
+    # under 1.0.0, whose `assembler` default is hifiasm_meta, and no 1.0.0 ticket
+    # recorded myloasm — its first run is 2026-09-02, under this version. Which
+    # matters because the two are now sized separately: 259.3 constrains the
+    # hifiasm_meta profile alone and says nothing about myloasm's 128.
+    #
+    # So 250 is knowingly below a hifiasm_meta peak, and covering it would cost the
+    # second slot: the smallest allocation above 259.3 is 260, and 260 x 1024 x 2 =
+    # 532480 MB exceeds the node, so this step would drop from two per node to one.
+    # The trade taken is one escalation rung for a sample in that range against
+    # halving the step's per-node occupancy for every sample that is not. The input
+    # scale behind that peak was not recorded and its sacct rows are gone, so it
+    # cannot be re-sized against more precisely than this.
     #
     # myloasm 128, 1.35x its observed max with 33.4 GiB of margin. It does not raise
     # this step's own concurrency (cpu:32 already caps that at two per node); what it
