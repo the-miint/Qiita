@@ -347,6 +347,30 @@ const ALLOWED_TABLES: &[&str] = &[
     // accepted on either, and neither is an empty one.
     "assembled_sequence",
     "assembled_sequence_chunks",
+    // Per-subject CheckM quality for one assembly run, read by the feature-table
+    // resolver to attach completeness/contamination to the genomes it stages.
+    //
+    // PRIVACY: it holds no sequence and no read — one row per assembled subject
+    // carrying marker lineage, completeness, contamination, strain heterogeneity,
+    // genome size, contig count and DAS_Tool provenance, over sequence a consumer
+    // can already reach through `assembled_sequence`. It carries no `feature_idx`,
+    // so nothing it streams joins the shared feature space without the Postgres
+    // bridge, and `build_bin_quality_query` refuses any filter that is not exactly
+    // one assembly run — there is no unscoped form.
+    //
+    // Two things this is NOT. It is not aggregated past the contig for every kind:
+    // `bin_id` is CheckM's Bin Id column, a refined bin's FASTA stem for a MAG but
+    // the ASSEMBLER'S CONTIG ID for an LCG or an UNBINNED row (the orchestrator's
+    // `assembly_load` job states this), so for those kinds a row does name a contig
+    // — in the assembler's id namespace, not the minted `feature_idx` one. And its
+    // reach is not the reach of `assembled_sequence`: that surface is minted one
+    // prep_sample per ticket behind a per-principal route gate, where this is a
+    // whole-cohort read signed in-process with no route in front of it.
+    //
+    // `assembly_membership` stays out regardless: it maps a run to its contigs in
+    // the MINTED namespace, which is the join into the shared feature space this
+    // table cannot make.
+    "bin_quality",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -2096,13 +2120,17 @@ struct ReplaceKey {
     /// Table in the same registration whose incoming files name the key set to
     /// delete on, unioned with this table's own files.
     ///
-    /// `bin_quality` borrows `assembly_membership`'s, because CheckM covers
-    /// refined bins only: a run with no MAG writes `bin_quality` with zero rows,
-    /// which names no key and so deletes nothing, leaving the previous run's
-    /// rows joined to a membership set that was replaced out from under them.
-    /// `assembly_membership` carries the run's key on every row and is never
-    /// empty where the load runs at all (`assembly_hash` raises `StepNoData` at
-    /// zero contigs of any kind). Every other entry is its own source.
+    /// `bin_quality` borrows `assembly_membership`'s, because it can be EMPTY
+    /// where the load still runs: CheckM scores MAG, LCG and the unbinned residue
+    /// in three separate passes, and a run in which none of them produced output —
+    /// no refined bin, nothing circular, no residue clearing the length cut —
+    /// writes zero rows. (A missing CheckM DB is NOT one of those — that step fails
+    /// loud rather than report quality as empty.) Zero rows name no key and so delete
+    /// nothing, leaving the previous run's rows joined to a membership set that
+    /// was replaced out from under them. `assembly_membership` carries the run's
+    /// key on every row and is never empty where the load runs at all
+    /// (`assembly_hash` raises `StepNoData` at zero contigs of any kind). Every
+    /// other entry is its own source.
     key_source: &'static str,
 }
 
@@ -3372,6 +3400,16 @@ fn is_assembly_run_surface(table: &str) -> bool {
     matches!(table, "assembled_sequence" | "assembled_sequence_chunks")
 }
 
+/// The per-subject quality surface, scoped to one assembly run over a cohort.
+///
+/// Separate from `is_assembly_run_surface` because the scope is a different shape,
+/// not a different table: `bin_quality` carries `prep_sample_idx` and
+/// `processing_idx` as real columns, so its run scope is a WHERE clause on itself
+/// and needs none of the `assembly_membership` semi join those two require.
+fn is_bin_quality_surface(table: &str) -> bool {
+    table == "bin_quality"
+}
+
 /// Build a SQL query for the given table and filter.
 ///
 /// SQL injection defense model:
@@ -3420,6 +3458,11 @@ fn build_query(
     // rather than a column of this one — also not a generic WHERE clause.
     if is_assembly_run_surface(table) {
         return build_assembly_run_query(table, filter);
+    }
+
+    // Scoped by a run it carries itself, and refused outright without one.
+    if is_bin_quality_surface(table) {
+        return build_bin_quality_query(filter);
     }
 
     if filter.is_empty() {
@@ -3614,6 +3657,43 @@ fn build_assembly_run_query(
             "SELECT * FROM {full_table} WHERE feature_idx IN (\
              SELECT feature_idx FROM qiita_lake.assembly_membership \
              WHERE prep_sample_idx = {prep_sample_idx} AND processing_idx = {processing_idx})"
+        ),
+        full_table,
+    ))
+}
+
+/// Build the run-scoped SELECT for `bin_quality`.
+///
+/// One assembly RUN, over a cohort: exactly one `processing_idx`, a non-empty
+/// `prep_sample_idx` set, and nothing else. Both halves are required because
+/// either alone widens past the run — `processing_idx` alone is every sample that
+/// run touched, `prep_sample_idx` alone is every run those samples ever had — and
+/// the `filter.len()` check is what stops a third column from riding along
+/// unnoticed.
+///
+/// A cohort where `build_assembly_run_query` takes one sample: this table's rows
+/// are per subject rather than per contig, so a whole cohort answers in one
+/// stream. The rows carry `prep_sample_idx`, so a sample that scored nothing is
+/// absent from the result rather than merged into a neighbour's rows.
+fn build_bin_quality_query(filter: &auth::TicketFilter) -> Result<(String, String), Status> {
+    let processing_idx = single_i64_filter(filter, "processing_idx")?;
+    let prep_sample_idx = i64_list_filter(filter, "prep_sample_idx")?;
+    if filter.len() != 2 {
+        return Err(Status::invalid_argument(format!(
+            "bin_quality accepts only prep_sample_idx and processing_idx, got {} columns",
+            filter.len()
+        )));
+    }
+    let full_table = "qiita_lake.bin_quality".to_string();
+    let preps = prep_sample_idx
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok((
+        format!(
+            "SELECT * FROM {full_table} \
+             WHERE processing_idx = {processing_idx} AND prep_sample_idx IN ({preps})"
         ),
         full_table,
     ))

@@ -50,11 +50,13 @@ what keeps the total the same.
 
 from __future__ import annotations
 
+from ..assembly_constants import BIN_QUALITY_SCORE_COLUMNS
 from .relations import (
     ALIGNMENT_TABLE,
     DENOVO_ALIGNMENT_TABLE,
     DENOVO_CONTIG_LENGTHS_TABLE,
     DENOVO_COVERAGE_ALIGNMENTS_VIEW,
+    DENOVO_GENOME_QUALITY_TABLE,
     DENOVO_MAP_TABLE,
     GENOME_LENGTHS_TABLE,
 )
@@ -116,6 +118,40 @@ def denovo_map_table_sql(source: str) -> str:
         f"CREATE TABLE {DENOVO_MAP_TABLE} AS "
         f"SELECT DISTINCT prep_sample_idx, feature_idx AS contig_id, "
         f"genome_idx AS genome_id "
+        f"FROM {source}"
+    )
+
+
+def denovo_genome_quality_table_sql(source: str) -> str:
+    """Stage the de novo arm's per-genome CheckM scores from `source` — a relation
+    keyed `(prep_sample_idx, genome_idx)` and carrying `BIN_QUALITY_SCORE_COLUMNS` —
+    into `DENOVO_GENOME_QUALITY_TABLE`.
+
+    The rename is `denovo_map_table_sql`'s, to the `genome_id` the other de novo
+    relations key on, so a consumer joins this to the map without a second spelling
+    for the same column. The score columns come from the shared constant rather than
+    a second spelling here, so widening what the resolver stages cannot leave this
+    silently projecting the old pair.
+
+    **The scores pass through untouched, and a NULL is not a zero.** The resolver
+    LEFT-joins, so a genome CheckM did not score arrives with both scores NULL and
+    keeps them. A predicate over these columns has to say what it does with the
+    unscored: SQL three-valued logic drops them from a bare `completeness >= x`,
+    which is a decision about genomes nobody measured, taken by omission.
+
+    **`source` must already be scoped to ONE assembly run**, for the reason
+    `denovo_map_table_sql` gives: a subject key is per-run, and a contig assembled
+    by two runs is one feature under two genomes.
+
+    No `DISTINCT`, where that sibling carries one: its source is per contig and can
+    hold exact repeats, this one is already per genome. A duplicate here would mean
+    the resolver's join fanned out, which is a load to fix rather than a repeat to
+    collapse — the resolver states that invariant at the join.
+    """
+    scores = ", ".join(BIN_QUALITY_SCORE_COLUMNS)
+    return (
+        f"CREATE TABLE {DENOVO_GENOME_QUALITY_TABLE} AS "
+        f"SELECT prep_sample_idx, genome_idx AS genome_id, {scores} "
         f"FROM {source}"
     )
 

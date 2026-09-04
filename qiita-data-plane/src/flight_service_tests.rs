@@ -4006,22 +4006,24 @@ fn feature_scope(values: &[i64]) -> auth::TicketFilter {
 
 #[test]
 fn assembly_surfaces_are_doget_allowed_and_the_junction_is_not() {
-    // The two sequence surfaces are Flight-readable. `assembly_membership`
-    // is read to RESOLVE their scope (`build_assembly_run_query`) but is not
-    // a table a ticket can name; `bin_quality` is a register_files write
-    // target only.
-    for readable in ["assembled_sequence", "assembled_sequence_chunks"] {
+    // The two sequence surfaces are Flight-readable, and so is the per-subject
+    // quality the feature-table resolver reads. `assembly_membership` is read to
+    // RESOLVE the sequence surfaces' scope (`build_assembly_run_query`) but is not
+    // a table a ticket can name; the allowlist carries why.
+    for readable in [
+        "assembled_sequence",
+        "assembled_sequence_chunks",
+        "bin_quality",
+    ] {
         assert!(
             ALLOWED_TABLES.contains(&readable),
-            "{readable:?} must be DoGet-readable for the contig read-back"
+            "{readable:?} must be DoGet-readable"
         );
     }
-    for sink in ["assembly_membership", "bin_quality"] {
-        assert!(
-            !ALLOWED_TABLES.contains(&sink),
-            "{sink:?} must not be Flight-reachable"
-        );
-    }
+    assert!(
+        !ALLOWED_TABLES.contains(&"assembly_membership"),
+        "assembly_membership must not be Flight-reachable"
+    );
 }
 
 /// A well-formed assembly ticket filter: the run, and only the run.
@@ -4147,6 +4149,125 @@ fn build_query_assembly_membership_reaches_no_output_column() {
     assert!(
         !sql.contains("kind") && !sql.contains("bin_id"),
         "got: {sql}"
+    );
+}
+
+/// A well-formed `bin_quality` ticket filter: one run, over a cohort.
+fn bin_quality_scope(prep_sample_idx: &[i64], processing_idx: i64) -> auth::TicketFilter {
+    filter_of(&[
+        (
+            "prep_sample_idx",
+            prep_sample_idx
+                .iter()
+                .map(|v| serde_json::json!(v))
+                .collect(),
+        ),
+        ("processing_idx", vec![serde_json::json!(processing_idx)]),
+    ])
+}
+
+#[test]
+fn build_query_bin_quality_scopes_the_run_on_its_own_columns() {
+    // No `assembly_membership` semi join: this table carries both halves of the
+    // run key itself, which is why it is a separate builder rather than another
+    // `is_assembly_run_surface` arm.
+    let (sql, full) =
+        build_query("bin_quality", &bin_quality_scope(&[42, 43], 7), &[], &[]).unwrap();
+    assert_eq!(full, "qiita_lake.bin_quality");
+    assert_eq!(
+        sql,
+        "SELECT * FROM qiita_lake.bin_quality \
+         WHERE processing_idx = 7 AND prep_sample_idx IN (42, 43)",
+        "got: {sql}"
+    );
+    assert!(
+        !sql.contains("assembly_membership"),
+        "the run scope is this table's own columns; got: {sql}"
+    );
+}
+
+#[test]
+fn build_query_bin_quality_requires_exactly_the_run_key() {
+    // Each rejected shape below returns quality rows for subjects outside the
+    // run the resolver asked about — a genome's completeness attributed to the
+    // wrong assembly is a wrong gate decision, not a missing one.
+    let empty = auth::TicketFilter::new();
+    let cases: &[(&str, auth::TicketFilter)] = &[
+        // Every sample's every run.
+        ("empty filter", empty.clone()),
+        // Every run those samples ever had.
+        (
+            "prep_sample_idx alone",
+            filter_of(&[("prep_sample_idx", vec![serde_json::json!(42)])]),
+        ),
+        // Every sample that run touched, cohort or not.
+        (
+            "processing_idx alone",
+            filter_of(&[("processing_idx", vec![serde_json::json!(7)])]),
+        ),
+        // Two runs blended into one indistinguishable stream.
+        (
+            "two runs",
+            filter_of(&[
+                ("prep_sample_idx", vec![serde_json::json!(42)]),
+                (
+                    "processing_idx",
+                    vec![serde_json::json!(7), serde_json::json!(8)],
+                ),
+            ]),
+        ),
+        // An empty cohort must never degrade to "every sample".
+        (
+            "empty cohort",
+            filter_of(&[
+                ("prep_sample_idx", vec![]),
+                ("processing_idx", vec![serde_json::json!(7)]),
+            ]),
+        ),
+        // A third column riding along is what `filter.len()` catches.
+        (
+            "the run plus a named contig",
+            filter_of(&[
+                ("prep_sample_idx", vec![serde_json::json!(42)]),
+                ("processing_idx", vec![serde_json::json!(7)]),
+                ("feature_idx", vec![serde_json::json!(11)]),
+            ]),
+        ),
+    ];
+    for (label, filter) in cases {
+        assert!(
+            build_query("bin_quality", filter, &[], &[]).is_err(),
+            "bin_quality must reject {label}"
+        );
+    }
+    // Control: the same empty filter IS served for a reference table, so the
+    // first case is about this table and not about empty filters in general.
+    assert!(build_query("reference_sequences", &empty, &[], &[]).is_ok());
+}
+
+#[test]
+fn build_query_bin_quality_takes_no_projection_and_no_members() {
+    // Same two refusals the assembly surfaces make: only the alignment surface
+    // is projectable, and `members` is only meaningful for the block selectors.
+    assert!(
+        build_query(
+            "bin_quality",
+            &bin_quality_scope(&[42], 7),
+            &[],
+            &columns(&["completeness"])
+        )
+        .is_err(),
+        "bin_quality must reject a projection column list"
+    );
+    assert!(
+        build_query(
+            "bin_quality",
+            &bin_quality_scope(&[42], 7),
+            &block_members(),
+            &[]
+        )
+        .is_err(),
+        "bin_quality must reject a block members selector"
     );
 }
 

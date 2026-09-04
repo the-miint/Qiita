@@ -550,6 +550,29 @@ def _write_denovo_map_parquet(path: Path, rows: list[tuple[int, int, int]]) -> P
     return path
 
 
+def _write_denovo_quality_parquet(
+    path: Path, rows: list[tuple[int, int, float | None, float | None]]
+) -> Path:
+    """The resolver-staged de novo quality: (prep_sample_idx, genome_idx,
+    completeness, contamination), as `_write_denovo_genome_quality` writes it.
+
+    The scores are nullable, so the fixtures carry a NULL row: a genome CheckM did
+    not score is an ordinary state, not an edge case.
+    """
+    with duckdb.connect(":memory:") as conn:
+        values = ", ".join(
+            "(CAST(? AS BIGINT), CAST(? AS BIGINT), CAST(? AS DOUBLE), CAST(? AS DOUBLE))"
+            for _ in rows
+        )
+        conn.execute(
+            f"COPY (SELECT * FROM (VALUES {values}) "
+            f"AS t(prep_sample_idx, genome_idx, completeness, contamination)) "
+            f"TO '{path}' (FORMAT PARQUET)",
+            [x for r in rows for x in r],
+        )
+    return path
+
+
 def _fake_two_arm_alignment_stream(reference_parquet: Path, denovo_parquet: Path, captured: dict):
     """The alignment seam for a combined run: ONE mint route, asked twice, with the
     `denovo` flag picking the arm.
@@ -595,7 +618,7 @@ def _fake_assembled_sequence_stream(per_sample: dict[int, Path], captured: dict)
     return fake
 
 
-def _run_combined(m, *, tmp_path, monkeypatch, threshold=0.01, denovo_map=None):
+def _run_combined(m, *, tmp_path, monkeypatch, threshold=0.01, denovo_map=None, quality=None):
     """Run `execute` over a two-arm fixture and return (output_map, captured).
 
     Contig 50 is BOTH a reference sequence of genome 300 and a contig each sample
@@ -621,6 +644,11 @@ def _run_combined(m, *, tmp_path, monkeypatch, threshold=0.01, denovo_map=None):
     denovo_map_pq = _write_denovo_map_parquet(
         tmp_path / "dn_map.parquet",
         [(1, 50, 900), (2, 50, 901)] if denovo_map is None else denovo_map,
+    )
+    # One scored genome and one unscored, which is the mixed state a real run is in.
+    denovo_quality_pq = _write_denovo_quality_parquet(
+        tmp_path / "dn_quality.parquet",
+        [(1, 900, 95.0, 1.0), (2, 901, None, None)] if quality is None else quality,
     )
     # Contig 50 is on BOTH samples' length streams — one content-addressed feature,
     # streamed once per sample, which is what the roll-up's dedupe exists for.
@@ -648,6 +676,7 @@ def _run_combined(m, *, tmp_path, monkeypatch, threshold=0.01, denovo_map=None):
         genome_map_path=map_pq,
         denovo_genome_map_path=denovo_map_pq,
         denovo_processing_idx=11,
+        denovo_genome_quality_path=denovo_quality_pq,
     )
     out = asyncio.run(m.execute(inputs, tmp_path / "ws"))
     return out, captured
@@ -687,6 +716,65 @@ def test_combined_run_reads_lengths_only_for_the_samples_the_map_named(tmp_path,
     )
     assert captured["lengths_samples"] == [1], "sample 2 is not in the map, so it is not asked for"
     assert captured["lengths_processing_idx"] == 11
+
+
+def test_the_staged_quality_relation_keeps_the_unscored_genomes(tmp_path):
+    """Round-trip the resolver's Parquet through the staging SQL the job runs.
+
+    The two halves are pinned apart — the CP suite asserts what lands in the Parquet,
+    `test_stage` asserts the SQL's shape — and this is where they meet: the columns
+    the resolver writes are the columns the CTAS projects, and a genome with NULL
+    scores survives as a row rather than being dropped somewhere between them.
+    """
+    quality_pq = _write_denovo_quality_parquet(
+        tmp_path / "q.parquet", [(1, 900, 95.0, 1.0), (2, 901, None, None)]
+    )
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(analytic.denovo_genome_quality_table_sql(f"read_parquet('{quality_pq}')"))
+        rows = conn.execute(
+            f"SELECT prep_sample_idx, genome_id, completeness, contamination "
+            f"FROM {analytic.DENOVO_GENOME_QUALITY_TABLE} ORDER BY genome_id"
+        ).fetchall()
+    # `genome_idx` in, `genome_id` out, and the unscored genome is still here.
+    assert rows == [(1, 900, 95.0, 1.0), (2, 901, None, None)]
+
+
+def test_a_combined_ticket_without_the_quality_path_fails_loud(tmp_path, monkeypatch):
+    """The map and the quality are bound by ONE resolver pass, so a combined ticket
+    carrying the map without the quality is a broken binding, not a lighter request.
+
+    The alternative — skipping the relation — does not fail either: it leaves every
+    assembled genome looking unscored, which is what a run CheckM legitimately scored
+    nothing in also looks like.
+    """
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    inputs = m.Inputs(
+        reference_idx=7,
+        work_ticket_idx=42,
+        coverage_threshold=0.01,
+        genome_map_path=_write_map_parquet(tmp_path / "map.parquet", [(10, 100)]),
+        denovo_genome_map_path=_write_denovo_map_parquet(
+            tmp_path / "dn_map.parquet", [(1, 50, 900)]
+        ),
+        denovo_processing_idx=11,
+    )
+    with pytest.raises(ValueError, match="denovo_genome_quality_path"):
+        asyncio.run(m.execute(inputs, tmp_path / "ws"))
+
+
+def test_a_reference_only_ticket_needs_no_quality(tmp_path, monkeypatch):
+    """The mirror of the check above: absent the de novo arm there is nothing to
+    score, so the unbound quality path is the normal state rather than a gap."""
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    inputs = m.Inputs(
+        reference_idx=7,
+        work_ticket_idx=42,
+        coverage_threshold=0.01,
+        genome_map_path=_write_map_parquet(tmp_path / "map.parquet", [(10, 100)]),
+    )
+    assert inputs.denovo_genome_quality_path is None
 
 
 def test_a_zero_threshold_skips_both_arms_lengths(tmp_path, monkeypatch):

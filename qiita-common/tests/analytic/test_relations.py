@@ -27,6 +27,11 @@ _CREATE_BUILDERS = {
     "labelled_relation_sql": lambda: ft.labelled_relation_sql(clearance=ft.LabelClearance(rows=10)),
     "taxonomy_table_sql": lambda: ft.taxonomy_table_sql("taxonomy_stream"),
     "taxonomy_sidecar_sql": ft.taxonomy_sidecar_sql,
+    "denovo_map_table_sql": lambda: ft.denovo_map_table_sql("read_parquet('d.parquet')"),
+    "denovo_contig_lengths_table_sql": ft.denovo_contig_lengths_table_sql,
+    "denovo_genome_quality_table_sql": lambda: ft.denovo_genome_quality_table_sql(
+        "read_parquet('q.parquet')"
+    ),
 }
 
 

@@ -490,6 +490,46 @@ ASSEMBLY_GENOME_MAP_PAIRS_SQL = _ASSEMBLY_GENOME_MAP_FROM + _ASSEMBLY_GENOME_MAP
 _ASSEMBLY_GENOME_SOURCE_JOIN = " JOIN qiita.genome g ON g.genome_idx = am.genome_idx"
 
 
+async def fetch_assembly_genome_subject(
+    db: asyncpg.Pool | asyncpg.Connection,
+    *,
+    prep_sample_idx: list[int],
+    processing_idx: int,
+) -> list[asyncpg.Record]:
+    """One assembly run's `(prep_sample_idx, kind, bin_id, genome_idx)` subjects for a
+    whole cohort.
+
+    **The bridge the lake cannot cross.** CheckM scores a SUBJECT, and the DuckLake
+    `bin_quality` rows it produces are keyed `(prep_sample_idx, processing_idx, kind,
+    bin_id)` with no `feature_idx`; `genome_idx` is this column, here. A consumer
+    holding streamed quality rows and a genome-keyed relation has no column joining
+    them until this supplies one.
+
+    The same PREDICATE as `fetch_assembly_genome_map` and the cohort export —
+    `ASSEMBLY_GENOME_MAP_PAIRS_SQL`, not a copy of it — so the subjects this returns
+    speak for exactly the genomes those admit. The row sets differ in cardinality
+    (this one is per subject, theirs per contig); what must not differ is which
+    genomes exist, because a genome on the map that this misses reaches a consumer
+    with no scores and no way to tell that from a subject CheckM did not score.
+
+    DISTINCT collapses a subject's contigs to one row: the mint is keyed on
+    `(prep_sample_idx, processing_idx, kind, bin_id)`, so a refined bin's hundreds of
+    contigs carry one genome between them. Two rows surviving for one subject would
+    mean a stored `genome_idx` disagreeing with the key it was minted from, which
+    nothing constrains — this column's own migration comment says so.
+
+    No `limit`, unlike `fetch_assembly_genome_map`: that one answers a REST read and
+    caps what a client can pull, this one feeds a join whose left side must be the
+    whole cohort or the join silently drops genomes.
+    """
+    return await db.fetch(
+        "SELECT DISTINCT am.prep_sample_idx, am.kind, am.bin_id, am.genome_idx"
+        + ASSEMBLY_GENOME_MAP_PAIRS_SQL,
+        prep_sample_idx,
+        processing_idx,
+    )
+
+
 async def fetch_assembly_genome_map(
     db: asyncpg.Pool | asyncpg.Connection,
     *,

@@ -1216,11 +1216,12 @@ def test_load_actions_loads_on_disk_estimate_feature_table_yaml():
     step = eft.steps[0]
     assert step.module == "qiita_compute_orchestrator.jobs.estimate_feature_table"
     assert step.inputs == ["genome_map_path"]
-    # The de novo arm's two bindings, both resolver-produced and both absent for a
-    # reference-only ticket — the map as an OPTIONAL input (a path), the assembly
-    # run as a params scalar (a scalar cannot ride `inputs:`). Declared required
-    # either way, the step would be undispatchable without a de novo arm.
-    assert step.optional_inputs == ["denovo_genome_map_path"]
+    # The de novo arm's three bindings, all resolver-produced and all absent for a
+    # reference-only ticket — the map and the per-genome quality as OPTIONAL inputs
+    # (paths), the assembly run as a params scalar (a scalar cannot ride `inputs:`).
+    # Declared required either way, the step would be undispatchable without a de
+    # novo arm.
+    assert step.optional_inputs == ["denovo_genome_map_path", "denovo_genome_quality_path"]
     assert step.params == {
         "coverage_threshold": "coverage_threshold",
         "denovo_processing_idx": "denovo_processing_idx",

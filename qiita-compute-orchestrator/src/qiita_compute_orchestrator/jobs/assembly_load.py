@@ -45,11 +45,13 @@ from pathlib import Path
 import duckdb
 from pydantic import BaseModel
 from qiita_common.assembly_constants import (
+    BIN_QUALITY_COLUMN_NAMES,
     CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
     CONTIG_ATTRIBUTES_FILE,
     KIND_LCG,
     KIND_MAG,
     KIND_UNBINNED,
+    bin_quality_projection,
     contig_attribute_join,
     contig_attribute_projection,
     register_contig_attribute_table,
@@ -99,27 +101,6 @@ _DAS_SUMMARY_TSV = "das_tool_summary.tsv"  # DAS_Tool `*_DASTool_summary.tsv`
 # YAML baseline is 32 GiB rather than 16. See that step's comment.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
-
-# The bin_quality projection (DuckLake column order + types are load-bearing:
-# ducklake.rs::ensure_assembly_tables). Every column is explicitly CAST so the
-# ONE template serves all three write paths — populated (with/without DAS_Tool
-# scores) and empty — with byte-identical schema (a bare NULL would otherwise get
-# an ambiguous type in the empty Parquet). Each placeholder is either a source
-# column reference (`c.completeness`, `d.das_tool_score`) or the literal `NULL`.
-_BIN_QUALITY_SELECT = (
-    "  CAST({ps} AS BIGINT) AS prep_sample_idx,"
-    "  CAST({proc} AS BIGINT) AS processing_idx,"
-    "  CAST({kind} AS VARCHAR) AS kind,"
-    "  CAST({bin_id} AS VARCHAR) AS bin_id,"
-    "  CAST({marker} AS VARCHAR) AS marker_lineage,"
-    "  CAST({completeness} AS DOUBLE) AS completeness,"
-    "  CAST({contamination} AS DOUBLE) AS contamination,"
-    "  CAST({strain} AS DOUBLE) AS strain_heterogeneity,"
-    "  CAST({genome_size} AS BIGINT) AS genome_size,"
-    "  CAST({n_contigs} AS BIGINT) AS n_contigs,"
-    "  CAST({das_score} AS DOUBLE) AS das_tool_score,"
-    "  CAST({das_binner} AS VARCHAR) AS source_binner"
-)
 
 
 class Inputs(BaseModel):
@@ -344,19 +325,21 @@ def _write_bin_quality(
         qa_tsv = checkm_dir / qa_name
         if not (lineage_tsv.is_file() and qa_tsv.is_file()):
             continue
-        projection = _BIN_QUALITY_SELECT.format(
-            ps=prep_sample_idx,
-            proc=processing_idx,
-            kind=f"'{kind}'",
-            bin_id='lin."Bin Id"',
-            marker='lin."Marker lineage"',
-            completeness='lin."Completeness"',
-            contamination='lin."Contamination"',
-            strain='lin."Strain heterogeneity"',
-            genome_size='qa."Genome size (bp)"',
-            n_contigs='qa."# contigs"',
-            das_score='das."bin_score"' if with_das else "NULL",
-            das_binner='das."bin_set"' if with_das else "NULL",
+        projection = bin_quality_projection(
+            {
+                "prep_sample_idx": str(prep_sample_idx),
+                "processing_idx": str(processing_idx),
+                "kind": f"'{kind}'",
+                "bin_id": 'lin."Bin Id"',
+                "marker_lineage": 'lin."Marker lineage"',
+                "completeness": 'lin."Completeness"',
+                "contamination": 'lin."Contamination"',
+                "strain_heterogeneity": 'lin."Strain heterogeneity"',
+                "genome_size": 'qa."Genome size (bp)"',
+                "n_contigs": 'qa."# contigs"',
+                "das_tool_score": 'das."bin_score"' if with_das else "NULL",
+                "source_binner": 'das."bin_set"' if with_das else "NULL",
+            }
         )
         source = f'  FROM {_READ_TSV} lin  JOIN {_READ_TSV} qa ON lin."Bin Id" = qa."Bin Id"'
         # `?` binds positionally across the whole statement, so each arm's paths are
@@ -368,21 +351,9 @@ def _write_bin_quality(
         arms.append(f"SELECT {projection} {source}")
 
     if not arms:
-        # Empty write — every placeholder NULL, no FROM, WHERE FALSE.
-        projection = _BIN_QUALITY_SELECT.format(
-            ps="NULL",
-            proc="NULL",
-            kind="NULL",
-            bin_id="NULL",
-            marker="NULL",
-            completeness="NULL",
-            contamination="NULL",
-            strain="NULL",
-            genome_size="NULL",
-            n_contigs="NULL",
-            das_score="NULL",
-            das_binner="NULL",
-        )
+        # Empty write — every source NULL, no FROM, WHERE FALSE. `bin_quality_projection`
+        # is what keeps this Parquet's schema identical to a populated one.
+        projection = bin_quality_projection(dict.fromkeys(BIN_QUALITY_COLUMN_NAMES, "NULL"))
         conn.execute(f"COPY (SELECT {projection} WHERE FALSE) TO '{out}' ({PARQUET_OPTS})")
         return
 

@@ -471,6 +471,8 @@ async def run_workflow(
                     action_context=bound,
                     reference_idx=scope_target["reference_idx"],
                     workspace=workspace,
+                    data_plane_url=data_plane_url,
+                    signing_key=signing_key,
                 )
             )
 

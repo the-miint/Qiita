@@ -1216,12 +1216,46 @@ def _do_get_reference_taxonomy(data_plane_url: str, ticket_bytes: bytes, out_pat
     return out_path
 
 
+async def _export_query_to_parquet(
+    pool: asyncpg.Pool,
+    *,
+    sql: str,
+    params: tuple,
+    schema: pa.Schema,
+    out_path: Path,
+) -> None:
+    """Stream a query's rows to a Parquet at `out_path` in `_CHUNK_SIZE` batches.
+
+    A server-side cursor inside one transaction, never `fetch()`-all: a GG2-scale
+    reference has millions of members, and the point of this shape is that neither
+    Postgres nor this process ever holds the whole result.
+
+    `schema` names the columns AND their order — each batch is read by name out of
+    the records, so the query's own column order does not have to match. Creating the
+    writer up front is what makes an EMPTY result still produce a valid, correctly
+    typed Parquet rather than a zero-byte file `read_parquet` chokes on; every caller
+    below depends on that.
+    """
+    writer = pq.ParquetWriter(str(out_path), schema, compression="snappy")
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            cursor = await conn.cursor(sql, *params)
+            while batch := await cursor.fetch(_CHUNK_SIZE):
+                writer.write_table(
+                    pa.table(
+                        {name: [r[name] for r in batch] for name in schema.names},
+                        schema=schema,
+                    )
+                )
+    finally:
+        writer.close()
+
+
 async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path: Path) -> None:
     """Stream this reference's (feature_idx, genome_idx) pairs from Postgres to a
-    Parquet at `out_path`, in `_CHUNK_SIZE` batches (a GG2-scale reference has
-    millions of members — never one giant array). The INNER JOIN to
-    feature_genome drops features with no genome, which is deliberate: no-genome
-    features (16S / deferred) never enter a shard and keep shard_id NULL.
+    Parquet at `out_path`. The INNER JOIN to feature_genome drops features with no
+    genome, which is deliberate: no-genome features (16S / deferred) never enter a
+    shard and keep shard_id NULL.
 
     Public (used by both the reference-load plan-shards step here and the
     feature-table runner resolver, runner/_feature_table.py).
@@ -1229,28 +1263,14 @@ async def export_member_genome(pool: asyncpg.Pool, reference_idx: int, out_path:
     The row set is `GENOME_MAP_PAIRS_SQL`, shared verbatim with the REST genome
     map: the compute side consumes this Parquet and a client consumes that map,
     so which features have genomes cannot be allowed to differ between them.
-
-    An empty result still writes a valid two-column Parquet (schema created up
-    front) so DuckDB's read_parquet doesn't fail on a zero-genome reference."""
-    schema = pa.schema([("feature_idx", pa.int64()), ("genome_idx", pa.int64())])
-    writer = pq.ParquetWriter(str(out_path), schema, compression="snappy")
-    try:
-        async with pool.acquire() as conn, conn.transaction():
-            cursor = await conn.cursor(
-                "SELECT rm.feature_idx, fg.genome_idx" + GENOME_MAP_PAIRS_SQL,
-                reference_idx,
-            )
-            while batch := await cursor.fetch(_CHUNK_SIZE):
-                writer.write_table(
-                    pa.table(
-                        {
-                            "feature_idx": pa.array([r["feature_idx"] for r in batch], pa.int64()),
-                            "genome_idx": pa.array([r["genome_idx"] for r in batch], pa.int64()),
-                        }
-                    )
-                )
-    finally:
-        writer.close()
+    """
+    await _export_query_to_parquet(
+        pool,
+        sql="SELECT rm.feature_idx, fg.genome_idx" + GENOME_MAP_PAIRS_SQL,
+        params=(reference_idx,),
+        schema=pa.schema([("feature_idx", pa.int64()), ("genome_idx", pa.int64())]),
+        out_path=out_path,
+    )
 
 
 async def export_assembly_member_genome(
@@ -1261,8 +1281,8 @@ async def export_assembly_member_genome(
     out_path: Path,
 ) -> None:
     """Stream one assembly run's `(prep_sample_idx, feature_idx, genome_idx)` triples
-    for a whole cohort from Postgres to a Parquet at `out_path`, in `_CHUNK_SIZE`
-    batches. The de novo arm's counterpart to `export_member_genome`.
+    for a whole cohort from Postgres to a Parquet at `out_path`. The de novo arm's
+    counterpart to `export_member_genome`.
 
     **Three columns, where the reference map has two.** A contig is content-addressed,
     so two cohort samples that assembled byte-identical contigs share one
@@ -1276,42 +1296,30 @@ async def export_assembly_member_genome(
 
     The row set is `ASSEMBLY_GENOME_MAP_PAIRS_SQL`, shared verbatim with the REST map
     the client-side recipe reads, so the two drivers cannot disagree about which
-    contigs have a genome. That row set admits MAG and LCG rows only, so a contig can
-    be absent from this map and present in `qiita.assembly_membership`.
+    contigs have a genome. `fetch_assembly_genome_subject` selects through the same
+    predicate for the per-subject bridge, one projection up — that shares which
+    GENOMES exist, not which contigs. That row set admits MAG and LCG rows only, so a
+    contig can be absent from this map and present in `qiita.assembly_membership`.
 
-    An empty result still writes a valid three-column Parquet, and it now has two
-    causes rather than one: a cohort that assembled nothing, and a cohort whose
-    contigs are all UNBINNED (no circular contig, and no refined bin clearing
-    DAS_Tool's threshold — a legitimate success). Both degrade to the reference arm.
+    An empty result is a valid answer with two causes rather than one: a cohort that
+    assembled nothing, and a cohort whose contigs are all UNBINNED (no circular
+    contig, and no refined bin clearing DAS_Tool's threshold — a legitimate success).
+    Both degrade to the reference arm.
     """
-    schema = pa.schema(
-        [
-            ("prep_sample_idx", pa.int64()),
-            ("feature_idx", pa.int64()),
-            ("genome_idx", pa.int64()),
-        ]
+    await _export_query_to_parquet(
+        pool,
+        sql="SELECT DISTINCT am.prep_sample_idx, am.feature_idx, am.genome_idx"
+        + ASSEMBLY_GENOME_MAP_PAIRS_SQL,
+        params=(prep_sample_idx, processing_idx),
+        schema=pa.schema(
+            [
+                ("prep_sample_idx", pa.int64()),
+                ("feature_idx", pa.int64()),
+                ("genome_idx", pa.int64()),
+            ]
+        ),
+        out_path=out_path,
     )
-    writer = pq.ParquetWriter(str(out_path), schema, compression="snappy")
-    try:
-        async with pool.acquire() as conn, conn.transaction():
-            cursor = await conn.cursor(
-                "SELECT DISTINCT am.prep_sample_idx, am.feature_idx, am.genome_idx"
-                + ASSEMBLY_GENOME_MAP_PAIRS_SQL,
-                prep_sample_idx,
-                processing_idx,
-            )
-            while batch := await cursor.fetch(_CHUNK_SIZE):
-                writer.write_table(
-                    pa.table(
-                        {
-                            name: pa.array([r[name] for r in batch], pa.int64())
-                            for name in ("prep_sample_idx", "feature_idx", "genome_idx")
-                        },
-                        schema=schema,
-                    )
-                )
-    finally:
-        writer.close()
 
 
 def _genome_lineages(con: duckdb.DuckDBPyConnection) -> list[LineageItem]:

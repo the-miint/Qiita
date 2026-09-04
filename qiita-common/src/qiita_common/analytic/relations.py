@@ -46,6 +46,12 @@ DENOVO_MAP_TABLE = "denovo_contig_genome"
 # deduplicated on `feature_idx` — see `reconcile.denovo_genome_lengths_insert_sql`.
 DENOVO_CONTIG_LENGTHS_TABLE = "denovo_contig_lengths"
 
+# The de novo arm's per-genome CheckM scores, keyed `(prep_sample_idx, genome_id)` —
+# by GENOME, where every other de novo relation here is keyed by contig. CheckM scores
+# the subject a genome was minted from, not the contigs in it, so a per-contig spelling
+# would repeat one bin's scores once per contig in it.
+DENOVO_GENOME_QUALITY_TABLE = "denovo_genome_quality"
+
 # The de novo arm's aligned intervals, the mirror of `COVERAGE_ALIGNMENTS_VIEW` and
 # a VIEW for the same reason: one reader, on this connection.
 DENOVO_COVERAGE_ALIGNMENTS_VIEW = "denovo_coverage_alignments"

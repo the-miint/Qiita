@@ -643,3 +643,67 @@ async def test_a_kind_nobody_listed_does_not_reach_the_map(postgres_pool, tmp_pa
         assert novel_genome not in {r["genome_idx"] for r in rows}
     finally:
         await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)
+
+
+async def test_one_genome_per_subject_is_enforced_by_the_database(postgres_pool, tmp_path):
+    """The subject -> genome invariant is a constraint, not a convention.
+
+    `write_assembly_membership` upserts on a hash of the subject tuple, so it cannot
+    produce a violation itself; what the constraint covers is every OTHER writer —
+    the backfill, a future one, and a hand-run UPDATE on the deploy host. A violation
+    does not surface as a duplicate row, it surfaces as a join to per-subject data
+    (CheckM scores, first) fanning out to two rows for one genome with nothing saying
+    so, which is why it is worth refusing at the write rather than de-duplicating at
+    every read.
+    """
+    principal_idx, prep, proc, ref, feats, paths = await _setup(
+        postgres_pool, tmp_path, label="agm-exclude"
+    )
+    try:
+        await lib.write_assembly_membership(postgres_pool, prep, proc, *paths)
+        subjects = await _subjects(postgres_pool, prep)
+        # The MAG is the subject with more than one contig, so it is the one whose
+        # rows can disagree — a single-contig subject cannot violate this.
+        mag_genome, n_contigs = subjects[(KIND_MAG, "bin.1")]
+        assert n_contigs > 1, "this test needs a multi-contig subject to be meaningful"
+        other_genome = next(g for (k, _b), (g, _n) in subjects.items() if k != KIND_MAG)
+
+        with pytest.raises(asyncpg.ExclusionViolationError):
+            await postgres_pool.execute(
+                "UPDATE qiita.assembly_membership SET genome_idx = $1"
+                " WHERE prep_sample_idx = $2 AND kind = $3 AND bin_id = 'bin.1'"
+                "   AND feature_idx = (SELECT min(feature_idx) FROM qiita.assembly_membership"
+                "                      WHERE prep_sample_idx = $2 AND kind = $3"
+                "                        AND bin_id = 'bin.1')",
+                other_genome,
+                prep,
+                KIND_MAG,
+            )
+
+        # Control: the rows are untouched, and re-stamping the SAME genome across the
+        # whole subject is still allowed — the constraint forbids disagreement, not
+        # writes.
+        assert (await _subjects(postgres_pool, prep))[(KIND_MAG, "bin.1")] == (
+            mag_genome,
+            n_contigs,
+        )
+        await postgres_pool.execute(
+            "UPDATE qiita.assembly_membership SET genome_idx = $1"
+            " WHERE prep_sample_idx = $2 AND kind = $3 AND bin_id = 'bin.1'",
+            mag_genome,
+            prep,
+            KIND_MAG,
+        )
+
+        # And NULL stays writable: it is what a pre-mint row carries and what the
+        # sequenced-pool delete writes before dropping a genome.
+        await postgres_pool.execute(
+            "UPDATE qiita.assembly_membership SET genome_idx = NULL"
+            " WHERE prep_sample_idx = $1 AND kind = $2 AND bin_id = 'bin.1'"
+            "   AND feature_idx = (SELECT min(feature_idx) FROM qiita.assembly_membership"
+            "                      WHERE prep_sample_idx = $1 AND kind = $2 AND bin_id = 'bin.1')",
+            prep,
+            KIND_MAG,
+        )
+    finally:
+        await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)

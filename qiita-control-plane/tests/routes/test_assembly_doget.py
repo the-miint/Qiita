@@ -25,6 +25,7 @@ from qiita_common.api_paths import URL_ASSEMBLY_DOGET, URL_REFERENCE_DOGET
 from qiita_common.assembly_constants import (
     ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
     ASSEMBLED_SEQUENCE_TABLE,
+    BIN_QUALITY_TABLE,
     KIND_LCG,
     KIND_MAG,
 )
@@ -32,6 +33,7 @@ from qiita_common.auth_constants import Scope
 
 from qiita_control_plane.auth.token import mint_api_token
 from qiita_control_plane.repositories.processing import mint_processing
+from qiita_control_plane.routes.assembly import ASSEMBLY_DOGET_TABLES
 from qiita_control_plane.testing.db_seeds import (
     seed_bare_feature,
     seed_biosample_with_sequenced_prep_sample,
@@ -388,13 +390,18 @@ async def test_doget_missing_field_422(ctx, env, drop):
 
 async def test_doget_assembly_surfaces_in_cp_allowlist():
     """Both tables the route signs must be in the CP-side DoGet allowlist that
-    mirrors the data plane's ALLOWED_TABLES — and the junction must NOT be."""
+    mirrors the data plane's ALLOWED_TABLES — and the junction must NOT be.
+
+    `bin_quality` is on that allowlist and not on this route's: the data plane
+    serves it and the feature-table resolver signs it in-process. Asserting both
+    halves here is what makes the second one deliberate rather than an omission."""
     from qiita_control_plane.routes.reference import _DOGET_ALLOWED_TABLES
 
     assert ASSEMBLED_SEQUENCE_TABLE in _DOGET_ALLOWED_TABLES
     assert ASSEMBLED_SEQUENCE_CHUNKS_TABLE in _DOGET_ALLOWED_TABLES
     assert "assembly_membership" not in _DOGET_ALLOWED_TABLES
-    assert "bin_quality" not in _DOGET_ALLOWED_TABLES
+    assert BIN_QUALITY_TABLE in _DOGET_ALLOWED_TABLES
+    assert BIN_QUALITY_TABLE not in ASSEMBLY_DOGET_TABLES
 
 
 async def test_doget_assembly_not_signable_via_reference_route():
@@ -406,7 +413,20 @@ async def test_doget_assembly_not_signable_via_reference_route():
     assert ASSEMBLED_SEQUENCE_CHUNKS_TABLE not in _REFERENCE_DOGET_TABLES
 
 
-@pytest.mark.parametrize("table", [ASSEMBLED_SEQUENCE_TABLE, ASSEMBLED_SEQUENCE_CHUNKS_TABLE])
+async def test_doget_bin_quality_not_signable_via_reference_route():
+    """`bin_quality` is on `_DOGET_ALLOWED_TABLES` and behind NO route, which is the
+    only reason it is not requestable: `_REFERENCE_DOGET_TABLES` is derived by
+    SUBTRACTION from that allowlist, so a table added to the superset and forgotten
+    in the subtraction becomes signable through the generic reference route by
+    default. That default is what this pins."""
+    from qiita_control_plane.routes.reference import _REFERENCE_DOGET_TABLES
+
+    assert BIN_QUALITY_TABLE not in _REFERENCE_DOGET_TABLES
+
+
+@pytest.mark.parametrize(
+    "table", [ASSEMBLED_SEQUENCE_TABLE, ASSEMBLED_SEQUENCE_CHUNKS_TABLE, BIN_QUALITY_TABLE]
+)
 async def test_doget_assembly_rejected_by_reference_route_http(ctx, table):
     """HTTP-level pin of the contract above: the constant test passes even if the
     reference route stopped consulting the allowlist, so exercise the behavior.

@@ -47,6 +47,27 @@ def test_staging_builders_read_from_the_source_they_are_given():
     assert "FROM my_lengths l" in ft.genome_lengths_table_sql("my_lengths")
 
 
+def test_denovo_quality_renames_genome_idx_to_the_shared_key():
+    """`genome_idx` in, `genome_id` out — the spelling every other de novo relation
+    keys on (`denovo_map_table_sql` makes the same rename), so a consumer joins the
+    quality to the map without a second name for one column."""
+    sql = ft.denovo_genome_quality_table_sql("read_parquet('q.parquet')")
+    assert f"CREATE TABLE {ft.DENOVO_GENOME_QUALITY_TABLE} AS " in sql
+    assert "genome_idx AS genome_id" in sql
+    assert "read_parquet('q.parquet')" in sql
+
+
+def test_denovo_quality_stages_the_scores_without_a_default():
+    """No COALESCE, no NOT NULL, no filter: the scores pass through as they arrive.
+
+    A genome CheckM did not score reaches this staging with NULLs, and defaulting
+    them here would turn "nobody measured this" into "this measured zero" — a value
+    a completeness predicate would then act on as if it were evidence."""
+    sql = ft.denovo_genome_quality_table_sql("src").upper()
+    assert "COALESCE" not in sql
+    assert "WHERE" not in sql
+
+
 def test_map_table_renames_each_column_to_the_right_one():
     """`genome_coverage`'s `subject_genome_id` relation is `(contig_id, genome_id)`.
     Both consumers stage the map from a source keyed `(feature_idx, genome_idx)`, so
