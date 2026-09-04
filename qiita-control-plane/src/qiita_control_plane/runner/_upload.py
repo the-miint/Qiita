@@ -60,13 +60,19 @@ _DP_SERIALIZATION_SIGNATURE = "could not serialize access due to concurrent upda
 # layer); any one substring is sufficient.
 #
 # pyarrow renders a Flight error TWO ways, and the difference decides which
-# substrings can fire. A client-side failure (nothing listening) gives
-# "Flight returned unavailable error, with message: failed to connect to all
-# addresses…" — the first three match that. A status the server actually returned
-# gives "<message>. Detail: Unavailable. gRPC client debug context: …", with the
-# class name absent, so only the fourth matches. That second form is the
-# saturated / restarting DP this list names first, and without "detail: unavailable"
-# it classified permanent. Both forms are pinned in test_dp_fetch_classifier.py.
+# substrings can fire. A client-side failure gives "Flight returned unavailable
+# error, with message: failed to connect to all addresses…" — the first three match
+# that, and it is the form every CP->DP failure reproduced so far takes (nothing
+# listening, and a server that has gone away). A status the server puts on the wire
+# gives "<message>. Detail: Unavailable. gRPC client debug context: …" with the class
+# name absent, which none of the first three match.
+#
+# The fourth signature covers that second form. It is not there for an observed
+# failure: the data plane emits no `Status::unavailable` of its own (grep it), so
+# nothing on this path has been shown to produce that rendering. It is there because
+# the rendering is real — pinned from a live pyarrow client in
+# test_dp_fetch_classifier.py — and a status gRPC defines as retriable must not
+# classify permanent on a stringification detail if anything ever does return it.
 _DP_UNAVAILABLE_SIGNATURES = (
     "flightunavailableerror",
     "flight returned unavailable",

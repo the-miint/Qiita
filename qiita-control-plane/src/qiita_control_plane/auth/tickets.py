@@ -74,6 +74,7 @@ _PROJECTION_COLUMNS: dict[str, frozenset[str]] = {
 TICKET_VERSION = 2
 DEFAULT_TTL_SECONDS = 300
 SIGNATURE_SIZE = 64  # Ed25519
+EXPIRY_SIZE = 8  # uint64, big-endian
 
 
 def _sign_payload(
@@ -119,11 +120,11 @@ def token_expiry(token: bytes) -> int:
     """
     payload_len = struct.unpack(">I", token[1:5])[0]
     expiry_start = 1 + 4 + payload_len + SIGNATURE_SIZE
-    expiry = token[expiry_start : expiry_start + 8]
-    if len(expiry) != 8:
+    expiry = token[expiry_start : expiry_start + EXPIRY_SIZE]
+    if len(expiry) != EXPIRY_SIZE:
         raise ValueError(
             f"token is {len(token)} bytes; its payload_len={payload_len} puts the "
-            f"8-byte expiry at {expiry_start}, past the end"
+            f"{EXPIRY_SIZE}-byte expiry at {expiry_start}, past the end"
         )
     return struct.unpack(">Q", expiry)[0]
 

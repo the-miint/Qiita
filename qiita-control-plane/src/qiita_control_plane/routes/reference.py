@@ -84,7 +84,7 @@ from ..auth.principal import (
     get_current_principal,
 )
 from ..auth.tickets import sign_ticket
-from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE
+from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE, READ_MASKED_TABLE
 from ..deps import (
     TxConnFactory,
     get_data_plane_url,
@@ -756,7 +756,7 @@ _DOGET_ALLOWED_TABLES = frozenset(
         "reference_phylogeny",
         "reference_placements",
         "reference_annotation",
-        "read_masked",
+        READ_MASKED_TABLE,
         # The alignment sink's DoGet read-side (feature-table OGU consumer), as the
         # exclusion-aware VIEW (raw `alignment` is not Flight-readable). Like
         # read_masked it is served by its own route (routes/alignment.py), scoped
@@ -789,7 +789,7 @@ _DOGET_ALLOWED_TABLES = frozenset(
 # exclusion view.
 _REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
     {
-        "read_masked",
+        READ_MASKED_TABLE,
         "alignment_visible",
         READ_BLOCK_TABLE,
         READ_MASKED_BLOCK_TABLE,

@@ -52,10 +52,10 @@ _REAL_UNAVAILABLE = (
 # data plane's `AuthError::Expired` text, captured verbatim from a read-mask
 # failure_reason. The signing token aged out before the call reached the DP; the
 # next attempt mints a fresh one, so a redrive self-heals it.
-# NOTE the shape: this is `str(exc)` as the classifier receives it
-# (`_upload.py` passes the exception, not the composed failure_reason), so the
-# CP's own "FlightUnauthenticatedError: " prefix is deliberately absent. With the
-# prefix here, the `unauthenticated` half of the match would be satisfied by the
+# The message body of the string in the incident report, with the CP's own
+# "FlightUnauthenticatedError: " prefix dropped: this is `str(exc)` as the classifier
+# receives it (`_upload.py` passes the exception, not the composed failure_reason).
+# With the prefix, the `unauthenticated` half of the match would be satisfied by the
 # CP's own text and the fixture would stop testing pyarrow's rendering at all.
 _REAL_EXPIRED = "Flight returned unauthenticated error, with message: ticket expired"
 
@@ -75,11 +75,14 @@ _REAL_BAD_SIGNATURE = "Flight returned unauthenticated error, with message: inva
 # happened: a client-side connect failure takes the first, a status the data plane
 # put on the wire takes the second.
 #
-# That second form is what a live data plane produces, so it is the one the deploy
-# actually sees. Captured verbatim from a pyarrow 23.0.1 FlightServerBase raising
-# each status (the version in uv.lock), with controls: the same message under a
-# different status renders a different Detail, and the same status with a different
-# message keeps the Detail — so each half of the expiry match discriminates.
+# Captured from a pyarrow 23.0.1 FlightServerBase (the uv.lock version) raising each
+# status, with controls: the same message under a different status renders a
+# different Detail, and the same status with a different message keeps the Detail —
+# so each half of the expiry match is shown to discriminate.
+#
+# The expiry fixture is what a live data plane produces. The UNAVAILABLE one is NOT
+# known to occur on the CP->DP path — the data plane emits no `Status::unavailable`
+# itself — it pins the rendering so the classifier is right if anything ever does.
 _SERVER_RETURNED_EXPIRED = (
     "ticket expired. Detail: Unauthenticated. gRPC client debug context: "
     "UNKNOWN:Error received from peer ipv4:127.0.0.1:50112 "
@@ -88,9 +91,9 @@ _SERVER_RETURNED_EXPIRED = (
     "IOError: Server never sent a data message. Detail: Internal"
 )
 
-# A data plane that is UP but returning UNAVAILABLE — saturated by a fan-out, or
-# restarting during a deploy. No connect failure happened, so none of the
-# connect-shaped substrings appear.
+# A server-returned UNAVAILABLE: no connect failure happened, so none of the
+# connect-shaped substrings appear. See the block comment above for why this is
+# pinned even though nothing on the CP->DP path is known to produce it.
 _SERVER_RETURNED_UNAVAILABLE = (
     "data plane is shutting down. Detail: Unavailable. gRPC client debug context: "
     "UNKNOWN:Error received from peer ipv4:127.0.0.1:50112 "
@@ -107,11 +110,11 @@ def test_expiry_is_detected_in_both_pyarrow_renderings():
 
 
 def test_a_data_plane_that_is_up_but_unavailable_is_retriable():
-    """A saturated or restarting DP returns UNAVAILABLE without any connect failure,
-    so the connect-shaped substrings never appear. This is the case
-    `_DP_UNAVAILABLE_SIGNATURES` names first, and it classified PERMANENT until
-    "detail: unavailable" was added — a redrive self-heals it like any other
-    UNAVAILABLE, so it must not land as a bad-input the operator has to resolve."""
+    """A server-returned UNAVAILABLE carries no connect failure, so the three
+    connect-shaped substrings never appear and it classified PERMANENT until
+    "detail: unavailable" was added. gRPC defines the status as retriable, so a
+    redrive self-heals it and it must not land as a bad-input an operator resolves —
+    whether or not this path has yet produced one."""
     assert _is_dp_unavailable(Exception(_SERVER_RETURNED_UNAVAILABLE)) is True
     f = _submission_dp_fetch_failure("could not fetch ...", Exception(_SERVER_RETURNED_UNAVAILABLE))
     assert f.kind is FailureKind.DATA_PLANE_TRANSIENT
@@ -122,6 +125,9 @@ def test_the_two_renderings_do_not_cross_contaminate():
     """The controls that make the above discriminating: a different status under the
     same message must not read as an expiry, and neither rendering of UNAVAILABLE
     may read as one."""
+    # Synthesized from the captured fixture, not captured: the grpc_status:16 it
+    # leaves behind makes it a string pyarrow would not emit. That is fine here —
+    # the subject is the substring match, not the rendering.
     same_message_other_status = _SERVER_RETURNED_EXPIRED.replace(
         "Detail: Unauthenticated", "Detail: Internal"
     )

@@ -39,7 +39,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- **A data-plane Flight failure at submission no longer reaches the originator's digest (#532).** An expired signing token now classifies `data_plane_transient` rather than `bad_input`, joining the DuckLake serialization conflict and gRPC UNAVAILABLE already classified that way. `notify.sweeper`'s owed set is `failure_type IS DISTINCT FROM 'retriable'`, so these tickets are held for an operator redrive instead of being reported as a settled outcome — and an originator whose whole batch failed this way gets no digest at all, because digest groups are built only from owed rows. Nothing to run; this is a change in what the mail says. Redrive held tickets with `/run` as before.
+- **A data-plane Flight failure at submission no longer reaches the originator's digest (#532).** An expired signing token now classifies `data_plane_transient` rather than `bad_input`, joining the DuckLake serialization conflict and the connect-failure rendering of gRPC UNAVAILABLE already classified that way (a server-returned UNAVAILABLE joins them in the same PR). `notify.sweeper`'s owed set is `failure_type IS DISTINCT FROM 'retriable'`, so these tickets are held for an operator redrive instead of being reported as a settled outcome — and an originator whose whole batch failed this way gets no digest at all, because digest groups are built only from owed rows. Nothing to run; this is a change in what the mail says. Redrive held tickets with `/run` as before.
 
 - **`long-read-assembly` baseline resources changed at three steps (#528):**
   `assembly_coverage` 64 → 96 GiB and `assembly_load` 16 → 32 both rise; `assemble`

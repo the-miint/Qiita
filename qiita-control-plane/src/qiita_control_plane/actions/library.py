@@ -386,18 +386,19 @@ def _do_action(
     token: bytes,
     timeout_seconds: float | None = None,
 ) -> list:
-    """Synchronous gRPC DoAction against the data plane — runs in a thread
-    executor. Every CP-side DoAction primitive differs only by action name, so
-    they share this one client-open/call/collect body: the single place the
-    Flight client is constructed, hence the single place to add a timeout, TLS,
-    or error mapping later. `action_type` is positional so it forwards cleanly
-    through `run_in_executor(None, _do_action, name, url, token)`.
+    """Synchronous gRPC DoAction against the data plane. Every CP-side DoAction
+    primitive differs only by action name, so they share this one
+    client-open/call/collect body: the single place the Flight client is
+    constructed, hence the single place to add TLS or error mapping later.
 
-    `timeout_seconds` (optional, 4th positional so existing callers are
-    unaffected) bounds the Flight call: a hung-but-reachable data plane raises
-    FlightTimedOutError (a FlightError subclass) instead of blocking forever. The
-    exclusion sync passes it because it makes the untimed call load-bearing under
-    a global advisory lock — see sync_reference_exclusion_data."""
+    Blocking, so callers reach it off the event loop through
+    `auth.tickets.run_signed_flight_call`, which also mints the token on the
+    worker rather than before the hop.
+
+    `timeout_seconds` bounds the Flight call: a hung-but-reachable data plane
+    raises FlightTimedOutError (a FlightError subclass) instead of blocking
+    forever. The exclusion sync passes it because it makes the call load-bearing
+    under a global advisory lock — see sync_reference_exclusion_data."""
     options = (
         _flight.FlightCallOptions(timeout=timeout_seconds) if timeout_seconds is not None else None
     )

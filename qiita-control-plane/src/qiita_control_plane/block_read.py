@@ -1,4 +1,4 @@
-"""Shared block-read scope rule.
+"""Shared DoGet selector names and the block-read scope rule.
 
 A block-scoped compute job (read-mask-block's ``qc`` / ``host_filter``, align's
 ``align_sharded``) reads its block's reads by STREAMING them from the data plane
@@ -29,8 +29,10 @@ from typing import Any
 READ_BLOCK_TABLE = "read_block"
 READ_MASKED_BLOCK_TABLE = "read_masked_block"
 
-# The per-sample pass-set DoGet selector the block ones shard. Same contract:
-# signed into a ticket's `table`, matched against the data plane's own name.
+# The per-prep_sample pass-set DoGet selector the block ones shard. Same contract:
+# signed into a ticket's `table`, matched against the data plane's own name. Lives
+# here with them so the signer, the route allowlists and the scope rule share one
+# definition.
 READ_MASKED_TABLE = "read_masked"
 
 

@@ -611,10 +611,6 @@ async def export_owner_biosample_id(
 # Masked-read export (system_admin + admin:masked_read_export)
 # ---------------------------------------------------------------------------
 
-# The masked-read macro the export ticket is signed for. Must match the
-# data plane's ALLOWED_TABLES and the CP-side _DOGET_ALLOWED_TABLES
-# (routes/reference.py) and the service-account read_masked route's own constant.
-_READ_MASKED_TABLE = READ_MASKED_TABLE
 
 # Export tickets are minted at the data plane's MAX_TICKET_LIFETIME (3600 s).
 # The data plane verifies expiry only at DoGet initiation, never mid-stream, so
@@ -746,7 +742,7 @@ async def create_masked_read_export_ticket(
         )
 
     ticket_bytes = sign_ticket(
-        table=_READ_MASKED_TABLE,
+        table=READ_MASKED_TABLE,
         filter=filter_,
         secret=signing_key,
         ttl_seconds=_EXPORT_TICKET_TTL_SECONDS,
