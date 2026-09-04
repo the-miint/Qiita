@@ -128,8 +128,9 @@ _None yet._
   - **A routine hifiasm_meta submission no longer needs the `--mem-gb 384` floor.** It
     was covering that assembler's demand, which this cohort measured to a 246.03 GiB
     max and 250 covers from the baseline. It is not full coverage: an earlier cohort
-    recorded a 259.3 GiB peak, and a sample in that range still OOMs and escalates to
-    500. Passing the floor still works, and still lifts every other step in the ticket.
+    recorded a 259.3 GiB peak (assembler unrecorded), and a sample in that range still
+    OOMs and escalates to 500. Passing the floor still works, and still lifts every
+    other step in the ticket.
   - **`assemble` is now sized per assembler:** hifiasm_meta 250 GiB, myloasm 128, so a
     myloasm ticket no longer holds an allocation sized for the other assembler. It
     resolves from a `profiles:` lookup rather than a flat number. That lookup keys on
@@ -140,6 +141,17 @@ _None yet._
     that is per *step attempt*, not per ticket — a ticket mid-flight at the restart
     finishes its in-flight step at the old numbers and picks up the new ones for the
     steps dispatched after it.
+- **A `build-shard-index` minimap2 shard build now requests ~21 GiB instead of ~29
+  (#fix/shard-index-memory-and-rationale-sweep).** No YAML baseline changed — the step's
+  `mem_gb: 32` and the 128 GiB ceiling are untouched. What moved is the job's own
+  `plan()` floor (28 → 20 GiB), the advisory the CP applies below baseline, so SLURM
+  slots shrink for shard builds only. Host builds (`host-reference-add`,
+  `local-host-reference-add`) are unaffected: `plan()` gives no opinion there, and the
+  reserve those use is unchanged at 16 GiB. DuckDB's own limit inside the job is
+  unchanged (9 GB for a 1 Gbp shard), so a build behaves as it did at the larger
+  allocation; per-node concurrency for the step rises from 15–17 to 23. An
+  under-estimate still escalates on OOM as before. Nothing to run — the action sync
+  does not carry this, it is job code that ships with the orchestrator restart.
 - **Reference-workflow resources also changed (#528):** `build-shard-index`'s
   `build_minimap2_index` `cpu: 4` → `1`; `local-reference-add`'s `load` `PT24H` →
   `PT36H` (an increase) and `build_routing_index` `PT24H` → `PT12H` (a reduction).

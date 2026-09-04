@@ -90,27 +90,27 @@ steps:
     inputs: [reads]
     optional_inputs: [host_rype_path, host_minimap2_path]
     outputs: [filtered_reads]
-    # mem_gb=16 / cpu=4 mirror host_filter.py's DuckDB cap (8 GB, half the
-    # allocation) + threads (4). Genome-scale host-index sizing is deferred
-    # (see host_filter.py): when sizing against a real host reference, bump
-    # mem_gb AND reconsider walltime together — minimap2 short-read alignment
-    # against a human-genome .mmi can exceed PT4H on 4 CPUs for a deep FASTQ.
+    # mem_gb / cpu mirror host_filter.py's DuckDB cap and thread count, which
+    # state the split and why DuckDB is held off the cgroup there. When sizing
+    # against a real host reference, bump mem_gb AND reconsider walltime together —
+    # minimap2 short-read alignment against a human-genome .mmi can exceed PT4H on
+    # 4 CPUs for a deep FASTQ.
     baseline_resources:
       cpu: 4
       mem_gb: 16
       walltime: PT4H
 
 # Ceiling must stay strictly ABOVE every step baseline on the escalating axes
-# (mem_gb, walltime), or escalation has no rung and the first OOM/TIMEOUT is
-# terminal at attempt 0. Mechanism: runner/_dispatch.py. Enforced for every
-# shipped workflow by test_actions_loader.py's ceiling-headroom guard. Baselines
-# are unchanged here; cpu/gpu never escalate.
+# (mem_gb, walltime); why, and what enforces it for every shipped workflow, are
+# stated at test_actions_loader.py's
+# `test_every_shipped_step_can_escalate_on_both_retry_axes`, which enforces it for
+# every shipped workflow. cpu/gpu never escalate.
 #
 # This version is DISABLED in qiita.action with no tickets — the raise is
 # insurance so re-enabling it does not restore a dead ladder, not active sizing.
-# host_filter OOM-kills at 16 GB and completes at 32, so the rung lands on the
-# size that works. Measured on read-mask/1.0.0, which carries essentially all
-# host_filter traffic; same jobs.host_filter module, so the sizing carries.
+# The rung lands on the size that works for host_filter, whose measured peak
+# jobs/host_filter.py states. Measured on read-mask/1.0.0, which carries
+# essentially all host_filter traffic; same module, so the sizing carries.
 action_ceiling:
   cpu: 8
   mem_gb: 32

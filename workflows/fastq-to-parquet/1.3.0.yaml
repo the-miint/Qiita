@@ -244,15 +244,14 @@ steps:
     outputs: []
 
 # Ceiling must stay strictly ABOVE every step baseline on the escalating axes
-# (mem_gb, walltime), or escalation has no rung and the first OOM/TIMEOUT is
-# terminal at attempt 0. Mechanism: runner/_dispatch.py. Enforced for every
-# shipped workflow by test_actions_loader.py's ceiling-headroom guard. Baselines
-# are unchanged here; cpu/gpu never escalate.
+# (mem_gb, walltime); why, and what enforces it for every shipped workflow, are
+# stated at test_actions_loader.py's
+# `test_every_shipped_step_can_escalate_on_both_retry_axes`, which enforces it for
+# every shipped workflow. cpu/gpu never escalate.
 #
-# host_filter peaks at 25.8 GB against a 32 GB baseline — real demand, since it
-# deliberately does not size DuckDB from the cgroup (jobs/host_filter.py). ~6 GB
-# of margin is what the ladder has to absorb. Measured on read-mask/1.0.0, which
-# carries essentially all host_filter traffic; same module, so it carries.
+# Sized on host_filter's measured peak against its 32 GB baseline, which
+# jobs/host_filter.py states along with why it is real demand; the margin over it
+# is what the ladder has to absorb. Measured on read-mask/1.0.0, same module.
 action_ceiling:
   cpu: 8
   mem_gb: 64

@@ -162,10 +162,11 @@ def apply_duckdb_settings(
 #    in actual RSS, and the overshoot grows with parallelism (per-thread operator
 #    state — sort/HASH_AGG runs that DuckDB doesn't perfectly bound). A flat
 #    headroom that is fine for the 4-thread steps is tight for the 8-thread `load`
-#    step; fastq_to_parquet's R11 note measured ~2.4 GB *resident* per thread on
-#    long-read work, most of it inside the limit. We reserve ~0.5 GB/thread on
-#    TOP of the limit as the above-limit margin — an envelope sized for the
-#    8-thread `load` step, to refine against a real genome-scale MaxRSS.
+#    step. fastq_to_parquet.py's DuckDB resource caps measure the per-thread
+#    resident figure on long-read work, most of it inside the limit; we reserve
+#    ~0.5 GB/thread on TOP of the limit as the above-limit margin — an envelope
+#    sized for the 8-thread `load` step, to refine against a real genome-scale
+#    MaxRSS.
 DUCKDB_BASE_HEADROOM_GB = 2
 DUCKDB_PER_THREAD_HEADROOM_GB = 0.5
 

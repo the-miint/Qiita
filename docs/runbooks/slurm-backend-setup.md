@@ -26,6 +26,23 @@ qiita-miint (orchestrator) --HTTP+JWT--> barnacle-api (slurmrestd)
                                   barnacle-login (slurmctld) --> compute nodes
 ```
 
+### Node shape
+
+The `qiita` partition is **14 standard nodes at `RealMemory=514000` MB with 64
+cores, plus 2 highmem at 1546528 MB**, and no `MemSpecLimit`. Confirm against the
+live cluster rather than trusting this line:
+
+```bash
+scontrol show partition qiita
+sinfo -p qiita -o '%n %c %m'    # node, cores, RealMemory (MB)
+```
+
+Two consequences the workflow YAMLs size against, which is why they point here
+instead of each restating the number: a step's `mem_gb` sets how many of it fit
+on one node (`floor(514000 / (mem_gb * 1024))`), and an allocation above 500 GB
+does not schedule at all. A step asking 251 GiB is the cliff worth knowing —
+`251 * 1024 * 2 = 514048` exceeds 514000, so two of them no longer share a node.
+
 ## Two identities — do not conflate
 
 | Identity | What it is | Where it must exist |

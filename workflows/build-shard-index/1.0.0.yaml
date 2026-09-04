@@ -98,20 +98,21 @@ steps:
     # and asserts it stays under the pool.
     #
     # Whether it buys more of this step per node depends on the shard, and standard
-    # nodes are 514000 MB / 64 cores. At the full mem_gb 32, memory caps concurrency
-    # at floor(514000/32768) = 15, already below the old cpu cap of 64/4 = 16, so
-    # nothing changes. `plan()` sizes a shard to 28 + ceil(bp/1e9) GiB, so one at or
-    # under 1 Gbp lands at 29, where floor(514000/29696) = 17 exceeds that cpu cap and
-    # the cut does add a slot; above 1 Gbp it lands at 30 or more, floor(514000/30720)
-    # = 16, and the gain is gone. 82.2% of this reference's 987 shards landed at 29 GiB.
+    # nodes are 514000 MB / 64 cores (docs/runbooks/slurm-backend-setup.md). At the
+    # full mem_gb 32, memory caps concurrency at floor(514000/32768) = 15, already
+    # below the old cpu cap of 64/4 = 16, so
+    # nothing changes. `plan()` sizes a shard to 20 + ceil(bp/1e9) GiB, so one at or
+    # under 1 Gbp lands at 21, where floor(514000/21504) = 23 exceeds that cpu cap and
+    # the cut does add slots. 82.2% of this reference's 987 shards landed in that band.
     # Either way the cores it stops reserving are available to other work on the node.
     #
     # The same step runs at cpu:4 in host-reference-add and local-host-reference-add,
     # unchanged: those build a whole reference rather than a shard, and no measurement
     # was taken there.
     #
-    # mem_gb stays 32: MaxRSS over the same 987 was p50 6.2, p90 10.3, max 17.1 GiB,
-    # and `plan()` already sizes a shard build down from this baseline by bp.
+    # mem_gb stays 32 as the whole-reference baseline; `plan()` sizes a shard build
+    # down from it. The shard floor and the MaxRSS behind it are stated once, at
+    # `_MINIMAP2_SHARD_RESERVE_GB` in the job module.
     baseline_resources:
       cpu: 1
       mem_gb: 32
@@ -142,8 +143,9 @@ steps:
     #
     # This is also the longer step of the pair: elapsed p50 14.5, p90 30.7, p99 65.2,
     # max 92.3 min against the same PT2H limit. mem_gb 32 is the whole-reference
-    # baseline; `plan()` sizes a shard down from it by bp, so those 987 ran at 29-31
-    # GiB, against a MaxRSS of p50 7.9, p90 13.3, max 21.9 GiB.
+    # baseline; `plan()` sizes a shard down from it by bp. The shard floor and the
+    # MaxRSS behind it are stated once, at `_BOWTIE2_RESERVE_GB` in the job module —
+    # it is a different number from minimap2's, and the two are not interchangeable.
     baseline_resources:
       cpu: 4
       mem_gb: 32

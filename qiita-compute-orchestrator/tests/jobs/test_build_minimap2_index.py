@@ -29,6 +29,8 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from qiita_compute_orchestrator.miint import duckdb_headroom_gb
+
 
 def _write_chunks_parquet(path: Path, rows: list[tuple[int, int, str]]) -> Path:
     """Write the feature-keyed `(feature_idx, chunk_index, chunk_data)` chunk
@@ -445,6 +447,112 @@ def test_build_minimap2_index_host_mode_requires_chunks():
 
     with pytest.raises(ValueError, match="reference_sequence_chunks"):
         build_minimap2_index.Inputs(reference_idx=1, work_ticket_idx=1)
+
+
+def _capture_duckdb_memory(build_minimap2_index, monkeypatch) -> list[int]:
+    """Append every DuckDB limit `execute()` resolves, keeping the real call.
+
+    One spy for the whole test rather than one per arm: installing a second spy
+    would wrap the first, so both arms would record into both captures and the
+    earlier arm's value would be overwritten by the later one.
+    """
+    seen: list[int] = []
+    real_apply = build_minimap2_index.apply_duckdb_settings
+
+    def spy_apply(conn, duckdb_tmp, *, memory_gb, threads):
+        seen.append(memory_gb)
+        real_apply(conn, duckdb_tmp, memory_gb=memory_gb, threads=threads)
+
+    monkeypatch.setattr(build_minimap2_index, "apply_duckdb_settings", spy_apply)
+    return seen
+
+
+def test_build_minimap2_index_reserve_differs_by_mode(tmp_path, monkeypatch):
+    """Host and shard mode carve DIFFERENT reserves out of the same cgroup.
+
+    The reserve bounds DuckDB, not minimap2 — it is the slack between DuckDB's
+    limit and the allocation — so the two modes reaching the same allocation with
+    different limits is the whole behaviour. Run at one allocation so the only
+    variable is the mode.
+
+    Both arms are asserted against the constants rather than literals, and the
+    two are asserted to DIFFER: a future edit collapsing them back to one value
+    fails here rather than silently restoring the host-sized reserve for shards.
+    """
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+
+    alloc_gb = 64
+    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
+    # slurm_alloc_gb reads SLURM_MEM_PER_NODE in MB.
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", str(alloc_gb * 1024))
+    headroom = duckdb_headroom_gb(build_minimap2_index._DUCKDB_THREADS)
+    seen = _capture_duckdb_memory(build_minimap2_index, monkeypatch)
+
+    # HOST arm — staged chunk Parquet, no shard_id.
+    parquet = _write_chunks_parquet(tmp_path / "chunks.parquet", [(1, 0, "ACGTACGT")])
+    _stub_capture_save(build_minimap2_index, monkeypatch)
+    asyncio.run(
+        build_minimap2_index.execute(
+            build_minimap2_index.Inputs(
+                reference_sequence_chunks=parquet, reference_idx=7, work_ticket_idx=42
+            ),
+            tmp_path / "ws-host",
+        )
+    )
+
+    # SHARD arm — same allocation, roster + streamed chunks.
+    stream_parquet = _write_chunks_parquet(tmp_path / "stream.parquet", [(100, 0, "ACGT")])
+    roster = _write_roster(tmp_path / "roster.parquet", [(100, 4)])
+    monkeypatch.setattr(
+        build_minimap2_index,
+        "open_reference_chunk_stream",
+        _fake_stream_from_parquet(stream_parquet, {}),
+    )
+    _stub_capture_save(build_minimap2_index, monkeypatch)
+    asyncio.run(
+        build_minimap2_index.execute(
+            build_minimap2_index.Inputs(
+                reference_idx=7, work_ticket_idx=42, shard_id=3, shard_features=roster
+            ),
+            tmp_path / "ws-shard",
+        )
+    )
+
+    host_mem, shard_mem = seen
+    assert host_mem == alloc_gb - headroom - build_minimap2_index._MINIMAP2_HOST_RESERVE_GB
+    assert shard_mem == alloc_gb - headroom - build_minimap2_index._MINIMAP2_SHARD_RESERVE_GB
+    assert host_mem != shard_mem, (
+        "host and shard mode resolved the same DuckDB limit — the per-mode reserve "
+        "has collapsed back to a single value"
+    )
+
+
+def test_build_minimap2_index_shard_sizing_holds_the_measured_duckdb_limit():
+    """A typical shard still hands DuckDB what it had when the MaxRSS was measured.
+
+    Those 987 builds ran at 29 GiB against a 16 GiB reserve. 82.2% of them were at
+    or under 1 Gbp, so the sizing that produced them was `floor + 1`. Dropping the
+    reserve by 8 and the floor by the same 8 leaves that shard's DuckDB limit
+    unchanged, which is what lets the measured peaks describe the smaller slot —
+    the allocation shrinks by 8 GiB of slack neither side was using.
+
+    Pins the PAIR: moving the reserve without the floor (or the reverse) changes
+    what DuckDB is handed, and the measurement stops transferring. Comparing at
+    `floor + 1` rather than at the floor on purpose — at the floor exactly, the
+    subtraction returns `_DUCKDB_MEMORY_GB` by construction and would pass for any
+    reserve at all.
+    """
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+
+    headroom = duckdb_headroom_gb(build_minimap2_index._DUCKDB_THREADS)
+    typical = build_minimap2_index._SHARD_PLAN_FLOOR_GB + 1
+
+    now = typical - headroom - build_minimap2_index._MINIMAP2_SHARD_RESERVE_GB
+    as_measured = 29 - headroom - 16
+    assert now == as_measured, (
+        f"a 1 Gbp shard is sized to {typical} GiB and hands DuckDB {now} GB, but the "
+        f"MaxRSS behind this sizing was measured with DuckDB at {as_measured} GB"
+    )
 
 
 def test_build_minimap2_index_plan_host_mode_no_opinion(tmp_path):

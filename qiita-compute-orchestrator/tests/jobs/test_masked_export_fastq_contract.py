@@ -6,7 +6,7 @@ via this COPY).
 These run against the team-mirror miint build (staged by the session-autouse
 `_stage_miint_extension` fixture in tests/conftest.py; `open_miint_conn` is
 LOAD-only). They pin the facts the CLI's FASTQ path depends on that the upstream
-`docs/copy-formats.md` summary does not spell out — verified empirically against
+`docs/writing.md` summary does not spell out — verified empirically against
 the build, not paraphrased:
 
   * The writer requires the **verbatim** `read_id`, `sequence1`, `qual1`

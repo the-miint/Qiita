@@ -151,12 +151,12 @@ steps:
     outputs: []
 
 # Ceiling must stay strictly ABOVE every step baseline on the escalating axes
-# (mem_gb, walltime), or escalation has no rung and the first OOM/TIMEOUT is
-# terminal at attempt 0. Mechanism: runner/_dispatch.py. Enforced for every
-# shipped workflow by test_actions_loader.py's ceiling-headroom guard. Baselines
-# are unchanged here; cpu/gpu never escalate.
+# (mem_gb, walltime); why, and what enforces it for every shipped workflow, are
+# stated at test_actions_loader.py's
+# `test_every_shipped_step_can_escalate_on_both_retry_axes`, which enforces it for
+# every shipped workflow. cpu/gpu never escalate.
 #
-# 500 GB is the node bound (RealMemory=514000 MB, no MemSpecLimit), so NovaSeq X
+# 500 GB is the node bound (see docs/runbooks/slurm-backend-setup.md), so NovaSeq X
 # gets one +4% rung rather than a doubling: better than a terminal first OOM, not
 # a guaranteed save. cpu stays 16 on purpose — more threads raise memory demand,
 # and memory is the axis already at the bound.
