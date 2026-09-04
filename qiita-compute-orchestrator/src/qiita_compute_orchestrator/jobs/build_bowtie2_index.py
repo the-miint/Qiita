@@ -84,11 +84,22 @@ _DUCKDB_THREADS = 4
 # — every workflow step declaring this module is a shard build.
 #
 # Measured on the reference-18 build (196,062 genomes): MaxRSS over 987 shard
-# builds was p50 7.9, p90 13.3, max 21.9 GiB, run at 29-31 GiB with DuckDB
-# limited to 9 GB. That max sits 6.1 GiB under this reserve's own floor of 28,
-# so 16 holds; it is NOT interchangeable with minimap2's shard reserve of 8,
-# which the same 987 builds put 4.8 GiB lower (max 17.1 GiB).
-_BOWTIE2_RESERVE_GB = 16
+# builds was p50 7.9, p90 13.3, max 21.9 GiB, run at 29-31 GiB with DuckDB limited
+# to 9-11 GB. Lowering the reserve by 4 and the floor by the same 4 holds that
+# limit exactly (25 - 4 - 12 = 9 for a 1 Gbp shard, as 29 - 4 - 16 was), so both
+# sides behave as measured and what goes is slack: a 1 Gbp shard now runs in 25 GiB,
+# 3.1 GiB above the observed max, and per-node concurrency rises from 17 to 20.
+#
+# Sized 4 higher than minimap2's shard reserve, not interchangeable with it: the
+# same 987 builds put this step's max 4.8 GiB above minimap2's (21.9 vs 17.1), and
+# it is the allocation that has to clear the max, not the reserve.
+_BOWTIE2_RESERVE_GB = 12
+# Under-SLURM HARD ceiling for DuckDB's share, for the reason
+# `build_minimap2_index` carries one — that comment states the mechanism (the
+# `min(hint, baseline)` clamp, and what this does NOT bound). Same value for the
+# same reason: 12 is the largest limit the old arithmetic ever produced here too
+# (32 - 4 - 16), so every shard size resolves to the limit it resolved to before.
+_BOWTIE2_SHARD_DUCKDB_CAP_GB = 12
 
 # In-DuckDB name handed to save_bowtie2_index (resolved by its separate
 # connection — must be non-temp; a TABLE because the reassembly is a blocking agg).
@@ -218,6 +229,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 _DUCKDB_MEMORY_GB,
                 threads=_DUCKDB_THREADS,
                 reserve_gb=_BOWTIE2_RESERVE_GB,
+                cap_gb=_BOWTIE2_SHARD_DUCKDB_CAP_GB if sharded else None,
             ),
             threads=_DUCKDB_THREADS,
         )

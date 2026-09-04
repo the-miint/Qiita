@@ -96,20 +96,28 @@ _MINIMAP2_HOST_RESERVE_GB = 16
 # Refine against an uncensored shard build (one run with DuckDB's limit raised
 # above its observed peak, which would separate the two shares).
 _MINIMAP2_SHARD_RESERVE_GB = 8
-# Under-SLURM HARD ceiling for DuckDB's share in SHARD mode, mirroring the split
-# `build_rype_index` makes for the same reason: this job only reassembles a
-# roster's chunks, so a bigger cgroup should reach minimap2's index rather than
-# DuckDB's heap.
+# Under-SLURM HARD ceiling for DuckDB's share in SHARD mode. It exists to keep the
+# reserve change above from being a raise anywhere: `plan()` is applied as
+# `min(hint, baseline)` (runner/_dispatch.py), so above the shard size where the
+# hint stops binding, a smaller reserve would hand DuckDB MORE inside an unchanged
+# 32 GiB cgroup — 20 GB rather than the 12 it had. 12 is exactly the largest limit
+# the old arithmetic ever produced (32 - 4 - 16), so every shard size now resolves
+# to the limit it resolved to before. Shards are planned by COUNT
+# (`shard_planner._SHARD_COUNT`), not by a bp budget, so shard size scales with the
+# catalogue and that band is reachable; reference-18 did not reach it (its shards
+# ran at 29-31 GiB, i.e. at most 3 Gbp).
 #
-# It is also what keeps the reserve change above from being a raise. `plan()` is
-# applied as `min(hint, baseline)` (runner/_dispatch.py), so above the shard size
-# where the hint stops binding, a smaller reserve would hand DuckDB MORE inside an
-# unchanged 32 GiB cgroup — 20 GB rather than the 12 it had. 12 is exactly the
-# largest limit the old arithmetic ever produced (32 - 4 - 16), so capping here
-# leaves every allocation at or below what it was and removes that band. Shards are
-# planned by COUNT (`shard_planner._SHARD_COUNT`), not by a bp budget, so shard size
-# scales with the catalogue and that band is reachable — reference-18 did not reach
-# it (its shards ran at 29-31 GiB, i.e. at most 3 Gbp).
+# It does NOT bound the reassembly's working set, and this is not the safe-because-
+# windowed cap `build_rype_index` carries — `rype_index_create` windows its feed, so
+# DuckDB's share there is bounded by window size rather than corpus size. Nothing
+# windows `stage_subject`: its `string_agg(chunk_data ORDER BY chunk_index) GROUP BY
+# feature_idx` grows with the shard, and it OOMs rather than spilling
+# (`test_duckdb_memory_behavior.py` pins that, measured at ~2.2x the chunk bytes as
+# `memory_limit`). So a 12 GB limit reassembles roughly 5 Gbp and no more, on the
+# first attempt and on every retry — the cap is hard, so OOM escalation grows only
+# minimap2's side. That ceiling is unchanged by this constant: the old arithmetic hit
+# the same 12 GB from a 4 Gbp shard upward. Windowing the shard feed the way rype's
+# is, is what would move it.
 #
 # HOST mode gets no cap: it reassembles genome-scale contigs from staging Parquet,
 # where a `--mem-gb` override is meant to grow DuckDB's reassembly headroom.

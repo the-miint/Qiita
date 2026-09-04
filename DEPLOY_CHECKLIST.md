@@ -141,21 +141,25 @@ _None yet._
     that is per *step attempt*, not per ticket — a ticket mid-flight at the restart
     finishes its in-flight step at the old numbers and picks up the new ones for the
     steps dispatched after it.
-- **A `build-shard-index` minimap2 shard build now requests ~21 GiB instead of ~29
-  (#537).** No YAML baseline changed — the step's
-  `mem_gb: 32` and the 128 GiB ceiling are untouched. What moved is the job's own
-  `plan()` floor (28 → 20 GiB), the advisory the CP applies below baseline, so SLURM
-  slots shrink for shard builds only. Host builds (`host-reference-add`,
-  `local-host-reference-add`) are unaffected: `plan()` gives no opinion there, and the
-  reserve those use is unchanged at 16 GiB. DuckDB's own limit inside a shard build is
-  unchanged at every shard size (9 GB for a 1 Gbp shard), so a build behaves as it did
-  at the larger allocation; per-node concurrency for the step rises from 15–17 to
-  21–23, depending on shard size. An under-estimate still escalates on OOM as before,
-  and the rung is unchanged (escalation grows from the YAML baseline, not from the
-  hint) — but a shard build's DuckDB is now capped at 12 GB on the escalated retry
-  rather than growing with the cgroup, so the extra memory reaches minimap2's index
-  instead. Nothing to run — the action sync does not carry this, it is job code that
-  ships with the orchestrator restart.
+- **`build-shard-index` shard builds request smaller SLURM slots (#537).** A 1 Gbp
+  shard now asks for ~21 GiB instead of ~29 for `build_minimap2_index`, and ~25 instead
+  of ~29 for `build_bowtie2_index`. No YAML baseline changed — both steps keep
+  `mem_gb: 32` and the 128 GiB ceiling. What moved is each job's own `plan()` floor
+  (minimap2 28 → 20, bowtie2 28 → 24), the advisory the CP applies below baseline, so
+  only shard builds shrink. Per-node concurrency rises from 15–17 to 21–23 for minimap2
+  (it varies with shard size) and from 17 to 20 for bowtie2.
+
+  Host builds (`host-reference-add`, `local-host-reference-add`) are unaffected:
+  `plan()` gives no opinion there and the reserve those use is unchanged at 16 GiB.
+  DuckDB's own limit inside a shard build is unchanged at every shard size (9 GB for a
+  1 Gbp shard), so a build behaves as it did at the larger allocation. An under-estimate
+  still escalates on OOM as before and the rung is unchanged, since escalation grows
+  from the YAML baseline rather than from the hint — but a shard build's DuckDB is now
+  capped at 12 GB on the escalated retry instead of growing with the cgroup, so the
+  extra memory reaches the index builder rather than DuckDB's heap.
+
+  Nothing to run: the action sync does not carry this, it is job code that ships with
+  the orchestrator restart.
 - **Reference-workflow resources also changed (#528):** `build-shard-index`'s
   `build_minimap2_index` `cpu: 4` → `1`; `local-reference-add`'s `load` `PT24H` →
   `PT36H` (an increase) and `build_routing_index` `PT24H` → `PT12H` (a reduction).

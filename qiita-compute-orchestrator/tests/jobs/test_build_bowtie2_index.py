@@ -45,6 +45,33 @@ def _write_chunks_parquet(path: Path, rows: list[tuple[int, int, str]]) -> Path:
     return path
 
 
+# `_resolve_step_resources` applies the hint only when `hint < resolved < ceiling`
+# (runner/_dispatch.py) — the down-size needs escalation headroom, or a shrunk
+# attempt that OOMs would read as saturation. The clamp below drops that third
+# term because `build-shard-index` declares a 128 GiB ceiling against a 32 GiB
+# baseline, so the headroom condition is never the binding one. Closing that gap
+# in the YAML would make this clamp diverge from production without either side
+# failing, which is what the ceiling assertion here is for.
+def _shard_yaml_baseline_gb() -> int:
+    """`build-shard-index`'s declared `mem_gb` for the bowtie2 step. Read from the
+    workflow rather than restated: a baseline raised there has to move this clamp."""
+    import yaml
+
+    repo_root = Path(__file__).resolve().parents[3]
+    data = yaml.safe_load((repo_root / "workflows/build-shard-index/1.0.0.yaml").read_text())
+    for step in data["steps"]:
+        if step.get("step") == "build_bowtie2_index":
+            mem_gb = step["baseline_resources"]["mem_gb"]
+            ceiling = data["action_ceiling"]["mem_gb"]
+            assert mem_gb < ceiling, (
+                f"build-shard-index baseline mem_gb={mem_gb} has no headroom under "
+                f"ceiling={ceiling}; the down-size would not apply at all and the "
+                "clamp below no longer matches runner/_dispatch.py"
+            )
+            return mem_gb
+    raise AssertionError("build-shard-index declares no build_bowtie2_index step")
+
+
 def _write_roster(path: Path, rows: list[tuple[int, int]]) -> Path:
     """Write a shard feature roster Parquet `(feature_idx BIGINT,
     sequence_length_bp BIGINT)`."""
@@ -370,6 +397,79 @@ def test_build_bowtie2_index_plan_shard_mode_sizes_mem(tmp_path):
     )
     assert plan.resources is not None
     assert plan.resources.mem_gb == expected
+
+
+@pytest.mark.parametrize("shard_gbp", [1, 2, 3, 4, 5, 12, 20])
+def test_build_bowtie2_index_shard_never_raises_duckdbs_limit(tmp_path, shard_gbp):
+    """No shard size hands DuckDB more than the reserve it replaced would have.
+
+    The bowtie2 twin of `build_minimap2_index`'s pin — that test's docstring states
+    the mechanism (the `min(hint, baseline)` clamp, and why a smaller reserve alone
+    is not conservative above the shard size where the hint stops binding). Kept as
+    its own test rather than shared, because the constants and the measured max
+    differ: this step's 987-build max was 21.9 GiB against minimap2's 17.1, which is
+    why its reserve is 12 and not 8.
+    """
+    from qiita_compute_orchestrator.jobs import build_bowtie2_index
+    from qiita_compute_orchestrator.miint import resolve_duckdb_memory_gb
+
+    baseline = _shard_yaml_baseline_gb()
+    roster = _write_roster(tmp_path / "r.parquet", [(1, shard_gbp * 1_000_000_000)])
+    inputs = build_bowtie2_index.Inputs(
+        reference_idx=1, work_ticket_idx=1, shard_id=0, shard_features=roster
+    )
+    hint = build_bowtie2_index.plan(inputs).resources.mem_gb
+    alloc = hint if hint < baseline else baseline
+
+    def _limit_at(alloc_gb, reserve_gb, cap_gb, monkey):
+        monkey.setenv("SLURM_MEM_PER_NODE", str(alloc_gb * 1024))
+        return resolve_duckdb_memory_gb(
+            build_bowtie2_index._DUCKDB_MEMORY_GB,
+            threads=build_bowtie2_index._DUCKDB_THREADS,
+            reserve_gb=reserve_gb,
+            cap_gb=cap_gb,
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        now = _limit_at(
+            alloc,
+            build_bowtie2_index._BOWTIE2_RESERVE_GB,
+            build_bowtie2_index._BOWTIE2_SHARD_DUCKDB_CAP_GB,
+            mp,
+        )
+        # What the 16 GiB reserve produced for the same shard, at ITS floor of 28.
+        # Frozen literals: this regime is gone from the source, so it cannot be read.
+        before_hint = 28 + shard_gbp
+        before_alloc = before_hint if before_hint < baseline else baseline
+        before = _limit_at(before_alloc, 16, None, mp)
+
+    assert now <= before, (
+        f"a {shard_gbp} Gbp shard now runs in {alloc} GiB with DuckDB at {now} GB, "
+        f"above the {before} GB it got in {before_alloc} GiB before the reserve cut"
+    )
+    assert alloc <= before_alloc
+
+
+def test_build_bowtie2_index_shard_allocation_clears_the_measured_max(tmp_path):
+    """A 1 Gbp shard's allocation still clears the largest MaxRSS ever measured here.
+
+    21.9 GiB over the reference-18 build's 987 shard builds is what the reserve is
+    sized against — the reserve bounds DuckDB, but it is the ALLOCATION that has to
+    hold the whole job. Lowering the floor is only safe while that stays true, and
+    at the floor+1 the 82.2% of shards at or under 1 Gbp land in, the gap is what
+    `_BOWTIE2_RESERVE_GB`'s comment quotes.
+    """
+    from qiita_compute_orchestrator.jobs import build_bowtie2_index
+
+    roster = _write_roster(tmp_path / "r.parquet", [(1, 1_000_000_000)])
+    inputs = build_bowtie2_index.Inputs(
+        reference_idx=1, work_ticket_idx=1, shard_id=0, shard_features=roster
+    )
+    alloc = build_bowtie2_index.plan(inputs).resources.mem_gb
+    assert alloc > 21.9, (
+        f"a 1 Gbp shard is sized to {alloc} GiB, at or under the 21.9 GiB max "
+        "measured over 987 shard builds — the allocation no longer covers what ran"
+    )
 
 
 def test_build_bowtie2_index_plan_shard_mem_scales_with_bp(tmp_path):

@@ -539,6 +539,13 @@ def test_build_minimap2_index_reserve_differs_by_mode(tmp_path, monkeypatch):
 # the hint clamped at that baseline. Read from the workflow rather than restated:
 # a baseline raised in the YAML has to move this clamp, and a literal here would
 # keep passing against the old one.
+# `_resolve_step_resources` applies the hint only when `hint < resolved < ceiling`
+# (runner/_dispatch.py) — the down-size needs escalation headroom, or a shrunk
+# attempt that OOMs would read as saturation. The clamp below drops that third
+# term because `build-shard-index` declares a 128 GiB ceiling against a 32 GiB
+# baseline, so the headroom condition is never the binding one. Closing that gap
+# in the YAML would make this clamp diverge from production without either side
+# failing, which is what the ceiling assertion here is for.
 def _shard_yaml_baseline_gb() -> int:
     """`build-shard-index`'s declared `mem_gb` for the minimap2 step."""
     import yaml
@@ -547,7 +554,14 @@ def _shard_yaml_baseline_gb() -> int:
     data = yaml.safe_load((repo_root / "workflows/build-shard-index/1.0.0.yaml").read_text())
     for step in data["steps"]:
         if step.get("step") == "build_minimap2_index":
-            return step["baseline_resources"]["mem_gb"]
+            mem_gb = step["baseline_resources"]["mem_gb"]
+            ceiling = data["action_ceiling"]["mem_gb"]
+            assert mem_gb < ceiling, (
+                f"build-shard-index baseline mem_gb={mem_gb} has no headroom under "
+                f"ceiling={ceiling}; the down-size would not apply at all and the "
+                "clamp below no longer matches runner/_dispatch.py"
+            )
+            return mem_gb
     raise AssertionError("build-shard-index declares no build_minimap2_index step")
 
 

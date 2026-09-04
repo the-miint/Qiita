@@ -3461,7 +3461,21 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   its previous value at every shard size and the allocation never rises; on an
   OOM-escalated retry the added memory now reaches minimap2 rather than DuckDB's heap.
   Host mode is uncapped, because there a `--mem-gb` override is meant to grow DuckDB's
-  genome-scale reassembly headroom. Two tests pin
+  genome-scale reassembly headroom. `build_bowtie2_index` takes the same treatment
+  against its own measurement: reserve 16 -> 12, floor 28 -> 24, and the same cap. Its
+  987-build max was 21.9 GiB — 4.8 above minimap2's — so a 1 Gbp shard lands at 25 GiB,
+  3.1 above that max, and its per-node concurrency rises from 17 to 20.
+
+  What the cap does NOT do is bound the reassembly's working set, and it is not the
+  safe-because-windowed cap `build_rype_index` carries. `stage_subject`'s
+  `string_agg(chunk_data ORDER BY chunk_index) GROUP BY feature_idx` raises
+  `OutOfMemoryException` rather than spilling, probed against the DuckDB this repo
+  ships and pinned in `test_duckdb_memory_behavior.py` beside the two behaviours that
+  module already covers; it wants roughly 2.2x the chunk bytes as `memory_limit`
+  (3.6x at 0.25 GiB, 2.4x at 1 GiB, 2.2x at 4 GiB). So a 12 GB limit reassembles about
+  5 Gbp and no more, on the first attempt and on every retry. That ceiling is
+  pre-existing and unchanged: the old arithmetic reached the same 12 GB from a 4 Gbp
+  shard upward. Windowing the shard feed the way rype's is, is what would move it. Two tests pin
   it: the modes must resolve different DuckDB limits, and the reserve and floor must move
   together or the measurement stops transferring.
 - **A measured rationale is stated at one site, and the other copies point at it (#537).**
