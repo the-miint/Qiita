@@ -244,11 +244,11 @@ def test_build_shard_index_cpu_is_below_duckdb_threads():
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.build_minimap2_index")
     for where, cpu in _baseline_cpu_every_version("build-shard-index", "build_minimap2_index"):
         assert cpu == 1 and cpu < mod._DUCKDB_THREADS, (
-            f"{where}: build_minimap2_index cpu={cpu}, "
-            f"measured at a largest-observed TotalCPU of 1.45 min over 987 shard "
-            f"builds. It sits below _DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — "
-            f"the step is blocked on its data-plane stream, so cores matched to the "
-            f"pool go unused."
+            f"{where}: build_minimap2_index cpu={cpu}. One core is enough because the "
+            f"largest TotalCPU over 987 shard builds is 1.45 min, so serialising the "
+            f"work onto it costs about a minute of a PT2H budget. It sits below "
+            f"_DUCKDB_THREADS={mod._DUCKDB_THREADS} on purpose — the step is blocked on "
+            f"its data-plane stream, so cores matched to the pool go unused."
         )
 
 

@@ -89,9 +89,8 @@ steps:
     #
     # CPU efficiency TotalCPU/(Elapsed x AllocCPUS) is not the bound here: it peaks at
     # 28.0% — 1.12 average cores, above the one allocated — on a 0.58-min shard that
-    # projects to 1.07 min. Efficiency falls as elapsed rises (pearson -0.60; mean
-    # efficiency by elapsed decile runs 13.7% down to 1.7%), so the shards where the
-    # ratio is high are the short ones.
+    # projects to 1.07 min. Mean efficiency by elapsed decile falls monotonically from
+    # 13.7% to 1.7%, so the shards where the ratio is high are the short ones.
     #
     # This does not touch DuckDB's pool: the job takes its thread count from its own
     # `_DUCKDB_THREADS`, so four threads now time-share one core instead of four.
@@ -131,12 +130,17 @@ steps:
     params: {shard_id: shard_id}
     when: build_bowtie2
     outputs: [bowtie2_index_meta]
-    # cpu from the same reference-18 build, 987 shard builds at cpu:4. Unlike
-    # build_minimap2_index above, this one spends its wall time computing: CPU
-    # efficiency TotalCPU/(Elapsed x AllocCPUS) is p50 65.5%, p90 75.7%, max 92.7%,
-    # so the four cores are used. It is also the long step of the pair — elapsed p50
-    # 14.5, p90 30.7, p99 65.2, max 92.3 min against the PT2H limit, where minimap2's
-    # max is 23.9.
+    # cpu:4 predates the reference-18 build; that build's 987 shard runs corroborate
+    # it rather than being where it came from. Unlike build_minimap2_index above, this
+    # step spends its wall time computing: CPU efficiency TotalCPU/(Elapsed x
+    # AllocCPUS) is p50 65.5%, p90 75.7%, max 92.7% — 2.6 of the four cores busy at the
+    # median, 3.7 at the maximum. Efficiency is read the opposite way here than in that
+    # block: a high ratio justifies KEEPING cores, where a high ratio on a short job
+    # says nothing about whether cutting them costs wall time.
+    #
+    # This is the long step of the pair: elapsed p50 14.5, p90 30.7, p99 65.2, max 92.3
+    # min, so walltime PT2H is the binding one of the two. mem_gb 32 against a MaxRSS
+    # of p50 7.9, p90 13.3, max 21.9 GiB.
     baseline_resources:
       cpu: 4
       mem_gb: 32

@@ -1702,7 +1702,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 - **`build_minimap2_index`'s `cpu: 1` was justified from the first ~1.4 hours of the
   reference-18 build, and the figures characterising that step were wrong (#TBD).** The
-  68-run sample behind it spans 09:41 to 11:07 of a build that ran to the next morning;
+  68-run slice behind it spans 09:41 to 11:07 of a build that ran to the next morning;
   re-pulled `sacct` for all 987 shard builds. CPU efficiency is p50 4.3% / max 28.0%, not
   p50 2.1% / max 13.9%, and 167 of the 987 exceed the figure given as the maximum. The
   derived "0.56 cores maximum average demand, which one covers" is 1.12 cores — above the
@@ -1716,9 +1716,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   representative: what one core must absorb is TotalCPU, which is p99 1.14 and max 1.45
   min. Worst case at `cpu: 1` is `elapsed + 0.75 x TotalCPU`, peaking at 24.7 min over all
   987 against the PT2H limit — none cross. Efficiency is the wrong axis because it falls
-  as elapsed rises (pearson -0.60), so the high ratios are all on short shards. Comment
+  as elapsed rises — mean efficiency by elapsed decile drops monotonically from 13.7%
+  to 1.7% — so the high ratios are all on short shards. Comment
   and test docstring rewritten on that basis, and the shard-size distribution the comment
-  called unmeasured is 82.2% of shards at 29 GiB.
+  called unmeasured was measured: 82.2% of shards at 29 GiB.
 
 - **Read materialization signed its `export_read` token before the executor hop, so a wide
   fan-out expired its own tokens (#532).** `_resolve_staged_reads` minted the token and only
