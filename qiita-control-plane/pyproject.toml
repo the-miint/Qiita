@@ -33,7 +33,7 @@ dependencies = [
     # pin matches the orchestrator (which calls `save_bclconvert_v1_csv`
     # from the same release) so a re-vendor is a coordinated bump;
     # an integration parity test enforces parity.
-    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@366e381a72b9b7ef8b9842735cf5d7d80906194c",
+    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@d3b82bfb1e0dcbf3e2ce7866fd3d9b67d061c57b",
 ]
 
 [project.scripts]

@@ -53,7 +53,6 @@ the sibling sequenced_sample route module.
 
 import base64
 import json
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any
@@ -149,6 +148,7 @@ from ..deps import (
     get_scratch_staging,
     get_tx_conn_factory,
 )
+from ..preflight import open_blob
 from ..repositories.alignment_definition import (
     list_alignments_over_prep_samples,
     list_completed_alignment_samples,
@@ -457,8 +457,9 @@ class _LaneUpdateRejected(Exception):
     """run_preflight.update_lane rejected the request — an unsupported platform, a
     post-update NULL/non-NULL lane mix, or a unique ``(prepped_sample, lane)``
     collision. A client-error condition (the route maps it to 422), kept distinct
-    from a ``ValueError`` raised by ``open_db_file`` (a server-side preflight
-    schema-version skew), which must surface as 5xx rather than 422."""
+    from a load failure — a blob that is not a SQLite database, or one written
+    against a newer preflight schema than this deployment ships — which must surface
+    as 5xx rather than 422."""
 
 
 def _apply_preflight_lane_update(
@@ -472,33 +473,24 @@ def _apply_preflight_lane_update(
     """Apply ``run_preflight.update_lane`` to a preflight SQLite blob, returning
     the edited bytes and the number of sample rows reassigned.
 
-    The blob is materialized to a private temp file because run_preflight
-    operates on a file-backed sqlite3 connection and commits the lane update in
-    place; the edited bytes are then read back. The ``run_preflight`` import is
-    lazy and local — matching ``jobs/bcl_convert_prep.py`` — so the git-pinned
-    dependency only loads on the rare edit path, never at module import.
-    ``open_db_file`` also applies any pending preflight-schema patches, which can
-    legitimately rewrite bytes even on a zero-row update; that is intended (it
-    keeps a stored preflight current).
+    The edit lands in the detached copy ``open_blob`` returns; the pending schema
+    patches it applies there can change the returned bytes even on a zero-row update,
+    which is intended (it keeps a stored preflight current). The ``run_preflight``
+    import is lazy so the git-pinned dependency only loads on this rare edit path.
 
-    Only update_lane's own ``ValueError`` (bad request) is translated to
-    ``_LaneUpdateRejected``; a ``ValueError`` from ``open_db_file`` (e.g. a stored
-    blob whose schema version exceeds the deployed run_preflight patch set — a
-    server/version-skew condition, not a bad request) is deliberately left to
-    propagate so the route returns 5xx rather than mislabeling it 422."""
-    from run_preflight import open_db_file, update_lane  # noqa: PLC0415
+    Only update_lane's own ``ValueError`` (bad request) becomes
+    ``_LaneUpdateRejected``. A blob that will not load raises ``ValueError`` too, so
+    the load is kept outside the ``except`` — ``open_blob`` performs it on entry — and
+    propagates as 5xx rather than being mislabeled a bad request."""
+    from run_preflight import dump_db_bytes, update_lane  # noqa: PLC0415
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "preflight.db"
-        db_path.write_bytes(blob)
-        conn = open_db_file(str(db_path))
+    with open_blob(blob) as conn:
         try:
             rows_updated = update_lane(conn, platform, from_lane, to_lane, reason)
         except ValueError as exc:
             raise _LaneUpdateRejected(str(exc)) from exc
-        finally:
-            conn.close()
-        return db_path.read_bytes(), rows_updated
+        new_blob = dump_db_bytes(conn)
+    return new_blob, rows_updated
 
 
 @router.post(PATH_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE)

@@ -3448,6 +3448,24 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **A run pre-flight is no longer modified by reading it.** kl-run-preflight's
+  file-opening entry point applied pending schema patches to the file it opened, so a
+  read of a schema-lagging pre-flight wrote it. That made a shared `644` pre-flight fail
+  outright with `attempt to write a readonly database`, and made pool identity unstable:
+  the CLI hashes the bytes *before* opening, pool identity is the SHA-256 of those bytes,
+  so a re-run hashed the *patched* file and minted a second pool instead of converging on
+  the first. The dependency now loads into a detached in-memory copy and the source is
+  never written, so re-running a submit converges and the operator work-around — copy the
+  file, `chmod u+w`, pre-apply patches, keep the patched copy for the life of the pool — is
+  gone from the PacBio ingest runbook. Reading a stored blob no longer round-trips through
+  a temp file either, on both the pool-roster read and the lane-update edit. Input that is
+  not a SQLite database now raises `ValueError` rather than `sqlite3.DatabaseError`; both
+  CLI readers surface it as the same single stderr line, and both server readers already
+  caught the pair. Because that is also the type `update_lane` raises to signal a bad
+  request, the lane-update route reads the stored blob through the same helper as the
+  roster read, which loads on context entry — so a blob that will not load stays a 5xx
+  instead of being mislabeled 422. (#541)
+
 - **`build_minimap2_index` sizes its DuckDB reserve per mode, and a shard build now
   asks for 21 GiB instead of 29 (#538).** `_MINIMAP2_RESERVE_GB` was one constant applied
   in both modes, and it was sized for the host case that introduced it — a genome-scale

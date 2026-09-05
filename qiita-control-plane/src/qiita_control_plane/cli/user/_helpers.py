@@ -4,6 +4,7 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 """
 
 import argparse
+import sqlite3
 from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
@@ -34,6 +35,30 @@ def _inspect_run_folder(
             ),
         )
     )
+
+
+def _load_preflight_conn(
+    preflight_blob: Path, parser: argparse.ArgumentParser, *, flag: str
+) -> sqlite3.Connection:
+    """Load an operator-supplied preflight SQLite into a detached connection.
+
+    `load_db_file` reads the file into an in-memory copy, so the operator's
+    preflight is never written to — schema patches land in memory and are
+    discarded. Caller owns the returned connection and must close it.
+
+    Requires a path that opens for reading; an OS-level open failure propagates.
+    A file that carries no SQLite header, is truncated, or was written against a
+    newer preflight schema than this client ships raises via `parser.error`, so the
+    CLI surfaces one stderr line and exits 2 before any network call. `flag` names
+    the option the path came from, so the message points at what the operator typed.
+    """
+    from run_preflight import load_db_file  # noqa: PLC0415
+
+    try:
+        conn = load_db_file(preflight_blob)
+    except (sqlite3.DatabaseError, ValueError) as exc:
+        parser.error(f"{flag} {preflight_blob}: cannot load preflight SQLite: {exc}")
+    return conn
 
 
 def _build_body(

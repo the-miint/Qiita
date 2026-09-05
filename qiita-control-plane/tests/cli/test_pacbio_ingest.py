@@ -5,13 +5,16 @@ Three surfaces, all pure-unit (no Postgres):
     disambiguation, exercised against a synthetic run folder on disk.
   * `_read_pacbio_preflight_rows` — the preflight reader (kl-run-preflight's
     `get_pacbio_sample_info`), exercised end-to-end against a REAL kl-run-preflight
-    SQLite built from the pinned case-5 fixture (good_pacbio_absquantv11.csv).
+    SQLite built from the pinned case-5 fixture (good_pacbio_absquantv11.csv),
+    including the load failure an unusable file produces and the read-only source
+    the load must leave untouched.
   * `_handle_submit_pacbio_ingest` — the full submit flow, HTTP mocked, asserting
     the run/pool/sample setup and the per-sample bam-to-parquet fan-out.
 """
 
 from __future__ import annotations
 
+import argparse
 import sqlite3
 from pathlib import Path
 
@@ -241,6 +244,46 @@ def test_read_preflight_rows_fails_on_missing_accession(build_case5_preflight):
     db = build_case5_preflight(populate_accessions=False)
     with pytest.raises(_RaisingParser.Error, match="missing required accession"):
         _read_pacbio_preflight_rows(db, _RaisingParser())
+
+
+def test__read_pacbio_preflight_rows_rejects_a_non_sqlite_blob(tmp_path, capsys):
+    """Tests the case where --preflight-blob names a file that is not a SQLite
+    database at all — the operator pointed at the CSV, or at a truncated copy.
+
+    Uses a real `argparse.ArgumentParser` rather than this module's `_RaisingParser`,
+    because the assertion is the argparse behaviour itself: one stderr line and exit
+    2, not a traceback. Pins the message, since a load failure and a query failure
+    are reported differently and the operator's next move differs."""
+    not_a_db = tmp_path / "preflight.db"
+    not_a_db.write_bytes(b"sample_name,barcode\nA,bc1001\n")
+
+    parser = argparse.ArgumentParser(prog="qiita")
+    with pytest.raises(SystemExit) as excinfo:
+        _read_pacbio_preflight_rows(not_a_db, parser)
+
+    assert excinfo.value.code == 2
+    assert "cannot load preflight SQLite" in capsys.readouterr().err
+
+
+def test__read_pacbio_preflight_rows_leaves_the_source_unwritten(build_case5_preflight):
+    """Tests the case where the operator's pre-flight is not writable by whoever
+    runs the CLI — a shared `644` file under the sequencing mounts.
+
+    This CANNOT fail against the reader as it stands today, and is not claimed to:
+    the fixture is stamped at the latest pre-flight schema, so there is nothing to
+    migrate and a writing loader would leave the bytes alone too. It is deliberate
+    insurance for the change that would break it — a reader that writes a migration
+    back, or persists the connection to the file — which would fail here rather than
+    in production against a file nobody owns. Acquiring the file read-write is NOT
+    itself caught: SQLite falls back to read-only and defers the error to the write."""
+    db = build_case5_preflight()
+    before = db.read_bytes()
+    db.chmod(0o444)
+
+    rows = _read_pacbio_preflight_rows(db, _RaisingParser())
+
+    assert rows, "case-5 fixture produced no CLI rows"
+    assert db.read_bytes() == before
 
 
 # ---------------------------------------------------------------------------

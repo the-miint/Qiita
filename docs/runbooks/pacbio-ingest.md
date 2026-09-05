@@ -1,8 +1,8 @@
 # PacBio ingest (runbook)
 
 **For:** whoever is ingesting a PacBio run (`qiita submit-pacbio-ingest`). Read it
-before the first ingest on a new deploy — four of its behaviours surprise people, and
-two of them (a second pool minted; reads duplicated in the lake) are expensive to undo.
+before the first ingest on a new deploy — three of its behaviours surprise people, and
+one of them (reads duplicated in the lake) is expensive to undo.
 Not needed for Illumina.
 
 Auth and the general CLI flow are **not** repeated here — see
@@ -40,38 +40,12 @@ host's checkout path, mounts, and `prep_protocol` indices.
 - The PAT identifies the Qiita principal regardless of the Unix account, so
   `sudo -u qiita env QIITA_TOKEN=… qiita …` still acts as the token's owner.
 
-## The pre-flight `.db` must be writable by whoever runs the CLI
-
-`run_preflight.open_db_file` opens the SQLite pre-flight **read-write** and applies
-schema patches in place. A shared `644` pre-flight owned by `qiita` — the normal case
-under `/qmounts/qiita_data/working_dir/…` — therefore fails with `attempt to write a
-readonly database`.
-
-Copy it somewhere you own, make it writable, and **pre-apply the patches once, before
-submitting**:
-
-```bash
-cp "$SHARED_PF" "$PF" && chmod u+w "$PF"
-"$QIITA_VENV/python" - "$PF" <<'PY'
-import sys
-from run_preflight import open_db_file
-open_db_file(sys.argv[1]).close()
-PY
-md5sum "$PF"   # baseline — must be unchanged after the submit
-```
-
-**Pre-patching is not cosmetic.** The CLI hashes the blob's bytes *before* opening and
-patching it, and pool identity is the SHA-256 of those bytes. Submitting against an
-unpatched file and then re-running would hash *different* bytes and mint a **second
-pool** instead of converging on the first. Keep the patched copy for the life of the
-pool — a later mask submission wants byte-identical content.
-
 ## Submit
 
 ```bash
 qiita --base-url https://qiita-miint.ucsd.edu/ submit-pacbio-ingest \
     --run-folder /sequencing/gcore_runs/Knightlab/r84137_20260623_040006 \
-    --preflight-blob "$PF" \
+    --preflight-blob ./r84137_preflight.db \
     --instrument-run-id r84137_20260623_040006 \
     --instrument-model Revio \
     --prep-protocol-idx 3
@@ -87,7 +61,9 @@ qiita --base-url https://qiita-miint.ucsd.edu/ submit-pacbio-ingest \
   copying a number (`qiita prep-protocol list`); on `qiita-miint` it is **3**, and the
   amplicon protocol you must *not* pick is 5.
 - **Retry by re-running the identical command.** Run and pool are find-or-create, the
-  roster is create-missing, and already-ingested samples come back `skipped`.
+  roster is create-missing, and already-ingested samples come back `skipped`. Pool
+  identity is the SHA-256 of the uploaded pre-flight bytes, so a retry has to submit the
+  same file content — different bytes mint a second pool instead of converging.
 - **Never use `--force` to retry.** It re-ingests, duplicating the reads in the lake.
 
 ## `pool-completion` does not report on ingest

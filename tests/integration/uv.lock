@@ -684,7 +684,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "pyarrow", specifier = ">=19" },
     { name = "qiita-common", directory = "../../qiita-common" },
-    { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=366e381a72b9b7ef8b9842735cf5d7d80906194c" },
+    { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=d3b82bfb1e0dcbf3e2ce7866fd3d9b67d061c57b" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
 
@@ -735,7 +735,7 @@ requires-dist = [
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "qiita-common", directory = "../../qiita-common" },
-    { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=366e381a72b9b7ef8b9842735cf5d7d80906194c" },
+    { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=d3b82bfb1e0dcbf3e2ce7866fd3d9b67d061c57b" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
 
@@ -831,8 +831,8 @@ wheels = [
 
 [[package]]
 name = "run-preflight"
-version = "2026.6.1.post7+g366e381"
-source = { git = "https://github.com/the-miint/kl-run-preflight?rev=366e381a72b9b7ef8b9842735cf5d7d80906194c#366e381a72b9b7ef8b9842735cf5d7d80906194c" }
+version = "2026.6.1.post12+gd3b82bf"
+source = { git = "https://github.com/the-miint/kl-run-preflight?rev=d3b82bfb1e0dcbf3e2ce7866fd3d9b67d061c57b#d3b82bfb1e0dcbf3e2ce7866fd3d9b67d061c57b" }
 
 [[package]]
 name = "starlette"
