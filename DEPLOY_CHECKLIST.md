@@ -39,7 +39,7 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- `run-preflight` pin moves to `d3b82bf`; the deploy's `uv sync` picks it up, no host step. Reading a pre-flight no longer writes it, so the PacBio runbook's copy / `chmod u+w` / pre-apply-the-patches ritual is gone. **An operator still holding a patched copy from that ritual must keep submitting with that same file** — pool identity is the SHA-256 of the uploaded bytes, so reverting to the original unpatched file mints a second pool. (#N)
 
 ## Deployed history
 

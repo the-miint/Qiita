@@ -25,6 +25,7 @@ import sqlite3
 
 import pytest
 
+from qiita_control_plane.cli.user.pacbio import _read_pacbio_preflight_rows
 from qiita_control_plane.preflight import (
     SHEET_TYPE_PACBIO_ABSQUANT,
     is_pacbio_sheet_type,
@@ -63,8 +64,6 @@ def test_cli_and_route_readers_agree_on_case5(build_case5_preflight):
     `get_pacbio_sample_info`; this asserts they agree field-for-field on the case-5
     fixture — including the KEY, which the rekey turned from the barcode into
     pacbio_sample_idx."""
-    from qiita_control_plane.cli.user.pacbio import _read_pacbio_preflight_rows
-
     db = build_case5_preflight()
     rows = _read_pacbio_preflight_rows(db, argparse.ArgumentParser())
     protocol = pacbio_protocol_from_blob(db.read_bytes())
@@ -87,17 +86,62 @@ def test_pacbio_readers_decline_a_non_pacbio_blob(build_case5_preflight):
     exception type — and, critically, an Illumina pool never pays for a PacBio read.
 
     Uses a real pre-flight with its sheet_type swapped (rather than an empty SQLite):
-    `open_db_file` applies run_preflight's schema patches on open, so a schema-less
-    database is not a "non-PacBio blob" — it is an unopenable one."""
+    `load_db_bytes` applies run_preflight's schema patches on load, so a schema-less
+    database is not a "non-PacBio blob" — it is an unloadable one."""
     db = build_case5_preflight(sheet_type="bclconvert")
     assert pacbio_protocol_from_blob(db.read_bytes()) == {}
 
 
 def test_pacbio_protocol_raises_on_an_unreadable_blob():
     """An unreadable blob PROPAGATES: the roster route degrades it to "unknown" and
-    warns; the CLI fails fast. Neither is served by swallowing it here."""
-    with pytest.raises(sqlite3.DatabaseError):
+    warns; the CLI fails fast. Neither is served by swallowing it here.
+
+    Input lacking the SQLite file header is rejected as `ValueError` before any
+    deserialize; a blob that carries the header but is truncated raises
+    `sqlite3.DatabaseError`. Both callers catch the pair."""
+    with pytest.raises(ValueError):
         pacbio_protocol_from_blob(b"this is not a sqlite file")
+
+
+def test__read_pacbio_preflight_rows_rejects_a_non_sqlite_blob(tmp_path, capsys):
+    """Tests the case where --preflight-blob names a file that is not a SQLite
+    database at all — the operator pointed at the CSV, or at a truncated copy.
+
+    Goes through the real loader rather than the CLI suite's `run_preflight` stub,
+    because the point is the `ValueError` the loader raises for input without the
+    SQLite file header: the reader must turn that into one stderr line and exit 2,
+    not a traceback. Pins the message, since a load failure and a query failure are
+    reported differently and the operator's next move differs."""
+    not_a_db = tmp_path / "preflight.db"
+    not_a_db.write_bytes(b"sample_name,barcode\nA,bc1001\n")
+
+    parser = argparse.ArgumentParser(prog="qiita")
+    with pytest.raises(SystemExit) as excinfo:
+        _read_pacbio_preflight_rows(not_a_db, parser)
+
+    assert excinfo.value.code == 2
+    assert "cannot load preflight SQLite" in capsys.readouterr().err
+
+
+def test__read_pacbio_preflight_rows_leaves_the_source_unwritten(build_case5_preflight):
+    """Tests the case where the operator's pre-flight is not writable by whoever
+    runs the CLI — a shared `644` file under the sequencing mounts.
+
+    This CANNOT fail against the reader as it stands today, and is not claimed to:
+    the fixture is stamped at the latest pre-flight schema, so there is nothing for
+    a loader to migrate and even a read-write loader would leave the bytes alone.
+    It is deliberate insurance for the change that would break it — a reader that
+    acquires the file read-write, writes a migration back, or persists the
+    connection — none of which the current code does and any of which would fail
+    here immediately rather than in production against a file nobody owns."""
+    db = build_case5_preflight()
+    before = db.read_bytes()
+    db.chmod(0o444)
+
+    rows = _read_pacbio_preflight_rows(db, argparse.ArgumentParser())
+
+    assert rows, "case-5 fixture produced no CLI rows"
+    assert db.read_bytes() == before
 
 
 @pytest.mark.parametrize(
@@ -128,7 +172,7 @@ def test_an_unreadable_blob_raises_rather_than_looking_non_pacbio(build_case5_pr
     So: a CORRUPT blob raises, while a well-formed NON-PacBio blob still returns {}.
     Those two must never collapse into the same answer."""
     corrupt = build_case5_preflight().read_bytes()[:512] + b"\x00" * 64
-    with pytest.raises((sqlite3.DatabaseError, ValueError)):
+    with pytest.raises(sqlite3.DatabaseError):
         pacbio_protocol_from_blob(corrupt)
 
     # ...and the benign case is unchanged: a real, readable, non-PacBio sheet is {}.

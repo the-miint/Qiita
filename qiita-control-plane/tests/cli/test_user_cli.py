@@ -2408,7 +2408,7 @@ def _seed_bcl_folder(tmp_path: Path, name: str, *, with_runinfo: bool = True) ->
 def preflight_stub(monkeypatch, tmp_path):
     """Install a fake `run_preflight` module + return a blob-path builder.
 
-    The reader imports `open_db_file` and `get_illumina_sample_info` from
+    The reader imports `load_db_file` and `get_illumina_sample_info` from
     `run_preflight` at call time; the fixture patches `sys.modules["run_preflight"]`
     so the test controls every per-sample input without a real SQLite schema.
 
@@ -2435,7 +2435,7 @@ def preflight_stub(monkeypatch, tmp_path):
                 pass
 
         stub_module = types.ModuleType("run_preflight")
-        stub_module.open_db_file = lambda _blob: _StubConn()
+        stub_module.load_db_file = lambda _blob: _StubConn()
         if raises is not None:
             captured_exc = raises
 

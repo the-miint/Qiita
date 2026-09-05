@@ -29,11 +29,12 @@ dependencies = [
     "grpcio-health-checking>=1.66",
     # The submit-bcl-convert CLI handler imports `get_illumina_sample_info`
     # from run_preflight at handler call time to extract per-illumina_sample
-    # biosample + study accession info from the operator's preflight SQLite. SHA
-    # pin matches the orchestrator (which calls `save_bclconvert_v1_csv`
+    # biosample + study accession info from the operator's preflight SQLite, and
+    # loads it via `load_db_file` / `load_db_bytes`, which never write the source.
+    # SHA pin matches the orchestrator (which calls `save_bclconvert_v1_csv`
     # from the same release) so a re-vendor is a coordinated bump;
     # an integration parity test enforces parity.
-    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@366e381a72b9b7ef8b9842735cf5d7d80906194c",
+    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@d3b82bfb1e0dcbf3e2ce7866fd3d9b67d061c57b",
 ]
 
 [project.scripts]

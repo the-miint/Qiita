@@ -58,7 +58,7 @@ from qiita_common.models import (
 
 from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
 from .. import _common
-from ._helpers import _inspect_run_folder
+from ._helpers import _inspect_run_folder, _load_preflight_conn
 
 # action_id + version for the bundled bcl-convert submission flow. Pinned
 # here so the CLI does not drift from the workflow YAML the operator's
@@ -115,19 +115,16 @@ def _lookup_accessions(
 def _read_preflight_rows(
     preflight_blob: Path, parser: argparse.ArgumentParser
 ) -> list[_PreflightRow]:
-    """Open the preflight SQLite and return one `_PreflightRow` per illumina_sample row.
+    """Load the preflight SQLite and return one `_PreflightRow` per illumina_sample row.
 
-    Errors that the operator can fix (file not a SQLite, library raises
-    on a malformed row, a row missing biosample_accession or
-    primary_project_accession) raise via parser.error so the CLI
-    surfaces a single stderr line and exits 2 before any network call.
+    Errors that the operator can fix (an unloadable preflight, library raises on a
+    malformed row, a row missing biosample_accession or primary_project_accession)
+    raise via parser.error so the CLI surfaces a single stderr line and exits 2
+    before any network call.
     """
-    from run_preflight import get_illumina_sample_info, open_db_file  # noqa: PLC0415
+    from run_preflight import get_illumina_sample_info  # noqa: PLC0415
 
-    try:
-        conn = open_db_file(preflight_blob)
-    except sqlite3.DatabaseError as exc:
-        parser.error(f"--preflight-blob {preflight_blob}: not a readable SQLite file: {exc}")
+    conn = _load_preflight_conn(preflight_blob, parser)
     try:
         illumina_samples = get_illumina_sample_info(conn)
     except (sqlite3.DatabaseError, ValueError) as exc:
