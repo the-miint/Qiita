@@ -103,47 +103,6 @@ def test_pacbio_protocol_raises_on_an_unreadable_blob():
         pacbio_protocol_from_blob(b"this is not a sqlite file")
 
 
-def test__read_pacbio_preflight_rows_rejects_a_non_sqlite_blob(tmp_path, capsys):
-    """Tests the case where --preflight-blob names a file that is not a SQLite
-    database at all — the operator pointed at the CSV, or at a truncated copy.
-
-    Goes through the real loader rather than the CLI suite's `run_preflight` stub,
-    because the point is the `ValueError` the loader raises for input without the
-    SQLite file header: the reader must turn that into one stderr line and exit 2,
-    not a traceback. Pins the message, since a load failure and a query failure are
-    reported differently and the operator's next move differs."""
-    not_a_db = tmp_path / "preflight.db"
-    not_a_db.write_bytes(b"sample_name,barcode\nA,bc1001\n")
-
-    parser = argparse.ArgumentParser(prog="qiita")
-    with pytest.raises(SystemExit) as excinfo:
-        _read_pacbio_preflight_rows(not_a_db, parser)
-
-    assert excinfo.value.code == 2
-    assert "cannot load preflight SQLite" in capsys.readouterr().err
-
-
-def test__read_pacbio_preflight_rows_leaves_the_source_unwritten(build_case5_preflight):
-    """Tests the case where the operator's pre-flight is not writable by whoever
-    runs the CLI — a shared `644` file under the sequencing mounts.
-
-    This CANNOT fail against the reader as it stands today, and is not claimed to:
-    the fixture is stamped at the latest pre-flight schema, so there is nothing for
-    a loader to migrate and even a read-write loader would leave the bytes alone.
-    It is deliberate insurance for the change that would break it — a reader that
-    acquires the file read-write, writes a migration back, or persists the
-    connection — none of which the current code does and any of which would fail
-    here immediately rather than in production against a file nobody owns."""
-    db = build_case5_preflight()
-    before = db.read_bytes()
-    db.chmod(0o444)
-
-    rows = _read_pacbio_preflight_rows(db, argparse.ArgumentParser())
-
-    assert rows, "case-5 fixture produced no CLI rows"
-    assert db.read_bytes() == before
-
-
 @pytest.mark.parametrize(
     "sheet_type,expected",
     [

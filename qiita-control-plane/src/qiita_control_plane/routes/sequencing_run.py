@@ -148,6 +148,7 @@ from ..deps import (
     get_scratch_staging,
     get_tx_conn_factory,
 )
+from ..preflight import open_blob
 from ..repositories.alignment_definition import (
     list_alignments_over_prep_samples,
     list_completed_alignment_samples,
@@ -456,8 +457,9 @@ class _LaneUpdateRejected(Exception):
     """run_preflight.update_lane rejected the request — an unsupported platform, a
     post-update NULL/non-NULL lane mix, or a unique ``(prepped_sample, lane)``
     collision. A client-error condition (the route maps it to 422), kept distinct
-    from a load that fails because the stored preflight was written against a newer
-    schema than this deployment ships, which must surface as 5xx rather than 422."""
+    from a load failure — a blob that is not a SQLite database, or one written
+    against a newer preflight schema than this deployment ships — which must surface
+    as 5xx rather than 422."""
 
 
 def _apply_preflight_lane_update(
@@ -471,27 +473,23 @@ def _apply_preflight_lane_update(
     """Apply ``run_preflight.update_lane`` to a preflight SQLite blob, returning
     the edited bytes and the number of sample rows reassigned.
 
-    ``load_db_bytes`` deserializes into a detached in-memory database, so the edit
-    and any pending schema patches both land there; those patches can change the
-    returned bytes even on a zero-row update, which is intended (it keeps a stored
-    preflight current). The ``run_preflight`` import is lazy and local so the
-    git-pinned dependency only loads on the rare edit path, never at module import.
+    The edit lands in the detached copy ``open_blob`` returns; the pending schema
+    patches it applies there can change the returned bytes even on a zero-row update,
+    which is intended (it keeps a stored preflight current). The ``run_preflight``
+    import is lazy so the git-pinned dependency only loads on this rare edit path.
 
     Only update_lane's own ``ValueError`` (bad request) becomes
-    ``_LaneUpdateRejected``. A load failure — notably a stored blob written against a
-    newer preflight schema than this deployment ships, a version-skew condition rather
-    than a bad request — is left to propagate so the route returns 5xx, not 422."""
-    from run_preflight import dump_db_bytes, load_db_bytes, update_lane  # noqa: PLC0415
+    ``_LaneUpdateRejected``. A blob that will not load raises ``ValueError`` too, so
+    the load is kept outside the ``except`` — ``open_blob`` performs it on entry — and
+    propagates as 5xx rather than being mislabeled a bad request."""
+    from run_preflight import dump_db_bytes, update_lane  # noqa: PLC0415
 
-    conn = load_db_bytes(blob)
-    try:
-        rows_updated = update_lane(conn, platform, from_lane, to_lane, reason)
-    except ValueError as exc:
-        raise _LaneUpdateRejected(str(exc)) from exc
-    else:
+    with open_blob(blob) as conn:
+        try:
+            rows_updated = update_lane(conn, platform, from_lane, to_lane, reason)
+        except ValueError as exc:
+            raise _LaneUpdateRejected(str(exc)) from exc
         new_blob = dump_db_bytes(conn)
-    finally:
-        conn.close()
     return new_blob, rows_updated
 
 

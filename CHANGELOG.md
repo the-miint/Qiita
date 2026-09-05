@@ -3461,7 +3461,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   a temp file either, on both the pool-roster read and the lane-update edit. Input that is
   not a SQLite database now raises `ValueError` rather than `sqlite3.DatabaseError`; both
   CLI readers surface it as the same single stderr line, and both server readers already
-  caught the pair. (#541)
+  caught the pair. Because that is also the type `update_lane` raises to signal a bad
+  request, the lane-update route reads the stored blob through the same helper as the
+  roster read, which loads on context entry — so a blob that will not load stays a 5xx
+  instead of being mislabeled 422. (#541)
 
 - **`build_minimap2_index` sizes its DuckDB reserve per mode, and a shard build now
   asks for 21 GiB instead of 29 (#538).** `_MINIMAP2_RESERVE_GB` was one constant applied

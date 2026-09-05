@@ -124,7 +124,7 @@ def _read_preflight_rows(
     """
     from run_preflight import get_illumina_sample_info  # noqa: PLC0415
 
-    conn = _load_preflight_conn(preflight_blob, parser)
+    conn = _load_preflight_conn(preflight_blob, parser, flag="--preflight-blob")
     try:
         illumina_samples = get_illumina_sample_info(conn)
     except (sqlite3.DatabaseError, ValueError) as exc:

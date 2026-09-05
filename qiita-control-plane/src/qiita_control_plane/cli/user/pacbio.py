@@ -102,7 +102,7 @@ class _PacbioPreflightRow(NamedTuple):
 def _read_pacbio_preflight_rows(
     preflight_blob: Path, parser: argparse.ArgumentParser
 ) -> list[_PacbioPreflightRow]:
-    """Load the preflight SQLite and return one `_PacbioPreflightRow` per PacBio sample.
+    """Load the preflight SQLite and return one `_PacbioPreflightRow` per `pacbio_sample` row.
 
     Reads via kl-run-preflight's `get_pacbio_sample_info` (the PacBio analogue of
     `get_illumina_sample_info` that `pool._read_preflight_rows` uses): per sample it
@@ -113,15 +113,15 @@ def _read_pacbio_preflight_rows(
     The `pacbio_sample_idx` it returns is the sample's unique id (used as the
     pool-item-id).
 
-    Operator-actionable errors (an unloadable preflight, a non-PacBio sheet, an empty
-    sample set, a missing accession, or an impossible protocol combo) raise via
-    `parser.error` so the CLI surfaces one stderr line and exits 2 before any network
-    call — matching `_read_preflight_rows`.
+    Operator-actionable errors (an unloadable preflight, a non-PacBio sheet, no
+    `pacbio_sample` rows, a missing accession, or an impossible protocol combo) raise
+    via `parser.error` so the CLI surfaces one stderr line and exits 2 before any
+    network call — matching `_read_preflight_rows`.
     """
     from run_preflight import get_pacbio_sample_info  # noqa: PLC0415
     from run_preflight.db import get_run_legacy_format, get_single_run_idx  # noqa: PLC0415
 
-    conn = _load_preflight_conn(preflight_blob, parser)
+    conn = _load_preflight_conn(preflight_blob, parser, flag="--preflight-blob")
     try:
         run_idx = get_single_run_idx(conn)
         legacy_format = get_run_legacy_format(conn.cursor(), run_idx)

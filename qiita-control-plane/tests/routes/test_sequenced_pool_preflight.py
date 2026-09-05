@@ -13,7 +13,8 @@ wet_lab_admin happy path that round-trips a real run_preflight SQLite through
 run_preflight.update_lane (lanes moved + change_log written + bytes rewritten),
 the not-processed gate (409 on a completed/in-flight pool ticket, allowed on a
 failed one), the auth matrix (regular-user 403, anonymous 401), the no-preflight
-404, and the update_lane ValueError → 422 collision path.
+404, the update_lane ValueError → 422 collision path, and the load failure that
+raises the same ValueError type but must NOT collapse into 422.
 """
 
 import base64
@@ -564,6 +565,25 @@ async def test_update_lane_collision_422(ctx):
     assert resp.status_code == 422, resp.text
     # Unchanged: a rejected edit writes nothing back.
     assert await _stored_blob(ctx, pool_idx) == blob
+
+
+async def test_update_lane_unloadable_preflight_not_422(ctx):
+    """Tests the case where the stored blob is not a SQLite database at all, so the
+    load fails before update_lane is ever reached.
+
+    The loader rejects it with `ValueError` — the SAME type update_lane raises to
+    signal a bad request. The two are told apart only by where the load happens:
+    `open_blob` performs it on context entry, outside the route's `except ValueError`.
+    Moving it inside would silently relabel a server-side condition as a client error,
+    which is what this pins."""
+    run_idx = await _seed_run(ctx, "lane-unloadable")
+    pool_idx = await _seed_pool(ctx, run_idx=run_idx, blob=b"X", filename="p.db")
+
+    with pytest.raises(ValueError):
+        await ctx["wet"].post(_lane_url(run_idx, pool_idx), json=_lane_body(from_lane=1, to_lane=2))
+
+    # Unchanged: a failed edit writes nothing back.
+    assert await _stored_blob(ctx, pool_idx) == b"X"
 
 
 async def test_update_lane_identical_lanes_422(ctx):
