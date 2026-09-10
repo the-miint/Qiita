@@ -21,6 +21,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A study-local field can declare that its values identify the study's samples.**
+  `unique_in_study` on `biosample_study_field` / `prep_sample_study_field` makes the
+  database reject a duplicate value within the study and reject a missing-value marker
+  outright — a field whose job is to tell samples apart cannot hold a sample that
+  declines to be told apart. Settable only on a purely-local row of type text, numeric
+  or date: a globally-linked field's metadata row is shared across every study that
+  links to it, so no single study owns the grouping, and a closed value set (boolean,
+  terminology) would cap the study at as many samples as the set has values. Enforced by
+  partial unique indexes keyed on the study field itself, which is study scoping, since
+  a purely-local field belongs to exactly one study. Two studies may still hold the same
+  value through their own fields — the flag claims nothing about identity outside the
+  study that set it. Defaults false, so existing fields are unaffected.
+
 - **The genome map is served as Parquet from a sibling route, so a large reference
   is no longer unbuildable (#550).** `GET /reference/{idx}/genome-map` caps at 250,000
   entries and 413s above it; both genome-bearing references on the deploy are past

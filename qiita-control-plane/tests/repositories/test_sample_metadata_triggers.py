@@ -10,14 +10,19 @@ study_field_table, study_field_global_fk_column, link_table); the spec
 carries every identifier that differs between the two stacks.
 """
 
+import secrets
+from datetime import date
+from decimal import Decimal
+
 import asyncpg
 import pytest
-from qiita_common.models import FieldDataType
+from qiita_common.models import FieldDataType, MissingReasonRef
 
 from qiita_control_plane.repositories._sample_helpers import (
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
     _insert_metadata,
+    insert_entity_to_study,
 )
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
@@ -27,6 +32,8 @@ from qiita_control_plane.testing.unique_names import unique_field_name
 from .conftest import (
     _create_linked_entity_for_spec,
     _seed_global_field_for_spec,
+    _seed_secondary_studies_for_entity,
+    _track_to_study_link,
 )
 
 pytestmark = pytest.mark.db
@@ -557,3 +564,297 @@ async def test_set_updated_at_bumps_on_global_link_propagation(ctx, spec):
 
     _, bumped_updated_at = await _fetch_timestamps(ctx, spec, metadata_idx)
     assert bumped_updated_at > seeded_updated_at
+
+
+# =============================================================================
+# unique_in_study
+#
+# The flag is switched on by raw UPDATE throughout: the repository helpers do
+# not carry the column, so the study_field table is the only way to set it.
+# =============================================================================
+
+
+async def _create_flagged_field(ctx, spec, *, study_idx, data_type, suffix):
+    """Create a purely-local study field in `study_idx` and switch its
+    unique_in_study flag on. Returns the field idx.
+    """
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=study_idx,
+            display_name=unique_field_name(suffix),
+            created_by_idx=ctx["principal_idx"],
+            data_type=data_type,
+            required=False,
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+
+    await ctx["pool"].execute(
+        f"UPDATE {spec.study_field_table} SET unique_in_study = true WHERE idx = $1",
+        field_idx,
+    )
+    return field_idx
+
+
+async def _write_value(ctx, spec, *, entity_idx, field_idx, data_type, value):
+    """Write one metadata row and track it for cleanup. Returns the row idx."""
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        meta_idx = await _insert_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_field_idx=field_idx,
+            data_type=data_type,
+            value=value,
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][_metadata_tracking_key(spec)].append(meta_idx)
+    return meta_idx
+
+
+# The three eligible data_types and a colliding value for each, so the
+# duplicate-rejection case is stated once rather than per type.
+_ELIGIBLE_TYPE_VALUES = [
+    (FieldDataType.TEXT, "Sample 1"),
+    (FieldDataType.NUMERIC, Decimal("42.5")),
+    (FieldDataType.DATE, date(2026, 3, 1)),
+]
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+@pytest.mark.parametrize("data_type,value", _ELIGIBLE_TYPE_VALUES, ids=lambda v: str(v))
+async def test_unique_in_study_rejects_duplicate(ctx, spec, data_type, value):
+    # Tests the case where two entities in one study are given the same value
+    # through a flagged field: the second write hits the partial unique index.
+    first_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    second_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await _create_flagged_field(
+        ctx, spec, study_idx=ctx["study_idx"], data_type=data_type, suffix="dup"
+    )
+
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=first_entity_idx,
+        field_idx=field_idx,
+        data_type=data_type,
+        value=value,
+    )
+
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await _write_value(
+            ctx,
+            spec,
+            entity_idx=second_entity_idx,
+            field_idx=field_idx,
+            data_type=data_type,
+            value=value,
+        )
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_allows_duplicate_when_flag_false(ctx, spec):
+    # Tests the case where the flag is left at its default: the same value
+    # through the same field for two entities is accepted, as before.
+    first_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    second_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=unique_field_name("unflagged"),
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+            required=False,
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+
+    for entity_idx in (first_entity_idx, second_entity_idx):
+        await _write_value(
+            ctx,
+            spec,
+            entity_idx=entity_idx,
+            field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="Sample 1",
+        )
+
+    written = await ctx["pool"].fetchval(
+        f"SELECT COUNT(*) FROM {spec.metadata_table}"
+        f" WHERE {spec.study_field_idx_column} = $1 AND value_text = $2",
+        field_idx,
+        "Sample 1",
+    )
+    assert written == 2
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_allows_same_value_in_another_study(ctx, spec):
+    # Tests the case where one entity carries the same value through two
+    # studies' own flagged fields: uniqueness is scoped to the field, and a
+    # purely-local field belongs to exactly one study, so there is no clash.
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    (second_study_idx,) = await _seed_secondary_studies_for_entity(ctx, spec, entity_idx, 1)
+    async with ctx["pool"].acquire() as conn:
+        await insert_entity_to_study(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_idx=second_study_idx,
+            created_by_idx=ctx["principal_idx"],
+        )
+    _track_to_study_link(ctx, spec, entity_idx, second_study_idx)
+
+    for study_idx, suffix in ((ctx["study_idx"], "own"), (second_study_idx, "other")):
+        field_idx = await _create_flagged_field(
+            ctx, spec, study_idx=study_idx, data_type=FieldDataType.TEXT, suffix=suffix
+        )
+        await _write_value(
+            ctx,
+            spec,
+            entity_idx=entity_idx,
+            field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="Sample 1",
+        )
+
+    written = await ctx["pool"].fetchval(
+        f"SELECT COUNT(*) FROM {spec.metadata_table}"
+        f" WHERE {spec.entity_key_column} = $1 AND value_text = $2",
+        entity_idx,
+        "Sample 1",
+    )
+    assert written == 2
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_rejects_missing_reason(ctx, spec):
+    # Tests the case where a flagged field is given a missing-value marker:
+    # a field whose job is to tell the study's samples apart cannot hold a
+    # sample that declines to be told apart.
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await _create_flagged_field(
+        ctx, spec, study_idx=ctx["study_idx"], data_type=FieldDataType.TEXT, suffix="missing"
+    )
+
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        f"reason_{secrets.token_hex(4)}",
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await _write_value(
+            ctx,
+            spec,
+            entity_idx=entity_idx,
+            field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value=MissingReasonRef(idx=reason_idx, name="not applicable"),
+        )
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_retired_entity_holds_the_slot(ctx, spec):
+    # Tests the case where the entity holding a value is retired: the slot
+    # stays occupied, matching the permanently-held semantics of the
+    # cross-study global field slot.
+    first_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    second_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await _create_flagged_field(
+        ctx, spec, study_idx=ctx["study_idx"], data_type=FieldDataType.TEXT, suffix="retired"
+    )
+
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=first_entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value="Sample 1",
+    )
+
+    entity_table = spec.metadata_table.replace("_metadata", "")
+    await ctx["pool"].execute(
+        f"UPDATE {entity_table}"
+        f" SET retired = true, retired_at = now(), retired_by_idx = $1"
+        f" WHERE idx = $2",
+        ctx["principal_idx"],
+        first_entity_idx,
+    )
+
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await _write_value(
+            ctx,
+            spec,
+            entity_idx=second_entity_idx,
+            field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="Sample 1",
+        )
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_rejected_on_globally_linked_field(ctx, spec):
+    # Tests the case where the flag is set on a globally-linked field: one
+    # metadata row is shared across every study linked to the global field,
+    # so grouping by the study field would not describe any single study.
+    gf = await _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT)
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            global_field_idx=gf.idx,
+            display_name=unique_field_name("linked"),
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await ctx["pool"].execute(
+            f"UPDATE {spec.study_field_table} SET unique_in_study = true WHERE idx = $1",
+            field_idx,
+        )
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+@pytest.mark.parametrize(
+    "data_type", [FieldDataType.BOOLEAN, FieldDataType.TERMINOLOGY], ids=lambda v: v.value
+)
+async def test_unique_in_study_rejected_on_ineligible_data_type(ctx, spec, data_type):
+    # Tests the case where the flag is set on a closed-value-set field:
+    # such a field caps the study at as many samples as it has values.
+    #
+    # A terminology field needs a vocabulary to point at; the *_study_field
+    # CHECK couples terminology_idx to the data_type either way.
+    terminology_idx = None
+    if data_type is FieldDataType.TERMINOLOGY:
+        terminology_idx = await ctx["pool"].fetchval(
+            "INSERT INTO qiita.terminology (name, version, loaded_at)"
+            " VALUES ($1, $2, now()) RETURNING idx",
+            f"term_{secrets.token_hex(4)}",
+            "v1",
+        )
+        ctx["created"]["terminology"].append(terminology_idx)
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=unique_field_name("ineligible"),
+            created_by_idx=ctx["principal_idx"],
+            data_type=data_type,
+            required=False,
+            terminology_idx=terminology_idx,
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await ctx["pool"].execute(
+            f"UPDATE {spec.study_field_table} SET unique_in_study = true WHERE idx = $1",
+            field_idx,
+        )
