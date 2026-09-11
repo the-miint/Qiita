@@ -280,6 +280,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_STUDY_PREFIX",
         "PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY",
     ),
+    (
+        "URL_BIOSAMPLE_STUDY_FIELD_BY_IDX",
+        "PATH_STUDY_PREFIX",
+        "PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX",
+    ),
     ("URL_BIOSAMPLE_BY_IDX", "PATH_BIOSAMPLE_PREFIX", "PATH_BIOSAMPLE_BY_IDX"),
     (
         "URL_BIOSAMPLE_LOOKUP_BY_ACCESSION",
@@ -365,6 +370,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY",
         "PATH_STUDY_PREFIX",
         "PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY",
+    ),
+    (
+        "URL_PREP_SAMPLE_STUDY_FIELD_BY_IDX",
+        "PATH_STUDY_PREFIX",
+        "PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX",
     ),
     # /biosample-global-field, /prep-sample-global-field
     (

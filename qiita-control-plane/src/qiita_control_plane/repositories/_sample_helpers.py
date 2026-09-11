@@ -26,7 +26,7 @@ from qiita_common.models import (
     derive_metadata_field_scope,
 )
 
-from . import require_transaction
+from . import require_transaction, update_row
 
 # Whether a colliding metadata write overwrites the existing value or raises.
 type MetadataConflictMode = Literal["raise", "upsert"]
@@ -247,6 +247,21 @@ class MetadataMissingRequiredFieldsError(Exception):
         super().__init__(
             f"missing required {entity_kind} global field(s): {missing_display_names!r}"
         )
+
+
+class UniqueInStudyViolation(StrEnum):
+    """Which study-local uniqueness rule a database error broke."""
+
+    DUPLICATE_VALUE = "duplicate_value"
+    MISSING_VALUE_MARKER = "missing_value_marker"
+
+
+# Columns a caller may edit on a {entity}_study_field row. data_type and the
+# global-field link are absent: changing either rewrites the meaning of every
+# value already stored through the field.
+STUDY_FIELD_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
+    {"display_name", "description", "required", "tier_override", "unique_in_study"}
+)
 
 
 class StudyUniqueValueConflictError(Exception):
@@ -601,6 +616,9 @@ class EntityMetadataSpec:
     global_field_table: str
     entity_key_column: str
     study_field_table: str
+    # The same table without its schema qualifier, for the shared update
+    # composer, which prepends `qiita.` itself.
+    study_field_table_name: str
     study_field_idx_column: str
     # The FK column on study_field_table pointing at the *_global_field
     # table (biosample_global_field_idx / prep_sample_global_field_idx).
@@ -1592,7 +1610,9 @@ async def _insert_metadata_or_diagnose(
         # occupies the caller's own (entity, field) slot, some *other* entity
         # in the study already holds this value. There is no occupant to
         # diagnose, so it answers directly rather than falling through.
-        if exc.constraint_name in spec.unique_in_study_index_names:
+        if classify_unique_in_study_violation(exc, spec=spec) is (
+            UniqueInStudyViolation.DUPLICATE_VALUE
+        ):
             raise StudyUniqueValueConflictError(
                 entity_kind=spec.entity_kind,
                 display_name=display_name,
@@ -1607,7 +1627,9 @@ async def _insert_metadata_or_diagnose(
         # Dispatch on constraint name, never on message prose: the metadata
         # tables carry several CHECKs and answering for the wrong one would
         # name the wrong cause.
-        if exc.constraint_name == spec.unique_in_study_no_missing_constraint:
+        if classify_unique_in_study_violation(exc, spec=spec) is (
+            UniqueInStudyViolation.MISSING_VALUE_MARKER
+        ):
             raise MissingValueOnUniqueFieldError(
                 entity_kind=spec.entity_kind,
                 display_name=display_name,
@@ -1860,7 +1882,8 @@ def _study_field_read_sql(spec: EntityMetadataSpec) -> str:
         f"    sf.tier_override,"
         f"    sf.unique_in_study,"
         f"    sf.created_by_idx,"
-        f"    sf.created_at"
+        f"    sf.created_at,"
+        f"    sf.updated_at"
         f" FROM {spec.study_field_table} sf"
         f" LEFT JOIN {spec.global_field_table} gf"
         f"     ON gf.idx = sf.{fk_column}"
@@ -1872,16 +1895,77 @@ async def fetch_study_field(
     *,
     spec: EntityMetadataSpec,
     idx: int,
+    for_update: bool = False,
 ) -> asyncpg.Record | None:
     """Return one {entity}_study_field row by idx, or None on miss.
 
     Values inherited from a linked global field arrive already resolved. The row
     names the global FK by its entity-specific column and the row's own idx as
     `idx`. Accepts either a pool or a connection.
+
+    for_update locks the study-field row for the rest of the caller's
+    transaction, so an edit preflight and the write that follows it cannot
+    straddle another writer's commit. It locks only the study-field row, not the
+    joined global field, and requires a connection inside a transaction.
     """
-    sql = f"{_study_field_read_sql(spec)} WHERE sf.idx = $1"
+    lock_clause = " FOR UPDATE OF sf" if for_update else ""
+    sql = f"{_study_field_read_sql(spec)} WHERE sf.idx = $1{lock_clause}"
     row = await pool_or_conn.fetchrow(sql, idx)
     return row
+
+
+async def update_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    idx: int,
+    fields: dict[str, object],
+) -> asyncpg.Record | None:
+    """Update the named columns on one {entity}_study_field row and return the
+    stored row, or None when no row matches.
+
+    Writes through the shared update composer, then re-reads: the composer's
+    RETURNING is a flat column list and cannot reproduce the join that resolves
+    a linked row's inherited values, so the returned Record comes from
+    fetch_study_field and carries the same shape every other read does.
+
+    The caller owns the transaction; the write and the re-read must see one
+    snapshot.
+    """
+    require_transaction(conn)
+    written_idx = await update_row(
+        conn,
+        table=spec.study_field_table_name,
+        row_idx=idx,
+        fields=fields,
+        allowlist=STUDY_FIELD_PATCHABLE_COLUMNS,
+        returning_cols="idx",
+        repo_name="update_study_field",
+    )
+    if written_idx is None:
+        return None
+    updated_row = await fetch_study_field(conn, spec=spec, idx=written_idx["idx"])
+    return updated_row
+
+
+def classify_unique_in_study_violation(
+    exc: asyncpg.PostgresError, *, spec: EntityMetadataSpec
+) -> UniqueInStudyViolation | None:
+    """Name which study-local uniqueness rule a database error broke, or None
+    when it broke neither.
+
+    Dispatches on the constraint name, never on message prose: these tables
+    carry several unique indexes and CHECKs, and answering for the wrong one
+    would name the wrong cause. Callers word their own response — the same
+    constraint means "this value is taken" to a write and "this field's existing
+    values are not distinct" to a policy change.
+    """
+    constraint_name = getattr(exc, "constraint_name", None)
+    if constraint_name in spec.unique_in_study_index_names:
+        return UniqueInStudyViolation.DUPLICATE_VALUE
+    if constraint_name == spec.unique_in_study_no_missing_constraint:
+        return UniqueInStudyViolation.MISSING_VALUE_MARKER
+    return None
 
 
 async def fetch_study_fields_for_study(

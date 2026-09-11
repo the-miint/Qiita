@@ -1441,6 +1441,76 @@ def test_biosample_study_field_create_request_linked_valid():
     assert req.tier_override is None
 
 
+@pytest.mark.parametrize(
+    "data_type,is_linked",
+    [("text", False), ("numeric", False), ("date", False)],
+)
+def test_unique_in_study_rejection_reason_accepts_eligible_shapes(data_type, is_linked):
+    """Tests the case where a purely-local field of an eligible type is asked
+    about: the predicate reports no reason to refuse.
+    """
+    from qiita_common.models.sample_field import unique_in_study_rejection_reason
+
+    assert (
+        unique_in_study_rejection_reason(data_type=data_type, is_globally_linked=is_linked) is None
+    )
+
+
+def test_unique_in_study_rejection_reason_refuses_globally_linked():
+    """Tests the case where the field is globally linked: the link is refused
+    ahead of the type, since no single study owns the grouping either way.
+    """
+    from qiita_common.models.sample_field import unique_in_study_rejection_reason
+
+    reason = unique_in_study_rejection_reason(data_type="text", is_globally_linked=True)
+
+    assert reason == "unique_in_study is unavailable on a globally-linked field"
+
+
+@pytest.mark.parametrize("data_type", ["boolean", "terminology", None])
+def test_unique_in_study_rejection_reason_refuses_closed_value_sets(data_type):
+    """Tests the case where the field carries a closed value set, or no
+    resolved type at all: the predicate names the eligible types.
+    """
+    from qiita_common.models.sample_field import unique_in_study_rejection_reason
+
+    reason = unique_in_study_rejection_reason(data_type=data_type, is_globally_linked=False)
+
+    assert reason == "unique_in_study requires data_type to be one of: date, numeric, text"
+
+
+def test_sample_study_field_patch_request_rejects_empty_body():
+    """Tests the case where a patch body names no field: the shared base
+    refuses it rather than issuing an UPDATE with nothing to set.
+    """
+    from qiita_common.models.sample_field import SampleStudyFieldPatchRequest
+
+    with pytest.raises(ValidationError):
+        SampleStudyFieldPatchRequest()
+
+
+@pytest.mark.parametrize("field_name", ["display_name", "required", "unique_in_study"])
+def test_sample_study_field_patch_request_rejects_explicit_null_on_not_null(field_name):
+    """Tests the case where a patch body sends an explicit null for a column
+    the database declares NOT NULL: the wire refuses it.
+    """
+    from qiita_common.models.sample_field import SampleStudyFieldPatchRequest
+
+    with pytest.raises(ValidationError):
+        SampleStudyFieldPatchRequest(**{field_name: None})
+
+
+def test_sample_study_field_patch_request_distinguishes_absent_from_sent():
+    """Tests the case where only some columns are named: model_fields_set
+    carries exactly what the caller sent, which is what the route writes.
+    """
+    from qiita_common.models.sample_field import SampleStudyFieldPatchRequest
+
+    body = SampleStudyFieldPatchRequest(description=None, unique_in_study=True)
+
+    assert body.model_fields_set == {"description", "unique_in_study"}
+
+
 def test_biosample_study_field_create_request_local_accepts_unique_in_study():
     """Tests the case where a purely-local field of an eligible type asks for
     study-local uniqueness — the local mode accepts it.

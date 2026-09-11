@@ -90,6 +90,7 @@ BIOSAMPLE_METADATA_SPEC = EntityMetadataSpec(
     global_field_table="qiita.biosample_global_field",
     entity_key_column="biosample_idx",
     study_field_table="qiita.biosample_study_field",
+    study_field_table_name="biosample_study_field",
     study_field_idx_column="biosample_study_field_idx",
     study_field_global_fk_column="biosample_global_field_idx",
     global_field_unique_index_name="biosample_metadata_one_value_per_global_field",

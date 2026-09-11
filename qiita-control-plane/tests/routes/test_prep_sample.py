@@ -466,6 +466,7 @@ async def test_create_prep_sample_field_admin_local(ctx):
         # presence without pinning the minted idx or the DB-assigned timestamp.
         "prep_sample_study_field_idx": body["prep_sample_study_field_idx"],
         "created_at": body["created_at"],
+        "updated_at": body["updated_at"],
         "study_idx": study_idx,
         "prep_sample_global_field_idx": None,
         "display_name": display_name,
@@ -504,6 +505,7 @@ async def test_create_prep_sample_field_linked_inherits(ctx):
     expected = {
         "prep_sample_study_field_idx": body["prep_sample_study_field_idx"],
         "created_at": body["created_at"],
+        "updated_at": body["updated_at"],
         "study_idx": study_idx,
         "prep_sample_global_field_idx": global_idx,
         "display_name": display_name,
@@ -646,6 +648,7 @@ async def test_list_prep_sample_fields_in_study_resolves_linked_and_local(ctx):
         {
             "prep_sample_study_field_idx": body[0]["prep_sample_study_field_idx"],
             "created_at": body[0]["created_at"],
+            "updated_at": body[0]["updated_at"],
             "study_idx": study_idx,
             "prep_sample_global_field_idx": None,
             "display_name": local_name,
@@ -660,6 +663,7 @@ async def test_list_prep_sample_fields_in_study_resolves_linked_and_local(ctx):
         {
             "prep_sample_study_field_idx": body[1]["prep_sample_study_field_idx"],
             "created_at": body[1]["created_at"],
+            "updated_at": body[1]["updated_at"],
             "study_idx": study_idx,
             "prep_sample_global_field_idx": global_idx,
             "display_name": linked_name,

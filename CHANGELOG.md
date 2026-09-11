@@ -21,6 +21,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Study-local field definitions report when they were last changed.** Both
+  entities' field reads now carry `updated_at`, which is what an edit will check
+  a caller's `If-Match` against. The routes that will let a study edit a field it
+  already minted are declared but not yet served; the rule governing which fields
+  may be unique within their study, and the naming of which uniqueness rule a
+  database rejection broke, each now live in one place so the edit path and the
+  create path cannot come to disagree about them.
+
 - **A study-local field's uniqueness policy can be changed after the field exists.**
   Both `*_study_field` tables gain `updated_at`, bumped by the shared trigger and
   available as an ETag, and a trigger mirrors a change of `unique_in_study` onto

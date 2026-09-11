@@ -6377,6 +6377,7 @@ async def test_fetch_study_field_local(ctx, spec):
         "created_by_idx": ctx["principal_idx"],
         # created_at is DB-assigned; copy it from the actual row.
         "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
     assert dict(row) == expected
 
@@ -6426,6 +6427,7 @@ async def test_fetch_study_field_globally_linked_inherits(ctx, spec):
         "unique_in_study": False,
         "created_by_idx": ctx["principal_idx"],
         "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
     assert dict(row) == expected
 
@@ -6483,6 +6485,7 @@ async def test_create_study_field_and_read_back_globally_linked(ctx, spec):
         # presence without pinning the minted idx or the DB-assigned timestamp.
         "idx": record["idx"],
         "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
         "study_idx": ctx["study_idx"],
         spec.study_field_global_fk_column: global_idx,
         "display_name": display_name,
@@ -6558,6 +6561,7 @@ async def test_fetch_study_fields_for_study_orders_and_resolves(ctx, spec):
             "created_by_idx": ctx["principal_idx"],
             # created_at is DB-assigned; copy it from the actual row.
             "created_at": rows[0]["created_at"],
+            "updated_at": rows[0]["updated_at"],
         },
         {
             "idx": linked_idx,
@@ -6572,6 +6576,7 @@ async def test_fetch_study_fields_for_study_orders_and_resolves(ctx, spec):
             "unique_in_study": False,
             "created_by_idx": ctx["principal_idx"],
             "created_at": rows[1]["created_at"],
+            "updated_at": rows[1]["updated_at"],
         },
     ]
     assert [dict(row) for row in rows] == expected

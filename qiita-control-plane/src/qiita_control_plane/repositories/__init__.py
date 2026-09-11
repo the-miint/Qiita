@@ -18,7 +18,12 @@ import asyncpg
 # directly. The runtime get_args() check inside each consumer rejects
 # any string the Literal does not cover, since Python does not enforce
 # Literal at runtime on its own.
-UpdatableTable = Literal["biosample", "study"]
+UpdatableTable = Literal[
+    "biosample",
+    "biosample_study_field",
+    "prep_sample_study_field",
+    "study",
+]
 
 
 def require_transaction(conn: asyncpg.Connection) -> None:

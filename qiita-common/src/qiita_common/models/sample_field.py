@@ -6,11 +6,11 @@ fields that carry its entity-qualified name on the wire; every other column,
 and the purely-local vs globally-linked mode coupling, lives here.
 """
 
-from typing import Annotated
+from typing import Annotated, ClassVar
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
-from qiita_common.models._base import NonBlankName, NonBlankText
+from qiita_common.models._base import NonBlankName, NonBlankText, PatchRequestModel
 from qiita_common.models.reference import FieldDataType, Tier
 
 # Attribute names of the two idx fields each entity subclass re-declares with
@@ -37,6 +37,30 @@ def field_wire_name(model: type[BaseModel], attr: str) -> str:
     """
     declared_alias = model.model_fields[attr].alias
     return declared_alias or attr
+
+
+def unique_in_study_rejection_reason(
+    *, data_type: FieldDataType | None, is_globally_linked: bool
+) -> str | None:
+    """Return why a field of this shape may not carry unique_in_study, or None
+    when it may.
+
+    A globally-linked field is refused because one metadata row through a global
+    field is shared by every study linked to it, so no single study owns the
+    grouping the flag would enforce. A closed value set (boolean, terminology)
+    is refused because it would cap the study at as many samples as the set has
+    values. Text, numeric, and date are eligible.
+
+    Callers supply the shape from wherever they hold it — a request body on a
+    create, the stored row on an edit — so the rule is stated here and nowhere
+    else.
+    """
+    if is_globally_linked:
+        return "unique_in_study is unavailable on a globally-linked field"
+    if data_type not in UNIQUE_IN_STUDY_DATA_TYPES:
+        eligible = ", ".join(sorted(t.value for t in UNIQUE_IN_STUDY_DATA_TYPES))
+        return f"unique_in_study requires data_type to be one of: {eligible}"
+    return None
 
 
 class SampleStudyFieldCreateRequest(BaseModel):
@@ -95,9 +119,12 @@ class SampleStudyFieldCreateRequest(BaseModel):
             raise ValueError(f"data_type is required when {global_fk_name} is omitted")
         if (self.data_type is FieldDataType.TERMINOLOGY) != (self.terminology_idx is not None):
             raise ValueError("terminology_idx must be set iff data_type is 'terminology'")
-        if self.unique_in_study and self.data_type not in UNIQUE_IN_STUDY_DATA_TYPES:
-            eligible = ", ".join(sorted(t.value for t in UNIQUE_IN_STUDY_DATA_TYPES))
-            raise ValueError(f"unique_in_study requires data_type to be one of: {eligible}")
+        if self.unique_in_study:
+            reason = unique_in_study_rejection_reason(
+                data_type=self.data_type, is_globally_linked=False
+            )
+            if reason is not None:
+                raise ValueError(reason)
         return self
 
 
@@ -126,6 +153,7 @@ class SampleStudyFieldResponse(BaseModel):
     unique_in_study: bool
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
+    updated_at: AwareDatetime
 
 
 class SampleGlobalFieldResponse(BaseModel):
@@ -145,3 +173,28 @@ class SampleGlobalFieldResponse(BaseModel):
     terminology_idx: Annotated[int, Field(gt=0)] | None
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
+
+
+class SampleStudyFieldPatchRequest(PatchRequestModel):
+    """Body for a study-local field edit — the columns a study may change on a
+    definition it already minted.
+
+    data_type and the global-field link are absent on purpose: changing either
+    rewrites the meaning of every value already stored through the field.
+
+    unique_in_study is accepted here without a type check, because this body
+    carries no data_type to check it against — the field's stored shape decides,
+    so the route applies unique_in_study_rejection_reason to the row it read.
+    required and tier_override are likewise only meaningful on a purely-local
+    row, which the route establishes from the same row.
+    """
+
+    NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"display_name", "required", "unique_in_study"}
+    )
+
+    display_name: NonBlankName | None = None
+    description: NonBlankText | None = None
+    required: bool | None = None
+    tier_override: Tier | None = None
+    unique_in_study: bool | None = None

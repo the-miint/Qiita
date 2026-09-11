@@ -21,10 +21,14 @@ from qiita_common.models import FieldDataType, MissingReasonRef
 from qiita_control_plane.repositories._sample_helpers import (
     MissingValueOnUniqueFieldError,
     StudyUniqueValueConflictError,
+    UniqueInStudyViolation,
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
     _insert_metadata,
+    classify_unique_in_study_violation,
+    fetch_study_field,
     insert_entity_to_study,
+    update_study_field,
     write_local_metadata_or_diagnose,
 )
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
@@ -1139,3 +1143,143 @@ async def test_unique_in_study_flip_on_rejected_when_missing_marker_exists(ctx, 
 
     assert excinfo.value.constraint_name == spec.unique_in_study_no_missing_constraint
     assert await _read_flags(ctx, spec, field_idx) == (False, [False])
+
+
+# =============================================================================
+# update_study_field, the locking read, and the violation classifier
+# =============================================================================
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_update_study_field_writes_and_returns_resolved_row(ctx, spec):
+    # Tests the case where a purely-local field is edited: the write lands and
+    # the returned row carries the full read shape, not the flat RETURNING the
+    # shared composer would give on its own.
+    field_idx = await _create_plain_field(ctx, spec, suffix="upd")
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        updated = await update_study_field(
+            conn,
+            spec=spec,
+            idx=field_idx,
+            fields={"description": "edited", "unique_in_study": True},
+        )
+
+    assert updated["description"] == "edited"
+    assert updated["unique_in_study"] is True
+    # The resolved shape, not the composer's RETURNING list.
+    assert updated["data_type"] == FieldDataType.TEXT
+    assert updated["updated_at"] is not None
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_update_study_field_returns_none_for_absent_row(ctx, spec):
+    # Tests the case where the row vanished between a caller's preflight and
+    # its write: the composer matches nothing and the absence is reported
+    # rather than masked as a successful no-op.
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        updated = await update_study_field(
+            conn, spec=spec, idx=2_000_000_000, fields={"description": "edited"}
+        )
+
+    assert updated is None
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_fetch_study_field_for_update_returns_the_row(ctx, spec):
+    # Tests the case where a preflight locks the row it is about to edit: the
+    # locking read returns the same shape the plain read does.
+    field_idx = await _create_plain_field(ctx, spec, suffix="lock")
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        locked = await fetch_study_field(conn, spec=spec, idx=field_idx, for_update=True)
+    plain = await fetch_study_field(ctx["pool"], spec=spec, idx=field_idx)
+
+    assert dict(locked) == dict(plain)
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_classify_unique_in_study_violation_names_each_rule(ctx, spec):
+    # Tests the case where each of the two study-local uniqueness rules is
+    # broken: the classifier names which one, so a caller can word its own
+    # answer without re-deriving the constraint names.
+    first_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    second_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await _create_flagged_field(
+        ctx, spec, study_idx=ctx["study_idx"], data_type=FieldDataType.TEXT, suffix="classify"
+    )
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=first_entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value="Sample 1",
+    )
+
+    with pytest.raises(asyncpg.UniqueViolationError) as dup_exc:
+        await _write_value(
+            ctx,
+            spec,
+            entity_idx=second_entity_idx,
+            field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="Sample 1",
+        )
+
+    reason_name = f"reason_{secrets.token_hex(4)}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+    with pytest.raises(asyncpg.CheckViolationError) as missing_exc:
+        await _write_value(
+            ctx,
+            spec,
+            entity_idx=second_entity_idx,
+            field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value=MissingReasonRef(idx=reason_idx, name=reason_name),
+        )
+
+    assert (
+        classify_unique_in_study_violation(dup_exc.value, spec=spec)
+        is UniqueInStudyViolation.DUPLICATE_VALUE
+    )
+    assert (
+        classify_unique_in_study_violation(missing_exc.value, spec=spec)
+        is UniqueInStudyViolation.MISSING_VALUE_MARKER
+    )
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_classify_unique_in_study_violation_ignores_other_constraints(ctx, spec):
+    # Tests the case where an unrelated constraint fires: the classifier
+    # reports neither rule, so a caller re-raises instead of answering for a
+    # cause it did not diagnose.
+    display_name = unique_field_name("collide")
+    await _create_plain_field(ctx, spec, suffix="collide-a")
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        first_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+            required=False,
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(first_idx)
+    second_idx = await _create_plain_field(ctx, spec, suffix="collide-b")
+
+    # Rename the second field onto the first's name: the (study_idx,
+    # display_name) unique constraint, which is neither uniqueness rule.
+    with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
+        await ctx["pool"].execute(
+            f"UPDATE {spec.study_field_table} SET display_name = $1 WHERE idx = $2",
+            display_name,
+            second_idx,
+        )
+
+    assert classify_unique_in_study_violation(excinfo.value, spec=spec) is None

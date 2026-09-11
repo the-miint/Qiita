@@ -180,8 +180,9 @@ async def create_prep_sample_field(
     field's values.
 
     unique_in_study makes the study's values through this field distinct and
-    forbids a missing-value marker among them. It is available only on a
-    purely-local field of type text, numeric, or date; anything else is a 422.
+    forbids a missing-value marker among them; the shapes that may carry it,
+    and why, are stated by unique_in_study_rejection_reason. Anything it
+    refuses is a 422.
     """
     async with tx() as conn:
         response = await create_and_map_study_field(

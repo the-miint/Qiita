@@ -23,6 +23,7 @@ PREP_SAMPLE_METADATA_SPEC = EntityMetadataSpec(
     global_field_table="qiita.prep_sample_global_field",
     entity_key_column="prep_sample_idx",
     study_field_table="qiita.prep_sample_study_field",
+    study_field_table_name="prep_sample_study_field",
     study_field_idx_column="prep_sample_study_field_idx",
     study_field_global_fk_column="prep_sample_global_field_idx",
     global_field_unique_index_name="prep_sample_metadata_one_value_per_global_field",

@@ -3146,6 +3146,7 @@ async def test_create_biosample_field_admin_local(ctx):
         "unique_in_study": False,
         "created_by_idx": ctx["user_session"]["principal_idx"],
         "created_at": body["created_at"],
+        "updated_at": body["updated_at"],
     }
     assert body == expected
 
@@ -3198,6 +3199,7 @@ async def test_create_biosample_field_admin_linked_inherits(ctx):
         "unique_in_study": False,
         "created_by_idx": ctx["user_session"]["principal_idx"],
         "created_at": body["created_at"],
+        "updated_at": body["updated_at"],
     }
     assert body == expected
 
@@ -4087,6 +4089,7 @@ async def test_list_biosample_fields_in_study_resolves_linked_and_local(ctx):
         {
             "biosample_study_field_idx": body[0]["biosample_study_field_idx"],
             "created_at": body[0]["created_at"],
+            "updated_at": body[0]["updated_at"],
             "study_idx": study_idx,
             "biosample_global_field_idx": None,
             "display_name": local_name,
@@ -4101,6 +4104,7 @@ async def test_list_biosample_fields_in_study_resolves_linked_and_local(ctx):
         {
             "biosample_study_field_idx": body[1]["biosample_study_field_idx"],
             "created_at": body[1]["created_at"],
+            "updated_at": body[1]["updated_at"],
             "study_idx": study_idx,
             "biosample_global_field_idx": global_idx,
             "display_name": linked_name,
