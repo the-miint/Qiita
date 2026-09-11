@@ -21,6 +21,7 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
     PATH_BIOSAMPLE_METADATA_BY_STUDY,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_STUDY_PREFIX,
 )
@@ -42,6 +43,7 @@ from qiita_common.models import (
     MetadataEntry,
     SampleMetadataWriteRequest,
     SampleMetadataWriteResponse,
+    SampleStudyFieldPatchRequest,
     StudyScopedBiosampleResponse,
     Tier,
 )
@@ -90,6 +92,7 @@ from ._helpers import (
     map_global_field_row,
     map_study_field_row,
     metadata_entries_from_rows,
+    patch_and_map_study_field,
     raise_for_unique_violation,
     raise_http_for_sample_metadata_write_error,
     read_study_scoped_entity,
@@ -931,3 +934,50 @@ async def patch_biosample(
         global_metadata=global_metadata,
         caller_system_role=caller.system_role,
     )
+
+
+# same-pattern-ok: cross-entity twin of patch_prep_sample_field. The decorator, path
+# constant, scope, spec, and response model are the whole per-entity
+# declaration, over a shared helper that carries the contract.
+@router.patch(PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX)
+async def patch_biosample_field(
+    study_idx: Annotated[int, Field(gt=0)],
+    study_field_idx: Annotated[int, Field(gt=0)],
+    body: SampleStudyFieldPatchRequest,
+    response: Response,
+    if_match: Annotated[str | None, Header(alias=IF_MATCH_HEADER)] = None,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> BiosampleStudyFieldResponse:
+    """Edit a study-local biosample field definition.
+
+    Same access bar as the create route on this study. If-Match is required;
+    patch_and_map_study_field carries the rest of the contract, including which
+    attributes a globally-linked field refuses and what happens when a field's
+    existing values cannot satisfy a uniqueness policy being switched on.
+
+    data_type and the global-field link are absent from the body on purpose:
+    changing either rewrites the meaning of every value already stored through
+    the field.
+
+    The response carries an `ETag` header derived from the new row's
+    `updated_at`, matching the create and list endpoints' contract.
+    """
+    async with tx() as conn:
+        updated = await patch_and_map_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            study_field_idx=study_field_idx,
+            body=body,
+            if_match=if_match,
+            response_model=BiosampleStudyFieldResponse,
+        )
+
+    response.headers[ETAG_HEADER] = etag_for_updated_at(updated.updated_at)
+    return updated

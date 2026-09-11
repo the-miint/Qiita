@@ -25,6 +25,18 @@ UNIQUE_IN_STUDY_DATA_TYPES = frozenset(
     {FieldDataType.TEXT, FieldDataType.NUMERIC, FieldDataType.DATE}
 )
 
+# Attributes a globally-linked study field may not carry: the first four are
+# owned by the global-field row and inherited at read time, and unique_in_study
+# is unavailable rather than inherited. A tuple, not a set, because the order is
+# the order a rejection lists the offending attributes in.
+NOT_SETTABLE_ON_LINKED_FIELD = (
+    "data_type",
+    "required",
+    "terminology_idx",
+    "tier_override",
+    "unique_in_study",
+)
+
 
 def field_wire_name(model: type[BaseModel], attr: str) -> str:
     """Return the wire spelling of one of model's fields: the alias it declares
@@ -96,15 +108,7 @@ class SampleStudyFieldCreateRequest(BaseModel):
         # must be NULL on the study-field row, so reject them at the wire.
         if self.global_field_idx is not None:
             forbidden = [
-                name
-                for name in (
-                    "data_type",
-                    "required",
-                    "terminology_idx",
-                    "tier_override",
-                    "unique_in_study",
-                )
-                if getattr(self, name) is not None
+                name for name in NOT_SETTABLE_ON_LINKED_FIELD if getattr(self, name) is not None
             ]
             if forbidden:
                 raise ValueError(

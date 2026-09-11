@@ -16,6 +16,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
     URL_BIOSAMPLE_METADATA_BY_STUDY,
+    URL_BIOSAMPLE_STUDY_FIELD_BY_IDX,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
@@ -166,13 +167,6 @@ async def ctx(role_keyed_clients):
     }
     yield {**role_keyed_clients, "created": created}
     await _cleanup_tracked(role_keyed_clients["pool"], created)
-
-
-@pytest_asyncio.fixture
-async def no_biosample_write_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.BIOSAMPLE_WRITE —
-    drives the require_scope guard's missing-scope 403."""
-    return await make_pat_client(label="bs-no-write", scopes=[Scope.SELF_PROFILE])
 
 
 # ---------------------------------------------------------------------------
@@ -3283,9 +3277,12 @@ async def _patch_biosample_metadata(
     )
 
 
-async def _seed_study_with_unique_field(ctx, *, suffix):
-    """Seed a wet-owned study carrying one purely-local text field flagged
-    unique_in_study. Returns (study_idx, display_name).
+async def _seed_study_with_unique_field(ctx, *, suffix, unique_in_study=True):
+    """Seed a wet-owned study carrying one purely-local text field. Returns
+    (study_idx, display_name, study_field_idx).
+
+    unique_in_study False seeds the field without the policy, for a test that
+    writes values first and switches the policy on afterwards.
     """
     wet_idx = ctx["wet_session"]["principal_idx"]
     study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix=suffix)
@@ -3295,12 +3292,13 @@ async def _seed_study_with_unique_field(ctx, *, suffix):
         json={
             "display_name": display_name,
             "data_type": "text",
-            "unique_in_study": True,
+            "unique_in_study": unique_in_study,
         },
     )
     assert created.status_code == 201, created.text
-    ctx["created"]["biosample_study_field"].append(created.json()["biosample_study_field_idx"])
-    return study_idx, display_name
+    field_idx = created.json()["biosample_study_field_idx"]
+    ctx["created"]["biosample_study_field"].append(field_idx)
+    return study_idx, display_name, field_idx
 
 
 async def test_patch_biosample_metadata_duplicate_on_unique_field_409(ctx):
@@ -3308,7 +3306,7 @@ async def test_patch_biosample_metadata_duplicate_on_unique_field_409(ctx):
     biosample in the study already holds through a unique_in_study field:
     the collision answers 409 rather than reaching the caller as a 500.
     """
-    study_idx, display_name = await _seed_study_with_unique_field(ctx, suffix="uniq-dup")
+    study_idx, display_name, _ = await _seed_study_with_unique_field(ctx, suffix="uniq-dup")
     wet_idx = ctx["wet_session"]["principal_idx"]
     first_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
     second_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
@@ -3331,7 +3329,7 @@ async def test_patch_biosample_metadata_missing_marker_on_unique_field_422(ctx):
     """Tests the case where a unique_in_study field is given a missing-value
     marker: the field cannot hold one, and the refusal is a 422.
     """
-    study_idx, display_name = await _seed_study_with_unique_field(ctx, suffix="uniq-miss")
+    study_idx, display_name, _ = await _seed_study_with_unique_field(ctx, suffix="uniq-miss")
     wet_idx = ctx["wet_session"]["principal_idx"]
     bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
 
@@ -4178,3 +4176,68 @@ async def test_list_biosample_fields_in_study_authz(ctx, case, no_biosample_read
         surface=BIOSAMPLE_FIELD_SURFACE,
         no_scope_client=no_biosample_read_client,
     )
+
+
+async def test_patch_biosample_field_enable_unique_over_duplicates_409(ctx):
+    """Tests the case where a study tries to declare a field unique after two
+    of its samples already share a value: the change is refused whole, so the
+    field never ends up claiming a distinctness its data does not have.
+    """
+    study_idx, display_name, field_idx = await _seed_study_with_unique_field(
+        ctx, suffix="flip-dup", unique_in_study=False
+    )
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    for _ in range(2):
+        bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+        written = await _patch_biosample_metadata(
+            ctx["wet"], study_idx, bs_idx, {display_name: "Sample 1"}
+        )
+        assert written.status_code == 200, written.text
+        await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
+
+    resp = await ctx["wet"].patch(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_IDX.format(study_idx=study_idx, study_field_idx=field_idx),
+        json={"unique_in_study": True},
+        headers={
+            "If-Match": await etag_for_row(
+                ctx["pool"], table="biosample_study_field", row_idx=field_idx
+            )
+        },
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "already share a value" in resp.json()["detail"]
+    still_unflagged = await ctx["pool"].fetchval(
+        "SELECT unique_in_study FROM qiita.biosample_study_field WHERE idx = $1", field_idx
+    )
+    assert still_unflagged is False
+
+
+async def test_patch_biosample_field_enable_unique_over_missing_marker_422(ctx):
+    """Tests the case where a study tries to declare a field unique while one
+    of its samples declined to give a value: a field that identifies samples
+    cannot hold a sample it has not named.
+    """
+    study_idx, display_name, field_idx = await _seed_study_with_unique_field(
+        ctx, suffix="flip-miss", unique_in_study=False
+    )
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+    written = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {display_name: "not applicable"}
+    )
+    assert written.status_code == 200, written.text
+    await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
+
+    resp = await ctx["wet"].patch(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_IDX.format(study_idx=study_idx, study_field_idx=field_idx),
+        json={"unique_in_study": True},
+        headers={
+            "If-Match": await etag_for_row(
+                ctx["pool"], table="biosample_study_field", row_idx=field_idx
+            )
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "declined to give a value" in resp.json()["detail"]

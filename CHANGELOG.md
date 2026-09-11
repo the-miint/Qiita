@@ -21,13 +21,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **Study-local field definitions report when they were last changed.** Both
-  entities' field reads now carry `updated_at`, which is what an edit will check
-  a caller's `If-Match` against. The routes that will let a study edit a field it
-  already minted are declared but not yet served; the rule governing which fields
-  may be unique within their study, and the naming of which uniqueness rule a
-  database rejection broke, each now live in one place so the edit path and the
-  create path cannot come to disagree about them.
+- **A study can edit a field definition it already minted.** `PATCH
+  /api/v1/study/{study_idx}/biosample-field/{study_field_idx}` and its
+  prep-sample twin change a field's display name, description, required flag,
+  tier override, and study-local uniqueness; `data_type` and the global-field
+  link stay immutable, since changing either rewrites the meaning of every value
+  already stored. `If-Match` is required and field reads now carry `updated_at`
+  to supply it. A globally-linked field refuses the attributes it inherits, and
+  uniqueness is refused on a shape that cannot carry it — both with a message
+  naming the problem rather than a generic constraint error. Switching
+  uniqueness on over values that already repeat answers 409, and over a sample
+  that declined to give a value answers 422; either way the change rolls back
+  whole, so a field is never left claiming a distinctness its data does not
+  have.
 
 - **A study-local field's uniqueness policy can be changed after the field exists.**
   Both `*_study_field` tables gain `updated_at`, bumped by the shared trigger and

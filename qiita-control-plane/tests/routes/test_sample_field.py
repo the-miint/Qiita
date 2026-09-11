@@ -12,10 +12,16 @@ import pytest_asyncio
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
+    _STUDY_FIELD_ADMIN_FLOOR_AUTHZ,
     SAMPLE_FIELD_SURFACES,
+    STUDY_FIELD_CREATE_AUTHZ_CASES,
     _grant_study_access,
+    _seed_field_global,
     _seed_study,
+    assert_study_field_authz,
     delete_idxs,
+    etag_for_row,
+    patch_study_field,
     post_study_field,
 )
 
@@ -33,6 +39,8 @@ async def ctx(role_keyed_clients):
     created: dict = {
         "biosample_study_field": [],
         "prep_sample_study_field": [],
+        "biosample_global_field": [],
+        "prep_sample_global_field": [],
         "study_access": [],
         "study": [],
     }
@@ -49,6 +57,9 @@ async def ctx(role_keyed_clients):
             principal_idx,
         )
     await delete_idxs(pool, "study", created["study"])
+    # Global fields outlive the study-local rows that link to them.
+    await delete_idxs(pool, "biosample_global_field", created["biosample_global_field"])
+    await delete_idxs(pool, "prep_sample_global_field", created["prep_sample_global_field"])
 
 
 def _surface_id(surface):
@@ -176,3 +187,318 @@ async def test_list_study_fields_reports_unique_in_study(ctx, surface):
     assert resp.status_code == 200, resp.text
     listed = {row["display_name"]: row["unique_in_study"] for row in resp.json()}
     assert listed[display_name] is True
+
+
+# ===========================================================================
+# PATCH /api/v1/study/{study_idx}/{entity}-field/{study_field_idx}
+# ===========================================================================
+
+
+async def _seed_editable_field(ctx, surface, *, study_idx, data_type="text", **body):
+    """Create one purely-local field on `study_idx` and return its idx."""
+    resp = await post_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        display_name=unique_field_name("Editable"),
+        data_type=data_type,
+        **body,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()[surface.idx_key]
+
+
+async def _etag(ctx, surface, study_field_idx):
+    """The ETag the edit route will compare an If-Match against."""
+    table = surface.created_key
+    return await etag_for_row(ctx["pool"], table=table, row_idx=study_field_idx)
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize("case", STUDY_FIELD_CREATE_AUTHZ_CASES)
+async def test_patch_study_field_authz(
+    ctx, surface, case, no_biosample_write_client, no_prep_sample_write_client
+):
+    """Tests the case where each row of the access matrix reaches the edit
+    route: the gate matches the create route's, at the same ADMIN floor.
+    """
+    # Both no-scope clients are async fixtures, so neither can be materialized
+    # on demand from inside the test; each is requested and the surface's own
+    # binding picks which one this entity's route should be denied by.
+    no_scope_client = {
+        "no_biosample_write_client": no_biosample_write_client,
+        "no_prep_sample_write_client": no_prep_sample_write_client,
+    }[surface.no_write_scope_fixture]
+
+    async def send(ctx_, surface_, client, study_idx):
+        # The field is seeded by the wet client, which clears the gate on every
+        # seeded study; the case's own client is the one being judged. The
+        # nonexistent-study row has no field to seed, and the study gate
+        # answers before the idx in the path is resolved.
+        if case == "nonexistent_study":
+            return await patch_study_field(
+                ctx_,
+                surface=surface_,
+                client=client,
+                study_idx=study_idx,
+                study_field_idx=1,
+                if_match='"unused"',
+                description="edited",
+            )
+        resp = await post_study_field(
+            ctx_,
+            surface=surface_,
+            client=ctx_["wet"],
+            study_idx=study_idx,
+            display_name=unique_field_name("Authz"),
+            data_type="text",
+        )
+        assert resp.status_code == 201, resp.text
+        field_idx = resp.json()[surface_.idx_key]
+        return await patch_study_field(
+            ctx_,
+            surface=surface_,
+            client=client,
+            study_idx=study_idx,
+            study_field_idx=field_idx,
+            if_match=await _etag(ctx_, surface_, field_idx),
+            description="edited",
+        )
+
+    await assert_study_field_authz(
+        ctx,
+        case=case,
+        cases=_STUDY_FIELD_ADMIN_FLOOR_AUTHZ,
+        surface=surface,
+        no_scope_client=no_scope_client,
+        send=send,
+        success_status=200,
+    )
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_edits_and_returns_new_etag(ctx, surface):
+    """Tests the case where a cosmetic edit succeeds: the body reflects the
+    change and the ETag moves, so a caller's next If-Match is the new one.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "pat-ok")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
+    before = await _etag(ctx, surface, field_idx)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=before,
+        description="edited",
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["description"] == "edited"
+    assert resp.headers["ETag"] != before
+    assert resp.headers["ETag"] == await _etag(ctx, surface, field_idx)
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_without_if_match_428(ctx, surface):
+    """Tests the case where a caller omits If-Match: the edit is refused
+    rather than applied without concurrency control.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "pat-428")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=None,
+        description="edited",
+    )
+
+    assert resp.status_code == 428, resp.text
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_stale_if_match_412(ctx, surface):
+    """Tests the case where a caller's ETag predates someone else's edit: the
+    second write is refused instead of silently overwriting the first.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "pat-412")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
+    stale = await _etag(ctx, surface, field_idx)
+    first = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=stale,
+        description="first",
+    )
+    assert first.status_code == 200, first.text
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=stale,
+        description="second",
+    )
+
+    assert resp.status_code == 412, resp.text
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_enables_unique_in_study(ctx, surface):
+    """Tests the case where a study decides after the fact that a field
+    identifies its samples: the policy is switched on and reads back.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "pat-uniq")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        unique_in_study=True,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["unique_in_study"] is True
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_unique_on_closed_value_set_422(ctx, surface):
+    """Tests the case where uniqueness is asked for on a boolean field: the
+    stored type decides, since the body carries no type of its own.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "pat-bool")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="boolean")
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        unique_in_study=True,
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "requires data_type to be one of" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize("attribute", ["unique_in_study", "required"])
+async def test_patch_study_field_inherited_attribute_on_linked_422(ctx, surface, attribute):
+    """Tests the case where an attribute the global field owns is set on a
+    linked row: it is refused, since the linked row stores none of them.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "pat-linked")
+    global_idx = await _seed_field_global(ctx, surface=surface, label="pat")
+    created = await post_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        display_name=unique_field_name("Linked"),
+        **{surface.global_fk_key: global_idx},
+    )
+    assert created.status_code == 201, created.text
+    field_idx = created.json()[surface.idx_key]
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        **{attribute: True},
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "linked to a global field" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_display_name_collision_409(ctx, surface):
+    """Tests the case where a rename takes a name another field on the study
+    already holds: the study's field names stay distinct.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "pat-dup")
+    taken = unique_field_name("Taken")
+    first = await post_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        display_name=taken,
+        data_type="text",
+    )
+    assert first.status_code == 201, first.text
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        display_name=taken,
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "already exists on this study" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_from_another_study_404(ctx, surface):
+    """Tests the case where the field exists but belongs to a different study:
+    the answer is 404, not 403, so it does not confirm the field elsewhere.
+    """
+    owning_study_idx = await _study_with_admin_grant(ctx, "pat-own")
+    other_study_idx = await _study_with_admin_grant(ctx, "pat-other")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=owning_study_idx)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=other_study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        description="edited",
+    )
+
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_absent_404(ctx, surface):
+    """Tests the case where the field idx names no row at all."""
+    study_idx = await _study_with_admin_grant(ctx, "pat-absent")
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=2_000_000_000,
+        if_match='"unused"',
+        description="edited",
+    )
+
+    assert resp.status_code == 404, resp.text

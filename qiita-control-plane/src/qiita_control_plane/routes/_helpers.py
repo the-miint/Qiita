@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from qiita_common.auth_constants import SystemRole
 from qiita_common.models import (
     GLOBAL_FIELD_IDX_ATTR,
+    NOT_SETTABLE_ON_LINKED_FIELD,
     STUDY_FIELD_IDX_ATTR,
     IdxsListResponse,
     MetadataEntry,
@@ -21,10 +22,12 @@ from qiita_common.models import (
     SampleGlobalFieldResponse,
     SampleMetadataWriteResponse,
     SampleStudyFieldCreateRequest,
+    SampleStudyFieldPatchRequest,
     SampleStudyFieldResponse,
     TerminologyTermRef,
     Tier,
     field_wire_name,
+    unique_in_study_rejection_reason,
 )
 
 from ..auth.guards import (
@@ -53,11 +56,15 @@ from ..repositories._sample_helpers import (
     StudyFieldConflictError,
     StudyUniqueValueConflictError,
     TransientWriteRaceError,
+    UniqueInStudyViolation,
+    classify_unique_in_study_violation,
     create_study_field_and_read_back,
     fetch_entity_is_linked_to_study,
     fetch_global_metadata,
     fetch_local_metadata,
     fetch_metadata_checklist_idx_by_name,
+    fetch_study_field,
+    update_study_field,
     write_sample_metadata,
 )
 from ..repositories.alignment_definition import alignment_definition_exists
@@ -255,6 +262,9 @@ def _attempted_label(value: object) -> str:
 # is not in a route's specific message map. Lifted here so the wording
 # stays identical across every route that falls back to it.
 GENERIC_FK_VIOLATION = "references a row that does not exist"
+# Fallback for a CHECK the wire models should have preempted. Both study-field
+# write surfaces fall back to it, so the wording lives here rather than at each.
+GENERIC_CHECK_VIOLATION = "violates a database constraint on"
 
 # The optimistic-concurrency header pair: every route that emits a version
 # stamp writes ETAG_HEADER, and every PATCH that gates on one reads
@@ -606,9 +616,121 @@ async def create_and_map_study_field(
     except asyncpg.ForeignKeyViolationError:
         raise HTTPException(status_code=422, detail=GENERIC_FK_VIOLATION)
     except asyncpg.CheckViolationError:
-        raise HTTPException(status_code=422, detail=f"violates a database constraint on {noun}")
+        raise_generic_check_violation(noun)
 
     return map_study_field_row(row, spec=spec, response_model=response_model)
+
+
+def raise_generic_check_violation(noun: str) -> NoReturn:
+    """Raise the 422 for a CHECK the wire models were meant to preempt.
+
+    The last line of defense on a study-field write: reaching it means a body
+    passed validation and the database still refused the row.
+    """
+    raise HTTPException(status_code=422, detail=f"{GENERIC_CHECK_VIOLATION} {noun}")
+
+
+async def patch_and_map_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    study_field_idx: int,
+    body: SampleStudyFieldPatchRequest,
+    if_match: str | None,
+    response_model: type[SampleStudyFieldResponse],
+) -> SampleStudyFieldResponse:
+    """Edit one study-local field and shape the stored row into response_model.
+
+    Requires If-Match (428 without). Reads the row under a lock held to commit,
+    so a concurrent edit of the same field serializes here rather than racing
+    past the ETag check: absent is 404, a field belonging to another study is
+    also 404 (it exists, but not where this path addresses, and saying so
+    differently would confirm it), and a stale tag is 412.
+
+    Then the two shape rules, both against the stored row rather than the body,
+    since the body carries neither the field's type nor its link: a linked row
+    refuses the attributes it inherits, and unique_in_study refuses a shape it
+    cannot govern. Both are 422.
+
+    Write rejections: a display_name already used in the study is 409; enabling
+    uniqueness over values that already repeat is 409; over a value that is a
+    missing-value marker, 422. The last two are the field's existing data
+    refusing the new policy, so they name the field, not one value.
+
+    The caller owns the transaction.
+    """
+    noun = spec.entity_kind
+    if_match = require_if_match(if_match)
+
+    row = await fetch_study_field(conn, spec=spec, idx=study_field_idx, for_update=True)
+    if row is not None and row["study_idx"] != study_idx:
+        row = None
+    require_etag_match(row, if_match=if_match, label=f"{noun} field", row_idx=study_field_idx)
+
+    named = body.model_fields_set
+    if row[spec.study_field_global_fk_column] is not None:
+        inherited = [name for name in NOT_SETTABLE_ON_LINKED_FIELD if name in named]
+        if inherited:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{noun} field {study_field_idx} is linked to a global field;"
+                    f" {', '.join(inherited)} cannot be set on it"
+                ),
+            )
+
+    if body.unique_in_study:
+        reason = unique_in_study_rejection_reason(
+            data_type=row["data_type"],
+            is_globally_linked=row[spec.study_field_global_fk_column] is not None,
+        )
+        if reason is not None:
+            raise HTTPException(status_code=422, detail=reason)
+
+    fields = {name: getattr(body, name) for name in named}
+    try:
+        updated_row = await update_study_field(conn, spec=spec, idx=study_field_idx, fields=fields)
+    except asyncpg.UniqueViolationError as exc:
+        if classify_unique_in_study_violation(exc, spec=spec) is (
+            UniqueInStudyViolation.DUPLICATE_VALUE
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{noun} field {row['display_name']!r} cannot be made unique within"
+                    " this study: two or more of its samples already share a value"
+                ),
+            )
+        raise_for_unique_violation(
+            exc,
+            constraint_messages={
+                f"{spec.study_field_table_name}_display_name_unique": (
+                    f"a {noun} field of that name already exists on this study"
+                )
+            },
+            generic=f"violates a uniqueness constraint on {noun} field",
+        )
+    except asyncpg.CheckViolationError as exc:
+        if classify_unique_in_study_violation(exc, spec=spec) is (
+            UniqueInStudyViolation.MISSING_VALUE_MARKER
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{noun} field {row['display_name']!r} cannot be made unique within"
+                    " this study: one of its samples declined to give a value"
+                ),
+            )
+        raise_generic_check_violation(noun)
+
+    # The row was locked from the preflight through this write, so an absent
+    # row here is corruption rather than a lost race.
+    if updated_row is None:
+        raise RuntimeError(
+            f"{spec.study_field_table} idx={study_field_idx} vanished under its own lock"
+        )
+    return map_study_field_row(updated_row, spec=spec, response_model=response_model)
 
 
 def map_study_field_row[T: SampleStudyFieldResponse](
