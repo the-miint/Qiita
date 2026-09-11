@@ -44,12 +44,14 @@ from ..repositories._sample_helpers import (
     MetadataParseError,
     MetadataRow,
     MetadataUnknownFieldsError,
+    MissingValueOnUniqueFieldError,
     OwnerSampleIdMetadataWriteError,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
     SlotOccupiedError,
     StudyFieldAlreadyExistsError,
     StudyFieldConflictError,
+    StudyUniqueValueConflictError,
     TransientWriteRaceError,
     create_study_field_and_read_back,
     fetch_entity_is_linked_to_study,
@@ -396,6 +398,8 @@ SAMPLE_METADATA_WRITE_ERRORS = (
     StudyFieldConflictError,
     DuplicateGlobalFieldTargetError,
     OwnerSampleIdMetadataWriteError,
+    StudyUniqueValueConflictError,
+    MissingValueOnUniqueFieldError,
     SlotOccupiedError,
     TransientWriteRaceError,
 )
@@ -407,9 +411,10 @@ async def raise_http_for_sample_metadata_write_error(
     """Map a sample-family metadata-write exception to its HTTPException.
 
     One exception maps to exactly one response, so the mapping cannot drift.
-    Parse, unknown-field, study-field-conflict, duplicate-global-target, and
-    owner-sample-id errors map to 422; a slot collision to 409 (diagnosed
-    against conn); a transient write race to 503. Always raises.
+    Parse, unknown-field, study-field-conflict, duplicate-global-target,
+    owner-sample-id, and missing-value-on-a-unique-field errors map to 422; a
+    slot collision and a study-local uniqueness collision to 409 (the former
+    diagnosed against conn); a transient write race to 503. Always raises.
     """
     if isinstance(exc, MetadataUnknownFieldsError):
         raise HTTPException(
@@ -449,6 +454,22 @@ async def raise_http_for_sample_metadata_write_error(
             detail=(
                 f"metadata field {exc.display_name!r} is an owner-sample-id field"
                 " and cannot be written as ordinary metadata"
+            ),
+        )
+    if isinstance(exc, StudyUniqueValueConflictError):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"metadata field {exc.display_name!r} is unique within this study"
+                f" and another sample already holds value {exc.attempted_value!r}"
+            ),
+        )
+    if isinstance(exc, MissingValueOnUniqueFieldError):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"metadata field {exc.display_name!r} is unique within this study"
+                " and cannot be given a missing-value marker"
             ),
         )
     if isinstance(exc, SlotOccupiedError):
@@ -565,6 +586,7 @@ async def create_and_map_study_field(
             required=body.required,
             terminology_idx=body.terminology_idx,
             tier_override=body.tier_override,
+            unique_in_study=body.unique_in_study,
         )
     except StudyFieldAlreadyExistsError:
         raise HTTPException(

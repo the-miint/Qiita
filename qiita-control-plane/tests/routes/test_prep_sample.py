@@ -474,6 +474,7 @@ async def test_create_prep_sample_field_admin_local(ctx):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["user_session"]["principal_idx"],
     }
     assert body == expected
@@ -511,6 +512,7 @@ async def test_create_prep_sample_field_linked_inherits(ctx):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["user_session"]["principal_idx"],
     }
     assert body == expected
@@ -652,6 +654,7 @@ async def test_list_prep_sample_fields_in_study_resolves_linked_and_local(ctx):
             "required": False,
             "terminology_idx": None,
             "tier_override": None,
+            "unique_in_study": False,
             "created_by_idx": ctx["user_session"]["principal_idx"],
         },
         {
@@ -665,6 +668,7 @@ async def test_list_prep_sample_fields_in_study_resolves_linked_and_local(ctx):
             "required": True,
             "terminology_idx": terminology_idx,
             "tier_override": None,
+            "unique_in_study": False,
             "created_by_idx": ctx["user_session"]["principal_idx"],
         },
     ]

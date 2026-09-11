@@ -1441,6 +1441,64 @@ def test_biosample_study_field_create_request_linked_valid():
     assert req.tier_override is None
 
 
+def test_biosample_study_field_create_request_local_accepts_unique_in_study():
+    """Tests the case where a purely-local field of an eligible type asks for
+    study-local uniqueness — the local mode accepts it.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    req = BiosampleStudyFieldCreateRequest(
+        display_name="sample name", data_type=FieldDataType.TEXT, unique_in_study=True
+    )
+
+    assert req.unique_in_study is True
+
+
+def test_biosample_study_field_create_request_unique_in_study_defaults_unset():
+    """Tests the case where a purely-local field omits unique_in_study — it
+    stays unset, which the repository layer stores as false.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest, FieldDataType
+
+    req = BiosampleStudyFieldCreateRequest(display_name="pH", data_type=FieldDataType.NUMERIC)
+
+    assert req.unique_in_study is None
+
+
+@pytest.mark.parametrize("data_type", ["boolean", "terminology"])
+def test_biosample_study_field_create_request_rejects_unique_on_closed_value_set(data_type):
+    """Tests the case where a field over a closed value set asks for study-local
+    uniqueness: such a field would cap the study at as many samples as the set
+    has values, so the local mode rejects it.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest
+
+    # terminology_idx is coupled to the terminology data_type by a separate
+    # rule, so it travels with that case to isolate the rejection under test.
+    terminology_idx = 7 if data_type == "terminology" else None
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(
+            display_name="flagged",
+            data_type=data_type,
+            terminology_idx=terminology_idx,
+            unique_in_study=True,
+        )
+
+
+def test_biosample_study_field_create_request_linked_rejects_unique_in_study():
+    """Tests the case where a globally-linked field asks for study-local
+    uniqueness: one metadata row through a global field is shared across every
+    study linked to it, so no single study owns the grouping.
+    """
+    from qiita_common.models import BiosampleStudyFieldCreateRequest
+
+    with pytest.raises(ValidationError):
+        BiosampleStudyFieldCreateRequest(
+            display_name="Sample pH", biosample_global_field_idx=7, unique_in_study=True
+        )
+
+
 def test_biosample_study_field_create_request_rejects_unaliased_global_fk():
     """Tests the case where the caller sends the entity-agnostic attribute name
     instead of the entity-qualified wire name: only the alias is accepted, so

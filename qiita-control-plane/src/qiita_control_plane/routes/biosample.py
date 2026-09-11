@@ -289,10 +289,15 @@ async def create_biosample_field(
 
     biosample_global_field_idx discriminates two mutually-exclusive modes.
     Purely-local (omitted): data_type is required, plus optional required /
-    terminology_idx / tier_override. Globally-linked (set): only display_name
-    (+ optional description); data_type / required / terminology_idx /
-    tier_override are inherited from the global field and must be omitted here,
-    and come back on the response resolved to the global field's values.
+    terminology_idx / tier_override / unique_in_study. Globally-linked (set):
+    only display_name (+ optional description); data_type / required /
+    terminology_idx / tier_override are inherited from the global field and must
+    be omitted here, and come back on the response resolved to the global
+    field's values.
+
+    unique_in_study makes the study's values through this field distinct and
+    forbids a missing-value marker among them. It is available only on a
+    purely-local field of type text, numeric, or date; anything else is a 422.
     """
     async with tx() as conn:
         response = await create_and_map_study_field(

@@ -18,6 +18,13 @@ from qiita_common.models.reference import FieldDataType, Tier
 STUDY_FIELD_IDX_ATTR = "study_field_idx"
 GLOBAL_FIELD_IDX_ATTR = "global_field_idx"
 
+# The value kinds a unique-in-study field may carry. A closed value set would
+# cap the study at as many samples as the set has values, so boolean and
+# terminology are excluded. Tracks the *_study_field data-type eligibility CHECK.
+UNIQUE_IN_STUDY_DATA_TYPES = frozenset(
+    {FieldDataType.TEXT, FieldDataType.NUMERIC, FieldDataType.DATE}
+)
+
 
 def field_wire_name(model: type[BaseModel], attr: str) -> str:
     """Return the wire spelling of one of model's fields: the alias it declares
@@ -38,9 +45,12 @@ class SampleStudyFieldCreateRequest(BaseModel):
 
     The global-field link discriminates two mutually-exclusive modes.
     If omitted, purely-local: data_type is required, plus optional required /
-    terminology_idx / tier_override. If set, globally-linked: only display_name
-    (+ optional description); data_type / required / terminology_idx /
-    tier_override are inherited from the global field and must be omitted.
+    terminology_idx / tier_override / unique_in_study. If set, globally-linked:
+    only display_name (+ optional description); data_type / required /
+    terminology_idx / tier_override are inherited from the global field and
+    must be omitted, and unique_in_study must be too — it is not inherited, it
+    is unavailable, since one metadata row through a global field is shared
+    across every study linked to it and no single study owns the grouping.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -52,6 +62,7 @@ class SampleStudyFieldCreateRequest(BaseModel):
     required: bool | None = None
     terminology_idx: Annotated[int, Field(gt=0)] | None = None
     tier_override: Tier | None = None
+    unique_in_study: bool | None = None
 
     @model_validator(mode="after")
     def _validate_mode_coupling(self) -> SampleStudyFieldCreateRequest:
@@ -62,7 +73,13 @@ class SampleStudyFieldCreateRequest(BaseModel):
         if self.global_field_idx is not None:
             forbidden = [
                 name
-                for name in ("data_type", "required", "terminology_idx", "tier_override")
+                for name in (
+                    "data_type",
+                    "required",
+                    "terminology_idx",
+                    "tier_override",
+                    "unique_in_study",
+                )
                 if getattr(self, name) is not None
             ]
             if forbidden:
@@ -78,6 +95,9 @@ class SampleStudyFieldCreateRequest(BaseModel):
             raise ValueError(f"data_type is required when {global_fk_name} is omitted")
         if (self.data_type is FieldDataType.TERMINOLOGY) != (self.terminology_idx is not None):
             raise ValueError("terminology_idx must be set iff data_type is 'terminology'")
+        if self.unique_in_study and self.data_type not in UNIQUE_IN_STUDY_DATA_TYPES:
+            eligible = ", ".join(sorted(t.value for t in UNIQUE_IN_STUDY_DATA_TYPES))
+            raise ValueError(f"unique_in_study requires data_type to be one of: {eligible}")
         return self
 
 
@@ -90,7 +110,8 @@ class SampleStudyFieldResponse(BaseModel):
     study-field columns are NULL. tier_override is instead always None on a
     linked row: a global field carries default_tier, so there is nothing per-study
     to override. internal_name and default_tier belong to the global field, not
-    to this row, and are excluded.
+    to this row, and are excluded. unique_in_study is always False on a linked
+    row, which is the stored value rather than a resolved one.
     """
 
     study_field_idx: Annotated[int, Field(gt=0)]
@@ -102,6 +123,7 @@ class SampleStudyFieldResponse(BaseModel):
     required: bool
     terminology_idx: Annotated[int, Field(gt=0)] | None
     tier_override: Tier | None
+    unique_in_study: bool
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
 

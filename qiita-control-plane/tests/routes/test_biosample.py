@@ -3143,6 +3143,7 @@ async def test_create_biosample_field_admin_local(ctx):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["user_session"]["principal_idx"],
         "created_at": body["created_at"],
     }
@@ -3194,6 +3195,7 @@ async def test_create_biosample_field_admin_linked_inherits(ctx):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["user_session"]["principal_idx"],
         "created_at": body["created_at"],
     }
@@ -3277,6 +3279,68 @@ async def _patch_biosample_metadata(
         URL_BIOSAMPLE_METADATA_BY_STUDY.format(study_idx=study_idx, biosample_idx=biosample_idx),
         json=body,
     )
+
+
+async def _seed_study_with_unique_field(ctx, *, suffix):
+    """Seed a wet-owned study carrying one purely-local text field flagged
+    unique_in_study. Returns (study_idx, display_name).
+    """
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix=suffix)
+    display_name = unique_field_name("Uniq")
+    created = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={
+            "display_name": display_name,
+            "data_type": "text",
+            "unique_in_study": True,
+        },
+    )
+    assert created.status_code == 201, created.text
+    ctx["created"]["biosample_study_field"].append(created.json()["biosample_study_field_idx"])
+    return study_idx, display_name
+
+
+async def test_patch_biosample_metadata_duplicate_on_unique_field_409(ctx):
+    """Tests the case where a second biosample is given a value another
+    biosample in the study already holds through a unique_in_study field:
+    the collision answers 409 rather than reaching the caller as a 500.
+    """
+    study_idx, display_name = await _seed_study_with_unique_field(ctx, suffix="uniq-dup")
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    first_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+    second_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+
+    first = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, first_idx, {display_name: "Sample 1"}
+    )
+    assert first.status_code == 200, first.text
+    await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], first_idx, study_idx, [])
+
+    second = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, second_idx, {display_name: "Sample 1"}
+    )
+
+    assert second.status_code == 409, second.text
+    assert "is unique within this study" in second.json()["detail"]
+
+
+async def test_patch_biosample_metadata_missing_marker_on_unique_field_422(ctx):
+    """Tests the case where a unique_in_study field is given a missing-value
+    marker: the field cannot hold one, and the refusal is a 422.
+    """
+    study_idx, display_name = await _seed_study_with_unique_field(ctx, suffix="uniq-miss")
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+
+    resp = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {display_name: "not applicable"}
+    )
+
+    assert resp.status_code == 422, resp.text
+    # Assert the reason, not just the field name: an unknown-field or parse
+    # rejection would also be a 422 naming this field.
+    assert "cannot be given a missing-value marker" in resp.json()["detail"]
 
 
 async def _seed_linked_biosample_and_global_field(ctx, *, suffix, data_type=FieldDataType.TEXT):
@@ -4031,6 +4095,7 @@ async def test_list_biosample_fields_in_study_resolves_linked_and_local(ctx):
             "required": False,
             "terminology_idx": None,
             "tier_override": None,
+            "unique_in_study": False,
             "created_by_idx": ctx["user_session"]["principal_idx"],
         },
         {
@@ -4044,6 +4109,7 @@ async def test_list_biosample_fields_in_study_resolves_linked_and_local(ctx):
             "required": True,
             "terminology_idx": terminology_idx,
             "tier_override": None,
+            "unique_in_study": False,
             "created_by_idx": ctx["user_session"]["principal_idx"],
         },
     ]

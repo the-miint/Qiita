@@ -249,6 +249,51 @@ class MetadataMissingRequiredFieldsError(Exception):
         )
 
 
+class StudyUniqueValueConflictError(Exception):
+    """Raised when a *_metadata write would repeat a value already held
+    through the same unique_in_study field. Carries the field and the
+    rejected value so the caller learns which of its inputs collided.
+    """
+
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        display_name: str,
+        study_field_idx: int,
+        attempted_value: SampleMetadataValue,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.display_name = display_name
+        self.study_field_idx = study_field_idx
+        self.attempted_value = attempted_value
+        super().__init__(
+            f"{entity_kind} field {display_name!r} is unique within its study and"
+            f" already holds value {attempted_value!r}"
+        )
+
+
+class MissingValueOnUniqueFieldError(Exception):
+    """Raised when a *_metadata write would put a missing-value marker on a
+    unique_in_study field. Carries the field; there is no value to carry.
+    """
+
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        display_name: str,
+        study_field_idx: int,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.display_name = display_name
+        self.study_field_idx = study_field_idx
+        super().__init__(
+            f"{entity_kind} field {display_name!r} is unique within its study and"
+            f" cannot hold a missing-value marker"
+        )
+
+
 class MetadataChecklistUnknownError(Exception):
     """Raised when a metadata_checklist name has no matching
     qiita.metadata_checklist row. Carries the unknown name.
@@ -563,6 +608,13 @@ class EntityMetadataSpec:
     study_field_global_fk_column: str
     global_field_unique_index_name: str
     local_unique_per_field_index_name: str
+    # The partial unique indexes enforcing a unique_in_study field's
+    # distinctness, one per eligible value column. A set rather than one field
+    # per column: which typed index caught a collision tells a caller nothing
+    # the field name and value do not already say.
+    unique_in_study_index_names: frozenset[str]
+    # The row CHECK refusing a missing-value marker on a unique_in_study field.
+    unique_in_study_no_missing_constraint: str
     # The per-study link table (biosample_to_study / prep_sample_to_study)
     # and the entity-id column on it (biosample_idx / prep_sample_idx).
     link_table: str
@@ -1536,10 +1588,32 @@ async def _insert_metadata_or_diagnose(
             outcome=FieldWriteOutcome.INSERTED,
         )
     except asyncpg.UniqueViolationError as exc:
+        # A study-local uniqueness index is not a slot collision: nothing
+        # occupies the caller's own (entity, field) slot, some *other* entity
+        # in the study already holds this value. There is no occupant to
+        # diagnose, so it answers directly rather than falling through.
+        if exc.constraint_name in spec.unique_in_study_index_names:
+            raise StudyUniqueValueConflictError(
+                entity_kind=spec.entity_kind,
+                display_name=display_name,
+                study_field_idx=target_field_idx,
+                attempted_value=value,
+            ) from exc
         # Only a diagnostic constraint drives the diagnostic path; any other
         # UniqueViolation is the caller's problem and propagates unchanged.
         if exc.constraint_name not in diagnostic_constraint_names:
             raise
+    except asyncpg.CheckViolationError as exc:
+        # Dispatch on constraint name, never on message prose: the metadata
+        # tables carry several CHECKs and answering for the wrong one would
+        # name the wrong cause.
+        if exc.constraint_name == spec.unique_in_study_no_missing_constraint:
+            raise MissingValueOnUniqueFieldError(
+                entity_kind=spec.entity_kind,
+                display_name=display_name,
+                study_field_idx=target_field_idx,
+            ) from exc
+        raise
 
     # Diagnose the occupant once; both the upsert decision and any raised error
     # read from this single diagnosis. Reached only via the controlled path
@@ -1703,6 +1777,7 @@ async def _get_or_create_local_study_field(
     required: bool = False,
     terminology_idx: int | None = None,
     tier_override: Tier | None = None,
+    unique_in_study: bool = False,
 ) -> tuple[int, bool, int | None]:
     """Find a {entity}_study_field by (study_idx, display_name); create
     purely-local on miss.
@@ -1729,8 +1804,8 @@ async def _get_or_create_local_study_field(
         f"INSERT INTO {spec.study_field_table} ("
         f"    study_idx, display_name, description,"
         f"    data_type, required, terminology_idx, tier_override,"
-        f"    created_by_idx"
-        f") VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        f"    unique_in_study, created_by_idx"
+        f") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
         f" ON CONFLICT (study_idx, display_name) DO NOTHING"
         f" RETURNING idx",
         study_idx,
@@ -1740,6 +1815,7 @@ async def _get_or_create_local_study_field(
         required,
         terminology_idx,
         tier_override,
+        unique_in_study,
         created_by_idx,
     )
     if idx is not None:
@@ -1782,6 +1858,7 @@ def _study_field_read_sql(spec: EntityMetadataSpec) -> str:
         f"    COALESCE(sf.required, gf.required) AS required,"
         f"    COALESCE(sf.terminology_idx, gf.terminology_idx) AS terminology_idx,"
         f"    sf.tier_override,"
+        f"    sf.unique_in_study,"
         f"    sf.created_by_idx,"
         f"    sf.created_at"
         f" FROM {spec.study_field_table} sf"
@@ -1860,6 +1937,7 @@ async def create_study_field(
     required: bool | None = None,
     terminology_idx: int | None = None,
     tier_override: Tier | None = None,
+    unique_in_study: bool | None = None,
 ) -> int:
     """Create one {entity}_study_field and return its idx, failing if the name
     is already used on the study.
@@ -1880,10 +1958,13 @@ async def create_study_field(
     # Globally-linked mode: the inherited columns live on the global-field row,
     # so the caller must omit them here — reject rather than silently drop.
     if global_field_idx is not None:
-        if any(x is not None for x in (data_type, required, terminology_idx, tier_override)):
+        if any(
+            x is not None
+            for x in (data_type, required, terminology_idx, tier_override, unique_in_study)
+        ):
             raise ValueError(
-                "data_type/required/terminology_idx/tier_override must be omitted "
-                "for a globally-linked study field"
+                "data_type/required/terminology_idx/tier_override/unique_in_study must be "
+                "omitted for a globally-linked study field"
             )
         idx, created = await _get_or_create_globally_linked_study_field(
             conn,
@@ -1915,6 +1996,7 @@ async def create_study_field(
             required=required if required is not None else False,
             terminology_idx=terminology_idx,
             tier_override=tier_override,
+            unique_in_study=unique_in_study if unique_in_study is not None else False,
         )
 
     # A row already at this name is an error here, not a silent reuse.
@@ -1940,6 +2022,7 @@ async def create_study_field_and_read_back(
     required: bool | None = None,
     terminology_idx: int | None = None,
     tier_override: Tier | None = None,
+    unique_in_study: bool | None = None,
 ) -> asyncpg.Record:
     """Create one {entity}_study_field and return the stored row, failing if
     the name is already used on the study.
@@ -1966,6 +2049,7 @@ async def create_study_field_and_read_back(
         required=required,
         terminology_idx=terminology_idx,
         tier_override=tier_override,
+        unique_in_study=unique_in_study,
     )
     created_row = await fetch_study_field(conn, spec=spec, idx=created_idx)
     # The row was just inserted inside this transaction, so a miss here means

@@ -19,10 +19,13 @@ import pytest
 from qiita_common.models import FieldDataType, MissingReasonRef
 
 from qiita_control_plane.repositories._sample_helpers import (
+    MissingValueOnUniqueFieldError,
+    StudyUniqueValueConflictError,
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
     _insert_metadata,
     insert_entity_to_study,
+    write_local_metadata_or_diagnose,
 )
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
@@ -858,3 +861,96 @@ async def test_unique_in_study_rejected_on_ineligible_data_type(ctx, spec, data_
             f"UPDATE {spec.study_field_table} SET unique_in_study = true WHERE idx = $1",
             field_idx,
         )
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_duplicate_raises_typed_error(ctx, spec):
+    # Tests the case where a duplicate reaches the write path rather than a
+    # raw INSERT: the index violation is translated, not propagated, so the
+    # route layer has something to map instead of a 500.
+    first_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    second_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    display_name = unique_field_name("typed-dup")
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+            required=False,
+            unique_in_study=True,
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=first_entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value="Sample 1",
+    )
+
+    with pytest.raises(StudyUniqueValueConflictError) as excinfo:
+        async with ctx["pool"].acquire() as conn, conn.transaction():
+            await write_local_metadata_or_diagnose(
+                conn,
+                spec=spec,
+                entity_idx=second_entity_idx,
+                study_idx=ctx["study_idx"],
+                display_name=display_name,
+                data_type=FieldDataType.TEXT,
+                value="Sample 1",
+                caller_idx=ctx["principal_idx"],
+            )
+
+    assert excinfo.value.display_name == display_name
+    assert excinfo.value.attempted_value == "Sample 1"
+    assert excinfo.value.study_field_idx == field_idx
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_missing_marker_raises_typed_error(ctx, spec):
+    # Tests the case where a missing-value marker reaches the write path for a
+    # flagged field: the CHECK violation is translated on its constraint name.
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    display_name = unique_field_name("typed-missing")
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+            required=False,
+            unique_in_study=True,
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+
+    reason_name = f"reason_{secrets.token_hex(4)}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+
+    with pytest.raises(MissingValueOnUniqueFieldError) as excinfo:
+        async with ctx["pool"].acquire() as conn, conn.transaction():
+            await write_local_metadata_or_diagnose(
+                conn,
+                spec=spec,
+                entity_idx=entity_idx,
+                study_idx=ctx["study_idx"],
+                display_name=display_name,
+                data_type=FieldDataType.TEXT,
+                value=MissingReasonRef(idx=reason_idx, name=reason_name),
+                caller_idx=ctx["principal_idx"],
+            )
+
+    assert excinfo.value.display_name == display_name
+    assert excinfo.value.study_field_idx == field_idx

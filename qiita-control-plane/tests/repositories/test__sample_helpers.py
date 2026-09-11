@@ -2567,6 +2567,64 @@ async def test__get_or_create_local_study_field_creates_purely_local(ctx, spec):
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
     ids=["biosample", "prep_sample"],
 )
+async def test__get_or_create_local_study_field_stores_unique_in_study(ctx, spec):
+    """Tests the case where the create branch is asked for a study-locally
+    unique field: the flag reaches the stored row.
+    """
+    field_name = unique_field_name()
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        idx, created, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=field_name,
+            created_by_idx=ctx["principal_idx"],
+            unique_in_study=True,
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
+
+    assert created is True
+    stored = await ctx["pool"].fetchval(
+        f"SELECT unique_in_study FROM {spec.study_field_table} WHERE idx = $1",
+        idx,
+    )
+    assert stored is True
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test__get_or_create_local_study_field_unique_in_study_defaults_false(ctx, spec):
+    """Tests the case where the create branch is not asked for uniqueness:
+    an implicitly-minted field carries no study-local uniqueness policy.
+    """
+    field_name = unique_field_name()
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=field_name,
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
+
+    stored = await ctx["pool"].fetchval(
+        f"SELECT unique_in_study FROM {spec.study_field_table} WHERE idx = $1",
+        idx,
+    )
+    assert stored is False
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
 async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
     field_name = unique_field_name()
 
@@ -6315,6 +6373,7 @@ async def test_fetch_study_field_local(ctx, spec):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["principal_idx"],
         # created_at is DB-assigned; copy it from the actual row.
         "created_at": row["created_at"],
@@ -6364,6 +6423,7 @@ async def test_fetch_study_field_globally_linked_inherits(ctx, spec):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["principal_idx"],
         "created_at": row["created_at"],
     }
@@ -6431,6 +6491,7 @@ async def test_create_study_field_and_read_back_globally_linked(ctx, spec):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["principal_idx"],
     }
     assert dict(record) == expected
@@ -6493,6 +6554,7 @@ async def test_fetch_study_fields_for_study_orders_and_resolves(ctx, spec):
             "required": False,
             "terminology_idx": None,
             "tier_override": None,
+            "unique_in_study": False,
             "created_by_idx": ctx["principal_idx"],
             # created_at is DB-assigned; copy it from the actual row.
             "created_at": rows[0]["created_at"],
@@ -6507,6 +6569,7 @@ async def test_fetch_study_fields_for_study_orders_and_resolves(ctx, spec):
             "required": False,
             "terminology_idx": None,
             "tier_override": None,
+            "unique_in_study": False,
             "created_by_idx": ctx["principal_idx"],
             "created_at": rows[1]["created_at"],
         },

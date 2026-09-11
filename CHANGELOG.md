@@ -21,6 +21,16 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A study can ask for a study-local field's values to be unique when it creates
+  the field.** `unique_in_study` is accepted on both entities' create-field routes
+  and comes back on create and list, so a study can mint the column it identifies
+  its own samples by. It is refused for a globally-linked field and for the closed
+  value sets (boolean, terminology) at the wire, with a per-field 422 rather than a
+  generic database rejection. A write that repeats a value another sample in the
+  study already holds answers 409; one that puts a missing-value marker on such a
+  field answers 422. Both previously reached the caller as a 500, since the
+  database rejected them and nothing translated the rejection.
+
 - **A study-local field can declare that its values identify the study's samples.**
   `unique_in_study` on `biosample_study_field` / `prep_sample_study_field` makes the
   database reject a duplicate value within the study and reject a missing-value marker
