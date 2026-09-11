@@ -21,6 +21,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A study-local field's uniqueness policy can be changed after the field exists.**
+  Both `*_study_field` tables gain `updated_at`, bumped by the shared trigger and
+  available as an ETag, and a trigger mirrors a change of `unique_in_study` onto
+  every metadata row already written through that field, so the enforcement always
+  describes the field's current policy rather than the one it was minted with.
+  Switching the policy on over values that already repeat, or over a sample that
+  declined to be named, is refused by the constraints the propagation runs into and
+  the change rolls back whole — a field never ends up half-governed. Switching it
+  off propagates freely. Nothing is yet reachable from the API; a caller-facing
+  route follows.
+
 - **A study can ask for a study-local field's values to be unique when it creates
   the field.** `unique_in_study` is accepted on both entities' create-field routes
   and comes back on create and list, so a study can mint the column it identifies

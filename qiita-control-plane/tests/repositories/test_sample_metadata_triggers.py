@@ -954,3 +954,188 @@ async def test_unique_in_study_missing_marker_raises_typed_error(ctx, spec):
 
     assert excinfo.value.display_name == display_name
     assert excinfo.value.study_field_idx == field_idx
+
+
+# =============================================================================
+# study-field updated_at and unique_in_study propagation
+# =============================================================================
+
+
+async def _create_plain_field(ctx, spec, *, suffix, data_type=FieldDataType.TEXT):
+    """Create a purely-local study field with no uniqueness policy. Returns
+    the field idx.
+    """
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=unique_field_name(suffix),
+            created_by_idx=ctx["principal_idx"],
+            data_type=data_type,
+            required=False,
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+    return field_idx
+
+
+async def _set_unique_in_study(ctx, spec, field_idx, value):
+    """Flip a study field's unique_in_study, driving the propagation trigger."""
+    await ctx["pool"].execute(
+        f"UPDATE {spec.study_field_table} SET unique_in_study = $1 WHERE idx = $2",
+        value,
+        field_idx,
+    )
+
+
+async def _read_flags(ctx, spec, field_idx):
+    """Return the field's stored flag and the flags on its metadata rows."""
+    field_flag = await ctx["pool"].fetchval(
+        f"SELECT unique_in_study FROM {spec.study_field_table} WHERE idx = $1",
+        field_idx,
+    )
+    metadata_flags = await ctx["pool"].fetch(
+        f"SELECT unique_in_study FROM {spec.metadata_table}"
+        f" WHERE {spec.study_field_idx_column} = $1",
+        field_idx,
+    )
+    return field_flag, [r["unique_in_study"] for r in metadata_flags]
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_study_field_set_updated_at_bumps_on_update(ctx, spec):
+    # Tests the case where a study field row is edited: the shared
+    # set_updated_at() function is attached to this table too, so the column
+    # moves without the caller setting it.
+    field_idx = await _create_plain_field(ctx, spec, suffix="touch")
+    before = await ctx["pool"].fetchval(
+        f"SELECT updated_at FROM {spec.study_field_table} WHERE idx = $1", field_idx
+    )
+
+    await ctx["pool"].execute(
+        f"UPDATE {spec.study_field_table} SET description = $1 WHERE idx = $2",
+        "edited",
+        field_idx,
+    )
+
+    after = await ctx["pool"].fetchval(
+        f"SELECT updated_at FROM {spec.study_field_table} WHERE idx = $1", field_idx
+    )
+    assert after > before
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_flip_on_propagates_to_metadata(ctx, spec):
+    # Tests the case where a field with existing values is switched to
+    # unique: the denormalized flag reaches every row already written through
+    # it, so the indexes describe the field's current policy.
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await _create_plain_field(ctx, spec, suffix="flip-on")
+    meta_idx = await _write_value(
+        ctx,
+        spec,
+        entity_idx=entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value="Sample 1",
+    )
+    before = await ctx["pool"].fetchval(
+        f"SELECT updated_at FROM {spec.metadata_table} WHERE idx = $1", meta_idx
+    )
+
+    await _set_unique_in_study(ctx, spec, field_idx, True)
+
+    assert await _read_flags(ctx, spec, field_idx) == (True, [True])
+    after = await ctx["pool"].fetchval(
+        f"SELECT updated_at FROM {spec.metadata_table} WHERE idx = $1", meta_idx
+    )
+    assert after > before
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_flip_off_propagates_to_metadata(ctx, spec):
+    # Tests the case where a unique field is relaxed: the flag is cleared on
+    # its metadata rows, so duplicates become writable again.
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    second_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await _create_flagged_field(
+        ctx, spec, study_idx=ctx["study_idx"], data_type=FieldDataType.TEXT, suffix="flip-off"
+    )
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value="Sample 1",
+    )
+
+    await _set_unique_in_study(ctx, spec, field_idx, False)
+
+    assert await _read_flags(ctx, spec, field_idx) == (False, [False])
+    # The relaxed field now accepts the value a second time.
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=second_entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value="Sample 1",
+    )
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_flip_on_rejected_when_duplicates_exist(ctx, spec):
+    # Tests the case where a field already holding a repeated value is
+    # switched to unique: the propagation trips the partial unique index and
+    # the flag change rolls back rather than leaving the policy half-applied.
+    first_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    second_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await _create_plain_field(ctx, spec, suffix="dup-flip")
+    for entity_idx in (first_entity_idx, second_entity_idx):
+        await _write_value(
+            ctx,
+            spec,
+            entity_idx=entity_idx,
+            field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="Sample 1",
+        )
+
+    with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
+        await _set_unique_in_study(ctx, spec, field_idx, True)
+
+    # Name the constraint: the study field's own eligibility CHECK would also
+    # refuse a flag change, and this must be the metadata index instead.
+    assert excinfo.value.constraint_name in spec.unique_in_study_index_names
+    assert await _read_flags(ctx, spec, field_idx) == (False, [False, False])
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_flip_on_rejected_when_missing_marker_exists(ctx, spec):
+    # Tests the case where a field holding a missing-value marker is switched
+    # to unique: the propagation trips the no-missing-value CHECK and rolls
+    # back, so the field cannot claim to identify samples it has not named.
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await _create_plain_field(ctx, spec, suffix="miss-flip")
+
+    reason_name = f"reason_{secrets.token_hex(4)}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value=MissingReasonRef(idx=reason_idx, name=reason_name),
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError) as excinfo:
+        await _set_unique_in_study(ctx, spec, field_idx, True)
+
+    assert excinfo.value.constraint_name == spec.unique_in_study_no_missing_constraint
+    assert await _read_flags(ctx, spec, field_idx) == (False, [False])
