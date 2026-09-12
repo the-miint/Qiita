@@ -4241,3 +4241,144 @@ async def test_patch_biosample_field_enable_unique_over_missing_marker_422(ctx):
 
     assert resp.status_code == 422, resp.text
     assert "declined to give a value" in resp.json()["detail"]
+
+
+# ===========================================================================
+# Owner-biosample-id fields must be unique within their study
+# ===========================================================================
+
+
+async def test_import_biosample_mints_owner_id_field_unique_in_study(ctx):
+    """Tests the case where an import creates the owner-id field: it is minted
+    already declaring that its values identify the study's samples.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="uniq-mint"
+    )
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=unique_field_name(),
+        owner_biosample_id_value="Sample 1",
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["owner_id_biosample_study_field_created"] is True
+    flagged = await ctx["pool"].fetchval(
+        "SELECT unique_in_study FROM qiita.biosample_study_field WHERE idx = $1",
+        resp.json()["owner_id_biosample_study_field_idx"],
+    )
+    assert flagged is True
+
+
+async def test_import_biosample_rejects_owner_id_field_not_unique_in_study(ctx):
+    """Tests the case where the named field already exists without the policy:
+    the import is refused rather than treating a field that guarantees no
+    distinctness as the owner's identifier.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="uniq-unflagged"
+    )
+    field_name = unique_field_name()
+    created = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={"display_name": field_name, "data_type": "text"},
+    )
+    assert created.status_code == 201, created.text
+    ctx["created"]["biosample_study_field"].append(created.json()["biosample_study_field_idx"])
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=field_name,
+        owner_biosample_id_value="Sample 1",
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "is not unique within this study" in resp.json()["detail"]
+
+
+async def test_import_biosample_accepts_owner_id_field_already_unique_in_study(ctx):
+    """Tests the case where the named field already exists WITH the policy:
+    the import proceeds, so declaring the field up front is a supported flow.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="uniq-preflagged"
+    )
+    field_name = unique_field_name()
+    created = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={"display_name": field_name, "data_type": "text", "unique_in_study": True},
+    )
+    assert created.status_code == 201, created.text
+    ctx["created"]["biosample_study_field"].append(created.json()["biosample_study_field_idx"])
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=field_name,
+        owner_biosample_id_value="Sample 1",
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["owner_id_biosample_study_field_created"] is False
+
+
+async def test_import_biosample_rejects_repeated_owner_id_in_one_study(ctx):
+    """Tests the case where a second biosample claims an owner id the study
+    already holds: the refusal names the value, not a generic conflict.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="uniq-repeat"
+    )
+    field_name = unique_field_name()
+    first = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=field_name,
+        owner_biosample_id_value="Sample 1",
+    )
+    assert first.status_code == 201, first.text
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=field_name,
+        owner_biosample_id_value="Sample 1",
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "already used by another biosample in this study" in resp.json()["detail"]
+
+
+async def test_import_biosample_allows_same_owner_id_in_another_study(ctx):
+    """Tests the case where one owner names samples the same way in two
+    studies: the policy is per-study, so the second study is unaffected by
+    the first's values.
+    """
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    first_study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="uniq-study-a")
+    second_study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="uniq-study-b")
+    field_name = unique_field_name()
+
+    for study_idx in (first_study_idx, second_study_idx):
+        resp = await _post_biosample(
+            ctx["wet"],
+            ctx,
+            study_idx,
+            owner_idx=wet_idx,
+            owner_biosample_id_field_name=field_name,
+            owner_biosample_id_value="Sample 1",
+        )
+        assert resp.status_code == 201, resp.text

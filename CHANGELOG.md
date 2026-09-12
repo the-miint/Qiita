@@ -21,6 +21,16 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A biosample's owner-submitted identifier must be unique within its study.** The
+  import mints the owner-id field declaring that policy, and refuses to write
+  through a field of that name that does not declare it — a field guaranteeing no
+  distinctness cannot serve as the identifier the study names its samples by. A
+  second biosample claiming an identifier the study already holds is refused and
+  told which value repeated; the same identifier in a different study is
+  untouched, since the policy is scoped to one study's own field. Owner-id fields
+  minted before this rule are brought up to it by migration, which aborts on any
+  study whose samples already share an identifier rather than picking a winner.
+
 - **A study can edit a field definition it already minted.** `PATCH
   /api/v1/study/{study_idx}/biosample-field/{study_field_idx}` and its
   prep-sample twin change a field's display name, description, required flag,

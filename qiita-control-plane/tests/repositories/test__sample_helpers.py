@@ -2524,7 +2524,7 @@ async def test__get_or_create_local_study_field_creates_purely_local(ctx, spec):
 
     # Create a new local field with required=True (composer's intended use).
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        idx, created, resolved_global_field_idx = await _get_or_create_local_study_field(
+        idx, created, resolved_row = await _get_or_create_local_study_field(
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
@@ -2538,7 +2538,7 @@ async def test__get_or_create_local_study_field_creates_purely_local(ctx, spec):
     # global_field_idx is None because the create branch always produces a
     # purely-local row.
     assert created is True
-    assert resolved_global_field_idx is None
+    assert resolved_row[spec.study_field_global_fk_column] is None
 
     # Verify the row reflects the local-field defaults plus the explicit required.
     row = await ctx["pool"].fetchrow(
@@ -2634,7 +2634,7 @@ async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
         (
             first_idx,
             first_created,
-            first_global_field_idx,
+            first_row,
         ) = await _get_or_create_local_study_field(
             conn,
             spec=spec,
@@ -2645,7 +2645,7 @@ async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
         (
             second_idx,
             second_created,
-            second_global_field_idx,
+            second_row,
         ) = await _get_or_create_local_study_field(
             conn,
             spec=spec,
@@ -2657,13 +2657,15 @@ async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
 
     # First call inserts (created=True); second call resolves via the
     # fallback SELECT branch (created=False) and converges on the same idx.
-    # Both calls resolve to a purely-local row, so the global_field_idx
-    # element is None in both.
+    # Both calls resolve to a purely-local row, so the global FK is None on
+    # both returned rows — and the create and lookup branches describe the
+    # same row identically, which is what lets a caller judge either one.
     assert first_created is True
     assert second_created is False
     assert first_idx == second_idx
-    assert first_global_field_idx is None
-    assert second_global_field_idx is None
+    assert first_row[spec.study_field_global_fk_column] is None
+    assert second_row[spec.study_field_global_fk_column] is None
+    assert dict(first_row) == dict(second_row)
 
     # Confirm the DB only has one row for this (study, display_name).
     count = await ctx["pool"].fetchval(

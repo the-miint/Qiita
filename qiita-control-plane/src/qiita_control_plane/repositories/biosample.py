@@ -20,6 +20,7 @@ from . import require_transaction, update_row
 from ._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     SampleEntityKind,
+    StudyFieldNotUniqueInStudyError,
     _get_or_create_local_study_field,
     assert_required_global_fields_supplied,
     fetch_missing_value_reason_idxs_by_names,
@@ -418,7 +419,7 @@ async def import_biosample_from_owner_biosample_id(
     (
         field_idx,
         field_created,
-        resolved_global_field_idx,
+        resolved_row,
     ) = await _get_or_create_local_study_field(
         conn,
         spec=BIOSAMPLE_METADATA_SPEC,
@@ -427,18 +428,35 @@ async def import_biosample_from_owner_biosample_id(
         created_by_idx=caller_idx,
         required=True,
         tier_override=OWNER_BIOSAMPLE_ID_TIER_OVERRIDE,
+        unique_in_study=True,
     )
     # The owner-biosample-id row is purely-local PII. If get-or-create
     # resolved an already globally-linked field at this
     # (study, display_name), refuse rather than write the value through
     # a cross-study global slot.
-    if resolved_global_field_idx is not None:
+    if resolved_row[BIOSAMPLE_METADATA_SPEC.study_field_global_fk_column] is not None:
         raise LocalWriteOnGloballyLinkedFieldError(
             entity_kind=SampleEntityKind.BIOSAMPLE,
             study_idx=primary_study_idx,
             display_name=owner_biosample_id_field_name,
             study_field_idx=field_idx,
-            found_global_field_idx=resolved_global_field_idx,
+            found_global_field_idx=resolved_row[
+                BIOSAMPLE_METADATA_SPEC.study_field_global_fk_column
+            ],
+        )
+
+    # An owner's identifier for a sample only identifies it if the study's
+    # other samples cannot carry the same one, so this write requires the
+    # policy rather than assuming it. A field minted here declares it; one
+    # minted before the policy existed, or by a caller who chose not to, is
+    # refused rather than silently used as an identifier it does not
+    # guarantee.
+    if not resolved_row["unique_in_study"]:
+        raise StudyFieldNotUniqueInStudyError(
+            entity_kind=SampleEntityKind.BIOSAMPLE,
+            study_idx=primary_study_idx,
+            display_name=owner_biosample_id_field_name,
+            study_field_idx=field_idx,
         )
 
     await insert_owner_biosample_id_metadata(

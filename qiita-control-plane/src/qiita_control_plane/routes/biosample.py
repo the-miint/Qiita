@@ -62,6 +62,9 @@ from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx
 from ..repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     MetadataMissingRequiredFieldsError,
+    StudyFieldNotUniqueInStudyError,
+    UniqueInStudyViolation,
+    classify_unique_in_study_violation,
     fetch_global_fields,
     fetch_global_metadata,
     fetch_study_fields_for_study,
@@ -242,7 +245,34 @@ async def import_biosample(
                     " already bound to a global field on this study"
                 ),
             )
+        except StudyFieldNotUniqueInStudyError as exc:
+            # The named field exists on this study but does not declare that
+            # its values are unique within it, so it cannot serve as the
+            # owner's identifier. Resolving it is the study's call — make that
+            # field unique, or name a different one — so the refusal says which
+            # field rather than choosing for them.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"owner_biosample_id_field_name {exc.display_name!r} is not unique"
+                    " within this study; make it unique or name a different field"
+                ),
+            )
         except asyncpg.UniqueViolationError as exc:
+            # A repeated owner id inside one study trips the field's own
+            # uniqueness index rather than any of the biosample-level
+            # constraints, and the generic message would not say so.
+            if (
+                classify_unique_in_study_violation(exc, spec=BIOSAMPLE_METADATA_SPEC)
+                is UniqueInStudyViolation.DUPLICATE_VALUE
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"owner_biosample_id_value {body.owner_biosample_id_value!r} is"
+                        " already used by another biosample in this study"
+                    ),
+                )
             raise_for_unique_violation(
                 exc,
                 constraint_messages=_UNIQUE_VIOLATION_MESSAGES,

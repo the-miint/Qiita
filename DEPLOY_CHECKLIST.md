@@ -23,7 +23,32 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- **[operator] `make migrate` can abort on duplicate owner biosample ids, and that is a data
+  finding, not a migration bug.** `20260911000000_owner_biosample_id_unique_in_study.sql` makes
+  every existing owner-biosample-id field unique within its study. It fails, and rolls back, for
+  any study whose samples already share an owner id. List them with:
+
+  ```sql
+  SELECT sf.study_idx,
+         sf.idx   AS study_field_idx,
+         sf.display_name,
+         m.value_text,
+         count(*) AS biosample_count
+    FROM qiita.biosample_study_field sf
+    JOIN qiita.biosample_metadata m
+      ON m.biosample_study_field_idx = sf.idx
+     AND m.is_owner_biosample_id
+   WHERE sf.biosample_global_field_idx IS NULL
+     AND NOT sf.unique_in_study
+   GROUP BY sf.study_idx, sf.idx, sf.display_name, m.value_text
+  HAVING count(*) > 1
+   ORDER BY sf.study_idx, m.value_text;
+  ```
+
+  Each row is two or more samples in one study answering to the same owner id, so at least one is
+  mislabelled. Resolving that is the study's decision, not a deploy step: take it back to the
+  study before re-running the migration. Deploying without this migration is not an option — the
+  code refuses imports into any study whose owner-id field is still unflagged.
 
 ### 4. Deploy
 
