@@ -2,8 +2,8 @@
 # metaWRAP binning of the noLCG contigs with three binners (metabat2 + maxbin2 +
 # concoct). Output `bins_dir` =
 # $QIITA_OUTPUT_PATH/bins/{metabat2_bins,maxbin2_bins,concoct_bins}/ (whichever
-# binners produced anything). No contigs, or no bins at all, leaves an empty
-# bins_dir — bin_refine handles that.
+# binners produced anything). With no contigs, or no bins, the step still finishes
+# with bins_dir, and bin_refine handles that.
 #
 # COVERAGE COMES FROM minimap2, NOT bwa — read this before touching work_files/.
 #
@@ -194,15 +194,50 @@ if [[ "${n_ordered}" -ne "${n_nolcg}" ]]; then
     exit 65
 fi
 
-# A single binner finding nothing is non-fatal — bin_refine consolidates whatever
-# bin dirs exist. Only a hard metaWRAP crash should fail the step, so we let its
-# real exit code through except for the empty-result case metaWRAP signals with a
-# clean run and no bins.
-# -m 90 (not 100): the step's SLURM allocation is 100 GB (baseline_resources), so
-# cap metaWRAP below it to leave ~10 GB headroom for its Python/aligner runtime
-# (else it can OOM-kill at the cgroup boundary).
+# metaWRAP's -m (GB) is MEM_MB (see _lib.sh) less METAWRAP_HEADROOM_GB, the part of
+# the allocation left out of -m. Re-run on one completed ticket's inputs at -m 4, 70
+# and 90, and on another's at -m 70, this step gave MaxBin2 and CONCOCT bins identical
+# to production's at -m 90; MetaBAT2's differed even between two runs at -m 90. With
+# 10 GB of headroom, long-read-assembly 1.0.0's 100 GB baseline, which runs this
+# script too, gets -m 90. A MEM_MB that leaves -m under 1, _lib.sh's fallback among
+# them, is refused rather than passed to metaWRAP.
+METAWRAP_HEADROOM_GB=10
+METAWRAP_MEM_GB=$(( MEM_MB / 1024 - METAWRAP_HEADROOM_GB ))
+if (( METAWRAP_MEM_GB < 1 )); then
+    echo "binning: MEM_MB=${MEM_MB} leaves no memory for metaWRAP's -m after" >&2
+    echo "         ${METAWRAP_HEADROOM_GB} GB of headroom. The SLURM payload sets QIITA_MEM_MB;" >&2
+    echo "         to run outside it, export QIITA_MEM_MB as the memory available in MB." >&2
+    exit 78
+fi
+# metaWRAP exits non-zero when any binner fails, and stops there. MaxBin2 fails on an
+# assembly whose contigs carry too few marker genes; when MetaBAT2 also formed no
+# bins, the step finishes with no bins instead of failing. The three lines matched
+# below are that outcome, verbatim from the step log's stdout, where metaWRAP writes
+# all three; tee copies stdout without changing what the job log receives. Any other
+# non-zero exit is passed through, with a line on stderr naming metaWRAP: the ticket's
+# stored failure reason is read from stderr, and metaWRAP writes its failure messages to
+# stdout. `micromamba run` returns metaWRAP's exit status unchanged (micromamba 1.5.8,
+# this image's base: a child's exit 3, exit 1 and SIGKILL came back as 3, 1 and 137).
+# Of the 528 binning logs on the deploy's scratch on 2026-09-11, only the two runs that
+# failed this way carry any of these lines.
+METAWRAP_STDOUT="${WORK}/metawrap.stdout"
+set +e
 micromamba run -n metawrap metawrap binning \
-    -a "${ORDERED_NOLCG}" -o "${OUT}" -t "${THREADS}" -m 90 -l 16000 \
-    --single-end --metabat2 --maxbin2 --concoct --universal "${READS_FQ}"
+    -a "${ORDERED_NOLCG}" -o "${OUT}" -t "${THREADS}" -m "${METAWRAP_MEM_GB}" -l 16000 \
+    --single-end --metabat2 --maxbin2 --concoct --universal "${READS_FQ}" \
+    | tee "${METAWRAP_STDOUT}"
+metawrap_rc=${PIPESTATUS[0]}
+set -e
+if (( metawrap_rc != 0 )); then
+    if grep -qxF '0 bins (0 bases in total) formed.' "${METAWRAP_STDOUT}" \
+        && grep -qxF 'Marker gene search reveals that the dataset cannot be binned (the medium of marker gene number <= 1). Program stop.' "${METAWRAP_STDOUT}" \
+        && grep -qF 'Something went wrong with running MaxBin2. Exiting.' "${METAWRAP_STDOUT}"; then
+        echo "binning: MetaBAT2 formed no bins and MaxBin2 found the dataset cannot be binned; finishing with no bins." >&2
+        qiita_finish bins_dir=bins
+        exit 0
+    fi
+    echo "binning: metaWRAP failed (exit ${metawrap_rc}), not with MetaBAT2 forming no bins and MaxBin2 declining the assembly; its messages are in the step's logs (qiita ticket logs)." >&2
+    exit "${metawrap_rc}"
+fi
 
 qiita_finish bins_dir=bins

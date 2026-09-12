@@ -2333,9 +2333,9 @@ fn transact_with_retry<T>(
 struct Registration {
     /// Permanent lake paths registered, in payload iteration order.
     registered: Vec<String>,
-    /// Rows the replace-by-key pass removed, per table — non-zero entries only.
-    /// Empty when nothing this call registered was a `REPLACE_KEY_TABLES`
-    /// target, or when every key it carried was new to the lake.
+    /// Rows the replace passes removed, per table — non-zero entries only. Empty
+    /// when no `REPLACE_KEY_TABLES` key this call carried was already in the lake
+    /// and this ticket had registered none of its `read` prep_samples before.
     ///
     /// Rides back to the control plane in the DoAction body, which logs it: a
     /// delete nothing recorded is the one thing an operator reconciling row
@@ -2345,15 +2345,17 @@ struct Registration {
 
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
 ///
-/// Validates all requested files exist in staging, moves them to permanent
-/// locations under `data_path/{table_name}/`, then attaches DuckLake and
-/// registers the moved files.
+/// Validates all requested files exist in staging, attaches DuckLake, moves the
+/// files to permanent locations under `data_path/{table_name}/`, and registers
+/// them.
 ///
 /// Uses `std::fs::rename` with a copy+delete fallback for cross-filesystem moves
 /// (e.g., SLURM local scratch → shared NFS).
 ///
 /// Some tables are REPLACED on their key rather than appended to — see
-/// `REPLACE_KEY_TABLES` for which, and why.
+/// `REPLACE_KEY_TABLES` for which, and why. The `read` rows a ticket registered
+/// before for a staged prep_sample are replaced too; the comment at that lookup
+/// says why.
 ///
 /// Note: the action token is scoped to staging_dir + files, not to a specific
 /// reference_idx. The control plane is responsible for issuing tokens only for
@@ -2402,6 +2404,25 @@ fn register_files(
         }
     }
 
+    // Tables are ensured at startup in main.rs.
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    // `read` is not replace-keyed, and DuckLake enforces no uniqueness. A ticket
+    // re-runs a step in a new attempt dir under its own workspace, so its second
+    // registration of a prep_sample's reads arrives from a new staging dir:
+    // `lake_dest_filename` mints a new name and `move_file` has nothing to refuse.
+    // The rows this ticket registered before for the staged prep_samples are
+    // deleted in the registration transaction below. Only files named for this
+    // ticket are deleted from, so rows another ticket registered are left as they
+    // are.
+    let staged_read = staged_read_prep_samples(&conn, staging, &payload.files)?;
+    let replace_read_files =
+        ticket_read_files_in_lake(&conn, payload.work_ticket_idx, &staged_read)?;
+    let replace_read_prep_samples: Vec<i64> = staged_read.into_iter().collect();
+
     // One scope key for the whole registration; it does not vary per file.
     let scope = staging_scope(&payload.staging_dir, scratch_root);
 
@@ -2448,12 +2469,6 @@ fn register_files(
             .to_string();
         moved.push((table.clone(), dest_str));
     }
-
-    // Register in DuckLake. Tables are ensured at startup in main.rs.
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
     // Replace-by-key the `REPLACE_KEY_TABLES` targets, then register every moved
     // file, in ONE DuckLake transaction so the catalog update is all-or-nothing
@@ -2520,6 +2535,18 @@ fn register_files(
         })
         .collect();
     let takes_lock = !incoming.is_empty();
+    // The `read` rows this ticket registered before (the lookup above the moves
+    // says why). The delete names the files that lookup found rather than matching
+    // a name pattern in SQL, so `lake_file_ticket` stays the one reader of a ticket
+    // out of a file name. Loop-invariant, so built outside the retry; the file
+    // paths are bound.
+    let read_replace_sql = (!replace_read_files.is_empty()).then(|| {
+        format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({}) AND filename IN ({})",
+            sql_i64_list(&replace_read_prep_samples),
+            vec!["?"; replace_read_files.len()].join(", ")
+        )
+    });
 
     let registration = transact_with_retry(
         &conn,
@@ -2548,6 +2575,18 @@ fn register_files(
                     replaced.insert(entry.table, deleted);
                 }
             }
+            if let Some(sql) = &read_replace_sql {
+                let params: Vec<&dyn duckdb::ToSql> = replace_read_files
+                    .iter()
+                    .map(|file| file as &dyn duckdb::ToSql)
+                    .collect();
+                let deleted = conn.execute(sql, params.as_slice()).map_err(|e| {
+                    Status::internal(format!("replace delete failed for read: {e}"))
+                })?;
+                if deleted > 0 {
+                    replaced.insert("read", deleted);
+                }
+            }
 
             let mut registered = Vec::new();
             for (table, dest) in &moved {
@@ -2570,6 +2609,99 @@ fn register_files(
     )?;
 
     Ok(registration)
+}
+
+/// The prep_samples the staged `read` files hold. Files headed for other tables
+/// are not opened. A row with a NULL `prep_sample_idx` is refused: the replace
+/// could never match it.
+fn staged_read_prep_samples(
+    conn: &duckdb::Connection,
+    staging: &std::path::Path,
+    files: &std::collections::HashMap<String, String>,
+) -> Result<std::collections::BTreeSet<i64>, Status> {
+    let mut prep_samples = std::collections::BTreeSet::new();
+    for (filename, table) in files {
+        if table != "read" {
+            continue;
+        }
+        let path = staging.join(filename);
+        let path = path
+            .to_str()
+            .ok_or_else(|| Status::invalid_argument(format!("non-UTF-8 path: {filename}")))?;
+        let read_failed =
+            |e: duckdb::Error| Status::internal(format!("failed to read {filename}: {e}"));
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT prep_sample_idx FROM read_parquet(?)")
+            .map_err(read_failed)?;
+        let found = stmt
+            .query_map(duckdb::params![path], |r| r.get::<_, Option<i64>>(0))
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .map_err(read_failed)?;
+        for prep_sample in found {
+            let prep_sample = prep_sample.ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "read file {filename} has rows with a NULL prep_sample_idx"
+                ))
+            })?;
+            prep_samples.insert(prep_sample);
+        }
+    }
+    Ok(prep_samples)
+}
+
+/// The lake files under `read` that `work_ticket_idx` registered and that hold
+/// rows of any of `prep_samples`.
+fn ticket_read_files_in_lake(
+    conn: &duckdb::Connection,
+    work_ticket_idx: i64,
+    prep_samples: &std::collections::BTreeSet<i64>,
+) -> Result<Vec<String>, Status> {
+    if prep_samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: Vec<i64> = prep_samples.iter().copied().collect();
+    let lookup_failed =
+        |e: duckdb::Error| Status::internal(format!("failed to look up read files: {e}"));
+    // `filename` is the data file each row is read from.
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT DISTINCT filename FROM qiita_lake.read WHERE prep_sample_idx IN ({})",
+            sql_i64_list(&wanted)
+        ))
+        .map_err(lookup_failed)?;
+    let files = stmt
+        .query_map([], |r| r.get::<_, Option<String>>(0))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map_err(lookup_failed)?;
+    Ok(files
+        .into_iter()
+        .flatten()
+        .filter(|file| lake_file_ticket(file) == Some(work_ticket_idx))
+        .collect())
+}
+
+/// Comma-separated `i64` literals for a SQL `IN (…)` list. The values are
+/// integers, so inlining them carries no injection surface.
+fn sql_i64_list(values: &[i64]) -> String {
+    values
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The work ticket a lake data file was registered under, read from the
+/// [`LAKE_FILE_TICKET_PREFIX`]`<work_ticket_idx>-` start that `lake_dest_filename`
+/// gives it. `None` for a file not named that way.
+fn lake_file_ticket(path: &str) -> Option<i64> {
+    let name = std::path::Path::new(path).file_name()?.to_str()?;
+    let (digits, _) = name
+        .strip_prefix(LAKE_FILE_TICKET_PREFIX)?
+        .split_once('-')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Delete every DuckLake row belonging to a reference.
@@ -2881,9 +3013,7 @@ fn sync_reference_exclusion(
 /// owns file lifecycle; orphan parquets are reclaimed by a future maintenance
 /// pass). Idempotent: an empty set, or a set whose rows are already gone,
 /// returns zero counts. The `prep_sample_idxs` are `i64` parsed from the
-/// Ed25519-signed payload, so inlining them into the `IN (...)` list carries no
-/// injection surface and avoids per-row parameter binding for the large
-/// (hundreds of prep_samples) pool case.
+/// Ed25519-signed payload and inlined through `sql_i64_list`.
 fn delete_pool_reads(
     catalog_connstr: &str,
     data_path: &str,
@@ -2904,12 +3034,7 @@ fn delete_pool_reads(
     ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
         .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
-    // i64 literals — no injection surface (see fn docs).
-    let in_list = prep_sample_idxs
-        .iter()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let in_list = sql_i64_list(prep_sample_idxs);
 
     // Both deletes run in one transaction so the action is all-or-nothing and
     // retriable: a mid-delete failure rolls both tables back rather than
@@ -3247,6 +3372,10 @@ fn delete_alignment_sample(
     }))
 }
 
+/// The start of every lake file name [`lake_dest_filename`] mints, ahead of the
+/// work ticket id.
+const LAKE_FILE_TICKET_PREFIX: &str = "wt";
+
 /// Mint a unique, ticket-traceable lake-storage filename for a registered
 /// Parquet.
 ///
@@ -3258,7 +3387,9 @@ fn delete_alignment_sample(
 /// table name — still distinguishes files within one registration; the two
 /// components below separate one registration from another:
 ///
-/// * `wt{work_ticket_idx}` traces the file back to the ticket that wrote it.
+/// * `wt{work_ticket_idx}` ([`LAKE_FILE_TICKET_PREFIX`]) traces the file back to
+///   the ticket that wrote it. `lake_file_ticket` reads the ticket back out, and
+///   `register_files` decides a `read` re-registration on it.
 /// * A digest of the registration's staging dir separates two loads from ONE
 ///   ticket. A ticket can load twice: a redrive replays its storage tail, and
 ///   the ticket alone yields the byte-identical path the first load already
@@ -3292,7 +3423,7 @@ fn lake_dest_filename(work_ticket_idx: i64, scope: &str, basename: &str) -> Stri
     // (`max_retries` bounds them). A collision lands on move_file's
     // AlreadyExists, not a silent clobber.
     let hex: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
-    format!("wt{work_ticket_idx}-{hex}-{basename}")
+    format!("{LAKE_FILE_TICKET_PREFIX}{work_ticket_idx}-{hex}-{basename}")
 }
 
 /// The part of a registration's staging dir that identifies WHICH registration

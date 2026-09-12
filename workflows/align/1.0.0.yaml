@@ -124,12 +124,6 @@ steps:
     # per-run `--mem-gb` do reach DuckDB — minus the helper's per-thread headroom and
     # the job's co-consumer reserve, so DuckDB's own limit lands BELOW this number,
     # not at it.
-    #
-    # Both axes sit AT `action_ceiling`. For memory that means the FIRST OOM is
-    # terminal: escalation has no headroom to grow into, so the ticket fails rather
-    # than retrying larger. (There is no cpu-escalation mechanism at all, so nothing
-    # is given up on that axis.) walltime keeps its headroom (PT4H baseline under a
-    # PT8H ceiling) so a TIMEOUT still escalates.
     baseline_resources:
       cpu: 8
       mem_gb: 64
@@ -173,5 +167,5 @@ steps:
 
 action_ceiling:
   cpu: 8
-  mem_gb: 64
+  mem_gb: 128
   walltime: PT8H

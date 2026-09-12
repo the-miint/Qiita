@@ -133,9 +133,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   kind, bin_id)` — the subject CheckM scored, with no `feature_idx` — and a feature
   table is keyed `genome_idx`, which exists only on the Postgres
   `qiita.assembly_membership`. Joining the streamed rows through `feature_idx` instead
-  gives a wrong answer rather than a slower one: an assembler can emit one sequence as
-  both a circular LCG and a member of a refined bin, so one contig carries two genomes
-  of one run and the contig-keyed map cannot say which subject a score belongs to.
+  would give a wrong answer rather than a slower one wherever one contig carries two
+  genomes of one run: the contig-keyed map cannot say which subject a score belongs to.
 
   So the bridge is read from Postgres and the join happens control-plane side, at
   submit. `bin_quality` joins `ALLOWED_TABLES`, refused by `build_bin_quality_query`
@@ -1788,6 +1787,21 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **long-read-assembly: binning no longer fails when MetaBAT2 forms no bins and MaxBin2 declines the assembly (#561).**
+  metaWRAP exits non-zero when any binner fails, and MaxBin2 fails on an assembly whose
+  contigs carry too few marker genes, so a prep_sample with such an assembly failed the
+  `binning` step and its contigs were never registered. `binning.sh` now copies metaWRAP's
+  stdout and, when it shows that MetaBAT2 formed no bins and MaxBin2 found the dataset
+  cannot be binned, finishes the step with no bins for `bin_refine`. Any other metaWRAP
+  failure still fails the step, now with a line on stderr naming metaWRAP, so the ticket's
+  stored failure reason says which tool failed and where its messages are.
+- **A work ticket that registers the same reads twice no longer stores them twice (#559).**
+  A ticket re-runs a step in a new `attempt-N` directory, so a second `register_files` for
+  the same reads arrived from a new staging dir, got a new lake filename, and was appended
+  to `read`: 5 rows became 10 in the reproducing test. `register_files` now reads which
+  prep_samples the staged `read` files hold and, in the registration transaction, deletes
+  the rows the same ticket registered for them before; the count comes back in `replaced`.
+  Rows other tickets registered are not touched.
 - **Three cross-references named things that do not exist (#538).**
   `build_minimap2_index`'s module docstring said its two modes mirror `build_rype_index`,
   which is whole-reference only and has no shard mode; the comment above its shard `plan()`
@@ -3535,6 +3549,41 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **`align/1.0.0`'s memory ceiling is 128 GB, above the `align_sharded` step's
+  unchanged 64 GB baseline (#560).** With the ceiling equal to the baseline, OOM
+  escalation had no larger size to grow to, so the step's first OOM failed its ticket
+  permanently. The first OOM now retries at 128 GB; an OOM at 128 GB still fails the
+  ticket. `align_sharded` defines no `plan()`, so ordinary tickets still request 64 GB.
+
+- **`analytic/reconcile.py`'s de novo map docstrings cite `qiita.assembly_membership`
+  on the deploy instead of an unprobed assembler behaviour (#558).**
+  `denovo_map_table_sql` no longer says an assembler can emit one sequence as both a
+  circular LCG and a refined bin's member; on 2026-09-10 the table held one row per
+  (prep_sample, assembly run, contig) triple, so no contig sat under two subjects of
+  one prep_sample's run, though 364 of that table's 400 (prep_sample, assembly run)
+  pairs held LCG rows and MAG rows — evidence the case does not arise in practice, not
+  a proof it cannot. Its one-run scoping paragraph and `denovo_map_join` gain that
+  date's repeat figures: 866,345 triples beyond one per (prep_sample, contig) pair,
+  and 77 contigs under two or more prep_samples of one run.
+  `export_assembly_member_genome`'s docstring drops "legitimately", and the
+  `bin_quality` entry under Added no longer states the assembler behaviour.
+  Comment-only.
+
+- **`long-read-assembly/1.0.1` resource baselines are sized from its three cohorts of
+  runs, and `binning.sh` derives metaWRAP's `-m` from the allocation (#557).**
+  `bin_refine` mem_gb 32 → 12 and walltime PT4H → PT2H30M (peak 6.78 GiB, longest run
+  1:12:17); `checkm` walltime PT4H → PT3H (longest run 2:03:10); `binning` mem_gb 100 →
+  80 and walltime PT8H → PT12H (longest run 7:44:43, 97% of the PT8H it replaces), where
+  80 is 1.42x the latest cohort's 56.16 GiB peak and below one earlier run's 82.77 GiB;
+  the `assemble` step's myloasm profile walltime PT16H → PT15H (longest run 7:05:35). CPU
+  counts, `assemble`'s and `checkm`'s memory, and the hifiasm_meta profile are unchanged.
+  On a standard node `binning` and `bin_refine` stay cpu-bound after their memory cuts, so
+  neither admits more runs of itself; each releases node memory to other steps.
+  `binning.sh` passes metaWRAP `-m` as the step's `MEM_MB` less 10 GB rather than a
+  literal, so a per-run `--mem-gb` or an OOM escalation raises the `-m` metaWRAP is given
+  along with the allocation. 1.0.0 shares the binning image; at its 100 GB baseline it is
+  `-m 90`.
 
 - **The Python Parquet writers that spelled their codec inline now name the shared
   constant (#550).** `PARQUET_COMPRESSION` / `PARQUET_COMPRESSION_INTERMEDIATE` were

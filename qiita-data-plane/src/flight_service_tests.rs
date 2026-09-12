@@ -1317,6 +1317,33 @@ fn lake_dest_filename_separates_redrives_of_one_ticket() {
     }
 }
 
+// `register_files` reads a lake file's ticket back out of the name
+// `lake_dest_filename` gave it, so the two have to agree on the format — for the
+// current name and for the pre-digest `wt<ticket>-<basename>` that files
+// registered earlier still carry.
+#[test]
+fn lake_file_ticket_reads_back_the_ticket_lake_dest_filename_wrote() {
+    let name = lake_dest_filename(
+        6939,
+        "ticket/6939/ingest/attempt-1/output",
+        "part_00000.parquet",
+    );
+    assert_eq!(lake_file_ticket(&format!("/lake/read/{name}")), Some(6939));
+    assert_eq!(
+        lake_file_ticket("/lake/read/wt6939-part_00000.parquet"),
+        Some(6939),
+        "pre-digest name"
+    );
+    for unnamed in [
+        "/lake/read/ducklake-0193a1.parquet",
+        "/lake/read/wt-part_00000.parquet",
+        "/lake/read/wtx1-part_00000.parquet",
+        "/lake/read/part_00000.parquet",
+    ] {
+        assert_eq!(lake_file_ticket(unnamed), None, "{unnamed}");
+    }
+}
+
 // PATH_SCRATCH is host configuration: a migration, a remount, or a
 // differently laid-out replacement host changes it without changing which
 // registration a staging dir denotes. Keying the digest on the absolute path
@@ -2142,6 +2169,362 @@ fn register_one_parquet(
 #[cfg(feature = "integration")]
 fn lake_count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+/// One ticket registering the same reads twice, from two staging dirs, leaves
+/// one copy in `read`: the second load replaces the first.
+///
+/// `register_one_parquet` stages into a fresh tempdir on every call, which is
+/// what a ticket's re-run hands `register_files`: a different staging dir under
+/// the same ticket.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_re_registering_a_tickets_reads_leaves_one_copy() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+
+    let prep_sample: i64 = 972_556;
+    let ticket: i64 = 972_100_000 + std::process::id() as i64;
+    let clear = format!("DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample}");
+    let count =
+        format!("SELECT count(*) FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample}");
+    let live_files = format!(
+        "SELECT count(DISTINCT filename) FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample}"
+    );
+
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+        conn.execute_batch(&clear).unwrap();
+    }
+
+    let reads = read_rows_sql(prep_sample, 1000, 5);
+    for load in 0..2 {
+        let registration = register_one_parquet(&connstr, &data_path, "read", &reads, ticket);
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        assert_eq!(lake_count(&reader, &count), 5, "rows after load {load}");
+        assert_eq!(
+            lake_count(&reader, &live_files),
+            1,
+            "files holding the prep_sample after load {load}"
+        );
+        assert_eq!(
+            registration.registered.len(),
+            1,
+            "load {load} registers its file"
+        );
+        assert_eq!(
+            registration.replaced.get("read").copied(),
+            if load == 0 { None } else { Some(5) },
+            "rows load {load} replaced"
+        );
+    }
+
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+    let _ = reader.execute_batch(&clear);
+}
+
+/// `n` single-end reads for `prep_sample`, with contiguous `sequence_idx`
+/// starting at `first`, in the `read` table's column order.
+fn read_rows_sql(prep_sample: i64, first: i64, n: i64) -> String {
+    format!(
+        "SELECT {prep_sample}::BIGINT AS prep_sample_idx, i::BIGINT AS sequence_idx, \
+         'read' || i AS read_id, 'ACGT' AS sequence1, [30, 30, 30, 30]::UTINYINT[] AS qual1, \
+         NULL::VARCHAR AS sequence2, NULL::UTINYINT[] AS qual2 \
+         FROM range({first}, {first} + {n}) t(i)"
+    )
+}
+
+/// Stage each `(name, SELECT)` as `read/<name>.parquet`, the per-prep_sample layout
+/// `ingest_reads` produces. Returns the staging dir and a payload's `files`.
+fn stage_read_files(
+    parts: &[(&str, String)],
+) -> (tempfile::TempDir, std::collections::HashMap<String, String>) {
+    let staging = tempfile::tempdir().unwrap();
+    std::fs::create_dir(staging.path().join("read")).unwrap();
+    let writer = Connection::open_in_memory().unwrap();
+    let mut files = std::collections::HashMap::new();
+    for (name, values_sql) in parts {
+        let rel = format!("read/{name}.parquet");
+        writer
+            .execute_batch(&format!(
+                "COPY ({values_sql}) TO '{}' (FORMAT PARQUET)",
+                staging.path().join(&rel).to_str().unwrap()
+            ))
+            .unwrap();
+        files.insert(rel, "read".to_string());
+    }
+    (staging, files)
+}
+
+#[test]
+fn staged_read_prep_samples_collects_every_staged_read_prep_sample() {
+    let spanning = format!(
+        "{} UNION ALL {}",
+        read_rows_sql(33, 300, 2),
+        read_rows_sql(44, 400, 2)
+    );
+    let (staging, mut files) = stage_read_files(&[
+        ("a", read_rows_sql(11, 100, 3)),
+        ("b", read_rows_sql(22, 200, 2)),
+        ("spanning", spanning),
+        ("empty", read_rows_sql(55, 500, 0)),
+    ]);
+    // Other tables in the same registration are not read.
+    files.insert("read_mask.parquet".to_string(), "read_mask".to_string());
+    let conn = Connection::open_in_memory().unwrap();
+    let prep_samples = staged_read_prep_samples(&conn, staging.path(), &files).unwrap();
+    assert_eq!(
+        prep_samples,
+        std::collections::BTreeSet::from([11, 22, 33, 44])
+    );
+}
+
+#[test]
+fn staged_read_prep_samples_refuses_a_null_prep_sample_idx() {
+    let null_row = read_rows_sql(0, 1, 1).replacen(
+        "0::BIGINT AS prep_sample_idx",
+        "NULL::BIGINT AS prep_sample_idx",
+        1,
+    );
+    assert!(
+        null_row.contains("NULL::BIGINT AS prep_sample_idx"),
+        "{null_row}"
+    );
+    let (staging, files) = stage_read_files(&[("null", null_row)]);
+    let conn = Connection::open_in_memory().unwrap();
+    let err = staged_read_prep_samples(&conn, staging.path(), &files)
+        .expect_err("a NULL prep_sample_idx is refused");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+    assert!(err.message().contains("read/null.parquet"), "{err}");
+}
+
+/// Register `stage_read_files`' output as ONE call.
+#[cfg(feature = "integration")]
+fn register_read_files(
+    connstr: &str,
+    data_path: &str,
+    parts: &[(&str, String)],
+    ticket: i64,
+) -> Result<Registration, Status> {
+    let (staging, files) = stage_read_files(parts);
+    let payload = auth::ActionPayload {
+        action: "register_files".to_string(),
+        staging_dir: staging.path().to_str().unwrap().to_string(),
+        files,
+        work_ticket_idx: ticket,
+    };
+    register_files(connstr, data_path, std::path::Path::new("/"), &payload)
+}
+
+/// A registration carrying one prep_sample this ticket registered before and one
+/// new prep_sample replaces the first and adds the second.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_decides_per_read_prep_sample() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+
+    let held: i64 = 972_557;
+    let new: i64 = 972_558;
+    let ticket: i64 = 972_200_000 + std::process::id() as i64;
+    let clear = format!("DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({held}, {new})");
+    let count = |prep_sample: i64| {
+        format!("SELECT count(*) FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample}")
+    };
+
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+        conn.execute_batch(&clear).unwrap();
+    }
+
+    register_read_files(
+        &connstr,
+        &data_path,
+        &[("held", read_rows_sql(held, 2000, 3))],
+        ticket,
+    )
+    .unwrap();
+    let registration = register_read_files(
+        &connstr,
+        &data_path,
+        &[
+            ("held", read_rows_sql(held, 2000, 3)),
+            ("new", read_rows_sql(new, 3000, 4)),
+        ],
+        ticket,
+    )
+    .unwrap();
+
+    assert_eq!(
+        registration.registered.len(),
+        2,
+        "both files are registered"
+    );
+    assert_eq!(
+        registration.replaced.get("read"),
+        Some(&3),
+        "the held prep_sample's rows are replaced"
+    );
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+    assert_eq!(
+        lake_count(&reader, &count(held)),
+        3,
+        "the held prep_sample keeps one copy"
+    );
+    assert_eq!(
+        lake_count(&reader, &count(new)),
+        4,
+        "the new prep_sample is registered"
+    );
+
+    let _ = reader.execute_batch(&clear);
+}
+
+/// Reads another ticket registered are left as they are: a registration of the
+/// same prep_sample by a different ticket adds its rows and replaces none.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_leaves_reads_another_ticket_registered() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+
+    let held: i64 = 972_561;
+    let owner: i64 = 972_400_000 + std::process::id() as i64;
+    let other = owner + 1;
+    let clear = format!("DELETE FROM qiita_lake.read WHERE prep_sample_idx = {held}");
+    let rows_of = |ticket: i64| {
+        format!(
+            "SELECT count(*) FROM qiita_lake.read WHERE prep_sample_idx = {held} \
+             AND filename LIKE '%{LAKE_FILE_TICKET_PREFIX}{ticket}-%'"
+        )
+    };
+
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+        conn.execute_batch(&clear).unwrap();
+    }
+
+    register_read_files(
+        &connstr,
+        &data_path,
+        &[("held", read_rows_sql(held, 6000, 3))],
+        owner,
+    )
+    .unwrap();
+    let registration = register_read_files(
+        &connstr,
+        &data_path,
+        &[("held", read_rows_sql(held, 6000, 3))],
+        other,
+    )
+    .unwrap();
+
+    assert_eq!(
+        registration.replaced.get("read"),
+        None,
+        "another ticket's rows are not replaced"
+    );
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+    assert_eq!(
+        lake_count(&reader, &rows_of(owner)),
+        3,
+        "the owner's rows are untouched"
+    );
+    assert_eq!(
+        lake_count(&reader, &rows_of(other)),
+        3,
+        "the other ticket's rows are registered"
+    );
+
+    let _ = reader.execute_batch(&clear);
+}
+
+/// A `read` file may hold more than one prep_sample. The same ticket
+/// re-registering it replaces the rows of each; re-registering one of them
+/// replaces only that one's rows.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_replaces_a_tickets_rows_from_a_file_spanning_prep_samples() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+
+    let first: i64 = 972_565;
+    let second: i64 = 972_566;
+    let ticket: i64 = 972_600_000 + std::process::id() as i64;
+    let clear = format!("DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({first}, {second})");
+    let count = |prep_sample: i64| {
+        format!("SELECT count(*) FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample}")
+    };
+    let spanning = format!(
+        "{} UNION ALL {}",
+        read_rows_sql(first, 8000, 2),
+        read_rows_sql(second, 9000, 3)
+    );
+
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+        conn.execute_batch(&clear).unwrap();
+    }
+
+    register_read_files(
+        &connstr,
+        &data_path,
+        &[("spanning", spanning.clone())],
+        ticket,
+    )
+    .unwrap();
+    let registration =
+        register_read_files(&connstr, &data_path, &[("spanning", spanning)], ticket).unwrap();
+    assert_eq!(
+        registration.replaced.get("read"),
+        Some(&5),
+        "both prep_samples' rows are replaced"
+    );
+
+    // Re-registering only the first leaves the second's rows in the file they share.
+    let registration = register_read_files(
+        &connstr,
+        &data_path,
+        &[("first", read_rows_sql(first, 8000, 2))],
+        ticket,
+    )
+    .unwrap();
+    assert_eq!(
+        registration.replaced.get("read"),
+        Some(&2),
+        "only the first prep_sample's rows are replaced"
+    );
+
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+    assert_eq!(
+        lake_count(&reader, &count(first)),
+        2,
+        "one copy of the first"
+    );
+    assert_eq!(
+        lake_count(&reader, &count(second)),
+        3,
+        "the second keeps its rows"
+    );
+
+    let _ = reader.execute_batch(&clear);
 }
 
 /// A second registration of one `(prep_sample_idx, processing_idx)`

@@ -650,15 +650,9 @@ def test_every_library_primitive_step_declares_the_runner_contract_inputs(primit
 # worse defect, rejected unconditionally by the second test below, and nothing
 # here can absolve it.
 
-# Deliberate: the step's YAML carries the reasoning at `baseline_resources`, and
-# a new entry belongs here only with the same. `align_sharded` sizes miint's
-# shard concurrency off cpu, which is pinned to the ceiling by design, and its
-# memory is sized to the same budget. Only the memory arm is given up — walltime
-# keeps headroom (PT4H under PT8H), so a TIMEOUT still escalates, which is why
-# the entry names one axis and not both.
-_ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
-    "align:1.0.0": {"align_sharded": ("mem_gb",)},
-}
+# Deliberate: an entry belongs here only when the step's YAML carries the
+# reasoning at `baseline_resources`.
+_ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {}
 
 # NOT accepts — a defect being tracked rather than fixed right now, listed so the
 # guard can land ahead of the re-sizing (which needs measured peak-RSS data per

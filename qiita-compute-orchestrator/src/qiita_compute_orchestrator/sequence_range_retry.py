@@ -62,11 +62,9 @@ CP_RETRY_BACKOFF_BASE_S = 0.5
 # The states a minting ticket may be in for its range to be REUSABLE: an ALLOWLIST,
 # derived from the canonical split so it cannot drift into a hand-maintained copy of
 # it. Reuse is legitimate only while the minting ticket is still IN FLIGHT — a job
-# reaching the mint under a ticket that has already terminated is a stale attempt, and
-# reusing a range whose reads are registered duplicates them in DuckLake, which has no
-# uniqueness and no way to notice afterwards. A denylist ("everything except
-# completed") would let a work_ticket_state added later fall through to the permissive
-# path by default; with a silent failure mode, the default must be refusal.
+# reaching the mint under a ticket that has already terminated is a stale attempt. A
+# denylist ("everything except completed") would let a work_ticket_state added later
+# fall through to the permissive path by default, so the default is refusal.
 _REUSABLE_MINTER_STATES: frozenset[str] = frozenset(NON_TERMINAL_WORK_TICKET_STATES)
 
 
@@ -293,7 +291,7 @@ async def mint_or_reuse_sequence_range(
                     f"prep_sample {prep_sample_idx}'s sequence_range was minted by "
                     f"work_ticket {work_ticket_idx}, which is no longer in flight "
                     f"(state={state!r}) — this attempt is stale. Refusing to re-write "
-                    f"the range, which could duplicate the sample's reads. {recovery}"
+                    f"the range. {recovery}"
                 ),
             ) from exc
         recovered_count = existing.sequence_idx_stop - existing.sequence_idx_start + 1
