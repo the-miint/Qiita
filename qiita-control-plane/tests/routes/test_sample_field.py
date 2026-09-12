@@ -9,6 +9,7 @@ that entity's own module instead.
 import pytest
 import pytest_asyncio
 
+from qiita_control_plane.testing.db_seeds import seed_terminology
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
@@ -24,6 +25,7 @@ from .conftest import (
     get_study_field,
     patch_study_field,
     post_study_field,
+    seed_sample_with_value,
 )
 
 pytestmark = pytest.mark.db
@@ -34,10 +36,17 @@ async def ctx(role_keyed_clients):
     """Per-test fixture: route-keyed clients plus a `created` tracker.
 
     Tracks both entities' study-field buckets, since one test body runs against
-    either surface. Nothing here seeds samples or metadata, so the teardown
-    surface is the fields, the access grants, and the studies.
+    either surface, plus the sample, link, and metadata rows the uniqueness
+    cases seed to give a field values to be unique over.
     """
     created: dict = {
+        "terminology": [],
+        "biosample_metadata": [],
+        "prep_sample_metadata": [],
+        "biosample_to_study": [],
+        "prep_sample_to_study": [],
+        "prep_sample": [],
+        "biosample": [],
         "biosample_study_field": [],
         "prep_sample_study_field": [],
         "biosample_global_field": [],
@@ -48,7 +57,25 @@ async def ctx(role_keyed_clients):
     yield {**role_keyed_clients, "created": created}
 
     pool = role_keyed_clients["pool"]
-    # FK-reverse: fields and access grants both reference study.
+    # FK-reverse. Metadata references both its sample and its study field, so
+    # it goes first; the links and the prep go before the biosample they name.
+    await delete_idxs(pool, "biosample_metadata", created["biosample_metadata"])
+    await delete_idxs(pool, "prep_sample_metadata", created["prep_sample_metadata"])
+    for prep_sample_idx, study_idx in created["prep_sample_to_study"]:
+        await pool.execute(
+            "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
+            prep_sample_idx,
+            study_idx,
+        )
+    for biosample_idx, study_idx in created["biosample_to_study"]:
+        await pool.execute(
+            "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
+            biosample_idx,
+            study_idx,
+        )
+    await delete_idxs(pool, "prep_sample", created["prep_sample"])
+    await delete_idxs(pool, "biosample", created["biosample"])
+    # Fields and access grants both reference study.
     await delete_idxs(pool, "biosample_study_field", created["biosample_study_field"])
     await delete_idxs(pool, "prep_sample_study_field", created["prep_sample_study_field"])
     for study_idx, principal_idx in created["study_access"]:
@@ -61,6 +88,8 @@ async def ctx(role_keyed_clients):
     # Global fields outlive the study-local rows that link to them.
     await delete_idxs(pool, "biosample_global_field", created["biosample_global_field"])
     await delete_idxs(pool, "prep_sample_global_field", created["prep_sample_global_field"])
+    # Terminologies are referenced by the fields deleted above.
+    await delete_idxs(pool, "terminology", created["terminology"])
 
 
 def _surface_id(surface):
@@ -129,9 +158,15 @@ async def test_create_study_field_defaults_unique_in_study_false(ctx, surface):
 @pytest.mark.parametrize("data_type", ["boolean", "terminology"])
 async def test_create_study_field_rejects_unique_on_closed_value_set(ctx, surface, data_type):
     """Tests the case where a field over a closed value set asks for study-local
-    uniqueness: the wire model refuses it before the database is reached.
+    uniqueness: the wire model refuses it before the database is reached, and
+    says which rule was broken rather than reporting a database rejection.
     """
     study_idx = await _study_with_admin_grant(ctx, "uis-closed")
+    # A terminology field is rejected for want of terminology_idx before
+    # uniqueness is considered, so supply one to reach the rule under test.
+    extra = {}
+    if data_type == "terminology":
+        extra["terminology_idx"] = await _seed_terminology(ctx)
 
     resp = await post_study_field(
         ctx,
@@ -141,9 +176,11 @@ async def test_create_study_field_rejects_unique_on_closed_value_set(ctx, surfac
         display_name=unique_field_name("Local"),
         data_type=data_type,
         unique_in_study=True,
+        **extra,
     )
 
     assert resp.status_code == 422, resp.text
+    assert "unique_in_study requires data_type" in resp.text
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
@@ -164,6 +201,7 @@ async def test_create_study_field_rejects_unique_on_linked_field(ctx, surface):
     )
 
     assert resp.status_code == 422, resp.text
+    assert "unique_in_study" in resp.text
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
@@ -195,6 +233,13 @@ async def test_list_study_fields_reports_unique_in_study(ctx, surface):
 # ===========================================================================
 
 
+async def _seed_terminology(ctx):
+    """Insert a terminology row and return its idx, for a field that needs one."""
+    terminology_idx = await seed_terminology(ctx["pool"], name=unique_field_name("Term"))
+    ctx["created"]["terminology"].append(terminology_idx)
+    return terminology_idx
+
+
 async def _seed_editable_field(ctx, surface, *, study_idx, data_type="text", **body):
     """Create one purely-local field on `study_idx` and return its idx."""
     resp = await post_study_field(
@@ -212,7 +257,7 @@ async def _seed_editable_field(ctx, surface, *, study_idx, data_type="text", **b
 
 async def _etag(ctx, surface, study_field_idx):
     """The ETag the edit route will compare an If-Match against."""
-    table = surface.created_key
+    table = surface.metadata_spec.study_field_table
     return await etag_for_row(ctx["pool"], table=table, row_idx=study_field_idx)
 
 
@@ -621,3 +666,146 @@ async def test_get_study_field_absent_404(ctx, surface):
     )
 
     assert resp.status_code == 404, resp.text
+
+
+# ===========================================================================
+# unique_in_study over existing values
+# ===========================================================================
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_enable_unique_over_duplicates_409(ctx, surface):
+    """Tests the case where a study tries to declare a field unique after two
+    of its samples already share a value: the change is refused whole, so the
+    field never ends up claiming a distinctness its data does not have.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "uniq-dup")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
+    for _ in range(2):
+        await seed_sample_with_value(
+            ctx, surface, study_idx=study_idx, study_field_idx=field_idx, value="Sample 1"
+        )
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        unique_in_study=True,
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "already share a value" in resp.json()["detail"]
+    assert await _stored_unique_in_study(ctx, surface, field_idx) is False
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_enable_unique_over_missing_marker_422(ctx, surface):
+    """Tests the case where a study tries to declare a field unique while one
+    of its samples declined to give a value: a field that identifies samples
+    cannot hold a sample it has not named.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "uniq-miss")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
+    await seed_sample_with_value(
+        ctx,
+        surface,
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        missing_reason_name="not applicable",
+    )
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        unique_in_study=True,
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "declined to give a value" in resp.json()["detail"]
+    assert await _stored_unique_in_study(ctx, surface, field_idx) is False
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize("target", [True, False], ids=["enable", "disable"])
+async def test_patch_study_field_unique_on_published_sample_409(ctx, surface, target):
+    """Tests the case where a field the caller wants to repolicy already holds
+    a value on a published sample: publication freezes the policy in both
+    directions, and the refusal names publication rather than reaching the
+    caller as a 500.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "uniq-pub")
+    field_idx = await _seed_editable_field(
+        ctx, surface, study_idx=study_idx, unique_in_study=not target
+    )
+    await seed_sample_with_value(
+        ctx,
+        surface,
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        value="Sample 1",
+        publish=True,
+    )
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        unique_in_study=target,
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "published" in resp.json()["detail"]
+    assert await _stored_unique_in_study(ctx, surface, field_idx) is (not target)
+
+
+async def _stored_unique_in_study(ctx, surface, study_field_idx):
+    """Read the policy straight from the row, to show a refusal left it alone."""
+    spec = surface.metadata_spec
+    stored = await ctx["pool"].fetchval(
+        f"SELECT unique_in_study FROM {spec.study_field_table} WHERE idx = $1", study_field_idx
+    )
+    return stored
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_resends_unique_on_published_sample(ctx, surface):
+    """Tests the case where a published field's other attributes are edited
+    while its uniqueness policy is re-sent unchanged: the propagation trigger
+    treats that as no change, so the edit lands rather than being frozen.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "uniq-noop")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, unique_in_study=True)
+    await seed_sample_with_value(
+        ctx,
+        surface,
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        value="Sample 1",
+        publish=True,
+    )
+    renamed = unique_field_name("Renamed")
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        display_name=renamed,
+        unique_in_study=True,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["display_name"] == renamed
+    assert await _stored_unique_in_study(ctx, surface, field_idx) is True

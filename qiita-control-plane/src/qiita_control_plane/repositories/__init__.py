@@ -10,17 +10,17 @@ from typing import Literal, get_args
 
 import asyncpg
 
-# Tables whose UPDATEs are composed by update_row below--membership
+# Tables whose UPDATEs are composed by update_row below — membership
 # tracks a shared composer's callers (not a PATCH surface). The table
 # name is interpolated into the SQL, so the set is a closed Literal —
 # never widen by accepting caller input directly. The runtime get_args()
 # check inside each consumer rejects any string the Literal does not
 # cover, since Python does not enforce Literal at runtime on its own.
 UpdatableTable = Literal[
-    "biosample",
-    "biosample_study_field",
-    "prep_sample_study_field",
-    "study",
+    "qiita.biosample",
+    "qiita.biosample_study_field",
+    "qiita.prep_sample_study_field",
+    "qiita.study",
 ]
 
 
@@ -78,7 +78,11 @@ async def update_row(
     jsonb_cols: frozenset[str] = frozenset(),
     repo_name: str,
 ) -> asyncpg.Record | None:
-    """Update the named columns on qiita.<table> row idx=row_idx, return the post-UPDATE row.
+    """Update the named columns on `table` row idx=row_idx, return the post-UPDATE row.
+
+    `table` is schema-qualified: the composer interpolates it verbatim rather
+    than assuming a schema, so a caller already holding a qualified name passes
+    it straight through.
 
     `fields` maps column name -> new value; only the listed keys are
     written, and explicit None sets the column to NULL. Unknown keys
@@ -125,7 +129,7 @@ async def update_row(
     # Single round trip: UPDATE ... RETURNING with the same column list
     # the per-repo fetch wrapper selects.
     return await conn.fetchrow(
-        f"UPDATE qiita.{table} SET {set_clause} WHERE idx = {row_param} RETURNING {returning_cols}",
+        f"UPDATE {table} SET {set_clause} WHERE idx = {row_param} RETURNING {returning_cols}",
         *values,
         row_idx,
     )

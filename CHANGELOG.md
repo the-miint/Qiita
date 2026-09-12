@@ -21,71 +21,36 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **A study-local field definition can be read on its own, and carries the tag an
-  edit needs.** `GET /api/v1/study/{study_idx}/biosample-field/{study_field_idx}`
-  and its prep-sample twin return one field definition at the same viewer floor as
-  the list route, since both return a definition and no metadata value. The read's
-  response, and now the create's, carry an `ETag`; previously the edit route
-  required an `If-Match` that no response supplied, leaving a caller to rebuild the
-  tag from a timestamp the API documents as opaque. Minting a field and editing it
-  needs no read between them.
+- **A study can declare that a study-local field's values identify its samples,
+  and can change that declaration later (#N).** `unique_in_study` on
+  `biosample_study_field` / `prep_sample_study_field` makes the database reject a
+  duplicate value within the study and reject a missing-value marker outright.
+  It is settable on create and on edit, comes back on every field read,
+  and is refused for a globally-linked field and for the closed value sets (boolean,
+  terminology) with a per-field 422 naming the rule. Enforcement follows the current
+  policy rather than the one the field was minted with: a trigger mirrors a change
+  onto every metadata row already written through the field. Switching it on over
+  values that already repeat answers 409, over a sample with a missing value
+  answers 422, and either way the change rolls back whole, so a field is never left
+  claiming a distinctness its data does not have. Uniqueness is case-sensitive and
+  scoped to one study: two studies may hold the same value through their own local
+  fields. Defaults false, so existing fields are unaffected. Editing a field also needs
+  a tag to edit against, so field reads and creates now carry an `ETag` and
+  `updated_at`, and `GET /api/v1/study/{study_idx}/biosample-field/{study_field_idx}`
+  and its prep-sample twin serve one definition at the same viewer floor as the list
+  route. `data_type` and the global-field link stay immutable, since changing either
+  rewrites the meaning of every value already stored. A field holding a value on a
+  published sample refuses a policy change in either direction: publication freezes
+  the policy along with the values it governs.
 
-- **A biosample's owner-submitted identifier must be unique within its study.** The
-  import mints the owner-id field declaring that policy, and refuses to write
-  through a field of that name that does not declare it — a field guaranteeing no
-  distinctness cannot serve as the identifier the study names its samples by. A
-  second biosample claiming an identifier the study already holds is refused and
-  told which value repeated; the same identifier in a different study is
-  untouched, since the policy is scoped to one study's own field. Owner-id fields
-  minted before this rule are brought up to it by migration, which aborts on any
+- **A biosample's owner-submitted identifier must be unique within its study
+  (#N).** The import mints the owner-id field declaring that policy, and refuses to
+  write through a field of that name that does not declare it — a field guaranteeing
+  no distinctness cannot serve as the identifier a study names its samples by. A
+  second biosample claiming an identifier the study already holds is refused and told
+  which value repeated; the same identifier in a different study is untouched. Owner-id
+  fields minted before this rule are brought up to it by migration, which aborts on any
   study whose samples already share an identifier rather than picking a winner.
-
-- **A study can edit a field definition it already minted.** `PATCH
-  /api/v1/study/{study_idx}/biosample-field/{study_field_idx}` and its
-  prep-sample twin change a field's display name, description, required flag,
-  tier override, and study-local uniqueness; `data_type` and the global-field
-  link stay immutable, since changing either rewrites the meaning of every value
-  already stored. `If-Match` is required and field reads now carry `updated_at`
-  to supply it. A globally-linked field refuses the attributes it inherits, and
-  uniqueness is refused on a shape that cannot carry it — both with a message
-  naming the problem rather than a generic constraint error. Switching
-  uniqueness on over values that already repeat answers 409, and over a sample
-  that declined to give a value answers 422; either way the change rolls back
-  whole, so a field is never left claiming a distinctness its data does not
-  have.
-
-- **A study-local field's uniqueness policy can be changed after the field exists.**
-  Both `*_study_field` tables gain `updated_at`, bumped by the shared trigger and
-  available as an ETag, and a trigger mirrors a change of `unique_in_study` onto
-  every metadata row already written through that field, so the enforcement always
-  describes the field's current policy rather than the one it was minted with.
-  Switching the policy on over values that already repeat, or over a sample that
-  declined to be named, is refused by the constraints the propagation runs into and
-  the change rolls back whole — a field never ends up half-governed. Switching it
-  off propagates freely.
-
-- **A study can ask for a study-local field's values to be unique when it creates
-  the field.** `unique_in_study` is accepted on both entities' create-field routes
-  and comes back on create and list, so a study can mint the column it identifies
-  its own samples by. It is refused for a globally-linked field and for the closed
-  value sets (boolean, terminology) at the wire, with a per-field 422 rather than a
-  generic database rejection. A write that repeats a value another sample in the
-  study already holds answers 409; one that puts a missing-value marker on such a
-  field answers 422. Both previously reached the caller as a 500, since the
-  database rejected them and nothing translated the rejection.
-
-- **A study-local field can declare that its values identify the study's samples.**
-  `unique_in_study` on `biosample_study_field` / `prep_sample_study_field` makes the
-  database reject a duplicate value within the study and reject a missing-value marker
-  outright — a field whose job is to tell samples apart cannot hold a sample that
-  declines to be told apart. Settable only on a purely-local row of type text, numeric
-  or date: a globally-linked field's metadata row is shared across every study that
-  links to it, so no single study owns the grouping, and a closed value set (boolean,
-  terminology) would cap the study at as many samples as the set has values. Enforced by
-  partial unique indexes keyed on the study field itself, which is study scoping, since
-  a purely-local field belongs to exactly one study. Two studies may still hold the same
-  value through their own fields — the flag claims nothing about identity outside the
-  study that set it. Defaults false, so existing fields are unaffected.
 
 - **The genome map is served as Parquet from a sibling route, so a large reference
   is no longer unbuildable (#550).** `GET /reference/{idx}/genome-map` caps at 250,000

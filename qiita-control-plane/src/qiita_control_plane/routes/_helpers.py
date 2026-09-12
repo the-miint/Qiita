@@ -752,7 +752,7 @@ async def patch_and_map_study_field(
         raise_for_unique_violation(
             exc,
             constraint_messages={
-                f"{spec.study_field_table_name}_display_name_unique": (
+                spec.study_field_display_name_unique_constraint: (
                     f"a {noun} field of that name already exists on this study"
                 )
             },
@@ -770,6 +770,20 @@ async def patch_and_map_study_field(
                 ),
             )
         raise_generic_check_violation(noun)
+    except asyncpg.RaiseError:
+        # Publication freezes a field's uniqueness policy, in both directions:
+        # the conservative default while nothing publishes yet, to be revisited
+        # for granularity once real publication use cases exist. Every other
+        # P0001 raiser on these metadata tables is scoped to the key and value
+        # columns, so a RaiseError on this policy-only write is the publication
+        # lock and nothing else.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{noun} field {row['display_name']!r} cannot change its uniqueness"
+                " policy: one or more of its samples has been published"
+            ),
+        )
 
     # The row was locked from the preflight through this write, so an absent
     # row here is corruption rather than a lost race.

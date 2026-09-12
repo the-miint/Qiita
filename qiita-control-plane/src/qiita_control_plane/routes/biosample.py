@@ -85,6 +85,7 @@ from ..repositories.biosample_metadata import (
 )
 from ._helpers import (
     ETAG_HEADER,
+    GENERIC_CHECK_VIOLATION,
     GENERIC_FK_VIOLATION,
     IF_MATCH_HEADER,
     SAMPLE_METADATA_WRITE_ERRORS,
@@ -138,7 +139,6 @@ _CHECK_VIOLATION_MESSAGES: dict[str, str] = {
     "biosample_matrix_tube_id_format": ("matrix_tube_id must be exactly 10 digits"),
 }
 _GENERIC_UNIQUE_VIOLATION = "conflicts with an existing biosample"
-_GENERIC_CHECK_VIOLATION = "violates a database constraint on biosample"
 
 
 @router.post(PATH_BIOSAMPLE_BY_STUDY, status_code=201)
@@ -284,7 +284,9 @@ async def import_biosample(
             detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)
         except asyncpg.CheckViolationError as exc:
-            detail = _CHECK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_CHECK_VIOLATION)
+            detail = _CHECK_VIOLATION_MESSAGES.get(
+                exc.constraint_name, f"{GENERIC_CHECK_VIOLATION} biosample"
+            )
             raise HTTPException(status_code=422, detail=detail)
 
     return BiosampleImportResponse(
@@ -988,7 +990,9 @@ async def patch_biosample(
             detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)
         except asyncpg.CheckViolationError as exc:
-            detail = _CHECK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_CHECK_VIOLATION)
+            detail = _CHECK_VIOLATION_MESSAGES.get(
+                exc.constraint_name, f"{GENERIC_CHECK_VIOLATION} biosample"
+            )
             raise HTTPException(status_code=422, detail=detail)
         except asyncpg.RaiseError as exc:
             # Role-typed FK trigger on biosample.owner_idx: candidate is

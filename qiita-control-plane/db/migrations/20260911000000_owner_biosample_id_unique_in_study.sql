@@ -26,7 +26,8 @@
 -- study answering to the same owner id means at least one of them is
 -- mislabelled, and which one is a decision no migration can take.
 --
--- To list them before or after an abort:
+-- To list them after an abort (the query reads unique_in_study, which the
+-- first migration in this set adds, so it cannot run before the deploy):
 --
 --   SELECT sf.study_idx,
 --          sf.idx   AS study_field_idx,

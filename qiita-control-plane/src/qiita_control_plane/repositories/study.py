@@ -242,7 +242,7 @@ async def update_study(
     """
     return await update_row(
         conn,
-        table="study",
+        table="qiita.study",
         row_idx=study_idx,
         fields=fields,
         allowlist=STUDY_PATCHABLE_COLUMNS,

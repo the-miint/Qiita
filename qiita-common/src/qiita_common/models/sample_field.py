@@ -194,6 +194,10 @@ class SampleStudyFieldPatchRequest(PatchRequestModel):
     row, which the route establishes from the same row.
     """
 
+    # Not "columns declared NOT NULL": required is nullable on a study-field
+    # row, holding NULL when the value is inherited from a linked global field.
+    # These are the fields an explicit null says nothing with, so sending one
+    # is a malformed request rather than an erasure.
     NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {"display_name", "required", "unique_in_study"}
     )

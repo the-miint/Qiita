@@ -16,7 +16,6 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
     URL_BIOSAMPLE_METADATA_BY_STUDY,
-    URL_BIOSAMPLE_STUDY_FIELD_BY_IDX,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
@@ -2420,7 +2419,7 @@ async def _etag_for(pool, bs_idx: int) -> str:
     conftest helper so the test-file call sites keep their existing
     two-argument shape.
     """
-    return await etag_for_row(pool, table="biosample", row_idx=bs_idx)
+    return await etag_for_row(pool, table="qiita.biosample", row_idx=bs_idx)
 
 
 async def _seed_biosample_for_patch(ctx) -> int:
@@ -4191,76 +4190,6 @@ async def test_get_biosample_field_authz(ctx, case, no_biosample_read_client):
         surface=BIOSAMPLE_FIELD_SURFACE,
         no_scope_client=no_biosample_read_client,
     )
-
-
-async def test_patch_biosample_field_enable_unique_over_duplicates_409(ctx):
-    """Tests the case where a study tries to declare a field unique after two
-    of its samples already share a value: the change is refused whole, so the
-    field never ends up claiming a distinctness its data does not have.
-    """
-    study_idx, display_name, field_idx = await _seed_study_with_unique_field(
-        ctx, suffix="flip-dup", unique_in_study=False
-    )
-    wet_idx = ctx["wet_session"]["principal_idx"]
-    for _ in range(2):
-        bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
-        written = await _patch_biosample_metadata(
-            ctx["wet"], study_idx, bs_idx, {display_name: "Sample 1"}
-        )
-        assert written.status_code == 200, written.text
-        await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
-
-    resp = await ctx["wet"].patch(
-        URL_BIOSAMPLE_STUDY_FIELD_BY_IDX.format(study_idx=study_idx, study_field_idx=field_idx),
-        json={"unique_in_study": True},
-        headers={
-            "If-Match": await etag_for_row(
-                ctx["pool"], table="biosample_study_field", row_idx=field_idx
-            )
-        },
-    )
-
-    assert resp.status_code == 409, resp.text
-    assert "already share a value" in resp.json()["detail"]
-    still_unflagged = await ctx["pool"].fetchval(
-        "SELECT unique_in_study FROM qiita.biosample_study_field WHERE idx = $1", field_idx
-    )
-    assert still_unflagged is False
-
-
-async def test_patch_biosample_field_enable_unique_over_missing_marker_422(ctx):
-    """Tests the case where a study tries to declare a field unique while one
-    of its samples declined to give a value: a field that identifies samples
-    cannot hold a sample it has not named.
-    """
-    study_idx, display_name, field_idx = await _seed_study_with_unique_field(
-        ctx, suffix="flip-miss", unique_in_study=False
-    )
-    wet_idx = ctx["wet_session"]["principal_idx"]
-    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
-    written = await _patch_biosample_metadata(
-        ctx["wet"], study_idx, bs_idx, {display_name: "not applicable"}
-    )
-    assert written.status_code == 200, written.text
-    await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
-
-    resp = await ctx["wet"].patch(
-        URL_BIOSAMPLE_STUDY_FIELD_BY_IDX.format(study_idx=study_idx, study_field_idx=field_idx),
-        json={"unique_in_study": True},
-        headers={
-            "If-Match": await etag_for_row(
-                ctx["pool"], table="biosample_study_field", row_idx=field_idx
-            )
-        },
-    )
-
-    assert resp.status_code == 422, resp.text
-    assert "declined to give a value" in resp.json()["detail"]
-
-
-# ===========================================================================
-# Owner-biosample-id fields must be unique within their study
-# ===========================================================================
 
 
 async def test_import_biosample_mints_owner_id_field_unique_in_study(ctx):

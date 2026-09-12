@@ -643,14 +643,13 @@ class EntityMetadataSpec:
     global_field_table: str
     entity_key_column: str
     study_field_table: str
-    # The same table without its schema qualifier, for the shared update
-    # composer, which prepends `qiita.` itself.
-    study_field_table_name: str
     study_field_idx_column: str
     # The FK column on study_field_table pointing at the *_global_field
     # table (biosample_global_field_idx / prep_sample_global_field_idx).
     # NULL on a purely-local row, non-NULL on a globally-linked one.
     study_field_global_fk_column: str
+    # UNIQUE (study_idx, display_name) on study_field_table.
+    study_field_display_name_unique_constraint: str
     global_field_unique_index_name: str
     local_unique_per_field_index_name: str
     # The partial unique indexes enforcing a unique_in_study field's
@@ -1534,6 +1533,35 @@ async def _update_metadata(
         )
 
 
+def _raise_for_unique_in_study_violation(
+    exc: asyncpg.PostgresError,
+    *,
+    spec: EntityMetadataSpec,
+    display_name: str,
+    study_field_idx: int,
+    attempted_value: SampleMetadataValue,
+) -> None:
+    """Translate a study-local uniqueness rejection into its typed error.
+
+    Returns without raising when the rejection is neither uniqueness rule,
+    leaving the caller to decide what the exception means.
+    """
+    violation = classify_unique_in_study_violation(exc, spec=spec)
+    if violation is UniqueInStudyViolation.DUPLICATE_VALUE:
+        raise StudyUniqueValueConflictError(
+            entity_kind=spec.entity_kind,
+            display_name=display_name,
+            study_field_idx=study_field_idx,
+            attempted_value=attempted_value,
+        ) from exc
+    if violation is UniqueInStudyViolation.MISSING_VALUE_MARKER:
+        raise MissingValueOnUniqueFieldError(
+            entity_kind=spec.entity_kind,
+            display_name=display_name,
+            study_field_idx=study_field_idx,
+        ) from exc
+
+
 async def _insert_metadata_or_diagnose(
     conn: asyncpg.Connection,
     *,
@@ -1634,31 +1662,25 @@ async def _insert_metadata_or_diagnose(
         # occupies the caller's own (entity, field) slot, some *other* entity
         # in the study already holds this value. There is no occupant to
         # diagnose, so it answers directly rather than falling through.
-        if classify_unique_in_study_violation(exc, spec=spec) is (
-            UniqueInStudyViolation.DUPLICATE_VALUE
-        ):
-            raise StudyUniqueValueConflictError(
-                entity_kind=spec.entity_kind,
-                display_name=display_name,
-                study_field_idx=target_field_idx,
-                attempted_value=value,
-            ) from exc
+        _raise_for_unique_in_study_violation(
+            exc,
+            spec=spec,
+            display_name=display_name,
+            study_field_idx=target_field_idx,
+            attempted_value=value,
+        )
         # Only a diagnostic constraint drives the diagnostic path; any other
         # UniqueViolation is the caller's problem and propagates unchanged.
         if exc.constraint_name not in diagnostic_constraint_names:
             raise
     except asyncpg.CheckViolationError as exc:
-        # Dispatch on constraint name, never on message prose: the metadata
-        # tables carry several CHECKs and answering for the wrong one would
-        # name the wrong cause.
-        if classify_unique_in_study_violation(exc, spec=spec) is (
-            UniqueInStudyViolation.MISSING_VALUE_MARKER
-        ):
-            raise MissingValueOnUniqueFieldError(
-                entity_kind=spec.entity_kind,
-                display_name=display_name,
-                study_field_idx=target_field_idx,
-            ) from exc
+        _raise_for_unique_in_study_violation(
+            exc,
+            spec=spec,
+            display_name=display_name,
+            study_field_idx=target_field_idx,
+            attempted_value=value,
+        )
         raise
 
     # Diagnose the occupant once; both the upsert decision and any raised error
@@ -1698,14 +1720,29 @@ async def _insert_metadata_or_diagnose(
             if existing_missing_reason_idx is not None
             else _resolve_typed_value_column(data_type)
         )
-        await _update_metadata(
-            conn,
-            spec=spec,
-            metadata_idx=existing_metadata_idx,
-            data_type=data_type,
-            value=value,
-            existing_value_column=existing_value_column,
-        )
+        # The overwrite reaches the study-local uniqueness index the INSERT
+        # never did: the caller's own slot was occupied, so the INSERT tripped
+        # the per-field constraint first. The no-missing-value CHECK is not
+        # reachable here, being evaluated ahead of any index, so a missing
+        # marker always fails at the INSERT above.
+        try:
+            await _update_metadata(
+                conn,
+                spec=spec,
+                metadata_idx=existing_metadata_idx,
+                data_type=data_type,
+                value=value,
+                existing_value_column=existing_value_column,
+            )
+        except asyncpg.UniqueViolationError as exc:
+            _raise_for_unique_in_study_violation(
+                exc,
+                spec=spec,
+                display_name=display_name,
+                study_field_idx=occupant_field_idx,
+                attempted_value=value,
+            )
+            raise
         return SampleMetadataWriteResult(
             metadata_idx=existing_metadata_idx,
             study_field_idx=occupant_field_idx,
@@ -1952,8 +1989,13 @@ async def fetch_study_field(
     for_update locks the study-field row for the rest of the caller's
     transaction, so an edit preflight and the write that follows it cannot
     straddle another writer's commit. It locks only the study-field row, not the
-    joined global field, and requires a connection inside a transaction.
+    joined global field, and requires a connection inside a transaction, which
+    it enforces rather than assuming.
     """
+    if for_update:
+        # A lock taken outside a transaction is released by the autocommit that
+        # ends the statement, leaving the caller unprotected and uninformed.
+        require_transaction(pool_or_conn)
     lock_clause = " FOR UPDATE OF sf" if for_update else ""
     sql = f"{_study_field_read_sql(spec)} WHERE sf.idx = $1{lock_clause}"
     row = await pool_or_conn.fetchrow(sql, idx)
@@ -1981,7 +2023,7 @@ async def update_study_field(
     require_transaction(conn)
     written_idx = await update_row(
         conn,
-        table=spec.study_field_table_name,
+        table=spec.study_field_table,
         row_idx=idx,
         fields=fields,
         allowlist=STUDY_FIELD_PATCHABLE_COLUMNS,

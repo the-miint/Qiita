@@ -17,6 +17,7 @@ from decimal import Decimal
 import asyncpg
 import pytest
 from qiita_common.models import FieldDataType, MissingReasonRef
+from qiita_common.models.biosample import FieldWriteOutcome
 
 from qiita_control_plane.repositories._sample_helpers import (
     MissingValueOnUniqueFieldError,
@@ -1283,3 +1284,115 @@ async def test_classify_unique_in_study_violation_ignores_other_constraints(ctx,
         )
 
     assert classify_unique_in_study_violation(excinfo.value, spec=spec) is None
+
+
+# ---------------------------------------------------------------------------
+# Overwriting a value on a unique_in_study field
+# ---------------------------------------------------------------------------
+
+
+async def _write_local(ctx, spec, *, entity_idx, display_name, value, on_conflict="raise"):
+    """Drive one study-local metadata write for `spec` in its own transaction."""
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        result = await write_local_metadata_or_diagnose(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            data_type=FieldDataType.TEXT,
+            value=value,
+            caller_idx=ctx["principal_idx"],
+            on_conflict=on_conflict,
+        )
+    ctx["created"][_metadata_tracking_key(spec)].append(result.metadata_idx)
+    return result
+
+
+async def _seed_unique_field(ctx, spec, *, suffix):
+    """Create one purely-local unique_in_study text field; return its display name."""
+    display_name = unique_field_name(suffix)
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+            required=False,
+            unique_in_study=True,
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+    return display_name, field_idx
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_upsert_onto_duplicate_value_raises_typed_error(ctx, spec):
+    # Tests the case where a sample that already holds a value is overwritten
+    # to a value another sample in the study holds: the overwrite trips the
+    # uniqueness index the insert never reached, and is translated the same way.
+    display_name, field_idx = await _seed_unique_field(ctx, spec, suffix="upsert-dup")
+    holder_idx = await _create_linked_entity_for_spec(ctx, spec)
+    writer_idx = await _create_linked_entity_for_spec(ctx, spec)
+    await _write_local(ctx, spec, entity_idx=holder_idx, display_name=display_name, value="TAKEN")
+    await _write_local(ctx, spec, entity_idx=writer_idx, display_name=display_name, value="MINE")
+
+    with pytest.raises(StudyUniqueValueConflictError) as excinfo:
+        await _write_local(
+            ctx,
+            spec,
+            entity_idx=writer_idx,
+            display_name=display_name,
+            value="TAKEN",
+            on_conflict="upsert",
+        )
+
+    assert excinfo.value.display_name == display_name
+    assert excinfo.value.study_field_idx == field_idx
+    assert excinfo.value.attempted_value == "TAKEN"
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_upsert_onto_free_value_overwrites(ctx, spec):
+    # Control for the two cases above: the same overwrite path succeeds when
+    # the new value collides with nothing, so their failures are the
+    # uniqueness rules and not the overwrite itself.
+    display_name, _ = await _seed_unique_field(ctx, spec, suffix="upsert-free")
+    writer_idx = await _create_linked_entity_for_spec(ctx, spec)
+    await _write_local(ctx, spec, entity_idx=writer_idx, display_name=display_name, value="MINE")
+
+    result = await _write_local(
+        ctx,
+        spec,
+        entity_idx=writer_idx,
+        display_name=display_name,
+        value="FRESH",
+        on_conflict="upsert",
+    )
+
+    assert result.outcome is FieldWriteOutcome.UPDATED
+    stored = await ctx["pool"].fetchval(
+        f"SELECT value_text FROM {spec.metadata_table} WHERE idx = $1", result.metadata_idx
+    )
+    assert stored == "FRESH"
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_fetch_study_field_for_update_locks_the_row(ctx, spec):
+    # Tests the case where a second reader wants the row a preflight is holding:
+    # the lock is what stops two edits both clearing the same ETag, so NOWAIT
+    # from a second connection must be refused rather than served.
+    field_idx = await _create_plain_field(ctx, spec, suffix="lock-excl")
+    nowait_sql = f"SELECT idx FROM {spec.study_field_table} WHERE idx = $1 FOR UPDATE NOWAIT"
+
+    async with ctx["pool"].acquire() as holder, holder.transaction():
+        await fetch_study_field(holder, spec=spec, idx=field_idx, for_update=True)
+        async with ctx["pool"].acquire() as other, other.transaction():
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                await other.fetchval(nowait_sql, field_idx)
+
+    # Control: with the holder's transaction closed, the same read is served,
+    # so the refusal above is the lock and not a broken query.
+    async with ctx["pool"].acquire() as after, after.transaction():
+        assert await after.fetchval(nowait_sql, field_idx) == field_idx

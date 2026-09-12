@@ -29,7 +29,10 @@ from qiita_common.models import FieldDataType
 from qiita_common.models.reference import Tier
 
 from qiita_control_plane.repositories import UpdatableTable
+from qiita_control_plane.repositories._sample_helpers import EntityMetadataSpec, SampleEntityKind
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
+from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
@@ -368,6 +371,9 @@ class SampleFieldSurface(NamedTuple):
     # test requests both entities' fixtures and selects on this name, an async
     # fixture not being materializable on demand from inside a test body.
     no_write_scope_fixture: str
+    # The production per-entity metadata bindings, so a seed that writes a
+    # metadata row stays one definition rather than one per entity.
+    metadata_spec: EntityMetadataSpec
 
     @property
     def global_idx_key(self) -> str:
@@ -392,6 +398,7 @@ BIOSAMPLE_FIELD_SURFACE = SampleFieldSurface(
     global_field_url=URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
     read_scope=Scope.BIOSAMPLE_READ,
     no_write_scope_fixture="no_biosample_write_client",
+    metadata_spec=BIOSAMPLE_METADATA_SPEC,
 )
 PREP_SAMPLE_FIELD_SURFACE = SampleFieldSurface(
     url_template=URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
@@ -405,8 +412,91 @@ PREP_SAMPLE_FIELD_SURFACE = SampleFieldSurface(
     global_field_url=URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
     read_scope=Scope.PREP_SAMPLE_READ,
     no_write_scope_fixture="no_prep_sample_write_client",
+    metadata_spec=PREP_SAMPLE_METADATA_SPEC,
 )
 SAMPLE_FIELD_SURFACES = (BIOSAMPLE_FIELD_SURFACE, PREP_SAMPLE_FIELD_SURFACE)
+
+
+async def seed_sample_with_value(
+    ctx,
+    surface: SampleFieldSurface,
+    *,
+    study_idx: int,
+    study_field_idx: int,
+    value: str | None = None,
+    missing_reason_name: str | None = None,
+    publish: bool = False,
+) -> int:
+    """Seed one sample of `surface`'s entity holding a text value through
+    study_field_idx, and return that sample's idx.
+
+    Exactly one of value / missing_reason_name carries the row's content.
+    publish flips is_published on the prep_sample's study link, freezing every
+    row that prep reaches against further UPDATE.
+    """
+    assert (value is None) != (missing_reason_name is None), (
+        "seed exactly one of value / missing_reason_name"
+    )
+    pool = ctx["pool"]
+    spec = surface.metadata_spec
+    owner_idx = ctx["wet_session"]["principal_idx"]
+
+    # One seed serves both entities: the biosample surface keys its metadata on
+    # the biosample, the prep_sample surface on the prep that references it.
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=owner_idx
+    )
+    ctx["created"]["biosample"].append(biosample_idx)
+    ctx["created"]["prep_sample"].append(prep_sample_idx)
+    entity_idx = {
+        SampleEntityKind.BIOSAMPLE: biosample_idx,
+        SampleEntityKind.PREP_SAMPLE: prep_sample_idx,
+    }[spec.entity_kind]
+
+    # Both link rows: the prep link's biosample-link precondition holds only
+    # once the biosample link exists, and publication rides the prep link.
+    await seed_biosample_to_study_link(
+        pool, biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["biosample_to_study"].append((biosample_idx, study_idx))
+    await seed_prep_sample_to_study_link(
+        pool, prep_sample_idx=prep_sample_idx, study_idx=study_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["prep_sample_to_study"].append((prep_sample_idx, study_idx))
+
+    missing_reason_idx = None
+    if missing_reason_name is not None:
+        missing_reason_idx = await pool.fetchval(
+            "SELECT idx FROM qiita.missing_value_reason WHERE name = $1", missing_reason_name
+        )
+        assert missing_reason_idx is not None, (
+            f"no missing_value_reason named {missing_reason_name!r}"
+        )
+
+    metadata_idx = await pool.fetchval(
+        f"INSERT INTO {spec.metadata_table}"
+        f" ({spec.entity_key_column}, {spec.study_field_idx_column},"
+        " value_text, value_missing_reason_idx, created_by_idx)"
+        " VALUES ($1, $2, $3, $4, $5) RETURNING idx",
+        entity_idx,
+        study_field_idx,
+        value,
+        missing_reason_idx,
+        owner_idx,
+    )
+    ctx["created"][spec.metadata_table.removeprefix("qiita.")].append(metadata_idx)
+
+    if publish:
+        # The publish action: FALSE -> TRUE on the link. OLD.is_published is
+        # still FALSE here, so the link's own lock permits this UPDATE.
+        await pool.execute(
+            "UPDATE qiita.prep_sample_to_study SET is_published = TRUE"
+            " WHERE prep_sample_idx = $1 AND study_idx = $2",
+            prep_sample_idx,
+            study_idx,
+        )
+
+    return entity_idx
 
 
 def sibling_field_surface(surface: SampleFieldSurface) -> SampleFieldSurface:
@@ -782,9 +872,7 @@ async def etag_for_row(pool, *, table: UpdatableTable, row_idx: int) -> str:
     # Python does not enforce Literal at runtime; the f-string below is raw SQL.
     if table not in get_args(UpdatableTable):
         raise ValueError(f"etag_for_row rejects non-updatable table: {table!r}")
-    updated_at = await pool.fetchval(
-        f"SELECT updated_at FROM qiita.{table} WHERE idx = $1", row_idx
-    )
+    updated_at = await pool.fetchval(f"SELECT updated_at FROM {table} WHERE idx = $1", row_idx)
     return f'"{updated_at.isoformat()}"'
 
 

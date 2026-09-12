@@ -146,7 +146,7 @@ async def update_biosample(
     """
     return await update_row(
         conn,
-        table="biosample",
+        table="qiita.biosample",
         row_idx=biosample_idx,
         fields=fields,
         allowlist=BIOSAMPLE_PATCHABLE_COLUMNS,

@@ -261,6 +261,10 @@ $$ LANGUAGE plpgsql;
 -- rows may exist.
 -- =============================================================================
 
+-- Text uniqueness is intentionally case-sensitive: the index keys on value_text
+-- as stored, so 'Sample 1' and 'sample 1' are two values. Folding case here would
+-- impose that choice on every text field and make the index unusable for
+-- values for which case is meaningful.
 CREATE UNIQUE INDEX biosample_metadata_unique_in_study_text
     ON qiita.biosample_metadata (biosample_study_field_idx, value_text)
     WHERE unique_in_study AND value_text IS NOT NULL;
