@@ -32,6 +32,7 @@ from .conftest import (
     _seed_study,
     assert_study_field_create_authz,
     assert_study_field_create_conflict,
+    assert_study_field_get_authz,
     assert_study_field_list_authz,
     delete_idxs,
     post_study_field,
@@ -730,6 +731,20 @@ async def test_list_prep_sample_fields_in_study_authz(ctx, case, no_prep_sample_
     404 even for a role-bypass caller.
     """
     await assert_study_field_list_authz(
+        ctx,
+        case=case,
+        surface=PREP_SAMPLE_FIELD_SURFACE,
+        no_scope_client=no_prep_sample_read_client,
+    )
+
+
+@pytest.mark.parametrize("case", STUDY_FIELD_LIST_AUTHZ_CASES)
+async def test_get_prep_sample_field_authz(ctx, case, no_prep_sample_read_client):
+    """Tests the case where each row of the shared list access matrix calls the
+    read-one route: it sits at the same viewer floor as the list, since both
+    return a field definition and no metadata value.
+    """
+    await assert_study_field_get_authz(
         ctx,
         case=case,
         surface=PREP_SAMPLE_FIELD_SURFACE,

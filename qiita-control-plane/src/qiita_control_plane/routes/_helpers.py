@@ -630,6 +630,53 @@ def raise_generic_check_violation(noun: str) -> NoReturn:
     raise HTTPException(status_code=422, detail=f"{GENERIC_CHECK_VIOLATION} {noun}")
 
 
+async def fetch_study_field_in_study(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    study_field_idx: int,
+    for_update: bool = False,
+) -> asyncpg.Record | None:
+    """Return one study-local field addressed under study_idx, or None.
+
+    A field that exists but belongs to another study answers None, the same as
+    one that does not exist: it is not where this path addresses it, and
+    answering differently would confirm it to a caller with no access to the
+    study holding it. for_update locks the row for the rest of the caller's
+    transaction.
+    """
+    row = await fetch_study_field(conn, spec=spec, idx=study_field_idx, for_update=for_update)
+    if row is not None and row["study_idx"] != study_idx:
+        return None
+    return row
+
+
+async def read_and_map_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    study_field_idx: int,
+    response_model: type[SampleStudyFieldResponse],
+) -> tuple[SampleStudyFieldResponse, datetime]:
+    """Read one study-local field and shape it into response_model.
+
+    Returns the response alongside the row's updated_at, which the caller turns
+    into the ETag its If-Match on a later edit must carry. Absent, and belonging
+    to another study, are both 404.
+    """
+    row = await fetch_study_field_in_study(
+        conn, spec=spec, study_idx=study_idx, study_field_idx=study_field_idx
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"{spec.entity_kind} field {study_field_idx} not found"
+        )
+    mapped = map_study_field_row(row, spec=spec, response_model=response_model)
+    return mapped, row["updated_at"]
+
+
 async def patch_and_map_study_field(
     conn: asyncpg.Connection,
     *,
@@ -663,9 +710,9 @@ async def patch_and_map_study_field(
     noun = spec.entity_kind
     if_match = require_if_match(if_match)
 
-    row = await fetch_study_field(conn, spec=spec, idx=study_field_idx, for_update=True)
-    if row is not None and row["study_idx"] != study_idx:
-        row = None
+    row = await fetch_study_field_in_study(
+        conn, spec=spec, study_idx=study_idx, study_field_idx=study_field_idx, for_update=True
+    )
     require_etag_match(row, if_match=if_match, label=f"{noun} field", row_idx=study_field_idx)
 
     named = body.model_fields_set

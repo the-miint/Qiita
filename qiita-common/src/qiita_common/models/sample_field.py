@@ -25,10 +25,12 @@ UNIQUE_IN_STUDY_DATA_TYPES = frozenset(
     {FieldDataType.TEXT, FieldDataType.NUMERIC, FieldDataType.DATE}
 )
 
-# Attributes a globally-linked study field may not carry: the first four are
-# owned by the global-field row and inherited at read time, and unique_in_study
-# is unavailable rather than inherited. A tuple, not a set, because the order is
-# the order a rejection lists the offending attributes in.
+# Attributes a globally-linked study field may not carry, for three different
+# reasons: data_type / required / terminology_idx live on the global-field row
+# and resolve from it at read time; tier_override has no global counterpart to
+# inherit, the global row carrying default_tier instead; unique_in_study is
+# unavailable, no single study owning the grouping it would enforce. A tuple,
+# not a set, because the order is the order a rejection lists them in.
 NOT_SETTABLE_ON_LINKED_FIELD = (
     "data_type",
     "required",
@@ -82,11 +84,10 @@ class SampleStudyFieldCreateRequest(BaseModel):
     The global-field link discriminates two mutually-exclusive modes.
     If omitted, purely-local: data_type is required, plus optional required /
     terminology_idx / tier_override / unique_in_study. If set, globally-linked:
-    only display_name (+ optional description); data_type / required /
-    terminology_idx / tier_override are inherited from the global field and
-    must be omitted, and unique_in_study must be too — it is not inherited, it
-    is unavailable, since one metadata row through a global field is shared
-    across every study linked to it and no single study owns the grouping.
+    only display_name (+ optional description); every attribute named by
+    NOT_SETTABLE_ON_LINKED_FIELD must be omitted, each for the reason given
+    there. data_type / required / terminology_idx come back on the response
+    resolved to the global field's values.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -113,7 +114,7 @@ class SampleStudyFieldCreateRequest(BaseModel):
             if forbidden:
                 raise ValueError(
                     f"{global_fk_name} links to a global field; "
-                    f"{', '.join(forbidden)} must be omitted (inherited from the global field)"
+                    f"{', '.join(forbidden)} must be omitted"
                 )
             return self
 

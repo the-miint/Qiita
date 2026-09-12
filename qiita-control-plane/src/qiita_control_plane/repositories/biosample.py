@@ -348,6 +348,9 @@ async def import_biosample_from_owner_biosample_id(
         - LocalWriteOnGloballyLinkedFieldError when
           owner_biosample_id_field_name resolves to a field on
           primary_study_idx that is already globally linked.
+        - StudyFieldNotUniqueInStudyError when it resolves to a field
+          on primary_study_idx that does not declare unique_in_study,
+          so its values cannot identify the study's samples.
 
     Caller must wrap the call in `async with conn.transaction():`;
     RuntimeError otherwise so partial failure cannot leave orphan

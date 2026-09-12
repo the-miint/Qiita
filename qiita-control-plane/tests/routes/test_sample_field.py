@@ -21,6 +21,7 @@ from .conftest import (
     assert_study_field_authz,
     delete_idxs,
     etag_for_row,
+    get_study_field,
     patch_study_field,
     post_study_field,
 )
@@ -499,6 +500,124 @@ async def test_patch_study_field_absent_404(ctx, surface):
         study_field_idx=2_000_000_000,
         if_match='"unused"',
         description="edited",
+    )
+
+    assert resp.status_code == 404, resp.text
+
+
+# ===========================================================================
+# GET /api/v1/study/{study_idx}/{entity}-field/{study_field_idx}
+# ===========================================================================
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_get_study_field_returns_the_row_and_an_etag(ctx, surface):
+    """Tests the case where one field is read by idx: the body is the same
+    shape the list route returns for that row, and the header carries the tag.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "get-ok")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
+
+    resp = await get_study_field(
+        ctx, surface=surface, client=ctx["user"], study_idx=study_idx, study_field_idx=field_idx
+    )
+
+    assert resp.status_code == 200, resp.text
+    listed = await ctx["user"].get(surface.url_template.format(study_idx=study_idx))
+    assert resp.json() in listed.json()
+    assert resp.headers["ETag"] == await _etag(ctx, surface, field_idx)
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_get_study_field_etag_is_accepted_as_if_match(ctx, surface):
+    """Tests the case where a caller edits a field using only what HTTP gave
+    it: the read's ETag is the If-Match the edit wants, with no out-of-band
+    knowledge of how the tag is built.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "get-rt")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
+
+    read = await get_study_field(
+        ctx, surface=surface, client=ctx["user"], study_idx=study_idx, study_field_idx=field_idx
+    )
+    assert read.status_code == 200, read.text
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=read.headers["ETag"],
+        description="edited",
+    )
+
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_create_study_field_etag_is_accepted_as_if_match(ctx, surface):
+    """Tests the case where a caller edits the field it just minted: the
+    create response's ETag is enough, so minting and editing need no read
+    between them.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "post-rt")
+    created = await post_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        display_name=unique_field_name("Minted"),
+        data_type="text",
+    )
+    assert created.status_code == 201, created.text
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=created.json()[surface.idx_key],
+        if_match=created.headers["ETag"],
+        description="edited",
+    )
+
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_get_study_field_from_another_study_404(ctx, surface):
+    """Tests the case where a field is addressed under a study that does not
+    hold it: the read answers 404 rather than confirming it exists elsewhere.
+    """
+    holding_study_idx = await _study_with_admin_grant(ctx, "get-holder")
+    other_study_idx = await _study_with_admin_grant(ctx, "get-other")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=holding_study_idx)
+
+    resp = await get_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=other_study_idx,
+        study_field_idx=field_idx,
+    )
+
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_get_study_field_absent_404(ctx, surface):
+    """Tests the case where no field carries the path's idx: the read answers
+    404 with the same wording an out-of-study field gets.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "get-absent")
+
+    resp = await get_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=2_000_000_000,
     )
 
     assert resp.status_code == 404, resp.text

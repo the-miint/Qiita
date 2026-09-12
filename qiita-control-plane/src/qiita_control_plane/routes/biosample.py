@@ -98,6 +98,7 @@ from ._helpers import (
     patch_and_map_study_field,
     raise_for_unique_violation,
     raise_http_for_sample_metadata_write_error,
+    read_and_map_study_field,
     read_study_scoped_entity,
     require_etag_match,
     require_if_match,
@@ -114,10 +115,11 @@ global_field_router = APIRouter(prefix=PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX, tags=
 
 _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own biosamples"
 
-# Map of constraint names import_biosample_from_owner_biosample_id can trip
-# (everything else is pre-flight-checked, swallowed by ON CONFLICT, or surfaces
-# as a different exception class). Unknown names fall back to the generic
-# strings on the matching exception path.
+# Map of biosample-level constraint names import_biosample_from_owner_biosample_id
+# can trip. The owner-id field's own uniqueness index is the same exception class
+# and is answered by an earlier arm; everything else is pre-flight-checked,
+# swallowed by ON CONFLICT, or surfaces as a different exception class. Unknown
+# names fall back to the generic strings on the matching exception path.
 _UNIQUE_VIOLATION_MESSAGES: dict[str, str] = {
     "biosample_accession_unique": "biosample_accession already in use",
     "biosample_ena_sample_accession_unique": "ena_sample_accession already in use",
@@ -296,6 +298,7 @@ async def import_biosample(
 async def create_biosample_field(
     study_idx: Annotated[int, Field(gt=0)],
     body: BiosampleStudyFieldCreateRequest,
+    response: Response,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
@@ -323,18 +326,21 @@ async def create_biosample_field(
     biosample_global_field_idx discriminates two mutually-exclusive modes.
     Purely-local (omitted): data_type is required, plus optional required /
     terminology_idx / tier_override / unique_in_study. Globally-linked (set):
-    only display_name (+ optional description); data_type / required /
-    terminology_idx / tier_override are inherited from the global field and must
-    be omitted here, and come back on the response resolved to the global
-    field's values.
+    only display_name (+ optional description), every other attribute omitted;
+    data_type / required / terminology_idx come back on the response resolved
+    to the global field's values.
 
     unique_in_study makes the study's values through this field distinct and
     forbids a missing-value marker among them; the shapes that may carry it,
     and why, are stated by unique_in_study_rejection_reason. Anything it
     refuses is a 422.
+
+    The response carries an `ETag` header derived from the new row's
+    `updated_at`, so a caller that mints a field holds the value an edit's
+    `If-Match` needs without a second round trip.
     """
     async with tx() as conn:
-        response = await create_and_map_study_field(
+        created = await create_and_map_study_field(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             study_idx=study_idx,
@@ -343,7 +349,8 @@ async def create_biosample_field(
             response_model=BiosampleStudyFieldResponse,
         )
 
-    return response
+    response.headers[ETAG_HEADER] = etag_for_updated_at(created.updated_at)
+    return created
 
 
 # same-pattern-ok: cross-entity twin of list_prep_sample_fields_in_study.
@@ -381,6 +388,45 @@ async def list_biosample_fields_in_study(
         for row in rows
     ]
     return fields
+
+
+# same-pattern-ok: cross-entity twin of get_prep_sample_field. The decorator,
+# path constant, scope, tier, spec, and response model are the whole per-entity
+# declaration, over a shared reader that carries the contract.
+@router.get(PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX)
+async def get_biosample_field(
+    study_idx: Annotated[int, Field(gt=0)],
+    study_field_idx: Annotated[int, Field(gt=0)],
+    response: Response,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> BiosampleStudyFieldResponse:
+    """Return one study-local biosample field definition.
+
+    Same access bar as the list route on this study: viewer tier suffices
+    because this returns a field definition and no metadata value. A field
+    absent, or belonging to another study, is a 404 either way.
+
+    The response carries an `ETag` header derived from the row's `updated_at`,
+    which is the value an edit's `If-Match` must carry; it is a quoted ISO 8601
+    timestamp and is opaque by contract.
+    """
+    async with pool.acquire() as conn:
+        field, updated_at = await read_and_map_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            study_field_idx=study_field_idx,
+            response_model=BiosampleStudyFieldResponse,
+        )
+
+    response.headers[ETAG_HEADER] = etag_for_updated_at(updated_at)
+    return field
 
 
 # same-pattern-ok: cross-entity twin of list_prep_sample_global_fields, and the
@@ -996,7 +1042,7 @@ async def patch_biosample_field(
     the field.
 
     The response carries an `ETag` header derived from the new row's
-    `updated_at`, matching the create and list endpoints' contract.
+    `updated_at`, matching the create and read endpoints' contract.
     """
     async with tx() as conn:
         updated = await patch_and_map_study_field(

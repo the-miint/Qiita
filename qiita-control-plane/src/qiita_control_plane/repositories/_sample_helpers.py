@@ -682,9 +682,8 @@ class EntityMetadataSpec:
 
 # The {entity}_study_field columns a globally-linked row leaves NULL because
 # they live on the global-field row, so every read COALESCEs them into their
-# effective values. tier_override is deliberately absent: the global row carries
-# default_tier, a distinct concept, so tier_override reads as stored. Tracks the
-# columns the *_study_field inheritance CHECK constrains.
+# effective values. tier_override is deliberately absent: the global row
+# carries default_tier, a distinct concept, so tier_override reads as stored.
 _STUDY_FIELD_INHERITED_COLUMNS: frozenset[str] = frozenset(
     {"data_type", "required", "terminology_idx"}
 )

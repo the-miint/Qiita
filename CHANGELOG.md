@@ -21,6 +21,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A study-local field definition can be read on its own, and carries the tag an
+  edit needs.** `GET /api/v1/study/{study_idx}/biosample-field/{study_field_idx}`
+  and its prep-sample twin return one field definition at the same viewer floor as
+  the list route, since both return a definition and no metadata value. The read's
+  response, and now the create's, carry an `ETag`; previously the edit route
+  required an `If-Match` that no response supplied, leaving a caller to rebuild the
+  tag from a timestamp the API documents as opaque. Minting a field and editing it
+  needs no read between them.
+
 - **A biosample's owner-submitted identifier must be unique within its study.** The
   import mints the owner-id field declaring that policy, and refuses to write
   through a field of that name that does not declare it — a field guaranteeing no
@@ -53,8 +62,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   Switching the policy on over values that already repeat, or over a sample that
   declined to be named, is refused by the constraints the propagation runs into and
   the change rolls back whole — a field never ends up half-governed. Switching it
-  off propagates freely. Nothing is yet reachable from the API; a caller-facing
-  route follows.
+  off propagates freely.
 
 - **A study can ask for a study-local field's values to be unique when it creates
   the field.** `unique_in_study` is accepted on both entities' create-field routes

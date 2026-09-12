@@ -364,8 +364,9 @@ class SampleFieldSurface(NamedTuple):
     global_field_table: str
     global_field_url: str  # the registry read; no path parameter
     read_scope: Scope  # what the registry read requires
-    # Fixture name for a PAT client holding every scope but this entity's
-    # write scope, resolved per test through request.getfixturevalue.
+    # Fixture name for a PAT client that lacks this entity's write scope. A
+    # test requests both entities' fixtures and selects on this name, an async
+    # fixture not being materializable on demand from inside a test body.
     no_write_scope_fixture: str
 
     @property
@@ -443,6 +444,18 @@ async def patch_study_field(
         surface.by_idx_url_template.format(study_idx=study_idx, study_field_idx=study_field_idx),
         json=body,
         headers=headers,
+    )
+
+
+async def get_study_field(
+    ctx, *, surface: SampleFieldSurface, client, study_idx: int, study_field_idx: int
+):
+    """GET one entity's read-field route and return the response untouched.
+
+    Nothing is tracked: a read creates no row.
+    """
+    return await client.get(
+        surface.by_idx_url_template.format(study_idx=study_idx, study_field_idx=study_field_idx)
     )
 
 
@@ -615,6 +628,57 @@ async def assert_study_field_list_authz(
 async def _send_study_field_list(ctx, surface, client, study_idx):
     """Issue the list request one access case needs."""
     return await client.get(surface.url_template.format(study_idx=study_idx))
+
+
+async def assert_study_field_get_authz(
+    ctx,
+    *,
+    case: str,
+    surface: SampleFieldSurface,
+    no_scope_client,
+) -> None:
+    """Drive one access case of a study-local field read and assert its status.
+
+    `case` names a row of the list access matrix, which the read shares: both
+    return a field definition and no metadata value, so both sit at the viewer
+    floor. `no_scope_client` is a PAT client lacking the route's read scope.
+    """
+    await assert_study_field_authz(
+        ctx,
+        case=case,
+        cases=_STUDY_FIELD_LIST_AUTHZ,
+        surface=surface,
+        no_scope_client=no_scope_client,
+        send=_send_study_field_get,
+        success_status=200,
+    )
+
+
+async def _send_study_field_get(ctx, surface, client, study_idx):
+    """Issue the read request one access case needs.
+
+    The field is seeded by the wet client, which clears the gate on every
+    seeded study; the case's own client is the one being judged. The
+    nonexistent-study row has no study to seed into, so the seed fails and the
+    request goes out against an unresolvable idx — the study gate answers
+    before the path's field idx is looked up either way.
+    """
+    seeded = await post_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["wet"],
+        study_idx=study_idx,
+        display_name=unique_field_name("Authz"),
+        data_type="text",
+    )
+    study_field_idx = seeded.json()[surface.idx_key] if seeded.status_code == 201 else 1
+    return await get_study_field(
+        ctx,
+        surface=surface,
+        client=client,
+        study_idx=study_idx,
+        study_field_idx=study_field_idx,
+    )
 
 
 # case -> expected status for the create's conflict / bad-reference surface.
