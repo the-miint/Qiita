@@ -62,6 +62,7 @@ from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx
 from ..repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     MetadataMissingRequiredFieldsError,
+    StudyFieldDataTypeNotTextError,
     StudyFieldNotUniqueInStudyError,
     UniqueInStudyViolation,
     classify_unique_in_study_violation,
@@ -258,6 +259,18 @@ async def import_biosample(
                 detail=(
                     f"owner_biosample_id_field_name {exc.display_name!r} is not unique"
                     " within this study; make it unique or name a different field"
+                ),
+            )
+        except StudyFieldDataTypeNotTextError as exc:
+            # The named field exists on this study but stores something other
+            # than text, so it cannot hold the identifier as submitted. Naming
+            # a different field is the study's call, so the refusal says which
+            # field and what it stores rather than choosing for them.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"owner_biosample_id_field_name {exc.display_name!r} does not store"
+                    f" text (data_type is {exc.data_type!r}); name a different field"
                 ),
             )
         except asyncpg.UniqueViolationError as exc:

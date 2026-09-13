@@ -70,6 +70,15 @@ CREATE TRIGGER prep_sample_study_field_set_updated_at
 --   true -> false: relaxing a constraint cannot violate one, so it propagates
 --     unconditionally.
 --
+-- Concurrent metadata INSERTs are not serialized against this. A row whose
+-- field-contract trigger read the old flag before this statement's snapshot
+-- commits after it, keeping the stale value -- and so staying outside the
+-- indexes and the CHECK -- until the next write through the field. An UPDATE is
+-- unaffected: it collides with this statement's row lock and re-reads the
+-- committed field row. Closing the INSERT window means a shared lock on the
+-- field row for every metadata write, permanently, which this write volume does
+-- not justify.
+--
 -- The propagation bumps each metadata row's own updated_at and, through the
 -- touch trigger, its parent entity's last_metadata_change_at and ETag: a policy
 -- change is a change to the row so a flip invalidates outstanding ETags in the

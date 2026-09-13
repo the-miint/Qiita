@@ -14,12 +14,13 @@ from dataclasses import dataclass
 from typing import Literal, get_args
 
 import asyncpg
-from qiita_common.models import BiosampleAccessionField, Tier
+from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
 
 from . import require_transaction, update_row
 from ._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     SampleEntityKind,
+    StudyFieldDataTypeNotTextError,
     StudyFieldNotUniqueInStudyError,
     _get_or_create_local_study_field,
     assert_required_global_fields_supplied,
@@ -351,6 +352,9 @@ async def import_biosample_from_owner_biosample_id(
         - StudyFieldNotUniqueInStudyError when it resolves to a field
           on primary_study_idx that does not declare unique_in_study,
           so its values cannot identify the study's samples.
+        - StudyFieldDataTypeNotTextError when it resolves to a field on
+          primary_study_idx declaring a data_type other than text,
+          which cannot hold the identifier as the owner submitted it.
 
     Caller must wrap the call in `async with conn.transaction():`;
     RuntimeError otherwise so partial failure cannot leave orphan
@@ -460,6 +464,19 @@ async def import_biosample_from_owner_biosample_id(
             study_idx=primary_study_idx,
             display_name=owner_biosample_id_field_name,
             study_field_idx=field_idx,
+        )
+
+    # The identifier is written as text, so a field declaring anything else
+    # cannot hold it. Refused here rather than coerced: an owner's identifier
+    # is theirs as submitted, and a value that has been through a numeric or
+    # date round-trip is no longer the string they sent.
+    if resolved_row["data_type"] != FieldDataType.TEXT:
+        raise StudyFieldDataTypeNotTextError(
+            entity_kind=SampleEntityKind.BIOSAMPLE,
+            study_idx=primary_study_idx,
+            display_name=owner_biosample_id_field_name,
+            study_field_idx=field_idx,
+            data_type=resolved_row["data_type"],
         )
 
     await insert_owner_biosample_id_metadata(

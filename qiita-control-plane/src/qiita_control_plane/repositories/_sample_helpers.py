@@ -336,6 +336,36 @@ class StudyFieldNotUniqueInStudyError(Exception):
         )
 
 
+class StudyFieldDataTypeNotTextError(Exception):
+    """Raised when a write that can only put text through a field resolves an
+    existing field declaring some other data_type.
+
+    Carries the field so a caller can name it: the fix is to name a field that
+    stores text, and choosing one is not a decision this layer can take. The
+    value is never coerced into the declared type -- an identifier that has
+    been through a numeric round-trip is a different identifier.
+    """
+
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        study_idx: int,
+        display_name: str,
+        study_field_idx: int,
+        data_type: str,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.study_idx = study_idx
+        self.display_name = display_name
+        self.study_field_idx = study_field_idx
+        self.data_type = data_type
+        super().__init__(
+            f"{entity_kind} field {display_name!r} on study {study_idx} declares"
+            f" data_type {data_type!r}, not text"
+        )
+
+
 class MetadataChecklistUnknownError(Exception):
     """Raised when a metadata_checklist name has no matching
     qiita.metadata_checklist row. Carries the unknown name.

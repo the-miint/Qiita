@@ -4275,6 +4275,35 @@ async def test_import_biosample_accepts_owner_id_field_already_unique_in_study(c
     assert resp.json()["owner_id_biosample_study_field_created"] is False
 
 
+async def test_import_biosample_rejects_owner_id_field_not_text(ctx):
+    """Tests the case where the named field is eligible for the uniqueness
+    policy but stores a non-text value: the import is refused up front rather
+    than writing text into a numeric field and failing deep in the database.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="uniq-numeric"
+    )
+    field_name = unique_field_name()
+    created = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={"display_name": field_name, "data_type": "numeric", "unique_in_study": True},
+    )
+    assert created.status_code == 201, created.text
+    ctx["created"]["biosample_study_field"].append(created.json()["biosample_study_field_idx"])
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=field_name,
+        owner_biosample_id_value="Sample 1",
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "does not store text" in resp.json()["detail"]
+
+
 async def test_import_biosample_rejects_repeated_owner_id_in_one_study(ctx):
     """Tests the case where a second biosample claims an owner id the study
     already holds: the refusal names the value, not a generic conflict.

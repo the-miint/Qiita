@@ -46,7 +46,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 - **A biosample's owner-submitted identifier must be unique within its study
   (#562).** The import mints the owner-id field declaring that policy, and refuses to
   write through a field of that name that does not declare it — a field guaranteeing
-  no distinctness cannot serve as the identifier a study names its samples by. A
+  no distinctness cannot serve as the identifier a study names its samples by. A field
+  of that name storing anything other than text is refused for a related reason, rather
+  than coercing the identifier into a shape its owner did not submit. A
   second biosample claiming an identifier the study already holds is refused and told
   which value repeated; the same identifier in a different study is untouched. Owner-id
   fields minted before this rule are brought up to it by migration, which aborts on any
