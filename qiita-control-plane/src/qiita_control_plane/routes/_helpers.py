@@ -705,6 +705,10 @@ async def patch_and_map_study_field(
     missing-value marker, 422. The last two are the field's existing data
     refusing the new policy, so they name the field, not one value.
 
+    A change of uniqueness policy propagates to every value stored through the
+    field and touches each value's parent entity, so it locks on the order of
+    two rows per sample in the study until the caller's transaction commits.
+
     The caller owns the transaction.
     """
     noun = spec.entity_kind
@@ -773,10 +777,11 @@ async def patch_and_map_study_field(
     except asyncpg.RaiseError:
         # Publication freezes a field's uniqueness policy, in both directions:
         # the conservative default while nothing publishes yet, to be revisited
-        # for granularity once real publication use cases exist. Every other
-        # P0001 raiser on these metadata tables is scoped to the key and value
-        # columns, so a RaiseError on this policy-only write is the publication
-        # lock and nothing else.
+        # for granularity once real publication use cases exist, along with
+        # whether to lock field definition columns.  Every other P0001 raiser on
+        # these metadata tables is scoped to the key and value columns, so a
+        # RaiseError on this policy-only write is the publication lock and
+        # nothing else.
         raise HTTPException(
             status_code=409,
             detail=(

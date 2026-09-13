@@ -71,9 +71,9 @@ CREATE TRIGGER prep_sample_study_field_set_updated_at
 --     unconditionally.
 --
 -- The propagation bumps each metadata row's own updated_at and, through the
--- touch trigger, its parent entity's last_metadata_change_at: both triggers
--- are unscoped, and a policy change is a change to the row. The global-link
--- propagation already behaves this way.
+-- touch trigger, its parent entity's last_metadata_change_at and ETag: a policy
+-- change is a change to the row so a flip invalidates outstanding ETags in the
+-- study. The global-link propagation already behaves this way.
 -- =============================================================================
 
 CREATE FUNCTION qiita.tg_propagate_unique_in_study() RETURNS trigger AS $$

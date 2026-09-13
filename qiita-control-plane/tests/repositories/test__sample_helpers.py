@@ -6445,6 +6445,21 @@ async def test_fetch_study_field_returns_none_when_missing(ctx, spec):
     assert result is None
 
 
+async def test_fetch_study_field_for_update_outside_transaction_raises(ctx):
+    """Tests the case where for_update is asked for on a bare connection: the
+    guard raises rather than taking a row lock the ending statement immediately
+    releases, which would leave the caller unprotected and unaware of it.
+
+    Unparametrized: the guard runs before any SQL, so the spec it would have
+    read the row through is not part of what fails.
+    """
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(RuntimeError, match="transaction"):
+            await fetch_study_field(
+                conn, spec=BIOSAMPLE_METADATA_SPEC, idx=987654321, for_update=True
+            )
+
+
 # ---------------------------------------------------------------------------
 # create_study_field_and_read_back (spec-parameterized over both entities)
 # ---------------------------------------------------------------------------

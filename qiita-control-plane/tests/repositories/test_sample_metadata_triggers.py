@@ -2,7 +2,9 @@
 
 Covers the structurally identical biosample and prep_sample trigger twins
 in one suite, parameterized over EntityMetadataSpec so every branch is
-exercised against both stacks.
+exercised against both stacks. The final section is the exception: it
+drives a migration rather than a trigger directly, and runs against the
+biosample stack alone for the reason its header gives.
 
 The SQL UPDATE/SELECT statements that drive the triggers interpolate
 identifiers from frozen module-level spec fields (metadata_table,
@@ -13,6 +15,7 @@ carries every identifier that differs between the two stacks.
 import secrets
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 
 import asyncpg
 import pytest
@@ -1396,3 +1399,197 @@ async def test_fetch_study_field_for_update_locks_the_row(ctx, spec):
     # so the refusal above is the lock and not a broken query.
     async with ctx["pool"].acquire() as after, after.transaction():
         assert await after.fetchval(nowait_sql, field_idx) == field_idx
+
+
+# =============================================================================
+# The migration that brings pre-rule owner-id fields up to unique_in_study
+#
+# Biosample-only, so these are not parameterized over both stacks: the owner
+# biosample id lives on biosample_metadata and the prep_sample tables carry no
+# counterpart. The migration flips the field flag, and everything that decides
+# whether the flip lands -- the propagation trigger and the partial unique
+# index -- is the subject of this module.
+# =============================================================================
+
+
+def _owner_id_migration_sql():
+    """The migration's `migrate:up` body, read from the file so the test tracks
+    the real migration rather than a hand-copied duplicate."""
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "db"
+        / "migrations"
+        / "20260911000000_owner_biosample_id_unique_in_study.sql"
+    )
+    text = path.read_text()
+    return text.split("-- migrate:up", 1)[1].split("-- migrate:down", 1)[0].strip()
+
+
+async def _flag_as_owner_id(ctx, metadata_idx):
+    """Mark one metadata row as the owner's identifier for its biosample. The
+    flag is application-maintained, and the path that sets it now also mints the
+    field with unique_in_study, so the pre-rule state is reachable only by raw
+    UPDATE."""
+    await ctx["pool"].execute(
+        "UPDATE qiita.biosample_metadata SET is_owner_biosample_id = true WHERE idx = $1",
+        metadata_idx,
+    )
+
+
+async def _write_owner_id(ctx, *, field_idx, value):
+    """Write one value through `field_idx` and mark it an owner id. Returns the
+    metadata row idx."""
+    spec = BIOSAMPLE_METADATA_SPEC
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    metadata_idx = await _write_value(
+        ctx,
+        spec,
+        entity_idx=entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value=value,
+    )
+    await _flag_as_owner_id(ctx, metadata_idx)
+    return metadata_idx
+
+
+async def _seed_owner_id_migration_cases(ctx):
+    """Seed one field per case the migration's predicate distinguishes: a local
+    field carrying an owner id, a local field carrying none, a globally-linked
+    field carrying one, and a field the study already declared unique.
+
+    Each owner-id row goes on its own biosample: at most one row per biosample
+    may carry the flag.
+    """
+    spec = BIOSAMPLE_METADATA_SPEC
+
+    owner_field = await _create_plain_field(ctx, spec, suffix="owner-id")
+    owner_metadata_idx = await _write_owner_id(ctx, field_idx=owner_field, value="OWNER-1")
+
+    # A field whose value is not an owner id: the marker, not the field's name
+    # or its locality, is what the predicate reads.
+    plain_field = await _create_plain_field(ctx, spec, suffix="no-owner-id")
+    plain_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=plain_entity_idx,
+        field_idx=plain_field,
+        data_type=FieldDataType.TEXT,
+        value="42",
+    )
+
+    # A globally-linked field carrying an owner id. The write path refuses to
+    # put one through a linked field, but a field that once held them could have
+    # been upgraded since.
+    gf = await _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT)
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        linked_field, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            global_field_idx=gf.idx,
+            display_name=unique_field_name("linked-owner-id"),
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(linked_field)
+    await _write_owner_id(ctx, field_idx=linked_field, value="OWNER-LINKED")
+
+    # An owner-id field a study already declared unique through the edit route.
+    _, already_field = await _seed_unique_field(ctx, spec, suffix="prior-owner-id")
+    await _write_owner_id(ctx, field_idx=already_field, value="PRIOR")
+
+    return {
+        "owner_field": owner_field,
+        "plain_field": plain_field,
+        "linked_field": linked_field,
+        "already_field": already_field,
+        "owner_metadata_idx": owner_metadata_idx,
+    }
+
+
+async def _flags_by_case(ctx, cases):
+    """The unique_in_study flag of every seeded field, keyed by the case it
+    stands for."""
+    case_names = ("owner_field", "plain_field", "linked_field", "already_field")
+    rows = await ctx["pool"].fetch(
+        "SELECT idx, unique_in_study FROM qiita.biosample_study_field WHERE study_idx = $1",
+        ctx["study_idx"],
+    )
+    by_idx = {row["idx"]: row["unique_in_study"] for row in rows}
+    return {name: by_idx[cases[name]] for name in case_names}
+
+
+async def test_owner_id_migration_flags_only_local_owner_id_fields(ctx):
+    # Tests the case where one study holds all four kinds of field: only the
+    # purely-local field carrying an owner id is changed, and the other three --
+    # no owner id, globally linked, already declared unique -- come through as
+    # they went in.
+    cases = await _seed_owner_id_migration_cases(ctx)
+    assert await _flags_by_case(ctx, cases) == {
+        "owner_field": False,
+        "plain_field": False,
+        "linked_field": False,
+        "already_field": True,
+    }
+
+    await ctx["pool"].execute(_owner_id_migration_sql())
+
+    assert await _flags_by_case(ctx, cases) == {
+        "owner_field": True,
+        "plain_field": False,
+        "linked_field": False,
+        "already_field": True,
+    }
+
+
+async def test_owner_id_migration_propagates_the_flag_to_the_fields_values(ctx):
+    # Tests the case where the flipped field already holds values: the policy
+    # reaches each of them, which is what makes the partial unique index govern
+    # the rows written before the flip.
+    cases = await _seed_owner_id_migration_cases(ctx)
+
+    await ctx["pool"].execute(_owner_id_migration_sql())
+
+    flagged = await ctx["pool"].fetchval(
+        "SELECT unique_in_study FROM qiita.biosample_metadata WHERE idx = $1",
+        cases["owner_metadata_idx"],
+    )
+    assert flagged is True
+
+
+async def test_owner_id_migration_is_idempotent(ctx):
+    # Tests the case where the statement is replayed -- by a re-run after a
+    # partial deploy, or by a later hand-run: the second pass matches nothing,
+    # since NOT unique_in_study excludes what the first pass set.
+    cases = await _seed_owner_id_migration_cases(ctx)
+
+    await ctx["pool"].execute(_owner_id_migration_sql())
+    await ctx["pool"].execute(_owner_id_migration_sql())
+
+    assert await _flags_by_case(ctx, cases) == {
+        "owner_field": True,
+        "plain_field": False,
+        "linked_field": False,
+        "already_field": True,
+    }
+
+
+async def test_owner_id_migration_aborts_when_two_samples_share_an_owner_id(ctx):
+    # Tests the case where a study's samples already answer to the same owner
+    # id: the partial unique index rejects the propagated flag and the whole
+    # statement rolls back, which is the migration's intended report about the
+    # data rather than a defect in it.
+    cases = await _seed_owner_id_migration_cases(ctx)
+    await _write_owner_id(ctx, field_idx=cases["owner_field"], value="OWNER-1")
+
+    with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
+        await ctx["pool"].execute(_owner_id_migration_sql())
+
+    assert excinfo.value.constraint_name == "biosample_metadata_unique_in_study_text"
+    assert await _flags_by_case(ctx, cases) == {
+        "owner_field": False,
+        "plain_field": False,
+        "linked_field": False,
+        "already_field": True,
+    }
