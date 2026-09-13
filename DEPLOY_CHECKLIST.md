@@ -33,7 +33,7 @@ _None yet._
   table — roughly four passes over each. Requests reaching any of the four in that window do not
   queue behind the lock: the control-plane pool's 10s `command_timeout` turns a lock wait into a
   failed request, and a metadata read joins the field table, so the whole sample-metadata surface
-  is affected rather than the writes alone.
+  is affected rather than the writes alone. (#562)
 
   Size the window first — count the two metadata tables on the live DB (the field tables hold one
   row per field definition and never drive the duration):
@@ -82,7 +82,7 @@ _None yet._
   Each row is two or more samples in one study answering to the same owner id, so at least one is
   mislabelled. Resolving that is the study's decision, not a deploy step: take it back to the
   study before re-running the migration. Deploying without this migration is not an option — the
-  code refuses imports into any study whose owner-id field is still unflagged.
+  code refuses imports into any study whose owner-id field is still unflagged. (#562)
 
 ### 4. Deploy
 

@@ -22,7 +22,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Added
 
 - **A study can declare that a study-local field's values identify its samples,
-  and can change that declaration later (#N).** `unique_in_study` on
+  and can change that declaration later (#562).** `unique_in_study` on
   `biosample_study_field` / `prep_sample_study_field` makes the database reject a
   duplicate value within the study and reject a missing-value marker outright.
   It is settable on create and on edit, comes back on every field read,
@@ -44,7 +44,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   the policy along with the values it governs.
 
 - **A biosample's owner-submitted identifier must be unique within its study
-  (#N).** The import mints the owner-id field declaring that policy, and refuses to
+  (#562).** The import mints the owner-id field declaring that policy, and refuses to
   write through a field of that name that does not declare it — a field guaranteeing
   no distinctness cannot serve as the identifier a study names its samples by. A
   second biosample claiming an identifier the study already holds is refused and told
