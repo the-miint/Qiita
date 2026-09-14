@@ -750,7 +750,7 @@ async def patch_and_map_study_field(
                 status_code=409,
                 detail=(
                     f"{noun} field {row['display_name']!r} cannot be made unique within"
-                    " this study: two or more of its samples already share a value"
+                    f" this study: two or more of its {noun}s already share a value"
                 ),
             )
         raise_for_unique_violation(
@@ -770,23 +770,21 @@ async def patch_and_map_study_field(
                 status_code=422,
                 detail=(
                     f"{noun} field {row['display_name']!r} cannot be made unique within"
-                    " this study: one of its samples declined to give a value"
+                    f" this study: one of its {noun}s carries a missing-value marker"
                 ),
             )
         raise_generic_check_violation(noun)
     except asyncpg.RaiseError:
         # Publication freezes a field's uniqueness policy, in both directions:
-        # the conservative default while nothing publishes yet, to be revisited
-        # for granularity once real publication use cases exist, along with
-        # whether to lock field definition columns.  Every other P0001 raiser on
-        # these metadata tables is scoped to the key and value columns, so a
-        # RaiseError on this policy-only write is the publication lock and
-        # nothing else.
+        # the conservative default while nothing publishes yet; see associated
+        # issue for details. Every other P0001 raiser on these metadata tables
+        # is scoped to the key and value columns, so a RaiseError on this
+        # policy-only write is the publication lock and nothing else.
         raise HTTPException(
             status_code=409,
             detail=(
                 f"{noun} field {row['display_name']!r} cannot change its uniqueness"
-                " policy: one or more of its samples has been published"
+                f" policy: one or more of its {noun}s has been published"
             ),
         )
 

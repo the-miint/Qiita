@@ -38,6 +38,7 @@ from qiita_control_plane.repositories._sample_helpers import (
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.routes._helpers import parse_kv_detail
+from qiita_control_plane.testing.db_seeds import seed_sequenced_prep_sample
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
@@ -1593,3 +1594,110 @@ async def test_owner_id_migration_aborts_when_two_samples_share_an_owner_id(ctx)
         "linked_field": False,
         "already_field": True,
     }
+
+
+async def _publish_prep_for_biosample(ctx, biosample_idx):
+    """Give `biosample_idx` a sequenced prep_sample whose study link is
+    published, which freezes that biosample's metadata rows."""
+    prep_sample_idx = await seed_sequenced_prep_sample(
+        ctx["pool"],
+        biosample_idx=biosample_idx,
+        owner_idx=ctx["principal_idx"],
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        await insert_entity_to_study(
+            conn,
+            spec=PREP_SAMPLE_METADATA_SPEC,
+            entity_idx=prep_sample_idx,
+            study_idx=ctx["study_idx"],
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"]["prep_sample"].append(prep_sample_idx)
+    ctx["created"]["prep_sample_to_study"].append((prep_sample_idx, ctx["study_idx"]))
+
+    # The publish action, which no write path performs yet.
+    await ctx["pool"].execute(
+        "UPDATE qiita.prep_sample_to_study SET is_published = true"
+        " WHERE prep_sample_idx = $1 AND study_idx = $2",
+        prep_sample_idx,
+        ctx["study_idx"],
+    )
+    return prep_sample_idx
+
+
+_UNCHANGED_MIGRATION_FLAGS = {
+    "owner_field": False,
+    "plain_field": False,
+    "linked_field": False,
+    "already_field": True,
+}
+
+
+async def test_owner_id_migration_aborts_on_a_non_owner_duplicate(ctx):
+    # Tests the case where the repeated value is not itself an owner id: the
+    # flag reaches every row written through the field, so an ordinary value
+    # matching an owner id collides exactly as a second owner id would.
+    spec = BIOSAMPLE_METADATA_SPEC
+    cases = await _seed_owner_id_migration_cases(ctx)
+    other_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=other_entity_idx,
+        field_idx=cases["owner_field"],
+        data_type=FieldDataType.TEXT,
+        value="OWNER-1",
+    )
+
+    with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
+        await ctx["pool"].execute(_owner_id_migration_sql())
+
+    assert excinfo.value.constraint_name == "biosample_metadata_unique_in_study_text"
+    assert await _flags_by_case(ctx, cases) == _UNCHANGED_MIGRATION_FLAGS
+
+
+async def test_owner_id_migration_aborts_on_a_missing_value_marker(ctx):
+    # Tests the case where another row in the owner-id field declines to give a
+    # value: the no-missing-value CHECK rejects the propagated flag, so the
+    # abort reports a rule the duplicate-value query would never surface.
+    spec = BIOSAMPLE_METADATA_SPEC
+    cases = await _seed_owner_id_migration_cases(ctx)
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        f"reason_{secrets.token_hex(4)}",
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+    other_entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=other_entity_idx,
+        field_idx=cases["owner_field"],
+        data_type=FieldDataType.TEXT,
+        value=MissingReasonRef(idx=reason_idx, name="not applicable"),
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError) as excinfo:
+        await ctx["pool"].execute(_owner_id_migration_sql())
+
+    assert excinfo.value.constraint_name == "biosample_metadata_unique_in_study_no_missing_value"
+    assert await _flags_by_case(ctx, cases) == _UNCHANGED_MIGRATION_FLAGS
+
+
+async def test_owner_id_migration_aborts_on_a_published_biosample(ctx):
+    # Tests the case where a row in the owner-id field sits on a biosample a
+    # published prep freezes: the propagated UPDATE trips the publication lock,
+    # which no data change can resolve, unlike the other two abort causes.
+    cases = await _seed_owner_id_migration_cases(ctx)
+    biosample_idx = await ctx["pool"].fetchval(
+        "SELECT biosample_idx FROM qiita.biosample_metadata WHERE idx = $1",
+        cases["owner_metadata_idx"],
+    )
+    await _publish_prep_for_biosample(ctx, biosample_idx)
+
+    with pytest.raises(asyncpg.RaiseError) as excinfo:
+        await ctx["pool"].execute(_owner_id_migration_sql())
+
+    assert excinfo.value.sqlstate == "P0001"
+    assert "published prep_sample" in str(excinfo.value)
+    assert await _flags_by_case(ctx, cases) == _UNCHANGED_MIGRATION_FLAGS

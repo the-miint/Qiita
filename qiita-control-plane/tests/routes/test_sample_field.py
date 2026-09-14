@@ -704,8 +704,8 @@ async def test_patch_study_field_enable_unique_over_duplicates_409(ctx, surface)
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
 async def test_patch_study_field_enable_unique_over_missing_marker_422(ctx, surface):
     """Tests the case where a study tries to declare a field unique while one
-    of its samples declined to give a value: a field that identifies samples
-    cannot hold a sample it has not named.
+    of its samples carries a missing-value marker: a field that identifies
+    samples cannot hold a sample it has not named.
     """
     study_idx = await _study_with_admin_grant(ctx, "uniq-miss")
     field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
@@ -728,7 +728,7 @@ async def test_patch_study_field_enable_unique_over_missing_marker_422(ctx, surf
     )
 
     assert resp.status_code == 422, resp.text
-    assert "declined to give a value" in resp.json()["detail"]
+    assert "carries a missing-value marker" in resp.json()["detail"]
     assert await _stored_unique_in_study(ctx, surface, field_idx) is False
 
 

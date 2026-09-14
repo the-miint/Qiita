@@ -4244,7 +4244,7 @@ async def test_import_biosample_rejects_owner_id_field_not_unique_in_study(ctx):
     )
 
     assert resp.status_code == 409, resp.text
-    assert "is not unique within this study" in resp.json()["detail"]
+    assert "does not declare its values unique within this study" in resp.json()["detail"]
 
 
 async def test_import_biosample_accepts_owner_id_field_already_unique_in_study(ctx):
@@ -4332,7 +4332,7 @@ async def test_import_biosample_rejects_repeated_owner_id_in_one_study(ctx):
     )
 
     assert resp.status_code == 409, resp.text
-    assert "already used by another biosample in this study" in resp.json()["detail"]
+    assert f"already used by another biosample through {field_name!r}" in resp.json()["detail"]
 
 
 async def test_import_biosample_allows_same_owner_id_in_another_study(ctx):

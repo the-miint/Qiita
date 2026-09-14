@@ -257,8 +257,9 @@ async def import_biosample(
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"owner_biosample_id_field_name {exc.display_name!r} is not unique"
-                    " within this study; make it unique or name a different field"
+                    f"owner_biosample_id_field_name {exc.display_name!r} does not"
+                    " declare its values unique within this study; make it unique or"
+                    " name a different field"
                 ),
             )
         except StudyFieldDataTypeNotTextError as exc:
@@ -274,9 +275,12 @@ async def import_biosample(
                 ),
             )
         except asyncpg.UniqueViolationError as exc:
-            # A repeated owner id inside one study trips the field's own
+            # A repeated owner id through one field trips that field's own
             # uniqueness index rather than any of the biosample-level
-            # constraints, and the generic message would not say so.
+            # constraints, and the generic message would not say so. The scope
+            # is the field, not the study: a study may record owner ids through
+            # more than one local field, and the same value through a different
+            # one is not a repeat.
             if (
                 classify_unique_in_study_violation(exc, spec=BIOSAMPLE_METADATA_SPEC)
                 is UniqueInStudyViolation.DUPLICATE_VALUE
@@ -285,7 +289,8 @@ async def import_biosample(
                     status_code=409,
                     detail=(
                         f"owner_biosample_id_value {body.owner_biosample_id_value!r} is"
-                        " already used by another biosample in this study"
+                        " already used by another biosample through"
+                        f" {body.owner_biosample_id_field_name!r}"
                     ),
                 )
             raise_for_unique_violation(
@@ -1053,10 +1058,6 @@ async def patch_biosample_field(
     patch_and_map_study_field carries the rest of the contract, including which
     attributes a globally-linked field refuses and what happens when a field's
     existing values cannot satisfy a uniqueness policy being switched on.
-
-    data_type and the global-field link are absent from the body on purpose:
-    changing either rewrites the meaning of every value already stored through
-    the field.
 
     The response carries an `ETag` header derived from the new row's
     `updated_at`, matching the create and read endpoints' contract.

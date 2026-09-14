@@ -18,31 +18,65 @@
 -- upgraded since, and setting the flag on a linked row trips the inheritance
 -- CHECK with a message about inheritance rather than about owner ids.
 --
--- THIS MIGRATION CAN FAIL, AND THAT IS THE POINT. The UPDATE fires the
--- propagation trigger, which mirrors the flag onto every metadata row through
--- each field; the partial unique index then rejects any study whose samples
--- already share an owner id, and the whole migration rolls back. That is a
--- report about the data, not a defect in the migration: two samples in one
--- study answering to the same owner id means at least one of them is
--- mislabelled, and which one is a decision no migration can take.
+-- THIS MIGRATION CAN FAIL. The UPDATE fires the propagation trigger, which
+-- mirrors the flag onto every metadata row written through each field -- not
+-- only the rows carrying an owner id. Three separate rules can then reject the
+-- flip, and any one of them rolls the whole migration back:
 --
--- To list them after an abort (the query reads unique_in_study, which the
+--   * two rows in one field hold the same value (the partial unique index).
+--     Either row may carry an owner id or an ordinary value; the index does
+--     not distinguish them. Two samples answering to the same value through
+--     one field means at least one is mislabelled, and which one is a decision
+--     no migration can take.
+--
+--   * a row in the field carries a missing-value marker (the no-missing-value
+--     CHECK). A field whose job is to tell a study's samples apart cannot hold
+--     a sample that declines to be told apart.
+--
+--   * a row's biosample reaches a published prep (the publication lock,
+--     SQLSTATE P0001). Unlike the first two this is not a report about the
+--     data and has no in-place resolution: a published biosample's metadata is
+--     immutable.
+--
+-- The first two are the point: they name data a human has to settle before the
+-- policy can hold. The third is a collision between this flip and publication,
+-- and it stops the deploy rather than pointing at something to fix.
+--
+-- To list all three after an abort (the query reads unique_in_study, which the
 -- first migration in this set adds, so it cannot run before the deploy):
 --
---   SELECT sf.study_idx,
---          sf.idx   AS study_field_idx,
---          sf.display_name,
---          m.value_text,
---          count(*) AS biosample_count
---     FROM qiita.biosample_study_field sf
---     JOIN qiita.biosample_metadata m
---       ON m.biosample_study_field_idx = sf.idx
---      AND m.is_owner_biosample_id
---    WHERE sf.biosample_global_field_idx IS NULL
---      AND NOT sf.unique_in_study
---    GROUP BY sf.study_idx, sf.idx, sf.display_name, m.value_text
+--   WITH candidate AS (
+--     SELECT sf.idx, sf.study_idx, sf.display_name
+--       FROM qiita.biosample_study_field sf
+--      WHERE sf.biosample_global_field_idx IS NULL
+--        AND NOT sf.unique_in_study
+--        AND EXISTS (SELECT 1 FROM qiita.biosample_metadata m
+--                     WHERE m.biosample_study_field_idx = sf.idx
+--                       AND m.is_owner_biosample_id)
+--   )
+--   SELECT c.study_idx, c.idx AS study_field_idx, c.display_name,
+--          'repeated value' AS problem, m.value_text AS detail,
+--          count(*) AS row_count
+--     FROM candidate c
+--     JOIN qiita.biosample_metadata m ON m.biosample_study_field_idx = c.idx
+--    WHERE m.value_text IS NOT NULL
+--    GROUP BY c.study_idx, c.idx, c.display_name, m.value_text
 --   HAVING count(*) > 1
---    ORDER BY sf.study_idx, m.value_text;
+--   UNION ALL
+--   SELECT c.study_idx, c.idx, c.display_name,
+--          'missing-value marker', NULL, count(*)
+--     FROM candidate c
+--     JOIN qiita.biosample_metadata m ON m.biosample_study_field_idx = c.idx
+--    WHERE m.value_missing_reason_idx IS NOT NULL
+--    GROUP BY c.study_idx, c.idx, c.display_name
+--   UNION ALL
+--   SELECT c.study_idx, c.idx, c.display_name,
+--          'biosample reaches a published prep', NULL, count(*)
+--     FROM candidate c
+--     JOIN qiita.biosample_metadata m ON m.biosample_study_field_idx = c.idx
+--    WHERE qiita.is_biosample_reaching_published_prep(m.biosample_idx)
+--    GROUP BY c.study_idx, c.idx, c.display_name
+--    ORDER BY 1, 2;
 
 UPDATE qiita.biosample_study_field sf
    SET unique_in_study = true

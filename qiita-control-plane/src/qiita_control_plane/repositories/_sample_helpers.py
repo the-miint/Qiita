@@ -256,9 +256,9 @@ class UniqueInStudyViolation(StrEnum):
     MISSING_VALUE_MARKER = "missing_value_marker"
 
 
-# Columns a caller may edit on a {entity}_study_field row. data_type and the
-# global-field link are absent: changing either rewrites the meaning of every
-# value already stored through the field.
+# Columns a caller may edit on a {entity}_study_field row, mirroring the wire
+# shape of SampleStudyFieldPatchRequest, whose docstring carries why data_type
+# and the global-field link are excluded.
 STUDY_FIELD_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
     {"display_name", "description", "required", "tier_override", "unique_in_study"}
 )
@@ -1248,7 +1248,8 @@ async def _fetch_slot_occupant(
     entity_idx: int,
     global_field_idx: int | None = None,
     study_field_idx: int | None = None,
-) -> Mapping[str, object]:
+    missing_ok: bool = False,
+) -> Mapping[str, object] | None:
     """Read the existing row occupying the metadata slot rejected by the
     unique constraint, joined to its source study_field to recover the
     contributing study and that field's own idx. Exactly one of
@@ -1289,11 +1290,17 @@ async def _fetch_slot_occupant(
     )
     row = await conn.fetchrow(sql, entity_idx, slot_value)
     if row is None:
-        # The unique constraint rejected the INSERT, yet the occupant is
-        # gone: a concurrent transaction deleted-and-committed it in the
-        # window between the savepoint rollback and this read. The slot is
-        # free again — a benign lost race, not schema corruption — so signal
-        # a retry rather than masquerading it as an invariant violation.
+        # An empty slot means one of two things, and only the caller knows
+        # which. Under missing_ok it is expected: the rejection came from a
+        # rule about the value rather than about the slot, so the caller's own
+        # slot was never occupied and None is the answer. Otherwise the slot
+        # index itself rejected the INSERT, so the occupant existed moments ago
+        # and a concurrent transaction deleted-and-committed it in the window
+        # between the savepoint rollback and this read — a benign lost race,
+        # not schema corruption, so signal a retry rather than masquerading it
+        # as an invariant violation.
+        if missing_ok:
+            return None
         raise TransientWriteRaceError(
             row_label=f"{spec.entity_kind}_metadata",
             slot_summary=(f"{spec.entity_kind}_idx={entity_idx}, {filter_column}={slot_value}"),
@@ -1644,6 +1651,10 @@ async def _insert_metadata_or_diagnose(
         slot_kwargs = {"study_field_idx": study_field_idx}
         diagnostic_constraint_names = {spec.local_unique_per_field_index_name}
 
+    # Bound before the try: the except arms name it, and on the global path the
+    # mint inside the try can itself raise before the assignment is reached.
+    target_field_idx = study_field_idx
+
     # Typed INSERT inside a SAVEPOINT so a unique violation rolls back only the
     # nested savepoint, leaving the caller's outer transaction alive to
     # diagnose and (under upsert) overwrite the occupant below.
@@ -1688,22 +1699,23 @@ async def _insert_metadata_or_diagnose(
             outcome=FieldWriteOutcome.INSERTED,
         )
     except asyncpg.UniqueViolationError as exc:
-        # A study-local uniqueness index is not a slot collision: nothing
-        # occupies the caller's own (entity, field) slot, some *other* entity
-        # in the study already holds this value. There is no occupant to
-        # diagnose, so it answers directly rather than falling through.
-        _raise_for_unique_in_study_violation(
-            exc,
-            spec=spec,
-            display_name=display_name,
-            study_field_idx=target_field_idx,
-            attempted_value=value,
-        )
-        # Only a diagnostic constraint drives the diagnostic path; any other
-        # UniqueViolation is the caller's problem and propagates unchanged.
-        if exc.constraint_name not in diagnostic_constraint_names:
+        # One INSERT can break the slot index and a study-local uniqueness
+        # index at once -- re-sending the value the caller's own row already
+        # holds breaks both -- and PostgreSQL reports only one of them, in an
+        # order it does not promise (index OID order, an artifact of the order
+        # the indexes were created in). So the reported name is not read as
+        # proof of what happened: both families fall through to the diagnosis
+        # below, which reads the slot and answers from what is actually there.
+        # The global path is unaffected either way, a globally-linked field
+        # being pinned to unique_in_study = false by its inheritance CHECK.
+        unique_in_study_rejected = classify_unique_in_study_violation(exc, spec=spec) is not None
+        if not unique_in_study_rejected and exc.constraint_name not in diagnostic_constraint_names:
+            # Neither family: the caller's problem, propagating unchanged.
             raise
+        insert_violation = exc
     except asyncpg.CheckViolationError as exc:
+        # No ambiguity to resolve here: a CHECK is evaluated ahead of index
+        # insertion, so nothing else got the chance to reject as well.
         _raise_for_unique_in_study_violation(
             exc,
             spec=spec,
@@ -1720,8 +1732,20 @@ async def _insert_metadata_or_diagnose(
         conn,
         spec=spec,
         entity_idx=entity_idx,
+        missing_ok=unique_in_study_rejected,
         **slot_kwargs,
     )
+    if existing_row is None:
+        # Nothing in the caller's own slot, so the rejection was about the
+        # value rather than the slot: another entity in the study holds it.
+        _raise_for_unique_in_study_violation(
+            insert_violation,
+            spec=spec,
+            display_name=display_name,
+            study_field_idx=target_field_idx,
+            attempted_value=value,
+        )
+        raise insert_violation
     compare_result, existing_value, existing_missing_reason_idx = _diagnose_slot_occupant(
         data_type, existing_row, value
     )
@@ -1750,11 +1774,12 @@ async def _insert_metadata_or_diagnose(
             if existing_missing_reason_idx is not None
             else _resolve_typed_value_column(data_type)
         )
-        # The overwrite reaches the study-local uniqueness index the INSERT
-        # never did: the caller's own slot was occupied, so the INSERT tripped
-        # the per-field constraint first. The no-missing-value CHECK is not
-        # reachable here, being evaluated ahead of any index, so a missing
-        # marker always fails at the INSERT above.
+        # The overwrite is judged against the study-local uniqueness index on
+        # its own terms: the INSERT's rejection said only that this slot was
+        # taken, which the occupant read above has now explained, and says
+        # nothing about whether the new value collides with another entity's.
+        # The no-missing-value CHECK is not reachable here, being evaluated
+        # ahead of any index, so a missing marker always fails at the INSERT.
         try:
             await _update_metadata(
                 conn,

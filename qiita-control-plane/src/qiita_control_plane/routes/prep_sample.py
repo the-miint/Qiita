@@ -333,10 +333,6 @@ async def patch_prep_sample_field(
     attributes a globally-linked field refuses and what happens when a field's
     existing values cannot satisfy a uniqueness policy being switched on.
 
-    data_type and the global-field link are absent from the body on purpose:
-    changing either rewrites the meaning of every value already stored through
-    the field.
-
     The response carries an `ETag` header derived from the new row's
     `updated_at`, matching the create and read endpoints' contract.
     """

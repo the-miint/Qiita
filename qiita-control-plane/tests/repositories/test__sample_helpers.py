@@ -1425,6 +1425,68 @@ async def test_write_local_metadata_or_diagnose_raises_duplicate_value(ctx):
     assert exc.attempted_value == "v1"
 
 
+async def test_write_local_metadata_or_diagnose_upsert_outcomes_on_unique_field(ctx):
+    """Tests the case where upserts run through a unique_in_study field, where
+    one INSERT can break the slot index and the study-local uniqueness index
+    together: the outcome follows what occupies the caller's own slot, never
+    whichever of the two indexes PostgreSQL happened to name.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    display_name = unique_field_name("unique_upsert")
+
+    # Minted flagged up front; the writes below resolve this same row by name.
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+            required=False,
+            unique_in_study=True,
+        )
+    ctx["created"]["biosample_study_field"].append(field_idx)
+
+    async def _upsert(value):
+        return await _commit_local_write(
+            ctx,
+            bs_idx=bs_idx,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            data_type=FieldDataType.TEXT,
+            value=value,
+            on_conflict="upsert",
+        )
+
+    inserted = await _upsert("A")
+    updated = await _upsert("B")
+    # The re-send breaks both indexes at once: the slot holds the caller's own
+    # row, and that row holds the very value being written.
+    unchanged = await _upsert("B")
+
+    assert inserted == SampleMetadataWriteResult(
+        metadata_idx=inserted.metadata_idx,
+        study_field_idx=field_idx,
+        study_field_created=False,
+        outcome=FieldWriteOutcome.INSERTED,
+    )
+    assert updated == SampleMetadataWriteResult(
+        metadata_idx=inserted.metadata_idx,
+        study_field_idx=field_idx,
+        study_field_created=False,
+        outcome=FieldWriteOutcome.UPDATED,
+    )
+    assert unchanged == SampleMetadataWriteResult(
+        metadata_idx=inserted.metadata_idx,
+        study_field_idx=field_idx,
+        study_field_created=False,
+        outcome=FieldWriteOutcome.UNCHANGED,
+    )
+    row = await _fetch_metadata_row(ctx["pool"], inserted.metadata_idx)
+    assert row["value_text"] == "B"
+
+
 async def test_write_local_metadata_or_diagnose_raises_conflicting_value(ctx):
     """Re-writing a different value through the same local field;
     classified as a local conflict.

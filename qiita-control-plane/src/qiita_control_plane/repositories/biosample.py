@@ -452,6 +452,19 @@ async def import_biosample_from_owner_biosample_id(
             ],
         )
 
+    # The identifier is written as text, so a field declaring anything else
+    # cannot hold it. Refused here rather than coerced: an owner's identifier
+    # is theirs as submitted, and a value that has been through a numeric or
+    # date round-trip is no longer the string they sent.
+    if resolved_row["data_type"] != FieldDataType.TEXT:
+        raise StudyFieldDataTypeNotTextError(
+            entity_kind=SampleEntityKind.BIOSAMPLE,
+            study_idx=primary_study_idx,
+            display_name=owner_biosample_id_field_name,
+            study_field_idx=field_idx,
+            data_type=resolved_row["data_type"],
+        )
+
     # An owner's identifier for a sample only identifies it if the study's
     # other samples cannot carry the same one, so this write requires the
     # policy rather than assuming it. A field minted here declares it; one
@@ -464,19 +477,6 @@ async def import_biosample_from_owner_biosample_id(
             study_idx=primary_study_idx,
             display_name=owner_biosample_id_field_name,
             study_field_idx=field_idx,
-        )
-
-    # The identifier is written as text, so a field declaring anything else
-    # cannot hold it. Refused here rather than coerced: an owner's identifier
-    # is theirs as submitted, and a value that has been through a numeric or
-    # date round-trip is no longer the string they sent.
-    if resolved_row["data_type"] != FieldDataType.TEXT:
-        raise StudyFieldDataTypeNotTextError(
-            entity_kind=SampleEntityKind.BIOSAMPLE,
-            study_idx=primary_study_idx,
-            display_name=owner_biosample_id_field_name,
-            study_field_idx=field_idx,
-            data_type=resolved_row["data_type"],
         )
 
     await insert_owner_biosample_id_metadata(

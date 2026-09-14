@@ -57,32 +57,65 @@ _None yet._
     index builds into `transaction:false` + `CREATE INDEX CONCURRENTLY` files is the fix, and it
     is one file per index — not a flag on this one.
 
-- **[operator] `make migrate` can abort on duplicate owner biosample ids, and that is a data
-  finding, not a migration bug.** `20260911000000_owner_biosample_id_unique_in_study.sql` makes
-  every existing owner-biosample-id field unique within its study. It fails, and rolls back, for
-  any study whose samples already share an owner id. List them with:
+- **[operator] `make migrate` can abort on
+  `20260911000000_owner_biosample_id_unique_in_study.sql`, and the cause decides what to do.**
+  The migration flags every existing owner-biosample-id field, and the flag propagates to every
+  metadata row written through that field — not only the rows carrying an owner id. Three rules
+  can reject it, and any one rolls the whole migration back. Run this after an abort to see
+  which:
 
   ```sql
-  SELECT sf.study_idx,
-         sf.idx   AS study_field_idx,
-         sf.display_name,
-         m.value_text,
-         count(*) AS biosample_count
-    FROM qiita.biosample_study_field sf
-    JOIN qiita.biosample_metadata m
-      ON m.biosample_study_field_idx = sf.idx
-     AND m.is_owner_biosample_id
-   WHERE sf.biosample_global_field_idx IS NULL
-     AND NOT sf.unique_in_study
-   GROUP BY sf.study_idx, sf.idx, sf.display_name, m.value_text
+  WITH candidate AS (
+    SELECT sf.idx, sf.study_idx, sf.display_name
+      FROM qiita.biosample_study_field sf
+     WHERE sf.biosample_global_field_idx IS NULL
+       AND NOT sf.unique_in_study
+       AND EXISTS (SELECT 1 FROM qiita.biosample_metadata m
+                    WHERE m.biosample_study_field_idx = sf.idx
+                      AND m.is_owner_biosample_id)
+  )
+  SELECT c.study_idx, c.idx AS study_field_idx, c.display_name,
+         'repeated value' AS problem, m.value_text AS detail, count(*) AS row_count
+    FROM candidate c
+    JOIN qiita.biosample_metadata m ON m.biosample_study_field_idx = c.idx
+   WHERE m.value_text IS NOT NULL
+   GROUP BY c.study_idx, c.idx, c.display_name, m.value_text
   HAVING count(*) > 1
-   ORDER BY sf.study_idx, m.value_text;
+  UNION ALL
+  SELECT c.study_idx, c.idx, c.display_name, 'missing-value marker', NULL, count(*)
+    FROM candidate c
+    JOIN qiita.biosample_metadata m ON m.biosample_study_field_idx = c.idx
+   WHERE m.value_missing_reason_idx IS NOT NULL
+   GROUP BY c.study_idx, c.idx, c.display_name
+  UNION ALL
+  SELECT c.study_idx, c.idx, c.display_name, 'biosample reaches a published prep', NULL, count(*)
+    FROM candidate c
+    JOIN qiita.biosample_metadata m ON m.biosample_study_field_idx = c.idx
+   WHERE qiita.is_biosample_reaching_published_prep(m.biosample_idx)
+   GROUP BY c.study_idx, c.idx, c.display_name
+   ORDER BY 1, 2;
   ```
 
-  Each row is two or more samples in one study answering to the same owner id, so at least one is
-  mislabelled. Resolving that is the study's decision, not a deploy step: take it back to the
-  study before re-running the migration. Deploying without this migration is not an option — the
-  code refuses imports into any study whose owner-id field is still unflagged. (#562)
+  - **`repeated value`** — two or more samples answer to the same value through one field, so at
+    least one is mislabelled. Resolving that is the study's decision, not a deploy step: take it
+    back to the study before re-running the migration.
+  - **`missing-value marker`** — a sample declined to give a value through a field that is about
+    to require distinct ones. Same route: back to the study, which either supplies the value or
+    moves it to a different field.
+  - **`biosample reaches a published prep`** — **stop and escalate.** A published biosample's
+    metadata is immutable, so there is nothing the operator can change to let the migration pass;
+    it needs a code change. As of this writing no `prep_sample_to_study` row has
+    `is_published = true`, so this cause is unreachable and listed for completeness.
+
+  **When it succeeds, biosample ETags change.** The flag lands on every metadata row in a
+  flagged field, and writing a metadata row touches its biosample's `updated_at`, which is what
+  the ETag is built from. So every biosample holding a value in one of these fields gets a new
+  ETag at migrate time. An `If-Match` captured before the deploy then fails against
+  `PATCH /api/v1/biosample/{biosample_idx}` with a 412; the client re-reads to pick up the
+  current tag. No operator action — this is a note for whoever fields the reports.
+
+  Deploying without this migration is not an option — the code refuses imports into any study
+  whose owner-id field is still unflagged. (#562)
 
 ### 4. Deploy
 
@@ -90,7 +123,36 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- **[operator] Re-run the owner-id flag UPDATE after the restart, to catch fields minted during
+  the deploy.** `make migrate` runs before the restart, so for the few minutes between them the
+  old code is still serving imports — and it mints an owner-id field without `unique_in_study`.
+  A field first created in that window is left unflagged, and once the new code is live, imports
+  naming it answer 409 (`... is not unique within this study; make it unique or name a different
+  field`). This is migration 3's statement verbatim; `dbmate` will not re-run an applied
+  migration, so it is pasted here. Its `WHERE` clause is self-limiting — it matches only
+  unflagged, purely-local, owner-id-holding fields — so it is safe to run whether or not the
+  window produced anything, and it updates nothing when it did not.
+
+  ```sql
+  UPDATE qiita.biosample_study_field sf
+     SET unique_in_study = true
+   WHERE sf.biosample_global_field_idx IS NULL
+     AND NOT sf.unique_in_study
+     AND EXISTS (
+         SELECT 1
+           FROM qiita.biosample_metadata m
+          WHERE m.biosample_study_field_idx = sf.idx
+            AND m.is_owner_biosample_id
+     );
+  ```
+
+  `UPDATE 0` means the window produced nothing, which is the expected result. A non-zero count
+  is fields the deploy window created, now fixed. If it aborts instead, it is one of the three
+  causes in the bucket-3 entry above — run that entry's query and follow the same per-cause
+  guidance; the statement rolls back whole, so nothing is left half-applied.
+
+  This step exists only for this deploy. Once the new code is live every mint sets the flag, so
+  the step retires with this checklist rather than becoming standing procedure. (#562)
 
 ### 6. After the deploy verifies green
 
