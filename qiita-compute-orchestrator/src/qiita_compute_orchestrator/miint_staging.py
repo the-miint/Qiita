@@ -46,6 +46,12 @@ MARKER_NAME = ".qiita-miint-staged.json"
 # to staging quickly, not stall the deploy.
 _HEAD_TIMEOUT = 10.0
 
+# DuckDB's own httpfs, staged into the same directory as miint by
+# `stage_miint_extension`. Named here because the gate must prove it is present
+# on disk: the marker's validators describe the miint object only, so nothing
+# else in this module would notice its absence.
+HTTPFS_EXTENSION = "httpfs"
+
 
 def _duckdb_platform() -> str:
     """DuckDB's platform string (e.g. ``linux_amd64``, ``osx_arm64``) — the
@@ -70,6 +76,17 @@ def _extension_url(repo: str, duckdb_version: str, platform: str) -> str:
     ``staging_is_current`` re-stages (never a wrong skip). Re-verify this shape on
     a DuckDB major bump."""
     return f"{repo}/v{duckdb_version}/{platform}/miint.duckdb_extension.gz"
+
+
+def _staged_extension_path(ext_dir: Path, name: str, duckdb_version: str, platform: str) -> Path:
+    """Where DuckDB puts an extension installed into *ext_dir*, mirroring its
+    local layout: ``<ext_dir>/v<duckdb_version>/<platform>/<name>.duckdb_extension``.
+
+    Same hand-derived-convention caveat as `_extension_url`: DuckDB owns this
+    layout and we re-derive it. The fail-safe runs the same way too — a drift
+    reads as "not staged" and costs an unnecessary (idempotent) re-stage, never
+    a wrong skip. Re-verify this shape on a DuckDB major bump."""
+    return Path(ext_dir) / f"v{duckdb_version}" / platform / f"{name}.duckdb_extension"
 
 
 def _head_validators(url: str) -> dict[str, str]:
@@ -118,12 +135,13 @@ def write_staging_marker() -> None:
 
 
 def staging_is_current() -> bool:
-    """True iff the staged miint build matches what the mirror serves now.
+    """True iff the staged miint build matches what the mirror serves now AND
+    the extensions staged alongside it are present.
 
     Returns ``False`` — re-stage — on any uncertainty: no marker, a changed
-    DuckDB-version / platform / repo, a mirror that offers no ``ETag`` /
-    ``Last-Modified`` to compare, a changed validator, or any network error.
-    Never skips on doubt.
+    DuckDB-version / platform / repo, a missing staged ``httpfs``, a mirror that
+    offers no ``ETag`` / ``Last-Modified`` to compare, a changed validator, or
+    any network error. Never skips on doubt.
 
     The skip engages only when *both* the stored and current ``ETag`` /
     ``Last-Modified`` match. A mirror/CDN that varies either validator per
@@ -148,6 +166,19 @@ def staging_is_current() -> bool:
         stored.get("platform"),
         stored.get("repo"),
     ) != (duckdb.__version__, platform, repo):
+        return False
+
+    # httpfs shares this directory but not the marker: the stored validators
+    # describe the miint object alone, so a stage taken before httpfs joined the
+    # step -- or a dir cleared of it since -- still matches everything above and
+    # would skip the INSTALL that puts it there. LOAD never downloads, so the
+    # miss would surface only at runtime, in both consumers (the CO's ENA
+    # download job and the CP's ENA resolver). Local check, no network: by here
+    # the stored triple already equals the current one.
+    if not _staged_extension_path(
+        marker.parent, HTTPFS_EXTENSION, duckdb.__version__, platform
+    ).is_file():
+        log.info("miint stage matches the mirror but httpfs is not staged; will re-stage")
         return False
 
     try:

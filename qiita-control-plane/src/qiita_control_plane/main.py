@@ -27,6 +27,7 @@ from .dispatch import (
     drain_running_dispatches,
     reconcile_inflight_tickets,
 )
+from .ena_import.batch import reconcile_inflight_batches
 from .health import aggregate_health
 from .landing import router as landing_router
 from .notify import build_transport, run_sweeper
@@ -36,11 +37,11 @@ _log = logging.getLogger(__name__)
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-# Bound on how long we wait for in-flight dispatches at shutdown. systemd's
-# default TimeoutStopSec is 90s; staying under that lets us cancel cleanly
-# before SIGKILL. Unfinished tasks are re-attached by reconcile_inflight_tickets
-# on the next startup as a safety net.
-_DISPATCH_DRAIN_TIMEOUT_SECONDS = 60.0
+# Bound on how long we wait for in-flight background tasks at shutdown (both the
+# dispatch set and ena_import_batch's own set). systemd's default TimeoutStopSec
+# is 90s; staying under that lets us cancel cleanly before SIGKILL. Unfinished
+# tasks are re-attached by the matching reconcile on the next startup.
+_DRAIN_TIMEOUT_SECONDS = 60.0
 
 
 @asynccontextmanager
@@ -88,6 +89,14 @@ async def lifespan(app: FastAPI):
     # that stops/starts the CP undrained doesn't nuke running work.
     await reconcile_inflight_tickets(app)
 
+    # ena_import_batch's OWN tracked task set (see ena_import.batch's module
+    # docstring for why it doesn't share running_dispatches). Re-drive any
+    # batch item still pending/resolving from a previous CP process — same
+    # "no live owner, resume in place" reasoning as reconcile_inflight_tickets
+    # above; register_ena_study is idempotent so this is always safe.
+    app.state.running_ena_import_batches = set()
+    await reconcile_inflight_batches(app)
+
     # Email-notification wiring. Build the transport (SMTP relay
     # when SMTP_HOST is set, else a no-op) and start the in-process sweeper that
     # coalesces terminal work-ticket outcomes into per-originator digests.
@@ -131,7 +140,13 @@ async def lifespan(app: FastAPI):
         await close_pool(app.state.notify_pool)
         await drain_running_dispatches(
             app.state.running_dispatches,
-            timeout_seconds=_DISPATCH_DRAIN_TIMEOUT_SECONDS,
+            timeout_seconds=_DRAIN_TIMEOUT_SECONDS,
+        )
+        await drain_running_dispatches(
+            app.state.running_ena_import_batches,
+            timeout_seconds=_DRAIN_TIMEOUT_SECONDS,
+            label="ena_import_batch",
+            reconcile_note="reconcile_inflight_batches",
         )
         if app.state.compute_backend_client is not None:
             await app.state.compute_backend_client.close()

@@ -36,6 +36,7 @@ from qiita_control_plane.repositories.biosample import (
     fetch_caller_has_biosample_access,
     import_biosample_from_owner_biosample_id,
     insert_biosample,
+    resolve_or_import_biosample_by_ena_accession,
     update_biosample,
 )
 from qiita_control_plane.repositories.biosample_metadata import (
@@ -139,6 +140,145 @@ async def test_insert_biosample_full_columns(ctx):
         "matrix_tube_id": tube_id,
     }
     assert dict(row) == expected
+
+
+# ---------------------------------------------------------------------------
+# resolve_or_import_biosample_by_ena_accession (ena_import.registration
+# cross-study de-dup). The link-and-idempotency coverage for the (biosample,
+# study) pair now lives in test__sample_helpers.py, parametrized alongside
+# insert_entity_to_study's other specs.
+#
+# Known coverage gap, same shape as get_or_create_study_by_ena_accessions'
+# (tests/repositories/test_study.py): the losing-race branch needs a genuinely
+# concurrent second writer to reach the "existing row" path via collision
+# rather than via the normal create-then-reuse sequence; not exercised here,
+# matching test__sample_helpers.py's documented equivalent gap.
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_or_import_biosample_by_ena_accession_imports_on_miss(ctx):
+    ena_acc = unique_accession("SAMEA")
+    field_name = unique_field_name()
+
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            idx, created = await resolve_or_import_biosample_by_ena_accession(
+                conn,
+                ena_sample_accession=ena_acc,
+                study_idx=ctx["study_idx"],
+                owner_idx=ctx["biosample_owner_idx"],
+                caller_idx=ctx["principal_idx"],
+                owner_biosample_id_field_name=field_name,
+                owner_biosample_id_value="ENA-ALIAS-1",
+                metadata=dict(_REQUIRED_METADATA),
+                local_metadata={"env_broad_scale": "marine biome"},
+                metadata_checklist_idx=None,
+            )
+    await _track_composer_outputs(ctx, idx, ctx["study_idx"], field_name)
+    # local_metadata's rows are not composer output, so track them separately.
+    retained_meta_idx = await ctx["pool"].fetchval(
+        "SELECT bm.idx FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_study_field bsf ON bsf.idx = bm.biosample_study_field_idx"
+        " WHERE bm.biosample_idx = $1 AND bsf.display_name = 'env_broad_scale'",
+        idx,
+    )
+    ctx["created"]["biosample_metadata"].append(retained_meta_idx)
+    retained_field_idx = await ctx["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample_study_field"
+        " WHERE study_idx = $1 AND display_name = 'env_broad_scale'",
+        ctx["study_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(retained_field_idx)
+
+    assert created is True
+    row = await ctx["pool"].fetchrow(
+        "SELECT owner_idx, created_by_idx, ena_sample_accession"
+        " FROM qiita.biosample WHERE idx = $1",
+        idx,
+    )
+    assert row["owner_idx"] == ctx["biosample_owner_idx"]
+    assert row["created_by_idx"] == ctx["principal_idx"]
+    assert row["ena_sample_accession"] == ena_acc
+
+    # The import wrote the study link, the owner id, and the local retention --
+    # none of which the caller has to do itself any more.
+    linked = await ctx["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
+        idx,
+        ctx["study_idx"],
+    )
+    assert linked == 1
+    local = await ctx["pool"].fetch(
+        "SELECT bsf.display_name, bm.value_text"
+        " FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_study_field bsf ON bsf.idx = bm.biosample_study_field_idx"
+        " WHERE bm.biosample_idx = $1 AND bm.global_field_idx IS NULL",
+        idx,
+    )
+    assert {r["display_name"]: r["value_text"] for r in local} == {
+        field_name: "ENA-ALIAS-1",
+        "env_broad_scale": "marine biome",
+    }
+
+
+async def test_resolve_or_import_biosample_by_ena_accession_reuses_on_hit(ctx):
+    ena_acc = unique_accession("SAMEA")
+    field_name = unique_field_name()
+
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            first_idx, first_created = await resolve_or_import_biosample_by_ena_accession(
+                conn,
+                ena_sample_accession=ena_acc,
+                study_idx=ctx["study_idx"],
+                owner_idx=ctx["biosample_owner_idx"],
+                caller_idx=ctx["principal_idx"],
+                owner_biosample_id_field_name=field_name,
+                owner_biosample_id_value="ENA-ALIAS-1",
+                metadata=dict(_REQUIRED_METADATA),
+                local_metadata={},
+                metadata_checklist_idx=None,
+            )
+    await _track_composer_outputs(ctx, first_idx, ctx["study_idx"], field_name)
+    assert first_created is True
+
+    # A second caller with a DIFFERENT owner (the cross-study-overlap case, e.g.
+    # a second study importing the same ENA BioSample under a different
+    # importing owner) reuses the row and writes NOTHING -- so it cannot
+    # overwrite the first import's values through the shared global slot.
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            second_idx, second_created = await resolve_or_import_biosample_by_ena_accession(
+                conn,
+                ena_sample_accession=ena_acc,
+                study_idx=ctx["study_idx"],
+                owner_idx=ctx["principal_idx"],
+                caller_idx=ctx["principal_idx"],
+                owner_biosample_id_field_name=unique_field_name(),
+                owner_biosample_id_value="ENA-ALIAS-2",
+                metadata=dict(_REQUIRED_METADATA),
+                local_metadata={"env_broad_scale": "would overwrite"},
+                metadata_checklist_idx=None,
+            )
+
+    assert second_idx == first_idx
+    assert second_created is False
+    count = await ctx["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample WHERE ena_sample_accession = $1", ena_acc
+    )
+    assert count == 1
+    owner = await ctx["pool"].fetchval(
+        "SELECT owner_idx FROM qiita.biosample WHERE idx = $1", first_idx
+    )
+    assert owner == ctx["biosample_owner_idx"]
+    owner_ids = await ctx["pool"].fetch(
+        "SELECT bm.value_text"
+        " FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_study_field bsf ON bsf.idx = bm.biosample_study_field_idx"
+        " WHERE bm.biosample_idx = $1 AND bm.global_field_idx IS NULL",
+        first_idx,
+    )
+    assert [r["value_text"] for r in owner_ids] == ["ENA-ALIAS-1"]
 
 
 # ---------------------------------------------------------------------------

@@ -63,6 +63,7 @@ Auth and data-access flow, upload and processing, work ticket lifecycle, the orc
 - [Auth & Data Access Flow](architecture/processing.md#auth--data-access-flow)
 - [Data Upload & Processing Workflow](architecture/processing.md#data-upload--processing-workflow)
 - [Work Ticket Lifecycle](architecture/processing.md#work-ticket-lifecycle)
+- [ENA Study Import](architecture/processing.md#ena-study-import)
 - [Compute Orchestrator](architecture/processing.md#compute-orchestrator)
 - [Health Checks](architecture/processing.md#health-checks)
 - [Work Ticket Queue](architecture/processing.md#work-ticket-queue)

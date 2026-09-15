@@ -119,6 +119,18 @@ from qiita_common.models.biosample import (
     TerminologyTermRef,
     derive_metadata_field_scope,
 )
+from qiita_common.models.ena import (
+    EnaRunRecord,
+    EnaSampleAttributes,
+    EnaStudyHeader,
+)
+from qiita_common.models.ena_import import (
+    BatchImportItem,
+    BatchImportRequest,
+    BatchImportResponse,
+    BatchImportStatus,
+    BatchItemState,
+)
 from qiita_common.models.health import HealthResponse, HealthStatus
 from qiita_common.models.host_filter_profile import (
     HostFilterOutcome,
@@ -547,6 +559,16 @@ __all__ = [
     "StudyLookupByAccessionResponse",
     "StudyScopedBiosampleResponse",
     "TerminologyTermRef",
+    # INSDC study metadata.
+    "EnaRunRecord",
+    "EnaSampleAttributes",
+    "EnaStudyHeader",
+    # Batch ENA import.
+    "BatchImportItem",
+    "BatchImportRequest",
+    "BatchImportResponse",
+    "BatchImportStatus",
+    "BatchItemState",
     # Study.
     "StudyCreate",
     "StudyPatchRequest",

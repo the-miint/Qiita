@@ -19,7 +19,11 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- `[admin]` Confirm outbound HTTPS from the control-plane host to
+  `www.ebi.ac.uk`, and from the SLURM compute nodes to `www.ebi.ac.uk` and
+  `ftp.sra.ebi.ac.uk`. ENA imports resolve metadata on the control plane and
+  download reads on the cluster; no readiness probe checks either, so a
+  blocked host fails its imports at runtime (#369).
 
 ### 3. Migrations
 
@@ -123,6 +127,13 @@ _None yet._
 
 ### 5. Verify
 
+- `make verify-deploy`'s workflow-actions check already lists every
+  row; confirm it includes `download-ena-study 1.0.0` (new `workflows/`
+  entry, picked up by the standing `qiita-admin actions sync` inside
+  `activate.sh` — no extra operator step). Its `ingest_ena_reads` step
+  declares the `ena_run_map` input; a stale synced copy naming `run_map`
+  means `actions sync` did not run.
+
 - **[operator] Re-run the owner-id flag UPDATE after the restart, to catch fields minted during
   the deploy.** `make migrate` runs before the restart, so for the few minutes between them the
   old code is still serving imports — and it mints an owner-id field without `unique_in_study`.
@@ -160,7 +171,27 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- Soft API change, additive, no host action. New `POST` /
+  `GET /api/v1/ena-import-batch` (batch multi-study ENA import driver) —
+  admin-only, no client is required to call either. The new migration
+  (`qiita.ena_import_batch` / `qiita.ena_import_batch_item`) is a plain
+  additive `CREATE TABLE`, handled autonomously by the standing `make
+  migrate` step (bucket 3) — no out-of-band setup (no `CREATE EXTENSION`,
+  no backfill), so it needs no bucket-3 entry.
+- miint deploy staging (`stage_miint_extension`, run at deploy via
+  `scripts/stage-miint-extension.sh`) now also installs DuckDB's own
+  `httpfs` extension into the same `MIINT_EXTENSION_DIRECTORY`. It is
+  LOADed with miint by `miint_load_sql`, so **every** miint connection in
+  both planes needs it staged — a staged directory without it takes out
+  `POST /ena-import-batch` at resolve as well as the download job. No new
+  operator action, but not because the step is
+  unconditional: the staging gate (`staging_is_current`) now reports a
+  stage missing `httpfs` as stale, so the standing step re-stages a host
+  that was already current on miint alone. `make verify-deploy`'s
+  `cp-miint` check LOADs `httpfs` too, so a host that somehow lacks it
+  fails the deploy rather than every ENA import at runtime. The install
+  itself is a plain `INSTALL`, not `FORCE` — httpfs is DuckDB's own signed
+  extension, not the team mirror, so a warm cache is always current.
 
 ## Deployed history
 

@@ -10,6 +10,7 @@ from .auth import router as auth_router
 from .biosample import biosample_router as biosample_top_level_router
 from .biosample import global_field_router as biosample_global_field_router
 from .biosample import router as biosample_router
+from .ena_import import router as ena_import_batch_router
 from .exported_feature import router as exported_feature_router
 from .exported_identifier import router as exported_identifier_router
 from .exported_processing import router as exported_processing_router
@@ -69,3 +70,4 @@ api_router.include_router(user_router)
 api_router.include_router(auth_router)
 api_router.include_router(admin_router)
 api_router.include_router(work_ticket_router)
+api_router.include_router(ena_import_batch_router)

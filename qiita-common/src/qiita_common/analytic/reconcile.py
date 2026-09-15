@@ -123,12 +123,15 @@ def denovo_map_table_sql(source: str) -> str:
     proof it cannot. Whether that split is the right assay answer for an LCG/MAG
     overlap is a question for the assay owner, not something this staging step
     should quietly decide.
+
+    The source is aliased `s` so `_quality_gate_predicate` can correlate its `EXISTS`
+    against it; `denovo_map_statements` appends that predicate to this statement.
     """
     return (
         f"CREATE TABLE {DENOVO_MAP_TABLE} AS "
-        f"SELECT DISTINCT prep_sample_idx, feature_idx AS contig_id, "
-        f"genome_idx AS genome_id "
-        f"FROM {source}"
+        f"SELECT DISTINCT s.prep_sample_idx, s.feature_idx AS contig_id, "
+        f"s.genome_idx AS genome_id "
+        f"FROM {source} s"
     )
 
 
@@ -145,9 +148,9 @@ def denovo_genome_quality_table_sql(source: str) -> str:
 
     **The scores pass through untouched, and a NULL is not a zero.** The resolver
     LEFT-joins, so a genome CheckM did not score arrives with both scores NULL and
-    keeps them. A predicate over these columns has to say what it does with the
-    unscored: SQL three-valued logic drops them from a bare `completeness >= x`,
-    which is a decision about genomes nobody measured, taken by omission.
+    keeps them. `_quality_gate_predicate` is the one consumer that reads these columns
+    and states what it does with such a genome; the resolver refuses the submission
+    before the gate ever sees one.
 
     **`source` must already be scoped to ONE assembly run**, for the reason
     `denovo_map_table_sql` gives: a subject key is per-run, and a contig assembled
@@ -163,6 +166,105 @@ def denovo_genome_quality_table_sql(source: str) -> str:
         f"CREATE TABLE {DENOVO_GENOME_QUALITY_TABLE} AS "
         f"SELECT prep_sample_idx, genome_idx AS genome_id, {scores} "
         f"FROM {source}"
+    )
+
+
+# The quality gate's defaults, on CheckM's percentage scale. In the contract layer
+# because the job's `Inputs` default is what a caller's omission resolves to, and the
+# estimate-feature-table `context_schema` describes the knob without restating the
+# number.
+DEFAULT_MIN_COMPLETENESS = 50.0
+DEFAULT_MAX_CONTAMINATION = 10.0
+
+
+def _validate_quality_gate(min_completeness: float, max_contamination: float) -> None:
+    """Refuse a completeness that is not a percentage, or a negative contamination.
+
+    `coverage_filter_applies` states the argument for refusing its own bound at all.
+    The upper bound is on completeness only: a percentage above 100 is not one, whereas
+    CheckM's contamination is not bounded at 100 — values reach 191.7 on the 2026-09-13
+    lake — so a ceiling here would refuse a threshold a caller needs to admit those rows.
+
+    **Both tests are written so NaN fails them**, which is why neither is the shorter
+    `x < 0.0` / `x > 100.0` form: every comparison against NaN is false, so that form
+    admits it. NaN reaches here — the route's JSON Schema accepts it for a bounded
+    `number` for the same reason — and a NaN bound is not inert, it excludes every row
+    and empties the de novo arm silently.
+    """
+    if not 0.0 <= min_completeness <= 100.0:
+        raise ValueError(
+            f"min_completeness must be a percentage in [0, 100], got {min_completeness!r}"
+        )
+    if not max_contamination >= 0.0:
+        raise ValueError(
+            f"max_contamination must be a non-negative percentage, got {max_contamination!r}"
+        )
+
+
+def _quality_gate_predicate(
+    min_completeness: float, max_contamination: float
+) -> tuple[str, list[float]]:
+    """The gate as a correlated `EXISTS` over `DENOVO_GENOME_QUALITY_TABLE`, plus its
+    bound parameters.
+
+    A semi-join, so nothing is removed: a genome that fails is never selected, and the
+    quality relation still holds every score afterwards. `EXISTS` rather than a join
+    because that relation is keyed per genome while the map is keyed per contig — a
+    join would fan the map out if a genome ever carried two quality rows, which
+    `_write_denovo_genome_quality` documents as assumed rather than enforced.
+
+    The correlation carries `prep_sample_idx` as well as the genome because
+    `bin_quality` keys on the pair; that function says why `bin_id` alone is not unique.
+
+    **An unscored genome does not pass, at every bound including the most permissive.**
+    The predicate is the positive form, so three-valued logic excludes a NULL. Partial
+    evidence still decides: a NULL completeness with 40% contamination fails on
+    contamination. That is why such a genome is refused at SUBMIT rather than handled
+    here — `runner/_feature_table.py::_stage_denovo_genome_quality` carries which runs
+    have them and why the score cannot be backfilled.
+    """
+    # Unpacked rather than indexed: the two axes are a floor and a ceiling and are not
+    # interchangeable, so a member added to the constant must break this rather than
+    # silently move the ceiling onto a different column.
+    completeness, contamination = BIN_QUALITY_SCORE_COLUMNS
+    return (
+        f" WHERE EXISTS (SELECT 1 FROM {DENOVO_GENOME_QUALITY_TABLE} q"
+        f" WHERE q.prep_sample_idx = s.prep_sample_idx AND q.genome_id = s.genome_idx"
+        f" AND q.{completeness} >= ? AND q.{contamination} <= ?)"
+    ), [min_completeness, max_contamination]
+
+
+def denovo_map_statements(
+    *,
+    map_source: str,
+    quality_source: str,
+    min_completeness: float,
+    max_contamination: float,
+) -> tuple[tuple[str, list[float]], ...]:
+    """Stage the de novo arm's scores, then its feature->genome map gated on them, as
+    ordered `(sql, parameters)` pairs.
+
+    One sequence for `denovo_alignment_statements`' reason: staging the map without the
+    gate does not fail, it returns a table containing genomes the caller excluded. The
+    order is not optional either — the map's `EXISTS` names the quality relation, so a
+    reversed sequence is a bind error.
+
+    Gating the map is what reaches the rest of the arm: the precedence DELETE, the
+    per-genome length denominators, the coverage survivor set and woltka's input all
+    resolve their genomes through it.
+
+    It also decides what happens to the reads on an excluded genome, and the answer
+    differs from the coverage filter's. Precedence reads the slice through this map, so
+    a read whose only de novo placement was on an excluded genome keeps its reference
+    placement — the fallback `denovo_alignment_statements` describes for a contig with
+    no genome. The third consequence in this module's header is the coverage filter's
+    alone: it runs after precedence, where this runs before it.
+    """
+    _validate_quality_gate(min_completeness, max_contamination)
+    predicate, parameters = _quality_gate_predicate(min_completeness, max_contamination)
+    return (
+        (denovo_genome_quality_table_sql(quality_source), []),
+        (denovo_map_table_sql(map_source) + predicate, parameters),
     )
 
 

@@ -15,6 +15,8 @@ are admissible must not have a server copy and a client copy.
 
 from typing import Any
 
+from qiita_common.models.processing import ProcessingStatus
+
 # The `params["subject"]` value a de novo alignment carries. Here rather than at the
 # runner that mints it, because this module is the one both the runner and the client
 # recipe import — the reverse direction is a cycle.
@@ -136,3 +138,31 @@ def denovo_alignment_processing_idx(
             f"its params, so the assembly run it aligned against is unknown"
         )
     return processing_idx
+
+
+def denovo_assembly_deprecation_error(
+    *, processing_idx: int, status: str, superseded_by: int | None
+) -> str | None:
+    """The refusal for a deprecated assembly run as a de novo arm, or None to allow it.
+
+    Pure, like `denovo_alignment_processing_idx` above, and for the same reason: the
+    runner resolver reads the run's row from Postgres and the client recipe from
+    `GET /processing/{processing_idx}`, so a rule either lives here or drifts between
+    them. What cannot live here is the read itself, which is why each driver fetches.
+
+    A deprecated run stays listed and its genomes stay on the map, so neither the
+    alignment nor the map distinguishes a withdrawn computation from a current one.
+    `superseded_by` is reported when set because it is the run the caller wants; a
+    deprecation need not record one, so its absence is its own message.
+    """
+    if status != ProcessingStatus.DEPRECATED.value:
+        return None
+    if superseded_by is None:
+        return (
+            f"assembly run {processing_idx} is deprecated and records no replacement, "
+            f"so it cannot be a de novo arm"
+        )
+    return (
+        f"assembly run {processing_idx} is deprecated and cannot be a de novo arm; "
+        f"assembly run {superseded_by} replaces it"
+    )

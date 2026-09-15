@@ -37,6 +37,8 @@ from qiita_common.api_paths import (
     PATH_EXPORTED_IDENTIFIER_ROOT,
     PATH_EXPORTED_PROCESSING_PREFIX,
     PATH_EXPORTED_PROCESSING_ROOT,
+    PATH_PROCESSING_BY_IDX,
+    PATH_PROCESSING_PREFIX,
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_DOGET,
     PATH_REFERENCE_EXCLUSION_BY_IDX,
@@ -56,7 +58,10 @@ from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 if TYPE_CHECKING:
     import pyarrow as pa
 
-from ...feature_table import denovo_alignment_processing_idx
+from ...feature_table import (
+    denovo_alignment_processing_idx,
+    denovo_assembly_deprecation_error,
+)
 from .. import _common
 from ._helpers import _UNSET
 from .alignment import (
@@ -134,6 +139,32 @@ def _fetch_assembly_genome_map(
         prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
     )
     return _fetch_map_parquet(base_url, token, f"{PATH_ASSEMBLY_PREFIX}{sub_path}")
+
+
+def _fetch_processing(base_url: str, token: str, *, processing_idx: int) -> dict:
+    """GET one assembly run's params and lifecycle columns."""
+    sub_path = PATH_PROCESSING_BY_IDX.format(processing_idx=processing_idx)
+    return _common.call("GET", base_url, token, f"{PATH_PROCESSING_PREFIX}{sub_path}")
+
+
+def _refuse_deprecated_denovo_run(base_url: str, token: str, *, processing_idx: int) -> None:
+    """Refuse a deprecated assembly run as a de novo arm, the client-side half of the
+    rule `runner/_feature_table.py` applies server-side.
+
+    `denovo_alignment_processing_idx` states why neither driver may be the only one
+    that checks, and `denovo_assembly_deprecation_error` owns the wording so the two
+    cannot word it differently. The read is one GET per build, not per cohort sample:
+    the assembly run is in the de novo alignment's hashed params, so one value covers
+    the whole cohort.
+    """
+    row = _fetch_processing(base_url, token, processing_idx=processing_idx)
+    message = denovo_assembly_deprecation_error(
+        processing_idx=processing_idx,
+        status=row.get("status"),
+        superseded_by=row.get("superseded_by"),
+    )
+    if message is not None:
+        raise ValueError(message)
 
 
 def _fetch_map_parquet(base_url: str, token: str, path: str) -> pa.Table:
@@ -1186,6 +1217,7 @@ def _run_build(
             denovo_params=denovo_summary.get("params"),
             reference_params=summary.get("params"),
         )
+        _refuse_deprecated_denovo_run(args.base_url, token, processing_idx=denovo_processing_idx)
 
     _stage_genome_map(con, _fetch_genome_map(args.base_url, token, reference_idx=reference_idx))
     denovo_cohort: list[int] = []

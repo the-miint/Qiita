@@ -290,10 +290,12 @@ does not publish (`_published_genome_idxs`).
 
 **The analytic is SQL text in the `qiita_common.analytic` package, shared with the
 compute-orchestrator's `estimate_feature_table` job.** Two consumers run the same
-analytic and must not disagree about it; they differ only in where the inputs come from
-and how the result is written — which is why the package owns no connection and no
-streaming. Its docstrings are the single copy of *why* each step is shaped as it is;
-this section is the map, not a second copy. What a reader of the pipeline needs to know is that six of
+analytic and must not disagree about it; they differ in where the inputs come from and
+how the result is written — which is why the package owns no connection and no
+streaming — and in one thing more: the de novo arm's CheckM quality gate, which the
+server-side job applies and this pipeline cannot reach the scores for. The
+`analytic` package docstring carries that. Its docstrings are the single copy of
+*why* each step is shaped as it is; this section is the map, not a second copy. What a reader of the pipeline needs to know is that six of
 its properties are load-bearing rather than stylistic, and each is enforced and
 explained at exactly one place:
 

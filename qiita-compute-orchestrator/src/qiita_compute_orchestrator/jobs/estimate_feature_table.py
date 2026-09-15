@@ -39,7 +39,9 @@ one.
 It adds one the reference arm has no counterpart for: the assembled genomes' CheckM
 completeness / contamination, staged as a third Parquet by the same resolver pass
 and arriving already keyed by genome. Neither store holds it whole, which is why the
-resolver rather than this module does the join (`runner/_feature_table.py`).
+resolver rather than this module does the join (`runner/_feature_table.py`). It gates
+which assembled genomes are staged into the map at all; `analytic.denovo_map_statements`
+owns that rule.
 
 Each stream is drained inside its own `with`, by the CREATE that stages it, so the
 Flight client closes before the compute starts.
@@ -101,6 +103,11 @@ class Inputs(BaseModel):
     the CP route derives `alignment_idx` + the cohort from the ticket's
     `action_context`. That holds for the de novo arm too — its `alignment_idx` is on
     the same `action_context`, and the mint names the arm rather than the run.
+
+    `min_completeness` / `max_contamination` are the de novo arm's quality gate, on
+    CheckM's percentage scale. Their default is reached here rather than resolved from
+    the `context_schema`, which declares no `default:`: this action hashes no params, so
+    nothing control-plane-side needs the value, and two declared defaults can diverge.
     """
 
     reference_idx: int
@@ -120,6 +127,10 @@ class Inputs(BaseModel):
     # Per-genome CheckM scores for the de novo arm, staged by the same resolver
     # pass that stages the map above. Nullable scores; the resolver states why.
     denovo_genome_quality_path: Path | None = None
+    # The de novo arm's quality gate; `analytic.denovo_map_statements` applies it. The
+    # params binding skips an absent key, which is how these defaults are reached.
+    min_completeness: float = Field(default=analytic.DEFAULT_MIN_COMPLETENESS, ge=0.0, le=100.0)
+    max_contamination: float = Field(default=analytic.DEFAULT_MAX_CONTAMINATION, ge=0.0)
 
 
 def _write_ogu_table(
@@ -196,10 +207,10 @@ async def _stage_denovo_lengths(conn: duckdb.DuckDBPyConnection, *, processing_i
     appended into one relation before the roll-up reads it.
 
     **The cohort comes from the de novo map itself**, not from a separate input. The
-    map holds exactly the samples that contributed a genome-bearing contig to this
-    run — so a sample that assembled nothing is absent from both, and asking the
-    data plane for its contigs would 404 on a run that legitimately produced none.
-    A second source for the same list is a second thing that can be wrong.
+    map holds the samples with a contig under a genome the quality gate admitted — so a
+    sample that assembled nothing, or whose genomes all failed the gate, is absent from
+    both, and asking the data plane for its contigs would 404 on a run that legitimately
+    produced none. A second source for the same list is a second thing that can be wrong.
     """
     conn.execute(analytic.denovo_contig_lengths_table_sql())
     cohort = [
@@ -243,12 +254,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             map_sql = validate_parquet_path(inputs.genome_map_path)
             conn.execute(analytic.map_table_sql(f"read_parquet('{map_sql}')"))
             if combined:
+                # The scores, then the map gated on them — `analytic.denovo_map_statements`
+                # owns the order and what the gate reaches.
                 denovo_map_sql = validate_parquet_path(inputs.denovo_genome_map_path)
-                conn.execute(analytic.denovo_map_table_sql(f"read_parquet('{denovo_map_sql}')"))
                 quality_sql = validate_parquet_path(_require_denovo_genome_quality_path(inputs))
-                conn.execute(
-                    analytic.denovo_genome_quality_table_sql(f"read_parquet('{quality_sql}')")
-                )
+                for sql, parameters in analytic.denovo_map_statements(
+                    map_source=f"read_parquet('{denovo_map_sql}')",
+                    quality_source=f"read_parquet('{quality_sql}')",
+                    min_completeness=inputs.min_completeness,
+                    max_contamination=inputs.max_contamination,
+                ):
+                    conn.execute(sql, parameters)
 
             # The lengths feed ONLY the coverage calc, so when that is skipped the
             # stream is skipped too — the point is to avoid the coverage calculation
