@@ -1850,6 +1850,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Reference load: a genome map is checked against the reference FASTA before anything is minted, so a map whose read_ids match no FASTA sequence fails and a partial match logs what went unmatched (#577).**
+  `_associate_genomes` INNER-JOINed the genome map onto the manifest's `read_id`, silently
+  dropping every map row whose `read_id` isn't a FASTA sequence ID. `mint-features` now
+  checks the map first: if no `read_id` matches, the step fails before any `qiita.feature`
+  row is written, naming a few of the unmatched IDs. For a `shard_index=true` load this
+  replaces the later `plan-shards` N=0 failure; an unsharded load, which used to succeed
+  with no genome associations, now fails. A partial match still loads and logs a warning
+  with the work ticket, the unmatched `read_id` count and a few examples. The genome map
+  must also carry a `read_id` column with no NULLs.
 - **ENA import: a cross-batch race that minted a duplicate `sequencing_run` pool (and a redundant `download-ena-study` ticket) for a `(study, platform)` is serialized (#575).**
   `_resolve_platform_pools` was a SELECT-then-INSERT with no arbitrating constraint on the
   no-preflight pool path, so two concurrent batches for the same `(study, platform)` each
