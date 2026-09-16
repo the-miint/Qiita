@@ -87,7 +87,9 @@ def tree_copy_sql(path: Path, *, clearance: TreeClearance) -> str:
     convert it — which also keeps `COPY … (FORMAT NEWICK)`'s edge-id default from being
     ours to dodge (it annotates every branch whenever an `edge_id` column is present; see
     `docs/duckdb-miint.md`). `edge_id` is worth carrying: the shear preserves the
-    surviving edge's original id, which is the handle back to the reference's placements.
+    surviving edge's original id, which is the handle back to the reference's
+    placements — see "Edge numbering" in `docs/architecture/reference-data.md` for
+    where that numbering comes from.
 
     **A consumer joining this to the table must filter `is_tip`.** Only tips are named from
     the mint; a surviving internal node keeps the reference's own Newick label, and nothing

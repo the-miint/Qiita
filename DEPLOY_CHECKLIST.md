@@ -35,7 +35,12 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-_None yet._
+- **[operator] Mint `edge_id` on references loaded before this deploy.** Unless its Newick carried jplace `{N}` decorations, such a reference's `reference_phylogeny` rows carry `edge_id` NULL on every node (the loader mints it only from this deploy on), which a phylogenetic-placement index cannot join back to. One call per reference, `reference:write` (wet_lab_admin or system_admin); idempotent, so re-running is a no-op and a reference whose tree already carries numbering is left alone:
+  ```bash
+  curl -sS -X POST -H "Authorization: Bearer $QIITA_TOKEN" \
+    "https://qiita-miint.ucsd.edu/api/v1/reference/<reference_idx>/phylogeny/mint-edge-id"
+  ```
+  Expect `{"reference_idx": N, "phylogeny_rows": <tree size>, "already_numbered_rows": 0, "minted_rows": <tree size>}`. A `200` with `minted_rows: 0` and `already_numbered_rows == phylogeny_rows` means that tree already had its numbering — nothing to do. A `404` is an unknown `reference_idx`. A `409` means the reference exists but has no phylogeny rows, or its tree is partly numbered; both need a look before anything is written. A `502` is either the data plane being unreachable or a reply whose counts do not add up — read the detail: it says whether re-issuing is safe, and for a partially written tree it is not. Run it for **both** references currently in the lake — `18` (Web of Life 3, 392,123 rows) and `16` (452,189 rows); both carry `edge_id` NULL on every row, and a tree left unnumbered fails at placement time rather than at load. References loaded after this PR are numbered by `reference_load` itself and need no call. (#581)
 
 ### Notes (no host action)
 

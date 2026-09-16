@@ -67,6 +67,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_REFERENCE_EXCLUSION_BY_IDX",
     ),
     (
+        "URL_REFERENCE_PHYLOGENY_MINT_EDGE_ID",
+        "PATH_REFERENCE_PREFIX",
+        "PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID",
+    ),
+    (
         "URL_REFERENCE_GENOME_MEMBER",
         "PATH_REFERENCE_PREFIX",
         "PATH_REFERENCE_GENOME_MEMBER",

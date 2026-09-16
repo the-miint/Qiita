@@ -354,6 +354,14 @@ The curated global blocklist that masks bad genomes/features from downstream pro
 | `/api/v1/reference/exclusion/sync` | POST | Force-resync the DuckLake mirror from the current Postgres blocklist — makes **no** blocklist change. Operator recovery when the mirror drifts (a prior sync's 502/503 never retried, a rebuilt DuckLake catalog, or a fresh data plane came up empty). Same retriable `502` (data plane unreachable) / `503` (no scratch, or a concurrent sync held the lock) as the mutations. Requires `reference:exclusion:write` (no complete-profile — nothing is curated, so no actor is recorded). Literal path, registered *before* the `/{reference_idx}` routes. |
 | `/api/v1/reference/{reference_idx}/exclusion` | GET | Intersect the global blocklist with this reference's membership; returns each blocked member with `reason`, `direct_block`/`via_genome`, and external provenance — genome `(source, source_id)` + the reference's `reference_membership.accession`. `[]` for a clean reference, `404` for an unknown one (fail-loud, matches `get_reference_index`). Requires `reference:read`. |
 
+### Reference maintenance
+
+Repairs to a reference already in the lake. Distinct from the curation block above: these change how a reference's own rows are shaped, not which of them downstream products may see, and they are gated on `reference:write` rather than a `system_admin`-only scope.
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/reference/{reference_idx}/phylogeny/mint-edge-id` | POST | Give one reference tree the `edge_id` numbering placements join on, for a tree loaded before the loader minted it (see *Edge numbering* in [reference-data](architecture/reference-data.md)). Writes only in DuckLake, never Postgres. `200` with `minted_rows == phylogeny_rows` when the tree had no numbering, `200` with `minted_rows: 0` when it already had one (a replay, or a jplace-decorated Newick). `404` for an unknown reference. `409` when the reference exists but has no phylogeny rows, and when its tree is only partly numbered — completing that would leave two numberings in one column, so nothing is written. `502` in two cases: a transport or data-plane error, which may be re-issued; or a reply whose counts do not add up, where the detail says whether re-issuing is safe (it is not, if rows were already written). Requires **`reference:write`** — wet_lab_admin or system_admin, the scope that loads a reference in the first place — and **no new scope**: this repairs a load rather than curating content, which is what puts `reference:exclusion:write` and the mask lifecycle behind system_admin. `reference:write` is not on `SERVICE_ACCOUNT_SCOPE_CEILING`, so no service principal can reach it. |
+
 ### Reference (read)
 
 General `reference:read` resolvers, unrelated to the curation blocklist above.

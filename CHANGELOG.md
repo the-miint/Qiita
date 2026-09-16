@@ -21,6 +21,27 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A reference tree carries the edge numbering a placement joins back on (#581).**
+  `read_newick` fills `edge_id` only from jplace `{N}` decorations, so a backbone
+  loaded from an undecorated Newick carried NULL on every node. `krepp_index_create`
+  carries an `edge_id` through the build and `place_krepp` returns it verbatim as
+  `edge_num`, so the numbering we supply is the one that comes back — supply none and
+  the index numbers its own edges, after which `tree_resolve_placement` errors on
+  every row and a hand-written join returns nothing. The build reports `status='ok'`
+  either way (duckdb-miint#272). `reference_load` now mints `edge_id = node_index` when a tree
+  decorates no node, and leaves a tree that decorates any node exactly as it came, so
+  a partially decorated tree never ends up with two numberings in one column. For a
+  reference already in the lake, `POST /reference/{reference_idx}/phylogeny/mint-edge-id`
+  (`reference:write`, the scope that loads a reference) does the same through a new
+  `mint_phylogeny_edge_id` DoAction — one DuckLake `UPDATE` in one transaction, scoped
+  to one reference and issued only when every one of that tree's rows is NULL. A
+  partly numbered tree is a `409` rather than a completed mint, a reference with no
+  phylogeny is a `409` rather than an ambiguous zero, and a tree that already carries
+  its numbering mints nothing, so the call is safe to repeat. The DuckLake semantics
+  this rests on — an `UPDATE` reporting the rows it actually changed, touching only the
+  named reference, and changing nothing on a second run — are pinned by an
+  `integration`-gated data-plane test against a real catalog.
+
 - **The genome map is served as Parquet from a sibling route, so a large reference
   is no longer unbuildable (#550).** `GET /reference/{idx}/genome-map` caps at 250,000
   entries and 413s above it; both genome-bearing references on the deploy are past
