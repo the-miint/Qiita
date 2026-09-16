@@ -588,7 +588,14 @@ def _write_phylogeny(
     out: str,
 ) -> None:
     """Parse a Newick tree and emit one DuckLake row per node, with
-    feature_idx populated on tips that match a known read_id."""
+    feature_idx populated on tips that match a known read_id.
+
+    A tree that decorates no node at all is given `edge_id = node_index`; one that
+    decorates any node keeps exactly what it carried, so a partially decorated tree
+    stays partial rather than ending up with two numberings in one column. Why the
+    column has to be minted at all, and what an all-NULL one costs: see "Edge
+    numbering (`edge_id`)" in `docs/architecture/reference-data.md`, and
+    duckdb-miint#272."""
     conn.execute(
         "CREATE TEMP TABLE tree_nodes AS SELECT * FROM read_newick(?)",
         [str(tree_path)],
@@ -597,7 +604,9 @@ def _write_phylogeny(
     conn.execute(
         "COPY ("
         f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx,"
-        "    t.node_index, t.name, t.branch_length, t.edge_id,"
+        "    t.node_index, t.name, t.branch_length,"
+        "    CASE WHEN count(t.edge_id) OVER () = 0 THEN t.node_index ELSE t.edge_id END"
+        "      AS edge_id,"
         "    t.parent_index, t.is_tip, m.feature_idx"
         "  FROM tree_nodes t"
         "  LEFT JOIN id_map m ON t.is_tip AND t.name = m.read_id"

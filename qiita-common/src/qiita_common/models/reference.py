@@ -482,6 +482,44 @@ class ReferenceExclusionSyncResponse(BaseModel):
     synced_feature_count: int
 
 
+class ReferencePhylogenyEdgeIdMintResponse(BaseModel):
+    """Result of POST /reference/{idx}/phylogeny/mint-edge-id.
+
+    `already_numbered_rows` counts what carried an `edge_id` before the call, so the
+    two 200 outcomes are distinguishable: `minted_rows == phylogeny_rows` numbered a
+    tree that had none, and `already_numbered_rows == phylogeny_rows` with
+    `minted_rows == 0` is a tree that already had one (a replay, or a tree loaded
+    from a decorated Newick). Anything between the two is refused, not reported —
+    see the route."""
+
+    reference_idx: Annotated[int, Field(gt=0)]
+    phylogeny_rows: Annotated[int, Field(ge=0)]
+    already_numbered_rows: Annotated[int, Field(ge=0)]
+    minted_rows: Annotated[int, Field(ge=0)]
+
+    @model_validator(mode="after")
+    def _counts_must_add_up(self) -> ReferencePhylogenyEdgeIdMintResponse:
+        """Neither count may exceed the tree, and the two together may not exceed it.
+
+        The route's own checks read the counts to choose a status; these bound what
+        the counts can be at all, so an arithmetically impossible reply raises here
+        and reaches the caller as the route's 502 rather than as a 200 whose body
+        does not add up.
+        """
+        if self.already_numbered_rows > self.phylogeny_rows:
+            raise ValueError(
+                f"already_numbered_rows {self.already_numbered_rows} exceeds"
+                f" phylogeny_rows {self.phylogeny_rows}"
+            )
+        if self.already_numbered_rows + self.minted_rows > self.phylogeny_rows:
+            raise ValueError(
+                f"already_numbered_rows {self.already_numbered_rows} +"
+                f" minted_rows {self.minted_rows} exceeds phylogeny_rows"
+                f" {self.phylogeny_rows}"
+            )
+        return self
+
+
 class ReferenceExclusionListItem(BaseModel):
     """One actively-blocked feature that appears in a given reference, with why +
     external ids. `direct_block` / `via_genome` are reported as MUTUALLY EXCLUSIVE:

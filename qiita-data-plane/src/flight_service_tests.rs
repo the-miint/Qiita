@@ -6217,3 +6217,132 @@ fn bench_merged_file_rowgroup_pruning() {
          (row-group pruning active); block={block_t:.4}s full={full_t:.4}s"
     );
 }
+
+/// The mint against a real DuckLake catalog: what `execute` reports as
+/// `minted_rows`, the all-or-nothing gate, replay, and isolation between
+/// references. Pinned here so a DuckDB or ducklake bump re-runs them.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+    ducklake::ensure_reference_tables(&conn).unwrap();
+
+    // Unique ids so leftover rows never collide with other serial tests.
+    let all_null: i64 = 974_210;
+    let partial: i64 = 974_211;
+    let neighbour: i64 = 974_212;
+    // Never inserted under: the "reference exists but has no tree" case.
+    let no_rows: i64 = 974_213;
+
+    for id in [all_null, partial, neighbour] {
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = {id};"
+        ))
+        .unwrap();
+    }
+
+    // Three nodes, no numbering at all — the shape the mint exists for.
+    // Columns named rather than positional: `edge_id` precedes `parent_index` in
+    // the table, and a positional VALUES list silently swaps them.
+    conn.execute_batch(&format!(
+        "INSERT INTO qiita_lake.reference_phylogeny
+           (reference_idx, node_index, name, branch_length, edge_id, parent_index, is_tip)
+         VALUES
+           ({all_null}, 11, 'root', 0.0, NULL, NULL, false),
+           ({all_null}, 4, 'tipA', 0.5, NULL, 11, true),
+           ({all_null}, 7, 'tipB', 0.5, NULL, 11, true);"
+    ))
+    .unwrap();
+
+    // Three nodes where one already carries a number the mint must not join.
+    conn.execute_batch(&format!(
+        "INSERT INTO qiita_lake.reference_phylogeny
+           (reference_idx, node_index, name, branch_length, edge_id, parent_index, is_tip)
+         VALUES
+           ({partial}, 0, 'root', 0.0, 77, NULL, false),
+           ({partial}, 1, 'tipA', 0.5, NULL, 0, true),
+           ({partial}, 2, 'tipB', 0.5, NULL, 0, true);"
+    ))
+    .unwrap();
+
+    // A second all-NULL reference that must be left alone throughout.
+    conn.execute_batch(&format!(
+        "INSERT INTO qiita_lake.reference_phylogeny
+           (reference_idx, node_index, name, branch_length, edge_id, parent_index, is_tip)
+         VALUES ({neighbour}, 0, 'root', 0.0, NULL, NULL, false);"
+    ))
+    .unwrap();
+
+    let edge_ids = |id: i64| -> Vec<Option<i64>> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT edge_id FROM qiita_lake.reference_phylogeny \
+                 WHERE reference_idx = {id} ORDER BY node_index"
+            ))
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, Option<i64>>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    };
+
+    // An entirely NULL tree is numbered, and `execute` reports the true count —
+    // which is what the operator reads back as `minted_rows`.
+    let first = mint_phylogeny_edge_id(&connstr, &data_path, all_null).expect("mint failed");
+    assert_eq!(first["phylogeny_rows"], 3);
+    assert_eq!(first["already_numbered_rows"], 0);
+    assert_eq!(
+        first["minted_rows"], 3,
+        "execute must report rows changed, not 0 or a file count"
+    );
+    assert_eq!(
+        first["reference_idx"], all_null,
+        "the body echoes the reference asked for"
+    );
+    // node_index is deliberately non-contiguous and out of insertion order, so this
+    // fails any dense renumbering (a row_number()) that a contiguous 0,1,2 fixture
+    // would accept as indistinguishable from node_index.
+    assert_eq!(edge_ids(all_null), vec![Some(4), Some(7), Some(11)]);
+
+    // Replay: the counts are re-read, the tree is already numbered, nothing moves.
+    let replay = mint_phylogeny_edge_id(&connstr, &data_path, all_null).expect("replay failed");
+    assert_eq!(replay["already_numbered_rows"], 3);
+    assert_eq!(replay["minted_rows"], 0, "a replay writes nothing");
+    assert_eq!(edge_ids(all_null), vec![Some(4), Some(7), Some(11)]);
+
+    // The all-or-nothing gate: one numbered node is enough to stop the whole tree,
+    // so the two NULLs stay NULL rather than being filled with a second numbering.
+    let mixed = mint_phylogeny_edge_id(&connstr, &data_path, partial).expect("gate call failed");
+    assert_eq!(mixed["phylogeny_rows"], 3);
+    assert_eq!(mixed["already_numbered_rows"], 1);
+    assert_eq!(
+        mixed["minted_rows"], 0,
+        "a partly numbered tree is not completed"
+    );
+    assert_eq!(
+        edge_ids(partial),
+        vec![Some(77), None, None],
+        "the carried number survives and no node beside it was minted"
+    );
+
+    // Scoping: none of the above touched another reference.
+    assert_eq!(edge_ids(neighbour), vec![None]);
+
+    // A reference with no rows at all is reported, not mistaken for a done tree.
+    let empty = mint_phylogeny_edge_id(&connstr, &data_path, no_rows).expect("empty call failed");
+    assert_eq!(empty["phylogeny_rows"], 0);
+    assert_eq!(empty["minted_rows"], 0);
+
+    for id in [all_null, partial, neighbour] {
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = {id};"
+        ))
+        .unwrap();
+    }
+}

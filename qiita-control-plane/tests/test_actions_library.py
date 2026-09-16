@@ -949,3 +949,71 @@ def test_warn_on_collapsed_records_leads_with_the_caller_s_scope(tmp_path, caplo
     message = caplog.records[0].getMessage()
     assert message.startswith("assembly run (prep_sample 7, processing 3): ")
     assert "c_fwd, c_rev" in message
+
+
+async def test_mint_phylogeny_edge_id_data_signs_and_dispatches_the_same_name(monkeypatch):
+    """The action name the CP signs must be the name the DP dispatches on. The two
+    live in different languages, so nothing but a test holds them together: the Rust
+    side pins its half against `REPLAY_SAFE_ACTIONS`, this pins ours."""
+    import json
+
+    from qiita_control_plane.actions import library as lib
+
+    captured: dict = {}
+
+    def _fake_do_action(action_type, data_plane_url, token, timeout_seconds=None):
+        captured["action_type"] = action_type
+        captured["timeout_seconds"] = timeout_seconds
+        captured["token"] = token
+        return [
+            _FakeResult(
+                json.dumps(
+                    {
+                        "reference_idx": 7,
+                        "phylogeny_rows": 9,
+                        "already_numbered_rows": 0,
+                        "minted_rows": 9,
+                    }
+                ).encode()
+            )
+        ]
+
+    monkeypatch.setattr(lib, "_do_action", _fake_do_action)
+
+    result = await lib.mint_phylogeny_edge_id_data(
+        reference_idx=7,
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://dp:50051",
+    )
+
+    assert captured["action_type"] == "mint_phylogeny_edge_id"
+    assert captured["timeout_seconds"] == lib._MINT_PHYLOGENY_EDGE_ID_DO_ACTION_TIMEOUT_S
+    assert _decode_action_payload(captured["token"]) == {
+        "action": "mint_phylogeny_edge_id",
+        "reference_idx": 7,
+    }
+    # The data plane's counts are relayed verbatim; the route decides what they mean.
+    assert result == {
+        "reference_idx": 7,
+        "phylogeny_rows": 9,
+        "already_numbered_rows": 0,
+        "minted_rows": 9,
+    }
+
+
+async def test_mint_phylogeny_edge_id_data_raises_when_the_data_plane_returns_nothing(
+    monkeypatch,
+):
+    """An empty result body means what the call changed is unknown, which is not a
+    thing to paper over with a zero."""
+    import pytest
+
+    from qiita_control_plane.actions import library as lib
+
+    monkeypatch.setattr(lib, "_do_action", lambda *a, **k: [])
+    with pytest.raises(RuntimeError, match="no result body"):
+        await lib.mint_phylogeny_edge_id_data(
+            reference_idx=7,
+            signing_key=b"\x00" * 32,
+            data_plane_url="grpc://dp:50051",
+        )

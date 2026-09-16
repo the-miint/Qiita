@@ -2390,6 +2390,53 @@ async def sync_reference_exclusion_data(
     return json.loads(results[0].body.to_pybytes()).get("feature_count", 0)
 
 
+# An UPDATE rewrites every DuckLake data file it touches, and this one covers a
+# whole reference's phylogeny rows — the trees it has to cover run to a few hundred
+# thousand nodes. This is a bound, not a measurement: nothing has been timed at that
+# size. A timeout surfaces as a 502 the caller may re-issue, which is safe because
+# the second call re-reads the counts before writing.
+_MINT_PHYLOGENY_EDGE_ID_DO_ACTION_TIMEOUT_S = 300.0
+
+
+async def mint_phylogeny_edge_id_data(
+    *,
+    reference_idx: int,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> dict[str, int]:
+    """Give one reference's phylogeny rows the edge numbering placement joins on.
+
+    Why the column can be NULL and what depends on it: see "Edge numbering
+    (`edge_id`)" in `docs/architecture/reference-data.md`.
+
+    Signs a ``mint_phylogeny_edge_id`` DoAction. The data plane mints only when the
+    reference's whole tree carries NULL, so a partly numbered tree comes back
+    untouched rather than half-written. Returns its counts verbatim —
+    ``reference_idx``, ``phylogeny_rows``, ``already_numbered_rows``,
+    ``minted_rows``; the caller decides which combinations are errors. Raises
+    pyarrow.flight.FlightError on transport / data-plane failure, and RuntimeError
+    when the data plane answers with no result body."""
+    results = await run_signed_flight_call(
+        lambda: sign_action(
+            action="mint_phylogeny_edge_id",
+            payload={"reference_idx": reference_idx},
+            secret=signing_key,
+        ),
+        lambda token: _do_action(
+            "mint_phylogeny_edge_id",
+            data_plane_url,
+            token,
+            _MINT_PHYLOGENY_EDGE_ID_DO_ACTION_TIMEOUT_S,
+        ),
+    )
+    if not results:
+        raise RuntimeError(
+            f"mint_phylogeny_edge_id for reference {reference_idx} returned no result"
+            " body, so what it changed is unknown"
+        )
+    return json.loads(results[0].body.to_pybytes())
+
+
 async def sync_reference_exclusion(
     pool: asyncpg.Pool,
     *,

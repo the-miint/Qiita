@@ -627,6 +627,34 @@ pub fn verify_sync_reference_exclusion(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed payload for the `mint_phylogeny_edge_id` DoAction.
+///
+/// Wire shape pinned by
+/// `qiita_control_plane.actions.library.mint_phylogeny_edge_id_data`:
+/// `{"action": "mint_phylogeny_edge_id", "reference_idx": <i64>}`. What the mint is
+/// for: see `mint_phylogeny_edge_id` in `flight_service.rs`. Scoped to one
+/// reference, which is why the field is here (unlike the global exclusion mirror).
+/// `deny_unknown_fields` keeps the contract tight: any extra field is a design slip
+/// surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MintPhylogenyEdgeIdPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "mint_phylogeny_edge_id".
+    pub action: String,
+    /// The reference whose `reference_phylogeny` rows are minted.
+    pub reference_idx: i64,
+}
+
+/// Verify a `mint_phylogeny_edge_id` DoAction token and return its payload.
+pub fn verify_mint_phylogeny_edge_id(
+    ticket: &[u8],
+    verifying_key: &VerifyingKey,
+) -> Result<MintPhylogenyEdgeIdPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 #[cfg(test)]
 #[path = "auth_tests.rs"]
 mod tests;

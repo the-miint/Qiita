@@ -85,6 +85,11 @@ PATH_REFERENCE_GENOME_MAP = "/{reference_idx}/genome-map"
 # path with one behaviour is what the api_paths triple can express. Param path,
 # 3 segments, no literal shadow.
 PATH_REFERENCE_GENOME_MAP_PARQUET = "/{reference_idx}/genome-map/parquet"
+# Operator maintenance: give one reference's phylogeny rows the edge numbering
+# placements join on, for a tree loaded before the loader minted it. A verb segment
+# (like /revoke-all-tokens) because it is an action on the tree, not a sub-resource
+# to read. Param path, 3 segments, no literal shadow.
+PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID = "/{reference_idx}/phylogeny/mint-edge-id"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -98,6 +103,9 @@ URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSI
 URL_REFERENCE_GENOME_MEMBER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MEMBER}"
 URL_REFERENCE_GENOME_MAP = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP}"
 URL_REFERENCE_GENOME_MAP_PARQUET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP_PARQUET}"
+URL_REFERENCE_PHYLOGENY_MINT_EDGE_ID = (
+    f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID}"
+)
 
 # =============================================================================
 # /host-filter-profile/*

@@ -518,6 +518,57 @@ def test_phylogeny_accepts_a_RAW_newick_on_the_local_path(staging_inputs, tmp_pa
     assert tips_with_fidx == set(_FEATURE_MAP.values())
 
 
+def test_phylogeny_mints_edge_id_when_the_tree_decorates_nothing(
+    staging_inputs, tree_path, tmp_path
+):
+    """An undecorated Newick leaves `edge_id` NULL on every node, and an index built
+    from such a tree numbers its own edges, which join back to nothing here. The
+    loader supplies `node_index` instead — dense and unique, and carried through a
+    placement build verbatim. See "Edge numbering" in
+    `docs/architecture/reference-data.md`."""
+    outputs = _run(_inputs(**staging_inputs, tree_path=tree_path), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_phylogeny.parquet"
+    with duckdb.connect(":memory:") as conn:
+        rows, nulls, differing = conn.execute(
+            "SELECT count(*),"
+            "       count(*) FILTER (WHERE edge_id IS NULL),"
+            "       count(*) FILTER (WHERE edge_id IS DISTINCT FROM node_index)"
+            f" FROM '{pq}'"
+        ).fetchone()
+    assert rows > 0
+    assert nulls == 0, "an undecorated tree must not reach the lake with NULL edge_id"
+    assert differing == 0, "the minted numbering is node_index"
+
+
+def test_phylogeny_leaves_a_partially_decorated_tree_partial(staging_inputs, tmp_path):
+    """A tree carrying jplace `{N}` decorations keeps exactly those numbers, and the
+    nodes it left undecorated stay NULL. The mint is all-or-nothing per tree: filling
+    those NULLs with `node_index` would put two numberings in one column, and nothing
+    downstream could tell which one an edge came from."""
+    raw_nwk = tmp_path / "decorated.nwk"
+    # Every node but the root is decorated; the root carries no branch length and
+    # so no `{N}`, which is what makes this tree partially decorated.
+    raw_nwk.write_text(
+        "((seq1:0.1{5},seq2:0.2{6}):0.3{7},"
+        "(seq3:0.4{8},(seq4:0.5{9},seq5:0.6{10}):0.7{11}):0.8{12});"
+    )
+
+    outputs = _run(_inputs(**staging_inputs, tree_path=raw_nwk), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_phylogeny.parquet"
+    with duckdb.connect(":memory:") as conn:
+        decorated = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT edge_id FROM '{pq}' WHERE edge_id IS NOT NULL ORDER BY edge_id"
+            ).fetchall()
+        ]
+        (still_null,) = conn.execute(
+            f"SELECT count(*) FILTER (WHERE edge_id IS NULL) FROM '{pq}'"
+        ).fetchone()
+    assert decorated == [5, 6, 7, 8, 9, 10, 11, 12]
+    assert still_null == 1, "the undecorated root must keep its NULL, not be minted"
+
+
 @pytest.fixture
 def jplace_path(tmp_path):
     """jplace input wrapped in the CLI's chunked DoPut shape.

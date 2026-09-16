@@ -577,6 +577,12 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   mirror from the CP's resolved blocklist Parquet (one DELETE + INSERT
 ///   transaction); a replay reloads the same authoritative set, so the table
 ///   converges to the same state.
+/// - `mint_phylogeny_edge_id` — sets `edge_id = node_index` on ONE reference's
+///   `reference_phylogeny` rows, and only when every one of them carries NULL.
+///   A replay re-reads the counts, finds the tree numbered, and writes nothing.
+///   The only writer that could put all-NULL rows back under the same
+///   `reference_idx` is `reference_load._write_phylogeny`, which mints them
+///   itself, so there is no window a replay could fill differently.
 ///
 /// The `do_action` dispatcher rejects any action not in this set, so a **new**
 /// action is refused until it is added here — forcing whoever adds it to
@@ -596,6 +602,7 @@ const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "count_masked",
     "mask_metrics",
     "sync_reference_exclusion",
+    "mint_phylogeny_edge_id",
 ];
 
 #[tonic::async_trait]
@@ -1214,6 +1221,41 @@ impl FlightService for QiitaFlightService {
                 .await
                 .map_err(|e| {
                     Status::internal(format!("sync_reference_exclusion task join failed: {e}"))
+                })??;
+
+                let result_body = serde_json::to_vec(&result)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "mint_phylogeny_edge_id" => {
+                let payload =
+                    auth::verify_mint_phylogeny_edge_id(&action.body, &self.flight_public_key)
+                        .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "mint_phylogeny_edge_id" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'mint_phylogeny_edge_id', \
+                         payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                // One blocking DuckLake transaction, like sync_reference_exclusion:
+                // run it on the blocking pool so it never starves a tonic async
+                // worker. The closure opens and drops its own connection.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let reference_idx = payload.reference_idx;
+                let result = tokio::task::spawn_blocking(move || {
+                    mint_phylogeny_edge_id(&catalog, &data_path, reference_idx)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("mint_phylogeny_edge_id task join failed: {e}"))
                 })??;
 
                 let result_body = serde_json::to_vec(&result)
@@ -2996,6 +3038,86 @@ fn sync_reference_exclusion(
 
     Ok(serde_json::json!({
         "feature_count": loaded,
+    }))
+}
+
+/// Give one reference's phylogeny rows the edge numbering krepp placement joins on.
+///
+/// Why the numbering has to be minted, and what an all-NULL column costs: "Edge
+/// numbering (`edge_id`)" in `docs/architecture/reference-data.md`, and
+/// duckdb-miint#272. `reference_load._write_phylogeny` does this at load; this
+/// action does it for a reference already in the lake.
+///
+/// All-or-nothing per tree, the rule `reference_load._write_phylogeny` applies at
+/// load: a tree that numbers any node keeps the numbering it arrived with. Minting
+/// only the NULL rows of a partly numbered tree would leave two numberings in one
+/// column with nothing to tell them apart, so this counts first and mints only when
+/// the whole tree is NULL. `reference_idx` is an `i64` from the Ed25519-signed
+/// payload, bound as a parameter rather than inlined.
+///
+/// Reports `phylogeny_rows` (0 means the reference has no tree), the pre-mint
+/// `already_numbered_rows`, and `minted_rows`. The caller decides what each state
+/// means: a partly numbered tree comes back with `minted_rows` 0 rather than a
+/// partial write.
+fn mint_phylogeny_edge_id(
+    catalog_connstr: &str,
+    data_path: &str,
+    reference_idx: i64,
+) -> Result<serde_json::Value, Status> {
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let counted = (|| -> Result<(i64, i64, i64), Status> {
+        let (total, already_numbered) = conn
+            .query_row(
+                "SELECT count(*), count(edge_id) FROM qiita_lake.reference_phylogeny \
+                 WHERE reference_idx = ?",
+                duckdb::params![reference_idx],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|e| {
+                Status::internal(format!(
+                    "failed to count phylogeny rows for reference {reference_idx}: {e}"
+                ))
+            })?;
+        if already_numbered != 0 {
+            return Ok((total, already_numbered, 0));
+        }
+        let minted = conn
+            .execute(
+                "UPDATE qiita_lake.reference_phylogeny SET edge_id = node_index \
+                 WHERE reference_idx = ? AND edge_id IS NULL",
+                duckdb::params![reference_idx],
+            )
+            .map_err(|e| {
+                Status::internal(format!(
+                    "failed to mint edge_id for reference {reference_idx}: {e}"
+                ))
+            })?;
+        Ok((total, already_numbered, minted as i64))
+    })();
+
+    let (total, already_numbered, minted) = match counted {
+        Ok(v) => v,
+        Err(e) => {
+            // Best-effort rollback; surface the original error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit mint transaction: {e}")))?;
+
+    Ok(serde_json::json!({
+        "reference_idx": reference_idx,
+        "phylogeny_rows": total,
+        "already_numbered_rows": already_numbered,
+        "minted_rows": minted,
     }))
 }
 
