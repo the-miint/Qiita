@@ -271,16 +271,14 @@ def test_probe_script_checks_miint_read_fastx():
 
 
 def test_probe_script_checks_ena_reachability_from_compute():
-    """The probe HEADs www.ebi.ac.uk and ftp.sra.ebi.ac.uk from the compute node —
-    a compute subnet with no outbound HTTPS passes every head-node check and then
-    fails every import's download step, so it must fail here, at deploy. The
-    compute-side half of the control-plane verify.sh ENA check (deploy/verify.sh).
-    Both hosts are named so the operator sees which archive is unreachable."""
+    """The compute half of the deploy's ENA egress check: a subnet with no
+    outbound HTTPS passes every head-node check and then fails every import's
+    download step. Runs `ena_reachability_check` as a module (like native-import),
+    so the hosts and the verdict are pinned on that module's own tests."""
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    assert "qiita_compute_orchestrator.ena_reachability_check" in script
     assert "ena-from-compute=ok" in script
     assert "ena-from-compute=fail" in script
-    assert "www.ebi.ac.uk" in script
-    assert "ftp.sra.ebi.ac.uk" in script
     # The parser maps the new key onto the standard ok/fail alphabet.
     assert cr._classify_probe_pair("ena-from-compute", "ok") == "pass"
     assert cr._classify_probe_pair("ena-from-compute", "fail") == "fail"

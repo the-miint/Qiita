@@ -21,14 +21,18 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **Deploy now fails on a host that cannot reach the ENA archives (#584).**
-  `deploy/verify.sh` gains an `ena-reachability` check (hatch `SKIP_ENA_REACHABILITY`)
-  that HEADs `www.ebi.ac.uk` as the `qiita-api` service user, and `qiita-admin
-  compute-readiness` gains an `ena-from-compute` probe that HEADs `www.ebi.ac.uk` and
-  `ftp.sra.ebi.ac.uk` from a SLURM compute node (pure stdlib `urllib`, no `curl`, no miint
-  LOAD). Previously a firewall/NAT blocking outbound HTTPS passed every deploy check and
-  then failed every ENA import at runtime — metadata resolve on the control plane, read
-  download on the cluster — with the gap invisible until an import was submitted.
+- **Deploy proves outbound HTTPS to the ENA archives, so a blocked host fails the deploy
+  instead of every import (#584).** `deploy/verify.sh` gains an `ena-reachability` check
+  (hatch `SKIP_ENA_REACHABILITY`) that HEADs `www.ebi.ac.uk` as the `qiita-api` service
+  user with the unit's own environment sourced, and `qiita-admin compute-readiness` gains
+  an `ena-from-compute` probe that runs `qiita_compute_orchestrator.ena_reachability_check`
+  (stdlib only, no miint LOAD and no `curl` on the image) to HEAD `www.ebi.ac.uk` and
+  `ftp.sra.ebi.ac.uk` from a SLURM compute node. Previously a firewall/NAT blocking
+  outbound HTTPS passed every deploy check and then failed every ENA import at runtime —
+  metadata resolve on the control plane, read download on the cluster — with the gap
+  invisible until an import was submitted. Both probes answer for egress only: the fetch
+  itself runs through DuckDB httpfs, so a proxy or CA problem confined to httpfs still
+  surfaces at the first import.
 
 - **`estimate-feature-table` gates the de novo arm on CheckM completeness /
   contamination (#564).** Two new optional `action_context` keys, `min_completeness` and
