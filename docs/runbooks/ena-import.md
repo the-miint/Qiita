@@ -156,11 +156,11 @@ that comes back truncated or empty fails loud either way.
 
 **Network access.** The control-plane host resolves metadata from `www.ebi.ac.uk`, and
 the SLURM compute nodes running `ingest_ena_reads` reach both `www.ebi.ac.uk` and
-`ftp.sra.ebi.ac.uk`, all over HTTPS. `deploy/verify.sh` (`ena-reachability`) and the
-`compute-readiness` probe job (`ena-from-compute`) HEAD those hosts at deploy, so a
-blocked host fails there rather than at the first import. Both probe egress with a
-stdlib/curl client; the fetch itself runs through DuckDB httpfs, so a proxy or CA
-problem confined to httpfs still surfaces first at resolve or download.
+`ftp.sra.ebi.ac.uk`, all over HTTPS. Two deploy rows HEAD those hosts so a blocked
+one fails at deploy rather than at the first import — `ena-reachability` from the
+control-plane host and `probe/ena-from-compute` from a compute node. What each row
+covers, what a green one does *not* prove, and which hatch skips which are in
+[`redeploy.md` §7](redeploy.md#7-verify).
 
 An unresolvable accession (malformed, or one ENA does not recognize) fails loud with
 an actionable message rather than resolving to a silent empty result — see

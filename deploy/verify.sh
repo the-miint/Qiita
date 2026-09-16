@@ -13,9 +13,15 @@
 # 0440 env files):  sudo deploy/verify.sh   (or: make verify-deploy)
 #
 # Read-only. Exit non-zero iff any ATTEMPTED check failed; absent env files
-# (first deploy) degrade to skip rows. Hatches: SKIP_HEALTH, SKIP_ACTIONS,
-# SKIP_COMPUTE_READINESS, SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_ENA_REACHABILITY,
-# SKIP_PREFLIGHT (the last passes through to preflight.sh). See docs/runbooks/redeploy.md.
+# (first deploy) degrade to skip rows — except ena-reachability, which asks a
+# question the env file is optional to and runs either way (see below).
+#
+# Hatches, one per row: SKIP_HEALTH, SKIP_ACTIONS, SKIP_COMPUTE_READINESS,
+# SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_ENA_REACHABILITY, SKIP_PREFLIGHT (the
+# last passes through to preflight.sh). SKIP_ENA_REACHABILITY skips the
+# CONTROL-PLANE row only; its compute-node counterpart (probe/ena-from-compute)
+# rides the SLURM probe job and goes with SKIP_SLURM_PROBE, which also drops
+# native-import, the miint probes and shared-fs. See docs/runbooks/redeploy.md.
 
 set -euo pipefail
 
@@ -139,28 +145,33 @@ else
 fi
 
 # --- 4b. ENA reachability from the control plane (as qiita-api) -----------
-# ENA import resolves study/sample metadata on the control plane over HTTPS to
-# www.ebi.ac.uk. A firewall/NAT that blocks outbound HTTPS from the cp host passes
-# every other check and then fails *every* import at resolve — invisible until
-# runtime. HEAD the archive as the service user, with the unit's own environment
-# sourced so a proxy set there applies. Egress only, for the reasons on the compute
-# side's `ena_reachability_check`. No CP_ENV gate — a first deploy is the likeliest
-# host to be blocked, and the env file is optional to this question. Any HTTP answer
-# counts as reachable (no -f), matching that probe.
+# The control-plane half of the deploy's ENA egress check; the compute-node half
+# is the compute-readiness probe row `ena-from-compute`. Why the deploy asks at
+# all, and what a green row does and does not prove, is stated once on
+# qiita_compute_orchestrator.ena_reachability_check.
+#
+# HEAD the archive as the service user, with the unit's own environment sourced
+# so a proxy set there applies. No CP_ENV gate — a first deploy is the likeliest
+# host to be blocked, and the env file is optional to this question, so this row
+# does not degrade to a skip the way the ones above it do. -f, so a blocking
+# gateway's 403 block page reads as unreachable rather than as an answer; both
+# archive roots serve a HEAD 200 with no redirect. Capture curl's own message
+# into the row (as cp-miint does), or DNS, timeout, TLS and proxy failures all
+# read identically.
 if [ -n "${SKIP_ENA_REACHABILITY:-}" ]; then
     skip "ena-reachability" "SKIP_ENA_REACHABILITY=1"
 elif sudo -u "$QIITA_API_USER" bash -c 'command -v curl >/dev/null 2>&1'; then
-    if sudo -u "$QIITA_API_USER" bash -c "
+    if out=$(sudo -u "$QIITA_API_USER" bash -c "
         if [ -r '$CP_ENV' ]; then
             set -a
             # shellcheck disable=SC1091
             . '$CP_ENV'; set +a
         fi
-        curl -sS -m 15 -o /dev/null -I https://www.ebi.ac.uk
-    " >/dev/null 2>&1; then
+        curl -fsS -m 15 -o /dev/null -I https://www.ebi.ac.uk
+    " 2>&1); then
         pass "ena-reachability" "control plane can HEAD www.ebi.ac.uk (run as $QIITA_API_USER)"
     else
-        fail "ena-reachability" "control plane cannot reach www.ebi.ac.uk over HTTPS — ENA import fails at resolve (run as $QIITA_API_USER)"
+        fail "ena-reachability" "control plane cannot reach www.ebi.ac.uk over HTTPS — ENA import fails at resolve (run as $QIITA_API_USER): ${out}"
     fi
 else
     skip "ena-reachability" "curl not available to $QIITA_API_USER"

@@ -31,7 +31,19 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- `[admin]` `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>` now carries two ENA egress rows —
+  grep its output for both (#584):
+  - `ena-reachability` — the control-plane host HEADs `https://www.ebi.ac.uk`. Red means
+    outbound HTTPS to the archive is blocked from this host, so **every** ENA import fails at
+    metadata resolve. Hatch: `SKIP_ENA_REACHABILITY=1` (this row only).
+  - `probe/ena-from-compute` — a SLURM compute node HEADs `www.ebi.ac.uk` and
+    `ftp.sra.ebi.ac.uk`. Red means every import's read-download step fails. No per-row hatch;
+    it rides the SLURM probe job, so `SKIP_SLURM_PROBE=1` drops it along with every other
+    `probe/*` row.
+
+  These replace the manual "confirm outbound HTTPS to the ENA archives" host-setup step this
+  deploy's predecessor carried by hand. Green proves egress only: the fetch itself runs through
+  DuckDB httpfs, so a proxy or CA problem confined to httpfs still surfaces at the first import.
 
 ### 6. After the deploy verifies green
 

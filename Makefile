@@ -292,8 +292,9 @@ preflight:
 
 # One-command post-deploy verification on an established host (run as root):
 #   sudo make verify-deploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
-# Runs health aggregate + qiita.action list + compute-readiness, each with the
-# correct service account/env baked in, then the preflight fingerprint summary.
+# Runs health aggregate + qiita.action list + compute-readiness + the CP miint
+# LOAD + ENA reachability from the control plane, each with the correct service
+# account/env baked in, then the preflight fingerprint summary.
 # Use this instead of hand-copying verify lines (see docs/runbooks/redeploy.md §7).
 verify-deploy:
 	QIITA_HOSTNAME="$(QIITA_HOSTNAME)" bash deploy/verify.sh

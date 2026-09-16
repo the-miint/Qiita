@@ -23,14 +23,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 - **Deploy proves outbound HTTPS to the ENA archives, so a blocked host fails the deploy
   instead of every import (#584).** `deploy/verify.sh` gains an `ena-reachability` check
-  (hatch `SKIP_ENA_REACHABILITY`) that HEADs `www.ebi.ac.uk` as the `qiita-api` service
-  user with the unit's own environment sourced, and `qiita-admin compute-readiness` gains
-  an `ena-from-compute` probe that runs `qiita_compute_orchestrator.ena_reachability_check`
-  (stdlib only, no miint LOAD and no `curl` on the image) to HEAD `www.ebi.ac.uk` and
-  `ftp.sra.ebi.ac.uk` from a SLURM compute node. Previously a firewall/NAT blocking
-  outbound HTTPS passed every deploy check and then failed every ENA import at runtime —
-  metadata resolve on the control plane, read download on the cluster — with the gap
-  invisible until an import was submitted. Both probes answer for egress only: the fetch
+  (hatch `SKIP_ENA_REACHABILITY`, which covers that row only) that HEADs `www.ebi.ac.uk` as
+  the `qiita-api` service user with the unit's own environment sourced, and
+  `qiita-admin compute-readiness` gains an `ena-from-compute` probe that runs
+  `qiita_compute_orchestrator.ena_reachability_check` (stdlib only, no miint LOAD, so a red
+  row means egress and never a broken extension) to HEAD `www.ebi.ac.uk` and
+  `ftp.sra.ebi.ac.uk` from a SLURM compute node; it rides the SLURM probe job, so
+  `SKIP_SLURM_PROBE` is what skips it. Both require a 2xx — a blocking gateway answers on
+  the socket, and its 403 block page must not read as reachable. Previously a firewall/NAT
+  blocking outbound HTTPS passed every deploy check and then failed every ENA import at
+  runtime — metadata resolve on the control plane, read download on the cluster — with the
+  gap invisible until an import was submitted. Both probes answer for egress only: the fetch
   itself runs through DuckDB httpfs, so a proxy or CA problem confined to httpfs still
   surfaces at the first import.
 

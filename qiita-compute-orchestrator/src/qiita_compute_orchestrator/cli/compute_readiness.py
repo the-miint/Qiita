@@ -259,28 +259,40 @@ else
     echo "{_PROBE_LINE_PREFIX} native-python-on-compute=fail path=$PYTHON"
 fi
 
-# The SAME check redeploy.sh runs on the head node after `uv sync`, invoked as a
-# module so neither side can drift into its own idea of "imports cleanly" — see
-# qiita_compute_orchestrator.native_import_check for what it covers and why it is
-# anchored on the job modules rather than on qiita_common. Same capture shape as
-# the miint probes below: the check prints one collapsed line naming the module
-# and the error, and that line is the operator's whole diagnosis — a bare `=fail`
-# leaves nothing to act on, and _parse_probe_log keeps only prefixed lines.
+# Run one check module under $PYTHON; on failure leave its one-line diagnosis in
+# MODULE_PROBE_ERR for the caller's `err=` field. Every module-form probe below
+# goes through this, so none of them can drift into its own idea of what reaches
+# the operator.
+#
 # -P keeps the cwd off sys.path so a probe launched from inside a source tree
 # cannot shadow the installed package it is there to check.
 #
 # 2>&1, because a failure BEFORE the module's own try block writes to stderr and
 # leaves stdout empty: `No module named ...` on a venv that predates the module is
-# the case the deploy checklist says to expect first. The collapse runs in the
-# else branch rather than on the capture, because a pipeline's status is the LAST
-# command's — `if VAR="$(python ... | tr ...)"` reads tr's 0 and reports ok on
-# every failure.
-NATIVE_IMPORT_MOD=qiita_compute_orchestrator.native_import_check
-if NATIVE_IMPORT_ERR="$("$PYTHON" -P -m "$NATIVE_IMPORT_MOD" 2>&1)"; then
+# the case the deploy checklist says to expect first. That captured line is the
+# operator's whole diagnosis — a bare `=fail` leaves nothing to act on, and
+# _parse_probe_log keeps only prefixed lines. The collapse runs after the capture
+# rather than in a pipeline, because a pipeline's status is the LAST command's —
+# `if VAR="$(python ... | tr ...)"` reads tr's 0 and reports ok on every failure.
+#
+# The row name stays a literal at each call site: the script-vs-parser parity
+# test reads `<key>=<value>` out of this script's text.
+run_module_probe() {{
+    if MODULE_PROBE_ERR="$("$PYTHON" -P -m "$1" 2>&1)"; then
+        return 0
+    fi
+    MODULE_PROBE_ERR="$(printf '%s' "$MODULE_PROBE_ERR" | tr -s '[:space:]' ' ')"
+    return 1
+}}
+
+# The SAME check redeploy.sh runs on the head node after `uv sync`, invoked as a
+# module so neither side can drift into its own idea of "imports cleanly" — see
+# qiita_compute_orchestrator.native_import_check for what it covers and why it is
+# anchored on the job modules rather than on qiita_common.
+if run_module_probe qiita_compute_orchestrator.native_import_check; then
     echo "{_PROBE_LINE_PREFIX} native-import=ok"
 else
-    NATIVE_IMPORT_ERR="$(printf '%s' "$NATIVE_IMPORT_ERR" | tr -s '[:space:]' ' ')"
-    echo "{_PROBE_LINE_PREFIX} native-import=fail err=$NATIVE_IMPORT_ERR"
+    echo "{_PROBE_LINE_PREFIX} native-import=fail err=$MODULE_PROBE_ERR"
 fi
 
 # miint must LOAD on the compute node from the deploy-staged
@@ -504,17 +516,13 @@ else
     echo "{_PROBE_LINE_PREFIX} cp-from-compute=skip cp_url_set=$CPSET token_set=$TOKSET"
 fi
 
-# ENA reachability from the compute node: a compute subnet with no outbound HTTPS
-# passes every head-node check and then fails *every* import's download step,
-# invisible until runtime. What a green row does and does not prove is on
-# `ena_reachability_check` itself. Same module form and capture shape as
-# native-import, so the two cannot disagree about what they print into `err=`.
-ENA_CHECK_MOD=qiita_compute_orchestrator.ena_reachability_check
-if ENA_ERR="$("$PYTHON" -P -m "$ENA_CHECK_MOD" 2>&1)"; then
+# Outbound HTTPS from this compute node to the ENA archives — why the deploy
+# checks it at all, and what a green row does and does not prove, is on
+# `ena_reachability_check` itself.
+if run_module_probe qiita_compute_orchestrator.ena_reachability_check; then
     echo "{_PROBE_LINE_PREFIX} ena-from-compute=ok"
 else
-    ENA_ERR="$(printf '%s' "$ENA_ERR" | tr -s '[:space:]' ' ')"
-    echo "{_PROBE_LINE_PREFIX} ena-from-compute=fail err=$ENA_ERR"
+    echo "{_PROBE_LINE_PREFIX} ena-from-compute=fail err=$MODULE_PROBE_ERR"
 fi
 exit 0
 """
