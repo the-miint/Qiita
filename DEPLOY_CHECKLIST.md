@@ -19,7 +19,11 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+_None yet._ (Outbound-HTTPS-to-ENA reachability is now proven at deploy: the
+control plane HEADs `www.ebi.ac.uk` in `deploy/verify.sh`, and the compute
+nodes probe `www.ebi.ac.uk` + `ftp.sra.ebi.ac.uk` in `qiita-admin
+compute-readiness`. A blocked host fails the deploy, naming the host, instead
+of the first import.)
 
 ### 3. Migrations
 

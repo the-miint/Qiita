@@ -14,8 +14,8 @@
 #
 # Read-only. Exit non-zero iff any ATTEMPTED check failed; absent env files
 # (first deploy) degrade to skip rows. Hatches: SKIP_HEALTH, SKIP_ACTIONS,
-# SKIP_COMPUTE_READINESS, SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_PREFLIGHT (the
-# last passes through to preflight.sh). See docs/runbooks/redeploy.md.
+# SKIP_COMPUTE_READINESS, SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_ENA_REACHABILITY,
+# SKIP_PREFLIGHT (the last passes through to preflight.sh). See docs/runbooks/redeploy.md.
 
 set -euo pipefail
 
@@ -136,6 +136,29 @@ elif [ -r "$CP_ENV" ]; then
     fi
 else
     skip "cp-miint" "$CP_ENV absent (first deploy)"
+fi
+
+# --- 4b. ENA reachability from the control plane (as qiita-api) -----------
+# ENA import resolves study/sample metadata on the control plane over HTTPS to
+# www.ebi.ac.uk. A firewall/NAT that blocks outbound HTTPS from the cp host passes
+# every other check and then fails *every* import at resolve — invisible until
+# runtime. HEAD the archive as the service user (the same user that runs the
+# resolve), so the deploy fails here, naming the host, instead of at the first
+# import. Same posture as cp-miint: a gap nothing else exercises, caught at deploy.
+if [ -n "${SKIP_ENA_REACHABILITY:-}" ]; then
+    skip "ena-reachability" "SKIP_ENA_REACHABILITY=1"
+elif [ -r "$CP_ENV" ]; then
+    if sudo -u "$QIITA_API_USER" bash -c 'command -v curl >/dev/null 2>&1'; then
+        if sudo -u "$QIITA_API_USER" bash -c 'curl -fsS -m 15 -o /dev/null -I https://www.ebi.ac.uk' >/dev/null 2>&1; then
+            pass "ena-reachability" "control plane can HEAD www.ebi.ac.uk (run as $QIITA_API_USER)"
+        else
+            fail "ena-reachability" "control plane cannot reach www.ebi.ac.uk over HTTPS — ENA import fails at resolve (run as $QIITA_API_USER)"
+        fi
+    else
+        skip "ena-reachability" "curl not available to $QIITA_API_USER"
+    fi
+else
+    skip "ena-reachability" "$CP_ENV absent (first deploy)"
 fi
 
 # --- 5. Config/secret fingerprint summary (preflight) -----------------------

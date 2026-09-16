@@ -21,6 +21,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Deploy now fails on a host that cannot reach the ENA archives (#584).**
+  `deploy/verify.sh` gains an `ena-reachability` check (hatch `SKIP_ENA_REACHABILITY`)
+  that HEADs `www.ebi.ac.uk` as the `qiita-api` service user, and `qiita-admin
+  compute-readiness` gains an `ena-from-compute` probe that HEADs `www.ebi.ac.uk` and
+  `ftp.sra.ebi.ac.uk` from a SLURM compute node (pure stdlib `urllib`, no `curl`, no miint
+  LOAD). Previously a firewall/NAT blocking outbound HTTPS passed every deploy check and
+  then failed every ENA import at runtime — metadata resolve on the control plane, read
+  download on the cluster — with the gap invisible until an import was submitted.
+
 - **`estimate-feature-table` gates the de novo arm on CheckM completeness /
   contamination (#564).** Two new optional `action_context` keys, `min_completeness` and
   `max_contamination`, defaulting to 50 / 10. The gate filters the de novo

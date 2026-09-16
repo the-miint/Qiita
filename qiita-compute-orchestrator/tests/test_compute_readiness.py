@@ -270,6 +270,22 @@ def test_probe_script_checks_miint_read_fastx():
     assert "max_batch_bytes" in script
 
 
+def test_probe_script_checks_ena_reachability_from_compute():
+    """The probe HEADs www.ebi.ac.uk and ftp.sra.ebi.ac.uk from the compute node —
+    a compute subnet with no outbound HTTPS passes every head-node check and then
+    fails every import's download step, so it must fail here, at deploy. The
+    compute-side half of the control-plane verify.sh ENA check (deploy/verify.sh).
+    Both hosts are named so the operator sees which archive is unreachable."""
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    assert "ena-from-compute=ok" in script
+    assert "ena-from-compute=fail" in script
+    assert "www.ebi.ac.uk" in script
+    assert "ftp.sra.ebi.ac.uk" in script
+    # The parser maps the new key onto the standard ok/fail alphabet.
+    assert cr._classify_probe_pair("ena-from-compute", "ok") == "pass"
+    assert cr._classify_probe_pair("ena-from-compute", "fail") == "fail"
+
+
 def test_probe_script_is_valid_bash():
     """The generated probe script must parse as valid bash. Regression for an
     f-string newline-escape written inside a comment that expanded to a real

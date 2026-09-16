@@ -503,6 +503,44 @@ else
     TOKSET=$([ -n "$TOK" ] && echo ok || echo fail)
     echo "{_PROBE_LINE_PREFIX} cp-from-compute=skip cp_url_set=$CPSET token_set=$TOKSET"
 fi
+
+# ENA reachability from the compute node. The download-ena-study job pulls reads
+# from ftp.sra.ebi.ac.uk (and www.ebi.ac.uk for some studies); a compute subnet
+# with no outbound HTTPS passes every head-node check and then fails *every*
+# import's download step — invisible until runtime. Probe BOTH from the compute
+# node with a HEAD (cheap, no bytes downloaded) so the deploy fails here, naming
+# the host, instead of inside a SLURM job. Pure stdlib urllib: no dependency on
+# miint being LOADable and no curl required on the compute image. Same capture
+# shape as the miint probes — the collapsed error line is the operator's whole
+# diagnosis, and _parse_probe_log keeps only these prefixed lines.
+ENA_PROBE="$(mktemp)"
+cat > "$ENA_PROBE" <<'PYEOF'
+import sys
+try:
+    import urllib.request
+    import urllib.error
+    hosts = ["https://www.ebi.ac.uk", "https://ftp.sra.ebi.ac.uk"]
+    unreachable = []
+    for host in hosts:
+        try:
+            req = urllib.request.Request(host, method="HEAD")
+            urllib.request.urlopen(req, timeout=10).close()
+        except urllib.error.HTTPError:
+            pass  # host answered (4xx/5xx) => reachable; only connectivity counts
+        except Exception as exc:
+            unreachable.append(host + " (" + type(exc).__name__ + ")")
+    assert not unreachable, "; ".join(unreachable)
+except Exception as exc:
+    msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
+    print(msg[:{MAX_DETAIL}])
+    sys.exit(1)
+PYEOF
+if ENA_ERR="$("$PYTHON" "$ENA_PROBE" 2>/dev/null)"; then
+    echo "{_PROBE_LINE_PREFIX} ena-from-compute=ok"
+else
+    echo "{_PROBE_LINE_PREFIX} ena-from-compute=fail err=$ENA_ERR"
+fi
+rm -f "$ENA_PROBE"
 exit 0
 """
 
