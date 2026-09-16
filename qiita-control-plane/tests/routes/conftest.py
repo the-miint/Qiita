@@ -18,8 +18,10 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
     URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
+    URL_BIOSAMPLE_STUDY_FIELD_BY_IDX,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
+    URL_PREP_SAMPLE_STUDY_FIELD_BY_IDX,
     URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope
@@ -27,7 +29,10 @@ from qiita_common.models import FieldDataType
 from qiita_common.models.reference import Tier
 
 from qiita_control_plane.repositories import UpdatableTable
+from qiita_control_plane.repositories._sample_helpers import EntityMetadataSpec, SampleEntityKind
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
+from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
@@ -230,6 +235,13 @@ async def make_pat_client(postgres_pool, regular_user_session):
 
 
 @pytest_asyncio.fixture
+async def no_biosample_write_client(make_pat_client):
+    """A regular_user PAT with a scope set that EXCLUDES Scope.BIOSAMPLE_WRITE —
+    drives the require_scope guard's missing-scope 403."""
+    return await make_pat_client(label="bs-no-write", scopes=[Scope.SELF_PROFILE])
+
+
+@pytest_asyncio.fixture
 async def no_prep_sample_write_client(make_pat_client):
     """A regular_user PAT with a scope set that EXCLUDES Scope.PREP_SAMPLE_WRITE
     so the require_scope guard's missing-scope 403 surfaces."""
@@ -346,6 +358,7 @@ class SampleFieldSurface(NamedTuple):
     """One entity's bindings for its field routes, study-local and global."""
 
     url_template: str  # create and list share this study-scoped path
+    by_idx_url_template: str  # the edit path, addressing one field under a study
     idx_key: str  # response key naming the study-local row
     created_key: str  # ctx cleanup bucket for created study-local rows
     global_fk_key: str  # request/response key naming the global-field link
@@ -354,6 +367,13 @@ class SampleFieldSurface(NamedTuple):
     global_field_table: str
     global_field_url: str  # the registry read; no path parameter
     read_scope: Scope  # what the registry read requires
+    # Fixture name for a PAT client that lacks this entity's write scope. A
+    # test requests both entities' fixtures and selects on this name, an async
+    # fixture not being materializable on demand from inside a test body.
+    no_write_scope_fixture: str
+    # The production per-entity metadata bindings, so a seed that writes a
+    # metadata row stays one definition rather than one per entity.
+    metadata_spec: EntityMetadataSpec
 
     @property
     def global_idx_key(self) -> str:
@@ -368,6 +388,7 @@ class SampleFieldSurface(NamedTuple):
 
 BIOSAMPLE_FIELD_SURFACE = SampleFieldSurface(
     url_template=URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    by_idx_url_template=URL_BIOSAMPLE_STUDY_FIELD_BY_IDX,
     idx_key="biosample_study_field_idx",
     created_key="biosample_study_field",
     global_fk_key="biosample_global_field_idx",
@@ -376,9 +397,12 @@ BIOSAMPLE_FIELD_SURFACE = SampleFieldSurface(
     global_field_table="qiita.biosample_global_field",
     global_field_url=URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
     read_scope=Scope.BIOSAMPLE_READ,
+    no_write_scope_fixture="no_biosample_write_client",
+    metadata_spec=BIOSAMPLE_METADATA_SPEC,
 )
 PREP_SAMPLE_FIELD_SURFACE = SampleFieldSurface(
     url_template=URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
+    by_idx_url_template=URL_PREP_SAMPLE_STUDY_FIELD_BY_IDX,
     idx_key="prep_sample_study_field_idx",
     created_key="prep_sample_study_field",
     global_fk_key="prep_sample_global_field_idx",
@@ -387,8 +411,92 @@ PREP_SAMPLE_FIELD_SURFACE = SampleFieldSurface(
     global_field_table="qiita.prep_sample_global_field",
     global_field_url=URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
     read_scope=Scope.PREP_SAMPLE_READ,
+    no_write_scope_fixture="no_prep_sample_write_client",
+    metadata_spec=PREP_SAMPLE_METADATA_SPEC,
 )
 SAMPLE_FIELD_SURFACES = (BIOSAMPLE_FIELD_SURFACE, PREP_SAMPLE_FIELD_SURFACE)
+
+
+async def seed_sample_with_value(
+    ctx,
+    surface: SampleFieldSurface,
+    *,
+    study_idx: int,
+    study_field_idx: int,
+    value: str | None = None,
+    missing_reason_name: str | None = None,
+    publish: bool = False,
+) -> int:
+    """Seed one sample of `surface`'s entity holding a text value through
+    study_field_idx, and return that sample's idx.
+
+    Exactly one of value / missing_reason_name carries the row's content.
+    publish flips is_published on the prep_sample's study link, freezing every
+    row that prep reaches against further UPDATE.
+    """
+    assert (value is None) != (missing_reason_name is None), (
+        "seed exactly one of value / missing_reason_name"
+    )
+    pool = ctx["pool"]
+    spec = surface.metadata_spec
+    owner_idx = ctx["wet_session"]["principal_idx"]
+
+    # One seed serves both entities: the biosample surface keys its metadata on
+    # the biosample, the prep_sample surface on the prep that references it.
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=owner_idx
+    )
+    ctx["created"]["biosample"].append(biosample_idx)
+    ctx["created"]["prep_sample"].append(prep_sample_idx)
+    entity_idx = {
+        SampleEntityKind.BIOSAMPLE: biosample_idx,
+        SampleEntityKind.PREP_SAMPLE: prep_sample_idx,
+    }[spec.entity_kind]
+
+    # Both link rows: the prep link's biosample-link precondition holds only
+    # once the biosample link exists, and publication rides the prep link.
+    await seed_biosample_to_study_link(
+        pool, biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["biosample_to_study"].append((biosample_idx, study_idx))
+    await seed_prep_sample_to_study_link(
+        pool, prep_sample_idx=prep_sample_idx, study_idx=study_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["prep_sample_to_study"].append((prep_sample_idx, study_idx))
+
+    missing_reason_idx = None
+    if missing_reason_name is not None:
+        missing_reason_idx = await pool.fetchval(
+            "SELECT idx FROM qiita.missing_value_reason WHERE name = $1", missing_reason_name
+        )
+        assert missing_reason_idx is not None, (
+            f"no missing_value_reason named {missing_reason_name!r}"
+        )
+
+    metadata_idx = await pool.fetchval(
+        f"INSERT INTO {spec.metadata_table}"
+        f" ({spec.entity_key_column}, {spec.study_field_idx_column},"
+        " value_text, value_missing_reason_idx, created_by_idx)"
+        " VALUES ($1, $2, $3, $4, $5) RETURNING idx",
+        entity_idx,
+        study_field_idx,
+        value,
+        missing_reason_idx,
+        owner_idx,
+    )
+    ctx["created"][spec.metadata_table.removeprefix("qiita.")].append(metadata_idx)
+
+    if publish:
+        # The publish action: FALSE -> TRUE on the link. OLD.is_published is
+        # still FALSE here, so the link's own lock permits this UPDATE.
+        await pool.execute(
+            "UPDATE qiita.prep_sample_to_study SET is_published = TRUE"
+            " WHERE prep_sample_idx = $1 AND study_idx = $2",
+            prep_sample_idx,
+            study_idx,
+        )
+
+    return entity_idx
 
 
 def sibling_field_surface(surface: SampleFieldSurface) -> SampleFieldSurface:
@@ -404,6 +512,41 @@ async def post_study_field(ctx, *, surface: SampleFieldSurface, client, study_id
     if resp.status_code == 201:
         ctx["created"][surface.created_key].append(resp.json()[surface.idx_key])
     return resp
+
+
+async def patch_study_field(
+    ctx,
+    *,
+    surface: SampleFieldSurface,
+    client,
+    study_idx: int,
+    study_field_idx: int,
+    if_match: str | None,
+    **body,
+):
+    """PATCH one entity's edit-field route and return the response untouched.
+
+    if_match None omits the header, which is how the 428 case is driven; the
+    row is already tracked by whoever created it, so nothing is tracked here.
+    """
+    headers = {} if if_match is None else {"If-Match": if_match}
+    return await client.patch(
+        surface.by_idx_url_template.format(study_idx=study_idx, study_field_idx=study_field_idx),
+        json=body,
+        headers=headers,
+    )
+
+
+async def get_study_field(
+    ctx, *, surface: SampleFieldSurface, client, study_idx: int, study_field_idx: int
+):
+    """GET one entity's read-field route and return the response untouched.
+
+    Nothing is tracked: a read creates no row.
+    """
+    return await client.get(
+        surface.by_idx_url_template.format(study_idx=study_idx, study_field_idx=study_field_idx)
+    )
 
 
 async def _seed_field_global(ctx, *, surface: SampleFieldSurface, label: str) -> int:
@@ -422,17 +565,23 @@ async def _seed_field_global(ctx, *, surface: SampleFieldSurface, label: str) ->
 
 # case -> (study owner, tier granted to the regular user, calling client,
 # expected status). A None owner means no study is seeded, so the path idx
-# names a study that does not exist.
-_STUDY_FIELD_CREATE_AUTHZ: dict[str, tuple[str | None, str | None, str, int]] = {
-    "owner": ("user", None, "user", 201),
-    "admin_grant": ("wet", "admin", "user", 201),
-    "wet_lab_admin_bypass": ("user", None, "wet", 201),
+# names a study that does not exist. A None status means the case is allowed
+# and the driver's caller supplies the success status its route returns, which
+# is what lets the create and edit routes share this table despite answering
+# 201 and 200.
+_STUDY_FIELD_ADMIN_FLOOR_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
+    "owner": ("user", None, "user", None),
+    "admin_grant": ("wet", "admin", "user", None),
+    "wet_lab_admin_bypass": ("user", None, "wet", None),
     "no_access": ("wet", None, "user", 403),
     "below_admin": ("wet", "member", "user", 403),
     "missing_scope": ("user", None, "no_scope", 403),
     "nonexistent_study": (None, None, "wet", 404),
 }
-STUDY_FIELD_CREATE_AUTHZ_CASES = tuple(_STUDY_FIELD_CREATE_AUTHZ)
+STUDY_FIELD_ADMIN_FLOOR_AUTHZ_CASES = tuple(_STUDY_FIELD_ADMIN_FLOOR_AUTHZ)
+# The create route's own name for the table it drives; the edit route drives
+# the same rows.
+STUDY_FIELD_CREATE_AUTHZ_CASES = STUDY_FIELD_ADMIN_FLOOR_AUTHZ_CASES
 
 
 async def _seed_authz_case_study(ctx, *, owner_key: str | None, grant_tier, case: str) -> int:
@@ -463,26 +612,41 @@ async def _seed_authz_case_study(ctx, *, owner_key: str | None, grant_tier, case
     return study_idx
 
 
-async def assert_study_field_create_authz(
+async def assert_study_field_authz(
     ctx,
     *,
     case: str,
+    cases: dict[str, tuple[str | None, str | None, str, int | None]],
     surface: SampleFieldSurface,
     no_scope_client,
+    send,
+    success_status: int,
 ) -> None:
-    """Drive one access case of a study-local field create and assert its status.
+    """Drive one access case of a study-local field route and assert its status.
 
-    `case` names a row of the access matrix, which fixes the study's ownership,
-    any grant to the regular user, the calling client, and the expected status.
-    `no_scope_client` is a PAT client lacking the route's write scope.
+    `case` names a row of `cases`, which fixes the study's ownership, any grant
+    to the regular user, the calling client, and the expected status; a None
+    status means the case is allowed and `success_status` is expected instead.
+    `send(ctx, surface, client, study_idx)` issues the route's request and
+    returns the response, so one driver serves routes with different verbs,
+    bodies, and success statuses. `no_scope_client` is a PAT client lacking the
+    route's own scope.
     """
-    owner_key, grant_tier, client_key, expected_status = _STUDY_FIELD_CREATE_AUTHZ[case]
+    owner_key, grant_tier, client_key, expected_status = cases[case]
     client = {"user": ctx["user"], "wet": ctx["wet"], "no_scope": no_scope_client}[client_key]
     study_idx = await _seed_authz_case_study(
         ctx, owner_key=owner_key, grant_tier=grant_tier, case=case
     )
 
-    resp = await post_study_field(
+    resp = await send(ctx, surface, client, study_idx)
+    assert resp.status_code == (success_status if expected_status is None else expected_status), (
+        resp.text
+    )
+
+
+async def _send_study_field_create(ctx, surface, client, study_idx):
+    """Issue the create request one access case needs."""
+    return await post_study_field(
         ctx,
         surface=surface,
         client=client,
@@ -490,19 +654,37 @@ async def assert_study_field_create_authz(
         display_name=unique_field_name("Authz"),
         data_type="text",
     )
-    assert resp.status_code == expected_status, resp.text
+
+
+async def assert_study_field_create_authz(
+    ctx,
+    *,
+    case: str,
+    surface: SampleFieldSurface,
+    no_scope_client,
+) -> None:
+    """Drive one access case of a study-local field create."""
+    await assert_study_field_authz(
+        ctx,
+        case=case,
+        cases=_STUDY_FIELD_ADMIN_FLOOR_AUTHZ,
+        surface=surface,
+        no_scope_client=no_scope_client,
+        send=_send_study_field_create,
+        success_status=201,
+    )
 
 
 # case -> (study owner, tier granted to the regular user, calling client,
 # expected status) for the list route. Mirrors the create matrix but at the
 # VIEWER floor, so a member grant must succeed here; that pair is what
 # pins the two routes to different tiers.
-_STUDY_FIELD_LIST_AUTHZ: dict[str, tuple[str | None, str | None, str, int]] = {
-    "owner": ("user", None, "user", 200),
-    "viewer_grant": ("wet", "viewer", "user", 200),
-    "member_grant": ("wet", "member", "user", 200),
-    "admin_grant": ("wet", "admin", "user", 200),
-    "wet_lab_admin_bypass": ("user", None, "wet", 200),
+_STUDY_FIELD_LIST_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
+    "owner": ("user", None, "user", None),
+    "viewer_grant": ("wet", "viewer", "user", None),
+    "member_grant": ("wet", "member", "user", None),
+    "admin_grant": ("wet", "admin", "user", None),
+    "wet_lab_admin_bypass": ("user", None, "wet", None),
     "no_access": ("wet", None, "user", 403),
     "missing_scope": ("user", None, "no_scope", 403),
     "nonexistent_study": (None, None, "wet", 404),
@@ -522,14 +704,71 @@ async def assert_study_field_list_authz(
     `case` names a row of the list access matrix. `no_scope_client` is a PAT
     client lacking the route's read scope.
     """
-    owner_key, grant_tier, client_key, expected_status = _STUDY_FIELD_LIST_AUTHZ[case]
-    client = {"user": ctx["user"], "wet": ctx["wet"], "no_scope": no_scope_client}[client_key]
-    study_idx = await _seed_authz_case_study(
-        ctx, owner_key=owner_key, grant_tier=grant_tier, case=case
+    await assert_study_field_authz(
+        ctx,
+        case=case,
+        cases=_STUDY_FIELD_LIST_AUTHZ,
+        surface=surface,
+        no_scope_client=no_scope_client,
+        send=_send_study_field_list,
+        success_status=200,
     )
 
-    resp = await client.get(surface.url_template.format(study_idx=study_idx))
-    assert resp.status_code == expected_status, resp.text
+
+async def _send_study_field_list(ctx, surface, client, study_idx):
+    """Issue the list request one access case needs."""
+    return await client.get(surface.url_template.format(study_idx=study_idx))
+
+
+async def assert_study_field_get_authz(
+    ctx,
+    *,
+    case: str,
+    surface: SampleFieldSurface,
+    no_scope_client,
+) -> None:
+    """Drive one access case of a study-local field read and assert its status.
+
+    `case` names a row of the list access matrix, which the read shares: both
+    return a field definition and no metadata value, so both sit at the viewer
+    floor. `no_scope_client` is a PAT client lacking the route's read scope.
+    """
+    await assert_study_field_authz(
+        ctx,
+        case=case,
+        cases=_STUDY_FIELD_LIST_AUTHZ,
+        surface=surface,
+        no_scope_client=no_scope_client,
+        send=_send_study_field_get,
+        success_status=200,
+    )
+
+
+async def _send_study_field_get(ctx, surface, client, study_idx):
+    """Issue the read request one access case needs.
+
+    The field is seeded by the wet client, which clears the gate on every
+    seeded study; the case's own client is the one being judged. The
+    nonexistent-study row has no study to seed into, so the seed fails and the
+    request goes out against an unresolvable idx — the study gate answers
+    before the path's field idx is looked up either way.
+    """
+    seeded = await post_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["wet"],
+        study_idx=study_idx,
+        display_name=unique_field_name("Authz"),
+        data_type="text",
+    )
+    study_field_idx = seeded.json()[surface.idx_key] if seeded.status_code == 201 else 1
+    return await get_study_field(
+        ctx,
+        surface=surface,
+        client=client,
+        study_idx=study_idx,
+        study_field_idx=study_field_idx,
+    )
 
 
 # case -> expected status for the create's conflict / bad-reference surface.
@@ -633,9 +872,7 @@ async def etag_for_row(pool, *, table: UpdatableTable, row_idx: int) -> str:
     # Python does not enforce Literal at runtime; the f-string below is raw SQL.
     if table not in get_args(UpdatableTable):
         raise ValueError(f"etag_for_row rejects non-updatable table: {table!r}")
-    updated_at = await pool.fetchval(
-        f"SELECT updated_at FROM qiita.{table} WHERE idx = $1", row_idx
-    )
+    updated_at = await pool.fetchval(f"SELECT updated_at FROM {table} WHERE idx = $1", row_idx)
     return f'"{updated_at.isoformat()}"'
 
 

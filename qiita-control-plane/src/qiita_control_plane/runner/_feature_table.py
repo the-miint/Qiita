@@ -52,6 +52,7 @@ from ..actions.library import export_assembly_member_genome, export_member_genom
 from ..auth.tickets import run_signed_flight_call, sign_ticket
 from ..feature_table import (
     denovo_alignment_processing_idx,
+    denovo_assembly_deprecation_error,
     parse_feature_table_denovo,
     parse_feature_table_scope,
 )
@@ -65,6 +66,7 @@ from ..repositories.assembly import (
     fetch_assembly_sample_states,
 )
 from ..repositories.block import list_incomplete_alignment_samples
+from ..repositories.processing import fetch_processing_by_idx
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
 # The genome-map Parquet the compute job consumes as an input (feature_idx ->
@@ -140,6 +142,7 @@ async def _validate_denovo_arm(
     except ValueError as exc:
         raise _submission_bad_input(str(exc)) from exc
 
+    await _refuse_deprecated_assembly(pool, processing_idx=processing_idx)
     await _apply_arm_gate(
         pool,
         denovo_alignment_idx=denovo_alignment_idx,
@@ -147,6 +150,30 @@ async def _validate_denovo_arm(
         prep_sample_idx=prep_sample_idx,
     )
     return processing_idx
+
+
+async def _refuse_deprecated_assembly(pool: asyncpg.Pool, *, processing_idx: int) -> None:
+    """Refuse a deprecated assembly run as a de novo arm, naming its replacement.
+
+    Nothing else on the feature-table path refuses one — the assembly mint has its own
+    check (`runner/_processing.py`), but a combined table names a run that was minted
+    long before. `denovo_assembly_deprecation_error` is the wording, shared with the
+    client recipe.
+
+    The row is fetched rather than derived: `processing_idx` comes out of the de novo
+    alignment's hashed params, which carry no lifecycle. A missing row is fail-loud
+    rather than a real state — withdrawal here is deprecation, not deletion.
+    """
+    row = await fetch_processing_by_idx(pool, processing_idx)
+    if row is None:
+        raise _submission_bad_input(f"assembly run {processing_idx} not found")
+    message = denovo_assembly_deprecation_error(
+        processing_idx=processing_idx,
+        status=row["status"],
+        superseded_by=row["superseded_by"],
+    )
+    if message is not None:
+        raise _submission_bad_input(message)
 
 
 async def _apply_arm_gate(
@@ -244,10 +271,12 @@ def _do_get_bin_quality(data_plane_url: str, ticket_bytes: bytes) -> pa.Table:
 
 def _write_denovo_genome_quality(
     subjects: list[asyncpg.Record], quality: pa.Table, out_path: Path
-) -> None:
-    """Join the streamed quality rows onto the run's subject->genome bridge and write
-    `(prep_sample_idx, genome_idx)` plus `BIN_QUALITY_SCORE_COLUMNS` to `out_path`,
-    one row per subject the bridge names.
+) -> dict[int, int]:
+    """Join the streamed quality rows onto the run's subject->genome bridge, returning
+    the per-prep_sample count of subjects the join left unscored — and writing
+    `(prep_sample_idx, genome_idx)` plus `BIN_QUALITY_SCORE_COLUMNS` to `out_path`, one
+    row per subject the bridge names, only when that count is empty. A non-empty return
+    means no file was written.
 
     Both sides are already in memory and neither is bound to a step, so they are
     registered as Arrow relations on one connection rather than staged as files: an
@@ -255,13 +284,12 @@ def _write_denovo_genome_quality(
     statements later is a shared-filesystem dependency bought for nothing, and a file
     nothing declares is one nothing cleans up.
 
-    **LEFT from the subject side.** A genome with no quality row keeps its row with
-    NULL scores. `bin_quality` is written empty-with-schema when CheckM scored
-    nothing — no refined bin, none circular, or no CheckM DB — and `_write_bin_quality`
-    skips a class whose tool output is absent, so a MAG or LCG subject with no quality
-    row is a normal outcome. (The residue length cut is NOT one of the causes here:
-    the driving side admits MAG and LCG only.) An inner join would drop those genomes
-    and leave this file disagreeing with the map it must match.
+    **LEFT from the subject side, and the count of what it left NULL is what this
+    returns.** The join is what makes an unscored subject visible at all: an inner join would
+    drop it, leaving nothing to count and nothing to refuse. On an empty count the same
+    join is the file, so every genome the map admits has a row there too. The caller
+    turns a non-empty count into a refusal — `_stage_denovo_genome_quality` carries why —
+    and no file is written in that case.
 
     **The join carries `prep_sample_idx` because `bin_id` is only unique within a
     prep_sample.** It is a refined bin's FASTA stem for a MAG and the assembler's
@@ -284,6 +312,7 @@ def _write_denovo_genome_quality(
     """
     scores = ", ".join(f"q.{c}" for c in BIN_QUALITY_SCORE_COLUMNS)
     on = " AND ".join(f"q.{c} = s.{c}" for c in BIN_QUALITY_SUBJECT_KEY)
+    missing = " OR ".join(f"{c} IS NULL" for c in BIN_QUALITY_SCORE_COLUMNS)
     out_sql = validate_parquet_path(out_path)
     # Both the ON clause above and this relation's key columns come from the one
     # constant: a member added to it must appear on both sides of the join, and
@@ -295,27 +324,45 @@ def _write_denovo_genome_quality(
             for col in _SUBJECT_COLUMNS
         }
     )
-    success = False
-    try:
-        with duckdb_connect() as con:
-            # `PARQUET_OPTS_INTERMEDIATE` requires this (its own comment says why);
-            # safe here because nothing reads this file in row order.
-            con.execute("SET preserve_insertion_order=false")
-            con.register("assembly_subject", subject_table)
-            con.register("bin_quality_stream", quality)
+    with duckdb_connect() as con:
+        # `PARQUET_OPTS_INTERMEDIATE` requires this (its own comment says why);
+        # safe here because nothing reads this file in row order.
+        con.execute("SET preserve_insertion_order=false")
+        con.register("assembly_subject", subject_table)
+        con.register("bin_quality_stream", quality)
+        # Staged once, and both readers below select from it, so the count and the file
+        # describe the same rows by construction.
+        con.execute(
+            f"CREATE TEMP VIEW subject_quality AS"
+            f" SELECT s.prep_sample_idx, s.genome_idx, {scores}"
+            f" FROM assembly_subject s"
+            f" LEFT JOIN bin_quality_stream q ON {on}"
+        )
+        unscored = {
+            row[0]: row[1]
+            for row in con.execute(
+                f"SELECT prep_sample_idx, count(*) FROM subject_quality"
+                f" WHERE {missing} GROUP BY prep_sample_idx"
+            ).fetchall()
+        }
+        # Counted before the write, and the write skipped on a non-empty count: the
+        # caller turns that into a refusal, and a refused submission must not leave a
+        # Parquet behind that no binding points at and nothing cleans up.
+        if unscored:
+            return unscored
+        success = False
+        try:
             con.execute(
-                f"COPY (SELECT s.prep_sample_idx, s.genome_idx, {scores}"
-                f" FROM assembly_subject s"
-                f" LEFT JOIN bin_quality_stream q ON {on})"
-                f" TO '{out_sql}' ({PARQUET_OPTS_INTERMEDIATE})"
+                f"COPY (SELECT * FROM subject_quality) TO '{out_sql}' ({PARQUET_OPTS_INTERMEDIATE})"
             )
-        success = True
-    finally:
-        # A half-written file left where the binding would have pointed, for the
-        # reason `_resolve_qc_adapters` unlinks its own: the next resume rebinds this
-        # path without rewriting it.
-        if not success:
-            out_path.unlink(missing_ok=True)
+            success = True
+        finally:
+            # A half-written file left where the binding would have pointed, for the
+            # reason `_resolve_qc_adapters` unlinks its own: the next resume rebinds
+            # this path without rewriting it.
+            if not success:
+                out_path.unlink(missing_ok=True)
+    return {}
 
 
 async def _stage_denovo_genome_quality(
@@ -375,7 +422,31 @@ async def _stage_denovo_genome_quality(
             exc,
         ) from exc
     quality_path = workspace / "denovo_genome_quality.parquet"
-    _write_denovo_genome_quality(subjects, quality, quality_path)
+    unscored = _write_denovo_genome_quality(subjects, quality, quality_path)
+    # Refused rather than staged, for the reason the unminted-genome check above it
+    # gives: the gate's predicate is the positive form, so a genome with no usable
+    # score is excluded at every bound including the most permissive one, and the
+    # omission shows up as a class quietly missing from the table rather than as an
+    # error.
+    #
+    # Not defensive: `checkm.sh` scored only the refined bins until circular genomes
+    # were added on 2026-09-01, while membership wrote every class, so a run at a
+    # version predating that carries MAG/LCG subjects with no `bin_quality` row.
+    # `_refuse_deprecated_assembly` turns those away first only because an operator
+    # deprecated them; one left active at such a version would still arrive here. Every
+    # ENABLED version now scores all three classes, which is what makes this a backstop.
+    # UNBINNED, whose quality rows are deliberately a subset of its memberships
+    # (`1.0.1.yaml`), cannot trip it: `fetch_assembly_genome_subject` admits MAG/LCG.
+    if unscored:
+        listed = sorted(unscored.items())[:_MAX_REPORTED]
+        raise _submission_bad_input(
+            f"{len(unscored)} prep_sample(s) of assembly run {processing_idx} have "
+            f"MAG/LCG subjects with no usable CheckM score, so a "
+            f"completeness/contamination gate would drop those genomes without "
+            f"reporting them. CheckM runs only as a step of the assembly workflow, so "
+            f"nothing scores an existing run's bins: use the superseding run if there "
+            f"is one, or assemble again at the enabled version: {listed}"
+        )
     return quality_path
 
 

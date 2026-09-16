@@ -1442,6 +1442,12 @@ _D_MAP = [(1, 50, 900), (1, 51, 900), (2, 50, 901), (2, 52, 901)]
 # One stream per cohort sample, as the assembly read-back is scoped. c50 is in both.
 _D_LENGTHS = {1: [(50, 1000), (51, 1000)], 2: [(50, 1000), (52, 1000)]}
 
+# (prep_sample_idx, genome_idx, completeness, contamination) — keyed by the pair, since
+# `bin_id` is unique only within a prep_sample. Both genomes clear the DEFAULT bounds,
+# so every combined test below runs through the real gate at the real thresholds and
+# would notice one that started excluding a genome it should not.
+_D_QUALITY = [(1, 900, 95.0, 1.0), (2, 901, 90.0, 2.0)]
+
 _R_ALIGNMENT = [
     # (prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position)
     (1, 1, 10, 0, 0, 500),  # R100, only the reference arm places it
@@ -1457,7 +1463,15 @@ _D_ALIGNMENT = [
 
 
 def _stage_combined(
-    conn, *, threshold, denovo_map=_D_MAP, denovo_lengths=None, denovo_alignment=None
+    conn,
+    *,
+    threshold,
+    denovo_map=_D_MAP,
+    denovo_lengths=None,
+    denovo_alignment=None,
+    quality=None,
+    min_completeness=ft.DEFAULT_MIN_COMPLETENESS,
+    max_contamination=ft.DEFAULT_MAX_CONTAMINATION,
 ):
     """Stage both arms through the shared builders, in the order both drivers use.
 
@@ -1466,6 +1480,7 @@ def _stage_combined(
     combined path alter what every reference-only test above exercises.
     """
     denovo_lengths = _D_LENGTHS if denovo_lengths is None else denovo_lengths
+    quality = _D_QUALITY if quality is None else quality
     conn.execute(
         "CREATE TABLE _r_map AS "
         + _values(_R_MAP, "feature_idx, genome_idx", "?::BIGINT, ?::BIGINT"),
@@ -1485,8 +1500,25 @@ def _stage_combined(
         + _values(_R_LENGTHS, "feature_idx, sequence_length_bp", "?::BIGINT, ?::BIGINT"),
         [x for r in _R_LENGTHS for x in r],
     )
+    conn.execute(
+        "CREATE TABLE _d_quality AS "
+        + _values(
+            quality,
+            "prep_sample_idx, genome_idx, completeness, contamination",
+            "?::BIGINT, ?::BIGINT, ?::DOUBLE, ?::DOUBLE",
+        ),
+        [x for r in quality for x in r],
+    )
     conn.execute(ft.map_table_sql("_r_map"))
-    conn.execute(ft.denovo_map_table_sql("_d_map"))
+    # The scores, then the map gated on them — one sequence, in the order the drivers
+    # use it. The reference arm is not gated: a reference genome has no CheckM score.
+    for sql, parameters in ft.denovo_map_statements(
+        map_source="_d_map",
+        quality_source="_d_quality",
+        min_completeness=min_completeness,
+        max_contamination=max_contamination,
+    ):
+        conn.execute(sql, parameters)
 
     if ft.coverage_filter_applies(threshold):
         conn.execute(ft.genome_lengths_table_sql("_r_len"))
@@ -1525,6 +1557,9 @@ def _combined_table(
     denovo_map=_D_MAP,
     denovo_lengths=None,
     denovo_alignment=None,
+    quality=None,
+    min_completeness=ft.DEFAULT_MIN_COMPLETENESS,
+    max_contamination=ft.DEFAULT_MAX_CONTAMINATION,
 ) -> list[tuple]:
     """The whole combined analytic, sorted. Same shape as `_table`, one arm wider."""
     with _miint_conn() as conn:
@@ -1534,6 +1569,9 @@ def _combined_table(
             denovo_map=denovo_map,
             denovo_lengths=denovo_lengths,
             denovo_alignment=denovo_alignment,
+            quality=quality,
+            min_completeness=min_completeness,
+            max_contamination=max_contamination,
         )
         for sql, parameters in ft.ogu_input_statements(
             scope=scope, coverage_threshold=threshold, combined=True
@@ -1737,3 +1775,152 @@ def test_several_rows_of_one_read_within_an_arm_still_count_once():
     with_secondary = [*_D_ALIGNMENT, (1, 5, 51, 256, 100, 600)]
     values = {(s, g): v for s, g, v in _combined_table(denovo_alignment=with_secondary)}
     assert values[(1, 900)] == 2.0, "reads 3 and 5, the secondary adding nothing"
+
+
+# ---------------------------------------------------------------------------
+# The de novo arm's quality gate. The fixture above gives Q900 two contigs (c50, c51)
+# and Q901 one shared with it (c50), so excluding either genome is visible in the
+# counts AND in what happens to the reads it held.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("completeness", "contamination", "why"),
+    [
+        (30.0, 1.0, "completeness under the bound"),
+        (95.0, 40.0, "contamination over the bound"),
+        (None, None, "unscored on both axes"),
+        (None, 40.0, "unscored completeness, but over on contamination"),
+        (30.0, None, "unscored contamination, but under on completeness"),
+    ],
+)
+def test_a_genome_outside_the_bounds_is_not_in_the_table(completeness, contamination, why):
+    """Each way a genome fails, including the two half-measured ones: partial evidence
+    still decides, and an unscored axis never counts as passing.
+
+    Q900 is the one moved; Q901 keeps the default scores so the table is not empty and
+    the assertion is about one genome rather than the arm.
+    """
+    quality = [(1, 900, completeness, contamination), (2, 901, 90.0, 2.0)]
+    values = {(s, g): v for s, g, v in _combined_table(quality=quality)}
+    assert (1, 900) not in values, why
+    assert (2, 901) in values, "the other sample's genome is untouched"
+
+
+def test_the_reads_of_an_excluded_genome_keep_their_reference_placement():
+    """The gate's difference from the coverage filter, and the reason it gates the MAP.
+
+    Precedence reads the de novo slice THROUGH the map, so a read whose only de novo
+    placement was on an excluded genome is never superseded. Read 3 sits on c50 in both
+    arms — Q900 de novo, R300 by reference. Exclude Q900 and read 3 must appear on R300
+    for sample 1, where `test_a_read_the_denovo_arm_won_can_fall_out_of_the_table_entirely`
+    shows the coverage filter losing exactly such a read from both arms.
+    """
+    excluded = [(1, 900, 10.0, 1.0), (2, 901, 90.0, 2.0)]
+    values = {(s, g): v for s, g, v in _combined_table(quality=excluded)}
+    assert (1, 900) not in values
+    assert values[(1, 300)] == 1.0, "read 3 fell back to the reference arm, not out"
+
+    # And with Q900 admitted it is the de novo arm that holds it — so the row above is
+    # the gate's doing rather than something true either way.
+    kept = {(s, g): v for s, g, v in _combined_table()}
+    assert (1, 300) not in kept
+    assert kept[(1, 900)] == 2.0
+
+
+def test_the_gate_removes_nothing_from_the_quality_relation():
+    """A filter, not a delete: the scores stay readable after the map is staged.
+
+    `reconcile` stages the quality relation for the gate to correlate against, and
+    nothing downstream re-reads it today — so this pins that the gate leaves it whole
+    rather than consuming it.
+    """
+    excluded = [(1, 900, 10.0, 1.0), (2, 901, 90.0, 2.0)]
+    with _miint_conn() as conn:
+        _stage_combined(conn, threshold=0.01, quality=excluded)
+        scored = conn.execute(
+            f"SELECT genome_id FROM {ft.DENOVO_GENOME_QUALITY_TABLE} ORDER BY genome_id"
+        ).fetchall()
+        mapped = conn.execute(
+            f"SELECT DISTINCT genome_id FROM {ft.DENOVO_MAP_TABLE} ORDER BY genome_id"
+        ).fetchall()
+    assert scored == [(900,), (901,)], "both genomes' scores survive the gate"
+    assert mapped == [(901,)], "only the passing one reaches the map"
+
+
+def test_a_genome_exactly_on_each_bound_is_kept():
+    """Inclusive on both sides, as `test_a_genome_exactly_at_the_threshold_survives`
+    pins for the coverage bound."""
+    on_the_line = [
+        (1, 900, ft.DEFAULT_MIN_COMPLETENESS, ft.DEFAULT_MAX_CONTAMINATION),
+        (2, 901, 90.0, 2.0),
+    ]
+    values = {(s, g): v for s, g, v in _combined_table(quality=on_the_line)}
+    assert (1, 900) in values
+
+
+def test_a_permissive_gate_admits_every_scored_genome():
+    """`min_completeness=0` with a large `max_contamination` admits every SCORED genome.
+
+    Not an ungated map: the positive predicate excludes a NULL at every bound, which is
+    why an unscored subject is refused at submit instead
+    (`runner/_feature_table.py::_stage_denovo_genome_quality`)."""
+    poor = [(1, 900, 0.5, 90.0), (2, 901, 0.5, 90.0)]
+    values = _combined_table(quality=poor, min_completeness=0.0, max_contamination=1000.0)
+    assert {(s, g) for s, g, _ in values} >= {(1, 900), (2, 901)}
+
+
+def test_the_gate_does_not_judge_the_reference_arm():
+    """Reference genomes carry no CheckM row, so a gate that reached them would empty
+    the reference arm rather than filter it. Excluding BOTH qiita genomes must leave
+    the reference-only table exactly as it is, reconciliation and all.
+    """
+    none_pass = [(1, 900, 1.0, 99.0), (2, 901, 1.0, 99.0)]
+    combined = _combined_table(quality=none_pass)
+    assert {(s, g) for s, g, _ in combined} == {(1, 100), (1, 200), (1, 300), (2, 100)}, (
+        "every reference genome, including R300 with read 3 back on it"
+    )
+
+
+@pytest.mark.parametrize(
+    ("min_completeness", "max_contamination"),
+    [(-0.1, 10.0), (100.1, 10.0), (50.0, -0.1)],
+)
+def test_the_gate_refuses_a_bound_that_is_not_a_percentage(min_completeness, max_contamination):
+    """The shared backstop, for the next consumer: each caller also validates at its own
+    boundary (the job's Pydantic `Field`), but out of range the failure is silent either
+    way — permissive below 0, empty above 100.
+    """
+    with pytest.raises(ValueError, match="percentage"):
+        ft.denovo_map_statements(
+            map_source="m",
+            quality_source="q",
+            min_completeness=min_completeness,
+            max_contamination=max_contamination,
+        )
+
+
+def test_the_gate_accepts_a_contamination_above_100():
+    """No ceiling on contamination: nothing here fixes one, and CheckM's range is not
+    something this repo has measured."""
+    assert ft.denovo_map_statements(
+        map_source="m", quality_source="q", min_completeness=50.0, max_contamination=1000.0
+    )[1][1] == [50.0, 1000.0]
+
+
+def test_the_gate_refuses_a_nan_bound():
+    """NaN reaches here. The route validates `action_context` against the action's
+    JSON Schema, and `{"type":"number","minimum":0,"maximum":100}` ACCEPTS NaN —
+    probed on the pinned jsonschema — because every comparison against it is false;
+    `json.loads` also accepts the non-standard `NaN` literal by default.
+
+    A NaN bound is not inert: `completeness >= NaN` is false for every row, so the de
+    novo arm empties and the table reads as reference-only. The `not 0 <= x <= 100`
+    spelling is what rejects it — the equivalent-looking `x < 0 or x > 100` would let it
+    through — which is why this is pinned rather than left to the shape of the
+    expression.
+    """
+    for bad in ({"min_completeness": float("nan")}, {"max_contamination": float("nan")}):
+        kwargs = {"min_completeness": 50.0, "max_contamination": 10.0} | bad
+        with pytest.raises(ValueError, match="percentage"):
+            ft.denovo_map_statements(map_source="m", quality_source="q", **kwargs)

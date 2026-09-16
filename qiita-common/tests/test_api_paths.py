@@ -125,6 +125,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
     # /upload
     ("URL_UPLOAD_BY_IDX", "PATH_UPLOAD_PREFIX", "PATH_UPLOAD_BY_IDX"),
     ("URL_UPLOAD_DONE", "PATH_UPLOAD_PREFIX", "PATH_UPLOAD_DONE"),
+    # /ena-import-batch
+    (
+        "URL_ENA_IMPORT_BATCH_BY_IDX",
+        "PATH_ENA_IMPORT_BATCH_PREFIX",
+        "PATH_ENA_IMPORT_BATCH_BY_IDX",
+    ),
     # /sequence-range
     (
         "URL_SEQUENCE_RANGE_BY_PREP_SAMPLE",
@@ -285,6 +291,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_STUDY_PREFIX",
         "PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY",
     ),
+    (
+        "URL_BIOSAMPLE_STUDY_FIELD_BY_IDX",
+        "PATH_STUDY_PREFIX",
+        "PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX",
+    ),
     ("URL_BIOSAMPLE_BY_IDX", "PATH_BIOSAMPLE_PREFIX", "PATH_BIOSAMPLE_BY_IDX"),
     (
         "URL_BIOSAMPLE_LOOKUP_BY_ACCESSION",
@@ -370,6 +381,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY",
         "PATH_STUDY_PREFIX",
         "PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY",
+    ),
+    (
+        "URL_PREP_SAMPLE_STUDY_FIELD_BY_IDX",
+        "PATH_STUDY_PREFIX",
+        "PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX",
     ),
     # /biosample-global-field, /prep-sample-global-field
     (

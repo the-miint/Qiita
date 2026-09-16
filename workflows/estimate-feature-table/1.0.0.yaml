@@ -19,6 +19,13 @@ description: >
   `qiita.genome` space, so the result is one table over both. Absent that key the
   behaviour is byte-identical to the reference-only form above.
 
+  The de novo arm's genomes are gated on their CheckM completeness / contamination
+  (`min_completeness` / `max_contamination`, both optional). The gate filters the map
+  the whole arm reads its genomes through; `analytic.denovo_map_statements` carries what
+  that reaches and what becomes of an excluded genome's reads. A run with any unscored
+  MAG/LCG subject is refused at submit rather than gated
+  (`runner/_feature_table.py`). Reference genomes carry no CheckM score and are not gated.
+
   Compute-on-demand by design: the table is deterministic but cohort-dependent
   (coverage pools over the sample set), so persisting would mean one artifact per
   sample-subset x threshold. No processing_idx / identity is minted, no DuckLake
@@ -35,7 +42,8 @@ description: >
   prep_sample not `completed` in `alignment_sample`). The de novo arm adds two more
   resolver-staged Parquets, one of them joining a lake read to a Postgres one.
   `reference_idx` is the reference-scope scalar the framework injects into the job
-  (SCOPE_SCALARS_BY_KIND[reference]); only `coverage_threshold` rides `params:`.
+  (SCOPE_SCALARS_BY_KIND[reference]); `coverage_threshold` and the two quality bounds
+  ride `params:`.
 
 # reference:read — this action only READS reference metadata + the (host-depleted,
 # derived) alignment table to compute a transient table; it writes no reference
@@ -87,6 +95,19 @@ context_schema:
       type: number
       minimum: 0
       maximum: 1
+    # The de novo arm's quality gate, on CheckM's percentage scale. Both optional; an
+    # omitted key resolves to the job's `Inputs` default, the one place the literal
+    # lives. No `default:` here: two declared defaults can diverge, and nothing CP-side
+    # reads this one. `analytic.denovo_map_statements` carries what the gate does.
+    #
+    # Ignored by a reference-only ticket: a reference genome has no CheckM score.
+    min_completeness:
+      type: number
+      minimum: 0
+      maximum: 100
+    max_contamination:
+      type: number
+      minimum: 0
 
 steps:
   # The single native step. `genome_map_path` (the reference's feature->genome
@@ -110,9 +131,12 @@ steps:
     # without the quality rather than treating a whole run as unscored.
     optional_inputs: [denovo_genome_map_path, denovo_genome_quality_path]
     # `denovo_processing_idx` is resolver-bound, not caller-supplied, and absent
-    # for a reference-only ticket — an unbound params key is skipped.
+    # for a reference-only ticket — an unbound params key is skipped. The two quality
+    # bounds are optional and skipped the same way.
     params: {coverage_threshold: coverage_threshold,
-             denovo_processing_idx: denovo_processing_idx}
+             denovo_processing_idx: denovo_processing_idx,
+             min_completeness: min_completeness,
+             max_contamination: max_contamination}
     outputs: [ogu_table]
     baseline_resources:
       cpu: 4

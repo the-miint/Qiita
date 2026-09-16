@@ -119,6 +119,18 @@ from qiita_common.models.biosample import (
     TerminologyTermRef,
     derive_metadata_field_scope,
 )
+from qiita_common.models.ena import (
+    EnaRunRecord,
+    EnaSampleAttributes,
+    EnaStudyHeader,
+)
+from qiita_common.models.ena_import import (
+    BatchImportItem,
+    BatchImportRequest,
+    BatchImportResponse,
+    BatchImportStatus,
+    BatchItemState,
+)
 from qiita_common.models.health import HealthResponse, HealthStatus
 from qiita_common.models.host_filter_profile import (
     HostFilterOutcome,
@@ -193,11 +205,14 @@ from qiita_common.models.run_folder import (
 )
 from qiita_common.models.sample_field import (
     GLOBAL_FIELD_IDX_ATTR,
+    NOT_SETTABLE_ON_LINKED_FIELD,
     STUDY_FIELD_IDX_ATTR,
     SampleGlobalFieldResponse,
     SampleStudyFieldCreateRequest,
+    SampleStudyFieldPatchRequest,
     SampleStudyFieldResponse,
     field_wire_name,
+    unique_in_study_rejection_reason,
 )
 from qiita_common.models.sequencing import (
     AlignmentDefinitionDeleteResponse,
@@ -532,7 +547,10 @@ __all__ = [
     "SampleMetadataValue",
     "SampleMetadataWriteRequest",
     "SampleMetadataWriteResponse",
+    "NOT_SETTABLE_ON_LINKED_FIELD",
     "SampleStudyFieldCreateRequest",
+    "SampleStudyFieldPatchRequest",
+    "unique_in_study_rejection_reason",
     "SampleStudyFieldResponse",
     "SequencedSampleListItem",
     "SequencedSampleListResponse",
@@ -543,6 +561,16 @@ __all__ = [
     "StudyLookupByAccessionResponse",
     "StudyScopedBiosampleResponse",
     "TerminologyTermRef",
+    # INSDC study metadata.
+    "EnaRunRecord",
+    "EnaSampleAttributes",
+    "EnaStudyHeader",
+    # Batch ENA import.
+    "BatchImportItem",
+    "BatchImportRequest",
+    "BatchImportResponse",
+    "BatchImportStatus",
+    "BatchItemState",
     # Study.
     "StudyCreate",
     "StudyPatchRequest",

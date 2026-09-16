@@ -397,6 +397,7 @@ async def _run_action_primitive(
             manifest_path,
             workspace,
             genome_map_path=Path(genome_map) if genome_map else None,
+            scope=f"work_ticket {work_ticket_idx}",
         )
         # YAML declares one output (typically "feature_map"); bind it.
         return {entry.outputs[0]: feature_map_path}

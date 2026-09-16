@@ -14,17 +14,20 @@ from dataclasses import dataclass
 from typing import Literal, get_args
 
 import asyncpg
-from qiita_common.models import BiosampleAccessionField, Tier
+from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
 
 from . import require_transaction, update_row
 from ._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     SampleEntityKind,
+    StudyFieldDataTypeNotTextError,
+    StudyFieldNotUniqueInStudyError,
     _get_or_create_local_study_field,
     assert_required_global_fields_supplied,
     fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
     validate_primary_secondary_studies,
+    write_local_metadata_or_diagnose,
     write_sample_metadata,
 )
 from .biosample_metadata import (
@@ -145,13 +148,86 @@ async def update_biosample(
     """
     return await update_row(
         conn,
-        table="biosample",
+        table="qiita.biosample",
         row_idx=biosample_idx,
         fields=fields,
         allowlist=BIOSAMPLE_PATCHABLE_COLUMNS,
         returning_cols=_BIOSAMPLE_RETURNING_COLS,
         repo_name="update_biosample",
     )
+
+
+async def resolve_or_import_biosample_by_ena_accession(
+    conn: asyncpg.Connection,
+    *,
+    ena_sample_accession: str,
+    study_idx: int,
+    owner_idx: int,
+    caller_idx: int,
+    owner_biosample_id_field_name: str,
+    owner_biosample_id_value: str,
+    metadata: dict[str, str],
+    local_metadata: dict[str, str],
+    metadata_checklist_idx: int,
+) -> tuple[int, bool]:
+    """Find a biosample by ena_sample_accession, importing it with its metadata
+    when absent. Returns (idx, created).
+
+    An ENA BioSample recurring across studies converges on one row: the found
+    branch returns the existing idx and writes nothing, so a later study never
+    overwrites the first import's values through the shared global-field slot.
+    Linking that existing biosample to the later study is the caller's next step.
+
+    `metadata` keys must name global fields; `local_metadata` is written as
+    purely-local TEXT, which is the only way to retain a tag whose name collides
+    with a global field the caller declined to map (ENA's environmental-context
+    tags are spelled exactly like their ENVO-typed globals, and its values are
+    submitter free text).
+    """
+    require_transaction(conn)
+
+    existing_idx = await conn.fetchval(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1",
+        ena_sample_accession,
+    )
+    if existing_idx is not None:
+        return existing_idx, False
+
+    try:
+        # Savepoint: a concurrent import of the same accession loses the unique
+        # and must roll back to the read below, not abort the caller's run.
+        async with conn.transaction():
+            result = await import_biosample_from_owner_biosample_id(
+                conn,
+                primary_study_idx=study_idx,
+                owner_idx=owner_idx,
+                caller_idx=caller_idx,
+                owner_biosample_id_field_name=owner_biosample_id_field_name,
+                owner_biosample_id_value=owner_biosample_id_value,
+                metadata=metadata,
+                metadata_checklist_idx=metadata_checklist_idx,
+                ena_sample_accession=ena_sample_accession,
+            )
+            for display_name, value in sorted(local_metadata.items()):
+                await write_local_metadata_or_diagnose(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=result.biosample_idx,
+                    study_idx=study_idx,
+                    display_name=display_name,
+                    data_type=FieldDataType.TEXT,
+                    value=value,
+                    caller_idx=caller_idx,
+                )
+    except asyncpg.UniqueViolationError:
+        raced_idx = await conn.fetchval(
+            "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1",
+            ena_sample_accession,
+        )
+        if raced_idx is None:
+            raise
+        return raced_idx, False
+    return result.biosample_idx, True
 
 
 async def fetch_caller_has_biosample_access(
@@ -347,6 +423,12 @@ async def import_biosample_from_owner_biosample_id(
         - LocalWriteOnGloballyLinkedFieldError when
           owner_biosample_id_field_name resolves to a field on
           primary_study_idx that is already globally linked.
+        - StudyFieldNotUniqueInStudyError when it resolves to a field
+          on primary_study_idx that does not declare unique_in_study,
+          so its values cannot identify the study's samples.
+        - StudyFieldDataTypeNotTextError when it resolves to a field on
+          primary_study_idx declaring a data_type other than text,
+          which cannot hold the identifier as the owner submitted it.
 
     Caller must wrap the call in `async with conn.transaction():`;
     RuntimeError otherwise so partial failure cannot leave orphan
@@ -418,7 +500,7 @@ async def import_biosample_from_owner_biosample_id(
     (
         field_idx,
         field_created,
-        resolved_global_field_idx,
+        resolved_row,
     ) = await _get_or_create_local_study_field(
         conn,
         spec=BIOSAMPLE_METADATA_SPEC,
@@ -427,18 +509,48 @@ async def import_biosample_from_owner_biosample_id(
         created_by_idx=caller_idx,
         required=True,
         tier_override=OWNER_BIOSAMPLE_ID_TIER_OVERRIDE,
+        unique_in_study=True,
     )
     # The owner-biosample-id row is purely-local PII. If get-or-create
     # resolved an already globally-linked field at this
     # (study, display_name), refuse rather than write the value through
     # a cross-study global slot.
-    if resolved_global_field_idx is not None:
+    if resolved_row[BIOSAMPLE_METADATA_SPEC.study_field_global_fk_column] is not None:
         raise LocalWriteOnGloballyLinkedFieldError(
             entity_kind=SampleEntityKind.BIOSAMPLE,
             study_idx=primary_study_idx,
             display_name=owner_biosample_id_field_name,
             study_field_idx=field_idx,
-            found_global_field_idx=resolved_global_field_idx,
+            found_global_field_idx=resolved_row[
+                BIOSAMPLE_METADATA_SPEC.study_field_global_fk_column
+            ],
+        )
+
+    # The identifier is written as text, so a field declaring anything else
+    # cannot hold it. Refused here rather than coerced: an owner's identifier
+    # is theirs as submitted, and a value that has been through a numeric or
+    # date round-trip is no longer the string they sent.
+    if resolved_row["data_type"] != FieldDataType.TEXT:
+        raise StudyFieldDataTypeNotTextError(
+            entity_kind=SampleEntityKind.BIOSAMPLE,
+            study_idx=primary_study_idx,
+            display_name=owner_biosample_id_field_name,
+            study_field_idx=field_idx,
+            data_type=resolved_row["data_type"],
+        )
+
+    # An owner's identifier for a sample only identifies it if the study's
+    # other samples cannot carry the same one, so this write requires the
+    # policy rather than assuming it. A field minted here declares it; one
+    # minted before the policy existed, or by a caller who chose not to, is
+    # refused rather than silently used as an identifier it does not
+    # guarantee.
+    if not resolved_row["unique_in_study"]:
+        raise StudyFieldNotUniqueInStudyError(
+            entity_kind=SampleEntityKind.BIOSAMPLE,
+            study_idx=primary_study_idx,
+            display_name=owner_biosample_id_field_name,
+            study_field_idx=field_idx,
         )
 
     await insert_owner_biosample_id_metadata(

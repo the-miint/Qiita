@@ -32,6 +32,7 @@ from .conftest import (
     _seed_study,
     assert_study_field_create_authz,
     assert_study_field_create_conflict,
+    assert_study_field_get_authz,
     assert_study_field_list_authz,
     delete_idxs,
     post_study_field,
@@ -466,6 +467,7 @@ async def test_create_prep_sample_field_admin_local(ctx):
         # presence without pinning the minted idx or the DB-assigned timestamp.
         "prep_sample_study_field_idx": body["prep_sample_study_field_idx"],
         "created_at": body["created_at"],
+        "updated_at": body["updated_at"],
         "study_idx": study_idx,
         "prep_sample_global_field_idx": None,
         "display_name": display_name,
@@ -474,6 +476,7 @@ async def test_create_prep_sample_field_admin_local(ctx):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["user_session"]["principal_idx"],
     }
     assert body == expected
@@ -503,6 +506,7 @@ async def test_create_prep_sample_field_linked_inherits(ctx):
     expected = {
         "prep_sample_study_field_idx": body["prep_sample_study_field_idx"],
         "created_at": body["created_at"],
+        "updated_at": body["updated_at"],
         "study_idx": study_idx,
         "prep_sample_global_field_idx": global_idx,
         "display_name": display_name,
@@ -511,6 +515,7 @@ async def test_create_prep_sample_field_linked_inherits(ctx):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["user_session"]["principal_idx"],
     }
     assert body == expected
@@ -644,6 +649,7 @@ async def test_list_prep_sample_fields_in_study_resolves_linked_and_local(ctx):
         {
             "prep_sample_study_field_idx": body[0]["prep_sample_study_field_idx"],
             "created_at": body[0]["created_at"],
+            "updated_at": body[0]["updated_at"],
             "study_idx": study_idx,
             "prep_sample_global_field_idx": None,
             "display_name": local_name,
@@ -652,11 +658,13 @@ async def test_list_prep_sample_fields_in_study_resolves_linked_and_local(ctx):
             "required": False,
             "terminology_idx": None,
             "tier_override": None,
+            "unique_in_study": False,
             "created_by_idx": ctx["user_session"]["principal_idx"],
         },
         {
             "prep_sample_study_field_idx": body[1]["prep_sample_study_field_idx"],
             "created_at": body[1]["created_at"],
+            "updated_at": body[1]["updated_at"],
             "study_idx": study_idx,
             "prep_sample_global_field_idx": global_idx,
             "display_name": linked_name,
@@ -665,6 +673,7 @@ async def test_list_prep_sample_fields_in_study_resolves_linked_and_local(ctx):
             "required": True,
             "terminology_idx": terminology_idx,
             "tier_override": None,
+            "unique_in_study": False,
             "created_by_idx": ctx["user_session"]["principal_idx"],
         },
     ]
@@ -722,6 +731,20 @@ async def test_list_prep_sample_fields_in_study_authz(ctx, case, no_prep_sample_
     404 even for a role-bypass caller.
     """
     await assert_study_field_list_authz(
+        ctx,
+        case=case,
+        surface=PREP_SAMPLE_FIELD_SURFACE,
+        no_scope_client=no_prep_sample_read_client,
+    )
+
+
+@pytest.mark.parametrize("case", STUDY_FIELD_LIST_AUTHZ_CASES)
+async def test_get_prep_sample_field_authz(ctx, case, no_prep_sample_read_client):
+    """Tests the case where each row of the shared list access matrix calls the
+    read-one route: it sits at the same viewer floor as the list, since both
+    return a field definition and no metadata value.
+    """
+    await assert_study_field_get_authz(
         ctx,
         case=case,
         surface=PREP_SAMPLE_FIELD_SURFACE,

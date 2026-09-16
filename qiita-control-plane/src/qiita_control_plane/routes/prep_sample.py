@@ -7,13 +7,14 @@ A prep_sample row itself is created by the sequenced-sample composer
 from typing import Annotated
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX,
     PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT,
     PATH_PREP_SAMPLE_PREFIX,
     PATH_PREP_SAMPLE_RETIRED,
+    PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX,
     PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_PREP_SAMPLE_STUDY_LIST,
     PATH_STUDY_PREFIX,
@@ -24,6 +25,7 @@ from qiita_common.models import (
     PrepSampleRetiredUpdate,
     PrepSampleStudyFieldCreateRequest,
     PrepSampleStudyFieldResponse,
+    SampleStudyFieldPatchRequest,
     StudyListItem,
     StudyListResponse,
     Tier,
@@ -47,10 +49,15 @@ from ..repositories.prep_sample import (
 )
 from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from ._helpers import (
+    ETAG_HEADER,
+    IF_MATCH_HEADER,
     cap_rows,
     create_and_map_study_field,
+    etag_for_updated_at,
     map_global_field_row,
     map_study_field_row,
+    patch_and_map_study_field,
+    read_and_map_study_field,
 )
 
 router = APIRouter(prefix=PATH_PREP_SAMPLE_PREFIX, tags=["prep-sample"])
@@ -147,6 +154,7 @@ async def set_prep_sample_retired_route(
 async def create_prep_sample_field(
     study_idx: Annotated[int, Field(gt=0)],
     body: PrepSampleStudyFieldCreateRequest,
+    response: Response,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
@@ -173,13 +181,22 @@ async def create_prep_sample_field(
 
     prep_sample_global_field_idx discriminates two mutually-exclusive modes.
     Purely-local (omitted): data_type is required, plus optional required /
-    terminology_idx / tier_override. Globally-linked (set): only display_name
-    (+ optional description); data_type / required / terminology_idx /
-    tier_override are inherited from the global field and must be omitted here,
-    and come back on the response resolved to the global field's values.
+    terminology_idx / tier_override / unique_in_study. Globally-linked (set):
+    only display_name (+ optional description), every other attribute omitted;
+    data_type / required / terminology_idx come back on the response resolved
+    to the global field's values.
+
+    unique_in_study makes the study's values through this field distinct and
+    forbids a missing-value marker among them; the shapes that may carry it,
+    and why, are stated by unique_in_study_rejection_reason. Anything it
+    refuses is a 422.
+
+    The response carries an `ETag` header derived from the new row's
+    `updated_at`, so a caller that mints a field holds the value an edit's
+    `If-Match` needs without a second round trip.
     """
     async with tx() as conn:
-        response = await create_and_map_study_field(
+        created = await create_and_map_study_field(
             conn,
             spec=PREP_SAMPLE_METADATA_SPEC,
             study_idx=study_idx,
@@ -188,7 +205,8 @@ async def create_prep_sample_field(
             response_model=PrepSampleStudyFieldResponse,
         )
 
-    return response
+    response.headers[ETAG_HEADER] = etag_for_updated_at(created.updated_at)
+    return created
 
 
 # same-pattern-ok: cross-entity twin of list_biosample_fields_in_study.
@@ -228,6 +246,45 @@ async def list_prep_sample_fields_in_study(
     return fields
 
 
+# same-pattern-ok: cross-entity twin of get_biosample_field. The decorator,
+# path constant, scope, tier, spec, and response model are the whole per-entity
+# declaration, over a shared reader that carries the contract.
+@study_scoped_router.get(PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX)
+async def get_prep_sample_field(
+    study_idx: Annotated[int, Field(gt=0)],
+    study_field_idx: Annotated[int, Field(gt=0)],
+    response: Response,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> PrepSampleStudyFieldResponse:
+    """Return one study-local prep_sample field definition.
+
+    Same access bar as the list route on this study: viewer tier suffices
+    because this returns a field definition and no metadata value. A field
+    absent, or belonging to another study, is a 404 either way.
+
+    The response carries an `ETag` header derived from the row's `updated_at`,
+    which is the value an edit's `If-Match` must carry; it is a quoted ISO 8601
+    timestamp and is opaque by contract.
+    """
+    async with pool.acquire() as conn:
+        field, updated_at = await read_and_map_study_field(
+            conn,
+            spec=PREP_SAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            study_field_idx=study_field_idx,
+            response_model=PrepSampleStudyFieldResponse,
+        )
+
+    response.headers[ETAG_HEADER] = etag_for_updated_at(updated_at)
+    return field
+
+
 # same-pattern-ok: cross-entity twin of list_biosample_global_fields, and the
 # study-free sibling of list_prep_sample_fields_in_study; same reason as that one —
 # the gate and the spec/model pair are the declaration, over an already-generic read.
@@ -249,3 +306,46 @@ async def list_prep_sample_global_fields(
         map_global_field_row(row, response_model=PrepSampleGlobalFieldResponse) for row in rows
     ]
     return fields
+
+
+# same-pattern-ok: cross-entity twin of patch_biosample_field. The decorator, path
+# constant, scope, spec, and response model are the whole per-entity
+# declaration, over a shared helper that carries the contract.
+@study_scoped_router.patch(PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX)
+async def patch_prep_sample_field(
+    study_idx: Annotated[int, Field(gt=0)],
+    study_field_idx: Annotated[int, Field(gt=0)],
+    body: SampleStudyFieldPatchRequest,
+    response: Response,
+    if_match: Annotated[str | None, Header(alias=IF_MATCH_HEADER)] = None,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> PrepSampleStudyFieldResponse:
+    """Edit a study-local prep_sample field definition.
+
+    Same access bar as the create route on this study. If-Match is required;
+    patch_and_map_study_field carries the rest of the contract, including which
+    attributes a globally-linked field refuses and what happens when a field's
+    existing values cannot satisfy a uniqueness policy being switched on.
+
+    The response carries an `ETag` header derived from the new row's
+    `updated_at`, matching the create and read endpoints' contract.
+    """
+    async with tx() as conn:
+        updated = await patch_and_map_study_field(
+            conn,
+            spec=PREP_SAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            study_field_idx=study_field_idx,
+            body=body,
+            if_match=if_match,
+            response_model=PrepSampleStudyFieldResponse,
+        )
+
+    response.headers[ETAG_HEADER] = etag_for_updated_at(updated.updated_at)
+    return updated

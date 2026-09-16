@@ -454,9 +454,11 @@ async def fetch_assembly_sample_states(
 # question it asks. And it sets the denominator of every de novo feature table — what
 # fraction of a sample's reads roll up to a reported genome — so it moves results, not
 # plumbing. The natural place for it is therefore not here: a quality gate at
-# estimate-feature-table (the `galah --min-completeness / --max-contamination` shape)
-# would admit on quality at QUERY time, where "which members of a class" is the ordinary
-# form of the question rather than an awkward one for a kind filter.
+# estimate-feature-table admits on quality at QUERY time, where "which members of a
+# class" is the ordinary form of the question rather than an awkward one for a kind
+# filter. That gate now exists (`analytic.denovo_map_statements`) and judges the MAG and
+# LCG this predicate admits; whether UNBINNED should join them is still open, and is the
+# assay decision above rather than a consequence of the gate existing.
 #
 # An ALLOWLIST, not `<> UNBINNED`: `qiita_common.assembly_constants` states that the
 # kind set is meant to extend without a migration, so a denylist would admit a kind

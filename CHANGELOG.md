@@ -42,6 +42,74 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   named reference, and changing nothing on a second run — are pinned by an
   `integration`-gated data-plane test against a real catalog.
 
+- **`estimate-feature-table` gates the de novo arm on CheckM completeness /
+  contamination (#564).** Two new optional `action_context` keys, `min_completeness` and
+  `max_contamination`, defaulting to 50 / 10. The gate filters the de novo
+  feature->genome map, and because every other de novo relation resolves its genomes
+  through that map, one term reaches the precedence DELETE, the per-genome length
+  denominators, the coverage survivor set and woltka's input. Nothing is removed from
+  Postgres or the lake: the bound is a term in the `SELECT` that stages the map, as a
+  semi-join so a genome carrying two quality rows cannot fan the map out. MAG and LCG
+  only, the two kinds the map admits; reference genomes carry no CheckM score and are
+  not gated.
+
+  Unlike the coverage filter, the gate runs before precedence, so a read whose only de
+  novo placement was on an excluded genome keeps its reference placement instead of being
+  lost from both arms.
+
+  **A deprecated assembly run is refused as a de novo arm**, naming its `superseded_by`
+  replacement. Nothing else on this path refused one: a deprecated run stays listed and
+  its genomes stay on the map, so neither the alignment nor the map distinguishes a
+  withdrawn computation from a current one. Both drivers apply it —
+  `denovo_assembly_deprecation_error` is the shared wording, the resolver reading the row
+  from Postgres and the client recipe from `GET /processing/{processing_idx}`.
+
+  **A run with any unscored MAG or LCG subject is also refused at submit** rather than
+  gated, because the predicate is the positive form and excludes a NULL at every bound.
+  `checkm.sh` scored only the refined bins until circular genomes were added to it, while
+  membership wrote every class, so a run at a version predating that carries MAG/LCG
+  subjects with no `bin_quality` row. Those runs are deprecated, so the refusal above
+  turns them away first; every enabled assembly version now scores all three classes,
+  which leaves this one a backstop against a run whose subjects and scores disagree.
+
+  The client-side `qiita feature-table build --denovo-alignment-idx` is not score-gated:
+  `bin_quality` is un-mintable over HTTP, so a PAT cannot reach the scores. The
+  `analytic` package docstring records that divergence. Deprecation status is not
+  privileged that way, which is why that half is checked on both sides.
+
+- **A study can declare that a study-local field's values identify its samples,
+  and can change that declaration later (#562).** `unique_in_study` on
+  `biosample_study_field` / `prep_sample_study_field` makes the database reject a
+  duplicate value within the study and reject a missing-value marker outright.
+  It is settable on create and on edit, comes back on every field read,
+  and is refused for a globally-linked field and for the closed value sets (boolean,
+  terminology) with a per-field 422 naming the rule. Enforcement follows the current
+  policy rather than the one the field was minted with: a trigger mirrors a change
+  onto every metadata row already written through the field. Switching it on over
+  values that already repeat answers 409, over a sample with a missing value answers
+  422, and either way the change rolls back whole. Uniqueness is case-sensitive and
+  scoped to one study: two studies may hold the same value through their own local
+  fields. Defaults false, so existing fields are unaffected. Editing a field also needs
+  a tag to edit against, so field reads and creates now carry an `ETag` and
+  `updated_at`, and `GET /api/v1/study/{study_idx}/biosample-field/{study_field_idx}`
+  and its prep-sample twin serve one definition at the same viewer floor as the list
+  route. `data_type` and the global-field link stay immutable, since changing either
+  rewrites the meaning of every value already stored. A field holding a value on a
+  published sample refuses a policy change in either direction: publication freezes
+  the policy along with the values it governs.
+
+- **A biosample's owner-submitted identifier must be unique within the study-local
+  field recording it (#562).** The import mints the owner-id field declaring that
+  policy, and refuses to write through a field of that name that does not declare it —
+  a field guaranteeing no distinctness cannot serve as the identifier a study names its
+  samples by. A field of that name storing anything other than text is refused for a
+  related reason, rather than coercing the identifier into a shape its owner did not
+  submit. A second biosample claiming an identifier that field already holds is refused
+  and told which value repeated. A study may record owner ids through more than one
+  local field — contributors arrive under different column names — so the same
+  identifier through a different field, or in a different study, is untouched. Owner-id
+  fields minted before this rule are brought up to it by migration, which aborts rather
+  than picking a winner when a field's existing values cannot satisfy the policy.
 - **The genome map is served as Parquet from a sibling route, so a large reference
   is no longer unbuildable (#550).** `GET /reference/{idx}/genome-map` caps at 250,000
   entries and 413s above it; both genome-bearing references on the deploy are past
@@ -312,6 +380,66 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   deploy host `CONCOCT_bin.13_sub.fa` came back as `CONCOCT_bin.13_sub`, which is what lets a
   dotted hifiasm contig id (`s0.ctg000001c`) round-trip as its own `bin_id`. An id that cannot
   be a filename stem stops the step rather than being sanitized into one that joins nothing (#519).
+
+- **INSDC study import: `POST` / `GET /api/v1/ena-import-batch` (#369).** An
+  admin-only (wet_lab_admin / system_admin) call takes a list of INSDC study
+  accessions and returns 202 with a batch handle. New tables
+  `qiita.ena_import_batch` / `qiita.ena_import_batch_item` (TEXT/CHECK state, no
+  `CREATE TYPE`) track each accession independently through `pending ->
+  resolving -> registered -> downloading`, with `failed` reachable from each, so
+  one bad accession never affects its siblings. A background driver
+  (`ena_import.batch`) resolves, registers and submits up to four studies at a
+  time on its own tracked task set, drained at shutdown and re-driven at startup
+  by `reconcile_inflight_batches`; an item whose submitter has since been
+  disabled or retired fails with that reason rather than being re-driven. `GET`
+  rolls each downloading item's tickets up on demand to `done`, `downloading`, or
+  `failed` (a failed or cancelled ticket), and returns each ENA run's
+  registration outcome as `ena_runs`. An import only adds to a study an import
+  created (`ena_import_batch_item.study_created`, written in the same transaction
+  as the study), so a natively created study that was later deposited is refused
+  before anything is written. Re-importing an accession picks up the runs it
+  gained: registered runs are skipped, and new ones go into a new pool with its
+  own ticket whenever the existing pool's download is in flight or finished,
+  since a download reads its roster once. A failed or cancelled download is
+  resubmitted on re-import.
+- **INSDC metadata resolution and registration (`ena_import`) (#369).**
+  `MiintEnaResolver` reads a study's header, runs and sample attributes through
+  miint's `read_ena` / `read_ena_attributes` into the new
+  `qiita_common.models.ena` models, grouping attributes per sample in SQL; an
+  invalid or unresolvable accession raises. `register_ena_study` then writes, per
+  run in its own transaction so a failure is isolated to that run: a biosample
+  keyed on `ena_sample_accession` (one row across studies, created through
+  `import_biosample_from_owner_biosample_id` with ENA's `sample_alias` as the
+  owner biosample id, or the accession when ENA has none), bound to the
+  `ERC000011` checklist; a `prep_sample` / `sequenced_sample` carrying the ENA
+  experiment and run accessions; and one `sequencing_run` per `(study,
+  platform)`. `ena_import.attribute_mapping` maps the GSC-MIxS display names and
+  underscore short names for collection date, country/sea, latitude/longitude
+  and depth onto global fields; every other attribute is kept as study-local
+  TEXT, ENVO- and taxonomy-typed tags included, since ENA's values are submitter
+  free text. `host taxon id` is recorded as a missing-value marker.
+  `platform_mapping` and `protocol_mapping` map ENA's `instrument_platform` and
+  library strategy/source to `qiita.platform` and a curated `prep_protocol`,
+  failing the run on an unmappable value.
+- **`download-ena-study` workflow and `ingest_ena_reads` job (#369).** A
+  `sequenced_pool`-scoped workflow that downloads a pool's runs with miint's
+  `read_ena_sequences` and stores them once in the DuckLake `read` table, the
+  ENA analog of bcl-convert. The runner stages the pool's `{prep_sample_idx,
+  ena_run_accession}` roster from a live query (`ena_run_map`). The job opens a
+  fresh DuckDB connection per run so `miint_warnings()` covers only that run,
+  mints `sequence_idx` ranges through the CO→CP callback, and fails loud: a
+  transport-shaped error is the new retriable
+  `FailureKind.EXTERNAL_FETCH_TRANSIENT`, while a skip or truncation warning,
+  zero reads, or an md5 mismatch is permanent `BAD_INPUT`. md5 verification is
+  miint's `verify_md5`, on by default (duckdb-miint#172); a run whose md5 miint
+  could not check still registers.
+- **ENA import tests and runbook (#369).** `tests/integration/test_ena_import_e2e.py`
+  and `test_ena_ingest_e2e.py` run registration and the download job into a real
+  DuckLake `read` table; `test_ena_import_live_e2e.py` and
+  `test_ena_resolver_live.py` are `system`-gated tests against live ENA.
+  `docs/runbooks/ena-import.md` covers the REST surface, re-import, scope limits,
+  md5 verification and the network access imports need; `docs/architecture.md`
+  gains an ENA Study Import subsection.
 
 - **The assembler's per-contig report is stored, so circularity can become a query-time
   predicate instead of a routing decision baked into the entrypoint (#517).** Both arms of
@@ -1742,6 +1870,29 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Reference load: a genome map is checked against the reference FASTA before anything is minted, so a map whose read_ids match no FASTA sequence fails and a partial match logs what went unmatched (#577).**
+  `_associate_genomes` INNER-JOINed the genome map onto the manifest's `read_id`, silently
+  dropping every map row whose `read_id` isn't a FASTA sequence ID. `mint-features` now
+  checks the map first: if no `read_id` matches, the step fails before any `qiita.feature`
+  row is written, naming a few of the unmatched IDs. For a `shard_index=true` load this
+  replaces the later `plan-shards` N=0 failure; an unsharded load, which used to succeed
+  with no genome associations, now fails. A partial match still loads and logs a warning
+  with the work ticket, the unmatched `read_id` count and a few examples. The genome map
+  must also carry a `read_id` column with no NULLs.
+- **ENA import: a cross-batch race that minted a duplicate `sequencing_run` pool (and a redundant `download-ena-study` ticket) for a `(study, platform)` is serialized (#575).**
+  `_resolve_platform_pools` was a SELECT-then-INSERT with no arbitrating constraint on the
+  no-preflight pool path, so two concurrent batches for the same `(study, platform)` each
+  created a pool. The get-or-create now holds a transaction-level advisory key on the
+  `sequencing_run` idx: the second writer blocks, re-reads pool state, and reuses the pool
+  the first created. A batch whose download-ticket submit 409s because a concurrent batch
+  already submitted one for the pool now reuses that ticket instead of failing the item.
+- **`align/1.0.0`'s walltime ceiling is PT16H, above the PT8H its `align_sharded` blocks
+  kept timing out at (#563).** Walltime escalation doubles on each TIMEOUT and clamps to
+  the ceiling, so with a PT8H ceiling a block that needed more than 8 h failed its ticket
+  permanently as walltime-ceiling exhausted. The `align_sharded` baseline stays PT4H, so
+  ordinary tickets request the same walltime as before. A redriven ticket starts at its
+  persisted escalated floor, so a block that already reached PT8H runs once more at PT8H
+  before escalating to PT16H.
 - **long-read-assembly: binning no longer fails when MetaBAT2 forms no bins and MaxBin2 declines the assembly (#561).**
   metaWRAP exits non-zero when any binner fails, and MaxBin2 fails on an assembly whose
   contigs carry too few marker genes, so a prep_sample with such an assembly failed the
@@ -3761,6 +3912,31 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   comments (a new migration — the one that shipped them is merged). One assembly and one binner
   configuration, so this establishes that these tools preserve both shapes, not that a future
   version must.
+
+- **Work-ticket submission is callable without a request (#369).**
+  `routes.work_ticket.submit_work_ticket_core(app=, principal=, body=)` holds
+  `POST /work-ticket`'s gates, INSERT and dispatch, and the route calls it, so
+  the ENA batch driver submits tickets through the same audience and
+  disallow-without-delete checks. The compute-orchestrator 503 guard is one
+  `require_compute_backend_client(app)` used by both routes and the core.
+- **One human-user loader (#369).** `auth.principal.load_human_user` loads a
+  principal and refuses a missing, disabled or retired one with
+  `PrincipalUnusableError`, for callers with no request; the OIDC path maps it to
+  the same 401 detail as before.
+- **`insert_entity_to_study` takes `on_conflict` (#369).** `"raise"` (default)
+  or `"ignore"` (`ON CONFLICT DO NOTHING`), for linking an existing biosample to
+  another study.
+- **`httpfs` is installed and loaded with miint (#369).** `miint_install_sql` /
+  `miint_load_sql` include `httpfs`, which miint needs to reach the network.
+  `staging_is_current` reports a stage missing `httpfs` as stale, and
+  `make verify-deploy`'s `cp-miint` check LOADs it.
+- **`ingest_reads`' staging helpers are shared (#369).** Sorting, hardlinking,
+  per-slot DuckDB caps and the roster reader move to
+  `qiita_compute_orchestrator.read_staging`, used by `ingest_reads` and
+  `ingest_ena_reads`.
+- **`drain_running_dispatches` drains any tracked task set (#369).** New
+  `label` / `reconcile_note` parameters let shutdown drain the ENA batch tasks
+  with the same helper and timeout.
 
 - **`hifiasm_meta` is pinned, and an unrecognised GFA segment name now fails the `assemble`
   step (#517).** The pin is `hamtv0.3.5`, with both of the binary's internal version strings

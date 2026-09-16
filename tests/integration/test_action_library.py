@@ -439,6 +439,42 @@ async def test_library_mint_features_genome_map_with_null_source_id_fails(
         )
 
 
+async def test_library_mint_features_genome_map_with_no_matching_read_id_writes_nothing(
+    postgres_pool, tmp_path
+):
+    from qiita_common.api_paths import LibraryPrimitive
+    from qiita_control_plane.actions import LIBRARY
+
+    h = _md5_uuid("NO_OVERLAP")
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, [h])
+
+    sid = f"GID-{uuid.uuid4()}"
+    genome_map = tmp_path / "genome_map.parquet"
+    _write_genome_map(genome_map, [("not-in-fasta", "genbank", sid)])
+
+    with pytest.raises(ValueError, match="not-in-fasta"):
+        await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+            postgres_pool, manifest, tmp_path, genome_map
+        )
+
+    assert not (tmp_path / "feature_map.parquet").exists()
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.feature WHERE sequence_hash = $1", h
+        )
+        == 0
+    )
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.feature_genome fg"
+            " JOIN qiita.genome g USING (genome_idx) WHERE g.source_id = $1",
+            sid,
+        )
+        == 0
+    )
+
+
 async def test_library_mint_features_rejects_unknown_genome_source(
     postgres_pool, tmp_path
 ):

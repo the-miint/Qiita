@@ -1425,6 +1425,68 @@ async def test_write_local_metadata_or_diagnose_raises_duplicate_value(ctx):
     assert exc.attempted_value == "v1"
 
 
+async def test_write_local_metadata_or_diagnose_upsert_outcomes_on_unique_field(ctx):
+    """Tests the case where upserts run through a unique_in_study field, where
+    one INSERT can break the slot index and the study-local uniqueness index
+    together: the outcome follows what occupies the caller's own slot, never
+    whichever of the two indexes PostgreSQL happened to name.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    display_name = unique_field_name("unique_upsert")
+
+    # Minted flagged up front; the writes below resolve this same row by name.
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+            required=False,
+            unique_in_study=True,
+        )
+    ctx["created"]["biosample_study_field"].append(field_idx)
+
+    async def _upsert(value):
+        return await _commit_local_write(
+            ctx,
+            bs_idx=bs_idx,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            data_type=FieldDataType.TEXT,
+            value=value,
+            on_conflict="upsert",
+        )
+
+    inserted = await _upsert("A")
+    updated = await _upsert("B")
+    # The re-send breaks both indexes at once: the slot holds the caller's own
+    # row, and that row holds the very value being written.
+    unchanged = await _upsert("B")
+
+    assert inserted == SampleMetadataWriteResult(
+        metadata_idx=inserted.metadata_idx,
+        study_field_idx=field_idx,
+        study_field_created=False,
+        outcome=FieldWriteOutcome.INSERTED,
+    )
+    assert updated == SampleMetadataWriteResult(
+        metadata_idx=inserted.metadata_idx,
+        study_field_idx=field_idx,
+        study_field_created=False,
+        outcome=FieldWriteOutcome.UPDATED,
+    )
+    assert unchanged == SampleMetadataWriteResult(
+        metadata_idx=inserted.metadata_idx,
+        study_field_idx=field_idx,
+        study_field_created=False,
+        outcome=FieldWriteOutcome.UNCHANGED,
+    )
+    row = await _fetch_metadata_row(ctx["pool"], inserted.metadata_idx)
+    assert row["value_text"] == "B"
+
+
 async def test_write_local_metadata_or_diagnose_raises_conflicting_value(ctx):
     """Re-writing a different value through the same local field;
     classified as a local conflict.
@@ -2524,7 +2586,7 @@ async def test__get_or_create_local_study_field_creates_purely_local(ctx, spec):
 
     # Create a new local field with required=True (composer's intended use).
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        idx, created, resolved_global_field_idx = await _get_or_create_local_study_field(
+        idx, created, resolved_row = await _get_or_create_local_study_field(
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
@@ -2538,7 +2600,7 @@ async def test__get_or_create_local_study_field_creates_purely_local(ctx, spec):
     # global_field_idx is None because the create branch always produces a
     # purely-local row.
     assert created is True
-    assert resolved_global_field_idx is None
+    assert resolved_row[spec.study_field_global_fk_column] is None
 
     # Verify the row reflects the local-field defaults plus the explicit required.
     row = await ctx["pool"].fetchrow(
@@ -2567,6 +2629,64 @@ async def test__get_or_create_local_study_field_creates_purely_local(ctx, spec):
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
     ids=["biosample", "prep_sample"],
 )
+async def test__get_or_create_local_study_field_stores_unique_in_study(ctx, spec):
+    """Tests the case where the create branch is asked for a study-locally
+    unique field: the flag reaches the stored row.
+    """
+    field_name = unique_field_name()
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        idx, created, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=field_name,
+            created_by_idx=ctx["principal_idx"],
+            unique_in_study=True,
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
+
+    assert created is True
+    stored = await ctx["pool"].fetchval(
+        f"SELECT unique_in_study FROM {spec.study_field_table} WHERE idx = $1",
+        idx,
+    )
+    assert stored is True
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test__get_or_create_local_study_field_unique_in_study_defaults_false(ctx, spec):
+    """Tests the case where the create branch is not asked for uniqueness:
+    an implicitly-minted field carries no study-local uniqueness policy.
+    """
+    field_name = unique_field_name()
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=field_name,
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
+
+    stored = await ctx["pool"].fetchval(
+        f"SELECT unique_in_study FROM {spec.study_field_table} WHERE idx = $1",
+        idx,
+    )
+    assert stored is False
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
 async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
     field_name = unique_field_name()
 
@@ -2576,7 +2696,7 @@ async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
         (
             first_idx,
             first_created,
-            first_global_field_idx,
+            first_row,
         ) = await _get_or_create_local_study_field(
             conn,
             spec=spec,
@@ -2587,7 +2707,7 @@ async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
         (
             second_idx,
             second_created,
-            second_global_field_idx,
+            second_row,
         ) = await _get_or_create_local_study_field(
             conn,
             spec=spec,
@@ -2599,13 +2719,15 @@ async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
 
     # First call inserts (created=True); second call resolves via the
     # fallback SELECT branch (created=False) and converges on the same idx.
-    # Both calls resolve to a purely-local row, so the global_field_idx
-    # element is None in both.
+    # Both calls resolve to a purely-local row, so the global FK is None on
+    # both returned rows — and the create and lookup branches describe the
+    # same row identically, which is what lets a caller judge either one.
     assert first_created is True
     assert second_created is False
     assert first_idx == second_idx
-    assert first_global_field_idx is None
-    assert second_global_field_idx is None
+    assert first_row[spec.study_field_global_fk_column] is None
+    assert second_row[spec.study_field_global_fk_column] is None
+    assert dict(first_row) == dict(second_row)
 
     # Confirm the DB only has one row for this (study, display_name).
     count = await ctx["pool"].fetchval(
@@ -3416,6 +3538,39 @@ async def test_insert_entity_to_study_rejects_duplicate(ctx, spec):
                 study_idx=ctx["study_idx"],
                 created_by_idx=ctx["principal_idx"],
             )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_insert_entity_to_study_on_conflict_ignore_is_idempotent(ctx, spec):
+    """on_conflict="ignore" is the ENA-import registration path's building
+    block: re-registering an already-linked (entity, study) pair on re-import
+    is the expected case, not an error -- unlike the "raise" default pinned
+    above."""
+    entity_idx = await _seed_unlinked_entity_for_spec(ctx, spec)
+
+    for _ in range(2):
+        async with ctx["pool"].acquire() as conn:
+            await insert_entity_to_study(
+                conn,
+                spec=spec,
+                entity_idx=entity_idx,
+                study_idx=ctx["study_idx"],
+                created_by_idx=ctx["principal_idx"],
+                on_conflict="ignore",
+            )
+    _track_to_study_link(ctx, spec, entity_idx, ctx["study_idx"])
+
+    count = await ctx["pool"].fetchval(
+        f"SELECT count(*) FROM {spec.link_table}"
+        f" WHERE {spec.link_entity_key_column} = $1 AND study_idx = $2",
+        entity_idx,
+        ctx["study_idx"],
+    )
+    assert count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -6315,9 +6470,11 @@ async def test_fetch_study_field_local(ctx, spec):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["principal_idx"],
         # created_at is DB-assigned; copy it from the actual row.
         "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
     assert dict(row) == expected
 
@@ -6364,8 +6521,10 @@ async def test_fetch_study_field_globally_linked_inherits(ctx, spec):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["principal_idx"],
         "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
     assert dict(row) == expected
 
@@ -6379,6 +6538,21 @@ async def test_fetch_study_field_returns_none_when_missing(ctx, spec):
     """Tests the case where the idx matches no row: fetch returns None."""
     result = await fetch_study_field(ctx["pool"], spec=spec, idx=987654321)
     assert result is None
+
+
+async def test_fetch_study_field_for_update_outside_transaction_raises(ctx):
+    """Tests the case where for_update is asked for on a bare connection: the
+    guard raises rather than taking a row lock the ending statement immediately
+    releases, which would leave the caller unprotected and unaware of it.
+
+    Unparametrized: the guard runs before any SQL, so the spec it would have
+    read the row through is not part of what fails.
+    """
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(RuntimeError, match="transaction"):
+            await fetch_study_field(
+                conn, spec=BIOSAMPLE_METADATA_SPEC, idx=987654321, for_update=True
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -6423,6 +6597,7 @@ async def test_create_study_field_and_read_back_globally_linked(ctx, spec):
         # presence without pinning the minted idx or the DB-assigned timestamp.
         "idx": record["idx"],
         "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
         "study_idx": ctx["study_idx"],
         spec.study_field_global_fk_column: global_idx,
         "display_name": display_name,
@@ -6431,6 +6606,7 @@ async def test_create_study_field_and_read_back_globally_linked(ctx, spec):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["principal_idx"],
     }
     assert dict(record) == expected
@@ -6493,9 +6669,11 @@ async def test_fetch_study_fields_for_study_orders_and_resolves(ctx, spec):
             "required": False,
             "terminology_idx": None,
             "tier_override": None,
+            "unique_in_study": False,
             "created_by_idx": ctx["principal_idx"],
             # created_at is DB-assigned; copy it from the actual row.
             "created_at": rows[0]["created_at"],
+            "updated_at": rows[0]["updated_at"],
         },
         {
             "idx": linked_idx,
@@ -6507,8 +6685,10 @@ async def test_fetch_study_fields_for_study_orders_and_resolves(ctx, spec):
             "required": False,
             "terminology_idx": None,
             "tier_override": None,
+            "unique_in_study": False,
             "created_by_idx": ctx["principal_idx"],
             "created_at": rows[1]["created_at"],
+            "updated_at": rows[1]["updated_at"],
         },
     ]
     assert [dict(row) for row in rows] == expected

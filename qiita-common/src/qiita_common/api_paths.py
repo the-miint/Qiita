@@ -353,6 +353,23 @@ URL_UPLOAD_BY_IDX = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_BY_IDX}"
 URL_UPLOAD_DONE = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_DONE}"
 
 
+# =============================================================================
+# /ena-import-batch/* — batch multi-study ENA import driver
+# =============================================================================
+# POST accepts a list of INSDC study accessions and returns a batch handle
+# immediately (202); the resolve+register+download-submit work runs in a
+# background task (qiita_control_plane.ena_import.batch). GET polls the
+# per-item rolled-up state. ADMIN-only (wet_lab_admin / system_admin) — see
+# routes/ena_import.py.
+
+PATH_ENA_IMPORT_BATCH_PREFIX = "/ena-import-batch"
+PATH_ENA_IMPORT_BATCH_ROOT = ""  # POST (submit) against the prefix itself
+PATH_ENA_IMPORT_BATCH_BY_IDX = "/{ena_import_batch_idx}"
+
+URL_ENA_IMPORT_BATCH_PREFIX = f"{API_PREFIX}{PATH_ENA_IMPORT_BATCH_PREFIX}"
+URL_ENA_IMPORT_BATCH_BY_IDX = f"{URL_ENA_IMPORT_BATCH_PREFIX}{PATH_ENA_IMPORT_BATCH_BY_IDX}"
+
+
 def compute_upload_staging_path(staging_root: Path, upload_idx: int) -> Path:
     """Canonical filesystem path for a staged DoPut upload.
 
@@ -850,9 +867,12 @@ PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 # anchor on the /study router (the caller is authorized on the study).
 PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
 PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
-# Create a study-local biosample field definition (POST). The study-scoped
-# mint hangs off the /study router (the caller is authorized on the study).
+# Create a study-local biosample field definition (POST). The study-scoped mint
+# hangs off the /study router (the caller is authorized on the study); the
+# by-idx path addresses a single definition under it, to read (GET) or edit
+# (PATCH).
 PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/biosample-field"
+PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/biosample-field/{study_field_idx}"
 
 PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
@@ -873,6 +893,7 @@ URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
 URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
 URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
+URL_BIOSAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
@@ -946,9 +967,12 @@ PATH_PREP_SAMPLE_STUDY_LIST = "/{prep_sample_idx}/study/list"
 # without a raw production UPDATE. Reversible by design (a misclassified well
 # must be recoverable), unlike the terminal principal retire.
 PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
-# Create a study-local prep_sample field definition (POST). The study-scoped
-# mint hangs off the /study router (the caller is authorized on the study).
+# Create a study-local prep_sample field definition (POST). The study-scoped mint
+# hangs off the /study router (the caller is authorized on the study); the
+# by-idx path addresses a single definition under it, to read (GET) or edit
+# (PATCH).
 PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/prep-sample-field"
+PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/prep-sample-field/{study_field_idx}"
 
 # =============================================================================
 # /exported-identifier — the public handle a published table carries per sample
@@ -997,6 +1021,7 @@ URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
 URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"
 URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"
+URL_PREP_SAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX}"
 
 
 # =============================================================================

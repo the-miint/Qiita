@@ -50,7 +50,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
 from qiita_common.actions import (
     FASTQ_PATH_CONTEXT_KEYS,
     PATH_SUFFIX,
@@ -101,7 +101,7 @@ from ..actions.reference import (
 from ..auth.guards import require_caller_has_admin_on_all_studies, require_scope
 from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, get_current_principal
 from ..config import Settings
-from ..deps import get_db_pool, get_settings
+from ..deps import get_db_pool
 from ..dispatch import schedule_dispatch
 from ..fanout_dispatch import (
     COHORT_BUILDERS,
@@ -698,14 +698,18 @@ async def _check_fastq_filename_prefix(
         )
 
 
-def _require_compute_backend_client(request: Request) -> None:
+def require_compute_backend_client(app: FastAPI) -> None:
     """Guard that 503s if the orchestrator dispatch path is not configured.
     Prevents creating tickets that can never run."""
-    if request.app.state.compute_backend_client is None:
+    if app.state.compute_backend_client is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="compute orchestrator not configured (COMPUTE_ORCHESTRATOR_URL unset)",
         )
+
+
+def _require_compute_backend_client(request: Request) -> None:
+    require_compute_backend_client(request.app)
 
 
 async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelRequest) -> list[int]:
@@ -740,19 +744,21 @@ async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelReque
 # =============================================================================
 
 
-@router.post(
-    PATH_WORK_TICKET_ROOT,
-    response_model=WorkTicketResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def submit_work_ticket(
+async def submit_work_ticket_core(
+    *,
+    app: FastAPI,
+    principal: Principal,
     body: WorkTicketCreateRequest,
-    request: Request,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    principal: Principal = Depends(get_current_principal),
-    settings: Settings = Depends(get_settings),
-    _: None = Depends(_require_compute_backend_client),
 ) -> WorkTicketResponse:
+    """Gate, INSERT, and dispatch one work ticket for `principal`.
+
+    Takes `app` rather than a `Request` so in-process callers get the same gates
+    as `POST /work-ticket`, including the action's audience check.
+    """
+    require_compute_backend_client(app)
+    pool: asyncpg.Pool = app.state.pool
+    settings: Settings = app.state.settings
+
     action = await _fetch_action_for_submission(pool, body.action_id, body.action_version)
     if action is None:
         raise HTTPException(
@@ -956,7 +962,7 @@ async def submit_work_ticket(
 
     # Fire-and-forget dispatch in the background. The route returns 202
     # immediately; the workflow runs in-process via asyncio.
-    schedule_dispatch(request.app, work_ticket_idx)
+    schedule_dispatch(app, work_ticket_idx)
 
     _log.info(
         "submitted work_ticket %d for action %s/%s by principal %d",
@@ -966,6 +972,20 @@ async def submit_work_ticket(
         principal.principal_idx,
     )
     return WorkTicketResponse(work_ticket_idx=work_ticket_idx, state=WorkTicketState.PENDING)
+
+
+@router.post(
+    PATH_WORK_TICKET_ROOT,
+    response_model=WorkTicketResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def submit_work_ticket(
+    body: WorkTicketCreateRequest,
+    request: Request,
+    principal: Principal = Depends(get_current_principal),
+) -> WorkTicketResponse:
+    """`submit_work_ticket_core` for the requesting principal."""
+    return await submit_work_ticket_core(app=request.app, principal=principal, body=body)
 
 
 # Two-row-source SELECT. work_ticket carries the scope_target_kind plus

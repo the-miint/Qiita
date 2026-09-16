@@ -153,7 +153,19 @@ def _columns(path: Path) -> list[str]:
     return [d[0] for d in desc]
 
 
-def _run(m, *, tmp_path, monkeypatch, alignment, lengths, mapping, threshold, ref_idx=7, wt_idx=42):
+def _run(
+    m,
+    *,
+    tmp_path,
+    monkeypatch,
+    alignment,
+    lengths,
+    mapping,
+    threshold,
+    ref_idx=7,
+    wt_idx=42,
+    gate=None,
+):
     """Seed the three Parquet inputs, install the stream fakes, run execute, and
     return (output_map, captured_scope)."""
     align_pq = _write_alignment_parquet(tmp_path / "alignment.parquet", alignment)
@@ -167,6 +179,7 @@ def _run(m, *, tmp_path, monkeypatch, alignment, lengths, mapping, threshold, re
         work_ticket_idx=wt_idx,
         coverage_threshold=threshold,
         genome_map_path=map_pq,
+        **({} if gate is None else gate),
     )
     out = asyncio.run(m.execute(inputs, tmp_path / "ws"))
     return out, captured
@@ -556,8 +569,8 @@ def _write_denovo_quality_parquet(
     """The resolver-staged de novo quality: (prep_sample_idx, genome_idx,
     completeness, contamination), as `_write_denovo_genome_quality` writes it.
 
-    The scores are nullable, so the fixtures carry a NULL row: a genome CheckM did
-    not score is an ordinary state, not an edge case.
+    The scores are nullable and stay so here: the resolver refuses a run with an
+    unscored MAG/LCG subject, which is upstream of this shape rather than in it.
     """
     with duckdb.connect(":memory:") as conn:
         values = ", ".join(
@@ -618,7 +631,16 @@ def _fake_assembled_sequence_stream(per_sample: dict[int, Path], captured: dict)
     return fake
 
 
-def _run_combined(m, *, tmp_path, monkeypatch, threshold=0.01, denovo_map=None, quality=None):
+def _run_combined(
+    m,
+    *,
+    tmp_path,
+    monkeypatch,
+    threshold=0.01,
+    denovo_map=None,
+    quality=None,
+    gate=None,
+):
     """Run `execute` over a two-arm fixture and return (output_map, captured).
 
     Contig 50 is BOTH a reference sequence of genome 300 and a contig each sample
@@ -645,10 +667,12 @@ def _run_combined(m, *, tmp_path, monkeypatch, threshold=0.01, denovo_map=None, 
         tmp_path / "dn_map.parquet",
         [(1, 50, 900), (2, 50, 901)] if denovo_map is None else denovo_map,
     )
-    # One scored genome and one unscored, which is the mixed state a real run is in.
+    # Both genomes scored and both clearing the default bounds, so every combined test
+    # below runs through the real gate at the real thresholds. A run holding an unscored
+    # subject never reaches the job — the resolver refuses it.
     denovo_quality_pq = _write_denovo_quality_parquet(
         tmp_path / "dn_quality.parquet",
-        [(1, 900, 95.0, 1.0), (2, 901, None, None)] if quality is None else quality,
+        [(1, 900, 95.0, 1.0), (2, 901, 90.0, 2.0)] if quality is None else quality,
     )
     # Contig 50 is on BOTH samples' length streams — one content-addressed feature,
     # streamed once per sample, which is what the roll-up's dedupe exists for.
@@ -677,6 +701,7 @@ def _run_combined(m, *, tmp_path, monkeypatch, threshold=0.01, denovo_map=None, 
         denovo_genome_map_path=denovo_map_pq,
         denovo_processing_idx=11,
         denovo_genome_quality_path=denovo_quality_pq,
+        **({} if gate is None else gate),
     )
     out = asyncio.run(m.execute(inputs, tmp_path / "ws"))
     return out, captured
@@ -865,3 +890,147 @@ def test_a_denovo_map_without_its_run_fails_loudly(tmp_path, monkeypatch, thresh
                 tmp_path / "ws",
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# The de novo arm's quality gate. `analytic`'s behaviour suite owns what the gate
+# COMPUTES; these own that the driver carries the knobs to it and what an omitted
+# action_context key resolves to.
+# ---------------------------------------------------------------------------
+
+
+def test_the_gate_defaults_to_the_contract_layers_literals():
+    """The one place the default lives. An omitted `action_context` key is skipped by the
+    params binding (`runner._dispatch._bind_step_inputs`), so this is what a caller who
+    names neither bound gets; the workflow `context_schema` declares no `default:` that
+    could disagree with it.
+    """
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    inputs = m.Inputs(
+        reference_idx=7, work_ticket_idx=42, coverage_threshold=0.01, genome_map_path=Path("m.pq")
+    )
+    assert inputs.min_completeness == analytic.DEFAULT_MIN_COMPLETENESS
+    assert inputs.max_contamination == analytic.DEFAULT_MAX_CONTAMINATION
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"min_completeness": -0.1},
+        {"min_completeness": 100.1},
+        {"max_contamination": -0.1},
+    ],
+)
+def test_inputs_quality_gate_bounds(bad, tmp_path):
+    """Refused at the boundary, like `coverage_threshold`, and for that bound's reason:
+    a value outside [0, 100] is not a percentage. Out of range the failure is silent
+    either way — permissive below 0, empty above 100 — rather than an error.
+    """
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    with pytest.raises(ValueError):
+        m.Inputs(
+            reference_idx=7,
+            work_ticket_idx=42,
+            coverage_threshold=0.01,
+            genome_map_path=tmp_path / "m.pq",
+            **bad,
+        )
+
+
+def test_max_contamination_has_no_upper_bound(tmp_path):
+    """Deliberately uncapped: nothing here needs a ceiling, and inventing one would be
+    a claim about CheckM's range that nothing in this repo has measured."""
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    assert (
+        m.Inputs(
+            reference_idx=7,
+            work_ticket_idx=42,
+            coverage_threshold=0.01,
+            genome_map_path=tmp_path / "m.pq",
+            max_contamination=1000.0,
+        ).max_contamination
+        == 1000.0
+    )
+
+
+def test_the_driver_carries_the_gate_into_the_table(tmp_path, monkeypatch):
+    """End to end through `execute`: genome 901 fails on contamination and is gone,
+    and read 6 — its only read — is gone with it, having no reference placement to
+    fall back to (contig 50's reference genome 300 lost read 3 to precedence).
+
+    Genome 900 is untouched, so this is one genome's exclusion rather than the arm's.
+    """
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    out, _captured = _run_combined(
+        m,
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        quality=[(1, 900, 95.0, 1.0), (2, 901, 90.0, 40.0)],
+    )
+    assert _read_ogu(out["ogu_table"]) == [
+        (1, 100, 1.0),  # read 1, reference-only
+        (1, 900, 1.0),  # read 3, still won by the de novo arm
+        (2, 100, 1.0),  # read 4
+    ]
+
+
+def test_an_unscored_genome_does_not_pass_the_gate(tmp_path, monkeypatch):
+    """The position `_quality_gate_predicate` takes, pinned at the driver: the positive
+    predicate excludes a NULL rather than admitting it, because a caller told every
+    genome cleared `min_completeness` must not be handed one nobody measured.
+
+    The resolver refuses such a run before the job runs, so this is the behaviour behind
+    that refusal rather than a path a submission reaches.
+    """
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    out, _captured = _run_combined(
+        m,
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        quality=[(1, 900, 95.0, 1.0), (2, 901, None, None)],
+    )
+    assert (2, 901) not in {(s, g) for s, g, _ in _read_ogu(out["ogu_table"])}
+
+
+def test_a_permissive_gate_admits_a_poorly_scored_genome(tmp_path, monkeypatch):
+    """`min_completeness=0` with a large `max_contamination` admits every scored genome.
+    There is no nullable spelling for a scalar on the wire — `_bind_step_inputs` coerces
+    through `str` — so this is the most permissive gate available."""
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    out, _captured = _run_combined(
+        m,
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        quality=[(1, 900, 0.5, 90.0), (2, 901, 0.5, 90.0)],
+        gate={"min_completeness": 0.0, "max_contamination": 1000.0},
+    )
+    genomes = {(s, g) for s, g, _ in _read_ogu(out["ogu_table"])}
+    assert {(1, 900), (2, 901)} <= genomes
+
+
+def test_a_reference_only_run_ignores_the_gate(tmp_path, monkeypatch):
+    """A reference genome has no CheckM row, so a gate that reached the reference arm
+    would empty it rather than filter it. The strictest possible bounds must leave a
+    reference-only table exactly as the default ones do.
+    """
+    from qiita_compute_orchestrator.jobs import estimate_feature_table as m
+
+    fixture = dict(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        threshold=0.01,
+        alignment=[(1, 1, 10, 0, 0, 500)],
+        lengths=[(10, 1000)],
+        mapping=[(10, 100)],
+    )
+    # Bounds no genome could clear: 100% complete AND 0% contaminated.
+    strict, _captured = _run(
+        m, gate={"min_completeness": 100.0, "max_contamination": 0.0}, **fixture
+    )
+    assert _read_ogu(strict["ogu_table"]) == [(1, 100, 1.0)]

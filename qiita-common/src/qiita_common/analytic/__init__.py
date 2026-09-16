@@ -4,9 +4,14 @@ Two consumers run this same analytic and must not disagree about it: the
 compute-orchestrator native job `estimate_feature_table` (server-side, reached
 through a work ticket) and the client-side feature-table recipe (a user's machine,
 composing the analytic-export routes). They differ in everything *around* the
-analytic — where the inputs come from, how the result is written — and in nothing
-about the analytic itself, so the SQL lives here and the streaming and I/O stay with
-each caller.
+analytic — where the inputs come from, how the result is written — so the SQL lives
+here and the streaming and I/O stay with each caller.
+
+They disagree about the analytic in exactly one place, and it is a reachability limit
+rather than a choice: `denovo_map_statements` gates the de novo arm on CheckM scores and
+the client cannot reach `bin_quality` — no route signs a ticket for it, which the
+exclusion in `routes/reference.py` states — so a client-built combined table calls
+`denovo_map_table_sql` ungated.
 
 **Plain SQL text, so nothing here needs a connection of its own.** Callers execute
 these statements on a connection that has miint loaded. (Same shape as `chunking.py`'s
@@ -98,6 +103,8 @@ from .ogu import (
     woltka_ogu_select_sql,
 )
 from .reconcile import (
+    DEFAULT_MAX_CONTAMINATION,
+    DEFAULT_MIN_COMPLETENESS,
     denovo_alignment_statements,
     denovo_contig_lengths_insert_sql,
     denovo_contig_lengths_table_sql,
@@ -105,6 +112,7 @@ from .reconcile import (
     denovo_genome_lengths_insert_sql,
     denovo_genome_quality_table_sql,
     denovo_map_join,
+    denovo_map_statements,
     denovo_map_table_sql,
     denovo_ogu_input_select_sql,
 )
@@ -183,6 +191,8 @@ __all__ = [
     "CIRCULAR_MIN_COVERAGE",
     "CIRCULAR_MIN_IDENTITY",
     "COVERAGE_ALIGNMENTS_VIEW",
+    "DEFAULT_MAX_CONTAMINATION",
+    "DEFAULT_MIN_COMPLETENESS",
     "DENOVO_ALIGNMENT_TABLE",
     "DENOVO_CONTIG_LENGTHS_TABLE",
     "DENOVO_COVERAGE_ALIGNMENTS_VIEW",
@@ -244,6 +254,7 @@ __all__ = [
     "denovo_coverage_alignments_view_sql",
     "denovo_genome_lengths_insert_sql",
     "denovo_genome_quality_table_sql",
+    "denovo_map_statements",
     "denovo_map_table_sql",
     "denovo_ogu_input_select_sql",
     "drop_circular_inputs_statements",
