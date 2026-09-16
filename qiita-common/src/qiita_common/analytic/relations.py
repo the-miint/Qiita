@@ -8,8 +8,8 @@ That separate connection also cannot see TEMP tables, registered stream relation
 or CTEs — hence every staging statement in this package creates a regular non-temp
 TABLE. **Some relations are exceptions, read only on the caller's own connection and
 VIEWs for the same reason** — materializing would duplicate a large relation
-in RAM for one reader: `COVERAGE_ALIGNMENTS_VIEW` (read by the `genome_coverage`
-macro), its de novo twin, and `LABELLED_RELATION` (read by one COPY).
+in RAM for one reader: `COVERAGE_ALIGNMENTS_VIEW` (read by the coverage
+macros), its de novo twin, and `LABELLED_RELATION` (read by one COPY).
 
 The releases at the bottom are the other half of the same subject: which relations
 are dead at which point, and what a caller runs to let go of them. On a client

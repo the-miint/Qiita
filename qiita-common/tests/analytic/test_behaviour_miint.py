@@ -203,13 +203,15 @@ def test_the_two_scopes_agree_exactly_on_a_single_sample_cohort(threshold):
     sample" are the same question and the two scopes must return byte-identical
     tables — at every threshold.
 
-    Pooled computes this inside miint's `genome_coverage`; per-sample reimplements
-    the macro's method in our own SQL. Anything that makes the two disagree — a
-    different denominator, a lost INNER JOIN, a missing DOUBLE cast, a different
-    per-contig grouping — shows up here as a divergence, on a fixture that exercises
-    a plain genome (G100), an unaligned-contig denominator (G300) and a multi-contig
-    sum (G400) at once. Several narrower tests would each catch *some* of that; only
-    this one states the general rule.
+    Pooled calls miint's `genome_coverage` and per-sample its
+    `genome_coverage_per_sample`. Upstream documents that on single-sample input the
+    two agree exactly, at
+    <https://the-miint.github.io/duckdb-miint/alignment_analysis/#per-sample-genome-coverage>.
+    This pins that contract, and the per-sample survivor set's rename of `sample_id`
+    back to `prep_sample_idx`, on a fixture that exercises a plain genome (G100), an
+    unaligned-contig denominator (G300) and a multi-contig sum (G400) at once.
+    Several narrower tests would each catch *some* of that; only this one states the
+    general rule.
 
     Swept across thresholds because a divergence may only be visible where one scope
     lands on the far side of the cut from the other.
@@ -250,15 +252,16 @@ def test_the_denominator_is_the_full_genome_length_in_both_scopes(scope):
 
 
 def test_per_sample_merges_intervals_within_a_contig_not_across_them():
-    """`compress_intervals` merges within one coordinate space, so a genome's covered
-    bases are the sum over its contigs — and the threshold here is chosen to make
-    that discriminating rather than incidental.
+    """A multi-contig genome's covered bases are the sum over its contigs: the
+    per-sample macro merges intervals within a sample and, as `genome_coverage` does,
+    per contig — its contract at
+    <https://the-miint.github.io/duckdb-miint/alignment_analysis/#per-sample-genome-coverage>.
+    The threshold here is chosen so the assertion rests on that.
 
-    Sample 1 covers [0, 300) on each of two 1000 bp contigs: 600/2000 = **30%**,
-    which clears a 20% threshold. Had the per-sample form grouped straight to the
-    genome, the two identical [0, 300) spans would have merged as though they shared
-    coordinates, giving 300/2000 = **15%** — below the threshold, so the genome
-    would vanish. Its presence is the assertion.
+    prep_sample 1 covers [0, 300) on each of two 1000 bp contigs: 600/2000 = **30%**,
+    which clears a 20% threshold. Merged across the two contigs as though they shared
+    coordinates, the identical spans would give 300/2000 = **15%** — below the
+    threshold, so the genome would vanish. Its presence is the assertion.
     """
     rows = _table(
         ft.CoverageScope.PER_SAMPLE,
@@ -273,10 +276,9 @@ def test_per_sample_merges_intervals_within_a_contig_not_across_them():
 
 @pytest.mark.parametrize("scope", list(ft.CoverageScope))
 def test_a_genome_exactly_at_the_threshold_survives(scope):
-    """`>=`, not `>`. A genome sitting precisely on the threshold is KEPT — pinned
-    because both scopes write the comparison independently (the pooled one inside
-    miint's macro, the per-sample one in our SQL) and nothing else would catch the
-    two disagreeing at the boundary.
+    """`>=`, not `>`. A genome sitting precisely on the threshold is KEPT — pinned for
+    both scopes because each compares a different macro's `proportion_covered`, and
+    nothing else would catch the two disagreeing at the boundary.
     """
     # 10 bp covered of a 1000 bp genome = exactly 0.01.
     rows = _table(
@@ -1439,6 +1441,9 @@ _R_LENGTHS = [(10, 1000), (20, 1000), (50, 1000)]
 
 # (prep_sample_idx, feature_idx, genome_idx) — scoped to ONE assembly run.
 _D_MAP = [(1, 50, 900), (1, 51, 900), (2, 50, 901), (2, 52, 901)]
+# The same map with no genome for c50 in prep_sample 1, so its read on c50 has no de
+# novo placement to win with.
+_D_MAP_WITHOUT_1_C50 = [row for row in _D_MAP if row[:2] != (1, 50)]
 # One stream per cohort sample, as the assembly read-back is scoped. c50 is in both.
 _D_LENGTHS = {1: [(50, 1000), (51, 1000)], 2: [(50, 1000), (52, 1000)]}
 
@@ -1626,7 +1631,7 @@ def test_the_reference_only_control_keeps_the_genome_the_combined_table_drops():
     ]
 
 
-@pytest.mark.parametrize("denovo_map", [_D_MAP, [row for row in _D_MAP if row[:2] != (1, 50)]])
+@pytest.mark.parametrize("denovo_map", [_D_MAP, _D_MAP_WITHOUT_1_C50])
 def test_no_read_is_lost_by_the_reconciliation(denovo_map):
     """Conservation: every read that reached either arm is still counted, so the
     table's values sum to the number of distinct reads staged.
@@ -1679,6 +1684,80 @@ def test_a_contig_two_samples_assembled_is_counted_once_in_each_denominator():
     ]
 
 
+# c50 as the whole of each prep_sample's genome (an LCG in both), with the two
+# prep_samples covering different spans of it: 20% by prep_sample 1, a disjoint 50% by
+# prep_sample 2, 70% together.
+_SHARED_LCG = {
+    "denovo_map": [(1, 50, 900), (2, 50, 901)],
+    "denovo_lengths": {1: [(50, 1000)], 2: [(50, 1000)]},
+    "denovo_alignment": [
+        (1, 3, 50, 0, 0, 200),  # prep_sample 1, [0, 200)
+        (2, 6, 50, 0, 500, 1000),  # prep_sample 2, [500, 1000)
+    ],
+}
+
+
+def test_pooled_breadth_of_a_shared_contig_counts_every_prep_samples_reads():
+    """Pooled is breadth over every prep_sample's intervals, for a qiita genome as for
+    a reference one. Together the prep_samples cover 70% of c50, so both genomes clear
+    30% — Q900 on prep_sample 2's reads, since prep_sample 1 alone covers 20%. A
+    coverage map joined on the prep_sample as well would drop Q900.
+
+    prep_sample 1's read is then counted on Q900 and nowhere else, and prep_sample 2's
+    on Q901: clearing the threshold on another prep_sample's reads does not move any
+    read.
+    """
+    assert _combined_table(threshold=0.30, **_SHARED_LCG) == [
+        (1, 100, 1.0),
+        (1, 200, 1.0),
+        (1, 900, 1.0),  # Q900 kept on the cohort's 70%
+        (2, 100, 1.0),
+        (2, 901, 1.0),
+    ]
+
+
+def test_per_sample_breadth_of_a_shared_contig_counts_only_that_prep_samples_reads():
+    """The same fixture per-sample: Q900 is judged on prep_sample 1's 20% alone and
+    drops.
+
+    The macro also scores (prep_sample 2, Q900) at 50% and keeps that pair. No read of
+    prep_sample 2 reaches Q900, because the read-level join carries the prep_sample —
+    without that term prep_sample 2's read would split across Q900 and Q901, and this
+    table would show it.
+    """
+    assert _combined_table(ft.CoverageScope.PER_SAMPLE, 0.30, **_SHARED_LCG) == [
+        (1, 100, 1.0),
+        (1, 200, 1.0),
+        (2, 100, 1.0),
+        (2, 901, 1.0),
+    ]
+
+
+def test_a_read_left_to_the_reference_arm_still_adds_pooled_de_novo_breadth():
+    """prep_sample 1 has no genome for c50 here, so precedence leaves read 3 on R300.
+    Its [0, 200) on c50 still counts toward the pooled breadth of Q901, prep_sample 2's
+    genome holding c50: 700/2000 = 35% clears 30%, where prep_sample 2's own
+    [500, 1000) alone is 25% and would not.
+    """
+    read_3 = (1, 3, 50, 0, 0, 200)
+    others = [
+        (1, 5, 51, 0, 0, 500),  # Q900 = c51 alone here: 50%, so prep_sample 1 stays in
+        (2, 6, 50, 0, 500, 1000),
+    ]
+
+    def table(alignment):
+        rows = _combined_table(
+            threshold=0.30, denovo_map=_D_MAP_WITHOUT_1_C50, denovo_alignment=alignment
+        )
+        return {(s, g): v for s, g, v in rows}
+
+    values = table([read_3, *others])
+    assert values[(1, 300)] == 1.0, "read 3 is counted on the reference arm"
+    assert values[(1, 900)] == 1.0, "read 5 alone on Q900"
+    assert values[(2, 901)] == 1.0, "and read 3's interval kept Q901 above the threshold"
+    assert (2, 901) not in table(others), "without read 3, Q901 is 25% and drops"
+
+
 def test_a_de_novo_placement_with_no_genome_leaves_the_read_to_the_reference_arm():
     """Precedence is over rollable placements: the DELETE reads the de novo slice
     THROUGH the map, so a run whose membership carries no genome for a contig falls
@@ -1688,17 +1767,16 @@ def test_a_de_novo_placement_with_no_genome_leaves_the_read_to_the_reference_arm
     reappear on R300, which the reference-only control shows is where it would have
     been all along.
     """
-    without_c50 = [row for row in _D_MAP if row[:2] != (1, 50)]
-    values = {(s, g): v for s, g, v in _combined_table(denovo_map=without_c50)}
+    values = {(s, g): v for s, g, v in _combined_table(denovo_map=_D_MAP_WITHOUT_1_C50)}
     assert values[(1, 300)] == 1.0, "read 3 falls back to its reference placement"
     assert values[(1, 900)] == 1.0, "only read 5 is left on Q900"
 
 
 def test_per_sample_scope_reaches_both_arms():
-    """The per-sample survivor set is built from two hand-rolled branches in one
-    statement, where pooled has the macro on one side; this is the shape that would
-    fail to parse or bind rather than answer wrongly. Every genome here clears 1% in
-    the sample that carries it, so the table is the pooled one.
+    """The per-sample survivor set is two `genome_coverage_per_sample` calls in one
+    statement; this is the shape that would fail to parse or bind rather than answer
+    wrongly. Every genome here clears 1% in the sample that carries it, so the table
+    is the pooled one.
     """
     assert _combined_table(scope=ft.CoverageScope.PER_SAMPLE) == _combined_table()
 

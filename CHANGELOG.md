@@ -1866,6 +1866,23 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Feature table: a de novo genome's pooled breadth of coverage counts other prep_samples' reads on contigs they also assembled, and both scopes call miint's coverage macros (#586).**
+  With a de novo arm, pooled coverage joined the contig→genome map on the prep_sample as
+  well as the contig, so a de novo genome saw only the reads of the prep_sample that
+  assembled it and pooled breadth equalled per-sample breadth. The de novo arm now calls
+  `genome_coverage` like the reference arm: a contig two cohort prep_samples assembled
+  gives both prep_samples' covered bases to each one's genome, so a combined table built
+  with pooled scope and a threshold above 0 can keep de novo genomes it used to drop.
+  Each de novo placement still counts only toward its own prep_sample's genome.
+  `estimate_feature_table` always uses pooled, and `qiita feature-table build` defaults
+  to it. Per-sample coverage calls `genome_coverage_per_sample` on both arms in place of
+  Qiita's own copy of the arithmetic, with the same results. `qiita feature-table build
+  --coverage-scope per-sample` therefore needs a miint build that has
+  `genome_coverage_per_sample` (duckdb-miint#220, merged 2026-08-18). The client installs
+  miint once and never refreshes it, so a cache filled from an older build fails on the
+  missing function until the cached extension file is deleted and the next run
+  re-installs it; its path is the `install_path` that `duckdb_extensions()` reports for
+  `miint`.
 - **Reference load: a genome map is checked against the reference FASTA before anything is minted, so a map whose read_ids match no FASTA sequence fails and a partial match logs what went unmatched (#577).**
   `_associate_genomes` INNER-JOINed the genome map onto the manifest's `read_id`, silently
   dropping every map row whose `read_id` isn't a FASTA sequence ID. `mint-features` now

@@ -26,14 +26,12 @@ from .coverage import (
     CoverageScope,
     coverage_alignments_view_sql,
     coverage_filter_applies,
+    denovo_coverage_alignments_view_sql,
     survivor_parameters,
     survivor_table_name,
     survivor_table_sql,
 )
-from .reconcile import (
-    denovo_coverage_alignments_view_sql,
-    denovo_ogu_input_select_sql,
-)
+from .reconcile import denovo_ogu_input_select_sql
 from .relations import (
     ALIGNMENT_TABLE,
     COVERAGE_ALIGNMENTS_VIEW,
