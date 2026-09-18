@@ -27,7 +27,7 @@ from .dispatch import (
     drain_running_dispatches,
     reconcile_inflight_tickets,
 )
-from .ena_import.batch import reconcile_inflight_batches
+from .ena_import.batch import build_ena_import_study_semaphore, reconcile_inflight_batches
 from .health import aggregate_health
 from .landing import router as landing_router
 from .notify import build_transport, run_sweeper
@@ -95,6 +95,7 @@ async def lifespan(app: FastAPI):
     # "no live owner, resume in place" reasoning as reconcile_inflight_tickets
     # above; register_ena_study is idempotent so this is always safe.
     app.state.running_ena_import_batches = set()
+    app.state.ena_import_study_semaphore = build_ena_import_study_semaphore()
     await reconcile_inflight_batches(app)
 
     # Email-notification wiring. Build the transport (SMTP relay

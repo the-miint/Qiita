@@ -1866,6 +1866,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **ENA import: the batch concurrency bound is process-wide instead of per-batch, so several batches submitted together no longer starve the connection pool (#593).**
+  `_run_batch` built its own `asyncio.Semaphore(_STUDY_CONCURRENCY)` per call, so N
+  concurrently-scheduled batches could together hold up to N × `_STUDY_CONCURRENCY`
+  connections at once -- exceeding the pool's `max_size` and blocking unrelated callers.
+  `schedule_ena_import_batch` now reads one semaphore off `app.state`, shared by every
+  in-flight batch; `_STUDY_CONCURRENCY` stays 4.
 - **Reference load: a genome map is checked against the reference FASTA before anything is minted, so a map whose read_ids match no FASTA sequence fails and a partial match logs what went unmatched (#577).**
   `_associate_genomes` INNER-JOINed the genome map onto the manifest's `read_id`, silently
   dropping every map row whose `read_id` isn't a FASTA sequence ID. `mint-features` now

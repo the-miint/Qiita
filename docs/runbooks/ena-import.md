@@ -13,7 +13,9 @@ specific to importing from ENA.
 
 A single admin-facing call kicks off a **batch**: a list of INSDC study accessions
 (`PRJNA…`, `PRJEB…`, `PRJDB…`, `ERP…`, `SRP…`, `DRP…`). Each accession in the batch is
-processed independently, with bounded concurrency, in three phases:
+processed independently, with bounded concurrency, in three phases. That bound is shared
+by every batch running in the control plane at once, first come first served, so a busy
+batch can make a newly submitted one wait its turn.
 
 1. **Resolve** — the study's header, run list, and per-sample attributes are pulled
    from ENA (via the `duckdb-miint` `read_ena` / `read_ena_attributes` table
