@@ -176,8 +176,11 @@ def _classify_ena_fetch_error(
             stage=WorkTicketFailureStage.STEP_RUN,
             step_name=step_name,
             reason=(
-                f"ENA run {run_accession}: ENA download md5 verification failed "
-                f"(data corruption) ({type(exc).__name__}): {exc}"
+                f"ENA run {run_accession}: downloaded bytes don't match ENA's "
+                f"declared fastq_md5; a retry reproduces this unless ENA's own "
+                f"metadata has since changed, so check the run's fastq_md5 via "
+                f"the ENA Portal API before re-queuing "
+                f"({type(exc).__name__}): {exc}"
             ),
         )
     return BackendFailure(
