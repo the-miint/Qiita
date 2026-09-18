@@ -23,6 +23,7 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import Tier
 
 from qiita_control_plane.repositories.study import (
+    EnaStudyAccessionConflictError,
     create_study,
     fetch_study,
     fetch_study_exists,
@@ -672,9 +673,10 @@ async def test_update_study_duplicate_bioproject_accession_raises_unique_error(p
 # genuinely concurrent second writer racing between this function's own
 # pre-check and its create_study attempt -- single-threaded, the pre-check
 # always sees a row this same function created moments earlier, so the
-# except branch is never reached from a single caller. test__sample_helpers.py
-# documents the identical gap for write_global_metadata_or_diagnose's
-# equivalent savepoint race.
+# except branch is never reached from a single caller. The refetch now
+# shares its resolver with the pre-check, so this gap is symmetric across
+# both accession fields -- not exercised here, matching
+# test__sample_helpers.py's documented equivalent gap.
 # ---------------------------------------------------------------------------
 
 
@@ -766,6 +768,145 @@ async def test_get_or_create_study_by_ena_accessions_null_secondary_accession(po
             )
 
             assert created is True
+            assert row["ena_study_accession"] is None
+        finally:
+            await tr.rollback()
+
+
+async def test_get_or_create_study_by_ena_accessions_reuses_on_secondary_accession_hit(
+    postgres_pool,
+):
+    """A study findable only by ena_study_accession (bioproject_accession NULL)
+    must still be reused, not re-created under a colliding bioproject_accession."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            existing_idx = await _insert_study(conn, owner_idx=owner)
+            ena = _suffix("ERP")
+            await update_study(conn, existing_idx, fields={"ena_study_accession": ena})
+
+            row, created = await get_or_create_study_by_ena_accessions(
+                conn,
+                bioproject_accession=_suffix("PRJNA"),
+                ena_study_accession=ena,
+                owner_idx=owner,
+                created_by_idx=owner,
+                title="incoming import",
+            )
+
+            assert created is False
+            assert row["idx"] == existing_idx
+            count = await conn.fetchval(
+                "SELECT count(*) FROM qiita.study WHERE ena_study_accession = $1", ena
+            )
+            assert count == 1
+        finally:
+            await tr.rollback()
+
+
+async def test_get_or_create_study_by_ena_accessions_conflicting_accessions_raises(
+    postgres_pool,
+):
+    """Two existing studies, each matched by a different one of the incoming
+    pair's accessions, must not be silently reconciled -- there is no rule
+    that picks a winner."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            bioproject = _suffix("PRJNA")
+            ena = _suffix("ERP")
+            study_a = await _insert_study(conn, owner_idx=owner)
+            await update_study(conn, study_a, fields={"bioproject_accession": bioproject})
+            study_b = await _insert_study(conn, owner_idx=owner)
+            await update_study(conn, study_b, fields={"ena_study_accession": ena})
+
+            with pytest.raises(EnaStudyAccessionConflictError) as excinfo:
+                await get_or_create_study_by_ena_accessions(
+                    conn,
+                    bioproject_accession=bioproject,
+                    ena_study_accession=ena,
+                    owner_idx=owner,
+                    created_by_idx=owner,
+                    title="incoming import",
+                )
+            message = str(excinfo.value)
+            assert bioproject in message
+            assert ena in message
+            assert str(study_a) in message
+            assert str(study_b) in message
+
+            count = await conn.fetchval("SELECT count(*) FROM qiita.study")
+            assert count == 2
+        finally:
+            await tr.rollback()
+
+
+async def test_get_or_create_study_by_ena_accessions_matched_study_contradicting_bioproject_raises(
+    postgres_pool,
+):
+    """The incoming ena_study_accession resolves to a study, but that study's
+    own recorded bioproject_accession disagrees with the incoming one --
+    reusing it would register the import into the wrong study."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            existing_idx = await _insert_study(conn, owner_idx=owner)
+            other_bioproject = _suffix("PRJNA")
+            ena = _suffix("ERP")
+            await update_study(
+                conn,
+                existing_idx,
+                fields={"bioproject_accession": other_bioproject, "ena_study_accession": ena},
+            )
+
+            with pytest.raises(
+                EnaStudyAccessionConflictError,
+                match=f"has bioproject_accession '{other_bioproject}'",
+            ):
+                await get_or_create_study_by_ena_accessions(
+                    conn,
+                    bioproject_accession=_suffix("PRJNA"),
+                    ena_study_accession=ena,
+                    owner_idx=owner,
+                    created_by_idx=owner,
+                    title="incoming import",
+                )
+        finally:
+            await tr.rollback()
+
+
+async def test_get_or_create_study_by_ena_accessions_reuses_when_existing_row_has_null_secondary(
+    postgres_pool,
+):
+    """A NULL ena_study_accession on the matched row means unknown, not
+    different -- every pre-existing study has this shape, since it is the
+    only column the bioproject-only lookup ever wrote before this fix."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            bioproject = _suffix("PRJNA")
+            existing_idx = await _insert_study(conn, owner_idx=owner)
+            await update_study(conn, existing_idx, fields={"bioproject_accession": bioproject})
+
+            row, created = await get_or_create_study_by_ena_accessions(
+                conn,
+                bioproject_accession=bioproject,
+                ena_study_accession=_suffix("ERP"),
+                owner_idx=owner,
+                created_by_idx=owner,
+                title="incoming import",
+            )
+
+            assert created is False
+            assert row["idx"] == existing_idx
             assert row["ena_study_accession"] is None
         finally:
             await tr.rollback()

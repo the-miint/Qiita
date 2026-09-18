@@ -51,6 +51,10 @@ anything is written. Deleting a batch (which cascades its items) discards the re
 that the import created the study, so a later re-import of that accession is refused
 as well.
 
+A study matched by either the incoming `bioproject_accession` or `ena_study_accession`
+is reused; if the pair identifies two different studies, or contradicts the one study
+it does resolve to, the accession fails loud rather than picking a winner.
+
 A failure in any one accession — an unmappable platform, a resolver error, a database
 conflict — is recorded on that accession alone; it never aborts the batch or its
 sibling accessions. Poll the batch's own status endpoint to see each accession's state
