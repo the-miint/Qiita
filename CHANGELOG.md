@@ -1866,6 +1866,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **The `miint-sequence-split`, `miint-host-filter-fns`, `miint-infer-trim`, and `miint-gpl-boundary` compute-readiness probes now fail under `python -O` / `PYTHONOPTIMIZE`, where they previously reported ok (#592).**
+  Each probe signaled the contract drift it exists to catch with a bare `assert`,
+  which `python -O` (or `PYTHONOPTIMIZE` set anywhere in the SLURM job env) strips —
+  the probe then exited 0 and printed nothing on exactly the drift it was checking
+  for. Each now raises `RuntimeError` from an explicit `if`, independent of the
+  interpreter's optimize level.
 - **Reference load: a genome map is checked against the reference FASTA before anything is minted, so a map whose read_ids match no FASTA sequence fails and a partial match logs what went unmatched (#577).**
   `_associate_genomes` INNER-JOINed the genome map onto the manifest's `read_id`, silently
   dropping every map row whose `read_id` isn't a FASTA sequence ID. `mint-features` now

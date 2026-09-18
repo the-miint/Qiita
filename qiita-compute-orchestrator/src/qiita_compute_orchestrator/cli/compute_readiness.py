@@ -356,7 +356,8 @@ try:
     conn = duckdb.connect(":memory:", config=miint_connect_config())
     conn.execute(miint_load_sql())
     rows = conn.execute("SELECT UNNEST(sequence_split('ACGTACGT', 4))").fetchall()
-    assert len(rows) == 2, rows
+    if len(rows) != 2:
+        raise RuntimeError(str(rows))
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
@@ -394,7 +395,8 @@ try:
     ).fetchall()
     have = [r[0] for r in rows]
     missing = [f for f in want if f not in have]
-    assert not missing, "missing miint host-filter functions: " + ", ".join(missing)
+    if missing:
+        raise RuntimeError("missing miint host-filter functions: " + ", ".join(missing))
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
@@ -432,7 +434,8 @@ try:
         "SELECT sequence_index, trimmed_5p, trimmed_3p FROM infer_trim(orig, qcd) "
         "ORDER BY sequence_index"
     ).fetchall()
-    assert rows == [(1, 3, 3), (2, None, None)], "infer_trim contract drift: " + str(rows)
+    if rows != [(1, 3, 3), (2, None, None)]:
+        raise RuntimeError("infer_trim contract drift: " + str(rows))
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
@@ -473,7 +476,8 @@ try:
         row = conn.execute(
             "SELECT success FROM save_bowtie2_index('bt2_subject', ?)", [out]
         ).fetchone()
-        assert row is not None and row[0], "save_bowtie2_index did not report success"
+        if row is None or not row[0]:
+            raise RuntimeError("save_bowtie2_index did not report success")
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])

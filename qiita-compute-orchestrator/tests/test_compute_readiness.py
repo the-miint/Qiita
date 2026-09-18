@@ -356,6 +356,85 @@ def test_probe_script_checks_gpl_boundary():
     assert "miint-gpl-boundary=fail" in script
 
 
+def _extract_probe_body(script: str, var: str) -> str:
+    """Return the Python heredoc body the built script writes to `$<var>`."""
+    marker = f"cat > \"${var}\" <<'PYEOF'\n"
+    start = script.index(marker) + len(marker)
+    end = script.index("\nPYEOF", start)
+    return script[start:end]
+
+
+def _write_duckdb_miint_stubs(tmp_path: Path) -> None:
+    """Stub duckdb and qiita_common beside the probe; `sys.path[0]` lets them shadow
+    the real packages, and their empty results violate every probe's contract."""
+    (tmp_path / "duckdb.py").write_text(
+        "class _Conn:\n"
+        "    def execute(self, *args, **kwargs):\n"
+        "        return self\n"
+        "    def fetchall(self):\n"
+        "        return []\n"
+        "    def fetchone(self):\n"
+        "        return None\n"
+        "\n"
+        "def connect(*args, **kwargs):\n"
+        "    return _Conn()\n"
+    )
+    qc = tmp_path / "qiita_common"
+    qc.mkdir()
+    (qc / "__init__.py").write_text("")
+    (qc / "duckdb_miint.py").write_text(
+        "def miint_connect_config():\n    return {}\n\ndef miint_load_sql():\n    return ''\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        "MIINT_SPLIT_PROBE",
+        "MIINT_HOSTFILTER_PROBE",
+        "MIINT_INFERTRIM_PROBE",
+        "MIINT_BOUNDARY_PROBE",
+    ],
+)
+@pytest.mark.parametrize("flags", [[], ["-O"]], ids=["plain", "dash-O"])
+def test_probe_body_signals_failure_without_assert(tmp_path, var, flags):
+    """A probe must report drift through its exit code even under `python -O`,
+    which strips `assert` and would otherwise let it exit 0."""
+    import os
+    import subprocess
+    import sys
+
+    script = cr.build_probe_script(path_scratch="/scratch")
+    body = _extract_probe_body(script, var)
+    _write_duckdb_miint_stubs(tmp_path)
+    probe = tmp_path / "probe.py"
+    probe.write_text(body)
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONOPTIMIZE"}
+    proc = subprocess.run(
+        [sys.executable, *flags, str(probe)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert proc.returncode == 1, (var, flags, proc.stdout, proc.stderr)
+    lines = proc.stdout.splitlines()
+    assert len(lines) == 1 and lines[0], (var, flags, proc.stdout)
+
+
+def test_no_probe_body_relies_on_assert():
+    """Covers every heredoc probe body, including ones added after the four above."""
+    import ast
+    import re
+
+    script = cr.build_probe_script(path_scratch="/scratch")
+    blocks = re.findall(r"<<'PYEOF'\n(.*?)\nPYEOF", script, re.DOTALL)
+    assert blocks, "no PYEOF probe blocks found in the built script"
+    for body in blocks:
+        tree = ast.parse(body)
+        asserts = [node for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+        assert not asserts, f"probe body relies on assert for its verdict:\n{body}"
+
+
 def test_parse_probe_log_unknown_value_defaults_to_fail():
     """If the probe emits a value the parser doesn't recognize, it
     should be reported as a failure rather than silently passed —
