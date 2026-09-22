@@ -57,9 +57,45 @@ async def fetch_caller_study_access(
     )
     if row is None:
         return None
-    access_tier = Tier(row["access_tier"]) if row["access_tier"] is not None else None
+    return _to_access_row(row)
+
+
+async def fetch_caller_study_access_batch(
+    conn: asyncpg.Connection | asyncpg.Pool,
+    *,
+    principal_idx: int,
+    study_idxs: list[int],
+) -> dict[int, CallerStudyAccessRow]:
+    """Batched `fetch_caller_study_access`: one query for many studies.
+
+    A study_idx with no `qiita.study` row is absent from the mapping, exactly as
+    the single-study form returns None for it.
+
+    Exists because the narrowing filter it feeds
+    (`auth.guards.filter_studies_caller_can_read`) is reachable from a route
+    where the CALLER chooses the identifier list, so the number of distinct
+    studies is attacker-controlled rather than bounded by a real pool's shape.
+    One round trip per study would make that a request-amplification lever.
+    """
+    if not study_idxs:
+        return {}
+    rows = await conn.fetch(
+        "SELECT s.idx, s.owner_idx, s.default_tier, sa.access_tier"
+        " FROM qiita.study s"
+        " LEFT JOIN qiita.study_access sa"
+        "   ON sa.study_idx = s.idx AND sa.principal_idx = $2"
+        " WHERE s.idx = ANY($1::bigint[])",
+        study_idxs,
+        principal_idx,
+    )
+    return {row["idx"]: _to_access_row(row) for row in rows}
+
+
+def _to_access_row(row: asyncpg.Record) -> CallerStudyAccessRow:
+    """Shared row → CallerStudyAccessRow mapping for the two fetches above, so
+    the NULL-access_tier convention has one definition."""
     return CallerStudyAccessRow(
         owner_idx=row["owner_idx"],
-        access_tier=access_tier,
+        access_tier=Tier(row["access_tier"]) if row["access_tier"] is not None else None,
         default_tier=Tier(row["default_tier"]),
     )

@@ -13,6 +13,13 @@ miint's readers (`read_newick`, `read_jplace`, `read_gff`) all parse an on-disk
 text file, so the upload shape has to be stitched back into one. Doing that
 unconditionally is wrong on the local path — `read_parquet()` on a raw `.nwk`
 raises. This helper sniffs which shape it was handed and does the right thing.
+
+Read ingest (`fastq-to-parquet`, `bam-to-parquet`) takes the same two front-ends
+and adds one constraint: miint detects gzip from the `.gz` extension
+(<https://the-miint.github.io/duckdb-miint/reading/>), and the uploaded bytes
+keep whatever compression the client's file had — a FASTQ is not worth sending
+decompressed. `resolve_reads_blob_input` therefore names the stitched file
+from its own leading bytes rather than from anything the client claimed.
 """
 
 from __future__ import annotations
@@ -98,3 +105,51 @@ def resolve_blob_input(
     if out_path.stat().st_size == 0:
         raise ValueError(f"{path} produced an empty file — upload was malformed")
     return out_path
+
+
+# gzip's magic number. It separates the two shapes each read format arrives in:
+# a compressed FASTQ from a plaintext one, and a binary BAM (BGZF is gzip) from
+# a text SAM.
+_GZIP_MAGIC = b"\x1f\x8b"
+
+
+def resolve_reads_blob_input(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    path: Path,
+    out_dir: Path,
+    stem: str,
+    gzipped_suffix: str,
+    plain_suffix: str,
+) -> Path:
+    """`resolve_blob_input` for a reads file, choosing the stitched file's name.
+
+    A raw host path is returned unchanged, as before. A chunked-BLOB upload is
+    stitched into `out_dir/{stem}{suffix}`, where the suffix is chosen by
+    whether the uploaded bytes start with gzip's magic number.
+
+    The name matters because miint detects a file's compression, and its
+    format, from the extension
+    (<https://the-miint.github.io/duckdb-miint/reading/>) — while the upload is
+    byte-exact, since the CLI does not inflate a client's `.gz` and a FASTQ is
+    the one input where the inflated bytes would actually cost something. So
+    the two have to be reconciled here, from the bytes rather than from
+    anything the client claimed: `upload.source_filename` is a label the
+    submitter chose and can be wrong about.
+
+    Each caller says what the two answers mean for its format:
+
+      * FASTQ — `.fastq.gz` / `.fastq`. A stitched `.fastq` holding gzip bytes
+        parses as garbage; a `.fastq.gz` holding plaintext fails to inflate.
+      * alignments — `.bam` / `.sam`. BGZF is gzip, so a compressed payload is
+        the binary container and a plaintext one is text SAM.
+    """
+    if not _is_chunked_blob_upload(conn, path):
+        return path
+    head = conn.execute(
+        "SELECT chunk_data FROM read_parquet(?) ORDER BY chunk_index LIMIT 1", [str(path)]
+    ).fetchone()
+    if head is None or head[0] is None:
+        raise ValueError(f"{path} carries no chunks — upload was malformed")
+    suffix = gzipped_suffix if bytes(head[0][:2]) == _GZIP_MAGIC else plain_suffix
+    return resolve_blob_input(conn, path=path, out_path=out_dir / f"{stem}{suffix}")

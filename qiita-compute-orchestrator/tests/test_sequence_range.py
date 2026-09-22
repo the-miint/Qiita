@@ -220,8 +220,7 @@ async def test_get_raises_http_error_on_5xx():
 def test_reusable_minter_states_are_derived_from_the_canonical_split():
     """The reuse allowlist is DERIVED from the canonical terminal/non-terminal split,
     never a hand-maintained copy of it. The load-bearing half is the loop: a state that
-    ever landed in BOTH sets would make a terminal minter's range reusable, silently
-    duplicating that sample's reads."""
+    ever landed in BOTH sets would make a terminal minter's range reusable."""
     from qiita_common.models import (
         NON_TERMINAL_WORK_TICKET_STATES,
         TERMINAL_WORK_TICKET_STATES,

@@ -9,17 +9,24 @@ cluster runtime LOADs a pre-staged build rather than installing per job.
 
 from __future__ import annotations
 
+import fnmatch
+import gzip
+import os
+import tempfile
+
 import pytest
 
 from qiita_common.duckdb_miint import (
     MIINT_EXTENSION_DIRECTORY_VAR,
     MIINT_MIRROR_URL,
     MIINT_REQUIRED_JOB_VARS,
+    is_empty_sequence_file,
     miint_connect_config,
     miint_install_sql,
     miint_job_env,
     miint_load_sql,
     require_staged_extension_directory,
+    setup_miint_test_env,
 )
 
 
@@ -29,7 +36,7 @@ def test_install_sql_defaults_to_plain_install_from_mirror(monkeypatch):
     its cache once; only deploy-time staging passes force=True."""
     monkeypatch.delenv("MIINT_EXTENSION_REPO", raising=False)
     sql = miint_install_sql()
-    assert sql == f"INSTALL miint FROM '{MIINT_MIRROR_URL}';"
+    assert sql == f"INSTALL miint FROM '{MIINT_MIRROR_URL}'; INSTALL httpfs;"
     assert "FORCE" not in sql
     assert "community" not in sql
 
@@ -38,19 +45,34 @@ def test_install_sql_force_for_deploy_staging(monkeypatch):
     """force=True (deploy-time staging only) refreshes the staged build to the
     mirror's current version."""
     monkeypatch.delenv("MIINT_EXTENSION_REPO", raising=False)
-    assert miint_install_sql(force=True) == f"FORCE INSTALL miint FROM '{MIINT_MIRROR_URL}';"
+    # httpfs stays a plain INSTALL under force -- DuckDB's own signed extension.
+    assert (
+        miint_install_sql(force=True)
+        == f"FORCE INSTALL miint FROM '{MIINT_MIRROR_URL}'; INSTALL httpfs;"
+    )
 
 
 def test_install_sql_honors_repo_override(monkeypatch):
     """MIINT_EXTENSION_REPO remains an override for local/dev builds."""
     monkeypatch.setenv("MIINT_EXTENSION_REPO", "/local/repo")
-    assert miint_install_sql() == "INSTALL miint FROM '/local/repo';"
-    assert miint_install_sql(force=True) == "FORCE INSTALL miint FROM '/local/repo';"
+    assert miint_install_sql() == "INSTALL miint FROM '/local/repo'; INSTALL httpfs;"
+    assert (
+        miint_install_sql(force=True) == "FORCE INSTALL miint FROM '/local/repo'; INSTALL httpfs;"
+    )
 
 
 def test_load_sql_is_load_only():
-    """Cluster runtime LOADs the pre-staged extension — no install verb."""
-    assert miint_load_sql() == "LOAD miint;"
+    """Cluster runtime LOADs the pre-staged extensions — no install verb."""
+    sql = miint_load_sql()
+    assert sql == "LOAD miint; LOAD httpfs;"
+    assert "INSTALL" not in sql
+
+
+def test_load_sql_includes_httpfs():
+    """httpfs rides with miint rather than being LOADed per caller: miint reaches
+    the network through DuckDB's filesystem layer, so every miint connection that
+    touches a URL needs it."""
+    assert "LOAD httpfs;" in miint_load_sql()
 
 
 def test_connect_config_allows_unsigned_by_default(monkeypatch):
@@ -146,3 +168,104 @@ def test_extension_directory_var_is_the_one_job_env_requires():
     """The named constant IS the job-env requirement, not a second spelling of
     it — the drift this constant exists to prevent."""
     assert MIINT_EXTENSION_DIRECTORY_VAR in MIINT_REQUIRED_JOB_VARS
+
+
+# --- setup_miint_test_env ---------------------------------------------------
+
+
+def _resolve_test_ext_dir(
+    monkeypatch, tmp_path, worker: str | None, inherited: str | None = None
+) -> str:
+    """Run the harness helper with `PYTEST_XDIST_WORKER` set to `worker` and
+    `MIINT_EXTENSION_DIRECTORY` pre-set to `inherited`, and return the directory
+    it chose. `tempfile.gettempdir` is redirected so the call doesn't create
+    directories in the real system temp."""
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    if inherited is None:
+        monkeypatch.delenv(MIINT_EXTENSION_DIRECTORY_VAR, raising=False)
+    else:
+        monkeypatch.setenv(MIINT_EXTENSION_DIRECTORY_VAR, inherited)
+    if worker is None:
+        monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    else:
+        monkeypatch.setenv("PYTEST_XDIST_WORKER", worker)
+    setup_miint_test_env("control-plane")
+    return os.environ[MIINT_EXTENSION_DIRECTORY_VAR]
+
+
+def test_setup_test_env_gives_each_xdist_worker_its_own_directory(monkeypatch, tmp_path):
+    """Each xdist worker is a separate process and each one INSTALLs, downloading
+    into its own `tmp-<uuid>` file and renaming that over `miint.duckdb_extension`
+    and its `.info`. One directory across N workers is N concurrent writers to
+    those two paths, so the directory carries the worker id."""
+    gw0 = _resolve_test_ext_dir(monkeypatch, tmp_path, "gw0")
+    gw1 = _resolve_test_ext_dir(monkeypatch, tmp_path, "gw1")
+    assert gw0 != gw1
+    assert os.path.isdir(gw0) and os.path.isdir(gw1)
+
+
+def test_setup_test_env_keeps_the_plain_name_without_xdist(monkeypatch, tmp_path):
+    """The suites that run single-process (qiita-common, the orchestrator, the
+    integration tier) keep the directory they already cache in."""
+    plain = _resolve_test_ext_dir(monkeypatch, tmp_path, None)
+    assert os.path.basename(plain) == "qiita-control-plane-duckdb-ext"
+
+
+def test_setup_test_env_replaces_the_directory_a_worker_inherits(monkeypatch, tmp_path):
+    """A worker inherits its environment from the xdist controller, which ran this
+    same helper first and exported the plain per-component directory. On `setdefault`
+    alone every worker points back at that one shared path and the split is a no-op —
+    the directories get created and nothing installs into them."""
+    controller = _resolve_test_ext_dir(monkeypatch, tmp_path, None)
+    worker = _resolve_test_ext_dir(monkeypatch, tmp_path, "gw0", inherited=controller)
+    assert worker != controller
+    assert os.path.basename(worker) == "qiita-control-plane-gw0-duckdb-ext"
+
+
+def test_setup_test_env_leaves_an_externally_pinned_directory_alone(monkeypatch, tmp_path):
+    """`setdefault`, not `set`: only the value this helper itself exports is replaced.
+    A directory pinned from outside — a deploy-staged one, say — is a different string
+    and reaches the suite as given, in a worker as anywhere else."""
+    pinned = str(tmp_path / "staged-elsewhere")
+    for worker in (None, "gw0"):
+        assert _resolve_test_ext_dir(monkeypatch, tmp_path, worker, inherited=pinned) == pinned
+
+
+def test_setup_test_env_directories_match_the_documented_clearing_glob(monkeypatch, tmp_path):
+    """`setup_miint_test_env`'s docstring tells the reader to clear a stale build
+    with `rm -rf "$TMPDIR"/qiita-*-duckdb-ext`. A name that escapes that glob
+    leaves a cache nothing clears, and the symptom is a `Catalog Error` from a
+    function the stale build predates."""
+    for worker in (None, "gw0", "gw11"):
+        chosen = _resolve_test_ext_dir(monkeypatch, tmp_path, worker)
+        assert fnmatch.fnmatch(os.path.basename(chosen), "qiita-*-duckdb-ext")
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "empty"),
+    [
+        ("empty.fa", b"", True),
+        ("full.fa", b">x\nACGT\n", False),
+        ("empty.fa.gz", None, True),
+        ("full.fa.gz", b">x\nACGT\n", False),
+    ],
+)
+def test_is_empty_sequence_file(tmp_path, name, payload, empty):
+    """The four cases the callers depend on, uncompressed and gzipped.
+
+    `.gz` is the pair that matters: an empty gzip member still occupies its framing
+    bytes on disk, so `st_size == 0` answers this question wrong in the direction
+    that costs — `read_fastx` raises on the file and one such path aborts a whole
+    multi-file scan.
+    """
+    path = tmp_path / name
+    if name.endswith(".gz"):
+        with gzip.open(path, "wb") as fh:
+            fh.write(payload or b"")
+    else:
+        path.write_bytes(payload or b"")
+
+    if name.endswith(".gz"):
+        assert path.stat().st_size > 0, "an empty gzip member is still bytes on disk"
+
+    assert is_empty_sequence_file(path) is empty

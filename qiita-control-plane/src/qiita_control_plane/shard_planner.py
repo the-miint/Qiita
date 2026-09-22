@@ -3,9 +3,10 @@
 An analysis reference's features are partitioned into shards (one `.ryxdi` per
 shard) so reads can later be routed to — and aligned against — only the shard(s)
 they classify into. This module holds the PURE tiler (`tile_by_lineage`,
-unit-testable with no DB). The ingest-time wiring — building lineage strings
-from taxonomy, choosing the sharding unit, expanding it back to features, and
-persisting via `write_shard_assignment` — is a later milestone.
+unit-testable with no DB). The ingest-time wiring around it — building lineage
+strings from taxonomy, choosing the sharding unit, expanding it back to features,
+and persisting via `write_shard_assignment` — lives in
+`actions.library.plan_shards`.
 
 Sharding strategy: sort the sharding units lexicographically by their taxonomy
 **lineage string**, then cut the sorted list into a fixed `_SHARD_COUNT` shards

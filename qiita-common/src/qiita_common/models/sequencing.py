@@ -7,6 +7,7 @@ rows) per pool item. Also carries the sequence-range allocator and the mask
 definition (read-filtering config identity) models.
 """
 
+from enum import StrEnum
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -21,8 +22,19 @@ from pydantic import (
 from pydantic.types import Base64Bytes
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, SystemRole
-from qiita_common.models._base import PatchRequestModel, _fraction_passing_quality_filter
-from qiita_common.models.biosample import GlobalMetadataEntry, MetadataChecklistRef
+from qiita_common.models._base import (
+    AccessionText,
+    MetadataRequestModel,
+    NonBlankText,
+    PatchRequestModel,
+    PrepSampleCohort,
+    ReadCounts,
+    check_withdrawal_reason,
+)
+from qiita_common.models.biosample import (
+    MetadataChecklistRef,
+    MetadataEntry,
+)
 from qiita_common.models.reference import Platform
 from qiita_common.models.work_ticket import WorkTicketState
 
@@ -150,17 +162,16 @@ class SequencedPoolCreateResponse(BaseModel):
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
 
 
-class PoolReadMetrics(BaseModel):
+class PoolReadMetrics(ReadCounts):
     """Compute-on-read read-metric rollup for a sequenced_pool.
 
-    The four counts are SUMS over the pool's NON-retired sequenced_samples
-    (each NULL until at least one sample in the pool has been processed);
-    `fraction_passing_quality_filter` is recomputed from the summed counts via
-    `_fraction_passing_quality_filter` — NOT a mean of per-sample fractions — and
-    is None when raw is absent or 0. `sample_count` is the pool's non-retired
-    sequenced_sample total; `samples_with_metrics` is how many of those carry
-    read counts, so a partial rollup (some samples still unprocessed) is
-    interpretable rather than looking complete.
+    The four `ReadCounts` fields are SUMS over the pool's NON-retired
+    sequenced_samples (each NULL until at least one sample in the pool has been
+    processed); `fraction_passing_quality_filter` is therefore recomputed from
+    the summed counts — NOT a mean of per-sample fractions. `sample_count` is
+    the pool's non-retired sequenced_sample total; `samples_with_metrics` is how
+    many of those carry read counts, so a partial rollup (some samples still
+    unprocessed) is interpretable rather than looking complete.
 
     The read-outcome breakdown splits `samples_with_metrics`'s implicit
     "processed" set so an operator can tell "no metrics yet" from "processed but
@@ -178,12 +189,6 @@ class PoolReadMetrics(BaseModel):
     experiment + run on the sequenced_sample subtype); `samples_fully_submitted_to_ena`
     requires all four. All are compute-on-read, like the read-count sums."""
 
-    raw_read_count_r1r2: int | None
-    biological_read_count_r1r2: int | None
-    quality_filtered_read_count_r1r2: int | None
-    # SynDNA spike-ins, disjoint from biological (added in the lab, not a molecule
-    # from the sample). Always 0/NULL for protocols that carry no spike-in.
-    spikein_read_count_r1r2: int | None
     sample_count: int
     samples_with_metrics: int
     # Read-outcome breakdown (partition of sample_count).
@@ -197,29 +202,28 @@ class PoolReadMetrics(BaseModel):
     samples_with_ena_run_accession: int
     samples_fully_submitted_to_ena: int
 
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def fraction_passing_quality_filter(self) -> float | None:
-        """Pool quality_filtered / raw, recomputed from the SUMMED counts (see
-        `_fraction_passing_quality_filter`)."""
-        return _fraction_passing_quality_filter(
-            self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
-        )
-
 
 # SequencingRunResponse.read_metrics is a forward ref to PoolReadMetrics (defined
 # above but after that class); resolve it now that the target exists.
 SequencingRunResponse.model_rebuild()
 
 
-class SequencedPoolResponse(BaseModel):
-    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}.
+class SequencedPoolSummary(BaseModel):
+    """One row of GET /api/v1/sequencing-run/{R}/sequenced-pool (the list view).
 
-    The pool's caller-visible metadata (the BYTEA `run_preflight_blob` is
-    omitted — only `run_preflight_filename` is surfaced) plus the compute-on-read
-    read-metric rollup. There is no stored pool-level metric: `read_metrics`
-    is aggregated from the constituent sequenced_samples at request time, so it
-    never drifts when a sample is re-processed or deleted."""
+    The pool's stored metadata and nothing computed. The BYTEA
+    `run_preflight_blob` is omitted here as it is on the single-pool read; only
+    `run_preflight_filename` is surfaced. It labels a pool rather than keying it:
+    the run's uniqueness indexes on filename and on preflight content are both
+    PARTIAL (`WHERE ... IS NOT NULL`), and the pair is co-populated or both NULL
+    (`sequenced_pool_run_preflight_pair_consistent`), so a non-NULL filename is
+    unique within its run while a run may hold any number of no-preflight pools
+    this field cannot tell apart. Those are distinguishable only by idx.
+
+    No `read_metrics`: that rollup aggregates every constituent sequenced_sample
+    at request time, and a list would pay it per row. The single-pool read
+    carries it for the one pool a caller picked out of this list.
+    """
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
@@ -227,7 +231,35 @@ class SequencedPoolResponse(BaseModel):
     extra_metadata: dict[str, Any] | None
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
+
+
+class SequencedPoolResponse(SequencedPoolSummary):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}.
+
+    The summary above plus the compute-on-read read-metric rollup. There is no
+    stored pool-level metric: `read_metrics` is aggregated from the constituent
+    sequenced_samples at request time, so it never drifts when a sample is
+    re-processed or deleted."""
+
     read_metrics: PoolReadMetrics
+
+
+class SequencedPoolListResponse(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool.
+
+    The pools of one run, ascending by `sequenced_pool_idx`, capped at the
+    route's hard limit; `truncated` is True when the run holds more than the page.
+    `sequencing_run_idx` is echoed so a stored response is self-describing.
+
+    This is the read that makes a `sequenced_pool_idx` obtainable: every other
+    pool-scoped route takes one as a path segment or a filter, and before this
+    nothing returned one.
+    """
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool: list[SequencedPoolSummary]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool = False
 
 
 class SampleQCReport(BaseModel):
@@ -412,29 +444,43 @@ class PoolCompletionStatus(BaseModel):
     no_data / failed / not_submitted (precedence highest-first when more than one
     bcl-convert ticket exists; not_submitted when there is none).
 
-    The per-sample buckets below — the HOST-MASKING stage: each non-retired
-    sequenced_sample classified by the state of its read-mask work tickets (any
-    version) and tallied into five mutually-exclusive buckets (precedence,
-    highest first, so a sample appears in exactly one):
-      completed     — has at least one COMPLETED read-mask ticket.
-      in_flight     — no COMPLETED ticket but at least one PENDING/QUEUED/
-                      PROCESSING (e.g. a re-submitted retry); work is ongoing.
-      no_data       — no COMPLETED and nothing in flight, but at least one
-                      NO_DATA (an empty/blank well — a terminal outcome that is
-                      NOT a failure). Outranks failed so a sample carrying both a
-                      no_data and a stale failed ticket counts as no_data.
-      failed        — no COMPLETED, nothing in flight, no NO_DATA, but at least
-                      one FAILED.
-      not_submitted — no read-mask ticket at all (e.g. a sample a partial
-                      submit-host-filter-pool fan-out never reached).
+    The per-sequenced_sample buckets below — the HOST-MASKING stage. Each
+    non-retired sequenced_sample lands in exactly one, by the precedence they are
+    listed in, and the seven sum to `sample_count`:
+
+      completed     — masked under at least one mask in scope.
+      invalidated   — not completed, and a masking run for it was withdrawn.
+                      Ranked above in_flight because a re-mask in progress does
+                      not make a withdrawn pass-set usable, and the question
+                      these buckets answer is "may I use this now".
+      in_flight     — neither of the above, and masking is outstanding: a ticket
+                      still running, or a gate row awaiting its flip.
+      no_data       — an empty/blank well. A terminal outcome that is NOT a
+                      failure, and it outranks the two below so a well that was
+                      retried-then-superseded still lets the pool reach
+                      `complete`.
+      cancelled     — an operator stopped it. Above failed because an operator
+                      cancels to stop a failing retry loop, so ranking it below
+                      would let the stale FAILED hide the deliberate stop — the
+                      thing `WorkTicketState` keeps CANCELLED distinct to avoid.
+      failed        — a masking ticket failed and nothing above applies.
+      not_submitted — the residual: nothing above claimed it. See
+                      `fetch_sequenced_pool_completion` for the one edge it also
+                      absorbs.
+
+    Which source decides which bucket, and how the masking gate and the work
+    tickets are resolved against each other, is on
+    `repositories.sequencing_run.fetch_sequenced_pool_completion`. Both sources
+    span the per-sample and the block masking paths.
 
     `complete` is the host-masking done flag: the pool is non-empty and every
-    sample is in a terminal-accounted state — COMPLETED or NO_DATA (so a plate
-    of real data with empty wells still reaches `complete=True`, and a
-    zero-sample pool reads `complete=False`, not vacuously true). `fully_processed`
-    is the end-to-end flag: demux completed AND `complete`. Everything is
-    compute-on-read over the work_ticket table, so it never drifts when a sample
-    is re-processed, re-submitted, or deleted."""
+    sequenced_sample is in a terminal-accounted state — completed or no_data (so
+    a plate of real data with empty wells still reaches `complete=True`, and a
+    zero-sample pool reads `complete=False`, not vacuously true). A withdrawn
+    sample is in neither bucket, so a pool holding one reads `complete=False`.
+    `fully_processed` is the end-to-end flag: demux completed AND `complete`.
+    Everything is compute-on-read, so it never drifts when a sample is
+    re-processed, re-submitted, withdrawn, or deleted."""
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
@@ -446,18 +492,21 @@ class PoolCompletionStatus(BaseModel):
     demux_state: Literal["completed", "in_flight", "no_data", "failed", "not_submitted"]
     sample_count: Annotated[int, Field(ge=0)]
     samples_completed: Annotated[int, Field(ge=0)]
+    samples_invalidated: Annotated[int, Field(ge=0)]
     samples_in_flight: Annotated[int, Field(ge=0)]
     samples_no_data: Annotated[int, Field(ge=0)]
     samples_failed: Annotated[int, Field(ge=0)]
+    samples_cancelled: Annotated[int, Field(ge=0)]
     samples_not_submitted: Annotated[int, Field(ge=0)]
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def complete(self) -> bool:
-        """True when the pool has samples and every one is in a terminal-
-        accounted state for HOST-MASKING: a COMPLETED read-mask ticket or a
-        NO_DATA (empty-well) outcome. Says nothing about demux — see
-        `fully_processed` for the end-to-end signal."""
+        """True when the pool has sequenced_samples and every one is in a
+        terminal-accounted state for HOST-MASKING: masked, or a NO_DATA
+        (empty-well) outcome. A withdrawn sample is in neither bucket and so
+        holds this False. Says nothing about demux — see `fully_processed` for
+        the end-to-end signal."""
         return (
             self.sample_count > 0
             and (self.samples_completed + self.samples_no_data) == self.sample_count
@@ -515,8 +564,13 @@ class PoolExceptionsResponse(BaseModel):
 
 
 class PoolReadMaskCoverage(BaseModel):
-    """Read-mask ticket coverage for a pool: how many non-retired samples have a
-    read-mask work ticket (any state) vs. none. `with + without == sample_count`."""
+    """Read-mask ticket coverage for a pool: how many non-retired
+    sequenced_samples have a read-mask work ticket (any state) vs. none.
+    `with + without == sample_count`.
+
+    "Has a ticket" is not "was masked" — a block ticket names no prep_sample
+    (`qiita_common.actions`) — so a block-masked sequenced_sample counts as
+    `without` here while `PoolCompletionStatus` reports it completed."""
 
     samples_with_read_mask_ticket: Annotated[int, Field(ge=0)]
     samples_without_read_mask_ticket: Annotated[int, Field(ge=0)]
@@ -527,11 +581,13 @@ class PoolWorkTicketSummary(BaseModel):
 
     The pool's read-mask work-ticket rollup with TICKETS (not samples) as the
     denominator — distinct from `PoolCompletionStatus`, whose per-sample buckets
-    collapse each sample's tickets by precedence. `read_mask` reconciles with the
-    completion rollup (`samples_with_read_mask_ticket` == `sample_count -
-    samples_not_submitted`); `ticket_state_counts` maps each work_ticket_state to
-    the number of the pool's read-mask tickets in it (states with zero tickets are
-    present with a 0 value). Compute-on-read."""
+    collapse each sequenced_sample's tickets by precedence. Both halves of this
+    response count read-mask TICKETS, so they share a denominator with each other
+    but not with the completion rollup, whose buckets are keyed on the masking
+    gate.
+    `ticket_state_counts` maps each work_ticket_state to the number of the pool's
+    read-mask tickets in it (states with zero tickets are present with a 0 value).
+    Compute-on-read."""
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
@@ -647,7 +703,7 @@ class SequencedPoolDeleteResponse(BaseModel):
     staged_reads_reaped: int = 0
 
 
-class SequencedSampleCreateRequest(BaseModel):
+class SequencedSampleCreateRequest(MetadataRequestModel):
     """Body for the sequenced-sample composer POST.
 
     Atomically creates a prep_sample row (with processing_kind='sequenced'),
@@ -666,10 +722,18 @@ class SequencedSampleCreateRequest(BaseModel):
     collapsed (order-preserving) rather than rejected.
 
     `metadata` keys must match seeded prep_sample_global_field display_name
+    values — or, when global_internal_names is set, their internal_name
     values; unknown names surface as a single 422 listing every bad key.
+    Every key and value strips on the way in and must still carry content,
+    so a name written with stray padding matches the same seeded field as
+    its unpadded spelling. A blank value is rejected — a field left
+    unanswered instead takes a missing-value marker, and a field with
+    nothing to say is simply omitted.
     The two ENA accession fields are nullable: a sample may already carry
     ENA accessions when it is created (e.g. ingesting already-submitted
-    data), or have them written back later after an ENA submission.
+    data), or have them written back later after an ENA submission. Absent
+    means null — empty text is refused, because the columns are UNIQUE and
+    admit only one empty string between them all.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -680,10 +744,11 @@ class SequencedSampleCreateRequest(BaseModel):
     sequenced_pool_item_id: str = Field(min_length=1)
     primary_study_idx: Annotated[int, Field(gt=0)]
     secondary_study_idxs: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list)
-    metadata: dict[str, str] = Field(default_factory=dict)
-    metadata_checklist_name: str | None = Field(default=None, min_length=1)
-    ena_experiment_accession: str | None = Field(default=None, max_length=50)
-    ena_run_accession: str | None = Field(default=None, max_length=50)
+    metadata: dict[NonBlankText, NonBlankText] = Field(default_factory=dict)
+    global_internal_names: bool = False
+    metadata_checklist_name: NonBlankText | None = None
+    ena_experiment_accession: AccessionText | None = None
+    ena_run_accession: AccessionText | None = None
 
     @model_validator(mode="after")
     def dedupe_secondary_study_idxs(self):
@@ -711,7 +776,7 @@ class SequencedSampleCreateResponse(BaseModel):
     sequenced_sample_idx: Annotated[int, Field(gt=0)]
 
 
-class SequencedSampleResponse(BaseModel):
+class SequencedSampleResponse(ReadCounts):
     """Returned by GET /api/v1/sequenced-sample/{sequenced_sample_idx}.
 
     Carries every caller-visible column from the sequenced_sample subtype
@@ -743,17 +808,6 @@ class SequencedSampleResponse(BaseModel):
     ena_run_accession: str | None
     last_submission_at: AwareDatetime | None
     submission_error: str | None
-    # Per-stage read counts, both-mates (R1+R2) totals. NULL until the
-    # sample is processed by fastq-to-parquet/1.2.0 (the persist-read-metrics
-    # action writes them). By the DB CHECK: quality_filtered <= biological and
-    # biological + spikein <= raw. `spikein` (SynDNA) is DISJOINT from biological —
-    # a spike-in is added in the lab, not a molecule from the sample — and is 0 for
-    # protocols that carry none. `qc_*` and `twist_no_adaptor` reads count toward
-    # raw only.
-    raw_read_count_r1r2: int | None
-    biological_read_count_r1r2: int | None
-    quality_filtered_read_count_r1r2: int | None
-    spikein_read_count_r1r2: int | None
     last_metadata_change_at: AwareDatetime | None
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
@@ -762,18 +816,22 @@ class SequencedSampleResponse(BaseModel):
     retired_by_idx: int | None
     retired_at: AwareDatetime | None
     retire_reason: str | None
-    global_metadata: dict[str, GlobalMetadataEntry]
+    global_metadata: dict[str, MetadataEntry]
     caller_system_role: SystemRole
 
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def fraction_passing_quality_filter(self) -> float | None:
-        """quality_filtered / raw for this sample — see
-        `_fraction_passing_quality_filter`. Computed on read, never stored, so it
-        can't drift from the counts."""
-        return _fraction_passing_quality_filter(
-            self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
-        )
+
+class StudyScopedSequencedSampleResponse(SequencedSampleResponse):
+    """Returned by GET /api/v1/study/{study_idx}/sequenced-sample/{sequenced_sample_idx}.
+
+    A study-scoped view: every field of the sequenced-sample-level
+    SequencedSampleResponse (core columns, caller_system_role, and the
+    globally-linked global_metadata keyed by internal_name) plus this study's
+    purely-local prep_sample metadata, keyed by display_name. local_metadata is
+    returned only on a study-scoped response, where the caller is already
+    authorized on the study.
+    """
+
+    local_metadata: dict[str, MetadataEntry]
 
 
 class SequencedSamplePatchRequest(PatchRequestModel):
@@ -787,11 +845,12 @@ class SequencedSamplePatchRequest(PatchRequestModel):
     out of scope; the former will land via a future
     PATCH /prep-sample/{idx} endpoint, the latter are not editable.
     Inherits extra="forbid" and the at_least_one_field rule from
-    PatchRequestModel.
+    PatchRequestModel. An accession is cleared by sending explicit null;
+    empty text is refused rather than taken as a clear.
     """
 
-    ena_experiment_accession: str | None = Field(default=None, max_length=50)
-    ena_run_accession: str | None = Field(default=None, max_length=50)
+    ena_experiment_accession: AccessionText | None = None
+    ena_run_accession: AccessionText | None = None
     last_submission_at: AwareDatetime | None = None
     submission_error: str | None = None
 
@@ -857,6 +916,66 @@ class SequenceRange(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+MaskSampleState = Literal["pending", "completed", "invalidated"]
+"""A sample's per-`(mask_idx, prep_sample)` masking state.
+
+Mirrors the `qiita.mask_sample.state` TEXT/CHECK column (NOT a Postgres ENUM —
+see the `mask_sample` migration for why the gate stays out of the enum-parity
+discipline). `'completed'` means the read_mask is whole; `'pending'` means it is
+not; `'invalidated'` means it was whole and has since been withdrawn, because the
+run that produced it is not trustworthy. The canonical statement of the gate
+contract lives on
+`qiita_control_plane.repositories.block.fetch_mask_sample_state`.
+
+Consumers of masked reads act only on `'completed'`. Absence of a state is not
+`'pass'`: `MaskedReadExportSample.mask_state` is `None` when no gate row exists,
+and the DoGet ticket route 409s that case the same as `'pending'`.
+
+`'invalidated'` is per-RUN, and deliberately not the same judgement as
+`MaskDefinitionStatus.DEPRECATED`, which is per-CONFIG: a sound config can
+produce an untrustworthy run (a job that OOM-escalated into a larger Arrow batch,
+say), and voiding the config to flag one such run would void every sound run
+beside it.
+"""
+
+MaskStateSource = Literal["mask_sample", "work_ticket"]
+"""Which source a roster row's `mask_state` was resolved from.
+
+`'mask_sample'` — the gate row. Both masking paths write it, so a
+masked-COMPLETE sample always has one.
+
+`'work_ticket'` — the sample's own per-sample masking ticket, read where no gate
+row exists. The per-sample path has no PENDING phase (it writes the gate
+`'completed'` in one upsert at its terminal step), so a ticket that ran and did
+not complete leaves no gate row at all — indistinguishable there from a sample
+nobody ever tried to mask. These rows are what the ticket supplies.
+
+A ticket that has not started is not among them: the mask is written onto the
+ticket inside the run, so a queued ticket carries no mask to be found by.
+"""
+
+
+class MaskDefinitionStatus(StrEnum):
+    """Lifecycle of a read-filtering CONFIG (`qiita.mask_definition.status`).
+
+    Mirrors a TEXT + CHECK column, NOT a Postgres `CREATE TYPE ... AS ENUM` — per
+    the enum-parity carve-out in CLAUDE.md it therefore has no `ENUM_PAIRS` entry
+    and is out of scope for the parity test. Keep this set and the CHECK list in
+    the `mask_lifecycle` migration in sync by hand.
+
+    `DEPRECATED` says the configuration itself is void: `qiita.mint_mask_definition`
+    refuses to return the row, so no new data can be masked under it. It says
+    nothing about any individual run — a run of a sound config is withdrawn with
+    `MaskSampleState` `'invalidated'` instead.
+
+    Deprecation never deletes: the GET routes keep listing deprecated masks so
+    "what filter produced this published submission?" stays answerable.
+    """
+
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
+
+
 class MaskDefinitionMintRequest(BaseModel):
     """Body for POST /api/v1/mask-definition.
 
@@ -877,11 +996,21 @@ class MaskDefinitionMintRequest(BaseModel):
 
 
 class MaskDefinition(BaseModel):
-    """Returned by POST /api/v1/mask-definition (200/201).
+    """Returned by POST /api/v1/mask-definition (200/201) and
+    GET /api/v1/mask-definition/{mask_idx}.
 
     `mask_idx` is the filtering-config discriminator that tags the data plane's
     read_mask / read_masked rows. The same `params` (canonically hashed) always
     yields the same `mask_idx`.
+
+    `params` carries the resolved config the mask was minted from — host/spike-in
+    reference idxs and the QC constants — so a non-null `host_rype_reference_idx`
+    separates a human-filtered mask from a QC-only one.
+
+    Scope: `params` is the mask's dedup key. It covers the hashed gate thresholds,
+    not the scoring expressions that consume them, so two masks with identical
+    `params` can have scored differently if those expressions changed between
+    their runs.
     """
 
     mask_idx: Annotated[int, Field(gt=0)]
@@ -889,6 +1018,182 @@ class MaskDefinition(BaseModel):
     filter_version: str
     params: dict[str, Any]
     created_at: AwareDatetime
+    # Lifecycle. A deprecated mask is still returned by every read route — the
+    # record of what filtered published data outlives the judgement that the
+    # filter was wrong. The three provenance fields are set exactly when
+    # `status` is DEPRECATED (a CHECK enforces the biconditional).
+    status: MaskDefinitionStatus
+    deprecated_at: AwareDatetime | None = None
+    deprecated_by_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+    deprecation_reason: str | None = None
+    superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
+
+
+class MaskDefinitionSummary(MaskDefinition):
+    """One row of GET /api/v1/mask-definition (the list view).
+
+    A MaskDefinition plus the per-mask sample tally, so a pool carrying several
+    masks is separable in one round trip instead of a GET per mask. The tally is
+    over the same rows the roster read returns — scoped to the filters the list
+    was called with (a `sequenced_pool_idx` filter tallies only that pool's
+    samples; an unfiltered list tallies fleet-wide), narrowed to the samples the
+    caller may see, and excluding entity-retired prep_samples.
+
+    `samples_completed` are masked and durable — the set a masked-read pull or an
+    assembly submission can act on. `samples_pending` are not whole: a covering
+    block still in flight on the block path, a ticket not yet completed on the
+    per-sample one. `samples_invalidated` finished and were withdrawn.
+    """
+
+    samples_completed: Annotated[int, Field(ge=0)]
+    samples_pending: Annotated[int, Field(ge=0)]
+    # Runs withdrawn after the fact. Counted separately rather than folded into
+    # either bucket above: an invalidated run is neither usable nor still coming,
+    # and rolling it into `samples_pending` would read as "wait for it".
+    samples_invalidated: Annotated[int, Field(ge=0)]
+
+
+class MaskDefinitionListResponse(BaseModel):
+    """Returned by GET /api/v1/mask-definition.
+
+    `masks` is ordered by descending `mask_idx` (newest first), capped at the
+    route's hard limit; `truncated` is True when the underlying set exceeded it.
+    The optional `sequenced_pool_idx` / `prep_sample_idx` filters the caller
+    passed are echoed back so a stored response is self-describing.
+    """
+
+    masks: list[MaskDefinitionSummary]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool = False
+    sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+    prep_sample_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+
+
+class MaskPrepSample(BaseModel):
+    """One sample in a mask's per-sample roster.
+
+    `mask_state` answers "may this sample's read_mask be read?" — `'completed'` if
+    so; `'pending'` if it is not whole yet, `'invalidated'` if it was whole and has
+    since been withdrawn. `source` names where that came from:
+
+      * `'mask_sample'` — the gate row, which both masking paths write.
+        `work_ticket_state` is None; the gate is a rollup, so no single ticket
+        describes it.
+      * `'work_ticket'` — the sample's own per-sample masking ticket, read where
+        no gate row exists, which on that path means the ticket has not completed.
+        So these rows are `'pending'`, and `work_ticket_state` is what separates
+        "still running" from "failed, resubmit it".
+
+    Retries collapse to one row per sample: a completed ticket if any exists,
+    else the newest.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    biosample_accession: str | None = None
+    mask_state: MaskSampleState
+    source: MaskStateSource
+    work_ticket_state: WorkTicketState | None = None
+
+
+class MaskPrepSampleListResponse(BaseModel):
+    """Returned by GET /api/v1/mask-definition/{mask_idx}/prep-sample.
+
+    The roster of samples masked under one mask, ascending by `prep_sample_idx`,
+    optionally narrowed to one `sequenced_pool_idx` and always narrowed to the
+    samples the caller may see. `truncated` is True when the underlying set
+    exceeded the route's hard cap.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    samples: list[MaskPrepSample]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool = False
+    sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+
+
+class MaskDefinitionStatusUpdate(BaseModel):
+    """Body for PATCH /api/v1/mask-definition/{mask_idx}/status.
+
+    Deprecating requires a `reason`: a bare `status` change leaves whoever later
+    finds a deprecated mask behind published data with no way to tell whether the
+    filter was wrong or the mask was merely superseded. `superseded_by` names the
+    replacement when a re-mint under corrected code produced one; it is accepted
+    only alongside DEPRECATED, matching the CHECK on the column.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: MaskDefinitionStatus
+    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
+
+    @model_validator(mode="after")
+    def _reason_required_to_deprecate(self) -> MaskDefinitionStatusUpdate:
+        deprecating = self.status is MaskDefinitionStatus.DEPRECATED
+        check_withdrawal_reason(
+            withdrawing=deprecating,
+            reason=self.reason,
+            field="status",
+            value=MaskDefinitionStatus.DEPRECATED.value,
+        )
+        if not deprecating and self.superseded_by is not None:
+            raise ValueError("superseded_by is only accepted when status is 'deprecated'")
+        return self
+
+
+class MaskSampleStatusUpdate(BaseModel):
+    """Body for PATCH /api/v1/mask-definition/{mask_idx}/sample-status.
+
+    Withdraws (or restores) specific runs of one mask. Bulk because that is the
+    unit the judgement is made in — "these N samples of this mask ran with a
+    defect" — and applying it one call per sample leaves a partially-withdrawn
+    mask for someone to reason about.
+
+    `state` accepts only the two settable values. `'pending'` is the masking
+    pipeline's to write and is not reachable here: a run that finished cannot
+    become unfinished.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[list[Annotated[int, Field(gt=0)]], Field(min_length=1)]
+    state: Literal["completed", "invalidated"]
+    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+
+    @model_validator(mode="after")
+    def _reason_required_to_invalidate(self) -> MaskSampleStatusUpdate:
+        check_withdrawal_reason(
+            withdrawing=self.state == "invalidated",
+            reason=self.reason,
+            field="state",
+            value="invalidated",
+        )
+        if len(set(self.prep_sample_idx)) != len(self.prep_sample_idx):
+            raise ValueError("prep_sample_idx must not repeat")
+        return self
+
+
+class MaskSampleStatusUpdateResponse(BaseModel):
+    """Returned by PATCH /api/v1/mask-definition/{mask_idx}/sample-status.
+
+    `updated` are the pairs whose state changed. `unchanged` already held the
+    requested state (the call is idempotent, so re-running a withdrawal is not an
+    error). `not_found` had no gate row under this mask at all — reported rather
+    than silently skipped, because a caller naming a sample that was never masked
+    under this mask has almost certainly named the wrong mask.
+
+    `skipped_pending` were left `'pending'`: the masking pipeline flips that value
+    to `'completed'` when the run lands, so a withdrawal written over it would be
+    undone without anyone being told, and there is no pass-set to withdraw yet.
+    Re-issue for those samples once they complete.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    state: Literal["completed", "invalidated"]
+    updated: list[int]
+    unchanged: list[int]
+    not_found: list[int]
+    skipped_pending: list[int] = []
 
 
 class MaskDefinitionDeleteResponse(BaseModel):
@@ -916,14 +1221,76 @@ class AlignmentDefinitionDeleteResponse(BaseModel):
     rows_deleted: int
 
 
+class PoolAlignmentSummary(BaseModel):
+    """One alignment over a pool, as the CALLER sees it.
+
+    **Both counts are scoped to the samples the caller may read**, not to the
+    alignment's real membership. That is deliberate and load-bearing: the
+    alignment DoGet mint is all-or-nothing, so a caller shown the pool's true
+    counts would request a cohort it cannot fully read and get a 403. Discovery
+    and the mint have to agree about what "your cohort" means.
+
+    `params` is the alignment's config blob verbatim (reference, aligner, mask,
+    shard set) — the same JSON `alignment_definition.params` stores, so an
+    alignment_idx is self-describing without a second lookup.
+
+    `params_hash` is the SHA-256 of that blob's canonical JSON, hex-rendered — the
+    digest the control plane deduplicates definitions on. It is here so a client can
+    recompute it from the `params` beside it (`qiita_common.hashing.
+    canonical_params_hash`) and **refuse on mismatch**: everything a client derives
+    from `params` is only as trustworthy as the round trip that delivered them, and a
+    published manifest cites this digest as the reproducibility key. A client that
+    copied a hash it never checked would be publishing a claim it cannot support.
+    """
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    params: dict[str, Any]
+    params_hash: str
+    samples_completed: int
+    samples_total: int
+
+
+class PoolAlignmentList(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{run}/sequenced-pool/{pool}/alignment.
+
+    An alignment the caller can read NO sample of is absent entirely rather than
+    present with zero counts — a zero-count row would still disclose that the
+    alignment exists over data they have no access to.
+    """
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    alignments: list[PoolAlignmentSummary]
+
+
+class PoolAlignmentCohort(BaseModel):
+    """Returned by GET .../sequenced-pool/{pool}/alignment/{alignment_idx}/cohort.
+
+    The prep_samples that are BOTH readable by the caller and `'completed'` for
+    this alignment — a valid alignment-DoGet mint body by construction. Sorted,
+    so the same pool and alignment always produce the same request bytes; the
+    cohort is signed into a ticket, and an unstable order would make two
+    identical requests sign different payloads.
+
+    Empty is a legitimate answer, not an error: it means "nothing here you may
+    mint", which is what a narrowing read should say rather than a 403 that
+    would confirm which alignments touch data the caller lacks.
+    """
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: list[Annotated[int, Field(gt=0)]]
+
+
 class ReadMaskedDoGetTicketRequest(BaseModel):
     """Body for POST /api/v1/read-masked/ticket/doget.
 
     Signs a Flight DoGet ticket scoped to a single (prep_sample_idx, mask_idx)
-    on the data plane's `read_masked` view. Both identifiers are mandatory: the
-    data plane's empty-filter path would dump every sample's pass reads across
-    every mask, so the route never signs an unfiltered read_masked ticket
-    (the mandatory-filter invariant).
+    on the data plane's `read_masked` macro. Both identifiers are mandatory —
+    they are the macro's required arguments — and the route refuses to sign a
+    ticket missing either, as defence in depth (the mandatory-filter invariant,
+    `routes/read_masked.py`).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -945,19 +1312,126 @@ class MaskedReadExportSample(BaseModel):
     per row.
 
     `mask_state` is the sample's per-`(mask_idx, prep_sample)` completion gate
-    (`qiita.mask_sample.state`): `'completed'` (masked and durable — exportable),
-    `'pending'` (a covering block is mid-flight, so the read_mask is partial — NOT
-    exportable, the ticket route 409s), or `None` (no gate row). Only `'completed'`
-    is exportable: `None` means "not masked-complete under this mask", NOT exempt, so
-    the ticket route 409s it too. The CLI reads it to fail the whole export up front
-    (before minting any per-sample ticket) when a sample is not `'completed'`, rather
-    than abort the download loop mid-run on the ticket route's 409 and leave a partial
-    output set.
+    (`qiita.mask_sample.state`, see `MaskSampleState`), or `None` when no gate row
+    exists. Only `'completed'` is exportable: `None` means "not masked-complete
+    under this mask", NOT exempt, so the ticket route 409s it the same as
+    `'pending'`. The CLI reads it to fail the whole export up front (before minting
+    any per-sample ticket) when a sample is not `'completed'`, rather than abort the
+    download loop mid-run on the ticket route's 409 and leave a partial output set.
+
+    This roster LEFT JOINs the gate table alone, so a sample whose per-sample mask
+    has not completed comes back `None` rather than showing why. `MaskPrepSample`
+    is the mask-side roster that also reads the ticket.
     """
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None
-    mask_state: str | None = None
+    mask_state: MaskSampleState | None = None
+
+
+class ExportedIdentifierRequest(BaseModel):
+    """Body for POST /api/v1/exported-identifier — mint (or recover) the public
+    handle for each processed sample in a cohort.
+
+    ``alignment_idx`` names the processing; together with each ``prep_sample_idx``
+    it identifies one processed sample, which is what an ``export_id`` stands for.
+    The pair is the request's shape rather than the URL's because the cohort has to
+    ride a body: it is a pool's or a study's worth of samples, past nginx's 8 KB
+    request-line cap in query params, and it routinely SPANS pools.
+
+    ``PrepSampleCohort`` is shared with the alignment ticket mint, cap included:
+    the two bound the same thing — a cohort a scientist assembles — for the same
+    payload-size and disclosure-width reasons. Non-empty because a cohort with no
+    members has no answer to give; a caller that meant "all of them" has to say
+    which.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: PrepSampleCohort
+
+
+class ExportedIdentifier(BaseModel):
+    """One processed sample's public handle, and the accessions it does NOT
+    replace.
+
+    ``export_id`` (``QM<idx>``) is the identifier a published table carries. It is
+    minted by Postgres as a generated column, so nothing in Python composes it and
+    no caller can supply one.
+
+    ``prep_sample_idx`` is echoed back because this map's whole job is the
+    translation: the caller's alignment rows are keyed by it, so without it there
+    is nothing to join ``export_id`` to. It is an identifier the caller already
+    sent us, which is why returning it is not a leak — but it belongs in the map
+    only, never in the artifact the map is shipped beside.
+
+    The two accessions ride along because they are already public, and because
+    neither can do ``export_id``'s job: a biosample sequenced repeatedly has
+    several prep_samples, so its accession cannot say which sequencing a row came
+    from, and ``ena_run_accession`` is NULL until the data is submitted. Both are
+    nullable and purely informational — an unaccessioned sample still gets an
+    ``export_id``.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    export_id: str
+    biosample_accession: str | None = None
+    ena_run_accession: str | None = None
+
+
+class ExportedIdentifierResponse(BaseModel):
+    """Returned by POST /api/v1/exported-identifier: one entry per requested
+    prep_sample, ascending by prep_sample_idx.
+
+    Every requested sample is present or the whole request failed, so there is no
+    partial answer to signal and no `truncated` — the cohort is already bounded by
+    the request body's own cap.
+    """
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    identifiers: list[ExportedIdentifier]
+    count: Annotated[int, Field(ge=0)]
+
+
+class ExportedProcessingRequest(BaseModel):
+    """Body for POST /api/v1/exported-processing — mint (or recover) the public
+    handle for the processing a bundle was built from.
+
+    ``alignment_idx`` is what the handle names. ``prep_sample_idx`` is not part of
+    that name at all: it is **how the caller proves they may have it**. Minting is a
+    write, and a route that wrote on behalf of data the caller cannot read would let
+    anyone walk the `alignment_idx` range and collect a handle for every processing in
+    the system. So the cohort rides the body and takes exactly the gate
+    ``/exported-identifier`` takes for the same pair — a caller who could not build
+    the table has no manifest to write.
+
+    Identical in shape to ``ExportedIdentifierRequest``: two routes over
+    one `(processing, cohort)` pair that authorized it differently would be two
+    answers to "may I read this data".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: PrepSampleCohort
+
+
+class ExportedProcessingResponse(BaseModel):
+    """Returned by POST /api/v1/exported-processing.
+
+    ``export_processing_id`` (``QP<idx>``) is what a published manifest cites. It is
+    minted by Postgres as a generated column, so nothing in Python composes one and
+    no caller can supply one.
+
+    ``alignment_idx`` is echoed back so the caller can tell which of several
+    processings the handle belongs to. It is an identifier they already sent us,
+    which is why returning it is not a leak — but it belongs in this response only,
+    never in the manifest the handle goes into.
+    """
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    export_processing_id: str
 
 
 class MaskedReadExportManifest(BaseModel):
@@ -980,7 +1454,7 @@ class MaskedReadExportTicketRequest(BaseModel):
     """Body for POST /admin/masked-read-export/ticket.
 
     Mints a Flight DoGet ticket scoped to one (prep_sample_idx, mask_idx) on the
-    data plane's read_masked view — the human (system_admin) counterpart to the
+    data plane's read_masked macro — the human (system_admin) counterpart to the
     service-account POST /read-masked/ticket/doget. Minted just-in-time per
     sample by the export CLI. Both identifiers mandatory (the data plane's
     empty-filter path would dump every sample's pass reads). system_admin +

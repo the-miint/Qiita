@@ -21,6 +21,7 @@ import asyncpg
 from qiita_common.actions import BLOCK_MASK_ACTION_ID
 
 from . import require_transaction
+from .alignment_definition import list_completed_alignment_samples
 
 
 async def create_block(conn: asyncpg.Connection) -> int:
@@ -227,16 +228,22 @@ async def fetch_mask_sample_state(
     prep_sample_idx)` gate row's state, or None when no row exists.
 
     THE mask_sample gate contract (canonical statement; the other consumers point
-    here rather than restate it). The gate has two states, 'pending' and
-    'completed', and every masking workflow writes it first-class: the block path
-    materializes 'pending' at plan time and flips it to 'completed' at reconcile;
+    here rather than restate it). The gate has three states. Two are written by the
+    masking workflows, first-class: the block path materializes 'pending' at plan
+    time and flips it to 'completed' at reconcile;
     the per-sample mask-model workflows (read-mask, fastq-to-parquet) write
-    'completed' at their `finalize-mask-sample` terminal step. So absence (`None`)
-    means "no mask has completed for this (mask_idx, prep_sample)" — NOT an exempt
-    sample. THE INVARIANT: any consumer that must not read an absent or PARTIAL
-    pass-set proceeds ONLY on 'completed', rejecting both `None` (absence is never
-    "pass") and 'pending'. Stated as a contract, not a roster — callers point here;
-    an enumerated consumer list would only go stale.
+    'completed' at their `finalize-mask-sample` terminal step. The third,
+    'invalidated', is written by an operator withdrawing a completed run whose
+    output is not trustworthy — a judgement about one RUN, distinct from
+    deprecating the CONFIG (`MaskDefinitionStatus`). So absence (`None`) means "no
+    mask has completed for this (mask_idx, prep_sample)" — NOT an exempt sample.
+
+    THE INVARIANT: any consumer that must not read an absent, PARTIAL or withdrawn
+    pass-set proceeds ONLY on 'completed', rejecting `None` (absence is never
+    "pass"), 'pending' and 'invalidated'. Expressing withdrawal as a state value
+    rather than a column beside it is what makes that hold without every consumer
+    growing a second check. Stated as a contract, not a roster — callers point
+    here; an enumerated consumer list would only go stale.
 
     Point-in-time read: no FOR UPDATE / no transaction requirement — it gates a
     read, it does not finalize."""
@@ -245,6 +252,43 @@ async def fetch_mask_sample_state(
         mask_idx,
         prep_sample_idx,
     )
+
+
+class MaskSampleInvalidated(Exception):
+    """Raised when a masking run tries to complete a `(mask_idx, prep_sample)` pair
+    whose previous run was withdrawn.
+
+    Withdrawal is a judgement someone made about a stored pass-set, so a redrive
+    does not quietly overturn it: the fresh read_mask rows land, the gate stays
+    'invalidated', and consumers keep refusing until someone restores the pair via
+    PATCH /mask-definition/{mask_idx}/sample-status. That is deliberate — the
+    alternative is a re-run of unfixed code re-completing the run it was withdrawn
+    for, with nothing said."""
+
+    def __init__(self, *, mask_idx: int, prep_sample_idx: int) -> None:
+        self.mask_idx = mask_idx
+        self.prep_sample_idx = prep_sample_idx
+        super().__init__(
+            f"mask_sample ({mask_idx}, {prep_sample_idx}) was invalidated; a masking "
+            "run cannot complete it. Restore it via PATCH "
+            "/mask-definition/{mask_idx}/sample-status once the output is trusted."
+        )
+
+
+async def _raise_if_invalidated(
+    conn: asyncpg.Connection, *, mask_idx: int, prep_sample_idx: int
+) -> None:
+    """Re-read a gate row that a guarded write did not move, and raise when the
+    reason was withdrawal rather than idempotence. Both writers guard on the same
+    state, so both need the same distinction: 'no row moved' otherwise reads as a
+    harmless re-run."""
+    state = await conn.fetchval(
+        "SELECT state FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        mask_idx,
+        prep_sample_idx,
+    )
+    if state == "invalidated":
+        raise MaskSampleInvalidated(mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
 
 
 async def finalize_mask_sample(
@@ -260,15 +304,22 @@ async def finalize_mask_sample(
     caller holds the row's FOR UPDATE lock (`lock_mask_sample`) across the
     check-and-flip, but the guard is belt-and-suspenders against a double
     finalize. A False return means the row was already completed (an idempotent
-    re-run, or a concurrent finalizer that won the race)."""
+    re-run, or a concurrent finalizer that won the race).
+
+    Raises `MaskSampleInvalidated` when the row was withdrawn. Completing over it
+    would both violate the invalidation CHECK and undo a human judgement about a
+    pass-set; see the exception for the operator's path forward."""
     require_transaction(conn)
     updated = await conn.fetchval(
         "UPDATE qiita.mask_sample SET state = 'completed'"
-        " WHERE mask_idx = $1 AND prep_sample_idx = $2 AND state <> 'completed'"
+        " WHERE mask_idx = $1 AND prep_sample_idx = $2"
+        "   AND state NOT IN ('completed', 'invalidated')"
         " RETURNING prep_sample_idx",
         mask_idx,
         prep_sample_idx,
     )
+    if updated is None:
+        await _raise_if_invalidated(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
     return updated is not None
 
 
@@ -286,15 +337,22 @@ async def upsert_mask_sample_completed(
     — per-sample masking is atomic per ticket, so there is no PENDING phase: the row
     is written 'completed' in one idempotent upsert. ON CONFLICT keeps it robust to a
     workflow retry and composes with a block-path row already present for the same
-    pair (it can only move a stale row forward to 'completed', never backward)."""
+    pair (it moves a 'pending' row forward to 'completed', never backward).
+
+    Raises `MaskSampleInvalidated` when the row was withdrawn — the DO UPDATE is
+    guarded so such a row is left alone rather than silently re-completed."""
     require_transaction(conn)
-    await conn.execute(
+    written = await conn.fetchval(
         "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
         " VALUES ($1, $2, 'completed')"
-        " ON CONFLICT (mask_idx, prep_sample_idx) DO UPDATE SET state = 'completed'",
+        " ON CONFLICT (mask_idx, prep_sample_idx) DO UPDATE SET state = 'completed'"
+        "   WHERE qiita.mask_sample.state <> 'invalidated'"
+        " RETURNING prep_sample_idx",
         mask_idx,
         prep_sample_idx,
     )
+    if written is None:
+        await _raise_if_invalidated(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
 
 
 async def has_incomplete_covering_block(
@@ -433,17 +491,16 @@ async def list_incomplete_alignment_samples(
     of rows is never 'done' — completion is a first-class state (see
     qiita.alignment_sample). Accepts a pool or a connection so it composes inside a
     transaction. Result is sorted for a deterministic error message; empty input
-    returns []."""
-    if not prep_sample_idxs:
-        return []
-    rows = await pool_or_conn.fetch(
-        "SELECT prep_sample_idx FROM qiita.alignment_sample"
-        " WHERE alignment_idx = $1 AND prep_sample_idx = ANY($2::bigint[])"
-        "   AND state = 'completed'",
-        alignment_idx,
-        list(prep_sample_idxs),
+    returns [].
+
+    The complement of `list_completed_alignment_samples`, and computed from it
+    rather than re-issuing its SELECT: the completion predicate has one
+    definition, which matters because the two consumers are the discovery read
+    and the mint, whose whole contract is that they never disagree about which
+    samples are done."""
+    completed = set(
+        await list_completed_alignment_samples(pool_or_conn, alignment_idx, prep_sample_idxs)
     )
-    completed = {r["prep_sample_idx"] for r in rows}
     return sorted(set(prep_sample_idxs) - completed)
 
 

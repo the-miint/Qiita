@@ -8,7 +8,7 @@ proves, against the running data-plane process + integration Postgres:
 
   * a REAL signed ticket minted by the REAL CP route (`sign_ticket` over the
     `{prep_sample_idx, mask_idx}` filter) is accepted by the data plane;
-  * the data plane's `read_masked` view REDACTS every non-'pass' read (host/QC
+  * the data plane's `read_masked` macro REDACTS every non-'pass' read (host/QC
     hits never cross the Flight boundary) — the privacy invariant — while the
     'pass' reads stream through;
   * the real `FlightStreamReader` feeds the CLI's DuckDB+miint writer, producing

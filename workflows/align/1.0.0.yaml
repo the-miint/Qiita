@@ -25,7 +25,7 @@ description: >
   once ALL its covering blocks are done.
 
   The reads are the MASKED reads — the host-depleted, QC-passed reads the
-  `read-mask-block` milestone produced (the DuckLake `read_masked` view). The
+  read-masking step produced (the DuckLake `read_masked` macro). The
   `align_sharded` job STREAMS them from the data plane at runtime (POST
   /read/ticket/doget, keyed on work_ticket_idx): the control plane resolves the
   block's `block_member` sub-ranges, signs the `read_masked_block` selector scoped
@@ -124,12 +124,6 @@ steps:
     # per-run `--mem-gb` do reach DuckDB — minus the helper's per-thread headroom and
     # the job's co-consumer reserve, so DuckDB's own limit lands BELOW this number,
     # not at it.
-    #
-    # Both axes sit AT `action_ceiling`. For memory that means the FIRST OOM is
-    # terminal: escalation has no headroom to grow into, so the ticket fails rather
-    # than retrying larger. (There is no cpu-escalation mechanism at all, so nothing
-    # is given up on that axis.) walltime keeps its headroom (PT4H baseline under a
-    # PT8H ceiling) so a TIMEOUT still escalates.
     baseline_resources:
       cpu: 8
       mem_gb: 64
@@ -137,7 +131,7 @@ steps:
 
   # Idempotent block replace: delete this block's exact alignment footprint (its
   # member sub-ranges under the ticket's alignment_idx) from the DuckLake
-  # `alignment` table BEFORE register-files re-writes it, so a block re-run (a
+  # alignment tables BEFORE register-files re-writes it, so a block re-run (a
   # retry, or an operator resubmit covering the same footprint) deletes-then-
   # re-registers and never double-counts. On a fresh block it deletes 0 rows.
   # Exact by construction (per-member OR), so a sample split across several blocks
@@ -171,7 +165,10 @@ steps:
 # NO success_status / failure_status: a single block's failure must not flip
 # anything reference-wide; reconcile-alignment-block owns the per-sample gate.
 
+# walltime PT16H: align_sharded blocks timed out at PT8H on repeated attempts, on
+# several nodes, so TIMEOUT escalation needs room for one doubling past PT8H. How far
+# past 8 h those blocks run is not measured.
 action_ceiling:
   cpu: 8
-  mem_gb: 64
-  walltime: PT8H
+  mem_gb: 128
+  walltime: PT16H

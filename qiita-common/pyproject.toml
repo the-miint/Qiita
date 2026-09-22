@@ -9,6 +9,11 @@ dependencies = [
     # import time to derive the {machine_prefix: model_name} table the
     # CLI and the bcl-convert prep step both consume.
     "pyyaml>=6.0",
+    # `qiita_common.analytic` builds SQL text and opens no connection, but the
+    # analytic it describes only means anything against duckdb+miint, so its
+    # behaviour is pinned by tests that execute it here rather than in a
+    # consumer's suite. Both importing services already declare the same floor.
+    "duckdb>=1.5.4",
 ]
 
 [dependency-groups]

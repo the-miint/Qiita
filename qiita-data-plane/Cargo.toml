@@ -20,6 +20,13 @@ tonic-reflection = "0.14"
 arrow-flight = "58"
 arrow-array = "58"
 arrow-schema = "58"
+# Direct only to turn on the `zstd` IPC body codec: `arrow-flight` pulls
+# `arrow-ipc` featureless, and without this feature a compressed stream fails
+# per batch inside arrow-ipc's `compress_zstd` ("zstd IPC compression requires
+# the zstd feature") — mid-stream, after the schema message has shipped, not at
+# `IpcWriteOptions::try_with_compression`, which only checks the metadata
+# version. Opt-in per stream; the encoder default is still no codec.
+arrow-ipc = { version = "58", features = ["zstd"] }
 # DoPut writes incoming Arrow stream as Parquet directly. The data plane's
 # embedded DuckDB cannot ingest an arbitrary Arrow schema without C-API
 # gymnastics, so the parquet crate from the arrow-rs ecosystem is the

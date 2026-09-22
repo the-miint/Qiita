@@ -1,0 +1,1784 @@
+"""The `qiita feature-table build` handler, driven end to end with the two REST maps
+and both Flight streams faked — real miint, real analytic, real writers.
+
+The pieces this wires are pinned elsewhere: the analytic against real miint in
+`qiita-common`'s `tests/analytic/test_behaviour_miint.py`, the maps / relabel / bundle in
+`tests/cli/test_feature_table_cli.py`, the BIOM writer's own behaviours in
+`tests/test_biom_writer_contract.py`. **What is only testable here is the wiring**:
+which columns ride the ticket, which scope reaches the survivor set, whether the
+lengths stream is opened at all, and that every refusal the recipe can make comes
+out as a message and a non-zero exit rather than a traceback or a half-written file.
+
+The fakes stop exactly at the two boundaries a client cannot reach in a unit test —
+HTTP and Flight. Everything past them is the real thing, so the table asserted at
+the bottom is the file a user would publish.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+
+import httpx
+import pyarrow as pa
+import pytest
+from qiita_common import analytic as ft
+from qiita_common.hashing import canonical_params_hash
+
+from qiita_control_plane.cli.user import feature_table as ftc
+from qiita_control_plane.cli.user._helpers import _UNSET
+from qiita_control_plane.miint import connect_with_miint
+
+from .conftest import genome_map_table
+
+# One 1000 bp genome fully covered in sample 1, and one 10 000 bp genome each sample
+# covers 0.6% of — extending halves, so 1.2% pooled. At a 1% threshold that genome
+# survives pooled and fails per-sample, which is the only asymmetry the two scopes
+# have (pooling unions intervals, so pooled breadth is never the smaller one).
+_MAP_ENTRIES = [
+    {"feature_idx": 10, "genome_idx": 100, "source": "refseq", "source_id": "GCF_100"},
+    {"feature_idx": 20, "genome_idx": 200, "source": "refseq", "source_id": "GCF_200"},
+]
+_LENGTHS = [(10, 1000), (20, 10000)]
+
+# (prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position, cigar)
+_ALIGNMENT = [
+    (1, 1, 10, 0, 0, 500, "500="),
+    (1, 2, 20, 0, 0, 60, "30=30X"),  # identity 0.5 — the row a gate at 0.9 drops
+    (2, 3, 20, 0, 60, 120, "60="),
+]
+_IDENTIFIERS = [
+    {"prep_sample_idx": 1, "export_id": "QM1", "biosample_accession": "SAMN1"},
+    {"prep_sample_idx": 2, "export_id": "QM2", "biosample_accession": None},
+]
+_PARAMS = {"reference_idx": 9, "aligner": "minimap2", "mask_idx": 2, "shard_ids": [0]}
+_ALIGNMENTS_BODY = {
+    "alignments": [
+        {
+            "alignment_idx": 3,
+            "params": _PARAMS,
+            # The real digest: the build verifies it before reading anything off
+            # `params`, so a placeholder here would refuse every test in this module.
+            "params_hash": canonical_params_hash(_PARAMS).hex(),
+            "samples_completed": 2,
+            "samples_total": 2,
+        }
+    ]
+}
+
+_ALIGNMENT_TICKET = b"alignment-ticket"
+_LENGTHS_TICKET = b"lengths-ticket"
+_TAXONOMY_TICKET = b"taxonomy-ticket"
+_PHYLOGENY_TICKET = b"phylogeny-ticket"
+
+# `((c10:0.2,c30:0.5)inner:0.1,c20:0.3);` in the lake's shape, node indices and all, as
+# `read_newick` assigns them at ingest. Written out rather than parsed so the fixture does
+# not depend on that indexing — and shaped so shearing it does real work: feature 30 has no
+# genome in the map, so its tip is unpublished and drops, leaving `inner` with one child.
+# The collapse must then hand c10 a branch of 0.2 + 0.1.
+#
+# (node_index, name, branch_length, parent_index, is_tip, feature_idx)
+_PHYLOGENY = [
+    (0, "c10", 0.2, 2, True, 10),
+    (1, "c30", 0.5, 2, True, 30),
+    (2, "inner", 0.1, 4, False, None),
+    (3, "c20", 0.3, 4, True, 20),
+    (4, "", None, None, False, None),
+]
+
+# The reference's per-feature taxonomy as the data plane streams it. Feature 10 (G100)
+# is classified to genus; feature 20 (G200) has a row with every rank NULL, which is how
+# ingest records an unclassified feature — a MISSING row is what an exclusion produces.
+_TAXONOMY = [
+    (
+        10,
+        "Bacteria",
+        "Bacillota",
+        "Bacilli",
+        "Lactobacillales",
+        "Listeriaceae",
+        "Listeria",
+        "",
+        None,
+    ),
+    (20, None, None, None, None, None, None, None, None),
+]
+
+_ALIGNMENT_TYPES = {
+    "prep_sample_idx": pa.int64(),
+    "sequence_idx": pa.int64(),
+    "feature_idx": pa.int64(),
+    "flags": pa.uint16(),
+    "position": pa.int64(),
+    "stop_position": pa.int64(),
+    "cigar": pa.string(),
+    "mate_position": pa.int64(),
+}
+
+
+def _alignment_reader(columns: list[str], rows: list[tuple]) -> pa.RecordBatchReader:
+    """The alignment slice as the data plane would stream it: **exactly the projected
+    columns**, in the ticket's order. A wider stream would hide the projection drift
+    the signed column list exists to prevent, so the fake honours it."""
+    padded = [tuple(r) + (None,) * (8 - len(r)) for r in rows]
+    named = dict(zip(_ALIGNMENT_TYPES, zip(*padded, strict=True), strict=True))
+    table = pa.table(
+        {name: pa.array(list(named[name]), _ALIGNMENT_TYPES[name]) for name in columns}
+    )
+    return table.to_reader()
+
+
+def _lengths_reader_rows(rows: list[tuple[int, int]]) -> pa.RecordBatchReader:
+    """`reference_sequences` / `assembled_sequence` as their tickets stream them —
+    `sequence_hash` rides along unused on both, which is what the analytic's
+    projection has to tolerate. One reader for the two because the two surfaces have
+    the same shape; only their scope differs, and that is the ticket's business."""
+    return pa.table(
+        {
+            "feature_idx": pa.array([f for f, _ in rows], pa.int64()),
+            "sequence_hash": pa.array([None] * len(rows), pa.string()),
+            "sequence_length_bp": pa.array([n for _, n in rows], pa.int64()),
+        }
+    ).to_reader()
+
+
+def _lengths_reader() -> pa.RecordBatchReader:
+    """The whole reference's lengths — the default every reference-only test uses."""
+    return _lengths_reader_rows(_LENGTHS)
+
+
+def _taxonomy_reader(rows) -> pa.RecordBatchReader:
+    """`reference_taxonomy_visible` as the whole-reference ticket streams it —
+    `reference_idx` and `ncbi_taxon_id` ride along and the analytic's projection drops
+    them, which is what makes the sidecar's column list ours rather than the lake's."""
+    ranks = ("domain", "phylum", "class", "order", "family", "genus", "species", "strain")
+    columns = {
+        "reference_idx": pa.array([9] * len(rows), pa.int64()),
+        "feature_idx": pa.array([r[0] for r in rows], pa.int64()),
+    }
+    for i, rank in enumerate(ranks, start=1):
+        columns[rank] = pa.array([r[i] for r in rows], pa.string())
+    columns["ncbi_taxon_id"] = pa.array([None] * len(rows), pa.int64())
+    return pa.table(columns).to_reader()
+
+
+def _phylogeny_reader(rows) -> pa.RecordBatchReader:
+    """`reference_phylogeny` as the whole-reference ticket streams it. `reference_idx` and
+    `edge_id` ride along — the first is dropped by our projection, the second is carried
+    into the published tree because it is the handle back to the reference's placements."""
+    return pa.table(
+        {
+            "reference_idx": pa.array([9] * len(rows), pa.int64()),
+            "node_index": pa.array([r[0] for r in rows], pa.int64()),
+            "name": pa.array([r[1] for r in rows], pa.string()),
+            "branch_length": pa.array([r[2] for r in rows], pa.float64()),
+            "edge_id": pa.array([None] * len(rows), pa.int64()),
+            "parent_index": pa.array([r[3] for r in rows], pa.int64()),
+            "is_tip": pa.array([r[4] for r in rows], pa.bool_()),
+            "feature_idx": pa.array([r[5] for r in rows], pa.int64()),
+        }
+    ).to_reader()
+
+
+class _FakeStream:
+    def __init__(self, reader):
+        self._reader = reader
+
+    def to_reader(self):
+        return self._reader
+
+
+class _FakeFlightClient:
+    """Routes each DoGet by the ticket bytes it was signed for, so a handler that
+    streamed the lengths ticket where the alignment belongs fails here rather than
+    producing a confusing bind error."""
+
+    instances: list[_FakeFlightClient] = []
+
+    def __init__(self, url, readers):
+        self.url = url
+        self._readers = readers
+        self.tickets: list[bytes] = []
+        self.closed = False
+        _FakeFlightClient.instances.append(self)
+
+    def do_get(self, ticket, *options):
+        self.tickets.append(ticket.ticket)
+        return _FakeStream(self._readers[ticket.ticket]())
+
+    def close(self):
+        self.closed = True
+
+    # `flight.FlightClient` is itself a context manager and the handler uses it as one,
+    # so the fake has to be too — otherwise the test would pass against a handler that
+    # leaked the real client.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def _namespace(tmp_path, **overrides) -> argparse.Namespace:
+    fields = {
+        "base_url": "http://cp",
+        "data_plane_url": "grpc://dp:50051",
+        "sequencing_run_idx": 4,
+        "sequenced_pool_idx": 5,
+        "alignment_idx": 3,
+        # Reference-only by default: the combined arm is opt-in, and every existing
+        # test here is about the analytic the reference arm alone produces.
+        "denovo_alignment_idx": None,
+        "prep_sample_idx": None,
+        "coverage_scope": ft.CoverageScope.POOLED.value,
+        "coverage_threshold": 0.01,
+        "min_identity": None,
+        "min_query_coverage": None,
+        "unpaired_gate": False,
+        "circular_gate": False,
+        "circular_min_coverage": _UNSET,
+        "circular_min_identity": _UNSET,
+        "format": ftc.DEFAULT_TABLE_FORMAT,
+        "taxonomy": False,
+        "tree": False,
+        "output": tmp_path / "table.parquet",
+    }
+    return argparse.Namespace(**(fields | overrides))
+
+
+def _patched(
+    monkeypatch,
+    *,
+    alignment=None,
+    map_entries=None,
+    cohort=None,
+    feature_handles=None,
+    taxonomy_rows=None,
+    phylogeny_rows=None,
+    blocked_features=(),
+):
+    """Patch the REST seams, both ticket mints, and the Flight client; return the
+    recorder every assertion below reads. A test that wants a seam to RAISE re-patches
+    it itself afterwards, rather than this growing a parameter per failure mode."""
+    rec: dict = {"lengths_minted": 0, "taxonomy_minted": 0, "phylogeny_minted": 0}
+    _FakeFlightClient.instances = []
+
+    monkeypatch.setattr(ftc._common, "read_token", lambda *a, **k: "qk_tok")
+
+    def _alignments(*args, **kwargs):
+        rec["alignments_fetched"] = True
+        return _ALIGNMENTS_BODY
+
+    monkeypatch.setattr(ftc, "_fetch_pool_alignments", _alignments)
+    # An ACTIVE assembly run: every test here is about a run the caller may use, and
+    # `_refuse_deprecated_denovo_run` turning a deprecated one away is its own test.
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_processing",
+        lambda *a, **k: {"status": "active", "superseded_by": None},
+    )
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_alignment_cohort",
+        lambda *a, **k: {"prep_sample_idx": [1, 2] if cohort is None else cohort},
+    )
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_genome_map",
+        lambda *a, **k: genome_map_table(_MAP_ENTRIES if map_entries is None else map_entries),
+    )
+
+    def _exclusion(*args, **kwargs):
+        rec["exclusion_fetched"] = True
+        return [{"feature_idx": f} for f in blocked_features]
+
+    monkeypatch.setattr(ftc, "_fetch_reference_exclusion", _exclusion)
+
+    def _mint_ids(base_url, token, *, alignment_idx, prep_sample_idx):
+        rec["minted_cohort"] = prep_sample_idx
+        return [i for i in _IDENTIFIERS if i["prep_sample_idx"] in prep_sample_idx]
+
+    monkeypatch.setattr(ftc, "_mint_exported_identifiers", _mint_ids)
+
+    def _mint_features(base_url, token, *, genome_idx):
+        """Stands in for the exported-feature mint. Answers with each genome's own
+        accession, which is what the real mint does whenever that accession is unique
+        in the published namespace — `feature_handles` overrides it for the tests that
+        need a handle the accession would not produce."""
+        rec["minted_genomes"] = list(genome_idx)
+        resolved = (
+            {e["genome_idx"]: e["source_id"] for e in (map_entries or _MAP_ENTRIES)}
+            if feature_handles is None
+            else feature_handles
+        )
+        return [
+            {
+                "genome_idx": g,
+                "export_feature_id": resolved[g],
+                "accession": resolved[g],
+                "accession_published": True,
+            }
+            for g in genome_idx
+        ]
+
+    monkeypatch.setattr(ftc, "_mint_exported_features", _mint_features)
+
+    def _mint_processing(base_url, token, *, alignment_idx, prep_sample_idx):
+        """The processing mint. `prep_sample_idx` authorizes and is not part of the
+        handle, so the fake records it to prove the cohort is what gets sent."""
+        rec["processing_cohort"] = list(prep_sample_idx)
+        return "QP7"
+
+    monkeypatch.setattr(ftc, "_mint_exported_processing", _mint_processing)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_reference",
+        lambda *a, **k: {
+            "reference_idx": 9,
+            "name": "gg2",
+            "version": "2022.10",
+            "kind": "sequence_reference",
+            "status": "active",
+            "is_host": False,
+            "created_by_idx": 1,
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+    )
+
+    def _alignment_ticket(base_url, token, *, alignment_idx, prep_sample_idx, columns):
+        rec["columns"] = list(columns)
+        rec["ticket_cohort"] = list(prep_sample_idx)
+        return _ALIGNMENT_TICKET
+
+    def _reference_ticket(base_url, token, *, reference_idx, table):
+        """One helper signs every reference table now, so the fake dispatches on the
+        table name the same way the route does."""
+        rec["reference_idx"] = reference_idx
+        if table == ftc._TAXONOMY_TABLE:
+            rec["taxonomy_minted"] += 1
+            return _TAXONOMY_TICKET
+        if table == ftc._PHYLOGENY_TABLE:
+            rec["phylogeny_minted"] += 1
+            return _PHYLOGENY_TICKET
+        rec["lengths_minted"] += 1
+        return _LENGTHS_TICKET
+
+    monkeypatch.setattr(ftc, "_create_alignment_doget_ticket", _alignment_ticket)
+    monkeypatch.setattr(ftc, "_create_reference_doget_ticket", _reference_ticket)
+
+    rows = _ALIGNMENT if alignment is None else alignment
+    readers = {
+        # The signed cohort IS the scope on the real data plane — it serves exactly the
+        # prep_samples the ticket carries — so the fake filters by it too. Streaming
+        # rows outside the cohort would otherwise look like a passing build here and a
+        # relabel refusal in production.
+        _ALIGNMENT_TICKET: lambda: _alignment_reader(
+            rec["columns"], [r for r in rows if r[0] in rec["ticket_cohort"]]
+        ),
+        _LENGTHS_TICKET: _lengths_reader,
+        _TAXONOMY_TICKET: lambda: _taxonomy_reader(
+            _TAXONOMY if taxonomy_rows is None else taxonomy_rows
+        ),
+        _PHYLOGENY_TICKET: lambda: _phylogeny_reader(
+            _PHYLOGENY if phylogeny_rows is None else phylogeny_rows
+        ),
+    }
+    monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
+    return rec
+
+
+def _table_rows(path, *, fmt="parquet") -> list[tuple]:
+    reader = "read_parquet" if fmt == "parquet" else "read_biom"
+    with connect_with_miint() as conn:
+        return sorted(conn.execute(f"SELECT * FROM {reader}('{path}')").fetchall())
+
+
+def test_a_pooled_build_writes_the_public_table_and_its_map(monkeypatch, tmp_path, capsys):
+    """The whole recipe, from an alignment_idx to a file a user publishes: public
+    handles on both axes, and the identifier map beside it with the warning that it is
+    the one artifact not to ship."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+
+    assert _table_rows(args.output) == [
+        ("QM1", "GCF_100", 1.0),
+        ("QM1", "GCF_200", 1.0),
+        ("QM2", "GCF_200", 1.0),
+    ]
+    assert (tmp_path / "table.exported-identifier.json").is_file()
+    out = capsys.readouterr().out
+    assert ftc.IDENTIFIER_MAP_NOTE in out
+    assert str(args.output) in out
+    # The reference came from the alignment's own params, never from a flag.
+    assert rec["reference_idx"] == 9
+    assert all(client.closed for client in _FakeFlightClient.instances)
+
+
+def test_the_per_sample_scope_reaches_the_survivor_set(monkeypatch, tmp_path):
+    """The one thing a wrong wiring here would hide: `--coverage-scope` silently
+    ignored still produces a plausible table, just the pooled one. G200 clears 1%
+    only when the two samples' intervals are unioned, so its absence is the proof the
+    flag arrived."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_scope=ft.CoverageScope.PER_SAMPLE.value)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0)]
+
+
+def test_a_zero_threshold_never_opens_the_lengths_stream(monkeypatch, tmp_path):
+    """At 0 every genome with any alignment qualifies, so there is no coverage
+    calculation — and the lengths stream is its only consumer. Observed at the
+    boundary rather than in the output, because a wasted whole-reference stream
+    produces exactly the same table."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=0.0)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["lengths_minted"] == 0
+    assert _FakeFlightClient.instances[0].tickets == [_ALIGNMENT_TICKET]
+    # Every genome survives, including the one a 1% threshold drops per-sample.
+    assert len(_table_rows(args.output)) == 3
+
+
+def test_an_ungated_build_leaves_cigar_off_the_wire(monkeypatch, tmp_path):
+    """`cigar` is ~96% of an alignment row and the analytic never reads it, so the
+    default projection must not carry it — that is what the signed column list is
+    for."""
+    rec = _patched(monkeypatch)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 0
+    assert rec["columns"] == list(ft.ALIGNMENT_COLUMNS)
+    assert "cigar" not in rec["columns"]
+
+
+def test_a_gate_requests_its_columns_and_filters_the_table(monkeypatch, tmp_path):
+    """A gate pays for `cigar` and `mate_position` on the wire and must be seen to
+    change the result: dropping sample 1's 60 bp of G200 takes that genome under 1%
+    pooled, so the gate reaches the coverage filter and not just the counts."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, min_identity=0.9)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["columns"] == [*ft.ALIGNMENT_COLUMNS, "cigar", "mate_position"]
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0)]
+
+
+def test_the_gate_pools_mates_by_default(monkeypatch, tmp_path):
+    """`paired=True` is correct for single-end rows too (their partition is one row),
+    and getting it wrong in the cheap direction is a silent correctness loss — so the
+    default is the safe one, and `mate_position` riding the projection above is what
+    that costs."""
+    rec = _patched(monkeypatch)
+    ftc._handle_feature_table_build(_namespace(tmp_path, min_query_coverage=0.5), parser=None)
+    assert "mate_position" in rec["columns"]
+
+    rec = _patched(monkeypatch)
+    unpaired = _namespace(
+        tmp_path, min_query_coverage=0.5, unpaired_gate=True, output=tmp_path / "b.parquet"
+    )
+    ftc._handle_feature_table_build(unpaired, parser=None)
+    assert "mate_position" not in rec["columns"]
+
+
+def test_a_circular_gate_counts_a_read_the_reference_origin_split(monkeypatch, tmp_path):
+    """The mode end to end. Feature 20 is 10 kb and read 2 crosses its origin: two
+    records covering half the read each, which the per-record gate at 0.9 discards and
+    the pooled one keeps. The two records are one read, so the table counts it once."""
+    split = [
+        (1, 1, 10, 0, 0, 500, "500="),
+        (1, 2, 20, 0, 9_000, 10_000, "1000=1000S"),
+        (1, 2, 20, 2048, 0, 1_000, "1000H1000="),
+    ]
+    rec = _patched(monkeypatch, alignment=split)
+    args = _namespace(tmp_path, circular_gate=True, coverage_threshold=0.0)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    # `mate_position` does not ride: the circular axis tells mates apart by the read1 bit.
+    assert rec["columns"] == [*ft.ALIGNMENT_COLUMNS, "cigar"]
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0), ("QM1", "GCF_200", 1.0)]
+
+    per_record = _patched(monkeypatch, alignment=split)
+    dropped = _namespace(
+        tmp_path,
+        min_query_coverage=ft.CIRCULAR_MIN_COVERAGE,
+        coverage_threshold=0.0,
+        output=tmp_path / "b.parquet",
+    )
+    assert ftc._handle_feature_table_build(dropped, parser=None) == 0
+    assert _table_rows(dropped.output) == [("QM1", "GCF_100", 1.0)]
+    assert per_record["columns"] != rec["columns"]
+
+
+def test_a_circular_gate_streams_the_lengths_even_with_no_coverage_filter(monkeypatch, tmp_path):
+    """It asks how much of a read one contig explains, so it needs a length per feature —
+    a whole-reference read the ungated path skips entirely at threshold 0."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=0.0)
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["lengths_minted"] == 0
+
+    rec = _patched(monkeypatch)
+    circular = _namespace(
+        tmp_path, circular_gate=True, coverage_threshold=0.0, output=tmp_path / "b.parquet"
+    )
+    assert ftc._handle_feature_table_build(circular, parser=None) == 0
+    assert rec["lengths_minted"] == 1
+
+
+def test_the_circular_thresholds_reach_the_predicate(monkeypatch, tmp_path):
+    """They are parameters, so a caller can move them: the same slice keeps the split
+    read at the default 0.90 coverage floor and loses it when the floor is raised past
+    what the read explains."""
+    partial = [
+        (1, 1, 10, 0, 0, 500, "500="),
+        (1, 2, 20, 0, 9_000, 10_000, "1000=1000S"),  # half the read, alone
+    ]
+    _patched(monkeypatch, alignment=partial)
+    strict = _namespace(tmp_path, circular_gate=True, coverage_threshold=0.0)
+    assert ftc._handle_feature_table_build(strict, parser=None) == 0
+    assert _table_rows(strict.output) == [("QM1", "GCF_100", 1.0)]
+
+    _patched(monkeypatch, alignment=partial)
+    lax = _namespace(
+        tmp_path,
+        circular_gate=True,
+        circular_min_coverage=0.4,
+        coverage_threshold=0.0,
+        output=tmp_path / "b.parquet",
+    )
+    assert ftc._handle_feature_table_build(lax, parser=None) == 0
+    assert _table_rows(lax.output) == [("QM1", "GCF_100", 1.0), ("QM1", "GCF_200", 1.0)]
+
+
+def test_a_circular_threshold_without_the_mode_is_refused_not_ignored(
+    monkeypatch, tmp_path, capsys
+):
+    """A flag that only says HOW to judge does nothing on its own — the same shape as
+    `--unpaired-gate` alone, and the same refusal. Silently building an UNGATED table
+    from a command that named a threshold is the failure this closes."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_min_coverage=0.5)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "--circular-min-coverage" in err and "--circular-gate" in err
+    assert "alignments_fetched" not in rec
+    assert not args.output.exists()
+
+
+def test_the_circular_thresholds_default_only_when_omitted(monkeypatch, tmp_path):
+    """Given, they are used; omitted, the shared constants are. The namespace cannot
+    tell those apart from the value alone, which is why the flags default to a
+    sentinel."""
+    _patched(monkeypatch)
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True))
+    assert (gate.circular_min_coverage, gate.circular_min_identity) == (
+        ft.CIRCULAR_MIN_COVERAGE,
+        ft.CIRCULAR_MIN_IDENTITY,
+    )
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True, circular_min_coverage=0.5))
+    assert (gate.circular_min_coverage, gate.circular_min_identity) == (
+        0.5,
+        ft.CIRCULAR_MIN_IDENTITY,
+    )
+
+
+def test_the_identity_term_can_be_dropped_for_an_alignment_that_cannot_be_scored(
+    monkeypatch, tmp_path
+):
+    """`--circular-min-identity none` is the documented escape hatch: pooled identity is
+    NULL on a legacy-`M` CIGAR and `NULL >= 0` is NULL too, so a threshold of 0 does not
+    express it. Reaching the dataclass's `None` is the whole point."""
+    _patched(monkeypatch)
+    gate = ftc._gate_from_args(_namespace(tmp_path, circular_gate=True, circular_min_identity=None))
+    assert gate.circular_min_identity is None
+    assert gate.circular_min_coverage == ft.CIRCULAR_MIN_COVERAGE
+
+
+def test_a_circular_gate_with_a_cigar_threshold_is_refused_before_any_round_trip(
+    monkeypatch, tmp_path, capsys
+):
+    """Two different questions, and combining them drops exactly the split records the
+    pooling exists to rescue. Refused from the flags alone, before the first REST call."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, min_query_coverage=0.9)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "--circular-min-identity" in capsys.readouterr().err
+    assert "alignments_fetched" not in rec
+
+
+def test_a_circular_gate_with_the_unpaired_flag_is_refused(monkeypatch, tmp_path, capsys):
+    """`--unpaired-gate` says how to pool a placement's mates, which the circular axis
+    does not do — so together they say nothing coherent."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, unpaired_gate=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "--unpaired-gate" in capsys.readouterr().err
+
+
+def test_an_unpaired_gate_over_paired_reads_is_refused(monkeypatch, tmp_path, capsys):
+    """The escape hatch exists (a slice whose mates did not both map cannot be pooled),
+    so it can also be reached by mistake — and judging a placement's mates
+    independently orphans one of them without any error. The refusal has to arrive as
+    a message and a non-zero exit."""
+    paired = [(1, 1, 10, 1, 0, 500, "500="), (1, 1, 10, 1, 500, 1000, "500=", 0)]
+    _patched(monkeypatch, alignment=paired)
+    args = _namespace(tmp_path, min_identity=0.9, unpaired_gate=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "paired" in capsys.readouterr().err
+    assert not args.output.exists()
+
+
+def test_unpaired_gate_alone_is_refused_before_any_round_trip(monkeypatch, tmp_path, capsys):
+    """`--unpaired-gate` only says how to judge a gate, so on its own it silently does
+    nothing — the same shape as a gate with no threshold, which the shared module refuses
+    for the same reason. It needs nothing but the flags, so it is refused before the
+    first REST call rather than after two."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, unpaired_gate=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "--unpaired-gate" in capsys.readouterr().err
+    assert "alignments_fetched" not in rec
+    assert not _FakeFlightClient.instances
+
+
+def test_an_unreachable_control_plane_is_named_not_traced(monkeypatch, tmp_path, capsys):
+    """No HTTP response at all — the control plane is down, or --base-url is wrong. A
+    transport traceback tells a user nothing they can act on."""
+
+    def _refused(*args, **kwargs):
+        raise httpx.ConnectError("connection refused")
+
+    _patched(monkeypatch)
+    monkeypatch.setattr(ftc, "_fetch_pool_alignments", _refused)
+
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
+    assert "--base-url" in capsys.readouterr().err
+
+
+def test_a_flight_failure_is_named_not_traced(monkeypatch, tmp_path, capsys):
+    """The data plane's half of the recipe fails on its own terms — an expired ticket, a
+    dead instance — and must arrive as a message, not a gRPC traceback."""
+    import pyarrow.flight as flight
+
+    rec = _patched(monkeypatch)
+
+    def _dead_stream(self, ticket, *options):
+        rec["reached_flight"] = True
+        raise flight.FlightUnavailableError("data plane unavailable")
+
+    monkeypatch.setattr(_FakeFlightClient, "do_get", _dead_stream)
+
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
+    assert rec["reached_flight"]
+    assert "flight error" in capsys.readouterr().err
+    assert all(client.closed for client in _FakeFlightClient.instances)
+
+
+def test_a_cohort_named_on_the_command_line_is_what_gets_signed(monkeypatch, tmp_path):
+    """The explicit list has to reach BOTH the ticket and the mint, not just one of
+    them. And narrowing it is not a filter on the same answer: dropping sample 2 takes
+    G200's pooled breadth from 1.2% to 0.6%, so the genome leaves the table — which is
+    why the cohort is part of the scientific question rather than a convenience.
+    """
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, prep_sample_idx=[1])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["ticket_cohort"] == [1]
+    assert rec["minted_cohort"] == [1]
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0)]
+
+
+def test_an_omitted_cohort_resolves_to_the_pools_mintable_set(monkeypatch, tmp_path):
+    """The cohort route returns what is both readable by the caller and completed for
+    this alignment — a valid mint body by construction — so the common case needs no
+    sample list at all."""
+    rec = _patched(monkeypatch)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 0
+    assert rec["ticket_cohort"] == [1, 2]
+
+
+def test_an_empty_resolved_cohort_says_so_before_minting_anything(monkeypatch, tmp_path, capsys):
+    """Empty is a legitimate answer from the cohort route ('nothing here you may
+    mint'), but it is not a table: both mints reject an empty cohort, and a 422 from
+    the far end would name a body the user never wrote."""
+    _patched(monkeypatch, cohort=[])
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
+    err = capsys.readouterr().err
+    assert "no prep_sample" in err
+    assert not _FakeFlightClient.instances
+
+
+def test_a_genome_map_over_the_cap_stops_the_build_with_the_size(monkeypatch, tmp_path, capsys):
+    """The route refuses over its cap rather than truncating, because a lookup table
+    silently missing rows yields a WRONG table. The 413 and the real size it names
+    have to reach the user."""
+    detail = "Genome map for reference 9 has 400000 entries, over the 250000 maximum"
+
+    def _too_big(*args, **kwargs):
+        request = httpx.Request("GET", "http://cp/genome-map")
+        raise httpx.HTTPStatusError(
+            detail, request=request, response=httpx.Response(413, text=detail, request=request)
+        )
+
+    _patched(monkeypatch)
+    monkeypatch.setattr(ftc, "_fetch_genome_map", _too_big)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
+    err = capsys.readouterr().err
+    assert "413" in err
+    assert "400000" in err
+
+
+def test_an_existing_output_is_refused_before_any_streaming(monkeypatch, tmp_path, capsys):
+    """The recipe streams a cohort's alignment and a whole reference before it has
+    anything to write, so discovering the collision at the end would waste all of it —
+    and the file it would collide with may be one somebody published."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path)
+    args.output.write_text("an earlier run")
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "refusing to overwrite" in capsys.readouterr().err
+    assert args.output.read_text() == "an earlier run"
+    assert not _FakeFlightClient.instances
+
+
+def test_a_mint_answering_one_handle_for_two_genomes_stops_the_build(monkeypatch, tmp_path, capsys):
+    """A BIOM write SUMS duplicate (feature_id, sample_id) pairs, so merging two
+    organisms under one handle would never surface in the file.
+
+    The published namespace is UNIQUE across the mint's live rows, so the server cannot
+    answer this way — a genome whose accession is taken gets a `QF<n>`. What this pins
+    is the client-side backstop: it exits non-zero with the message and leaves nothing
+    behind.
+
+    A genome with no label at all is not reachable either: the mint is asked for the
+    roll-up's OWN output, so the label set covers the counts by construction.
+    """
+    _patched(monkeypatch, feature_handles={100: "GCF_1", 200: "GCF_1"})
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "merges genomes" in capsys.readouterr().err
+    assert not list(tmp_path.iterdir())
+
+
+def test_the_row_labels_are_minted_only_for_the_genomes_actually_published(monkeypatch, tmp_path):
+    """A public handle is a durable act, so the mint is asked for the genomes the
+    roll-up EMITTED — not for every genome in the reference. Minting the reference's
+    whole set because a table mentioned it would leave permanent public identifiers for
+    rows nobody published.
+
+    At this threshold G200 (0.012 breadth) fails and G100 (0.5) survives, so the map
+    covers two genomes and exactly one is minted for.
+    """
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=0.02)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["minted_genomes"] == [100]
+
+
+def test_biom_is_written_when_asked_for(monkeypatch, tmp_path):
+    """The other format, read back through miint's own reader: the same numbers, so
+    the choice is only about who opens the file next."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, format="biom", output=tmp_path / "table.biom")
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _table_rows(args.output, fmt="biom") == [
+        ("QM1", "GCF_100", 1.0),
+        ("QM1", "GCF_200", 1.0),
+        ("QM2", "GCF_200", 1.0),
+    ]
+
+
+def test_an_empty_cohort_result_still_writes_a_readable_table(monkeypatch, tmp_path):
+    """Every genome dropped by the threshold is a legitimate answer, and it must be a
+    real file rather than an error or an absent one — the path a caller exercises least
+    and would notice last."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=1.0)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _table_rows(args.output) == []
+
+
+def test_the_data_plane_url_reaches_the_flight_client(monkeypatch, tmp_path):
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, data_plane_url="grpc+tls://qiita.example.com:443")
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _FakeFlightClient.instances[0].url == "grpc+tls://qiita.example.com:443"
+
+
+# The flags a valid `build` needs, so each parser test states only its own delta
+# instead of re-spelling thirteen argv elements. A `None` value drops the flag.
+_BUILD_FLAGS = {
+    "--sequencing-run-idx": "4",
+    "--sequenced-pool-idx": "5",
+    "--alignment-idx": "3",
+    "--coverage-threshold": "0.01",
+    "--output": "/tmp/ft/gut.parquet",
+    "--data-plane-url": "grpc://dp:50051",
+}
+
+
+def _build_argv(**overrides) -> list[str]:
+    """`feature-table build` argv from `_BUILD_FLAGS`, with `--flag-name` written as
+    `flag_name=`. A value of `None` omits the flag; a list repeats it."""
+    flags = _BUILD_FLAGS | {f"--{name.replace('_', '-')}": v for name, v in overrides.items()}
+    argv = ["feature-table", "build"]
+    for flag, value in flags.items():
+        if value is None:
+            continue
+        for one in value if isinstance(value, list) else [value]:
+            argv += [flag, one]
+    return argv
+
+
+def test_parser_wires_the_build_with_parquet_and_pooled_as_defaults():
+    from pathlib import Path
+
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    args = _build_parser().parse_args(_build_argv())
+    assert args.handler is ftc._handle_feature_table_build
+    assert args.output == Path("/tmp/ft/gut.parquet")
+    assert args.format == ftc.DEFAULT_TABLE_FORMAT == "parquet"
+    assert args.coverage_scope == ft.CoverageScope.POOLED.value
+    assert args.coverage_threshold == 0.01
+    assert args.prep_sample_idx is None  # omitted -> resolved from the pool
+    assert args.min_identity is None and args.min_query_coverage is None
+    assert args.unpaired_gate is False
+    assert args.circular_gate is False
+    # Omitted is a sentinel, not the threshold: passing one without --circular-gate has
+    # to be distinguishable from not passing it at all.
+    assert args.circular_min_coverage is _UNSET
+    assert args.circular_min_identity is _UNSET
+
+
+def test_parser_takes_the_circular_mode_and_its_two_thresholds():
+    """Both are settable on the command, which is the point of them being parameters."""
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    args = _build_parser().parse_args(
+        _build_argv(circular_min_coverage="0.8", circular_min_identity="0.99") + ["--circular-gate"]
+    )
+    assert args.circular_gate is True
+    assert (args.circular_min_coverage, args.circular_min_identity) == (0.8, 0.99)
+
+    # `none` drops the identity term, the way `--lane none` spells a NULL lane.
+    dropped = _build_parser().parse_args(
+        _build_argv(circular_min_identity="none") + ["--circular-gate"]
+    )
+    assert dropped.circular_min_identity is None
+
+
+def test_parser_takes_a_repeated_cohort_and_the_per_sample_scope():
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    args = _build_parser().parse_args(
+        _build_argv(
+            prep_sample_idx=["1", "2"],
+            coverage_scope="per-sample",
+            coverage_threshold="0",
+            min_identity="0.95",
+            format="biom",
+            output="/tmp/ft/gut.biom",
+        )
+    )
+    assert args.prep_sample_idx == [1, 2]
+    assert args.coverage_scope == ft.CoverageScope.PER_SAMPLE.value
+    assert args.min_identity == 0.95
+    assert args.format == "biom"
+
+
+@pytest.mark.parametrize(
+    "missing", ["alignment_idx", "coverage_threshold", "output", "data_plane_url"]
+)
+def test_parser_rejects_a_build_missing_any_required_flag(missing):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(_build_argv(**{missing: None}))
+
+
+@pytest.mark.parametrize("value", ["1.5", "-0.1", "not-a-number"])
+def test_parser_rejects_a_threshold_that_is_not_a_proportion(value):
+    """The thresholds are proportions in [0, 1] and a bad one is a usage error, caught
+    at parse time rather than after a cohort's worth of streaming."""
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(_build_argv(coverage_threshold=value))
+
+
+# ---------------------------------------------------------------------------
+# The taxonomy sidecar
+# ---------------------------------------------------------------------------
+
+
+def test_the_taxonomy_sidecar_names_exactly_the_tables_rows(monkeypatch, tmp_path, capsys):
+    """The point of both files coming from one mint: they join on one column.
+
+    G100 is classified to genus and reports a blank species; G200's taxonomy row is all
+    NULL, which is how ingest records an unclassified feature — it appears with NULL
+    ranks rather than being left out, because a row missing from the sidecar reads as
+    though it were unclassified anyway and there would be no way to tell.
+    """
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, taxonomy=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    sidecar = tmp_path / "table.taxonomy.parquet"
+    assert sidecar.exists()
+    assert str(sidecar) in capsys.readouterr().out
+
+    with connect_with_miint() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM read_parquet('{sidecar}') ORDER BY feature_id"
+        ).fetchall()
+        columns = [
+            r[0]
+            for r in conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{sidecar}')").fetchall()
+        ]
+
+    assert columns == list(ft.TAXONOMY_SIDECAR_COLUMNS)
+    assert rows == [
+        (
+            "GCF_100",
+            "d__Bacteria",
+            "p__Bacillota",
+            "c__Bacilli",
+            "o__Lactobacillales",
+            "f__Listeriaceae",
+            "g__Listeria",
+            "s__",
+            None,
+        ),
+        ("GCF_200", None, None, None, None, None, None, None, None),
+    ]
+    # The join key is the table's own, not a second vocabulary.
+    assert {r[0] for r in rows} == {r[1] for r in _table_rows(args.output)}
+
+
+def test_no_sidecar_is_written_without_the_flag(monkeypatch, tmp_path):
+    """And no taxonomy ticket is minted either — a whole reference's taxonomy is not
+    something to stream for a caller who did not ask for it."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["taxonomy_minted"] == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "table.exported-identifier.json",
+        "table.manifest.json",
+        "table.parquet",
+    ]
+
+
+def test_a_blocked_lowest_contig_does_not_unclassify_its_genome(monkeypatch, tmp_path):
+    """The exclusion case, end to end. G200's two contigs: the lower one is excluded so
+    the stream carries no row for it, and the higher one is classified. The genome must
+    publish the surviving member's lineage rather than tiling as unclassified.
+    """
+    _patched(
+        monkeypatch,
+        map_entries=[
+            {"feature_idx": 10, "genome_idx": 100, "source": "refseq", "source_id": "GCF_100"},
+            {"feature_idx": 20, "genome_idx": 200, "source": "refseq", "source_id": "GCF_200"},
+            {"feature_idx": 21, "genome_idx": 200, "source": "refseq", "source_id": "GCF_200"},
+        ],
+        # No row for feature 20 at all — that is what an exclusion looks like here.
+        taxonomy_rows=[
+            (10, "Bacteria", None, None, None, None, None, None, None),
+            (21, "Archaea", None, None, None, None, None, None, None),
+        ],
+    )
+    args = _namespace(tmp_path, taxonomy=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    with connect_with_miint() as conn:
+        rows = conn.execute(
+            f"SELECT feature_id, domain FROM read_parquet("
+            f"'{tmp_path / 'table.taxonomy.parquet'}') ORDER BY feature_id"
+        ).fetchall()
+    assert rows == [("GCF_100", "d__Bacteria"), ("GCF_200", "d__Archaea")]
+
+
+def test_a_reference_whose_taxonomy_repeats_a_feature_is_refused(monkeypatch, tmp_path, capsys):
+    """Two rows for one feature, which the reference's own ingest forbids — and here they
+    disagree, one calling feature 10 Bacteria and the other Archaea.
+
+    The reduction resolves a repeat to one row per genome, so nothing downstream can see
+    it: the sidecar would be the right SHAPE and carry whichever lineage the scan reached.
+    That is why the repeat is measured on the streamed taxonomy instead.
+    """
+    _patched(
+        monkeypatch,
+        taxonomy_rows=[
+            (10, "Bacteria", None, None, None, None, None, None, None),
+            (10, "Archaea", None, None, None, None, None, None, None),
+            (20, None, None, None, None, None, None, None, None),
+        ],
+    )
+    args = _namespace(tmp_path, taxonomy=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "more than one row" in capsys.readouterr().err
+    assert not list(tmp_path.iterdir()), "no half-bundle survives a refused sidecar"
+
+
+def test_alignments_to_features_with_no_genome_are_reported(monkeypatch, tmp_path, capsys):
+    """The roll-up's INNER JOIN to the map drops them silently, and for some references
+    that is most of the data streamed. Nothing else in the recipe would ever mention it,
+    so a table that is a fraction of the alignment says so.
+    """
+    _patched(
+        monkeypatch,
+        map_entries=[
+            {"feature_idx": 10, "genome_idx": 100, "source": "refseq", "source_id": "GCF_100"},
+        ],
+    )
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    err = capsys.readouterr().err
+    assert "no genome in this reference" in err
+    assert "2 of 3 alignment rows" in err
+
+
+# ---------------------------------------------------------------------------
+# The sheared tree
+# ---------------------------------------------------------------------------
+
+
+def _tree_rows(path) -> list[tuple]:
+    with connect_with_miint() as conn:
+        return conn.execute(
+            f"SELECT name, branch_length, is_tip FROM read_parquet('{path}') ORDER BY node_index"
+        ).fetchall()
+
+
+def test_the_tree_is_sheared_to_the_published_rows_and_keeps_their_distances(monkeypatch, tmp_path):
+    """Why shearing rather than filtering: c30 drops because feature 30 has
+    no genome, `inner` is left with one child and collapses, and c10's branch becomes
+    0.2 + 0.1 — the distance it had in the whole tree. Tips are named the way the table's
+    rows are, so the two files join on one column."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    rows = _tree_rows(tmp_path / "table.tree.parquet")
+
+    tips = {name: branch for name, branch, is_tip in rows if is_tip}
+    assert tips == pytest.approx({"GCF_100": 0.3, "GCF_200": 0.3})
+    # Two tips and the new root, which the shear leaves unnamed — `inner` is gone.
+    assert [name for name, _, is_tip in rows if not is_tip] == [""]
+
+
+def test_a_published_genome_whose_only_tip_is_blocked_stops_the_build(
+    monkeypatch, tmp_path, capsys
+):
+    """The exclusion contract the phylogeny defers to, applied. Feature 10 is G100's only
+    tip; blocking it leaves the genome published — nothing blocked its counts — with no
+    position in the tree that a curator accepts.
+
+    The blocklist is a REST read of its own because the phylogeny stream cannot carry it:
+    unlike the alignment and the taxonomy, it has no exclusion-aware view.
+    """
+    rec = _patched(monkeypatch, blocked_features=[10])
+    args = _namespace(tmp_path, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert rec["exclusion_fetched"]
+    err = capsys.readouterr().err
+    assert "GCF_100" in err
+    assert "blocked" in err
+    assert not list(tmp_path.iterdir())
+
+
+def test_no_tree_is_written_or_streamed_without_the_flag(monkeypatch, tmp_path):
+    """A whole reference's tree is the largest stream in this recipe, so the flag has to
+    gate the ticket mint too, not just the file."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["phylogeny_minted"] == 0
+    assert not (tmp_path / "table.tree.parquet").exists()
+
+
+def test_both_companions_land_beside_the_table_when_both_are_asked_for(monkeypatch, tmp_path):
+    """Four files, and the same `feature_id` vocabulary across all three that carry one."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, taxonomy=True, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "table.exported-identifier.json",
+        "table.manifest.json",
+        "table.parquet",
+        "table.taxonomy.parquet",
+        "table.tree.parquet",
+    ]
+    published = {feature_id for _, feature_id, _ in _table_rows(tmp_path / "table.parquet")}
+    tips = {name for name, _, is_tip in _tree_rows(tmp_path / "table.tree.parquet") if is_tip}
+    assert tips == published
+
+
+def test_a_reference_with_no_tree_stops_the_build_rather_than_writing_a_bundle(
+    monkeypatch, tmp_path, capsys
+):
+    """An absent phylogeny is an empty stream, not an error — the recipe has to notice."""
+    _patched(monkeypatch, phylogeny_rows=[])
+    args = _namespace(tmp_path, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "no phylogeny" in capsys.readouterr().err
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_published_genome_with_two_tips_stops_the_build(monkeypatch, tmp_path, capsys):
+    """A contig-level tree for a genome the table publishes as one row. The shear would
+    accept it and emit both tips under the one handle."""
+    both_contigs_of_g100 = [
+        (0, "c10", 0.2, 2, True, 10),
+        (1, "c11", 0.5, 2, True, 11),
+        (2, "inner", 0.1, 4, False, None),
+        (3, "c20", 0.3, 4, True, 20),
+        (4, "", None, None, False, None),
+    ]
+    _patched(
+        monkeypatch,
+        map_entries=[
+            *_MAP_ENTRIES,
+            {"feature_idx": 11, "genome_idx": 100, "source": "refseq", "source_id": "GCF_100"},
+        ],
+        phylogeny_rows=both_contigs_of_g100,
+    )
+    args = _namespace(tmp_path, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "GCF_100" in capsys.readouterr().err
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_duckdb_failure_is_named_not_traced(monkeypatch, tmp_path, capsys):
+    """The analytic runs on the caller's own machine, so duckdb's own failures are the
+    ones a user is most likely to hit and least able to place: an out-of-memory shearing
+    a six-figure tree says nothing about whose memory ran out.
+
+    Raised at the shear because that is the recipe's peak, but the handler's clause is
+    what is under test — any duckdb call in the recipe has the same exposure.
+    """
+    import duckdb
+
+    def _oom(_con):
+        raise duckdb.OutOfMemoryException("failed to allocate block of 256MB")
+
+    _patched(monkeypatch)
+    monkeypatch.setattr(ftc, "_shear_tree", _oom)
+
+    assert ftc._handle_feature_table_build(_namespace(tmp_path, tree=True), parser=None) == 1
+    err = capsys.readouterr().err
+    assert "on this machine" in err
+    assert "256MB" in err
+    assert not list(tmp_path.iterdir())
+
+
+def test_an_empty_cohort_still_writes_a_readable_tree(monkeypatch, tmp_path):
+    """Every genome dropped by the threshold is a legitimate answer, and the bundle stays
+    whole: an empty table, an empty sidecar, an empty tree. `shear_tree` raises rather
+    than shearing a tree to nothing, so the empty case cannot go through it — and reaching
+    it left a raw `InvalidInputException` escaping as a traceback, past every `except` the
+    handler has."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, coverage_threshold=1.0, taxonomy=True, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _table_rows(args.output) == []
+    assert _tree_rows(tmp_path / "table.tree.parquet") == []
+    with connect_with_miint() as conn:
+        described = conn.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{tmp_path / 'table.tree.parquet'}')"
+        ).fetchall()
+    assert [(r[0], r[1]) for r in described] == list(ft.TREE_SCHEMA.items())
+
+
+# ---------------------------------------------------------------------------
+# The bundle manifest
+# ---------------------------------------------------------------------------
+
+
+def _manifest(tmp_path) -> dict:
+    return json.loads((tmp_path / "table.manifest.json").read_text())
+
+
+def _walk(node, *, keys: set, strings: set) -> None:
+    """Every key and every string value anywhere in the document."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            keys.add(key)
+            _walk(value, keys=keys, strings=strings)
+    elif isinstance(node, list):
+        for item in node:
+            _walk(item, keys=keys, strings=strings)
+    elif isinstance(node, str):
+        strings.add(node)
+
+
+def test_the_manifest_records_the_processing_by_its_public_handle(monkeypatch, tmp_path):
+    """The whole reason the handle exists: a manifest has to say what produced the table,
+    and `alignment_idx` is ours. The digest rides alongside because it identifies the
+    config by content, which is what somebody reproducing the table actually needs."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    manifest = _manifest(tmp_path)
+
+    assert manifest["processing"]["export_processing_id"] == "QP7"
+    assert manifest["processing"]["params_hash"] == canonical_params_hash(_PARAMS).hex()
+    assert manifest["processing"]["aligner"] == "minimap2"
+    # The reference by name and version, resolved rather than carried as an idx.
+    assert manifest["processing"]["reference"] == {
+        "name": "gg2",
+        "version": "2022.10",
+        "kind": "sequence_reference",
+    }
+    # The cohort authorizes the mint and is not part of the handle.
+    assert rec["processing_cohort"] == [1, 2]
+
+
+def test_the_manifest_names_the_cohort_and_the_table_it_describes(monkeypatch, tmp_path):
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    table = _manifest(tmp_path)["table"]
+
+    assert table["cohort"] == ["QM1", "QM2"]
+    assert table["rows"] == len(_table_rows(args.output))
+    assert table["format"] == "parquet"
+    assert table["coverage_scope"] == ft.CoverageScope.POOLED.value
+    assert table["coverage_threshold"] == 0.01
+    assert table["gate"] is None
+    assert rec["minted_cohort"] == [1, 2]
+
+
+def test_the_manifest_records_the_gate_that_filtered_the_table(monkeypatch, tmp_path):
+    """A gate changes which rows exist, so a record of the table that omitted it would
+    describe a different table."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, min_identity=0.9)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _manifest(tmp_path)["table"]["gate"] == {
+        "min_identity": 0.9,
+        "min_query_coverage": None,
+        "mates_pooled": True,
+    }
+
+
+def test_the_manifest_records_the_circular_gates_own_thresholds(monkeypatch, tmp_path):
+    """The other axis has other keys, and reporting it under the CIGAR ones would record
+    a build with two thresholds as one with none."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, circular_gate=True, circular_min_identity=0.99)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _manifest(tmp_path)["table"]["gate"] == {
+        "circular_min_coverage": ft.CIRCULAR_MIN_COVERAGE,
+        "circular_min_identity": 0.99,
+    }
+
+
+def test_the_manifest_lists_every_file_in_the_bundle_including_itself(monkeypatch, tmp_path):
+    """Basenames, so the record does not describe the machine that built it — and the
+    list is derived from the same targets the writer uses, not a second guess at them."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, taxonomy=True, tree=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _manifest(tmp_path)["files"] == [
+        "table.parquet",
+        "table.exported-identifier.json",
+        "table.manifest.json",
+        "table.taxonomy.parquet",
+        "table.tree.parquet",
+    ]
+    assert sorted(_manifest(tmp_path)["files"]) == sorted(p.name for p in tmp_path.iterdir())
+
+
+def test_the_manifest_records_what_computed_the_table(monkeypatch, tmp_path):
+    """The miint build especially: every bioinformatics primitive is compiled INTO the
+    extension, so two clients on different builds can get different numbers from the same
+    input. Read from the catalog, since the client's cache never refreshes itself."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    tools = _manifest(tmp_path)["tools"]
+
+    assert set(tools) == {"duckdb", "miint", "qiita_cli"}
+    with connect_with_miint() as conn:
+        expected = conn.execute(
+            "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'miint'"
+        ).fetchone()[0]
+    assert tools["miint"] == expected
+    assert tools["duckdb"] and tools["qiita_cli"]
+    # A path on this machine is not something a published file should carry.
+    assert not [value for value in tools.values() if "/" in value]
+
+
+def test_no_internal_identifier_appears_anywhere_in_the_manifest(monkeypatch, tmp_path):
+    """The property the two mints exist to make possible, asserted over the whole
+    document rather than field by field — a future field cannot quietly reintroduce one."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, taxonomy=True, tree=True, min_identity=0.5)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    keys: set[str] = set()
+    strings: set[str] = set()
+    _walk(_manifest(tmp_path), keys=keys, strings=strings)
+
+    assert not [key for key in keys if "idx" in key]
+    assert not [value for value in strings if "idx" in value]
+    # `shard_ids` and `mask_idx` ride the params blob, which is why the manifest lifts
+    # `aligner` out of it rather than copying it whole.
+    assert "shard_ids" not in keys
+    assert "params" not in keys
+
+
+def test_a_params_hash_mismatch_stops_the_build_before_anything_is_written(
+    monkeypatch, tmp_path, capsys
+):
+    """The manifest cites the digest as its reproducibility key, so publishing one the
+    client never verified would publish a claim it cannot support."""
+    rec = _patched(monkeypatch)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_pool_alignments",
+        lambda *a, **k: {
+            "alignments": [
+                {"alignment_idx": 3, "params": _PARAMS, "params_hash": "00" * 32},
+            ]
+        },
+    )
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "params_hash" in capsys.readouterr().err
+    assert not list(tmp_path.iterdir())
+    # Both mints, named separately. The processing handle is the one this test's premise
+    # is about, and asserting only the identifier mint would prove it just transitively —
+    # via an ordering inside `_run_build` that nothing here checks.
+    assert "processing_cohort" not in rec, "no public handle for a processing we cannot vouch for"
+    assert "minted_cohort" not in rec, "nothing should be minted for a build that cannot run"
+
+
+def test_a_version_the_manifest_cannot_resolve_is_recorded_as_unknown(monkeypatch, tmp_path):
+    """These describe the build, not the data. A run whose table, digests and sidecars are
+    all correct must not be thrown away because a version string could not be read — and
+    `PackageNotFoundError` is the one that happens, on a from-source run with no installed
+    distribution. It is also an ImportError, which no `except` in the handler catches, so
+    unguarded it would be a traceback rather than a build.
+    """
+    _patched(monkeypatch)
+
+    def _absent(name):
+        raise ftc.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(ftc.metadata, "version", _absent)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    tools = _manifest(tmp_path)["tools"]
+    assert tools["qiita_cli"] == "unknown"
+    # The two it could still read are unaffected.
+    assert tools["duckdb"] and tools["duckdb"] != "unknown"
+    assert tools["miint"] != "unknown"
+
+
+class _VersionCatalog:
+    """A connection stub answering the two version queries. `duckdb_extensions()` cannot be
+    made to yield a NULL version through a real install, so the guard for that row is
+    pinned here instead of by inspection."""
+
+    def __init__(self, miint_row):
+        self._miint_row = miint_row
+
+    def execute(self, sql):
+        self._row = ("v1.5.4",) if "SELECT version()" in sql else self._miint_row
+        return self
+
+    def fetchone(self):
+        return self._row
+
+
+@pytest.mark.parametrize("miint_row", [None, (None,)], ids=["no-row", "null-version"])
+def test_an_unresolvable_miint_version_is_a_string_not_a_json_null(miint_row):
+    """A row that is present but carries no version is a non-empty tuple, so testing the
+    tuple alone would return None and write `"miint": null` — breaking the declared
+    `dict[str, str]` while looking like a working fallback."""
+    tools = ftc._tool_versions(_VersionCatalog(miint_row))
+    assert tools["miint"] == "unknown"
+    assert all(isinstance(value, str) for value in tools.values())
+
+
+# ---------------------------------------------------------------------------
+# The combined (inverted open reference) build: --denovo-alignment-idx.
+#
+# The analytic's rules are pinned against real miint in qiita-common; what is
+# pinned here is this driver's own wiring — the second alignment's summary comes
+# from the SAME verified pool listing, the map is fetched per sample and keyed by
+# it, the lengths are fetched only for the samples the map named, and the
+# reference-only path is untouched.
+# ---------------------------------------------------------------------------
+
+_DENOVO_PARAMS = {
+    "subject": "assembly",
+    "aligner": "minimap2",
+    # Same mask as the reference arm's `_PARAMS`; the pairing rule refuses otherwise.
+    "mask_idx": 2,
+    "processing_idx": 11,
+}
+_DENOVO_TICKET = b"denovo-alignment-ticket"
+_DENOVO_LENGTHS_TICKET = b"denovo-lengths-ticket"
+
+# Sample 1 assembled contig 50; sample 2 assembled the same content-addressed
+# contig, under its own genome. Read 2 is placed by BOTH arms — it is the reference
+# arm's row on contig 20 — so precedence has something to decide.
+_DENOVO_MAP = {
+    1: [{"feature_idx": 50, "genome_idx": 900, "source": "qiita", "source_id": "qiita-900"}],
+    2: [{"feature_idx": 50, "genome_idx": 901, "source": "qiita", "source_id": "qiita-901"}],
+}
+_DENOVO_ALIGNMENT = [
+    (1, 2, 50, 0, 0, 500, "500="),  # read 2, also placed by the reference arm
+    (2, 9, 50, 0, 0, 500, "500="),  # sample 2's own, on the same contig
+]
+_DENOVO_LENGTHS = [(50, 1000)]
+
+
+def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None):
+    """`_patched`, plus the three de novo seams. Returns the same recorder, with
+    `denovo_map_samples`, `denovo_lengths_samples` and `arm_tickets` added."""
+    # The exported-feature mint has to answer for BOTH arms' genomes: a qiita genome
+    # is minted a handle exactly as a reference one is, which is the point of the two
+    # arms sharing one `qiita.genome` space.
+    rec = _patched(
+        monkeypatch,
+        feature_handles={100: "GCF_100", 200: "GCF_200", 900: "qiita-900", 901: "qiita-901"},
+    )
+    rec["denovo_map_samples"] = []
+    rec["denovo_lengths_samples"] = []
+    rec["arm_tickets"] = []
+
+    body = {
+        "alignments": [
+            *_ALIGNMENTS_BODY["alignments"],
+            {
+                "alignment_idx": 4,
+                "params": _DENOVO_PARAMS,
+                "params_hash": canonical_params_hash(_DENOVO_PARAMS).hex(),
+                "samples_completed": 2,
+                "samples_total": 2,
+            },
+        ]
+    }
+    monkeypatch.setattr(ftc, "_fetch_pool_alignments", lambda *a, **k: body)
+
+    the_map = _DENOVO_MAP if denovo_map is None else denovo_map
+
+    def _assembly_map(base_url, token, *, prep_sample_idx, processing_idx):
+        rec["denovo_map_samples"].append(prep_sample_idx)
+        rec["denovo_map_processing_idx"] = processing_idx
+        if prep_sample_idx not in the_map:
+            # What the route returns for a sample that assembled nothing, which the
+            # recipe reads as "no de novo arm" rather than as an error.
+            raise httpx.HTTPStatusError(
+                "no contigs",
+                request=httpx.Request("GET", "http://cp"),
+                response=httpx.Response(404),
+            )
+        return genome_map_table(the_map[prep_sample_idx])
+
+    monkeypatch.setattr(ftc, "_fetch_assembly_genome_map", _assembly_map)
+
+    def _assembly_ticket(base_url, token, *, prep_sample_idx, processing_idx, table):
+        rec["denovo_lengths_samples"].append(prep_sample_idx)
+        rec["denovo_lengths_table"] = table
+        return _DENOVO_LENGTHS_TICKET
+
+    monkeypatch.setattr(ftc, "_create_assembly_run_doget_ticket", _assembly_ticket)
+
+    # The alignment mint is ONE helper for both arms, dispatching on alignment_idx —
+    # exactly as the human cohort route does, which is subject-agnostic.
+    #
+    # **This fake enforces what the real route enforces**, which the rest of this
+    # module's fakes do not need to: `authorize_completed_alignment_cohort` refuses
+    # a cohort member with no `alignment_sample` row for that alignment, and a
+    # sample that assembled nothing has none — `align-denovo` ends NO_DATA for it
+    # before a gate row exists. A fake that signed any cohort would let the driver
+    # ask for the whole build's samples and still go green, which is exactly the
+    # difference between the two drivers this module exists to catch.
+    def _alignment_ticket(base_url, token, *, alignment_idx, prep_sample_idx, columns):
+        rec["arm_tickets"].append(alignment_idx)
+        rec["columns"] = list(columns)
+        rec["ticket_cohort"] = list(prep_sample_idx)
+        if alignment_idx == 4:
+            rec["denovo_ticket_cohort"] = list(prep_sample_idx)
+            unaligned = sorted(set(prep_sample_idx) - set(the_map))
+            if unaligned:
+                raise httpx.HTTPStatusError(
+                    f"{len(unaligned)} prep_sample(s) not completed for alignment 4",
+                    request=httpx.Request("POST", "http://cp"),
+                    response=httpx.Response(422),
+                )
+            return _DENOVO_TICKET
+        return _ALIGNMENT_TICKET
+
+    monkeypatch.setattr(ftc, "_create_alignment_doget_ticket", _alignment_ticket)
+
+    denovo_rows = _DENOVO_ALIGNMENT if denovo_alignment is None else denovo_alignment
+    readers = {
+        _ALIGNMENT_TICKET: lambda: _alignment_reader(
+            rec["columns"], [r for r in _ALIGNMENT if r[0] in rec["ticket_cohort"]]
+        ),
+        _DENOVO_TICKET: lambda: _alignment_reader(
+            rec["columns"], [r for r in denovo_rows if r[0] in rec["ticket_cohort"]]
+        ),
+        _LENGTHS_TICKET: _lengths_reader,
+        _DENOVO_LENGTHS_TICKET: lambda: _lengths_reader_rows(_DENOVO_LENGTHS),
+        _TAXONOMY_TICKET: lambda: _taxonomy_reader(_TAXONOMY),
+        _PHYLOGENY_TICKET: lambda: _phylogeny_reader(_PHYLOGENY),
+    }
+    monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
+    return rec
+
+
+def test_the_client_refuses_a_deprecated_denovo_run(monkeypatch, tmp_path, capsys):
+    """The client driver applies the deprecation rule too, with the shared wording.
+
+    `feature_table.denovo_alignment_processing_idx` states why neither driver may be
+    the only one that checks. The score gate genuinely is server-only — `bin_quality`
+    is un-mintable over HTTP — but lifecycle status is an ordinary read, so a table
+    the CLI builds from a withdrawn assembly would be a divergence rather than a
+    documented limit.
+    """
+    _patched_combined(monkeypatch)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_processing",
+        lambda *a, **k: {"status": "deprecated", "superseded_by": 3},
+    )
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "deprecated" in err
+    # The replacement is named, which is the whole point of reading the row.
+    assert "assembly run 3 replaces it" in err
+    # Nothing is written: the refusal is before any staging.
+    assert not args.output.exists()
+
+
+def test_a_deprecated_denovo_run_with_no_replacement_says_so_client_side(
+    monkeypatch, tmp_path, capsys
+):
+    """`superseded_by` is optional on a deprecation, so the client gets the same
+    distinct message the resolver does rather than a reference to run `None`."""
+    _patched_combined(monkeypatch)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_processing",
+        lambda *a, **k: {"status": "deprecated", "superseded_by": None},
+    )
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "records no replacement" in err
+    assert "None" not in err
+
+
+def test_a_combined_build_counts_each_read_on_one_arm(monkeypatch, tmp_path):
+    """Read 2 is placed by BOTH arms and is counted once, on the de novo side.
+
+    **The discriminator is the 1.0, not the genome.** Without precedence read 2 would
+    sit in both arms, and `woltka_ogu` splits a read across the distinct genomes it
+    sees — so it would come back as 0.5 against `qiita-900` and 0.5 against
+    `GCF_200`, a plausible pair of numbers rather than an error. Asserting the whole
+    value is what tells the two apart.
+
+    Sample 2's read 9 is the second arm's own contribution, on the same
+    content-addressed contig under its own genome: 1.0 there proves the map join
+    carried `prep_sample_idx`, since the contig-only join would have split it too.
+    """
+    rec = _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["arm_tickets"] == [3, 4], "the reference arm first, then the de novo one"
+    rows = _table_rows(args.output)
+    assert ("QM1", "qiita-900", 1.0) in rows
+    assert ("QM2", "qiita-901", 1.0) in rows
+
+
+def test_a_combined_build_keys_the_map_and_the_lengths_by_sample(monkeypatch, tmp_path):
+    """One map fetch and one lengths mint per cohort sample, both at the assembly run
+    the de novo alignment's own params named — never a caller-supplied one. The
+    lengths read the contig surface, which carries hash and length and no bytes."""
+    rec = _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_map_samples"] == [1, 2]
+    assert rec["denovo_map_processing_idx"] == 11
+    assert rec["denovo_lengths_samples"] == [1, 2]
+    assert rec["denovo_lengths_table"] == "assembled_sequence"
+
+
+def test_a_sample_that_assembled_nothing_stays_reference_only(monkeypatch, tmp_path):
+    """The 404 on that sample's map is the design's graceful path, not an error: the
+    build succeeds and the sample keeps its reference placement.
+
+    Run at threshold 0 so breadth of coverage does not confound the point — at 1% it
+    does, and that is the subject of the test below rather than of this one.
+    """
+    rec = _patched_combined(monkeypatch, denovo_map={1: _DENOVO_MAP[1]})
+    args = _namespace(tmp_path, denovo_alignment_idx=4, coverage_threshold=0.0)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_map_samples"] == [1, 2], "both were asked; only one had a run"
+    # **The de novo mint got only the assembled sample.** The real route refuses a
+    # cohort member with no `alignment_sample` row, so passing the whole cohort here
+    # 422s the entire build — turning the graceful path into a hard failure.
+    assert rec["denovo_ticket_cohort"] == [1]
+    rows = _table_rows(args.output)
+    assert ("QM2", "GCF_200", 1.0) in rows, "sample 2 is still on the reference arm"
+    assert not [r for r in rows if r[0] == "QM2" and r[1].startswith("qiita-")], (
+        "and it has no de novo genome, having assembled nothing"
+    )
+
+
+def test_a_sample_with_no_run_is_never_asked_for_its_lengths(monkeypatch, tmp_path):
+    """The lengths cohort comes from the STAGED MAP, not from the requested one: a
+    sample whose map 404'd has no assembly run, and the DoGet mint for it would 404
+    too. Asserted separately from the fallback above because it needs a threshold
+    that actually opens the lengths streams."""
+    rec = _patched_combined(monkeypatch, denovo_map={1: _DENOVO_MAP[1]})
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_lengths_samples"] == [1]
+
+
+def test_the_reference_arm_can_lose_a_genome_to_the_coverage_filter(monkeypatch, tmp_path):
+    """**The consequence of precedence that looks like a result, not an error.**
+
+    G200 clears the 1% threshold in the reference-only build of this same fixture,
+    on the two samples' extending intervals pooled (0.6% + 0.6%). The combined build
+    gives sample 1's read to the de novo arm, so only sample 2's 0.6% is left and
+    G200 drops out entirely — for BOTH samples, pooled scope keeping or dropping a
+    genome cohort-wide.
+
+    `test_a_pooled_build_writes_the_public_table_and_its_map` is the control: it is
+    this fixture with no de novo arm, and G200 is in it twice.
+    """
+    _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert not [r for r in _table_rows(args.output) if r[1] == "GCF_200"]
+
+
+def test_a_reference_alignment_cannot_be_passed_as_the_de_novo_arm(monkeypatch, tmp_path, capsys):
+    """Passing the same alignment twice is refused on `params.subject`, by the rule
+    the server-side resolver applies. Unchecked it is not an error: precedence would
+    reconcile the reference arm against itself and empty it.
+
+    The handler turns the ValueError into a non-zero exit and a message, as it does
+    every other bad-flag refusal — so this asserts the exit code and the wording
+    rather than the exception.
+    """
+    _patched_combined(monkeypatch)
+    args = _namespace(tmp_path, denovo_alignment_idx=3)
+
+    assert ftc._handle_feature_table_build(args, parser=None) != 0
+    assert "not a de novo alignment" in capsys.readouterr().err
+
+
+def test_the_circular_gate_is_refused_alongside_the_de_novo_arm(monkeypatch, tmp_path):
+    """`--circular-gate` would re-judge both arms against thresholds their producers
+    never aligned at — redundant for the de novo arm, which align_denovo already
+    gated, and wrong for the reference arm, which align_sharded scored per record."""
+    args = _namespace(tmp_path, denovo_alignment_idx=4, circular_gate=True)
+    with pytest.raises(ValueError, match="without it"):
+        ftc._gate_from_args(args)
+
+
+def test_a_cohort_where_nothing_assembled_degrades_to_a_reference_only_build(
+    monkeypatch, tmp_path, capsys
+):
+    """Every sample 404s on its map, so there is no second arm at all. The build must
+    fall back to reference-only rather than sign an unscoped de novo ticket (which the
+    mint refuses) or bind against a de novo slice nothing staged.
+
+    The boundary case of the graceful path, and the one where "skip the samples the
+    map did not name" leaves nothing to skip TO.
+    """
+    rec = _patched_combined(monkeypatch, denovo_map={})
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["arm_tickets"] == [3], "no de novo ticket was minted"
+    assert rec["denovo_lengths_samples"] == []
+    assert _table_rows(args.output) == [
+        ("QM1", "GCF_100", 1.0),
+        ("QM1", "GCF_200", 1.0),
+        ("QM2", "GCF_200", 1.0),
+    ], "the counts are the reference-only build's"
+    # **But the bundle is not.** The table matching a reference-only build is exactly
+    # why the request has to be recorded: without it a combined ask and a
+    # reference-only ask leave no distinguishable trace, and the caller has no way to
+    # tell a degraded build from the one they asked for.
+    denovo = json.loads((tmp_path / "table.manifest.json").read_text())["table"]["denovo"]
+    assert denovo["requested_alignment_idx"] == 4
+    assert denovo["applied"] is False
+    assert denovo["prep_samples_with_a_de_novo_arm"] == 0
+    assert "reference-only table" in capsys.readouterr().err
+
+
+def test_a_partly_assembled_cohort_says_how_many_samples_had_no_arm(monkeypatch, tmp_path, capsys):
+    """A build where SOME samples degrade is the case a caller is least likely to
+    notice: the table is populated, the exit code is 0, and the missing arm shows up
+    only as counts that are lower than expected. Say it on stderr and record it."""
+    _patched_combined(monkeypatch, denovo_map={1: _DENOVO_MAP[1]})
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert "1 of 2 prep_sample(s) have no contigs" in capsys.readouterr().err
+    denovo = json.loads((tmp_path / "table.manifest.json").read_text())["table"]["denovo"]
+    assert denovo["applied"] is True
+    assert denovo["processing_idx"] == 11
+    assert denovo["prep_samples_with_a_de_novo_arm"] == 1
+
+
+def test_a_reference_only_build_records_no_denovo_block(monkeypatch, tmp_path):
+    """The key is absent, not null: a build that never asked for a second arm should
+    read exactly as it did before the arm existed."""
+    _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert "denovo" not in json.loads((tmp_path / "table.manifest.json").read_text())["table"]

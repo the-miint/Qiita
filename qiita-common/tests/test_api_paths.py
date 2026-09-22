@@ -71,6 +71,16 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_REFERENCE_PREFIX",
         "PATH_REFERENCE_GENOME_MEMBER",
     ),
+    (
+        "URL_REFERENCE_GENOME_MAP",
+        "PATH_REFERENCE_PREFIX",
+        "PATH_REFERENCE_GENOME_MAP",
+    ),
+    (
+        "URL_REFERENCE_GENOME_MAP_PARQUET",
+        "PATH_REFERENCE_PREFIX",
+        "PATH_REFERENCE_GENOME_MAP_PARQUET",
+    ),
     # /host-filter-profile
     (
         "URL_HOST_FILTER_PROFILE_LIST",
@@ -110,6 +120,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
     # /upload
     ("URL_UPLOAD_BY_IDX", "PATH_UPLOAD_PREFIX", "PATH_UPLOAD_BY_IDX"),
     ("URL_UPLOAD_DONE", "PATH_UPLOAD_PREFIX", "PATH_UPLOAD_DONE"),
+    # /ena-import-batch
+    (
+        "URL_ENA_IMPORT_BATCH_BY_IDX",
+        "PATH_ENA_IMPORT_BATCH_PREFIX",
+        "PATH_ENA_IMPORT_BATCH_BY_IDX",
+    ),
     # /sequence-range
     (
         "URL_SEQUENCE_RANGE_BY_PREP_SAMPLE",
@@ -171,6 +187,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_STUDY_PREFIX",
         "PATH_STUDY_LOOKUP_BY_ACCESSION",
     ),
+    # /run-folder
+    (
+        "URL_RUN_FOLDER_INSPECT",
+        "PATH_RUN_FOLDER_PREFIX",
+        "PATH_RUN_FOLDER_INSPECT",
+    ),
     # /sequencing-run
     (
         "URL_SEQUENCING_RUN_BY_IDX",
@@ -223,6 +245,16 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCED_POOL_ALIGN_PLAN",
     ),
     (
+        "URL_SEQUENCED_POOL_ALIGNMENT",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_POOL_ALIGNMENT",
+    ),
+    (
+        "URL_SEQUENCED_POOL_ALIGNMENT_COHORT",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_POOL_ALIGNMENT_COHORT",
+    ),
+    (
         "URL_SEQUENCED_SAMPLE_EXCEPTIONS",
         "PATH_SEQUENCING_RUN_PREFIX",
         "PATH_SEQUENCED_SAMPLE_EXCEPTIONS",
@@ -238,6 +270,26 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_BIOSAMPLE_LIST_BY_STUDY",
         "PATH_STUDY_PREFIX",
         "PATH_BIOSAMPLE_LIST_BY_STUDY",
+    ),
+    (
+        "URL_BIOSAMPLE_BY_STUDY_AND_IDX",
+        "PATH_STUDY_PREFIX",
+        "PATH_BIOSAMPLE_BY_STUDY_AND_IDX",
+    ),
+    (
+        "URL_BIOSAMPLE_METADATA_BY_STUDY",
+        "PATH_STUDY_PREFIX",
+        "PATH_BIOSAMPLE_METADATA_BY_STUDY",
+    ),
+    (
+        "URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY",
+        "PATH_STUDY_PREFIX",
+        "PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY",
+    ),
+    (
+        "URL_BIOSAMPLE_STUDY_FIELD_BY_IDX",
+        "PATH_STUDY_PREFIX",
+        "PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX",
     ),
     ("URL_BIOSAMPLE_BY_IDX", "PATH_BIOSAMPLE_PREFIX", "PATH_BIOSAMPLE_BY_IDX"),
     (
@@ -272,6 +324,16 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY",
     ),
     (
+        "URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX",
+        "PATH_STUDY_PREFIX",
+        "PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX",
+    ),
+    (
+        "URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY",
+        "PATH_STUDY_PREFIX",
+        "PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY",
+    ),
+    (
         "URL_SEQUENCED_SAMPLE_LIST_BY_POOL",
         "PATH_SEQUENCING_RUN_PREFIX",
         "PATH_SEQUENCED_SAMPLE_LIST_BY_POOL",
@@ -280,6 +342,24 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_SEQUENCED_SAMPLE_BY_IDX",
         "PATH_SEQUENCED_SAMPLE_PREFIX",
         "PATH_SEQUENCED_SAMPLE_BY_IDX",
+    ),
+    # /sample-label
+    (
+        "URL_EXPORTED_IDENTIFIER",
+        "PATH_EXPORTED_IDENTIFIER_PREFIX",
+        "PATH_EXPORTED_IDENTIFIER_ROOT",
+    ),
+    # /exported-feature
+    (
+        "URL_EXPORTED_FEATURE",
+        "PATH_EXPORTED_FEATURE_PREFIX",
+        "PATH_EXPORTED_FEATURE_ROOT",
+    ),
+    # /exported-processing
+    (
+        "URL_EXPORTED_PROCESSING",
+        "PATH_EXPORTED_PROCESSING_PREFIX",
+        "PATH_EXPORTED_PROCESSING_ROOT",
     ),
     # /prep-sample
     (
@@ -292,15 +372,82 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_PREP_SAMPLE_PREFIX",
         "PATH_PREP_SAMPLE_RETIRED",
     ),
+    (
+        "URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY",
+        "PATH_STUDY_PREFIX",
+        "PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY",
+    ),
+    (
+        "URL_PREP_SAMPLE_STUDY_FIELD_BY_IDX",
+        "PATH_STUDY_PREFIX",
+        "PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX",
+    ),
+    # /biosample-global-field, /prep-sample-global-field
+    (
+        "URL_BIOSAMPLE_GLOBAL_FIELD_LIST",
+        "PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX",
+        "PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT",
+    ),
+    (
+        "URL_PREP_SAMPLE_GLOBAL_FIELD_LIST",
+        "PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX",
+        "PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT",
+    ),
     # /read-masked
     ("URL_READ_MASKED_DOGET", "PATH_READ_MASKED_PREFIX", "PATH_READ_MASKED_DOGET"),
     # /read (Flight DoGet ticket for a block's reads)
     ("URL_READ_DOGET", "PATH_READ_PREFIX", "PATH_READ_DOGET"),
+    # /assembly (Flight DoGet ticket for one assembly run's contigs, and that
+    # run's contig -> genome map)
+    ("URL_ASSEMBLY_DOGET", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_DOGET"),
+    ("URL_ASSEMBLY_RUN_DOGET", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_RUN_DOGET"),
+    ("URL_ASSEMBLY_GENOME_MAP", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_GENOME_MAP"),
+    (
+        "URL_ASSEMBLY_GENOME_MAP_PARQUET",
+        "PATH_ASSEMBLY_PREFIX",
+        "PATH_ASSEMBLY_GENOME_MAP_PARQUET",
+    ),
     # /mask-definition
     (
         "URL_MASK_DEFINITION_BY_IDX",
         "PATH_MASK_DEFINITION_PREFIX",
         "PATH_MASK_DEFINITION_BY_IDX",
+    ),
+    (
+        "URL_MASK_DEFINITION_PREP_SAMPLE",
+        "PATH_MASK_DEFINITION_PREFIX",
+        "PATH_MASK_DEFINITION_PREP_SAMPLE",
+    ),
+    (
+        "URL_MASK_DEFINITION_STATUS",
+        "PATH_MASK_DEFINITION_PREFIX",
+        "PATH_MASK_DEFINITION_STATUS",
+    ),
+    (
+        "URL_MASK_DEFINITION_SAMPLE_STATUS",
+        "PATH_MASK_DEFINITION_PREFIX",
+        "PATH_MASK_DEFINITION_SAMPLE_STATUS",
+    ),
+    # /processing (assembly run identity + its lifecycle)
+    (
+        "URL_PROCESSING_BY_IDX",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_BY_IDX",
+    ),
+    (
+        "URL_PROCESSING_PREP_SAMPLE",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_PREP_SAMPLE",
+    ),
+    (
+        "URL_PROCESSING_STATUS",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_STATUS",
+    ),
+    (
+        "URL_PROCESSING_SAMPLE_STATUS",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_SAMPLE_STATUS",
     ),
     # /alignment-definition
     (
@@ -310,6 +457,7 @@ _TRIPLES: list[tuple[str, str, str]] = [
     ),
     # /alignment (Flight DoGet ticket for the alignment sink)
     ("URL_ALIGNMENT_DOGET", "PATH_ALIGNMENT_PREFIX", "PATH_ALIGNMENT_DOGET"),
+    ("URL_ALIGNMENT_COHORT_DOGET", "PATH_ALIGNMENT_PREFIX", "PATH_ALIGNMENT_COHORT_DOGET"),
 ]
 
 

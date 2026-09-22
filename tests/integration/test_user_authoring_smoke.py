@@ -19,27 +19,26 @@ smoke covers full-pipeline execution). The ticket-status assertion is
 therefore permissive on `state`.
 """
 
-import base64
 import json
 import os
-import socket
 import subprocess
 import sys
-import time
 import uuid
 from pathlib import Path
 
 import httpx
 import pytest
+from qiita_common.api_paths import URL_UPLOAD_PREFIX
 from qiita_common.models import WorkTicketState
 
-from qiita_control_plane.testing.postgres import resolve_postgres_url
-
+# 1.3.0, not 1.0.0: this smoke submits UPLOAD HANDLES (a USER may not name a
+# host path), and `fastq_upload_idx` only exists in the widened schema.
+_FASTQ_TO_PARQUET_VERSION = "1.3.0"
 _FASTQ_TO_PARQUET_YAML_PATH = (
     Path(__file__).parent.parent.parent
     / "workflows"
     / "fastq-to-parquet"
-    / "1.0.0.yaml"
+    / f"{_FASTQ_TO_PARQUET_VERSION}.yaml"
 )
 
 # The ticket-status assertion accepts any WorkTicketState value because
@@ -47,110 +46,6 @@ _FASTQ_TO_PARQUET_YAML_PATH = (
 # read. WorkTicketState is a StrEnum, so its members compare equal to
 # the plain strings the CLI prints.
 _WORK_TICKET_STATES = frozenset(WorkTicketState)
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture
-def cp_server(tmp_path, signing_key):
-    """Spawn the control-plane app under uvicorn against the test
-    Postgres; yield its base URL.
-
-    `COMPUTE_ORCHESTRATOR_URL` points at a dead port so the
-    work-ticket POST's compute-backend guard passes (it only checks the
-    client is non-None) while the background dispatch simply fails —
-    irrelevant to what this test pins. The CP→CO token file must exist
-    on disk because `ComputeBackendClient.__init__` reads it eagerly,
-    so the fixture writes a dummy one.
-    """
-    port = _free_port()
-    token_file = tmp_path / "cp-to-co.token"
-    token_file.write_text("unused-dispatch-token")
-    # Settings.from_env() requires PATH_SCRATCH, CONTACT_EMAIL, and (since the
-    # cookie split) LOGIN_COOKIE_SECRET_KEY — the CP would fail to boot without
-    # them. PATH_SCRATCH/ticket and PATH_SCRATCH/staging are derived but don't
-    # need to exist for this smoke (the dispatch points at a dead orchestrator
-    # port, so the runner never reaches mkdir); the value just needs to be an
-    # absolute path so the boot-time validation passes.
-    env = {
-        **os.environ,
-        "DATABASE_URL": resolve_postgres_url(),
-        # CP signs Flight tickets with the Ed25519 private seed; the cookie key
-        # is a distinct required secret (from_env fails without it).
-        "FLIGHT_TICKET_SIGNING_KEY": base64.b64encode(signing_key).decode(),
-        "LOGIN_COOKIE_SECRET_KEY": base64.b64encode(b"\x02" * 32).decode(),
-        "COMPUTE_ORCHESTRATOR_URL": "http://127.0.0.1:1",
-        "CP_TO_CO_TOKEN_PATH": str(token_file),
-        "PATH_SCRATCH": str(tmp_path / "scratch"),
-        "CONTACT_EMAIL": "qiita-test@example.org",
-    }
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "qiita_control_plane.main:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--log-level",
-            "warning",
-        ],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    base_url = f"http://127.0.0.1:{port}"
-
-    def _fail(reason: str) -> None:
-        proc.terminate()
-        out, err = proc.communicate(timeout=5)
-        pytest.fail(
-            f"{reason}\nstdout: {out.decode()[:2000]}\nstderr: {err.decode()[:2000]}"
-        )
-
-    deadline = time.monotonic() + 20.0
-    healthy = False
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            _fail(f"cp server exited during startup (rc={proc.returncode})")
-        try:
-            resp = httpx.get(f"{base_url}/health", timeout=1.0)
-            if resp.status_code == 200:
-                # The CP's aggregated /health probes the CO and DP
-                # too, but this fixture intentionally configures a
-                # dead CO (see COMPUTE_ORCHESTRATOR_URL above) and
-                # doesn't spawn a DP — so the aggregate top-level
-                # status will be `degraded`. Check the cp sub-
-                # service instead, since that's the only piece this
-                # test cares about being up. Fall back to top-level
-                # status for legacy /health responses that omit the
-                # services dict.
-                body = resp.json()
-                services = body.get("services") or {}
-                cp_status = services.get("cp", body.get("status"))
-                if cp_status == "ok":
-                    healthy = True
-                    break
-        except httpx.HTTPError:
-            pass
-        time.sleep(0.25)
-    if not healthy:
-        _fail("cp server did not become healthy within 20s")
-
-    yield base_url
-
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
 
 
 @pytest.fixture
@@ -166,8 +61,10 @@ async def synced_fastq_to_parquet_action(postgres_pool, tmp_path):
     workflows_dir.mkdir(parents=True)
     yaml_text = _FASTQ_TO_PARQUET_YAML_PATH.read_text()
     test_version = f"smoke-{uuid.uuid4()}"
-    yaml_text = yaml_text.replace("version: 1.0.0", f"version: {test_version}")
-    (workflows_dir / "1.0.0.yaml").write_text(yaml_text)
+    yaml_text = yaml_text.replace(
+        f"version: {_FASTQ_TO_PARQUET_VERSION}", f"version: {test_version}"
+    )
+    (workflows_dir / f"{_FASTQ_TO_PARQUET_VERSION}.yaml").write_text(yaml_text)
 
     actions = load_actions(tmp_path / "workflows")
     assert len(actions) == 1
@@ -205,6 +102,23 @@ def _invoke_cli(base_url: str, token: str, *args: str) -> subprocess.CompletedPr
         text=True,
         timeout=30,
     )
+
+
+def _create_upload_slot(base_url: str, token: str, source_filename: str) -> int:
+    """Mint an upload slot over HTTP and return its `upload_idx`.
+
+    The one non-CLI step in this smoke: `qiita submit-reads` is the CLI that
+    mints a slot, and it streams over Flight to a data plane this fixture does
+    not run. The slot alone is what the submit gate reads.
+    """
+    resp = httpx.post(
+        f"{base_url}{URL_UPLOAD_PREFIX}",
+        json={"source_filename": source_filename},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["upload_idx"]
 
 
 def _run_cli(base_url: str, token: str, *args: str) -> dict:
@@ -357,11 +271,22 @@ async def test_user_authoring_smoke_via_cli(
 
         # 6. ticket submit — fastq-to-parquet, prep_sample-scoped. The
         #    audience admits USER; the per-study ADMIN check passes via
-        #    owner-bypass. Both fastq basenames start with the
-        #    --pool-item-id from step 5, so the work-ticket POST route's
-        #    filename-prefix gate admits the submission.
-        fastq_fwd = f"/scratch/{pool_item_id}_R1.fastq"
-        fastq_rev = f"/scratch/{pool_item_id}_R2.fastq"
+        #    owner-bypass.
+        #
+        #    A USER submits UPLOAD HANDLES, not host paths: naming a
+        #    `fastq_path` is wet_lab_admin+. Minting the two slots needs
+        #    `ticket:doput`, which is on the USER ceiling for exactly this
+        #    reason. No DoPut follows — the slots stay `pending` and the
+        #    dispatch dies against the dead orchestrator, which this test
+        #    already tolerates; what is under test here is the submit gate.
+        #    Each source_filename starts with the --pool-item-id from step 5,
+        #    so the route's filename-prefix gate admits the submission.
+        fwd_upload = _create_upload_slot(
+            cp_server, user_token, f"{pool_item_id}_R1.fastq"
+        )
+        rev_upload = _create_upload_slot(
+            cp_server, user_token, f"{pool_item_id}_R2.fastq"
+        )
         ticket = _run_cli(
             cp_server,
             user_token,
@@ -374,7 +299,12 @@ async def test_user_authoring_smoke_via_cli(
             "--prep-sample-idx",
             str(prep_sample_idx),
             "--context-json",
-            json.dumps({"fastq_path": fastq_fwd, "reverse_fastq_path": fastq_rev}),
+            json.dumps(
+                {
+                    "fastq_upload_idx": fwd_upload,
+                    "reverse_fastq_upload_idx": rev_upload,
+                }
+            ),
         )
         ticket_idx = ticket["work_ticket_idx"]
         created_ticket_idxs.append(ticket_idx)
@@ -395,9 +325,11 @@ async def test_user_authoring_smoke_via_cli(
             "kind": "prep_sample",
             "prep_sample_idx": prep_sample_idx,
         }
+        # Stored verbatim as submitted — the runner rewrites the handles into
+        # `fastq_path` bindings at dispatch, not at submit.
         assert status["action_context"] == {
-            "fastq_path": fastq_fwd,
-            "reverse_fastq_path": fastq_rev,
+            "fastq_upload_idx": fwd_upload,
+            "reverse_fastq_upload_idx": rev_upload,
         }
         # State may have advanced (or FAILED) as the background dispatch
         # raced against the dead orchestrator — assert only that it is a

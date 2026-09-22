@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import asyncpg
@@ -53,9 +54,11 @@ from .repositories.block import (
 from .repositories.mask_definition import mint_mask_definition
 from .repositories.sequencing_run import fetch_sequencing_run_platform
 from .runner import (
+    AdapterSetHashes,
     ReferenceNotFound,
     _build_mask_params,
     _resolve_reference_index_path,
+    mask_params_both_derivations,
 )
 
 if TYPE_CHECKING:
@@ -218,10 +221,11 @@ async def resolve_block_mask_adapter_hash(
     staging_root,
     sequencing_run_idx: int,
     sequenced_pool_idx: int,
-) -> str | None:
-    """Return the adapter_set_hash the block mask identity must fold in — computed
-    to match the per-sample read-mask mint EXACTLY, so a block-masked sample and a
-    per-sample read-mask of the identical config collapse to one mask_idx.
+) -> AdapterSetHashes:
+    """Return the adapter identity the block mask must fold in, under both
+    derivations — computed to match the per-sample read-mask mint EXACTLY, so a
+    block-masked sample and a per-sample read-mask of the identical config
+    collapse to one mask_idx.
 
     The per-sample runner folds the hash iff `_workflow_needs_adapters(read-mask
     steps)` (the qc step declares `adapter_parquet`) AND a default adapter
@@ -230,20 +234,24 @@ async def resolve_block_mask_adapter_hash(
     inputs (not on the config alone) — so the two mask identities stay identical
     even if the read-mask YAML ever drops adapters while a default reference stays
     configured. When it must materialize but no `staging_root` is available it
-    raises AdapterMaterializationUnavailable (the route → 503)."""
+    raises AdapterMaterializationUnavailable (the route → 503).
+
+    The materialization is what the legacy digest needs; the current digest is a
+    Postgres read.
+    """
     from .runner import (
         _fetch_action,
-        _materialize_backfill_adapter_set_hash,
+        _materialize_adapter_set_hashes,
         _workflow_needs_adapters,
     )
 
     if default_adapter_reference_idx is None:
-        return None
+        return AdapterSetHashes(None, None)
     action = await _fetch_action(pool, _MASK_FILTER_WORKFLOW, _MASK_FILTER_VERSION)
     if action is None or not _workflow_needs_adapters(action.steps):
         # The read-mask filter workflow doesn't fold an adapter hash into its
         # mask identity, so neither does the block plan (keeps them identical).
-        return None
+        return AdapterSetHashes(None, None)
     if staging_root is None:
         raise AdapterMaterializationUnavailable(
             "a default adapter reference is configured and the read-mask workflow "
@@ -252,7 +260,7 @@ async def resolve_block_mask_adapter_hash(
         )
     workspace = staging_root / f"block-plan-adapter-{sequencing_run_idx}-{sequenced_pool_idx}"
     workspace.mkdir(parents=True, exist_ok=True)
-    return await _materialize_backfill_adapter_set_hash(
+    return await _materialize_adapter_set_hashes(
         pool,
         default_adapter_reference_idx=default_adapter_reference_idx,
         data_plane_url=data_plane_url,
@@ -495,7 +503,7 @@ async def plan_and_submit_blocks(
     sequenced_pool_idx: int,
     force_decision: SampleHostFilter | None,
     only_missing: bool,
-    adapter_set_hash: str | None,
+    adapter_set_hashes: AdapterSetHashes,
     originator_principal_idx: int,
     block_action_id: str,
     block_action_version: str,
@@ -510,11 +518,12 @@ async def plan_and_submit_blocks(
     partition's `mask_idx` and the host/instrument `action_context`), back-filling
     `block.work_ticket_idx`. After commit each ticket is dispatched.
 
-    `adapter_set_hash` is resolved by the caller (a data-plane DoGet over the
-    canonical adapter set) and threaded into the mask identity so it matches what
-    a per-sample read-mask would mint. `only_missing` drops samples already
-    carrying a `mask_sample` row for their resolved mask (an interrupted plan is
-    re-runnable without duplicating work).
+    `adapter_set_hashes` is resolved by the caller over the canonical adapter set
+    and threaded into the mask identity so it matches what a per-sample read-mask
+    would mint — `current` is what the mask mints on, `legacy` the fallback lookup
+    key that finds a mask minted under the byte derivation. `only_missing` drops
+    samples already carrying a `mask_sample` row for their resolved mask (an
+    interrupted plan is re-runnable without duplicating work).
 
     Host filtering is resolved PER SAMPLE from each sample's `host_taxon_id`
     metadata + the run's platform (`resolve_pool_sample_decisions`), not chosen
@@ -576,11 +585,14 @@ async def plan_and_submit_blocks(
             key = (s.prep_protocol_idx, decision)
             mask_idx = mask_by_key.get(key)
             if mask_idx is None:
-                params = _mask_params_for(
-                    decision,
-                    prep_protocol_idx=s.prep_protocol_idx,
-                    instrument_model=instrument_model,
-                    adapter_set_hash=adapter_set_hash,
+                params, legacy_params = mask_params_both_derivations(
+                    partial(
+                        _mask_params_for,
+                        decision,
+                        prep_protocol_idx=s.prep_protocol_idx,
+                        instrument_model=instrument_model,
+                    ),
+                    adapter_set_hashes,
                 )
                 mask_row = await mint_mask_definition(
                     conn,
@@ -588,6 +600,8 @@ async def plan_and_submit_blocks(
                     filter_version=_MASK_FILTER_VERSION,
                     params=params,
                     principal_idx=originator_principal_idx,
+                    legacy_params=legacy_params,
+                    adapter_hash_scheme=adapter_set_hashes.scheme(),
                 )
                 mask_idx = mask_row["mask_idx"]
                 mask_by_key[key] = mask_idx

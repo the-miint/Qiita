@@ -215,7 +215,7 @@ async def test_mask_sample_primary_key(postgres_pool):
 async def test_mask_sample_state_check(postgres_pool):
     defs = await _check_defs(postgres_pool, "mask_sample")
     joined = " ".join(defs.values())
-    for state in ("pending", "completed"):
+    for state in ("pending", "completed", "invalidated"):
         assert state in joined, f"mask_sample.state CHECK is missing {state!r}: {defs}"
 
 

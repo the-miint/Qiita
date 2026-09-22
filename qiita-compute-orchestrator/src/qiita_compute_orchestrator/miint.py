@@ -162,10 +162,11 @@ def apply_duckdb_settings(
 #    in actual RSS, and the overshoot grows with parallelism (per-thread operator
 #    state — sort/HASH_AGG runs that DuckDB doesn't perfectly bound). A flat
 #    headroom that is fine for the 4-thread steps is tight for the 8-thread `load`
-#    step; fastq_to_parquet's R11 note measured ~2.4 GB *resident* per thread on
-#    long-read work, most of it inside the limit. We reserve ~0.5 GB/thread on
-#    TOP of the limit as the above-limit margin — an envelope sized for the
-#    8-thread `load` step, to refine against a real genome-scale MaxRSS.
+#    step. fastq_to_parquet.py's DuckDB resource caps derive the per-thread
+#    resident figure for long-read work, most of it inside the limit; we reserve
+#    ~0.5 GB/thread on TOP of the limit as the above-limit margin — an envelope
+#    sized for the 8-thread `load` step, to refine against a real genome-scale
+#    MaxRSS.
 DUCKDB_BASE_HEADROOM_GB = 2
 DUCKDB_PER_THREAD_HEADROOM_GB = 0.5
 
@@ -256,14 +257,12 @@ def open_miint_conn() -> duckdb.DuckDBPyConnection:
 
 
 def stage_miint_extension() -> str:
-    """Deploy-time staging: FORCE INSTALL miint into the configured
-    extension_directory, then LOAD it to prove the staged build is usable.
+    """Deploy-time staging: install miint (and httpfs, per `miint_install_sql`)
+    into the configured extension_directory, then LOAD to prove it is usable.
 
-    Runs **once per deploy** (via `scripts/stage-miint-extension.sh`), not per
-    job — so FORCE (refresh to the mirror's current build) is the right call
-    here, unlike the retired per-job install. Returns the resolved
-    extension_directory for the caller to report (or the DuckDB default marker
-    when MIINT_EXTENSION_DIRECTORY is unset, e.g. in a dev/test stage)."""
+    Runs once per deploy, so FORCE is right for miint — it refreshes the shared
+    directory to the mirror's current build. Returns the resolved
+    extension_directory for the caller to report."""
     with open_conn() as conn:
         conn.execute(miint_install_sql(force=True))
         conn.execute(miint_load_sql())

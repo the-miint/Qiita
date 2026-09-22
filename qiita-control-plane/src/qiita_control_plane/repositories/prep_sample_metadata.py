@@ -25,8 +25,18 @@ PREP_SAMPLE_METADATA_SPEC = EntityMetadataSpec(
     study_field_table="qiita.prep_sample_study_field",
     study_field_idx_column="prep_sample_study_field_idx",
     study_field_global_fk_column="prep_sample_global_field_idx",
+    study_field_display_name_unique_constraint="prep_sample_study_field_display_name_unique",
     global_field_unique_index_name="prep_sample_metadata_one_value_per_global_field",
     local_unique_per_field_index_name="prep_sample_metadata_unique_per_field",
+    unique_in_study_index_names=frozenset(
+        {
+            "prep_sample_metadata_unique_in_study_text",
+            "prep_sample_metadata_unique_in_study_numeric",
+            "prep_sample_metadata_unique_in_study_date",
+        }
+    ),
+    unique_in_study_no_missing_constraint="prep_sample_metadata_unique_in_study_no_missing_value",
     link_table="qiita.prep_sample_to_study",
     link_entity_key_column="prep_sample_idx",
+    metadata_retired_link_trigger="prep_sample_metadata_reject_if_link_retired",
 )

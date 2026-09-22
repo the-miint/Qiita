@@ -46,12 +46,17 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from qiita_common.actions import FASTQ_PATH_CONTEXT_KEYS, Audience
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
+from qiita_common.actions import (
+    FASTQ_PATH_CONTEXT_KEYS,
+    PATH_SUFFIX,
+    UPLOAD_IDX_SUFFIX,
+    Audience,
+)
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_BY_IDX,
     PATH_WORK_TICKET_CANCEL,
@@ -79,6 +84,7 @@ from qiita_common.models import (
     WorkTicketCancelResponse,
     WorkTicketCancelResult,
     WorkTicketCreateRequest,
+    WorkTicketListResponse,
     WorkTicketReadOutcome,
     WorkTicketResponse,
     WorkTicketState,
@@ -94,6 +100,7 @@ from ..actions.reference import (
 )
 from ..auth.guards import require_caller_has_admin_on_all_studies, require_scope
 from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, get_current_principal
+from ..config import Settings
 from ..deps import get_db_pool
 from ..dispatch import schedule_dispatch
 from ..fanout_dispatch import (
@@ -106,9 +113,11 @@ from ..fanout_dispatch import (
     set_override,
     top_up_dispatch,
 )
+from ..ingest_path import IngestPathError, named_host_paths, resolve_ingest_path
 from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
 from ..step_progress import load_step_progress
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
+from ._helpers import cap_rows
 
 _log = logging.getLogger(__name__)
 
@@ -483,8 +492,122 @@ def _basename_carries_prefix(basename: str, prefix: str) -> bool:
     return basename[len(prefix) : len(prefix) + 1] in ("_", ".")
 
 
+def _check_ingest_paths(
+    principal: Principal,
+    *,
+    context_schema: dict[str, Any],
+    action_context: dict[str, Any],
+    roots: tuple[Path, ...],
+) -> None:
+    """Gate every host path the submitted `action_context` names.
+
+    Two rules, in order:
+
+    1. Naming a host path at all is wet_lab_admin-or-higher. A path is
+       re-opened later on a compute node under the job account, so a submitter
+       who can name one reaches every file that account can read — a wider
+       reach than the action's own audience implies. A `user` submits the file
+       as an upload instead and names the `{prefix}_upload_idx` handle, which
+       the runner resolves to a path the submitter never chose.
+    2. The path resolves under one of `PATH_INGEST_ROOTS` and, where the
+       control plane can tell, exists (`ingest_path.resolve_ingest_path`).
+
+    Which keys are host paths comes from the action's own `context_schema` and
+    from the `*_path` / `*_dir` naming convention (`named_host_paths`), so an
+    action that adds one is covered without a change here.
+
+    Every offending path is reported in one 422 body, so a submission naming
+    two bad paths takes one round-trip to fix rather than two.
+    """
+    named = named_host_paths(context_schema, action_context)
+    if not named:
+        return
+
+    if not principal.has_role_at_least(SystemRole.WET_LAB_ADMIN):
+        upload_keys = sorted(
+            key.removesuffix(PATH_SUFFIX) + UPLOAD_IDX_SUFFIX
+            for key in named
+            if key.endswith(PATH_SUFFIX)
+        )
+        detail: dict[str, Any] = {
+            "reason": (
+                "naming a host path in action_context requires wet_lab_admin or system_admin"
+            ),
+            "context_keys": sorted(named),
+        }
+        if upload_keys:
+            detail["upload_instead"] = upload_keys
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+    errors = []
+    for key, raw in sorted(named.items()):
+        try:
+            resolve_ingest_path(raw, roots=roots)
+        except IngestPathError as exc:
+            errors.append({"context_key": key, "path": exc.path, "reason": exc.reason})
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "reason": "action_context names a host path the compute cluster cannot use",
+                "errors": errors,
+                "ingest_roots": [str(root) for root in roots],
+            },
+        )
+
+
+async def _fastq_upload_filenames(
+    pool: asyncpg.Pool, *, action_context: dict[str, Any], principal_idx: int
+) -> dict[str, str]:
+    """`{context_key: source_filename}` for every fastq key submitted as an
+    upload handle rather than a path.
+
+    An upload-fed submission carries `fastq_upload_idx` instead of
+    `fastq_path`, and the staging path the runner resolves it to
+    (`uploads/{idx}/upload.parquet`) is not a name the submitter chose — so
+    the filename-prefix rule has to read what the client said it sent
+    (`upload.source_filename`). One batched fetch, keyed back to the context
+    key so the 422 names the field the submitter wrote.
+
+    Scoped to uploads the caller created. The runner refuses another
+    principal's upload anyway (`runner._upload`), but the 422 this feeds quotes
+    the filename back, and a filename here carries a `sequenced_pool_item_id` —
+    so an unscoped lookup would answer "what is upload N called" for any N to
+    anyone holding a prep_sample of their own.
+
+    An upload with no `source_filename` (it predates the column, or the client
+    did not send one) is omitted: the rule is vacuous without a name, the same
+    way it is vacuous without a `sequenced_pool_item_id`.
+    """
+    by_idx: dict[int, str] = {}
+    for key in FASTQ_PATH_CONTEXT_KEYS:
+        # Report against the key the submitter actually wrote
+        # (`fastq_upload_idx`), not its resolved `fastq_path` twin.
+        upload_key = key.removesuffix(PATH_SUFFIX) + UPLOAD_IDX_SUFFIX
+        handle = action_context.get(upload_key)
+        if isinstance(handle, int) and not isinstance(handle, bool) and handle > 0:
+            by_idx[handle] = upload_key
+    if not by_idx:
+        return {}
+    rows = await pool.fetch(
+        "SELECT upload_idx, source_filename FROM qiita.upload"
+        " WHERE upload_idx = ANY($1::bigint[]) AND created_by_idx = $2",
+        list(by_idx),
+        principal_idx,
+    )
+    return {
+        by_idx[row["upload_idx"]]: row["source_filename"]
+        for row in rows
+        if row["source_filename"] is not None
+    }
+
+
 async def _check_fastq_filename_prefix(
-    pool: asyncpg.Pool, *, prep_sample_idx: int, action_context: dict[str, Any]
+    pool: asyncpg.Pool,
+    *,
+    prep_sample_idx: int,
+    action_context: dict[str, Any],
+    principal_idx: int,
 ) -> None:
     """422 when a fastq path in `action_context` has a basename that is
     not the prep_sample's `sequenced_pool_item_id` followed by a `_` or
@@ -497,6 +620,12 @@ async def _check_fastq_filename_prefix(
     minted in two separate calls and nothing else couples them, so the
     check lives here. Keyed on the context keys (FASTQ_PATH_CONTEXT_KEYS),
     not the action_id, so the route stays generic over actions.
+
+    Covers both routes a fastq arrives by. A path-fed submission is checked on
+    the basename of the path; an upload-fed one (`fastq_upload_idx`, the route
+    a regular user takes) on the client-claimed `upload.source_filename`, since
+    the staging path the runner resolves the handle to is not a name the
+    submitter chose. See `_fastq_upload_filenames`.
 
     Skipped when the resolved `sequenced_pool_item_id` is NULL. Two
     shapes reach that branch:
@@ -530,7 +659,10 @@ async def _check_fastq_filename_prefix(
         # it is skipped here rather than rejected.
         if isinstance(action_context.get(key), str)
     }
-    if not fastq_paths:
+    fastq_uploads = await _fastq_upload_filenames(
+        pool, action_context=action_context, principal_idx=principal_idx
+    )
+    if not fastq_paths and not fastq_uploads:
         return
     pool_item_id = await pool.fetchval(
         "SELECT sequenced_pool_item_id FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
@@ -547,6 +679,11 @@ async def _check_fastq_filename_prefix(
         for key, path in sorted(fastq_paths.items())
         if not _basename_carries_prefix(PurePosixPath(path).name, pool_item_id)
     ]
+    mismatched += [
+        {"context_key": key, "source_filename": name, "basename": name}
+        for key, name in sorted(fastq_uploads.items())
+        if not _basename_carries_prefix(name, pool_item_id)
+    ]
     if mismatched:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -561,14 +698,18 @@ async def _check_fastq_filename_prefix(
         )
 
 
-def _require_compute_backend_client(request: Request) -> None:
+def require_compute_backend_client(app: FastAPI) -> None:
     """Guard that 503s if the orchestrator dispatch path is not configured.
     Prevents creating tickets that can never run."""
-    if request.app.state.compute_backend_client is None:
+    if app.state.compute_backend_client is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="compute orchestrator not configured (COMPUTE_ORCHESTRATOR_URL unset)",
         )
+
+
+def _require_compute_backend_client(request: Request) -> None:
+    require_compute_backend_client(request.app)
 
 
 async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelRequest) -> list[int]:
@@ -603,18 +744,21 @@ async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelReque
 # =============================================================================
 
 
-@router.post(
-    PATH_WORK_TICKET_ROOT,
-    response_model=WorkTicketResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def submit_work_ticket(
+async def submit_work_ticket_core(
+    *,
+    app: FastAPI,
+    principal: Principal,
     body: WorkTicketCreateRequest,
-    request: Request,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    principal: Principal = Depends(get_current_principal),
-    _: None = Depends(_require_compute_backend_client),
 ) -> WorkTicketResponse:
+    """Gate, INSERT, and dispatch one work ticket for `principal`.
+
+    Takes `app` rather than a `Request` so in-process callers get the same gates
+    as `POST /work-ticket`, including the action's audience check.
+    """
+    require_compute_backend_client(app)
+    pool: asyncpg.Pool = app.state.pool
+    settings: Settings = app.state.settings
+
     action = await _fetch_action_for_submission(pool, body.action_id, body.action_version)
     if action is None:
         raise HTTPException(
@@ -724,6 +868,15 @@ async def submit_work_ticket(
             },
         )
 
+    # Every host path in the (now schema-valid) action_context must be one the
+    # caller is allowed to name and the compute cluster can reach.
+    _check_ingest_paths(
+        principal,
+        context_schema=action["context_schema"],
+        action_context=body.action_context,
+        roots=settings.path_ingest_roots,
+    )
+
     # A fastq path in the (now schema-valid) action_context must carry a
     # basename prefixed by the prep_sample's sequenced_pool_item_id.
     if scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value:
@@ -731,6 +884,7 @@ async def submit_work_ticket(
             pool,
             prep_sample_idx=scope_target["prep_sample_idx"],
             action_context=body.action_context,
+            principal_idx=principal.principal_idx,
         )
 
     await _check_disallow_without_delete(
@@ -808,7 +962,7 @@ async def submit_work_ticket(
 
     # Fire-and-forget dispatch in the background. The route returns 202
     # immediately; the workflow runs in-process via asyncio.
-    schedule_dispatch(request.app, work_ticket_idx)
+    schedule_dispatch(app, work_ticket_idx)
 
     _log.info(
         "submitted work_ticket %d for action %s/%s by principal %d",
@@ -818,6 +972,20 @@ async def submit_work_ticket(
         principal.principal_idx,
     )
     return WorkTicketResponse(work_ticket_idx=work_ticket_idx, state=WorkTicketState.PENDING)
+
+
+@router.post(
+    PATH_WORK_TICKET_ROOT,
+    response_model=WorkTicketResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def submit_work_ticket(
+    body: WorkTicketCreateRequest,
+    request: Request,
+    principal: Principal = Depends(get_current_principal),
+) -> WorkTicketResponse:
+    """`submit_work_ticket_core` for the requesting principal."""
+    return await submit_work_ticket_core(app=request.app, principal=principal, body=body)
 
 
 # Two-row-source SELECT. work_ticket carries the scope_target_kind plus
@@ -830,7 +998,7 @@ _WORK_TICKET_COLUMNS = (
     "wt.work_ticket_idx, wt.action_id, wt.action_version, wt.originator_principal_idx,"
     " wt.scope_target_kind, wt.study_idx, wt.prep_idx, wt.reference_idx,"
     " wt.prep_sample_idx, wt.sequenced_pool_idx, wt.block_idx,"
-    " sp.sequencing_run_idx, wt.shard_id,"
+    " sp.sequencing_run_idx, wt.shard_id, wt.mask_idx,"
     " wt.action_context, wt.state, wt.retry_count, wt.max_retries,"
     " wt.failure_type, wt.failure_stage, wt.failure_step_name, wt.failure_reason,"
     " wt.transient_reason, wt.transient_since,"
@@ -1178,7 +1346,7 @@ async def get_work_ticket(
 
 @router.get(
     PATH_WORK_TICKET_ROOT,
-    response_model=list[WorkTicketSummary],
+    response_model=WorkTicketListResponse,
 )
 async def list_work_tickets(
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -1198,10 +1366,27 @@ async def list_work_tickets(
             "wet_lab_admin or higher). Default is the caller's own tickets."
         ),
     ),
+    sequenced_pool_idx: int | None = Query(
+        default=None,
+        gt=0,
+        description=(
+            "Filter to tickets that touch this sequenced_pool: pool-scoped tickets, "
+            "tickets on one of the pool's samples, and block tickets whose block "
+            "covers one of them."
+        ),
+    ),
+    prep_sample_idx: int | None = Query(
+        default=None, gt=0, description="Filter to tickets scoped to this prep_sample."
+    ),
+    action_id: str | None = Query(
+        default=None,
+        min_length=1,
+        description="Filter to one action_id (e.g. read-mask), across every action_version.",
+    ),
     limit: int = Query(
         default=_WORK_TICKET_LIST_DEFAULT_LIMIT, ge=1, le=_WORK_TICKET_LIST_MAX_LIMIT
     ),
-) -> list[WorkTicketSummary]:
+) -> WorkTicketListResponse:
     """List work tickets, each with a snapshot of its *current* compute
     placement (target, SLURM job id, step state) from a single LATERAL join
     against work_ticket_step — no live SLURM hop, so the read is at most one
@@ -1211,11 +1396,38 @@ async def list_work_tickets(
     widens to every originator and is gated to wet_lab_admin+ (mirrors the
     single-ticket GET's role bypass); a non-admin requesting it gets 403.
     Anonymous → 401. Ordered newest-first (work_ticket_idx DESC), capped by
-    `limit`.
+    `limit`, with `truncated` True when the underlying set exceeded it — a
+    pool's ticket set can run to hundreds of rows, so a caller assembling one
+    can tell a complete answer from a prefix instead of inferring it from the
+    row count.
 
-    `state` and `active` AND-compose (`?state=completed&active=true` is a
-    valid — empty — intersection), so a caller can scope to "my active
-    tickets" or "all failed tickets" in one query."""
+    Every filter AND-composes (`?state=completed&active=true` is a valid —
+    empty — intersection), so a caller can scope to "my active tickets" or
+    "this pool's read-mask tickets" in one query. `sequenced_pool_idx`
+    composes with the originator scoping rather than replacing it: a caller
+    without `?all=true` still sees only the tickets they originated, so the
+    pool filter is not a way around that.
+
+    `sequenced_pool_idx` matches a ticket by any of the three ways a ticket
+    reaches a pool, so a pool's work is visible whichever submit path
+    produced it:
+      • pool-scoped   — wt.sequenced_pool_idx (bcl-convert)
+      • sample-scoped — the ticket's prep_sample is one of the pool's
+        sequenced_samples (read-mask; the join that also feeds read_outcome)
+      • block-scoped  — the ticket's block covers one of those samples
+        (read-mask-block, whose own prep_sample_idx is NULL)
+    A block ticket spans many samples, so it carries no read_outcome; the
+    per-sample counts for a block-masked pool come from the pool's
+    sequenced-sample roster instead.
+
+    The pool arms read the sample's CURRENT sequenced_pool_idx and do not
+    exclude retired prep_samples, so this list keeps a retired sample's
+    tickets while the pool roster drops the sample itself — a ticket is a
+    record of work that ran, the roster is the pool's live membership.
+
+    An idx that matches nothing (including one that does not exist) returns
+    an empty list rather than 404 — these are filters on a list, and the
+    route stays enumeration-safe like the single-ticket GET above."""
     if isinstance(principal, Anonymous):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
@@ -1239,14 +1451,41 @@ async def list_work_tickets(
     if active:
         args.append(list(NON_TERMINAL_WORK_TICKET_STATES))
         conditions.append(f"wt.state = ANY(${len(args)}::qiita.work_ticket_state[])")
+    if prep_sample_idx is not None:
+        args.append(prep_sample_idx)
+        conditions.append(f"wt.prep_sample_idx = ${len(args)}")
+    if action_id is not None:
+        args.append(action_id)
+        conditions.append(f"wt.action_id = ${len(args)}")
+    if sequenced_pool_idx is not None:
+        args.append(sequenced_pool_idx)
+        n = len(args)
+        # The three arms of "touches this pool" (see the docstring). The
+        # sample arm reads the already-joined `ss` — sequenced_sample is
+        # UNIQUE on prep_sample_idx, so it cannot fan a ticket into several
+        # rows. The block arm is an EXISTS because a block covers many
+        # samples; a join there would.
+        conditions.append(
+            f"(wt.sequenced_pool_idx = ${n} OR ss.sequenced_pool_idx = ${n}"
+            " OR EXISTS (SELECT 1 FROM qiita.block_member bm"
+            "            JOIN qiita.sequenced_sample bss"
+            "              ON bss.prep_sample_idx = bm.prep_sample_idx"
+            f"            WHERE bm.block_idx = wt.block_idx AND bss.sequenced_pool_idx = ${n}))"
+        )
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-    args.append(limit)
+    # Over-fetch by one so cap_rows can tell a full page from a cut one.
+    args.append(limit + 1)
     rows = await pool.fetch(
         f"SELECT {_WORK_TICKET_SUMMARY_COLUMNS}{_WORK_TICKET_SUMMARY_FROM_WITH_READ_OUTCOME}{where}"
         f" ORDER BY wt.work_ticket_idx DESC LIMIT ${len(args)}",
         *args,
     )
-    return [_row_to_work_ticket_summary(row) for row in rows]
+    rows, truncated = cap_rows(rows, limit)
+    return WorkTicketListResponse(
+        tickets=[_row_to_work_ticket_summary(row) for row in rows],
+        count=len(rows),
+        truncated=truncated,
+    )
 
 
 @router.get(

@@ -117,12 +117,17 @@ def test_sequence_range_mint_is_workers_only():
         )
 
 
-def test_ticket_doput_in_admin_role_ceilings_not_user():
-    """ticket:doput gates the generic upload-slot endpoint. Reference loading
-    (the first consumer) is admin-only — the reference-add workflow's
-    audience is `[wet_lab_admin, system_admin]` — so the scope must be in
-    both admin ceilings but NOT in the USER ceiling. Service accounts also
-    get it for future worker-driven uploads (sequencing-run import, etc.)."""
+def test_ticket_doput_on_every_role_ceiling():
+    """ticket:doput gates the generic upload-slot endpoint, and is on every
+    ceiling including USER.
+
+    A user may not name a host path in `action_context` (wet_lab_admin+), so
+    an upload is their only route for their own reads; withholding this would
+    leave them unable to ingest at all. The scope buys a numbered staging slot
+    the caller owns: the signed ticket carries only `{"action": "doput",
+    "upload_idx": N}` and the data plane derives the path. What the upload may
+    then feed is gated separately — reference-add needs `reference:write`,
+    which a USER does not have."""
     from qiita_control_plane.auth.scopes import (
         ROLE_IMPLIED_SCOPES,
         SERVICE_ACCOUNT_SCOPE_CEILING,
@@ -130,8 +135,10 @@ def test_ticket_doput_in_admin_role_ceilings_not_user():
 
     assert Scope.TICKET_DOPUT in ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
     assert Scope.TICKET_DOPUT in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
-    assert Scope.TICKET_DOPUT not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
+    assert Scope.TICKET_DOPUT in ROLE_IMPLIED_SCOPES[SystemRole.USER]
     assert Scope.TICKET_DOPUT in SERVICE_ACCOUNT_SCOPE_CEILING
+    # The grant is the slot, not what it feeds.
+    assert Scope.REFERENCE_WRITE not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
 
 
 def test_mask_definition_delete_is_system_admin_only():
@@ -219,3 +226,40 @@ def test_reject_scopes_outside_ceiling():
     assert set(rejected) == {Scope.ADMIN_USER, Scope.REFERENCE_WRITE}
     # Sorted, so the API can echo them deterministically.
     assert rejected == sorted(rejected)
+
+
+def test_alignment_doget_is_on_every_role_ceiling_and_not_the_worker_one():
+    """alignment:doget is the HUMAN-callable alignment mint.
+
+    The inverse of `test_sequence_range_mint_is_workers_only`. It exists as a
+    separate scope precisely because `ticket:doget` is workers-only: that scope
+    signs a cohort the control plane read out of a work ticket's action_context,
+    which a worker's runner already validated. A human request has no work
+    ticket, so the new route resolves and authorizes the cohort per-study at
+    mint time instead — a different trust model, and reusing `ticket:doget`
+    would have put a human PAT on the worker path.
+
+    On every role ceiling because the per-study `Tier.VIEWER` check is the real
+    boundary; a plain user with access to a study may pull its alignments.
+    Absent from the service-account ceiling because workers keep using
+    `ticket:doget` — a worker holding both would be two ways in with two
+    different validation paths.
+    """
+    from qiita_control_plane.auth.scopes import (
+        ROLE_IMPLIED_SCOPES,
+        SERVICE_ACCOUNT_SCOPE_CEILING,
+    )
+
+    for role, ceiling in ROLE_IMPLIED_SCOPES.items():
+        assert Scope.ALIGNMENT_DOGET in ceiling, (
+            f"alignment:doget must be on role {role!r}'s ceiling — the per-study "
+            "tier check is the boundary, not the role"
+        )
+    assert Scope.ALIGNMENT_DOGET not in SERVICE_ACCOUNT_SCOPE_CEILING
+    # And the worker scope stays workers-only, which is the whole reason the
+    # new scope exists rather than widening this one.
+    assert Scope.TICKET_DOGET in SERVICE_ACCOUNT_SCOPE_CEILING
+    for role, ceiling in ROLE_IMPLIED_SCOPES.items():
+        assert Scope.TICKET_DOGET not in ceiling, (
+            f"ticket:doget must stay off role {role!r}'s ceiling"
+        )

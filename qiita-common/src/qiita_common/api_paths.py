@@ -73,6 +73,18 @@ PATH_REFERENCE_EXCLUSION_BY_IDX = "/{reference_idx}/exclusion"
 # genome_idx) because the accession is per-(reference, feature) and a DoGet ticket
 # is per-reference. Param path, distinct 4-segment shape (no literal shadow).
 PATH_REFERENCE_GENOME_MEMBER = "/{reference_idx}/genome/{genome_idx}/member"
+# The whole reference's feature_idx → genome lookup, the inverse direction of
+# GENOME_MEMBER: one entry per (feature, genome) pair with the genome's
+# provenance. Named `genome-map` rather than `/genome` because it is not a
+# listing of genomes — it is the join table a client rolls alignment rows up
+# through. Param path, 2 segments, no literal shadow.
+PATH_REFERENCE_GENOME_MAP = "/{reference_idx}/genome-map"
+# The same rows as GENOME_MAP, as a Parquet body, with no cap. A sub-resource
+# segment rather than an Accept header on the path above: the two forms differ in
+# more than encoding — this one has no size ceiling and therefore no 413 — and one
+# path with one behaviour is what the api_paths triple can express. Param path,
+# 3 segments, no literal shadow.
+PATH_REFERENCE_GENOME_MAP_PARQUET = "/{reference_idx}/genome-map/parquet"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -84,6 +96,8 @@ URL_REFERENCE_EXCLUSION = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION}"
 URL_REFERENCE_EXCLUSION_SYNC = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_SYNC}"
 URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_BY_IDX}"
 URL_REFERENCE_GENOME_MEMBER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MEMBER}"
+URL_REFERENCE_GENOME_MAP = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP}"
+URL_REFERENCE_GENOME_MAP_PARQUET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP_PARQUET}"
 
 # =============================================================================
 # /host-filter-profile/*
@@ -169,6 +183,13 @@ class LibraryPrimitive(StrEnum):
     # fresh block it deletes 0 rows. See
     # qiita_control_plane.actions.library.delete_alignment_block.
     DELETE_ALIGNMENT_BLOCK = "delete-alignment-block"
+    # Per-sample (align): idempotent sample replace, the per-sample twin of
+    # delete-alignment-block. Its slot is the one that twin occupies — immediately
+    # BEFORE register-files, on a prep_sample-scoped ticket — deleting the
+    # (alignment_idx, prep_sample_idx) pair's rows so a re-run deletes-then-
+    # re-registers without double-counting. See
+    # qiita_control_plane.actions.library.delete_alignment_sample.
+    DELETE_ALIGNMENT_SAMPLE = "delete-alignment-sample"
     # Block-compute (align): the `align` workflow's terminal step, the alignment
     # twin of reconcile-block. Marks the block completed, then finalizes each
     # covered sample's alignment_sample gate once ALL its covering blocks are done.
@@ -191,6 +212,18 @@ class LibraryPrimitive(StrEnum):
     # Runs AFTER register-files so the gate never reads 'completed' before the masked
     # reads are in DuckLake. See qiita_control_plane.actions.library.finalize_mask_sample_gate.
     FINALIZE_MASK_SAMPLE = "finalize-mask-sample"
+    # Per-sample assembly completion: the terminal step of the long-read-assembly
+    # workflow. Writes 'completed' into the qiita.assembly_sample gate for this
+    # ticket's (processing_idx, prep_sample). See
+    # qiita_control_plane.actions.library.finalize_assembly_sample_gate.
+    FINALIZE_ASSEMBLY_SAMPLE = "finalize-assembly-sample"
+    # Per-sample alignment completion: the terminal step of a prep_sample-scoped
+    # alignment workflow (align-denovo). Writes 'completed' into the
+    # qiita.alignment_sample gate for this ticket's (alignment_idx, prep_sample) — the
+    # per-sample twin of reconcile-alignment-block's gate flip, and the signal the
+    # runner keys its de novo alignment resolver off. See
+    # qiita_control_plane.actions.library.finalize_alignment_sample_gate.
+    FINALIZE_ALIGNMENT_SAMPLE = "finalize-alignment-sample"
 
 
 # =============================================================================
@@ -201,7 +234,7 @@ class LibraryPrimitive(StrEnum):
 # trio: submit returns a handle immediately, the CP runner polls status until
 # terminal, then asks for the verified result — so the runner can drive a long
 # SLURM job without holding a connection open. find-by-name closes the
-# write-ahead idempotency gap. See docs/architecture.md "Compute Orchestrator".
+# write-ahead idempotency gap. See docs/architecture/processing.md "Compute Orchestrator".
 
 PATH_STEP_PREFIX = "/step"
 PATH_STEP_SUBMIT = "/submit"
@@ -312,6 +345,23 @@ URL_UPLOAD_BY_IDX = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_BY_IDX}"
 URL_UPLOAD_DONE = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_DONE}"
 
 
+# =============================================================================
+# /ena-import-batch/* — batch multi-study ENA import driver
+# =============================================================================
+# POST accepts a list of INSDC study accessions and returns a batch handle
+# immediately (202); the resolve+register+download-submit work runs in a
+# background task (qiita_control_plane.ena_import.batch). GET polls the
+# per-item rolled-up state. ADMIN-only (wet_lab_admin / system_admin) — see
+# routes/ena_import.py.
+
+PATH_ENA_IMPORT_BATCH_PREFIX = "/ena-import-batch"
+PATH_ENA_IMPORT_BATCH_ROOT = ""  # POST (submit) against the prefix itself
+PATH_ENA_IMPORT_BATCH_BY_IDX = "/{ena_import_batch_idx}"
+
+URL_ENA_IMPORT_BATCH_PREFIX = f"{API_PREFIX}{PATH_ENA_IMPORT_BATCH_PREFIX}"
+URL_ENA_IMPORT_BATCH_BY_IDX = f"{URL_ENA_IMPORT_BATCH_PREFIX}{PATH_ENA_IMPORT_BATCH_BY_IDX}"
+
+
 def compute_upload_staging_path(staging_root: Path, upload_idx: int) -> Path:
     """Canonical filesystem path for a staged DoPut upload.
 
@@ -378,13 +428,34 @@ URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
 # Mints (idempotently, deduped on a canonical-config hash) the mask_idx that
 # tags the data plane's read_mask / read_masked rows. POST is service-account-
 # only (Scope.READ_MASKED_DOGET).
+#
+# The three GETs are the human read surface: which masks exist, what config a
+# mask encodes, and which samples are masked-complete under it. They carry no
+# read data — only filter metadata and per-sample completion state — so they sit
+# at Scope.PREP_SAMPLE_READ (every human role holds it), narrowed per study for a
+# plain user. The privacy-sensitive pulls (read_masked:doget,
+# admin:masked_read_export) are unchanged.
 
 PATH_MASK_DEFINITION_PREFIX = "/mask-definition"
-PATH_MASK_DEFINITION_ROOT = ""  # POST against the prefix itself
-PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # DELETE a mask (lake rows + Postgres row)
+PATH_MASK_DEFINITION_ROOT = ""  # POST (mint) / GET (list) against the prefix itself
+PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # GET one mask; DELETE (lake rows + Postgres row)
+PATH_MASK_DEFINITION_PREP_SAMPLE = "/{mask_idx}/prep-sample"  # GET the per-sample roster
+# PATCH the CONFIG's lifecycle (active <-> deprecated). Mirrors
+# PATH_REFERENCE_STATUS; a deprecated config cannot be minted against.
+PATH_MASK_DEFINITION_STATUS = "/{mask_idx}/status"
+# PATCH specific RUNS of the config (completed <-> invalidated), naming the
+# prep_samples in the body. Bulk because the judgement is made per cohort, not per
+# sample. Distinct from the route above: config lifecycle and run lifecycle are
+# different questions (see qiita_common.models.MaskDefinitionStatus).
+PATH_MASK_DEFINITION_SAMPLE_STATUS = "/{mask_idx}/sample-status"
 
 URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
 URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
+URL_MASK_DEFINITION_PREP_SAMPLE = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_PREP_SAMPLE}"
+URL_MASK_DEFINITION_STATUS = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_STATUS}"
+URL_MASK_DEFINITION_SAMPLE_STATUS = (
+    f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_SAMPLE_STATUS}"
+)
 
 # =============================================================================
 # /alignment-definition/* — control-plane sharded-alignment config identity
@@ -407,27 +478,42 @@ URL_ALIGNMENT_DEFINITION_BY_IDX = (
 # /alignment/* — Flight DoGet ticket for the alignment sink (feature-table OGU)
 # =============================================================================
 # Signs a DoGet ticket scoped to a single alignment run + its explicit
-# prep_sample_idx cohort on the data plane's `alignment` table. POST is
-# service-account-only (Scope.TICKET_DOGET) — the compute job mints it at
-# runtime. The body carries only work_ticket_idx; the route reads alignment_idx
-# and the cohort from that ticket's action_context (keeping the sample list
-# CP-side, off the wire). Distinct prefix from /alignment-definition (the
-# alignment identity CRUD).
+# prep_sample_idx cohort on the data plane's `alignment` table. Distinct prefix
+# from /alignment-definition (the alignment identity CRUD).
+#
+# TWO mint paths, differing in where the cohort comes from and therefore in how
+# it is authorized:
+#
+#   PATH_ALIGNMENT_DOGET         service-account-only (Scope.TICKET_DOGET). The
+#                                compute job mints it at runtime; the body
+#                                carries only work_ticket_idx and the route
+#                                reads alignment_idx + the cohort from that
+#                                ticket's action_context, already validated by
+#                                the runner resolver at submit (and kept CP-side,
+#                                off the wire).
+#   PATH_ALIGNMENT_COHORT_DOGET  human-callable (Scope.ALIGNMENT_DOGET). The
+#                                caller names the alignment in the path and the
+#                                cohort in the body, so the route authorizes
+#                                every sample per-study before signing. Both are
+#                                POSTs under /alignment but never ambiguous:
+#                                one has a path parameter, the other does not.
 
 PATH_ALIGNMENT_PREFIX = "/alignment"
 PATH_ALIGNMENT_DOGET = "/ticket/doget"
+PATH_ALIGNMENT_COHORT_DOGET = "/{alignment_idx}/ticket/doget"
 
 URL_ALIGNMENT_PREFIX = f"{API_PREFIX}{PATH_ALIGNMENT_PREFIX}"
 URL_ALIGNMENT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_DOGET}"
+URL_ALIGNMENT_COHORT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_COHORT_DOGET}"
 
 # =============================================================================
 # /read-masked/* — Flight DoGet ticket for the masked-read surface
 # =============================================================================
 # Signs an HMAC DoGet ticket scoped to a single (prep_sample_idx, mask_idx) on
-# the data plane's `read_masked` view. POST is service-account-only
+# the data plane's `read_masked` macro. POST is service-account-only
 # (Scope.READ_MASKED_DOGET). The route enforces the mandatory-filter invariant:
-# both identifiers are required, so an unfiltered read_masked ticket is never
-# signed.
+# both identifiers are required (they are the macro's arguments), so an
+# unfiltered read_masked ticket is never signed.
 
 PATH_READ_MASKED_PREFIX = "/read-masked"
 PATH_READ_MASKED_DOGET = "/ticket/doget"
@@ -441,9 +527,10 @@ URL_READ_MASKED_DOGET = f"{URL_READ_MASKED_PREFIX}{PATH_READ_MASKED_DOGET}"
 # Signs a DoGet ticket scoped to ONE block's `(prep_sample_idx, sequence_idx
 # sub-range)` members, so a block-scoped compute job streams its reads from the
 # data plane instead of reading a Parquet the control plane materialized onto
-# shared scratch. POST is service-account-only (Scope.TICKET_DOGET) — the job
-# mints it at runtime (short TTL; a SLURM queue can outlive a submit-time
-# ticket), the same shape as /alignment/ticket/doget.
+# shared scratch. POST is service-account-only (Scope.READ_DOGET — its own scope,
+# not the generic ticket:doget; routes/read.py carries why) — the job mints it at
+# runtime (short TTL; a SLURM queue can outlive a submit-time ticket), the same
+# shape as /alignment/ticket/doget.
 #
 # The body carries only work_ticket_idx. The route reads the block's members
 # from qiita.block_member (keeping a large member list CP-side, off the wire)
@@ -456,6 +543,77 @@ PATH_READ_DOGET = "/ticket/doget"
 
 URL_READ_PREFIX = f"{API_PREFIX}{PATH_READ_PREFIX}"
 URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
+
+# =============================================================================
+# /assembly/* — one assembly run's contigs, and its feature -> genome map
+# =============================================================================
+# The two DoGet routes sign the same ticket for the same data plane surfaces
+# (`assembled_sequence` / `assembled_sequence_chunks`), scoped to ONE assembly
+# run — a `(prep_sample_idx, processing_idx)` pair — and differ only in who may
+# ask and how the pair is authorized. The split mirrors /alignment's exactly, for
+# the reason Scope.ALIGNMENT_DOGET states there.
+#
+#   PATH_ASSEMBLY_DOGET      service-account-only (Scope.TICKET_DOGET). The job
+#                            mints it at runtime; the pair rides the body.
+#   PATH_ASSEMBLY_RUN_DOGET  human-callable (Scope.ASSEMBLY_DOGET). The caller
+#                            names the run in the path, so the route authorizes
+#                            that prep_sample against the caller's studies before
+#                            signing.
+#
+# Either way the pair is what is signed; the data plane resolves that run's
+# contigs through the lake's own assembly_membership. Why the resolution lives
+# there is at the route (routes/assembly.py).
+#
+# PATH_ASSEMBLY_GENOME_MAP is not a ticket at all — `genome_idx` exists only in
+# Postgres, so it is a control-plane read, the assembly twin of
+# PATH_REFERENCE_GENOME_MAP.
+
+PATH_ASSEMBLY_PREFIX = "/assembly"
+PATH_ASSEMBLY_DOGET = "/ticket/doget"
+PATH_ASSEMBLY_RUN_DOGET = "/{prep_sample_idx}/{processing_idx}/ticket/doget"
+PATH_ASSEMBLY_GENOME_MAP = "/{prep_sample_idx}/{processing_idx}/genome-map"
+# The Parquet form, uncapped — the de novo twin of
+# PATH_REFERENCE_GENOME_MAP_PARQUET, which carries why it is a segment.
+PATH_ASSEMBLY_GENOME_MAP_PARQUET = "/{prep_sample_idx}/{processing_idx}/genome-map/parquet"
+
+URL_ASSEMBLY_PREFIX = f"{API_PREFIX}{PATH_ASSEMBLY_PREFIX}"
+URL_ASSEMBLY_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_DOGET}"
+URL_ASSEMBLY_RUN_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_RUN_DOGET}"
+URL_ASSEMBLY_GENOME_MAP = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP}"
+URL_ASSEMBLY_GENOME_MAP_PARQUET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP_PARQUET}"
+
+
+# =============================================================================
+# /processing/* — assembly run identity and its lifecycle
+# =============================================================================
+# A processing_idx is minted by the runner, not by a route: it is the
+# canonical-params hash over {workflow, version, mask_idx, assembler}, and there
+# is nothing to key on at HTTP submit. So this surface has no POST — only the
+# reads and the two lifecycle PATCHes.
+#
+# The three GETs are the human read surface, at Scope.PREP_SAMPLE_READ and
+# narrowed per study for a plain user, matching /mask-definition; the two PATCHes
+# sit at Scope.PROCESSING_LIFECYCLE. Contig bytes stay on the assembly DoGet
+# ticket (POST /assembly/ticket/doget, service-account-only). routes/processing.py
+# carries what each gating rests on.
+
+PATH_PROCESSING_PREFIX = "/processing"
+PATH_PROCESSING_ROOT = ""  # GET (list) against the prefix itself
+PATH_PROCESSING_BY_IDX = "/{processing_idx}"
+PATH_PROCESSING_PREP_SAMPLE = "/{processing_idx}/prep-sample"  # GET the per-sample roster
+# PATCH the run CONFIG's lifecycle (active <-> deprecated). Mirrors
+# PATH_MASK_DEFINITION_STATUS; a deprecated run cannot be minted against.
+PATH_PROCESSING_STATUS = "/{processing_idx}/status"
+# PATCH specific RUNS of the config (completed <-> invalidated), naming the
+# prep_samples in the body. Bulk because the judgement is made per cohort, not
+# per sample. Distinct from the route above, which is the CONFIG's lifecycle.
+PATH_PROCESSING_SAMPLE_STATUS = "/{processing_idx}/sample-status"
+
+URL_PROCESSING_PREFIX = f"{API_PREFIX}{PATH_PROCESSING_PREFIX}"
+URL_PROCESSING_BY_IDX = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_BY_IDX}"
+URL_PROCESSING_PREP_SAMPLE = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_PREP_SAMPLE}"
+URL_PROCESSING_STATUS = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_STATUS}"
+URL_PROCESSING_SAMPLE_STATUS = f"{URL_PROCESSING_PREFIX}{PATH_PROCESSING_SAMPLE_STATUS}"
 
 
 # =============================================================================
@@ -497,7 +655,7 @@ PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS = "/principal/{principal_idx}/revoke-all-
 PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID = "/study/{study_idx}/owner-biosample-id"
 # Masked-read export (system_admin only): the manifest GET lists a
 # sequenced_pool's non-retired samples to export under ?mask_idx=; the ticket
-# POST mints a per-sample DoGet ticket on the data plane's read_masked view.
+# POST mints a per-sample DoGet ticket on the data plane's read_masked macro.
 PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
     "/sequenced-pool/{sequenced_pool_idx}/masked-read-export"
 )
@@ -550,6 +708,24 @@ PATH_STUDY_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 URL_STUDY_PREFIX = f"{API_PREFIX}{PATH_STUDY_PREFIX}"
 URL_STUDY_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_STUDY_BY_IDX}"
 URL_STUDY_LOOKUP_BY_ACCESSION = f"{URL_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}"
+
+
+# =============================================================================
+# /run-folder/* — read-only inspection of a sequencing run folder on the cluster
+# =============================================================================
+# The bundled submit gestures need two facts that only exist on the filesystem:
+# an Illumina run's instrument_run_id / model (from RunInfo.xml) and a PacBio
+# run's barcode -> HiFi BAM index. Reading them server-side is what lets a
+# submit run from a machine that does not mount the cluster.
+#
+# Not a resource under /sequencing-run: no run row exists yet at inspect time —
+# the gesture inspects the folder in order to mint one.
+
+PATH_RUN_FOLDER_PREFIX = "/run-folder"
+# POST, not GET: the body carries an absolute path, and a path in a querystring
+# lands in access logs and proxy caches. `inspect` is a verb, which the naming
+# rule allows as a path segment.
+PATH_RUN_FOLDER_INSPECT = "/inspect"
 
 
 # =============================================================================
@@ -609,6 +785,18 @@ PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
 PATH_SEQUENCED_POOL_ALIGN_PLAN = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/align-plan"
 )
+# GET the alignments over this pool's samples: per alignment_idx, its config
+# params and completed/total sample counts. Counts are scoped to the samples the
+# CALLER may read, so they agree with what the alignment DoGet mint will sign.
+PATH_SEQUENCED_POOL_ALIGNMENT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/alignment"
+)
+# GET the cohort to mint an alignment DoGet ticket for: the pool's prep_samples
+# that are BOTH readable by the caller and 'completed' for this alignment. The
+# list this returns is a valid mint body by construction.
+PATH_SEQUENCED_POOL_ALIGNMENT_COHORT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/alignment/{alignment_idx}/cohort"
+)
 # GET the pool's exception drill-down: only the anomalous non-retired
 # sequenced_samples — no usable reads (unprocessed or zero survived), missing any
 # of the four submission accessions, or a genuinely-failed read-mask ticket (failed
@@ -624,6 +812,9 @@ PATH_SEQUENCED_SAMPLE_EXCEPTIONS = (
 PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/work-ticket/summary"
 )
+
+URL_RUN_FOLDER_PREFIX = f"{API_PREFIX}{PATH_RUN_FOLDER_PREFIX}"
+URL_RUN_FOLDER_INSPECT = f"{URL_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}"
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
@@ -644,6 +835,10 @@ URL_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN}"
 )
 URL_SEQUENCED_POOL_ALIGN_PLAN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGN_PLAN}"
+URL_SEQUENCED_POOL_ALIGNMENT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGNMENT}"
+URL_SEQUENCED_POOL_ALIGNMENT_COHORT = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_ALIGNMENT_COHORT}"
+)
 URL_SEQUENCED_SAMPLE_EXCEPTIONS = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_EXCEPTIONS}"
 URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY}"
@@ -659,6 +854,17 @@ URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
 
 PATH_BIOSAMPLE_BY_STUDY = "/{study_idx}/biosample"
 PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
+# Study-scoped single biosample: a GET view carrying this study's local
+# metadata alongside the global metadata, and a metadata upsert PATCH. Both
+# anchor on the /study router (the caller is authorized on the study).
+PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
+PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
+# Create a study-local biosample field definition (POST). The study-scoped mint
+# hangs off the /study router (the caller is authorized on the study); the
+# by-idx path addresses a single definition under it, to read (GET) or edit
+# (PATCH).
+PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/biosample-field"
+PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/biosample-field/{study_field_idx}"
 
 PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
@@ -676,6 +882,10 @@ PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
+URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
+URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
+URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
+URL_BIOSAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
@@ -702,6 +912,10 @@ PATH_SEQUENCED_SAMPLE_LIST_BY_RUN = "/{sequencing_run_idx}/sequenced-sample/list
 # rather than `list-idxs`, paralleling LIST_BY_POOL.
 PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = "/{sequencing_run_idx}/sequenced-sample/list"
 PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY = "/{study_idx}/sequenced-sample/list-idxs"
+PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/sequenced-sample/{sequenced_sample_idx}"
+PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
+    "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata"
+)
 # Pool-scoped sibling of LIST_BY_RUN. Returns richer per-sample rows
 # (prep_sample_idx + sequenced_pool_item_id), hence the `list` segment rather
 # than `list-idxs`. Anchored on /sequencing-run so require_sequenced_pool_in_run
@@ -719,6 +933,12 @@ URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL}"
 )
 URL_SEQUENCED_SAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY}"
+URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = (
+    f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX}"
+)
+URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
+    f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY}"
+)
 URL_SEQUENCED_SAMPLE_LIST_BY_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_POOL}"
 )
@@ -739,7 +959,81 @@ PATH_PREP_SAMPLE_STUDY_LIST = "/{prep_sample_idx}/study/list"
 # without a raw production UPDATE. Reversible by design (a misclassified well
 # must be recoverable), unlike the terminal principal retire.
 PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
+# Create a study-local prep_sample field definition (POST). The study-scoped mint
+# hangs off the /study router (the caller is authorized on the study); the
+# by-idx path addresses a single definition under it, to read (GET) or edit
+# (PATCH).
+PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/prep-sample-field"
+PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/prep-sample-field/{study_field_idx}"
+
+# =============================================================================
+# /exported-identifier — the public handle a published table carries per sample
+# =============================================================================
+# POST, and not only because it writes: the cohort has to ride the body, like
+# /biosample/lookup-by-accession, because a feature table's cohort is a pool's or
+# a study's worth of samples and routinely spans pools, neither of which a query
+# string can carry.
+
+PATH_EXPORTED_IDENTIFIER_PREFIX = "/exported-identifier"
+PATH_EXPORTED_IDENTIFIER_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_IDENTIFIER_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_IDENTIFIER_PREFIX}"
+URL_EXPORTED_IDENTIFIER = f"{URL_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_ROOT}"
+
+
+# =============================================================================
+# /exported-feature — the public handle a published table carries per ROW
+# =============================================================================
+# The other axis of the same artifact: /exported-identifier names the columns
+# (processed samples), this names the rows (genomes and features). POST for the
+# same two reasons — it mints, and the entity set has to ride the body.
+
+PATH_EXPORTED_FEATURE_PREFIX = "/exported-feature"
+PATH_EXPORTED_FEATURE_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_FEATURE_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_FEATURE_PREFIX}"
+URL_EXPORTED_FEATURE = f"{URL_EXPORTED_FEATURE_PREFIX}{PATH_EXPORTED_FEATURE_ROOT}"
+
+
+# =============================================================================
+# /exported-processing — the public handle a published bundle's manifest cites
+# =============================================================================
+# The third axis: /exported-identifier names a table's columns, /exported-feature
+# its rows, and this names what was DONE to produce it. POST because it mints, and
+# against the prefix like its two siblings.
+
+PATH_EXPORTED_PROCESSING_PREFIX = "/exported-processing"
+PATH_EXPORTED_PROCESSING_ROOT = ""  # POST against the prefix itself
+
+URL_EXPORTED_PROCESSING_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_PROCESSING_PREFIX}"
+URL_EXPORTED_PROCESSING = f"{URL_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_ROOT}"
+
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
 URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"
+URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"
+URL_PREP_SAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX}"
+
+
+# =============================================================================
+# /biosample-global-field, /prep-sample-global-field — the global field registries
+# =============================================================================
+# A registry is global, so it hangs off its own prefix rather than a segment
+# under /biosample: a literal GET sub-path there is shadowed by that router's
+# GET /{biosample_idx}, which coerces the segment to int and 422s unless it is
+# registered first. Having its own prefix removes any ordering constraint.
+
+PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX = "/biosample-global-field"
+PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT = ""  # list against the prefix itself
+PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX = "/prep-sample-global-field"
+PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT = ""  # list against the prefix itself
+
+URL_BIOSAMPLE_GLOBAL_FIELD_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX}"
+URL_BIOSAMPLE_GLOBAL_FIELD_LIST = (
+    f"{URL_BIOSAMPLE_GLOBAL_FIELD_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT}"
+)
+URL_PREP_SAMPLE_GLOBAL_FIELD_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX}"
+URL_PREP_SAMPLE_GLOBAL_FIELD_LIST = (
+    f"{URL_PREP_SAMPLE_GLOBAL_FIELD_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT}"
+)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from pathlib import Path
@@ -13,15 +12,17 @@ from qiita_common.api_paths import (
     compute_reads_staging_path,
 )
 from qiita_common.backend_failure import StepNoData
-from qiita_common.parquet import validate_parquet_path
+from qiita_common.parquet import PARQUET_COMPRESSION_INTERMEDIATE, validate_parquet_path
 
 import qiita_control_plane.runner as _runner_pkg
 
-from ..auth.tickets import sign_action, sign_ticket
+from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
+from ..block_read import READ_MASKED_TABLE
 from ..host_filter_resolver import is_control_sample
 from ..miint import connect_with_miint_staged
 from ..repositories.block import fetch_mask_sample_state
 from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
+from ..repositories.sequenced_sample import fetch_sequenced_pool_ena_run_roster
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
 _log = logging.getLogger(__name__)
@@ -52,6 +53,19 @@ STAGED_READS_BINDING = "reads"
 # consume `masked_reads_fastq`.
 STAGED_MASKED_READS_BINDING = "masked_reads_fastq"
 READS_STAGING_ROOT_BINDING = "reads_staging_root"
+
+# The download-ena-study workflow's `ingest_ena_reads` step roster:
+# `{prep_sample_idx, ena_run_accession}`, one row per sequenced_sample in the
+# ticket's sequenced_pool. Unlike `sample_map` (embedded in action_context by
+# the CP composer at submit time), this is sourced by a LIVE Postgres query at
+# dispatch time (`_stage_ena_run_roster`) — the pool's sequenced_samples don't
+# exist yet when a batch-driver-style submitter could embed them, and re-
+# reading live means a ticket resubmitted after a registration correction
+# picks up the current roster rather than a submit-time snapshot. Dispatched
+# by DECLARED-INPUT NAME (`_workflow_declares_input`), not scope-kind — both
+# bcl-convert and download-ena-study are sequenced_pool-scoped, so keying off
+# scope-kind would wire this resolver into bcl-convert's ticket too.
+ENA_RUN_MAP_BINDING = "ena_run_map"
 
 
 # Bindings a sharded build ticket's build steps consume: the per-shard feature
@@ -97,7 +111,7 @@ def _do_get_reference_sequences_roster(
     # sequence_hash) — the shard build reads `feature_idx` to scope its own chunk
     # stream and `sequence_length_bp` for plan() sizing.
     roster = table.select(["feature_idx", "sequence_length_bp"])
-    pq.write_table(roster, str(out_path), compression="snappy")
+    pq.write_table(roster, str(out_path), compression=PARQUET_COMPRESSION_INTERMEDIATE)
     return roster.num_rows
 
 
@@ -120,12 +134,10 @@ async def _stage_shard_roster(
     and write `<workspace>/shard_roster.parquet`. Binds `shard_features` (the
     roster path) and `shard_id` so the build steps' `Inputs` resolve.
 
-    Like the other pre-loop resolvers, a Flight failure is wrapped as a
-    SUBMISSION-attributed failure (via `_submission_dp_fetch_failure`: a DuckLake
-    serialization conflict is retriable, everything else BAD_INPUT) so it lands in
-    the outer FAILED handler instead of escaping as an untyped exception (which
-    would violate the step-name CHECK). An empty membership shard is a
-    misconfiguration — fail loud rather than build an empty index."""
+    Like the other pre-loop resolvers, a Flight failure is wrapped by
+    `_submission_dp_fetch_failure` (see it for what wrapping buys and how the
+    cause is classified). An empty membership shard is a misconfiguration — fail
+    loud rather than build an empty index."""
     rows = await pool.fetch(
         "SELECT feature_idx FROM qiita.reference_membership"
         " WHERE reference_idx = $1 AND shard_id = $2",
@@ -138,20 +150,18 @@ async def _stage_shard_roster(
             f"shard {shard_id} of reference {reference_idx} has no member features "
             "(reference_membership.shard_id) — nothing to build"
         )
-    ticket = sign_ticket(
-        table=_REFERENCE_SEQUENCES_TABLE,
-        filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
-        secret=signing_key,
-    )
     workspace.mkdir(parents=True, exist_ok=True)
     roster_path = workspace / "shard_roster.parquet"
     try:
-        await asyncio.get_event_loop().run_in_executor(
-            None,
-            _runner_pkg._do_get_reference_sequences_roster,
-            data_plane_url,
-            ticket,
-            roster_path,
+        await run_signed_flight_call(
+            lambda: sign_ticket(
+                table=_REFERENCE_SEQUENCES_TABLE,
+                filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
+                secret=signing_key,
+            ),
+            lambda ticket: _runner_pkg._do_get_reference_sequences_roster(
+                data_plane_url, ticket, roster_path
+            ),
         )
     except Exception as exc:
         raise _submission_dp_fetch_failure(
@@ -288,6 +298,69 @@ async def _resolve_sample_map(action_context: dict[str, Any], workspace: Path) -
     return {SAMPLE_MAP_BINDING: out}
 
 
+def _write_ena_run_map_parquet(roster: list[tuple[int, str]], out_path: Path) -> None:
+    """Write the `{prep_sample_idx, ena_run_accession}` roster to a Parquet
+    `(prep_sample_idx BIGINT, ena_run_accession VARCHAR)` for the
+    `ingest_ena_reads` step. pyarrow (already a Flight dependency) writes it
+    directly, mirroring `_write_sample_map_parquet`."""
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    prep = [int(prep_sample_idx) for prep_sample_idx, _ in roster]
+    accessions = [str(ena_run_accession) for _, ena_run_accession in roster]
+    table = pa.table(
+        {
+            "prep_sample_idx": pa.array(prep, type=pa.int64()),
+            "ena_run_accession": pa.array(accessions, type=pa.string()),
+        }
+    )
+    pq.write_table(table, str(out_path))
+
+
+async def _stage_ena_run_roster(
+    pool: asyncpg.Pool,
+    sequenced_pool_idx: int,
+    *,
+    workspace: Path,
+) -> dict[str, Path]:
+    """Stage the download-ena-study pool's run roster before the step loop.
+
+    SOURCE is a LIVE Postgres query (`repositories.sequenced_sample.
+    fetch_sequenced_pool_ena_run_roster`), unlike `_resolve_sample_map`'s
+    action_context-embedded roster: bcl-convert's submitter enumerates its own
+    freshly-created samples and can embed them at submit time, but a
+    download-ena-study ticket is submitted by the batch driver against a
+    pool `ena_import.registration.register_ena_study` already populated, so
+    reading it live (rather than requiring the submitter to re-embed it) keeps
+    the two ticket-creation paths from having to agree on a duplicated roster
+    shape, and picks up a post-submit registration correction rather than a
+    submit-time snapshot.
+
+    Fails loud (SUBMISSION-attributed BAD_INPUT, matching the other pre-loop
+    resolvers) on an empty pool, and — just as loud — on any row whose
+    `ena_run_accession` is NULL: a download-ena-study ticket only makes sense
+    against ENA-origin sequenced_samples, so a NULL accession is a
+    misconfiguration (e.g. a non-ENA sample sharing the pool) that must never
+    be silently skipped out of the roster."""
+    rows = await fetch_sequenced_pool_ena_run_roster(pool, sequenced_pool_idx=sequenced_pool_idx)
+    if not rows:
+        raise _submission_bad_input(
+            f"sequenced_pool {sequenced_pool_idx} has no sequenced_samples to build "
+            "a download-ena-study run roster from"
+        )
+    missing = [r["prep_sample_idx"] for r in rows if r["ena_run_accession"] is None]
+    if missing:
+        raise _submission_bad_input(
+            f"sequenced_pool {sequenced_pool_idx} has prep_sample(s) with no "
+            f"ena_run_accession, so no ENA run to download: {sorted(missing)}"
+        )
+    roster = [(r["prep_sample_idx"], r["ena_run_accession"]) for r in rows]
+    workspace.mkdir(parents=True, exist_ok=True)
+    out = workspace / "ena_run_map.parquet"
+    _write_ena_run_map_parquet(roster, out)
+    return {ENA_RUN_MAP_BINDING: out}
+
+
 def _do_action_export(action_type: str, data_plane_url: str, token: bytes) -> dict[str, Any]:
     """Shared body for the read-export DoActions (`export_read` is the only one
     left — block reads stream): run a synchronous Flight DoAction of `action_type` in a
@@ -411,19 +484,19 @@ async def _resolve_staged_reads(
     # data plane validates); the data plane writes it.
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "reads.parquet"
-    token = sign_action(
-        action="export_read",
-        payload={"prep_sample_idx": prep_sample_idx, "dest": str(dest)},
-        secret=signing_key,
-    )
-    # A Flight failure (data plane unreachable / errored) is NOT a BackendFailure;
-    # wrap it as a SUBMISSION BAD_INPUT like the other pre-loop resolvers so the
-    # outer handler FAILs the ticket cleanly (step_name=None) rather than letting
-    # an untyped exception strand it in PROCESSING. (Not retried in place: the
-    # operator resubmits if the data plane was down.)
+    # Wrapped by `_submission_dp_fetch_failure` like the other pre-loop resolvers
+    # — see it for what that buys and how the cause is classified. Note what a
+    # retriable classification does NOT do here: a resolver runs before the step
+    # loop, so it never reaches `_run_entry_with_retry` and is never re-run in
+    # place. The label routes the ticket to an operator redrive.
     try:
-        result = await asyncio.get_running_loop().run_in_executor(
-            None, _runner_pkg._do_action_export_read, data_plane_url, token
+        result = await run_signed_flight_call(
+            lambda: sign_action(
+                action="export_read",
+                payload={"prep_sample_idx": prep_sample_idx, "dest": str(dest)},
+                secret=signing_key,
+            ),
+            lambda token: _runner_pkg._do_action_export_read(data_plane_url, token),
         )
     except Exception as exc:
         raise _submission_dp_fetch_failure(
@@ -509,22 +582,21 @@ async def _resolve_staged_masked_reads(
             "completed."
         )
 
-    # The SAME read_masked DoGet ticket the admin masked-read export mints — a
-    # generic ticket scoped to exactly (prep_sample_idx, mask_idx), no bespoke
-    # action or payload type.
-    ticket = sign_ticket(
-        table="read_masked",
-        filter={"prep_sample_idx": [prep_sample_idx], "mask_idx": [mask_idx]},
-        secret=signing_key,
-    )
     workspace.mkdir(parents=True, exist_ok=True)
     dest = workspace / "masked_reads.fastq.gz"
-    # Flight failure -> SUBMISSION BAD_INPUT like the other pre-loop resolvers
-    # (step_name=None), so the outer handler FAILs the ticket cleanly rather than
-    # stranding it in PROCESSING. The blocking stream+COPY runs off the event loop.
+    # Flight failure -> wrapped by `_submission_dp_fetch_failure` like the other
+    # pre-loop resolvers. The blocking stream+COPY runs off the event loop. The
+    # ticket is the SAME read_masked DoGet ticket the admin export
+    # mints — a generic ticket scoped to exactly (prep_sample_idx, mask_idx), no
+    # bespoke action or payload type.
     try:
-        count = await asyncio.get_running_loop().run_in_executor(
-            None, _runner_pkg._stream_masked_reads_to_fastq, data_plane_url, ticket, dest
+        count = await run_signed_flight_call(
+            lambda: sign_ticket(
+                table=READ_MASKED_TABLE,
+                filter={"prep_sample_idx": [prep_sample_idx], "mask_idx": [mask_idx]},
+                secret=signing_key,
+            ),
+            lambda ticket: _runner_pkg._stream_masked_reads_to_fastq(data_plane_url, ticket, dest),
         )
     except Exception as exc:
         raise _submission_dp_fetch_failure(

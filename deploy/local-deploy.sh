@@ -36,6 +36,12 @@ qiita_resolve_user_clone
 QIITA_BUILD_SHA="$(sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" rev-parse HEAD 2>/dev/null || true)"
 export QIITA_BUILD_SHA
 
+# Calver derived from the deployed commit's date — always current, no manual
+# bumping. Falls back to empty when no git clone is available (non-fatal: the
+# landing footer then renders the static package version).
+QIITA_BUILD_VERSION="$(sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" log -1 --format=%cd --date=format:'%Y.%-m.%-d' 2>/dev/null || true)"
+export QIITA_BUILD_VERSION
+
 DP_BINARY="$QIITA_CLONE/qiita-data-plane/target/release/qiita-data-plane"
 [ -x "$DP_BINARY" ] || { echo "ERROR: data-plane binary missing at $DP_BINARY" >&2; exit 1; }
 

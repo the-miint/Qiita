@@ -30,7 +30,7 @@ manifest write and the verifier both require every declared output to resolve
 under ``$QIITA_OUTPUT_PATH``, so an out-of-tree output is a CONTRACT_VIOLATION.
 Communicate a derived artifact's location via an in-tree meta JSON instead
 (``register-index`` reads ``fs_path`` from it). The home for this rule is
-``docs/architecture.md`` (the native-step note under the Container contract).
+``docs/architecture/processing.md`` (the native-step note under the Container contract).
 
 This module is a sibling of ``jobs/`` (not inside it) by design: the boot scan
 validates every non-dunder module under ``jobs/`` as a native job, so shared

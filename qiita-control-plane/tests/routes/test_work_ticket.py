@@ -29,6 +29,7 @@ from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
     ComputeTarget,
     ReferenceStatus,
+    ScopeTargetKind,
     StepProgressState,
     WorkTicketState,
 )
@@ -63,8 +64,13 @@ async def _patch_run_and_log(monkeypatch):
 
 
 @pytest.fixture
-async def wt_client(postgres_pool, stub_compute_backend_client):
-    """App configured for work-ticket route tests."""
+async def wt_client(postgres_pool, stub_compute_backend_client, ingest_root):
+    """App configured for work-ticket route tests.
+
+    Overrides the Settings `_route_settings` stashes, so it has to carry
+    `path_ingest_roots` too — the submit gate refuses an action_context host
+    path outside them, and several tests here submit one.
+    """
     from qiita_control_plane.config import Settings
     from qiita_control_plane.main import app
 
@@ -74,6 +80,7 @@ async def wt_client(postgres_pool, stub_compute_backend_client):
         database_url="unused",
         flight_signing_key=b"\x00" * 32,
         data_plane_url="unused",
+        path_ingest_roots=(ingest_root,),
     )
     app.state.compute_backend_client = stub_compute_backend_client
     app.state.running_dispatches = set()
@@ -286,6 +293,7 @@ async def _seed_action(
     *,
     context_schema: dict,
     target_kind: str = "reference",
+    action_id: str = "wt-test-action",
     scopes: list[str] | None = None,
     target_processing_kinds: list[str] | None = None,
     human_roles: list[str] | None = None,
@@ -302,8 +310,10 @@ async def _seed_action(
     DB CHECK action_processing_kinds_only_for_prep_sample enforces
     that pairing). `human_roles` overrides the default audience
     ([system_admin]) — pass [user, wet_lab_admin, system_admin] to
-    exercise the wider audience the fastq-to-parquet YAML declares."""
-    action_id = "wt-test-action"
+    exercise the wider audience the fastq-to-parquet YAML declares.
+
+    Every action here shares one `action_id` and varies only by `version`;
+    `action_id` overrides that for a test that needs two distinct ids."""
     version = f"v-{uuid.uuid4()}"
     await postgres_pool.execute(
         "INSERT INTO qiita.action ("
@@ -870,6 +880,55 @@ async def test_submit_prep_sample_disallow_without_delete(
     assert "in flight" in second.text.lower()
 
 
+async def test_submit_prep_sample_completed_does_not_block(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    prep_sample_action,
+    prep_sample_idx,
+):
+    """A COMPLETED prep_sample ticket does NOT block a fresh submission of the
+    same (action, sample) triple — no force, no admin role needed.
+
+    The prep_sample arm of `_check_disallow_without_delete` binds only
+    `NON_TERMINAL_WORK_TICKET_STATES`; the COMPLETED gate is sequenced_pool-only.
+    For actions whose result is a minted row (a mask), a downstream
+    DELETE-gated check refuses the re-run. `long-read-assembly` has no such
+    gate, so this 202 is what a re-run of an already-assembled sample gets.
+    """
+    token, admin_idx = admin_token
+    action_id, version = prep_sample_action
+
+    completed_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, state)"
+        " VALUES ($1, $2, $3, 'prep_sample', $4, $5::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        prep_sample_idx,
+        WorkTicketState.COMPLETED.value,
+    )
+    wt_client._created_tickets.append(completed_idx)
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    new_idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(new_idx)
+    assert new_idx != completed_idx
+
+
 async def test_submit_prep_sample_kind_match_passes(
     wt_client,
     postgres_pool,
@@ -1173,7 +1232,7 @@ async def test_submit_unique_index_catches_select_race(
     assert "in flight" in second.json()["detail"]["reason"]
 
 
-def _sequenced_pool_body(action_id, version, pool_idx, run_idx, **overrides):
+def _sequenced_pool_body(action_id, version, pool_idx, run_idx, ingest_dir, **overrides):
     base = {
         "action_id": action_id,
         "action_version": version,
@@ -1182,14 +1241,14 @@ def _sequenced_pool_body(action_id, version, pool_idx, run_idx, **overrides):
             "sequenced_pool_idx": pool_idx,
             "sequencing_run_idx": run_idx,
         },
-        "action_context": {"bcl_input_dir": "/data/runs/240101_M00001_0001_000000000-ABCDE"},
+        "action_context": {"bcl_input_dir": ingest_dir("runs/240101_M00001_0001_000000000-ABCDE")},
     }
     base.update(overrides)
     return base
 
 
 async def test_submit_sequenced_pool_scope_round_trips_both_idxs(
-    wt_client, postgres_pool, admin_token, sequenced_pool_action, sequenced_pool_for_wt
+    wt_client, postgres_pool, admin_token, sequenced_pool_action, sequenced_pool_for_wt, ingest_dir
 ):
     """A sequenced_pool-scoped submission (the bcl-convert shape) persists
     sequenced_pool_idx with every other scope arm NULL, and a GET round-
@@ -1203,7 +1262,7 @@ async def test_submit_sequenced_pool_scope_round_trips_both_idxs(
 
     resp = await wt_client.post(
         URL_WORK_TICKET_PREFIX,
-        json=_sequenced_pool_body(action_id, version, pool_idx, run_idx),
+        json=_sequenced_pool_body(action_id, version, pool_idx, run_idx, ingest_dir),
         headers=headers,
     )
     assert resp.status_code == 202, resp.text
@@ -1238,7 +1297,7 @@ async def test_submit_sequenced_pool_scope_round_trips_both_idxs(
 
 
 async def test_submit_sequenced_pool_disallow_without_delete(
-    wt_client, admin_token, sequenced_pool_action, sequenced_pool_for_wt
+    wt_client, admin_token, sequenced_pool_action, sequenced_pool_for_wt, ingest_dir
 ):
     """A second sequenced_pool submission against the same (action, pool)
     while the first is non-terminal must 409 via the SELECT-side
@@ -1247,7 +1306,7 @@ async def test_submit_sequenced_pool_disallow_without_delete(
     action_id, version = sequenced_pool_action
     run_idx, pool_idx = sequenced_pool_for_wt
     headers = {"Authorization": f"Bearer {token}"}
-    body = _sequenced_pool_body(action_id, version, pool_idx, run_idx)
+    body = _sequenced_pool_body(action_id, version, pool_idx, run_idx, ingest_dir)
 
     first = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
     assert first.status_code == 202, first.text
@@ -1261,7 +1320,7 @@ async def test_submit_sequenced_pool_disallow_without_delete(
 
 
 async def test_submit_sequenced_pool_completed_blocks_without_force(
-    wt_client, postgres_pool, admin_token, sequenced_pool_action, sequenced_pool_for_wt
+    wt_client, postgres_pool, admin_token, sequenced_pool_action, sequenced_pool_for_wt, ingest_dir
 ):
     """A re-submit over an already-COMPLETED pool ticket is refused (409)
     without force — a re-run would re-register the pool's reads into the lake.
@@ -1287,7 +1346,7 @@ async def test_submit_sequenced_pool_completed_blocks_without_force(
 
     resp = await wt_client.post(
         URL_WORK_TICKET_PREFIX,
-        json=_sequenced_pool_body(action_id, version, pool_idx, run_idx),
+        json=_sequenced_pool_body(action_id, version, pool_idx, run_idx, ingest_dir),
         headers=headers,
     )
     assert resp.status_code == 409, resp.text
@@ -1298,7 +1357,7 @@ async def test_submit_sequenced_pool_completed_blocks_without_force(
 
 
 async def test_submit_sequenced_pool_completed_force_allows(
-    wt_client, postgres_pool, admin_token, sequenced_pool_action, sequenced_pool_for_wt
+    wt_client, postgres_pool, admin_token, sequenced_pool_action, sequenced_pool_for_wt, ingest_dir
 ):
     """force=true (here a system_admin) intentionally re-submits over a
     COMPLETED pool ticket: 202 with a fresh PENDING ticket alongside the
@@ -1324,7 +1383,7 @@ async def test_submit_sequenced_pool_completed_force_allows(
 
     resp = await wt_client.post(
         URL_WORK_TICKET_PREFIX,
-        json=_sequenced_pool_body(action_id, version, pool_idx, run_idx, force=True),
+        json=_sequenced_pool_body(action_id, version, pool_idx, run_idx, ingest_dir, force=True),
         headers=headers,
     )
     assert resp.status_code == 202, resp.text
@@ -1368,7 +1427,7 @@ async def test_submit_force_noop_on_non_pool_scope(
 
 
 async def test_submit_sequenced_pool_unique_index_catches_select_race(
-    wt_client, admin_token, sequenced_pool_action, sequenced_pool_for_wt, monkeypatch
+    wt_client, admin_token, sequenced_pool_action, sequenced_pool_for_wt, monkeypatch, ingest_dir
 ):
     """The atomic gate for a sequenced_pool double-submit is the partial
     unique index `work_ticket_one_in_flight_per_sequenced_pool`. Short-
@@ -1379,7 +1438,7 @@ async def test_submit_sequenced_pool_unique_index_catches_select_race(
     action_id, version = sequenced_pool_action
     run_idx, pool_idx = sequenced_pool_for_wt
     headers = {"Authorization": f"Bearer {token}"}
-    body = _sequenced_pool_body(action_id, version, pool_idx, run_idx)
+    body = _sequenced_pool_body(action_id, version, pool_idx, run_idx, ingest_dir)
 
     first = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
     assert first.status_code == 202, first.text
@@ -1615,13 +1674,167 @@ async def test_submit_invalid_context_type_returns_422(
 
 
 # ---------------------------------------------------------------------------
+# ingest-path gate: naming a host path is wet_lab_admin+, and the path must
+# resolve under a configured PATH_INGEST_ROOTS entry.
+# ---------------------------------------------------------------------------
+
+
+async def test_submit_host_path_by_user_returns_403(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    user_audience_prep_sample_action,
+    prep_sample_with_study_link,
+    ingest_file,
+):
+    """A USER who clears the action's audience AND the study-access gate is
+    still refused when the action_context names a host path: the path is
+    re-opened later under the job account, so naming one reaches every file
+    that account can read. The detail names the upload handle to use instead."""
+    token, user_idx = regular_token
+    action_id, version = user_audience_prep_sample_action
+    prep_sample_idx, study_idx, granted_by_idx = prep_sample_with_study_link
+    await postgres_pool.execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
+        " VALUES ($1, $2, 'admin'::qiita.tier, $3)",
+        study_idx,
+        user_idx,
+        granted_by_idx,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": ingest_file("sample_R1.fastq")},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403, resp.text
+    detail = resp.json()["detail"]
+    assert "wet_lab_admin" in detail["reason"]
+    assert detail["context_keys"] == ["fastq_path"]
+    assert detail["upload_instead"] == ["fastq_upload_idx"]
+
+
+async def test_submit_upload_handle_by_user_passes(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    user_audience_prep_sample_action,
+    prep_sample_with_study_link,
+):
+    """The same USER submitting an upload handle instead of a path clears the
+    gate — the handle is the route left open to them."""
+    token, user_idx = regular_token
+    action_id, version = user_audience_prep_sample_action
+    prep_sample_idx, study_idx, granted_by_idx = prep_sample_with_study_link
+    await postgres_pool.execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
+        " VALUES ($1, $2, 'admin'::qiita.tier, $3)",
+        study_idx,
+        user_idx,
+        granted_by_idx,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_upload_idx": 1},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_host_path_outside_ingest_root_returns_422(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """The laptop-path case the gate exists for: an absolute path that resolves
+    on the submitting machine but sits outside every configured root is refused
+    at submit, naming the roots, instead of failing inside a job hours later."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": f"/home/me/{pool_item_id}_R1.fastq"},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["errors"][0]["context_key"] == "fastq_path"
+    assert "outside every configured ingest root" in detail["errors"][0]["reason"]
+    assert detail["ingest_roots"]
+
+
+async def test_submit_missing_host_path_returns_422(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item, ingest_root
+):
+    """A typo'd path inside the root is caught at submit too — the second of the
+    gate's two rules."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": str(ingest_root / f"{pool_item_id}_typo.fastq")},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["errors"][0]["reason"] == "host path does not exist"
+
+
+async def test_submit_reports_every_bad_host_path_at_once(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item, ingest_root
+):
+    """Both offending paths land in one 422 body, so a submission with two bad
+    paths takes one round-trip to fix rather than two."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {
+                "fastq_path": f"/home/me/{pool_item_id}_R1.fastq",
+                "reverse_fastq_path": str(ingest_root / f"{pool_item_id}_R2.fastq"),
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    errors = resp.json()["detail"]["errors"]
+    assert [e["context_key"] for e in errors] == ["fastq_path", "reverse_fastq_path"]
+
+
+# ---------------------------------------------------------------------------
 # fastq filename-prefix gate: a fastq path in action_context must carry a
 # basename prefixed by the prep_sample's sequenced_pool_item_id.
 # ---------------------------------------------------------------------------
 
 
 async def test_submit_fastq_path_prefix_match_passes(
-    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item, ingest_file
 ):
     """fastq_path and reverse_fastq_path whose basenames both start with
     the prep_sample's sequenced_pool_item_id clear the filename-prefix
@@ -1636,8 +1849,8 @@ async def test_submit_fastq_path_prefix_match_passes(
             "action_version": version,
             "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
             "action_context": {
-                "fastq_path": f"/scratch/{pool_item_id}_R1.fastq",
-                "reverse_fastq_path": f"/scratch/{pool_item_id}_R2.fastq",
+                "fastq_path": ingest_file(f"{pool_item_id}_R1.fastq"),
+                "reverse_fastq_path": ingest_file(f"{pool_item_id}_R2.fastq"),
             },
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -1647,7 +1860,7 @@ async def test_submit_fastq_path_prefix_match_passes(
 
 
 async def test_submit_single_end_fastq_path_prefix_match_passes(
-    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item, ingest_file
 ):
     """Forward-only (single-end) submission stays valid: a lone fastq_path
     with no reverse_fastq_path, basename prefixed by the
@@ -1662,7 +1875,7 @@ async def test_submit_single_end_fastq_path_prefix_match_passes(
             "action_id": action_id,
             "action_version": version,
             "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
-            "action_context": {"fastq_path": f"/scratch/{pool_item_id}.fastq"},
+            "action_context": {"fastq_path": ingest_file(f"{pool_item_id}.fastq")},
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -1671,7 +1884,7 @@ async def test_submit_single_end_fastq_path_prefix_match_passes(
 
 
 async def test_submit_fastq_path_prefix_mismatch_returns_422(
-    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item, ingest_file
 ):
     """A fastq_path whose basename does not start with the prep_sample's
     sequenced_pool_item_id is rejected with 422; the detail names the
@@ -1685,7 +1898,7 @@ async def test_submit_fastq_path_prefix_mismatch_returns_422(
             "action_id": action_id,
             "action_version": version,
             "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
-            "action_context": {"fastq_path": "/scratch/wrong-prefix_R1.fastq"},
+            "action_context": {"fastq_path": ingest_file("wrong-prefix_R1.fastq")},
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -1699,7 +1912,7 @@ async def test_submit_fastq_path_prefix_mismatch_returns_422(
 
 
 async def test_submit_fastq_path_prefix_segment_anchored(
-    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item, ingest_file
 ):
     """The gate is segment-anchored, not a bare substring match: a
     basename carrying the pool item id followed straight by another
@@ -1714,7 +1927,7 @@ async def test_submit_fastq_path_prefix_segment_anchored(
             "action_id": action_id,
             "action_version": version,
             "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
-            "action_context": {"fastq_path": f"/scratch/{pool_item_id}9_R1.fastq"},
+            "action_context": {"fastq_path": ingest_file(f"{pool_item_id}9_R1.fastq")},
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -1723,7 +1936,7 @@ async def test_submit_fastq_path_prefix_segment_anchored(
 
 
 async def test_submit_reverse_fastq_path_prefix_checked(
-    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item, ingest_file
 ):
     """The gate covers reverse_fastq_path too: a matching fastq_path
     paired with a mismatched reverse_fastq_path still 422s, and the
@@ -1738,8 +1951,8 @@ async def test_submit_reverse_fastq_path_prefix_checked(
             "action_version": version,
             "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
             "action_context": {
-                "fastq_path": f"/scratch/{pool_item_id}_R1.fastq",
-                "reverse_fastq_path": "/scratch/other-sample_R2.fastq",
+                "fastq_path": ingest_file(f"{pool_item_id}_R1.fastq"),
+                "reverse_fastq_path": ingest_file("other-sample_R2.fastq"),
             },
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -1749,8 +1962,144 @@ async def test_submit_reverse_fastq_path_prefix_checked(
     assert [m["context_key"] for m in mismatched] == ["reverse_fastq_path"]
 
 
+@pytest.fixture
+async def upload_slot(postgres_pool, admin_token):
+    """Mint a `qiita.upload` row owned by the admin, with a chosen
+    `source_filename`. Returns a factory so one test can mint an R1 and an R2.
+    """
+    _, admin_idx = admin_token
+    created: list[int] = []
+
+    async def _make(source_filename: str | None, *, owner_idx: int | None = None) -> int:
+        idx = await postgres_pool.fetchval(
+            "INSERT INTO qiita.upload (created_by_idx, source_filename)"
+            " VALUES ($1, $2) RETURNING upload_idx",
+            admin_idx if owner_idx is None else owner_idx,
+            source_filename,
+        )
+        created.append(idx)
+        return idx
+
+    yield _make
+    if created:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.upload WHERE upload_idx = ANY($1::bigint[])", created
+        )
+
+
+async def test_submit_fastq_upload_prefix_match_passes(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item, upload_slot
+):
+    """An upload-fed submission whose `upload.source_filename` carries the
+    pool item id clears the same gate a path-fed one does."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {
+                "fastq_upload_idx": await upload_slot(f"{pool_item_id}_R1.fastq.gz")
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_fastq_upload_prefix_mismatch_returns_422(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item, upload_slot
+):
+    """The rule is not vacuous on the upload route: a filename that does not
+    carry the pool item id is refused, and the detail names the key the
+    submitter wrote (`fastq_upload_idx`), not its resolved `fastq_path` twin."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, _pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_upload_idx": await upload_slot("other-sample_R1.fastq.gz")},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    mismatched = resp.json()["detail"]["mismatched"]
+    assert [m["context_key"] for m in mismatched] == ["fastq_upload_idx"]
+    assert mismatched[0]["source_filename"] == "other-sample_R1.fastq.gz"
+
+
+async def test_another_principals_upload_filename_is_not_disclosed(
+    wt_client,
+    admin_token,
+    regular_token,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+    upload_slot,
+):
+    """The filename lookup is scoped to the caller's own uploads.
+
+    A filename here carries a `sequenced_pool_item_id`, and the mismatch 422
+    quotes it back. Unscoped, naming someone else's `upload_idx` against a
+    prep_sample of one's own would answer "what is upload N called" for any N.
+    The runner still refuses the upload itself, so nothing is gained by
+    admitting the submit — but nothing is leaked by it either.
+    """
+    token, _ = admin_token
+    _, other_idx = regular_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, _pool_item_id = prep_sample_with_pool_item
+    theirs = await upload_slot("their-sample_R1.fastq.gz", owner_idx=other_idx)
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_upload_idx": theirs},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert "their-sample_R1.fastq.gz" not in resp.text
+    if resp.status_code == 202:
+        wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_fastq_upload_without_source_filename_skips_the_rule(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item, upload_slot
+):
+    """An upload row carrying no `source_filename` — one that predates the
+    column, or a client that sent none — leaves the rule nothing to anchor
+    against, so the submission proceeds. Same shape as the NULL
+    `sequenced_pool_item_id` arm."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, _pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_upload_idx": await upload_slot(None)},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
 async def test_submit_fastq_path_prefix_skipped_without_pool_item(
-    wt_client, admin_token, prep_sample_action, prep_sample_idx
+    wt_client, admin_token, prep_sample_action, prep_sample_idx, ingest_file
 ):
     """When the prep_sample has no sequenced_sample subtype row (hence no
     sequenced_pool_item_id), the filename-prefix gate is vacuous and
@@ -1764,7 +2113,7 @@ async def test_submit_fastq_path_prefix_skipped_without_pool_item(
             "action_id": action_id,
             "action_version": version,
             "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
-            "action_context": {"fastq_path": "/scratch/anything-goes_R1.fastq"},
+            "action_context": {"fastq_path": ingest_file("anything-goes_R1.fastq")},
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -2837,9 +3186,9 @@ async def ticket_seeder(postgres_pool):
         )
 
 
-def _summary_by_idx(payload: list[dict], idx: int) -> dict | None:
-    """Find the summary dict for `idx` in a list response, or None."""
-    return next((row for row in payload if row["work_ticket_idx"] == idx), None)
+def _summary_by_idx(body: dict, idx: int) -> dict | None:
+    """Find the summary dict for `idx` in a WorkTicketListResponse body, or None."""
+    return next((row for row in body["tickets"] if row["work_ticket_idx"] == idx), None)
 
 
 async def test_list_work_ticket_401_on_anonymous(wt_client):
@@ -3072,7 +3421,7 @@ async def test_list_work_ticket_state_filter(
         headers={"Authorization": f"Bearer {admin_tok}"},
     )
     assert resp.status_code == 200, resp.text
-    returned = {row["work_ticket_idx"] for row in resp.json()}
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
     assert processing_idx in returned
     assert pending_idx not in returned
     assert completed_idx not in returned
@@ -3103,7 +3452,7 @@ async def test_list_work_ticket_active_filter(
         headers={"Authorization": f"Bearer {admin_tok}"},
     )
     assert resp.status_code == 200, resp.text
-    returned = {row["work_ticket_idx"] for row in resp.json()}
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
     assert {pending_idx, processing_idx} <= returned
     assert completed_idx not in returned
     assert failed_idx not in returned
@@ -3144,14 +3493,17 @@ async def test_list_work_ticket_orders_newest_first(
         URL_WORK_TICKET_LIST, headers={"Authorization": f"Bearer {admin_tok}"}
     )
     assert resp.status_code == 200, resp.text
-    returned = [row["work_ticket_idx"] for row in resp.json()]
+    returned = [row["work_ticket_idx"] for row in resp.json()["tickets"]]
     assert returned == sorted(seeded, reverse=True)
 
 
 async def test_list_work_ticket_limit_caps_results(
     wt_client, admin_token, reference_action, ticket_seeder
 ):
-    """`?limit=N` caps the page size (own-scoped, so the count is exact)."""
+    """`?limit=N` caps the page size and says so: a capped page reports
+    `truncated` true with `count` at the cap, an uncapped one false — the
+    caller never has to infer a cut from the row count. Own-scoped, so both
+    counts are exact."""
     admin_tok, admin_idx = admin_token
     for _ in range(3):
         await ticket_seeder.ticket(
@@ -3163,7 +3515,379 @@ async def test_list_work_ticket_limit_caps_results(
         headers={"Authorization": f"Bearer {admin_tok}"},
     )
     assert resp.status_code == 200, resp.text
-    assert len(resp.json()) == 2
+    body = resp.json()
+    assert len(body["tickets"]) == 2
+    assert body["count"] == 2
+    assert body["truncated"] is True
+
+    # limit == the exact row count: the limit+1 fetch finds no extra row, so
+    # this is a complete page, not a truncated one.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"limit": "3"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 3
+    assert body["truncated"] is False
+
+
+# The tagged-union idx column each scope kind fills in (mirrors the DB CHECK on
+# qiita.work_ticket). Keyed on the enum, so the column name interpolated into
+# the INSERT is always one of these three literals.
+_SCOPE_IDX_COLUMN = {
+    ScopeTargetKind.PREP_SAMPLE: "prep_sample_idx",
+    ScopeTargetKind.SEQUENCED_POOL: "sequenced_pool_idx",
+    ScopeTargetKind.BLOCK: "block_idx",
+}
+
+
+async def _seed_scoped_ticket(
+    wt_client,
+    postgres_pool,
+    *,
+    action,
+    originator_idx,
+    kind: ScopeTargetKind,
+    idx,
+    state: WorkTicketState = WorkTicketState.PROCESSING,
+):
+    """Insert one work_ticket of `kind` pointing at `idx` (the tagged-union
+    column that kind uses), register it for wt_client teardown, and return its
+    work_ticket_idx. Only the column NAME is interpolated — both closed-set
+    labels bind through their enum twin."""
+    action_id, version = action
+    column = _SCOPE_IDX_COLUMN[kind]
+    work_ticket_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        f"  scope_target_kind, {column}, state)"
+        " VALUES ($1, $2, $3, $4::qiita.scope_target_kind, $5,"
+        "         $6::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        originator_idx,
+        kind.value,
+        idx,
+        state.value,
+    )
+    wt_client._created_tickets.append(work_ticket_idx)
+    return work_ticket_idx
+
+
+@pytest.fixture
+async def pool_of_prep_sample(postgres_pool, prep_sample_with_pool_item):
+    """The sequenced_pool_idx behind `prep_sample_with_pool_item` — the pool a
+    `?sequenced_pool_idx=` filter names when the ticket is sample-scoped."""
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    return await postgres_pool.fetchval(
+        "SELECT sequenced_pool_idx FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
+        prep_sample_idx,
+    )
+
+
+async def test_list_work_ticket_pool_filter_matches_all_three_scope_kinds(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    reference_action,
+    ticket_seeder,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+    pool_of_prep_sample,
+    sequenced_pool_action,
+    block_action,
+    block_for_wt,
+):
+    """`?sequenced_pool_idx=P` returns every ticket that touches P by any of the
+    three routes a ticket reaches a pool — the pool itself, one of its samples,
+    or a block covering one of its samples — and nothing else."""
+    admin_tok, admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    await postgres_pool.execute(
+        "INSERT INTO qiita.block_member"
+        " (block_idx, prep_sample_idx, min_sequence_idx, max_sequence_idx)"
+        " VALUES ($1, $2, 1, 10)",
+        block_for_wt,
+        prep_sample_idx,
+    )
+    sample_scoped = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+    pool_scoped = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=sequenced_pool_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.SEQUENCED_POOL,
+        idx=pool_of_prep_sample,
+    )
+    block_scoped = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=block_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.BLOCK,
+        idx=block_for_wt,
+    )
+    # Control: same originator, touches no pool at all.
+    unrelated = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="processing"
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = [row["work_ticket_idx"] for row in resp.json()["tickets"]]
+    assert set(returned) == {sample_scoped, pool_scoped, block_scoped}
+    assert unrelated not in returned
+    # One row per ticket: the block arm covers many samples and the sample arm
+    # rides a UNIQUE join, so neither can fan a ticket into duplicate rows.
+    assert len(returned) == len(set(returned))
+    # The sample-scoped ticket carries read_outcome; the block ticket spans many
+    # samples and carries none.
+    assert _summary_by_idx(resp.json(), sample_scoped)["read_outcome"] is not None
+    assert _summary_by_idx(resp.json(), block_scoped)["read_outcome"] is None
+
+    # AND-composes with the state filters: all three are PROCESSING, so
+    # ?state=completed intersects to empty and ?active=true keeps all three.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={
+            "sequenced_pool_idx": str(pool_of_prep_sample),
+            "state": WorkTicketState.COMPLETED.value,
+        },
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["tickets"] == []
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample), "active": "true"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert {row["work_ticket_idx"] for row in resp.json()["tickets"]} == {
+        sample_scoped,
+        pool_scoped,
+        block_scoped,
+    }
+
+
+async def test_list_work_ticket_pool_filter_excludes_other_pools(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+    pool_of_prep_sample,
+    sequenced_pool_action,
+    sequenced_pool_for_wt,
+):
+    """A ticket on a DIFFERENT pool is excluded — the filter narrows to the
+    named pool rather than to "has a pool"."""
+    admin_tok, admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    _run_idx, other_pool_idx = sequenced_pool_for_wt
+    mine = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+    theirs = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=sequenced_pool_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.SEQUENCED_POOL,
+        idx=other_pool_idx,
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
+    assert mine in returned
+    assert theirs not in returned
+
+
+async def test_list_work_ticket_pool_filter_keeps_originator_scoping(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    regular_token,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+    pool_of_prep_sample,
+):
+    """The pool filter composes with the originator scoping instead of
+    replacing it: another principal's ticket on the pool stays invisible
+    without `?all=true`."""
+    user_tok, user_idx = regular_token
+    admin_tok, _admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    theirs = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=user_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), theirs) is None
+
+    # The originator sees it under the same filter.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample)},
+        headers={"Authorization": f"Bearer {user_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), theirs) is not None
+
+    # ...and so does the operator view: ?all=true widens across originators
+    # with the pool filter still applied, rather than the two cancelling out.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"sequenced_pool_idx": str(pool_of_prep_sample), "all": "true"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), theirs) is not None
+
+
+@pytest.fixture
+async def other_id_reference_action(postgres_pool):
+    """A reference-targeting action under a DIFFERENT action_id. The module's
+    other action fixtures all share `wt-test-action`, so an action_id filter
+    needs this one to have anything to exclude."""
+    action_id, version = await _seed_action(
+        postgres_pool, context_schema={}, action_id="wt-test-other-action"
+    )
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+async def test_list_work_ticket_prep_sample_and_action_id_filters(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    other_id_reference_action,
+    ticket_seeder,
+    prep_sample_action,
+    prep_sample_with_pool_item,
+):
+    """`?prep_sample_idx=` narrows to one sample's tickets and `?action_id=`
+    to one action; both AND-compose with the rest of the filters."""
+    admin_tok, admin_idx = admin_token
+    prep_sample_idx, _item = prep_sample_with_pool_item
+    sample_ticket = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=prep_sample_action,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+    )
+    other_action_ticket = await ticket_seeder.ticket(
+        action=other_id_reference_action, originator_idx=admin_idx, state="processing"
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"prep_sample_idx": str(prep_sample_idx)},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert {row["work_ticket_idx"] for row in resp.json()["tickets"]} == {sample_ticket}
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"action_id": other_id_reference_action[0]},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
+    assert other_action_ticket in returned
+    assert sample_ticket not in returned
+
+    # The other direction: the sample's own action_id excludes the other action.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"action_id": prep_sample_action[0]},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
+    assert sample_ticket in returned
+    assert other_action_ticket not in returned
+
+    # AND-composed: this sample has no ticket for the other action.
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={
+            "prep_sample_idx": str(prep_sample_idx),
+            "action_id": other_id_reference_action[0],
+        },
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["tickets"] == []
+
+
+async def test_list_work_ticket_unknown_filter_idx_is_empty_not_404(wt_client, admin_token):
+    """An idx that matches nothing returns an empty list — these are filters on
+    a list, and the route does not confirm which pools or samples exist."""
+    admin_tok, _ = admin_token
+    for params in (
+        {"sequenced_pool_idx": "999999999"},
+        {"prep_sample_idx": "999999999"},
+        {"action_id": "no-such-action"},
+    ):
+        resp = await wt_client.get(
+            URL_WORK_TICKET_LIST,
+            params=params,
+            headers={"Authorization": f"Bearer {admin_tok}"},
+        )
+        assert resp.status_code == 200, (params, resp.text)
+        assert resp.json()["tickets"] == []
+
+
+async def test_list_work_ticket_filter_idx_out_of_range_422(wt_client, admin_token):
+    """The two idx filters are positive integers (gt=0), like every other idx
+    on this surface."""
+    admin_tok, _ = admin_token
+    for params in ({"sequenced_pool_idx": "0"}, {"prep_sample_idx": "0"}, {"action_id": ""}):
+        resp = await wt_client.get(
+            URL_WORK_TICKET_LIST,
+            params=params,
+            headers={"Authorization": f"Bearer {admin_tok}"},
+        )
+        assert resp.status_code == 422, (params, resp.text)
 
 
 async def test_list_work_ticket_limit_out_of_range_422(wt_client, admin_token):

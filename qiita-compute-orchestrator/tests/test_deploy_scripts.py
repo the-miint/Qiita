@@ -1,4 +1,4 @@
-"""Smoke-check the deploy shell scripts (deploy/*.sh).
+"""Smoke-check the deploy shell scripts (deploy/*.sh) and the workflow entrypoints.
 
 These run on the Linux deploy host, not in CI's Python env, so they have no
 unit-test harness of their own. This pure-unit guard (under `make test`) catches
@@ -6,6 +6,12 @@ the cheap-but-real failures — syntax errors and shellcheck warnings — before
 ship to a host where a broken deploy script is expensive. Mirrors the `bash -n`
 precedent in test_compute_readiness.py::test_probe_script_is_valid_bash and the
 repo-root reach in test_sif_build_spec.py.
+
+The workflow entrypoints get the `bash -n` half for the same reason and a sharper
+one: they run inside a SIF, so a syntax error surfaces as a container step dying
+on a real ticket, after the image has been rebuilt and staged. Several embed a
+long single-quoted awk program, where an apostrophe in a comment closes the quote
+and breaks the script — the shape this gate is here to stop.
 
 shellcheck is optional: when it isn't installed the shellcheck assertion skips
 gracefully (same posture as the apptainer-optional workflow tests).
@@ -26,6 +32,7 @@ _DEPLOY = _REPO_ROOT / "deploy"
 _COMMON = _DEPLOY / "_common.sh"
 _BUILD_SIF = _REPO_ROOT / "scripts" / "build-sif.sh"
 _LAKE_SHELL = _REPO_ROOT / "scripts" / "lake-shell.sh"
+_LAKE_GC = _REPO_ROOT / "scripts" / "lake-gc.sh"
 
 # The scripts introduced/maintained for the deploy-ease work. Kept
 # explicit (not a glob) so a new deploy script is a deliberate add here.
@@ -36,6 +43,11 @@ _SCRIPTS = ("preflight.sh", "verify.sh", "redeploy.sh", "build-sifs.sh")
 # scripts rely on, so it gets the same bash -n + shellcheck gate — but NOT the
 # executable-bit check below, since it's never run directly.
 _SOURCED = ("_common.sh",)
+
+# The per-step entrypoints and the shared helper they source. A glob, not a list:
+# a new workflow step ships a new .sh, and it wants this gate by default rather
+# than by remembering to register it.
+_WORKFLOW_SCRIPTS = sorted((_REPO_ROOT / "workflows").rglob("*.sh"))
 
 
 @pytest.mark.parametrize("name", _SCRIPTS)
@@ -514,6 +526,255 @@ def test_native_checkout_fails_outside_git_clone(tmp_path: Path) -> None:
     assert "git clone" in result.stderr
 
 
+# --- qiita_deploy_self_fingerprint / qiita_deploy_reexec_if_changed ----------
+# redeploy.sh pulls the clone it lives in, so the pull can replace redeploy.sh and
+# _common.sh under the running shell. The fingerprint is how the script notices;
+# the re-exec is what it does about it. Both are exercised end to end below, on a
+# fixture that copies the real _common.sh so the helpers under test are the
+# shipped ones. -----------------------------------------------------------------
+
+_REDEPLOY = _DEPLOY / "redeploy.sh"
+
+
+def _fake_deploy_dir(tmp_path: Path, *, script: str, common_suffix: str = "") -> Path:
+    """A `deploy/`-shaped dir: a script beside a copy of the real `_common.sh`.
+    The copy is what `QIITA_COMMON_SH` resolves to, so a test can edit or delete
+    it. `common_suffix` appends bytes, standing in for a pull that touched only
+    `_common.sh`."""
+    d = tmp_path / "deploy"
+    d.mkdir(parents=True)
+    (d / "_common.sh").write_text(_COMMON.read_text() + common_suffix)
+    path = d / "redeploy.sh"
+    path.write_text(script)
+    return path
+
+
+def _call_self_fingerprint(script: Path, *, prelude: str = "") -> subprocess.CompletedProcess[str]:
+    """Source the fixture's `_common.sh`, then fingerprint the fixture script."""
+    common = script.parent / "_common.sh"
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{common}"; {prelude} qiita_deploy_self_fingerprint "$1"',
+            "_",
+            str(script),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_self_fingerprint_changes_when_the_script_is_replaced_by_rename(tmp_path: Path) -> None:
+    """The production event, exactly: `git checkout` writes a temp file and
+    renames it over the tracked path. Same path, new inode, new bytes."""
+    script = _fake_deploy_dir(tmp_path, script="# old\n")
+    before = _call_self_fingerprint(script)
+    assert before.returncode == 0, before.stderr
+    assert before.stdout.strip() != ""
+
+    replacement = script.parent / "redeploy.sh.pulled"
+    replacement.write_text("# new\n")
+    os.replace(replacement, script)
+
+    after = _call_self_fingerprint(script)
+    assert after.returncode == 0, after.stderr
+    assert after.stdout != before.stdout
+
+
+def test_self_fingerprint_covers_the_sourced_common(tmp_path: Path) -> None:
+    """`_common.sh` is read into the same process, so a pull that changes only it
+    leaves the running script just as stale. Anchoring on the script alone would
+    miss that."""
+    script = _fake_deploy_dir(tmp_path, script="# script\n")
+    before = _call_self_fingerprint(script).stdout
+    common = script.parent / "_common.sh"
+    common.write_text(common.read_text() + "\n# pulled\n")
+    assert _call_self_fingerprint(script).stdout != before
+
+
+def test_self_fingerprint_separates_the_two_files(tmp_path: Path) -> None:
+    """Digesting each file under its name, rather than hashing the two
+    concatenated, is what keeps bytes moving from one to the other visible."""
+    moved = "# moved line\n"
+    in_script = _fake_deploy_dir(tmp_path / "a", script=f"# script\n{moved}")
+    in_common = _fake_deploy_dir(tmp_path / "b", script="# script\n", common_suffix=moved)
+    assert _call_self_fingerprint(in_script).stdout != _call_self_fingerprint(in_common).stdout
+
+
+def test_self_fingerprint_fails_loudly_when_the_script_is_unreadable(tmp_path: Path) -> None:
+    """rc=1 + a stderr reason, not an empty digest. An empty digest compares
+    unequal to the pre-pull one, which would re-exec a file that just failed to
+    read."""
+    script = _fake_deploy_dir(tmp_path, script="# script\n")
+    script.unlink()
+    result = _call_self_fingerprint(script)
+    assert result.returncode == 1
+    assert result.stdout.strip() == ""
+    assert "redeploy.sh" in result.stderr
+
+
+def test_self_fingerprint_fails_loudly_when_common_is_unreadable(tmp_path: Path) -> None:
+    """Same, for the sourced half: the file is gone from disk after this process
+    read it, which is what an interrupted pull can leave behind."""
+    script = _fake_deploy_dir(tmp_path, script="# script\n")
+    common = script.parent / "_common.sh"
+    result = _call_self_fingerprint(script, prelude=f'rm "{common}";')
+    assert result.returncode == 1
+    assert result.stdout.strip() == ""
+    assert "_common.sh" in result.stderr
+
+
+# A script that mimics redeploy.sh step 1 against the fixture's own _common.sh:
+# fingerprint, optionally let a "pull" replace it by rename, then hand off to the
+# helper. v1 prints `original`; the replacement prints `pulled`, so stdout says
+# which body finished the run.
+_PULLED_DEFAULT = "printf 'pulled\\n'"
+
+_STEP1_V1 = """#!/usr/bin/env bash
+set -euo pipefail
+source "{common}"
+SELF="{self}"
+printf 'original\\n'
+before=$(qiita_deploy_self_fingerprint "$SELF")
+if [ -n "{replace}" ]; then
+    cat > "$SELF.pulled" <<'PULLED'
+#!/usr/bin/env bash
+{pulled}
+PULLED
+    mv "$SELF.pulled" "$SELF"
+fi
+qiita_deploy_reexec_if_changed "$SELF" "$before"
+printf 'original-continued\\n'
+"""
+
+
+def _run_step1(
+    tmp_path: Path,
+    *,
+    replace: bool,
+    env: dict[str, str] | None = None,
+    pulled: str = _PULLED_DEFAULT,
+) -> subprocess.CompletedProcess[str]:
+    d = tmp_path / "deploy"
+    d.mkdir(parents=True)
+    (d / "_common.sh").write_text(_COMMON.read_text())
+    script = d / "redeploy.sh"
+    script.write_text(
+        _STEP1_V1.format(
+            common=d / "_common.sh",
+            self=script,
+            replace="1" if replace else "",
+            pulled=pulled,
+        )
+    )
+    return subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **(env or {})},
+    )
+
+
+def test_reexec_runs_the_pulled_body_and_abandons_the_original(tmp_path: Path) -> None:
+    """The whole point, end to end: the helper `exec`s, so the run finishes on the
+    replacement and never returns to the line after the call."""
+    run = _run_step1(tmp_path, replace=True)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.splitlines()[0] == "original"
+    assert run.stdout.splitlines()[-1] == "pulled"
+    assert "original-continued" not in run.stdout
+
+
+def test_reexec_is_a_no_op_when_nothing_changed(tmp_path: Path) -> None:
+    """Control for the test above: same fixture, no replacement. The helper must
+    return so the caller carries on — a deploy that re-execs every time would
+    never leave step 1."""
+    run = _run_step1(tmp_path, replace=False)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.splitlines() == ["original", "original-continued"]
+
+
+def test_reexec_refuses_a_second_time_rather_than_looping(tmp_path: Path) -> None:
+    """With the sentinel already set, a further change aborts. Nothing is deployed
+    at step 1, so the caller can be stopped for the cost of a re-run; carrying on
+    would be running code the process knows is not the pulled code."""
+    run = _run_step1(tmp_path, replace=True, env={"QIITA_REDEPLOY_REEXECED": "1"})
+    assert run.returncode != 0
+    assert "changed again after the re-exec" in run.stderr
+    assert "pulled" not in run.stdout
+    assert "original-continued" not in run.stdout
+
+
+def test_reexec_sentinel_reaches_the_replacement(tmp_path: Path) -> None:
+    """The sentinel is exported, so the re-exec'd process sees it. Were it a plain
+    shell variable the replacement would start with it unset, and a clone that
+    kept changing could re-exec without end."""
+    run = _run_step1(
+        tmp_path,
+        replace=True,
+        pulled="printf 'pulled sentinel=%s\\n' \"$QIITA_REDEPLOY_REEXECED\"",
+    )
+    assert run.returncode == 0, run.stderr
+    assert "pulled sentinel=1" in run.stdout
+
+
+def test_bash_keeps_executing_a_script_replaced_by_rename(tmp_path: Path) -> None:
+    """The premise the re-exec rests on, asserted rather than read off the docs.
+
+    bash holds the script's fd, so a rename over the path swaps the inode without
+    touching what the running shell reads: the process finishes on the original
+    body. That is why steps 2-8 of a redeploy run pre-pull code, and it is a
+    property of bash, not something the deploy arranges. The body is padded well
+    past a single read so the case is not decided by read-ahead alone; either way
+    what is asserted is the observable. The control below shows the swap landed."""
+    script = tmp_path / "self-replacing.sh"
+    padding = "\n".join(f"# pad {i:05d}" * 4 for i in range(4096))
+    body = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "printf 'start\\n'",
+            padding,
+            # The replacement is a script in its own right, so the control below
+            # can run it and show the rename landed.
+            "cat > \"$0.new\" <<'NEW'",
+            "printf 'REPLACEMENT\\n'",
+            "NEW",
+            'mv "$0.new" "$0"',
+            "printf 'end-of-original\\n'",
+            "",
+        ]
+    )
+    script.write_text(body)
+    assert len(body) > 65536, "keep the body well past a single read"
+
+    run = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.splitlines() == ["start", "end-of-original"], (
+        "bash executed something other than the original body after the rename; "
+        f"stdout was {run.stdout!r}"
+    )
+
+    # Control: the swap landed, so a FRESH bash on the same path runs the new body.
+    fresh = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    assert fresh.stdout.splitlines() == ["REPLACEMENT"], (
+        "the rename did not replace the script, so the assertion above proved "
+        f"nothing (stdout={fresh.stdout!r}, stderr={fresh.stderr!r})"
+    )
+
+
+def test_redeploy_refuses_a_self_outside_the_clone(tmp_path: Path) -> None:
+    """The re-exec check can only see a pull that lands in $QIITA_CLONE, so
+    redeploy.sh aborts when it is not running from that clone — otherwise the
+    check is green for a reason unrelated to freshness."""
+    text = _REDEPLOY.read_text()
+    guard = text.find('case "$SELF" in')
+    pull = text.find('git -C "$QIITA_CLONE" pull --ff-only')
+    assert 0 <= guard < pull, "the containment guard must run before the pull"
+    assert '"$QIITA_CLONE"/*' in text
+
+
 # --- qiita_buckets_12: the "skip the bucket 1 & 2 ack when there's nothing to
 # apply" predicate redeploy.sh uses. rc 0 = empty (skip prompt), 1 = has steps
 # (prompt), 2 = unreadable/markers-absent (fail safe → prompt). -----------------
@@ -654,87 +915,6 @@ def test_deploy_archive_index_covers_every_archived_deploy() -> None:
         f"index: {sorted(on_disk - linked)}. Indexed but absent from disk (dead "
         f"links): {sorted(linked - on_disk)}."
     )
-
-
-# --- qiita_paths_touch_native: the pure path-prefix predicate behind redeploy.sh's
-# "did this pull touch a package the native SLURM venv runs?" decision. rc 0 = a
-# path is under qiita-common/ or qiita-compute-orchestrator/, 1 = none are. -------
-
-
-def _call_paths_touch_native(paths: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["bash", "-c", f'source "{_COMMON}"; qiita_paths_touch_native "$1"', "_", paths],
-        capture_output=True,
-        text=True,
-    )
-
-
-@pytest.mark.parametrize(
-    "paths",
-    [
-        "qiita-common/src/qiita_common/config.py\nother/x",
-        "qiita-compute-orchestrator/pyproject.toml",
-        "docs/a.md\nqiita-common/f",  # native path is not the first line
-    ],
-)
-def test_paths_touch_native_matches(paths: str) -> None:
-    """Any path under the two native packages → rc 0 (refresh needed)."""
-    assert _call_paths_touch_native(paths).returncode == 0
-
-
-@pytest.mark.parametrize(
-    "paths",
-    [
-        "docs/a.md\nworkflows/b.yaml\nqiita-data-plane/src/main.rs",
-        "qiita-common-extra/z.py",  # sibling prefix must NOT match
-        "",  # empty diff → nothing touched
-    ],
-)
-def test_paths_touch_native_no_match(paths: str) -> None:
-    """No path under the native packages (incl. a sibling-prefix dir or an empty
-    list) → rc 1 (no refresh needed)."""
-    assert _call_paths_touch_native(paths).returncode == 1
-
-
-# --- qiita_paths_touch_cli: the pure path-prefix predicate behind redeploy.sh's
-# "did this pull touch a package the operator's checkout CLI venv runs?" decision.
-# rc 0 = a path is under qiita-common/ or qiita-control-plane/, 1 = none are. -----
-
-
-def _call_paths_touch_cli(paths: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["bash", "-c", f'source "{_COMMON}"; qiita_paths_touch_cli "$1"', "_", paths],
-        capture_output=True,
-        text=True,
-    )
-
-
-@pytest.mark.parametrize(
-    "paths",
-    [
-        "qiita-common/src/qiita_common/api_paths.py\nother/x",
-        "qiita-control-plane/src/qiita_control_plane/cli/user.py",
-        "docs/a.md\nqiita-control-plane/f",  # CLI path is not the first line
-    ],
-)
-def test_paths_touch_cli_matches(paths: str) -> None:
-    """Any path under qiita-common or qiita-control-plane → rc 0 (refresh needed)."""
-    assert _call_paths_touch_cli(paths).returncode == 0
-
-
-@pytest.mark.parametrize(
-    "paths",
-    [
-        # The native packages alone do NOT change what the CLI venv imports.
-        "docs/a.md\nqiita-compute-orchestrator/pyproject.toml\nqiita-data-plane/src/main.rs",
-        "qiita-control-plane-extra/z.py",  # sibling prefix must NOT match
-        "",  # empty diff → nothing touched
-    ],
-)
-def test_paths_touch_cli_no_match(paths: str) -> None:
-    """No path under the CLI packages (incl. a sibling-prefix dir or an empty
-    list) → rc 1 (no refresh needed)."""
-    assert _call_paths_touch_cli(paths).returncode == 1
 
 
 # --- scripts/build-sif.sh: now sources deploy/_common.sh for the build-inputs
@@ -993,36 +1173,29 @@ def test_missing_sources_some_missing_returns_one_and_lists_them(tmp_path: Path)
 # same bash -n + shellcheck gate as the deploy scripts. ------------------------
 
 
-def test_lake_shell_exists_and_executable() -> None:
-    assert _LAKE_SHELL.is_file(), f"{_LAKE_SHELL} missing"
-    assert _LAKE_SHELL.stat().st_mode & 0o111, f"{_LAKE_SHELL} is not executable"
-
-
-def test_lake_shell_is_valid_bash() -> None:
-    result = subprocess.run(["bash", "-n", str(_LAKE_SHELL)], capture_output=True, text=True)
-    assert result.returncode == 0, f"bash -n failed for lake-shell.sh:\n{result.stderr}"
-
-
-def test_lake_shell_passes_shellcheck() -> None:
-    if shutil.which("shellcheck") is None:
-        pytest.skip("shellcheck not installed")
-    result = subprocess.run(
-        ["shellcheck", "-S", "warning", str(_LAKE_SHELL)], capture_output=True, text=True
-    )
-    assert result.returncode == 0, (
-        f"shellcheck flagged lake-shell.sh:\n{result.stdout}\n{result.stderr}"
-    )
-
-
-def test_lake_shell_derives_data_path_exactly_like_the_data_plane() -> None:
+def test_lake_data_path_helper_derives_exactly_like_the_data_plane() -> None:
     """DuckLake pins DATA_PATH into the catalog at creation and rejects an attach
-    whose DATA_PATH differs by even a slash, so the script must reproduce
+    whose DATA_PATH differs by even a slash, so the derivation must reproduce
     config.rs's bare `format!("{path_persistent_raw}/ducklake")` — no trailing-slash
-    normalization. A `${PERSISTENT%/}` here breaks every host whose
-    PATH_PERSISTENT ends in `/`."""
-    body = _LAKE_SHELL.read_text()
-    assert 'DATA_PATH="${PERSISTENT}/ducklake"' in body
-    assert "PERSISTENT%/" not in body
+    normalization. A `${PERSISTENT%/}` anywhere breaks every host whose
+    PATH_PERSISTENT ends in `/`. Exercised through the helper rather than grepped
+    for, and both callers are pinned to it."""
+
+    def derive(persistent: str) -> str:
+        result = subprocess.run(
+            ["bash", "-c", f'source "{_COMMON}"; qiita_lake_data_path "$1"', "_", persistent],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+
+    assert derive("/data") == "/data/ducklake"
+    assert derive("/data/") == "/data//ducklake", "a trailing slash must survive verbatim"
+    for script in (_LAKE_SHELL, _LAKE_GC):
+        body = script.read_text()
+        assert "PERSISTENT%/" not in body, f"{script.name} normalizes the trailing slash"
+        assert "qiita_lake_data_path" in body, f"{script.name} must use the shared helper"
 
 
 def _call_split_conn_password(connstr: str) -> list[str]:
@@ -1114,3 +1287,266 @@ def test_lake_shell_refuses_to_open_without_the_staged_miint_extension(tmp_path:
     )
     assert result.returncode == 1, f"expected a hard failure, got:\n{result.stdout}"
     assert "MIINT_EXTENSION_DIRECTORY" in result.stderr
+
+
+# --- scripts/lake-gc.sh: DuckLake reclamation. Reports by default; --reclaim
+# expires snapshots and unlinks files. Sources deploy/_common.sh like
+# lake-shell.sh, so it gets the same bash -n + shellcheck gate. ---------------
+
+
+_LAKE_SCRIPTS = (_LAKE_SHELL, _LAKE_GC)
+
+
+@pytest.mark.parametrize("script", _LAKE_SCRIPTS, ids=lambda p: p.name)
+def test_lake_script_exists_and_executable(script: Path) -> None:
+    assert script.is_file(), f"{script} missing"
+    assert script.stat().st_mode & 0o111, f"{script} is not executable"
+
+
+@pytest.mark.parametrize("script", _LAKE_SCRIPTS, ids=lambda p: p.name)
+def test_lake_script_is_valid_bash(script: Path) -> None:
+    result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed for {script.name}:\n{result.stderr}"
+
+
+@pytest.mark.parametrize("script", _LAKE_SCRIPTS, ids=lambda p: p.name)
+def test_lake_script_passes_shellcheck(script: Path) -> None:
+    if shutil.which("shellcheck") is None:
+        pytest.skip("shellcheck not installed")
+    result = subprocess.run(
+        ["shellcheck", "-S", "warning", str(script)], capture_output=True, text=True
+    )
+    assert result.returncode == 0, (
+        f"shellcheck flagged {script.name}:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def _lake_gc_code() -> str:
+    """The script with comment-only lines stripped, so an invariant test can
+    assert about what the script *runs* without matching the header prose that
+    explains the same thing."""
+    return "\n".join(
+        line for line in _LAKE_GC.read_text().splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def test_lake_gc_help_exits_zero_and_names_reclaim() -> None:
+    result = subprocess.run(["bash", str(_LAKE_GC), "--help"], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "--reclaim" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "7; DROP TABLE x",  # injection shape — the value lands in an INTERVAL literal
+        "7 FORTNIGHTS",  # not an INTERVAL unit
+        "DAYS",  # no quantity
+        "-1 DAYS",  # negative retention would expire everything
+    ],
+)
+def test_lake_gc_rejects_malformed_retention(bad: str) -> None:
+    """--older-than is interpolated into `now() - INTERVAL <value>`, so it is
+    constrained to the shape an INTERVAL takes rather than screened afterwards."""
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC), "--older-than", bad], capture_output=True, text=True
+    )
+    assert result.returncode == 1, f"expected refusal for {bad!r}:\n{result.stdout}"
+    assert "--older-than must be" in result.stderr
+
+
+def test_lake_gc_rejects_unknown_argument() -> None:
+    result = subprocess.run(["bash", str(_LAKE_GC), "--wat"], capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "unknown argument" in result.stderr
+
+
+def _lake_gc_env(tmp_path, *, writable: bool = True) -> dict:
+    """A data-plane env plus a lake dir, with duckdb stubbed by `true` so the
+    script's own logic runs without a catalog. `true` prints nothing, which is the
+    same shape as a maintenance call that reclaims nothing. Resolved via PATH —
+    it is /usr/bin/true on macOS and /bin/true on most Linux."""
+    persistent = tmp_path / "persistent"
+    (persistent / "ducklake").mkdir(parents=True)
+    if not writable:
+        (persistent / "ducklake").chmod(0o500)
+    dp_env = tmp_path / "data-plane.env"
+    dp_env.write_text(
+        "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=localhost user=lake_rw'\n"
+        f"PATH_PERSISTENT={persistent}\n"
+    )
+    # Stub duckdb with a shim that SAVES the SQL it is handed. `true` would
+    # discard it, leaving the thing these tests are about — dry_run, the
+    # transaction split — unasserted: a hardcoded `dry_run := false` would pass.
+    captured = tmp_path / "captured.sql"
+    stub = tmp_path / "duckdb-stub"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "while [ $# -gt 0 ]; do\n"
+        f'  if [ "$1" = -f ]; then cat "$2" >> "{captured}"; fi\n'
+        "  shift\n"
+        "done\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    return {**os.environ, "DP_ENV": str(dp_env), "QIITA_DUCKDB_BIN": str(stub)}
+
+
+def test_lake_gc_defaults_to_report_only(tmp_path) -> None:
+    """No flag must never reclaim: the whole point of the default run is that an
+    operator can look before anything is unlinked."""
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC)], capture_output=True, text=True, env=_lake_gc_env(tmp_path)
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "report only" in result.stdout
+    assert "Nothing was removed" in result.stdout
+    sql = (tmp_path / "captured.sql").read_text()
+    assert "dry_run := true" in sql, "report mode must ask the database for a dry run"
+    assert "dry_run := false" not in sql
+
+
+def test_lake_gc_reclaim_mode_announces_it_acts(tmp_path) -> None:
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC), "--reclaim"],
+        capture_output=True,
+        text=True,
+        env={**_lake_gc_env(tmp_path), "ASSUME_YES": "1"},
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "Nothing was removed" not in result.stdout
+    # The banner alone is a weak signal — report mode's banner also contains the
+    # string "--reclaim" ("pass --reclaim to act"). The SQL is what discriminates,
+    # and --reclaim is deliberately mixed: steps 1-2 act, step 3 stays dry.
+    sql = (tmp_path / "captured.sql").read_text()
+    assert "ducklake_expire_snapshots('qiita_lake', dry_run := false" in sql
+    assert "ducklake_cleanup_old_files('qiita_lake', dry_run := false" in sql
+    assert "ducklake_delete_orphaned_files('qiita_lake', dry_run := true" in sql, (
+        "--reclaim must NOT delete orphans: a registration in flight has its file "
+        "on disk with no catalog row, which is what that step deletes"
+    )
+
+
+def test_lake_gc_reclaim_orphans_is_the_only_way_to_delete_orphans(tmp_path) -> None:
+    """The orphan step is the only one that can reach a file belonging to a
+    registration in flight (register_files moves the file before opening the
+    catalog transaction). It gets its own flag so the safe bulk reclaim needs no
+    quiescing, and only this one carries that precondition."""
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC), "--reclaim-orphans"],
+        capture_output=True,
+        text=True,
+        env={**_lake_gc_env(tmp_path), "ASSUME_YES": "1"},
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    sql = (tmp_path / "captured.sql").read_text()
+    assert "ducklake_delete_orphaned_files('qiita_lake', dry_run := false" in sql
+    assert "dry_run := true" not in sql, "--reclaim-orphans acts on all three steps"
+
+
+def test_lake_gc_reclaim_requires_typed_confirmation(tmp_path) -> None:
+    """--reclaim expires snapshot history irreversibly, so it must not proceed on
+    the flag alone. Anything other than the typed word aborts before the first
+    maintenance call."""
+    env = _lake_gc_env(tmp_path)
+    for reply in ("", "yes\n", "y\n", "RECLAIM\n"):
+        result = subprocess.run(
+            ["bash", str(_LAKE_GC), "--reclaim"],
+            capture_output=True,
+            text=True,
+            input=reply,
+            env=env,
+        )
+        assert result.returncode == 1, f"expected an abort for {reply!r}:\n{result.stdout}"
+        assert "Aborted" in result.stderr
+    assert not (tmp_path / "captured.sql").exists(), "aborting must not reach the database"
+
+
+def test_lake_gc_refuses_unwritable_data_path(tmp_path) -> None:
+    """The gate is unconditional, so it fires in report mode too — which is what
+    this exercises. DuckLake needs to write the data path even for the dry-run
+    orphan scan (it fails read-only there), so a group-read operator cannot run
+    even the report. Failing here names the right run-as instead of surfacing as
+    a permission error from inside duckdb."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the write bit")
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC)],
+        capture_output=True,
+        text=True,
+        env=_lake_gc_env(tmp_path, writable=False),
+    )
+    assert result.returncode == 1
+    assert "not writable" in result.stderr
+    assert "qiita-data" in result.stderr
+
+
+def test_lake_gc_never_passes_cleanup_all() -> None:
+    """`cleanup_all := true` drops the mtime filter outright, so a reclaim would
+    also sweep files produced inside the cutoff. The script header carries the
+    rationale, including why that filter is not sufficient on its own."""
+    assert "cleanup_all" not in _lake_gc_code()
+
+
+def test_lake_gc_uses_the_documented_call_form() -> None:
+    """DuckLake documents these table functions as `CALL f(...)`. `SELECT * FROM
+    f(...)` behaves identically (measured on 1.5.4 — same rows, same deletions),
+    but a reader checking this against the docs should find the documented form.
+    https://ducklake.select/docs/stable/duckdb/maintenance/expire_snapshots"""
+    code = _lake_gc_code()
+    assert "SELECT * FROM ducklake_" not in code
+    for fn in ("expire_snapshots", "cleanup_old_files", "delete_orphaned_files"):
+        assert f"CALL ducklake_{fn}(" in code, f"{fn} must be invoked with CALL"
+
+
+def test_lake_gc_scopes_the_orphan_scan_to_its_own_transaction() -> None:
+    """Steps 1-2 share a transaction (cleanup only sees the expiry from inside
+    it). Step 3 must open a NEW one: measured on 1.5.4, an orphan scan inside a
+    transaction that opened earlier reports a file another session registered and
+    COMMITTED in the meantime, so acting on it would unlink a live file whose
+    catalog row survives. Asserting positions, not mere presence — a CALL that
+    drifts across a COMMIT is exactly the regression this guards."""
+    code = _lake_gc_code()
+    assert code.count("BEGIN TRANSACTION;") == 2, "expected the 1-2 / 3 split"
+    assert code.count("COMMIT;") == 2
+    begin1 = code.index("BEGIN TRANSACTION;")
+    commit1 = code.index("COMMIT;")
+    begin2 = code.index("BEGIN TRANSACTION;", commit1)
+    commit2 = code.index("COMMIT;", begin2)
+    expire = code.index("CALL ducklake_expire_snapshots(")
+    cleanup = code.index("CALL ducklake_cleanup_old_files(")
+    orphans = code.index("CALL ducklake_delete_orphaned_files(")
+    assert begin1 < expire < cleanup < commit1, "expire+cleanup belong to the first transaction"
+    assert begin2 < orphans < commit2, "the orphan scan belongs to its own, later transaction"
+
+
+def test_lake_gc_always_passes_older_than_explicitly() -> None:
+    """Relying on the extension's default retention would let an upstream change
+    silently move how much history this script destroys."""
+    code = _lake_gc_code()
+    pattern = r"ducklake_(?:expire_snapshots|cleanup_old_files|delete_orphaned_files)\([^;]*"
+    calls = re.findall(pattern, code)
+    assert len(calls) == 3, f"expected the three maintenance calls, found {len(calls)}"
+    for call in calls:
+        assert "older_than :=" in call, f"call without an explicit older_than: {call}"
+        assert "dry_run :=" in call, f"call without an explicit dry_run: {call}"
+
+
+def test_workflow_scripts_were_found() -> None:
+    """Anti-vacuity guard: the parametrization below is a glob, so an empty or
+    moved `workflows/` tree would leave it silently exercising nothing.
+
+    Named rather than counted — a floor would still pass if the glob stopped
+    reaching a whole workflow's directory. These four are the shared helper and
+    one entrypoint from each workflow that ships them.
+    """
+    found = {p.name for p in _WORKFLOW_SCRIPTS}
+    assert {"_lib.sh", "assemble.sh", "entrypoint.sh", "lima.sh"} <= found, found
+
+
+@pytest.mark.parametrize("path", _WORKFLOW_SCRIPTS, ids=lambda p: p.name)
+def test_workflow_script_is_valid_bash(path: Path) -> None:
+    """`bash -n` parses without executing — the container never gets that chance
+    until a ticket is already running inside it."""
+    result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed for {path}:\n{result.stderr}"

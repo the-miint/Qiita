@@ -10,15 +10,18 @@ from typing import Literal, get_args
 
 import asyncpg
 
-# Tables that expose a PATCH route. The set is 1:1 with the tables
-# whose ETag is read from `updated_at`: a table that supports PATCH
-# exposes the matching ETag, and a table that does not is also not
-# ETag-readable. The table name is interpolated into the SQL, so the
-# set is a closed Literal — never widen by accepting caller input
-# directly. The runtime get_args() check inside each consumer rejects
-# any string the Literal does not cover, since Python does not enforce
-# Literal at runtime on its own.
-UpdatableTable = Literal["biosample", "study"]
+# Tables whose UPDATEs are composed by update_row below — membership
+# tracks a shared composer's callers (not a PATCH surface). The table
+# name is interpolated into the SQL, so the set is a closed Literal —
+# never widen by accepting caller input directly. The runtime get_args()
+# check inside each consumer rejects any string the Literal does not
+# cover, since Python does not enforce Literal at runtime on its own.
+UpdatableTable = Literal[
+    "qiita.biosample",
+    "qiita.biosample_study_field",
+    "qiita.prep_sample_study_field",
+    "qiita.study",
+]
 
 
 def require_transaction(conn: asyncpg.Connection) -> None:
@@ -75,7 +78,11 @@ async def update_row(
     jsonb_cols: frozenset[str] = frozenset(),
     repo_name: str,
 ) -> asyncpg.Record | None:
-    """Update the named columns on qiita.<table> row idx=row_idx, return the post-UPDATE row.
+    """Update the named columns on `table` row idx=row_idx, return the post-UPDATE row.
+
+    `table` is schema-qualified: the composer interpolates it verbatim rather
+    than assuming a schema, so a caller already holding a qualified name passes
+    it straight through.
 
     `fields` maps column name -> new value; only the listed keys are
     written, and explicit None sets the column to NULL. Unknown keys
@@ -122,7 +129,26 @@ async def update_row(
     # Single round trip: UPDATE ... RETURNING with the same column list
     # the per-repo fetch wrapper selects.
     return await conn.fetchrow(
-        f"UPDATE qiita.{table} SET {set_clause} WHERE idx = {row_param} RETURNING {returning_cols}",
+        f"UPDATE {table} SET {set_clause} WHERE idx = {row_param} RETURNING {returning_cols}",
         *values,
         row_idx,
     )
+
+
+def gate_state_literal(value: str, declared: object) -> str:
+    """Assert `value` is a member of the `declared` gate-state Literal and return it.
+
+    A membership check, not a lookup: the string is still written at the call
+    site, because it is the string that goes into SQL. What it buys is that a
+    renamed or removed member fails at import instead of silently matching no
+    rows — the failure mode a gate query has, where a typo returns an empty
+    result rather than an error.
+
+    Shared by every repository module that binds gate states as query
+    parameters (`mask_definition`, `processing`), so the two cannot drift into
+    two spellings of the same assertion.
+    """
+    members = get_args(declared)
+    if value not in members:
+        raise ValueError(f"{value!r} is not a member of {declared}; have {members}")
+    return value

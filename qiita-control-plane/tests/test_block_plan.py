@@ -8,7 +8,7 @@ per block (with the partition's mask_idx + host/instrument action_context, and
 block.work_ticket_idx back-filled), and dispatches each ticket exactly once.
 
 schedule_dispatch is monkeypatched to a recorder so no real orchestrator work is
-fired. adapter_set_hash is passed in fixed (no data plane) — the route owns the
+fired. adapter_set_hashes is passed in fixed (no data plane) — the route owns the
 one-time adapter DoGet.
 """
 
@@ -32,6 +32,7 @@ from qiita_control_plane.repositories._sample_helpers import (
 )
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.sequence_range import mint_sequence_range
+from qiita_control_plane.runner import AdapterSetHashes
 from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_HUMAN_TERM_ID,
     fetch_missing_value_reason_idx,
@@ -200,7 +201,7 @@ async def _plan(pooled, planapp, **overrides):
         # Tests exercising REAL per-sample resolution pass `force_decision=None`.
         force_decision=block_planner.SampleHostFilter(enabled=False),
         only_missing=False,
-        adapter_set_hash=None,
+        adapter_set_hashes=AdapterSetHashes(None, None),
         originator_principal_idx=pooled["principal_idx"],
         block_action_id=_BLOCK_ACTION_ID,
         block_action_version=_BLOCK_ACTION_VERSION,

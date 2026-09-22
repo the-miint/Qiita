@@ -57,6 +57,69 @@ qiita_resolve_user_clone() {
     [ -d "$QIITA_CLONE/.git" ] || { echo "ERROR: $QIITA_CLONE is not a git clone" >&2; exit 1; }
 }
 
+# sha256 of stdin, hex digest only. Prefers sha256sum (Linux deploy host); falls
+# back to `shasum -a 256` on a macOS dev/test box.
+_qiita_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+    else shasum -a 256 | cut -d' ' -f1; fi
+}
+
+# Absolute path to THIS file, resolved as it is sourced. The two deploy-freshness
+# helpers below hash it as the file the sourcing process actually read, rather
+# than re-deriving it from the caller's location or a later cwd.
+QIITA_COMMON_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# Fingerprint the bytes a running deploy script has already read into its own
+# process: the script itself, plus this file, which it sourced. redeploy.sh takes
+# it either side of its `git pull` (see redeploy.sh step 1).
+#
+# Same digest shape as qiita_sif_build_inputs_hash below — name plus per-file
+# sha256, then a hash over that stream — so bytes moving from one file to the
+# other cannot leave the digest unchanged, as hashing their concatenation would.
+#
+# $1 = path to the running script. Echoes a hex digest; returns 1 with a stderr
+# reason if either file is unreadable, so the caller aborts rather than reading an
+# empty digest as a change.
+qiita_deploy_self_fingerprint() {
+    local script="${1:?qiita_deploy_self_fingerprint needs the path of the running script}"
+    local f
+    for f in "$script" "$QIITA_COMMON_SH"; do
+        [ -r "$f" ] || { echo "ERROR: cannot read $f to fingerprint it" >&2; return 1; }
+    done
+    for f in "$script" "$QIITA_COMMON_SH"; do
+        printf '%s ' "${f##*/}"
+        _qiita_sha256 < "$f"
+    done | _qiita_sha256
+}
+
+# Re-exec the running deploy script when the pull replaced it.
+#
+# $1 = the running script (absolute), $2 = its fingerprint from before the pull.
+# Returns 0 when the two match and the caller carries on. When they differ, execs
+# the pulled copy — replacing this process, so nothing after the call runs.
+#
+# Returns 1 when the fingerprint cannot be taken, and when it changed again after
+# a re-exec already happened: a second re-exec is how this loops, and the caller
+# reaches here before anything is deployed, so aborting costs a re-run.
+qiita_deploy_reexec_if_changed() {
+    local script="${1:?qiita_deploy_reexec_if_changed needs the path of the running script}"
+    local before="${2:?qiita_deploy_reexec_if_changed needs the pre-pull fingerprint}"
+    local after
+    after=$(qiita_deploy_self_fingerprint "$script") || return 1
+    [ "$after" = "$before" ] && return 0
+    if [ -n "${QIITA_REDEPLOY_REEXECED:-}" ]; then
+        echo "ERROR: $script or $QIITA_COMMON_SH changed again after the re-exec." >&2
+        echo "       Nothing has been deployed at this point; re-run once the clone" >&2
+        echo "       has settled." >&2
+        return 1
+    fi
+    echo "The pull changed ${script##*/} or ${QIITA_COMMON_SH##*/} — re-execing the"
+    echo "pulled copy so the rest of the deploy runs the code that was just pulled."
+    echo "The banner and step 1 repeat below; the second pull is a no-op."
+    export QIITA_REDEPLOY_REEXECED=1
+    exec bash "$script"
+}
+
 # Resolve the SLURM native-venv checkout from SLURM_NATIVE_PYTHON.
 #
 # Native SLURM jobs run from the venv SLURM_NATIVE_PYTHON points at — a separate
@@ -100,49 +163,11 @@ qiita_native_checkout_from_python() {
     printf '%s' "$checkout"
 }
 
-# Does a list of changed paths touch a package a native SLURM venv runs
-# (qiita-common or qiita-compute-orchestrator)? redeploy.sh feeds this the
-# `git diff --name-only <before> <after>` of a pull to decide whether the native
-# venv needs a refresh — the path-prefix match is the part worth unit-testing
-# (e.g. it must match `qiita-common/...` but NOT a sibling like
-# `qiita-common-extra/...`), so it lives here as a pure function while the git +
-# sudo wiring stays in redeploy.sh. Pure (no side effects); the unit test in
-# test_deploy_scripts.py exercises the matching directly.
-#
-# $1 = newline-separated path list. Returns 0 when at least one path is under
-# qiita-common/ or qiita-compute-orchestrator/, 1 when none are (incl. empty).
-qiita_paths_touch_native() {
-    printf '%s\n' "${1:-}" | grep -qE '^(qiita-common|qiita-compute-orchestrator)/'
-}
-
-# Does a list of changed paths touch a package the operator's CHECKOUT CLI venv
-# runs? Operators invoke `uv run qiita` / `qiita-admin` from the checkout's
-# qiita-control-plane venv, which imports qiita_control_plane (and the path-dep
-# qiita_common). redeploy.sh feeds this the same `git diff --name-only` of a pull
-# it feeds qiita_paths_touch_native, to decide whether that CLI venv needs a
-# `--reinstall-package qiita-common` refresh. Pure (no side effects); the unit
-# test in test_deploy_scripts.py exercises the matching directly. NB: qiita-data-
-# plane / qiita-compute-orchestrator are deliberately NOT here — they don't change
-# what the control-plane CLI venv imports.
-#
-# $1 = newline-separated path list. Returns 0 when at least one path is under
-# qiita-common/ or qiita-control-plane/, 1 when none are (incl. empty).
-qiita_paths_touch_cli() {
-    printf '%s\n' "${1:-}" | grep -qE '^(qiita-common|qiita-control-plane)/'
-}
-
 # --- SIF auto-build helpers (used by scripts/build-sif.sh + deploy/build-sifs.sh) ---
 # Pure (echo/return only), so test_deploy_scripts.py exercises them directly while
 # the apptainer/root/chown wiring stays in the entrypoint scripts. This is why the
 # header says _common.sh is sourced by build-sif.sh too — these definitions have no
 # side effects on source.
-
-# sha256 of stdin, hex digest only. Prefers sha256sum (Linux deploy host); falls
-# back to `shasum -a 256` on a macOS dev/test box. Internal to the hash below.
-_qiita_sha256() {
-    if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
-    else shasum -a 256 | cut -d' ' -f1; fi
-}
 
 # Content hash of a container workflow's IN-REPO build inputs, used by
 # build-sif.sh's idempotency check to detect a changed Apptainer.def /
@@ -576,3 +601,140 @@ qiita_buckets_12() {
 pass() { printf '  \xe2\x9c\x93 %s: %s\n' "$1" "$2"; n_pass=$((${n_pass:-0} + 1)); }
 fail() { printf '  \xe2\x9c\x97 %s: %s\n' "$1" "$2"; n_fail=$((${n_fail:-0} + 1)); }
 skip() { printf '  \xc2\xb7 %s: %s\n' "$1" "$2"; n_skip=$((${n_skip:-0} + 1)); }
+
+# ATTACH takes no bind parameters, so connection strings and paths are
+# interpolated into SQL. Reject the same characters
+# qiita-data-plane/src/ducklake.rs validate_sql_literal does — this is input
+# validation, not sanitization. Exits non-zero rather than returning, because
+# every caller's next act is to interpolate the value it just checked.
+# $1 = value, $2 = label used in the error.
+reject_sql_metacharacters() {
+    local value="$1" label="$2"
+    case "${value}" in
+        *\'*|*\;*)
+            echo "ERROR: ${label} contains a quote or semicolon; refusing to interpolate it into SQL." >&2
+            exit 1
+            ;;
+    esac
+}
+
+# The lake data path, byte-identical to the data plane's derivation — config.rs
+# does a bare format!("{path_persistent_raw}/ducklake") with NO normalization,
+# and DuckLake pins that exact string into the catalog at creation. Do not
+# "tidy" a trailing slash off the input: on a host with PATH_PERSISTENT=/data/
+# the catalog holds "/data//ducklake", and the tidied "/data/ducklake" is
+# rejected outright with `DATA_PATH parameter ... does not match existing data
+# path in the catalog`. $1 = PATH_PERSISTENT.
+qiita_lake_data_path() { printf '%s/ducklake' "$1"; }
+
+# --- DuckDB CLI + pgpass plumbing, shared by scripts/lake-*.sh ---------------
+
+# The DuckDB CLI must match the version the data plane links (duckdb crate
+# 1.10504.0 == DuckDB 1.5.4): the ducklake extension is versioned with DuckDB,
+# and a newer one may want to migrate the catalog schema it opens.
+QIITA_DUCKDB_VERSION="1.5.4"
+
+# Resolve the duckdb CLI into DUCKDB_BIN, or exit with install instructions.
+# Two install sites because the callers run as different accounts: a human with
+# a home, or a service account (qiita-data) whose home is /dev/null.
+qiita_resolve_duckdb_bin() {
+    DUCKDB_BIN="${QIITA_DUCKDB_BIN:-$(command -v duckdb || true)}"
+    [ -n "${DUCKDB_BIN}" ] && return 0
+    cat >&2 <<EOF
+ERROR: no duckdb CLI on PATH.
+
+Install v${QIITA_DUCKDB_VERSION} — it must match what the data plane links.
+
+  cd "\$(mktemp -d)" \\
+    && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v${QIITA_DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip \\
+    && unzip -q duckdb_cli-linux-amd64.zip
+
+Then, for your own account (no root needed):
+    mkdir -p ~/.local/bin && install -m 0755 duckdb ~/.local/bin/duckdb
+Or, to reach it from a service account with no home (e.g. qiita-data):
+    sudo install -m 0755 duckdb /usr/local/bin/duckdb
+
+Then re-run this script (or point QIITA_DUCKDB_BIN at the binary).
+EOF
+    exit 1
+}
+
+# Print a script's own header comment block as its usage text — one copy, not
+# two. $1 = the script file (pass "${BASH_SOURCE[0]}").
+qiita_usage_from_header() {
+    awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$1"
+}
+
+# A 0700 temp dir holding an empty 0600 pgpass, removed on exit. The file is
+# created at 0600 BEFORE anything is written — a redirection would otherwise
+# create it at the umask's mode and only narrow it afterwards. Traps the signals
+# a dropped session actually sends, not just EXIT, so a pgpass never outlives
+# the shell. Sets TMPROOT and PGPASS_FILE. $1 = temp-dir name prefix.
+qiita_pgpass_init() {
+    TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/$1.XXXXXX")"
+    chmod 700 "${TMPROOT}"
+    # shellcheck disable=SC2064  # expand TMPROOT now: it must not be re-read at trap time
+    trap "rm -rf '${TMPROOT}'" EXIT INT TERM HUP
+    PGPASS_FILE="${TMPROOT}/pgpass"
+    : > "${PGPASS_FILE}"; chmod 600 "${PGPASS_FILE}"
+}
+
+# Append one entry to the pgpass. Lines are `host:port:database:user:password`
+# with `:` and `\` escaped. Entries are keyed on the username alone (wildcard
+# host/port/db), which is unambiguous as long as two connections do not share
+# one — and if they do share a username with different passwords, error rather
+# than let the first line win.
+#
+# The seen-set is two parallel indexed arrays and a linear scan rather than an
+# associative array, because macOS ships bash 3.2 — which has none, and which
+# `make test` exercises these scripts under on the mac CI runner. The `_COUNT`
+# scalar bounds the scan instead of `${#array[@]}`: under `set -u`, bash 3.2
+# treats an empty array as unset. Passwords may hold any byte, so a single
+# delimited-string map would need escaping that a scan does not.
+QIITA_PGPASS_SEEN_COUNT=0
+QIITA_PGPASS_SEEN_USERS=()
+QIITA_PGPASS_SEEN_PASSWORDS=()
+qiita_pgpass_add() {
+    local user="$1" password="$2" escaped_user escaped_password i
+    for ((i = 0; i < QIITA_PGPASS_SEEN_COUNT; i++)); do
+        [[ "${QIITA_PGPASS_SEEN_USERS[i]}" == "${user}" ]] || continue
+        if [[ "${QIITA_PGPASS_SEEN_PASSWORDS[i]}" != "${password}" ]]; then
+            echo "ERROR: two connections both connect as '${user}' with different" >&2
+            echo "  passwords, so they cannot be keyed apart in a pgpass file." >&2
+            echo "  Give one of them its own role (lake-shell.sh: or re-run --no-cp)." >&2
+            exit 1
+        fi
+        return 0
+    done
+    QIITA_PGPASS_SEEN_USERS[QIITA_PGPASS_SEEN_COUNT]="${user}"
+    QIITA_PGPASS_SEEN_PASSWORDS[QIITA_PGPASS_SEEN_COUNT]="${password}"
+    QIITA_PGPASS_SEEN_COUNT=$((QIITA_PGPASS_SEEN_COUNT + 1))
+    escaped_user="${user//\\/\\\\}"; escaped_user="${escaped_user//:/\\:}"
+    escaped_password="${password//\\/\\\\}"; escaped_password="${escaped_password//:/\\:}"
+    printf '*:*:*:%s:%s\n' "${escaped_user}" "${escaped_password}" >> "${PGPASS_FILE}"
+}
+
+# Every duckdb invocation goes through here so the PGPASSFILE handling exists in
+# exactly one place. The file is only handed over when it actually holds an
+# entry — libpq ignores an empty one anyway, but not setting the variable keeps
+# a password-less deployment obviously password-less.
+qiita_run_duckdb() {
+    if [[ -s "${PGPASS_FILE}" ]]; then
+        PGPASSFILE="${PGPASS_FILE}" "${DUCKDB_BIN}" "$@"
+    else
+        "${DUCKDB_BIN}" "$@"
+    fi
+}
+
+# The lake data path must be a directory this account can traverse and read.
+# $1 = the path. Callers needing to WRITE it check that themselves.
+qiita_require_lake_data_path() {
+    local path="$1"
+    [ -d "${path}" ] || { echo "ERROR: lake data path ${path} is not a directory" >&2; exit 1; }
+    if [ ! -r "${path}" ] || [ ! -x "${path}" ]; then
+        echo "ERROR: cannot read ${path}" >&2
+        echo "  It is mode 0750 qiita-data:qiita-data — you must be in the owning group." >&2
+        echo "  Check with: ls -ld ${path} && id" >&2
+        exit 1
+    fi
+}

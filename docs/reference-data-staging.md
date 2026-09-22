@@ -67,6 +67,8 @@ jplace format (Matsen et al. 2012). Placement edges reference the backbone phylo
 ### genome_mapping
 Tab-separated, three columns: `feature_id<TAB>genome_source<TAB>genome_source_id`. Maps sequence identifiers to external genome accessions. `genome_source` is one of: `genbank`, `refseq`, `collaborator`, `qiita`. `genome_source_id` is the external accession.
 
+What this file establishes is read back out by `GET /reference/{reference_idx}/genome-map`, which returns the whole reference's `feature_idx → (genome_idx, source, source_id)` lookup, and by its uncapped Parquet sibling `GET /reference/{reference_idx}/genome-map/parquet`. Both are control-plane reads rather than Flight tickets because none of those columns exist in DuckLake; see [`architecture/flight.md`](architecture/flight.md) under "One map and three mints that are REST, not Flight tickets".
+
 ## Host references and the rype index
 
 A **host reference** (`qiita.reference.is_host = true`) is an ordinary `sequence_reference` used for **host-read depletion**: at filter time the `host_filter` step classifies reads against its rype index (host = any emitted match — a POSITIVE index, **not** rype's `negative_index`/`-N` mode) and re-checks the survivors against a minimap2 `.mmi` sidecar; reads matching either are dropped (paired-end: the pair drops if either mate hits). `is_host` is orthogonal to `kind` and is set once at creation; **taxonomy is required** for a host reference (the rype mapping authority's source), phylogeny is not.

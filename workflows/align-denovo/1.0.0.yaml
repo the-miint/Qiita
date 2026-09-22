@@ -1,0 +1,184 @@
+action_id: align-denovo
+version: 1.0.0
+target_kind: prep_sample
+# prep_sample-scoped, NOT block-scoped like `align`: the subject is this sample's OWN
+# contigs, so there is no cohort of samples sharing one alignment identity to tile into
+# blocks. One ticket is one sample, and `alignment_idx` is minted by the runner before
+# the step loop rather than fixed by a planner.
+#
+# target_processing_kinds is intentionally absent: the input selector is
+# `assembly_processing_idx` (which assembly run's contigs) plus `align_mask_idx` (which
+# reads), not a ProcessingKind.
+
+description: >
+  Align a sample's HOST-DEPLETED, QC-passed reads back against the contigs its OWN
+  long-read-assembly run produced, and land the results in the DuckLake `alignment`
+  table. The de novo arm of alignment: `align` aligns a block of reads against a
+  sharded REFERENCE, this aligns one sample against itself.
+
+  Both inputs are STREAMED from the data plane at runtime by the `align_denovo`
+  native job — the contigs over an assembly-run-scoped DoGet, the reads over a
+  `(prep_sample, mask)`-scoped `read_masked` DoGet — so nothing is materialized onto
+  shared scratch at submit time and the bulk bytes never transit the control plane.
+  The control plane refuses to sign the read ticket unless the sample's `mask_sample`
+  gate reads 'completed', so this workflow cannot receive raw (un-host-depleted)
+  reads or a mask still in flight.
+
+  The gate applied to the alignments is the CIRCULAR-POOLED one: an assembler emits a
+  circular contig linearised, so a read crossing its origin arrives as one record per
+  side and a per-record coverage floor would drop it. The job pools a read's records
+  against one contig and judges the read there, and records the reads it found
+  origin-spanning in the DuckLake `alignment_origin_spanning` side table.
+
+  `alignment_idx` is the CP-minted alignment-config identity, hashed over the assembly
+  run, the mask, the aligner, the preset and the two thresholds — so a re-run at a
+  different threshold is a distinct alignment rather than a silent overwrite, and a
+  re-run at the SAME params re-resolves the same id and replaces its own rows.
+
+# Same rationale as `align` and `read-mask-block`: this streams host-depleted
+# (human-derived) reads to the compute node, so submitters must hold prep_sample:write.
+# No new alignment:write scope — reuse bounds the surface.
+scopes:
+  - prep_sample:write
+
+# Admin-only, for the reason the scope is privileged: the workflow moves reads derived
+# from human-containing reads out of the lake and onto a compute node.
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [assembly_processing_idx, align_mask_idx]
+  properties:
+    # The assembly RUN whose contigs are the subject — not the sample, because a
+    # sample re-assembled under different params has different contigs. The runner
+    # refuses the submission unless this run's `assembly_sample` gate reads
+    # 'completed' for this sample, and ends the ticket at NO_DATA when it reads
+    # 'no_data' (the run assembled nothing, so there is no subject).
+    #
+    # Prefixed rather than spelled `processing_idx`: a step naming `processing_idx` as
+    # a `params:` FIELD is the runner's signal to MINT a processing identity, and this
+    # workflow consumes an existing one.
+    assembly_processing_idx:
+      type: integer
+      minimum: 1
+    # The completed host-depletion mask whose pass-set is aligned. Prefixed for the
+    # same reason as above (`mask_idx` as a field would make the runner mint a mask),
+    # and named as `align/1.0.0.yaml` names its own.
+    align_mask_idx:
+      type: integer
+      minimum: 1
+    # minimap2 preset. HiFi by default because the subject is a long-read assembly.
+    # Hashed into alignment_idx, so changing it mints a new alignment rather than
+    # rewriting the old one's rows.
+    preset:
+      type: string
+      enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
+      default: map-hifi
+    # The two gate thresholds, and they bind the CIRCULAR axis: what a READ must score
+    # against one contig with all of its records POOLED, not what one record must
+    # score on its own. These ARE the live values — the job declares no defaults of
+    # its own — and they equal `qiita_common.analytic.gate`'s CIRCULAR_MIN_IDENTITY /
+    # CIRCULAR_MIN_COVERAGE, so the caller-facing default and the library default are
+    # one gate rather than two that can drift; a control-plane test pins the equality.
+    min_identity:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+      default: 0.95
+    min_query_coverage:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+      default: 0.90
+
+steps:
+  # Stream the contigs and the masked reads, align, gate, and emit the two Parquets.
+  # No `inputs:` at all — every argument is a scalar, and the two data inputs are
+  # streamed by the job itself from identifiers, so nothing is staged at submit time.
+  # `alignment_idx` comes from the runner's pre-loop mint (it is not a context key a
+  # submitter sets); the rest are context keys, defaulted above.
+  - step: align_denovo
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.align_denovo
+    params:
+      assembly_processing_idx: assembly_processing_idx
+      align_mask_idx: align_mask_idx
+      alignment_idx: alignment_idx
+      preset: preset
+      min_identity: min_identity
+      min_query_coverage: min_query_coverage
+    outputs: [alignment, alignment_origin_spanning, alignment_staging_dir]
+    # cpu EQUALS the job's `_DUCKDB_THREADS`, and must stay equal:
+    # `align_minimap2` draws its parallelism from DuckDB's thread pool, so the pool
+    # size IS the aligner's core count. Measured on the staged build, 60k x 2 kb reads
+    # against a 500 kb contig: 17.72 s at 1 thread, 8.91 at 2, 4.76 at 4, 2.40 at 8 —
+    # near-linear, with `MaxThreads()` tracking `SET threads` exactly. A cpu above the
+    # literal therefore reserves cores nothing can use.
+    # `test_align_denovo_cpu_pins_duckdb_threads` fails if the two drift, the same pin
+    # `align_sharded` carries for its own (different) reason.
+    #
+    # 8 rather than 16: the thread count is also a memory multiplier for the aligner's
+    # own per-thread state, which lives in the cgroup remainder and cannot spill.
+    #
+    # mem_gb is NOT VALIDATED AGAINST A REAL SAMPLE, and no measured job is a stand-in.
+    # `assembly_coverage` aligns the same reads against the same contigs, but it holds
+    # a `SEQUENCE_DATA` lookup over the whole read set for its BAM writer, which is what
+    # its measured remainder is made of; this job writes Parquet and holds no such
+    # lookup. `align_sharded` shares this job's shape but indexes a sharded whole
+    # reference across up to 8 concurrent shards against one sample's contigs here. Both
+    # bound this job from above without estimating it.
+    #
+    # This job now collects secondary alignments, so the slice is one row per placement
+    # rather than per read — a multiplier the numbers below have never seen. It is
+    # bounded twice over: by how many near-identical contigs the assembly holds (see
+    # `MAX_SECONDARY`), and by the same coverage/identity thresholds the pooled arm
+    # applies, which each secondary must clear on its own CIGAR. Neither bound is a
+    # measurement of this job. `assembly_coverage` is weaker evidence than it looks for
+    # the same reason: it requests no cap at all, so its measured remainder was taken
+    # under a different collection policy again.
+    #
+    # So the baseline is a starting point with the ceiling as its safety net, not a
+    # measurement: a sample that does not fit escalates once, and the first real
+    # ticket's `sacct` MaxRSS is what settles the number. The allocation has to cover
+    # `duckdb_headroom_gb(8)` = 6 GB, DuckDB's own limit, and `_DUCKDB_RESERVE_GB` for
+    # the in-process minimap2 index — see those constants in the job module.
+    baseline_resources:
+      cpu: 8
+      mem_gb: 16
+      walltime: PT4H
+
+  # Idempotent sample replace: delete this (alignment_idx, prep_sample) pair's rows
+  # from the DuckLake alignment tables BEFORE register-files re-writes them, so a
+  # re-run (a retry, or a resubmission under the same params) deletes-then-
+  # re-registers and never double-counts. On a first run it deletes 0 rows.
+  # alignment_idx from the ticket column, prep_sample_idx from the scope target — no
+  # file inputs.
+  - action: delete-alignment-sample
+    inputs: []
+    outputs: []
+
+  # Load alignment.parquet and alignment_origin_spanning.parquet into their DuckLake
+  # tables (register-files maps each by filename stem). alignment_staging_dir holds
+  # only those two — the DuckDB spill dir is torn down before the job returns. Must
+  # run BEFORE the gate flip: the gate must never read 'completed' ahead of the rows.
+  - action: register-files
+    inputs: [alignment_staging_dir]
+    outputs: []
+
+  # Terminal: flip this sample's alignment_sample gate to 'completed'. No covering-set
+  # bookkeeping (the block path's reconcile has that) — one ticket aligned the whole
+  # sample. alignment_idx from the ticket column, prep_sample_idx from the scope
+  # target.
+  - action: finalize-alignment-sample
+    inputs: []
+    outputs: []
+
+# NO success_status / failure_status: nothing reference-wide moves on one sample's
+# alignment; the alignment_sample gate is the only state this workflow owns.
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 32
+  walltime: PT8H

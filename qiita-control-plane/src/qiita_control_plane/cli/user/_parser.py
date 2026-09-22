@@ -6,11 +6,22 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 import argparse
 from pathlib import Path
 
+from qiita_common.analytic import (
+    CIRCULAR_MIN_COVERAGE,
+    CIRCULAR_MIN_IDENTITY,
+    CoverageScope,
+)
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
+    PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX,
+    PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX,
+    PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT,
     PATH_PREP_SAMPLE_PREFIX,
+    PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_PREP_SAMPLE_STUDY_LIST,
     PATH_SEQUENCED_SAMPLE_BY_IDX,
     PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
@@ -24,7 +35,11 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     BiosamplePatchRequest,
+    BiosampleStudyFieldCreateRequest,
+    FieldDataType,
     Platform,
+    PrepSampleStudyFieldCreateRequest,
+    ProcessingStatus,
     SequencedSamplePatchRequest,
     StudyPatchRequest,
     Tier,
@@ -33,9 +48,20 @@ from qiita_common.models import (
 
 from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
-from ._helpers import _handle_patch, _handle_read, _lane_arg
+from ._helpers import (
+    _UNSET,
+    _handle_patch,
+    _handle_read,
+    _handle_study_field_create,
+    _lane_arg,
+    _proportion_arg,
+    _proportion_or_none_arg,
+)
+from .alignment import _handle_alignment_cohort, _handle_alignment_list
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
+from .feature_table import DEFAULT_TABLE_FORMAT, TABLE_FORMATS, _handle_feature_table_build
+from .mask import _handle_mask_list, _handle_mask_samples, _handle_mask_show
 from .pacbio import _handle_submit_pacbio_ingest
 from .pool import (
     _handle_delete_sequenced_pool,
@@ -45,6 +71,12 @@ from .pool import (
     _handle_submit_block_mask_pool,
     _handle_submit_host_filter_pool,
 )
+from .processing import (
+    _handle_processing_list,
+    _handle_processing_samples,
+    _handle_processing_show,
+)
+from .reads import _handle_submit_reads
 from .reference import (
     _EXPORT_FORMATS,
     _handle_reference_genome_export,
@@ -56,6 +88,7 @@ from .sequencing import (
     _handle_prep_sample_retire,
     _handle_run_preflight_update_lane,
     _handle_sequenced_pool_create,
+    _handle_sequenced_pool_list,
     _handle_sequenced_sample_create,
     _handle_sequencing_run_create,
     _handle_sequencing_run_lookup,
@@ -68,6 +101,86 @@ from .ticket import (
     _handle_ticket_status,
     _handle_ticket_submit,
 )
+
+
+def _add_study_field_create_args(subparser: argparse.ArgumentParser, *, entity_noun: str) -> None:
+    """Declare the flags every study-local field create subcommand takes.
+
+    `entity_noun` names the entity in the link flag and in help text; that
+    flag's dest matches the request model's alias for the global-field link, so
+    the parsed namespace feeds body construction directly.
+    """
+    subparser.add_argument("--study-idx", type=int, required=True)
+    subparser.add_argument(
+        "--display-name",
+        required=True,
+        help="the field's display_name (unique within the study)",
+    )
+    subparser.add_argument("--description")
+    subparser.add_argument(
+        f"--{entity_noun.replace('_', '-')}-global-field-idx",
+        type=int,
+        help=(
+            f"link the new field to this existing {entity_noun}_global_field;"
+            " omit for a purely-local field (then --data-type is required)"
+        ),
+    )
+    subparser.add_argument(
+        "--data-type",
+        choices=tuple(d.value for d in FieldDataType),
+        help="field data type; local-mode only",
+    )
+    subparser.add_argument(
+        "--required",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="whether the field is required; local-mode only (defaults to false server-side)",
+    )
+    subparser.add_argument(
+        "--terminology-idx",
+        type=int,
+        help="terminology idx; required iff --data-type is terminology (local-mode only)",
+    )
+    subparser.add_argument(
+        "--tier-override",
+        choices=tuple(t.value for t in Tier),
+        help="visibility tier override; local-mode only",
+    )
+
+
+def _add_field_list_subcommands(
+    entity_sub,
+    *,
+    entity_noun: str,
+    study_field_path: str,
+    global_field_path: str,
+) -> None:
+    """Declare one entity's two field-listing subcommands.
+
+    `entity_noun` names the entity in help text.
+    """
+    hyphenated = entity_noun.replace("_", "-")
+
+    p_list_fields = entity_sub.add_parser(
+        "list-fields",
+        help=f"List a study's {hyphenated} field definitions",
+    )
+    p_list_fields.add_argument("--study-idx", type=int, required=True)
+    p_list_fields.set_defaults(
+        handler=_handle_read,
+        read_path=study_field_path,
+        read_idx_arg="study_idx",
+    )
+
+    p_list_global_fields = entity_sub.add_parser(
+        "list-global-fields",
+        help=f"List the global {hyphenated} field definitions",
+    )
+    p_list_global_fields.set_defaults(
+        handler=_handle_read,
+        read_path=global_field_path,
+        read_idx_arg=None,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -142,6 +255,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_study_create.set_defaults(handler=_handle_study_create)
 
+    study_by_idx_path = f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}"
+
     p_study_get = p_study_sub.add_parser(
         "get",
         help="Fetch a study by idx (GET /study/{study_idx})",
@@ -149,7 +264,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_get.add_argument("--study-idx", type=int, required=True)
     p_study_get.set_defaults(
         handler=_handle_read,
-        read_path=f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}",
+        read_path=study_by_idx_path,
         read_idx_arg="study_idx",
     )
 
@@ -171,7 +286,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_patch.set_defaults(
         handler=_handle_patch,
         patch_model=StudyPatchRequest,
-        patch_path=f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}",
+        patch_path=study_by_idx_path,
         patch_idx_arg="study_idx",
         patch_json_fields=("extra_metadata",),
     )
@@ -224,7 +339,41 @@ def _build_parser() -> argparse.ArgumentParser:
         "--matrix-tube-id",
         help="Matrix-tube identifier (digits only); validated server-side",
     )
+    p_biosample_create.add_argument(
+        "--global-internal-names",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Interpret --metadata KEYs for global fields as their internal_name"
+            " rather than display_name (local fields stay display-name-keyed)"
+        ),
+    )
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
+
+    biosample_study_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
+
+    p_biosample_create_field = p_biosample_sub.add_parser(
+        "create-field",
+        help="Create a study-local biosample field (POST /study/{S}/biosample-field)",
+    )
+    _add_study_field_create_args(p_biosample_create_field, entity_noun="biosample")
+    p_biosample_create_field.set_defaults(
+        handler=_handle_study_field_create,
+        study_field_model=BiosampleStudyFieldCreateRequest,
+        study_field_path=biosample_study_field_path,
+    )
+
+    _add_field_list_subcommands(
+        p_biosample_sub,
+        entity_noun="biosample",
+        study_field_path=biosample_study_field_path,
+        global_field_path=(
+            f"{PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT}"
+        ),
+    )
+
+    biosample_by_idx_path = f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 
     p_biosample_get = p_biosample_sub.add_parser(
         "get",
@@ -233,7 +382,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_biosample_get.add_argument("--biosample-idx", type=int, required=True)
     p_biosample_get.set_defaults(
         handler=_handle_read,
-        read_path=f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}",
+        read_path=biosample_by_idx_path,
         read_idx_arg="biosample_idx",
     )
 
@@ -264,7 +413,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_biosample_patch.set_defaults(
         handler=_handle_patch,
         patch_model=BiosamplePatchRequest,
-        patch_path=f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}",
+        patch_path=biosample_by_idx_path,
         patch_idx_arg="biosample_idx",
         patch_json_fields=(),
     )
@@ -328,6 +477,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_seqpool = sub.add_parser("sequenced-pool", help="Sequenced-pool operations")
     p_seqpool_sub = p_seqpool.add_subparsers(dest="sequenced_pool_cmd", required=True)
+
+    # The read that produces a sequenced_pool_idx. Every other pool-scoped verb
+    # takes one and, before this, nothing returned one.
+    p_seqpool_list = p_seqpool_sub.add_parser(
+        "list",
+        help="List a sequencing-run's pools (GET /sequencing-run/{idx}/sequenced-pool)",
+    )
+    p_seqpool_list.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_seqpool_list.set_defaults(handler=_handle_sequenced_pool_list)
     p_seqpool_create = p_seqpool_sub.add_parser(
         "create",
         help="Create a sequenced-pool on a run (POST /sequencing-run/{R}/sequenced-pool)",
@@ -472,6 +630,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--ena-run-accession",
         help="ENA run accession (ERR…), if this sample already has one",
     )
+    p_seqsample_create.add_argument(
+        "--global-internal-names",
+        action="store_const",
+        const=True,
+        default=None,
+        help=("Interpret --metadata KEYs as global-field internal_names rather than display_names"),
+    )
     p_seqsample_create.set_defaults(handler=_handle_sequenced_sample_create)
 
     p_seqsample_patch = p_seqsample_sub.add_parser(
@@ -519,6 +684,28 @@ def _build_parser() -> argparse.ArgumentParser:
         read_idx_arg="prep_sample_idx",
     )
 
+    prep_sample_study_field_path = f"{PATH_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"
+
+    p_prepsample_create_field = p_prepsample_sub.add_parser(
+        "create-field",
+        help="Create a study-local prep-sample field (POST /study/{S}/prep-sample-field)",
+    )
+    _add_study_field_create_args(p_prepsample_create_field, entity_noun="prep_sample")
+    p_prepsample_create_field.set_defaults(
+        handler=_handle_study_field_create,
+        study_field_model=PrepSampleStudyFieldCreateRequest,
+        study_field_path=prep_sample_study_field_path,
+    )
+
+    _add_field_list_subcommands(
+        p_prepsample_sub,
+        entity_noun="prep_sample",
+        study_field_path=prep_sample_study_field_path,
+        global_field_path=(
+            f"{PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT}"
+        ),
+    )
+
     p_prepsample_retire = p_prepsample_sub.add_parser(
         "retire",
         help=(
@@ -543,6 +730,305 @@ def _build_parser() -> argparse.ArgumentParser:
     p_prepsample_unretire.set_defaults(
         handler=_handle_prep_sample_retire, retired=False, reason=None
     )
+
+    p_mask = sub.add_parser("mask", help="Read-mask discovery (read-only)")
+    p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
+    p_mask_list = p_mask_sub.add_parser(
+        "list",
+        help=(
+            "List read-filtering masks with their per-mask sample tallies (GET /mask-definition)"
+        ),
+    )
+    p_mask_list.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help="Only masks with at least one sample on this sequenced_pool",
+    )
+    p_mask_list.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        help="Only masks this prep_sample is masked under",
+    )
+    p_mask_list.set_defaults(handler=_handle_mask_list)
+
+    p_mask_show = p_mask_sub.add_parser(
+        "show",
+        help="Print one mask's filtering config (GET /mask-definition/{mask_idx})",
+    )
+    p_mask_show.add_argument("--mask-idx", type=int, required=True)
+    p_mask_show.set_defaults(handler=_handle_mask_show)
+
+    p_mask_samples = p_mask_sub.add_parser(
+        "samples",
+        help=(
+            "List the samples masked under one mask, with their masking state"
+            " (GET /mask-definition/{mask_idx}/prep-sample)"
+        ),
+    )
+    p_mask_samples.add_argument("--mask-idx", type=int, required=True)
+    p_mask_samples.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help="Only samples on this sequenced_pool",
+    )
+    p_mask_samples.set_defaults(handler=_handle_mask_samples)
+
+    # `processing list` / `show` / `samples` — the mask twin. See
+    # `cli/user/processing.py` for which identity these discover and why.
+    p_processing = sub.add_parser("processing", help="Assembly-run discovery (read-only)")
+    p_processing_sub = p_processing.add_subparsers(dest="processing_cmd", required=True)
+    p_processing_list = p_processing_sub.add_parser(
+        "list",
+        help="List assembly runs with their per-run sample tallies (GET /processing)",
+    )
+    p_processing_list.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help="Only runs with at least one sample on this sequenced_pool",
+    )
+    p_processing_list.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        help="Only runs this prep_sample was assembled under",
+    )
+    p_processing_list.add_argument(
+        "--status",
+        choices=[s.value for s in ProcessingStatus],
+        help="Only runs with this config lifecycle status; omit to list both",
+    )
+    p_processing_list.set_defaults(handler=_handle_processing_list)
+
+    p_processing_show = p_processing_sub.add_parser(
+        "show",
+        help="Print one run's assembly config (GET /processing/{processing_idx})",
+    )
+    p_processing_show.add_argument("--processing-idx", type=int, required=True)
+    p_processing_show.set_defaults(handler=_handle_processing_show)
+
+    p_processing_samples = p_processing_sub.add_parser(
+        "samples",
+        help=(
+            "List the samples assembled under one run, with their assembly state"
+            " (GET /processing/{processing_idx}/prep-sample)"
+        ),
+    )
+    p_processing_samples.add_argument("--processing-idx", type=int, required=True)
+    p_processing_samples.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help="Only samples on this sequenced_pool",
+    )
+    p_processing_samples.set_defaults(handler=_handle_processing_samples)
+
+    # `alignment list` / `cohort` — the discovery a user needs before building a
+    # feature table: an --alignment-idx is otherwise unobtainable, and the cohort is
+    # part of the scientific question (coverage is measured over it), so it is worth
+    # seeing before it is built over. Both are pool-scoped and reader-scoped.
+    p_alignment = sub.add_parser("alignment", help="Alignment discovery (read-only)")
+    p_alignment_sub = p_alignment.add_subparsers(dest="alignment_cmd", required=True)
+    p_alignment_list = p_alignment_sub.add_parser(
+        "list",
+        help=(
+            "List the alignments over a sequenced pool, each with the config params it"
+            " ran under and its completed / total sample counts"
+        ),
+    )
+    p_alignment_list.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_alignment_list.add_argument("--sequenced-pool-idx", type=int, required=True)
+    p_alignment_list.set_defaults(handler=_handle_alignment_list)
+
+    p_alignment_cohort = p_alignment_sub.add_parser(
+        "cohort",
+        help=(
+            "List the pool's prep_samples that are both readable by you and completed"
+            " for one alignment — the set `feature-table build` uses by default"
+        ),
+    )
+    p_alignment_cohort.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_alignment_cohort.add_argument("--sequenced-pool-idx", type=int, required=True)
+    p_alignment_cohort.add_argument("--alignment-idx", type=int, required=True)
+    p_alignment_cohort.set_defaults(handler=_handle_alignment_cohort)
+
+    # `feature-table build` — the client-side recipe: two REST maps, two Flight
+    # streams, the analytic, and the relabel to public handles, all on the caller's
+    # own machine. There is no --reference-idx: the alignment records
+    # the reference it ran against.
+    p_feature_table = sub.add_parser(
+        "feature-table", help="Build a feature table from an alignment (client-side)"
+    )
+    p_feature_table_sub = p_feature_table.add_subparsers(dest="feature_table_cmd", required=True)
+    p_ft_build = p_feature_table_sub.add_parser(
+        "build",
+        help=(
+            "Build a genome-keyed (OGU) feature table from an alignment and write it"
+            " with the exported-identifier map needed to read it"
+        ),
+    )
+    p_ft_build.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_ft_build.add_argument("--sequenced-pool-idx", type=int, required=True)
+    p_ft_build.add_argument(
+        "--alignment-idx",
+        type=int,
+        required=True,
+        help="From `qiita alignment list`; its params say which reference it used.",
+    )
+    p_ft_build.add_argument(
+        "--denovo-alignment-idx",
+        type=int,
+        help=(
+            "Also read this alignment — the cohort against its OWN assembled contigs —"
+            " and build a COMBINED (inverted open reference) table. Each read is counted"
+            " once: against its own contig where the de novo arm placed it, against the"
+            " reference otherwise. Reference genomes therefore lose the reads the de novo"
+            " arm wins, so one that clears --coverage-threshold without this flag can drop"
+            " out with it. From `qiita alignment list`; its params must name the same"
+            " mask_idx as --alignment-idx. Cannot be combined with --circular-gate."
+            " A prep_sample in the cohort that assembled nothing simply has no de novo"
+            " arm and stays reference-only; it is not an error."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        action="append",
+        help=(
+            "Restrict the cohort to these samples; repeat for several. Omit to use the"
+            " pool's whole mintable cohort for this alignment (`qiita alignment cohort`)."
+            " The cohort changes the table — breadth of coverage is measured over it."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--coverage-scope",
+        choices=tuple(s.value for s in CoverageScope),
+        default=CoverageScope.POOLED.value,
+        help=(
+            "Whether breadth of coverage is measured over the whole cohort (pooled,"
+            " default) or per (sample, genome). Per-sample is strictly stricter."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--coverage-threshold",
+        type=_proportion_arg,
+        required=True,
+        help=(
+            "Minimum breadth of coverage a genome must clear to appear, as a proportion"
+            " of its FULL length (0.01 is the usual choice; 0 keeps every genome with"
+            " any alignment and skips the coverage calculation entirely)."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--taxonomy",
+        action="store_true",
+        help=(
+            "Also write <table-stem>.taxonomy.parquet: one row per published row,"
+            " carrying the same feature_id and the eight ranks with their d__/p__"
+            " prefixes. An unclassified genome appears with NULL ranks rather than"
+            " being left out."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--tree",
+        action="store_true",
+        help=(
+            "Also write <table-stem>.tree.parquet: the reference's phylogeny sheared to"
+            " the rows this table publishes, as a node table (node_index, name,"
+            " branch_length, edge_id, parent_index, is_tip) whose tip names are the"
+            " table's own feature_ids. Branch lengths are preserved across pruned"
+            " ancestors. Refused, rather than approximated, if the reference has no tree"
+            " or its tips are not one-to-one with the published rows."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--min-identity",
+        type=_proportion_arg,
+        help=(
+            "Drop alignments below this CIGAR-derived sequence identity. Needs an"
+            " eqx (=/X) CIGAR — the build refuses rather than silently drop every row"
+            " if none can be scored."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--min-query-coverage",
+        type=_proportion_arg,
+        help=(
+            "Drop alignments covering less than this proportion of the read. Works on"
+            " any CIGAR, unlike --min-identity."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--unpaired-gate",
+        action="store_true",
+        help=(
+            "Score each alignment row on its own CIGAR instead of pooling a placement's"
+            " mates. Only for a slice whose mates did not both map, which cannot be"
+            " pooled; pooling is the default and is correct for single-end data too."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--circular-gate",
+        action="store_true",
+        help=(
+            "Judge each read against each reference with every record the aligner split"
+            " it into pooled, instead of scoring records one at a time. A read crossing"
+            " the origin of a circular reference is emitted as two records covering half"
+            " of it each, which a per-record coverage floor discards; pooled, it scores"
+            " what it is. Replaces --min-identity / --min-query-coverage, and single-end"
+            " only — mates are different molecules and are never pooled together."
+        ),
+    )
+    # Both default to `_UNSET`, not to the threshold, so "omitted" is distinguishable
+    # from "given" — passing either without --circular-gate is refused rather than
+    # silently ignored.
+    p_ft_build.add_argument(
+        "--circular-min-coverage",
+        type=_proportion_arg,
+        default=_UNSET,
+        help=(
+            "Minimum proportion of a read that one reference must explain, pooled over"
+            f" the read's records, under --circular-gate (default {CIRCULAR_MIN_COVERAGE})."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--circular-min-identity",
+        type=_proportion_or_none_arg,
+        default=_UNSET,
+        help=(
+            "Minimum pooled sequence identity a read must clear against a reference under"
+            f" --circular-gate (default {CIRCULAR_MIN_IDENTITY}), or 'none' to gate on"
+            " coverage and strand alone. Needs an eqx (=/X) CIGAR; the build refuses"
+            " rather than silently drop reads it cannot score."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--format",
+        choices=TABLE_FORMATS,
+        default=DEFAULT_TABLE_FORMAT,
+        help=(
+            f"Table format ({DEFAULT_TABLE_FORMAT} by default). Both carry the same"
+            " numbers, so this is a choice of what reads the file next: parquet for"
+            " dataframe tooling, biom for the microbiome tools that require it."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help=(
+            "Where to write the table. The rest of the bundle is named after it —"
+            " <stem>.exported-identifier.json and <stem>.manifest.json always, plus"
+            " whatever --taxonomy and --tree add. None is overwritten if it exists,"
+            " and a failure part-way leaves none of them behind."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--data-plane-url",
+        required=True,
+        help=(
+            "gRPC URL of the data plane the alignment and reference lengths stream from"
+            " (e.g. grpc+tls://qiita.example.com:443, or grpc://<host>:50051 on-host)."
+        ),
+    )
+    p_ft_build.set_defaults(handler=_handle_feature_table_build)
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
     p_ticket_sub = p_ticket.add_subparsers(dest="ticket_cmd", required=True)
@@ -637,6 +1123,23 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="all_tickets",
         action="store_true",
         help="All originators' tickets (requires wet_lab_admin+); default is your own.",
+    )
+    p_ticket_list.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help=(
+            "Only tickets that touch this sequenced_pool: pool-scoped, on one of its"
+            " samples, or on a block covering one of them."
+        ),
+    )
+    p_ticket_list.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        help="Only tickets scoped to this prep_sample.",
+    )
+    p_ticket_list.add_argument(
+        "--action-id",
+        help="Only tickets for this action_id (e.g. read-mask), across every version.",
     )
     p_ticket_list.add_argument(
         "--limit",
@@ -993,6 +1496,78 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
+
+    p_submit_reads = sub.add_parser(
+        "submit-reads",
+        help=(
+            "Load one sample's reads from THIS machine: upload the FASTQ(s) or BAM"
+            " to the data plane, then submit the ingest work-ticket against them."
+        ),
+        description=(
+            "For reads that live on the machine you are typing on rather than on"
+            " the cluster's filesystem. The file is streamed to the data plane over"
+            " Flight, byte-exact and without decompressing a .gz, and the ticket"
+            " names the resulting upload handle instead of a path. Naming a host"
+            " path directly requires wet_lab_admin or system_admin, so this is the"
+            " route for a regular user — and the only route for anyone whose reads"
+            " are not on a filesystem the cluster mounts."
+            " FASTQ goes to fastq-to-parquet, BAM to bam-to-parquet."
+            " The uploaded basename must be the sequenced-sample's --pool-item-id"
+            " followed by '_' or '.', the same rule a path-named submission obeys."
+        ),
+    )
+    p_submit_reads.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        required=True,
+        help="The prep_sample these reads belong to.",
+    )
+    reads_source = p_submit_reads.add_mutually_exclusive_group(required=True)
+    reads_source.add_argument(
+        "--fastq",
+        type=Path,
+        help="Forward (R1) FASTQ on this machine. Plain or .gz.",
+    )
+    reads_source.add_argument(
+        "--bam",
+        type=Path,
+        help=(
+            "Unaligned basecaller uBAM (PacBio HiFi / ONT) on this machine."
+            " An aligned BAM is rejected by the loader."
+        ),
+    )
+    p_submit_reads.add_argument(
+        "--reverse-fastq",
+        type=Path,
+        help="Reverse (R2) FASTQ for paired-end input. Not valid with --bam.",
+    )
+    p_submit_reads.add_argument(
+        "--data-plane-url",
+        help=(
+            "gRPC URL of the data plane the reads are streamed to. From off the"
+            " deploy host use the public TLS edge (e.g."
+            " grpc+tls://qiita.example.com:443); grpc://<host>:50051 is the"
+            " direct/on-host form."
+        ),
+    )
+    p_submit_reads.add_argument(
+        "--no-watch",
+        action="store_true",
+        help="Submit the work_ticket and exit without polling. Default polls until terminal.",
+    )
+    p_submit_reads.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds between work_ticket polls under --watch (default: 2.0)",
+    )
+    p_submit_reads.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=24 * 3600,
+        help="Max seconds to wait for the work_ticket under --watch (default: 86400)",
+    )
+    p_submit_reads.set_defaults(handler=_handle_submit_reads)
 
     p_submit_pacbio = sub.add_parser(
         "submit-pacbio-ingest",
@@ -1379,16 +1954,21 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "GET the pool's completion status. Reports the pool-scoped demux"
             " (bcl-convert) `demux_state`, then classifies each non-retired"
-            " sequenced_sample by the state of its read-mask (host-masking) work"
-            " tickets (completed / in-flight / no-data / failed / not-submitted)"
-            " into pool-level counts, with a `complete` flag set when every sample"
-            " reached a terminal-accounted state (COMPLETED or NO_DATA) and a"
+            " sequenced_sample into pool-level counts (completed / invalidated /"
+            " in-flight / no-data / cancelled / failed / not-submitted), with a"
+            " `complete` flag set when every sequenced_sample reached a usable or"
+            " terminal-accounted state (masked, or NO_DATA) and a"
             " `fully_processed` flag set when demux COMPLETED and host-masking is"
-            " complete. It tells the operator whether the per-sample fan-out from"
-            " submit-host-filter-pool has finished — including samples a partial"
-            " fan-out never submitted (`samples_not_submitted`). Compute-on-read"
-            " over the work tickets — it never drifts when a sample is re-processed"
-            " or deleted."
+            " complete. It tells the operator whether host-masking has finished,"
+            " by either path — the per-sample read-mask fan-out from"
+            " submit-host-filter-pool, or a block-mask plan —"
+            " including sequenced_samples a partial fan-out never submitted"
+            " (`samples_not_submitted`) and masking runs withdrawn after the fact"
+            " (`samples_invalidated`), which are counted but are not usable."
+            " Whether a sequenced_sample counts as masked is read primarily from"
+            " the same gate the masked-read pull reads. Compute-on-read — it never"
+            " drifts when a sequenced_sample is re-processed, withdrawn, or"
+            " deleted."
         ),
     )
     p_pool_completion.add_argument(

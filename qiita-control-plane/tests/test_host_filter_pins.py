@@ -120,7 +120,6 @@ def test_every_filter_knob_in_the_job_is_pinned():
     knob_suffixes = ("_THRESHOLD", "_PRESET", "_IDENTITY", "_FLOOR", "_CUTOFF")
     not_filter_knobs = {
         # In-DuckDB relation names that happen to start with a knob prefix.
-        "_RYPE_QUERY",
         "_RYPE_HOST",
         # Not a per-mask choice: the job pins it to the preset its `.mmi` was built
         # with, and the identity already names that index via

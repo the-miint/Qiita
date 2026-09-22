@@ -53,22 +53,21 @@ the deployed commit for the §8 archive hand-off. Key behaviours:
   not pause on no-ops, and it does not prompt to do work it has already proven is
   needed. The buckets 1 & 2 acknowledgement is skipped when both are empty in
   `DEPLOY_CHECKLIST.md` (nothing to apply out-of-band → nothing to confirm). The
-  native-venv refresh (§6) is skipped — no prompt, no `uv sync` — when provably
-  already current (the native checkout is the clone just pulled, neither
-  `qiita-common` nor `qiita-compute-orchestrator` changed in that pull, and the
-  existing venv still imports); when a refresh **is** needed on that same clone it
-  now runs automatically (no confirm), prompting only for a *separate* native
-  checkout it didn't pull. miint staging is gated the same way: a
+  two venv refreshes (§6, steps 5 and 6) are **not** skippable — they run every
+  deploy, prompting only for a *separate* native checkout the script didn't pull;
+  §6 carries why "already current" is not something a deploy can establish. miint
+  staging is gated on a real check: a
   `stage-miint --check` probe skips it when the staged build still matches the
   mirror and stages automatically otherwise — so the two prompts that used to
   fire on every deploy are gone.
 - `ASSUME_YES=1` skips the interactive acks (automation); `SKIP_STAGE_MIINT=1`
   skips the miint stage; `FORCE_STAGE_MIINT=1` forces it even when `--check` says
   it is current (use after a mirror bump the `HEAD` can't see, or to recover a
-  partial stage); `SKIP_NATIVE_REFRESH=1` skips the native-venv refresh;
-  `FORCE_NATIVE_REFRESH=1` forces it even when the "already current" skip would
-  fire (use to recover a deploy interrupted mid-`uv sync`); `FORCE_CLI_REFRESH=1`
-  does the same for the operator checkout CLI-venv refresh (step 6).
+  partial stage); `SKIP_NATIVE_REFRESH=1` / `SKIP_CLI_REFRESH=1` skip the step-5 /
+  step-6 venv refreshes, which otherwise run every deploy and abort it on failure.
+  `FORCE_NATIVE_REFRESH=1` / `FORCE_CLI_REFRESH=1` no longer do anything — they
+  overrode a skip that no longer exists. Where the refresh runs, the script says so
+  and refreshes regardless; where it is skipped they are silent.
 
 This **root-run, drop-into-each-account** model is why it works where the
 operator account has **no sudo** (the documented default — see
@@ -114,6 +113,11 @@ We pull here (not via `local-deploy.sh`'s own pull) so the migration
 files are present for the migrate step *before* the deploy script runs.
 The deploy step therefore runs with `SKIP_PULL=1`.
 
+`sudo make redeploy` does this same pull as its step 1. When that pull
+changes `deploy/redeploy.sh` or `deploy/_common.sh`, the script re-execs
+the pulled copy, so the log shows the banner and step 1 twice — expected,
+and the second pull is a no-op. It aborts if that happens twice over.
+
 ## 3. Apply env-var (bucket 1) and one-time host setup (bucket 2)
 
 Run buckets 1 and 2 of the Pending-deploy checklist verbatim. Env vars
@@ -150,6 +154,13 @@ sudo make -C ~/qiita-miint preflight
 #            flags it.
 make -C ~/qiita-miint migrate
 ```
+
+**Any later step that needs `DATABASE_URL` in the shell — a `qiita-admin backfill`, a
+`psql` check in a `DEPLOY_CHECKLIST.md` verify bucket — uses the same
+`set -a; . /etc/qiita/control-plane.env; set +a` above.** Do not reach for
+`grep -oP '^DATABASE_URL=\K.*'`: the value is quoted in the file, so a line grep
+captures the quotes and the DSN parser refuses it with `scheme is expected to be
+either "postgresql" or "postgres", got ''`. Sourcing lets the shell strip them.
 
 `make migrate` runs `dbmate up` and is idempotent — already-applied
 migrations are skipped. **This is a separate step on purpose:**
@@ -220,21 +231,20 @@ step above — run `make migrate` and re-run this command.
 > --reinstall-package qiita-common` **as the checkout owner `qiita`** (never
 > root — a root-owned `.venv` is the #80 footgun), and fails loud if the synced
 > venv can't import. It skips cleanly when `SLURM_NATIVE_PYTHON` is unset (local
-> backend), and `SKIP_NATIVE_REFRESH=1` opts out. It also **skips the refresh
-> entirely — no prompt, no `uv sync`** — when it can prove the venv is already
-> current: the native checkout is the clone this run just pulled, that pull
-> changed neither `qiita-common` nor `qiita-compute-orchestrator`, and the
-> existing venv still imports. When it can't prove that (a separate native
-> checkout, an actual code change, or a failing import probe) it refreshes — and
-> on that same clone it does so **automatically, without a prompt** (the refresh
-> is unambiguously needed; a confirm only appears for a *separate* checkout it
-> didn't pull). So the optimisation never skips a refresh a code change requires,
-> and never stops to ask you to approve necessary work. The one case it can't see
-> is a prior run that died **mid-`uv sync`**: a re-run sees "nothing pulled" and a
-> partial venv that may still import, so it would skip. After an interrupted
-> deploy, re-run with `FORCE_NATIVE_REFRESH=1` (or refresh by hand per the
-> fallback below) to force the resync — this keeps the "re-run after a failed
-> deploy is safe" property intact.
+> backend), and `SKIP_NATIVE_REFRESH=1` opts out.
+>
+> **The refresh is otherwise unconditional**, and a confirm appears only for a
+> *separate* native checkout the script didn't pull — on the same clone there is
+> nothing for you to decide. **Do not reason from "nothing changed in this pull"**:
+> pulling before you run the deploy makes every pull a no-op, and neither that nor
+> an import of `qiita_common` can tell you the venv is current. Two production
+> deploys shipped a stale venv on that reasoning.
+>
+> After the sync the script verifies by importing every dispatchable job module, so
+> a job's own `from qiita_common.x import Y` is what fails — that catches a missing
+> module and a missing NAME alike, which is what the two incidents were. The
+> compute-node side (`probe/native-import`) runs the same check as the same module,
+> and reports the failing module in its `err=` field.
 >
 > **miint staging is gated the same way.** Before staging, `redeploy.sh` runs
 > `stage-miint --check` (as `qiita-orch`, same interpreter + env): it compares the
@@ -250,8 +260,10 @@ step above — run `make migrate` and re-run this command.
 > If you run `local-deploy.sh` directly (not via `redeploy.sh`), or skipped the
 > step, refresh it by hand:
 > ```bash
-> # [operator] in the SLURM_NATIVE_PYTHON checkout, on the shared FS
-> cd <native-checkout>/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common
+> # [operator] in the SLURM_NATIVE_PYTHON checkout, on the shared FS.
+> # Absolute uv + login shell are both required: sudo's secure_path excludes
+> # /usr/local/bin, so bare `uv` reports "command not found".
+> sudo -u qiita bash -lc 'cd <native-checkout>/qiita-compute-orchestrator && /usr/local/bin/uv sync --reinstall-package qiita-common'
 > ```
 > The next native job FORCE-installs miint from the mirror, overwriting any
 > stale cached extension. Bucket-5 `compute-readiness` confirms both
@@ -265,23 +277,23 @@ step above — run `make migrate` and re-run this command.
 > path-dep, so the CLI ImportErrors on a newly-added symbol. `redeploy.sh` step 6
 > runs `uv sync --reinstall-package qiita-common` in
 > `$QIITA_CLONE/qiita-control-plane` **as the checkout owner `qiita`** (never
-> root), skipping it when neither `qiita-common` nor `qiita-control-plane` changed
-> in the pull and the venv still imports the CLI entrypoint. `FORCE_CLI_REFRESH=1`
-> forces it (recovery after a deploy interrupted mid-`uv sync`). If you run
+> root), every deploy — unconditional for the same reason step 5 is, with
+> `SKIP_CLI_REFRESH=1` as the opt-out. If you run
 > `local-deploy.sh` directly and hit the ImportError, refresh by hand:
 > ```bash
 > # [operator] in the checkout where you run `uv run qiita` / `qiita-admin`
-> cd <checkout>/qiita-control-plane && uv sync --reinstall-package qiita-common
+> # (same absolute-uv + login-shell requirement as above)
+> sudo -u qiita bash -lc 'cd <checkout>/qiita-control-plane && /usr/local/bin/uv sync --reinstall-package qiita-common'
 > ```
 
 ## 7. Verify
 
 ```bash
-# [admin] one command runs the three generic post-deploy checks with the
-#         correct run-as baked in for each — health aggregate, workflow
-#         actions list, and compute-readiness. Use this; do NOT hand-copy
-#         the individual invocations (that is how the compute-readiness
-#         run-as bug recurred every deploy — see below).
+# [admin] one command runs the generic post-deploy checks with the correct
+#         run-as baked in for each — health aggregate, workflow actions list,
+#         compute-readiness, the CP miint LOAD, and ENA reachability. Use this;
+#         do NOT hand-copy the individual invocations (that is how the
+#         compute-readiness run-as bug recurred every deploy — see below).
 sudo make -C ~/qiita-miint verify-deploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
 ```
 
@@ -296,7 +308,33 @@ env file it actually needs:
   **`compute-orchestrator.env`** (NOT `qiita-api`/`control-plane.env`): the
   command subprocesses into the orchestrator venv, reads `COMPUTE_BACKEND` /
   `SLURM*` from that env, and reads the `0400 qiita-orch` `co-to-cp.token` —
-  none of which `qiita-api` can reach.
+  none of which `qiita-api` can reach. Its SLURM probe job contributes the
+  `probe/*` rows, run on a compute node rather than the head node;
+- **cp-miint** — as `qiita-api` sourcing `control-plane.env`, LOADs miint +
+  httpfs from the staged `MIINT_EXTENSION_DIRECTORY`. Red means
+  `long-read-assembly` fails at submission and ENA import at resolve;
+- **ena-reachability** — as `qiita-api` sourcing `control-plane.env` when it is
+  readable, HEADs `https://www.ebi.ac.uk`. Red means outbound HTTPS from this
+  host to the ENA archives is blocked, so **every** ENA import fails at
+  metadata resolve. Its compute-node counterpart is the
+  `probe/ena-from-compute` row above, which HEADs `www.ebi.ac.uk` and
+  `ftp.sra.ebi.ac.uk` from a compute node and, red, means every import's
+  download step fails. Both answer for egress only — the fetch itself runs
+  through DuckDB httpfs, so a proxy or CA problem confined to httpfs still
+  surfaces first at the import.
+
+Then the `deploy/preflight.sh` fingerprint summary, as its own row.
+
+**Escape hatches.** Each row has one, set in the environment of the
+`make verify-deploy` call; use them only to get past a check you have already
+diagnosed, never to make a red deploy read green. `SKIP_HEALTH`, `SKIP_ACTIONS`,
+`SKIP_COMPUTE_READINESS`, `SKIP_CP_MIINT`, `SKIP_ENA_REACHABILITY`,
+`SKIP_PREFLIGHT` (passed through to `preflight.sh`), and `SKIP_SLURM_PROBE`,
+which drops the whole SLURM probe job — every `probe/*` row, including
+`ena-from-compute`, `native-import`, the miint probes and shared-fs. There is no
+per-row hatch on the compute side: `SKIP_ENA_REACHABILITY` skips the
+control-plane row only. A skipped row prints as `skip`, not `pass`, and
+`verify.sh` exits non-zero only on an *attempted* check that failed.
 
 If you need to run compute-readiness by hand (e.g. `make` is unavailable), the
 **correct** form is — matching [`first-deploy.md`](first-deploy.md) §10d:

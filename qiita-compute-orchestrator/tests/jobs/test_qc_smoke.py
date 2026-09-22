@@ -13,7 +13,7 @@ read `(sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2)`:
   - polyG is applied ONLY for a 2-color instrument — the same low-quality 3'
     G-run inflates `right_trim1` on a NextSeq run but not on a MiSeq run.
 
-The trim-length invariant the read_masked view relies on (a `pass` read's
+The trim-length invariant the read_masked macro relies on (a `pass` read's
 `left_trim + right_trim <= length`) is verified by reconstructing the trimmed
 sequence from the raw read + recorded trims.
 
@@ -73,7 +73,7 @@ def _mask(path: Path) -> dict[int, dict]:
 
 
 def _apply_se_trim(raw: str, m: dict) -> str:
-    """Reconstruct the SE trimmed sequence the read_masked view would serve."""
+    """Reconstruct the SE trimmed sequence the read_masked macro would serve."""
     return raw[m["left_trim1"] : len(raw) - m["right_trim1"]]
 
 
@@ -228,7 +228,7 @@ def test_qc_smoke_incoming_mask_trims_are_cumulative_from_raw(
     _ADAPTER` and trims the adapter off the 3' end. The emitted trims must be
     cumulative from the RAW read, so applying them to the raw read recovers the
     bare insert. Emitting QC's substring-relative trims instead would leave
-    `_LEAD` in the sequence `host_filter` and the `read_masked` view serve.
+    `_LEAD` in the sequence `host_filter` and the `read_masked` macro serve.
     """
     from qiita_compute_orchestrator.jobs import qc
 

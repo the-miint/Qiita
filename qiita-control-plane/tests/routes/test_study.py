@@ -663,7 +663,7 @@ async def test_patch_study_owner_self_patch_happy_path(ctx):
     assert create_resp.status_code == 201, create_resp.text
     posted = create_resp.json()
     study_idx = posted["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
@@ -689,7 +689,7 @@ async def test_patch_study_admin_tier_grant_happy_path(ctx):
         tier="admin",
         granted_by_idx=ctx["wet_session"]["principal_idx"],
     )
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
@@ -705,7 +705,7 @@ async def test_patch_study_wet_lab_admin_role_bypass(ctx):
     the study patches successfully via the bypass_role path inside
     require_study_access (no DB access-tier lookup runs)."""
     study_idx = await _post_study_owned_by_other(ctx)
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await ctx["wet"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
@@ -724,7 +724,7 @@ async def test_patch_study_etag_advances_on_ena_accession_round_trip(ctx):
     create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-etag"))
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
     new_acc = f"ERP{secrets.token_hex(4)}"
 
     resp = await ctx["user"].patch(
@@ -744,7 +744,7 @@ async def test_patch_study_sets_bioproject_accession(ctx):
     create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-bp"))
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
     new_acc = f"PRJNA{secrets.token_hex(4)}"
 
     resp = await ctx["user"].patch(
@@ -803,7 +803,7 @@ async def test_patch_study_submission_field_forbidden_422(ctx, field, value):
     create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-sub"))
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
@@ -835,7 +835,7 @@ async def test_patch_study_caller_without_study_write_scope_403(ctx, no_study_wr
     create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-no-scope"))
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await no_study_write_client.patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
@@ -851,7 +851,7 @@ async def test_patch_study_caller_with_scope_without_tier_403(ctx):
     is not the owner and has no Tier.ADMIN study_access grant on the
     study. require_study_access returns 403."""
     study_idx = await _post_study_owned_by_other(ctx)
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
@@ -912,7 +912,7 @@ async def test_patch_study_empty_body_422(ctx):
     create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-empty"))
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
@@ -929,7 +929,7 @@ async def test_patch_study_extra_forbidden_field_422(ctx):
     create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-extra"))
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
@@ -946,7 +946,7 @@ async def test_patch_study_explicit_null_title_422(ctx):
     create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-null"))
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
@@ -963,7 +963,7 @@ async def test_patch_study_empty_title_422(ctx):
     create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-empty-title"))
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
@@ -981,7 +981,7 @@ async def test_patch_study_unknown_pi_idx_422(ctx):
     create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-bad-pi"))
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.principal")
 
     resp = await ctx["user"].patch(
@@ -1002,7 +1002,7 @@ async def test_patch_study_pi_is_service_account_422(ctx):
     create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-pi-svc"))
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
     svc_idx = await seed_service_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix="patch-pi-svc")
     ctx["created"]["service_account_principals"].append(svc_idx)
 
@@ -1031,7 +1031,7 @@ async def test_patch_study_duplicate_ena_accession_409(ctx):
     second = await _post_study(ctx["user"], ctx, title=_unique_title("patch-dup-2"))
     assert second.status_code == 201, second.text
     study_idx = second.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
@@ -1058,7 +1058,7 @@ async def test_patch_study_duplicate_bioproject_accession_409(ctx):
     second = await _post_study(ctx["user"], ctx, title=_unique_title("patch-dup-bp-2"))
     assert second.status_code == 201, second.text
     study_idx = second.json()["study_idx"]
-    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    if_match = await etag_for_row(ctx["pool"], table="qiita.study", row_idx=study_idx)
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),

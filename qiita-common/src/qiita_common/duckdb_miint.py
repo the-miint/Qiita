@@ -34,12 +34,13 @@ the same env contract (`MIINT_EXTENSION_REPO` / `MIINT_EXTENSION_DIRECTORY`)
 independently — keep the sides in sync (see `qiita-data-plane/src/main.rs`).
 
 There is a THIRD copy for the same reason: `workflows/long-read-assembly/`'s
-myloasm splitter runs inside a container SIF, which installs `python-duckdb` but
-not `qiita-common` (a path dep of the two Python services only). It reaches the
-deploy-staged extension through the step's `derived_inputs` bind and mirrors
-`miint_connect_config()` inline. A change to the connect config or the
+`miint_connect.py` runs inside the assemble and checkm SIFs, which install
+`python-duckdb` but not `qiita-common` (a path dep of the two Python services only).
+It reaches the deploy-staged extension through each step's `derived_inputs` bind and
+mirrors `miint_connect_config()` inline; both splitters in that workflow import it
+rather than carrying their own. A change to the connect config or the
 LOAD-vs-INSTALL rule has to reach all three — the container one fails at LOAD on
-the cluster, after the assembler has already done its work.
+the cluster, after the tool has already done its work.
 """
 
 from __future__ import annotations
@@ -95,17 +96,29 @@ def miint_install_sql(*, force: bool = False) -> str:
     it re-installs even when present, so a deploy refreshes the shared
     `extension_directory` to the mirror's current build. Cluster runtime never
     INSTALLs at all — it `LOAD`s from that pre-staged directory (`miint_load_sql`).
+
+    Installs `httpfs` alongside, because `miint_load_sql` LOADs it: miint reaches
+    the network through DuckDB's filesystem layer, so httpfs is part of a working
+    miint, not a per-caller extra. Plain `INSTALL` even under `force` — httpfs is
+    DuckDB's own signed extension, not the team mirror, so there is no mirror bump
+    to chase and FORCE would only re-download it.
     """
     verb = "FORCE INSTALL" if force else "INSTALL"
-    return f"{verb} miint FROM '{miint_repo()}';"
+    return f"{verb} miint FROM '{miint_repo()}'; INSTALL httpfs;"
 
 
 def miint_load_sql() -> str:
-    """The LOAD statement for miint. Cluster runtime paths (CO service, native
-    jobs, the compute-readiness probe) only LOAD: the extension is pre-staged
-    into `MIINT_EXTENSION_DIRECTORY` at deploy, so no node downloads it, depends
-    on mirror reachability, or needs a writable `$HOME`."""
-    return "LOAD miint;"
+    """The LOAD statements for miint. Cluster runtime paths (CO service, native
+    jobs, the compute-readiness probe) only LOAD: the extensions are pre-staged
+    into `MIINT_EXTENSION_DIRECTORY` at deploy, so no node downloads them, depends
+    on mirror reachability, or needs a writable `$HOME`.
+
+    Includes `httpfs`: miint opens remote URLs through DuckDB's own filesystem
+    layer, which dispatches `https://` to httpfs, so anything reaching the network
+    (`read_ena*`, `read_ena_sequences`) needs it loaded. Kept here rather than in
+    each caller so no path can forget it — httpfs is regrettably not transiently
+    loaded by miint itself."""
+    return "LOAD miint; LOAD httpfs;"
 
 
 # miint is a CORE, non-optional dependency (see CLAUDE.md "miint is a core
@@ -226,23 +239,50 @@ def is_empty_sequence_file(path: Path) -> bool:
 
 def setup_miint_test_env(component: str) -> None:
     """Test-harness helper: point miint installs at the team mirror and a
-    per-component private extension directory, via `setdefault` (a no-op when
-    the env is already set). Call at conftest top. `component` names the
-    private dir (`qiita-<component>-duckdb-ext` under the system temp), kept
-    distinct per component so a mirror build in one suite doesn't collide with
-    another's cached extension.
+    private extension directory, via `setdefault` (a no-op when the env is
+    already set). Call at conftest top. `component` names the private dir
+    (`qiita-<component>-duckdb-ext` under the system temp), kept distinct per
+    component so a mirror build in one suite doesn't collide with another's
+    cached extension.
+
+    Under xdist the worker id joins the name (`qiita-<component>-gw0-duckdb-ext`),
+    so no two processes share a directory. A worker is a separate process and each
+    one installs: a cold INSTALL downloads its own copy into a `tmp-<uuid>` file
+    and renames that over the final `miint.duckdb_extension` and its `.info`, so
+    one directory across N workers is N concurrent writers to those two paths. The
+    split costs no extra downloads on a cold cache — the download already happens
+    once per worker, the rename target is all that changes — and each directory
+    caches for later runs the same way. It also puts the owning worker in the path,
+    so a file-level DuckDB error naming that directory says which process owns it.
+
+    A worker inherits its environment from the xdist controller, which ran this
+    same helper first and so already exported the plain per-component directory —
+    `setdefault` alone leaves every worker pointing back at that one shared path.
+    So a worker also REPLACES that value, and only that value: a directory pinned
+    from outside is a different string and survives untouched, which is the
+    `setdefault` contract this keeps.
 
     The conftest fixtures INSTALL (not FORCE INSTALL) into that dir, so it caches
     across runs and NEVER refreshes. After the mirror rebuilds — e.g. a new miint
     function lands — a warm cache still holds the old build, and the symptom is a
     bare `Catalog Error: ... does not exist` from the new function, which points at
-    the code rather than at the cache. Clear it:
+    the code rather than at the cache. Clear it — the glob matches the per-worker
+    directories too:
 
         rm -rf "$TMPDIR"/qiita-*-duckdb-ext        # NOT /tmp on macOS
 
     CI is unaffected (it always starts cold), and the deploy is covered by
     compute-readiness's miint probes."""
     os.environ.setdefault("MIINT_EXTENSION_REPO", MIINT_MIRROR_URL)
-    ext_dir = os.path.join(tempfile.gettempdir(), f"qiita-{component}-duckdb-ext")
-    os.makedirs(ext_dir, exist_ok=True)
-    os.environ.setdefault("MIINT_EXTENSION_DIRECTORY", ext_dir)
+    # xdist sets this in each worker's environment before the worker imports
+    # conftest; it is unset in the controller and in a plain single-process run.
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    shared_dir = os.path.join(tempfile.gettempdir(), f"qiita-{component}-duckdb-ext")
+    if worker:
+        ext_dir = os.path.join(tempfile.gettempdir(), f"qiita-{component}-{worker}-duckdb-ext")
+        if os.environ.get(MIINT_EXTENSION_DIRECTORY_VAR) == shared_dir:
+            del os.environ[MIINT_EXTENSION_DIRECTORY_VAR]
+    else:
+        ext_dir = shared_dir
+    os.environ.setdefault(MIINT_EXTENSION_DIRECTORY_VAR, ext_dir)
+    os.makedirs(os.environ[MIINT_EXTENSION_DIRECTORY_VAR], exist_ok=True)

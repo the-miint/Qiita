@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +20,7 @@ import qiita_control_plane.runner as _runner_pkg
 from ..actions.reference import (
     ReferenceNotFound,
 )
-from ..auth.tickets import sign_ticket
+from ..auth.tickets import run_signed_flight_call, sign_ticket
 from ._read_ingest import _workflow_declares_input
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
@@ -56,9 +55,10 @@ async def _resolve_reference_index_path(
 
     This is the *whole-reference* (unsharded) lookup: it filters to
     `shard_id IS NULL` so a per-shard analysis-index row can never be served
-    here. All rows are NULL today, so this is a no-op now and forward-safe once
-    shard rows exist. Shard-aware resolution (routing a read to its shard) is a
-    later milestone and is deliberately NOT built here.
+    here. `actions.library.register_index` writes rows carrying a `shard_id`,
+    so the filter selects rather than merely being forward-safe. Shard-aware
+    resolution (routing a read to its shard) is `_resolve_sharded_align_indexes`
+    below.
 
     Raises:
       * ReferenceNotFound — the reference row doesn't exist.
@@ -476,6 +476,9 @@ QC_ADAPTER_BINDING = "adapter_parquet"
 # route's _DOGET_ALLOWED_TABLES.
 _REFERENCE_CHUNKS_TABLE = "reference_sequence_chunks"
 
+# Cap on how many repeated chunk positions the adapter reassembly error lists.
+_MAX_REPORTED = 20
+
 
 def _do_get_reference_sequence_chunks(
     data_plane_url: str, ticket_bytes: bytes
@@ -498,13 +501,12 @@ def _do_get_reference_sequence_chunks(
 
 def _write_adapter_parquet(rows: list[tuple[int, int, str]], out_path: Path) -> int:
     """Reassemble chunked sequences (group by feature_idx, order by chunk_index,
-    concat chunk_data — the same string_agg the data plane documents) into a
-    Parquet at `out_path`, one row per feature with columns `feature_idx` (BIGINT,
-    provenance) and `sequence` (VARCHAR, the adapter). Rows are sorted by
-    feature_idx for determinism; the qc job reads only `sequence` via
-    `read_parquet`. Returns the sequence count. Raises ValueError on an empty set
-    — an adapter reference with no sequences is a misconfiguration, not a valid QC
-    input.
+    concat chunk_data) into a Parquet at `out_path`, one row per feature with
+    columns `feature_idx` (BIGINT, provenance) and `sequence` (VARCHAR, the
+    adapter). Rows are sorted by feature_idx for determinism; the qc job reads
+    only `sequence` via `read_parquet`. Returns the sequence count. Raises
+    ValueError on an empty set — an adapter reference with no sequences is a
+    misconfiguration, not a valid QC input — and on a repeated chunk position.
 
     Parquet (not FASTA) keeps the adapter set in the same columnar format as the
     reads it trims, so the qc job reads it with `read_parquet` and no FASTA
@@ -513,22 +515,43 @@ def _write_adapter_parquet(rows: list[tuple[int, int, str]], out_path: Path) -> 
     pre-loop path.
 
     Input contract (the reference-load flow, jobs/reference_load.py): chunk_data
-    is a substring of a parsed FASTA record, so it is newline-free, and a feature
-    is loaded exactly once with monotonic chunk_index (a reference is loaded once,
-    pending→loading→active), so (feature_idx, chunk_index) is unique. Hence no
-    newline sanitation or chunk dedup here — both would mask a real corruption we
-    want to surface."""
+    is a substring of a parsed FASTA record, hence newline-free, so chunks are
+    concatenated with no newline sanitation — stripping would hide a chunk that is
+    not what the loader wrote. `qiita_common.chunking.reassemble_chunks_expr` holds
+    the chunk contract this reproduces in Python: the column names and the
+    concatenation order.
+
+    `(feature_idx, chunk_index)` uniqueness is a write-path convention, not a
+    constraint — `qiita-data-plane/src/ducklake.rs` declares
+    `reference_sequence_chunks` with no primary key and no UNIQUE — so a repeat
+    reaches here and raises instead of being joined: the join returns a sequence
+    longer than the one the reference holds, and picking a row needs a survivor
+    rule this function does not have."""
     import pyarrow as pa  # noqa: PLC0415
     import pyarrow.parquet as pq  # noqa: PLC0415
 
-    by_feature: dict[int, list[tuple[int, str]]] = {}
+    by_feature: dict[int, dict[int, str]] = {}
+    repeated: set[tuple[int, int]] = set()
     for feature_idx, chunk_index, chunk_data in rows:
-        by_feature.setdefault(feature_idx, []).append((chunk_index, chunk_data))
+        chunks = by_feature.setdefault(feature_idx, {})
+        if chunk_index in chunks:
+            repeated.add((feature_idx, chunk_index))
+        chunks[chunk_index] = chunk_data
     if not by_feature:
         raise ValueError("adapter reference returned no sequences")
+    if repeated:
+        positions = [
+            f"(feature_idx {feature}, chunk_index {index})"
+            for feature, index in sorted(repeated)[:_MAX_REPORTED]
+        ]
+        raise ValueError(
+            f"{len(repeated)} chunk position(s) carry more than one row: "
+            f"{', '.join(positions)} — repair {_REFERENCE_CHUNKS_TABLE} before "
+            "running QC against this reference"
+        )
     feature_ids = sorted(by_feature)
     sequences = [
-        "".join(chunk for _, chunk in sorted(by_feature[feature_idx]))
+        "".join(chunk for _, chunk in sorted(by_feature[feature_idx].items()))
         for feature_idx in feature_ids
     ]
     table = pa.table(
@@ -604,11 +627,6 @@ async def _resolve_qc_adapters(
             f"{row['status']!r}, must be {ReferenceStatus.ACTIVE.value!r}"
         )
 
-    ticket = sign_ticket(
-        table=_REFERENCE_CHUNKS_TABLE,
-        filter={"reference_idx": [default_adapter_reference_idx]},
-        secret=signing_key,
-    )
     # A Flight failure (data plane unreachable / errored) raises
     # pyarrow.flight.FlightError, which is NOT a BackendFailure — letting it
     # escape this pre-loop pass would hit run_workflow's bare `except Exception`,
@@ -616,13 +634,16 @@ async def _resolve_qc_adapters(
     # work_ticket_failure_step_name_consistent CHECK (step_run ⇒ step_name NOT
     # NULL) — the failure transition itself would throw and strand the ticket in
     # PROCESSING. Wrap it as a SUBMISSION failure like every other pre-loop
-    # resolver via _submission_dp_fetch_failure, which classifies a transient
-    # serialization conflict (concurrent DuckLake attach, SQLSTATE 40001) as
-    # RETRIABLE (a redrive self-heals) and anything else — DP down / errored — as
-    # permanent (the operator resubmits).
+    # resolver via _submission_dp_fetch_failure, which decides permanent vs
+    # retriable.
     try:
-        rows = await asyncio.get_event_loop().run_in_executor(
-            None, _runner_pkg._do_get_reference_sequence_chunks, data_plane_url, ticket
+        rows = await run_signed_flight_call(
+            lambda: sign_ticket(
+                table=_REFERENCE_CHUNKS_TABLE,
+                filter={"reference_idx": [default_adapter_reference_idx]},
+                secret=signing_key,
+            ),
+            lambda ticket: _runner_pkg._do_get_reference_sequence_chunks(data_plane_url, ticket),
         )
     except Exception as exc:
         raise _submission_dp_fetch_failure(

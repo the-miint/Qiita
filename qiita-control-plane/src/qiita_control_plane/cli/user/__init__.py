@@ -29,11 +29,12 @@ from ~/.qiita/token (mode 0600).
 from .. import _common
 from ._helpers import _build_body, _handle_patch, _handle_read, _lane_arg
 from ._parser import _build_parser
+from .alignment import _handle_alignment_cohort, _handle_alignment_list
 from .auth import _handle_login, _handle_profile_set, _handle_whoami, _patch_user_me
 from .biosample import _handle_biosample_create, _post_biosample
+from .feature_table import _handle_feature_table_build
 from .pacbio import (
     _handle_submit_pacbio_ingest,
-    _index_run_bams,
     _PacbioPreflightRow,
     _read_pacbio_preflight_rows,
     _resolve_sample_bams,
@@ -111,8 +112,11 @@ __all__ = [
     "_build_missing_section",
     "_get_work_ticket",
     "_get_work_ticket_step_logs",
+    "_handle_alignment_cohort",
+    "_handle_alignment_list",
     "_handle_biosample_create",
     "_handle_delete_sequenced_pool",
+    "_handle_feature_table_build",
     "_handle_login",
     "_handle_patch",
     "_handle_pool_completion",
@@ -138,7 +142,6 @@ __all__ = [
     "_handle_ticket_status",
     "_handle_ticket_submit",
     "_handle_whoami",
-    "_index_run_bams",
     "_lane_arg",
     "_list_work_tickets",
     "_lookup_accessions",

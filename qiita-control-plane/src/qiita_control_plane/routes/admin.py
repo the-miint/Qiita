@@ -58,6 +58,7 @@ from ..auth.scopes import (
 )
 from ..auth.tickets import sign_ticket
 from ..auth.token import mint_api_token
+from ..block_read import READ_MASKED_TABLE
 from ..deps import TxConnFactory, get_db_pool, get_flight_signing_key, get_tx_conn_factory
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["admin"])
@@ -539,9 +540,11 @@ async def export_owner_biosample_id(
     a study, keyed by minted biosample_idx + public accession.
 
     The owner name (biosample_metadata.value_text where
-    is_owner_biosample_id=true) is PII-pinned and masked on the normal read
-    path; this route is the only way to recover it, so it is gated by
-    system_admin PLUS admin:biosample_owner_id_read.
+    is_owner_biosample_id=true) is the owner's own name for their sample.
+    It is restricted to authorized study members rather than shown on the
+    general read path — submitters sometimes put PII in sample names — so
+    recovering it across a whole study is gated by system_admin PLUS
+    admin:biosample_owner_id_read.
 
     Without sequenced_pool_idx, returns one row per active biosample link in
     the study. With it, returns the study's sequenced_samples in that pool,
@@ -608,10 +611,6 @@ async def export_owner_biosample_id(
 # Masked-read export (system_admin + admin:masked_read_export)
 # ---------------------------------------------------------------------------
 
-# The masked-read view table the export ticket is signed for. Must match the
-# data plane's ALLOWED_TABLES and the CP-side _DOGET_ALLOWED_TABLES
-# (routes/reference.py) and the service-account read_masked route's own constant.
-_READ_MASKED_TABLE = "read_masked"
 
 # Export tickets are minted at the data plane's MAX_TICKET_LIFETIME (3600 s).
 # The data plane verifies expiry only at DoGet initiation, never mid-stream, so
@@ -692,7 +691,7 @@ async def create_masked_read_export_ticket(
     _scope: Principal = Depends(require_scope(Scope.ADMIN_MASKED_READ_EXPORT)),
 ) -> DoGetTicketResponse:
     """Mint a Flight DoGet ticket scoped to one (prep_sample_idx, mask_idx) on
-    the data plane's read_masked view — the human (system_admin) counterpart to
+    the data plane's read_masked macro — the human (system_admin) counterpart to
     the service-account POST /read-masked/ticket/doget. The export CLI mints one
     just-in-time per sample.
 
@@ -730,9 +729,11 @@ async def create_masked_read_export_ticket(
                 "reason": (
                     "the sample is not masked-complete under this mask_idx "
                     f"(mask_sample.state={mask_state!r}). Either no read-mask has "
-                    "completed for this (prep_sample, mask_idx), or a covering block is "
-                    "still in flight — the read_masked pass-set would be absent or "
-                    "partial. Refusing to export; retry once masking is completed."
+                    "completed for this (prep_sample, mask_idx), a covering block is "
+                    "still in flight, or the run was withdrawn as untrustworthy "
+                    "('invalidated'). The read_masked pass-set would be absent, "
+                    "partial, or unfit. Refusing to export; a withdrawn run is not "
+                    "retryable — re-mask under a corrected config."
                 ),
                 "prep_sample_idx": body.prep_sample_idx,
                 "mask_idx": body.mask_idx,
@@ -741,7 +742,7 @@ async def create_masked_read_export_ticket(
         )
 
     ticket_bytes = sign_ticket(
-        table=_READ_MASKED_TABLE,
+        table=READ_MASKED_TABLE,
         filter=filter_,
         secret=signing_key,
         ttl_seconds=_EXPORT_TICKET_TTL_SECONDS,

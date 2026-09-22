@@ -40,6 +40,7 @@ def _minimal_boot_env(monkeypatch, tmp_path):
         "LOGIN_COOKIE_SECRET_KEY", base64.b64encode(secrets.token_bytes(32)).decode()
     )
     monkeypatch.setenv("PATH_SCRATCH", str(tmp_path))
+    monkeypatch.setenv("PATH_INGEST_ROOTS", str(tmp_path))
     monkeypatch.setenv("CONTACT_EMAIL", "ops@example.com")
 
 

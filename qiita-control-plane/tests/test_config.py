@@ -13,11 +13,13 @@ _TEST_COOKIE_B64 = base64.b64encode(secrets.token_bytes(32)).decode()
 
 @pytest.fixture(autouse=True)
 def _set_workspace_root(monkeypatch):
-    """Default required env vars for every test (PATH_SCRATCH, CONTACT_EMAIL,
-    FLIGHT_TICKET_SIGNING_KEY, LOGIN_COOKIE_SECRET_KEY). Tests that specifically
-    exercise an env var's absence or invalid value `delenv` / `setenv` to
-    override after this fixture runs."""
+    """Default required env vars for every test (PATH_SCRATCH,
+    PATH_INGEST_ROOTS, CONTACT_EMAIL, FLIGHT_TICKET_SIGNING_KEY,
+    LOGIN_COOKIE_SECRET_KEY). Tests that specifically exercise an env var's
+    absence or invalid value `delenv` / `setenv` to override after this fixture
+    runs."""
     monkeypatch.setenv("PATH_SCRATCH", "/tmp/qiita-test-scratch-unused")
+    monkeypatch.setenv("PATH_INGEST_ROOTS", "/tmp/qiita-test-ingest-unused")
     monkeypatch.setenv("CONTACT_EMAIL", "qiita-test@example.org")
     monkeypatch.setenv("FLIGHT_TICKET_SIGNING_KEY", _TEST_SECRET_B64)
     monkeypatch.setenv("LOGIN_COOKIE_SECRET_KEY", _TEST_COOKIE_B64)
@@ -355,6 +357,33 @@ def test_settings_build_sha_empty_is_none(monkeypatch):
 
     settings = Settings.from_env()
     assert settings.build_sha is None
+
+
+def test_settings_build_version_set_from_env(monkeypatch):
+    """BUILD_VERSION is optional — set only by the deploy scripts. When
+    the deploy writes it, it lands on the Settings object so the landing
+    footer renders the calver instead of the static package version."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("BUILD_VERSION", "2026.8.6")
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.build_version == "2026.8.6"
+
+
+def test_settings_build_version_empty_is_none(monkeypatch):
+    """An empty BUILD_VERSION (activate.sh writes an empty build.env when
+    the date is unavailable) must normalize to None, not the empty
+    string — the footer keys off truthiness to decide whether to render
+    the calver or fall back to the static package version."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("BUILD_VERSION", "")
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.build_version is None
 
 
 def test_settings_default_adapter_reference_idx_unset_is_none(monkeypatch):

@@ -1,4 +1,4 @@
-"""Assert every path the directory-tree code block in docs/architecture.md
+"""Assert every path the directory-tree code block in docs/architecture/build-and-deploy.md
 lists actually exists on disk.
 
 Asymmetric (curated) check: paths in the doc must exist; files on disk
@@ -6,7 +6,7 @@ that aren't in the doc are fine (the tree is a high-level map, not an
 exhaustive listing). Catches the failure mode where someone deletes or
 renames a file/directory without updating the doc.
 
-When this test fails, either update the tree in docs/architecture.md to
+When this test fails, either update the tree in docs/architecture/build-and-deploy.md to
 match disk, or restore the missing path.
 
 Parser notes:
@@ -25,7 +25,7 @@ import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ARCH_DOC = REPO_ROOT / "docs" / "architecture.md"
+ARCH_DOC = REPO_ROOT / "docs" / "architecture" / "build-and-deploy.md"
 
 # A tree line looks like: `<prefix>├── <name>[ # comment]` or `<prefix>└── <name>...`.
 # Prefix is composed of `│   ` or `    ` segments (4 chars each).
@@ -57,14 +57,16 @@ def _parse_tree(text: str) -> list[str]:
 def test_architecture_tree_paths_exist() -> None:
     text = ARCH_DOC.read_text()
     m = _TREE_BLOCK_RE.search(text)
-    assert m, "no fenced tree block starting with 'qiita/' found in docs/architecture.md"
+    assert m, (
+        "no fenced tree block starting with 'qiita/' found in docs/architecture/build-and-deploy.md"
+    )
 
     paths = _parse_tree(m.group(1))
     assert paths, "tree parsed to zero paths — parser is probably broken"
 
     missing = sorted(p for p in paths if not (REPO_ROOT / p).exists())
     assert not missing, (
-        "docs/architecture.md tree references paths that don't exist:\n  "
+        "docs/architecture/build-and-deploy.md tree references paths that don't exist:\n  "
         + "\n  ".join(missing)
         + "\n\nFix: remove the stale entries from the tree, or restore "
         "the missing files/directories."

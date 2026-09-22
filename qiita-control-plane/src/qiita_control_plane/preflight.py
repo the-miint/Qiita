@@ -24,11 +24,9 @@ the two readers to each other (`tests/test_preflight.py`).
 from __future__ import annotations
 
 import sqlite3
-import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import NamedTuple
 
 # Sheet types the PacBio path recognizes. `pacbio_absquant` is the absolute-
@@ -69,25 +67,21 @@ def is_pacbio_sheet_type(sheet_type: str | None) -> bool:
 def open_blob(blob: bytes) -> Iterator[sqlite3.Connection]:
     """Open a stored pre-flight blob as a run_preflight sqlite3 connection.
 
-    run_preflight operates on a FILE-backed connection, so the blob is
-    materialized to a private temp file (the same shape
-    `routes/sequencing_run.py::_apply_preflight_lane_update` uses). The
-    run_preflight import is lazy and local so the git-pinned dependency loads only
-    on this path.
+    `load_db_bytes` deserializes into a detached in-memory database and applies any
+    pending schema patches there. The run_preflight import is lazy and local so the
+    git-pinned dependency loads only on this path.
 
-    `open_db_file` opens read-WRITE and applies schema patches in place, which is
-    exactly why the copy must be private and disposable — never the caller's bytes.
+    RAISES `ValueError` when `blob` is not a SQLite database at all or was written
+    against a newer pre-flight schema than this deployment ships, and
+    `sqlite3.DatabaseError` when it carries the header but is unreadable.
     """
-    from run_preflight import open_db_file  # noqa: PLC0415
+    from run_preflight import load_db_bytes  # noqa: PLC0415
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "preflight.db"
-        db_path.write_bytes(blob)
-        conn = open_db_file(str(db_path))
-        try:
-            yield conn
-        finally:
-            conn.close()
+    conn = load_db_bytes(blob)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def run_sheet_type(conn: sqlite3.Connection) -> str | None:

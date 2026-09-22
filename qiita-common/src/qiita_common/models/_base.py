@@ -11,12 +11,71 @@ import re
 from enum import StrEnum
 from typing import Annotated, Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    computed_field,
+    model_validator,
+)
+
+from qiita_common.auth_constants import MAX_ACCESSION_LENGTH, MAX_NAME_LENGTH
 
 # A `derived_inputs` key becomes an env var forwarded into the container, so it
 # must look like one. Anchored: a stray `=` or space would corrupt the
 # `--env K=V` apptainer argument it is interpolated into.
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+# Upper bound on a prep_sample cohort a HUMAN assembles and names in a request
+# body — the alignment ticket mint and the sample-label map. Shared rather than
+# duplicated because the two bound the same thing for the same two reasons:
+# request-payload size, and the width of a refusal's disclosure (both routes
+# report which of the caller's chosen identifiers they could not authorize, so
+# the cohort length is the width of that answer).
+#
+# Deliberately an order of magnitude tighter than the machine-driven roster caps
+# in models/step.py, which only have to keep a ticket payload and its `IN (...)`
+# sane and disclose nothing.
+#
+# **10k bounds one REQUEST, not one analysis, and analyses larger than this are
+# expected.** It is a per-request ceiling chosen for the two costs above, and a
+# caller who needs more issues more requests. Raising it is a deliberate
+# decision about payload size and disclosure width, not a formality — so do not
+# read a cohort that hits the cap as evidence the number is wrong.
+MAX_COHORT_PREP_SAMPLE_IDX = 10_000
+
+# The whole cohort contract, not just its cap: positive idxs, non-empty, bounded.
+# All three parts are load-bearing — an empty cohort would sign an unscoped ticket
+# on one route and have no answer to give on the other — so they travel together
+# rather than being re-spelled per request model.
+PrepSampleCohort = Annotated[
+    list[Annotated[int, Field(gt=0)]],
+    Field(min_length=1, max_length=MAX_COHORT_PREP_SAMPLE_IDX),
+]
+
+
+def _strip_text(value: Any) -> Any:
+    """Strip outer whitespace from text, passing anything else through so the
+    type check still owns the type error.
+    """
+    return value.strip() if isinstance(value, str) else value
+
+
+# Inbound text that has to carry content. Stripping runs ahead of the length
+# bounds, so whitespace-only text fails min_length instead of reaching storage
+# as '', and one identifier written with stray padding resolves to the same row
+# as the unpadded spelling. Declining to give a value should be expressed with a
+# missing-value marker, not with empty text. Read models built from stored rows
+# must NOT use this: they could refuse rows already in the database.
+NonBlankText = Annotated[str, BeforeValidator(_strip_text), Field(min_length=1)]
+NonBlankName = Annotated[NonBlankText, Field(max_length=MAX_NAME_LENGTH)]
+
+# An externally-assigned accession (ENA, BioSample, BioProject). Every accession
+# column is UNIQUE, and Postgres admits many NULLs there but only one '', so the
+# first caller sending empty text would take that single slot and every later one
+# would collide. Absent means NULL, never empty text.
+AccessionText = Annotated[NonBlankText, Field(max_length=MAX_ACCESSION_LENGTH)]
 
 
 def _fraction_passing_quality_filter(
@@ -34,6 +93,36 @@ def _fraction_passing_quality_filter(
     if raw_read_count_r1r2 == 0:
         return None
     return quality_filtered_read_count_r1r2 / raw_read_count_r1r2
+
+
+class ReadCounts(BaseModel):
+    """The four per-stage read counts plus the fraction derived from them —
+    one definition of the column names, their invariants, and the fraction, for
+    every surface that reports read outcome. Each subclass documents what its
+    own four counts cover (one sample, one ticket's sample, a pool's sums).
+
+    Both-mates (R1+R2) totals. Per sample they stay NULL until the sample is
+    processed by fastq-to-parquet/1.2.0 (the persist-read-metrics action writes
+    them). By the DB CHECK: quality_filtered <= biological and biological +
+    spikein <= raw. `spikein` (SynDNA) is DISJOINT from biological — a spike-in
+    is added in the lab, not a molecule from the sample — and is 0 for protocols
+    that carry none. `qc_*` and `twist_no_adaptor` reads count toward raw only.
+    """
+
+    raw_read_count_r1r2: int | None
+    biological_read_count_r1r2: int | None
+    quality_filtered_read_count_r1r2: int | None
+    spikein_read_count_r1r2: int | None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def fraction_passing_quality_filter(self) -> float | None:
+        """quality_filtered / raw for whatever this instance counts — see
+        `_fraction_passing_quality_filter`. Computed on read, never stored, so it
+        can't drift from the counts."""
+        return _fraction_passing_quality_filter(
+            self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
+        )
 
 
 def check_exactly_one_runtime(
@@ -66,6 +155,33 @@ def check_exactly_one_runtime(
             "is run as `apptainer exec <image> <entrypoint>` and needs the in-container "
             "launcher path (e.g. /opt/qiita/<step>.sh)"
         )
+
+
+def check_withdrawal_reason(
+    *,
+    withdrawing: bool,
+    reason: str | None,
+    field: str,
+    value: str,
+) -> None:
+    """Shared reason-gating check for the lifecycle PATCH bodies — the two config
+    deprecations and the two per-run invalidations. Raises ValueError when the
+    shape is wrong.
+
+    A reason is MANDATORY on the withdrawing transition and REFUSED on its
+    reverse. Mandatory because it is what a reader who finds a withdrawn row
+    behind published data has to go on; refused on the reverse because the
+    repository clears the provenance columns there, so a reason supplied with a
+    restore would be accepted and silently dropped.
+
+    `field` / `value` name the discriminator in the message ("status",
+    "deprecated"), so one implementation produces each body's own wording.
+    """
+    if withdrawing:
+        if reason is None or not reason.strip():
+            raise ValueError(f"reason is required when {field} is {value!r}")
+    elif reason is not None:
+        raise ValueError(f"reason is only accepted when {field} is {value!r}")
 
 
 def check_derived_inputs(
@@ -246,6 +362,41 @@ class StepStatus(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class MetadataRequestModel(BaseModel):
+    """Base class for every request body carrying a `metadata` dict keyed on a
+    sample field's name.
+
+    Keys are stripped on the way in, so one field name written with stray
+    padding resolves to the same field as its unpadded spelling. Two keys
+    differing only in that padding would collapse onto one another and silently
+    drop a value, so they are refused here rather than resolved arbitrarily.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_colliding_metadata_keys(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            return data
+        # Group the raw keys by the form each will carry once stripped; a
+        # stripped form claimed by more than one raw key is ambiguous.
+        raw_keys_by_stripped: dict[str, list[str]] = {}
+        for raw_key in metadata:
+            if isinstance(raw_key, str):
+                raw_keys_by_stripped.setdefault(raw_key.strip(), []).append(raw_key)
+        collisions = sorted(
+            stripped for stripped, raw_keys in raw_keys_by_stripped.items() if len(raw_keys) > 1
+        )
+        if collisions:
+            raise ValueError(
+                "metadata keys differing only in surrounding whitespace:"
+                f" {collisions}; supply each field once"
+            )
+        return data
 
 
 class PatchRequestModel(BaseModel):

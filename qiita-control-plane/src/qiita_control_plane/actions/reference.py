@@ -162,11 +162,13 @@ async def delete_reference_cascade(
     explicit: work_ticket (→ work_ticket_step CASCADEs) → reference_index →
     reference_membership → annotation_to_term → reference_annotation → orphan
     annotation_term → orphan feature_genome/feature → orphan genome → reference.
-    Features, genomes and terms are deleted only when *orphaned* — claimed by no
-    other reference — so a shared one survives.
+    Features, genomes and terms are deleted only when *orphaned* — claimed by
+    nothing that outlives this delete — so a shared one survives. A feature has one
+    claim from outside the reference graph: `qiita.assembly_membership`, which keeps
+    an assembled contig's feature whatever happens to the reference.
 
     Returns the per-table delete counts for the caller's response."""
-    # Orphan features: this reference's features that no other reference claims.
+    # Orphan features: this reference's features that nothing else claims.
     #
     # A reference claims a feature in TWO ways, and both count: as a member
     # (reference_membership — a whole sequence, indexed and aligned against) or as
@@ -176,21 +178,54 @@ async def delete_reference_cascade(
     # referenced by nothing; reading only membership on the *right* side of the
     # EXCEPT would delete a feature another reference still annotates.
     #
+    # reference_annotation.parent_feature_idx is a third FK on qiita.feature and is on
+    # neither side, resting on an ingest invariant rather than a constraint: the parent
+    # is resolved from the same reference's own feature map (mint_annotation_features),
+    # so a parent always carries that reference's membership row and the right side
+    # covers it there.
+    #
+    # assembly_membership is a claim from OUTSIDE the reference graph, and appears on
+    # the RIGHT side only. An assembled contig is minted through the same mint-features
+    # path and the same canonical hash as a reference sequence, so a contig whose bytes
+    # match a reference sequence collapses to one feature_idx. The FK declares no
+    # ON DELETE action, so deleting a feature an assembly still claims raises
+    # ForeignKeyViolationError and aborts the whole cascade. It is absent from the LEFT
+    # side because an assembly claim carries no reference_idx — this reference does not
+    # own it and deleting this reference does not release it.
+    #
     # Computed before the DELETEs below (the EXCEPT needs this reference's rows
-    # present). This set MUST match the data-plane orphan computation in
-    # qiita-data-plane's flight_service.rs::delete_reference — the two stores GC the
-    # same features independently, so a change to either query must change the other
-    # or sequences/features desync across stores.
+    # present). The two reference-claim terms MUST match the data-plane orphan
+    # computation in qiita-data-plane's flight_service.rs::delete_reference — the two
+    # stores GC the same features independently, so a change to either query must
+    # change the other or sequences/features desync across stores. The assembly term is
+    # deliberately Postgres-only: an assembly's contig bytes land in
+    # qiita_lake.assembled_sequence(_chunks) once its assembly_load step has run, so
+    # dropping the qiita_lake.reference_sequences copy of a feature no reference claims
+    # leaves the assembly's own copy resolvable, keyed by the qiita.feature row this
+    # query retains.
+    #
+    # The assembly term is scoped to `claimed` rather than reading the table whole:
+    # unlike the other two it has no reference_idx to filter on, and assembly_membership
+    # grows per (prep_sample x run x contig). The IN keeps it on an index-only scan of
+    # assembly_membership(feature_idx), so the cost tracks the size of THIS reference,
+    # not of every assembly ever loaded. Measured on Postgres 17.10, 1M
+    # assembly_membership rows and 50k members in the deleted reference: 158 ms scoped
+    # against 844 ms reading the table whole.
     orphan_features = [
         r["feature_idx"]
         for r in await conn.fetch(
+            "WITH claimed AS ("
             "  SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx = $1"
             "  UNION"
-            "  SELECT feature_idx FROM qiita.reference_annotation WHERE reference_idx = $1"
+            "  SELECT feature_idx FROM qiita.reference_annotation WHERE reference_idx = $1)"
+            "  SELECT feature_idx FROM claimed"
             " EXCEPT"
             " ( SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx <> $1"
             "  UNION"
-            "  SELECT feature_idx FROM qiita.reference_annotation WHERE reference_idx <> $1)",
+            "  SELECT feature_idx FROM qiita.reference_annotation WHERE reference_idx <> $1"
+            "  UNION"
+            "  SELECT am.feature_idx FROM qiita.assembly_membership am"
+            "   WHERE am.feature_idx IN (SELECT feature_idx FROM claimed))",
             reference_idx,
         )
     ]

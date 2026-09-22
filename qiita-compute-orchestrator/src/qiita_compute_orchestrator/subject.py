@@ -46,10 +46,10 @@ def stage_subject(
     reference.
 
     A non-temp TABLE (not a VIEW or TEMP): the `GROUP BY` reassembly is a blocking
-    aggregation (materialise once rather than recompute on every scan the aligner
-    issues), and miint's `save_*_index` opens a SEPARATE connection on the same
-    DuckDB instance during bind/execute, which resolves regular `view`/`table`
-    names but not TEMP tables / CTEs (see docs/duckdb-miint.md).
+    aggregation, so materialise once rather than recompute on every scan the aligner
+    issues. Visibility is no longer part of the reason — `save_minimap2_index`
+    resolves a TEMP TABLE and a registered Arrow relation as readily as a base table
+    (measured; see docs/duckdb-miint.md).
 
     `source` is inlined into the DDL (DuckDB rejects prepared parameters inside
     CREATE TABLE AS); the caller is responsible for escaping any path it embeds

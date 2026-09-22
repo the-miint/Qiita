@@ -3,6 +3,7 @@
 import pytest
 import yaml
 from pydantic import ValidationError
+from qiita_common.actions import HOST_PATH_KEY_SUFFIXES
 
 _REFERENCE_ADD_YAML = """
 action_id: reference-add
@@ -180,8 +181,9 @@ def test_load_actions_loads_on_disk_reference_add_yaml():
     assert _REFERENCE_ADD_ACTION_VERSION == ref_add.version == "1.0.0"
 
 
-def test_load_actions_loads_on_disk_long_read_assembly_yaml():
-    """The on-disk `workflows/long-read-assembly/1.0.0.yaml` loads as a valid
+@pytest.mark.parametrize("version", ["1.0.0", "1.0.1"])
+def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
+    """Each on-disk `workflows/long-read-assembly/<version>.yaml` loads as a valid
     ActionDefinition with the per-sample assembly→MAG shape:
 
       * target_kind prep_sample; context_schema REQUIRES mask_idx (the selector
@@ -198,6 +200,12 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
       * assembly_run_config threads the `assembler` scalar and assembly_load
         threads `processing_idx` via params (a container step can't take a scalar
         param — the runner treats it as a bind path).
+
+    Keyed on `(action_id, version)`, as `qiita.action` is: keying on action_id alone
+    collapses the two versions onto whichever sorts last. The two differ only in the
+    checkm image — 1.0.1 scores the unbinned residue and 1.0.0 does not — so the step
+    chain, the modules and the params asserted here hold for both, and the container
+    set is the one thing parametrized.
     """
     from pathlib import Path
 
@@ -207,12 +215,13 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
 
     repo_root = Path(__file__).resolve().parents[2]
     actions = load_actions(repo_root / "workflows")
-    by_id = {a.action_id: a for a in actions}
-    assert "long-read-assembly" in by_id, "workflows/long-read-assembly/1.0.0.yaml must load"
-    assembly = by_id["long-read-assembly"]
+    by_key = {(a.action_id, a.version): a for a in actions}
+    key = ("long-read-assembly", version)
+    assert key in by_key, f"workflows/long-read-assembly/{version}.yaml must load"
+    assembly = by_key[key]
 
     assert assembly.target_kind == ScopeTargetKind.PREP_SAMPLE
-    assert assembly.version == "1.0.0"
+    assert assembly.version == version
     assert assembly.context_schema["required"] == ["mask_idx"]
 
     assert [s.name for s in assembly.steps] == [
@@ -227,6 +236,7 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
         "write-assembly-membership",
         "assembly_load",
         "register-files",
+        "finalize-assembly-sample",
     ]
 
     export_step = next(s for s in assembly.steps if s.name == "assembly_run_config")
@@ -253,11 +263,15 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml():
     # checkm), each with its own SIF + entrypoint — the multi-SIF packaging.
     container_steps = [s for s in assembly.steps if getattr(s, "container", None)]
     assert len(container_steps) == 4
+    # checkm is per-version: 1.0.1 scores the unbinned residue and 1.0.0 does not, so
+    # the two run DIFFERENT images and the filenames say so. The other three are the
+    # same image for both versions, which is what a SIF name is for.
+    checkm_sif = f"long-read-assembly-checkm-{version}.sif"
     assert {s.container for s in container_steps} == {
         "long-read-assembly-assemble-1.0.0.sif",
         "long-read-assembly-binning-1.0.0.sif",
         "long-read-assembly-dastool-1.0.0.sif",
-        "long-read-assembly-checkm-1.0.0.sif",
+        checkm_sif,
     }
     assert len({s.entrypoint for s in container_steps}) == 4
 
@@ -581,32 +595,44 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
     assert _REFERENCE_ADD_ACTION_VERSION == local_host.version == "1.0.0"
 
 
-def test_every_write_membership_step_declares_the_runner_contract_inputs():
-    """Every on-disk `write-membership` action must declare `inputs:` exactly
-    {manifest, feature_map} — the runner's `_run_action_primitive` dispatch arm
-    hard-asserts that set and raises (failing the whole ticket) on any other
-    shape. This guards against the drift that a per-workflow-shape unit test can't
-    see: when `write-membership` gained its second input (`manifest`, for the
-    persisted accession), a workflow left on the old single-input form crashes at
-    runtime, not at load. Enumerating the real YAML here catches it at build time.
-    Same guard-by-enumeration applies to any future primitive-contract change."""
+@pytest.mark.parametrize(
+    ("primitive", "required"),
+    [
+        ("WRITE_MEMBERSHIP", {"manifest", "feature_map"}),
+        (
+            "WRITE_ASSEMBLY_MEMBERSHIP",
+            {"bin_map", "manifest", "feature_map", "genomes_dir"},
+        ),
+    ],
+    ids=["write-membership", "write-assembly-membership"],
+)
+def test_every_library_primitive_step_declares_the_runner_contract_inputs(primitive, required):
+    """Every on-disk step for these primitives must declare `inputs:` exactly the
+    set the runner's `_run_action_primitive` dispatch arm hard-asserts, which
+    raises and fails the whole ticket on any other shape.
+
+    This catches the drift a per-workflow-shape unit test cannot see: when
+    `write-membership` gained its second input (`manifest`, for the persisted
+    accession), a workflow left on the old single-input form crashed at runtime
+    rather than at load. `write-assembly-membership` gaining `genomes_dir` is the
+    same change, so both are enumerated here against the real YAML.
+    """
     from pathlib import Path
 
     from qiita_common.api_paths import LibraryPrimitive
 
     from qiita_control_plane.actions import load_actions
 
+    name = getattr(LibraryPrimitive, primitive)
     actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
-    offenders = {
-        f"{a.action_id}:{s.name}": s.inputs
-        for a in actions
-        for s in a.steps
-        if s.name == LibraryPrimitive.WRITE_MEMBERSHIP
-        and set(s.inputs) != {"manifest", "feature_map"}
-    }
+    steps = [(a, s) for a in actions for s in a.steps if s.name == name]
+    # Without this the filter below is vacuous: a renamed primitive, or a workflow
+    # that stopped loading, leaves `offenders` empty and greens the guard.
+    assert steps, f"no on-disk step declares {name}; this guard would pass unchecked"
+    offenders = {f"{a.action_id}:{s.name}": s.inputs for a, s in steps if set(s.inputs) != required}
     assert not offenders, (
-        "these write-membership steps don't match the runner's required "
-        f"[manifest, feature_map] contract and will crash at dispatch: {offenders}"
+        f"these {name} steps don't match the runner's required {sorted(required)} "
+        f"contract and will crash at dispatch: {offenders}"
     )
 
 
@@ -624,15 +650,9 @@ def test_every_write_membership_step_declares_the_runner_contract_inputs():
 # worse defect, rejected unconditionally by the second test below, and nothing
 # here can absolve it.
 
-# Deliberate: the step's YAML carries the reasoning at `baseline_resources`, and
-# a new entry belongs here only with the same. `align_sharded` sizes miint's
-# shard concurrency off cpu, which is pinned to the ceiling by design, and its
-# memory is sized to the same budget. Only the memory arm is given up — walltime
-# keeps headroom (PT4H under PT8H), so a TIMEOUT still escalates, which is why
-# the entry names one axis and not both.
-_ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
-    "align:1.0.0": {"align_sharded": ("mem_gb",)},
-}
+# Deliberate: an entry belongs here only when the step's YAML carries the
+# reasoning at `baseline_resources`.
+_ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {}
 
 # NOT accepts — a defect being tracked rather than fixed right now, listed so the
 # guard can land ahead of the re-sizing (which needs measured peak-RSS data per
@@ -646,6 +666,115 @@ _ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
 _ESCALATION_PENDING_RESIZE: dict[str, dict[str, tuple[str, ...]]] = {}
 
 
+# (action_id, version, action_context, accepted?) — the exactly-one rule the
+# read-ingest workflows use to admit reads by either route.
+_READ_INGEST_ROUTE_CASES = [
+    ("fastq-to-parquet", "1.3.0", {"fastq_path": "/seq/a_R1.fastq"}, True),
+    ("fastq-to-parquet", "1.3.0", {"fastq_upload_idx": 4}, True),
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {"fastq_path": "/seq/a_R1.fastq", "reverse_fastq_path": "/seq/a_R2.fastq"},
+        True,
+    ),
+    ("fastq-to-parquet", "1.3.0", {"fastq_upload_idx": 4, "reverse_fastq_upload_idx": 5}, True),
+    # Both routes for the forward read: ambiguous, and `oneOf` catches it
+    # because BOTH branches match.
+    ("fastq-to-parquet", "1.3.0", {"fastq_path": "/seq/a_R1.fastq", "fastq_upload_idx": 4}, False),
+    # Neither route: no reads to load.
+    ("fastq-to-parquet", "1.3.0", {}, False),
+    # Both routes for the reverse read.
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {
+            "fastq_upload_idx": 4,
+            "reverse_fastq_path": "/seq/a_R2.fastq",
+            "reverse_fastq_upload_idx": 5,
+        },
+        False,
+    ),
+    # A CROSSED pair: the mates arrive by different routes. Both spellings
+    # resolve to the same step inputs, so this would run — it is refused
+    # because one sample's R1 and R2 having two provenances is a submit slip,
+    # and a mis-paired mate is silent in the output.
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {"fastq_upload_idx": 4, "reverse_fastq_path": "/seq/a_R2.fastq"},
+        False,
+    ),
+    (
+        "fastq-to-parquet",
+        "1.3.0",
+        {"fastq_path": "/seq/a_R1.fastq", "reverse_fastq_upload_idx": 5},
+        False,
+    ),
+    ("bam-to-parquet", "1.0.0", {"bam_path": "/seq/a.bam"}, True),
+    ("bam-to-parquet", "1.0.0", {"bam_upload_idx": 2}, True),
+    ("bam-to-parquet", "1.0.0", {"bam_path": "/seq/a.bam", "bam_upload_idx": 2}, False),
+    ("bam-to-parquet", "1.0.0", {}, False),
+]
+
+
+@pytest.mark.parametrize(("action_id", "version", "context", "accepted"), _READ_INGEST_ROUTE_CASES)
+def test_read_ingest_accepts_exactly_one_route(action_id, version, context, accepted):
+    """A sample's reads reach the ingest workflows by a host path or by an
+    upload handle, never both and never neither — and for paired-end, both
+    mates take the same route.
+
+    Both spellings resolve to the same step input — the runner rewrites
+    `{prefix}_upload_idx` into the `{prefix}_path` binding — so a context
+    carrying both would leave which file the step reads decided by resolution
+    order rather than by the submitter.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+    from qiita_control_plane.actions.context_validator import validate_context
+
+    actions = {
+        (a.action_id, a.version): a
+        for a in load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    }
+    schema = actions[(action_id, version)].context_schema
+    errors = validate_context(schema, context)
+    assert (not errors) is accepted, errors
+
+
+def test_every_shipped_host_path_property_is_pinned_absolute():
+    """A `*_path` / `*_dir` / `*_folder` string property in a shipped workflow's
+    `context_schema` must declare `pattern: "^/"`.
+
+    Two things read that pattern. `SlurmBackend._resolve_input_binds` turns the
+    value into an apptainer `--bind`, and a relative path there resolves against
+    whatever CWD the launcher started in. The work_ticket submit gate reads it
+    to decide which context keys to bound against `PATH_INGEST_ROOTS`
+    (`ingest_path.host_path_keys`); a property that omits the pattern is still
+    caught by the gate's naming rule, but the YAML then no longer says what the
+    field is, and a reader has to know the route's conventions to find out.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    unpinned = {
+        f"{action.action_id}:{action.version}:{name}"
+        for action in actions
+        for name, spec in (action.context_schema.get("properties") or {}).items()
+        if name.endswith(HOST_PATH_KEY_SUFFIXES)
+        and isinstance(spec, dict)
+        and spec.get("type") == "string"
+        and spec.get("pattern") != "^/"
+    }
+    assert not unpinned, (
+        'context_schema host-path properties missing `pattern: "^/"` — add it,'
+        " or rename the property if it does not name a host path: "
+        f"{sorted(unpinned)}"
+    )
+
+
 def test_every_shipped_step_can_escalate_on_both_retry_axes():
     """No shipped workflow may pin a step's `mem_gb`/`walltime` at its
     `action_ceiling` unless it is listed above.
@@ -653,8 +782,10 @@ def test_every_shipped_step_can_escalate_on_both_retry_axes():
     A pinned axis silently disables retry: the runner grows the escalation floor
     by a fixed factor and clamps it to the ceiling, so an equal pair leaves the
     grown value unchanged, which the retry loop reads as saturation and fails the
-    ticket PERMANENTLY on attempt 0. That is invisible at author time, in the
-    per-workflow unit tests above, and at `qiita-admin actions sync` — it
+    ticket PERMANENTLY on attempt 0. The mechanism is in `runner/_dispatch.py`
+    (`_escalated_mem_floor_after_oom` and the saturation check beside it). That is
+    invisible at author time, in the per-workflow unit tests above, and at
+    `qiita-admin actions sync` — it
     surfaces only in production, as a work ticket dead at retry_count=0 with
     RESOURCE_CEILING_EXHAUSTED.
 
@@ -866,7 +997,7 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     Illumina families); and action_ceiling leaves escalation headroom
     above the largest profile.
 
-    Locks the YAML shape so the runner's A4 resolution branch (the
+    Locks the YAML shape so the runner's lookup-population resolution (the
     lookup vs flat split in qiita_control_plane.runner._dispatch_step)
     is exercised end-to-end the first time sync drops bcl-convert into
     qiita.action.
@@ -915,7 +1046,7 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     assert convert.module is None
     # Lookup-population baseline_resources: from_step_output names the
     # upstream output file that carries the instrument key, and profiles
-    # covers exactly the three A4-supported Illumina families.
+    # covers exactly the three supported Illumina families.
     br = convert.baseline_resources
     assert br.from_step_output == "instrument_model"
     assert br.profiles is not None
@@ -951,6 +1082,89 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     # The pool roster the ingest_reads step keys off (prep_sample_idx ↔
     # pool_item_id), embedded by submit-bcl-convert.
     assert bcl.context_schema["properties"]["sample_map"]["type"] == "array"
+
+
+def test_load_actions_loads_on_disk_download_ena_study_yaml():
+    """The actual on-disk `workflows/download-ena-study/1.0.0.yaml` loads as a
+    valid ActionDefinition — the ENA-fetch analog of bcl-convert:
+
+      * target_kind sequenced_pool (there is no `study` ScopeTargetKind);
+      * admin-only audience (not end-user-submittable), mirroring bcl-convert;
+      * context_schema REQUIRES `ena_study_accession`; `download_method` is
+        OPTIONAL and pinned to the single-value enum `["http"]` (no Aspera
+        key-staging in this compute env);
+      * steps `ingest_ena_reads` (module) -> `register-files`, in that order;
+      * the inert placeholder `workflows/download-ena-study/workflow.yaml`
+        (no top-level `action_id`, so the loader skipped it) is GONE now
+        that the real workflow has landed — this test's own `by_id` lookup
+        would otherwise still pass with a stale placeholder alongside, so
+        the placeholder's absence is asserted directly.
+    """
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "download-ena-study" in by_id, "workflows/download-ena-study/1.0.0.yaml must load"
+    dl = by_id["download-ena-study"]
+
+    assert dl.target_kind == ScopeTargetKind.SEQUENCED_POOL
+    assert dl.audience.service is False
+
+    from qiita_common.auth_constants import SystemRole
+
+    assert set(dl.audience.human_roles) == {SystemRole.WET_LAB_ADMIN, SystemRole.SYSTEM_ADMIN}
+
+    # Pin the submit helper's hardcoded action_id/version against the YAML the
+    # operator's deploy syncs into qiita.action — mirrors the bcl-convert pin
+    # above. A drift here would submit tickets against a non-existent action.
+    from qiita_control_plane.ena_import import (
+        DOWNLOAD_ENA_STUDY_ACTION_ID,
+        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    )
+
+    assert DOWNLOAD_ENA_STUDY_ACTION_ID == dl.action_id == "download-ena-study"
+    assert DOWNLOAD_ENA_STUDY_ACTION_VERSION == dl.version == "1.0.0"
+
+    step_names = [s.name for s in dl.steps]
+    assert step_names == ["ingest_ena_reads", "register-files"]
+
+    ingest = next(s for s in dl.steps if s.name == "ingest_ena_reads")
+    assert ingest.module == "qiita_compute_orchestrator.jobs.ingest_ena_reads"
+    assert ingest.container is None
+    assert ingest.inputs == ["ena_run_map", "reads_staging_root"]
+    assert ingest.params == {"download_method": "download_method"}
+    assert ingest.outputs == ["read_staging_dir"]
+
+    # download_method is OPTIONAL (not in `required`) and pinned to 'http'.
+    assert dl.context_schema["required"] == ["ena_study_accession"]
+    props = dl.context_schema["properties"]
+    assert props["ena_study_accession"]["type"] == "string"
+    assert props["download_method"]["enum"] == ["http"]
+
+    # The inert placeholder must be gone now that the real workflow has landed.
+    assert not (repo_root / "workflows" / "download-ena-study" / "workflow.yaml").exists()
+
+
+def test_download_ena_study_yaml_declares_ena_run_map_binding():
+    """Checks the YAML against the constant, not a second copy of the string:
+    input wiring matches by name, so a half-done rename only surfaces at
+    dispatch."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+    from qiita_control_plane.runner import ENA_RUN_MAP_BINDING
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    dl = next(a for a in actions if a.action_id == "download-ena-study")
+    ingest = next(s for s in dl.steps if s.name == "ingest_ena_reads")
+
+    assert ENA_RUN_MAP_BINDING in ingest.inputs
 
 
 def test_load_actions_loads_on_disk_read_mask_block_yaml():
@@ -1081,7 +1295,18 @@ def test_load_actions_loads_on_disk_estimate_feature_table_yaml():
     step = eft.steps[0]
     assert step.module == "qiita_compute_orchestrator.jobs.estimate_feature_table"
     assert step.inputs == ["genome_map_path"]
-    assert step.params == {"coverage_threshold": "coverage_threshold"}
+    # The de novo arm's three bindings, all resolver-produced and all absent for a
+    # reference-only ticket — the map and the per-genome quality as OPTIONAL inputs
+    # (paths), the assembly run as a params scalar (a scalar cannot ride `inputs:`).
+    # Declared required either way, the step would be undispatchable without a de
+    # novo arm.
+    assert step.optional_inputs == ["denovo_genome_map_path", "denovo_genome_quality_path"]
+    assert step.params == {
+        "coverage_threshold": "coverage_threshold",
+        "denovo_processing_idx": "denovo_processing_idx",
+        "min_completeness": "min_completeness",
+        "max_contamination": "max_contamination",
+    }
     assert step.outputs == ["ogu_table"]
     # reference_idx is framework-injected (REFERENCE scope scalar); binding it via
     # params would collide with that injection at flatten_native_inputs.
@@ -1089,6 +1314,22 @@ def test_load_actions_loads_on_disk_estimate_feature_table_yaml():
 
     required = set(eft.context_schema.get("required", []))
     assert {"alignment_idx", "prep_sample_idx", "coverage_threshold"} <= required
+    # The de novo arm is opt-in: a reference-only ticket names no assembly.
+    assert "denovo_alignment_idx" not in required
+    assert "denovo_alignment_idx" in eft.context_schema["properties"]
+
+    # The quality gate is optional and carries NO schema `default:` — the literal lives
+    # at the job's `Inputs` (the `rype_w` shape), and a second copy here is what
+    # `runner._processing._mint_processing_idx` describes drifting. An omitted key is
+    # skipped by the params binding, which is how the job's default is reached.
+    properties = eft.context_schema["properties"]
+    for knob in ("min_completeness", "max_contamination"):
+        assert knob not in required, knob
+        assert knob in properties, knob
+        assert "default" not in properties[knob], knob
+    assert properties["min_completeness"]["maximum"] == 100
+    # No upper bound on contamination: `analytic.reconcile._validate_quality_gate` says why.
+    assert "maximum" not in properties["max_contamination"]
 
 
 def test_load_actions_handles_two_versions_of_same_action(tmp_path):
@@ -1171,3 +1412,89 @@ def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
     names = [s.name for s in ftp_130.steps]
     assert names[-1] == "finalize-mask-sample"
     assert names[-2] == "register-files"  # register-files immediately precedes the gate flip
+
+
+def test_load_actions_long_read_assembly_finalizes_gate_after_register_files():
+    """`finalize-assembly-sample` (the assembly_sample completion writer) must be the
+    LAST entry and run strictly AFTER `register-files`: the gate must not read
+    'completed' until the contigs are durable in DuckLake. Pins the terminal
+    ordering so a reorder that flips the gate first surfaces here."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    # Keyed with the version, like `qiita.action`: `{a.action_id: a}` would resolve
+    # to whichever of the two long-read-assembly versions is yielded last, and pass
+    # on the collapsed key rather than on the version this names.
+    by_key = {(a.action_id, a.version): a for a in load_actions(repo_root / "workflows")}
+    names = [s.name for s in by_key[("long-read-assembly", "1.0.0")].steps]
+
+    assert names[-1] == "finalize-assembly-sample"
+    assert names[-2] == "register-files"
+
+
+def test_the_version_sync_leaves_enabled_is_the_highest_of_each_action():
+    """`load_actions` must yield each action_id's versions newest-last.
+
+    `sync_actions` walks this list in order, re-enabling each version it syncs and
+    auto-deprecating every other version of that action_id, so whichever version the
+    loader yields LAST for an action_id is the one a deploy leaves submittable. That
+    makes the ordering the thing that decides it, and this the test that pins it.
+
+    `loader._version_sort_key` is what produces that order, comparing each dotted
+    component numerically. Checked here against a semver sort written independently
+    of it, over the versions actually on disk: reusing the loader's own key would
+    make this compare the implementation with itself and pass whatever it did.
+    `test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one` covers the
+    case no on-disk version reaches yet.
+    """
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_action: dict[str, list[str]] = {}
+    for action in load_actions(repo_root / "workflows"):
+        by_action.setdefault(action.action_id, []).append(action.version)
+
+    for action_id, versions in by_action.items():
+        # Dotted integers only. The loader orders a non-numeric component too, but
+        # the oracle below does not, so such a version is refused with a message
+        # rather than raising ValueError out of this comparator, where it would
+        # surface as an error in whatever PR happened to add the version.
+        for version in versions:
+            assert all(part.isdecimal() for part in version.split(".")), (
+                f"{action_id} {version!r} is not dotted integers; this test orders "
+                "versions numerically and needs extending before such a version lands."
+            )
+        semver = sorted(versions, key=lambda v: tuple(int(p) for p in v.split(".")))
+        assert versions == semver, (
+            f"{action_id} versions load as {versions} but sort semantically as "
+            f"{semver}; sync enables the LAST one, so the newest must come last."
+        )
+
+    # Named rather than left to the sweep: 1.0.1 exists to be submitted against, and
+    # it only reaches an operator if it is the version sync leaves enabled.
+    assert by_action["long-read-assembly"][-1] == "1.0.1", by_action["long-read-assembly"]
+
+
+def test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one(tmp_path):
+    """1.10.0 loads after 1.9.0, so a tenth minor bump stays the enabled version.
+
+    The case the on-disk sweep above cannot reach — no action has a two-digit
+    component yet — and the one a string compare gets wrong, since `"1.10.0"` sorts
+    before `"1.9.0"`. Sync enables whichever version comes last, so under a string
+    compare the tenth minor bump of any action would deploy disabled while 1.9.0
+    stayed live, and every submission naming the new version would be refused.
+    """
+    from qiita_control_plane.actions import load_actions
+
+    for version in ("1.9.0", "1.10.0"):
+        doc = yaml.safe_load(_REFERENCE_ADD_YAML)
+        doc["version"] = version
+        _write(tmp_path, f"reference-add/{version}.yaml", yaml.safe_dump(doc))
+
+    versions = [a.version for a in load_actions(tmp_path)]
+
+    assert versions == ["1.9.0", "1.10.0"], versions

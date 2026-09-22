@@ -4,7 +4,7 @@
     — the roster manifest (one row per non-retired sample, with filename parts).
   * POST /admin/masked-read-export/ticket
     — a per-sample DoGet ticket scoped to (prep_sample_idx, mask_idx) on the
-      data plane's read_masked view.
+      data plane's read_masked macro.
 
 Both are dual-gated: system_admin role PLUS admin:masked_read_export scope. The
 ticket is the human counterpart to the service-account POST
@@ -29,6 +29,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 
+from qiita_control_plane.auth.tickets import token_expiry
 from qiita_control_plane.auth.token import mint_api_token
 from qiita_control_plane.main import app
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
@@ -71,10 +72,7 @@ def _decode_ticket_payload(ticket_b64: str) -> dict:
 
 
 def _decode_ticket_expiry(ticket_b64: str) -> int:
-    raw = base64.b64decode(ticket_b64)
-    payload_len = struct.unpack(">I", raw[1:5])[0]
-    expiry_start = 1 + 4 + payload_len + 64
-    return struct.unpack(">Q", raw[expiry_start : expiry_start + 8])[0]
+    return token_expiry(base64.b64decode(ticket_b64))
 
 
 @pytest_asyncio.fixture

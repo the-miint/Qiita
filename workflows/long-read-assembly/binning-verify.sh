@@ -108,9 +108,13 @@ fi
 # ship a green image. This is the one place that can observe the built result —
 # a test in the repo can only read the spec string, which is already visible in
 # a diff.
-#   samtools .... binning.sh runs `samtools sort` on the staged coverage BAM.
+#   samtools .... binning.sh reads the staged BAM's @SQ order with
+#                 `samtools view -H` (parsed by awk on `SN:`) and reorders the
+#                 assembly with `samtools faidx`; metaWRAP's concoct block also
+#                 runs `samtools index` over the staged BAM.
 #   metabat2 .... owns jgi_summarize_bam_contig_depths, whose "is not sorted!"
-#                 rejection is the acceptance criterion that sort exists to meet.
+#                 rejection is the acceptance criterion the coordinate-sorted
+#                 coverage BAM is written to meet.
 # Version is read from the tool, not the package metadata, so a hand-modified
 # env cannot satisfy it. The two disagree about HOW to ask, and guessing gets it
 # wrong: samtools takes --version, while jgi REJECTS it ("unrecognized option")
@@ -142,7 +146,8 @@ if (( ${#drifted[@]} > 0 )); then
     echo "binning image resolved ${#drifted[@]} pinned tool(s) at the wrong version:" >&2
     printf '  - %s\n' "${drifted[@]}" >&2
     echo "binning.def pins these; the solve moved anyway. Reconcile the two before" >&2
-    echo "shipping — binning.sh's sort and jgi's acceptance of it are version-bound." >&2
+    echo "shipping — the assembly reorder and jgi's acceptance criteria are" >&2
+    echo "version-bound." >&2
     exit 1
 fi
 

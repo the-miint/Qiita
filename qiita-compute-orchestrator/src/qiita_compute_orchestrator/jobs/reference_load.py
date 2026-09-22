@@ -60,6 +60,7 @@ from pathlib import Path
 import duckdb
 from pydantic import BaseModel
 from qiita_common.parquet import validate_parquet_path
+from qiita_common.taxonomy import RANK_COLUMNS, RANK_PREFIXES, quote_rank
 
 from ..miint import (
     PARQUET_OPTS,
@@ -485,17 +486,16 @@ def _write_taxonomy(
         ids = [r[0] for r in bad]
         raise ValueError(f"Taxonomy contains blank fields for feature_idx: {ids}")
 
+    # Built from RANK_PREFIXES rather than spelled out, because the published
+    # taxonomy sidecar RESTORES these prefixes by position from that same tuple —
+    # so a drift between the two would silently relabel ranks in a file people
+    # join. See qiita_common.taxonomy.
+    prefix_order = " OR ".join(
+        f"(nranks >= {i} AND NOT starts_with(ranks[{i}], '{prefix}'))"
+        for i, prefix in enumerate(RANK_PREFIXES, start=1)
+    )
     bad = conn.execute(
-        "SELECT feature_idx FROM parsed_taxonomy WHERE "
-        "(nranks >= 1 AND NOT starts_with(ranks[1], 'd__')) OR "
-        "(nranks >= 2 AND NOT starts_with(ranks[2], 'p__')) OR "
-        "(nranks >= 3 AND NOT starts_with(ranks[3], 'c__')) OR "
-        "(nranks >= 4 AND NOT starts_with(ranks[4], 'o__')) OR "
-        "(nranks >= 5 AND NOT starts_with(ranks[5], 'f__')) OR "
-        "(nranks >= 6 AND NOT starts_with(ranks[6], 'g__')) OR "
-        "(nranks >= 7 AND NOT starts_with(ranks[7], 's__')) OR "
-        "(nranks >= 8 AND NOT starts_with(ranks[8], 't__')) "
-        "LIMIT 5"
+        f"SELECT feature_idx FROM parsed_taxonomy WHERE {prefix_order} LIMIT 5"
     ).fetchall()
     if bad:
         ids = [r[0] for r in bad]
@@ -558,15 +558,18 @@ def _write_taxonomy(
         "  SELECT "
         f"    CAST({reference_idx} AS BIGINT) AS reference_idx,"
         "    m.feature_idx,"
-        "    NULLIF(substr(p.ranks[1], 4), '') AS domain,"
-        "    NULLIF(substr(p.ranks[2], 4), '') AS phylum,"
-        "    NULLIF(substr(p.ranks[3], 4), '') AS class,"
-        "    NULLIF(substr(p.ranks[4], 4), '') AS \"order\","
-        "    NULLIF(substr(p.ranks[5], 4), '') AS family,"
-        "    NULLIF(substr(p.ranks[6], 4), '') AS genus,"
-        "    NULLIF(substr(p.ranks[7], 4), '') AS species,"
-        "    NULLIF(substr(p.ranks[8], 4), '') AS strain,"
-        "    NULL::BIGINT AS ncbi_taxon_id"
+        # Strips the prefix the check above REQUIRED, per rank, so the column a rank
+        # lands in and the prefix it was required to carry cannot come apart. The cut
+        # length comes from the prefix itself rather than a literal 3: every prefix is
+        # three characters today, so a four-character one would otherwise leave a
+        # stray character in a published sidecar and nothing here would notice.
+        + "".join(
+            f"    NULLIF(substr(p.ranks[{i}], {len(prefix) + 1}), '') AS {quote_rank(column)},"
+            for i, (column, prefix) in enumerate(
+                zip(RANK_COLUMNS, RANK_PREFIXES, strict=True), start=1
+            )
+        )
+        + "    NULL::BIGINT AS ncbi_taxon_id"
         "  FROM (SELECT DISTINCT feature_idx FROM id_map) m"
         "  LEFT JOIN ("
         "    SELECT feature_idx, any_value(ranks) AS ranks"

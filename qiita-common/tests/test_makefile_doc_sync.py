@@ -1,4 +1,4 @@
-"""Assert the curated `makefile fenced block in docs/architecture.md
+"""Assert the curated `makefile fenced block in docs/architecture/build-and-deploy.md
 mirrors the public-API targets in the repo-root Makefile.
 
 Catches recipe-body and dependency-list drift on every target the doc
@@ -7,7 +7,7 @@ targets (e.g. $(DBMATE_BIN), $(GRPCURL_BIN), dev-setup) that the doc
 does not embed.
 
 When this test fails, copy the affected recipes from Makefile into the
-```makefile block in docs/architecture.md.
+```makefile block in docs/architecture/build-and-deploy.md.
 
 Parser limitations (extend if the Makefile starts using these):
 - Multi-target lines `a b: deps` are silently dropped (the regex
@@ -27,7 +27,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MAKEFILE = REPO_ROOT / "Makefile"
-ARCH_DOC = REPO_ROOT / "docs" / "architecture.md"
+ARCH_DOC = REPO_ROOT / "docs" / "architecture" / "build-and-deploy.md"
 
 # Match `<target>: <deps...>` lines. Excludes `.PHONY:`, `$(VAR):`, and
 # variable assignment lines like `FOO := bar`. The negative lookahead on
@@ -63,7 +63,7 @@ def _parse_targets(text: str) -> dict[str, str]:
 
 def _extract_doc_block(text: str) -> str:
     m = _DOC_FENCE_RE.search(text)
-    assert m, "no ```makefile fenced block found in docs/architecture.md"
+    assert m, "no ```makefile fenced block found in docs/architecture/build-and-deploy.md"
     return m.group(1)
 
 
@@ -73,7 +73,7 @@ def test_doc_makefile_block_matches_repo_makefile() -> None:
 
     missing = sorted(name for name in doc_blocks if name not in makefile_blocks)
     assert not missing, (
-        "docs/architecture.md references Makefile targets that don't exist "
+        "docs/architecture/build-and-deploy.md references Makefile targets that don't exist "
         f"in Makefile: {missing}. Either remove them from the doc or add "
         "them to the Makefile."
     )
@@ -84,13 +84,13 @@ def test_doc_makefile_block_matches_repo_makefile() -> None:
         if doc_blocks[name] != makefile_blocks[name]
     }
     if mismatched:
-        parts = ["docs/architecture.md recipes drifted from Makefile:\n"]
+        parts = ["docs/architecture/build-and-deploy.md recipes drifted from Makefile:\n"]
         for name, (doc, mk) in sorted(mismatched.items()):
             parts.append(f"\n--- doc: {name} ---\n{doc}")
             parts.append(f"--- Makefile: {name} ---\n{mk}")
         parts.append(
             "\n\nFix: copy the affected recipes from Makefile into the "
-            "```makefile block in docs/architecture.md. The fenced block "
+            "```makefile block in docs/architecture/build-and-deploy.md. The fenced block "
             "is a curated subset of the public-API targets; internal "
             "helpers ($(DBMATE_BIN), $(GRPCURL_BIN), dev-setup) live in "
             "Makefile only."

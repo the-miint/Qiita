@@ -21,7 +21,7 @@ from typing import Annotated
 import asyncpg
 import httpx
 import pyarrow.flight as _flight
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
@@ -29,6 +29,8 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_EXCLUSION,
     PATH_REFERENCE_EXCLUSION_BY_IDX,
     PATH_REFERENCE_EXCLUSION_SYNC,
+    PATH_REFERENCE_GENOME_MAP,
+    PATH_REFERENCE_GENOME_MAP_PARQUET,
     PATH_REFERENCE_GENOME_MEMBER,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
@@ -36,10 +38,17 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_SHARD_INDEX_STATUS,
     PATH_REFERENCE_STATUS,
 )
+from qiita_common.assembly_constants import (
+    ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+    ASSEMBLED_SEQUENCE_TABLE,
+    BIN_QUALITY_TABLE,
+)
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     DoGetTicketRequest,
     DoGetTicketResponse,
+    GenomeMapEntry,
+    GenomeMapResponse,
     ReferenceCreateRequest,
     ReferenceDeleteResponse,
     ReferenceExclusionCreateRequest,
@@ -55,8 +64,13 @@ from qiita_common.models import (
     ReferenceStatusUpdate,
     WorkTicketState,
 )
+from qiita_common.parquet import PARQUET_MEDIA_TYPE, PARQUET_RESPONSES
 
-from ..actions.library import delete_reference_data, sync_reference_exclusion_data
+from ..actions.library import (
+    delete_reference_data,
+    genome_map_parquet,
+    sync_reference_exclusion_data,
+)
 from ..actions.reference import (
     REFERENCE_RETURNING,
     IllegalStatusTransition,
@@ -77,7 +91,7 @@ from ..auth.principal import (
     get_current_principal,
 )
 from ..auth.tickets import sign_ticket
-from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE
+from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE, READ_MASKED_TABLE
 from ..deps import (
     TxConnFactory,
     get_data_plane_url,
@@ -91,10 +105,19 @@ from ..repositories.reference_exclusion import (
     list_for_reference,
     remove_exclusion,
 )
-from ..repositories.reference_membership import count_reference_shards
+from ..repositories.reference_membership import (
+    count_genome_map,
+    count_reference_shards,
+    fetch_genome_map,
+)
 from ..shard_orchestration import (
     BUILD_SHARD_INDEX_ACTION_ID,
     expected_shard_index_types,
+)
+from ._helpers import (
+    GENOME_MAP_HARD_CAP,
+    REFERENCE_NOT_FOUND_DETAIL,
+    require_reference_exists,
 )
 
 router = APIRouter(prefix=PATH_REFERENCE_PREFIX, tags=["reference"])
@@ -109,8 +132,6 @@ _REFERENCE_RETURNING = REFERENCE_RETURNING
 # worst-case payload and is caller-overridable via ?limit=.
 _DEFAULT_LIST_LIMIT = 1000
 _MAX_LIST_LIMIT = 5000
-
-_MSG_REFERENCE_NOT_FOUND = "Reference not found"
 
 
 @router.post(PATH_REFERENCE_ROOT, status_code=201)
@@ -198,11 +219,7 @@ async def get_reference_index(
     visibility / admin). Scoped to reference:read — unlike the anonymous-OK
     reference metadata GETs — because fs_path exposes internal filesystem
     layout; reference:read is held by every human role and service account."""
-    exists = await pool.fetchval(
-        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
-    )
-    if exists is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+    await require_reference_exists(pool, reference_idx)
     rows = await pool.fetch(
         "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at,"
         " shard_id"
@@ -242,11 +259,7 @@ async def get_reference_shard_index_status(
     whose sharding fanned out zero shards — reads all-zero / empty (a valid
     "nothing sharded here" answer, not an error). Scoped to reference:read like
     the /index listing: it exposes build progress, not payload."""
-    exists = await pool.fetchval(
-        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
-    )
-    if exists is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+    await require_reference_exists(pool, reference_idx)
 
     # N = the shards the planner assigned (COUNT(DISTINCT shard_id) over the
     # non-NULL membership rows — the same derivation finalize_shard uses; there
@@ -336,6 +349,86 @@ async def get_reference_genome_members(
     return [ReferenceGenomeMember.model_validate(dict(r)) for r in rows]
 
 
+@router.get(PATH_REFERENCE_GENOME_MAP)
+async def get_reference_genome_map(
+    reference_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_READ)),
+) -> GenomeMapResponse:
+    """The whole reference's feature_idx → genome lookup: one entry per (feature,
+    genome) pair with the genome's `source` / `source_id`, ordered by
+    (feature_idx, genome_idx).
+
+    This is a control-plane read rather than a Flight ticket because `genome_idx`
+    and the genome's provenance exist only in Postgres — no lake table carries
+    them, so there is nothing for the data plane to serve. Every downstream step
+    of the client-side feature-table recipe rolls features up to genomes through
+    it (per-genome length, breadth, the survivor join, the relabel).
+
+    A feature shared across genomes contributes one entry per genome, so `count`
+    counts PAIRS. Features with no genome are absent — the INNER JOIN matches
+    export_member_genome, whose Parquet the compute side consumes; the two must
+    not disagree about which features have genomes.
+
+    404s an unknown reference, but an existing reference with no genome-bearing
+    features is a 200 with `entries: []` — a 16S reference legitimately has none,
+    so empty is a meaningful clean state (the exclusion-listing posture, not the
+    genome-member one).
+
+    413 — not a truncated 200 — above the hard cap, naming the real size. This is
+    the one capped read here that refuses rather than truncating: a lookup table
+    silently missing rows drops those features from the caller's roll-up,
+    producing a WRONG feature table rather than a partial one. So a 200 is always
+    the complete map, which is why the response carries no `truncated`."""
+    await require_reference_exists(pool, reference_idx)
+    # Over-fetch by one to detect the overflow; only the refusal path pays for
+    # counting the true size, which is what tells a caller whether they are barely
+    # over or hopelessly over.
+    rows = await fetch_genome_map(pool, reference_idx, limit=GENOME_MAP_HARD_CAP + 1)
+    if len(rows) > GENOME_MAP_HARD_CAP:
+        total = await count_genome_map(pool, reference_idx)
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Genome map for reference {reference_idx} has {total} entries,"
+                f" over the {GENOME_MAP_HARD_CAP} maximum this endpoint serves."
+            ),
+        )
+    return GenomeMapResponse(
+        reference_idx=reference_idx,
+        entries=[GenomeMapEntry.model_validate(dict(r)) for r in rows],
+        count=len(rows),
+    )
+
+
+@router.get(
+    PATH_REFERENCE_GENOME_MAP_PARQUET,
+    response_class=Response,
+    responses=PARQUET_RESPONSES,
+)
+async def get_reference_genome_map_parquet(
+    reference_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_READ)),
+) -> Response:
+    """The same map as the JSON route above, as Parquet, with no cap.
+
+    Same rows, same four columns, same order — `GENOME_MAP_ROWS_SQL` is shared
+    text, not a second query, so the two forms and `export_member_genome`'s
+    compute-side Parquet cannot disagree about which features have genomes.
+
+    No cap and no `truncated`; `actions.library._genome_map_parquet_body` carries
+    why this form can drop what the JSON route needs.
+
+    404s an unknown reference; a reference with no genome-bearing features is a 200
+    with a zero-row Parquet — a valid file with the right schema, not an empty
+    body, which is what `read_parquet` needs on a 16S reference. Same "empty is a
+    meaningful clean state" posture the JSON route takes."""
+    await require_reference_exists(pool, reference_idx)
+    body = await genome_map_parquet(pool, reference_idx)
+    return Response(content=body, media_type=PARQUET_MEDIA_TYPE)
+
+
 @router.get(PATH_REFERENCE_BY_IDX)
 async def get_reference(
     reference_idx: Annotated[int, Field(gt=0)],
@@ -350,7 +443,7 @@ async def get_reference(
         reference_idx,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
     return ReferenceResponse(**dict(row))
 
 
@@ -364,7 +457,7 @@ async def update_reference_status(
     try:
         return await transition_reference_status(pool, reference_idx, body.status)
     except ReferenceNotFound:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
     except IllegalStatusTransition as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -582,11 +675,7 @@ async def list_reference_exclusions(
     `get_reference_shard_index_status`) so a typo'd idx is distinguishable from a
     genuinely clean reference — an existing reference with no blocked features
     yields `[]`."""
-    exists = await pool.fetchval(
-        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
-    )
-    if exists is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+    await require_reference_exists(pool, reference_idx)
     rows = await list_for_reference(pool, reference_idx)
     return [ReferenceExclusionListItem.model_validate(dict(r)) for r in rows]
 
@@ -624,7 +713,7 @@ async def delete_reference(
     try:
         await assert_reference_deletable(pool, reference_idx, force=force)
     except ReferenceNotFound:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
     except ReferenceDeleteBlocked as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -671,7 +760,7 @@ async def delete_reference(
         try:
             await assert_reference_deletable(conn, reference_idx, force=True)
         except ReferenceNotFound:
-            raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+            raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
         except ReferenceDeleteBlocked as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         counts = await delete_reference_cascade(conn, reference_idx)
@@ -686,11 +775,10 @@ async def delete_reference(
 # Tables that can appear in a DoGet ticket, CP-side mirror of the data plane's
 # ALLOWED_TABLES whitelist in flight_service.rs. Must stay in sync with it
 # (test_cp_doget_allowlist_matches_the_rust_one_exactly parses the Rust const and
-# fails on drift). `read_masked` (the masked-read surface) and the two block-read
-# selectors are what the data plane reaches via Flight in addition to the
-# reference_* tables; the bare `read` / `read_mask` TABLES are deliberately absent
-# from both allowlists (privacy by construction — see the PRIVACY note on the
-# Rust const for why the members-scoped `read_block` selector is not a hole).
+# fails on drift). Each non-reference entry below names the route that serves it.
+# The bare `read` / `read_mask` TABLES are deliberately absent from both
+# allowlists (privacy by construction — see the PRIVACY note on the Rust const
+# for why the members-scoped `read_block` selector is not a hole).
 _DOGET_ALLOWED_TABLES = frozenset(
     {
         "reference_sequences",
@@ -703,7 +791,7 @@ _DOGET_ALLOWED_TABLES = frozenset(
         "reference_phylogeny",
         "reference_placements",
         "reference_annotation",
-        "read_masked",
+        READ_MASKED_TABLE,
         # The alignment sink's DoGet read-side (feature-table OGU consumer), as the
         # exclusion-aware VIEW (raw `alignment` is not Flight-readable). Like
         # read_masked it is served by its own route (routes/alignment.py), scoped
@@ -715,6 +803,14 @@ _DOGET_ALLOWED_TABLES = frozenset(
         # signer, the allowlist, and the scope rule cannot drift from each other.
         READ_BLOCK_TABLE,
         READ_MASKED_BLOCK_TABLE,
+        # The assembly surfaces, served by routes/assembly.py and scoped to one
+        # `(prep_sample_idx, processing_idx)` run. Named from the shared
+        # constants for the same reason as the block-read pair above.
+        ASSEMBLED_SEQUENCE_TABLE,
+        ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+        # Per-subject assembly quality. The one entry here that no route signs —
+        # the exclusion below says what that rests on.
+        BIN_QUALITY_TABLE,
     }
 )
 
@@ -722,12 +818,30 @@ _DOGET_ALLOWED_TABLES = frozenset(
 # reached through its own dedicated route, which enforces a scope the generic
 # reference route cannot: `read_masked` via /read-masked/ticket/doget
 # (prep_sample_idx + mask_idx), `alignment_visible` via /alignment/ticket/doget
-# (alignment_idx + cohort), and the block-read selectors via /read/ticket/doget
-# (a block's members). The reference route restricts itself to the reference_*
-# tables whose membership it resolves — including `reference_taxonomy_visible`,
-# so external taxonomy reads also go through the exclusion view.
+# (alignment_idx + cohort), the block-read selectors via /read/ticket/doget
+# (a block's members), and the assembly surfaces via /assembly/ticket/doget (one
+# `(prep_sample_idx, processing_idx)` run — a reference_idx filter means nothing
+# to a table keyed on sample-derived contigs). The reference route restricts itself
+# to the reference_* tables whose membership it resolves — including
+# `reference_taxonomy_visible`, so external taxonomy reads also go through the
+# exclusion view.
+#
+# `bin_quality` is excluded with no route behind it AT ALL: the feature-table
+# resolver mints its ticket in-process (`runner/_feature_table.py`), the way the
+# adapter and shard-roster resolvers mint theirs, and it is absent from
+# `ASSEMBLY_DOGET_TABLES` too. Excluding it here is therefore what leaves it
+# un-mintable over HTTP by anyone, which
+# `test_doget_bin_quality_not_signable_via_reference_route` pins.
 _REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
-    {"read_masked", "alignment_visible", READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE}
+    {
+        READ_MASKED_TABLE,
+        "alignment_visible",
+        READ_BLOCK_TABLE,
+        READ_MASKED_BLOCK_TABLE,
+        ASSEMBLED_SEQUENCE_TABLE,
+        ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
+        BIN_QUALITY_TABLE,
+    }
 )
 
 
@@ -782,7 +896,7 @@ async def create_doget_ticket(
         reference_idx,
     )
     if status is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
     if status not in _STREAMABLE_STATUSES:
         raise HTTPException(
             status_code=409,

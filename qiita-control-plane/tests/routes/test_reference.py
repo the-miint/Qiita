@@ -611,16 +611,16 @@ async def test_doget_missing_reference_404(doget_ctx, postgres_pool):
 
 
 async def test_doget_feature_idx_over_bound_422(doget_ctx):
-    """The _MAX_DOGET_FEATURE_IDX bound rejects an over-long subset at the
+    """The MAX_DOGET_FEATURE_IDX bound rejects an over-long subset at the
     request layer (422), before any reference lookup."""
-    from qiita_common.models.step import _MAX_DOGET_FEATURE_IDX
+    from qiita_common.models.step import MAX_DOGET_FEATURE_IDX
 
     ref = await doget_ctx["seed_reference"]("active")
     resp = await doget_ctx["sa"].post(
         URL_REFERENCE_DOGET.format(reference_idx=ref),
         json={
             "table": "reference_sequence_chunks",
-            "feature_idx": list(range(1, _MAX_DOGET_FEATURE_IDX + 2)),
+            "feature_idx": list(range(1, MAX_DOGET_FEATURE_IDX + 2)),
         },
     )
     assert resp.status_code == 422, resp.text

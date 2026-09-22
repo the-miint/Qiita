@@ -72,12 +72,17 @@ variation in the upload (`atcg` vs `ATCG`) doesn't desync the hash.
 
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
-from qiita_common.chunking import canonical_sequence_hash_expr, reassemble_chunks_expr
+from qiita_common.chunking import (
+    ANNOTATION_STRAND_WARNING,
+    canonical_sequence_hash_expr,
+    reassemble_chunks_expr,
+)
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -90,6 +95,8 @@ from ..miint import (
 )
 from ._blob_input import resolve_blob_input
 from ._feature_load import bin_pack_by_chunks
+
+_LOG = logging.getLogger(__name__)
 
 YAML_STEP_NAME = "hash_sequences"
 
@@ -439,6 +446,8 @@ def _write_annotation_manifest(
         tmp_dir.mkdir(parents=True, exist_ok=True)
         gff_path = tmp_dir / "_no_annotations.gff3"
         gff_path.write_text("##gff-version 3\n")
+    else:
+        _LOG.warning(ANNOTATION_STRAND_WARNING)
 
     # read_gff's `attributes` is already a MAP(VARCHAR,VARCHAR) — no parsing.
     #

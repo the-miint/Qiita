@@ -79,8 +79,42 @@ steps:
     params: {minimap2_preset: preset, shard_id: shard_id}
     when: build_minimap2
     outputs: [minimap2_index_meta]
+    # cpu from the reference-18 build: 987 shard builds at cpu:4, all COMPLETED.
+    # The step runs blocked on the data-plane chunk stream rather than computing, so
+    # the serial work one core has to absorb is small — TotalCPU p50 0.44, p99 1.14,
+    # max 1.45 min, against an elapsed of p50 2.5, p99 10.0, max 23.9 min. Worst case
+    # at cpu:1 is elapsed + 0.75 x TotalCPU (the CPU portion perfectly parallel across
+    # four cores, fully serialised onto one), which peaks at 24.7 min over all 987
+    # against the PT2H limit.
+    #
+    # CPU efficiency TotalCPU/(Elapsed x AllocCPUS) is not the bound here: it peaks at
+    # 28.0% — 1.12 average cores, above the one allocated — on a 0.58-min shard that
+    # projects to 1.07 min. Mean efficiency by elapsed decile falls monotonically from
+    # 13.7% to 1.7%, so the shards where the ratio is high are the short ones.
+    #
+    # This does not touch DuckDB's pool: the job takes its thread count from its own
+    # `_DUCKDB_THREADS`, so four threads now time-share one core instead of four.
+    # `test_build_shard_index_cpu_is_below_duckdb_threads` pins this to the measured 1
+    # and asserts it stays under the pool.
+    #
+    # Whether it buys more of this step per node depends on the shard; the node
+    # shape it divides into is in docs/runbooks/slurm-backend-setup.md. At the full
+    # mem_gb 32, memory caps concurrency at floor(514000/32768) = 15, already below
+    # the old cpu cap of 64/4 = 16, so nothing changes. `plan()` sizes a shard to
+    # 20 + ceil(bp/1e9) GiB, so one at or under 1 Gbp lands at 21, where
+    # floor(514000/21504) = 23 exceeds that cpu cap and the cut does add slots;
+    # 82.2% of this reference's 987 shards landed in that band. Either way the cores
+    # it stops reserving are available to other work on the node.
+    #
+    # The same step runs at cpu:4 in host-reference-add and local-host-reference-add,
+    # unchanged: those build a whole reference rather than a shard, and no measurement
+    # was taken there.
+    #
+    # mem_gb stays 32 as the whole-reference baseline; `plan()` sizes a shard build
+    # down from it. The shard floor and the MaxRSS behind it are stated once, at
+    # `_MINIMAP2_SHARD_RESERVE_GB` in the job module.
     baseline_resources:
-      cpu: 4
+      cpu: 1
       mem_gb: 32
       walltime: PT2H
 
@@ -97,6 +131,21 @@ steps:
     params: {shard_id: shard_id}
     when: build_bowtie2
     outputs: [bowtie2_index_meta]
+    # cpu:4 predates the reference-18 build. That build's 987 shard builds show the
+    # cores being used, but they do not establish the number: fitting inside PT2H takes
+    # more than one core for 36 of them and more than two for three of those, so the
+    # measurement rules out cpu:1 and cpu:2 without separating 3 from 4.
+    #
+    # What it does show is that this step, unlike build_minimap2_index above, spends its
+    # wall time computing. TotalCPU is p50 35.4, p90 84.7, max 269.0 min, and the
+    # busiest run averaged 3.71 of the four cores over 37.4 min. There the extra cores
+    # were waste; here they are not.
+    #
+    # This is also the longer step of the pair: elapsed p50 14.5, p90 30.7, p99 65.2,
+    # max 92.3 min against the same PT2H limit. mem_gb 32 is the whole-reference
+    # baseline; `plan()` sizes a shard down from it by bp. The shard floor and the
+    # MaxRSS behind it are stated once, at `_BOWTIE2_RESERVE_GB` in the job module —
+    # it is a different number from minimap2's, and the two are not interchangeable.
     baseline_resources:
       cpu: 4
       mem_gb: 32

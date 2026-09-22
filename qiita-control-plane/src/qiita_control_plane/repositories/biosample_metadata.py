@@ -92,8 +92,19 @@ BIOSAMPLE_METADATA_SPEC = EntityMetadataSpec(
     study_field_table="qiita.biosample_study_field",
     study_field_idx_column="biosample_study_field_idx",
     study_field_global_fk_column="biosample_global_field_idx",
+    study_field_display_name_unique_constraint="biosample_study_field_display_name_unique",
     global_field_unique_index_name="biosample_metadata_one_value_per_global_field",
     local_unique_per_field_index_name="biosample_metadata_unique_per_field",
+    unique_in_study_index_names=frozenset(
+        {
+            "biosample_metadata_unique_in_study_text",
+            "biosample_metadata_unique_in_study_numeric",
+            "biosample_metadata_unique_in_study_date",
+        }
+    ),
+    unique_in_study_no_missing_constraint="biosample_metadata_unique_in_study_no_missing_value",
     link_table="qiita.biosample_to_study",
     link_entity_key_column="biosample_idx",
+    metadata_retired_link_trigger="biosample_metadata_reject_if_link_retired",
+    owner_sample_id_flag_column="is_owner_biosample_id",
 )

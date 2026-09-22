@@ -7,9 +7,9 @@ STREAMS its reads from the data plane instead of reading a Parquet the control
 plane materialized onto shared scratch at submit time.
 
 Service-account-only, gated on its OWN ``Scope.READ_DOGET`` — deliberately not
-the generic ``ticket:doget`` the sibling ``POST /alignment/ticket/doget`` uses.
-That scope covers reference data and the derived ``alignment`` slice; this route
-signs tickets for RAW ``read`` rows, which is a strict superset of the
+the generic ``ticket:doget`` the sibling ``POST /alignment/ticket/doget`` uses
+(``Scope.TICKET_DOGET`` enumerates what that one covers). This route signs
+tickets for RAW ``read`` rows, which is a strict superset of the
 ``read_masked`` surface that already has its own privacy-sensitive scope. Reusing
 ``ticket:doget`` would have let any account minting reference tickets pull raw
 human/host reads. Like its siblings the ticket is minted at RUNTIME (short TTL; a

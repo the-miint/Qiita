@@ -21,7 +21,7 @@ it is unbound, QC is the first step and behaves exactly as before.
 **Trims stay cumulative from the RAW read.** With an incoming mask, QC's emitted
 `left_trim1`/`right_trim1` are the incoming trims PLUS what QC itself removed —
 NOT offsets into the trimmed substring. This is load-bearing: `host_filter`'s
-query view and the `read_masked` view both apply mask trims to the raw
+query view and the `read_masked` macro both apply mask trims to the raw
 `read.sequence1`, so a substring-relative trim would silently leave the adaptor
 in every downstream read. The incoming trims slice `sequence1` and `qual1` in
 lockstep, so `filter_read` judges the insert against its own phred array.
@@ -40,7 +40,7 @@ tests/jobs/test_qc_miint_contract.py for the pinned contracts):
      non-bcl upload);
   3. **length/quality filter** — `filter_read(seq, qual, 100, 0, 15, 40, 5, 0)`
      == fastp defaults with `-l 100`. A read failing this is NOT dropped — it is
-     recorded with the matching `qc_*` reason so the `read_masked` view excludes
+     recorded with the matching `qc_*` reason so the `read_masked` macro excludes
      it while raw `read` retains it.
 
 **Reason mapping** (filter_read `fail_reason` -> ReadMaskReason): `length` ->
@@ -48,7 +48,7 @@ tests/jobs/test_qc_miint_contract.py for the pinned contracts):
 `quality` -> `qc_low_quality`; a passing read is `pass`. `filter_read` runs on
 the TRIMMED sequence, so a read whose post-trim length is below min_length is
 `qc_too_short` by construction — the trim-length invariant the `read_masked`
-view relies on (a `pass` read's `left_trim + right_trim <= length`).
+macro relies on (a `pass` read's `left_trim + right_trim <= length`).
 
 **Trims are the cumulative bases removed from each end** (adapter + polyG),
 recorded even when the read fails QC so an admin reading raw `read` can
@@ -326,7 +326,7 @@ def _qc_se_select(
     is 3'-only, never adds to the left) and `right_trim1 = in_right1 +
     trim_adapters.trimmed_3p + trim_polyg.trimmed_3p` (when polyG applies, else
     just adapter). Emitting `ta['trimmed_5p']` alone would be a substring-relative
-    trim, which `host_filter` and the `read_masked` view would then apply to the
+    trim, which `host_filter` and the `read_masked` macro would then apply to the
     RAW sequence — silently un-trimming the adaptor. `left_trim2`/`right_trim2`
     are NULL (no mate). The reason comes from `filter_read` on the TRIMMED
     sequence (so a too-short trimmed read is qc_too_short, never pass). Struct

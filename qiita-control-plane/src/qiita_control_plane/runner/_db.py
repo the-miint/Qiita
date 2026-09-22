@@ -24,6 +24,28 @@ from qiita_common.models import (
 # =============================================================================
 
 
+# The runner mints two identities onto the ticket row itself, so the arms that act
+# later read a COLUMN rather than the submitter's action_context. The column name is
+# looked up here rather than passed as SQL, so a caller cannot reach the statement.
+_TICKET_IDX_COLUMNS = {"alignment_idx": "alignment_idx", "mask_idx": "mask_idx"}
+
+
+async def persist_ticket_idx(
+    pool: asyncpg.Pool, *, column: str, work_ticket_idx: int, value: int
+) -> None:
+    """Write one minted identity onto `qiita.work_ticket`.
+
+    Idempotent by construction: both callers re-resolve to the same value on a resume,
+    so re-running writes what is already there. Like every runner DB write it fails
+    loud — a PG outage raises and unwinds the run via run_workflow's catch-all."""
+    await pool.execute(
+        f"UPDATE qiita.work_ticket SET {_TICKET_IDX_COLUMNS[column]} = $1 "
+        "WHERE work_ticket_idx = $2",
+        value,
+        work_ticket_idx,
+    )
+
+
 # LEFT JOIN qiita.sequenced_pool so the SEQUENCED_POOL scope_target arm
 # can carry the parent sequencing_run_idx — _build_scope_target reads it
 # alongside sequenced_pool_idx to produce the {kind: sequenced_pool, ...}

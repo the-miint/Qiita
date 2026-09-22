@@ -1468,8 +1468,8 @@ async def test_container_is_told_its_own_allocation(jwt_path, tmp_path):
     (which equals the allocation only because SLURM cpuset-binds the step, an
     accident of site config), and memory has nothing at all, while the cgroup
     ceiling is real and fatal. `workflows/_shared/_lib.sh` resolves THREADS/MEM_MB
-    from these, and `binning.sh` sizes `samtools sort -m` — a PER-THREAD budget —
-    off MEM_MB so its total cannot exceed the allocation.
+    from these, and the assemble step's `myloasm_split.py` sizes its DuckDB
+    `memory_limit` off MEM_MB so it stays under the cgroup ceiling.
 
     The values must be the STEP's, not the node's, which is why this asserts a
     distinctive cpu/mem rather than the shared `baseline` fixture's 1/1."""

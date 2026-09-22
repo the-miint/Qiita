@@ -33,6 +33,7 @@ import os
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 import asyncpg
@@ -40,15 +41,20 @@ import httpx
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
+from ...backfill.assembly_genome import BackfillPlan as GenomeBackfillPlan
+from ...backfill.assembly_genome import apply_backfill as apply_assembly_genome_backfill
+from ...backfill.assembly_genome import plan_backfill as plan_assembly_genome_backfill
 from ...backfill.host_taxon import (
     BackfillPlan,
     HostTaxonSource,
     apply_backfill,
     plan_backfill,
 )
+from ...backfill.mask_adapter_hash import RekeyPlan, apply_rekey, plan_rekey
+from ...config import _parse_optional_positive_int_env
 from .. import _common
 from .._reference_exclusion import add_admin_exclusion_subparsers
-from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS
+from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS, open_admin_pool
 from .actions_sync import _handle_actions_sync, _sync_actions
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
@@ -63,6 +69,7 @@ from .force_fail import (
     _validate_force_fail_args,
 )
 from .mask import (
+    _MASK_IDX_COVERAGE_ACTION_IDS,
     _PURGE_FAILED_ACTION_IDS,
     _READ_MASK_PARQUET_NOT_FOUND,
     _RESUBMITTABLE_SCOPE_KIND,
@@ -96,6 +103,14 @@ from .owner_id import (
     _write_owner_biosample_id_tsv,
 )
 from .role import _VALID_ROLE_VALUES, _handle_set_system_role, _set_system_role
+from .terminology import (
+    DEFAULT_ROBOT_COMMAND_LINE,
+    DEFAULT_ROBOT_EXPORT_FILENAME,
+    _handle_terminology_load,
+    _handle_terminology_prepare_owl,
+    _handle_terminology_prepare_taxdump,
+    _handle_terminology_robot_command,
+)
 from .ticket_cancel import _handle_ticket_cancel
 
 # ---------------------------------------------------------------------------
@@ -210,6 +225,129 @@ def _build_parser() -> argparse.ArgumentParser:
 
     add_fanout_parser(sub)
 
+    p_terminology = sub.add_parser("terminology", help="Terminology release operations")
+    p_terminology_sub = p_terminology.add_subparsers(dest="terminology_cmd", required=True)
+
+    # Note that this command is *intended to be temporary* and will go away
+    # once the terminology release is integrated with apptainer/workflow/slurm.
+    p_robot_command = p_terminology_sub.add_parser(
+        "robot-command",
+        help=(
+            "Print the ROBOT export command to run against a staged OWL file."
+            " Nothing is executed — run the printed command yourself, then feed"
+            " its output to `terminology prepare-owl`."
+        ),
+    )
+    p_robot_command.add_argument(
+        "--input",
+        required=True,
+        help="OWL filename to export, named without a directory",
+    )
+    p_robot_command.add_argument(
+        "--export",
+        default=DEFAULT_ROBOT_EXPORT_FILENAME,
+        help=f"export filename ROBOT should write (default: {DEFAULT_ROBOT_EXPORT_FILENAME})",
+    )
+    p_robot_command.add_argument(
+        "--executable",
+        default=DEFAULT_ROBOT_COMMAND_LINE,
+        help=(
+            "command that runs ROBOT, ending with the executable itself"
+            f' (e.g. "apptainer exec /images/robot.sif robot"); default:'
+            f" {DEFAULT_ROBOT_COMMAND_LINE}"
+        ),
+    )
+    p_robot_command.set_defaults(handler=_handle_terminology_robot_command)
+
+    p_prepare_owl = p_terminology_sub.add_parser(
+        "prepare-owl",
+        help=(
+            "Turn a ROBOT export into the release tables and the manifest that"
+            " declares them, ready for `terminology load`."
+        ),
+    )
+    p_prepare_owl.add_argument(
+        "--export",
+        type=Path,
+        default=Path(DEFAULT_ROBOT_EXPORT_FILENAME),
+        help=f"path to ROBOT's export (default: ./{DEFAULT_ROBOT_EXPORT_FILENAME})",
+    )
+    p_prepare_owl.add_argument("--name", required=True, help="terminology name to load under")
+    p_prepare_owl.add_argument("--version", required=True, help="release version to load under")
+    p_prepare_owl.add_argument(
+        "--term-id-prefix",
+        default=None,
+        help=(
+            "keep only term ids carrying this prefix (e.g. UBERON:), excluding"
+            " classes the release imports from other vocabularies"
+        ),
+    )
+    p_prepare_owl.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="directory to write the release files into (default: the export's own directory)",
+    )
+    p_prepare_owl.set_defaults(handler=_handle_terminology_prepare_owl)
+
+    p_prepare_taxdump = p_terminology_sub.add_parser(
+        "prepare-taxdump",
+        help=(
+            "Turn an NCBI taxdump archive into the release tables and the"
+            " manifest that declares them, ready for `terminology load`. Reads"
+            " the archive in place; nothing is unpacked."
+        ),
+    )
+    # Required, unlike prepare-owl's --export: that names a file our own
+    # robot-command told the operator to create, while the archive is NCBI's
+    # and sits wherever they downloaded it.
+    p_prepare_taxdump.add_argument(
+        "--taxdump",
+        required=True,
+        type=Path,
+        help="path to NCBI's taxdump.tar.gz or new_taxdump.tar.gz",
+    )
+    p_prepare_taxdump.add_argument("--name", required=True, help="terminology name to load under")
+    p_prepare_taxdump.add_argument("--version", required=True, help="release version to load under")
+    p_prepare_taxdump.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="directory to write the release files into (default: the archive's own directory)",
+    )
+    p_prepare_taxdump.set_defaults(handler=_handle_terminology_prepare_taxdump)
+
+    p_terminology_load = p_terminology_sub.add_parser(
+        "load",
+        help=(
+            "Apply a prepared release to the database (direct DB; needs"
+            " DATABASE_URL). The three files are named individually and are"
+            " copied into a temporary directory, so no staging directory has to"
+            " exist on the host. Prints the per-term counts of what changed."
+        ),
+    )
+    p_terminology_load.add_argument(
+        "--manifest", required=True, type=Path, help="path to the release's manifest.json"
+    )
+    p_terminology_load.add_argument(
+        "--terms", required=True, type=Path, help="path to the release's terms table"
+    )
+    p_terminology_load.add_argument(
+        "--closure", required=True, type=Path, help="path to the release's closure table"
+    )
+    p_terminology_load.add_argument(
+        "--tolerate-anomalies",
+        action="store_true",
+        help=(
+            "absorb structural anomalies instead of refusing the load:"
+            " auto-obsolete terms the release dropped without deprecating them,"
+            " record an unresolvable replacement pointer as a note, and drop a"
+            " closure row naming an endpoint the release does not define, which"
+            " lowers the closure count the load reports"
+        ),
+    )
+    p_terminology_load.set_defaults(handler=_handle_terminology_load)
+
     p_mask = sub.add_parser("mask", help="Mask-definition maintenance operations")
     p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
     p_mask_delete = p_mask_sub.add_parser(
@@ -312,6 +450,80 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_backfill_host.set_defaults(handler=_handle_backfill_host_taxon_id)
 
+    p_backfill_mask = p_backfill_sub.add_parser(
+        "mask-adapter-hash",
+        help="Re-key mask_definition rows onto the current adapter-identity derivation",
+        description=(
+            "Convert qiita.mask_definition rows whose resolved_qc.adapter_set_hash"
+            " still comes from the SHA-256 of the serialized adapter Parquet (a digest"
+            " that tracked the pyarrow writer version) onto the SHA-256 of the"
+            " reference's sorted qiita.feature.sequence_hash values. The mint already"
+            " converts a row when something re-mints its config; this converts the"
+            " rest, which is what the contract phase reads as its go-ahead. mask_idx is"
+            " unchanged, so nothing re-masks. Rows carrying a stored hash other than the"
+            " single canonical adapter set cannot be attributed without the adapter"
+            " bytes and are REPORTED, not written. Idempotent; dry-run by default."
+            " Needs DATABASE_URL."
+        ),
+    )
+    p_backfill_mask.add_argument(
+        "--reference-idx",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "The adapter reference to derive the current identity from"
+            " (default: QIITA_DEFAULT_ADAPTER_REFERENCE_IDX)."
+        ),
+    )
+    p_backfill_mask.add_argument(
+        "--mask-idx",
+        dest="mask_idxs",
+        type=int,
+        action="append",
+        default=None,
+        metavar="N",
+        help="Restrict the plan to these mask_idx values. Repeatable.",
+    )
+    p_backfill_mask.add_argument(
+        "--attribute-all",
+        action="store_true",
+        help=(
+            "Assert that every --mask-idx row was minted from --reference-idx, so they"
+            " all convert however many distinct hashes they carry. Requires --mask-idx."
+            " This is how an unattributable report is resolved: without it, a deploy"
+            " that has held more than one adapter set can never finish the migration."
+        ),
+    )
+    p_backfill_mask.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write the re-keyed rows (default: dry-run, report only, no writes).",
+    )
+    p_backfill_mask.set_defaults(handler=_handle_backfill_mask_adapter_hash)
+
+    p_backfill_genome = p_backfill_sub.add_parser(
+        "assembly-genome",
+        help="Mint qiita.genome rows for assembly runs that predate the inline mint",
+        description=(
+            "Mint one qiita-origin genome per assembled subject — per refined bin, per"
+            " LCG contig, per unbinned contig — and stamp it onto"
+            " qiita.assembly_membership.genome_idx, for runs that completed before the"
+            " mint became part of write-assembly-membership. A pure Postgres replay:"
+            " the identity is a hash of columns already on the row, so nothing"
+            " re-assembles and nothing is re-read from the data plane. Run it before a"
+            " feature-table build that rolls de novo contigs up to genomes; no consumer"
+            " reads this column yet, so today it is a prerequisite rather than a"
+            " correction. Idempotent; dry-run by default. Needs DATABASE_URL."
+        ),
+    )
+    p_backfill_genome.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write the genomes and stamps (default: dry-run, report only, no writes).",
+    )
+    p_backfill_genome.set_defaults(handler=_handle_backfill_assembly_genome)
+
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
     p_actions_sync = p_actions_sub.add_parser(
@@ -331,7 +543,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Export the owner-submitted original sample names for a study as a"
             " TSV (system_admin only). Maps biosample_idx + accession back to"
-            " the PII-pinned owner name."
+            " the owner's original sample name (member-restricted; may contain PII)."
         ),
     )
     p_owner_id.add_argument(
@@ -413,6 +625,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "gRPC URL of the data plane. From off the deploy host use the public "
             "TLS edge (e.g. grpc+tls://qiita.example.com:443); grpc://<host>:50051 "
             "is the direct/on-host form and is not reachable off-host."
+        ),
+    )
+    p_export.add_argument(
+        "--compress",
+        action="store_true",
+        help=(
+            "Ask the data plane to zstd-compress the DoGet stream. Off by"
+            " default because compression costs more time than it saves on a"
+            " fast link (break-even is around 4 Gbit/s), so it is a loss"
+            " on-host and a large win over the TLS edge from off-site. Output"
+            " files are identical either way."
         ),
     )
     p_export.set_defaults(handler=_handle_masked_read_export)
@@ -498,22 +721,18 @@ async def _purge_failed(
     mask_idx and cannot duplicate rows. The command exits non-zero whenever the
     failures list is non-empty.
     """
-    try:
-        pool = await asyncpg.create_pool(
-            database_url, timeout=_DB_CONNECT_TIMEOUT_SECONDS, min_size=1, max_size=4
-        )
-    except Exception as exc:  # noqa: BLE001 — show full reason, including OS errors
-        raise RuntimeError(
-            f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
-        ) from exc
+    pool = await open_admin_pool(database_url)
     try:
         # Mask-idx coverage gate (computed up front so dry-run reports it and
         # --execute can refuse on it before any destructive work). The shared-mask
         # guard is only sound once every NON-failed ticket carries its mask_idx;
         # a non-failed sharer with a NULL mask_idx is invisible to the guard, so
-        # the mask could be wrongly deleted out from under a live result.
+        # the mask could be wrongly deleted out from under a live result. Scoped to
+        # _MASK_IDX_COVERAGE_ACTION_IDS rather than this run's `action_ids`: the
+        # guard reads tickets of every action, so narrowing the candidate set with
+        # --action must not narrow what counts as a blind spot.
         non_failed_missing_mask_idx = await _count_non_failed_missing_mask_idx(
-            pool, action_ids=action_ids
+            pool, action_ids=_MASK_IDX_COVERAGE_ACTION_IDS
         )
 
         candidates = await _select_purge_failed_candidates(pool, action_ids=action_ids, limit=limit)
@@ -570,6 +789,10 @@ async def _purge_failed(
             "executed": execute,
             "with_tickets": with_tickets,
             "action_ids": list(action_ids),
+            # The coverage gate's own scope, reported separately because it is
+            # deliberately wider than the candidate `action_ids` above — a reader
+            # comparing the count to the wrong list looks in the wrong place.
+            "coverage_action_ids": list(_MASK_IDX_COVERAGE_ACTION_IDS),
             "non_failed_missing_mask_idx": non_failed_missing_mask_idx,
             "candidates": len(candidates),
             "eligible": [
@@ -593,13 +816,14 @@ async def _purge_failed(
         if non_failed_missing_mask_idx:
             raise RuntimeError(
                 f"mask-idx coverage incomplete: {non_failed_missing_mask_idx} non-failed"
-                f" work_ticket(s) for {list(action_ids)} have mask_idx IS NULL, so the"
-                " shared-mask guard cannot see them and a shared mask could be wrongly"
-                " deleted. A non-failed masking ticket should always carry its mask_idx"
-                " (minted at submit time); the one-time backfill that populated"
-                " pre-tracking tickets has been retired. Investigate why these are"
-                " unmasked (a submit-path regression, or a pre-tracking ticket that"
-                " backfill never reached) and set their mask_idx before re-running."
+                f" work_ticket(s) for {list(_MASK_IDX_COVERAGE_ACTION_IDS)} have mask_idx"
+                " IS NULL, so the shared-mask guard cannot see them and a shared mask"
+                " could be wrongly deleted. Note this list is WIDER than the --action"
+                " selection: the guard reads tickets of every action, so the blind spot"
+                " may be outside what this run would purge. A non-failed ticket that"
+                " mints or consumes a mask should always carry its mask_idx (the runner"
+                " writes it before the step loop). Investigate why these are unmasked and"
+                " set their mask_idx before re-running."
             )
 
         # --execute: process each eligible candidate in isolation. Mask deletes
@@ -731,15 +955,16 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
         print(
             f"  *** MASK-IDX COVERAGE INCOMPLETE:"
             f" {report['non_failed_missing_mask_idx']} non-failed work_ticket(s)"
-            f" for {report['action_ids']} have mask_idx IS NULL."
+            f" for {report['coverage_action_ids']} have mask_idx IS NULL."
         )
         print(
             "      The shared-mask guard cannot see them; a shared mask could be wrongly deleted."
         )
         print(
-            "      A non-failed masking ticket should always carry its mask_idx; the"
-            " one-time backfill has been retired. Investigate and set their mask_idx"
-            " before proceeding. --execute will REFUSE until this is 0."
+            "      That list is WIDER than --action: the guard reads tickets of every"
+            " action, so the blind spot may be outside what this run would purge."
+            " Investigate and set their mask_idx before proceeding."
+            " --execute will REFUSE until this is 0."
         )
     print(f"  candidates: {report['candidates']}")
     print(f"  eligible:   {len(report['eligible'])}")
@@ -835,14 +1060,7 @@ async def _backfill_host_taxon_id(database_url: str, *, execute: bool) -> tuple[
     the same way either way, so the report an operator reads before writing is
     the report of exactly what will be written.
     """
-    try:
-        pool = await asyncpg.create_pool(
-            database_url, timeout=_DB_CONNECT_TIMEOUT_SECONDS, min_size=1, max_size=4
-        )
-    except Exception as exc:  # noqa: BLE001 — show full reason, including OS errors
-        raise RuntimeError(
-            f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
-        ) from exc
+    pool = await open_admin_pool(database_url)
     try:
         plan = await plan_backfill(pool)
         if not execute:
@@ -914,6 +1132,183 @@ def _handle_backfill_host_taxon_id(
     return 0
 
 
+async def _backfill_mask_adapter_hash(
+    database_url: str,
+    *,
+    reference_idx: int,
+    mask_idxs: list[int] | None,
+    attribute_all: bool,
+    execute: bool,
+    report: Callable[[RekeyPlan], None],
+) -> tuple[RekeyPlan, int]:
+    """Plan the adapter-hash re-key and, when `execute`, apply it.
+
+    Returns `(plan, written)`. `written` is 0 on a dry run and on a blocked plan.
+    The plan carries every value the write uses, including the collision check, so
+    the report an operator reads before writing is the report of exactly what will
+    be written.
+    """
+    pool = await open_admin_pool(database_url)
+    try:
+        plan = await plan_rekey(
+            pool,
+            reference_idx=reference_idx,
+            mask_idxs=mask_idxs,
+            attribute_all=attribute_all,
+        )
+        # Print before applying: apply_rekey raises on a blocked plan, and the
+        # rows it is refusing over are exactly what the operator needs to see.
+        report(plan)
+        if not execute or plan.blocked():
+            return plan, 0
+        return plan, await apply_rekey(pool, plan)
+    finally:
+        await pool.close()
+
+
+def _handle_backfill_mask_adapter_hash(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+
+    reference_idx = args.reference_idx
+    if reference_idx is None:
+        # Same parse the CP settings loader applies to this var, so a
+        # present-but-invalid value fails the same way here as at boot rather
+        # than raising a bare ValueError traceback.
+        try:
+            reference_idx = _parse_optional_positive_int_env("QIITA_DEFAULT_ADAPTER_REFERENCE_IDX")
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if reference_idx is None:
+            print(
+                "error: no --reference-idx and QIITA_DEFAULT_ADAPTER_REFERENCE_IDX not set",
+                file=sys.stderr,
+            )
+            return 2
+
+    def report(plan: RekeyPlan) -> None:
+        in_scope = (
+            len(plan.writable()) + len(plan.collided) + sum(map(len, plan.unattributable.values()))
+        )
+        print(f"adapter reference                  : {plan.reference_idx}")
+        print(f"current adapter_set_hash           : {plan.current_hash}")
+        if args.mask_idxs is not None:
+            # A named row that is already stamped, or carries no adapter set, is
+            # out of scope — say so rather than letting it vanish from the counts.
+            print(f"named / in scope                   : {len(args.mask_idxs)} / {in_scope}")
+        print(f"already current (stamp scheme only): {len(plan.stamp_only)}")
+        print(f"legacy hash -> re-key              : {len(plan.convertible)}")
+        print(f"unattributable (left unwritten)    : {sum(map(len, plan.unattributable.values()))}")
+        print(f"collided (left unwritten)          : {len(plan.collided)}")
+
+        for stored, mask_idxs in plan.unattributable.items():
+            # Name the hash and the masks on it: attributing these needs the
+            # adapter bytes that produced them — an operator decision, not a
+            # default. `--mask-idx … --attribute-all` is how that decision is
+            # stated.
+            print(f"\n  stored adapter_set_hash {stored}")
+            print(f"    mask_idx: {mask_idxs}")
+
+        if plan.collided:
+            print(
+                f"\n  {len(plan.collided)} row(s) would land on a params_hash another row"
+                f" holds, or on the same one as a sibling here: {plan.collided}."
+                " Two mask_idx values would describe one config; merging them means"
+                " repointing qiita.mask_sample and qiita.work_ticket off one of them."
+            )
+
+    try:
+        plan, written = asyncio.run(
+            _backfill_mask_adapter_hash(
+                database_url,
+                reference_idx=reference_idx,
+                mask_idxs=args.mask_idxs,
+                attribute_all=args.attribute_all,
+                execute=args.execute,
+                report=report,
+            )
+        )
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if plan.blocked():
+        # Exit non-zero so a wrapping script sees the gate DEPLOY_CHECKLIST.md
+        # turns this report into; `apply_rekey` refuses in this state too.
+        print(
+            "\nerror: nothing written — resolve the rows above first."
+            " An unattributable hash means more than one adapter set is stored"
+            " fleet-wide, which also puts the convertible attribution in doubt.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.execute:
+        print(f"\nwrote {written} mask_definition row(s)")
+    else:
+        print(
+            f"\nDRY RUN — nothing written. Pass --execute to write {len(plan.writable())} row(s)."
+        )
+    return 0
+
+
+async def _backfill_assembly_genome(
+    database_url: str, *, execute: bool
+) -> tuple[GenomeBackfillPlan, int]:
+    """Plan, report, and (with `execute`) apply the assembly-genome backfill.
+
+    Returns `(plan, stamped)`; `stamped` is 0 on a dry run. Unlike the mask re-key
+    there is no blocked state: a subject's identity is a hash of its own columns, so
+    every un-minted subject is writable and there is nothing to attribute.
+    """
+    pool = await open_admin_pool(database_url)
+    try:
+        plan = await plan_assembly_genome_backfill(pool)
+        if not execute:
+            return plan, 0
+        return plan, await apply_assembly_genome_backfill(pool, plan)
+    finally:
+        await pool.close()
+
+
+def _handle_backfill_assembly_genome(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+
+    try:
+        plan, stamped = asyncio.run(_backfill_assembly_genome(database_url, execute=args.execute))
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"subjects without a genome : {plan.genomes_to_mint}")
+    print(f"rows they cover           : {plan.rows_to_stamp}")
+    print(f"rows already stamped      : {plan.already_stamped_rows}")
+
+    if not plan.subjects:
+        # The empty plan IS the completeness signal a feature-table build wants.
+        print("\nnothing to do — every assembly_membership row carries a genome_idx.")
+        return 0
+
+    if args.execute:
+        print(f"\nminted {plan.genomes_to_mint} genome(s), stamped {stamped} row(s)")
+    else:
+        print(
+            f"\nDRY RUN — nothing written. Pass --execute to mint"
+            f" {plan.genomes_to_mint} genome(s) and stamp {plan.rows_to_stamp} row(s)."
+        )
+    return 0
+
+
 __all__ = [
     "_DB_CONNECT_TIMEOUT_SECONDS",
     "_DEFAULT_ORCHESTRATOR_VENV",
@@ -921,6 +1316,7 @@ __all__ = [
     "_FAILURE_STAGES_REQUIRING_STEP_NAME",
     "_FAILURE_STAGE_CHOICES",
     "_FORCE_FAIL_ELIGIBLE_STATES",
+    "_MASK_IDX_COVERAGE_ACTION_IDS",
     "_OWNER_ID_BASE_COLUMNS",
     "_OWNER_ID_POOL_COLUMNS",
     "_PURGE_FAILED_ACTION_IDS",
@@ -943,8 +1339,12 @@ __all__ = [
     "_handle_compute_readiness",
     "_handle_login",
     "_handle_mask_delete",
+    "_backfill_assembly_genome",
     "_backfill_host_taxon_id",
+    "_backfill_mask_adapter_hash",
+    "_handle_backfill_assembly_genome",
     "_handle_backfill_host_taxon_id",
+    "_handle_backfill_mask_adapter_hash",
     "_handle_mask_purge_failed",
     "_handle_masked_read_export",
     "_handle_owner_biosample_id",

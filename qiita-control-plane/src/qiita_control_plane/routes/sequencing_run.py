@@ -13,24 +13,46 @@ system_role gate (any USER may stand up a run); the pool POST
 additionally gates on caller-creator semantics against the path's run
 via `require_caller_owns_run()` (wet_lab_admin+ bypass). Both
 write handlers are find-or-create on their natural keys
-(instrument_run_id for the run; (run_idx, run_preflight_filename) for the
-pool) — a same-key + same-payload retry returns HTTP 200 with the
-existing idx; a same-key + different-payload retry returns 409 with a
-structured PayloadMismatch detail — a soft API-contract change downstream
+(instrument_run_id for the run; (run_idx, run_preflight_sha256) for the
+pool — the preflight CONTENT, not its filename) — a same-key + same-payload
+retry returns HTTP 200 with the existing idx; a same-key + different-payload
+retry returns 409 with a structured PayloadMismatch detail — a soft API-contract change downstream
 clients should be aware of.
+
+Read gating splits on what a response CARRIES, not on which resource it hangs
+off:
+
+  * The four AGGREGATE reads — run metadata, pool metadata, completion, work-ticket
+    summary — take `Scope.PREP_SAMPLE_READ` plus `require_caller_owns_run()`, the
+    guard the pool POST already used. Sums and bucket counts over a run the caller
+    stood up disclose nothing per-sample, so its creator reads them; wet_lab_admin+
+    bypasses ownership. The bypass returns without a DB lookup, so an admin still
+    gets `require_sequenced_pool_in_run`'s 404 / 422 unchanged.
+  * The two PER-SAMPLE reads — QC report and sequenced-sample exceptions — stay at a
+    wet_lab_admin floor. They return a row per sequenced_sample, unnarrowed, and a
+    pool spans studies, so the run's creator is not entitled to them by having
+    created the run. Each carries the reasoning at its own handler.
+  * The two pool-ALIGNMENT reads narrow to the caller's readable samples instead of
+    gating on the pool, so they answer for any pool the caller owns part of.
+
+Not covered by that split: `lookup-by-instrument-run-id` is a human read behind
+`Scope.PREP_SAMPLE_READ` alone; and of the mutating routes only preflight
+update-lane, block-mask plan and align plan carry a wet_lab_admin floor — the run
+and pool POSTs and the pool DELETE gate on scope and ownership instead.
 
 The preflight GET is SA-only via Scope.SEQUENCED_POOL_PREFLIGHT_READ,
 matching the existing CO→CP precedent (routes/sequence_range.py).
 
-Every handler delegates its DB work to the repositories.sequencing_run
-module. The per-item sequenced-sample import composer, the run-scoped
-sequenced_sample bulk-id read, and the single-sequenced-sample
-read/PATCH live in the sibling sequenced_sample route module.
+Handlers delegate their DB work to the repositories layer — mostly
+repositories.sequencing_run, and repositories.alignment_definition for the two
+pool-alignment discovery reads, which query the alignment tables rather than the
+run's own. The per-item sequenced-sample import composer, the run-scoped
+sequenced_sample bulk-id read, and the single-sequenced-sample read/PATCH live in
+the sibling sequenced_sample route module.
 """
 
 import base64
 import json
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any
@@ -41,6 +63,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_SEQUENCED_POOL_ALIGN_PLAN,
+    PATH_SEQUENCED_POOL_ALIGNMENT,
+    PATH_SEQUENCED_POOL_ALIGNMENT_COHORT,
     PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN,
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_COMPLETION,
@@ -62,6 +86,9 @@ from qiita_common.models import (
     AlignPlanResponse,
     BlockMaskPlanRequest,
     BlockMaskPlanResponse,
+    PoolAlignmentCohort,
+    PoolAlignmentList,
+    PoolAlignmentSummary,
     PoolCompletionStatus,
     PoolExceptionsResponse,
     PoolQCReport,
@@ -72,10 +99,12 @@ from qiita_common.models import (
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
     SequencedPoolDeleteResponse,
+    SequencedPoolListResponse,
     SequencedPoolPreflightResponse,
     SequencedPoolPreflightUpdateLaneRequest,
     SequencedPoolPreflightUpdateLaneResponse,
     SequencedPoolResponse,
+    SequencedPoolSummary,
     SequencedSampleException,
     SequencingRunCreateRequest,
     SequencingRunCreateResponse,
@@ -99,6 +128,8 @@ from ..actions.sequenced_pool import (
     reap_staged_reads,
 )
 from ..auth.guards import (
+    COHORT_MIN_TIER,
+    filter_prep_samples_caller_can_read,
     require_caller_owns_run,
     require_complete_profile,
     require_human,
@@ -117,11 +148,19 @@ from ..deps import (
     get_scratch_staging,
     get_tx_conn_factory,
 )
+from ..preflight import open_blob
+from ..repositories.alignment_definition import (
+    list_alignments_over_prep_samples,
+    list_completed_alignment_samples,
+    list_pool_prep_sample_idxs,
+)
+from ..repositories.mask_definition import MaskDefinitionDeprecated
 from ..repositories.sequencing_run import (
     PayloadMismatch,
     fetch_sequenced_pool_completion,
     fetch_sequenced_pool_demux_state,
     fetch_sequenced_pool_preflight,
+    fetch_sequenced_pool_read_mask_coverage,
     fetch_sequenced_pool_read_mask_ticket_state_counts,
     fetch_sequenced_pool_read_metrics,
     fetch_sequenced_pool_sample_exceptions,
@@ -131,11 +170,17 @@ from ..repositories.sequencing_run import (
     fetch_sequencing_run_read_metrics,
     insert_sequenced_pool,
     insert_sequencing_run,
+    list_sequenced_pools,
     update_sequenced_pool_preflight_blob,
 )
-from ._helpers import GENERIC_FK_VIOLATION, resolve_idxs_by_natural_key
+from ._helpers import GENERIC_FK_VIOLATION, cap_rows, resolve_idxs_by_natural_key
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequencing-run"])
+
+# Hard cap on the pool listing. Bounded by how many pools one run carries — a
+# lane count in practice — so the cap is a backstop rather than a page size;
+# `truncated` says so rather than paginating.
+_SEQUENCED_POOL_LIST_HARD_CAP = 1_000
 
 
 def _host_filter_refusal_http(exc: block_planner.PoolHostFilterRefusal) -> HTTPException:
@@ -219,7 +264,7 @@ async def get_sequencing_run(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _owns_run: None = Depends(require_caller_owns_run()),
 ) -> SequencingRunResponse:
     """Read one sequencing_run's metadata by idx.
 
@@ -227,9 +272,12 @@ async def get_sequencing_run(
     notably `instrument_model` — the field `qiita submit-host-filter-pool` reads
     to forward QC's polyG gate per sample — plus `read_metrics`, the run-level
     twin of the pool rollup (the identical PoolReadMetrics shape summed across the
-    run's pools, compute-on-read). Same read gate as the pool roster route
-    (`list_sequenced_samples_in_pool`): a HumanUser with `Scope.PREP_SAMPLE_READ`
-    and system_role at least wet_lab_admin. 404 when the run does not exist.
+    run's pools, compute-on-read). Read gate: a HumanUser with
+    `Scope.PREP_SAMPLE_READ` who created the run, or any wet_lab_admin+
+    (`require_caller_owns_run()`'s bypass). 404 when the run does not exist. A
+    non-owner gets 403 on a run that exists and 404 on one that does not, so this
+    route does distinguish the two for them — the run's existence, not its
+    contents.
     """
     row = await fetch_sequencing_run(pool, sequencing_run_idx)
     if row is None:
@@ -314,6 +362,52 @@ async def create_sequenced_pool(
     return SequencedPoolCreateResponse(sequenced_pool_idx=sequenced_pool_idx)
 
 
+@router.get(PATH_SEQUENCING_RUN_SEQUENCED_POOL)
+async def list_sequenced_pools_route(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _run_exists: None = Depends(require_sequencing_run_exists),
+    _owns_run: None = Depends(require_caller_owns_run()),
+) -> SequencedPoolListResponse:
+    """List the pools on one sequencing_run, ascending by `sequenced_pool_idx`.
+
+    The read that makes a `sequenced_pool_idx` obtainable. Every other pool-scoped
+    route takes one as a path segment or a query filter, and the POST on this same
+    path only returns the idx of the pool it just created-or-reused, so a caller who
+    did not perform the create had no way to name a pool at all.
+
+    Gated on the RUN's creator (`require_caller_owns_run()`, wet_lab_admin+ bypass),
+    as the POST on this path and the aggregate reads under it are. The two
+    per-sample reads (QC report, exceptions) stay at a wet_lab_admin floor; naming
+    a run's pools discloses nothing about whose samples are on them.
+
+    `require_sequencing_run_exists` fires the 404 before the guard, so a typo'd run
+    404s rather than reading as "no pools". An empty list on a real run means the run
+    has no pools yet.
+    """
+    rows, truncated = cap_rows(
+        await list_sequenced_pools(
+            pool, sequencing_run_idx, limit=_SEQUENCED_POOL_LIST_HARD_CAP + 1
+        ),
+        _SEQUENCED_POOL_LIST_HARD_CAP,
+    )
+    pools = []
+    for row in rows:
+        # asyncpg returns JSONB as text (no codec), as the single-pool read notes.
+        data = dict(row)
+        if isinstance(data["extra_metadata"], str):
+            data["extra_metadata"] = json.loads(data["extra_metadata"])
+        pools.append(SequencedPoolSummary.model_validate(data))
+    return SequencedPoolListResponse(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool=pools,
+        count=len(pools),
+        truncated=truncated,
+    )
+
+
 @router.get(PATH_SEQUENCED_POOL_PREFLIGHT)
 async def get_sequenced_pool_preflight(
     sequencing_run_idx: Annotated[int, Field(gt=0)],
@@ -363,8 +457,9 @@ class _LaneUpdateRejected(Exception):
     """run_preflight.update_lane rejected the request — an unsupported platform, a
     post-update NULL/non-NULL lane mix, or a unique ``(prepped_sample, lane)``
     collision. A client-error condition (the route maps it to 422), kept distinct
-    from a ``ValueError`` raised by ``open_db_file`` (a server-side preflight
-    schema-version skew), which must surface as 5xx rather than 422."""
+    from a load failure — a blob that is not a SQLite database, or one written
+    against a newer preflight schema than this deployment ships — which must surface
+    as 5xx rather than 422."""
 
 
 def _apply_preflight_lane_update(
@@ -378,33 +473,24 @@ def _apply_preflight_lane_update(
     """Apply ``run_preflight.update_lane`` to a preflight SQLite blob, returning
     the edited bytes and the number of sample rows reassigned.
 
-    The blob is materialized to a private temp file because run_preflight
-    operates on a file-backed sqlite3 connection and commits the lane update in
-    place; the edited bytes are then read back. The ``run_preflight`` import is
-    lazy and local — matching ``jobs/bcl_convert_prep.py`` — so the git-pinned
-    dependency only loads on the rare edit path, never at module import.
-    ``open_db_file`` also applies any pending preflight-schema patches, which can
-    legitimately rewrite bytes even on a zero-row update; that is intended (it
-    keeps a stored preflight current).
+    The edit lands in the detached copy ``open_blob`` returns; the pending schema
+    patches it applies there can change the returned bytes even on a zero-row update,
+    which is intended (it keeps a stored preflight current). The ``run_preflight``
+    import is lazy so the git-pinned dependency only loads on this rare edit path.
 
-    Only update_lane's own ``ValueError`` (bad request) is translated to
-    ``_LaneUpdateRejected``; a ``ValueError`` from ``open_db_file`` (e.g. a stored
-    blob whose schema version exceeds the deployed run_preflight patch set — a
-    server/version-skew condition, not a bad request) is deliberately left to
-    propagate so the route returns 5xx rather than mislabeling it 422."""
-    from run_preflight import open_db_file, update_lane  # noqa: PLC0415
+    Only update_lane's own ``ValueError`` (bad request) becomes
+    ``_LaneUpdateRejected``. A blob that will not load raises ``ValueError`` too, so
+    the load is kept outside the ``except`` — ``open_blob`` performs it on entry — and
+    propagates as 5xx rather than being mislabeled a bad request."""
+    from run_preflight import dump_db_bytes, update_lane  # noqa: PLC0415
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "preflight.db"
-        db_path.write_bytes(blob)
-        conn = open_db_file(str(db_path))
+    with open_blob(blob) as conn:
         try:
             rows_updated = update_lane(conn, platform, from_lane, to_lane, reason)
         except ValueError as exc:
             raise _LaneUpdateRejected(str(exc)) from exc
-        finally:
-            conn.close()
-        return db_path.read_bytes(), rows_updated
+        new_blob = dump_db_bytes(conn)
+    return new_blob, rows_updated
 
 
 @router.post(PATH_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE)
@@ -523,7 +609,7 @@ async def get_sequenced_pool(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _owns_run: None = Depends(require_caller_owns_run()),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
 ) -> SequencedPoolResponse:
     """Read one sequenced_pool's metadata plus its compute-on-read read-metric
@@ -533,8 +619,8 @@ async def get_sequenced_pool(
 
     Nothing is stored at the pool level — the rollup is aggregated at request
     time, so it never drifts when a sample is re-processed or deleted. Same read
-    gate as `get_sequencing_run` / the pool roster: a HumanUser with
-    `Scope.PREP_SAMPLE_READ` and system_role at least wet_lab_admin.
+    gate as `get_sequencing_run`: a HumanUser with `Scope.PREP_SAMPLE_READ` who
+    created the RUN, or any wet_lab_admin+.
     `require_sequenced_pool_in_run` fronts 404 (no such pool) and 422 (pool not
     under this run); the rollup is always present (an unprocessed pool reads as
     NULL sums / 0 counts). The BYTEA `run_preflight_blob` is not surfaced — only
@@ -581,9 +667,16 @@ async def get_sequenced_pool_qc_report(
 
     Everything is compute-on-read — the merge runs at request time over the
     constituent sequenced_samples, so it never drifts when a sample is
-    re-processed or deleted. Same read gate as the pool metadata endpoint: a
-    HumanUser with `Scope.PREP_SAMPLE_READ` and system_role at least
-    wet_lab_admin. `require_sequenced_pool_in_run` fronts 404 (no such pool) /
+    re-processed or deleted. Read gate: a HumanUser with `Scope.PREP_SAMPLE_READ`
+    at system_role wet_lab_admin+ — NOT the run-creator gate the pool metadata and
+    completion reads use. `samples` carries one row per sequenced_sample with no
+    per-study narrowing, and a pool spans studies (the alignment reads below
+    narrow for exactly this reason), so admitting the run's creator here would
+    hand them QC blobs for samples in studies they hold nothing on. Narrowing this
+    to the caller's readable samples would change what `merged` and `sample_count`
+    aggregate over, so it is a separate decision — Qiita#529 carries it, along with
+    the gate move that depends on it.
+    `require_sequenced_pool_in_run` fronts 404 (no such pool) /
     422 (pool not under this run). A pool with no processed samples reads as an
     empty `samples` list and `merged.raw`/`merged.filtered` of None."""
     # Two sequential reads (rollup, then per-sample rows) on separate
@@ -624,6 +717,112 @@ async def get_sequenced_pool_qc_report(
     )
 
 
+async def _readable_pool_prep_samples(
+    pool: asyncpg.Pool, *, sequenced_pool_idx: int, caller: Principal
+) -> list[int]:
+    """The pool's non-retired prep_samples that `caller` may read.
+
+    Pool membership, then the shared per-study read gate
+    (`filter_prep_samples_caller_can_read`) — the same one the all-or-nothing
+    alignment mint raises on, so a cohort discovered here is one the mint
+    accepts. Everything about what "may read" means, including the orphan drop
+    and the wet_lab_admin bypass, lives in that guard rather than here.
+    """
+    prep_sample_idxs = await list_pool_prep_sample_idxs(pool, sequenced_pool_idx)
+    access = await filter_prep_samples_caller_can_read(
+        pool, caller=caller, prep_sample_idxs=prep_sample_idxs, min_tier=COHORT_MIN_TIER
+    )
+    return access.readable
+
+
+@router.get(PATH_SEQUENCED_POOL_ALIGNMENT)
+async def list_sequenced_pool_alignments(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolAlignmentList:
+    """List the alignments over this pool's samples — the answer to "what has
+    been aligned here, against which reference, and is it finished".
+
+    **Narrowed to the caller's readable slice**, not gated on the whole pool. A
+    pool spans studies, so 403ing it would make it undiscoverable to someone who
+    legitimately owns part of it; narrowing is safe on a listing because no
+    scientific result depends on it. The per-study `Tier.VIEWER` check is the
+    boundary, which is why this is open to role `user` on ANY pool, where the
+    sibling completion rollup admits role `user` only on a run they created.
+
+    Both counts are over the caller's own samples (see `PoolAlignmentSummary`),
+    so they agree with what the alignment DoGet mint will accept — that mint is
+    all-or-nothing, and showing the pool's real counts here would set the caller
+    up for a 403. An alignment the caller can read no sample of is absent
+    entirely rather than reported with zero counts.
+    """
+    prep_sample_idxs = await _readable_pool_prep_samples(
+        pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
+    )
+    rows = await list_alignments_over_prep_samples(pool, prep_sample_idxs)
+    return PoolAlignmentList(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+        alignments=[
+            PoolAlignmentSummary(
+                alignment_idx=row["alignment_idx"],
+                # asyncpg hands JSONB back as str under the default codec.
+                params=json.loads(row["params"])
+                if isinstance(row["params"], str)
+                else row["params"],
+                # Hex, not raw bytes: this is a string a client compares against its
+                # own `canonical_params_hash(params).hex()` and a manifest publishes.
+                params_hash=row["params_hash"].hex(),
+                samples_completed=row["samples_completed"],
+                samples_total=row["samples_total"],
+            )
+            for row in rows
+        ],
+    )
+
+
+@router.get(PATH_SEQUENCED_POOL_ALIGNMENT_COHORT)
+async def get_sequenced_pool_alignment_cohort(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    alignment_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolAlignmentCohort:
+    """Resolve the cohort to mint an alignment DoGet ticket for: this pool's
+    prep_samples that are both readable by the caller and `'completed'` for this
+    alignment.
+
+    Two filters, and both are load-bearing. Readability makes the result a valid
+    mint body by construction — the mint is all-or-nothing, so a cohort this
+    route hands back can never 403 there. Completion is a first-class state:
+    alignment rows are NOT 1:1 with reads (cross-shard routing and paired-end
+    mates both multiply rows per read), so the presence of rows says nothing
+    about whether a sample is done.
+
+    An empty cohort is a legitimate answer, not a 404 or a 403 — it means
+    "nothing here you may mint", and unlike a rejection it does not confirm
+    which of the pool's alignments touch data the caller lacks.
+    """
+    prep_sample_idxs = await _readable_pool_prep_samples(
+        pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
+    )
+    return PoolAlignmentCohort(
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+        alignment_idx=alignment_idx,
+        prep_sample_idx=await list_completed_alignment_samples(
+            pool, alignment_idx, prep_sample_idxs
+        ),
+    )
+
+
 @router.get(PATH_SEQUENCED_POOL_COMPLETION)
 async def get_sequenced_pool_completion(
     sequencing_run_idx: Annotated[int, Field(gt=0)],
@@ -631,7 +830,7 @@ async def get_sequenced_pool_completion(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _owns_run: None = Depends(require_caller_owns_run()),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
     reference_idx: int | None = Query(
         default=None,
@@ -646,18 +845,23 @@ async def get_sequenced_pool_completion(
     """Read the pool's end-to-end processing rollup: the demux (bcl-convert)
     stage state plus the host-masking stage. `demux_state` is the pool-scoped
     bcl-convert ticket's state; the per-sample buckets classify each non-retired
-    sequenced_sample by the state of its read-mask work tickets (any version) —
-    completed / in-flight / no-data / failed / not-submitted — with a pool-level
-    `complete` flag for host-masking (every sample COMPLETED or NO_DATA and the
-    pool non-empty, so a plate of real data with empty wells still reaches
-    `complete=True`) and `fully_processed` = demux completed AND `complete` (the
-    single "this pool is done and clean" signal). Surfaced alongside the
-    read-metric and QC rollups.
+    sequenced_sample — completed / invalidated / in-flight / no-data / failed /
+    cancelled / not-submitted — with a pool-level `complete` flag for
+    host-masking (every sample masked or NO_DATA and the pool non-empty, so a
+    plate of real data with empty wells still reaches `complete=True`) and
+    `fully_processed` = demux completed AND `complete` (the single "this pool is
+    done and clean" signal). Whether a sample is masked comes from the
+    `qiita.mask_sample` gate; see `fetch_sequenced_pool_completion` for how the
+    gate and the work tickets are resolved. Surfaced alongside the read-metric
+    and QC rollups.
 
-    Everything is compute-on-read over the work_ticket table, so it never drifts
-    when a sample is re-processed, re-submitted, or deleted. Same read gate as the
-    pool metadata / QC-report endpoints: a HumanUser with `Scope.PREP_SAMPLE_READ`
-    and system_role at least wet_lab_admin. `require_sequenced_pool_in_run` fronts
+    Everything is compute-on-read, so it never drifts when a sample is
+    re-processed, re-submitted, withdrawn, or deleted. Same read gate as the
+    QC report, and for the same reason: a HumanUser with `Scope.PREP_SAMPLE_READ` at
+    system_role wet_lab_admin+, NOT the run's creator. Every row carries a
+    `biosample_accession` and the ENA accessions, unnarrowed across the pool's
+    studies. Narrowing then admitting the run's creator is Qiita#529.
+    `require_sequenced_pool_in_run` fronts
     404 (no such pool) / 422 (pool not under this run); a pool with no non-retired
     samples reads as all-zero counts and `complete=False`."""
     row = await fetch_sequenced_pool_completion(
@@ -671,9 +875,11 @@ async def get_sequenced_pool_completion(
         demux_state=demux_state,
         sample_count=row["sample_count"],
         samples_completed=row["samples_completed"],
+        samples_invalidated=row["samples_invalidated"],
         samples_in_flight=row["samples_in_flight"],
         samples_no_data=row["samples_no_data"],
         samples_failed=row["samples_failed"],
+        samples_cancelled=row["samples_cancelled"],
         samples_not_submitted=row["samples_not_submitted"],
     )
 
@@ -683,8 +889,14 @@ def _sequenced_sample_exception_flags(row: Mapping[str, Any]) -> list[str]:
     SQL WHERE in `fetch_sequenced_pool_sample_exceptions`, so every row that query
     returns yields at least one flag. `unprocessed` (no metrics) and `no_reads`
     (processed, 0 survived) are mutually exclusive; `failed_ticket` is a FAILED
-    read-mask ticket with no COMPLETED one (same precedence as the completion
-    rollup)."""
+    read-mask ticket with no COMPLETED one.
+
+    That is a ticket question, so it does not track the completion rollup's
+    buckets: a withdrawn run has a COMPLETED ticket and raises no flag here while
+    the rollup counts it `samples_invalidated`, and a block-masked sample has no
+    per-sample ticket at all. An operator reconciling the two surfaces will find
+    samples the rollup reports as unusable that this drill-down does not
+    list."""
     flags: list[str] = []
     if row["raw_read_count_r1r2"] is None:
         flags.append("unprocessed")
@@ -748,7 +960,7 @@ async def get_sequenced_pool_work_ticket_summary(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _owns_run: None = Depends(require_caller_owns_run()),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
 ) -> PoolWorkTicketSummary:
     """Read the pool's read-mask work-ticket rollup: coverage (samples with vs.
@@ -756,24 +968,30 @@ async def get_sequenced_pool_work_ticket_summary(
     denominator — no per-sample precedence collapse, unlike the completion
     rollup's buckets).
 
-    Coverage is taken from the completion rollup so the two reconcile by
-    construction (`samples_with_read_mask_ticket` == `sample_count -
-    samples_not_submitted`). `ticket_state_counts` carries every WorkTicketState
-    (states with no tickets read 0). Compute-on-read; same read gate and 404/422
-    fronting as the pool completion endpoint."""
-    completion = await fetch_sequenced_pool_completion(pool, sequenced_pool_idx)
-    state_counts = await fetch_sequenced_pool_read_mask_ticket_state_counts(
-        pool, sequenced_pool_idx
-    )
-    sample_count = completion["sample_count"]
-    without = completion["samples_not_submitted"]
+    Coverage and the state counts come from the same read-mask-ticket source and
+    one connection, so the two halves of one response share a denominator and a
+    snapshot. Neither comes from the completion rollup, whose buckets are keyed
+    on the masking gate and answer a different question — a block-masked sample
+    is masked and has no read-mask ticket at all. `ticket_state_counts` carries
+    every WorkTicketState (states with no tickets read 0). Compute-on-read; same
+    read gate and 404/422 fronting as the pool completion endpoint."""
+    # One connection for both reads: they are two halves of one response and a
+    # separate acquisition each would read them from two snapshots, so a
+    # concurrent writer could land between the denominator and the state counts.
+    async with pool.acquire() as conn:
+        coverage = await fetch_sequenced_pool_read_mask_coverage(conn, sequenced_pool_idx)
+        state_counts = await fetch_sequenced_pool_read_mask_ticket_state_counts(
+            conn, sequenced_pool_idx
+        )
+    sample_count = coverage["sample_count"]
+    with_ticket = coverage["samples_with_ticket"]
     return PoolWorkTicketSummary(
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=sequencing_run_idx,
         sample_count=sample_count,
         read_mask=PoolReadMaskCoverage(
-            samples_with_read_mask_ticket=sample_count - without,
-            samples_without_read_mask_ticket=without,
+            samples_with_read_mask_ticket=with_ticket,
+            samples_without_read_mask_ticket=sample_count - with_ticket,
         ),
         # Fill every state so the map is complete regardless of which appear in the DB.
         ticket_state_counts={s.value: state_counts.get(s.value, 0) for s in WorkTicketState},
@@ -853,7 +1071,7 @@ async def submit_block_mask_plan(
     # the read-mask workflow declaring adapter_parquet AND a default reference
     # being configured — and materializes it once (a data-plane hop) only then.
     try:
-        adapter_set_hash = await block_planner.resolve_block_mask_adapter_hash(
+        adapter_set_hashes = await block_planner.resolve_block_mask_adapter_hash(
             pool,
             default_adapter_reference_idx=request.app.state.settings.default_adapter_reference_idx,
             data_plane_url=data_plane_url,
@@ -879,7 +1097,7 @@ async def submit_block_mask_plan(
                 host_minimap2_reference_idx=body.host_minimap2_reference_idx,
             ),
             only_missing=body.only_missing,
-            adapter_set_hash=adapter_set_hash,
+            adapter_set_hashes=adapter_set_hashes,
             originator_principal_idx=user.principal_idx,
             block_action_id=block_planner.BLOCK_MASK_ACTION_ID,
             block_action_version=block_planner.BLOCK_MASK_ACTION_VERSION,
@@ -890,6 +1108,11 @@ async def submit_block_mask_plan(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
+    except MaskDefinitionDeprecated as exc:
+        # The config this plan would mint against is void. 409, not the
+        # unmapped 500 an unhandled raise gives: the request is well-formed
+        # and would have succeeded before the deprecation.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.detail) from exc
     except block_planner.BlockMaskResubmitError as exc:
         # A sample already gated for the resolved mask would be re-masked
         # (completed → read_mask double-write) or wedged (pending → duplicate
@@ -998,6 +1221,11 @@ async def submit_align_plan(
     except align_planner.AlignMaskNotFound as exc:
         # The named mask_idx does not exist (a client-supplied identifier).
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except align_planner.AlignMaskDeprecated as exc:
+        # The mask exists but its config is void, so new results must not be built
+        # on it. 409, not 404: the request is well-formed and would have succeeded
+        # before the deprecation.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except align_planner.AlignReferenceNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except align_planner.AlignUnsupportedPlatform as exc:
@@ -1051,13 +1279,17 @@ async def delete_sequenced_pool(
     prep_sample). Because sequenced_sample↔prep_sample is 1:1 and each
     sequenced_sample belongs to one pool, the deleted prep_samples are
     exclusive to this pool. They are removed outright, which severs **every**
-    study link they hold — not only the run/pool the operator is thinking of.
+    study link they hold — not only the run/pool the operator is thinking of. It also
+    deletes the qiita-origin genomes this pool's assemblies minted, which retires any
+    published `QF<n>` handle naming one (`exported_feature.genome_idx` is ON DELETE SET
+    NULL behind a retire trigger).
 
     Gating: in-flight work tickets (pending/queued/processing) block the delete
-    unconditionally (409). Terminal work tickets (completed/no_data/failed),
-    prep_samples published into a study, and samples carrying an ENA accession
-    each block it unless
-    `force=true`.
+    unconditionally (409), as does a qiita-origin genome from one of these
+    prep_samples that a reference claims through `qiita.feature_genome` — `force`
+    does not override that one, because it cannot make the genome deletable.
+    Terminal work tickets (completed/no_data/failed), prep_samples published into a
+    study, and samples carrying an ENA accession each block it unless `force=true`.
 
     The DuckLake purge (the `read`/`read_mask` rows the pool's bcl-convert run
     wrote, keyed by prep_sample_idx) runs first, then the Postgres teardown —
@@ -1119,8 +1351,9 @@ async def delete_sequenced_pool(
 
     # Re-gate inside the teardown transaction to close the precheck→cascade
     # window: a work ticket that went in-flight since the precheck must abort
-    # the teardown (and 409 loudly) rather than be silently deleted. force=True
-    # here means only a *new in-flight* ticket aborts — terminal tickets,
+    # the teardown (and 409 loudly) rather than be silently deleted. Under
+    # force=True the two that still abort here are a *new in-flight* ticket and a
+    # reference claim on one of these prep_samples' genomes — terminal tickets,
     # published links, and ENA samples are the cascade's to delete.
     async with tx() as conn:
         try:

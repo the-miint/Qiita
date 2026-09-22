@@ -1,7 +1,7 @@
 """Tests for qiita_compute_orchestrator.cli.compute_readiness.
 
-The bash probe script itself is intentionally not covered here — it
-runs on a SLURM compute node, not in our test env. Instead we cover:
+The bash wrapper itself (the SLURM job script, submit/poll flow) is not
+run on a real cluster here. What is covered:
 
 - The Python-side checks (JWT decode, CP /healthz) that run on the
   orchestrator host. Tests use monkeypatch for env, MockTransport for
@@ -10,6 +10,9 @@ runs on a SLURM compute node, not in our test env. Instead we cover:
   → parse log. Uses MockTransport against the slurmrestd routes plus
   a pre-staged log file (the probe never actually runs).
 - The log-line parser and `key=value` → CheckResult classifier.
+- Each heredoc probe body extracted from the generated script and run
+  for real: against stubbed `duckdb`/`qiita_common` (failure direction)
+  and against the session's real staged miint (success direction).
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import re
 import time
 from pathlib import Path
 
@@ -193,6 +197,7 @@ compute-readiness: miint-read-fastx=ok
 compute-readiness: shared-fs-visible=ok path=/scratch/qiita
 compute-readiness: shared-fs-writable=ok
 compute-readiness: cp-from-compute=ok cp_url=https://qiita.example.org
+compute-readiness: ena-from-compute=ok
 trailing line outside the prefix
 """
     results = cr._parse_probe_log(log)
@@ -207,6 +212,7 @@ trailing line outside the prefix
         ("probe/shared-fs-visible", "pass"),
         ("probe/shared-fs-writable", "pass"),
         ("probe/cp-from-compute", "pass"),
+        ("probe/ena-from-compute", "pass"),
     ]
 
 
@@ -217,6 +223,7 @@ compute-readiness: native-import=fail
 compute-readiness: miint-read-fastx=fail
 compute-readiness: shared-fs-visible=fail path=/scratch/qiita
 compute-readiness: cp-from-compute=skip cp_url_set=fail token_set=fail
+compute-readiness: ena-from-compute=fail err=URLError: no route to host
 """
     statuses = {r.name: r.status for r in cr._parse_probe_log(log)}
     assert statuses == {
@@ -225,6 +232,7 @@ compute-readiness: cp-from-compute=skip cp_url_set=fail token_set=fail
         "probe/miint-read-fastx": "fail",
         "probe/shared-fs-visible": "fail",
         "probe/cp-from-compute": "skip",
+        "probe/ena-from-compute": "fail",
     }
 
 
@@ -268,6 +276,29 @@ def test_probe_script_checks_miint_read_fastx():
     assert "miint-read-fastx=ok" in script
     assert "miint-read-fastx=fail" in script
     assert "max_batch_bytes" in script
+
+
+def test_probe_script_checks_ena_reachability_from_compute():
+    """The compute half of the deploy's ENA egress check. Runs
+    `ena_reachability_check` as a module through the shared `run_module_probe`
+    helper, so the hosts and the verdict are pinned on that module's own tests
+    and the `err=` capture on native-import's."""
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    assert "run_module_probe qiita_compute_orchestrator.ena_reachability_check" in script
+    assert "ena-from-compute=ok" in script
+    assert "ena-from-compute=fail err=$MODULE_PROBE_ERR" in script
+
+
+def test_probe_script_runs_both_module_probes_through_one_helper():
+    """native-import and ena-from-compute share one capture path, so they cannot
+    drift into different ideas of what reaches the operator's `err=` field. The
+    row names stay literals at the call sites — `_parse_probe_log` and the
+    script-vs-parser parity test both read them out of the script's text."""
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    assert script.count("run_module_probe() {") == 1
+    assert script.count("run_module_probe qiita_compute_orchestrator.") == 2
+    # No call site re-implements the capture the helper owns.
+    assert "-P -m" not in script.split("run_module_probe() {", 1)[1].split("}", 1)[1]
 
 
 def test_probe_script_is_valid_bash():
@@ -327,6 +358,115 @@ def test_probe_script_checks_gpl_boundary():
     assert "save_bowtie2_index" in script
     assert "miint-gpl-boundary=ok" in script
     assert "miint-gpl-boundary=fail" in script
+
+
+_PYEOF_BLOCK_RE = re.compile(r"cat > \"\$(\w+)\" <<'PYEOF'\n(.*?)\nPYEOF", re.DOTALL)
+
+
+def _extract_probe_bodies(script: str) -> dict[str, str]:
+    """Return every heredoc probe body, keyed by its `$VAR` name. A probe written
+    in a form this regex misses fails loudly rather than skipping the tests."""
+    bodies = dict(_PYEOF_BLOCK_RE.findall(script))
+    assert script.count("<<") == len(bodies), (
+        f"found {script.count('<<')} heredoc openers but parsed {len(bodies)} "
+        "probe bodies — a probe body uses a heredoc form this regex doesn't match"
+    )
+    return bodies
+
+
+def _write_duckdb_miint_stubs(tmp_path: Path) -> None:
+    """Stub duckdb and qiita_common for PYTHONPATH (not `sys.path[0]`, which `-P`
+    — the flag production invokes every probe with — deliberately drops). Their
+    empty results violate every probe's contract."""
+    (tmp_path / "duckdb.py").write_text(
+        "class _Conn:\n"
+        "    def execute(self, *args, **kwargs):\n"
+        "        return self\n"
+        "    def fetchall(self):\n"
+        "        return []\n"
+        "    def fetchone(self):\n"
+        "        return None\n"
+        "\n"
+        "def connect(*args, **kwargs):\n"
+        "    return _Conn()\n"
+    )
+    qc = tmp_path / "qiita_common"
+    qc.mkdir()
+    (qc / "__init__.py").write_text("")
+    (qc / "duckdb_miint.py").write_text(
+        "def miint_connect_config():\n    return {}\n\ndef miint_load_sql():\n    return ''\n"
+    )
+
+
+# Pinned exactly, not by prefix: a probe that dies on the wrong exception still
+# exits 1 with one line, and only the message tells the two apart.
+_EXPECTED_STUB_FAILURE = {
+    "MIINT_SPLIT_PROBE": "RuntimeError: sequence_split contract drift: []",
+    "MIINT_HOSTFILTER_PROBE": (
+        "RuntimeError: missing miint host-filter functions: save_minimap2_index, align_minimap2"
+    ),
+    "MIINT_INFERTRIM_PROBE": "RuntimeError: infer_trim contract drift: []",
+    "MIINT_BOUNDARY_PROBE": "RuntimeError: save_bowtie2_index did not report success",
+}
+
+
+@pytest.mark.parametrize("var", sorted(_EXPECTED_STUB_FAILURE))
+@pytest.mark.parametrize("flags", [[], ["-O"]], ids=["plain", "dash-O"])
+def test_probe_body_signals_failure_without_assert(tmp_path, var, flags):
+    """A probe must report drift through its exit code and message even under
+    `python -O`, which strips `assert`. Invoked with `-P` and the stubs on
+    PYTHONPATH, the shape production runs a probe in."""
+    import os
+    import subprocess
+    import sys
+
+    script = cr.build_probe_script(path_scratch="/scratch")
+    body = _extract_probe_bodies(script)[var]
+    _write_duckdb_miint_stubs(tmp_path)
+    probe = tmp_path / "probe.py"
+    probe.write_text(body)
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONOPTIMIZE", "PYTHONSAFEPATH")}
+    env["PYTHONPATH"] = str(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-P", *flags, str(probe)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert proc.returncode == 1, (var, flags, proc.stdout, proc.stderr)
+    assert proc.stdout.splitlines() == [_EXPECTED_STUB_FAILURE[var]], (var, flags, proc.stdout)
+
+
+@pytest.mark.parametrize("var", sorted(_EXPECTED_STUB_FAILURE))
+def test_probe_body_passes_against_real_miint(tmp_path, var):
+    """The stub fails a probe whatever it expects, so a wrong expectation would
+    report drift on every real deploy and still pass above. Run each body against
+    the session's staged miint and require success."""
+    import subprocess
+    import sys
+
+    script = cr.build_probe_script(path_scratch="/scratch")
+    body = _extract_probe_bodies(script)[var]
+    probe = tmp_path / "probe.py"
+    probe.write_text(body)
+    proc = subprocess.run(
+        [sys.executable, "-P", str(probe)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (var, proc.stdout, proc.stderr)
+
+
+def test_no_probe_body_relies_on_assert():
+    """Covers every heredoc probe body, including ones added after the four above."""
+    import ast
+
+    script = cr.build_probe_script(path_scratch="/scratch")
+    bodies = _extract_probe_bodies(script)
+    for var, body in bodies.items():
+        tree = ast.parse(body)
+        asserts = [node for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+        assert not asserts, f"{var} relies on assert for its verdict:\n{body}"
 
 
 def test_parse_probe_log_unknown_value_defaults_to_fail():

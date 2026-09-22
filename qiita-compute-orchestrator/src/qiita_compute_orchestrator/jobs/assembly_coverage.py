@@ -42,18 +42,19 @@ notes below are what a probe against the shipped build adds on top:
     length mismatches, jgi accepts with no warnings. This is why keeping secondaries
     (no `max_secondary := 0`, unlike syndna/host_filter) is safe here.
 
-THIS BAM IS NOT COORDINATE SORTED, and cannot be made so here. A BAM's sort order
-is on *tid* — the @SQ index — and the @SQ order miint's writer emits is not
-derivable from the REFERENCE_LENGTHS table's row order (probed; filed upstream as
-duckdb-miint#173, which asks for a defined or steerable @SQ order — see
-docs/duckdb-miint.md's "Open upstream gaps" table for the removal ticket). So no
-ORDER BY on either the reflen table or the copied relation can produce a
-coordinate sort, and none is attempted: whoever needs one runs `samtools sort`,
-which `binning.sh` does before staging this file for metaWRAP. Do not add a reflen
-ORDER BY back in the belief that it steers @SQ — an earlier version of this step
-did exactly that, called the BAM correct by construction, and cost a production
-ticket (jgi: "ERROR: the bam file 'reads.bam' is not sorted!").
-`tests/jobs/test_assembly_coverage.py` pins the finding.
+THIS BAM IS COORDINATE SORTED, by the `ORDER BY` on the COPY below. `binning.sh`
+stages it for metaWRAP as-is, so nothing downstream sorts it. A BAM is coordinate
+sorted on *tid*, the @SQ index, and miint emits @SQ sorted by reference name
+(<https://the-miint.github.io/duckdb-miint/writing/>), so ordering the copied
+relation by `reference, position` orders it by (tid, position) too. What jgi and
+`samtools index` do with an ordered vs an unordered file was measured against a
+control; docs/duckdb-miint.md's `FORMAT BAM` writer section records it.
+
+The REFERENCE_LENGTHS row order does not steer @SQ, so ordering that table changes
+nothing. An earlier version of this step ordered it and treated the result as
+sorted; @SQ was in hash-bucket order then, so the name `ORDER BY` was not a
+coordinate sort, and a production ticket died in jgi.
+`tests/jobs/test_assembly_coverage.py` pins both halves.
 
 WHY `SEQUENCE_DATA` IS NOT OPTIONAL. By default `FORMAT BAM` writes SEQ as `*`,
 and that silently corrupts the depth jgi reports. Coverage ramps DOWN at both
@@ -77,11 +78,16 @@ produces, to every printed digit, and silences jgi's per-record warnings. If you
 are tempted to drop it because "the aligner already knows the sequences": it does
 not put them in the file, and the resulting error is silent.
 
-TODO(sizing): the SEQUENCE_DATA lookup is unspillable and holds ~1.5-1.7x the raw
-read-sequence bytes (probed). `baseline_resources` in the workflow YAML has not
-been validated against a real per-sample masked HiFi read volume — do that against
-a real ticket's MaxRSS (`sacct`) and adjust, or the largest samples OOM in a way
-escalation cannot fix. See the memory-split note at `_DUCKDB_CAP_GB`.
+SIZING. The unspillable SEQUENCE_DATA lookup pushes the largest samples past the
+baseline, and escalation recovers them. Two cohorts have now measured it at a 64 GiB
+baseline and both reached the allocation, which is what settled the question of
+whether to re-size; the current number and the cohort behind it are recorded on this
+step in the workflow YAML that declares it. Each version declares its own — an older
+version keeps the allocation it ran with, since a version's spec is its identity.
+
+Re-measure the same way: `sacct --user=qiita-job` from a host that can reach slurmdbd,
+job names `qiita-wt{idx}-assembly_coverage-a{n}`, MaxRSS read off the `.0` sub-step and
+not the parent. See the memory-split note at `_DUCKDB_CAP_GB`.
 """
 
 from __future__ import annotations
@@ -97,6 +103,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ._assembly import NOLCG_FILE
 
 # YAML step name this module implements.
 YAML_STEP_NAME = "assembly_coverage"
@@ -105,9 +112,6 @@ YAML_STEP_NAME = "assembly_coverage"
 # (`tmp=${reads##*/}; sample=${tmp%.*}`), so the name that matters is the one
 # binning.sh copies this to inside work_files/ — not this one.
 _BAM_NAME = "coverage.bam"
-
-# The assemble step's non-circular contigs; the thing being binned.
-_NOLCG_NAME = "noLCG.fa"
 
 # PacBio HiFi. `map-hifi` is accepted by align_minimap2 (probed; an unknown preset
 # raises `Unknown minimap2 preset`, so acceptance is not a silent no-op). This is
@@ -133,10 +137,30 @@ _MM2_PRESET = "map-hifi"
 # and sent every escalated GB to the side that can already spill — an SEQUENCE_DATA
 # OOM could never be escalated out of.
 #
-# CEILING, NOT YET SETTLED: for a read set whose sequence bytes * ~1.6 exceed the
-# cgroup remainder, no escalation helps (the lookup is unspillable). Whether one
-# sample's masked HiFi read set fits `baseline_resources` is a sizing question for
-# a real sample — see the module TODO.
+# CEILING: for a read set whose sequence bytes * ~1.6 exceed the cgroup remainder,
+# no escalation helps (the lookup is unspillable). The remainder is the attempt's
+# allocation less DuckDB's cap below — the baseline on a first attempt, more once
+# escalation has raised it. Where that ceiling falls in reads is still not measured.
+# The peak RSS a real cohort reached, and the allocation sized from it, are recorded
+# on this step in the workflow YAML that declares it.
+# Equal to this step's `baseline_resources.cpu`, and it must stay equal — but the
+# binding reason is MEMORY, not cores. `align_minimap2` draws its parallelism from
+# DuckDB's thread pool (measured near-linear at 1/2/4/8), so this number is also the
+# aligner's concurrency, and therefore a multiplier on the per-thread state it holds
+# in the cgroup remainder — the side that cannot spill.
+#
+# That remainder is already the constraint, measured on the deploy host (`sacct`,
+# 2026-01-01 onward, threads=8): across 49 completions at the then-64 GiB baseline,
+# peak RSS sat at ~56 GiB — 87% of the allocation — at the median, with 35 of the 49
+# above 80%, and ten further attempts pegged at the allocation and died
+# `OUT_OF_MEMORY`. So raising this number buys wall time the step does not need
+# (p50 10.4 min against a PT4H limit) against memory that is already the binding
+# side.
+#
+# `_DUCKDB_CAP_GB` is NOT what bounds this step: DuckDB sits at 16 GB and spills. The
+# ~56 GiB above is the extension side — the SEQUENCE_DATA lookup above plus the minimap2
+# index. `test_assembly_coverage_cpu_pins_duckdb_threads` keeps the YAML's `cpu:` on
+# this number so the two cannot drift.
 _DUCKDB_THREADS = 8
 # DuckDB's cap under SLURM — modest on purpose: it spills beyond this, and the
 # memory that matters is the extension's. Off SLURM (local/dev), the resolver
@@ -170,7 +194,7 @@ class Inputs(BaseModel):
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    nolcg = inputs.genomes_dir / _NOLCG_NAME
+    nolcg = inputs.genomes_dir / NOLCG_FILE
     if not inputs.genomes_dir.is_dir():
         raise FileNotFoundError(f"genomes_dir not found: {inputs.genomes_dir}")
     if not inputs.masked_reads_fastq.exists():
@@ -203,14 +227,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 ),
                 threads=_DUCKDB_THREADS,
             )
-            # NOTE: no `preserve_insertion_order=true` override. This job used to
-            # set one, to protect an ORDER BY on the COPY that was believed to make
-            # the BAM coordinate sorted. That belief was wrong (see the docstring),
-            # the ORDER BY is gone with it, and nothing downstream reads this file
-            # in record order — `binning.sh` sorts it. So the helper's `false`
-            # stands, and the writer's record order is whatever the engine
-            # produces. If a consumer ever needs a defined order here, sort at the
-            # consumer, not by re-pinning a global setting.
+            # NOTE: no `preserve_insertion_order=true` override, though the COPY
+            # below carries an ORDER BY the consumers depend on. This job once set
+            # that override to protect an ORDER BY, so the setting was measured
+            # against it at production scale, with the sort spilling: the two
+            # settings give the same tid-monotonic file. Numbers and conditions are
+            # in docs/duckdb-miint.md's `FORMAT BAM` writer section.
+            # `test_written_bam_is_tid_monotonic` runs this whole function, so the
+            # ORDER BY cannot stop reaching the writer without a test failing.
 
             # Persistent relations, not TEMP/CTE: miint's table functions resolve
             # relation names on a SEPARATE connection, which sees neither.
@@ -288,14 +312,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # see the module docstring. Without it SEQ is written as `*`, and
             # jgi silently reports a length-dependent under-estimate of depth.
             #
-            # No ORDER BY on the copied relation either, and this one had a price:
-            # it sorted a read-set-sized relation, which the memory split above
-            # says outright can spill to temp_directory. It bought a name order
-            # that is not the tid order, so it was never the coordinate sort it
-            # looked like, and its only consumer (`binning.sh`) re-sorts with
-            # samtools regardless.
+            # The ORDER BY is the coordinate sort: @SQ is name sorted, so this is
+            # (tid, position) order (see the docstring), and `binning.sh` stages
+            # the result without re-sorting it.
+            #
+            # It sorts one row per alignment. SEQ and QUAL are not in this relation
+            # (the writer fetches them per record from SEQUENCE_DATA), so the sort
+            # width is the identifier/CIGAR/tag columns rather than the read bytes;
+            # the row count scales with the read set. DuckDB spills it to
+            # temp_directory — the side of the memory split above that can spill.
             conn.execute(
-                f"COPY (SELECT * FROM {_ALIGNMENT}) "
+                f"COPY (SELECT * FROM {_ALIGNMENT} ORDER BY reference, position) "
                 f"TO '{bam_sql}' (FORMAT BAM, REFERENCE_LENGTHS '{_REFLEN}', "
                 f"SEQUENCE_DATA '{_SEQDATA}')"
             )

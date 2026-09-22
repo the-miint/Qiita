@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 import asyncpg
 from qiita_common.actions import ALIGN_ACTION_ID as _ALIGN_ACTION_ID
+from qiita_common.models import MaskDefinitionStatus
 
 from .actions.reference import ReferenceNotFound
 from .block_planner import (
@@ -77,6 +78,14 @@ class AlignMaskNotFound(RuntimeError):
     under (a client-supplied identifier), so a nonexistent one is a 404 — distinct
     from a valid mask under which no pool sample is masked-complete
     (`AlignNoMasksFound`, 422)."""
+
+
+class AlignMaskDeprecated(RuntimeError):
+    """The requested `mask_idx` exists but its config has been deprecated.
+
+    Distinct from `AlignMaskNotFound`: the mask is real and its existing results
+    stay readable — what is refused is building NEW ones on it. A 409, since the
+    request is well-formed and would have succeeded before the deprecation."""
 
 
 class AlignReferenceNotReady(RuntimeError):
@@ -279,6 +288,7 @@ async def plan_and_submit_alignments(
     plan any already-gated sample raises `AlignResubmitError` (409).
 
     Raises `AlignMaskNotFound` (404) if `mask_idx` does not exist,
+    `AlignMaskDeprecated` (409) if its config has been deprecated,
     `AlignNoMasksFound` (422) if no pool sample is masked under it,
     `AlignReferenceNotFound` (404) / `AlignReferenceNotReady` (409) if the reference
     can't be aligned against; asyncpg errors on a genuine DB fault (fail loud).
@@ -304,11 +314,19 @@ async def plan_and_submit_alignments(
     # The caller names the mask to align under; it must exist. A pool with no sample
     # masked under an EXISTING mask is AlignNoMasksFound (422, below); a nonexistent
     # mask_idx is a client error (404).
-    if (
-        await pool.fetchval("SELECT 1 FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-        is None
-    ):
+    mask_status = await pool.fetchval(
+        "SELECT status FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
+    )
+    if mask_status is None:
         raise AlignMaskNotFound(f"no mask_definition with mask_idx={mask_idx}")
+    # A deprecated config is void. Aligning against it would build new results on a
+    # filter we no longer stand behind — the same reason the mint refuses it, one
+    # step further downstream. Individual withdrawn RUNS need no check here: the
+    # cohort below admits only gate state 'completed', which 'invalidated' is not.
+    if mask_status == MaskDefinitionStatus.DEPRECATED.value:
+        raise AlignMaskDeprecated(
+            f"mask_definition {mask_idx} is deprecated and cannot be aligned against"
+        )
 
     # Assert ACTIVE + sharded (fail-fast; the route maps the typed errors to 4xx).
     # We don't need the resolved paths here — the runner resolves them per block at
@@ -350,7 +368,9 @@ async def plan_and_submit_alignments(
     # what gate state? Alignment does NOT re-derive the mask config — the caller
     # names the mask its reads were produced under (per-sample or block, any host /
     # adapter / lima / syndna config), and we select the samples whose mask_sample
-    # gate is 'completed' (gate contract: see `fetch_mask_sample_state` — a sample
+    # gate is 'completed' (gate contract: see `fetch_mask_sample_state` — which
+    # covers 'invalidated' too: a withdrawn run is not 'completed', so it drops out
+    # of the cohort here with no extra predicate — a sample
     # with NO gate row under this mask was never masked under it).
     gate_rows = await pool.fetch(
         "SELECT prep_sample_idx, state FROM qiita.mask_sample"

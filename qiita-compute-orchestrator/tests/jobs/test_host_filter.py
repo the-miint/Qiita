@@ -102,36 +102,27 @@ def _inputs(host_filter, **kw):
 
 
 @pytest.mark.parametrize(
-    ("mates", "rype_cols"),
+    "mates",
     [
-        ([None, None], ["read_id", "sequence1"]),
-        (["ACGTACGTAC", "ACGTACGTAC"], ["read_id", "sequence1", "sequence2"]),
-        ([None, "ACGTACGTAC"], ["read_id", "sequence1", "sequence2"]),
+        [None, None],
+        ["ACGTACGTAC", "ACGTACGTAC"],
+        [None, "ACGTACGTAC"],
     ],
-    ids=["single-end", "paired-end", "mixed-keeps-the-mate-column"],
+    ids=["single-end", "paired-end", "mixed"],
 )
-def test_host_filter_rype_query_drops_an_all_null_mate(
-    tmp_path, monkeypatch, write_reads, mates, rype_cols
-):
-    """rype is handed `sequence1` ALONE when NO read in the block carries a mate; minimap2
-    keeps both mates in every case.
+def test_host_filter_hands_both_tools_both_mates(tmp_path, monkeypatch, write_reads, mates):
+    """Both tools read the full `_QUERY`, mate column included.
 
-    A batch-SIZING property with no effect on the mask, so only the COLUMN LIST can pin it.
-    miint reads rype's `is_paired` off the presence of a `sequence2` column and never off
-    its values (duckdb-miint#199), and rype then assumes a query twice as long and halves
-    its Arrow batch — and it reloads the whole index per batch, so an all-NULL mate column
-    doubles the host-index reloads.
+    The parametrize is the assertion: the same column list for every read shape is what
+    says the projection handed to rype is UNCONDITIONAL. A shape-dependent one is what
+    this job used to build, and re-introducing it would pass a single-shape test.
 
-    Narrowing minimap2's query instead would be a correctness bug (it aligns pairs
-    natively), hence the second assertion.
+    Neither relation's column list is visible in the mask, so nothing else can pin it.
+    Narrowing minimap2's would be a correctness bug — it aligns pairs natively.
 
-    The MIXED arm is the one that pins the deliberate divergence from `align_sharded`:
-    this job gates on `paired > 0`, not all-or-none, so one mate-carrying read keeps the
-    column for the whole batch (conservative sizing rather than dropped mates). Nothing
-    else in the suite constrains that — `test_host_filter_marks_rype_union_minimap2` has a
-    mixed fixture but asserts read ids, reasons, threshold and preset, never a column
-    list, so it passes either way and the `> 0` could be flipped to all-or-none with the
-    suite green."""
+    The `mixed` arm is not a shape production emits: a block is planned per
+    `sequencing_run_idx` (`block_planner.py`) and a run carries one platform. It is here
+    because the job has no mixed-batch rejection of its own, unlike `align_sharded`."""
     from qiita_compute_orchestrator.jobs import host_filter
 
     reads = write_reads(
@@ -173,7 +164,7 @@ def test_host_filter_rype_query_drops_an_all_null_mate(
         )
     )
 
-    assert seen["rype_cols"] == rype_cols
+    assert seen["rype_cols"] == ["read_id", "sequence1", "sequence2"]
     assert seen["mm2_cols"] == ["read_id", "sequence1", "sequence2"]
 
 

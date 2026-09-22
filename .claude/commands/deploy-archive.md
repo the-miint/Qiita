@@ -14,7 +14,7 @@ The archive lives in its own directory precisely so `DEPLOY_CHECKLIST.md` stays 
 
 ## 2. Move the block
 
-1. **Write a new archive file** `docs/deploy-archive/<YYYY-MM-DD>-<short SHA>.md`, holding the entire current `## Pending deploy` body (every bucket + Notes). Copy the shape of the newest existing file in that directory: an H1 stamp, then each bucket demoted one level (`### 1. Env vars` in the checklist becomes `## 1. Env vars` in the archive).
+1. **Write a new archive file** `docs/deploy-archive/<YYYY-MM-DD>-<short SHA>.md`, holding the entire current `## Pending deploy` body (every bucket + Notes). Copy the shape of the newest existing file in that directory: an H1 stamp, then each bucket demoted one level (`### 1. Env vars` in the checklist becomes `## 1. Env vars` in the archive). **Rewrite every relative link as you move it:** the checklist sits at the repo root, so `](docs/runbooks/redeploy.md)` is right there and resolves to `docs/deploy-archive/docs/runbooks/…` once archived — it becomes `](../runbooks/redeploy.md)`, and a link to a sibling archive becomes the bare filename. A line pointing at the archive that will hold it — `([archived](…))` — is a self-reference once moved; drop it. `qiita-common/tests/test_doc_link.py` fails the build on both.
    ```
    # Deployed YYYY-MM-DD — <short SHA>
 

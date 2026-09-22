@@ -298,12 +298,29 @@ def _use_fixture_pool(postgres_pool, monkeypatch):
     monkeypatch.setattr(admin.asyncpg, "create_pool", _fake_create_pool)
 
 
+@pytest.fixture
+def clean_coverage_gate(monkeypatch):
+    """Pin the mask-idx coverage gate to 0 for tests about the purge mechanics.
+
+    The gate counts NULL `mask_idx` across the whole DB for three action_ids, so it
+    reads whatever other test modules have in flight — under `-n auto` that is a
+    different answer per run. Tests that assert on the gate itself
+    (`test_s2_gate_refuses_execute_on_non_failed_null_mask_idx`, and the coverage
+    test at the end of this file, which calls the real function directly) do not use
+    this."""
+
+    async def _clean(pool, *, action_ids):
+        return 0
+
+    monkeypatch.setattr(admin, "_count_non_failed_missing_mask_idx", _clean)
+
+
 # ---------------------------------------------------------------------------
 # (c) dry-run mutates nothing
 # ---------------------------------------------------------------------------
 
 
-async def test_dry_run_mutates_nothing(seeded, monkeypatch):
+async def test_dry_run_mutates_nothing(seeded, monkeypatch, clean_coverage_gate):
     pool = seeded["pool"]
     aid, ver = seeded["action_id"], seeded["version"]
     base = dict(
@@ -365,7 +382,7 @@ async def test_dry_run_mutates_nothing(seeded, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_execute_deletes_mask_and_resubmits(seeded, monkeypatch):
+async def test_execute_deletes_mask_and_resubmits(seeded, monkeypatch, clean_coverage_gate):
     pool = seeded["pool"]
     aid, ver = seeded["action_id"], seeded["version"]
     base = dict(
@@ -447,7 +464,9 @@ async def test_execute_deletes_mask_and_resubmits(seeded, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_resubmit_failure_after_mask_delete_is_recoverable(seeded, monkeypatch):
+async def test_resubmit_failure_after_mask_delete_is_recoverable(
+    seeded, monkeypatch, clean_coverage_gate
+):
     pool = seeded["pool"]
     aid, ver = seeded["action_id"], seeded["version"]
     base = dict(
@@ -672,7 +691,9 @@ async def test_s2_gate_refuses_execute_on_non_failed_null_mask_idx(seeded, monke
 # ---------------------------------------------------------------------------
 
 
-async def test_shared_mask_dedup_deletes_once_resubmits_both(seeded, monkeypatch):
+async def test_shared_mask_dedup_deletes_once_resubmits_both(
+    seeded, monkeypatch, clean_coverage_gate
+):
     pool = seeded["pool"]
     aid, ver = seeded["action_id"], seeded["version"]
     base = dict(
@@ -744,3 +765,143 @@ async def test_shared_mask_dedup_deletes_once_resubmits_both(seeded, monkeypatch
     assert len(report["purged"]) == 1
     assert report["purged"][0]["mask_idx"] == mask
     assert report["failures"] == []
+
+
+# ---------------------------------------------------------------------------
+# (i) a CONSUMING ticket's mask: long-read-assembly reads a mask it never minted
+# ---------------------------------------------------------------------------
+
+
+async def test_shared_mask_guard_sees_an_assembly_ticket(seeded, monkeypatch, clean_coverage_gate):
+    """A completed long-read-assembly ticket makes its mask undeletable.
+
+    The assembly CONSUMES the mask's pass-set rather than minting it, but the guard
+    keys on `work_ticket.mask_idx` and does not distinguish the two — so once the
+    runner persists the consumed mask, an assembly protects it exactly as a
+    read-mask ticket does. Blind to it, purge-failed deletes a mask completed
+    assemblies read, dropping its read_mask rows.
+    """
+    pool = seeded["pool"]
+    mask = await _seed_mask(pool, seeded["principal_idx"])
+    seeded["masks"].append(mask)
+    assembly_version = f"assembly-{secrets.token_hex(4)}"
+    await _seed_action(pool, "long-read-assembly", assembly_version)
+    try:
+        failed = await _seed_ticket(
+            pool,
+            action_id=seeded["action_id"],
+            version=seeded["version"],
+            principal_idx=seeded["principal_idx"],
+            prep_sample_idx=seeded["prep_sample_idx"],
+            state="failed",
+            mask_idx=mask,
+            failure_reason="read_mask parquet not found",
+        )
+        assembly = await _seed_ticket(
+            pool,
+            action_id="long-read-assembly",
+            version=assembly_version,
+            principal_idx=seeded["principal_idx"],
+            prep_sample_idx=seeded["prep_sample_idx"],
+            state="completed",
+            mask_idx=mask,
+            action_context={"mask_idx": mask},
+        )
+        seeded["tickets"] += [failed, assembly]
+
+        # The guard itself sees it — it queries work_ticket unscoped by action.
+        assert assembly in await admin._mask_shared_with_non_failed(pool, mask)
+
+        # ...and the command acts on that: the mask lands in skipped_shared, and
+        # --execute deletes nothing.
+        def _boom(*a, **k):
+            raise AssertionError("must not touch a mask a completed assembly reads")
+
+        monkeypatch.setattr(admin, "_mask_delete_via_route", _boom)
+        monkeypatch.setattr(admin, "_resubmit_work_ticket", _boom)
+        report = await admin._purge_failed(
+            "unused",
+            "http://localhost:8080",
+            "tok",
+            action_ids=("read-mask",),
+            execute=True,
+            with_tickets=True,
+            limit=None,
+            rate_seconds=0.0,
+            wait=False,
+        )
+        assert mask in {s["mask_idx"] for s in report["skipped_shared"]}
+        assert not report["eligible"]
+        assert (
+            await pool.fetchval("SELECT 1 FROM qiita.mask_definition WHERE mask_idx = $1", mask)
+            == 1
+        )
+    finally:
+        await pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+            "long-read-assembly",
+            assembly_version,
+        )
+        await pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
+            "long-read-assembly",
+            assembly_version,
+        )
+
+
+async def test_coverage_gate_counts_assembly_tickets_without_widening_candidates(seeded):
+    # Imported from the defining module so the `clean_coverage_gate` stub other
+    # tests install on `admin` cannot reach it.
+    from qiita_control_plane.cli.admin.mask import _count_non_failed_missing_mask_idx
+
+    """A non-failed assembly ticket with a NULL mask_idx is a blind spot in the
+    guard, so the coverage gate must count it — while the purge CANDIDATE set stays
+    where it was. The two lists answer different questions: which masks may this run
+    delete, versus where could a missing mask_idx make the guard lie.
+    """
+    pool = seeded["pool"]
+    assembly_version = f"assembly-{secrets.token_hex(4)}"
+    await _seed_action(pool, "long-read-assembly", assembly_version)
+    try:
+        before_coverage = await _count_non_failed_missing_mask_idx(
+            pool, action_ids=admin._MASK_IDX_COVERAGE_ACTION_IDS
+        )
+        before_candidates = await _count_non_failed_missing_mask_idx(
+            pool, action_ids=admin._PURGE_FAILED_ACTION_IDS
+        )
+
+        assembly = await _seed_ticket(
+            pool,
+            action_id="long-read-assembly",
+            version=assembly_version,
+            principal_idx=seeded["principal_idx"],
+            prep_sample_idx=seeded["prep_sample_idx"],
+            state="completed",
+            mask_idx=None,
+            action_context={"mask_idx": 1},
+        )
+        seeded["tickets"].append(assembly)
+
+        assert (
+            await _count_non_failed_missing_mask_idx(
+                pool, action_ids=admin._MASK_IDX_COVERAGE_ACTION_IDS
+            )
+            == before_coverage + 1
+        )
+        assert (
+            await _count_non_failed_missing_mask_idx(
+                pool, action_ids=admin._PURGE_FAILED_ACTION_IDS
+            )
+            == before_candidates
+        )
+    finally:
+        await pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+            "long-read-assembly",
+            assembly_version,
+        )
+        await pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
+            "long-read-assembly",
+            assembly_version,
+        )

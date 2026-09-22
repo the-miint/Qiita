@@ -198,8 +198,15 @@ async def test_delete_alignment_detaches_work_ticket(client, postgres_pool):
 
 
 async def test_delete_alignment_not_found(client):
+    """The 404 body is the SHARED wording, not a second spelling of it. This route had
+    its own constant saying `Alignment definition not found` while the three cohort
+    routes said `alignment not found`, and nothing asserted either — so one condition
+    answered two ways and a client could come to depend on the difference."""
+    from qiita_control_plane.routes._helpers import ALIGNMENT_NOT_FOUND_DETAIL
+
     resp = await client.delete(URL_ALIGNMENT_DEFINITION_BY_IDX.format(alignment_idx=99_999_999))
     assert resp.status_code == 404
+    assert resp.json()["detail"] == ALIGNMENT_NOT_FOUND_DETAIL
 
 
 async def test_delete_alignment_requires_delete_scope(postgres_pool, wet_lab_admin_session):

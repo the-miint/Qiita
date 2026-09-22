@@ -9,6 +9,7 @@ import sys
 import time
 
 import asyncpg
+from qiita_common.actions import ALIGN_DENOVO_ACTION_ID, LONG_READ_ASSEMBLY_ACTION_ID
 from qiita_common.api_paths import (
     PATH_MASK_DEFINITION_PREFIX,
     PATH_WORK_TICKET_PREFIX,
@@ -24,10 +25,33 @@ from .. import _common
 
 # The two affected workflows. The move-then-read ordering bug lived in both
 # read-mask/1.0.0 and fastq-to-parquet/1.3.0 (same register→persist shape), so
-# the recovery covers both. The selector keys on failure_reason, not workflow,
-# but we still scope the candidate set to these action_ids so an unrelated
-# action that happens to log the same string is never swept up.
+# the recovery covers both. The selector keys on failure_reason, not workflow, but
+# we still scope the candidate set to these action_ids so an unrelated action that
+# happens to log the same string is never swept up.
+#
+# Equal to PER_SAMPLE_MASK_ACTION_IDS today, and deliberately not that constant:
+# this set is the incident's blast radius, which does not grow when a third
+# per-sample masking action is added. Widening a destructive purge-and-resubmit
+# sweep is a decision to make, not to inherit.
 _PURGE_FAILED_ACTION_IDS = ("read-mask", "fastq-to-parquet")
+
+# The actions whose mask_idx coverage `_count_non_failed_missing_mask_idx` checks.
+# Wider than the candidate set above, and independent of the operator's --action
+# selection, because the two answer different questions: that one is "whose masks
+# may this run delete", this one is "where could a mask_idx be missing such that
+# the guard lies". `_mask_shared_with_non_failed` queries work_ticket unscoped by
+# action, so a blind spot in ANY mask-carrying action makes it unsound, not only
+# among the tickets a given run happens to be purging.
+#
+# long-read-assembly and align-denovo both consume a mask's pass-set rather than
+# minting one; the runner persists that mask_idx from action_context before its first
+# step, so a PENDING or QUEUED ticket of either carries NULL and is invisible to the
+# guard until it runs. Not exhaustive over every action that touches a mask — adding
+# one is a decision about which pre-existing NULLs may block --execute.
+_MASK_IDX_COVERAGE_ACTION_IDS = _PURGE_FAILED_ACTION_IDS + (
+    LONG_READ_ASSEMBLY_ACTION_ID,
+    ALIGN_DENOVO_ACTION_ID,
+)
 
 # The failure_reason substring the move-then-read bug leaves behind: host_filter
 # and register-files both succeeded (the mask IS registered in DuckLake), only
@@ -90,7 +114,11 @@ async def _count_non_failed_missing_mask_idx(
     COMPLETED result depends on, silently dropping its read_mask rows. While ANY
     such ticket exists, the guard is unsound, so --execute must refuse. (Tickets
     in a *failed* state with NULL mask_idx are fine here: they are not the ones
-    the guard protects — they land in skipped_no_mask_idx.)"""
+    the guard protects — they land in skipped_no_mask_idx.)
+
+    Callers pass `_MASK_IDX_COVERAGE_ACTION_IDS`, not the run's candidate actions:
+    the guard reads every ticket carrying the mask, so coverage is a question about
+    all mask-carrying actions rather than about the ones being purged."""
     return await pool.fetchval(
         "SELECT COUNT(*) FROM qiita.work_ticket"
         " WHERE action_id = ANY($1::text[])"

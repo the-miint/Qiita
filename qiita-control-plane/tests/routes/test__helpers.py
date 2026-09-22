@@ -12,15 +12,10 @@ even though only one branch touches the DB. Also covers
 parse_kv_detail and detail_for_biosample_link_rejection — pure string
 helpers that turn a trigger's structured error DETAIL into an
 unambiguous 422 message.
-
-No route integration tests live here: both metadata-write callers
-(the biosample import route and the sequenced-sample create route)
-always create a fresh entity per call, so neither slot constraint
-fires through them today. The typed except clauses are mechanical
-plumbing; the wording dispatch is the load-bearing surface and is
-fully covered below.
 """
 
+import ast
+import inspect
 import secrets
 from datetime import date
 from decimal import Decimal
@@ -41,10 +36,12 @@ from qiita_control_plane.repositories._sample_helpers import (
     TransientWriteRaceError,
 )
 from qiita_control_plane.routes._helpers import (
+    SAMPLE_METADATA_WRITE_ERRORS,
     detail_for_biosample_link_rejection,
     detail_for_slot_collision,
     parse_kv_detail,
     raise_for_transient_write_race,
+    raise_http_for_sample_metadata_write_error,
 )
 from qiita_control_plane.testing.db_seeds import fetch_seeded_metagenome_term
 
@@ -608,3 +605,48 @@ async def test_detail_for_slot_occupied_by_typed_value_terminology(postgres_pool
     assert f"({term_row['label']!r})" in detail
     assert "typed row must be deleted" in detail
     assert f"({term_row['idx']})" not in detail
+
+
+def _isinstance_target_names(func) -> set[str]:
+    """Return the names every `isinstance(exc, ...)` call in func tests against.
+
+    Parses func's own source, so the set reflects the dispatch as written
+    rather than a second hand-maintained list. Handles both the single-name
+    and tuple-of-names argument forms.
+    """
+    tree = ast.parse(inspect.getsource(func))
+    target_names: set[str] = set()
+    for node in ast.walk(tree):
+        # Only isinstance() calls with both arguments present carry a target.
+        is_isinstance_call = (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "isinstance"
+            and len(node.args) == 2
+        )
+        if not is_isinstance_call:
+            continue
+
+        # isinstance(x, A) and isinstance(x, (A, B)) are both permitted forms.
+        target = node.args[1]
+        if isinstance(target, ast.Name):
+            target_names.add(target.id)
+        elif isinstance(target, ast.Tuple):
+            target_names.update(
+                element.id for element in target.elts if isinstance(element, ast.Name)
+            )
+    return target_names
+
+
+def test_raise_http_for_sample_metadata_write_error_covers_every_caught_error():
+    """Tests the case where SAMPLE_METADATA_WRITE_ERRORS and the dispatch's
+    isinstance branches disagree.
+
+    Callers catch the tuple and hand what they caught to the dispatch, so a
+    member with no branch falls through to the bare re-raise and surfaces as a
+    500 instead of the status that error means. Comparison is by class name,
+    which is what the dispatch's source can report.
+    """
+    dispatched_names = _isinstance_target_names(raise_http_for_sample_metadata_write_error)
+    caught_names = {exc.__name__ for exc in SAMPLE_METADATA_WRITE_ERRORS}
+    assert dispatched_names == caught_names

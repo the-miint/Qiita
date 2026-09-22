@@ -7,7 +7,7 @@ the `container:` form. This is the guide to adding one.
 
 If your step needs bioinformatics tooling or system packages that don't already
 ship in `qiita-compute-orchestrator`'s `pyproject.toml`, it belongs in a
-**container**, not a native job — see [`architecture.md`](architecture.md) and
+**container**, not a native job — see [`architecture/processing.md`](architecture/processing.md) and
 the "Workflow runtimes" section of [`../CLAUDE.md`](../CLAUDE.md). Native jobs
 may only import dependencies already in the orchestrator's environment.
 
@@ -103,9 +103,12 @@ Three kinds of field arrive in `Inputs`:
 - Return a `name -> Path` map whose keys **exactly match** the YAML step's
   `outputs:` names (a mismatch is a workflow-authoring error surfaced as a
   `KeyError`).
-- Result Parquet written for DuckLake registration must be mode `0o440` and
-  carry the identifier columns in the canonical sort order (see
-  [`architecture.md`](architecture.md) — the data-plane result-file contract).
+- Result Parquet written for DuckLake registration must be mode `0o440`. The
+  SLURM backend gates the manifest, each file's declared size, and that mode —
+  and nothing else; `LocalBackend` gates none of them. Sorting by the identifier
+  columns the destination table has helps DuckLake prune, but is not verified
+  (see [`architecture/cross-cutting.md`](architecture/cross-cutting.md) — result
+  file requirements).
 
 ### Error classification
 
