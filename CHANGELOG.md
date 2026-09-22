@@ -1873,7 +1873,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `genome_coverage` like the reference arm: a contig two cohort prep_samples assembled
   gives both prep_samples' covered bases to each one's genome, so a combined table built
   with pooled scope and a threshold above 0 can keep de novo genomes it used to drop.
-  Each de novo placement still counts only toward its own prep_sample's genome.
+  Each de novo placement still counts only toward its own prep_sample's genome. The
+  pooled merge does not reconcile orientation: when a later assembly run stores a shared
+  contig as its reverse complement, prep_samples aligned before it keep positions on the
+  other axis, and that contig's pooled breadth can come out too high or too low
+  (`survivor_table_sql` in `qiita_common.analytic.coverage`).
   `estimate_feature_table` always uses pooled, and `qiita feature-table build` defaults
   to it. Per-sample coverage calls `genome_coverage_per_sample` on both arms in place of
   Qiita's own copy of the arithmetic, with the same results. `qiita feature-table build

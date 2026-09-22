@@ -187,7 +187,14 @@ def survivor_table_sql(scope: CoverageScope, *, combined: bool = False) -> str:
       prep_samples' reads a de novo genome gains are those on contigs they also
       assembled. That includes a read whose own prep_sample has no genome for the
       contig in the gated map: precedence leaves it on the reference arm for counting,
-      and its interval still adds to the de novo breadth here;
+      and its interval still adds to the de novo breadth here. The intervals merged
+      are positions on whichever copy of the contig the lake held when each
+      prep_sample's `align_denovo` ran. A contig and its reverse complement share one
+      `feature_idx`, and a later assembly run's copy replaces the stored one
+      (`flight_service::REPLACE_KEY_TABLES` in the data plane). A prep_sample aligned
+      before a run that stored the reverse complement keeps positions on the opposite
+      axis, and nothing re-aligns it, so pooled breadth on that contig can count one
+      stretch twice or merge two distinct stretches into one;
     * per-sample, it adds `(prep_sample, genome)` pairs for the other prep_sample's
       genome, and those never reach the table: `denovo_ogu_input_select_sql` maps each
       read through the prep_sample term, so no read of that prep_sample is on that
