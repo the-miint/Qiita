@@ -333,7 +333,7 @@ PYEOF
 # Capture the probe's stdout (the one-line error above on failure); drop stderr
 # noise. The previous `>/dev/null 2>&1` discarded the reason entirely, which is
 # why a broken deploy reported a bare `=fail` with nothing to act on.
-if MIINT_ERR="$("$PYTHON" "$MIINT_PROBE" 2>/dev/null)"; then
+if MIINT_ERR="$("$PYTHON" -P "$MIINT_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-read-fastx=ok"
 else
     echo "{_PROBE_LINE_PREFIX} miint-read-fastx=fail err=$MIINT_ERR"
@@ -356,13 +356,14 @@ try:
     conn = duckdb.connect(":memory:", config=miint_connect_config())
     conn.execute(miint_load_sql())
     rows = conn.execute("SELECT UNNEST(sequence_split('ACGTACGT', 4))").fetchall()
-    assert len(rows) == 2, rows
+    if len(rows) != 2:
+        raise RuntimeError("sequence_split contract drift: " + str(rows))
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
-if MIINT_ERR="$("$PYTHON" "$MIINT_SPLIT_PROBE" 2>/dev/null)"; then
+if MIINT_ERR="$("$PYTHON" -P "$MIINT_SPLIT_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-sequence-split=ok"
 else
     echo "{_PROBE_LINE_PREFIX} miint-sequence-split=fail err=$MIINT_ERR"
@@ -373,7 +374,7 @@ rm -f "$MIINT_SPLIT_PROBE"
 # and `align_minimap2` (the host_filter step) are the newest miint additions the
 # deploy depends on. Unlike read_fastx / sequence_split there was no probe for
 # them, so a v1.5.3 mirror build missing either was only caught at the first
-# host-reference build. Assert both are REGISTERED in the staged build's
+# host-reference build. Check both are REGISTERED in the staged build's
 # duckdb_functions() so a missing one fails here, at deploy. Existence-only:
 # invoking them needs a real index / alignment, but registration is exactly the
 # bucket-2 mirror prerequisite. No curly braces in the Python below — the whole
@@ -394,13 +395,14 @@ try:
     ).fetchall()
     have = [r[0] for r in rows]
     missing = [f for f in want if f not in have]
-    assert not missing, "missing miint host-filter functions: " + ", ".join(missing)
+    if missing:
+        raise RuntimeError("missing miint host-filter functions: " + ", ".join(missing))
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
-if MIINT_ERR="$("$PYTHON" "$MIINT_HOSTFILTER_PROBE" 2>/dev/null)"; then
+if MIINT_ERR="$("$PYTHON" -P "$MIINT_HOSTFILTER_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-host-filter-fns=ok"
 else
     echo "{_PROBE_LINE_PREFIX} miint-host-filter-fns=fail err=$MIINT_ERR"
@@ -412,7 +414,7 @@ rm -f "$MIINT_HOSTFILTER_PROBE"
 # two-row relations. It is also the newest miint dependency, and the failure mode
 # it guards is nasty: a stale extension_directory (a plain INSTALL never refreshes
 # a warm cache) yields a build with every OTHER function present, so the lima_mask
-# step fails at the first real submit with a bare catalog error. Assert the whole
+# step fails at the first real submit with a bare catalog error. Check the whole
 # contract here, at deploy: one row per ORIGINAL read, NULL/NULL for a read the
 # tool omitted.
 MIINT_INFERTRIM_PROBE="$(mktemp)"
@@ -432,13 +434,14 @@ try:
         "SELECT sequence_index, trimmed_5p, trimmed_3p FROM infer_trim(orig, qcd) "
         "ORDER BY sequence_index"
     ).fetchall()
-    assert rows == [(1, 3, 3), (2, None, None)], "infer_trim contract drift: " + str(rows)
+    if rows != [(1, 3, 3), (2, None, None)]:
+        raise RuntimeError("infer_trim contract drift: " + str(rows))
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
-if MIINT_ERR="$("$PYTHON" "$MIINT_INFERTRIM_PROBE" 2>/dev/null)"; then
+if MIINT_ERR="$("$PYTHON" -P "$MIINT_INFERTRIM_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-infer-trim=ok"
 else
     echo "{_PROBE_LINE_PREFIX} miint-infer-trim=fail err=$MIINT_ERR"
@@ -473,13 +476,14 @@ try:
         row = conn.execute(
             "SELECT success FROM save_bowtie2_index('bt2_subject', ?)", [out]
         ).fetchone()
-        assert row is not None and row[0], "save_bowtie2_index did not report success"
+        if row is None or not row[0]:
+            raise RuntimeError("save_bowtie2_index did not report success")
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
-if MIINT_ERR="$("$PYTHON" "$MIINT_BOUNDARY_PROBE" 2>/dev/null)"; then
+if MIINT_ERR="$("$PYTHON" -P "$MIINT_BOUNDARY_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-gpl-boundary=ok"
 else
     echo "{_PROBE_LINE_PREFIX} miint-gpl-boundary=fail err=$MIINT_ERR"

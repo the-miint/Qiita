@@ -36,6 +36,19 @@ def test_ena_study_header_full():
     assert header.tax_id == 408170
 
 
+def test_ena_study_header_blank_secondary_accession_is_none():
+    """read_ena reports a missing secondary accession as "" or whitespace,
+    not NULL -- this must normalize to None, not survive as a distinct
+    empty-string value (qiita.study.ena_study_accession is UNIQUE, and
+    Postgres admits only one '')."""
+    from qiita_common.models.ena import EnaStudyHeader
+
+    blank = EnaStudyHeader(study_accession="PRJEB11419", secondary_study_accession="")
+    whitespace = EnaStudyHeader(study_accession="PRJEB11419", secondary_study_accession="  ")
+    assert blank.secondary_study_accession is None
+    assert whitespace.secondary_study_accession is None
+
+
 def test_ena_study_header_rejects_empty_accession():
     from qiita_common.models.ena import EnaStudyHeader
 

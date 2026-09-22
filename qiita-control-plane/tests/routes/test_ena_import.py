@@ -20,6 +20,7 @@ from qiita_control_plane.ena_import import (
     DOWNLOAD_ENA_STUDY_ACTION_ID,
     DOWNLOAD_ENA_STUDY_ACTION_VERSION,
 )
+from qiita_control_plane.ena_import.batch import build_ena_import_study_semaphore
 from qiita_control_plane.testing.unique_names import unique_accession
 
 pytestmark = pytest.mark.db
@@ -120,6 +121,7 @@ async def eib_client(postgres_pool, stub_compute_backend_client):
     app.state.compute_backend_client = stub_compute_backend_client
     app.state.running_dispatches = set()
     app.state.running_ena_import_batches = set()
+    app.state.ena_import_study_semaphore = build_ena_import_study_semaphore()
 
     created_principals: list[int] = []
     created_batches: list[int] = []

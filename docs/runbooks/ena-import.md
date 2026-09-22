@@ -13,7 +13,11 @@ specific to importing from ENA.
 
 A single admin-facing call kicks off a **batch**: a list of INSDC study accessions
 (`PRJNA…`, `PRJEB…`, `PRJDB…`, `ERP…`, `SRP…`, `DRP…`). Each accession in the batch is
-processed independently, with bounded concurrency, in three phases:
+processed independently, with bounded concurrency, in three phases. That bound is shared
+by every batch running in the control plane at once, first come first served: a later
+batch's accessions are not admitted until every accession of every batch submitted before
+it has itself been admitted, so a busy batch can make a newly submitted one wait for it
+to clear the gate first.
 
 1. **Resolve** — the study's header, run list, and per-sample attributes are pulled
    from ENA (via the `duckdb-miint` `read_ena` / `read_ena_attributes` table
@@ -50,6 +54,15 @@ data. That case fails the accession with `not created by an ENA import`, before
 anything is written. Deleting a batch (which cascades its items) discards the record
 that the import created the study, so a later re-import of that accession is refused
 as well.
+
+A study matched by either the incoming `bioproject_accession` or `ena_study_accession`
+is reused, and is still subject to the import-created guard above. If the pair
+identifies two different studies, or contradicts the accession the one study it
+resolves to has on file, the accession fails instead of picking a winner. The stored
+failure text is the raw contradiction, e.g. `bioproject_accession='PRJNA1',
+ena_study_accession='ERP1': study 42 has bioproject_accession 'PRJNA2'` — it does not
+say the import was refused. Fix the accession passed to the import, or the study's
+recorded value, then re-import.
 
 A failure in any one accession — an unmappable platform, a resolver error, a database
 conflict — is recorded on that accession alone; it never aborts the batch or its

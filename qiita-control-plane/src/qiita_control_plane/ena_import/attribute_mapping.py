@@ -35,6 +35,14 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
+from qiita_common.models import (
+    BIOSAMPLE_DISPLAY_COLLECTION_DATE,
+    BIOSAMPLE_DISPLAY_DEPTH,
+    BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_COUNTRY_OR_SEA,
+    BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE,
+    BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE,
+)
+
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
@@ -67,7 +75,7 @@ def _map_geo_loc_name(value: str) -> dict[str, str]:
     region/locality are dropped rather than guessed at. A value with no `:` (or an INSDC
     missing marker) passes through whole."""
     country = value.split(":", 1)[0] if ":" in value else value
-    return {"geographic location (country and/or sea)": country.strip()}
+    return {BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_COUNTRY_OR_SEA: country.strip()}
 
 
 # MIxS `lat_lon`: "<lat> <N|S> <lon> <E|W>", e.g. "35.6895 N 139.6917 E". Deliberately
@@ -91,21 +99,24 @@ def _map_lat_lon(value: str) -> dict[str, str] | None:
     lat = match["lat"] if match["lat_dir"].upper() == "N" else f"-{match['lat']}"
     lon = match["lon"] if match["lon_dir"].upper() == "E" else f"-{match['lon']}"
     return {
-        "geographic location (latitude)": lat,
-        "geographic location (longitude)": lon,
+        BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE: lat,
+        BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE: lon,
     }
 
 
-# Curated normalized ENA/MIxS attribute tag -> handler. Every display_name a handler
-# returns names a global field a migration already seeded; this table doesn't create it.
+# Keys are the ENA/MIxS tags we recognize, so they stay literal: keying on the display-name
+# constants would let a Qiita rename change which ENA tags are recognized, and `geo loc
+# name` / `lat lon` match no display name anyway. Handlers emit the seeded display names.
 _ENA_ATTRIBUTE_TAG_HANDLERS: dict[str, _TagHandler] = {
-    "collection date": _passthrough("collection date"),
+    "collection date": _passthrough(BIOSAMPLE_DISPLAY_COLLECTION_DATE),
     "geographic location (country and/or sea)": _passthrough(
-        "geographic location (country and/or sea)"
+        BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_COUNTRY_OR_SEA
     ),
-    "geographic location (latitude)": _passthrough("geographic location (latitude)"),
-    "geographic location (longitude)": _passthrough("geographic location (longitude)"),
-    "depth": _passthrough("depth"),
+    "geographic location (latitude)": _passthrough(BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE),
+    "geographic location (longitude)": _passthrough(
+        BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE
+    ),
+    "depth": _passthrough(BIOSAMPLE_DISPLAY_DEPTH),
     "geo loc name": _map_geo_loc_name,
     "lat lon": _map_lat_lon,
 }

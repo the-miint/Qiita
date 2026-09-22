@@ -1883,6 +1883,42 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   missing function until the cached extension file is deleted and the next run
   re-installs it; its path is the `install_path` that `duckdb_extensions()` reports for
   `miint`.
+- **ENA import: a study findable only by its secondary accession (`ena_study_accession`) is now reused instead of failing with an opaque error, and a pair that resolves to a contradicting study now fails loud instead of reusing the wrong one (#590).**
+  `get_or_create_study_by_ena_accessions` looked up an existing study by
+  `bioproject_accession` only. A study recorded with an `ena_study_accession` but no
+  `bioproject_accession` was invisible to that lookup: re-importing it hit the
+  `ena_study_accession` unique constraint on create, then the same bioproject-only
+  refetch missed again and raised an opaque `PostgresError`. The find-or-create now
+  resolves an existing study by either accession, and raises a new
+  `EnaStudyAccessionConflictError` when the incoming pair identifies two different
+  studies, or contradicts the one study it does resolve to.
+  **Behavior change on already-deployed data:** a study whose two recorded accessions
+  contradict an incoming import's pair now fails that import item instead of silently
+  reusing the study.
+- **`ingest_ena_reads`'s md5-mismatch failure reason says how to tell a corrupted download from a digest ENA itself publishes wrong, instead of blaming "data corruption" (#591).**
+  The old wording named one cause among several and pointed at a re-queue a permanent
+  failure never reaches. The message now tells the operator to compare the run's
+  `fastq_md5` in the ENA Portal API against the value in the error: equal means ENA's own
+  file disagrees with its digest and a re-import fails identically, different means the
+  download was corrupted and a re-import retries it. The classification stays `BAD_INPUT`,
+  now as a stated choice rather than a claim about retries — miint raises the same error
+  for both causes ([duckdb-miint#274](https://github.com/the-miint/duckdb-miint/issues/274)),
+  and #595 tracks revisiting it.
+- **The `miint-sequence-split`, `miint-host-filter-fns`, `miint-infer-trim`, and `miint-gpl-boundary` compute-readiness probes now report contract drift under `python -O` / `PYTHONOPTIMIZE`, where they previously reported ok (#592).**
+  Each probe signaled the contract drift it exists to catch with a bare `assert`,
+  which `python -O` (or `PYTHONOPTIMIZE` set anywhere in the SLURM job env) strips —
+  the probe then exited 0 and printed nothing on exactly the drift it was checking
+  for. Each now raises `RuntimeError` from an explicit `if`, independent of the
+  interpreter's optimize level.
+- **ENA import: the batch concurrency bound is process-wide instead of per-batch, so several batches submitted together no longer starve the connection pool (#593).**
+  `_run_batch` built its own `asyncio.Semaphore(_STUDY_CONCURRENCY)` per call, so N
+  concurrently-scheduled batches could together claim up to N × `_STUDY_CONCURRENCY`
+  connections -- enough to take every connection the pool has, leaving unrelated
+  callers queued behind them. `schedule_ena_import_batch` now reads one semaphore off
+  `app.state`, shared first-come-first-served by every in-flight batch;
+  `_STUDY_CONCURRENCY` stays 4. The bound covers resolve, register, and ticket submit;
+  the fire-and-forget `schedule_dispatch` each submitted ticket starts still runs
+  outside it.
 - **Reference load: a genome map is checked against the reference FASTA before anything is minted, so a map whose read_ids match no FASTA sequence fails and a partial match logs what went unmatched (#577).**
   `_associate_genomes` INNER-JOINed the genome map onto the manifest's `read_id`, silently
   dropping every map row whose `read_id` isn't a FASTA sequence ID. `mint-features` now
@@ -3668,6 +3704,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **The ENA ingestion path names the `biosample_global_field` display names it writes as
+  constants instead of literals (#589).** `collection date`, the three geographic-location
+  fields, `depth`, and `host taxon id` are now `BIOSAMPLE_DISPLAY_*` in
+  `qiita_common.models.biosample`, re-exported from `qiita_common.models`.
+  `attribute_mapping.py` and `harmonization.py` emit them; the normalized-tag lookup keys
+  in `attribute_mapping.py` are unaffected. No behavior change.
 
 - **`align/1.0.0`'s memory ceiling is 128 GB, above the `align_sharded` step's
   unchanged 64 GB baseline (#560).** With the ceiling equal to the baseline, OOM

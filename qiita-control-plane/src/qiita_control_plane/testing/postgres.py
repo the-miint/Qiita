@@ -28,6 +28,11 @@ import pytest_asyncio
 # (QIITA_TEST_POSTGRES_URL) must include it too.
 POSTGRES_URL_DEFAULT = "postgresql://qiita:qiita@localhost:5433/qiita_test?sslmode=disable"
 
+# Deliberately far below db.PRODUCTION_POOL_MAX_SIZE: a test bug that saturates
+# the pool must surface as a fast, obvious connection-exhaustion failure, not a
+# slow accidental pass because the fixture happened to have production's headroom.
+POSTGRES_POOL_MAX_SIZE = 5
+
 
 def resolve_postgres_url() -> str:
     """Return the test database URL, honoring QIITA_TEST_POSTGRES_URL."""
@@ -175,6 +180,8 @@ def _run_db_migrations(postgres_url, migrations_dir):
 @pytest_asyncio.fixture(scope="session")
 async def postgres_pool(_run_db_migrations, postgres_url):
     """Session-scoped asyncpg pool connected to the test database."""
-    pool = await asyncpg.create_pool(postgres_url, min_size=1, max_size=5, timeout=5)
+    pool = await asyncpg.create_pool(
+        postgres_url, min_size=1, max_size=POSTGRES_POOL_MAX_SIZE, timeout=5
+    )
     yield pool
     await pool.close()
