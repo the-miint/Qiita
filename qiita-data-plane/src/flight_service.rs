@@ -2245,7 +2245,7 @@ const LAKE_COMMIT_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_
 /// RNG, which keeps the data plane's write path deterministic; two callers whose
 /// salts happen to be congruent modulo the current spread still collide, which
 /// costs an attempt and not correctness.
-fn lake_commit_backoff(attempt: u32, salt: i64) -> std::time::Duration {
+pub(crate) fn lake_commit_backoff(attempt: u32, salt: i64) -> std::time::Duration {
     let base = LAKE_COMMIT_BACKOFF_BASE
         .saturating_mul(1u32 << attempt.min(6))
         .min(LAKE_COMMIT_BACKOFF_CAP);

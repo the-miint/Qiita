@@ -15,17 +15,20 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-- **`DATA_PLANE_URL` for the control plane** — point it at the new loopback gRPC balancer so CP-side Flight traffic spreads across data-plane instances instead of pinning to instance #1. Not fail-fast (unset falls back to `grpc://localhost:50051`, so the unit still boots) — but leaving it unset means horizontal scaling has no effect on CP traffic. Compute nodes are unaffected: `compute-orchestrator.env` already points at `grpc+tls://<fqdn>:443`, which nginx balances. (#363)
-
-  ```bash
-  # [admin]
-  grep -q '^DATA_PLANE_URL=' /etc/qiita/control-plane.env \
-    || sudo bash -c 'echo "DATA_PLANE_URL=grpc://127.0.0.1:50050" >> /etc/qiita/control-plane.env'
-  ```
+_None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- `[admin]` If `getenforce` prints `Enforcing`, let nginx bind its new loopback listener
+  (#363) — every deploy now renders it, single instance included, and the stock Rocky 10
+  policy does not let nginx bind that port:
+
+  ```bash
+  # [admin]
+  sudo semanage port -a -t http_port_t -p tcp 50050
+  ```
+
+  `make preflight` reports it as `selinux/lb-port` (fails while Enforcing and unlabelled).
 
 ### 3. Migrations
 
@@ -33,36 +36,11 @@ _None yet._
 
 ### 4. Deploy
 
-- **Optional — scale the data plane out on this host.** The local instance set is one knob, `QIITA_DATA_PLANE_PORTS` (default `50051`), read by `deploy/activate.sh` to render the nginx upstream AND to enable/restart the matching `qiita-data-plane@NNNN` units. Previously the upstream was a checked-in literal that `activate.sh` overwrote on every deploy and the restart list was hardcoded to `@50051`, so a hand-added instance lost its upstream entry at the next deploy and never restarted onto new code. Pass it through `sudo -E` so it survives into the privileged half. Deploying without it is a no-op (single instance, as today). (#363)
-
-  ```bash
-  # [admin] — one instance per ~core you want to give the data plane
-  sudo -E env QIITA_DATA_PLANE_PORTS="50051 50052 50053" make redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
-  ```
-
-  The unit is a template whose instance specifier IS the listen port, so no new unit files are needed. `activate.sh` `systemctl enable`s each instance, so added ones also survive a reboot.
-
-  **Scaling back DOWN is not automatic.** `activate.sh` only enables/restarts the ports in the list; it never disables one you removed. Drop an instance by hand after redeploying with the shorter list, or it keeps running (out of the nginx upstream, but still bound and holding a DuckLake connection):
-
-  ```bash
-  # [admin]
-  sudo systemctl disable --now qiita-data-plane@50053
-  ```
-
-- **Optional — scale the data plane across HOSTS.** Extra processes on one box share its cores, memory, and NIC, so they stop helping once the box saturates; `QIITA_DATA_PLANE_PEERS` (space-separated `host:port`, empty by default) adds data planes running on *other* hosts to the same nginx upstream. Local instances and peers are separate knobs because only the local list drives systemd here — a peer is another host's deploy, and this one neither starts, restarts, nor upgrades it. **You must deploy the peer host yourself** (same checkout, its own `QIITA_DATA_PLANE_PORTS`, and an env pointing at the SAME Postgres/DuckLake catalog and the same `PATH_SCRATCH`/`PATH_PERSISTENT` — a data plane serving a different lake would return wrong data, not an error). (#363)
-
-  ```bash
-  # [admin] — three local instances plus two on a second host
-  sudo -E env QIITA_DATA_PLANE_PORTS="50051 50052 50053" \
-             QIITA_DATA_PLANE_PEERS="dp2.internal:50051 dp2.internal:50052" \
-             make redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
-  ```
-
-  ⚠️ **Peer traffic is plaintext gRPC.** The upstream is consumed by `grpc_pass grpc://` and the scheme is per-`grpc_pass`, not per-member, so a peer cannot use TLS while the loopback members stay plaintext. Only add a peer reachable over a network you control (private VLAN / VPC / WireGuard) — never across the public internet. Flight tickets stay Ed25519-signed, so a peer cannot be fed forged identifiers, but the payload on the wire is unencrypted.
-
-  A peer hostname that does not resolve aborts the deploy **before** any service restarts, rather than at the `nginx -t` that runs after them. (Skipped where `getent` is unavailable, e.g. a macOS dev box.)
-
-  **Removing a peer IS automatic**, unlike removing a local instance: drop it from `QIITA_DATA_PLANE_PEERS` and redeploy, and it leaves the upstream at the next render — there is no unit here to disable. Stopping the peer host's own instances is that host's deploy.
+- Nothing extra for a single instance (#363): with no `QIITA_DATA_PLANE_*` keys in
+  `/etc/qiita/data-plane.env`, the deploy runs the one instance `@50051` as before. To run
+  more instances or add data planes on other hosts, see
+  [`docs/runbooks/data-plane-scaling.md`](docs/runbooks/data-plane-scaling.md) before
+  deploying.
 
 ### 5. Verify
 
@@ -80,18 +58,20 @@ _None yet._
   deploy's predecessor carried by hand. Green proves egress only: the fetch itself runs through
   DuckDB httpfs, so a proxy or CA problem confined to httpfs still surfaces at the first import.
 
-- **Per-member data-plane health + the balancer.** `make verify-deploy` now health-checks every upstream member individually — local instances *and* remote peers — plus `localhost:50050` (nginx → the pool). Checking only `:50051` would have reported a healthy data plane while a scaled-out instance was down, with nginx still routing a share of every job's traffic into it. **You do not need to re-export anything:** the member list is read from the rendered `/etc/nginx/conf.d/qiita.conf`, i.e. what nginx is actually serving, so a forgotten export cannot produce a green run that checked nothing. (It falls back to the env lists only when no config is rendered yet, as on a first deploy.) (#363)
-
-  ```bash
-  # [admin] — no QIITA_DATA_PLANE_* needed; the member list comes from the rendered nginx config
-  sudo make verify-deploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
-  ```
-
-  Each peer gets its own `health/data-plane-peer@<host:port>` row; local instances stay `health/data-plane@<port>`. A peer that is down fails the check rather than hiding behind the local instances, since nginx routes a share of every job's traffic into it either way.
+- `verify-deploy`'s data-plane rows (#363): `health/data-plane` is now
+  `health/data-plane@<port>`, one row per instance; `health/data-plane-peer@<host:port>`
+  appears per peer; `health/data-plane-lb` checks nginx's loopback listener
+  `127.0.0.1:50050` (skipped when the TLS files are absent); `health/data-plane-upstream`
+  fails when verify cannot read the members from the rendered nginx config, and is skipped
+  when grpcurl is missing or `SKIP_HEALTH=1`. On an Enforcing host, a red
+  `health/data-plane-lb` can mean the bucket-2 port label is missing.
 
 ### 6. After the deploy verifies green
 
-_None yet._
+- Only on a host running more than one data-plane instance (#363): point the control plane
+  at nginx's loopback listener so its calls spread across them —
+  [`data-plane-scaling.md` § The control plane through nginx](docs/runbooks/data-plane-scaling.md#the-control-plane-through-nginx).
+  Undo it before any rollback to a commit without that listener.
 
 ### Notes (no host action)
 

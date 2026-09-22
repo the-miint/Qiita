@@ -1741,35 +1741,25 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   term `ENVO:00006776` (animal-associated habitat, seeded as obsolete since it
   is deprecated at source but appears in data we import), to the existing
   pre-release MVP terminologies.
-- **Data-plane horizontal scaling is now deploy-durable, and reaches past one host.** The
-  instance set is `QIITA_DATA_PLANE_PORTS` (default `50051`), read once by
-  `qiita_data_plane_ports` and used to render the nginx upstream, to
-  enable/restart the matching `qiita-data-plane@NNNN` units, and to health-check
-  each instance in `verify-deploy`. Previously scaling out did not survive a
-  deploy: `activate.sh` overwrites `/etc/nginx/conf.d/qiita.conf` from the
-  checked-in file, so a hand-added upstream member disappeared at the next
-  deploy, and the restart list was hardcoded to `@50051`, so an added instance
-  kept running stale code. Also adds a loopback-only plaintext gRPC balancer
-  (`127.0.0.1:50050`) for on-host clients: compute nodes already reach the pool
-  through nginx at `grpc+tls://<host>:443`, but the control plane's default
-  `DATA_PLANE_URL` addressed instance #1 directly, so CP-side Flight traffic
-  bypassed the balancer entirely. Scaling is not limited to one host:
-  `QIITA_DATA_PLANE_PEERS` (space-separated `host:port`, empty by default) adds
-  data planes running elsewhere to the same upstream, because extra processes on
-  one box share its cores, memory, and NIC and stop helping once it saturates.
-  Peers are a separate knob from `QIITA_DATA_PLANE_PORTS` rather than entries in
-  it: only the local list drives systemd, so overloading one list would have made
-  "which entries get a unit" a parsing question and would have tried to restart a
-  unit named after a remote host. Peer entries are shape-validated before any
-  config is written (they land verbatim in an nginx `server` directive) and each
-  gets its own `verify-deploy` health row, and a peer hostname that does not
-  resolve aborts the deploy before any service restarts rather than at the
-  `nginx -t` that runs after them. `verify-deploy` reads its member list from
-  the rendered nginx config rather than the env lists, so it checks what is
-  actually being served instead of what the verifying shell happens to have
-  exported. Note peer traffic is plaintext gRPC —
-  `grpc_pass`'s scheme is per-directive, not per-member, so a peer belongs only on
-  a trusted network. (#363)
+- **Data-plane scaling is host configuration rendered on every deploy, and can include data planes on other hosts (#363).**
+  Three keys in `/etc/qiita/data-plane.env` — `QIITA_DATA_PLANE_PORTS` (default `50051`),
+  `QIITA_DATA_PLANE_PEERS` (default none) and `QIITA_DATA_PLANE_BIND_HOST` (default
+  `127.0.0.1`) — decide what `activate.sh` renders into the nginx `qiita_data_plane`
+  upstream, which `qiita-data-plane@<port>` units it enables and restarts, and what
+  `verify-deploy` checks: `health/data-plane@<port>` per instance (replacing the single
+  `health/data-plane` row), `health/data-plane-peer@<host:port>` per peer, and
+  `health/data-plane-lb`. Before, the upstream was a checked-in literal the deploy
+  overwrote and only `@50051` was restarted, so an added instance lost its upstream entry
+  and kept running old code after the next deploy. The keys are validated, and peer names
+  resolved, before anything is installed, and the rendered nginx config is tested before
+  any service restarts; one `nginx -t` rejects is replaced by the config it overwrote,
+  so the next nginx start does not fail on it. nginx also serves the upstream on a loopback
+  listener, `127.0.0.1:50050`, which the control plane uses when
+  `DATA_PLANE_URL=grpc://127.0.0.1:50050`. `make preflight` gains `selinux/lb-port`, which
+  fails on an Enforcing host where that port is not labelled `http_port_t`. `make deploy`
+  prints the `local-deploy.sh` / `make redeploy` command instead of a hand copy of
+  `deploy/nginx/qiita.conf`, a template that fails `nginx -t` unrendered. Procedure:
+  `docs/runbooks/data-plane-scaling.md`.
 - **Block-read DoGet: block-scoped compute jobs stream their reads.** New
   `read_block` / `read_masked_block` ticket selectors on the data plane, scoped
   by a block's `(prep_sample_idx, sequence_idx sub-range)` members rather than a
@@ -3560,12 +3550,21 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   both name a shared path every component must resolve identically, so a per-file
   typo was a silent divergence. The comparison is now a helper called twice
   rather than a copied loop.
-- **`qiita-data-plane@.service` set `LISTEN_ADDR` before `EnvironmentFile=`.**
-  systemd applies the two in file order, last writer wins, so a `LISTEN_ADDR` in
-  the SHARED `/etc/qiita/data-plane.env` would have overridden the per-instance
-  value for every instance and collapsed them all onto one port. Latent until
-  now (the live host leaves it unset), and a trap for the first operator to scale
-  out. The per-instance assignment now comes last. (#363)
+- **Data planes booting together against one DuckLake catalog: all but one exited (#363).**
+  Every boot writes the catalog (`set_option`, the `ensure_*` DDL, and on an empty catalog
+  DuckLake's own metadata tables), and overlapping boots conflict. Measured with 4
+  processes started together: 1 of 4 came up in each of 19 trials against an existing
+  catalog (the rest exited on SQLSTATE 40001), and 1 of 4 on an empty one; started one
+  after another, all came up. A deploy now restarts every instance back to back and a
+  reboot starts them together, so this was the routine case. Boot re-runs its catalog
+  setup on those conflicts for up to 60 s (`ducklake::setup_catalog`); any other boot
+  error still fails at once. 4 of 4 came up in each of 30 trials after the change.
+- **`qiita-data-plane@.service`: a `LISTEN_ADDR` in the shared `/etc/qiita/data-plane.env` set the address of every instance (#363).**
+  A variable in `EnvironmentFile=` overrides the same variable in `Environment=` whatever
+  their order in the unit (measured on systemd 257), so all instances would have tried to
+  bind that one address. The unit now sets `LISTEN_ADDR` on its `ExecStart` command line,
+  from `QIITA_DATA_PLANE_BIND_HOST` and the instance port, where the env file cannot
+  override it.
 - **Native SLURM jobs can now reach the miint GPL-boundary host (#331).** The
   boundary (bowtie2/vsearch/MAFFT/SortMeRNA run out-of-process behind it) installs
   under `$HOME/.cache/miint/bin`, but native jobs run with an ephemeral per-ticket

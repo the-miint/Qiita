@@ -4,16 +4,9 @@
 
 On-premise Linux, systemd services. Local dev on macOS.
 
-The `make deploy` target builds all components and prints the required admin commands for systemd/nginx installation. An admin executes the privileged commands manually.
+The `make deploy` target builds all components and prints the admin command that installs them: `deploy/local-deploy.sh` on a first deploy, `make redeploy` on an established host. An admin runs it.
 
-The data plane is deployed as multiple systemd instances of the `qiita-data-plane@.service` template. The instance specifier *is* the listen port — `qiita-data-plane@50051` binds `127.0.0.1:50051`, `qiita-data-plane@50052` binds `:50052`, etc. nginx upstream `qiita_data_plane` (in `deploy/nginx/qiita.conf`) load-balances gRPC traffic across the members.
-
-That upstream block is **generated** at deploy time by `deploy/activate.sh`, which overwrites `/etc/nginx/conf.d/qiita.conf` from the checked-in file — so it is never hand-edited on the host. Two env vars drive it, and they answer different questions:
-
-- `QIITA_DATA_PLANE_PORTS` (default `50051`) — instances **this** host runs. One list renders the `server 127.0.0.1:<port>` members *and* enables/restarts the matching `qiita-data-plane@NNNN` units, so the upstream and the running instances cannot disagree.
-- `QIITA_DATA_PLANE_PEERS` (default empty) — data planes on **other** hosts, as `server <host:port>` members only. This deploy does not start, restart, or upgrade them; a peer is the peer host's own deploy, and must point at the same Postgres/DuckLake catalog and the same scratch/persistent paths. Peers exist because extra processes on one box share its cores, memory, and NIC, so they stop helping once it saturates.
-
-Every member is reached over plaintext gRPC (`grpc_pass grpc://`, and the scheme is per-directive rather than per-member), so a peer belongs only on a trusted network. `deploy/verify.sh` health-checks each member individually, reading the list back out of the rendered config rather than the env vars.
+The data plane is deployed as systemd instances of the `qiita-data-plane@.service` template. The instance specifier is the listen port and `QIITA_DATA_PLANE_BIND_HOST` the address (default `127.0.0.1`), so `qiita-data-plane@50051` listens on `127.0.0.1:50051`. The nginx upstream `qiita_data_plane` (in `deploy/nginx/qiita.conf`) balances gRPC across the members. `deploy/activate.sh` renders that upstream on every deploy from three keys in `/etc/qiita/data-plane.env` — this host's ports, data planes on other hosts, and the bind host — and enables and restarts one unit per port. nginx also serves the same upstream on a loopback listener, `127.0.0.1:50050`, for on-host clients, and `deploy/verify.sh` health-checks each member and that listener. The keys, defaults and validation are under "Data-plane topology" in `deploy/_common.sh`; the procedure is [`docs/runbooks/data-plane-scaling.md`](../runbooks/data-plane-scaling.md).
 
 ## Monorepo Structure
 
@@ -274,17 +267,14 @@ sync-actions:
 
 # Deploy / health
 deploy: build
-	@echo "=== Build complete. Run the following commands as admin: ==="
+	@echo "=== Build complete. Install as admin: ==="
 	@echo ""
-	@echo "  sudo cp deploy/systemd/qiita-control-plane.service /etc/systemd/system/"
-	@echo "  sudo cp deploy/systemd/qiita-data-plane@.service /etc/systemd/system/"
-	@echo "  sudo cp deploy/systemd/qiita-compute-orchestrator.service /etc/systemd/system/"
-	@echo "  sudo cp deploy/nginx/qiita.conf /etc/nginx/conf.d/"
-	@echo "  sudo systemctl daemon-reload"
-	@echo "  sudo systemctl restart qiita-control-plane"
-	@echo "  sudo systemctl restart 'qiita-data-plane@50051'"
-	@echo "  sudo systemctl restart qiita-compute-orchestrator"
-	@echo "  sudo systemctl reload nginx"
+	@echo "  First deploy:     sudo QIITA_HOSTNAME=<fqdn> deploy/local-deploy.sh   (docs/runbooks/first-deploy.md)"
+	@echo "  Established host: sudo make redeploy QIITA_HOSTNAME=<fqdn>           (docs/runbooks/redeploy.md)"
+	@echo ""
+	@echo "Both render /etc/nginx/conf.d/qiita.conf and restart one data-plane unit per"
+	@echo "port, from /etc/qiita/data-plane.env. deploy/nginx/qiita.conf is a template:"
+	@echo "copied as is, it fails 'nginx -t'."
 	@echo ""
 	@echo "Then verify: make verify-health"
 

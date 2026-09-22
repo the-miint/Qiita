@@ -107,7 +107,7 @@ DUCKLAKE_CATALOG_CONNSTR = ducklake_catalog_connstr()
 
 # Cold-start ceiling (seconds) for the data-plane gRPC port to open. The FIRST
 # module to use the module-scoped `data_plane` fixture pays the coldest start:
-# right after `_reset_ducklake_catalog()` drops/recreates the catalog DB, the
+# right after `reset_ducklake_catalog()` drops/recreates the catalog DB, the
 # binary must boot, load DuckDB + the miint extension, connect to the catalog,
 # and create the DuckLake tables before its first TCP accept — which on a loaded
 # CI runner can exceed a tight ceiling (later modules reuse warm caches and come
@@ -115,7 +115,7 @@ DUCKLAKE_CATALOG_CONNSTR = ducklake_catalog_connstr()
 # ceiling costs nothing on success and only lengthens the wait on a genuine hang.
 # Override via QIITA_DP_START_TIMEOUT_S (e.g. CI can set it higher than a local
 # box); a malformed value fails loudly here at import rather than mid-run.
-_DATA_PLANE_START_TIMEOUT_S = float(os.environ.get("QIITA_DP_START_TIMEOUT_S", "30"))
+DATA_PLANE_START_TIMEOUT_S = float(os.environ.get("QIITA_DP_START_TIMEOUT_S", "30"))
 
 
 @pytest.fixture(scope="session")
@@ -166,7 +166,7 @@ def data_plane_location() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _reset_ducklake_catalog() -> None:
+def reset_ducklake_catalog() -> None:
     """Drop and recreate the DuckLake catalog database for a clean run."""
 
     async def _do():
@@ -182,8 +182,8 @@ def _reset_ducklake_catalog() -> None:
     asyncio.run(_do())
 
 
-def _wait_for_grpc(
-    host: str, port: int, timeout: float = _DATA_PLANE_START_TIMEOUT_S
+def wait_for_grpc(
+    host: str, port: int, timeout: float = DATA_PLANE_START_TIMEOUT_S
 ) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -195,7 +195,33 @@ def _wait_for_grpc(
     return False
 
 
-def _alloc_free_port() -> int:
+def data_plane_env(
+    signing_key: bytes, scratch_base: Path, persistent_base: Path, port: int
+) -> dict[str, str]:
+    """The environment the data-plane binary boots with in these tests: listening on
+    `port`, verifying tickets signed with `signing_key`, against the test catalog."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    lib_path = os.environ.get(LIB_PATH_ENV, "")
+    if DUCKDB_LIB_DIR is not None and DUCKDB_LIB_DIR.is_dir():
+        lib_path = f"{DUCKDB_LIB_DIR}:{lib_path}" if lib_path else str(DUCKDB_LIB_DIR)
+    return {
+        **os.environ,
+        "LISTEN_ADDR": f"{LOOPBACK_HOST}:{port}",
+        # The data plane verifies with the PUBLIC key derived from the signing seed.
+        "FLIGHT_TICKET_PUBLIC_KEY": base64.b64encode(
+            Ed25519PrivateKey.from_private_bytes(signing_key)
+            .public_key()
+            .public_bytes_raw()
+        ).decode(),
+        "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
+        "PATH_PERSISTENT": str(persistent_base),
+        "PATH_SCRATCH": str(scratch_base),
+        LIB_PATH_ENV: lib_path,
+    }
+
+
+def alloc_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((LOOPBACK_HOST, 0))
         return s.getsockname()[1]
@@ -244,9 +270,7 @@ def data_plane(signing_key, tmp_path_factory):
             f"which builds it first)."
         )
 
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    _reset_ducklake_catalog()
+    reset_ducklake_catalog()
 
     # Two base roots; the data plane derives PATH_SCRATCH/staging and
     # PATH_PERSISTENT/ducklake from them (matching production). The CP
@@ -260,26 +284,9 @@ def data_plane(signing_key, tmp_path_factory):
     os.makedirs(data_path, exist_ok=True)
     os.makedirs(staging_root, exist_ok=True)
     os.makedirs(workspace_root, exist_ok=True)
-    port = _alloc_free_port()
+    port = alloc_free_port()
 
-    lib_path = os.environ.get(LIB_PATH_ENV, "")
-    if DUCKDB_LIB_DIR is not None and DUCKDB_LIB_DIR.is_dir():
-        lib_path = f"{DUCKDB_LIB_DIR}:{lib_path}" if lib_path else str(DUCKDB_LIB_DIR)
-
-    env = {
-        **os.environ,
-        "LISTEN_ADDR": f"{LOOPBACK_HOST}:{port}",
-        # The data plane verifies with the PUBLIC key derived from the signing seed.
-        "FLIGHT_TICKET_PUBLIC_KEY": base64.b64encode(
-            Ed25519PrivateKey.from_private_bytes(signing_key)
-            .public_key()
-            .public_bytes_raw()
-        ).decode(),
-        "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
-        "PATH_PERSISTENT": str(persistent_base),
-        "PATH_SCRATCH": str(scratch_base),
-        LIB_PATH_ENV: lib_path,
-    }
+    env = data_plane_env(signing_key, scratch_base, persistent_base, port)
 
     proc = subprocess.Popen(
         [str(DATA_PLANE_BINARY)],
@@ -297,7 +304,7 @@ def data_plane(signing_key, tmp_path_factory):
             f"stdout: {stdout.decode()[:1000]}\nstderr: {stderr.decode()[:1000]}"
         )
 
-    if not _wait_for_grpc(LOOPBACK_HOST, port):
+    if not wait_for_grpc(LOOPBACK_HOST, port):
         rc = proc.poll()
         if rc is not None:
             stdout, stderr = proc.communicate(timeout=5)
@@ -316,7 +323,7 @@ def data_plane(signing_key, tmp_path_factory):
         stdout, stderr = proc.communicate(timeout=5)
         pytest.fail(
             f"data plane (pid {pid}) is alive but did not accept a connection on "
-            f"{LOOPBACK_HOST}:{port} within {_DATA_PLANE_START_TIMEOUT_S:g}s "
+            f"{LOOPBACK_HOST}:{port} within {DATA_PLANE_START_TIMEOUT_S:g}s "
             f"(raise QIITA_DP_START_TIMEOUT_S if this is a slow cold start, not a hang).\n"
             f"stdout: {stdout.decode()[:1000]}\nstderr: {stderr.decode()[:1000]}"
         )
@@ -351,7 +358,7 @@ def cp_server(tmp_path, signing_key):
     on disk because `ComputeBackendClient.__init__` reads it eagerly,
     so the fixture writes a dummy one.
     """
-    port = _alloc_free_port()
+    port = alloc_free_port()
     token_file = tmp_path / "cp-to-co.token"
     token_file.write_text("unused-dispatch-token")
     # Settings.from_env() requires PATH_SCRATCH, CONTACT_EMAIL, PATH_INGEST_ROOTS,
