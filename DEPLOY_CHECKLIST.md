@@ -19,7 +19,16 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- `[admin]` If `getenforce` prints `Enforcing`, let nginx bind its new loopback listener
+  (#363) — every deploy now renders it, single instance included, and the stock Rocky 10
+  policy does not let nginx bind that port:
+
+  ```bash
+  # [admin]
+  sudo semanage port -a -t http_port_t -p tcp 50050
+  ```
+
+  `make preflight` reports it as `selinux/lb-port` (fails while Enforcing and unlabelled).
 
 ### 3. Migrations
 
@@ -27,7 +36,11 @@ _None yet._
 
 ### 4. Deploy
 
-_None yet._
+- Nothing extra for a single instance (#363): with no `QIITA_DATA_PLANE_*` keys in
+  `/etc/qiita/data-plane.env`, the deploy runs the one instance `@50051` as before. To run
+  more instances or add data planes on other hosts, see
+  [`docs/runbooks/data-plane-scaling.md`](docs/runbooks/data-plane-scaling.md) before
+  deploying.
 
 ### 5. Verify
 
@@ -45,9 +58,20 @@ _None yet._
   deploy's predecessor carried by hand. Green proves egress only: the fetch itself runs through
   DuckDB httpfs, so a proxy or CA problem confined to httpfs still surfaces at the first import.
 
+- `verify-deploy`'s data-plane rows (#363): `health/data-plane` is now
+  `health/data-plane@<port>`, one row per instance; `health/data-plane-peer@<host:port>`
+  appears per peer; `health/data-plane-lb` checks nginx's loopback listener
+  `127.0.0.1:50050` (skipped when the TLS files are absent); `health/data-plane-upstream`
+  fails when verify cannot read the members from the rendered nginx config, and is skipped
+  when grpcurl is missing or `SKIP_HEALTH=1`. On an Enforcing host, a red
+  `health/data-plane-lb` can mean the bucket-2 port label is missing.
+
 ### 6. After the deploy verifies green
 
-_None yet._
+- Only on a host running more than one data-plane instance (#363): point the control plane
+  at nginx's loopback listener so its calls spread across them —
+  [`data-plane-scaling.md` § The control plane through nginx](docs/runbooks/data-plane-scaling.md#the-control-plane-through-nginx).
+  Undo it before any rollback to a commit without that listener.
 
 ### Notes (no host action)
 

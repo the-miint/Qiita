@@ -323,6 +323,16 @@ AuthRocket's URL validator on first realm setup:
 sudo mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled
 ```
 
+nginx also listens on `127.0.0.1:50050`, the data-plane loopback listener. If
+`getenforce` prints `Enforcing`, label that port first; on the stock Rocky 10
+policy nginx cannot bind it otherwise (`qiita_selinux_lb_port_state` in
+`deploy/_common.sh` has the policy detail):
+```bash
+# [admin]
+sudo semanage port -a -t http_port_t -p tcp 50050
+```
+`make preflight` reports it as `selinux/lb-port`.
+
 ### 0.5 Build + ops tooling
 
 The deploy host needs the toolchain to compile the data-plane binary
@@ -449,8 +459,9 @@ sudo QIITA_HOSTNAME=<fqdn> /home/qiita/qiita-miint/deploy/local-deploy.sh
 Expected: build runs to completion; rsyncs land in `/opt/qiita/`; `uv
 sync` populates each Python venv under `/opt/qiita/<service>/.venv/`;
 data-plane binary is installed at `/opt/qiita/data-plane/qiita-data-plane`;
-systemd units land in `/etc/systemd/system/`; nginx config installs at
-`/etc/nginx/conf.d/qiita.conf` with `__QIITA_HOSTNAME__` substituted.
+systemd units land in `/etc/systemd/system/`; nginx config is rendered to
+`/etc/nginx/conf.d/qiita.conf` with every `__QIITA_…__` placeholder (the
+hostname, the loopback listener port, the data-plane upstream) filled in.
 
 Verify the venvs use a world-traversable Python (not `/root/.local/`):
 ```bash
@@ -672,9 +683,10 @@ Failure modes:
 - **`curl: (60) SSL certificate problem`** — cert/key mismatch, expired
   cert, or the symlinks at `/etc/ssl/{certs,private}/qiita.{crt,key}`
   don't resolve. `sudo readlink -f` them.
-- **`404 Not Found` on `/health` but other paths return 502** — the
-  `__QIITA_HOSTNAME__` substitution didn't run. Check `grep server_name
-  /etc/nginx/conf.d/qiita.conf` for the placeholder still present.
+- **`404 Not Found` on `/health` but other paths return 502** — the config
+  was not rendered (e.g. `deploy/nginx/qiita.conf` copied by hand). Check
+  `grep -n __QIITA_ /etc/nginx/conf.d/qiita.conf` for a placeholder still
+  present, and re-run `local-deploy.sh`.
 - **`502 Bad Gateway`** — nginx is up but the CP isn't on `127.0.0.1:8080`.
   `systemctl status qiita-control-plane` and `journalctl -u qiita-control-plane`.
 
@@ -855,12 +867,13 @@ unset FLIGHT_TICKET_SIGNING_KEY FLIGHT_TICKET_PUBLIC_KEY LOGIN_COOKIE_SECRET_KEY
 sudo systemctl enable --now qiita-data-plane@50051
 ```
 
-The systemd template `qiita-data-plane@.service` reads
-`LISTEN_ADDR=127.0.0.1:%i` — the instance number *is* the port.
+The systemd template `qiita-data-plane@.service` sets `LISTEN_ADDR` to
+`${QIITA_DATA_PLANE_BIND_HOST}:%i` (bind host default `127.0.0.1`) — the
+instance number *is* the port.
 `qiita-data-plane@50051` listens on `127.0.0.1:50051`, the upstream
-nginx already routes to. For first deploy a single instance is fine;
-add `qiita-data-plane@50052` (etc.) and the matching nginx upstream
-entry when traffic warrants horizontal scaling.
+nginx already routes to. A single instance is right for first deploy.
+Running more instances, or data planes on other hosts, is
+[`data-plane-scaling.md`](data-plane-scaling.md).
 
 On first start, the DP attaches DuckLake to `qiita_miint_lake` (creates
 metadata tables) and runs `ensure_reference_tables`. All idempotent —

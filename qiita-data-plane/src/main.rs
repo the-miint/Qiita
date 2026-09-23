@@ -1,5 +1,4 @@
 use arrow_flight::flight_service_server::FlightServiceServer;
-use duckdb::Connection;
 use tonic::transport::Server;
 use tonic_health::ServingStatus;
 
@@ -16,28 +15,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
 
-    // Ensure DuckLake tables exist (one-time setup connection)
-    let setup_conn = Connection::open_in_memory()?;
-    ducklake::connect_ducklake(
-        &setup_conn,
+    // Attach the catalog and create its tables once, at boot (see setup_catalog);
+    // the listen port is the retry backoff's salt.
+    ducklake::setup_catalog(
         &cfg.ducklake_catalog_connstr,
         &cfg.path_persistent_ducklake,
+        i64::from(cfg.listen_addr.port()),
     )?;
-    // Catalog-global Parquet defaults (zstd + v2). Set ONCE here at boot, NOT on
-    // every per-request attach: a per-attach write races on ducklake_metadata
-    // under concurrent Flight load and fails with SQLSTATE 40001. See
-    // set_catalog_options.
-    ducklake::set_catalog_options(&setup_conn)?;
-    ducklake::ensure_reference_tables(&setup_conn)?;
-    ducklake::ensure_read_tables(&setup_conn)?;
-    ducklake::ensure_alignment_tables(&setup_conn)?;
-    ducklake::ensure_assembly_tables(&setup_conn)?;
-    // The row concurrent registrations into the replace-keyed tables contend
-    // for. Seeded here so no request path has to create it.
-    ducklake::ensure_registration_lock(&setup_conn)?;
-    // Must run after reference + alignment tables — the `_visible` views join them.
-    ducklake::ensure_exclusion_tables(&setup_conn)?;
-    drop(setup_conn);
 
     // Build Flight service — each request opens its own DuckDB connection
     let flight_svc = flight_service::QiitaFlightService::new(

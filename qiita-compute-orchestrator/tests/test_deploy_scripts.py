@@ -119,6 +119,724 @@ def _fake_native_checkout(tmp_path: Path) -> Path:
     return py
 
 
+# The data-plane topology variables. Removed from every topology test's environment
+# so the caller's shell cannot reach the helpers under test.
+_TOPOLOGY_VARS = ("QIITA_DATA_PLANE_PORTS", "QIITA_DATA_PLANE_PEERS", "QIITA_DATA_PLANE_BIND_HOST")
+_ABSENT_DP_ENV = "/nonexistent/qiita/data-plane.env"
+
+
+def _run_common(
+    snippet: str,
+    *args: str,
+    dp_env: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Source _common.sh and run `snippet`, with `args` as $1…
+
+    The topology variables are removed from the environment and DP_ENV points at
+    `dp_env`, or at a path that does not exist, so neither the caller's shell nor a
+    real /etc/qiita/data-plane.env reaches the test. `extra_env` is applied last."""
+    env = {k: v for k, v in os.environ.items() if k not in _TOPOLOGY_VARS}
+    env["DP_ENV"] = str(dp_env) if dp_env is not None else _ABSENT_DP_ENV
+    env.update(extra_env or {})
+    return subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; {snippet}', "_", *args],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _dp_env(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "data-plane.env"
+    path.write_text(body)
+    return path
+
+
+def _lb_port() -> str:
+    """QIITA_DATA_PLANE_LB_PORT as _common.sh defines it."""
+    result = _run_common('printf %s "$QIITA_DATA_PLANE_LB_PORT"')
+    assert result.returncode == 0 and result.stdout, result.stderr
+    return result.stdout
+
+
+def test_data_plane_ports_defaults_to_the_single_instance() -> None:
+    """Set neither in the environment nor in data-plane.env ⇒ the one instance every
+    host has run, so a host that sets nothing deploys as before."""
+    result = _run_common("qiita_data_plane_ports")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "50051"
+
+
+def test_data_plane_ports_reads_the_host_file(tmp_path: Path) -> None:
+    """The list lives in data-plane.env, so a routine redeploy — which passes no
+    scaling variables — renders the instances the host was given."""
+    env_file = _dp_env(tmp_path, 'QIITA_DATA_PLANE_PORTS="50051 50052 50053"\n')
+    result = _run_common("qiita_data_plane_ports", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["50051", "50052", "50053"]
+
+
+def test_data_plane_ports_defaults_when_the_host_file_omits_it(tmp_path: Path) -> None:
+    env_file = _dp_env(tmp_path, "PATH_SCRATCH=/scratch\n")
+    result = _run_common("qiita_data_plane_ports", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "50051"
+
+
+def test_data_plane_ports_environment_overrides_the_host_file(tmp_path: Path) -> None:
+    env_file = _dp_env(tmp_path, 'QIITA_DATA_PLANE_PORTS="50051 50052 50053"\n')
+    result = _run_common(
+        "qiita_data_plane_ports",
+        dp_env=env_file,
+        extra_env={"QIITA_DATA_PLANE_PORTS": "50051"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "50051"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "50051 abc",  # non-numeric entry
+        "0",  # not a valid TCP port
+        "99999",  # out of range
+        "-1",  # negative
+        "050051",  # a second unit name for port 50051
+        "50051 50052 50051",  # one member rendered twice
+        "50051; rm -rf /",  # the value reaches a systemd unit name + nginx config
+        "   ",  # blank
+    ],
+)
+def test_data_plane_ports_rejects_malformed_values(value: str) -> None:
+    """Each port becomes a systemd unit name, an nginx `server` line and a
+    health-check target, so a bad entry fails here instead of rendering broken
+    config."""
+    result = _run_common("qiita_data_plane_ports", extra_env={"QIITA_DATA_PLANE_PORTS": value})
+    assert result.returncode != 0, f"{value!r} should be rejected, got {result.stdout!r}"
+    assert result.stdout == ""
+
+
+def test_data_plane_ports_rejects_the_loopback_listener_port() -> None:
+    """nginx binds QIITA_DATA_PLANE_LB_PORT itself; an instance on it would fight
+    nginx for the port."""
+    result = _run_common(
+        "qiita_data_plane_ports",
+        extra_env={"QIITA_DATA_PLANE_PORTS": f"50051 {_lb_port()}"},
+    )
+    assert result.returncode != 0, result.stdout
+    assert "loopback listener" in result.stderr
+
+
+def test_data_plane_peers_defaults_to_empty() -> None:
+    """Unset everywhere ⇒ no remote members; a single-host deploy is unchanged."""
+    result = _run_common("qiita_data_plane_peers")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_data_plane_peers_reads_the_host_file(tmp_path: Path) -> None:
+    env_file = _dp_env(tmp_path, 'QIITA_DATA_PLANE_PEERS="10.0.0.9:50051 10.0.0.9:50052"\n')
+    result = _run_common("qiita_data_plane_peers", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["10.0.0.9:50051", "10.0.0.9:50052"]
+
+
+def test_data_plane_peers_blank_environment_overrides_the_host_file(tmp_path: Path) -> None:
+    """Setting the variable to blank for one deploy drops the peers the file names."""
+    env_file = _dp_env(tmp_path, 'QIITA_DATA_PLANE_PEERS="10.0.0.9:50051"\n')
+    result = _run_common(
+        "qiita_data_plane_peers", dp_env=env_file, extra_env={"QIITA_DATA_PLANE_PEERS": ""}
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "dp2.example.org:50051",
+        "dp2.example.org:50051 dp3.example.org:50051",
+        "10.0.0.7:50051",
+        "[2001:db8::1]:50051",  # bracketed IPv6 literal
+    ],
+)
+def test_data_plane_peers_accepts_host_port_forms(value: str) -> None:
+    result = _run_common("qiita_data_plane_peers", extra_env={"QIITA_DATA_PLANE_PEERS": value})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == value.split()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "dp2.example.org",  # no port
+        "dp2.example.org:",  # empty port
+        ":50051",  # empty host
+        "dp2.example.org:abc",  # non-numeric port
+        "dp2.example.org:0",  # not a valid TCP port
+        "dp2.example.org:99999",  # out of range
+        "2001:db8::1:50051",  # unbracketed IPv6 — ambiguous
+        "dp2.example.org:50051; rm -rf /",  # reaches an nginx `server` directive
+        "dp2.example.org:50051;",  # a bare `;` would inject config
+        "dp2.example.org:50051 }",  # would close the upstream block early
+        "999.999.999.999:50051",  # digits and dots, not an address
+        "10.0.0.256:50051",  # one octet out of range
+        "1.2.3:50051",  # nginx and getent read this as 1.2.0.3
+        "1.2.3.4.5:50051",  # too many octets
+        "010.0.0.1:50051",  # inet_aton reads 010 as octal 8
+        "1.2.3.4.:50051",  # trailing dot; nginx fails to resolve it
+    ],
+)
+def test_data_plane_peers_rejects_malformed_values(value: str) -> None:
+    """Each entry is written into an nginx `server` directive verbatim, so shape
+    validation is what stands between the setting and an injected directive or a
+    member at an address nobody meant."""
+    result = _run_common("qiita_data_plane_peers", extra_env={"QIITA_DATA_PLANE_PEERS": value})
+    assert result.returncode != 0, f"{value!r} should be rejected, got {result.stdout!r}"
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("blank", ["   ", "\t", " \t "])
+def test_data_plane_peers_treats_whitespace_only_as_unset(blank: str) -> None:
+    """Whitespace-only ⇒ no peers, not an error (the ports list rejects blank because
+    a host always runs at least one instance). Tabs count: a tab-only value must not
+    be echoed back as a peer."""
+    result = _run_common("qiita_data_plane_peers", extra_env={"QIITA_DATA_PLANE_PEERS": blank})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_bind_host_defaults_to_loopback() -> None:
+    result = _run_common("qiita_data_plane_bind_host")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "127.0.0.1"
+
+
+def test_bind_host_defaults_to_loopback_when_the_host_file_omits_it(tmp_path: Path) -> None:
+    env_file = _dp_env(tmp_path, "PATH_SCRATCH=/scratch\n")
+    result = _run_common("qiita_data_plane_bind_host", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "127.0.0.1"
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["QIITA_DATA_PLANE_BIND_HOST=10.0.0.5", 'QIITA_DATA_PLANE_BIND_HOST="10.0.0.5"'],
+)
+def test_bind_host_reads_the_host_file(tmp_path: Path, line: str) -> None:
+    result = _run_common("qiita_data_plane_bind_host", dp_env=_dp_env(tmp_path, line + "\n"))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "10.0.0.5"
+
+
+def test_bind_host_ignores_the_environment() -> None:
+    """The unit reads the bind host from data-plane.env, not from the deploy's
+    environment; honouring an environment value here would render members at an
+    address no instance listens on."""
+    result = _run_common(
+        "qiita_data_plane_bind_host", extra_env={"QIITA_DATA_PLANE_BIND_HOST": "10.9.9.9"}
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "127.0.0.1"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",  # set but empty: the unit would build LISTEN_ADDR=":<port>"
+        "0.0.0.0",  # every interface
+        "dp1.internal",  # a name, not an address
+        "10.0.0.256",
+        "010.0.0.1",
+        "10.0.0.5.",
+        "::1",
+    ],
+)
+def test_bind_host_rejects_values_that_are_not_one_ipv4_interface(
+    tmp_path: Path, value: str
+) -> None:
+    env_file = _dp_env(tmp_path, f"QIITA_DATA_PLANE_BIND_HOST={value}\n")
+    result = _run_common("qiita_data_plane_bind_host", dp_env=env_file)
+    assert result.returncode != 0, f"{value!r} should be rejected, got {result.stdout!r}"
+    assert result.stdout == ""
+
+
+def test_ipv4_literal_refuses_an_octet_past_int64_without_a_shell_error() -> None:
+    result = _run_common('qiita_is_ipv4_literal "$1"', "1.2.3.99999999999999999999")
+    assert result.returncode != 0
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "helper", ["qiita_data_plane_ports", "qiita_data_plane_peers", "qiita_data_plane_bind_host"]
+)
+def test_topology_refuses_a_host_file_that_does_not_parse(tmp_path: Path, helper: str) -> None:
+    """An unclosed quote would otherwise read every key as unset and deploy the
+    default topology on a host configured for more."""
+    env_file = _dp_env(tmp_path, 'QIITA_DATA_PLANE_PORTS="50051 50052\nPATH_SCRATCH=/scratch\n')
+    result = _run_common(helper, dp_env=env_file)
+    assert result.returncode != 0, result.stdout
+    assert result.stdout == ""
+    assert "does not parse" in result.stderr
+
+
+def test_data_plane_unit_sets_listen_addr_on_the_command_line() -> None:
+    """The unit's comment carries why an `Environment=LISTEN_ADDR` line does not
+    hold against data-plane.env. This pins the form that does: LISTEN_ADDR on the
+    ExecStart command line from the bind host and the instance port, with the bind
+    host defaulting to loopback."""
+    unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text().splitlines()
+    assert not [line for line in unit if line.startswith("Environment=LISTEN_ADDR")]
+    assert "Environment=QIITA_DATA_PLANE_BIND_HOST=127.0.0.1" in unit
+    assert [line for line in unit if line.startswith("ExecStart=")] == [
+        "ExecStart=/usr/bin/env LISTEN_ADDR=${QIITA_DATA_PLANE_BIND_HOST}:%i "
+        "/opt/qiita/data-plane/qiita-data-plane"
+    ]
+
+
+def _render(
+    tmp_path: Path,
+    *,
+    bind_host: str = "127.0.0.1",
+    ports: str = "50051",
+    peers: str = "",
+    template: Path | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Render deploy/nginx/qiita.conf (or `template`) with the function activate.sh
+    calls, into tmp_path/qiita.conf."""
+    dest = tmp_path / "qiita.conf"
+    result = _run_common(
+        'qiita_render_nginx_conf "$1" "$2" "$3" "$4" "$5" "$6"',
+        str(template or _DEPLOY / "nginx" / "qiita.conf"),
+        str(dest),
+        "qiita.example.org",
+        bind_host,
+        ports,
+        peers,
+    )
+    return result, dest
+
+
+def _call_rendered_members(conf: str) -> subprocess.CompletedProcess[str]:
+    return _run_common('qiita_data_plane_rendered_members "$1"', conf)
+
+
+def test_render_fills_every_placeholder(tmp_path: Path) -> None:
+    result, dest = _render(tmp_path)
+    assert result.returncode == 0, result.stderr
+    text = dest.read_text()
+    assert "__QIITA_" not in text
+    assert "server_name qiita.example.org;" in text
+    assert f"listen 127.0.0.1:{_lb_port()};" in text
+
+
+def test_render_places_local_members_at_the_bind_host_then_peers(tmp_path: Path) -> None:
+    """Local instances at the bind host, then peers verbatim, read back through the
+    same parser verify.sh uses."""
+    result, dest = _render(
+        tmp_path,
+        bind_host="10.0.0.5",
+        ports="50051 50052",
+        peers="dp2.internal:50051 [2001:db8::1]:50052",
+    )
+    assert result.returncode == 0, result.stderr
+    members = _call_rendered_members(str(dest))
+    assert members.returncode == 0, members.stderr
+    assert members.stdout.split() == [
+        "10.0.0.5:50051",
+        "10.0.0.5:50052",
+        "dp2.internal:50051",
+        "[2001:db8::1]:50052",
+    ]
+
+
+def test_render_from_an_unconfigured_host_is_one_loopback_member(tmp_path: Path) -> None:
+    """The validators' defaults fed to the render, as activate.sh chains them: one
+    member, 127.0.0.1:50051."""
+    dest = tmp_path / "qiita.conf"
+    result = _run_common(
+        'qiita_render_nginx_conf "$1" "$2" example.org "$(qiita_data_plane_bind_host)" '
+        '"$(qiita_data_plane_ports)" "$(qiita_data_plane_peers)"',
+        str(_DEPLOY / "nginx" / "qiita.conf"),
+        str(dest),
+    )
+    assert result.returncode == 0, result.stderr
+    assert _call_rendered_members(str(dest)).stdout.split() == ["127.0.0.1:50051"]
+
+
+def _template_with_unfilled_placeholder(tmp_path: Path) -> Path:
+    """deploy/nginx/qiita.conf plus a placeholder the render has no substitution for."""
+    template = tmp_path / "template.conf"
+    template.write_text((_DEPLOY / "nginx" / "qiita.conf").read_text() + "# __QIITA_NEW__\n")
+    return template
+
+
+def test_render_refuses_a_placeholder_it_does_not_fill(tmp_path: Path) -> None:
+    """A placeholder added to the template without a matching substitution fails the
+    render and leaves no config behind, instead of reaching `nginx -t`."""
+    template = _template_with_unfilled_placeholder(tmp_path)
+    result, dest = _render(tmp_path, template=template)
+    assert result.returncode != 0
+    assert "__QIITA_NEW__" in result.stderr
+    assert not dest.exists()
+
+
+def test_rendered_members_ignores_the_sibling_control_plane_upstream(tmp_path: Path) -> None:
+    """`upstream qiita_control_plane { server 127.0.0.1:8080; }` is in the same file;
+    picking it up would health-check the control plane as a data plane."""
+    result, dest = _render(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "qiita_control_plane" in dest.read_text(), "fixture no longer has the sibling"
+    assert _call_rendered_members(str(dest)).stdout.split() == ["127.0.0.1:50051"]
+
+
+def test_rendered_members_signals_fallback_when_config_is_absent(tmp_path: Path) -> None:
+    """rc 1 = no config ⇒ verify.sh falls back to the data-plane.env lists, the real
+    state on a first deploy."""
+    result = _call_rendered_members(str(tmp_path / "does-not-exist.conf"))
+    assert result.returncode == 1
+    assert result.stdout == ""
+
+
+def test_rendered_members_distinguishes_unparseable_from_absent(tmp_path: Path) -> None:
+    """rc 2 = config present, nothing parsed. The fallback would yield the single
+    default port whatever the host runs, so verify.sh fails instead of falling back."""
+    conf = tmp_path / "qiita.conf"
+    conf.write_text("upstream qiita_control_plane {\n    server 127.0.0.1:8080;\n}\n")
+    result = _call_rendered_members(str(conf))
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "no 'upstream qiita_data_plane' members" in result.stderr
+
+
+def test_rendered_members_ignores_upstream_server_parameters(tmp_path: Path) -> None:
+    """A `server` line may carry parameters; only the address is a health-check
+    target."""
+    conf = tmp_path / "qiita.conf"
+    conf.write_text(
+        "upstream qiita_data_plane {\n    server 127.0.0.1:50051 max_fails=3 fail_timeout=30s;\n}\n"
+    )
+    result = _call_rendered_members(str(conf))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["127.0.0.1:50051"]
+
+
+@pytest.mark.parametrize(
+    ("member", "bind_host", "label"),
+    [
+        ("127.0.0.1:50051", "127.0.0.1", "health/data-plane@50051"),
+        ("10.0.0.5:50052", "10.0.0.5", "health/data-plane@50052"),
+        ("10.0.0.50:50051", "10.0.0.5", "health/data-plane-peer@10.0.0.50:50051"),
+        ("[2001:db8::1]:50052", "127.0.0.1", "health/data-plane-peer@[2001:db8::1]:50052"),
+    ],
+)
+def test_member_label_names_local_instances_by_port(
+    member: str, bind_host: str, label: str
+) -> None:
+    result = _run_common('qiita_data_plane_member_label "$1" "$2"', member, bind_host)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == label
+
+
+def _first_command(src: str, pattern: str) -> int:
+    """Offset of the first non-comment line of a shell script matching `pattern`, so
+    an ordering assertion cannot be satisfied by a comment that mentions the step."""
+    match = re.search(rf"^(?![ \t]*#)[^\n]*{pattern}", src, re.M)
+    assert match, f"no command matching {pattern!r}"
+    return match.start()
+
+
+def test_activate_tests_the_nginx_config_before_restarting_services() -> None:
+    """`nginx -t` rejects what the shell checks do not (a peer such as
+    `[1::2::3]:50051`, whose characters pass the IPv6 check but which is not an
+    address); run after the restarts, it would fail the deploy with the services
+    already on new code."""
+    src = (_DEPLOY / "activate.sh").read_text()
+    tested = _first_command(src, r"qiita_render_and_test_nginx_conf ")
+    first_restart = _first_command(src, r"restart_if_env_present qiita-control-plane")
+    assert tested < first_restart
+
+
+def _render_and_test(
+    tmp_path: Path,
+    *,
+    nginx_accepts: bool,
+    previous: str | None,
+    template: Path | None = None,
+    failing: tuple[str, ...] = (),
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Run qiita_render_and_test_nginx_conf with a stub `nginx` whose `-t` accepts or
+    rejects, over an existing deployed file holding `previous` (or none). Each command
+    in `failing` is stubbed to exit 1."""
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    stubs = {"nginx": 0 if nginx_accepts else 1, **dict.fromkeys(failing, 1)}
+    for command, rc in stubs.items():
+        (stub / command).write_text(f"#!/bin/sh\nexit {rc}\n")
+        (stub / command).chmod(0o755)
+    dest = tmp_path / "qiita.conf"
+    if previous is not None:
+        dest.write_text(previous)
+    result = _run_common(
+        'qiita_render_and_test_nginx_conf "$1" "$2" example.org 127.0.0.1 50051 ""',
+        str(template or _DEPLOY / "nginx" / "qiita.conf"),
+        str(dest),
+        extra_env={"PATH": f"{stub}:{os.environ['PATH']}"},
+    )
+    return result, dest
+
+
+def test_a_rejected_render_puts_the_previous_config_back(tmp_path: Path) -> None:
+    """nginx refuses to start on a config `nginx -t` rejects, so the rejected render
+    must not stay in conf.d for the next nginx start."""
+    result, dest = _render_and_test(tmp_path, nginx_accepts=False, previous="# previous\n")
+    assert result.returncode != 0
+    assert dest.read_text() == "# previous\n"
+    assert not (tmp_path / "qiita.conf.previous").exists()
+
+
+def test_a_rejected_first_render_leaves_no_config(tmp_path: Path) -> None:
+    result, dest = _render_and_test(tmp_path, nginx_accepts=False, previous=None)
+    assert result.returncode != 0
+    assert not dest.exists()
+
+
+def test_an_accepted_render_replaces_the_config(tmp_path: Path) -> None:
+    result, dest = _render_and_test(tmp_path, nginx_accepts=True, previous="# previous\n")
+    assert result.returncode == 0, result.stderr
+    assert "upstream qiita_data_plane" in dest.read_text()
+    assert not (tmp_path / "qiita.conf.previous").exists()
+
+
+def test_a_render_failure_leaves_the_config_untouched(tmp_path: Path) -> None:
+    template = _template_with_unfilled_placeholder(tmp_path)
+    result, dest = _render_and_test(
+        tmp_path, nginx_accepts=True, previous="# previous\n", template=template
+    )
+    assert result.returncode != 0
+    assert dest.read_text() == "# previous\n"
+    assert not (tmp_path / "qiita.conf.previous").exists()
+
+
+@pytest.mark.parametrize("failure", ["missing template", "mktemp fails"])
+def test_a_failed_render_step_fails_the_tested_render(tmp_path: Path, failure: str) -> None:
+    """A failed step inside the render fails the wrapper, with `nginx -t` accepting,
+    and leaves the deployed file as it was. Why each step checks its own status: the
+    comment above qiita_render_nginx_conf."""
+    result, dest = _render_and_test(
+        tmp_path,
+        nginx_accepts=True,
+        previous="# previous\n",
+        template=tmp_path / "missing.conf" if failure == "missing template" else None,
+        failing=("mktemp",) if failure == "mktemp fails" else (),
+    )
+    assert result.returncode != 0
+    assert dest.read_text() == "# previous\n"
+    assert not (tmp_path / "qiita.conf.previous").exists()
+    assert not (tmp_path / "qiita.conf.tmp").exists()
+
+
+def test_a_member_list_write_error_fails_the_render(tmp_path: Path) -> None:
+    """With no peers, the default, a failed write of the member list fails the render
+    instead of rendering an empty upstream. `printf` is shadowed by a function that
+    fails, standing in for a write error such as ENOSPC on $TMPDIR."""
+    dest = tmp_path / "qiita.conf"
+    dest.write_text("# previous\n")
+    result = _run_common(
+        'printf() { return 1; }; qiita_render_nginx_conf "$1" "$2" example.org 127.0.0.1 50051 ""',
+        str(_DEPLOY / "nginx" / "qiita.conf"),
+        str(dest),
+    )
+    assert result.returncode != 0
+    assert dest.read_text() == "# previous\n"
+    assert not (tmp_path / "qiita.conf.tmp").exists()
+
+
+def _flight_locations(conf: str) -> list[dict[str, str]]:
+    """The directives of each `location /arrow.flight.protocol.FlightService/` block."""
+    blocks = re.findall(
+        r"location /arrow\.flight\.protocol\.FlightService/ \{(.*?)\n    \}", conf, re.S
+    )
+    return [
+        dict(
+            line.strip().rstrip(";").split(None, 1)
+            for line in block.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        )
+        for block in blocks
+    ]
+
+
+def test_nginx_flight_locations_agree_on_body_cap_and_timeouts() -> None:
+    """The loopback listener copies the 443 edge's Flight location; a change to the
+    edge's body cap or timeouts has to reach the copy too. limit_conn is the one
+    directive only the public edge carries."""
+    locations = _flight_locations((_DEPLOY / "nginx" / "qiita.conf").read_text())
+    assert len(locations) == 2, "expected the 443 edge and the loopback listener"
+    edge, loopback = locations
+    for directive in (
+        "grpc_pass",
+        "client_max_body_size",
+        "grpc_read_timeout",
+        "grpc_send_timeout",
+    ):
+        assert edge[directive] == loopback[directive], directive
+    assert set(edge) - set(loopback) == {"limit_conn"}
+
+
+def test_activate_resolves_topology_before_installing_anything() -> None:
+    """A malformed topology or an unresolvable peer has to fail with the running
+    deploy untouched: before the first rsync, the binary install, the nginx render
+    and any restart. Asserted on source order, since the order is the property."""
+    src = (_DEPLOY / "activate.sh").read_text()
+    resolved = max(
+        _first_command(src, re.escape("DP_PORTS=$(qiita_data_plane_ports)")),
+        _first_command(src, re.escape("DP_PEERS=$(qiita_data_plane_peers)")),
+        _first_command(src, re.escape("DP_BIND_HOST=$(qiita_data_plane_bind_host)")),
+        _first_command(src, re.escape('qiita_assert_peer_resolves "$peer"')),
+    )
+    for step in (
+        r"rsync -a",
+        r"install -m 0755",
+        r"qiita_render_(?:and_test_)?nginx_conf ",
+        r"systemctl restart",
+    ):
+        assert resolved < _first_command(src, step), f"topology must be resolved before {step!r}"
+
+
+def _call_peer_resolves(peer: str, stub_dir: str | None) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ}
+    if stub_dir is not None:
+        env["PATH"] = f"{stub_dir}:{env['PATH']}"
+    return subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_assert_peer_resolves "$1"', "_", peer],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+@pytest.fixture
+def getent_stub(tmp_path: Path) -> str:
+    """A stand-in for glibc's getent that resolves only `good.internal`.
+
+    getent does not exist on macOS, so without a stub the resolvable and
+    unresolvable cases are indistinguishable here — both would take the
+    tool-absent path and the test would pass without testing anything.
+    """
+    d = tmp_path / "stub"
+    d.mkdir()
+    (d / "getent").write_text(
+        '#!/bin/sh\n[ "$1" = hosts ] && [ "$2" = good.internal ] && exit 0\nexit 2\n'
+    )
+    (d / "getent").chmod(0o755)
+    return str(d)
+
+
+def test_peer_resolves_accepts_a_resolvable_host(getent_stub: str) -> None:
+    result = _call_peer_resolves("good.internal:50051", getent_stub)
+    assert result.returncode == 0, result.stderr
+
+
+def test_peer_resolves_rejects_an_unresolvable_host(getent_stub: str) -> None:
+    result = _call_peer_resolves("bad.internal:50051", getent_stub)
+    assert result.returncode != 0
+    assert "does not resolve" in result.stderr
+
+
+@pytest.mark.parametrize("peer", ["10.0.0.7:50051", "[2001:db8::1]:50051"])
+def test_peer_resolves_accepts_ip_literals_without_lookup(peer: str, getent_stub: str) -> None:
+    """The stub resolves neither, so passing means no lookup ran (see
+    qiita_assert_peer_resolves for why none should)."""
+    result = _call_peer_resolves(peer, getent_stub)
+    assert result.returncode == 0, result.stderr
+
+
+def test_peer_resolves_skips_when_getent_is_unavailable(tmp_path: Path) -> None:
+    """No getent ⇒ skip, not fail: the check only moves an nginx config-load failure
+    earlier, so missing tooling does not block a deploy."""
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    bash = shutil.which("bash")
+    assert bash, "bash not found"
+    result = subprocess.run(
+        # bash by ABSOLUTE path: the empty PATH is meant to hide getent from the
+        # script, not to hide the interpreter from subprocess.
+        [bash, "-c", f'source "{_COMMON}"; qiita_assert_peer_resolves "$1"', "_", "bad.internal:1"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": str(empty)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "getent unavailable" in result.stderr
+
+
+# `semanage port -l` rows as Rocky 10 prints them (selinux-policy 42.1.18), with
+# tcp/50050 labelled http_port_t, plus two rows carrying ranges.
+_SEMANAGE_LABELLED = """\
+SELinux Port Type              Proto    Port Number
+
+amanda_port_t                  tcp      10080-10083
+amqp_port_t                    tcp      15672, 5671-5672
+http_port_t                    tcp      50050, 80, 81, 443, 488, 8008, 8009, 8443, 9000
+http_port_t                    udp      80, 443
+"""
+_SEMANAGE_UNLABELLED = _SEMANAGE_LABELLED.replace("tcp      50050, 80", "tcp      80")
+_SEMANAGE_RANGE = _SEMANAGE_UNLABELLED.replace("tcp      80, 81", "tcp      50040-50060, 80, 81")
+
+
+def _selinux_state(
+    tmp_path: Path, *, mode: str | None, listing: str | None, semanage_fails: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """Run qiita_selinux_lb_port_state with stub getenforce/semanage on a PATH that
+    holds only them and the tools sourcing _common.sh and the stubs use, so a real
+    SELinux toolchain on the test host cannot answer instead."""
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    bash = shutil.which("bash")
+    assert bash
+    for tool in ("awk", "cat", "dirname", "basename"):
+        found = shutil.which(tool)
+        assert found, f"{tool} not found"
+        (stub / tool).symlink_to(found)
+    if mode is not None:
+        (stub / "getenforce").write_text(f"#!/bin/sh\necho {mode}\n")
+        (stub / "getenforce").chmod(0o755)
+    if listing is not None or semanage_fails:
+        (tmp_path / "listing").write_text(listing or "")
+        body = "exit 1" if semanage_fails else f'cat "{tmp_path / "listing"}"'
+        (stub / "semanage").write_text(f"#!/bin/sh\n{body}\n")
+        (stub / "semanage").chmod(0o755)
+    return subprocess.run(
+        [bash, "-c", f'source "{_COMMON}"; qiita_selinux_lb_port_state'],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": str(stub)},
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "listing", "semanage_fails", "rc"),
+    [
+        (None, None, False, 0),  # SELinux not installed
+        ("Disabled", None, False, 0),
+        ("Permissive", None, False, 0),
+        ("Enforcing", _SEMANAGE_LABELLED, False, 0),
+        ("Enforcing", _SEMANAGE_RANGE, False, 0),  # a labelled range covering the port
+        ("Enforcing", _SEMANAGE_UNLABELLED, False, 1),
+        ("Enforcing", None, True, 2),  # semanage present but failing (non-root)
+        ("Enforcing", None, False, 3),  # semanage not installed
+    ],
+)
+def test_selinux_lb_port_state(
+    tmp_path: Path, mode: str | None, listing: str | None, semanage_fails: bool, rc: int
+) -> None:
+    result = _selinux_state(tmp_path, mode=mode, listing=listing, semanage_fails=semanage_fails)
+    assert result.returncode == rc, result.stdout + result.stderr
+    assert result.stdout.strip(), "every state prints a reason"
+
+
 def test_native_checkout_resolves_valid_layout(tmp_path: Path) -> None:
     py = _fake_native_checkout(tmp_path)
     result = _call_native_checkout(str(py))
