@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from qiita_common.compute_backend_client import ComputeBackendClient
@@ -43,6 +44,45 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
 _log = logging.getLogger(__name__)
+
+# Process-wide bound on concurrently-running dispatch tasks, shared by every
+# dispatch path (route submit, ENA batch submit, startup reconcile) and across
+# every fan-out cohort at once. Each running task acquires pool connections per
+# call only (runner._base), but each is a concurrent acquirer — the count is
+# what must stay well below db.get_pool's max_size. (The exception that can
+# outlast a call's usual budget: the runner's `_stage_ena_run_roster`, parked
+# on the registration lock, holds its connection for the whole bounded wait,
+# `POOL_LOCK_WAIT_TIMEOUT_S`, rather than cycling it.) Sized the way
+# ena_import._STUDY_CONCURRENCY is; test_dispatch pins both the ratio and the
+# two semaphores' joint draw on the pool. 8 equals fanout's
+# DEFAULT_FANOUT_MAX_INFLIGHT on purpose: a single cohort at its default cap
+# stays reachable, and FANOUT_MAX_INFLIGHT tuned above 8 buys a cohort nothing
+# — its children queue for these same shared slots. What a slot covers, and the
+# workflow cap that follows from it, is documented on `schedule_dispatch`.
+_DISPATCH_CONCURRENCY = 8
+
+
+def build_dispatch_semaphore() -> asyncio.Semaphore:
+    """The process-wide cap `schedule_dispatch` binds every dispatch task to."""
+    return asyncio.Semaphore(_DISPATCH_CONCURRENCY)
+
+
+def dispatch_semaphore(app: FastAPI) -> asyncio.Semaphore:
+    """Resolve dispatch's cap on `app.state`, or fail naming the wiring gap.
+
+    Read once at boot by the lifespan (so an assignment that was removed or
+    reordered fails before reconcile dispatches anything, instead of a route
+    failing post-commit or the fan-out pump stranding a released ticket), and
+    again by `schedule_dispatch` (test fixtures build `app.state` by hand and
+    never run the lifespan)."""
+    semaphore = getattr(app.state, "dispatch_semaphore", None)
+    if semaphore is None:
+        raise RuntimeError(
+            "app.state.dispatch_semaphore is not wired; the lifespan sets it via"
+            " build_dispatch_semaphore(), so a fixture that builds app.state by"
+            " hand must set it too"
+        )
+    return semaphore
 
 
 async def _run_and_log(app: FastAPI, work_ticket_idx: int, *, resume: bool = False) -> None:
@@ -155,6 +195,16 @@ def schedule_dispatch(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fals
     `app.state.running_dispatches` so the GC can't drop it mid-run, and removed
     by a done-callback when complete.
 
+    The task body runs under `app.state.dispatch_semaphore`, the process-wide
+    cap of `_DISPATCH_CONCURRENCY` concurrently-running dispatches (what it is
+    sized against, and why 8, is on the constant). A task holds its slot for
+    its whole workflow, an hours-long download poll included, so the cap is
+    also a process-wide cap on in-flight workflows: tasks past it queue FIFO
+    and start as slots free, logging the wait when they do. Startup reconcile
+    and `POST /work-ticket/{idx}/run` dispatch through this same path, so they
+    queue here too. The semaphore is read before the task exists, so a boot
+    that never wired it raises here instead of orphaning a task.
+
     Pre-conditions enforced by the caller, not here:
       * Without `resume`, the ticket must be PENDING. The runner enforces this
         via its own atomic transition; if it's not PENDING, the runner raises
@@ -171,8 +221,33 @@ def schedule_dispatch(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fals
             " set COMPUTE_ORCHESTRATOR_URL or block this route at the dependency layer"
         )
 
+    semaphore = dispatch_semaphore(app)
+
+    async def _bounded_run() -> None:
+        # Observable queueing: without this a ticket waiting for a slot is
+        # indistinguishable from one whose dispatch died (no runner has started
+        # it, so no transient_reason, no dispatch_held), and the in-flight gate
+        # blocks resubmission while it waits.
+        queued = semaphore.locked()
+        if queued:
+            _log.info(
+                "work_ticket %d queued behind the dispatch cap (%d running);"
+                " it starts when a slot frees",
+                work_ticket_idx,
+                _DISPATCH_CONCURRENCY,
+            )
+        queued_at = time.monotonic()
+        async with semaphore:
+            if queued:
+                _log.info(
+                    "work_ticket %d dispatched after waiting %.1fs for a slot",
+                    work_ticket_idx,
+                    time.monotonic() - queued_at,
+                )
+            await _run_and_log(app, work_ticket_idx, resume=resume)
+
     task = asyncio.create_task(
-        _run_and_log(app, work_ticket_idx, resume=resume),
+        _bounded_run(),
         name=f"dispatch_ticket_{work_ticket_idx}",
     )
     app.state.running_dispatches.add(task)

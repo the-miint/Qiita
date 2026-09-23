@@ -41,6 +41,7 @@ async def ctx(postgres_pool):
     cleanup."""
     from qiita_control_plane.auth.token import mint_api_token
     from qiita_control_plane.config import Settings
+    from qiita_control_plane.dispatch import build_dispatch_semaphore
     from qiita_control_plane.main import app
 
     app.state.pool = postgres_pool
@@ -51,6 +52,7 @@ async def ctx(postgres_pool):
     backend = _FakeBackendClient()
     app.state.compute_backend_client = backend
     app.state.running_dispatches = set()
+    app.state.dispatch_semaphore = build_dispatch_semaphore()
 
     suffix = uuid.uuid4().hex[:8]
     admin_idx = await postgres_pool.fetchval(

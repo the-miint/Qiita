@@ -141,7 +141,9 @@ Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retr
 
 Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
 - Atomic UPDATE: state ← PENDING, `retry_count = 0`, all `failure_*` columns ← NULL (the DB CHECK requires `failure_*` all-NULL when state ≠ failed; the route clears them in one statement).
-- Triggers a fresh in-process dispatch via `schedule_dispatch`. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
+- Triggers a fresh in-process dispatch via `schedule_dispatch`, which queues behind the process-wide dispatch cap below when all slots are held. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
+
+**Dispatch concurrency.** Every dispatch path (route submit, ENA batch submit, startup reconcile, fan-out pump release) goes through `schedule_dispatch`, whose task holds one slot of the process-wide `_DISPATCH_CONCURRENCY` cap (8) for its whole workflow — an hours-long download poll included. Tasks past the cap queue FIFO and start as slots free, logging `queued behind the dispatch cap` when they start waiting and `dispatched after waiting` when they get one; nothing fails while it waits. Bounding in-flight workflows, not just connections, is the deliberate consequence: it is what keeps a burst of submits from pressuring the connection pool after `_STUDY_CONCURRENCY`'s permit has already been released at submit. Two behaviours follow that an operator should expect: a restart with more than 8 tickets in flight re-attaches the first 8 and queues the rest, and `/run` queues behind the same slots as ordinary submits. The cap is sized against the pool and `FANOUT_MAX_INFLIGHT` together — see the note on the constant.
 
 **Single-CP-process contract.** The control plane runs as a single
 `qiita-control-plane.service` instance. Dispatch tasks are bound to the

@@ -18,14 +18,10 @@ from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
 
 from . import require_transaction, update_row
 from ._sample_helpers import (
-    LocalWriteOnGloballyLinkedFieldError,
-    SampleEntityKind,
-    StudyFieldDataTypeNotTextError,
-    StudyFieldNotUniqueInStudyError,
-    _get_or_create_local_study_field,
     assert_required_global_fields_supplied,
     fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
+    resolve_local_study_field,
     validate_primary_secondary_studies,
     write_local_metadata_or_diagnose,
     write_sample_metadata,
@@ -497,11 +493,14 @@ async def import_biosample_from_owner_biosample_id(
     # names sometimes carry incautiously-entered PII. wet_lab_admin and
     # system_admin callers are admitted regardless of tier. (Tier
     # enforcement is not yet built — see docs/architecture/data-model.md.)
+    # The shape this PII write needs -- purely-local, text, unique within the
+    # study; the docstring above says why each matters -- is refused by the
+    # resolver when the resolved row contradicts it.
     (
         field_idx,
         field_created,
-        resolved_row,
-    ) = await _get_or_create_local_study_field(
+        _resolved_row,
+    ) = await resolve_local_study_field(
         conn,
         spec=BIOSAMPLE_METADATA_SPEC,
         study_idx=primary_study_idx,
@@ -510,48 +509,8 @@ async def import_biosample_from_owner_biosample_id(
         required=True,
         tier_override=OWNER_BIOSAMPLE_ID_TIER_OVERRIDE,
         unique_in_study=True,
+        enforce_unique_in_study=True,
     )
-    # The owner-biosample-id row is purely-local PII. If get-or-create
-    # resolved an already globally-linked field at this
-    # (study, display_name), refuse rather than write the value through
-    # a cross-study global slot.
-    if resolved_row[BIOSAMPLE_METADATA_SPEC.study_field_global_fk_column] is not None:
-        raise LocalWriteOnGloballyLinkedFieldError(
-            entity_kind=SampleEntityKind.BIOSAMPLE,
-            study_idx=primary_study_idx,
-            display_name=owner_biosample_id_field_name,
-            study_field_idx=field_idx,
-            found_global_field_idx=resolved_row[
-                BIOSAMPLE_METADATA_SPEC.study_field_global_fk_column
-            ],
-        )
-
-    # The identifier is written as text, so a field declaring anything else
-    # cannot hold it. Refused here rather than coerced: an owner's identifier
-    # is theirs as submitted, and a value that has been through a numeric or
-    # date round-trip is no longer the string they sent.
-    if resolved_row["data_type"] != FieldDataType.TEXT:
-        raise StudyFieldDataTypeNotTextError(
-            entity_kind=SampleEntityKind.BIOSAMPLE,
-            study_idx=primary_study_idx,
-            display_name=owner_biosample_id_field_name,
-            study_field_idx=field_idx,
-            data_type=resolved_row["data_type"],
-        )
-
-    # An owner's identifier for a sample only identifies it if the study's
-    # other samples cannot carry the same one, so this write requires the
-    # policy rather than assuming it. A field minted here declares it; one
-    # minted before the policy existed, or by a caller who chose not to, is
-    # refused rather than silently used as an identifier it does not
-    # guarantee.
-    if not resolved_row["unique_in_study"]:
-        raise StudyFieldNotUniqueInStudyError(
-            entity_kind=SampleEntityKind.BIOSAMPLE,
-            study_idx=primary_study_idx,
-            display_name=owner_biosample_id_field_name,
-            study_field_idx=field_idx,
-        )
 
     await insert_owner_biosample_id_metadata(
         conn,

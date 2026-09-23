@@ -31,6 +31,7 @@ from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models.ena_import import BatchItemState
 
 from qiita_control_plane.auth.principal import HumanUser
+from qiita_control_plane.dispatch import build_dispatch_semaphore
 from qiita_control_plane.ena_import import (
     DOWNLOAD_ENA_STUDY_ACTION_ID,
     DOWNLOAD_ENA_STUDY_ACTION_VERSION,
@@ -151,6 +152,7 @@ async def batch_app(postgres_pool):
     app.state.compute_backend_client = object()
     app.state.running_dispatches = set()
     app.state.running_ena_import_batches = set()
+    app.state.dispatch_semaphore = build_dispatch_semaphore()
 
     yield app
 
@@ -259,6 +261,12 @@ async def _cleanup_study(postgres_pool, study_accession: str) -> None:
         await postgres_pool.execute(
             "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])", ps_idxs
         )
+        # prep_sample_metadata RESTRICTs its prep_sample and study field, so
+        # sweep both before prep_sample / prep_sample_study_field / study below.
+        await postgres_pool.execute(
+            "DELETE FROM qiita.prep_sample_metadata WHERE prep_sample_idx = ANY($1::bigint[])",
+            ps_idxs,
+        )
     await postgres_pool.execute(
         "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
     )
@@ -266,6 +274,9 @@ async def _cleanup_study(postgres_pool, study_accession: str) -> None:
         await postgres_pool.execute(
             "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", ps_idxs
         )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.prep_sample_study_field WHERE study_idx = $1", study_idx
+    )
     bs_rows = await postgres_pool.fetch(
         "SELECT biosample_idx FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
     )

@@ -184,6 +184,7 @@ async def cli_cp_client(postgres_pool, signing_key, human_admin_session, data_pl
     POST /work-ticket can fire schedule_dispatch against a real backend."""
     from qiita_common.api_paths import LOOPBACK_HOST
     from qiita_control_plane.config import Settings as CPSettings
+    from qiita_control_plane.dispatch import build_dispatch_semaphore
     from qiita_control_plane.main import app as cp_app
 
     cp_app.state.pool = postgres_pool
@@ -196,6 +197,7 @@ async def cli_cp_client(postgres_pool, signing_key, human_admin_session, data_pl
     )
     cp_app.state.compute_backend_client = LocalComputeBackendClient()
     cp_app.state.running_dispatches = set()
+    cp_app.state.dispatch_semaphore = build_dispatch_semaphore()
 
     async with AsyncClient(
         transport=ASGITransport(app=cp_app),

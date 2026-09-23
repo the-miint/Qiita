@@ -23,6 +23,7 @@ from ..miint import connect_with_miint_staged
 from ..repositories.block import fetch_mask_sample_state
 from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
 from ..repositories.sequenced_sample import fetch_sequenced_pool_ena_run_roster
+from ..repositories.sequencing_run import lock_sequencing_run
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
 _log = logging.getLogger(__name__)
@@ -321,6 +322,7 @@ async def _stage_ena_run_roster(
     pool: asyncpg.Pool,
     sequenced_pool_idx: int,
     *,
+    sequencing_run_idx: int,
     workspace: Path,
 ) -> dict[str, Path]:
     """Stage the download-ena-study pool's run roster before the step loop.
@@ -341,8 +343,18 @@ async def _stage_ena_run_roster(
     `ena_run_accession` is NULL: a download-ena-study ticket only makes sense
     against ENA-origin sequenced_samples, so a NULL accession is a
     misconfiguration (e.g. a non-ENA sample sharing the pool) that must never
-    be silently skipped out of the roster."""
-    rows = await fetch_sequenced_pool_ena_run_roster(pool, sequenced_pool_idx=sequenced_pool_idx)
+    be silently skipped out of the roster.
+
+    The read runs in a transaction holding `lock_sequencing_run`, so it waits
+    for an in-flight registration that already picked this pool to commit its
+    runs first (see the helper for the race that closes). This resolver also
+    re-runs on a resume or a `/run` redrive, not only at first dispatch, and a
+    re-read can only add runs."""
+    async with pool.acquire() as conn, conn.transaction():
+        await lock_sequencing_run(conn, sequencing_run_idx=sequencing_run_idx)
+        rows = await fetch_sequenced_pool_ena_run_roster(
+            conn, sequenced_pool_idx=sequenced_pool_idx
+        )
     if not rows:
         raise _submission_bad_input(
             f"sequenced_pool {sequenced_pool_idx} has no sequenced_samples to build "
@@ -359,6 +371,37 @@ async def _stage_ena_run_roster(
     out = workspace / "ena_run_map.parquet"
     _write_ena_run_map_parquet(roster, out)
     return {ENA_RUN_MAP_BINDING: out}
+
+
+async def _stage_ena_run_roster_binding(
+    pool: asyncpg.Pool,
+    *,
+    action_steps: list[Any],
+    scope_target: dict[str, Any],
+    workspace: Path,
+) -> dict[str, Path] | None:
+    """Stage the `ena_run_map` roster for a workflow that declares that input
+    (the download-ena-study workflow's `ingest_ena_reads` step); None when the
+    workflow declares no `ena_run_map` input.
+
+    The roster comes from a LIVE Postgres query (unlike `sample_map`, which the
+    CP composer embeds in action_context at submit time): reading it live keeps
+    the two ticket-creation paths from having to agree on a duplicated roster
+    shape, and picks up a post-submit registration correction rather than a
+    submit-time snapshot. Dispatched by DECLARED-INPUT NAME, not scope-kind:
+    bcl-convert is also sequenced_pool-scoped, so keying off scope-kind would
+    wire this resolver into its ticket too. Called inside run_workflow's
+    pre-loop try, so an empty-pool / missing-accession failure lands in the
+    outer FAILED handler.
+    """
+    if not _workflow_declares_input(action_steps, ENA_RUN_MAP_BINDING):
+        return None
+    return await _stage_ena_run_roster(
+        pool,
+        scope_target["sequenced_pool_idx"],
+        sequencing_run_idx=scope_target["sequencing_run_idx"],
+        workspace=workspace,
+    )
 
 
 def _do_action_export(action_type: str, data_plane_url: str, token: bytes) -> dict[str, Any]:

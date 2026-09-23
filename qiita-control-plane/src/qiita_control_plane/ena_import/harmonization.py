@@ -11,12 +11,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from qiita_common.models import BIOSAMPLE_DISPLAY_HOST_TAXON_ID
+
 from .attribute_mapping import map_ena_attributes
 
-# The import composer enforces this required global field. ENA carries no NCBI
+# The import composer requires the `host taxon id` global field. ENA carries no NCBI
 # host taxon id -- its `host` is submitter free text -- so the honest value is
 # the missing-value marker rather than a guess or a weakened gate.
-HOST_TAXON_ID_DISPLAY_NAME = "host taxon id"
 HOST_TAXON_ID_UNKNOWN = "not provided"
 
 
@@ -44,7 +45,7 @@ def build_biosample_metadata(
     are), and the import resolves any key naming a global to that global.
     """
     mapped, unmapped = map_ena_attributes(attributes)
-    global_metadata = {**mapped, HOST_TAXON_ID_DISPLAY_NAME: HOST_TAXON_ID_UNKNOWN}
+    global_metadata = {**mapped, BIOSAMPLE_DISPLAY_HOST_TAXON_ID: HOST_TAXON_ID_UNKNOWN}
     return (
         global_metadata,
         dict(unmapped),

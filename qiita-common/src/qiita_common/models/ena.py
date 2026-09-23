@@ -25,6 +25,15 @@ class EnaStudyHeader(BaseModel):
     scientific_name: str | None = None
     tax_id: int | None = None
 
+    @field_validator("secondary_study_accession")
+    @classmethod
+    def _normalize_blank_to_none(cls, v: str | None) -> str | None:
+        # read_ena reports a missing secondary accession as "", not NULL --
+        # normalize so a consumer's `is not None` means "ENA reported one".
+        if v is not None and not v.strip():
+            return None
+        return v
+
 
 class EnaRunRecord(BaseModel):
     """One sequencing run — `read_ena(accession)` (default `result='read_run'`) —
@@ -54,6 +63,16 @@ class EnaRunRecord(BaseModel):
     fastq_md5: list[str] | None = None
     read_count: int | None = None
     base_count: int | None = None
+
+    @field_validator("library_layout", "library_strategy", "library_source", "library_selection")
+    @classmethod
+    def _normalize_blank_library_to_none(cls, v: str | None) -> str | None:
+        # read_ena reports a missing library field as "", not NULL -- normalize
+        # so a consumer's `is not None` means "ENA reported one", as on
+        # EnaStudyHeader.
+        if v is not None and not v.strip():
+            return None
+        return v
 
 
 class EnaSampleAttributes(BaseModel):

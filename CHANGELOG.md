@@ -42,6 +42,36 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   named reference, and changing nothing on a second run — are pinned by an
   `integration`-gated data-plane test against a real catalog.
 
+- **ENA import preserves every deposited `library_*` field as prep_sample metadata
+  (#599).** `register_ena_study` now writes `library_strategy`, `library_source`,
+  `library_selection`, and `library_layout` onto each run's prep_sample as the
+  study-local TEXT fields `ena library strategy`, `ena library source`,
+  `ena library selection`, and `ena library layout` — whitespace-trimmed, otherwise
+  exactly as deposited (no case normalization), so what ENA deposited survives
+  independently of the `prep_protocol` mapping, which consumes only strategy/source
+  and is slated for replacement. The four fields are resolved and vetted once per
+  study before any run is written, so a pre-existing field at one of those names that
+  is non-text, unique within the study, or globally linked fails the whole accession
+  loudly instead of run by run. A field ENA left blank writes no row. **New imports
+  only:** runs imported before this change are not backfilled, so a re-import of an
+  older study leaves those runs' slots empty.
+
+- **Deploy proves outbound HTTPS to the ENA archives, so a blocked host fails the deploy
+  instead of every import (#584).** `deploy/verify.sh` gains an `ena-reachability` check
+  (hatch `SKIP_ENA_REACHABILITY`, which covers that row only) that HEADs `www.ebi.ac.uk` as
+  the `qiita-api` service user with the unit's own environment sourced, and
+  `qiita-admin compute-readiness` gains an `ena-from-compute` probe that runs
+  `qiita_compute_orchestrator.ena_reachability_check` (stdlib only, no miint LOAD, so a red
+  row means egress and never a broken extension) to HEAD `www.ebi.ac.uk` and
+  `ftp.sra.ebi.ac.uk` from a SLURM compute node; it rides the SLURM probe job, so
+  `SKIP_SLURM_PROBE` is what skips it. Both require a 2xx — a blocking gateway answers on
+  the socket, and its 403 block page must not read as reachable. Previously a firewall/NAT
+  blocking outbound HTTPS passed every deploy check and then failed every ENA import at
+  runtime — metadata resolve on the control plane, read download on the cluster — with the
+  gap invisible until an import was submitted. Both probes answer for egress only: the fetch
+  itself runs through DuckDB httpfs, so a proxy or CA problem confined to httpfs still
+  surfaces at the first import.
+
 - **`estimate-feature-table` gates the de novo arm on CheckM completeness /
   contamination (#564).** Two new optional `action_context` keys, `min_completeness` and
   `max_contamination`, defaulting to 50 / 10. The gate filters the de novo
@@ -1870,6 +1900,84 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Work-ticket dispatch now has its own process-wide concurrency bound, so a burst of ticket submits can no longer starve the connection pool through dispatch alone (#598).**
+  `_STUDY_CONCURRENCY` releases its permit at submit, but the fire-and-forget
+  `schedule_dispatch` that submit starts keeps running, and acquiring connections, for
+  as long as the workflow does; `fanout_max_inflight` only caps fan-out cohorts, and an
+  ENA `download-ena-study` ticket is not one. Dispatch now runs under its own
+  semaphore, `_DISPATCH_CONCURRENCY` (8, sized against `PRODUCTION_POOL_MAX_SIZE` the
+  way `_STUDY_CONCURRENCY` is). A task holds its slot for its whole workflow, an
+  hours-long download poll included, so this also caps in-flight workflows
+  process-wide: tickets past the limit dispatch when a slot frees instead of all at
+  once, and log the wait at INFO while they queue.
+
+- **ENA import: close the race where a run added after its pool's download ticket read
+  the roster was never downloaded (#602)** — `register_ena_study` now holds the
+  sequencing_run pool-write advisory lock from pool resolution until its run inserts
+  commit (one transaction, savepoints per run), and the runner's dispatch-time roster
+  read (`_stage_ena_run_roster`) takes the same lock, so a roster read either waits
+  for the in-flight registration or the registration sees the covering ticket and
+  keeps its runs out of that pool. One transaction also makes a study
+  **all-or-nothing per attempt**: a failure or shutdown mid-study discards every run
+  it had written so far — recoverable, because `reconcile_inflight_batches`
+  re-registers idempotently — where runs used to bank one COMMIT at a time.
+- **Feature table: a de novo genome's pooled breadth of coverage counts other prep_samples' reads on contigs they also assembled, and both scopes call miint's coverage macros (#586).**
+  With a de novo arm, pooled coverage joined the contig→genome map on the prep_sample as
+  well as the contig, so a de novo genome saw only the reads of the prep_sample that
+  assembled it and pooled breadth equalled per-sample breadth. The de novo arm now calls
+  `genome_coverage` like the reference arm: a contig two cohort prep_samples assembled
+  gives both prep_samples' covered bases to each one's genome, so a combined table built
+  with pooled scope and a threshold above 0 can keep de novo genomes it used to drop.
+  Each de novo placement still counts only toward its own prep_sample's genome. The
+  pooled merge does not reconcile orientation: when a later assembly run stores a shared
+  contig as its reverse complement, prep_samples aligned before it keep positions on the
+  other axis, and that contig's pooled breadth can come out too high or too low
+  (`survivor_table_sql` in `qiita_common.analytic.coverage`).
+  `estimate_feature_table` always uses pooled, and `qiita feature-table build` defaults
+  to it. Per-sample coverage calls `genome_coverage_per_sample` on both arms in place of
+  Qiita's own copy of the arithmetic, with the same results. `qiita feature-table build
+  --coverage-scope per-sample` therefore needs a miint build that has
+  `genome_coverage_per_sample` (duckdb-miint#220, merged 2026-08-18). The client installs
+  miint once and never refreshes it, so a cache filled from an older build fails on the
+  missing function until the cached extension file is deleted and the next run
+  re-installs it; its path is the `install_path` that `duckdb_extensions()` reports for
+  `miint`.
+- **ENA import: a study findable only by its secondary accession (`ena_study_accession`) is now reused instead of failing with an opaque error, and a pair that resolves to a contradicting study now fails loud instead of reusing the wrong one (#590).**
+  `get_or_create_study_by_ena_accessions` looked up an existing study by
+  `bioproject_accession` only. A study recorded with an `ena_study_accession` but no
+  `bioproject_accession` was invisible to that lookup: re-importing it hit the
+  `ena_study_accession` unique constraint on create, then the same bioproject-only
+  refetch missed again and raised an opaque `PostgresError`. The find-or-create now
+  resolves an existing study by either accession, and raises a new
+  `EnaStudyAccessionConflictError` when the incoming pair identifies two different
+  studies, or contradicts the one study it does resolve to.
+  **Behavior change on already-deployed data:** a study whose two recorded accessions
+  contradict an incoming import's pair now fails that import item instead of silently
+  reusing the study.
+- **`ingest_ena_reads`'s md5-mismatch failure reason says how to tell a corrupted download from a digest ENA itself publishes wrong, instead of blaming "data corruption" (#591).**
+  The old wording named one cause among several and pointed at a re-queue a permanent
+  failure never reaches. The message now tells the operator to compare the run's
+  `fastq_md5` in the ENA Portal API against the value in the error: equal means ENA's own
+  file disagrees with its digest and a re-import fails identically, different means the
+  download was corrupted and a re-import retries it. The classification stays `BAD_INPUT`,
+  now as a stated choice rather than a claim about retries — miint raises the same error
+  for both causes ([duckdb-miint#274](https://github.com/the-miint/duckdb-miint/issues/274)),
+  and #595 tracks revisiting it.
+- **The `miint-sequence-split`, `miint-host-filter-fns`, `miint-infer-trim`, and `miint-gpl-boundary` compute-readiness probes now report contract drift under `python -O` / `PYTHONOPTIMIZE`, where they previously reported ok (#592).**
+  Each probe signaled the contract drift it exists to catch with a bare `assert`,
+  which `python -O` (or `PYTHONOPTIMIZE` set anywhere in the SLURM job env) strips —
+  the probe then exited 0 and printed nothing on exactly the drift it was checking
+  for. Each now raises `RuntimeError` from an explicit `if`, independent of the
+  interpreter's optimize level.
+- **ENA import: the batch concurrency bound is process-wide instead of per-batch, so several batches submitted together no longer starve the connection pool (#593).**
+  `_run_batch` built its own `asyncio.Semaphore(_STUDY_CONCURRENCY)` per call, so N
+  concurrently-scheduled batches could together claim up to N × `_STUDY_CONCURRENCY`
+  connections -- enough to take every connection the pool has, leaving unrelated
+  callers queued behind them. `schedule_ena_import_batch` now reads one semaphore off
+  `app.state`, shared first-come-first-served by every in-flight batch;
+  `_STUDY_CONCURRENCY` stays 4. The bound covers resolve, register, and ticket submit;
+  the fire-and-forget `schedule_dispatch` each submitted ticket starts still runs
+  outside it.
 - **Reference load: a genome map is checked against the reference FASTA before anything is minted, so a map whose read_ids match no FASTA sequence fails and a partial match logs what went unmatched (#577).**
   `_associate_genomes` INNER-JOINed the genome map onto the manifest's `read_id`, silently
   dropping every map row whose `read_id` isn't a FASTA sequence ID. `mint-features` now
@@ -3655,6 +3763,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **The ENA ingestion path names the `biosample_global_field` display names it writes as
+  constants instead of literals (#589).** `collection date`, the three geographic-location
+  fields, `depth`, and `host taxon id` are now `BIOSAMPLE_DISPLAY_*` in
+  `qiita_common.models.biosample`, re-exported from `qiita_common.models`.
+  `attribute_mapping.py` and `harmonization.py` emit them; the normalized-tag lookup keys
+  in `attribute_mapping.py` are unaffected. No behavior change.
 
 - **`align/1.0.0`'s memory ceiling is 128 GB, above the `align_sharded` step's
   unchanged 64 GB baseline (#560).** With the ceiling equal to the baseline, OOM

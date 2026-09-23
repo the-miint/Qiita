@@ -341,6 +341,33 @@ class StudyFieldNotUniqueInStudyError(Exception):
         )
 
 
+class StudyFieldUniqueInStudyError(Exception):
+    """Raised when a write whose value repeats across the study's entities
+    resolves an existing field that declares unique_in_study.
+
+    Carries the field so a caller can name it: the fix is to clear the policy
+    or to name a different field, and neither is a decision this layer can take.
+    """
+
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        study_idx: int,
+        display_name: str,
+        study_field_idx: int,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.study_idx = study_idx
+        self.display_name = display_name
+        self.study_field_idx = study_field_idx
+        super().__init__(
+            f"{entity_kind} field {display_name!r} on study {study_idx} declares its"
+            f" values unique within the study, so the same value cannot be written"
+            f" for every {entity_kind}"
+        )
+
+
 class StudyFieldDataTypeNotTextError(Exception):
     """Raised when a write that can only put text through a field resolves an
     existing field declaring some other data_type.
@@ -2294,6 +2321,139 @@ async def create_study_field_and_read_back(
     return created_row
 
 
+async def resolve_local_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    display_name: str,
+    created_by_idx: int,
+    description: str | None = None,
+    data_type: FieldDataType = FieldDataType.TEXT,
+    required: bool = False,
+    terminology_idx: int | None = None,
+    tier_override: Tier | None = None,
+    unique_in_study: bool = False,
+    enforce_unique_in_study: bool = False,
+) -> tuple[int, bool, asyncpg.Record]:
+    """Get-or-create a purely-local study field fit to receive the caller's
+    writes; return (study_field_idx, created, resolved row).
+
+    The row comes back resolved whichever branch produced it, so the caller can
+    judge what it got rather than being told only what this call asked for. A
+    resolution that contradicts the write is refused here, before any value
+    INSERT, with the typed error naming the field:
+
+      - a globally-linked row raises LocalWriteOnGloballyLinkedFieldError:
+        writing a local-only value through it would let the value compete in
+        the cross-study global slot, the opposite of local-only intent.
+      - when the caller writes text, a row declaring another data_type raises
+        StudyFieldDataTypeNotTextError: refused rather than coerced, because a
+        value that has been through a type round-trip is a different value.
+        (The field-contract trigger would reject the value anyway; this turns
+        its raw error into a typed one naming the field.)
+      - enforce_unique_in_study pins the resolved row's unique_in_study to
+        unique_in_study: a value whose meaning needs the policy raises
+        StudyFieldNotUniqueInStudyError when the row lacks it, a value every
+        entity of the study may share raises StudyFieldUniqueInStudyError when
+        the row declares it.
+
+    Requires a wrapping transaction: both get-or-create branches must share
+    one snapshot (see _get_or_create_local_study_field).
+    """
+    (
+        study_field_idx,
+        created,
+        resolved_row,
+    ) = await _get_or_create_local_study_field(
+        conn,
+        spec=spec,
+        study_idx=study_idx,
+        display_name=display_name,
+        created_by_idx=created_by_idx,
+        description=description,
+        data_type=data_type,
+        required=required,
+        terminology_idx=terminology_idx,
+        tier_override=tier_override,
+        unique_in_study=unique_in_study,
+    )
+    if resolved_row[spec.study_field_global_fk_column] is not None:
+        raise LocalWriteOnGloballyLinkedFieldError(
+            entity_kind=spec.entity_kind,
+            study_idx=study_idx,
+            display_name=display_name,
+            study_field_idx=study_field_idx,
+            found_global_field_idx=resolved_row[spec.study_field_global_fk_column],
+        )
+    if data_type == FieldDataType.TEXT and resolved_row["data_type"] != FieldDataType.TEXT:
+        raise StudyFieldDataTypeNotTextError(
+            entity_kind=spec.entity_kind,
+            study_idx=study_idx,
+            display_name=display_name,
+            study_field_idx=study_field_idx,
+            data_type=resolved_row["data_type"],
+        )
+    if enforce_unique_in_study and resolved_row["unique_in_study"] != unique_in_study:
+        if unique_in_study:
+            raise StudyFieldNotUniqueInStudyError(
+                entity_kind=spec.entity_kind,
+                study_idx=study_idx,
+                display_name=display_name,
+                study_field_idx=study_field_idx,
+            )
+        raise StudyFieldUniqueInStudyError(
+            entity_kind=spec.entity_kind,
+            study_idx=study_idx,
+            display_name=display_name,
+            study_field_idx=study_field_idx,
+        )
+    return study_field_idx, created, resolved_row
+
+
+async def write_local_metadata_on_resolved_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+    study_field_idx: int,
+    display_name: str,
+    data_type: FieldDataType,
+    value: SampleMetadataValue,
+    caller_idx: int,
+    study_field_created: bool = False,
+    on_conflict: MetadataConflictMode = "raise",
+) -> SampleMetadataWriteResult:
+    """Write one value against an already-resolved purely-local study field:
+    the per-value half of write_local_metadata_or_diagnose, for a caller that
+    resolved the field once (resolve_local_study_field) and writes it many
+    times, so the get-or-create runs once instead of per write.
+
+    The field's shape was judged at resolution; only the value slot is
+    diagnosed here, under the same on_conflict rules. The caller owns the
+    transaction. study_field_created is reported back in the result only --
+    write_local_metadata_or_diagnose forwards the flag its own get-or-create
+    returned.
+    """
+    require_transaction(conn)
+    # Insert-and-diagnose; the local path has no cross-study slot key, so
+    # global_field_idx stays None (which selects the per-field constraint).
+    return await _insert_metadata_or_diagnose(
+        conn,
+        spec=spec,
+        entity_idx=entity_idx,
+        study_idx=study_idx,
+        study_field_idx=study_field_idx,
+        study_field_created=study_field_created,
+        display_name=display_name,
+        data_type=data_type,
+        value=value,
+        caller_idx=caller_idx,
+        on_conflict=on_conflict,
+    )
+
+
 async def write_local_metadata_or_diagnose(
     conn: asyncpg.Connection,
     *,
@@ -2309,9 +2469,9 @@ async def write_local_metadata_or_diagnose(
     tier_override: Tier | None = None,
     on_conflict: MetadataConflictMode = "raise",
 ) -> SampleMetadataWriteResult:
-    """Write one local (non-globally-linked) metadata row; on collision,
-    diagnose the existing occupant and either overwrite it (on_conflict=
-    "upsert") or raise a typed exception.
+    """Resolve the local study_field, then write one metadata row against it;
+    on a value-slot collision, diagnose the existing occupant and either
+    overwrite it (on_conflict="upsert") or raise a typed exception.
 
     Returns SampleMetadataWriteResult (carrying the write outcome) on success.
     The caller owns the outer transaction: any study_field row created here
@@ -2319,23 +2479,17 @@ async def write_local_metadata_or_diagnose(
     tier_override are forwarded to the study_field create branch only.
     UniqueViolations whose constraint_name is NOT
     spec.local_unique_per_field_index_name propagate unchanged.
-    LocalWriteOnGloballyLinkedFieldError and TransientWriteRaceError also
-    propagate. A purely-local slot is single-study by construction, so upsert
-    always overwrites the caller's own value here (no foreign-study case).
+    LocalWriteOnGloballyLinkedFieldError, StudyFieldDataTypeNotTextError (a
+    text write against a non-text field, refused here rather than by the
+    contract trigger), and TransientWriteRaceError also propagate. A
+    purely-local slot is single-study by construction, so upsert always
+    overwrites the caller's own value here (no foreign-study case).
     """
     # Fail-fast: the caller must own the transaction so the typed exception
     # rolls back any study_field row this function created before raising.
     require_transaction(conn)
 
-    # Get-or-create the local study_field. The third tuple element is the
-    # resolved row's global_field_idx; non-None means the row is globally
-    # linked, which contradicts the caller's local-only intent and triggers
-    # the strict-mode guard.
-    (
-        study_field_idx,
-        study_field_created,
-        resolved_row,
-    ) = await _get_or_create_local_study_field(
+    study_field_idx, study_field_created, _ = await resolve_local_study_field(
         conn,
         spec=spec,
         study_idx=study_idx,
@@ -2346,31 +2500,17 @@ async def write_local_metadata_or_diagnose(
         terminology_idx=terminology_idx,
         tier_override=tier_override,
     )
-    if resolved_row[spec.study_field_global_fk_column] is not None:
-        # Strict-mode: the caller asked for local-only, but the resolved
-        # row is an existing field that is globally linked.
-        # Refuse the write before any metadata INSERT.
-        raise LocalWriteOnGloballyLinkedFieldError(
-            entity_kind=spec.entity_kind,
-            study_idx=study_idx,
-            display_name=display_name,
-            study_field_idx=study_field_idx,
-            found_global_field_idx=resolved_row[spec.study_field_global_fk_column],
-        )
-
-    # Insert-and-diagnose; the local path has no cross-study slot key, so
-    # global_field_idx stays None (which selects the per-field constraint).
-    return await _insert_metadata_or_diagnose(
+    return await write_local_metadata_on_resolved_field(
         conn,
         spec=spec,
         entity_idx=entity_idx,
         study_idx=study_idx,
         study_field_idx=study_field_idx,
-        study_field_created=study_field_created,
         display_name=display_name,
         data_type=data_type,
         value=value,
         caller_idx=caller_idx,
+        study_field_created=study_field_created,
         on_conflict=on_conflict,
     )
 

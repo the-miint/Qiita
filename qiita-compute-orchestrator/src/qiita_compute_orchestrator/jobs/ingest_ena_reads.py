@@ -170,14 +170,22 @@ def _classify_ena_fetch_error(
                 f"ENA run {run_accession}: transient fetch error ({type(exc).__name__}): {exc}"
             ),
         )
+    # Permanent is the deliberate choice, not a documented one: miint raises the
+    # same error for a truncated transfer and for bytes that genuinely disagree
+    # with ENA's digest (duckdb-miint#274).
     if "md5" in text:
         return BackendFailure(
             kind=FailureKind.BAD_INPUT,
             stage=WorkTicketFailureStage.STEP_RUN,
             step_name=step_name,
             reason=(
-                f"ENA run {run_accession}: ENA download md5 verification failed "
-                f"(data corruption) ({type(exc).__name__}): {exc}"
+                f"ENA run {run_accession}: downloaded bytes don't match ENA's "
+                f"declared fastq_md5. Compare the run's fastq_md5 in the ENA "
+                f"Portal API against the value reported here: if they agree, "
+                f"ENA's own file disagrees with its digest and a re-import "
+                f"fails the same way; if they differ, the download was "
+                f"corrupted and re-importing the study retries it "
+                f"({type(exc).__name__}): {exc}"
             ),
         )
     return BackendFailure(

@@ -16,10 +16,12 @@ from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_ENA_IMPORT_BATCH_BY_IDX, URL_ENA_IMPORT_BATCH_PREFIX
 from qiita_common.auth_constants import Scope, SystemRole
 
+from qiita_control_plane.dispatch import build_dispatch_semaphore
 from qiita_control_plane.ena_import import (
     DOWNLOAD_ENA_STUDY_ACTION_ID,
     DOWNLOAD_ENA_STUDY_ACTION_VERSION,
 )
+from qiita_control_plane.ena_import.batch import build_ena_import_study_semaphore
 from qiita_control_plane.testing.unique_names import unique_accession
 
 pytestmark = pytest.mark.db
@@ -120,6 +122,8 @@ async def eib_client(postgres_pool, stub_compute_backend_client):
     app.state.compute_backend_client = stub_compute_backend_client
     app.state.running_dispatches = set()
     app.state.running_ena_import_batches = set()
+    app.state.ena_import_study_semaphore = build_ena_import_study_semaphore()
+    app.state.dispatch_semaphore = build_dispatch_semaphore()
 
     created_principals: list[int] = []
     created_batches: list[int] = []
@@ -287,6 +291,12 @@ async def _cleanup_study(postgres_pool, study_accession: str) -> None:
             "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])",
             ps_idxs,
         )
+        # prep_sample_metadata RESTRICTs its prep_sample and study field, so
+        # sweep both before prep_sample / prep_sample_study_field / study below.
+        await postgres_pool.execute(
+            "DELETE FROM qiita.prep_sample_metadata WHERE prep_sample_idx = ANY($1::bigint[])",
+            ps_idxs,
+        )
     await postgres_pool.execute(
         "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
     )
@@ -294,6 +304,9 @@ async def _cleanup_study(postgres_pool, study_accession: str) -> None:
         await postgres_pool.execute(
             "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", ps_idxs
         )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.prep_sample_study_field WHERE study_idx = $1", study_idx
+    )
     bs_rows = await postgres_pool.fetch(
         "SELECT biosample_idx FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
     )

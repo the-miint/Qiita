@@ -13,7 +13,11 @@ specific to importing from ENA.
 
 A single admin-facing call kicks off a **batch**: a list of INSDC study accessions
 (`PRJNA…`, `PRJEB…`, `PRJDB…`, `ERP…`, `SRP…`, `DRP…`). Each accession in the batch is
-processed independently, with bounded concurrency, in three phases:
+processed independently, with bounded concurrency, in three phases. That bound is shared
+by every batch running in the control plane at once, first come first served: a later
+batch's accessions are not admitted until every accession of every batch submitted before
+it has itself been admitted, so a busy batch can make a newly submitted one wait for it
+to clear the gate first.
 
 1. **Resolve** — the study's header, run list, and per-sample attributes are pulled
    from ENA (via the `duckdb-miint` `read_ena` / `read_ena_attributes` table
@@ -26,12 +30,38 @@ processed independently, with bounded concurrency, in three phases:
    runs go into a `sequenced_pool` on it — a multi-platform study yields more than one
    pool. Each run's ENA sample attributes are harmonized onto its biosample's metadata
    the first time that biosample is created (a re-import or a cross-study reuse does
-   not re-harmonize).
+   not re-harmonize). Each run also keeps ENA's four deposited `library_*` values as
+   study-local `ena library strategy` / `ena library source` /
+   `ena library selection` / `ena library layout` metadata on its prep_sample — new
+   imports only, since runs imported before that writer existed are not backfilled,
+   and a field ENA left blank writes no row.
 3. **Submit** — one `download-ena-study` work ticket per pool holding the study's
    runs, scoped to that `sequenced_pool`. A pool whose ticket is in flight or finished
    reuses it; one with no ticket, or whose ticket failed or was cancelled, gets a new
    one. This is the ticket that actually pulls read bytes; registration itself never
    touches read data.
+
+That gate ends at submit. The background dispatch each submitted ticket starts runs
+past it under its own process-wide bound: at most **8** dispatch tasks run at once
+(`_DISPATCH_CONCURRENCY` in `qiita-control-plane/src/qiita_control_plane/dispatch.py`,
+download workflows included), so a large import queues its downloads rather than
+pressuring the control plane's connection pool. A ticket past the cap dispatches as
+soon as a slot frees — nothing fails while it waits — and logs `queued behind the
+dispatch cap` at INFO when it starts waiting, `dispatched after waiting` when it gets
+one. The queue is a single FIFO shared by every dispatch path: ENA downloads, user-
+submitted tickets, a redrive through `POST /work-ticket/{idx}/run`, and a restart's
+re-attach all wait on the same 8 slots, so eight hours-long downloads can hold a user
+ticket until one finishes. Raising the cap is a joint decision with the connection
+pool and `FANOUT_MAX_INFLIGHT` — the sizing note on the constant says what it is
+weighed against.
+
+A download ticket's roster read also waits at most 90 s
+(`POOL_LOCK_WAIT_TIMEOUT_S`) for an in-flight registration of the same
+sequencing_run to commit, so a study of many hundreds of runs cannot fail the
+read by holding that lock past the pool's default 10 s statement budget. A
+download ticket that still fails there is FAILED/RETRIABLE: let the import
+finish, then redrive it with `POST /work-ticket/{idx}/run` — the re-read only
+adds runs.
 
 ### Re-importing, and studies we created ourselves
 
@@ -50,6 +80,15 @@ data. That case fails the accession with `not created by an ENA import`, before
 anything is written. Deleting a batch (which cascades its items) discards the record
 that the import created the study, so a later re-import of that accession is refused
 as well.
+
+A study matched by either the incoming `bioproject_accession` or `ena_study_accession`
+is reused, and is still subject to the import-created guard above. If the pair
+identifies two different studies, or contradicts the accession the one study it
+resolves to has on file, the accession fails instead of picking a winner. The stored
+failure text is the raw contradiction, e.g. `bioproject_accession='PRJNA1',
+ena_study_accession='ERP1': study 42 has bioproject_accession 'PRJNA2'` — it does not
+say the import was refused. Fix the accession passed to the import, or the study's
+recorded value, then re-import.
 
 A failure in any one accession — an unmappable platform, a resolver error, a database
 conflict — is recorded on that accession alone; it never aborts the batch or its
@@ -156,8 +195,11 @@ that comes back truncated or empty fails loud either way.
 
 **Network access.** The control-plane host resolves metadata from `www.ebi.ac.uk`, and
 the SLURM compute nodes running `ingest_ena_reads` reach both `www.ebi.ac.uk` and
-`ftp.sra.ebi.ac.uk`, all over HTTPS. Nothing probes this at deploy: a host that cannot
-reach them fails its imports at resolve, and a compute node its download tickets.
+`ftp.sra.ebi.ac.uk`, all over HTTPS. Two deploy rows HEAD those hosts so a blocked
+one fails at deploy rather than at the first import — `ena-reachability` from the
+control-plane host and `probe/ena-from-compute` from a compute node. What each row
+covers, what a green one does *not* prove, and which hatch skips which are in
+[`redeploy.md` §7](redeploy.md#7-verify).
 
 An unresolvable accession (malformed, or one ENA does not recognize) fails loud with
 an actionable message rather than resolving to a silent empty result — see

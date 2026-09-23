@@ -22,6 +22,11 @@ from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 from qiita_control_plane.auth import tickets
 from qiita_control_plane.auth.tickets import run_signed_flight_call, token_expiry
+from qiita_control_plane.repositories import INT4_MASK
+from qiita_control_plane.repositories.sequencing_run import (
+    POOL_LOCK_WAIT_TIMEOUT_S,
+    POOL_RESOLVE_LOCK_CLASS,
+)
 from qiita_control_plane.runner import (
     ENA_RUN_MAP_BINDING,
     SAMPLE_MAP_BINDING,
@@ -31,6 +36,7 @@ from qiita_control_plane.runner import (
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
     _stage_ena_run_roster,
+    _stage_ena_run_roster_binding,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
@@ -75,17 +81,52 @@ def test_resolve_sample_map_rejects_empty_roster(tmp_path):
 # --- ENA run roster (_stage_ena_run_roster) ---------------------------------
 
 
+class _NoopAsyncCtx:
+    """Async context manager yielding its value; lets the fake pool stand in
+    for `acquire()` / `transaction()` without a DB."""
+
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
 class _FakeRosterPool:
     """Minimal asyncpg.Pool stand-in: `.fetch()` returns canned
     (prep_sample_idx, ena_run_accession) rows regardless of the query text —
     the resolver's own SQL shape is exercised by
     repositories/tests/test_sequenced_sample.py; this fake only needs to hand
-    back rows in a stable, asserted order."""
+    back rows in a stable, asserted order. `acquire`/`transaction` hand back
+    no-op context managers; `execute` and `fetch` RECORD their calls instead
+    of running SQL, so a test can pin which key the advisory-lock statement
+    locked (and with what timeout), or that nothing ran at all.
+    `in_transaction` is what `require_transaction` sees, to pin that guard."""
 
-    def __init__(self, rows: list[tuple[int, str | None]]):
+    def __init__(self, rows: list[tuple[int, str | None]], *, in_transaction: bool = True):
         self._rows = [{"prep_sample_idx": p, "ena_run_accession": a} for p, a in rows]
+        self.in_transaction = in_transaction
+        self.execute_calls: list[tuple[tuple, dict]] = []
+        self.fetch_calls: list[tuple] = []
 
-    async def fetch(self, *_args, **_kwargs):
+    def acquire(self):
+        return _NoopAsyncCtx(self)
+
+    def transaction(self):
+        return _NoopAsyncCtx(self)
+
+    def is_in_transaction(self):
+        return self.in_transaction
+
+    async def execute(self, *args, **kwargs):
+        self.execute_calls.append((args, kwargs))
+        return "SET"
+
+    async def fetch(self, *args, **kwargs):
+        self.fetch_calls.append(args)
         return self._rows
 
 
@@ -94,7 +135,9 @@ def test_stage_ena_run_roster_writes_ordered_parquet(tmp_path):
     to `ena_run_map.parquet`, ordered by prep_sample_idx (the repo fetch's own
     ORDER BY — this asserts the resolver preserves it verbatim)."""
     pool = _FakeRosterPool([(82, "ERR002"), (81, "ERR001")])
-    bound = asyncio.run(_stage_ena_run_roster(pool, 5, workspace=tmp_path / "ws"))
+    bound = asyncio.run(
+        _stage_ena_run_roster(pool, 5, sequencing_run_idx=7, workspace=tmp_path / "ws")
+    )
     out = bound[ENA_RUN_MAP_BINDING]
     assert out.exists()
     with duckdb.connect(":memory:") as conn:
@@ -110,7 +153,7 @@ def test_stage_ena_run_roster_rejects_empty_pool(tmp_path):
     and this must never silently produce a 0-row ena_run_map."""
     pool = _FakeRosterPool([])
     with pytest.raises(BackendFailure) as exc:
-        asyncio.run(_stage_ena_run_roster(pool, 5, workspace=tmp_path / "ws"))
+        asyncio.run(_stage_ena_run_roster(pool, 5, sequencing_run_idx=7, workspace=tmp_path / "ws"))
     assert exc.value.kind == FailureKind.BAD_INPUT
     assert "no sequenced_samples" in exc.value.reason
 
@@ -121,9 +164,83 @@ def test_stage_ena_run_roster_rejects_missing_accession(tmp_path):
     dropping it from the roster."""
     pool = _FakeRosterPool([(81, "ERR001"), (82, None)])
     with pytest.raises(BackendFailure) as exc:
-        asyncio.run(_stage_ena_run_roster(pool, 5, workspace=tmp_path / "ws"))
+        asyncio.run(_stage_ena_run_roster(pool, 5, sequencing_run_idx=7, workspace=tmp_path / "ws"))
     assert exc.value.kind == FailureKind.BAD_INPUT
     assert "82" in exc.value.reason
+
+
+def test_stage_ena_run_roster_locks_the_run_key_with_the_bounded_wait(tmp_path):
+    """The lock goes to the *sequencing_run* key (7 — distinct from the pool
+    idx 5 passed alongside it), under POOL_RESOLVE_LOCK_CLASS and the
+    deliberate POOL_LOCK_WAIT_TIMEOUT_S bound rather than the pool's
+    inherited 10s command_timeout."""
+    pool = _FakeRosterPool([(81, "ERR001")])
+    asyncio.run(_stage_ena_run_roster(pool, 5, sequencing_run_idx=7, workspace=tmp_path / "ws"))
+    (args, kwargs) = pool.execute_calls[0]
+    assert args == (
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        POOL_RESOLVE_LOCK_CLASS,
+        7 & INT4_MASK,
+    )
+    assert kwargs["timeout"] == POOL_LOCK_WAIT_TIMEOUT_S
+
+
+def test_lock_sequencing_run_refuses_without_a_transaction(tmp_path):
+    """In autocommit the xact-lock dies with the statement, silently
+    protecting nothing — a caller that forgot its transaction must fail
+    loudly instead, before any SQL runs."""
+    pool = _FakeRosterPool([(81, "ERR001")], in_transaction=False)
+    with pytest.raises(RuntimeError, match="outside a transaction"):
+        asyncio.run(_stage_ena_run_roster(pool, 5, sequencing_run_idx=7, workspace=tmp_path / "ws"))
+    assert pool.execute_calls == []
+
+
+def test_stage_ena_run_roster_binding_stages_for_declared_workflow(tmp_path):
+    """run_workflow's pre-loop wiring: a workflow declaring `ena_run_map` gets
+    the roster staged from the ticket's scope — pool idx 5 and sequencing_run
+    idx 7 travel as separate arguments, so a swap fails on the recorded lock
+    key here rather than on a live DB."""
+    pool = _FakeRosterPool([(81, "ERR001")])
+    steps = [_step(inputs=["ena_run_map"], outputs=["read_staging_dir"])]
+    scope_target = {
+        "kind": "sequenced_pool",
+        "sequenced_pool_idx": 5,
+        "sequencing_run_idx": 7,
+    }
+    bound = asyncio.run(
+        _stage_ena_run_roster_binding(
+            pool, action_steps=steps, scope_target=scope_target, workspace=tmp_path / "ws"
+        )
+    )
+    assert bound is not None
+    assert bound[ENA_RUN_MAP_BINDING].exists()
+    assert pool.fetch_calls  # the live roster read ran
+    (args, _kwargs) = pool.execute_calls[0]
+    assert args == (
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        POOL_RESOLVE_LOCK_CLASS,
+        7 & INT4_MASK,
+    )
+
+
+def test_stage_ena_run_roster_binding_skips_undeclared_workflow(tmp_path):
+    """A workflow that declares no `ena_run_map` (bcl-convert: also
+    sequenced_pool-scoped) stages nothing — no lock taken, no read run."""
+    pool = _FakeRosterPool([(81, "ERR001")])
+    steps = [_step(inputs=["convert_dir", "sample_map"], outputs=["read_staging_dir"])]
+    scope_target = {
+        "kind": "sequenced_pool",
+        "sequenced_pool_idx": 5,
+        "sequencing_run_idx": 7,
+    }
+    bound = asyncio.run(
+        _stage_ena_run_roster_binding(
+            pool, action_steps=steps, scope_target=scope_target, workspace=tmp_path / "ws"
+        )
+    )
+    assert bound is None
+    assert pool.execute_calls == []
+    assert pool.fetch_calls == []
 
 
 def test_workflow_declares_run_map_binding_gate():

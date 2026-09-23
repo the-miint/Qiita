@@ -20,14 +20,16 @@ from qiita_common.models import HealthResponse, HealthStatus
 from .auth.cli_login_code_sweeper import run_cli_login_code_sweeper
 from .auth.oidc import AuthRocketVerifier
 from .config import Settings
-from .db import close_pool, get_pool
+from .db import PRODUCTION_POOL_MAX_SIZE, close_pool, get_pool
 from .deps import get_db_pool
 from .dispatch import (
     build_compute_backend_client,
+    build_dispatch_semaphore,
+    dispatch_semaphore,
     drain_running_dispatches,
     reconcile_inflight_tickets,
 )
-from .ena_import.batch import reconcile_inflight_batches
+from .ena_import.batch import build_ena_import_study_semaphore, reconcile_inflight_batches
 from .health import aggregate_health
 from .landing import router as landing_router
 from .notify import build_transport, run_sweeper
@@ -62,7 +64,7 @@ async def lifespan(app: FastAPI):
         log_level,
         settings.fanout_max_inflight,
     )
-    app.state.pool = await get_pool(settings.database_url)
+    app.state.pool = await get_pool(settings.database_url, max_size=PRODUCTION_POOL_MAX_SIZE)
     app.state.settings = settings
     # Build the OIDC verifier eagerly when AUTHROCKET_* is set.
     # AuthRocketVerifier.from_settings raises on missing env, which makes
@@ -82,6 +84,12 @@ async def lifespan(app: FastAPI):
         token_path=settings.cp_to_co_token_path,
     )
     app.state.running_dispatches = set()
+    app.state.dispatch_semaphore = build_dispatch_semaphore()
+    # Boot-time read: if the assignment above was removed or reordered, fail
+    # here — before reconcile dispatches anything — rather than post-commit at
+    # the first route, or in the fan-out pump where a raise strands a released
+    # ticket that no later pump counts.
+    dispatch_semaphore(app)
     # Re-attach any tickets left in non-terminal state by a previous CP
     # process — they have no live owner. Resumed in-place (re-attach to a
     # live SLURM job, finalize one that finished while we were down, or fail
@@ -95,6 +103,7 @@ async def lifespan(app: FastAPI):
     # "no live owner, resume in place" reasoning as reconcile_inflight_tickets
     # above; register_ena_study is idempotent so this is always safe.
     app.state.running_ena_import_batches = set()
+    app.state.ena_import_study_semaphore = build_ena_import_study_semaphore()
     await reconcile_inflight_batches(app)
 
     # Email-notification wiring. Build the transport (SMTP relay
