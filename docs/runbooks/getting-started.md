@@ -324,8 +324,8 @@ damage what you already have.
 
 It gets a submission past a single refusal: on Illumina, submitting again over a
 run whose demultiplexing already completed is refused, and `--force` waives that.
-On PacBio nothing refuses you in the first place, so it changes nothing at all
-there. It needs a `wet_lab_admin` account either way.
+It needs a `wet_lab_admin` account. The PacBio command has no `--force`, because
+nothing refuses a PacBio re-submit in the first place.
 
 **On Illumina, forcing stores the run's reads a second time.** The re-run finds
 each prep_sample's reads already staged from the first run and files them again;

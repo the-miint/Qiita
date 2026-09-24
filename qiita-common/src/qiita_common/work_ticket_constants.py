@@ -27,10 +27,9 @@ POOL_REMOVAL_RECOVERY = (
 # `submit-bcl-convert --force`, by the 409 the route returns when it refuses,
 # and by the wire model's `force` field; each prepends its own lead sentence.
 #
-# `submit-pacbio-ingest --force` carries its own text instead: the gate this
-# waives is scoped to sequenced_pool actions, and PacBio ingest submits
-# prep_sample-scoped tickets, so neither the refusal nor the duplication below
-# applies to it. Every sequenced_pool action that stores reads short-circuits on
+# `submit-pacbio-ingest` has no `--force`: the gate this waives is scoped to
+# sequenced_pool actions, and PacBio ingest submits prep_sample-scoped tickets.
+# Every sequenced_pool action that stores reads short-circuits on
 # the durable per-prep_sample staging copy, which is what the text rests on.
 #
 # The wire semantics that are not operator-facing (force is privileged for every

@@ -340,9 +340,9 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
     and re-submits the rest. The in-flight gate blocks only non-terminal tickets,
     so a prep_sample whose reads already loaded gets a fresh ticket, which stops
     at the read-numbering step without storing anything (see
-    `sequence_range_retry.mint_or_reuse_sequence_range`). --force changes nothing
-    here: the COMPLETED-ticket gate it waives is sequenced_pool-scoped. All calls
-    share one PAT.
+    `sequence_range_retry.mint_or_reuse_sequence_range`). There is no --force: the
+    COMPLETED-ticket gate it waives is sequenced_pool-scoped. All calls share one
+    PAT.
     """
     # The path is checked SERVER-side (POST /run-folder/inspect, below), not
     # here: it names the folder as the CLUSTER sees it, and a check against this
@@ -443,7 +443,6 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                     "bam_path": entry["bam_path"],
                     "expect_unaligned": True,
                 },
-                force=args.force,
             ).model_dump(exclude_unset=True, mode="json")
             try:
                 ticket_resp, _status = _common.call_with_status(

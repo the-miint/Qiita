@@ -7,8 +7,7 @@ Not needed for Illumina.
 This covers only what is different about PacBio. Everything the two platforms
 share — where to run the command, what privileges the submit needs, working from
 a remote machine, the studies and biosamples the pre-flight file has to match,
-building that file, how to retry, and why not to use
-`--force` — is in [`getting-started.md`](getting-started.md), which these
+building that file, how to retry, and what Illumina's `--force` is — is in [`getting-started.md`](getting-started.md), which these
 examples carry on from.
 
 Paths and protocol numbers below are from the `qiita-miint.ucsd.edu` deploy;

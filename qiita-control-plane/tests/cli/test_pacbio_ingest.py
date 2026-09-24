@@ -545,24 +545,14 @@ def test_submit_pacbio_ingest_resilient_to_ticket_failure(
     assert len(ticket_posts) == 3
 
 
-def test_submit_pacbio_ingest_force_reaches_ticket_body(
-    monkeypatch, tmp_path, build_case5_preflight
-):
-    db = build_case5_preflight()
-    run = tmp_path / "run"
-    for bc in ("bc3011", "bc0112", "bc9992"):
-        _make_bam(run, "1_A01", "m84_s1", bc)
-
-    captured: dict = {}
-    _stub_submit_flow(monkeypatch, captured)
-    rc = main(_submit_args(run, db, force=True))
-    assert rc == 0
-    ticket_posts = [
-        r
-        for r in captured["requests"]
-        if r["method"] == "POST" and r["url"].endswith("/work-ticket")
-    ]
-    assert ticket_posts and all(r["json"]["force"] is True for r in ticket_posts)
+def test_submit_pacbio_ingest_has_no_force_flag(tmp_path, capsys):
+    """`force` waives only the sequenced_pool COMPLETED gate, and PacBio ingest
+    submits prep_sample-scoped tickets, so the flag would change nothing but the
+    role check; it is not offered."""
+    with pytest.raises(SystemExit) as ei:
+        main(_submit_args(tmp_path / "run", tmp_path / "pf.db", force=True))
+    assert ei.value.code == 2
+    assert "unrecognized arguments: --force" in capsys.readouterr().err
 
 
 def test_submit_pacbio_ingest_retry_reuses_existing_roster(

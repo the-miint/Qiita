@@ -4243,8 +4243,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   copy (`compute_reads_staging_path`, keyed on `prep_sample_idx` alone) before the mint, and
   `register_files` replaces only rows the *same* ticket registered, so the forced ticket's
   registration appends. The `--force` help, the 409 that offers it and the `force` field's
-  description say so, and the PacBio `--force` help keeps its own text, since neither the
-  refusal nor the duplication reaches a prep_sample-scoped ticket. Where these named a
+  description say so. Where these named a
   recovery, it is now one the reader can run or request: `qiita delete-sequenced-pool
   --force`, with the account it needs (`sequenced_pool:delete` is system_admin only, and the
   COMPLETED ticket blocks the delete unless forced), through one `POOL_REMOVAL_RECOVERY`
@@ -4781,6 +4780,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 
 ### Removed
+
+- **`qiita submit-pacbio-ingest --force` (#461).** The refusal `force` waives is scoped to
+  `sequenced_pool` actions, and PacBio ingest submits prep_sample-scoped tickets, so the flag
+  changed nothing but requiring wet_lab_admin. Passing it is now an argument error.
 
 - **The single-end rype projections are gone (#478).** `align_sharded._ROUTING_QUERY` and
   `host_filter._RYPE_QUERY` narrowed the classify relation to `sequence1` so miint would not

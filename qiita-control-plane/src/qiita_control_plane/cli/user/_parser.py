@@ -47,7 +47,6 @@ from qiita_common.models import (
 )
 from qiita_common.work_ticket_constants import (
     FORCE_RESUBMIT_EXPLANATION,
-    POOL_REMOVAL_RECOVERY,
 )
 
 from .. import _common
@@ -1641,20 +1640,6 @@ def _build_parser() -> argparse.ArgumentParser:
             " non-PacBio/short-read protocol here silently mislabels every"
             " prep_sample in the run, so double-check it is the intended long-read"
             " protocol."
-        ),
-    )
-    p_submit_pacbio.add_argument(
-        "--force",
-        action="store_true",
-        help=(
-            "Requires wet_lab_admin or system_admin, and changes nothing else"
-            " here: the COMPLETED-ticket refusal this waives is scoped to"
-            " sequenced_pool actions, and PacBio ingest submits one"
-            " prep_sample-scoped ticket per prep_sample. A re-submit over an"
-            " already-loaded prep_sample is admitted with or without it, and"
-            " stops at the read-numbering step either way, before anything is"
-            " stored. Loading a prep_sample's reads again means removing its pool:"
-            f" {POOL_REMOVAL_RECOVERY}."
         ),
     )
     p_submit_pacbio.set_defaults(handler=_handle_submit_pacbio_ingest)
