@@ -2,7 +2,7 @@
 
 from typing import Annotated, ClassVar
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from qiita_common.models._base import PatchRequestModel
 from qiita_common.models.reference import Tier
@@ -117,12 +117,15 @@ class StudyAccessGrant(BaseModel):
     """Body for POST /api/v1/study/{study_idx}/access — grant a tier.
 
     The grantee is named by the email on their qiita.user row; they must
-    have logged in once so that row exists.
+    have logged in once so that row exists. The email is only looked up, never
+    stored, so it is checked for shape alone: `EmailStr` would refuse addresses
+    an account can already carry (it rejects special-use domains such as
+    `.local`).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    email: EmailStr
+    email: Annotated[str, Field(max_length=320, pattern=r"^[^@\s]+@[^@\s]+$")]
     access_tier: Tier
 
     _no_public = field_validator("access_tier")(_reject_public_tier)

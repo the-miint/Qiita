@@ -244,7 +244,13 @@ async def test_grant_to_unknown_email_says_to_log_in_first(ctx):
 async def test_grant_to_inactive_account_is_422(ctx, flag):
     study_idx = await _study_with_caller_at(ctx, "admin")
     grantee, email = await _seed_person(ctx, "g")
-    await ctx["pool"].execute(f"UPDATE qiita.principal SET {flag} = true WHERE idx = $1", grantee)
+    # The *_consistent CHECKs require the timestamp and actor alongside the flag.
+    await ctx["pool"].execute(
+        f"UPDATE qiita.principal SET {flag} = true, {flag}_at = now(), {flag}_by_idx = $2"
+        " WHERE idx = $1",
+        grantee,
+        ctx["user_session"]["principal_idx"],
+    )
     resp = await ctx["user"].post(_url(study_idx), json={"email": email, "access_tier": "viewer"})
     assert resp.status_code == 422, resp.text
     assert resp.json()["detail"] == "that account is disabled or retired"
