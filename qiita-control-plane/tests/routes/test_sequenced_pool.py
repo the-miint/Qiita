@@ -449,7 +449,9 @@ async def test_create_sequenced_pool_different_content_same_filename_returns_409
     # By design: a DIFFERENT-content upload that reuses an existing filename in
     # the run trips the (permanent) filename index and is surfaced as a 409
     # (PayloadMismatch on the filename), never a raw 500. Distinct pools must
-    # differ in both content and filename; the operator renames.
+    # differ in both content and filename. The detail names both remedies, since
+    # a separate pool (rename) and the same pool with changed bytes (resubmit the
+    # original) look identical from here.
     run_idx = await _seed_sequencing_run(ctx, "foc-fname")
     r1 = await _post_pool(
         ctx["wet"],
@@ -468,7 +470,10 @@ async def test_create_sequenced_pool_different_content_same_filename_returns_409
         run_preflight_filename="preflight.db",
     )
     assert r2.status_code == 409, r2.text
-    assert r2.json()["detail"]["conflicting_field"] == "run_preflight_filename"
+    detail = r2.json()["detail"]
+    assert detail["conflicting_field"] == "run_preflight_filename"
+    assert "exactly as it was first submitted" in detail["existing_value"]
+    assert "give this pre-flight file a different name" in detail["existing_value"]
 
 
 async def test_create_sequenced_pool_no_preflight_always_creates_201(ctx):

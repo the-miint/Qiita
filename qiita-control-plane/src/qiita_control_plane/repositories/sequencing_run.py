@@ -354,7 +354,10 @@ async def insert_sequenced_pool(
     that reuses an existing filename within the run trips that index (not the
     content index this ON CONFLICT targets) and is surfaced as a PayloadMismatch
     409 by design — two distinct pools in a run must differ in both content and
-    filename, so the operator renames. (Same content + same filename is the
+    filename. The server cannot tell a second pool that happens to share a filename
+    from the same pool resubmitted with changed bytes, so the 409 names the remedy
+    for each: rename for the first, resubmit the original bytes for the second.
+    (Same content + same filename is the
     idempotent-retry case: the content ON CONFLICT reuses the row, so the
     filename collision never surfaces. This relies on Postgres evaluating the
     ON CONFLICT arbiter — the content index — before inserting into any
@@ -393,9 +396,10 @@ async def insert_sequenced_pool(
         if exc.constraint_name == "sequenced_pool_one_per_run_and_filename":
             raise PayloadMismatch(
                 "run_preflight_filename",
-                f"<a different-content pool already uses filename "
-                f"{run_preflight_filename!r} in this run; rename this preflight "
-                f"to mint a separate pool>",
+                f"<a pool in this run already uses filename "
+                f"{run_preflight_filename!r} with different contents. Resubmitting "
+                f"that same pool: submit the file exactly as it was first submitted. "
+                f"A separate pool: give this pre-flight file a different name>",
                 run_preflight_filename,
             ) from exc
         raise

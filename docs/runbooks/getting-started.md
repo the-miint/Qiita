@@ -220,66 +220,42 @@ accessions so they match what you created in steps 2 and 3:
 
 ```python
 from run_preflight import (
+    load_db_file,
     migrate_legacy_csv_to_db_file,
-    open_db_file,
+    save_db_file,
     set_bioproject_accession,
     set_biosample_accession,
 )
 
 migrate_legacy_csv_to_db_file("run.csv", "preflight.db")
-conn = open_db_file("preflight.db")
+conn = load_db_file("preflight.db")
 set_bioproject_accession(conn, "PRJNA123456", project_name="KnightLab_Run1")
 set_biosample_accession(conn, "SAMPLE-1", "SAMN0000001")
+save_db_file(conn, "preflight.db")
 conn.close()
 ```
 
 Both calls find their target by **the pre-flight file's own names** — the project
 name in the sheet, and the sheet's sample name — and set the accession on it. The
-accession is the only thing the two systems share. Each call saves as it goes,
-and refuses rather than guessing if the name matches nothing or matches more than
-one row.
+accession is the only thing the two systems share. Each call refuses rather than
+guessing if the name matches nothing or matches more than one row. `load_db_file`
+works on a copy in memory, so nothing reaches the file until `save_db_file`.
 
-### Make your own copy first, and open it once before submitting
+### Submit the same file every time
 
-Opening a pre-flight file modifies it: the library upgrades it in place. Two
-things follow.
+Qiita recognises a pool by the exact contents of the pre-flight file you submit.
+Submitting only reads the file — it never changes it, so a copy you cannot write
+to is fine — and a retry that sends the same file lands on the same pool.
 
-A file you cannot write — the usual `644` copy owned by someone else on a shared
-filesystem — cannot be opened at all: you get `attempt to write a readonly
-database`. Copy it somewhere you own.
+If you change the file after submitting it — to correct an accession, say — a
+re-submit under the same file name is refused: the run already has a pool under
+that name, with different contents. The refusal names two ways out. If it is the
+same pool, submit the file as it was the first time. Renaming the file is for a
+genuinely separate pool; doing it here gives the run a second pool for the same
+prep_samples, and removing that needs an operator.
 
-More important: Qiita identifies a pool by the exact bytes of the file you hand
-it, and the submit reads those bytes *before* opening it. Submit a file that has
-never been opened, then re-run to retry, and the second submit sends the
-now-upgraded bytes — a different file as far as Qiita is concerned. Your retry is
-refused: the run already has a pool under that filename, and the contents no
-longer match it.
-
-**That refusal tells you to rename the pre-flight. Do not.** Renaming is the
-right answer when two genuinely different pools collide on a filename; here
-there is only one pool, whose bytes moved under you. Renaming would give you a
-second pool for the same run, and removing that needs an operator. Open the file
-once yourself first, and the bytes stop changing, so a retry is a retry:
-
-```bash
-SHARED_PF=/qmounts/qiita_data/working_dir/RunPreflight.db   # the lab's copy
-PF="$HOME/preflight/RunPreflight.db"                        # yours
-QIITA_VENV=/home/qiita/qiita-miint/qiita-control-plane/.venv
-
-mkdir -p "$(dirname "$PF")" && cp "$SHARED_PF" "$PF" && chmod u+w "$PF"
-"$QIITA_VENV/bin/python" - "$PF" <<'PY'
-import sys
-from run_preflight import open_db_file
-open_db_file(sys.argv[1]).close()
-PY
-md5sum "$PF"   # note this down — it should not change when you submit
-```
-
-Use the interpreter from the same place as the `qiita` command, as above; a
-system `python` will not have the library.
-
-Keep your copy for as long as the run matters. Later steps expect the same file,
-byte for byte.
+So keep the file exactly as you submitted it, for as long as you might need to
+submit it again.
 
 ## 5. Submit the run
 
@@ -308,7 +284,7 @@ qiita prep-protocol list
 ```bash
 qiita submit-bcl-convert \
     --bcl-input-dir /sequencing/250520_M05314_0001_000000000-ABCDE \
-    --preflight-blob "$PF" \
+    --preflight-blob ./preflight.db \
     --prep-protocol-idx 1
 ```
 
