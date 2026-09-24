@@ -52,9 +52,11 @@ qiita submit-pacbio-ingest \
   prepped the run rather than reading it off this page, then look the number up
   on your own site with `qiita prep-protocol list`. Qiita stores whatever number
   you give it, and a wrong one mislabels every prep_sample in the run.
-- **Re-running the identical command is the retry**, but it is not free. The run
-  and pool are reused and missing prep_samples are added, and any whose job is
-  still running are reported `skipped`. The pool is recognised by the exact
+- **Re-running the identical command retries the submit**, but it is not free.
+  The run and pool are reused and missing prep_samples are added, and any whose
+  job is still running are reported `skipped`. A prep_sample whose job *failed*
+  is re-driven with `qiita ticket run <idx>` instead; a fresh job for it stops
+  and says so if the failed one had already numbered its reads. The pool is recognised by the exact
   contents of the pre-flight file, so submit the same file again. Changed
   contents under the same file name are refused; under a new name they create a
   second pool. A prep_sample whose reads already loaded

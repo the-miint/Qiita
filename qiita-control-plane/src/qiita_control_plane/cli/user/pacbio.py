@@ -426,8 +426,9 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         # _check_disallow_without_delete binds NON_TERMINAL states only, so an
         # already-loaded prep_sample is admitted (202) and then fails at the
         # read-numbering step, which refuses a range another ticket reserved.
-        # A FAILED prep_sample's ticket is reset by the route and re-submitted, so it
-        # converges without a skip.
+        # A FAILED prep_sample's ticket is not reset by a submit: the route inserts
+        # a new ticket, which converges if the failed one never numbered the
+        # reads and otherwise stops, naming `qiita ticket run` for the failed one.
         failures: list[dict] = []
         skipped: list[dict] = []
         for entry in per_sample:

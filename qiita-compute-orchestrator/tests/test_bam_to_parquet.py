@@ -378,6 +378,42 @@ def test_execute_refuses_a_range_minted_by_a_different_ticket(monkeypatch, tmp_p
     assert not (tmp_path / "ws" / "read").exists()
 
 
+@pytest.mark.parametrize("minter_state", [WorkTicketState.FAILED, WorkTicketState.CANCELLED])
+def test_execute_points_at_a_redrive_when_the_other_minter_did_not_finish(
+    monkeypatch, tmp_path, minter_state
+):
+    """A range minted by another ticket that FAILED or was CANCELLED is still refused,
+    but the reason names that ticket's redrive: a re-submit over a job that never
+    finished is not a re-load of stored reads, and removing the pool is not the fix."""
+
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _unfinished(*, http, prep_sample_idx):
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1001,
+            minted_by_work_ticket_idx=999,
+            minted_by_work_ticket_state=minter_state.value,
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _unfinished)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "`qiita ticket run 999`" in ei.value.reason
+    assert "already loaded" not in ei.value.reason
+    assert "delete-sequenced-pool" not in ei.value.reason
+    assert not (tmp_path / "ws" / "read").exists()
+
+
 def test_execute_refuses_a_range_with_unknown_provenance(monkeypatch, tmp_path):
     """A NULL minted_by (a range predating the column, or one the backfill could not
     attribute) is treated as NOT-mine: fail closed. Reusing a range we cannot prove

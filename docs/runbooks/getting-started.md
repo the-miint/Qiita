@@ -176,7 +176,7 @@ grant — see [`auth.md`](../auth.md) under *User self-service*.
 ## 4. Build the pre-flight file
 
 The pre-flight file is a [kl-run-preflight](https://github.com/the-miint/kl-run-preflight)
-SQLite file describing one sequencing run — its plates, its rows of samples, its projects
+SQLite file describing one sequencing run — its plates and their rows, its projects
 and the barcodes or indices for the platform. It is normally produced by whoever
 prepped the run. Qiita only reads it, and it has no command-line tool, so the
 snippets below are short Python.
@@ -252,7 +252,7 @@ re-submit under the same file name is refused: the run already has a pool under
 that name, with different contents. The refusal names two ways out. If it is the
 same pool, submit the file as it was the first time. Renaming the file is for a
 genuinely separate pool; doing it here gives the run a second pool for the same
-prep_samples, and removing that needs an operator.
+biosamples, and removing that needs an operator.
 
 So keep the file exactly as you submitted it, for as long as you might need to
 submit it again.
@@ -308,8 +308,15 @@ covers the flags Illumina does not have, which protocol to choose, and why
 
 ### Retrying, and what `--force` is for
 
-**To retry either command, run it again unchanged.** Both pick up where they left
-off.
+**What to retry depends on what failed.**
+
+- **The command failed at your terminal:** run it again unchanged. It reuses the
+  run, pool and prep_samples it already made and adds only what is missing.
+- **A job it queued failed:** re-drive that job with `qiita ticket run <idx>`
+  (step 6), which resumes it at the first unfinished step. Running the command
+  again instead queues a new job, and if the failed one had already numbered a
+  prep_sample's reads, the new one stops there and tells you to re-drive the
+  failed one.
 
 `--force` is not how you retry, and on Illumina it is the one thing here that can
 damage what you already have.

@@ -148,10 +148,6 @@ _RUN_APPLICABLE_STATES = frozenset(
         WorkTicketState.CANCELLED.value,
     }
 )
-# The two terminal states /run redrives by resetting to PENDING (vs. PENDING, which
-# just dispatches). Shared with the orchestrator, whose sequence-range refusal
-# names `qiita ticket run` only for a state this admits.
-_RUN_REDRIVE_STATES = REDRIVABLE_WORK_TICKET_STATES
 _RUN_NOT_APPLICABLE_STATES = tuple(
     state.value for state in WorkTicketState if state.value not in _RUN_APPLICABLE_STATES
 )
@@ -1720,7 +1716,7 @@ async def run_work_ticket(
             },
         )
 
-    if current_state in _RUN_REDRIVE_STATES:
+    if current_state in REDRIVABLE_WORK_TICKET_STATES:
         # Manual restart: FAILED / CANCELLED → PENDING. Per arch.md spec, resets
         # retry_count to 0 (operator override of the auto-retry budget)
         # and clears the failure_* columns so the

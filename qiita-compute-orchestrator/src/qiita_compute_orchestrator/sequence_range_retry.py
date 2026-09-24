@@ -243,11 +243,30 @@ async def mint_or_reuse_sequence_range(
             ) from exc
         if existing.minted_by_work_ticket_idx != work_ticket_idx:
             # A DIFFERENT ticket minted this range (or its provenance is unknown —
-            # NULL, which we read as not-mine). Either way the sample's reads are
-            # already registered in the lake, so reusing the range would register
-            # them a second time. DuckLake has no uniqueness: the duplication would
-            # be silent. Refuse, and tell the operator the one thing that fixes it.
+            # NULL, which we read as not-mine). Its reads may already be registered
+            # in the lake, so reusing the range could register them a second time.
+            # DuckLake has no uniqueness: the duplication would be silent. Refuse.
             owner = existing.minted_by_work_ticket_idx
+            if owner is not None and (
+                existing.minted_by_work_ticket_state in REDRIVABLE_WORK_TICKET_STATES
+            ):
+                # The minter failed or was cancelled, so this is a re-submit over a
+                # job that never finished, not over loaded reads. Re-driving the
+                # minter resumes it with its own range; removing the pool is not
+                # what this needs.
+                raise BackendFailure(
+                    kind=FailureKind.UNKNOWN_PERMANENT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=step_name,
+                    reason=(
+                        f"prep_sample {prep_sample_idx}'s read numbering was reserved "
+                        f"by ticket {owner}, which did not finish "
+                        f"(state={existing.minted_by_work_ticket_state!r}), not by "
+                        f"this one (ticket {work_ticket_idx}), so this step stopped "
+                        "without writing anything. Re-drive that ticket with "
+                        f"`qiita ticket run {owner}` rather than submitting again"
+                    ),
+                ) from exc
             owner_detail = (
                 f"ticket {owner}" if owner is not None else "a ticket Qiita cannot identify"
             )
@@ -272,10 +291,9 @@ async def mint_or_reuse_sequence_range(
             # its own attempt must not re-write the range.
             state = existing.minted_by_work_ticket_state
             # The recovery differs by state, so name it rather than just refusing —
-            # and only offer a redrive where the CP will actually accept one. `/run`
-            # takes a ticket in PENDING, FAILED or CANCELLED (_RUN_APPLICABLE_STATES
-            # in routes/work_ticket.py); it 409s on `no_data` and 404s on a ticket row
-            # that is gone (state=None). So the three-way is not cosmetic: the
+            # and only offer a redrive where the CP will actually accept one:
+            # REDRIVABLE_WORK_TICKET_STATES. `/run` 409s on `no_data` and 404s on a
+            # ticket row that is gone (state=None). So the three-way is not cosmetic: the
             # fall-through arm exists because a fail-closed allowlist must land an
             # UNANTICIPATED state on advice that works, not on advice that bounces.
             if state in REDRIVABLE_WORK_TICKET_STATES:

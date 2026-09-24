@@ -4237,29 +4237,24 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   is deliberately generic over both; the rest of the user CLI's `--help` still says bare
   "sample" in roughly forty places and wants its own sweep.
 
-- **`--force` says what it costs, which is the opposite of what an earlier draft of this
-  branch claimed (#461).** The draft told the operator a forced re-run cannot duplicate reads
-  because the read-numbering step refuses a range another ticket reserved. That holds for
-  `fastq-to-parquet` and `bam-to-parquet`, but not for the one action the gate offering
-  `--force` actually covers: `bcl-convert` is the only `target_kind: sequenced_pool` workflow,
-  and its `ingest_reads` step short-circuits on the durable per-prep_sample staging copy
-  (`compute_reads_staging_path`, keyed on `prep_sample_idx` alone) before it ever reaches the
-  mint — it re-creates the register hardlink and returns. `read` is not in the data plane's
-  `REPLACE_KEY_TABLES`, so the following `register-files` appends. A forced re-run therefore
-  stores the pool's reads a second time, which is what the message now says. The PacBio
-  `--force` help keeps its own text, since neither the refusal nor the duplication reaches a
-  prep_sample-scoped ticket. All four of these strings also named a remedy their own reader
-  cannot run: `sequenced_pool:delete` is on the system_admin ceiling only, and the COMPLETED
-  ticket that triggers the 409 blocks the delete too unless that is forced as well — so they
-  now say `qiita delete-sequenced-pool --force` and name the account it needs. The
-  read-numbering refusals told the operator to delete the prep_sample, and no such gesture
-  exists (there is no prep_sample DELETE route); they name the pool instead, through one
-  `POOL_REMOVAL_RECOVERY` constant that also states what else the delete takes. A pure-unit
-  Rust test pins the fact the `--force` text rests on — `read` is absent from
-  `REPLACE_KEY_TABLES`, so a second registration appends — and fails by name if that changes.
-  `fastq-to-parquet-retry-recovery.md` quoted two of the rewritten failure reasons verbatim
-  and gave the prep_sample-delete recovery; it now quotes the current text and names the
-  three things about `delete-sequenced-pool` that catch people out.
+- **`--force`, the read-numbering refusals and the retry advice name a remedy their reader
+  can act on (#461).** A forced re-run of a `sequenced_pool` action stores the pool's reads a
+  second time: its read-storage step short-circuits on the durable per-prep_sample staging
+  copy (`compute_reads_staging_path`, keyed on `prep_sample_idx` alone) before the mint, and
+  `register_files` replaces only rows the *same* ticket registered, so the forced ticket's
+  registration appends. The `--force` help, the 409 that offers it and the `force` field's
+  description say so, and the PacBio `--force` help keeps its own text, since neither the
+  refusal nor the duplication reaches a prep_sample-scoped ticket. Where these named a
+  recovery, it is now one the reader can run or request: `qiita delete-sequenced-pool
+  --force`, with the account it needs (`sequenced_pool:delete` is system_admin only, and the
+  COMPLETED ticket blocks the delete unless forced), through one `POOL_REMOVAL_RECOVERY`
+  constant — there is no prep_sample delete. A read-numbering refusal over a range another
+  ticket reserved no longer says the reads are loaded when that ticket failed or was
+  cancelled; it names `qiita ticket run` for that ticket instead of the pool delete. The
+  runbooks now say to re-drive a failed job rather than re-run the submit, which queues a new
+  ticket. A pure-unit Rust test pins that `read` is absent from `REPLACE_KEY_TABLES`, the
+  table-level half of the `--force` claim. `fastq-to-parquet-retry-recovery.md` quotes the
+  current failure reasons.
 
 - **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`,
   `manual-sample-walkthrough.md` and `pacbio-ingest.md` are what a person with samples reads, so
