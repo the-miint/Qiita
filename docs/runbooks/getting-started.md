@@ -145,7 +145,7 @@ much that covers is a per-site choice: a deploy starts with a small seeded set
 full NCBI release, after which the whole taxonomy is accepted. An id your site does
 not have is refused, and there is no self-service way to list or add one — ask your
 operator. For a biosample with no host of its own — a blank, a control, an
-environmental sample — use `not applicable`.
+environmental biosample — use `not applicable`.
 
 `--owner-biosample-id-value` is your own name for the biosample, stored under the
 field named by `--owner-biosample-id-field-name` (the field is created the first
@@ -199,8 +199,10 @@ Qiita refuses the file outright — before creating anything — if:
 - A row of the standard sample type has no project, or a control row has one.
   The pre-flight file's two control types — an extraction blank and a
   KatharoSeq positive control — both take their project from the plate, which is
-  why neither may carry one of its own. This is checked before the accessions,
-  so it is the only error you see until it is fixed.
+  why neither may carry one of its own. Every other control, including any that
+  belongs to one project, is a standard row with that project set. This is
+  checked before the accessions, so it is the only error you see until it is
+  fixed.
 - Any `biosample_accession` or `bioproject_accession` it needs is still empty.
   The pre-flight format allows them to be empty, so a file that is perfectly
   valid otherwise can still be unusable here. This is the common one.
