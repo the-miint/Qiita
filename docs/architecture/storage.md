@@ -33,14 +33,14 @@ PATH_PERSISTENT/                            durable, backed up
   ducklake/<table>/<filename>               DuckLake data path (flat per logical table; CRC sharding only if file count pressures the FS)
   logs/<ticket_id>/step_n-<job>.{out,err}   archived SLURM stdout/stderr after job terminal state
 
-/scratch/
+/scratch/                                   recommended PATH_SCRATCH (and PATH_DERIVED = /scratch/persistent)
+  ticket/<work_ticket_idx>/<step>/attempt-<N>/  per-ticket workspace: control-plane runner files, params.json, step outputs (output/ under SLURM); not reclaimed automatically
+  staging/uploads/<upload_idx>/upload.parquet   DoPut upload staging; not reclaimed automatically
   persistent/                               shared FS, never auto-deleted; cluster purge exemption requested
     references/<reference_idx>/<aligner>/   built reference data that doesn't need local-SSD random access
   persistent-local/                         local SSD, never auto-deleted; cluster purge exemption requested
     references/<reference_idx>/<aligner>/   built reference data that needs local-SSD random access (e.g. aligner indices); rebuild-on-miss is the safety net
   ephemeral/                                auto-deleted 45 days after ticket terminal state
-    workspace/<work_ticket_idx>/            control-plane runner workspace + SLURM-side params.json + per-step outputs
-    staging/<ticket_id>/                    per-ticket SLURM step outputs
     references/incoming/<name>/<version>/   source FASTA staging during reference ingest
 ```
 
@@ -57,7 +57,7 @@ Retention:
 - `/scratch/persistent/` and `/scratch/persistent-local/` — never auto-deleted by us; cluster purge exemption requested for both. For aligner indices specifically, if the local-SSD copy is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
 - `/scratch/ephemeral/` — per-ticket directories are deleted 45 days after the ticket reaches a terminal state. The 45-day grace exists for post-mortem debugging.
 
-Same-FS constraint: the SLURM job's final-step output directory and the DuckLake data path (`PATH_PERSISTENT/ducklake`) must live on the same filesystem — the data plane moves files via atomic rename, falling back to copy+delete only on cross-filesystem moves (a slow path that bypasses the rename's atomicity guarantee). The final-step output therefore lives on `PATH_PERSISTENT/` even when intermediate map/reduce outputs use `PATH_SCRATCH/staging/`.
+Same-FS preference: registration moves each file from the producing step's output dir under `PATH_SCRATCH/ticket/` into `PATH_PERSISTENT/ducklake/<table>/` by `rename`, falling back to copy + delete when the two are on different filesystems (`EXDEV`; `move_file` in `qiita-data-plane/src/flight_service.rs`). The fallback is not atomic and copies the whole file, so placing `PATH_SCRATCH` on the same filesystem as `PATH_PERSISTENT` keeps registration on the rename path ([`first-deploy.md`](../runbooks/first-deploy.md) §0.3).
 
 No hive partitioning: a prep sample can be associated with multiple studies, so the on-disk layout is keyed by logical table only — never by `study_idx`. DuckLake's catalog is the sole index over file contents.
 

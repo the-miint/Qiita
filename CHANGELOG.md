@@ -3803,7 +3803,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `/data/parquet/<table>/` and that the data plane checks mode 440 before registering; it
   now says that jobs write into their per-ticket workspace, the
   orchestrator checks the mode (`slurm/verify.py`), and the data plane moves each file
-  into `PATH_PERSISTENT/ducklake/<table>/` when it registers it.
+  into `PATH_PERSISTENT/ducklake/<table>/` when it registers it. The same claims are
+  corrected in `processing.md` (sequence diagram, orchestrator section, step-output
+  paths), `storage.md` (layout, same-filesystem note) and `overview.md`.
 
 - **The ENA ingestion path names the `biosample_global_field` display names it writes as
   constants instead of literals (#589).** `collection date`, the three geographic-location

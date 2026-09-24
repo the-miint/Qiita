@@ -72,7 +72,7 @@ Phylogeny internal nodes are addressed by `(reference_idx, node_index)` — scop
 The data plane is intentionally "dumb": it only operates on identifiers it receives. Its three Arrow Flight operations map directly to DuckLake:
 
 - **DoGet** — select rows by identifier set from a signed Flight ticket
-- **DoPut** — stream RecordBatches to the shared filesystem (`/scratch/ephemeral/staging/`)
+- **DoPut** — stream RecordBatches to the shared filesystem (`PATH_SCRATCH/staging/uploads/<upload_idx>/`)
 - **DoAction** — register Parquet into DuckLake, delete, or insert from processing method
 
 **Flight ticket signing**: the control plane signs tickets with Ed25519 (asymmetric) before handing them to clients — it holds the private seed (`FLIGHT_TICKET_SIGNING_KEY`); the publicly-reachable data plane holds only the public key (`FLIGHT_TICKET_PUBLIC_KEY`) and verifies signatures on every request, so a data-plane compromise cannot forge tickets. It never trusts the client's claimed identifiers directly.
