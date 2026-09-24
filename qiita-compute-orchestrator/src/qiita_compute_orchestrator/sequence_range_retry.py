@@ -44,6 +44,7 @@ from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
     REDRIVABLE_WORK_TICKET_STATES,
     WorkTicketFailureStage,
+    WorkTicketState,
 )
 from qiita_common.work_ticket_constants import POOL_REMOVAL_RECOVERY
 
@@ -180,8 +181,9 @@ async def mint_or_reuse_sequence_range(
       - a prior ATTEMPT of this ticket minted then crashed → the reads are NOT in
         the lake, the range is orphaned, reuse is correct and is what makes the
         step idempotent across runner retries;
-      - a DIFFERENT ticket minted it → the sample's reads ARE already registered,
-        and reusing the range would register them a second time. DuckLake has no
+      - a DIFFERENT ticket minted it → that ticket has registered, or may yet
+        register, the sample's reads, and reusing the range would register them a
+        second time. DuckLake has no
         uniqueness, so that duplication is silent and permanent.
 
     Nothing else in the system can separate them. The submit-time
@@ -226,9 +228,9 @@ async def mint_or_reuse_sequence_range(
             raise cp_call_failure(prep_sample_idx, get_exc, step_name=step_name) from get_exc
         if existing is None:
             # 409 on mint but 404 on read-back: the range vanished between the two
-            # calls (an operator deleted the prep_sample / range mid-retry). A fresh
-            # resubmit will re-mint cleanly, but THIS attempt can't run against a
-            # moving target.
+            # calls. A range goes only with its prep_sample (ON DELETE CASCADE), and
+            # a prep_sample goes only with its pool, so there is nothing left for
+            # this ticket to load.
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
@@ -237,8 +239,9 @@ async def mint_or_reuse_sequence_range(
                     f"prep_sample {prep_sample_idx}'s read numbering was deleted while "
                     "this step was retrying, so the step could not finish against it — "
                     "reserving the numbering reported that it already existed (409), "
-                    "then reading it back did not find it (404). Submit the prep_sample "
-                    "again"
+                    "then reading it back did not find it (404). The numbering is "
+                    "deleted only with the prep_sample, when its pool is removed; to "
+                    "load these reads, register the pool again and submit"
                 ),
             ) from exc
         if existing.minted_by_work_ticket_idx != work_ticket_idx:
@@ -291,13 +294,22 @@ async def mint_or_reuse_sequence_range(
             owner_detail = (
                 f"ticket {owner}" if owner is not None else "a ticket Qiita cannot identify"
             )
+            # Only a COMPLETED minter is known to have stored the reads; any other
+            # state that lands here (no_data, a ticket row that is gone) may have.
+            if existing.minted_by_work_ticket_state == WorkTicketState.COMPLETED.value:
+                finding = f"prep_sample {prep_sample_idx}'s reads were already loaded by "
+            else:
+                finding = (
+                    f"prep_sample {prep_sample_idx}'s read numbering was reserved "
+                    f"(state={existing.minted_by_work_ticket_state!r}), and its reads "
+                    "may already have been loaded, by "
+                )
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
-                    f"prep_sample {prep_sample_idx}'s reads were already loaded by "
-                    f"{owner_detail}, not by this one (ticket {work_ticket_idx}). "
+                    f"{finding}{owner_detail}, not by this one (ticket {work_ticket_idx}). "
                     "Loading them again would store every read twice, so this step "
                     "stopped without writing anything. Loading them again on purpose "
                     "means removing the prep_sample's pool: "

@@ -141,12 +141,8 @@ _STEP_LOGS_MAX_TAIL_BYTES = 256 * 1024
 # live with a real slurm_job_id. The redrive's step-row cleanup keys off exactly that
 # difference — see the DELETE in the redrive branch. PENDING just (re)dispatches a
 # lost create-time task.
-_RUN_APPLICABLE_STATES = frozenset(
-    {
-        WorkTicketState.PENDING.value,
-        WorkTicketState.FAILED.value,
-        WorkTicketState.CANCELLED.value,
-    }
+_RUN_APPLICABLE_STATES = frozenset({WorkTicketState.PENDING.value}) | (
+    REDRIVABLE_WORK_TICKET_STATES
 )
 _RUN_NOT_APPLICABLE_STATES = tuple(
     state.value for state in WorkTicketState if state.value not in _RUN_APPLICABLE_STATES
@@ -435,7 +431,7 @@ async def _check_disallow_without_delete(
                     "reason": (
                         "a ticket for this pool and action has already COMPLETED, so "
                         "the pool's reads are already stored. Pass force=true "
-                        "(--force in the CLI) to submit anyway. "
+                        "(`qiita submit-bcl-convert --force`) to submit anyway. "
                         f"{FORCE_RESUBMIT_EXPLANATION}"
                     ),
                     "blocking_work_ticket_idx": completed,

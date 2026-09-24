@@ -516,6 +516,39 @@ def test_submit_pacbio_ingest_missing_bam_aborts_before_network(
     assert [r["url"].split("/api/v1")[-1] for r in captured["requests"]] == ["/run-folder/inspect"]
 
 
+def test_submit_pacbio_ingest_names_missing_rows_as_pacbio_sample_rows(
+    monkeypatch, tmp_path, build_case5_preflight, capsys
+):
+    """A biosample accession Qiita does not have is reported against the
+    pre-flight's `pacbio_sample` rows, as Illumina's names `illumina_sample`."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured)
+    stubbed = _common.httpx.request
+
+    def missing_one(method, url, headers=None, json=None, params=None, timeout=None):
+        if url.endswith("/lookup-by-accession") and "biosample" in url:
+            return httpx.Response(
+                200,
+                json={
+                    "resolved": {"BIO_sample.1": 11, "BIO_sample.2": 12},
+                    "missing": ["BIO_sample.3"],
+                },
+                request=httpx.Request(method, url),
+            )
+        return stubbed(method, url, headers=headers, json=json, params=params, timeout=timeout)
+
+    monkeypatch.setattr(_common.httpx, "request", missing_one)
+    with pytest.raises(SystemExit):
+        main(_submit_args(run, db))
+    err = capsys.readouterr().err
+    assert "affecting 1 pacbio_sample row" in err
+
+
 def test_submit_pacbio_ingest_resilient_to_ticket_failure(
     monkeypatch, tmp_path, build_case5_preflight
 ):

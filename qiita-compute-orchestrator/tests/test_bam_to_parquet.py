@@ -33,6 +33,7 @@ from qiita_common.models import (
     TERMINAL_WORK_TICKET_STATES,
     WorkTicketState,
 )
+from qiita_common.work_ticket_constants import POOL_REMOVAL_RECOVERY
 
 import qiita_compute_orchestrator.jobs.bam_to_parquet as bam_module
 from qiita_compute_orchestrator import sequence_range_retry
@@ -359,6 +360,7 @@ def test_execute_refuses_a_range_minted_by_a_different_ticket(monkeypatch, tmp_p
             sequence_idx_start=1000,
             sequence_idx_stop=1001,
             minted_by_work_ticket_idx=999,  # a different ticket loaded these reads
+            minted_by_work_ticket_state=WorkTicketState.COMPLETED.value,
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
@@ -375,6 +377,42 @@ def test_execute_refuses_a_range_minted_by_a_different_ticket(monkeypatch, tmp_p
     assert "ticket 999" in ei.value.reason
     assert "already loaded" in ei.value.reason
     # Nothing was written: the refusal happens before the durable rewrite.
+    assert not (tmp_path / "ws" / "read").exists()
+
+
+@pytest.mark.parametrize("minter_state", [WorkTicketState.NO_DATA.value, None])
+def test_execute_does_not_claim_the_reads_loaded_unless_the_other_minter_completed(
+    monkeypatch, tmp_path, minter_state
+):
+    # Only a COMPLETED minter is known to have stored the reads. A no_data minter, or
+    # one whose ticket row is gone, gets the pool removal without "already loaded".
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _someone_elses(*, http, prep_sample_idx):
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1001,
+            minted_by_work_ticket_idx=999,
+            minted_by_work_ticket_state=minter_state,
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _someone_elses)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "ticket 999" in ei.value.reason
+    assert "were already loaded" not in ei.value.reason
+    assert f"state={minter_state!r}" in ei.value.reason
+    assert POOL_REMOVAL_RECOVERY in ei.value.reason
+    assert "ticket run" not in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()
 
 
@@ -411,9 +449,7 @@ def test_execute_points_at_a_redrive_when_the_other_minter_did_not_finish(
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert "`qiita ticket run 999`" in ei.value.reason
     assert "were already loaded" not in ei.value.reason
-    assert ei.value.reason.index("qiita ticket run") < ei.value.reason.index(
-        "delete-sequenced-pool"
-    )
+    assert ei.value.reason.index("qiita ticket run") < ei.value.reason.index(POOL_REMOVAL_RECOVERY)
     assert not (tmp_path / "ws" / "read").exists()
 
 
@@ -535,7 +571,7 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
         # The recovery has to be a gesture that exists: there is no prep_sample
         # DELETE route, so the pool is what gets removed, and the COMPLETED
         # ticket blocks that too unless it is forced.
-        assert "qiita delete-sequenced-pool --force" in ei.value.reason
+        assert POOL_REMOVAL_RECOVERY in ei.value.reason
         assert "ticket run" not in ei.value.reason
 
 
@@ -623,6 +659,6 @@ def test_execute_refuses_when_the_minter_state_is_unknown(monkeypatch, tmp_path)
     assert "no longer running" in ei.value.reason
     # No ticket row to redrive — `/run` would 404. Removing the pool is the only
     # recovery, and it needs its own --force past the terminal ticket.
-    assert "qiita delete-sequenced-pool --force" in ei.value.reason
+    assert POOL_REMOVAL_RECOVERY in ei.value.reason
     assert "ticket run" not in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()

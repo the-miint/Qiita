@@ -1648,21 +1648,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_delete_pool = sub.add_parser(
         "delete-sequenced-pool",
         help=(
-            "Hard-delete a full sequenced-pool (one bcl-convert sample"
+            "Hard-delete a full sequenced_pool (one bcl-convert sample"
             " sheet's worth of prep_samples) and everything under it. Admin only."
         ),
         description=(
             "Fully purge a sequenced_pool: the pool row plus every"
-            " sequenced-sample / prep-sample under it, their metadata, study"
-            " links, and pool-/prep-sample-scoped work tickets, PLUS the DuckLake"
-            " read/read_mask rows those prep-samples produced and their durable"
-            " staged read copies on disk. The parent sequencing-run and the"
-            " underlying biosamples are retained. Because each prep-sample is"
-            " exclusive to this pool, deleting it removes those prep-samples from"
+            " sequenced_sample / prep_sample under it, their metadata, study"
+            " links, and pool- and prep_sample-scoped work tickets, PLUS the DuckLake"
+            " read/read_mask rows those prep_samples produced and their durable"
+            " staged read copies on disk. The parent sequencing_run and the"
+            " underlying biosamples are retained. Because each prep_sample is"
+            " exclusive to this pool, deleting it removes those prep_samples from"
             " EVERY study they link to, not only one. Requires system_admin"
             " (sequenced_pool:delete). In-flight work tickets block the delete"
             " unconditionally; terminal tickets (completed/no_data/failed),"
-            " published prep-samples, and ENA-submitted sequenced-samples block it unless"
+            " published prep_samples, and ENA-submitted sequenced_samples block it unless"
             " --force is passed."
         ),
     )

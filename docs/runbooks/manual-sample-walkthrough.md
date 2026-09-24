@@ -58,7 +58,13 @@ one prep_sample you are registering by hand, so there is no sheet to attach.
 
 ## 3. Add your prep_sample to the pool
 
+`--prep-protocol-idx` says how the library was prepared; `qiita
+prep-protocol list` shows the numbers your site has, and
+`short_read_metagenomics` is the one that ships by default. Set
+`PROTOCOL_IDX` to the number you find there:
+
 ```bash
+PROTOCOL_IDX=<the idx from qiita prep-protocol list>
 PREP_SAMPLE_IDX=$(qiita sequenced-sample create \
     --run-idx "$RUN_IDX" \
     --pool-idx "$POOL_IDX" \
@@ -76,11 +82,6 @@ actual prefix, so that paired-end reads are `filename_prefix_R1.fastq` and
 `filename_prefix_R2.fastq`. (In a normal run this value comes out of the
 pre-flight file, not out of your head — see
 [`getting-started.md`](getting-started.md).)
-
-`--prep-protocol-idx` says how the library was prepared; `qiita
-prep-protocol list` shows the numbers your site has, and
-`short_read_metagenomics` is the one that ships by default. Set
-`PROTOCOL_IDX` to the number you find there before running the command above.
 
 To attach the prep_sample to further studies, repeat `--secondary-study-idx`
 — you need admin access on each one, which you have on studies you own.
@@ -148,10 +149,11 @@ that handle in for you.
 
 ## 5. Watch it
 
-Step 4 already waited for the job and printed it. To look again later, using
+Step 4 already waited for the job and printed it. To look again later, take
 the ticket number from `work_ticket.work_ticket_idx` in that output:
 
 ```bash
+WORK_TICKET_IDX=<work_ticket.work_ticket_idx from step 4>
 qiita ticket status "$WORK_TICKET_IDX"
 ```
 

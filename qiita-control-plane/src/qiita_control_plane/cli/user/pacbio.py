@@ -340,7 +340,10 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
     and re-submits the rest. The in-flight gate blocks only non-terminal tickets,
     so a prep_sample whose reads already loaded gets a fresh ticket, which stops
     at the read-numbering step without storing anything (see
-    `sequence_range_retry.mint_or_reuse_sequence_range`). There is no --force: the
+    `sequence_range_retry.mint_or_reuse_sequence_range`). A FAILED prep_sample's
+    ticket is not reset by a submit either: the new ticket converges if the failed
+    one never numbered the reads, and otherwise stops, naming `qiita ticket run`
+    for the failed one. There is no --force: the
     COMPLETED-ticket gate it waives is sequenced_pool-scoped. All calls share one
     PAT.
     """
@@ -394,7 +397,7 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
             prep_protocol_idx=args.prep_protocol_idx,
             pool_item_id=lambda row: str(row.pacbio_sample_idx),
             row_label=lambda row: f"pacbio_sample_idx {row.pacbio_sample_idx}",
-            row_noun="sample",
+            row_noun="pacbio_sample",
         )
         sequencing_run_idx = provision.sequencing_run_idx
         sequenced_pool_idx = provision.sequenced_pool_idx
@@ -421,14 +424,8 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         # work already running. Recorded as SKIPPED and NOT counted toward the
         # non-zero exit, so re-running to retry one prep_sample does not report the
         # running ones as failures.
-        #
-        # A COMPLETED ticket does NOT land here: the prep_sample arm of
-        # _check_disallow_without_delete binds NON_TERMINAL states only, so an
-        # already-loaded prep_sample is admitted (202) and then fails at the
-        # read-numbering step, which refuses a range another ticket reserved.
-        # A FAILED prep_sample's ticket is not reset by a submit: the route inserts
-        # a new ticket, which converges if the failed one never numbered the
-        # reads and otherwise stops, naming `qiita ticket run` for the failed one.
+        # A COMPLETED or FAILED prep_sample is admitted instead; the docstring's
+        # convergent-retry paragraph says where its new ticket stops.
         failures: list[dict] = []
         skipped: list[dict] = []
         for entry in per_sample:

@@ -313,7 +313,10 @@ covers the flags Illumina does not have, which protocol to choose, and why
 **What to retry depends on what failed.**
 
 - **The command failed at your terminal:** run it again unchanged. It reuses the
-  run, pool and prep_samples it already made and adds only what is missing.
+  run, pool and prep_samples it already made and creates only what is missing.
+  On Illumina it then refuses to queue demultiplexing again if that already
+  completed; on PacBio it queues a job for every prep_sample again (see the end of
+  this section).
 - **A job it queued failed:** re-drive that job with `qiita ticket run <idx>`
   (step 6), which resumes it at the first unfinished step. Running the command
   again instead queues a new job, which may stop and tell you to re-drive the
@@ -324,8 +327,12 @@ damage what you already have.
 
 It gets a submission past a single refusal: on Illumina, submitting again over a
 run whose demultiplexing already completed is refused, and `--force` waives that.
-It needs a `wet_lab_admin` account. The PacBio command has no `--force`, because
-nothing refuses a PacBio re-submit in the first place.
+It needs a `wet_lab_admin` account. The PacBio command has no `--force`: once a
+prep_sample's job has completed, nothing refuses a PacBio re-submit, so there is
+no refusal to waive.
+
+When would you want it? Only when you mean to store the run's reads a second
+time — nothing in this guide needs that, and the next paragraph is why.
 
 **On Illumina, forcing stores the run's reads a second time.** The re-run finds
 each prep_sample's reads already staged from the first run and files them again;
@@ -358,8 +365,10 @@ ordinary at plate scale, where a blank, a no-template control or a well that
 failed to yield gives no reads — and you can resubmit it later if that was a
 surprise. `cancelled` means somebody stopped it; `qiita ticket run` restarts it.
 `failed` comes with the reason and the step it failed at, and the reason says what
-to do next. Most read-loading failures recover on their own or with
-`qiita ticket run`. The ones that do not end in removing the pool, which only an
+to do next. A job that fails on a transient problem, such as a node failure or running out
+of memory, is retried automatically; other
+read-loading failures are re-driven with `qiita ticket run`. The ones that
+cannot be re-driven end in removing the pool, which only an
 operator can do — so take the reason to yours;
 [`fastq-to-parquet-retry-recovery.md`](fastq-to-parquet-retry-recovery.md) is the
 page they will work from.

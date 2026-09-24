@@ -4224,7 +4224,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   unique or as one contig per row. None of that is recoverable from the bare `TEXT` column.
 
 - **The messages a user hits at the terminal say what happened, not how we store it (#461).**
-  The 409 for re-submitting a finished pool, the `--force` help on both submit commands, and the
+  The 409 for re-submitting a finished pool, the `submit-bcl-convert --force` help, and the
   read-loading failures a `qiita ticket status` reports asked the reader to know about the lake,
   DuckLake's lack of uniqueness, and `ON DELETE CASCADE` in order to act. They now name what
   happened to the reader's data and which command to run, keeping the identifiers, roles,
@@ -4251,7 +4251,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   constant — there is no prep_sample delete. A read-numbering refusal over a range another
   ticket reserved no longer says the reads are loaded when that ticket failed or was
   cancelled — it may have stored them or not — and names `qiita ticket run` for that
-  ticket first, ahead of the pool delete for a deliberate re-load. The
+  ticket first, ahead of the pool delete for a deliberate re-load; over a ticket still in
+  flight it names `qiita ticket status` for that ticket; and it says the reads are loaded
+  only when that ticket COMPLETED. `/run` admits exactly `REDRIVABLE_WORK_TICKET_STATES`
+  plus PENDING, the set the refusal reads to decide whether to offer a redrive. The
   runbooks now say to re-drive a failed job rather than re-run the submit, which queues a new
   ticket. A pure-unit Rust test pins that `read` is absent from `REPLACE_KEY_TABLES`, the
   table-level half of the `--force` claim. `fastq-to-parquet-retry-recovery.md` quotes the
@@ -4268,7 +4271,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   the landing page points at the new runbook (#461).** The old name claimed to be the quickstart
   for a procedure nobody should run on a live system; it exists to prove a deploy works and to
   learn the CLI, and `getting-started.md` is the quickstart. Both manual steps it was first
-  written against were removed while this branch was open — needing a machine that mounts the
+  written against have been removed — needing a machine that mounts the
   cluster by #484, so the runbook states the ingest-root bound and the `wet_lab_admin`
   requirement instead, and hand-copying and pre-opening the pre-flight file by #541, so that
   section is gone and the accession snippet uses `load_db_file` / `save_db_file`. It kept a full copy of login, profile, study and biosample

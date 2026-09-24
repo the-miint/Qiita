@@ -65,7 +65,7 @@ qiita submit-pacbio-ingest \
 
 ## `pool-completion` will not tell you the load finished
 
-It reports on two later things, not on the load. Its per-prep_sample counts are
+It reports on two later things, not on the load. Its per-sequenced_sample counts are
 about read masking — PacBio runs **are** host-filtered, exactly like Illumina
 ones, via `qiita submit-host-filter-pool`; you just have not done it yet at this
 point. Its `demux_state` is about Illumina demultiplexing, which PacBio never
@@ -75,4 +75,4 @@ So a freshly loaded PacBio pool reads `samples_not_submitted: N` and
 `demux_state: not_submitted`. The first means "not masked yet" and changes once
 you mask; the second never changes. Because it never changes, **`fully_processed`
 stays `false` for a PacBio pool forever** — use `complete` as the signal that the
-prep_samples are done instead.
+sequenced_samples are done instead.

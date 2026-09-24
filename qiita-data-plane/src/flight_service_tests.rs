@@ -1453,14 +1453,10 @@ fn replace_key_tables_names_each_table_once() {
 /// this table; `register_files_leaves_reads_another_ticket_registered` pins the
 /// end-to-end behaviour against a real catalog.)
 ///
-/// Pinned because three user-facing strings rest on it — the `--force` help on
-/// `submit-bcl-convert`, the 409 body that offers `force=true`, and the
-/// `force` field's OpenAPI description all state that a forced re-run stores
-/// the pool's reads a second time. A forced re-run is a second ticket, and
-/// `ingest_reads` short-circuits on the durable per-prep_sample staging copy
-/// before it reaches the sequence-range mint, so nothing upstream stops its
-/// registration either. Adding `read` to `REPLACE_KEY_TABLES` would make those
-/// three strings wrong, and this is what says so.
+/// Pinned because `FORCE_RESUBMIT_EXPLANATION` (qiita-common
+/// `work_ticket_constants.py`) tells users a forced re-run stores the pool's
+/// reads a second time; adding `read` to `REPLACE_KEY_TABLES` would make that
+/// text wrong.
 #[test]
 fn read_is_not_replace_keyed_so_a_forced_rerun_appends() {
     assert!(
