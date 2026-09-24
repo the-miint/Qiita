@@ -90,6 +90,10 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.assembly_run_config
     params: {assembler: assembler}
+    # `run_config` has two readers: the `assemble` container reads `.assembler` from
+    # it with jq, and the runner reads the whole file, stripped, as the key of that
+    # step's `profiles:` lookup below. Its serialized bytes are therefore a contract —
+    # `test_run_config_bytes_are_the_resource_profile_keys` pins them to those keys.
     outputs: [run_config]
     baseline_resources:
       cpu: 1
@@ -131,10 +135,120 @@ steps:
     derived_inputs:
       MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [genomes_dir]
+    # mem_gb is per-assembler, because the peaks are. Measured on the 1.0.1 re-run
+    # cohort (2026-09-02 to 09-03, qiita partition), MaxRSS off each job's `.batch`
+    # row, GiB throughout, split by the assembler the ticket asked for:
+    #
+    #   assembler       n     min     p50     max
+    #   hifiasm_meta   26   17.67  201.12  246.03
+    #   myloasm        16    2.78   53.35   94.58
+    #
+    # All 5 OUT_OF_MEMORY first attempts at the old flat 192 were hifiasm_meta. A
+    # single number has to cover hifiasm_meta, which then over-reserves for every
+    # myloasm ticket; the 2026-09-08 to 09-09 cohort's myloasm peak is in its own
+    # paragraph below.
+    #
+    # The lookup keys on `assembly_run_config`'s existing `run_config` output, whose
+    # stripped bytes the runner reads at dispatch — hence the JSON-shaped keys below.
+    # A dedicated bare-name output would read better and is not worth it: a completed
+    # step's bindings are rebuilt on resume as `{name: manifest[name] for name in
+    # entry.outputs}` against the spec in force at resume, so a new output raises for
+    # every in-flight ticket that already completed this step. Keying on a file that
+    # is already declared costs nothing at deploy.
+    #
+    # Two pins hold the seam: `test_run_config_bytes_are_the_resource_profile_keys`
+    # ties these keys to what the job actually writes, and
+    # `test_assemble_profiles_cover_every_assembler` ties them to `Inputs.assembler`'s
+    # Literal members. The lookup has no default — an unmatched key fails the step at
+    # dispatch rather than silently sizing from another assembler's measurement.
+    #
+    # Every figure below is MaxRSS — what a run's cgroup held at its peak, not what it
+    # asked for; on this cluster sacct's `.batch` MaxRSS equals the job cgroup's
+    # `memory.peak`, to 0.01 GiB on seven re-run jobs. A peak at its allocation shows
+    # only that the run reached it. One below it can differ between runs of the same
+    # input: bin_refine re-run on a production ticket's inputs, image and 32 GiB
+    # allocation peaked at 3.53 GiB where production peaked at 5.95. Rows are split at
+    # 120 GiB, which is where the two assemblers separate:
+    #
+    #   ran at   n     p50      max   what the rows are
+    #   103      1    8.01     8.01   myloasm; request set out of band on the ticket
+    #                                 to shorten its queue wait, peak far below it
+    #   192     19   53.75   114.86   15 myloasm, 4 hifiasm_meta
+    #   192      3  191.07   192.00   hifiasm_meta; one of the three pegged at 192.00
+    #   384     14  209.17   246.03   hifiasm_meta, ticket-wide --mem-gb 384
+    #   384      5  202.74   241.17   hifiasm_meta, escalated retries of the 5 OOMs
+    #
+    # That is all 42 completions; the window held 54 assemble jobs in total, the rest
+    # being the 5 OUT_OF_MEMORY first attempts and 7 still in flight at 192.
+    #
+    # hifiasm_meta 250. Exactly one of its 26 rows reached its allocation (the 192.00
+    # above); the 246.03 max, at 64% of a 384 GiB allocation, is what 250 answers. None
+    # of the 16 myloasm rows reached its allocation.
+    #
+    # 250 keeps a standard node able to hold two of these and 251 does not:
+    # 251 x 1024 x 2 = 514048 MB against the node's RealMemory, which
+    # docs/runbooks/slurm-backend-setup.md carries. cpu:32 on 64-core nodes
+    # caps the step at two per node regardless, so memory only matters where it
+    # admits fewer. On the two highmem nodes that same cliff sits at 755 (the
+    # runbook above carries both node sizes). That slot was not observed and
+    # the cap is not what prevented it: 40 of those 54 jobs went to the two
+    # highmem nodes, those on a standard node ran strictly back-to-back, and at probe
+    # time every node reported 0 idle CPUs with 60-354 GiB free. 250 preserves the
+    # slot rather than demonstrating one, and stops 3.97 GiB above this cohort's max.
+    # An earlier and larger cohort — 59 first attempts at 192, of which 30 OOMed —
+    # peaked at 259.3 GiB on its 384 GiB retries, so a sample in that range still
+    # escalates here. That peak is THIS profile's, not the other one's: `assembler`
+    # is a closed two-value enum, no 1.0.0 work ticket ever recorded myloasm (its
+    # first run is 2026-09-02, under this version), and the version's default is
+    # hifiasm_meta — so with the only alternative ruled out directly, every 1.0.0
+    # assemble ran hifiasm_meta whether the key was recorded or defaulted. Which
+    # matters because the two are now sized separately: 259.3 constrains the
+    # hifiasm_meta profile alone and says nothing about myloasm's 128.
+    #
+    # So 250 is knowingly below a hifiasm_meta peak, and covering it would cost the
+    # second slot: the smallest allocation above 259.3 is 260, and 260 x 1024 x 2 =
+    # 532480 MB exceeds the node, so this step would drop from two per node to one.
+    # The trade taken is one escalation rung for a sample in that range against
+    # halving the step's per-node occupancy for every sample that is not. The input
+    # scale behind that peak was not recorded and its sacct rows are gone, so it
+    # cannot be re-sized against more precisely than this.
+    #
+    # This step's myloasm paragraphs and the binning, bin_refine and checkm comments
+    # cite three cohorts, by job start, all on the qiita partition: 2026-09-02 to 09-03
+    # (the window of the table above, which was taken before its last runs finished and
+    # counts retries), 2026-09-04 to 09-05 and 2026-09-08 to 09-09. Those figures count
+    # COMPLETED first attempts, MaxRSS off each job's `.batch` row, as p50 / p90 / max.
+    # In the first cohort, ticket-wide overrides put 15 tickets at 384 (14) or 103 (1),
+    # and their assemble, binning, bin_refine and checkm jobs ran at that allocation.
+    #
+    # myloasm 128. The 2026-09-08 to 09-09 cohort's 235 myloasm runs, all at 128,
+    # peaked at 104.26 with p50 51.29, so 128 is 1.23x its max with 23.74 GiB of margin,
+    # and no run reached the allocation. The 2026-09-04 to 09-05 cohort's 56, also at
+    # 128, peaked at 87.77. 128 does not raise this step's own concurrency (cpu:32
+    # already caps that at two per node); what it does is stop holding 122 GiB per
+    # myloasm ticket that nothing on the node can use.
+    #
+    # Escalation doubles and clamps to `action_ceiling.mem_gb`: 250 -> 500 is one
+    # rung, 128 -> 256 -> 500 is two. Against a ticket-wide `max_retries` a shorter
+    # ladder is both one less rung to climb and one less retry spent climbing it,
+    # which is the cost myloasm takes on for the smaller reservation.
+    #
+    # walltime is per-assembler too. myloasm PT15H is 2.1x its longest run in any
+    # cohort, 7:05:35 in 2026-09-04 to 09-05 (p50 1:05:45, p90 2:43:43); the other two
+    # cohorts' longest were 1:05:34 (2026-09-02 to 09-03) and 2:29:24 (2026-09-08 to
+    # 09-09, p50 1:00:19, p90 1:32:48). hifiasm_meta keeps PT16H, 1.68x its longest,
+    # 9:31:47 at 384 in 2026-09-02 to 09-03; the later cohorts ran no hifiasm_meta.
     baseline_resources:
-      cpu: 32
-      mem_gb: 192
-      walltime: PT16H
+      from_step_output: run_config
+      profiles:
+        '{"assembler": "hifiasm_meta"}':
+          cpu: 32
+          mem_gb: 250
+          walltime: PT16H
+        '{"assembler": "myloasm"}':
+          cpu: 32
+          mem_gb: 128
+          walltime: PT15H
 
   # Align the masked HiFi reads back to the noLCG contigs with miint's embedded
   # minimap2 (`map-hifi`), emitting the coordinate-sorted BAM the binning step
@@ -158,10 +272,28 @@ steps:
     # the constant's comment for the 59-step `sacct` measurement.
     #
     # The wall-clock cost of 8 rather than 16 is slack this step has: measured p50 10.4
-    # min and max 15.4 min against the PT4H limit below, i.e. 6% of it.
+    # min and max 15.4 min against the PT4H limit below, i.e. 6% of it. The
+    # 2026-09-08 to 09-09 cohort (see the assemble step) ran p50 18.6 min and max 56.1
+    # min, 23% of it.
+    #
+    # mem_gb measured on the same cohort. At 64, 2 of 24 first attempts were
+    # OUT_OF_MEMORY pegged at 63.99 GiB, and both completed on the 128 GiB retry at
+    # 73.15 and 73.82 GiB. Runs that fit 64 peaked at p50 52.43, max 59.01 (n=22) —
+    # the tail is what 64 missed, not the median. 96 clears that cohort's 73.82 max by
+    # 22.18 GiB. An earlier cohort saw ten escalations of this same shape. At 96, the
+    # 2026-09-08 to 09-09 cohort — 235 runs, all first attempts, none OUT_OF_MEMORY,
+    # MaxRSS off the `.0` sub-step — peaked at p50 46.01, p90 61.56 and max 84.66 GiB,
+    # 11.34 GiB under the allocation.
+    #
+    # The whole increment reaches the side that binds: DuckDB is held to
+    # `_DUCKDB_CAP_GB` whatever the allocation, so the cgroup remainder — minimap2's
+    # index and the writer's SEQUENCE_DATA lookup, neither of which spills — takes
+    # every added GiB. Per node, memory already held this step to 7 concurrent at 64
+    # GiB (8 x 64 GiB exceeds one node's RealMemory); 96 GiB lowers that to 5. cpu:8 was
+    # never the binding limit.
     baseline_resources:
       cpu: 8
-      mem_gb: 64
+      mem_gb: 96
       walltime: PT4H
 
   # metawrap binning (metabat2 + maxbin2 + concoct) over the noLCG contigs +
@@ -178,10 +310,24 @@ steps:
     entrypoint: /opt/qiita/binning.sh
     inputs: [genomes_dir, masked_reads_fastq, coverage_bam]
     outputs: [bins_dir]
+    # MaxRSS and elapsed by cohort (see the assemble step), at 100 GB apart from the
+    # first cohort's overridden tickets.
+    #
+    #   cohort                 n    MaxRSS GiB                elapsed
+    #   2026-09-02 to 09-03    52   31.75 / 41.73 / 65.53    2:07:49 / 3:59:49 / 5:11:47
+    #   2026-09-04 to 09-05    56   27.97 / 46.53 / 82.77    1:28:23 / 4:13:24 / 6:24:14
+    #   2026-09-08 to 09-09   233   26.75 / 36.37 / 56.16    1:31:58 / 3:17:20 / 7:44:43
+    #
+    # The last cohort's other two runs FAILED after 3 s at under 0.6 GiB, on a binner's
+    # cannot-be-binned verdict rather than a limit. mem_gb 80 is 1.42x the last cohort's
+    # peak and below the 82.77 GiB peak of 2026-09-04 to 09-05; a run that OOMs at 80
+    # escalates as `action_ceiling` sets out. metaWRAP's `-m` derives from mem_gb in
+    # binning.sh, which carries the headroom it leaves. walltime PT12H is 1.55x the
+    # longest run.
     baseline_resources:
       cpu: 16
-      mem_gb: 100
-      walltime: PT8H
+      mem_gb: 80
+      walltime: PT12H
 
   # DAS_Tool consensus refinement over the three binners' output. "No bins >0.5"
   # → empty refined_bins_dir (exit 0); a real DAS_Tool crash fails the step.
@@ -191,10 +337,19 @@ steps:
     entrypoint: /opt/qiita/bin_refine.sh
     inputs: [genomes_dir, bins_dir]
     outputs: [refined_bins_dir]
+    # MaxRSS and elapsed by cohort (see the assemble step), at 32 GB apart from the
+    # first cohort's overridden tickets.
+    #
+    #   cohort                 n    MaxRSS GiB             elapsed
+    #   2026-09-02 to 09-03    52   4.70 / 5.44 / 6.78    0:38:52 / 0:54:53 / 1:12:17
+    #   2026-09-04 to 09-05    56   3.79 / 5.16 / 5.75    0:24:12 / 0:41:14 / 0:47:46
+    #   2026-09-08 to 09-09   233   3.82 / 4.89 / 5.95    0:25:37 / 0:39:31 / 1:09:33
+    #
+    # mem_gb 12 is 1.77x the highest peak and walltime PT2H30M 2.08x the longest run.
     baseline_resources:
       cpu: 8
-      mem_gb: 32
-      walltime: PT4H
+      mem_gb: 12
+      walltime: PT2H30M
 
   # CheckM lineage_wf + qa -o 2, run THREE times — over the refined MAGs, over the
   # circular contigs, and over the unbinned residue above the length cut → raw
@@ -215,7 +370,7 @@ steps:
     # manifest an earlier attempt wrote, while an input resolves from a binding
     # already produced, so adding one here strands nothing.
     inputs: [refined_bins_dir, genomes_dir]
-    # CheckM's ~1.4 GB reference DB is operator-provisioned under PATH_DERIVED,
+    # CheckM's reference DB is operator-provisioned under PATH_DERIVED,
     # deliberately NOT baked into the SIF. Bind it in and point checkm.sh at it:
     # the entrypoint reads QIITA_CHECKM_DB (falling back to an /opt/checkm_data
     # that does not exist in the image, so an unbound DB exits 78).
@@ -263,9 +418,9 @@ steps:
     #
     # What the 103 row controls for, and what it does not: 56 subjects at 40 GiB used
     # 35.95 and 52 subjects at 103 GiB used 35.98 — comparable workloads, 2.6x the
-    # allocation, 0.03 GiB apart, so at ~36 GiB of demand a 40 GiB cap is not binding.
-    # There is no run above 40 GiB at 445 subjects, so whether 38.88 is demand or a cap
-    # effect at that size is not established by this table.
+    # allocation, 0.03 GiB apart, so at peaks of ~36 GiB a 40 GiB cap is not binding.
+    # There is no run above 40 GiB at 445 subjects, so whether 38.88 would be higher
+    # without the 40 GiB cap is not established by this table.
     #
     # 1 subject cost 31.78 GiB and 445 cost 38.88 — a large fixed floor plus a small
     # sublinear term. That floor is why the margin is sized as headroom over a measured
@@ -274,11 +429,16 @@ steps:
     # opposite reason: there the question was the shape of a distribution, not headroom
     # over a peak.)
     #
-    # walltime stays PT4H; the worst run used 40% of it.
+    # walltime PT3H, 1.46x the longest run in any cohort (see the assemble step):
+    # 2:03:10, of 52 in 2026-09-02 to 09-03, which include the nine above. The
+    # 2026-09-04 to 09-05 cohort (56) peaked at 1:20:00 and 37.54 GiB, and the
+    # 2026-09-08 to 09-09 cohort (233) at 1:32:12 and 37.64 GiB. A run that times out
+    # escalates as `action_ceiling` sets out. Memory is sized from the 38.88 GiB peak
+    # above, also the highest of the first cohort's 52.
     baseline_resources:
       cpu: 8
       mem_gb: 48
-      walltime: PT4H
+      walltime: PT3H
 
   # Hash the LCG contigs, the MAG contigs, and the unbinned noLCG residue into the
   # reference-load shape: manifest (synthetic per-contig read_id, SHARED canonical
@@ -326,9 +486,34 @@ steps:
     inputs: [manifest, feature_map, assembly_chunks, bin_map, genomes_dir, checkm_dir, refined_bins_dir]
     params: {processing_idx: processing_idx}
     outputs: [staging_dir]
+    # mem_gb measured on the same cohort: 3 of 15 first attempts at 16 failed with a
+    # DuckDB OutOfMemoryException in write_feature_sequence_chunks' per-part ORDER BY
+    # ("failed to allocate data of size 432.0 MiB (10.3 GiB/11.1 GiB used)"). What
+    # shows this was not a cgroup kill is the RSS, not the state: process RSS at
+    # failure was 9.39 / 6.09 / 6.19 GiB inside a 16 GiB cgroup. The state does not
+    # discriminate — a step-level cgroup kill also surfaces through slurmrestd as a
+    # job-level FAILED (see `log_tail.py`). The retries were automatic even so: the
+    # message DuckDB raises begins "Out of Memory Error:", which the classifier's
+    # signature list matches, so it reached OOM_KILLED without an operator. That is
+    # third-party formatting, probed and pinned by
+    # `test_duckdb_out_of_memory_text_is_classified_as_oom`.
+    #
+    # What bound was DuckDB's own limit. `resolve_duckdb_memory_gb` subtracts
+    # `duckdb_headroom_gb(4)` = 4 from the allocation, so a 16 GiB step ran DuckDB at
+    # 12 GB (11.18 GiB); the headroom is additive, so it costs a quarter of a 16 GiB
+    # step and a sixteenth of a 64 GiB one. All three completed on the 32 GiB retry
+    # at 8.83 / 6.31 / 6.62 GiB RSS, so what the step wanted was a higher DuckDB
+    # limit, not more resident memory. 32 is the value measured to pass; nothing
+    # between 16 and 32 was tried, and the step now reserves headroom it has never
+    # touched. What was measured is the pair of endpoints: the sort failed against an
+    # 11.18 GiB limit and passed against 26.07. Whether it would pass at 14.9 — the
+    # same 16 GiB allocation without the headroom subtracted — was not tried, so the
+    # headroom's share is a candidate for the fix rather than an established cause.
+    # Re-sizing that helper against real MaxRSS is the route back down. Runs take
+    # 2-23 s, so the allocation is held briefly.
     baseline_resources:
       cpu: 4
-      mem_gb: 16
+      mem_gb: 32
       walltime: PT2H
 
   # Load the staging Parquets → the `assembled_sequence`, `assembled_sequence_chunks`,
@@ -351,13 +536,11 @@ steps:
     outputs: []
 
 # Per-step cap (the runner enforces resolved <= ceiling on every axis at
-# dispatch). The two ESCALATING axes — mem_gb (on OOM) and walltime (on
-# TIMEOUT) — must sit strictly ABOVE the heaviest step's baseline, or retry is
-# silently dead: the runner grows the floor by a fixed factor and clamps to the
-# ceiling, so an equal pair leaves the grown value unchanged, which reads as
-# saturation and fails the ticket permanently on attempt 0 rather than ever
-# retrying. `cpu` is deliberately left equal to assemble's baseline — nothing
-# escalates it. See the runner's escalation helpers for the mechanism.
+# dispatch). The two ESCALATING axes — mem_gb (on OOM) and walltime (on TIMEOUT)
+# — must sit strictly ABOVE the heaviest step's baseline; why, and what enforces
+# it for every shipped workflow, are stated at test_actions_loader.py's
+# `test_every_shipped_step_can_escalate_on_both_retry_axes`. `cpu` is left equal
+# to assemble's baseline — nothing escalates it.
 #
 # Sizing is measured, not guessed. `assemble` is the binding step, and its peak
 # scales with THREAD COUNT, so our 32-thread runs cost materially more than the
@@ -365,11 +548,11 @@ steps:
 # 164.8 GiB across 26 samples, while our smallest input peaked at 182.3 GiB and
 # a mid-sized one blew past 192 GiB during minimizer counting. The reference's
 # slowest sample also ran 28h16m, which a PT16H cap cannot express. 500 GB fits
-# a qiita-partition node (RealMemory 514000 MB, no MemSpecLimit) with little to
+# a qiita-partition node (see docs/runbooks/slurm-backend-setup.md) with little to
 # spare, so an escalated retry effectively reserves a whole node.
 #
 # Both assemblers run on this step (hifiasm_meta and myloasm); the numbers above
-# are hifiasm_meta's. Note the retry budget is TICKET-wide, not per-step, so a
+# are hifiasm_meta's. The retry budget is TICKET-wide, not per-step, so a
 # ticket that already spent retries earlier cannot count on reaching the top rung.
 action_ceiling:
   cpu: 32

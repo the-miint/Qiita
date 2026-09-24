@@ -58,6 +58,7 @@ from ..auth.scopes import (
 )
 from ..auth.tickets import sign_ticket
 from ..auth.token import mint_api_token
+from ..block_read import READ_MASKED_TABLE
 from ..deps import TxConnFactory, get_db_pool, get_flight_signing_key, get_tx_conn_factory
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["admin"])
@@ -610,10 +611,6 @@ async def export_owner_biosample_id(
 # Masked-read export (system_admin + admin:masked_read_export)
 # ---------------------------------------------------------------------------
 
-# The masked-read macro the export ticket is signed for. Must match the
-# data plane's ALLOWED_TABLES and the CP-side _DOGET_ALLOWED_TABLES
-# (routes/reference.py) and the service-account read_masked route's own constant.
-_READ_MASKED_TABLE = "read_masked"
 
 # Export tickets are minted at the data plane's MAX_TICKET_LIFETIME (3600 s).
 # The data plane verifies expiry only at DoGet initiation, never mid-stream, so
@@ -745,7 +742,7 @@ async def create_masked_read_export_ticket(
         )
 
     ticket_bytes = sign_ticket(
-        table=_READ_MASKED_TABLE,
+        table=READ_MASKED_TABLE,
         filter=filter_,
         secret=signing_key,
         ttl_seconds=_EXPORT_TICKET_TTL_SECONDS,

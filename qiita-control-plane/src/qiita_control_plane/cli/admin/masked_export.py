@@ -18,7 +18,7 @@ from qiita_common.api_paths import (
     PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT,
 )
 from qiita_common.flight_constants import ipc_compression_headers
-from qiita_common.parquet import ROW_GROUP_SIZE_BYTES
+from qiita_common.parquet import PARQUET_COMPRESSION, ROW_GROUP_SIZE_BYTES
 
 from qiita_control_plane.miint import connect_with_miint
 
@@ -116,7 +116,7 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
             # (ROW_GROUP_SIZE_BYTES, the qiita-wide cap from PARQUET_OPTS) rather
             # than a fixed row count, so wide rows don't produce oversized groups;
             # batch.nbytes is the in-memory size DuckDB's byte cap also measures.
-            writer = pq.ParquetWriter(partial, reader.schema, compression="zstd")
+            writer = pq.ParquetWriter(partial, reader.schema, compression=PARQUET_COMPRESSION)
             try:
                 buffer: list = []
                 buffered_bytes = 0

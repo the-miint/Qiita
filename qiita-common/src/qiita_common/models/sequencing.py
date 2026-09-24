@@ -208,14 +208,22 @@ class PoolReadMetrics(ReadCounts):
 SequencingRunResponse.model_rebuild()
 
 
-class SequencedPoolResponse(BaseModel):
-    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}.
+class SequencedPoolSummary(BaseModel):
+    """One row of GET /api/v1/sequencing-run/{R}/sequenced-pool (the list view).
 
-    The pool's caller-visible metadata (the BYTEA `run_preflight_blob` is
-    omitted — only `run_preflight_filename` is surfaced) plus the compute-on-read
-    read-metric rollup. There is no stored pool-level metric: `read_metrics`
-    is aggregated from the constituent sequenced_samples at request time, so it
-    never drifts when a sample is re-processed or deleted."""
+    The pool's stored metadata and nothing computed. The BYTEA
+    `run_preflight_blob` is omitted here as it is on the single-pool read; only
+    `run_preflight_filename` is surfaced. It labels a pool rather than keying it:
+    the run's uniqueness indexes on filename and on preflight content are both
+    PARTIAL (`WHERE ... IS NOT NULL`), and the pair is co-populated or both NULL
+    (`sequenced_pool_run_preflight_pair_consistent`), so a non-NULL filename is
+    unique within its run while a run may hold any number of no-preflight pools
+    this field cannot tell apart. Those are distinguishable only by idx.
+
+    No `read_metrics`: that rollup aggregates every constituent sequenced_sample
+    at request time, and a list would pay it per row. The single-pool read
+    carries it for the one pool a caller picked out of this list.
+    """
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
@@ -223,7 +231,35 @@ class SequencedPoolResponse(BaseModel):
     extra_metadata: dict[str, Any] | None
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
+
+
+class SequencedPoolResponse(SequencedPoolSummary):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}.
+
+    The summary above plus the compute-on-read read-metric rollup. There is no
+    stored pool-level metric: `read_metrics` is aggregated from the constituent
+    sequenced_samples at request time, so it never drifts when a sample is
+    re-processed or deleted."""
+
     read_metrics: PoolReadMetrics
+
+
+class SequencedPoolListResponse(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool.
+
+    The pools of one run, ascending by `sequenced_pool_idx`, capped at the
+    route's hard limit; `truncated` is True when the run holds more than the page.
+    `sequencing_run_idx` is echoed so a stored response is self-describing.
+
+    This is the read that makes a `sequenced_pool_idx` obtainable: every other
+    pool-scoped route takes one as a path segment or a filter, and before this
+    nothing returned one.
+    """
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool: list[SequencedPoolSummary]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool = False
 
 
 class SampleQCReport(BaseModel):

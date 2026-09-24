@@ -159,7 +159,7 @@ def library_spy(monkeypatch):
     calls: list[tuple] = []
     state = {"fail_on": None}
 
-    async def mint_features(pool, manifest_path, output_dir, *, genome_map_path=None):
+    async def mint_features(pool, manifest_path, output_dir, *, genome_map_path=None, scope):
         calls.append(("mint-features", manifest_path, output_dir, genome_map_path))
         if state["fail_on"] == LibraryPrimitive.MINT_FEATURES:
             raise RuntimeError("simulated mint-features failure")

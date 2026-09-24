@@ -259,28 +259,40 @@ else
     echo "{_PROBE_LINE_PREFIX} native-python-on-compute=fail path=$PYTHON"
 fi
 
-# The SAME check redeploy.sh runs on the head node after `uv sync`, invoked as a
-# module so neither side can drift into its own idea of "imports cleanly" — see
-# qiita_compute_orchestrator.native_import_check for what it covers and why it is
-# anchored on the job modules rather than on qiita_common. Same capture shape as
-# the miint probes below: the check prints one collapsed line naming the module
-# and the error, and that line is the operator's whole diagnosis — a bare `=fail`
-# leaves nothing to act on, and _parse_probe_log keeps only prefixed lines.
+# Run one check module under $PYTHON; on failure leave its one-line diagnosis in
+# MODULE_PROBE_ERR for the caller's `err=` field. Every module-form probe below
+# goes through this, so none of them can drift into its own idea of what reaches
+# the operator.
+#
 # -P keeps the cwd off sys.path so a probe launched from inside a source tree
 # cannot shadow the installed package it is there to check.
 #
 # 2>&1, because a failure BEFORE the module's own try block writes to stderr and
 # leaves stdout empty: `No module named ...` on a venv that predates the module is
-# the case the deploy checklist says to expect first. The collapse runs in the
-# else branch rather than on the capture, because a pipeline's status is the LAST
-# command's — `if VAR="$(python ... | tr ...)"` reads tr's 0 and reports ok on
-# every failure.
-NATIVE_IMPORT_MOD=qiita_compute_orchestrator.native_import_check
-if NATIVE_IMPORT_ERR="$("$PYTHON" -P -m "$NATIVE_IMPORT_MOD" 2>&1)"; then
+# the case the deploy checklist says to expect first. That captured line is the
+# operator's whole diagnosis — a bare `=fail` leaves nothing to act on, and
+# _parse_probe_log keeps only prefixed lines. The collapse runs after the capture
+# rather than in a pipeline, because a pipeline's status is the LAST command's —
+# `if VAR="$(python ... | tr ...)"` reads tr's 0 and reports ok on every failure.
+#
+# The row name stays a literal at each call site: the script-vs-parser parity
+# test reads `<key>=<value>` out of this script's text.
+run_module_probe() {{
+    if MODULE_PROBE_ERR="$("$PYTHON" -P -m "$1" 2>&1)"; then
+        return 0
+    fi
+    MODULE_PROBE_ERR="$(printf '%s' "$MODULE_PROBE_ERR" | tr -s '[:space:]' ' ')"
+    return 1
+}}
+
+# The SAME check redeploy.sh runs on the head node after `uv sync`, invoked as a
+# module so neither side can drift into its own idea of "imports cleanly" — see
+# qiita_compute_orchestrator.native_import_check for what it covers and why it is
+# anchored on the job modules rather than on qiita_common.
+if run_module_probe qiita_compute_orchestrator.native_import_check; then
     echo "{_PROBE_LINE_PREFIX} native-import=ok"
 else
-    NATIVE_IMPORT_ERR="$(printf '%s' "$NATIVE_IMPORT_ERR" | tr -s '[:space:]' ' ')"
-    echo "{_PROBE_LINE_PREFIX} native-import=fail err=$NATIVE_IMPORT_ERR"
+    echo "{_PROBE_LINE_PREFIX} native-import=fail err=$MODULE_PROBE_ERR"
 fi
 
 # miint must LOAD on the compute node from the deploy-staged
@@ -321,7 +333,7 @@ PYEOF
 # Capture the probe's stdout (the one-line error above on failure); drop stderr
 # noise. The previous `>/dev/null 2>&1` discarded the reason entirely, which is
 # why a broken deploy reported a bare `=fail` with nothing to act on.
-if MIINT_ERR="$("$PYTHON" "$MIINT_PROBE" 2>/dev/null)"; then
+if MIINT_ERR="$("$PYTHON" -P "$MIINT_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-read-fastx=ok"
 else
     echo "{_PROBE_LINE_PREFIX} miint-read-fastx=fail err=$MIINT_ERR"
@@ -344,13 +356,14 @@ try:
     conn = duckdb.connect(":memory:", config=miint_connect_config())
     conn.execute(miint_load_sql())
     rows = conn.execute("SELECT UNNEST(sequence_split('ACGTACGT', 4))").fetchall()
-    assert len(rows) == 2, rows
+    if len(rows) != 2:
+        raise RuntimeError("sequence_split contract drift: " + str(rows))
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
-if MIINT_ERR="$("$PYTHON" "$MIINT_SPLIT_PROBE" 2>/dev/null)"; then
+if MIINT_ERR="$("$PYTHON" -P "$MIINT_SPLIT_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-sequence-split=ok"
 else
     echo "{_PROBE_LINE_PREFIX} miint-sequence-split=fail err=$MIINT_ERR"
@@ -361,7 +374,7 @@ rm -f "$MIINT_SPLIT_PROBE"
 # and `align_minimap2` (the host_filter step) are the newest miint additions the
 # deploy depends on. Unlike read_fastx / sequence_split there was no probe for
 # them, so a v1.5.3 mirror build missing either was only caught at the first
-# host-reference build. Assert both are REGISTERED in the staged build's
+# host-reference build. Check both are REGISTERED in the staged build's
 # duckdb_functions() so a missing one fails here, at deploy. Existence-only:
 # invoking them needs a real index / alignment, but registration is exactly the
 # bucket-2 mirror prerequisite. No curly braces in the Python below — the whole
@@ -382,13 +395,14 @@ try:
     ).fetchall()
     have = [r[0] for r in rows]
     missing = [f for f in want if f not in have]
-    assert not missing, "missing miint host-filter functions: " + ", ".join(missing)
+    if missing:
+        raise RuntimeError("missing miint host-filter functions: " + ", ".join(missing))
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
-if MIINT_ERR="$("$PYTHON" "$MIINT_HOSTFILTER_PROBE" 2>/dev/null)"; then
+if MIINT_ERR="$("$PYTHON" -P "$MIINT_HOSTFILTER_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-host-filter-fns=ok"
 else
     echo "{_PROBE_LINE_PREFIX} miint-host-filter-fns=fail err=$MIINT_ERR"
@@ -400,7 +414,7 @@ rm -f "$MIINT_HOSTFILTER_PROBE"
 # two-row relations. It is also the newest miint dependency, and the failure mode
 # it guards is nasty: a stale extension_directory (a plain INSTALL never refreshes
 # a warm cache) yields a build with every OTHER function present, so the lima_mask
-# step fails at the first real submit with a bare catalog error. Assert the whole
+# step fails at the first real submit with a bare catalog error. Check the whole
 # contract here, at deploy: one row per ORIGINAL read, NULL/NULL for a read the
 # tool omitted.
 MIINT_INFERTRIM_PROBE="$(mktemp)"
@@ -420,13 +434,14 @@ try:
         "SELECT sequence_index, trimmed_5p, trimmed_3p FROM infer_trim(orig, qcd) "
         "ORDER BY sequence_index"
     ).fetchall()
-    assert rows == [(1, 3, 3), (2, None, None)], "infer_trim contract drift: " + str(rows)
+    if rows != [(1, 3, 3), (2, None, None)]:
+        raise RuntimeError("infer_trim contract drift: " + str(rows))
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
-if MIINT_ERR="$("$PYTHON" "$MIINT_INFERTRIM_PROBE" 2>/dev/null)"; then
+if MIINT_ERR="$("$PYTHON" -P "$MIINT_INFERTRIM_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-infer-trim=ok"
 else
     echo "{_PROBE_LINE_PREFIX} miint-infer-trim=fail err=$MIINT_ERR"
@@ -461,13 +476,14 @@ try:
         row = conn.execute(
             "SELECT success FROM save_bowtie2_index('bt2_subject', ?)", [out]
         ).fetchone()
-        assert row is not None and row[0], "save_bowtie2_index did not report success"
+        if row is None or not row[0]:
+            raise RuntimeError("save_bowtie2_index did not report success")
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
     sys.exit(1)
 PYEOF
-if MIINT_ERR="$("$PYTHON" "$MIINT_BOUNDARY_PROBE" 2>/dev/null)"; then
+if MIINT_ERR="$("$PYTHON" -P "$MIINT_BOUNDARY_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-gpl-boundary=ok"
 else
     echo "{_PROBE_LINE_PREFIX} miint-gpl-boundary=fail err=$MIINT_ERR"
@@ -502,6 +518,15 @@ else
     CPSET=$([ -n "$CP_URL" ] && echo ok || echo fail)
     TOKSET=$([ -n "$TOK" ] && echo ok || echo fail)
     echo "{_PROBE_LINE_PREFIX} cp-from-compute=skip cp_url_set=$CPSET token_set=$TOKSET"
+fi
+
+# Outbound HTTPS from this compute node to the ENA archives — why the deploy
+# checks it at all, and what a green row does and does not prove, is on
+# `ena_reachability_check` itself.
+if run_module_probe qiita_compute_orchestrator.ena_reachability_check; then
+    echo "{_PROBE_LINE_PREFIX} ena-from-compute=ok"
+else
+    echo "{_PROBE_LINE_PREFIX} ena-from-compute=fail err=$MODULE_PROBE_ERR"
 fi
 exit 0
 """

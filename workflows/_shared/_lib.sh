@@ -48,7 +48,8 @@ fi
 #     reason. Do not rely on that accident; QIITA_CPUS is the contract.
 #   * memory has NO such fallback available — nothing inside the container exposes
 #     the cgroup ceiling — so it takes a deliberately small literal. A tool sized
-#     off MEM_MB then under-uses a big dev box rather than OOM-killing a real step.
+#     off MEM_MB then under-uses a big dev box rather than OOM-killing a real step,
+#     unless its entrypoint refuses a MEM_MB that small.
 THREADS="${QIITA_CPUS:-${SLURM_CPUS_PER_TASK:-}}"
 if [[ -z "${THREADS}" ]]; then
     THREADS=$(nproc 2>/dev/null || echo 1)

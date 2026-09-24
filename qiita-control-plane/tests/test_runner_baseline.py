@@ -1,4 +1,4 @@
-"""Pure-unit tests for the runner's A4 baseline-resource resolution.
+"""Pure-unit tests for the runner's baseline-resource resolution.
 
 `_resolve_baseline_for_step` and `_assert_within_ceiling` are sync, pure
 functions (no DB, no orchestrator round-trip) — they translate a step's

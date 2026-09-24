@@ -70,15 +70,11 @@ _EXPECTED_FEATURES = 331269
 _EXPECTED_TAXONOMY = 331269
 _EXPECTED_PHYLOGENY = 662537
 
-# feature-to-genome.parquet has 72,765 non-null-genome_id rows but the
-# FASTA read_ids are amplicon-style (e.g. `MJ020_2_barcode53_...`)
-# while genome_map's feature_ids are NCBI-accession-style
-# (e.g. `NZ_CP039371.1`); only 12,283 IDs overlap. The runner's INNER
-# JOIN on read_id drops the non-overlap rows ("the genome map may
-# legitimately cover only a subset of FASTA reads" — see
-# qiita_control_plane.actions.library._associate_genomes). 12,283 is
-# the intersection size, derived empirically on the 2024.09 snapshot.
-_EXPECTED_GENOME_ASSOCIATIONS = 12283
+# The FASTA's read_ids are feature-to-genome.parquet's `tip_name`
+# (e.g. `RS_GCF_001956155.1_NZ_MRTN01000002.1`), not its `feature_id`, so
+# the fixture joins on `tip_name`: all 72,765 distinct (tip_name, genome_id)
+# pairs match a FASTA read on the 2024.09 snapshot.
+_EXPECTED_GENOME_ASSOCIATIONS = 72765
 
 _REFERENCE_ADD_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "reference-add" / "1.0.0.yaml"
@@ -92,7 +88,7 @@ pytestmark = [
 
 @pytest.fixture
 def gg2_genome_map(tmp_path):
-    """Convert GG2's `(feature_id, genome_id)` Parquet to the path-based
+    """Convert GG2's `(tip_name, genome_id)` Parquet to the path-based
     schema `(read_id, genome_source, genome_source_id)` that
     `mint_features` JOINs against the manifest's read_id.
 
@@ -109,7 +105,7 @@ def gg2_genome_map(tmp_path):
     with duckdb.connect(":memory:") as conn:
         conn.execute(
             "COPY ("
-            "  SELECT feature_id AS read_id,"
+            "  SELECT tip_name AS read_id,"
             "         'genbank' AS genome_source,"
             "         genome_id AS genome_source_id"
             "  FROM read_parquet(?) WHERE genome_id IS NOT NULL"
@@ -188,6 +184,7 @@ async def cli_cp_client(postgres_pool, signing_key, human_admin_session, data_pl
     POST /work-ticket can fire schedule_dispatch against a real backend."""
     from qiita_common.api_paths import LOOPBACK_HOST
     from qiita_control_plane.config import Settings as CPSettings
+    from qiita_control_plane.dispatch import build_dispatch_semaphore
     from qiita_control_plane.main import app as cp_app
 
     cp_app.state.pool = postgres_pool
@@ -200,6 +197,7 @@ async def cli_cp_client(postgres_pool, signing_key, human_admin_session, data_pl
     )
     cp_app.state.compute_backend_client = LocalComputeBackendClient()
     cp_app.state.running_dispatches = set()
+    cp_app.state.dispatch_semaphore = build_dispatch_semaphore()
 
     async with AsyncClient(
         transport=ASGITransport(app=cp_app),
@@ -276,11 +274,7 @@ async def test_gg2_backbone_full_pipeline(
     )
     assert membership_count == _EXPECTED_FEATURES
 
-    # --- Genome associations: the runner JOINs genome_map.read_id
-    # against the manifest's read_id (INNER JOIN), so only the
-    # intersection produces feature_genome rows. For GG2 the
-    # intersection is much smaller than the genome_map row count —
-    # see _EXPECTED_GENOME_ASSOCIATIONS for the locked figure.
+    # --- Genome associations: see _EXPECTED_GENOME_ASSOCIATIONS.
     actual_genome_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.feature_genome fg"
         " JOIN qiita.genome g USING (genome_idx)"

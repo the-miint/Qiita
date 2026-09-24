@@ -34,6 +34,8 @@ from qiita_common.models import (
     WorkTicketState,
 )
 
+from qiita_control_plane.dispatch import build_dispatch_semaphore
+
 pytestmark = pytest.mark.db
 
 
@@ -84,6 +86,7 @@ async def wt_client(postgres_pool, stub_compute_backend_client, ingest_root):
     )
     app.state.compute_backend_client = stub_compute_backend_client
     app.state.running_dispatches = set()
+    app.state.dispatch_semaphore = build_dispatch_semaphore()
 
     created_principals: list[int] = []
     created_tickets: list[int] = []

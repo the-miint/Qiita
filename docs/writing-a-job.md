@@ -103,9 +103,12 @@ Three kinds of field arrive in `Inputs`:
 - Return a `name -> Path` map whose keys **exactly match** the YAML step's
   `outputs:` names (a mismatch is a workflow-authoring error surfaced as a
   `KeyError`).
-- Result Parquet written for DuckLake registration must be mode `0o440` and
-  carry the identifier columns in the canonical sort order (see
-  [`architecture/cross-cutting.md`](architecture/cross-cutting.md) — the data-plane result-file contract).
+- Result Parquet written for DuckLake registration must be mode `0o440`. The
+  SLURM backend gates the manifest, each file's declared size, and that mode —
+  and nothing else; `LocalBackend` gates none of them. Sorting by the identifier
+  columns the destination table has helps DuckLake prune, but is not verified
+  (see [`architecture/cross-cutting.md`](architecture/cross-cutting.md) — result
+  file requirements).
 
 ### Error classification
 

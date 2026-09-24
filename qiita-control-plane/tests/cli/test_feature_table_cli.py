@@ -1,9 +1,9 @@
 """Unit tests for the client-side feature-table recipe's maps and relabel
 (`qiita_control_plane.cli.user.feature_table`) — no DB, no server, no data plane.
 
-Covers the two route helpers (patching `httpx.request`, the entry point
-`_common.call` delegates to), what the JSON responses become once staged into
-DuckDB, and the relabel driver. The analytic and every refusal the relabel makes
+Covers the route helpers — patching `httpx.request` for the JSON mints and
+`httpx.stream` for the two Parquet maps — what each response becomes once staged
+into DuckDB, and the relabel driver. The analytic and every refusal the relabel makes
 are pinned against real miint in `qiita-common`'s
 `tests/analytic/test_behaviour_miint.py`; what is specific here is the boundary
 between a REST response and a DuckDB relation, where a wrong column type or a lost
@@ -16,10 +16,17 @@ import duckdb
 import httpx
 import pytest
 from qiita_common import analytic as ft
-from qiita_common.api_paths import URL_EXPORTED_IDENTIFIER, URL_REFERENCE_GENOME_MAP
+from qiita_common.api_paths import (
+    URL_ASSEMBLY_GENOME_MAP_PARQUET,
+    URL_EXPORTED_IDENTIFIER,
+    URL_REFERENCE_GENOME_MAP_PARQUET,
+)
+from qiita_common.parquet import PARQUET_COMPRESSION, PARQUET_MEDIA_TYPE
 
 from qiita_control_plane.cli.user import feature_table as ftc
 from qiita_control_plane.miint import connect_with_miint
+
+from .conftest import genome_map_table
 
 _ENTRIES = [
     # G400's two contigs: the per-(feature, genome) fan-out the roll-up key must keep.
@@ -73,29 +80,110 @@ def _fake_request(captured, *, status=200, json_body=None, text=""):
     return fake_request
 
 
-def test_fetch_genome_map_gets_the_route_and_returns_its_entries(monkeypatch):
+def _fake_stream(captured, *, status=200, content=b"", headers_out=None):
+    """Stand in for `httpx.stream`, which is what `fetch_binary` uses."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_stream(method, url, headers=None, timeout=None, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        request = httpx.Request(method, url)
+        yield httpx.Response(
+            status,
+            content=content,
+            request=request,
+            headers=headers_out or {"content-type": PARQUET_MEDIA_TYPE},
+        )
+
+    return fake_stream
+
+
+def _parquet_body(entries):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    sink = pa.BufferOutputStream()
+    pq.write_table(genome_map_table(entries), sink, compression=PARQUET_COMPRESSION)
+    return sink.getvalue().to_pybytes()
+
+
+def test_fetch_genome_map_reads_the_parquet_route(monkeypatch):
+    """The client reads the Parquet form, not the JSON one — the JSON route 413s
+    above `GENOME_MAP_HARD_CAP`, which the deploy's references exceed."""
     captured: dict = {}
-    body = {"reference_idx": 7, "entries": _ENTRIES, "count": len(_ENTRIES)}
-    monkeypatch.setattr(ftc._common.httpx, "request", _fake_request(captured, json_body=body))
+    monkeypatch.setattr(
+        ftc._common.httpx, "stream", _fake_stream(captured, content=_parquet_body(_ENTRIES))
+    )
 
-    entries = ftc._fetch_genome_map("http://cp", "qk_tok", reference_idx=7)
+    table = ftc._fetch_genome_map("http://cp", "qk_tok", reference_idx=7)
     assert captured["method"] == "GET"
-    assert captured["url"] == f"http://cp{URL_REFERENCE_GENOME_MAP.format(reference_idx=7)}"
-    assert entries == _ENTRIES
+    assert captured["url"] == f"http://cp{URL_REFERENCE_GENOME_MAP_PARQUET.format(reference_idx=7)}"
+    assert table.to_pylist() == _ENTRIES
 
 
-def test_a_genome_map_over_the_route_cap_reaches_the_caller_with_the_real_size(monkeypatch):
-    """The route refuses over its cap rather than truncating, and this helper must not
-    soften that: a lookup table silently missing rows yields a WRONG feature table, not
-    a short one, and there is no paged form to fall back to. The 413 and the size it
-    names have to arrive intact at whoever can tell the user.
-    """
-    detail = "Genome map for reference 7 has 400000 entries, over the 250000 maximum"
-    monkeypatch.setattr(ftc._common.httpx, "request", _fake_request({}, status=413, text=detail))
+def test_fetch_assembly_genome_map_reads_its_own_parquet_route(monkeypatch):
+    """The de novo fetcher's URL, which nothing else asserts — the build tests
+    monkeypatch this function away, so a wrong `.format()` key would ship unseen.
+    Its reference twin has the same test above."""
+    captured: dict = {}
+    monkeypatch.setattr(
+        ftc._common.httpx, "stream", _fake_stream(captured, content=_parquet_body(_ENTRIES))
+    )
+
+    table = ftc._fetch_assembly_genome_map(
+        "http://cp", "qk_tok", prep_sample_idx=4, processing_idx=11
+    )
+    assert captured["url"] == "http://cp" + URL_ASSEMBLY_GENOME_MAP_PARQUET.format(
+        prep_sample_idx=4, processing_idx=11
+    )
+    assert table.to_pylist() == _ENTRIES
+
+
+def test_a_map_body_that_is_not_parquet_is_named_not_parsed(monkeypatch):
+    """A wrong `Content-Type` is reported as what the server sent, rather than
+    reaching `read_table` and surfacing as an Arrow complaint about magic bytes."""
+    monkeypatch.setattr(
+        ftc._common.httpx,
+        "stream",
+        _fake_stream({}, content=b"<html>oops</html>", headers_out={"content-type": "text/html"}),
+    )
+    with pytest.raises(RuntimeError, match="text/html"):
+        ftc._fetch_genome_map("http://cp", "qk_tok", reference_idx=7)
+
+
+def test_fetch_genome_map_uses_the_bulk_timeout_not_the_shared_one(monkeypatch):
+    """This call gets a longer READ budget — above the gateway's own ceiling, so a
+    slow control plane surfaces as the gateway's 504 rather than a local
+    ReadTimeout. Connect keeps the shared, shorter budget: reaching the host is no
+    slower here than anywhere else, and a bare float would set every phase, making
+    an unreachable host take the read timeout to fail."""
+    captured: dict = {}
+    monkeypatch.setattr(
+        ftc._common.httpx, "stream", _fake_stream(captured, content=_parquet_body(_ENTRIES))
+    )
+
+    ftc._fetch_genome_map("http://cp", "qk_tok", reference_idx=7)
+    timeout = captured["timeout"]
+    assert timeout.read == ftc._common.BULK_READ_HTTP_TIMEOUT_SECONDS
+    assert timeout.read > ftc._common.GATEWAY_READ_TIMEOUT_SECONDS
+    assert timeout.connect == ftc._common.CLI_HTTP_TIMEOUT_SECONDS
+
+
+def test_a_refusal_from_the_map_route_reaches_the_caller(monkeypatch):
+    """There is nothing to fall back to: a lookup table silently missing rows yields
+    a WRONG feature table, not a short one. Any non-2xx has to arrive intact at
+    whoever can tell the user, body included."""
+    detail = "Reference not found"
+    monkeypatch.setattr(
+        ftc._common.httpx, "stream", _fake_stream({}, status=404, content=detail.encode())
+    )
 
     with pytest.raises(httpx.HTTPStatusError) as exc:
         ftc._fetch_genome_map("http://cp", "qk_tok", reference_idx=7)
-    assert exc.value.response.status_code == 413
+    assert exc.value.response.status_code == 404
     assert detail in exc.value.response.text
 
 
@@ -129,7 +217,7 @@ def test_an_invalid_cohort_is_refused_before_the_round_trip(monkeypatch):
 def _staged(entries=None, identifiers=None, features=None):
     """Stage all three responses into a miint connection and describe what landed."""
     conn = connect_with_miint()
-    ftc._stage_genome_map(conn, _ENTRIES if entries is None else entries)
+    ftc._stage_genome_map(conn, genome_map_table(_ENTRIES if entries is None else entries))
     ftc._stage_exported_identifiers(conn, _IDENTIFIERS if identifiers is None else identifiers)
     ftc._stage_exported_features(conn, _FEATURES if features is None else features)
     return conn
@@ -199,7 +287,7 @@ def test_a_failed_staging_releases_its_source_too():
     fails on the relation that already exists, part-way through the loop."""
     with _staged() as conn:
         with pytest.raises(duckdb.CatalogException, match="already exists"):
-            ftc._stage_genome_map(conn, _ENTRIES)
+            ftc._stage_genome_map(conn, genome_map_table(_ENTRIES))
         with pytest.raises(duckdb.CatalogException):
             conn.execute(f"SELECT count(*) FROM {ftc._GENOME_MAP_SOURCE}")
 

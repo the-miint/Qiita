@@ -141,7 +141,9 @@ Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retr
 
 Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
 - Atomic UPDATE: state ← PENDING, `retry_count = 0`, all `failure_*` columns ← NULL (the DB CHECK requires `failure_*` all-NULL when state ≠ failed; the route clears them in one statement).
-- Triggers a fresh in-process dispatch via `schedule_dispatch`. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
+- Triggers a fresh in-process dispatch via `schedule_dispatch`, which queues behind the process-wide dispatch cap below when all slots are held. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
+
+**Dispatch concurrency.** Every dispatch path (route submit, ENA batch submit, startup reconcile, fan-out pump release) goes through `schedule_dispatch`, whose task holds one slot of the process-wide `_DISPATCH_CONCURRENCY` cap (8) for its whole workflow — an hours-long download poll included. Tasks past the cap queue FIFO and start as slots free, logging `queued behind the dispatch cap` when they start waiting and `dispatched after waiting` when they get one; nothing fails while it waits. Bounding in-flight workflows, not just connections, is the deliberate consequence: it is what keeps a burst of submits from pressuring the connection pool after `_STUDY_CONCURRENCY`'s permit has already been released at submit. Two behaviours follow that an operator should expect: a restart with more than 8 tickets in flight re-attaches the first 8 and queues the rest, and `/run` queues behind the same slots as ordinary submits. The cap is sized against the pool and `FANOUT_MAX_INFLIGHT` together — see the note on the constant.
 
 **Single-CP-process contract.** The control plane runs as a single
 `qiita-control-plane.service` instance. Dispatch tasks are bound to the
@@ -161,6 +163,26 @@ work is routine, so it must never nuke running jobs (the pre-decoupling
 other CP process is concurrently dispatching; a CP HA topology requires
 fencing it (per-process owner column or advisory lock) before lifting that
 restriction.
+
+## ENA Study Import
+
+Admin-facing bulk import of public INSDC studies' metadata and reads, distinct
+from a workflow entry: `POST /api/v1/ena-import-batch` takes a list of study
+accessions and returns immediately with a batch handle, while a background task
+(`qiita_control_plane.ena_import.batch`) resolves each accession's metadata (via
+`duckdb-miint`'s `read_ena` / `read_ena_attributes`), registers it into
+`study`/`biosample`/`sequenced_sample` rows (de-duplicating biosamples that share
+an ENA sample accession across studies), and submits one `download-ena-study`
+work ticket per `sequenced_pool` holding the study's runs (a re-import's new runs
+get a new pool once an earlier pool's download is under way). That ticket then
+runs like any other workflow: a native `ingest_ena_reads` step (`read_ena_sequences`
++ the same mint-then-sort-and-assign pipeline `ingest_reads` uses) followed by the
+standard `register-files` action into DuckLake. One accession's failure — resolver
+error, unmappable platform, a DB conflict — is isolated to that accession; it never
+aborts the batch or its siblings. See
+[`docs/runbooks/ena-import.md`](../runbooks/ena-import.md) for the operator-facing
+walkthrough, the REST surface, and this surface's hard scope limits (INSDC only,
+`http` transport only, no DDBJ/legacy-platform or ENVO harmonization yet).
 
 ## Compute Orchestrator
 

@@ -203,13 +203,15 @@ def test_the_two_scopes_agree_exactly_on_a_single_sample_cohort(threshold):
     sample" are the same question and the two scopes must return byte-identical
     tables — at every threshold.
 
-    Pooled computes this inside miint's `genome_coverage`; per-sample reimplements
-    the macro's method in our own SQL. Anything that makes the two disagree — a
-    different denominator, a lost INNER JOIN, a missing DOUBLE cast, a different
-    per-contig grouping — shows up here as a divergence, on a fixture that exercises
-    a plain genome (G100), an unaligned-contig denominator (G300) and a multi-contig
-    sum (G400) at once. Several narrower tests would each catch *some* of that; only
-    this one states the general rule.
+    Pooled calls miint's `genome_coverage` and per-sample its
+    `genome_coverage_per_sample`. Upstream documents that on single-sample input the
+    two agree exactly, at
+    <https://the-miint.github.io/duckdb-miint/alignment_analysis/#per-sample-genome-coverage>.
+    This pins that contract, and the per-sample survivor set's rename of `sample_id`
+    back to `prep_sample_idx`, on a fixture that exercises a plain genome (G100), an
+    unaligned-contig denominator (G300) and a multi-contig sum (G400) at once.
+    Several narrower tests would each catch *some* of that; only this one states the
+    general rule.
 
     Swept across thresholds because a divergence may only be visible where one scope
     lands on the far side of the cut from the other.
@@ -250,15 +252,16 @@ def test_the_denominator_is_the_full_genome_length_in_both_scopes(scope):
 
 
 def test_per_sample_merges_intervals_within_a_contig_not_across_them():
-    """`compress_intervals` merges within one coordinate space, so a genome's covered
-    bases are the sum over its contigs — and the threshold here is chosen to make
-    that discriminating rather than incidental.
+    """A multi-contig genome's covered bases are the sum over its contigs: the
+    per-sample macro merges intervals within a sample and, as `genome_coverage` does,
+    per contig — its contract at
+    <https://the-miint.github.io/duckdb-miint/alignment_analysis/#per-sample-genome-coverage>.
+    The threshold here is chosen so the assertion rests on that.
 
-    Sample 1 covers [0, 300) on each of two 1000 bp contigs: 600/2000 = **30%**,
-    which clears a 20% threshold. Had the per-sample form grouped straight to the
-    genome, the two identical [0, 300) spans would have merged as though they shared
-    coordinates, giving 300/2000 = **15%** — below the threshold, so the genome
-    would vanish. Its presence is the assertion.
+    prep_sample 1 covers [0, 300) on each of two 1000 bp contigs: 600/2000 = **30%**,
+    which clears a 20% threshold. Merged across the two contigs as though they shared
+    coordinates, the identical spans would give 300/2000 = **15%** — below the
+    threshold, so the genome would vanish. Its presence is the assertion.
     """
     rows = _table(
         ft.CoverageScope.PER_SAMPLE,
@@ -273,10 +276,9 @@ def test_per_sample_merges_intervals_within_a_contig_not_across_them():
 
 @pytest.mark.parametrize("scope", list(ft.CoverageScope))
 def test_a_genome_exactly_at_the_threshold_survives(scope):
-    """`>=`, not `>`. A genome sitting precisely on the threshold is KEPT — pinned
-    because both scopes write the comparison independently (the pooled one inside
-    miint's macro, the per-sample one in our SQL) and nothing else would catch the
-    two disagreeing at the boundary.
+    """`>=`, not `>`. A genome sitting precisely on the threshold is KEPT — pinned for
+    both scopes because each compares a different macro's `proportion_covered`, and
+    nothing else would catch the two disagreeing at the boundary.
     """
     # 10 bp covered of a 1000 bp genome = exactly 0.01.
     rows = _table(
@@ -1439,8 +1441,17 @@ _R_LENGTHS = [(10, 1000), (20, 1000), (50, 1000)]
 
 # (prep_sample_idx, feature_idx, genome_idx) — scoped to ONE assembly run.
 _D_MAP = [(1, 50, 900), (1, 51, 900), (2, 50, 901), (2, 52, 901)]
+# The same map with no genome for c50 in prep_sample 1, so its read on c50 has no de
+# novo placement to win with.
+_D_MAP_WITHOUT_1_C50 = [row for row in _D_MAP if row[:2] != (1, 50)]
 # One stream per cohort sample, as the assembly read-back is scoped. c50 is in both.
 _D_LENGTHS = {1: [(50, 1000), (51, 1000)], 2: [(50, 1000), (52, 1000)]}
+
+# (prep_sample_idx, genome_idx, completeness, contamination) — keyed by the pair, since
+# `bin_id` is unique only within a prep_sample. Both genomes clear the DEFAULT bounds,
+# so every combined test below runs through the real gate at the real thresholds and
+# would notice one that started excluding a genome it should not.
+_D_QUALITY = [(1, 900, 95.0, 1.0), (2, 901, 90.0, 2.0)]
 
 _R_ALIGNMENT = [
     # (prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position)
@@ -1457,7 +1468,15 @@ _D_ALIGNMENT = [
 
 
 def _stage_combined(
-    conn, *, threshold, denovo_map=_D_MAP, denovo_lengths=None, denovo_alignment=None
+    conn,
+    *,
+    threshold,
+    denovo_map=_D_MAP,
+    denovo_lengths=None,
+    denovo_alignment=None,
+    quality=None,
+    min_completeness=ft.DEFAULT_MIN_COMPLETENESS,
+    max_contamination=ft.DEFAULT_MAX_CONTAMINATION,
 ):
     """Stage both arms through the shared builders, in the order both drivers use.
 
@@ -1466,6 +1485,7 @@ def _stage_combined(
     combined path alter what every reference-only test above exercises.
     """
     denovo_lengths = _D_LENGTHS if denovo_lengths is None else denovo_lengths
+    quality = _D_QUALITY if quality is None else quality
     conn.execute(
         "CREATE TABLE _r_map AS "
         + _values(_R_MAP, "feature_idx, genome_idx", "?::BIGINT, ?::BIGINT"),
@@ -1485,8 +1505,25 @@ def _stage_combined(
         + _values(_R_LENGTHS, "feature_idx, sequence_length_bp", "?::BIGINT, ?::BIGINT"),
         [x for r in _R_LENGTHS for x in r],
     )
+    conn.execute(
+        "CREATE TABLE _d_quality AS "
+        + _values(
+            quality,
+            "prep_sample_idx, genome_idx, completeness, contamination",
+            "?::BIGINT, ?::BIGINT, ?::DOUBLE, ?::DOUBLE",
+        ),
+        [x for r in quality for x in r],
+    )
     conn.execute(ft.map_table_sql("_r_map"))
-    conn.execute(ft.denovo_map_table_sql("_d_map"))
+    # The scores, then the map gated on them — one sequence, in the order the drivers
+    # use it. The reference arm is not gated: a reference genome has no CheckM score.
+    for sql, parameters in ft.denovo_map_statements(
+        map_source="_d_map",
+        quality_source="_d_quality",
+        min_completeness=min_completeness,
+        max_contamination=max_contamination,
+    ):
+        conn.execute(sql, parameters)
 
     if ft.coverage_filter_applies(threshold):
         conn.execute(ft.genome_lengths_table_sql("_r_len"))
@@ -1525,6 +1562,9 @@ def _combined_table(
     denovo_map=_D_MAP,
     denovo_lengths=None,
     denovo_alignment=None,
+    quality=None,
+    min_completeness=ft.DEFAULT_MIN_COMPLETENESS,
+    max_contamination=ft.DEFAULT_MAX_CONTAMINATION,
 ) -> list[tuple]:
     """The whole combined analytic, sorted. Same shape as `_table`, one arm wider."""
     with _miint_conn() as conn:
@@ -1534,6 +1574,9 @@ def _combined_table(
             denovo_map=denovo_map,
             denovo_lengths=denovo_lengths,
             denovo_alignment=denovo_alignment,
+            quality=quality,
+            min_completeness=min_completeness,
+            max_contamination=max_contamination,
         )
         for sql, parameters in ft.ogu_input_statements(
             scope=scope, coverage_threshold=threshold, combined=True
@@ -1588,7 +1631,7 @@ def test_the_reference_only_control_keeps_the_genome_the_combined_table_drops():
     ]
 
 
-@pytest.mark.parametrize("denovo_map", [_D_MAP, [row for row in _D_MAP if row[:2] != (1, 50)]])
+@pytest.mark.parametrize("denovo_map", [_D_MAP, _D_MAP_WITHOUT_1_C50])
 def test_no_read_is_lost_by_the_reconciliation(denovo_map):
     """Conservation: every read that reached either arm is still counted, so the
     table's values sum to the number of distinct reads staged.
@@ -1641,6 +1684,80 @@ def test_a_contig_two_samples_assembled_is_counted_once_in_each_denominator():
     ]
 
 
+# c50 as the whole of each prep_sample's genome (an LCG in both), with the two
+# prep_samples covering different spans of it: 20% by prep_sample 1, a disjoint 50% by
+# prep_sample 2, 70% together.
+_SHARED_LCG = {
+    "denovo_map": [(1, 50, 900), (2, 50, 901)],
+    "denovo_lengths": {1: [(50, 1000)], 2: [(50, 1000)]},
+    "denovo_alignment": [
+        (1, 3, 50, 0, 0, 200),  # prep_sample 1, [0, 200)
+        (2, 6, 50, 0, 500, 1000),  # prep_sample 2, [500, 1000)
+    ],
+}
+
+
+def test_pooled_breadth_of_a_shared_contig_counts_every_prep_samples_reads():
+    """Pooled is breadth over every prep_sample's intervals, for a qiita genome as for
+    a reference one. Together the prep_samples cover 70% of c50, so both genomes clear
+    30% — Q900 on prep_sample 2's reads, since prep_sample 1 alone covers 20%. A
+    coverage map joined on the prep_sample as well would drop Q900.
+
+    prep_sample 1's read is then counted on Q900 and nowhere else, and prep_sample 2's
+    on Q901: clearing the threshold on another prep_sample's reads does not move any
+    read.
+    """
+    assert _combined_table(threshold=0.30, **_SHARED_LCG) == [
+        (1, 100, 1.0),
+        (1, 200, 1.0),
+        (1, 900, 1.0),  # Q900 kept on the cohort's 70%
+        (2, 100, 1.0),
+        (2, 901, 1.0),
+    ]
+
+
+def test_per_sample_breadth_of_a_shared_contig_counts_only_that_prep_samples_reads():
+    """The same fixture per-sample: Q900 is judged on prep_sample 1's 20% alone and
+    drops.
+
+    The macro also scores (prep_sample 2, Q900) at 50% and keeps that pair. No read of
+    prep_sample 2 reaches Q900, because the read-level join carries the prep_sample —
+    without that term prep_sample 2's read would split across Q900 and Q901, and this
+    table would show it.
+    """
+    assert _combined_table(ft.CoverageScope.PER_SAMPLE, 0.30, **_SHARED_LCG) == [
+        (1, 100, 1.0),
+        (1, 200, 1.0),
+        (2, 100, 1.0),
+        (2, 901, 1.0),
+    ]
+
+
+def test_a_read_left_to_the_reference_arm_still_adds_pooled_de_novo_breadth():
+    """prep_sample 1 has no genome for c50 here, so precedence leaves read 3 on R300.
+    Its [0, 200) on c50 still counts toward the pooled breadth of Q901, prep_sample 2's
+    genome holding c50: 700/2000 = 35% clears 30%, where prep_sample 2's own
+    [500, 1000) alone is 25% and would not.
+    """
+    read_3 = (1, 3, 50, 0, 0, 200)
+    others = [
+        (1, 5, 51, 0, 0, 500),  # Q900 = c51 alone here: 50%, so prep_sample 1 stays in
+        (2, 6, 50, 0, 500, 1000),
+    ]
+
+    def table(alignment):
+        rows = _combined_table(
+            threshold=0.30, denovo_map=_D_MAP_WITHOUT_1_C50, denovo_alignment=alignment
+        )
+        return {(s, g): v for s, g, v in rows}
+
+    values = table([read_3, *others])
+    assert values[(1, 300)] == 1.0, "read 3 is counted on the reference arm"
+    assert values[(1, 900)] == 1.0, "read 5 alone on Q900"
+    assert values[(2, 901)] == 1.0, "and read 3's interval kept Q901 above the threshold"
+    assert (2, 901) not in table(others), "without read 3, Q901 is 25% and drops"
+
+
 def test_a_de_novo_placement_with_no_genome_leaves_the_read_to_the_reference_arm():
     """Precedence is over rollable placements: the DELETE reads the de novo slice
     THROUGH the map, so a run whose membership carries no genome for a contig falls
@@ -1650,17 +1767,16 @@ def test_a_de_novo_placement_with_no_genome_leaves_the_read_to_the_reference_arm
     reappear on R300, which the reference-only control shows is where it would have
     been all along.
     """
-    without_c50 = [row for row in _D_MAP if row[:2] != (1, 50)]
-    values = {(s, g): v for s, g, v in _combined_table(denovo_map=without_c50)}
+    values = {(s, g): v for s, g, v in _combined_table(denovo_map=_D_MAP_WITHOUT_1_C50)}
     assert values[(1, 300)] == 1.0, "read 3 falls back to its reference placement"
     assert values[(1, 900)] == 1.0, "only read 5 is left on Q900"
 
 
 def test_per_sample_scope_reaches_both_arms():
-    """The per-sample survivor set is built from two hand-rolled branches in one
-    statement, where pooled has the macro on one side; this is the shape that would
-    fail to parse or bind rather than answer wrongly. Every genome here clears 1% in
-    the sample that carries it, so the table is the pooled one.
+    """The per-sample survivor set is two `genome_coverage_per_sample` calls in one
+    statement; this is the shape that would fail to parse or bind rather than answer
+    wrongly. Every genome here clears 1% in the sample that carries it, so the table
+    is the pooled one.
     """
     assert _combined_table(scope=ft.CoverageScope.PER_SAMPLE) == _combined_table()
 
@@ -1737,3 +1853,152 @@ def test_several_rows_of_one_read_within_an_arm_still_count_once():
     with_secondary = [*_D_ALIGNMENT, (1, 5, 51, 256, 100, 600)]
     values = {(s, g): v for s, g, v in _combined_table(denovo_alignment=with_secondary)}
     assert values[(1, 900)] == 2.0, "reads 3 and 5, the secondary adding nothing"
+
+
+# ---------------------------------------------------------------------------
+# The de novo arm's quality gate. The fixture above gives Q900 two contigs (c50, c51)
+# and Q901 one shared with it (c50), so excluding either genome is visible in the
+# counts AND in what happens to the reads it held.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("completeness", "contamination", "why"),
+    [
+        (30.0, 1.0, "completeness under the bound"),
+        (95.0, 40.0, "contamination over the bound"),
+        (None, None, "unscored on both axes"),
+        (None, 40.0, "unscored completeness, but over on contamination"),
+        (30.0, None, "unscored contamination, but under on completeness"),
+    ],
+)
+def test_a_genome_outside_the_bounds_is_not_in_the_table(completeness, contamination, why):
+    """Each way a genome fails, including the two half-measured ones: partial evidence
+    still decides, and an unscored axis never counts as passing.
+
+    Q900 is the one moved; Q901 keeps the default scores so the table is not empty and
+    the assertion is about one genome rather than the arm.
+    """
+    quality = [(1, 900, completeness, contamination), (2, 901, 90.0, 2.0)]
+    values = {(s, g): v for s, g, v in _combined_table(quality=quality)}
+    assert (1, 900) not in values, why
+    assert (2, 901) in values, "the other sample's genome is untouched"
+
+
+def test_the_reads_of_an_excluded_genome_keep_their_reference_placement():
+    """The gate's difference from the coverage filter, and the reason it gates the MAP.
+
+    Precedence reads the de novo slice THROUGH the map, so a read whose only de novo
+    placement was on an excluded genome is never superseded. Read 3 sits on c50 in both
+    arms — Q900 de novo, R300 by reference. Exclude Q900 and read 3 must appear on R300
+    for sample 1, where `test_a_read_the_denovo_arm_won_can_fall_out_of_the_table_entirely`
+    shows the coverage filter losing exactly such a read from both arms.
+    """
+    excluded = [(1, 900, 10.0, 1.0), (2, 901, 90.0, 2.0)]
+    values = {(s, g): v for s, g, v in _combined_table(quality=excluded)}
+    assert (1, 900) not in values
+    assert values[(1, 300)] == 1.0, "read 3 fell back to the reference arm, not out"
+
+    # And with Q900 admitted it is the de novo arm that holds it — so the row above is
+    # the gate's doing rather than something true either way.
+    kept = {(s, g): v for s, g, v in _combined_table()}
+    assert (1, 300) not in kept
+    assert kept[(1, 900)] == 2.0
+
+
+def test_the_gate_removes_nothing_from_the_quality_relation():
+    """A filter, not a delete: the scores stay readable after the map is staged.
+
+    `reconcile` stages the quality relation for the gate to correlate against, and
+    nothing downstream re-reads it today — so this pins that the gate leaves it whole
+    rather than consuming it.
+    """
+    excluded = [(1, 900, 10.0, 1.0), (2, 901, 90.0, 2.0)]
+    with _miint_conn() as conn:
+        _stage_combined(conn, threshold=0.01, quality=excluded)
+        scored = conn.execute(
+            f"SELECT genome_id FROM {ft.DENOVO_GENOME_QUALITY_TABLE} ORDER BY genome_id"
+        ).fetchall()
+        mapped = conn.execute(
+            f"SELECT DISTINCT genome_id FROM {ft.DENOVO_MAP_TABLE} ORDER BY genome_id"
+        ).fetchall()
+    assert scored == [(900,), (901,)], "both genomes' scores survive the gate"
+    assert mapped == [(901,)], "only the passing one reaches the map"
+
+
+def test_a_genome_exactly_on_each_bound_is_kept():
+    """Inclusive on both sides, as `test_a_genome_exactly_at_the_threshold_survives`
+    pins for the coverage bound."""
+    on_the_line = [
+        (1, 900, ft.DEFAULT_MIN_COMPLETENESS, ft.DEFAULT_MAX_CONTAMINATION),
+        (2, 901, 90.0, 2.0),
+    ]
+    values = {(s, g): v for s, g, v in _combined_table(quality=on_the_line)}
+    assert (1, 900) in values
+
+
+def test_a_permissive_gate_admits_every_scored_genome():
+    """`min_completeness=0` with a large `max_contamination` admits every SCORED genome.
+
+    Not an ungated map: the positive predicate excludes a NULL at every bound, which is
+    why an unscored subject is refused at submit instead
+    (`runner/_feature_table.py::_stage_denovo_genome_quality`)."""
+    poor = [(1, 900, 0.5, 90.0), (2, 901, 0.5, 90.0)]
+    values = _combined_table(quality=poor, min_completeness=0.0, max_contamination=1000.0)
+    assert {(s, g) for s, g, _ in values} >= {(1, 900), (2, 901)}
+
+
+def test_the_gate_does_not_judge_the_reference_arm():
+    """Reference genomes carry no CheckM row, so a gate that reached them would empty
+    the reference arm rather than filter it. Excluding BOTH qiita genomes must leave
+    the reference-only table exactly as it is, reconciliation and all.
+    """
+    none_pass = [(1, 900, 1.0, 99.0), (2, 901, 1.0, 99.0)]
+    combined = _combined_table(quality=none_pass)
+    assert {(s, g) for s, g, _ in combined} == {(1, 100), (1, 200), (1, 300), (2, 100)}, (
+        "every reference genome, including R300 with read 3 back on it"
+    )
+
+
+@pytest.mark.parametrize(
+    ("min_completeness", "max_contamination"),
+    [(-0.1, 10.0), (100.1, 10.0), (50.0, -0.1)],
+)
+def test_the_gate_refuses_a_bound_that_is_not_a_percentage(min_completeness, max_contamination):
+    """The shared backstop, for the next consumer: each caller also validates at its own
+    boundary (the job's Pydantic `Field`), but out of range the failure is silent either
+    way — permissive below 0, empty above 100.
+    """
+    with pytest.raises(ValueError, match="percentage"):
+        ft.denovo_map_statements(
+            map_source="m",
+            quality_source="q",
+            min_completeness=min_completeness,
+            max_contamination=max_contamination,
+        )
+
+
+def test_the_gate_accepts_a_contamination_above_100():
+    """No ceiling on contamination: nothing here fixes one, and CheckM's range is not
+    something this repo has measured."""
+    assert ft.denovo_map_statements(
+        map_source="m", quality_source="q", min_completeness=50.0, max_contamination=1000.0
+    )[1][1] == [50.0, 1000.0]
+
+
+def test_the_gate_refuses_a_nan_bound():
+    """NaN reaches here. The route validates `action_context` against the action's
+    JSON Schema, and `{"type":"number","minimum":0,"maximum":100}` ACCEPTS NaN —
+    probed on the pinned jsonschema — because every comparison against it is false;
+    `json.loads` also accepts the non-standard `NaN` literal by default.
+
+    A NaN bound is not inert: `completeness >= NaN` is false for every row, so the de
+    novo arm empties and the table reads as reference-only. The `not 0 <= x <= 100`
+    spelling is what rejects it — the equivalent-looking `x < 0 or x > 100` would let it
+    through — which is why this is pinned rather than left to the shape of the
+    expression.
+    """
+    for bad in ({"min_completeness": float("nan")}, {"max_contamination": float("nan")}):
+        kwargs = {"min_completeness": 50.0, "max_contamination": 10.0} | bad
+        with pytest.raises(ValueError, match="percentage"):
+            ft.denovo_map_statements(map_source="m", quality_source="q", **kwargs)

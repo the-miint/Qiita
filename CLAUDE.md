@@ -161,6 +161,13 @@ When you add, rename, or remove a value in an enum that *does* have a `CREATE TY
 A PR that changes one side without the other, the two-way comment, and the `ENUM_PAIRS` entry is
 incomplete.
 
+## Reviewing a branch
+
+Code review of pending changes runs the `qiita-review` skill — it owns the loop (review,
+fix, re-review to convergence), the disposition ledger, and the stop rule. The rules
+themselves live in `.claude/agents/qiita-reviewer.md`. One pass is not a review: the
+fixes change the diff, and the next pass reads what the fixes wrote.
+
 ## Operator-facing changes (DEPLOY_CHECKLIST.md)
 
 `DEPLOY_CHECKLIST.md` is the operator's deploy checklist — **not** a per-PR change log (that's

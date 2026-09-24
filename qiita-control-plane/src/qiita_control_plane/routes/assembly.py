@@ -8,7 +8,7 @@ Ed25519 Flight DoGet ticket for the contig sequences ONE assembly run produced �
 same surfaces; they differ in who may ask and how the run is authorized, the way
 ``/alignment``'s two mints do (``Scope.ASSEMBLY_DOGET`` carries the argument).
 
-``GET /assembly/{prep_sample_idx}/{processing_idx}/genome-map`` is not a ticket:
+``GET /assembly/{prep_sample_idx}/{processing_idx}/genome-map[/parquet]`` is not a ticket:
 ``genome_idx`` lives only in Postgres, so there is nothing for the data plane to
 serve, and it is a control-plane read like its reference twin.
 
@@ -33,11 +33,12 @@ import base64
 from typing import Annotated
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_ASSEMBLY_DOGET,
     PATH_ASSEMBLY_GENOME_MAP,
+    PATH_ASSEMBLY_GENOME_MAP_PARQUET,
     PATH_ASSEMBLY_PREFIX,
     PATH_ASSEMBLY_RUN_DOGET,
 )
@@ -53,7 +54,9 @@ from qiita_common.models import (
     DoGetTicketResponse,
     GenomeMapEntry,
 )
+from qiita_common.parquet import PARQUET_MEDIA_TYPE, PARQUET_RESPONSES
 
+from ..actions.library import assembly_genome_map_parquet
 from ..auth.guards import (
     COHORT_MIN_TIER,
     require_complete_profile,
@@ -219,6 +222,80 @@ async def create_assembly_run_doget_ticket(
     )
 
 
+async def _authorize_assembly_genome_map(
+    pool: asyncpg.Pool,
+    *,
+    caller: HumanUser,
+    prep_sample_idx: int,
+    processing_idx: int,
+) -> None:
+    """Every gate both genome-map forms run, in the one order they run it.
+
+    Shared rather than copied because the order carries a disclosure decision:
+    access before completeness before mintedness, so a 422 naming this run's
+    unminted rows never reaches a caller with no right to know the run exists. Two
+    copies could drift into two different answers to that.
+
+    Runs ahead of any body on both forms. Contigs whose membership carries no
+    ``genome_idx`` are absent from the map, and the absence is invisible
+    downstream — the genomes they belong to keep their other contigs, so their
+    length denominators come back short and their breadth comes back high.
+    """
+    await authorize_prep_sample_cohort(
+        pool, caller=caller, prep_sample_idx=[prep_sample_idx], min_tier=COHORT_MIN_TIER
+    )
+    await _require_completed_assembly_run(
+        pool, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+    )
+    unminted = await count_assembly_membership_without_genome(
+        pool, prep_sample_idx=[prep_sample_idx], processing_idx=processing_idx
+    )
+    if unminted:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{unminted[prep_sample_idx]} membership row(s) of"
+                f" prep_sample_idx={prep_sample_idx},"
+                f" processing_idx={processing_idx} carry no genome_idx, so this map"
+                " would silently omit their contigs and shorten their genomes'"
+                " length denominators. An operator has to run the assembly-genome"
+                " backfill on the host before this run can be used as a de novo arm"
+                " — `qiita-admin` is host-side and reads DATABASE_URL, so it is not"
+                " something this caller can run."
+            ),
+        )
+
+
+@assembly_router.get(
+    PATH_ASSEMBLY_GENOME_MAP_PARQUET,
+    response_class=Response,
+    responses=PARQUET_RESPONSES,
+)
+async def get_assembly_genome_map_parquet(
+    prep_sample_idx: Annotated[int, Field(gt=0)],
+    processing_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+) -> Response:
+    """The same map as the JSON route below, as Parquet, with no cap — the de novo
+    twin of ``GET /reference/{idx}/genome-map/parquet``.
+
+    Runs the identical gates through ``_authorize_assembly_genome_map``, so the
+    422 on unminted memberships still fires and still fires before any body
+    exists. A zero-row run is a 200 with a valid zero-row Parquet — a completed run
+    whose contigs are all UNBINNED — and degrades to the reference arm rather than
+    erroring. A run that produced no contig at all never reaches here: it closes at
+    ``'no_data'``, which ``_require_completed_assembly_run`` answers 404."""
+    await _authorize_assembly_genome_map(
+        pool, caller=caller, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+    )
+    body = await assembly_genome_map_parquet(
+        pool, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+    )
+    return Response(content=body, media_type=PARQUET_MEDIA_TYPE)
+
+
 @assembly_router.get(PATH_ASSEMBLY_GENOME_MAP)
 async def get_assembly_genome_map(
     prep_sample_idx: Annotated[int, Field(gt=0)],
@@ -252,30 +329,9 @@ async def get_assembly_genome_map(
     silently short lookup table yields a WRONG feature table rather than a partial
     one, which is the reference twin's reasoning unchanged.
     """
-    await authorize_prep_sample_cohort(
-        pool, caller=caller, prep_sample_idx=[prep_sample_idx], min_tier=COHORT_MIN_TIER
+    await _authorize_assembly_genome_map(
+        pool, caller=caller, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
     )
-    await _require_completed_assembly_run(
-        pool, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
-    )
-
-    unminted = await count_assembly_membership_without_genome(
-        pool, prep_sample_idx=[prep_sample_idx], processing_idx=processing_idx
-    )
-    if unminted:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"{unminted[prep_sample_idx]} membership row(s) of"
-                f" prep_sample_idx={prep_sample_idx},"
-                f" processing_idx={processing_idx} carry no genome_idx, so this map"
-                " would silently omit their contigs and shorten their genomes'"
-                " length denominators. An operator has to run the assembly-genome"
-                " backfill on the host before this run can be used as a de novo arm"
-                " — `qiita-admin` is host-side and reads DATABASE_URL, so it is not"
-                " something this caller can run."
-            ),
-        )
 
     rows = await fetch_assembly_genome_map(
         pool,
@@ -316,10 +372,12 @@ async def _require_completed_assembly_run(
 
     The two human reads need the stronger one. They feed the client-side combined
     feature table, and its server-side counterpart refuses exactly these states at
-    submit (`runner/_feature_table.py`'s arm gate): a ``'pending'`` run would give a
-    table that changes underneath it, and an ``'invalidated'`` one would carry
-    withdrawn contigs into a published result. A client cannot re-derive either from
-    a 404, which is deliberately three answers in one.
+    submit (`runner/_feature_table.py`'s arm gate): a ``'pending'`` run has not closed
+    — still going, or ended without a terminal write, which
+    `repositories.assembly.fetch_assembly_sample_state` documents — so its contigs are
+    partial either way, and an ``'invalidated'`` one would carry withdrawn contigs into
+    a published result. A client cannot re-derive either from a 404, which is
+    deliberately three answers in one.
 
     ``'no_data'`` keeps the 404 the caller already handles as "no de novo arm for
     this prep_sample", so the graceful path is unchanged.
@@ -338,8 +396,10 @@ async def _require_completed_assembly_run(
         detail=(
             f"assembly run {processing_idx} for prep_sample_idx={prep_sample_idx} reads"
             f" {state!r} in qiita.assembly_sample, not 'completed', so its contigs are"
-            " not to be consumed. A run still going would change the answer underneath"
-            " you; a withdrawn one was judged untrustworthy by a person."
+            " not to be consumed. 'pending' means the row never closed — the run is"
+            " still going, or its ticket failed and nothing swept the gate; read the"
+            " work_ticket to tell which. 'invalidated' was judged untrustworthy by a"
+            " person."
         ),
     )
 

@@ -354,8 +354,8 @@ fn delete_mask_drops_target_idempotently() {
 }
 
 /// `delete_read_mask_block` deletes EXACTLY one block's footprint: the
-/// per-member OR residual keeps a split sample's sibling-block sub-range, the
-/// `mask_idx` scope keeps a different mask's rows for the same sample, and a
+/// per-member OR residual keeps a split prep_sample's sibling-block sub-range, the
+/// `mask_idx` scope keeps a different mask's rows for the same prep_sample, and a
 /// re-delete is an idempotent 0-row noop (the self-cleaning re-run guarantee).
 #[test]
 #[serial_test::serial]
@@ -373,7 +373,7 @@ fn delete_read_mask_block_deletes_footprint_only() {
     let prep_a: i64 = 940_010;
     let prep_b: i64 = 940_011;
 
-    // mask_a/prep_a is a SPLIT sample: block 1 owns seq 100-101, block 2 owns
+    // mask_a/prep_a is a SPLIT prep_sample: block 1 owns seq 100-101, block 2 owns
     // seq 102-103. mask_a/prep_b (seq 200-201) is whole in block 1. mask_b's
     // row for prep_a (seq 100) is a different filtering identity.
     conn.execute_batch(&format!(
@@ -425,15 +425,15 @@ fn delete_read_mask_block_deletes_footprint_only() {
         )
         .unwrap()
     };
-    // Block 2's sub-range of the split sample survives (per-member OR exact).
+    // Block 2's sub-range of the split prep_sample survives (per-member OR exact).
     assert_eq!(
         count(mask_a, prep_a),
         2,
         "prep_a 102-103 (block 2) untouched"
     );
-    // prep_b's whole sample was in block 1 — fully deleted.
+    // prep_b's whole prep_sample was in block 1 — fully deleted.
     assert_eq!(count(mask_a, prep_b), 0, "prep_b fully deleted");
-    // The different mask's row for the same sample is out of scope.
+    // The different mask's row for the same prep_sample is out of scope.
     assert_eq!(count(mask_b, prep_a), 1, "mask_b untouched");
 
     // Idempotency: re-deleting the same footprint removes nothing.
@@ -527,15 +527,15 @@ fn delete_alignment_drops_target_idempotently() {
 
 /// `delete_alignment_block` deletes EXACTLY one block's footprint from every
 /// `ALIGNMENT_DELETE_TABLES` table: the per-member OR residual keeps a split
-/// sample's sibling-block sub-range, the `alignment_idx` scope keeps a
-/// different alignment's rows for the same sample, ALL of a read's rows go
+/// prep_sample's sibling-block sub-range, the `alignment_idx` scope keeps a
+/// different alignment's rows for the same prep_sample, ALL of a read's rows go
 /// (multiplicity — a read with two feature_idx rows loses both), and a
 /// re-delete is an idempotent 0-row noop. The alignment twin of
 /// `delete_read_mask_block_deletes_footprint_only`.
 ///
 /// The side table gets a row in each of the four regions the footprint
 /// distinguishes — inside block 1, inside block 2 (still within the coarse
-/// `BETWEEN` span), a second sample inside block 1, and a different
+/// `BETWEEN` span), a second prep_sample inside block 1, and a different
 /// alignment_idx — so the one clause is shown to select the same reads there
 /// as in `alignment`.
 #[test]
@@ -554,7 +554,7 @@ fn delete_alignment_block_deletes_footprint_only() {
     let prep_a: i64 = 960_210;
     let prep_b: i64 = 960_211;
 
-    // align_a/prep_a is a SPLIT sample: block 1 owns seq 100-101, block 2 owns
+    // align_a/prep_a is a SPLIT prep_sample: block 1 owns seq 100-101, block 2 owns
     // seq 102-103. seq 100 has TWO rows (feature 10 + 11 — a read aligned to
     // two shards' features), exercising the feature_idx-agnostic multiplicity
     // delete. align_a/prep_b (seq 200-201) is whole in block 1. align_b's row
@@ -622,19 +622,19 @@ fn delete_alignment_block_deletes_footprint_only() {
         )
         .unwrap()
     };
-    // Block 2's sub-range of the split sample survives (per-member OR exact).
+    // Block 2's sub-range of the split prep_sample survives (per-member OR exact).
     assert_eq!(
         count("alignment", align_a, prep_a),
         2,
         "prep_a 102-103 (block 2) untouched"
     );
-    // prep_b's whole sample was in block 1 — fully deleted.
+    // prep_b's whole prep_sample was in block 1 — fully deleted.
     assert_eq!(
         count("alignment", align_a, prep_b),
         0,
         "prep_b fully deleted"
     );
-    // The different alignment's row for the same sample is out of scope.
+    // The different alignment's row for the same prep_sample is out of scope.
     assert_eq!(count("alignment", align_b, prep_a), 1, "align_b untouched");
 
     // The same three properties on the side table. prep_a's surviving row is
@@ -670,11 +670,11 @@ fn delete_alignment_block_deletes_footprint_only() {
 
 /// `delete_alignment_sample` deletes EXACTLY one `(alignment_idx,
 /// prep_sample_idx)` pair's rows from every `ALIGNMENT_DELETE_TABLES` table.
-/// Both halves of the pair are pinned: a sibling sample under the SAME
+/// Both halves of the pair are pinned: a sibling prep_sample under the SAME
 /// alignment_idx survives (so the delete is not `delete_alignment`), and the
-/// target sample's rows under a DIFFERENT alignment_idx survive (so it is not
+/// target prep_sample's rows under a DIFFERENT alignment_idx survive (so it is not
 /// keyed on prep_sample_idx alone). All of a read's rows go regardless of
-/// feature_idx, and a sample with no rows deletes an idempotent 0.
+/// feature_idx, and a prep_sample with no rows deletes an idempotent 0.
 ///
 /// Every one of those regions is seeded in the side table too, so the one
 /// clause is shown to select the same rows there as in `alignment`.
@@ -693,13 +693,13 @@ fn delete_alignment_sample_deletes_the_pair_only() {
     let align_b: i64 = 960_301;
     let prep_a: i64 = 960_310;
     let prep_b: i64 = 960_311;
-    // A sample that never registered rows — the idempotent-zero case.
+    // A prep_sample that never registered rows — the idempotent-zero case.
     let prep_empty: i64 = 960_312;
 
     // align_a/prep_a is the target: seq 100 has TWO rows (feature 10 + 11 — a
     // read aligned to two shards' features), exercising the feature_idx-agnostic
-    // multiplicity delete. align_a/prep_b is a sibling sample under the same
-    // align-config identity; align_b/prep_a is the same sample under a different
+    // multiplicity delete. align_a/prep_b is a sibling prep_sample under the same
+    // align-config identity; align_b/prep_a is the same prep_sample under a different
     // one. Identity columns only, as in the other alignment delete tests.
     conn.execute_batch(&format!(
         "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
@@ -742,12 +742,12 @@ fn delete_alignment_sample_deletes_the_pair_only() {
     assert_eq!(
         count("alignment", align_a, prep_b),
         2,
-        "a sibling sample under the SAME alignment survives"
+        "a sibling prep_sample under the SAME alignment survives"
     );
     assert_eq!(
         count("alignment", align_b, prep_a),
         1,
-        "the SAME sample under a different alignment survives"
+        "the SAME prep_sample under a different alignment survives"
     );
 
     // The same three properties on the side table.
@@ -759,7 +759,7 @@ fn delete_alignment_sample_deletes_the_pair_only() {
     assert_eq!(
         count("alignment_origin_spanning", align_a, prep_b),
         1,
-        "the sibling sample's evidence survives"
+        "the sibling prep_sample's evidence survives"
     );
     assert_eq!(
         count("alignment_origin_spanning", align_b, prep_a),
@@ -772,10 +772,13 @@ fn delete_alignment_sample_deletes_the_pair_only() {
         .expect("idempotent re-delete failed");
     assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
-    // A sample that never registered rows is the same 0-row success.
+    // A prep_sample that never registered rows is the same 0-row success.
     let never = delete_alignment_sample(&connstr, &data_path, align_a, prep_empty)
-        .expect("delete of a sample with no rows failed");
-    assert_eq!(never["rows_deleted"], 0, "a sample with no rows deletes 0");
+        .expect("delete of a prep_sample with no rows failed");
+    assert_eq!(
+        never["rows_deleted"], 0,
+        "a prep_sample with no rows deletes 0"
+    );
 
     let _ = conn.execute_batch(&format!(
         "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
@@ -1314,6 +1317,33 @@ fn lake_dest_filename_separates_redrives_of_one_ticket() {
     }
 }
 
+// `register_files` reads a lake file's ticket back out of the name
+// `lake_dest_filename` gave it, so the two have to agree on the format — for the
+// current name and for the pre-digest `wt<ticket>-<basename>` that files
+// registered earlier still carry.
+#[test]
+fn lake_file_ticket_reads_back_the_ticket_lake_dest_filename_wrote() {
+    let name = lake_dest_filename(
+        6939,
+        "ticket/6939/ingest/attempt-1/output",
+        "part_00000.parquet",
+    );
+    assert_eq!(lake_file_ticket(&format!("/lake/read/{name}")), Some(6939));
+    assert_eq!(
+        lake_file_ticket("/lake/read/wt6939-part_00000.parquet"),
+        Some(6939),
+        "pre-digest name"
+    );
+    for unnamed in [
+        "/lake/read/ducklake-0193a1.parquet",
+        "/lake/read/wt-part_00000.parquet",
+        "/lake/read/wtx1-part_00000.parquet",
+        "/lake/read/part_00000.parquet",
+    ] {
+        assert_eq!(lake_file_ticket(unnamed), None, "{unnamed}");
+    }
+}
+
 // PATH_SCRATCH is host configuration: a migration, a remount, or a
 // differently laid-out replacement host changes it without changing which
 // registration a staging dir denotes. Keying the digest on the absolute path
@@ -1548,9 +1578,9 @@ fn replace_key_delete_matches_the_whole_composite_key() {
              bin_id VARCHAR NOT NULL,
              feature_idx BIGINT NOT NULL
          );
-         -- Sample 10 run 20 is the run being re-registered. Sample 11 run 20
-         -- shares its processing_idx, sample 10 run 21 shares its
-         -- prep_sample_idx; each agrees on one half and must survive.
+         -- prep_sample 10 run 20 is the run being re-registered; prep_sample 11
+         -- run 20 shares its processing_idx and prep_sample 10 run 21 shares its
+         -- prep_sample_idx, so each agrees on one half and must survive.
          INSERT INTO qiita_lake.assembly_membership VALUES
              (10, 20, 'LCG', 'circular_1', 700),
              (10, 20, 'MAG', 'bin.1', 701),
@@ -1578,7 +1608,7 @@ fn replace_key_delete_matches_the_whole_composite_key() {
     let deleted = conn
         .execute(&sql, duckdb::params![incoming.to_str().unwrap()])
         .unwrap();
-    assert_eq!(deleted, 2, "both of sample 10 / run 20's rows");
+    assert_eq!(deleted, 2, "both of prep_sample 10 / run 20's rows");
 
     let mut stmt = conn
         .prepare(
@@ -2163,10 +2193,366 @@ fn lake_count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
+/// One ticket registering the same reads twice, from two staging dirs, leaves
+/// one copy in `read`: the second load replaces the first.
+///
+/// `register_one_parquet` stages into a fresh tempdir on every call, which is
+/// what a ticket's re-run hands `register_files`: a different staging dir under
+/// the same ticket.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_re_registering_a_tickets_reads_leaves_one_copy() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+
+    let prep_sample: i64 = 972_556;
+    let ticket: i64 = 972_100_000 + std::process::id() as i64;
+    let clear = format!("DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample}");
+    let count =
+        format!("SELECT count(*) FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample}");
+    let live_files = format!(
+        "SELECT count(DISTINCT filename) FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample}"
+    );
+
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+        conn.execute_batch(&clear).unwrap();
+    }
+
+    let reads = read_rows_sql(prep_sample, 1000, 5);
+    for load in 0..2 {
+        let registration = register_one_parquet(&connstr, &data_path, "read", &reads, ticket);
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        assert_eq!(lake_count(&reader, &count), 5, "rows after load {load}");
+        assert_eq!(
+            lake_count(&reader, &live_files),
+            1,
+            "files holding the prep_sample after load {load}"
+        );
+        assert_eq!(
+            registration.registered.len(),
+            1,
+            "load {load} registers its file"
+        );
+        assert_eq!(
+            registration.replaced.get("read").copied(),
+            if load == 0 { None } else { Some(5) },
+            "rows load {load} replaced"
+        );
+    }
+
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+    let _ = reader.execute_batch(&clear);
+}
+
+/// `n` single-end reads for `prep_sample`, with contiguous `sequence_idx`
+/// starting at `first`, in the `read` table's column order.
+fn read_rows_sql(prep_sample: i64, first: i64, n: i64) -> String {
+    format!(
+        "SELECT {prep_sample}::BIGINT AS prep_sample_idx, i::BIGINT AS sequence_idx, \
+         'read' || i AS read_id, 'ACGT' AS sequence1, [30, 30, 30, 30]::UTINYINT[] AS qual1, \
+         NULL::VARCHAR AS sequence2, NULL::UTINYINT[] AS qual2 \
+         FROM range({first}, {first} + {n}) t(i)"
+    )
+}
+
+/// Stage each `(name, SELECT)` as `read/<name>.parquet`, the per-prep_sample layout
+/// `ingest_reads` produces. Returns the staging dir and a payload's `files`.
+fn stage_read_files(
+    parts: &[(&str, String)],
+) -> (tempfile::TempDir, std::collections::HashMap<String, String>) {
+    let staging = tempfile::tempdir().unwrap();
+    std::fs::create_dir(staging.path().join("read")).unwrap();
+    let writer = Connection::open_in_memory().unwrap();
+    let mut files = std::collections::HashMap::new();
+    for (name, values_sql) in parts {
+        let rel = format!("read/{name}.parquet");
+        writer
+            .execute_batch(&format!(
+                "COPY ({values_sql}) TO '{}' (FORMAT PARQUET)",
+                staging.path().join(&rel).to_str().unwrap()
+            ))
+            .unwrap();
+        files.insert(rel, "read".to_string());
+    }
+    (staging, files)
+}
+
+#[test]
+fn staged_read_prep_samples_collects_every_staged_read_prep_sample() {
+    let spanning = format!(
+        "{} UNION ALL {}",
+        read_rows_sql(33, 300, 2),
+        read_rows_sql(44, 400, 2)
+    );
+    let (staging, mut files) = stage_read_files(&[
+        ("a", read_rows_sql(11, 100, 3)),
+        ("b", read_rows_sql(22, 200, 2)),
+        ("spanning", spanning),
+        ("empty", read_rows_sql(55, 500, 0)),
+    ]);
+    // Other tables in the same registration are not read.
+    files.insert("read_mask.parquet".to_string(), "read_mask".to_string());
+    let conn = Connection::open_in_memory().unwrap();
+    let prep_samples = staged_read_prep_samples(&conn, staging.path(), &files).unwrap();
+    assert_eq!(
+        prep_samples,
+        std::collections::BTreeSet::from([11, 22, 33, 44])
+    );
+}
+
+#[test]
+fn staged_read_prep_samples_refuses_a_null_prep_sample_idx() {
+    let null_row = read_rows_sql(0, 1, 1).replacen(
+        "0::BIGINT AS prep_sample_idx",
+        "NULL::BIGINT AS prep_sample_idx",
+        1,
+    );
+    assert!(
+        null_row.contains("NULL::BIGINT AS prep_sample_idx"),
+        "{null_row}"
+    );
+    let (staging, files) = stage_read_files(&[("null", null_row)]);
+    let conn = Connection::open_in_memory().unwrap();
+    let err = staged_read_prep_samples(&conn, staging.path(), &files)
+        .expect_err("a NULL prep_sample_idx is refused");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+    assert!(err.message().contains("read/null.parquet"), "{err}");
+}
+
+/// Register `stage_read_files`' output as ONE call.
+#[cfg(feature = "integration")]
+fn register_read_files(
+    connstr: &str,
+    data_path: &str,
+    parts: &[(&str, String)],
+    ticket: i64,
+) -> Result<Registration, Status> {
+    let (staging, files) = stage_read_files(parts);
+    let payload = auth::ActionPayload {
+        action: "register_files".to_string(),
+        staging_dir: staging.path().to_str().unwrap().to_string(),
+        files,
+        work_ticket_idx: ticket,
+    };
+    register_files(connstr, data_path, std::path::Path::new("/"), &payload)
+}
+
+/// A registration carrying one prep_sample this ticket registered before and one
+/// new prep_sample replaces the first and adds the second.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_decides_per_read_prep_sample() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+
+    let held: i64 = 972_557;
+    let new: i64 = 972_558;
+    let ticket: i64 = 972_200_000 + std::process::id() as i64;
+    let clear = format!("DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({held}, {new})");
+    let count = |prep_sample: i64| {
+        format!("SELECT count(*) FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample}")
+    };
+
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+        conn.execute_batch(&clear).unwrap();
+    }
+
+    register_read_files(
+        &connstr,
+        &data_path,
+        &[("held", read_rows_sql(held, 2000, 3))],
+        ticket,
+    )
+    .unwrap();
+    let registration = register_read_files(
+        &connstr,
+        &data_path,
+        &[
+            ("held", read_rows_sql(held, 2000, 3)),
+            ("new", read_rows_sql(new, 3000, 4)),
+        ],
+        ticket,
+    )
+    .unwrap();
+
+    assert_eq!(
+        registration.registered.len(),
+        2,
+        "both files are registered"
+    );
+    assert_eq!(
+        registration.replaced.get("read"),
+        Some(&3),
+        "the held prep_sample's rows are replaced"
+    );
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+    assert_eq!(
+        lake_count(&reader, &count(held)),
+        3,
+        "the held prep_sample keeps one copy"
+    );
+    assert_eq!(
+        lake_count(&reader, &count(new)),
+        4,
+        "the new prep_sample is registered"
+    );
+
+    let _ = reader.execute_batch(&clear);
+}
+
+/// Reads another ticket registered are left as they are: a registration of the
+/// same prep_sample by a different ticket adds its rows and replaces none.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_leaves_reads_another_ticket_registered() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+
+    let held: i64 = 972_561;
+    let owner: i64 = 972_400_000 + std::process::id() as i64;
+    let other = owner + 1;
+    let clear = format!("DELETE FROM qiita_lake.read WHERE prep_sample_idx = {held}");
+    let rows_of = |ticket: i64| {
+        format!(
+            "SELECT count(*) FROM qiita_lake.read WHERE prep_sample_idx = {held} \
+             AND filename LIKE '%{LAKE_FILE_TICKET_PREFIX}{ticket}-%'"
+        )
+    };
+
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+        conn.execute_batch(&clear).unwrap();
+    }
+
+    register_read_files(
+        &connstr,
+        &data_path,
+        &[("held", read_rows_sql(held, 6000, 3))],
+        owner,
+    )
+    .unwrap();
+    let registration = register_read_files(
+        &connstr,
+        &data_path,
+        &[("held", read_rows_sql(held, 6000, 3))],
+        other,
+    )
+    .unwrap();
+
+    assert_eq!(
+        registration.replaced.get("read"),
+        None,
+        "another ticket's rows are not replaced"
+    );
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+    assert_eq!(
+        lake_count(&reader, &rows_of(owner)),
+        3,
+        "the owner's rows are untouched"
+    );
+    assert_eq!(
+        lake_count(&reader, &rows_of(other)),
+        3,
+        "the other ticket's rows are registered"
+    );
+
+    let _ = reader.execute_batch(&clear);
+}
+
+/// A `read` file may hold more than one prep_sample. The same ticket
+/// re-registering it replaces the rows of each; re-registering one of them
+/// replaces only that one's rows.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_replaces_a_tickets_rows_from_a_file_spanning_prep_samples() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+
+    let first: i64 = 972_565;
+    let second: i64 = 972_566;
+    let ticket: i64 = 972_600_000 + std::process::id() as i64;
+    let clear = format!("DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({first}, {second})");
+    let count = |prep_sample: i64| {
+        format!("SELECT count(*) FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample}")
+    };
+    let spanning = format!(
+        "{} UNION ALL {}",
+        read_rows_sql(first, 8000, 2),
+        read_rows_sql(second, 9000, 3)
+    );
+
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+        conn.execute_batch(&clear).unwrap();
+    }
+
+    register_read_files(
+        &connstr,
+        &data_path,
+        &[("spanning", spanning.clone())],
+        ticket,
+    )
+    .unwrap();
+    let registration =
+        register_read_files(&connstr, &data_path, &[("spanning", spanning)], ticket).unwrap();
+    assert_eq!(
+        registration.replaced.get("read"),
+        Some(&5),
+        "both prep_samples' rows are replaced"
+    );
+
+    // Re-registering only the first leaves the second's rows in the file they share.
+    let registration = register_read_files(
+        &connstr,
+        &data_path,
+        &[("first", read_rows_sql(first, 8000, 2))],
+        ticket,
+    )
+    .unwrap();
+    assert_eq!(
+        registration.replaced.get("read"),
+        Some(&2),
+        "only the first prep_sample's rows are replaced"
+    );
+
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+    assert_eq!(
+        lake_count(&reader, &count(first)),
+        2,
+        "one copy of the first"
+    );
+    assert_eq!(
+        lake_count(&reader, &count(second)),
+        3,
+        "the second keeps its rows"
+    );
+
+    let _ = reader.execute_batch(&clear);
+}
+
 /// A second registration of one `(prep_sample_idx, processing_idx)`
 /// SUPERSEDES that run's `assembly_membership` / `bin_quality` rows, and
-/// reaches no other key: neither another sample's rows under the same
-/// `processing_idx`, nor the same sample's rows under a different one. Both
+/// reaches no other key: neither another prep_sample's rows under the same
+/// `processing_idx`, nor the same prep_sample's rows under a different one. Both
 /// halves of the composite key have to be compared for that to hold.
 ///
 /// `reference_sequences` is the control — same two-registration sequence,
@@ -2186,11 +2572,11 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
     let connstr = delete_test_catalog_connstr();
     let data_path = delete_test_data_path();
 
-    // Sample A run P is the re-run under test. Sample B run P shares its
-    // processing_idx, sample A run Q shares its prep_sample_idx; each agrees
-    // on one half of the key and must survive.
-    let sample_a: i64 = 972_010;
-    let sample_b: i64 = 972_011;
+    // prep_sample A run P is the re-run under test; prep_sample B run P shares
+    // its processing_idx and prep_sample A run Q shares its prep_sample_idx, so
+    // each agrees on one half of the key and must survive.
+    let prep_sample_a: i64 = 972_010;
+    let prep_sample_b: i64 = 972_011;
     let run_p: i64 = 972_020;
     let run_q: i64 = 972_021;
     let feature_a: i64 = 972_030;
@@ -2198,11 +2584,12 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
     let control_feature: i64 = 972_040;
     let base_ticket: i64 = 972_000_000 + std::process::id() as i64;
 
-    let scope =
-        |sample: i64, run: i64| format!("prep_sample_idx = {sample} AND processing_idx = {run}");
-    let a_p = scope(sample_a, run_p);
-    let b_p = scope(sample_b, run_p);
-    let a_q = scope(sample_a, run_q);
+    let scope = |prep_sample: i64, run: i64| {
+        format!("prep_sample_idx = {prep_sample} AND processing_idx = {run}")
+    };
+    let a_p = scope(prep_sample_a, run_p);
+    let b_p = scope(prep_sample_b, run_p);
+    let a_q = scope(prep_sample_a, run_q);
     let control_where = format!("feature_idx = {control_feature}");
 
     {
@@ -2229,21 +2616,21 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
     // Nine columns: `ducklake_add_data_files` refuses a Parquet missing a column
     // the target table has, just as it refuses an extra one, so these fixtures
     // carry the assembler attribute columns `ensure_assembly_tables` adds.
-    let membership_values = |sample: i64, run: i64| {
+    let membership_values = |prep_sample: i64, run: i64| {
         format!(
             "SELECT * FROM (VALUES \
-                 ({sample}::BIGINT, {run}::BIGINT, 'LCG', 'circular_1', {feature_a}::BIGINT, \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, 'LCG', 'circular_1', {feature_a}::BIGINT, \
                   'circular_1'::VARCHAR, 'yes'::VARCHAR, 30.5::DOUBLE, 1.02::DOUBLE), \
-                 ({sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', {feature_b}::BIGINT, \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', {feature_b}::BIGINT, \
                   NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx, \
                    raw_name, circularity, depth, mult)"
         )
     };
-    let quality_values = |sample: i64, run: i64| {
+    let quality_values = |prep_sample: i64, run: i64| {
         format!(
             "SELECT * FROM (VALUES \
-                 ({sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
                   'k__Bacteria'::VARCHAR, 91.5::DOUBLE, 1.25::DOUBLE, 0.0::DOUBLE, \
                   4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, marker_lineage, \
@@ -2297,13 +2684,22 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
         register_one_parquet(&connstr, &data_path, table, values, ticket)
     };
 
-    let m1 = register("assembly_membership", &membership_values(sample_a, run_p));
-    let q1 = register("bin_quality", &quality_values(sample_a, run_p));
+    let m1 = register(
+        "assembly_membership",
+        &membership_values(prep_sample_a, run_p),
+    );
+    let q1 = register("bin_quality", &quality_values(prep_sample_a, run_p));
     let c1 = register("reference_sequences", &control_values);
-    register("assembly_membership", &membership_values(sample_b, run_p));
-    register("bin_quality", &quality_values(sample_b, run_p));
-    register("assembly_membership", &membership_values(sample_a, run_q));
-    register("bin_quality", &quality_values(sample_a, run_q));
+    register(
+        "assembly_membership",
+        &membership_values(prep_sample_b, run_p),
+    );
+    register("bin_quality", &quality_values(prep_sample_b, run_p));
+    register(
+        "assembly_membership",
+        &membership_values(prep_sample_a, run_q),
+    );
+    register("bin_quality", &quality_values(prep_sample_a, run_q));
 
     assert!(
         m1.replaced.is_empty() && q1.replaced.is_empty() && c1.replaced.is_empty(),
@@ -2322,8 +2718,11 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
         "control loaded once"
     );
 
-    let m2 = register("assembly_membership", &membership_values(sample_a, run_p));
-    let q2 = register("bin_quality", &quality_values(sample_a, run_p));
+    let m2 = register(
+        "assembly_membership",
+        &membership_values(prep_sample_a, run_p),
+    );
+    let q2 = register("bin_quality", &quality_values(prep_sample_a, run_p));
     let c2 = register("reference_sequences", &control_values);
 
     assert_eq!(
@@ -2343,8 +2742,8 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
     );
 
     assert_run_rows(&a_p, 2, 1, "after the re-run (superseded, not appended)");
-    assert_run_rows(&b_p, 2, 1, "after the re-run (same run, other sample)");
-    assert_run_rows(&a_q, 2, 1, "after the re-run (same sample, other run)");
+    assert_run_rows(&b_p, 2, 1, "after the re-run (same run, other prep_sample)");
+    assert_run_rows(&a_q, 2, 1, "after the re-run (same prep_sample, other run)");
     assert_eq!(
         lake_count(&reader, &control_count),
         1,
@@ -2381,11 +2780,11 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
     let connstr = delete_test_catalog_connstr();
     let data_path = delete_test_data_path();
 
-    let sample: i64 = 974_010;
+    let prep_sample: i64 = 974_010;
     let run: i64 = 974_020;
     let feature: i64 = 974_030;
     let base_ticket: i64 = 974_000_000 + std::process::id() as i64;
-    let where_clause = format!("prep_sample_idx = {sample} AND processing_idx = {run}");
+    let where_clause = format!("prep_sample_idx = {prep_sample} AND processing_idx = {run}");
 
     {
         let conn = Connection::open_in_memory().unwrap();
@@ -2402,7 +2801,7 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
     let membership_values = |kind: &str, bin_id: &str| {
         format!(
             "SELECT * FROM (VALUES \
-                 ({sample}::BIGINT, {run}::BIGINT, '{kind}', '{bin_id}', {feature}::BIGINT, \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, '{kind}', '{bin_id}', {feature}::BIGINT, \
                   NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx, \
                    raw_name, circularity, depth, mult)"
@@ -2411,7 +2810,7 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
     let quality_values = |suffix: &str| {
         format!(
             "SELECT * FROM (VALUES \
-                 ({sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
                   'k__Bacteria'::VARCHAR, 91.5::DOUBLE, 1.25::DOUBLE, 0.0::DOUBLE, \
                   4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, marker_lineage, \
@@ -3074,14 +3473,14 @@ fn sync_reference_exclusion_full_replace_is_idempotent() {
     );
 }
 
-/// `export_read_to_parquet` writes one sample's full reads from the DuckLake
+/// `export_read_to_parquet` writes one prep_sample's full reads from the DuckLake
 /// `read` table to a Parquet drop-in: the 7-col schema with `qual` as
-/// UTINYINT[], the seeded rows, mode 0o440. An unknown sample writes NO file
+/// UTINYINT[], the seeded rows, mode 0o440. An unknown prep_sample writes NO file
 /// and returns 0 (the control plane turns that into a submission failure).
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
-fn export_read_writes_sample_parquet() {
+fn export_read_writes_prep_sample_parquet() {
     let connstr = delete_test_catalog_connstr();
     let data_path = delete_test_data_path();
     let conn = Connection::open_in_memory().unwrap();
@@ -3150,10 +3549,10 @@ fn export_read_writes_sample_parquet() {
         .unwrap();
     assert_eq!(full, 2);
 
-    // An unknown sample writes no file and reports 0.
+    // An unknown prep_sample writes no file and reports 0.
     let dest_absent = dir.path().join("absent.parquet");
     let zero = export_read_to_parquet(&connstr, &data_path, absent, &dest_absent, dir.path())
-        .expect("export of an unknown sample should succeed with 0");
+        .expect("export of an unknown prep_sample should succeed with 0");
     assert_eq!(zero, 0);
     assert!(!dest_absent.exists(), "no file written for an empty result");
     assert!(
@@ -3173,7 +3572,7 @@ fn export_read_writes_sample_parquet() {
 /// The streaming-path twin of the retired export-to-Parquet helpers: same
 /// source relation, same `block_read_where_clause` selector, same
 /// `EXPORT_READ_COLUMNS` projection — only the sink differs. The member
-/// semantics these tests pin (a gap sample excluded, a split member
+/// semantics these tests pin (a gap prep_sample excluded, a split member
 /// contributing only its sub-range) are properties of the SELECTOR, so they
 /// are exercised here exactly as they were through the export.
 ///
@@ -3199,8 +3598,8 @@ fn bind_block_read_doget(
 }
 
 /// The `read_block` selector streams the UNION of its members' `read`
-/// sub-ranges and nothing else: a sample whose `sequence_idx` falls in the
-/// gap between two block members (but whose prep_sample is not a member) is
+/// sub-ranges and nothing else: a prep_sample that is not a member, but whose
+/// reads' `sequence_idx` values fall in the gap between two block members, is
 /// excluded, and a split member contributes only its sub-range (rows beyond
 /// its `sequence_idx_stop` stay out). Per-row `prep_sample_idx` is preserved
 /// so the block kernel can group by it.
@@ -3266,7 +3665,7 @@ fn read_block_selector_streams_union_and_excludes_gap_and_split() {
 
     let reader = &conn;
     let rows_rel = "block_doget_rows";
-    // The gap sample must be entirely absent.
+    // The gap prep_sample must be entirely absent.
     let gap_rows: i64 = reader
         .query_row(
             &format!("SELECT count(*) FROM {rows_rel} WHERE prep_sample_idx = {prep_gap}"),
@@ -3276,9 +3675,9 @@ fn read_block_selector_streams_union_and_excludes_gap_and_split() {
         .unwrap();
     assert_eq!(
         gap_rows, 0,
-        "gap sample excluded by the prep_sample_idx IN clause"
+        "gap prep_sample excluded by the prep_sample_idx IN clause"
     );
-    // The split sample contributes only its sub-range (no 941032..034).
+    // The split prep_sample contributes only its sub-range (no 941032..034).
     let c_max: i64 = reader
         .query_row(
             &format!("SELECT max(sequence_idx) FROM {rows_rel} WHERE prep_sample_idx = {prep_c}"),
@@ -3312,7 +3711,7 @@ fn read_block_selector_streams_union_and_excludes_gap_and_split() {
 
 /// The `read_masked_block` DoGet selector streams the block's members from the
 /// `read_masked` MACRO scoped to `mask_idx`: it excludes non-`pass` reads (the
-/// macro's privacy filter), a different mask's rows, and non-member samples —
+/// macro's privacy filter), a different mask's rows, and non-member prep_samples —
 /// in the same `EXPORT_READ_COLUMNS` shape the raw `read_block` selector
 /// yields. Because masked-out reads drop, a masked block can be a proper
 /// subset of the raw range.
@@ -3329,7 +3728,7 @@ fn read_masked_block_selector_streams_only_pass_rows_for_mask() {
     // Unique ids so leftover rows never collide with other serial tests.
     let mask_a: i64 = 942_000;
     let mask_b: i64 = 942_001;
-    let prep_a: i64 = 942_010; // the member sample
+    let prep_a: i64 = 942_010; // the member prep_sample
     let prep_b: i64 = 942_011; // present in read_mask but NOT a member
 
     conn.execute_batch(&format!(
@@ -3435,8 +3834,8 @@ fn read_masked_block_selector_streams_only_pass_rows_for_mask() {
 
 /// A split member whose `sequence_idx_stop` is NOT the block's max still
 /// contributes only its own sub-range: the per-member predicate excludes the
-/// part of that sample living in a sibling block, even though those rows fall
-/// inside the block's overall [min, max] span and the sample is in the IN-set.
+/// part of that prep_sample living in a sibling block, even though those rows fall
+/// inside the block's overall [min, max] span and the prep_sample is in the IN-set.
 /// This is the case a bare global `BETWEEN block_min AND block_max` would leak.
 #[test]
 #[serial_test::serial]
@@ -3630,7 +4029,7 @@ fn build_query_taxonomy_reference_idx_direct() {
 
 /// THE pruning regression guard. `read_masked` must be reached as a scoped
 /// MACRO CALL, never as a relation with a `WHERE`: a filtered select puts the
-/// sample scope on only one side of the macro's internal join, DuckLake prunes
+/// prep_sample scope on only one side of the macro's internal join, DuckLake prunes
 /// nothing, and the DoGet reads every file in the lake (see the measurements on
 /// the macro in ducklake.rs). That failure is invisible in results — the rows
 /// are correct, only the cost explodes — so nothing but this shape assertion
@@ -3658,13 +4057,13 @@ fn build_query_read_masked_requires_its_full_scope() {
     let mask_only = filter_of(&[("mask_idx", vec![serde_json::json!(7)])]);
     assert!(
         build_query("read_masked", &mask_only, &[], &[]).is_err(),
-        "a mask with no samples has no macro call — refuse it"
+        "a mask with no prep_samples has no macro call — refuse it"
     );
 
     let preps_only = filter_of(&[("prep_sample_idx", vec![serde_json::json!(11)])]);
     assert!(
         build_query("read_masked", &preps_only, &[], &[]).is_err(),
-        "samples with no mask would blend pass-sets from different masks"
+        "prep_samples with no mask would blend pass-sets from different masks"
     );
 
     // An empty filter on the human-read surface must never degrade to a
@@ -3693,7 +4092,7 @@ fn build_query_read_masked_requires_its_full_scope() {
         "sequence_idx is not an allowed filter column"
     );
 
-    // An explicitly EMPTY sample list. This is the one shape that would
+    // An explicitly EMPTY prep_sample list. This is the one shape that would
     // otherwise reach `read_masked_relation` and emit `read_masked(7, [])` —
     // which the macro reads as "match nothing", so it would answer zero rows
     // instead of failing. Reject it at the boundary, loudly.
@@ -3756,16 +4155,16 @@ fn build_query_read_masked_block_scopes_to_one_mask() {
     filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
     let (sql, table) = build_query("read_masked_block", &filter, &members, &[]).unwrap();
     assert_eq!(table, "qiita_lake.read_masked");
-    // The mask AND the block's samples move into the macro call, so both of
+    // The mask AND the block's prep_samples move into the macro call, so both of
     // the macro's inputs are pruned; the member clause stays outside because
-    // it carries the per-sample sequence sub-ranges the scope cannot express.
+    // it carries the per-prep_sample sequence sub-ranges the scope cannot express.
     let preps = block_member_preps(&members);
     assert!(
         sql.starts_with(&format!(
             "SELECT {EXPORT_READ_COLUMNS} FROM {} WHERE ",
             read_masked_relation(7, &preps)
         )),
-        "expected a scoped macro call carrying the block's samples, got: {sql}"
+        "expected a scoped macro call carrying the block's prep_samples, got: {sql}"
     );
     assert!(
         sql.contains(&block_read_where_clause(&members)),
@@ -3774,9 +4173,9 @@ fn build_query_read_masked_block_scopes_to_one_mask() {
 }
 
 /// The block path must not regress to scanning the lake either: every member's
-/// sample has to reach the macro's argument list, not just the outer clause.
+/// prep_sample has to reach the macro's argument list, not just the outer clause.
 #[test]
-fn build_query_read_masked_block_passes_every_block_sample_into_the_macro() {
+fn build_query_read_masked_block_passes_every_block_prep_sample_into_the_macro() {
     let members = block_members();
     let filter = filter_of(&[("mask_idx", vec![serde_json::json!(7)])]);
     let (sql, _) = build_query("read_masked_block", &filter, &members, &[]).unwrap();
@@ -4028,22 +4427,24 @@ fn feature_scope(values: &[i64]) -> auth::TicketFilter {
 
 #[test]
 fn assembly_surfaces_are_doget_allowed_and_the_junction_is_not() {
-    // The two sequence surfaces are Flight-readable. `assembly_membership`
-    // is read to RESOLVE their scope (`build_assembly_run_query`) but is not
-    // a table a ticket can name; `bin_quality` is a register_files write
-    // target only.
-    for readable in ["assembled_sequence", "assembled_sequence_chunks"] {
+    // The two sequence surfaces are Flight-readable, and so is the per-subject
+    // quality the feature-table resolver reads. `assembly_membership` is read to
+    // RESOLVE the sequence surfaces' scope (`build_assembly_run_query`) but is not
+    // a table a ticket can name; the allowlist carries why.
+    for readable in [
+        "assembled_sequence",
+        "assembled_sequence_chunks",
+        "bin_quality",
+    ] {
         assert!(
             ALLOWED_TABLES.contains(&readable),
-            "{readable:?} must be DoGet-readable for the contig read-back"
+            "{readable:?} must be DoGet-readable"
         );
     }
-    for sink in ["assembly_membership", "bin_quality"] {
-        assert!(
-            !ALLOWED_TABLES.contains(&sink),
-            "{sink:?} must not be Flight-reachable"
-        );
-    }
+    assert!(
+        !ALLOWED_TABLES.contains(&"assembly_membership"),
+        "assembly_membership must not be Flight-reachable"
+    );
 }
 
 /// A well-formed assembly ticket filter: the run, and only the run.
@@ -4097,7 +4498,7 @@ fn build_query_assembly_requires_exactly_the_run_key() {
             ]),
         ),
         (
-            "two samples",
+            "two prep_samples",
             filter_of(&[
                 (
                     "prep_sample_idx",
@@ -4169,6 +4570,125 @@ fn build_query_assembly_membership_reaches_no_output_column() {
     assert!(
         !sql.contains("kind") && !sql.contains("bin_id"),
         "got: {sql}"
+    );
+}
+
+/// A well-formed `bin_quality` ticket filter: one run, over a cohort.
+fn bin_quality_scope(prep_sample_idx: &[i64], processing_idx: i64) -> auth::TicketFilter {
+    filter_of(&[
+        (
+            "prep_sample_idx",
+            prep_sample_idx
+                .iter()
+                .map(|v| serde_json::json!(v))
+                .collect(),
+        ),
+        ("processing_idx", vec![serde_json::json!(processing_idx)]),
+    ])
+}
+
+#[test]
+fn build_query_bin_quality_scopes_the_run_on_its_own_columns() {
+    // No `assembly_membership` semi join: this table carries both halves of the
+    // run key itself, which is why it is a separate builder rather than another
+    // `is_assembly_run_surface` arm.
+    let (sql, full) =
+        build_query("bin_quality", &bin_quality_scope(&[42, 43], 7), &[], &[]).unwrap();
+    assert_eq!(full, "qiita_lake.bin_quality");
+    assert_eq!(
+        sql,
+        "SELECT * FROM qiita_lake.bin_quality \
+         WHERE processing_idx = 7 AND prep_sample_idx IN (42, 43)",
+        "got: {sql}"
+    );
+    assert!(
+        !sql.contains("assembly_membership"),
+        "the run scope is this table's own columns; got: {sql}"
+    );
+}
+
+#[test]
+fn build_query_bin_quality_requires_exactly_the_run_key() {
+    // Each rejected shape below returns quality rows for subjects outside the
+    // run the resolver asked about — a genome's completeness attributed to the
+    // wrong assembly is a wrong gate decision, not a missing one.
+    let empty = auth::TicketFilter::new();
+    let cases: &[(&str, auth::TicketFilter)] = &[
+        // Every prep_sample's every run.
+        ("empty filter", empty.clone()),
+        // Every run those prep_samples ever had.
+        (
+            "prep_sample_idx alone",
+            filter_of(&[("prep_sample_idx", vec![serde_json::json!(42)])]),
+        ),
+        // Every prep_sample that run touched, cohort or not.
+        (
+            "processing_idx alone",
+            filter_of(&[("processing_idx", vec![serde_json::json!(7)])]),
+        ),
+        // Two runs blended into one indistinguishable stream.
+        (
+            "two runs",
+            filter_of(&[
+                ("prep_sample_idx", vec![serde_json::json!(42)]),
+                (
+                    "processing_idx",
+                    vec![serde_json::json!(7), serde_json::json!(8)],
+                ),
+            ]),
+        ),
+        // An empty cohort must never degrade to "every prep_sample".
+        (
+            "empty cohort",
+            filter_of(&[
+                ("prep_sample_idx", vec![]),
+                ("processing_idx", vec![serde_json::json!(7)]),
+            ]),
+        ),
+        // A third column riding along is what `filter.len()` catches.
+        (
+            "the run plus a named contig",
+            filter_of(&[
+                ("prep_sample_idx", vec![serde_json::json!(42)]),
+                ("processing_idx", vec![serde_json::json!(7)]),
+                ("feature_idx", vec![serde_json::json!(11)]),
+            ]),
+        ),
+    ];
+    for (label, filter) in cases {
+        assert!(
+            build_query("bin_quality", filter, &[], &[]).is_err(),
+            "bin_quality must reject {label}"
+        );
+    }
+    // Control: the same empty filter IS served for a reference table, so the
+    // first case is about this table and not about empty filters in general.
+    assert!(build_query("reference_sequences", &empty, &[], &[]).is_ok());
+}
+
+#[test]
+fn build_query_bin_quality_takes_no_projection_and_no_members() {
+    // Same two refusals the assembly surfaces make: only the alignment surface
+    // is projectable, and `members` is only meaningful for the block selectors.
+    assert!(
+        build_query(
+            "bin_quality",
+            &bin_quality_scope(&[42], 7),
+            &[],
+            &columns(&["completeness"])
+        )
+        .is_err(),
+        "bin_quality must reject a projection column list"
+    );
+    assert!(
+        build_query(
+            "bin_quality",
+            &bin_quality_scope(&[42], 7),
+            &block_members(),
+            &[]
+        )
+        .is_err(),
+        "bin_quality must reject a block members selector"
     );
 }
 
@@ -5351,7 +5871,7 @@ fn staging_path_for_layout() {
 
 // --- pushdown performance assessment helpers/tests ----------------------
 
-/// Write one per-sample `read` Parquet (matching the durable ingest layout:
+/// Write one per-prep_sample `read` Parquet (matching the durable ingest layout:
 /// one file per prep_sample, sorted by sequence_idx, small row groups so
 /// intra-file pruning is exercised) and register it into DuckLake by path.
 #[cfg(feature = "integration")]
@@ -5416,8 +5936,8 @@ fn files_read_for(conn: &Connection, query: &str) -> i64 {
 /// grows — i.e. a block's cost is bounded by the block, not the table size.
 /// Assumes a fresh catalog (CI resets `qiita_ducklake` before the Rust tier).
 ///
-/// Layout mirrors production: one file per sample (`ducklake_add_data_files`
-/// of a per-sample Parquet sorted by sequence_idx, small row groups). A fixed
+/// Layout mirrors production: one file per prep_sample (`ducklake_add_data_files`
+/// of a per-prep_sample Parquet sorted by sequence_idx, small row groups). A fixed
 /// 4-file block (one a mid-file split member) is queried after seeding a
 /// SMALL then a LARGE set of disjoint filler files; `Total Files Read` must
 /// stay == the block's file count both times. Also confirms the shipped
@@ -5446,7 +5966,7 @@ fn block_read_selector_prunes_and_scales() {
     let seed_dir = Path::new(&data_path).join("seed_scale");
     std::fs::create_dir_all(&seed_dir).unwrap();
 
-    // Fixed block: 4 samples, each seeded as a whole 6000-read file. Member
+    // Fixed block: 4 prep_samples, each seeded as a whole 6000-read file. Member
     // 970_002 is a SPLIT — its block sub-range is only the first 2000 reads.
     let bp: i64 = 970_000;
     let members: [(i64, i64, i64, i64); 4] = [
@@ -5506,7 +6026,7 @@ fn block_read_selector_prunes_and_scales() {
         .unwrap();
     let v3_small = files_read_for(&conn, &v3);
     eprintln!(
-        "[1b] {files_small} sample-files total; V3 files read = {v3_small} (block = {block_files})"
+        "[1b] {files_small} prep_sample files total; V3 files read = {v3_small} (block = {block_files})"
     );
     assert_eq!(v3_small, block_files, "V3 must read only the block's files");
 
@@ -5523,7 +6043,7 @@ fn block_read_selector_prunes_and_scales() {
     let v2_large = files_read_for(&conn, &v2);
     let v1_large = files_read_for(&conn, &v1);
     eprintln!(
-        "[1b] {files_large} sample-files total; files read V1={v1_large} V2={v2_large} V3={v3_large} (block = {block_files})"
+        "[1b] {files_large} prep_sample files total; files read V1={v1_large} V2={v2_large} V3={v3_large} (block = {block_files})"
     );
 
     // SCALE INVARIANCE: 5x more files, same block → same files read.
@@ -5566,12 +6086,12 @@ fn block_read_selector_prunes_and_scales() {
     );
 }
 
-/// BENCHMARK (post-compaction): DuckLake may compact our per-sample files into
+/// BENCHMARK (post-compaction): DuckLake may compact our per-prep_sample files into
 /// one big file sorted by (prep_sample_idx, sequence_idx) — we don't control
 /// that ("blind to" compaction). File-level pruning then can't skip the merged
 /// file (its prep range spans the block), so efficiency rests on PARQUET
 /// ROW-GROUP pruning inside the file. This benchmark seeds one large merged
-/// file of INCOMPRESSIBLE rows and times a 4-sample block (and a 1-sample
+/// file of INCOMPRESSIBLE rows and times a 4-prep_sample block (and a 1-prep_sample
 /// "tight" query) against a forced full scan.
 ///
 /// VERDICT (DuckDB crate 1.10504.0 / DuckLake, measured): row-group pruning IS
@@ -5604,13 +6124,13 @@ fn bench_merged_file_rowgroup_pruning() {
     let seed_dir = Path::new(&data_path).join("seed_merged");
     std::fs::create_dir_all(&seed_dir).unwrap();
 
-    // ONE file: 100 samples x 10k reads = 1M rows, sorted by (prep, seq),
-    // ROW_GROUP_SIZE 25k -> ~40 row groups. sequence1 is ~150 INCOMPRESSIBLE
+    // ONE file: 100 prep_samples x 30k reads = 3M rows, sorted by (prep, seq),
+    // ROW_GROUP_SIZE 25k -> ~120 row groups. sequence1 is ~150 INCOMPRESSIBLE
     // chars (5x md5) so the file is large (I/O real) — a constant string would
     // zstd away to nothing and mask any full-scan-vs-pruned I/O difference.
     let base: i64 = 980_000;
     let reads_per: i64 = 30_000;
-    let n_samples: i64 = 100;
+    let n_prep_samples: i64 = 100;
     let seq_base: i64 = 8_000_000;
     let file = seed_dir.join("merged.parquet");
     let file_str = file.to_str().unwrap();
@@ -5620,7 +6140,7 @@ fn bench_merged_file_rowgroup_pruning() {
                 substr(md5(i::VARCHAR) || md5((i*7)::VARCHAR) || md5((i*13)::VARCHAR) \
                        || md5((i*17)::VARCHAR) || md5((i*19)::VARCHAR), 1, 150) AS sequence1, \
                 NULL::UTINYINT[] AS qual1, NULL::VARCHAR AS sequence2, NULL::UTINYINT[] AS qual2 \
-             FROM range(0, {n_samples} * {reads_per}) t(i) \
+             FROM range(0, {n_prep_samples} * {reads_per}) t(i) \
              ORDER BY prep_sample_idx, sequence_idx) \
          TO '{file_str}' (FORMAT PARQUET, ROW_GROUP_SIZE 25000)"
     ))
@@ -5633,7 +6153,7 @@ fn bench_merged_file_rowgroup_pruning() {
     )
     .unwrap();
 
-    // Block = 4 SCATTERED samples (worst case for row-group locality).
+    // Block = 4 SCATTERED prep_samples (worst case for row-group locality).
     let members = [
         (
             base + 10,
@@ -5718,4 +6238,133 @@ fn bench_merged_file_rowgroup_pruning() {
         "expected the block query to be materially faster than a full scan \
          (row-group pruning active); block={block_t:.4}s full={full_t:.4}s"
     );
+}
+
+/// The mint against a real DuckLake catalog: what `execute` reports as
+/// `minted_rows`, the all-or-nothing gate, replay, and isolation between
+/// references. Pinned here so a DuckDB or ducklake bump re-runs them.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+    ducklake::ensure_reference_tables(&conn).unwrap();
+
+    // Unique ids so leftover rows never collide with other serial tests.
+    let all_null: i64 = 974_210;
+    let partial: i64 = 974_211;
+    let neighbour: i64 = 974_212;
+    // Never inserted under: the "reference exists but has no tree" case.
+    let no_rows: i64 = 974_213;
+
+    for id in [all_null, partial, neighbour] {
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = {id};"
+        ))
+        .unwrap();
+    }
+
+    // Three nodes, no numbering at all — the shape the mint exists for.
+    // Columns named rather than positional: `edge_id` precedes `parent_index` in
+    // the table, and a positional VALUES list silently swaps them.
+    conn.execute_batch(&format!(
+        "INSERT INTO qiita_lake.reference_phylogeny
+           (reference_idx, node_index, name, branch_length, edge_id, parent_index, is_tip)
+         VALUES
+           ({all_null}, 11, 'root', 0.0, NULL, NULL, false),
+           ({all_null}, 4, 'tipA', 0.5, NULL, 11, true),
+           ({all_null}, 7, 'tipB', 0.5, NULL, 11, true);"
+    ))
+    .unwrap();
+
+    // Three nodes where one already carries a number the mint must not join.
+    conn.execute_batch(&format!(
+        "INSERT INTO qiita_lake.reference_phylogeny
+           (reference_idx, node_index, name, branch_length, edge_id, parent_index, is_tip)
+         VALUES
+           ({partial}, 0, 'root', 0.0, 77, NULL, false),
+           ({partial}, 1, 'tipA', 0.5, NULL, 0, true),
+           ({partial}, 2, 'tipB', 0.5, NULL, 0, true);"
+    ))
+    .unwrap();
+
+    // A second all-NULL reference that must be left alone throughout.
+    conn.execute_batch(&format!(
+        "INSERT INTO qiita_lake.reference_phylogeny
+           (reference_idx, node_index, name, branch_length, edge_id, parent_index, is_tip)
+         VALUES ({neighbour}, 0, 'root', 0.0, NULL, NULL, false);"
+    ))
+    .unwrap();
+
+    let edge_ids = |id: i64| -> Vec<Option<i64>> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT edge_id FROM qiita_lake.reference_phylogeny \
+                 WHERE reference_idx = {id} ORDER BY node_index"
+            ))
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, Option<i64>>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    };
+
+    // An entirely NULL tree is numbered, and `execute` reports the true count —
+    // which is what the operator reads back as `minted_rows`.
+    let first = mint_phylogeny_edge_id(&connstr, &data_path, all_null).expect("mint failed");
+    assert_eq!(first["phylogeny_rows"], 3);
+    assert_eq!(first["already_numbered_rows"], 0);
+    assert_eq!(
+        first["minted_rows"], 3,
+        "execute must report rows changed, not 0 or a file count"
+    );
+    assert_eq!(
+        first["reference_idx"], all_null,
+        "the body echoes the reference asked for"
+    );
+    // node_index is deliberately non-contiguous and out of insertion order, so this
+    // fails any dense renumbering (a row_number()) that a contiguous 0,1,2 fixture
+    // would accept as indistinguishable from node_index.
+    assert_eq!(edge_ids(all_null), vec![Some(4), Some(7), Some(11)]);
+
+    // Replay: the counts are re-read, the tree is already numbered, nothing moves.
+    let replay = mint_phylogeny_edge_id(&connstr, &data_path, all_null).expect("replay failed");
+    assert_eq!(replay["already_numbered_rows"], 3);
+    assert_eq!(replay["minted_rows"], 0, "a replay writes nothing");
+    assert_eq!(edge_ids(all_null), vec![Some(4), Some(7), Some(11)]);
+
+    // The all-or-nothing gate: one numbered node is enough to stop the whole tree,
+    // so the two NULLs stay NULL rather than being filled with a second numbering.
+    let mixed = mint_phylogeny_edge_id(&connstr, &data_path, partial).expect("gate call failed");
+    assert_eq!(mixed["phylogeny_rows"], 3);
+    assert_eq!(mixed["already_numbered_rows"], 1);
+    assert_eq!(
+        mixed["minted_rows"], 0,
+        "a partly numbered tree is not completed"
+    );
+    assert_eq!(
+        edge_ids(partial),
+        vec![Some(77), None, None],
+        "the carried number survives and no node beside it was minted"
+    );
+
+    // Scoping: none of the above touched another reference.
+    assert_eq!(edge_ids(neighbour), vec![None]);
+
+    // A reference with no rows at all is reported, not mistaken for a done tree.
+    let empty = mint_phylogeny_edge_id(&connstr, &data_path, no_rows).expect("empty call failed");
+    assert_eq!(empty["phylogeny_rows"], 0);
+    assert_eq!(empty["minted_rows"], 0);
+
+    for id in [all_null, partial, neighbour] {
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = {id};"
+        ))
+        .unwrap();
+    }
 }

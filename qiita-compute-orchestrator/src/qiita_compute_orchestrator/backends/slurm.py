@@ -558,8 +558,8 @@ class SlurmBackend(ComputeBackend):
         slurmrestd errors are classified into a typed BackendFailure so the
         caller sees the same surface as submit/result: transport / 5xx / 401
         => retriable SLURMRESTD_UNREACHABLE (the runner keeps polling); other
-        4xx (e.g. 404 purged) => UNKNOWN_PERMANENT (status unknowable; Phase 5
-        recovery uses the filesystem tiebreaker)."""
+        4xx (e.g. 404 purged) => UNKNOWN_PERMANENT (status unknowable; recovery
+        uses the filesystem tiebreaker)."""
         self._require_slurm_handle(handle)
         try:
             info = await self._client.get_job(handle.slurm_job_id)

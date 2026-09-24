@@ -18,19 +18,30 @@ from pathlib import Path
 # under parallel writes row groups land in thread-finish order — but each row
 # group stays clustered on the COPY's ORDER BY key, which is what catalog
 # pruning and row-group pushdown read (min/max stats, not physical row order).
+
+# The codec, as its own constant rather than a literal inside the string above:
+# a pyarrow `ParquetWriter` takes it directly, so the writers that bypass DuckDB
+# name this instead of spelling it again. `ROW_GROUP_SIZE_BYTES` below exists for
+# the same reason.
+PARQUET_COMPRESSION: str = "zstd"
 PARQUET_OPTS: str = (
-    "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd', ROW_GROUP_SIZE_BYTES '64MB'"
+    "FORMAT PARQUET, PARQUET_VERSION 'v2',"
+    f" COMPRESSION '{PARQUET_COMPRESSION}', ROW_GROUP_SIZE_BYTES '64MB'"
 )
 
 # Same shape with COMPRESSION 'snappy' — for transient/intermediate files read
 # once by a later pipeline phase then deleted (snappy decompresses faster than
 # zstd at the cost of a larger on-disk file, the right tradeoff for a file whose
-# lifetime is "until the next phase reads it"). NOT for files the data plane
-# registers into DuckLake (those want zstd's smaller long-term footprint; see
-# PARQUET_OPTS). Carries the same ROW_GROUP_SIZE_BYTES cap and the same
-# preserve_insertion_order=false requirement.
+# lifetime is "until the next phase reads it"). NOT for anything that leaves this
+# filesystem — a file the data plane registers into DuckLake, one a user downloads
+# and keeps, or a body served over the wire — where zstd buys either a smaller
+# stored footprint or fewer bytes on the network; see PARQUET_OPTS. Carries the
+# same ROW_GROUP_SIZE_BYTES cap and the same preserve_insertion_order=false
+# requirement.
+PARQUET_COMPRESSION_INTERMEDIATE: str = "snappy"
 PARQUET_OPTS_INTERMEDIATE: str = (
-    "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'snappy', ROW_GROUP_SIZE_BYTES '64MB'"
+    "FORMAT PARQUET, PARQUET_VERSION 'v2',"
+    f" COMPRESSION '{PARQUET_COMPRESSION_INTERMEDIATE}', ROW_GROUP_SIZE_BYTES '64MB'"
 )
 
 # The `ROW_GROUP_SIZE_BYTES '64MB'` cap above, as an int, for write paths that
@@ -50,3 +61,14 @@ def validate_parquet_path(path: Path) -> str:
     if "'" in text or "\\" in text or any(ord(c) < 0x20 for c in text):
         raise ValueError(f"Output path contains unsafe characters: {text}")
     return text
+
+
+# Media type for a Parquet response body. Apache registered
+# `application/vnd.apache.parquet` in 2024; it is what the genome-map routes
+# serve and what a client asserts it received. Lives here, beside the write
+# options, so the server and the CLI name one string.
+PARQUET_MEDIA_TYPE: str = "application/vnd.apache.parquet"
+
+# The OpenAPI `responses=` a Parquet route declares, so the schema says what the
+# body actually is instead of defaulting to JSON.
+PARQUET_RESPONSES: dict = {200: {"content": {PARQUET_MEDIA_TYPE: {}}}}

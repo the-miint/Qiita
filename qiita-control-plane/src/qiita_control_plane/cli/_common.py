@@ -10,6 +10,9 @@ Surface:
 - The authenticated HTTP call helper (`call`) plus `whoami` as a thin
   wrapper, and the generic token-read + invoke + JSON-print runner
   (`run_http_subcommand`).
+- `fetch_binary`, the bulk-binary read for routes that answer with a file
+  rather than JSON, and `SlowResponseError`, which it raises when a
+  transfer averages under the rate floor.
 - LoginRocket Web loopback flow (`do_login`, plus the `LoopbackResult`
   / `bind_loopback` / `loopback_handler_factory` building blocks the
   flow composes from).
@@ -45,6 +48,7 @@ import json
 import os
 import sys
 import threading
+import time
 import urllib.parse
 import webbrowser
 from collections.abc import Callable
@@ -74,6 +78,36 @@ LOGIN_WAIT_TIMEOUT_SECONDS = 300
 # HTTP timeout for CLI-driven control-plane calls. Generous enough to tolerate
 # transient network blips without papering over a hung server.
 CLI_HTTP_TIMEOUT_SECONDS = 10
+
+# How long the gateway gives an upstream to produce its first byte. nginx's
+# compiled default, and `deploy/nginx/qiita.conf` sets no `proxy_read_timeout`,
+# so it is what the deploy uses; measured against nginx 1.27 running that conf
+# (upstream sleeping 30 s -> 200, 61 s -> 504 at 60.1 s). Read by the bulk
+# timeout below.
+GATEWAY_READ_TIMEOUT_SECONDS = 60
+
+# Read-phase timeout for a bulk body, above the gateway's own ceiling so a control
+# plane too slow to answer surfaces as the gateway's 504 — which says a gateway
+# gave up — rather than as a local ReadTimeout, which says nothing about where
+# the time went. Every other CLI call keeps CLI_HTTP_TIMEOUT_SECONDS.
+BULK_READ_HTTP_TIMEOUT_SECONDS = GATEWAY_READ_TIMEOUT_SECONDS + 30
+
+# Floor transfer rate for a bulk body, below which the client stops waiting.
+#
+# A policy choice rather than a measurement: the slowest link worth waiting for.
+# It can be generous because nginx buffers the whole response and releases the
+# upstream immediately (measured: a 124 MB body read over 98 s left the
+# upstream's write() returning at t+0.4 s), so a slow reader costs the server
+# nothing and this bounds only how long a user waits on a link that will not
+# finish. Set too high it breaks a working client on a slow link; set too low it
+# only means a longer wait before the same error. 100 KB/s gives up under
+# roughly 0.8 Mbit/s of DECODED throughput — under `Content-Encoding` that is
+# less wire bandwidth than it sounds, which errs toward waiting.
+BULK_READ_FLOOR_BYTES_PER_SECOND = 100_000
+
+# Grace period before the rate floor above is applied at all. A small body can
+# arrive entirely within one slow round trip, whose average rate says nothing.
+BULK_READ_TRANSFER_SLACK_SECONDS = 10
 
 # HTML rendered to the browser at the loopback after the handoff redirect
 # delivers the ot_code. Friendly "you can close this tab now" message. The
@@ -259,6 +293,17 @@ def commit_partials(
 # ---------------------------------------------------------------------------
 
 
+def _api_url(base_url: str, path: str) -> str:
+    """The full control-plane URL for a post-API-prefix `path`. One spelling, so a
+    prefix or trailing-slash rule cannot differ between the JSON and binary reads."""
+    return f"{base_url.rstrip('/')}{API_PREFIX}{path}"
+
+
+def _auth_headers(token: str, **extra: str) -> dict[str, str]:
+    """The bearer header every authenticated call sends, plus any extras."""
+    return {"Authorization": f"{BEARER_PREFIX}{token}", **extra}
+
+
 def _request(
     method: str,
     base_url: str,
@@ -278,12 +323,10 @@ def _request(
     Response so the caller can read body, status, or headers; raises
     httpx.HTTPStatusError on a non-2xx status.
     """
-    headers = {"Authorization": f"{BEARER_PREFIX}{token}"}
-    if extra_headers:
-        headers.update(extra_headers)
+    headers = _auth_headers(token, **(extra_headers or {}))
     resp = httpx.request(
         method,
-        f"{base_url.rstrip('/')}{API_PREFIX}{path}",
+        _api_url(base_url, path),
         headers=headers,
         json=json,
         params=params,
@@ -291,6 +334,115 @@ def _request(
     )
     resp.raise_for_status()
     return resp
+
+
+class SlowResponseError(RuntimeError):
+    """A bulk body arrived too slowly to be worth continuing to wait for.
+
+    Distinct from a timeout: the server is sending, just not fast enough to
+    finish in a sane time. `httpx.Timeout` has only connect/read/write/pool — its
+    `timeout` is per socket read — so a body dribbling for hours never trips it
+    and this is the only thing that bounds the transfer.
+    """
+
+
+def _below_floor(received: int, elapsed: float, slack: float, floor_rate: int) -> bool:
+    """Is the transfer so far averaging under the floor?
+
+    False inside the grace period: a body that fits in one slow round trip has an
+    average that says nothing about the link. The grace also keeps the division
+    away from a zero elapsed.
+    """
+    return elapsed > slack and received / elapsed < floor_rate
+
+
+def fetch_binary(
+    base_url: str,
+    token: str,
+    path: str,
+    *,
+    accept: str,
+    timeout: float = BULK_READ_HTTP_TIMEOUT_SECONDS,
+    floor_rate: int = BULK_READ_FLOOR_BYTES_PER_SECOND,
+    slack: float = BULK_READ_TRANSFER_SLACK_SECONDS,
+) -> tuple[bytes, str]:
+    """GET a bulk binary body, refusing to wait on a link that will not finish.
+
+    Returns `(body, content_type)`. The type is handed back rather than checked
+    here because only the caller knows what it asked for; `PARQUET_MEDIA_TYPE`'s
+    comment names that as the client's assertion.
+
+    Two independent bounds, because they catch different failures:
+
+    * `timeout` is the READ-phase timeout and covers time-to-first-byte — the
+      server building the body. Connect keeps the shared, shorter budget.
+    * The rate floor bounds the TRANSFER, and is measured from when the headers
+      land so a slow server cannot eat the transfer's budget.
+
+    The bound is the OBSERVED rate, not a size-derived budget, because
+    `Content-Length` is not something the client can rely on: with `gzip` enabled
+    at the gateway a body comes back chunked with no length at all (measured), and
+    where a length IS sent under `Content-Encoding` it counts compressed bytes
+    while httpx yields decompressed ones. A rate check needs neither, and the
+    loop below never has to ask whether a body is complete.
+
+    Verifying what arrived is the CALLER's, and the format is what does it — a
+    Parquet body cut short fails to parse. This adds only the transport's own
+    check, which httpx raises when a peer closes early against a declared length.
+    """
+    with httpx.stream(
+        "GET",
+        _api_url(base_url, path),
+        headers=_auth_headers(token, Accept=accept),
+        # Only the READ phase gets the longer budget — it is the server building
+        # the body. Every other phase keeps the shared one: connecting is no
+        # slower here than on any other call, and a bare float would set all four,
+        # so an unreachable host would take the read timeout to fail.
+        timeout=httpx.Timeout(CLI_HTTP_TIMEOUT_SECONDS, read=timeout),
+    ) as resp:
+        if not resp.is_success:
+            # A streamed response has not read its body yet, so materialize it
+            # first or the raised error carries no server detail. `is_success` is
+            # 2xx only: httpx does not follow redirects here, and a 3xx body would
+            # otherwise reach the caller's parser as if it were the real thing.
+            resp.read()
+            resp.raise_for_status()
+        started = time.monotonic()
+        body = bytearray()
+        breached = False
+        for chunk in resp.iter_bytes():
+            body += chunk
+            elapsed = time.monotonic() - started
+            below = _below_floor(len(body), elapsed, slack, floor_rate)
+            # Two consecutive observations under the floor, both counting the
+            # chunk in hand. One is not enough: a transfer that dips and recovers
+            # is not abandoned for the dip, and a body whose breach is first seen
+            # on its final chunk is returned whole because no second observation
+            # follows.
+            #
+            # This cannot be exact — a transfer is abandoned on evidence that
+            # more was coming, which a chunk that never arrives would have
+            # disproved. The clock is read once per chunk so the rate reported is
+            # the one the decision was made on.
+            if breached and below:
+                raise SlowResponseError(
+                    f"{path}: {len(body):,} bytes in {elapsed:.0f}s"
+                    f" ({len(body) / elapsed / 1000:.0f} KB/s) is under the"
+                    f" {floor_rate // 1000} KB/s floor. Giving up rather than"
+                    " waiting further."
+                )
+            breached = below
+    return bytes(body), resp.headers.get("content-type", "")
+
+
+def filter_params(**filters: int | str | None) -> dict[str, str]:
+    """Stringify the supplied query filters, dropping the unset ones, so an
+    omitted flag stays off the wire and the server's own default applies.
+
+    Builds the `params` argument of `call` below, and sits beside it for that
+    reason.
+    """
+    return {name: str(value) for name, value in filters.items() if value is not None}
 
 
 def call(

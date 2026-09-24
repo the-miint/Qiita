@@ -22,13 +22,13 @@ import sys
 from collections.abc import Callable, Iterator
 from importlib import metadata
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from qiita_common import analytic as ft
 from qiita_common.api_paths import (
     PATH_ALIGNMENT_COHORT_DOGET,
     PATH_ALIGNMENT_PREFIX,
-    PATH_ASSEMBLY_GENOME_MAP,
+    PATH_ASSEMBLY_GENOME_MAP_PARQUET,
     PATH_ASSEMBLY_PREFIX,
     PATH_ASSEMBLY_RUN_DOGET,
     PATH_EXPORTED_FEATURE_PREFIX,
@@ -37,10 +37,12 @@ from qiita_common.api_paths import (
     PATH_EXPORTED_IDENTIFIER_ROOT,
     PATH_EXPORTED_PROCESSING_PREFIX,
     PATH_EXPORTED_PROCESSING_ROOT,
+    PATH_PROCESSING_BY_IDX,
+    PATH_PROCESSING_PREFIX,
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_DOGET,
     PATH_REFERENCE_EXCLUSION_BY_IDX,
-    PATH_REFERENCE_GENOME_MAP,
+    PATH_REFERENCE_GENOME_MAP_PARQUET,
     PATH_REFERENCE_PREFIX,
 )
 from qiita_common.assembly_constants import ASSEMBLED_SEQUENCE_TABLE
@@ -50,9 +52,16 @@ from qiita_common.models import (
     ExportedIdentifierRequest,
     ExportedProcessingRequest,
 )
+from qiita_common.parquet import PARQUET_MEDIA_TYPE
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 
-from ...feature_table import denovo_alignment_processing_idx
+if TYPE_CHECKING:
+    import pyarrow as pa
+
+from ...feature_table import (
+    denovo_alignment_processing_idx,
+    denovo_assembly_deprecation_error,
+)
 from .. import _common
 from ._helpers import _UNSET
 from .alignment import (
@@ -67,6 +76,9 @@ from .alignment import (
 # relations, and nothing outside sees them (they are unregistered immediately —
 # see `_stage_genome_map`).
 _GENOME_MAP_SOURCE = "genome_map_response"
+# The two columns either map stages; provenance rides the wire for callers that
+# want it and is dropped here (see `_stage_genome_map`).
+_MAP_KEY_COLUMNS = ["feature_idx", "genome_idx"]
 _MINT_SOURCE = "exported_identifier_response"
 _EXPORTED_FEATURE_SOURCE = "exported_feature_response"
 _EXCLUSION_SOURCE = "reference_exclusion_response"
@@ -96,23 +108,21 @@ _TAXONOMY_TABLE = TAXONOMY_SOURCE_TABLE
 _PHYLOGENY_TABLE = "reference_phylogeny"
 
 
-def _fetch_genome_map(base_url: str, token: str, *, reference_idx: int) -> list[dict[str, Any]]:
-    """GET the whole reference's `feature_idx → genome` map: one entry per (feature,
-    genome) pair with the genome's `source` / `source_id`.
+def _fetch_genome_map(base_url: str, token: str, *, reference_idx: int) -> pa.Table:
+    """GET the whole reference's `feature_idx → genome` map as an Arrow table: one
+    row per (feature, genome) pair with the genome's `source` / `source_id`.
 
-    **A refusal propagates.** Over its hard cap the route 413s, naming the real size,
-    rather than truncating — and there is nothing to fall back to here: a lookup table
-    silently missing rows produces a WRONG feature table rather than a short one, and
-    the route serves the map whole or not at all. So the `HTTPStatusError` travels up
-    to whoever can show the user the size and stop.
+    The Parquet form, because the JSON one caps at `GENOME_MAP_HARD_CAP` — which
+    `routes/_helpers.py` records the deploy's references as exceeding — and
+    because that form needs no cap at all.
     """
-    path = f"{PATH_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP.format(reference_idx=reference_idx)}"
-    return _common.call("GET", base_url, token, path)["entries"]
+    sub_path = PATH_REFERENCE_GENOME_MAP_PARQUET.format(reference_idx=reference_idx)
+    return _fetch_map_parquet(base_url, token, f"{PATH_REFERENCE_PREFIX}{sub_path}")
 
 
 def _fetch_assembly_genome_map(
     base_url: str, token: str, *, prep_sample_idx: int, processing_idx: int
-) -> list[dict[str, Any]]:
+) -> pa.Table:
     """GET one assembly run's `feature_idx → genome` map, the de novo twin of
     `_fetch_genome_map`.
 
@@ -121,19 +131,65 @@ def _fetch_assembly_genome_map(
     response was scoped to — `_stage_denovo_genome_map` says why that key matters.
 
     Refusals propagate, for the reason its twin's do, and one more of its own: the
-    route 422s a run whose memberships are not all genome-minted, because a map short
-    by a contig does not read as short — it reads as a genome that covered more of a
-    smaller length than it did.
+    route 422s a run whose memberships are not all genome-minted, because a map
+    short by a contig does not read as short — it reads as a genome that covered
+    more of a smaller length than it did.
     """
-    sub_path = PATH_ASSEMBLY_GENOME_MAP.format(
+    sub_path = PATH_ASSEMBLY_GENOME_MAP_PARQUET.format(
         prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
     )
-    return _common.call("GET", base_url, token, f"{PATH_ASSEMBLY_PREFIX}{sub_path}")["entries"]
+    return _fetch_map_parquet(base_url, token, f"{PATH_ASSEMBLY_PREFIX}{sub_path}")
+
+
+def _fetch_processing(base_url: str, token: str, *, processing_idx: int) -> dict:
+    """GET one assembly run's params and lifecycle columns."""
+    sub_path = PATH_PROCESSING_BY_IDX.format(processing_idx=processing_idx)
+    return _common.call("GET", base_url, token, f"{PATH_PROCESSING_PREFIX}{sub_path}")
+
+
+def _refuse_deprecated_denovo_run(base_url: str, token: str, *, processing_idx: int) -> None:
+    """Refuse a deprecated assembly run as a de novo arm, the client-side half of the
+    rule `runner/_feature_table.py` applies server-side.
+
+    `denovo_alignment_processing_idx` states why neither driver may be the only one
+    that checks, and `denovo_assembly_deprecation_error` owns the wording so the two
+    cannot word it differently. The read is one GET per build, not per cohort sample:
+    the assembly run is in the de novo alignment's hashed params, so one value covers
+    the whole cohort.
+    """
+    row = _fetch_processing(base_url, token, processing_idx=processing_idx)
+    message = denovo_assembly_deprecation_error(
+        processing_idx=processing_idx,
+        status=row.get("status"),
+        superseded_by=row.get("superseded_by"),
+    )
+    if message is not None:
+        raise ValueError(message)
+
+
+def _fetch_map_parquet(base_url: str, token: str, path: str) -> pa.Table:
+    """The shared half of the two map fetches: read the Parquet body and decode it.
+
+    **A refusal propagates.** There is nothing to fall back to — a lookup table
+    silently missing rows produces a WRONG feature table rather than a short one —
+    so any non-2xx travels up to whoever can show the user what happened.
+    """
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    body, content_type = _common.fetch_binary(base_url, token, path, accept=PARQUET_MEDIA_TYPE)
+    # Parameters (`; charset=`) are not part of the type, and media types are
+    # case-insensitive. A body that is not Parquet fails in `read_table` anyway,
+    # but with an Arrow error about magic bytes rather than a statement of what
+    # the server actually sent.
+    if content_type.split(";")[0].strip().lower() != PARQUET_MEDIA_TYPE:
+        raise RuntimeError(f"{path}: expected {PARQUET_MEDIA_TYPE}, server sent {content_type!r}")
+    return pq.read_table(pa.BufferReader(body))
 
 
 def _assembly_genome_map_or_none(
     base_url: str, token: str, *, prep_sample_idx: int, processing_idx: int
-) -> list[dict[str, Any]] | None:
+) -> pa.Table | None:
     """This sample's run-scoped genome map, or `None` when it assembled nothing.
 
     **A 404 here is the design's graceful path, not an error.** A sample whose
@@ -338,12 +394,14 @@ def _stage_response(
     """Stage a REST response into the relation `table_sql` builds from it.
 
     **The arrow schema is written out rather than inferred**, and it is what selects the
-    columns: miint's functions take native BIGINT id columns, and an empty response — a
-    16S reference has no genome-bearing features, an unblocked reference no exclusions —
-    would otherwise stage NULL-typed columns that fail the first join. `from_pylist` with
-    an explicit schema also reads the entries once, where a column-at-a-time
-    comprehension walks a quarter-million dicts once per column, and drops the columns
-    nobody staged for free.
+    columns: miint's functions take native BIGINT id columns, and an empty response — an
+    unblocked reference has no exclusions, a cohort no minted handles — would otherwise
+    stage NULL-typed columns that fail the first join. `from_pylist` with an explicit
+    schema also reads the entries once, where a column-at-a-time comprehension walks them
+    once per column, and drops the columns nobody staged for free.
+
+    JSON responses only. The two genome maps arrive as Parquet and stage their Arrow
+    table directly, having no dicts to walk.
 
     Each caller below says which columns those are and why the rest are left behind; that
     choice is the only thing they differ in.
@@ -355,25 +413,23 @@ def _stage_response(
         con.execute(table_sql(relation))
 
 
-def _stage_genome_map(con, entries: list[dict[str, Any]]) -> None:
-    """Stage the genome-map response into the roll-up key, `MAP_TABLE`.
+def _stage_genome_map(con, table: pa.Table) -> None:
+    """Stage the genome-map Parquet into the roll-up key, `MAP_TABLE`.
 
     Neither `source` nor `source_id` is staged. The map's job here is the roll-up key;
     what a published row is NAMED comes from the exported-feature mint, which is the
     only authority on whether a genome's accession is unique in the published namespace.
+
+    The projection happens on the Arrow table rather than in the CREATE, so the two
+    columns nobody stages are dropped before DuckDB ever sees them. The Parquet
+    schema is typed, so an empty map stages BIGINT columns rather than NULL-typed
+    ones the first join would reject.
     """
-    import pyarrow as pa  # noqa: PLC0415
-
-    _stage_response(
-        con,
-        entries,
-        relation=_GENOME_MAP_SOURCE,
-        columns=[("feature_idx", pa.int64()), ("genome_idx", pa.int64())],
-        table_sql=ft.map_table_sql,
-    )
+    with _registered(con, _GENOME_MAP_SOURCE, table.select(_MAP_KEY_COLUMNS)):
+        con.execute(ft.map_table_sql(_GENOME_MAP_SOURCE))
 
 
-def _stage_denovo_genome_map(con, per_sample: dict[int, list[dict[str, Any]]]) -> None:
+def _stage_denovo_genome_map(con, per_sample: dict[int, pa.Table]) -> None:
     """Stage the cohort's per-run genome maps into `DENOVO_MAP_TABLE`, one relation
     keyed `(prep_sample_idx, feature_idx, genome_idx)`.
 
@@ -386,26 +442,32 @@ def _stage_denovo_genome_map(con, per_sample: dict[int, list[dict[str, Any]]]) -
     """
     import pyarrow as pa  # noqa: PLC0415
 
-    entries = [
-        {
-            "prep_sample_idx": prep_sample_idx,
-            "feature_idx": entry["feature_idx"],
-            "genome_idx": entry["genome_idx"],
-        }
-        for prep_sample_idx, rows in sorted(per_sample.items())
-        for entry in rows
+    per_run = [
+        table.select(_MAP_KEY_COLUMNS).add_column(
+            0,
+            pa.field("prep_sample_idx", pa.int64()),
+            pa.array([prep_sample_idx] * table.num_rows, type=pa.int64()),
+        )
+        for prep_sample_idx, table in sorted(per_sample.items())
     ]
-    _stage_response(
-        con,
-        entries,
-        relation=_DENOVO_GENOME_MAP_SOURCE,
-        columns=[
+    # Spelled out rather than derived from the served schema: importing it here
+    # would pull a server-side action module into the CLI for three int64 columns.
+    # `test_an_empty_genome_map_still_stages_typed_relations` is what catches a
+    # drift, since it stages through this branch.
+    schema = pa.schema(
+        [
             ("prep_sample_idx", pa.int64()),
             ("feature_idx", pa.int64()),
             ("genome_idx", pa.int64()),
-        ],
-        table_sql=ft.denovo_map_table_sql,
+        ]
     )
+    # `concat_tables` takes no `schema=` (it reads only `promote_options` out of
+    # its kwargs and drops the rest silently), and refuses an empty list outright —
+    # so the no-run case is the `empty_table()` branch, not an argument. A cohort
+    # that assembled nothing still has to stage typed columns.
+    combined = pa.concat_tables(per_run) if per_run else schema.empty_table()
+    with _registered(con, _DENOVO_GENOME_MAP_SOURCE, combined):
+        con.execute(ft.denovo_map_table_sql(_DENOVO_GENOME_MAP_SOURCE))
 
 
 def _stage_blocked_features(con, entries: list[dict[str, Any]]) -> None:
@@ -466,10 +528,10 @@ def _registered(con, relation: str, obj) -> Iterator[str]:
     """Register an Arrow object on `con` as `relation` for the block's duration, and
     release it however the block ends.
 
-    One lifecycle for all three staged inputs — `con.register` takes an Arrow table as
-    happily as a stream reader. The release matters most for what it frees soonest: at
-    the genome-map route's cap the registered table is a quarter-million pairs, and
-    holding it alongside the two relations copied out of it doubles that for nothing.
+    One lifecycle for every staged input — `con.register` takes an Arrow table as
+    happily as a stream reader. The release matters most for what it frees soonest:
+    the genome map is the largest of them by far, and uncapped, so holding it
+    alongside the relations copied out of it doubles that for nothing.
     """
     con.register(relation, obj)
     try:
@@ -1155,6 +1217,7 @@ def _run_build(
             denovo_params=denovo_summary.get("params"),
             reference_params=summary.get("params"),
         )
+        _refuse_deprecated_denovo_run(args.base_url, token, processing_idx=denovo_processing_idx)
 
     _stage_genome_map(con, _fetch_genome_map(args.base_url, token, reference_idx=reference_idx))
     denovo_cohort: list[int] = []
@@ -1419,6 +1482,18 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
             written, rows = _run_build(args, token, con, gate=gate)
     except _common.httpx.HTTPStatusError as exc:
         print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        return 1
+    except _common.httpx.RemoteProtocolError as exc:
+        # Ahead of RequestError, which it subclasses. httpx raises this both for a
+        # body cut mid-transfer and for a peer that closed before any response, so
+        # the message covers both rather than asserting which happened — the first
+        # is a retry, the second is usually a wrong --base-url.
+        print(
+            f"error: the connection ended before a complete response arrived ({exc})."
+            " Retry; a partial genome map is never used. If it persists, check"
+            " --base-url / $QIITA_CONTROL_PLANE_URL.",
+            file=sys.stderr,
+        )
         return 1
     except _common.httpx.RequestError as exc:
         print(

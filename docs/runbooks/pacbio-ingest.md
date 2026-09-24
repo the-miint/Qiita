@@ -7,7 +7,7 @@ Not needed for Illumina.
 This covers only what is different about PacBio. Everything the two platforms
 share — where to run the command, what privileges the submit needs, working from
 a remote machine, the studies and biosamples the pre-flight file has to match,
-building that file and opening it once first, how to retry, and why not to use
+building that file, how to retry, and why not to use
 `--force` — is in [`getting-started.md`](getting-started.md), which these
 examples carry on from.
 
@@ -33,13 +33,10 @@ If the submit fails at `/run-folder/inspect`, read which failure it is:
 
 ## Submit
 
-`$PF` is your own writable copy of the pre-flight file, already opened once
-([`getting-started.md`](getting-started.md), step 4).
-
 ```bash
 qiita submit-pacbio-ingest \
     --run-folder /sequencing/gcore_runs/Knightlab/r84137_20260623_040006 \
-    --preflight-blob "$PF" \
+    --preflight-blob ./r84137_preflight.db \
     --instrument-run-id r84137_20260623_040006 \
     --instrument-model Revio \
     --prep-protocol-idx 3
@@ -57,7 +54,10 @@ qiita submit-pacbio-ingest \
   you give it, and a wrong one mislabels every prep_sample in the run.
 - **Re-running the identical command is the retry**, but it is not free. The run
   and pool are reused and missing prep_samples are added, and any whose job is
-  still running are reported `skipped`. A prep_sample whose reads already loaded
+  still running are reported `skipped`. The pool is recognised by the exact
+  contents of the pre-flight file, so submit the same file again. Changed
+  contents under the same file name are refused; under a new name they create a
+  second pool. A prep_sample whose reads already loaded
   is **not** skipped — it gets a fresh job, which then stops at the read-numbering
   step because its reads are already numbered. That is safe (nothing is stored
   twice) but it shows up as a failed job, so expect it and do not chase it.

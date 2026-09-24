@@ -79,6 +79,17 @@ PATH_REFERENCE_GENOME_MEMBER = "/{reference_idx}/genome/{genome_idx}/member"
 # listing of genomes — it is the join table a client rolls alignment rows up
 # through. Param path, 2 segments, no literal shadow.
 PATH_REFERENCE_GENOME_MAP = "/{reference_idx}/genome-map"
+# The same rows as GENOME_MAP, as a Parquet body, with no cap. A sub-resource
+# segment rather than an Accept header on the path above: the two forms differ in
+# more than encoding — this one has no size ceiling and therefore no 413 — and one
+# path with one behaviour is what the api_paths triple can express. Param path,
+# 3 segments, no literal shadow.
+PATH_REFERENCE_GENOME_MAP_PARQUET = "/{reference_idx}/genome-map/parquet"
+# Operator maintenance: give one reference's phylogeny rows the edge numbering
+# placements join on, for a tree loaded before the loader minted it. A verb segment
+# (like /revoke-all-tokens) because it is an action on the tree, not a sub-resource
+# to read. Param path, 3 segments, no literal shadow.
+PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID = "/{reference_idx}/phylogeny/mint-edge-id"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -91,6 +102,10 @@ URL_REFERENCE_EXCLUSION_SYNC = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION
 URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION_BY_IDX}"
 URL_REFERENCE_GENOME_MEMBER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MEMBER}"
 URL_REFERENCE_GENOME_MAP = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP}"
+URL_REFERENCE_GENOME_MAP_PARQUET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP_PARQUET}"
+URL_REFERENCE_PHYLOGENY_MINT_EDGE_ID = (
+    f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID}"
+)
 
 # =============================================================================
 # /host-filter-profile/*
@@ -338,6 +353,23 @@ URL_UPLOAD_BY_IDX = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_BY_IDX}"
 URL_UPLOAD_DONE = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_DONE}"
 
 
+# =============================================================================
+# /ena-import-batch/* — batch multi-study ENA import driver
+# =============================================================================
+# POST accepts a list of INSDC study accessions and returns a batch handle
+# immediately (202); the resolve+register+download-submit work runs in a
+# background task (qiita_control_plane.ena_import.batch). GET polls the
+# per-item rolled-up state. ADMIN-only (wet_lab_admin / system_admin) — see
+# routes/ena_import.py.
+
+PATH_ENA_IMPORT_BATCH_PREFIX = "/ena-import-batch"
+PATH_ENA_IMPORT_BATCH_ROOT = ""  # POST (submit) against the prefix itself
+PATH_ENA_IMPORT_BATCH_BY_IDX = "/{ena_import_batch_idx}"
+
+URL_ENA_IMPORT_BATCH_PREFIX = f"{API_PREFIX}{PATH_ENA_IMPORT_BATCH_PREFIX}"
+URL_ENA_IMPORT_BATCH_BY_IDX = f"{URL_ENA_IMPORT_BATCH_PREFIX}{PATH_ENA_IMPORT_BATCH_BY_IDX}"
+
+
 def compute_upload_staging_path(staging_root: Path, upload_idx: int) -> Path:
     """Canonical filesystem path for a staged DoPut upload.
 
@@ -548,11 +580,15 @@ PATH_ASSEMBLY_PREFIX = "/assembly"
 PATH_ASSEMBLY_DOGET = "/ticket/doget"
 PATH_ASSEMBLY_RUN_DOGET = "/{prep_sample_idx}/{processing_idx}/ticket/doget"
 PATH_ASSEMBLY_GENOME_MAP = "/{prep_sample_idx}/{processing_idx}/genome-map"
+# The Parquet form, uncapped — the de novo twin of
+# PATH_REFERENCE_GENOME_MAP_PARQUET, which carries why it is a segment.
+PATH_ASSEMBLY_GENOME_MAP_PARQUET = "/{prep_sample_idx}/{processing_idx}/genome-map/parquet"
 
 URL_ASSEMBLY_PREFIX = f"{API_PREFIX}{PATH_ASSEMBLY_PREFIX}"
 URL_ASSEMBLY_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_DOGET}"
 URL_ASSEMBLY_RUN_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_RUN_DOGET}"
 URL_ASSEMBLY_GENOME_MAP = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP}"
+URL_ASSEMBLY_GENOME_MAP_PARQUET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP_PARQUET}"
 
 
 # =============================================================================
@@ -831,9 +867,12 @@ PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 # anchor on the /study router (the caller is authorized on the study).
 PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
 PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
-# Create a study-local biosample field definition (POST). The study-scoped
-# mint hangs off the /study router (the caller is authorized on the study).
+# Create a study-local biosample field definition (POST). The study-scoped mint
+# hangs off the /study router (the caller is authorized on the study); the
+# by-idx path addresses a single definition under it, to read (GET) or edit
+# (PATCH).
 PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/biosample-field"
+PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/biosample-field/{study_field_idx}"
 
 PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
@@ -854,6 +893,7 @@ URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
 URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
 URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
+URL_BIOSAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
@@ -927,9 +967,12 @@ PATH_PREP_SAMPLE_STUDY_LIST = "/{prep_sample_idx}/study/list"
 # without a raw production UPDATE. Reversible by design (a misclassified well
 # must be recoverable), unlike the terminal principal retire.
 PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
-# Create a study-local prep_sample field definition (POST). The study-scoped
-# mint hangs off the /study router (the caller is authorized on the study).
+# Create a study-local prep_sample field definition (POST). The study-scoped mint
+# hangs off the /study router (the caller is authorized on the study); the
+# by-idx path addresses a single definition under it, to read (GET) or edit
+# (PATCH).
 PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = "/{study_idx}/prep-sample-field"
+PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/prep-sample-field/{study_field_idx}"
 
 # =============================================================================
 # /exported-identifier — the public handle a published table carries per sample
@@ -978,6 +1021,7 @@ URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
 URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"
 URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"
+URL_PREP_SAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX}"
 
 
 # =============================================================================

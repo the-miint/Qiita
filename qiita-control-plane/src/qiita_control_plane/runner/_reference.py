@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +20,7 @@ import qiita_control_plane.runner as _runner_pkg
 from ..actions.reference import (
     ReferenceNotFound,
 )
-from ..auth.tickets import sign_ticket
+from ..auth.tickets import run_signed_flight_call, sign_ticket
 from ._read_ingest import _workflow_declares_input
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
@@ -56,9 +55,10 @@ async def _resolve_reference_index_path(
 
     This is the *whole-reference* (unsharded) lookup: it filters to
     `shard_id IS NULL` so a per-shard analysis-index row can never be served
-    here. All rows are NULL today, so this is a no-op now and forward-safe once
-    shard rows exist. Shard-aware resolution (routing a read to its shard) is a
-    later milestone and is deliberately NOT built here.
+    here. `actions.library.register_index` writes rows carrying a `shard_id`,
+    so the filter selects rather than merely being forward-safe. Shard-aware
+    resolution (routing a read to its shard) is `_resolve_sharded_align_indexes`
+    below.
 
     Raises:
       * ReferenceNotFound — the reference row doesn't exist.
@@ -627,11 +627,6 @@ async def _resolve_qc_adapters(
             f"{row['status']!r}, must be {ReferenceStatus.ACTIVE.value!r}"
         )
 
-    ticket = sign_ticket(
-        table=_REFERENCE_CHUNKS_TABLE,
-        filter={"reference_idx": [default_adapter_reference_idx]},
-        secret=signing_key,
-    )
     # A Flight failure (data plane unreachable / errored) raises
     # pyarrow.flight.FlightError, which is NOT a BackendFailure — letting it
     # escape this pre-loop pass would hit run_workflow's bare `except Exception`,
@@ -639,13 +634,16 @@ async def _resolve_qc_adapters(
     # work_ticket_failure_step_name_consistent CHECK (step_run ⇒ step_name NOT
     # NULL) — the failure transition itself would throw and strand the ticket in
     # PROCESSING. Wrap it as a SUBMISSION failure like every other pre-loop
-    # resolver via _submission_dp_fetch_failure, which classifies a transient
-    # serialization conflict (concurrent DuckLake attach, SQLSTATE 40001) as
-    # RETRIABLE (a redrive self-heals) and anything else — DP down / errored — as
-    # permanent (the operator resubmits).
+    # resolver via _submission_dp_fetch_failure, which decides permanent vs
+    # retriable.
     try:
-        rows = await asyncio.get_event_loop().run_in_executor(
-            None, _runner_pkg._do_get_reference_sequence_chunks, data_plane_url, ticket
+        rows = await run_signed_flight_call(
+            lambda: sign_ticket(
+                table=_REFERENCE_CHUNKS_TABLE,
+                filter={"reference_idx": [default_adapter_reference_idx]},
+                secret=signing_key,
+            ),
+            lambda ticket: _runner_pkg._do_get_reference_sequence_chunks(data_plane_url, ticket),
         )
     except Exception as exc:
         raise _submission_dp_fetch_failure(

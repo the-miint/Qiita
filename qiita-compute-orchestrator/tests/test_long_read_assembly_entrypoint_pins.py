@@ -1,12 +1,12 @@
-"""Static pins on the `long-read-assembly` container entrypoints and their images.
+"""Pins on the `long-read-assembly` container entrypoints and their images.
 
 Most of the file is about `binning.sh` and the coverage BAM (below), but it also
 pins `bin_refine.sh`'s `--write_bins` flag, `checkm.sh`'s TMPDIR shortening for the
 AF_UNIX socket, the genomes_dir basenames the entrypoints write and read against
 their Python constants, and the version constraints in `binning.def` /
-`bin_refine.def` that each entrypoint's behaviour depends on. All of it is the same
-kind of assertion: read the shipped file, check the command it pins is still there
-and still shaped correctly.
+`bin_refine.def` that each entrypoint's behaviour depends on. All of it but the tests
+that run lines of `binning.sh` under bash is the same kind of assertion: read the shipped
+file, check the command it pins is still there and still shaped correctly.
 
 The coverage BAM: how `binning.sh` puts it where metaWRAP will read it.
 
@@ -37,18 +37,29 @@ assertions: they show the commands are present and shaped correctly, not that th
 succeed. They need no binary and run everywhere, including CI and a stock dev box.
 Correct-operation evidence is elsewhere: the behavioural test above, the consumer
 measurements in `docs/duckdb-miint.md`, and the deploy verify step.
+
+The exceptions are the tests that run `binning.sh`'s lines under bash, where no binary
+has to be behind them. Its `-m` derivation is shell arithmetic and a guard, run at fixed
+allocations, at each workflow version's binning baseline, and after sourcing `_lib.sh`
+where its fallback is what is being tested. Its handling of metaWRAP's exit runs from
+the stdout copy to the end, with a stand-in `micromamba` that prints saved stdout lines
+and exits with a chosen code.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 from qiita_common.assembly_constants import (
     CONTIG_ATTRIBUTE_COLUMNS,
     CONTIG_ATTRIBUTES_FILE,
 )
+from qiita_common.log_tail import contains_oom_signature
 
 from qiita_compute_orchestrator.jobs._assembly import LCG_FILE, NOLCG_FILE
 
@@ -62,6 +73,7 @@ _BIN_REFINE_SH = _WORKFLOW_DIR / "bin_refine.sh"
 _BIN_REFINE_DEF = _WORKFLOW_DIR / "bin_refine.def"
 _CHECKM_SH = _WORKFLOW_DIR / "checkm.sh"
 _ASSEMBLE_DEF = _WORKFLOW_DIR / "assemble.def"
+_LIB_SH = _REPO_ROOT / "workflows" / "_shared" / "_lib.sh"
 
 # What each assembler's `%test` must grep its `--version` output for. myloasm
 # reports its conda version verbatim; hifiasm_meta reports two internal versions
@@ -565,6 +577,195 @@ def test_metawrap_gets_the_reordered_assembly_not_raw_nolcg() -> None:
         f"`metawrap binning` is passed the raw ${{NOLCG}} on its `-a`: {call!r}. "
         "That is the numeric-order assembly the reorder exists to replace."
     )
+
+
+def test_metawrap_memory_cap_derives_from_the_allocation() -> None:
+    """metaWRAP's `-m` comes from MEM_MB, never a numeric literal.
+
+    binning.sh's comment on the `metawrap binning` call carries why.
+    """
+    lines = _code_lines(_BINNING_SH)
+    binning_call = [ln for ln in lines if "metawrap binning" in ln]
+    assert len(binning_call) == 1, f"expected one `metawrap binning`, got {binning_call!r}"
+    call = binning_call[0]
+    assert re.search(r'-m\s+"\$\{METAWRAP_MEM_GB\}"', call), (
+        f"`metawrap binning` no longer takes -m from ${{METAWRAP_MEM_GB}}: {call!r}."
+    )
+    assert re.search(r"-m\s+\d", call) is None, (
+        f"`metawrap binning` passes a numeric -m: {call!r}. A literal does not follow "
+        "the allocation when it is overridden or escalated."
+    )
+    derivation = [ln for ln in lines if ln.startswith("METAWRAP_MEM_GB=")]
+    assert len(derivation) == 1, f"expected one METAWRAP_MEM_GB assignment, got {derivation!r}"
+    assert "MEM_MB" in derivation[0], (
+        f"METAWRAP_MEM_GB is not computed from MEM_MB: {derivation[0]!r}."
+    )
+
+
+def _run_metawrap_mem_derivation(
+    prelude: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run binning.sh's own `-m` derivation block under bash, after `prelude` sets MEM_MB."""
+    lines = _code_lines(_BINNING_SH)
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("METAWRAP_HEADROOM_GB=")]
+    assert len(starts) == 1, f"expected one METAWRAP_HEADROOM_GB assignment, got {len(starts)}"
+    ends = [i for i in range(starts[0], len(lines)) if lines[i].strip() == "fi"]
+    assert ends, "no `fi` closes the METAWRAP_MEM_GB guard"
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            prelude,
+            *lines[starts[0] : ends[0] + 1],
+            'echo "${METAWRAP_MEM_GB}"',
+        ]
+    )
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False, env=env
+    )
+
+
+@pytest.mark.parametrize(("mem_mb", "expected_m"), [(102400, "90"), (81920, "70"), (14336, "4")])
+def test_metawrap_memory_cap_arithmetic(mem_mb: int, expected_m: str) -> None:
+    """The `-m` binning.sh passes for an allocation, from running its derivation."""
+    result = _run_metawrap_mem_derivation(f"MEM_MB={mem_mb}")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected_m
+
+
+def test_metawrap_memory_cap_fits_every_binning_baseline() -> None:
+    """Every workflow version whose binning step runs binning.sh gives metaWRAP a `-m` of
+    at least 1 at its baseline, forwarded as `slurm/payload.py` forwards it (mem_gb * 1024
+    MB), rather than the guard's exit 78 on every ticket."""
+    baselines = []
+    for path in sorted(_WORKFLOW_DIR.glob("*.yaml")):
+        for step in yaml.safe_load(path.read_text()).get("steps", []):
+            is_binning = step.get("step") == "binning"
+            runs_binning_sh = step.get("entrypoint") == "/opt/qiita/binning.sh"
+            if not (is_binning or runs_binning_sh):
+                continue
+            assert is_binning and runs_binning_sh, (
+                path.name,
+                step.get("step"),
+                step.get("entrypoint"),
+            )
+            resources = step["baseline_resources"]
+            profiles = (resources.get("profiles") or {}).values()
+            for mem_gb in [resources.get("mem_gb"), *(p.get("mem_gb") for p in profiles)]:
+                if mem_gb is not None:
+                    baselines.append((path.name, mem_gb))
+    assert baselines, f"no binning.sh step with a mem_gb under {_WORKFLOW_DIR}"
+    for yaml_name, mem_gb in baselines:
+        result = _run_metawrap_mem_derivation(f"MEM_MB={mem_gb * 1024}")
+        assert result.returncode == 0, (yaml_name, mem_gb, result.stderr)
+        assert int(result.stdout.strip()) >= 1, (yaml_name, mem_gb, result.stdout)
+
+
+def test_metawrap_memory_cap_refuses_the_lib_sh_fallback(tmp_path: Path) -> None:
+    """With no allocation forwarded, MEM_MB is whatever `_lib.sh` falls back to, and the
+    guard refuses it: exit 78 naming QIITA_MEM_MB, not a `-m` under 1."""
+    (tmp_path / "params.json").write_text("{}")
+    env = {k: v for k, v in os.environ.items() if k not in {"QIITA_MEM_MB", "SLURM_MEM_PER_NODE"}}
+    env |= {"QIITA_INPUT_PATH": str(tmp_path), "QIITA_OUTPUT_PATH": str(tmp_path)}
+    result = _run_metawrap_mem_derivation(f'source "{_LIB_SH}"', env=env)
+    assert result.returncode == 78, (result.returncode, result.stdout, result.stderr)
+    assert "QIITA_MEM_MB" in result.stderr
+
+
+# Lines from binning runs' stdout, verbatim. The first three are from a run in which
+# MetaBAT2 formed no bins and MaxBin2 declined the assembly; the MetaBAT2 error line is
+# from a run that failed on a different binner, and the bins line from a run that
+# binned normally.
+_METABAT2_NO_BINS = "0 bins (0 bases in total) formed."
+_MAXBIN2_VERDICT = (
+    "Marker gene search reveals that the dataset cannot be binned "
+    "(the medium of marker gene number <= 1). Program stop."
+)
+_METAWRAP_MAXBIN2_ERROR = (
+    "*****                              Something went wrong with running MaxBin2. Exiting."
+    "                             *****"
+)
+_METAWRAP_METABAT2_ERROR = (
+    "*****                              Something went wrong with running MetaBAT2. Exiting"
+    "                             *****"
+)
+_METABAT2_BINS = "4 bins (5313148 bases in total) formed."
+_METABAT2_NONE_MAXBIN2_DECLINED = "\n".join(
+    [_METABAT2_NO_BINS, _MAXBIN2_VERDICT, _METAWRAP_MAXBIN2_ERROR]
+)
+
+
+def _run_metawrap_exit_handling(
+    tmp_path: Path, stdout: str, exit_code: int
+) -> subprocess.CompletedProcess[str]:
+    """Run binning.sh from its metaWRAP stdout copy to the end under bash, with a stand-in
+    `micromamba` that prints `stdout` and exits `exit_code`, and a `qiita_finish` that
+    echoes its arguments."""
+    lines = _code_lines(_BINNING_SH)
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("METAWRAP_STDOUT=")]
+    assert len(starts) == 1, f"expected one METAWRAP_STDOUT assignment, got {len(starts)}"
+    fixture = tmp_path / "fixture.stdout"
+    fixture.write_text(stdout + "\n")
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            f'WORK="{tmp_path}"',
+            "OUT=bins THREADS=1 METAWRAP_MEM_GB=1 ORDERED_NOLCG=nolcg.fa READS_FQ=reads.fastq",
+            f'micromamba() {{ cat "{fixture}"; return {exit_code}; }}',
+            'qiita_finish() { echo "qiita_finish $*"; }',
+            *lines[starts[0] :],
+        ]
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+
+
+# The start of the line binning.sh prints on stderr when it passes a metaWRAP failure on.
+_METAWRAP_FAILED = "binning: metaWRAP failed"
+
+
+def test_binning_finishes_when_metabat2_formed_no_bins_and_maxbin2_declined(
+    tmp_path: Path,
+) -> None:
+    """When MetaBAT2 formed no bins and MaxBin2 declined the assembly, metaWRAP's failure
+    finishes the step with bins_dir, and its stdout still reaches the log."""
+    result = _run_metawrap_exit_handling(tmp_path, _METABAT2_NONE_MAXBIN2_DECLINED, 1)
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert "qiita_finish bins_dir=bins" in result.stdout
+    assert _MAXBIN2_VERDICT in result.stdout
+    assert _METAWRAP_FAILED not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        pytest.param(_METAWRAP_METABAT2_ERROR, id="another binner failed"),
+        pytest.param(
+            _METABAT2_NONE_MAXBIN2_DECLINED.replace(_METABAT2_NO_BINS, _METABAT2_BINS),
+            id="metabat2 formed bins",
+        ),
+        pytest.param(
+            _METABAT2_NONE_MAXBIN2_DECLINED.replace(_METAWRAP_MAXBIN2_ERROR, ""),
+            id="no metawrap maxbin2 error",
+        ),
+        pytest.param(
+            _METABAT2_NONE_MAXBIN2_DECLINED.replace(_MAXBIN2_VERDICT, ""), id="no maxbin2 verdict"
+        ),
+        pytest.param("", id="no output"),
+    ],
+)
+def test_binning_passes_any_other_metawrap_failure_through(tmp_path: Path, stdout: str) -> None:
+    """When metaWRAP's stdout lacks one or more of the three lines, the step exits with
+    metaWRAP's code and names metaWRAP on stderr, in words that match no OOM signature."""
+    result = _run_metawrap_exit_handling(tmp_path, stdout, 3)
+    assert result.returncode == 3, (result.returncode, result.stdout, result.stderr)
+    assert "qiita_finish" not in result.stdout
+    assert f"{_METAWRAP_FAILED} (exit 3)" in result.stderr
+    assert not contains_oom_signature(result.stderr), result.stderr
+
+
+def test_binning_finishes_after_a_clean_metawrap_run(tmp_path: Path) -> None:
+    result = _run_metawrap_exit_handling(tmp_path, _METABAT2_BINS, 0)
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert result.stdout.splitlines()[-1] == "qiita_finish bins_dir=bins"
 
 
 def test_binning_fails_loud_on_contig_set_drift() -> None:

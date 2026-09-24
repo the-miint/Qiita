@@ -416,12 +416,10 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
     re-written once that ticket has left flight.
 
     The gate is an ALLOWLIST — reuse is legitimate only while the minting ticket is
-    still in flight — not a denylist of `completed`. That matters because the failure
-    mode is silent: reusing a range whose reads are already registered duplicates them
-    in DuckLake, which has no uniqueness. A denylist would let a work_ticket_state
-    added later fall through to the reuse path by default — fail-open — and this
-    parametrisation is what pins it: it walks EVERY terminal state, so a new one is
-    covered the day it is added.
+    still in flight — not a denylist of `completed`. A denylist would let a
+    work_ticket_state added later fall through to the reuse path by default —
+    fail-open — and this parametrisation is what pins it: it walks EVERY terminal
+    state, so a new one is covered the day it is added.
 
     Reachable if a stale attempt outlives the attempt that finished the ticket (an
     orphaned SLURM job never reaped): it reaches the mint, 409s, reads back a range

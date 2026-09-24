@@ -145,7 +145,7 @@ qiita/
 
 ## Build System (Makefile)
 
-The unified build entry point lives in [`Makefile`](../../Makefile). The recipes below mirror the public-API targets verbatim; the test in [`qiita-common/tests/test_makefile_doc_sync.py`](../../qiita-common/tests/test_makefile_doc_sync.py) asserts they stay in sync and is part of `make test`. Internal helpers (`$(DBMATE_BIN)` / `$(GRPCURL_BIN)` auto-fetch, the `UNAME_S/UNAME_M` arch detection, the verbose `dev-setup` install hints) live in `Makefile` only.
+The unified build entry point lives in [`Makefile`](../../Makefile). The recipes below mirror the public-API targets verbatim; the test in [`qiita-common/tests/test_makefile_doc_sync.py`](../../qiita-common/tests/test_makefile_doc_sync.py) asserts they stay in sync and is part of `make test`. Internal helpers (`$(DBMATE_BIN)` / `$(GRPCURL_BIN)` auto-fetch, the `UNAME_S/UNAME_M` arch detection, the verbose `dev-setup` install hints) live in `Makefile` only, as do the make-level comments — the sync test compares recipe bodies, so read `Makefile` for why a recipe is shaped the way it is (`test-workflows`' single-line apptainer guard and its `_sif-build-smoke` half are the ones that need it).
 
 <!-- KEEP IN SYNC WITH ../Makefile; qiita-common/tests/test_makefile_doc_sync.py enforces this -->
 ```makefile
@@ -213,18 +213,14 @@ test-workflows:
 	@if ! command -v apptainer > /dev/null 2>&1; then \
 		echo "apptainer not found — skipping workflow smoke tests"; \
 		exit 0; \
-	fi
-	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def
-	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"
-	rm -f /tmp/qiita-workflow-smoke.sif
-	# Exercise scripts/build-sif.sh end-to-end against real apptainer via the
-	# _sif-build-smoke sentinel (no licensed artifact). Uses a throwaway
-	# PATH_DERIVED so the built SIF lands in a temp images/ dir. The trap
-	# removes it on success, failure, OR signal; set -e propagates a build
-	# failure as the recipe's exit status (no trailing `exit` tripwire).
-	set -e; smoke_derived=$$(mktemp -d); trap 'rm -rf "$$smoke_derived"' EXIT; \
-		mkdir -p "$$smoke_derived/images"; \
-		PATH_DERIVED="$$smoke_derived" bash scripts/build-sif.sh _sif-build-smoke
+	fi; \
+	set -ex; \
+	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def; \
+	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"; \
+	rm -f /tmp/qiita-workflow-smoke.sif; \
+	smoke_derived=$$(mktemp -d); trap 'rm -rf "$$smoke_derived"' EXIT; \
+	mkdir -p "$$smoke_derived/images"; \
+	PATH_DERIVED="$$smoke_derived" bash scripts/build-sif.sh _sif-build-smoke
 
 test-integration: build-data-plane-debug build-integration $(DBMATE_BIN)
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \

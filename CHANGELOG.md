@@ -21,6 +21,255 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A reference tree carries the edge numbering a placement joins back on (#581).**
+  `read_newick` fills `edge_id` only from jplace `{N}` decorations, so a backbone
+  loaded from an undecorated Newick carried NULL on every node. `krepp_index_create`
+  carries an `edge_id` through the build and `place_krepp` returns it verbatim as
+  `edge_num`, so the numbering we supply is the one that comes back — supply none and
+  the index numbers its own edges, after which `tree_resolve_placement` errors on
+  every row and a hand-written join returns nothing. The build reports `status='ok'`
+  either way (duckdb-miint#272). `reference_load` now mints `edge_id = node_index` when a tree
+  decorates no node, and leaves a tree that decorates any node exactly as it came, so
+  a partially decorated tree never ends up with two numberings in one column. For a
+  reference already in the lake, `POST /reference/{reference_idx}/phylogeny/mint-edge-id`
+  (`reference:write`, the scope that loads a reference) does the same through a new
+  `mint_phylogeny_edge_id` DoAction — one DuckLake `UPDATE` in one transaction, scoped
+  to one reference and issued only when every one of that tree's rows is NULL. A
+  partly numbered tree is a `409` rather than a completed mint, a reference with no
+  phylogeny is a `409` rather than an ambiguous zero, and a tree that already carries
+  its numbering mints nothing, so the call is safe to repeat. The DuckLake semantics
+  this rests on — an `UPDATE` reporting the rows it actually changed, touching only the
+  named reference, and changing nothing on a second run — are pinned by an
+  `integration`-gated data-plane test against a real catalog.
+
+- **ENA import preserves every deposited `library_*` field as prep_sample metadata
+  (#599).** `register_ena_study` now writes `library_strategy`, `library_source`,
+  `library_selection`, and `library_layout` onto each run's prep_sample as the
+  study-local TEXT fields `ena library strategy`, `ena library source`,
+  `ena library selection`, and `ena library layout` — whitespace-trimmed, otherwise
+  exactly as deposited (no case normalization), so what ENA deposited survives
+  independently of the `prep_protocol` mapping, which consumes only strategy/source
+  and is slated for replacement. The four fields are resolved and vetted once per
+  study before any run is written, so a pre-existing field at one of those names that
+  is non-text, unique within the study, or globally linked fails the whole accession
+  loudly instead of run by run. A field ENA left blank writes no row. **New imports
+  only:** runs imported before this change are not backfilled, so a re-import of an
+  older study leaves those runs' slots empty.
+
+- **Deploy proves outbound HTTPS to the ENA archives, so a blocked host fails the deploy
+  instead of every import (#584).** `deploy/verify.sh` gains an `ena-reachability` check
+  (hatch `SKIP_ENA_REACHABILITY`, which covers that row only) that HEADs `www.ebi.ac.uk` as
+  the `qiita-api` service user with the unit's own environment sourced, and
+  `qiita-admin compute-readiness` gains an `ena-from-compute` probe that runs
+  `qiita_compute_orchestrator.ena_reachability_check` (stdlib only, no miint LOAD, so a red
+  row means egress and never a broken extension) to HEAD `www.ebi.ac.uk` and
+  `ftp.sra.ebi.ac.uk` from a SLURM compute node; it rides the SLURM probe job, so
+  `SKIP_SLURM_PROBE` is what skips it. Both require a 2xx — a blocking gateway answers on
+  the socket, and its 403 block page must not read as reachable. Previously a firewall/NAT
+  blocking outbound HTTPS passed every deploy check and then failed every ENA import at
+  runtime — metadata resolve on the control plane, read download on the cluster — with the
+  gap invisible until an import was submitted. Both probes answer for egress only: the fetch
+  itself runs through DuckDB httpfs, so a proxy or CA problem confined to httpfs still
+  surfaces at the first import.
+
+- **`estimate-feature-table` gates the de novo arm on CheckM completeness /
+  contamination (#564).** Two new optional `action_context` keys, `min_completeness` and
+  `max_contamination`, defaulting to 50 / 10. The gate filters the de novo
+  feature->genome map, and because every other de novo relation resolves its genomes
+  through that map, one term reaches the precedence DELETE, the per-genome length
+  denominators, the coverage survivor set and woltka's input. Nothing is removed from
+  Postgres or the lake: the bound is a term in the `SELECT` that stages the map, as a
+  semi-join so a genome carrying two quality rows cannot fan the map out. MAG and LCG
+  only, the two kinds the map admits; reference genomes carry no CheckM score and are
+  not gated.
+
+  Unlike the coverage filter, the gate runs before precedence, so a read whose only de
+  novo placement was on an excluded genome keeps its reference placement instead of being
+  lost from both arms.
+
+  **A deprecated assembly run is refused as a de novo arm**, naming its `superseded_by`
+  replacement. Nothing else on this path refused one: a deprecated run stays listed and
+  its genomes stay on the map, so neither the alignment nor the map distinguishes a
+  withdrawn computation from a current one. Both drivers apply it —
+  `denovo_assembly_deprecation_error` is the shared wording, the resolver reading the row
+  from Postgres and the client recipe from `GET /processing/{processing_idx}`.
+
+  **A run with any unscored MAG or LCG subject is also refused at submit** rather than
+  gated, because the predicate is the positive form and excludes a NULL at every bound.
+  `checkm.sh` scored only the refined bins until circular genomes were added to it, while
+  membership wrote every class, so a run at a version predating that carries MAG/LCG
+  subjects with no `bin_quality` row. Those runs are deprecated, so the refusal above
+  turns them away first; every enabled assembly version now scores all three classes,
+  which leaves this one a backstop against a run whose subjects and scores disagree.
+
+  The client-side `qiita feature-table build --denovo-alignment-idx` is not score-gated:
+  `bin_quality` is un-mintable over HTTP, so a PAT cannot reach the scores. The
+  `analytic` package docstring records that divergence. Deprecation status is not
+  privileged that way, which is why that half is checked on both sides.
+
+- **A study can declare that a study-local field's values identify its samples,
+  and can change that declaration later (#562).** `unique_in_study` on
+  `biosample_study_field` / `prep_sample_study_field` makes the database reject a
+  duplicate value within the study and reject a missing-value marker outright.
+  It is settable on create and on edit, comes back on every field read,
+  and is refused for a globally-linked field and for the closed value sets (boolean,
+  terminology) with a per-field 422 naming the rule. Enforcement follows the current
+  policy rather than the one the field was minted with: a trigger mirrors a change
+  onto every metadata row already written through the field. Switching it on over
+  values that already repeat answers 409, over a sample with a missing value answers
+  422, and either way the change rolls back whole. Uniqueness is case-sensitive and
+  scoped to one study: two studies may hold the same value through their own local
+  fields. Defaults false, so existing fields are unaffected. Editing a field also needs
+  a tag to edit against, so field reads and creates now carry an `ETag` and
+  `updated_at`, and `GET /api/v1/study/{study_idx}/biosample-field/{study_field_idx}`
+  and its prep-sample twin serve one definition at the same viewer floor as the list
+  route. `data_type` and the global-field link stay immutable, since changing either
+  rewrites the meaning of every value already stored. A field holding a value on a
+  published sample refuses a policy change in either direction: publication freezes
+  the policy along with the values it governs.
+
+- **A biosample's owner-submitted identifier must be unique within the study-local
+  field recording it (#562).** The import mints the owner-id field declaring that
+  policy, and refuses to write through a field of that name that does not declare it —
+  a field guaranteeing no distinctness cannot serve as the identifier a study names its
+  samples by. A field of that name storing anything other than text is refused for a
+  related reason, rather than coercing the identifier into a shape its owner did not
+  submit. A second biosample claiming an identifier that field already holds is refused
+  and told which value repeated. A study may record owner ids through more than one
+  local field — contributors arrive under different column names — so the same
+  identifier through a different field, or in a different study, is untouched. Owner-id
+  fields minted before this rule are brought up to it by migration, which aborts rather
+  than picking a winner when a field's existing values cannot satisfy the policy.
+- **The genome map is served as Parquet from a sibling route, so a large reference
+  is no longer unbuildable (#550).** `GET /reference/{idx}/genome-map` caps at 250,000
+  entries and 413s above it; both genome-bearing references on the deploy are past
+  that (421,717 and 392,122 pairs), so the client-side `feature-table build` recipe
+  could not obtain the lookup it joins every downstream step against. Adds
+  `GET /reference/{idx}/genome-map/parquet` and the de novo twin
+  `GET /assembly/{prep_sample_idx}/{processing_idx}/genome-map/parquet`, both uncapped,
+  both projecting shared SQL text so the compute-side Parquet, the JSON map and the
+  count cannot disagree about which features have genomes. The JSON routes, their cap
+  and their 413 are unchanged, and the cap is not raised — the Parquet form needs none,
+  for the reason `actions.library._genome_map_parquet_body` gives. Measured on 392,122
+  pairs at the deploy's shape: ~3.5 MB of Parquet at ~100 MB peak RSS, against ~290 MB
+  for the JSON route's capped fetch, which then 413s — the JSON figure is fixed by the
+  cap and the Parquet one grows with the reference, so that comparison reverses on a
+  large enough map (`docs/architecture/flight.md` carries both measured points). Arrow
+  IPC was measured and rejected. The CLI reads the new form, bounding the transfer with
+  an observed-rate floor rather than a fixed timeout.
+  `docs/architecture/flight.md` carries the three-class rule for when a control-plane
+  read may ship a columnar body at all. `docs/auth.md` gains the `### Assembly` endpoint
+  section it never had — all four routes, plus the run-state `404` / `409` gate the three
+  run-scoped ones share.
+
+- **One genome per assembled subject is now a database constraint
+  (#534).** `qiita.assembly_membership.genome_idx` is minted
+  per `(prep_sample_idx, processing_idx, kind, bin_id)` and stamped onto every contig
+  row of that subject, and nothing checked that the rows agreed — the column's own
+  comment said so, and every reader rolling contigs up to subjects carried a `DISTINCT`
+  as a stand-in. A violation is not a duplicate row: it is a join to per-subject data
+  fanning out to two rows for one genome, silently, which the `bin_quality` join added
+  in this PR is the first reader to be exposed to. `EXCLUDE USING gist` rather than a
+  unique index, because the invariant is "rows agreeing on the subject may not disagree
+  on the genome" — a `<>` comparison, outside what a unique index can express. NULL
+  stays unconstrained: it is what a pre-mint row carries and what the sequenced-pool
+  delete writes before dropping a genome.
+
+- **`bin_quality` is reachable from `estimate-feature-table`: the assembled genomes'
+  completeness and contamination now reach the de novo arm
+  (#534).** CheckM's per-subject scores had no reader —
+  written to DuckLake by `assembly_load`, replaced on its run key by `register-files`,
+  and read by nothing. A quality gate on the de novo feature table had no path to its
+  own input, by either the streamed or the staged route.
+
+  No store holds the join. The scores are keyed `(prep_sample_idx, processing_idx,
+  kind, bin_id)` — the subject CheckM scored, with no `feature_idx` — and a feature
+  table is keyed `genome_idx`, which exists only on the Postgres
+  `qiita.assembly_membership`. Joining the streamed rows through `feature_idx` instead
+  would give a wrong answer rather than a slower one wherever one contig carries two
+  genomes of one run: the contig-keyed map cannot say which subject a score belongs to.
+
+  So the bridge is read from Postgres and the join happens control-plane side, at
+  submit. `bin_quality` joins `ALLOWED_TABLES`, refused by `build_bin_quality_query`
+  unless the filter is exactly one `processing_idx` over a non-empty cohort — either
+  half alone widens past the run. `fetch_assembly_genome_subject` reads the run's
+  `(prep_sample_idx, kind, bin_id, genome_idx)` subjects under the predicate the de
+  novo map already uses, so the two cannot disagree about which genomes exist. The
+  feature-table resolver signs its own ticket, DoGets the scores, LEFT-joins the two
+  in DuckDB and writes `denovo_genome_quality.parquet` beside the map it already
+  stages; the job reads it as `denovo_genome_quality_path` and stages
+  `DENOVO_GENOME_QUALITY_TABLE`.
+
+  **LEFT, and the scores stay nullable.** `bin_quality` is written empty-with-schema
+  when CheckM scored nothing, and its writer skips a class whose tool output is
+  absent, so a subject with no quality row is an ordinary outcome. An inner join would
+  shorten the genome set against the map it must agree with, and a COALESCE would turn
+  "nobody measured this" into "this measured zero". What a predicate does with an
+  unscored genome is left to the reader rather than settled here by omission.
+
+  No route mints a `bin_quality` ticket: it is on both allowlists and absent from
+  `ASSEMBLY_DOGET_TABLES`, so the resolver is the only path to the table. Nothing
+  gates on the scores yet. The source is the lake rather than a new Postgres twin, so
+  the scores of runs already assembled are reachable without anything being rebuilt.
+
+  Sized against the deploy (2026-09-04): the whole lake holds 23,027 `bin_quality`
+  rows, ~2.2 MB, largest single run 9,030 — so the resolver reads a cohort whole
+  rather than streaming it, and the UNBINNED rows it fetches and then drops are 5.6%
+  of that. Those 23,027 rows carry 23,027 distinct subject keys, so the one-row-per-
+  subject assumption the join rests on has never been violated in production.
+
+  Three things it cleaned up on the way past. The `bin_quality` staging Parquet's
+  twelve columns are now one ordered `(name, type)` constant in `qiita-common`, pinned
+  against the lake DDL by a test that reads the Rust — the writer and the schema it
+  writes into previously shared nothing but a comment saying they must agree. The two
+  near-identical `export_*_genome` Parquet writers now share
+  `_export_query_to_parquet`, differing only in SQL, params and schema. And the
+  `REPLACE_KEY_TABLES` note saying `bin_quality` borrows its delete key "because CheckM
+  covers refined bins only" was stale — CheckM scores three kinds in three passes; the
+  reason the borrow is needed is that ALL of them can be empty at once.
+
+- **`GET /sequencing-run/{idx}/sequenced-pool` and `qiita sequenced-pool list` — a
+  `sequenced_pool_idx` can now be read out (#530).** Every pool-scoped surface takes a
+  `sequenced_pool_idx` — `alignment list`, `pool-completion`, `submit-align-pool`, the pool
+  QC and completion reads — and nothing returned one: the path was registered `POST`-only,
+  `GET /sequencing-run/{idx}` carries no pool list, and the create's find-or-create is keyed
+  on the preflight *content*, so recovering an idx meant replaying the create with the
+  original bytes. Holding only a run, an operator could not name any of its pools without
+  reading `qiita.sequenced_pool` over psql on the deploy host. The listing returns stored
+  columns only — no `read_metrics`, which aggregates every constituent sequenced_sample and
+  would cost a scan per row; the single-pool read still carries it for the one pool picked
+  out of the list. `run_preflight_filename` labels a pool rather than keying it: both of the
+  run's uniqueness indexes are partial (`WHERE ... IS NOT NULL`), so a non-NULL filename is
+  unique within its run while no-preflight pools are distinguishable only by idx.
+  Gated on the run's creator (`require_caller_owns_run()`, wet_lab_admin+ bypass), as the POST
+  on this path and the aggregate reads under it are — see the `Changed` entry below.
+  `SequencedPoolResponse` now extends the new `SequencedPoolSummary` so the shared fields
+  have one definition. No new path constant — the `PATH_`/`URL_` pair already existed for
+  the POST.
+
+- **`qiita processing list` / `show` / `samples` — assembly-run discovery without psql
+  (#526).** `align-denovo` is submitted against a `processing_idx`, and until one has
+  already run against a given assembly there was no way to read one out: `qiita alignment
+  list` reports a de novo alignment's `processing_idx` in its `params`, but the FIRST
+  submission against a run had to find it with `SELECT processing_idx, params->>'assembler',
+  params->>'mask_idx' FROM qiita.processing` over a psql shell on the deploy host, which
+  needs `DATABASE_URL` and therefore an operator. The three GETs behind it already existed
+  at `Scope.PREP_SAMPLE_READ` (`routes/processing.py`); these are the client verbs over
+  them. `list` carries each run's `params` (which mask's pass-set, which assembler) and its
+  completed / pending / no_data / invalidated tally, which is the state `align-denovo`
+  admits or refuses a submission on; `samples` is the same gate per prep_sample. Thin
+  clients — one GET each, printed verbatim — so a new server field reaches the user
+  without a CLI change. The mask twin (`qiita mask list|show|samples`) is the shape, and
+  the two now cover both identities an `align-denovo` submission names.
+  `align-denovo`'s refusal for an absent selector now names the read that produces each
+  identity (`qiita processing list` / `qiita mask list`), so the verbs are found at the
+  moment the identity is wrong rather than only by knowing they exist — the shape
+  `qiita alignment list` already has in `cli/user/alignment.py`. The named commands are
+  fed to the CLI's own parser by the test, so a rename cannot leave the message and the
+  test agreeing on a verb that no longer exists. `filter_params` moved
+  from `cli/user/mask.py` to `cli/_common.py`, beside the `call` whose `params`
+  argument it builds, so the two modules share one copy.
+
 - **`POST /run-folder/inspect` lets a submit run from a machine that does not mount the
   cluster (#484).** `submit-bcl-convert` read `RunInfo.xml` and `submit-pacbio-ingest`
   globbed `*/hifi_reads/*.bam`, both on the submitting machine — which is why submitting
@@ -161,6 +410,66 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   deploy host `CONCOCT_bin.13_sub.fa` came back as `CONCOCT_bin.13_sub`, which is what lets a
   dotted hifiasm contig id (`s0.ctg000001c`) round-trip as its own `bin_id`. An id that cannot
   be a filename stem stops the step rather than being sanitized into one that joins nothing (#519).
+
+- **INSDC study import: `POST` / `GET /api/v1/ena-import-batch` (#369).** An
+  admin-only (wet_lab_admin / system_admin) call takes a list of INSDC study
+  accessions and returns 202 with a batch handle. New tables
+  `qiita.ena_import_batch` / `qiita.ena_import_batch_item` (TEXT/CHECK state, no
+  `CREATE TYPE`) track each accession independently through `pending ->
+  resolving -> registered -> downloading`, with `failed` reachable from each, so
+  one bad accession never affects its siblings. A background driver
+  (`ena_import.batch`) resolves, registers and submits up to four studies at a
+  time on its own tracked task set, drained at shutdown and re-driven at startup
+  by `reconcile_inflight_batches`; an item whose submitter has since been
+  disabled or retired fails with that reason rather than being re-driven. `GET`
+  rolls each downloading item's tickets up on demand to `done`, `downloading`, or
+  `failed` (a failed or cancelled ticket), and returns each ENA run's
+  registration outcome as `ena_runs`. An import only adds to a study an import
+  created (`ena_import_batch_item.study_created`, written in the same transaction
+  as the study), so a natively created study that was later deposited is refused
+  before anything is written. Re-importing an accession picks up the runs it
+  gained: registered runs are skipped, and new ones go into a new pool with its
+  own ticket whenever the existing pool's download is in flight or finished,
+  since a download reads its roster once. A failed or cancelled download is
+  resubmitted on re-import.
+- **INSDC metadata resolution and registration (`ena_import`) (#369).**
+  `MiintEnaResolver` reads a study's header, runs and sample attributes through
+  miint's `read_ena` / `read_ena_attributes` into the new
+  `qiita_common.models.ena` models, grouping attributes per sample in SQL; an
+  invalid or unresolvable accession raises. `register_ena_study` then writes, per
+  run in its own transaction so a failure is isolated to that run: a biosample
+  keyed on `ena_sample_accession` (one row across studies, created through
+  `import_biosample_from_owner_biosample_id` with ENA's `sample_alias` as the
+  owner biosample id, or the accession when ENA has none), bound to the
+  `ERC000011` checklist; a `prep_sample` / `sequenced_sample` carrying the ENA
+  experiment and run accessions; and one `sequencing_run` per `(study,
+  platform)`. `ena_import.attribute_mapping` maps the GSC-MIxS display names and
+  underscore short names for collection date, country/sea, latitude/longitude
+  and depth onto global fields; every other attribute is kept as study-local
+  TEXT, ENVO- and taxonomy-typed tags included, since ENA's values are submitter
+  free text. `host taxon id` is recorded as a missing-value marker.
+  `platform_mapping` and `protocol_mapping` map ENA's `instrument_platform` and
+  library strategy/source to `qiita.platform` and a curated `prep_protocol`,
+  failing the run on an unmappable value.
+- **`download-ena-study` workflow and `ingest_ena_reads` job (#369).** A
+  `sequenced_pool`-scoped workflow that downloads a pool's runs with miint's
+  `read_ena_sequences` and stores them once in the DuckLake `read` table, the
+  ENA analog of bcl-convert. The runner stages the pool's `{prep_sample_idx,
+  ena_run_accession}` roster from a live query (`ena_run_map`). The job opens a
+  fresh DuckDB connection per run so `miint_warnings()` covers only that run,
+  mints `sequence_idx` ranges through the CO→CP callback, and fails loud: a
+  transport-shaped error is the new retriable
+  `FailureKind.EXTERNAL_FETCH_TRANSIENT`, while a skip or truncation warning,
+  zero reads, or an md5 mismatch is permanent `BAD_INPUT`. md5 verification is
+  miint's `verify_md5`, on by default (duckdb-miint#172); a run whose md5 miint
+  could not check still registers.
+- **ENA import tests and runbook (#369).** `tests/integration/test_ena_import_e2e.py`
+  and `test_ena_ingest_e2e.py` run registration and the download job into a real
+  DuckLake `read` table; `test_ena_import_live_e2e.py` and
+  `test_ena_resolver_live.py` are `system`-gated tests against live ENA.
+  `docs/runbooks/ena-import.md` covers the REST surface, re-import, scope limits,
+  md5 verification and the network access imports need; `docs/architecture.md`
+  gains an ENA Study Import subsection.
 
 - **The assembler's per-contig report is stored, so circularity can become a query-time
   predicate instead of a routing decision baked into the entrypoint (#517).** Both arms of
@@ -1607,6 +1916,323 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **Work-ticket dispatch now has its own process-wide concurrency bound, so a burst of ticket submits can no longer starve the connection pool through dispatch alone (#598).**
+  `_STUDY_CONCURRENCY` releases its permit at submit, but the fire-and-forget
+  `schedule_dispatch` that submit starts keeps running, and acquiring connections, for
+  as long as the workflow does; `fanout_max_inflight` only caps fan-out cohorts, and an
+  ENA `download-ena-study` ticket is not one. Dispatch now runs under its own
+  semaphore, `_DISPATCH_CONCURRENCY` (8, sized against `PRODUCTION_POOL_MAX_SIZE` the
+  way `_STUDY_CONCURRENCY` is). A task holds its slot for its whole workflow, an
+  hours-long download poll included, so this also caps in-flight workflows
+  process-wide: tickets past the limit dispatch when a slot frees instead of all at
+  once, and log the wait at INFO while they queue.
+
+- **ENA import: close the race where a run added after its pool's download ticket read
+  the roster was never downloaded (#602)** — `register_ena_study` now holds the
+  sequencing_run pool-write advisory lock from pool resolution until its run inserts
+  commit (one transaction, savepoints per run), and the runner's dispatch-time roster
+  read (`_stage_ena_run_roster`) takes the same lock, so a roster read either waits
+  for the in-flight registration or the registration sees the covering ticket and
+  keeps its runs out of that pool. One transaction also makes a study
+  **all-or-nothing per attempt**: a failure or shutdown mid-study discards every run
+  it had written so far — recoverable, because `reconcile_inflight_batches`
+  re-registers idempotently — where runs used to bank one COMMIT at a time.
+- **Feature table: a de novo genome's pooled breadth of coverage counts other prep_samples' reads on contigs they also assembled, and both scopes call miint's coverage macros (#586).**
+  With a de novo arm, pooled coverage joined the contig→genome map on the prep_sample as
+  well as the contig, so a de novo genome saw only the reads of the prep_sample that
+  assembled it and pooled breadth equalled per-sample breadth. The de novo arm now calls
+  `genome_coverage` like the reference arm: a contig two cohort prep_samples assembled
+  gives both prep_samples' covered bases to each one's genome, so a combined table built
+  with pooled scope and a threshold above 0 can keep de novo genomes it used to drop.
+  Each de novo placement still counts only toward its own prep_sample's genome. The
+  pooled merge does not reconcile orientation: when a later assembly run stores a shared
+  contig as its reverse complement, prep_samples aligned before it keep positions on the
+  other axis, and that contig's pooled breadth can come out too high or too low
+  (`survivor_table_sql` in `qiita_common.analytic.coverage`).
+  `estimate_feature_table` always uses pooled, and `qiita feature-table build` defaults
+  to it. Per-sample coverage calls `genome_coverage_per_sample` on both arms in place of
+  Qiita's own copy of the arithmetic, with the same results. `qiita feature-table build
+  --coverage-scope per-sample` therefore needs a miint build that has
+  `genome_coverage_per_sample` (duckdb-miint#220, merged 2026-08-18). The client installs
+  miint once and never refreshes it, so a cache filled from an older build fails on the
+  missing function until the cached extension file is deleted and the next run
+  re-installs it; its path is the `install_path` that `duckdb_extensions()` reports for
+  `miint`.
+- **ENA import: a study findable only by its secondary accession (`ena_study_accession`) is now reused instead of failing with an opaque error, and a pair that resolves to a contradicting study now fails loud instead of reusing the wrong one (#590).**
+  `get_or_create_study_by_ena_accessions` looked up an existing study by
+  `bioproject_accession` only. A study recorded with an `ena_study_accession` but no
+  `bioproject_accession` was invisible to that lookup: re-importing it hit the
+  `ena_study_accession` unique constraint on create, then the same bioproject-only
+  refetch missed again and raised an opaque `PostgresError`. The find-or-create now
+  resolves an existing study by either accession, and raises a new
+  `EnaStudyAccessionConflictError` when the incoming pair identifies two different
+  studies, or contradicts the one study it does resolve to.
+  **Behavior change on already-deployed data:** a study whose two recorded accessions
+  contradict an incoming import's pair now fails that import item instead of silently
+  reusing the study.
+- **`ingest_ena_reads`'s md5-mismatch failure reason says how to tell a corrupted download from a digest ENA itself publishes wrong, instead of blaming "data corruption" (#591).**
+  The old wording named one cause among several and pointed at a re-queue a permanent
+  failure never reaches. The message now tells the operator to compare the run's
+  `fastq_md5` in the ENA Portal API against the value in the error: equal means ENA's own
+  file disagrees with its digest and a re-import fails identically, different means the
+  download was corrupted and a re-import retries it. The classification stays `BAD_INPUT`,
+  now as a stated choice rather than a claim about retries — miint raises the same error
+  for both causes ([duckdb-miint#274](https://github.com/the-miint/duckdb-miint/issues/274)),
+  and #595 tracks revisiting it.
+- **The `miint-sequence-split`, `miint-host-filter-fns`, `miint-infer-trim`, and `miint-gpl-boundary` compute-readiness probes now report contract drift under `python -O` / `PYTHONOPTIMIZE`, where they previously reported ok (#592).**
+  Each probe signaled the contract drift it exists to catch with a bare `assert`,
+  which `python -O` (or `PYTHONOPTIMIZE` set anywhere in the SLURM job env) strips —
+  the probe then exited 0 and printed nothing on exactly the drift it was checking
+  for. Each now raises `RuntimeError` from an explicit `if`, independent of the
+  interpreter's optimize level.
+- **ENA import: the batch concurrency bound is process-wide instead of per-batch, so several batches submitted together no longer starve the connection pool (#593).**
+  `_run_batch` built its own `asyncio.Semaphore(_STUDY_CONCURRENCY)` per call, so N
+  concurrently-scheduled batches could together claim up to N × `_STUDY_CONCURRENCY`
+  connections -- enough to take every connection the pool has, leaving unrelated
+  callers queued behind them. `schedule_ena_import_batch` now reads one semaphore off
+  `app.state`, shared first-come-first-served by every in-flight batch;
+  `_STUDY_CONCURRENCY` stays 4. The bound covers resolve, register, and ticket submit;
+  the fire-and-forget `schedule_dispatch` each submitted ticket starts still runs
+  outside it.
+- **Reference load: a genome map is checked against the reference FASTA before anything is minted, so a map whose read_ids match no FASTA sequence fails and a partial match logs what went unmatched (#577).**
+  `_associate_genomes` INNER-JOINed the genome map onto the manifest's `read_id`, silently
+  dropping every map row whose `read_id` isn't a FASTA sequence ID. `mint-features` now
+  checks the map first: if no `read_id` matches, the step fails before any `qiita.feature`
+  row is written, naming a few of the unmatched IDs. For a `shard_index=true` load this
+  replaces the later `plan-shards` N=0 failure; an unsharded load, which used to succeed
+  with no genome associations, now fails. A partial match still loads and logs a warning
+  with the work ticket, the unmatched `read_id` count and a few examples. The genome map
+  must also carry a `read_id` column with no NULLs.
+- **ENA import: a cross-batch race that minted a duplicate `sequencing_run` pool (and a redundant `download-ena-study` ticket) for a `(study, platform)` is serialized (#575).**
+  `_resolve_platform_pools` was a SELECT-then-INSERT with no arbitrating constraint on the
+  no-preflight pool path, so two concurrent batches for the same `(study, platform)` each
+  created a pool. The get-or-create now holds a transaction-level advisory key on the
+  `sequencing_run` idx: the second writer blocks, re-reads pool state, and reuses the pool
+  the first created. A batch whose download-ticket submit 409s because a concurrent batch
+  already submitted one for the pool now reuses that ticket instead of failing the item.
+- **`align/1.0.0`'s walltime ceiling is PT16H, above the PT8H its `align_sharded` blocks
+  kept timing out at (#563).** Walltime escalation doubles on each TIMEOUT and clamps to
+  the ceiling, so with a PT8H ceiling a block that needed more than 8 h failed its ticket
+  permanently as walltime-ceiling exhausted. The `align_sharded` baseline stays PT4H, so
+  ordinary tickets request the same walltime as before. A redriven ticket starts at its
+  persisted escalated floor, so a block that already reached PT8H runs once more at PT8H
+  before escalating to PT16H.
+- **long-read-assembly: binning no longer fails when MetaBAT2 forms no bins and MaxBin2 declines the assembly (#561).**
+  metaWRAP exits non-zero when any binner fails, and MaxBin2 fails on an assembly whose
+  contigs carry too few marker genes, so a prep_sample with such an assembly failed the
+  `binning` step and its contigs were never registered. `binning.sh` now copies metaWRAP's
+  stdout and, when it shows that MetaBAT2 formed no bins and MaxBin2 found the dataset
+  cannot be binned, finishes the step with no bins for `bin_refine`. Any other metaWRAP
+  failure still fails the step, now with a line on stderr naming metaWRAP, so the ticket's
+  stored failure reason says which tool failed and where its messages are.
+- **A work ticket that registers the same reads twice no longer stores them twice (#559).**
+  A ticket re-runs a step in a new `attempt-N` directory, so a second `register_files` for
+  the same reads arrived from a new staging dir, got a new lake filename, and was appended
+  to `read`: 5 rows became 10 in the reproducing test. `register_files` now reads which
+  prep_samples the staged `read` files hold and, in the registration transaction, deletes
+  the rows the same ticket registered for them before; the count comes back in `replaced`.
+  Rows other tickets registered are not touched.
+- **Three cross-references named things that do not exist (#538).**
+  `build_minimap2_index`'s module docstring said its two modes mirror `build_rype_index`,
+  which is whole-reference only and has no shard mode; the comment above its shard `plan()`
+  sizing, and `build_bowtie2_index`'s twin, both said they mirror `build_rype_index`, which
+  defines no `plan()`. `jobs/_feature_load.py` cited
+  `miint-localdocs/sequence-chunking-assessment.md` for a benchmark — a path that is not in
+  this repo, its parent, or anywhere on the machine; the two measurements it was cited for
+  are stated in the same paragraph, so the dead pointer is dropped rather than replaced.
+  `test_masked_export_fastq_contract.py` cited upstream `docs/copy-formats.md`, which
+  `docs/duckdb-miint.md` lists among the files that reorg split up or renamed. Upstream's
+  rendered `writing/` page carries the FASTQ writer and the `read_id` / `sequence1` /
+  `qual1` column contract this test pins, so that is where the comment now links.
+- **Two workflow YAMLs stated a DuckDB cap that had been lowered under them (#538).**
+  `host-reference-add` and `local-host-reference-add` both said `build_rype_index` "hard-caps
+  DuckDB at 30 GB". The cap is `_DUCKDB_MEMORY_CAP_GB` = 8; 30 is `_RYPE_MAX_MEMORY_GB`,
+  rype's floor. The commit that lowered the cap updated the module, changelog, checklist and
+  test but not the YAMLs, and the module comment already called 30 "the old ~30 GB cap".
+  Both now point at the constant instead of restating it.
+- **`build_bowtie2_index` and `build_rype_index` had no cpu pin (#538).** Four steps pinned
+  their `cpu:` against the module's `_DUCKDB_THREADS`; these two did not, so the YAML and
+  the thread pool could drift with nothing failing at runtime. bowtie2 takes the equality
+  form the aligner pins use (4 == 4 today); rype takes a bound (`cpu <= _DUCKDB_THREADS`),
+  because its two workflows disagree — `host-reference-add` runs it at 4 and
+  `local-host-reference-add` at 8 against a pool of 8 — and whether rype's build
+  parallelism derives from that pool has not been probed, so there is no measurement to
+  pin an equality to.
+- **The `assemble` 259.3 GiB peak is now attributed (#538).** The workflow comment placed
+  it in the hifiasm_meta paragraph and said "a sample in that class", which the recorded
+  figure did not support — it carried no assembler, input scale, or censoring status.
+  Settled against the deploy: `assembler` is a closed two-value enum defaulting to
+  hifiasm_meta, and no `1.0.0` work ticket ever recorded myloasm (its first run is
+  2026-09-02, under `1.0.1`) — so with the only alternative ruled out, every `1.0.0`
+  assemble ran hifiasm_meta whether the key was recorded or defaulted. So the peak is
+  hifiasm_meta's and does bound the 250 GiB profile. That matters because `assemble` is
+  now sized per assembler: 259.3 constrains the hifiasm_meta profile alone and says
+  nothing about myloasm's 128. The comment states the trade it implies — 250 is knowingly
+  below a hifiasm_meta peak, and covering it would take 260, whose `260 * 1024 * 2`
+  exceeds the node, dropping the step from two per node to one; one escalation rung for
+  the tail is taken over halving occupancy for every sample that is not in it. It also
+  says what stays unrecoverable: the input scale behind the peak, whose `sacct` rows are
+  gone and which is not reachable from the orchestrator host in any case.
+- **`_baseline_cpu_every_version`'s docstring credited the wrong site for a guard (#538).**
+  It said the caller asserts the result is non-empty; the helper raises on it itself, and
+  no caller checked. The behaviour was right and the attribution wrong, which would have
+  sent the next reader adding a guard that already exists.
+
+- **The documented identifier hierarchy named identifiers that do not exist (#535).**
+  `docs/architecture/cross-cutting.md` gave the chain as `study_idx -> prep_idx ->
+  sample_idx -> prep_sample_idx -> processing_idx -> processed_prep_sample_idx`. Of those,
+  `sample_idx` has no column in any migration and no `qiita.sample` table — the level it
+  names is `biosample_idx`, a direct FK from `prep_sample`; `processed_prep_sample_idx` is
+  unbuilt, the only migration mention being a comment recording it as deferred; and
+  `prep_idx` is a `qiita.work_ticket` scope column that `data-model.md` already calls
+  vestigial. `study_idx` and `processing_idx` are real but are not levels either — the
+  first attaches through a many-to-many junction, the second is a params-hash identity with
+  no FK to `prep_sample`. The section now states the one containment it can support and
+  names the rest as what they are.
+
+  The same section said result Parquets are verified for identifier sort order before
+  registration. Nothing verifies the sort: the gates in `slurm/verify.py` are a manifest,
+  per-file `size_bytes`, and mode `0o440`, and only the SLURM backend runs them —
+  `LocalBackend` runs none. Two sites that pointed at the retracted contract now match it:
+  `docs/writing-a-job.md`, which sent job authors here for "the canonical sort order", and
+  this file's own `result_step` line, which claimed identifier-integrity verification. The
+  `read` DDL comment in `ducklake.rs` no longer contrasts its sort against a canonical
+  order that no doc lists.
+
+  `data-model.md`, `processing.md` and the two component READMEs still carry the older
+  claims. Reconciling them is its own change, and `cross-cutting.md` says so rather than
+  leaving the disagreement silent.
+
+- **`build_minimap2_index`'s `cpu: 1` was justified from the first ~1.4 hours of the
+  reference-18 build, and the figures characterising that step were wrong (#536).** The
+  68-run slice behind it spans 09:41 to 11:07 of a build that ran to the next morning;
+  re-pulled `sacct` for all 987 shard builds. CPU efficiency is p50 4.3% / max 28.0%, not
+  p50 2.1% / max 13.9%, and 167 of the 987 exceed the figure given as the maximum. The
+  derived "0.56 cores maximum average demand, which one covers" is 1.12 cores — above the
+  single core the step now gets. `MaxRSS` max is 17.1 GiB, not 11.0. The elapsed tail the
+  comment weighed against PT2H (p50 14.5, p90 30.7, p99 65.2, max 92.3 min) was itself
+  correct but belongs to `build_bowtie2_index`, the sibling step, which keeps `cpu: 4`;
+  this step's own elapsed is p50 2.5, p99 10.0, max 23.9 min. Those four figures moved
+  onto `build_bowtie2_index`'s `baseline_resources`, which carried no evidence at all.
+
+  The pin itself stands, on a bound that does not depend on the 68-run slice being
+  representative: what one core must absorb is TotalCPU, which is p99 1.14 and max 1.45
+  min. Worst case at `cpu: 1` is `elapsed + 0.75 x TotalCPU`, peaking at 24.7 min over all
+  987 against the PT2H limit — none cross. Efficiency is the wrong axis because it falls
+  as elapsed rises — mean efficiency by elapsed decile drops monotonically from 13.7% to
+  1.7% — so the high ratios are all on short shards. Comment and test docstring rewritten
+  on that basis, and the shard-size distribution the comment called unmeasured was
+  measured: 82.2% of shards at 29 GiB.
+
+- **Read materialization signed its `export_read` token before the executor hop, so a wide
+  fan-out expired its own tokens (#532).** `_resolve_staged_reads` minted the token and only
+  then handed the Flight call to `run_in_executor(None, ...)`; asyncio's default
+  ThreadPoolExecutor holds `min(32, process_cpu_count() + 4)` threads, so a fan-out wider
+  than that queues, and the wait was spent against the token's own 300 s TTL. A read-mask submission of 56
+  prep_samples across two PacBio pools failed 24 tickets with
+  `FlightUnauthenticatedError: ... ticket expired`, all stamped within the same second as the
+  queue drained onto tokens that had already died. Minting now happens on the worker, through
+  one `run_signed_flight_call` seam applied at **all 15** sites that had this shape — three in
+  `runner/_read_ingest.py` (the `export_read` action, the shard-roster DoGet, the masked-read
+  stream), one in `runner/_reference.py`, and eleven in `actions/library.py`. The read-ingest
+  fan-out is only the path that got wide first; the rest carried the same 300 s exposure. One
+  was worse: `sync_reference_exclusion_data` minted inside a held advisory lock, so lock-wait
+  and queue-wait both burned the TTL — its Flight timeout is preserved through the conversion.
+  The seam lives in `auth/tickets.py`, beside the `DEFAULT_TTL_SECONDS` it exists to protect
+  and below all three minting layers: `runner` imports `actions`, so a home in either would
+  invert that. Not converted: `cli/reference_load.py`'s DoPut ticket is minted by the *server*
+  over HTTP, so there is no local mint to move, and its uploads are sequential (one caller, no
+  `gather`) with nothing to queue behind. The call's own duration was never counted against the TTL either
+  way: the data plane verifies at handler entry, before the export or the stream runs, which
+  is the property `routes/admin.py` already states for its 3600 s export tickets. So the TTL
+  now spans mint to verify and nothing else, and `DEFAULT_TTL_SECONDS` is unchanged — raising
+  it would only move the width at which this reappears. A `ThreadPoolExecutor` subclass that
+  advances a fake `auth.tickets` clock past the TTL on submit pins it without a real wait.
+- **An expired Flight token classified `BAD_INPUT` (#532).** `_is_retriable_dp_error`
+  recognized only a DuckLake serialization conflict and gRPC UNAVAILABLE, so the 24 tickets
+  above landed permanent. The next attempt mints a fresh token, which is the same self-healing
+  test those two already pass, so an expired token now classifies `DATA_PLANE_TRANSIENT`.
+  **Retriable does not mean retried here**, and the `retry_count 0` in the incident was not the
+  classification's doing: every caller is a pre-loop resolver, which runs before the step loop
+  and so never reaches `_run_entry_with_retry` — the two already-retriable causes are not
+  re-run in place either. What the label moves is where the ticket lands.
+  `notify.sweeper`'s owed set is `failure_type IS DISTINCT FROM 'retriable'`, so these are held
+  for an operator redrive rather than reported as a settled outcome; see the
+  `DEPLOY_CHECKLIST.md` note, since an originator whose whole batch fails this way now gets no
+  digest. Whether a pre-loop resolver should retry in place at all is a separate question this
+  does not answer. The match requires the gRPC unauthenticated marker AND the data plane's
+  `ticket expired` text: the class alone is too loose (every `AuthError` variant maps to that
+  one status, and `invalid signature` / `malformed payload` never self-heal), and the text
+  alone is too loose the other way ("ticket" names a work_ticket here too, and "work ticket
+  expired" contains it). Two tests parse the Rust: one pins the `AuthError::Expired` wording,
+  the other that all 14 `auth::verify_*` sites still map to `Status::unauthenticated`. An
+  integration test asserts the string that actually crosses Rust → gRPC → pyarrow carries both
+  markers, with a live-expiry control.
+- **A server-returned gRPC UNAVAILABLE would have classified permanent (#532).** Found probing
+  what pyarrow 23.0.1 renders, which it does two ways: a client-side connect failure gives
+  `Flight returned unavailable error, with message: failed to connect to all addresses…`, while
+  a status the server puts on the wire gives `<message>. Detail: Unavailable. gRPC client debug
+  context: …` with the error class name absent. All three existing
+  `_DP_UNAVAILABLE_SIGNATURES` match only the first form. Adds `detail: unavailable`.
+  **This is defensive, not a fix for an observed failure**: the data plane emits no
+  `Status::unavailable` of its own, and both transport cases reproduced (nothing listening, a
+  server that has gone away) render the connect-shaped form the existing signatures already
+  match — so nothing on this path has been shown to produce the second rendering. It is added
+  because the rendering is real and gRPC defines the status as retriable, so it must not
+  classify permanent on a stringification detail. The same probe is what confirmed the expiry
+  match fires on the string a live client produces rather than only on the fixture shape; both
+  renderings are now pinned, with controls that show each half of that match discriminates.
+
+- **`make test-workflows` ran apptainer on a host without it (#531).** The guard
+  `if ! command -v apptainer ...; exit 0; fi` sat on its own recipe line, and `exit 0`
+  ends only the line it is on — make moved to the next line and ran `apptainer build`
+  anyway, so a macOS run printed "apptainer not found — skipping workflow smoke tests"
+  and then failed with `make: apptainer: No such file or directory` (exit 2). CLAUDE.md
+  and `docs/container-images.md` both describe this target as skipping gracefully off
+  Linux. The guard and everything it guards are now one recipe line; the second half
+  needed it too, since it reaches apptainer through `scripts/build-sif.sh`. `set -e` still
+  propagates a real build failure as the recipe's exit status (the `EXIT` trap's `rm -rf`
+  does not clobber it — checked under `/bin/sh`, which is the shell make uses here, against
+  a trap-free control). One recipe line means one `@`, which would have dropped the
+  per-command trace make printed by echoing each line, so the recipe now sets `-x` after
+  the guard: the skip path stays quiet and CI still shows which command failed.
+- **`_baseline_cpu_every_version` would raise a bare `KeyError` on a `profiles:` step
+  (#531).** The workflow-param pin helper read `baseline_resources["cpu"]`, which exists
+  only on the flat population, so a pin newly placed on a lookup step would get
+  `KeyError: 'cpu'`, naming neither the workflow nor the step. Every pin sits on a flat
+  step today, so this had not fired. It now resolves through
+  `ActionDefinition._labelled_baselines()` — the model the runner dispatches on, which
+  already emits one pair for a flat population and one per profile for a lookup — rather
+  than carrying a second copy of that rule here, free to drift from it. A test reads both
+  populations out of `long-read-assembly` (1.0.0's `assemble` is flat, 1.0.1's is the
+  per-assembler lookup), which keeps the lookup branch exercised while every pin still sits
+  on a flat step. The helper's own duplicate-step assertion went with the rewrite:
+  `ActionDefinition` rejects duplicate step names itself, so it was unreachable.
+- **Stale comments corrected (#531).** `build_minimap2_index.plan()` said it mirrors
+  `build_rype_index.plan()`, which does not exist — the mutual reference is with
+  `build_bowtie2_index.plan()`, which points back at it. `shard_planner` called the
+  ingest-time wiring "a later milestone" when `actions.library.plan_shards` does exactly
+  the four things it lists. `_resolve_reference_index_path` said all `reference_index` rows
+  carry a NULL `shard_id` "so this is a no-op", and that shard-aware resolution "is a later
+  milestone and is deliberately NOT built here" — `actions.library.register_index` writes
+  rows with a `shard_id`, and `_resolve_sharded_align_indexes` sits in the same module.
+  `test_shard_planner.py` and `test_shard_assignment.py` carried the same "later milestone"
+  sentence and are corrected with it. `FlatBaselineResources` said `profiles` holds "one
+  profile per instrument family", which `long-read-assembly` 1.0.1 contradicts — its
+  profiles are per assembler — so it now names the mechanism instead of one workflow's
+  key.
+- **Development-plan vocabulary removed from comments (#531).** "A4" (nine sites across
+  `actions.py`, `bcl-convert/1.0.0.yaml`, `bcl_convert_prep.py`,
+  `sequencer_types.yml`, `test_runner_baseline.py` and `test_actions_loader.py`), "Phase 5"
+  (`step_progress.py`, `slurm.py`) and "Phase 2" (`test_qc_miint_contract.py`) name
+  planning documents that are not in the repo, which CLAUDE.md forbids — including in test
+  docstrings, which that rule names explicitly. The surrounding words already carried the
+  meaning. The `Phase 1` / `Phase 2` comments in `_feature_load.py`, `align_sharded.py` and
+  `test_align_sharded.py` are left alone: they number the stages of an algorithm, not a
+  milestone. The tenth site, `bcl-convert/entrypoint.sh`, is left for a different reason:
+  it is a SIF build input (`qiita_sif_build_inputs_hash`), so editing the comment would
+  change the build hash and rebuild that image on the next deploy.
 
 - **A paired-end read submission can no longer cross routes (#484).** The exactly-one
   constraint on `fastq-to-parquet` was per key, not per family: it stopped the forward read
@@ -3161,6 +3787,216 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **The ENA ingestion path names the `biosample_global_field` display names it writes as
+  constants instead of literals (#589).** `collection date`, the three geographic-location
+  fields, `depth`, and `host taxon id` are now `BIOSAMPLE_DISPLAY_*` in
+  `qiita_common.models.biosample`, re-exported from `qiita_common.models`.
+  `attribute_mapping.py` and `harmonization.py` emit them; the normalized-tag lookup keys
+  in `attribute_mapping.py` are unaffected. No behavior change.
+
+- **`align/1.0.0`'s memory ceiling is 128 GB, above the `align_sharded` step's
+  unchanged 64 GB baseline (#560).** With the ceiling equal to the baseline, OOM
+  escalation had no larger size to grow to, so the step's first OOM failed its ticket
+  permanently. The first OOM now retries at 128 GB; an OOM at 128 GB still fails the
+  ticket. `align_sharded` defines no `plan()`, so ordinary tickets still request 64 GB.
+
+- **`analytic/reconcile.py`'s de novo map docstrings cite `qiita.assembly_membership`
+  on the deploy instead of an unprobed assembler behaviour (#558).**
+  `denovo_map_table_sql` no longer says an assembler can emit one sequence as both a
+  circular LCG and a refined bin's member; on 2026-09-10 the table held one row per
+  (prep_sample, assembly run, contig) triple, so no contig sat under two subjects of
+  one prep_sample's run, though 364 of that table's 400 (prep_sample, assembly run)
+  pairs held LCG rows and MAG rows — evidence the case does not arise in practice, not
+  a proof it cannot. Its one-run scoping paragraph and `denovo_map_join` gain that
+  date's repeat figures: 866,345 triples beyond one per (prep_sample, contig) pair,
+  and 77 contigs under two or more prep_samples of one run.
+  `export_assembly_member_genome`'s docstring drops "legitimately", and the
+  `bin_quality` entry under Added no longer states the assembler behaviour.
+  Comment-only.
+
+- **`long-read-assembly/1.0.1` resource baselines are sized from its three cohorts of
+  runs, and `binning.sh` derives metaWRAP's `-m` from the allocation (#557).**
+  `bin_refine` mem_gb 32 → 12 and walltime PT4H → PT2H30M (peak 6.78 GiB, longest run
+  1:12:17); `checkm` walltime PT4H → PT3H (longest run 2:03:10); `binning` mem_gb 100 →
+  80 and walltime PT8H → PT12H (longest run 7:44:43, 97% of the PT8H it replaces), where
+  80 is 1.42x the latest cohort's 56.16 GiB peak and below one earlier run's 82.77 GiB;
+  the `assemble` step's myloasm profile walltime PT16H → PT15H (longest run 7:05:35). CPU
+  counts, `assemble`'s and `checkm`'s memory, and the hifiasm_meta profile are unchanged.
+  On a standard node `binning` and `bin_refine` stay cpu-bound after their memory cuts, so
+  neither admits more runs of itself; each releases node memory to other steps.
+  `binning.sh` passes metaWRAP `-m` as the step's `MEM_MB` less 10 GB rather than a
+  literal, so a per-run `--mem-gb` or an OOM escalation raises the `-m` metaWRAP is given
+  along with the allocation. 1.0.0 shares the binning image; at its 100 GB baseline it is
+  `-m 90`.
+
+- **The Python Parquet writers that spelled their codec inline now name the shared
+  constant (#550).** `PARQUET_COMPRESSION` / `PARQUET_COMPRESSION_INTERMEDIATE` were
+  added so the DuckDB `COPY` strings could interpolate rather than repeat a literal,
+  which left six `"zstd"` / `"snappy"` literals across `actions/library.py`,
+  `cli/admin/masked_export.py`, `cli/user/reference.py` and `runner/_read_ingest.py`.
+  Same codecs, no behaviour change, and no Parquet codec is now spelled inline in the
+  Python that writes Parquet. (The `FORMAT FASTQ` / `FASTA` / `BIOM` writers still name
+  `'gzip'` in their DuckDB `COPY` strings; those are a different question.)
+
+- **A run pre-flight is no longer modified by reading it.** kl-run-preflight's
+  file-opening entry point applied pending schema patches to the file it opened, so a
+  read of a schema-lagging pre-flight wrote it. That made a shared `644` pre-flight fail
+  outright with `attempt to write a readonly database`, and made pool identity unstable:
+  the CLI hashes the bytes *before* opening, pool identity is the SHA-256 of those bytes,
+  so a re-run hashed the *patched* file and minted a second pool instead of converging on
+  the first. The dependency now loads into a detached in-memory copy and the source is
+  never written, so re-running a submit converges and the operator work-around — copy the
+  file, `chmod u+w`, pre-apply patches, keep the patched copy for the life of the pool — is
+  gone from the PacBio ingest runbook. Reading a stored blob no longer round-trips through
+  a temp file either, on both the pool-roster read and the lane-update edit. Input that is
+  not a SQLite database now raises `ValueError` rather than `sqlite3.DatabaseError`; both
+  CLI readers surface it as the same single stderr line, and both server readers already
+  caught the pair. Because that is also the type `update_lane` raises to signal a bad
+  request, the lane-update route reads the stored blob through the same helper as the
+  roster read, which loads on context entry — so a blob that will not load stays a 5xx
+  instead of being mislabeled 422. (#541)
+
+- **`build_minimap2_index` sizes its DuckDB reserve per mode, and a shard build now
+  asks for 21 GiB instead of 29 (#538).** `_MINIMAP2_RESERVE_GB` was one constant applied
+  in both modes, and it was sized for the host case that introduced it — a genome-scale
+  human reference that OOMed in `stage_local_fasta`. Shard mode reused it a month later
+  as its `plan()` floor, so every shard of a many-genome catalogue was allocated against a
+  whole-human-genome envelope. It is now `_MINIMAP2_HOST_RESERVE_GB` (16, unchanged and
+  still unmeasured) and `_MINIMAP2_SHARD_RESERVE_GB` (8), selected by mode at the one
+  runtime site that carves it; the shard `plan()` floor drops 28 -> 20. The reserve bounds
+  DuckDB rather than minimap2 — it is the slack between DuckDB's limit and the allocation
+  — so lowering reserve and floor by the same 8 leaves a 1 Gbp shard's DuckDB limit at the
+  9 GB it had when the reference-18 MaxRSS was measured (p50 6.2, p90 10.3, max 17.1 GiB
+  over 987 builds); what goes is 8 GiB of slack neither side used. Memory is the binding
+  axis for this step's per-node concurrency, which rises from 15-17 to 21-23
+  depending on shard size. A shard build also gains a DuckDB cap
+  (`_MINIMAP2_SHARD_DUCKDB_CAP_GB` = 12, the largest limit the old arithmetic ever
+  produced), for the reason `build_rype_index` has one: `plan()` is applied as
+  `min(hint, baseline)`, so above the shard size where the hint stops binding a smaller
+  reserve would have handed DuckDB *more* inside an unchanged 32 GiB cgroup. Shards are
+  planned by count rather than by a bp budget, so that band is reachable as a catalogue
+  grows — reference-18 did not reach it. With the cap, DuckDB's limit is identical to
+  its previous value at every shard size and the allocation never rises; on an
+  OOM-escalated retry the added memory now reaches minimap2 rather than DuckDB's heap.
+  Host mode is uncapped, because there a `--mem-gb` override is meant to grow DuckDB's
+  genome-scale reassembly headroom. Two measurements these constants still owe — the
+  never-measured host reserve, and a shard build run with DuckDB's limit lifted so its
+  share and the index builder's can be told apart — are tracked in issue #537.
+
+  `build_bowtie2_index` takes the same treatment against its own measurement: reserve
+  16 -> 12, floor 28 -> 24, and the same cap. Its 987-build max was 21.9 GiB — 4.8 above
+  minimap2's — so a 1 Gbp shard lands at 25 GiB, 3.1 above that max, and its per-node
+  concurrency rises from 17 to 20.
+
+  What the cap does NOT do is bound the reassembly's working set, and it is not the
+  safe-because-windowed cap `build_rype_index` carries. `stage_subject`'s
+  `string_agg(chunk_data ORDER BY chunk_index) GROUP BY feature_idx` raises
+  `OutOfMemoryException` rather than spilling, probed against the DuckDB this repo
+  ships and pinned in `test_duckdb_memory_behavior.py` beside the two behaviours that
+  module already covers; it wants roughly 2.2x the chunk bytes as `memory_limit`
+  (3.6x at 0.25 GiB, 2.4x at 1 GiB, 2.2x at 4 GiB). So a 12 GB limit reassembles about
+  5 Gbp and no more, on the first attempt and on every retry. That ceiling is
+  pre-existing and unchanged: the old arithmetic reached the same 12 GB from a 4 Gbp
+  shard upward. Windowing the shard feed the way rype's is, is what would move it. Two tests pin
+  it: the modes must resolve different DuckDB limits, and the reserve and floor must move
+  together or the measurement stops transferring.
+- **A measured rationale is stated at one site, and the other copies point at it (#538).**
+  Twelve clusters restated the same resource fact in two to ten places each. The
+  escalation-ceiling rule is now stated once at the test that enforces it
+  (`test_every_shipped_step_can_escalate_on_both_retry_axes`) and pointed at from eight
+  workflow YAMLs; the node shape (`RealMemory=514000` MB / 64 cores, plus two highmem at
+  1546528) is stated once in `docs/runbooks/slurm-backend-setup.md` under a new **Node
+  shape** section, which the four sizing comments still needing it now point at;
+  `host_filter`'s measured 25.8 GiB peak moves to the module whose memory behaviour it
+  describes, replacing five copies in two framings. The per-workflow arithmetic each
+  comment actually computes stays where it is — only the shared fact moved.
+
+- **The data plane's prose says `prep_sample` where it means one (#535).**
+  146 sites across `flight_service.rs`, `ducklake.rs`, `auth.rs`, `config.rs` and the Rust
+  test module used the bare word "sample" for the entity the code keys on — mostly
+  comments, plus test bindings and assertion messages. 145 now say `prep_sample`; the
+  remaining one is the `sequenced_sample` noted below. The snake_case identifiers whose own
+  prose had come to say `prep_sample` were renamed with them — two test names
+  (`export_read_writes_prep_sample_parquet`,
+  `..._passes_every_block_prep_sample_into_the_macro`) and three test-local bindings
+  (`prep_sample_a`, `prep_sample_b`, `n_prep_samples`). The `alignment_sample` family is
+  untouched for two reasons: `qiita.alignment_sample` is a real table, and
+  `delete_alignment_sample` is a DoAction discriminator matched as a literal on both sides
+  of the wire (`flight_service.rs` against `actions/library.py`), so it is not free to
+  follow a table rename. The bare word is
+  ambiguous because the schema carries several sample-shaped entities — `qiita.biosample`,
+  `qiita.sequenced_sample`, `qiita.prep_sample` and the `mask_sample` / `alignment_sample`
+  gate rows — so a reader arriving from the control plane had no way to tell which one a
+  data-plane comment meant. Inside the data plane there was never any doubt:
+  `prep_sample_idx` is the only sample-family identifier it uses at all (351 uses), which
+  is exactly what let the prose drift free of the code.
+  Several docstrings used both spellings for one thing — `export_read_to_parquet` opened
+  "one prep_sample's reads" and then said "a sample with no stored reads", and
+  `delete_pool_reads` said "prep_samples" twice before "hundreds of samples". Behaviour is
+  unchanged: the only non-comment edit in production Rust is a `debug_assert!` message, and
+  the `ducklake.rs` edits inside SQL string literals are `--` comments the database
+  discards.
+  `sequenced sample` is left alone where it appears, and backticked at its one site:
+  `qiita.sequenced_sample` is the 1:1 `processing_kind = 'sequenced'` subtype of
+  `prep_sample`. The test helper `sample_batch()` is likewise untouched: it builds an
+  example RecordBatch and has nothing to do with the entity.
+
+- **The AGGREGATE sequencing-run and sequenced-pool reads admit the run's creator, not just
+  wet_lab_admin (#530).** `GET /sequencing-run/{R}` and the pool metadata, completion rollup
+  and work-ticket summary reads under it were gated `require_role_at_least(WET_LAB_ADMIN)`, so
+  a plain `user` who stood a run up could not read the run or any metric under it though they
+  could create both. Those four now use the `require_caller_owns_run()` the pool POST on the
+  same path already used: the creator reads what is under their run, wet_lab_admin+ still
+  reads any run via the guard's bypass, and because that bypass returns before any DB lookup
+  an admin sees `require_sequenced_pool_in_run`'s 404 / 422 unchanged.
+
+  **The two PER-SAMPLE reads under the same prefix deliberately did not move.** The QC report
+  and the sequenced-sample exceptions return a row per sequenced_sample with no per-study
+  narrowing — the exceptions rows carry `biosample_accession` and the ENA accessions — and a
+  multiplexed pool spans studies, with the wet lab loading other groups' samples onto a run
+  through the wet_lab_admin bypass on pool create and sample import. Admitting the run's
+  creator there would disclose per-sample data for studies they hold nothing on, so both keep
+  the wet_lab_admin floor and each carries the reasoning at its handler. Narrowing them to the
+  caller's readable samples the way the pool-ALIGNMENT reads do would change what `merged` and
+  `sample_count` aggregate over, so it is left as a separate decision. The alignment reads
+  themselves are untouched, and the three POSTs that mutate or launch compute (preflight
+  update-lane, block-mask plan, align plan) keep the wet_lab_admin floor: running work is not
+  reading it.
+
+- **`long-read-assembly` memory re-sized at three steps, and `assemble` is now
+  sized per assembler (#528).** `assembly_coverage` 64 → 96 GiB and `assembly_load`
+  16 → 32 rise off first-attempt failures; `assemble` splits into 250 GiB for
+  hifiasm_meta and 128 for myloasm — a reduction for the latter, whose peak RSS
+  across 16 completions never reached 94.58 where hifiasm_meta reaches 246.03.
+  Measured on the 1.0.1 re-run cohort (2026-09-02 to 09-03) from MaxRSS, counting
+  first-attempt failures only where a job actually ran at the YAML baseline. Each
+  step's comment carries its table and its sizing argument.
+
+  `assemble` resolves through a `profiles:` lookup, the mechanism `bcl-convert`
+  already uses for instrument model. It keys on `assembly_run_config`'s existing
+  `run_config` output rather than a new one, because a completed step's bindings
+  are rebuilt on resume from its manifest against the spec in force then — so a
+  newly declared output would raise for any in-flight ticket past that step. That
+  makes `run_config.json`'s serialized bytes a contract, pinned from both sides.
+
+  `assembly_load`'s failures were not cgroup kills: it raised a DuckDB
+  `OutOfMemoryException` holding 9.39 GiB of a 16 GiB allocation, against a limit
+  set to the allocation less an additive headroom that takes a quarter of a 16 GiB
+  step. Issue #288 tracks re-sizing that helper, which is what would let this come
+  back down.
+
+- **Reference-workflow resources corrected from the reference-18 build (#528).**
+  `build-shard-index`'s `build_minimap2_index` drops `cpu: 4` → `1` (CPU
+  efficiency p50 2.1%, max 13.9% over 68 shard builds — a maximum average demand
+  of 0.56 cores; the step is blocked on its data-plane stream, and its DuckDB
+  pool is a module constant this number never controlled). In
+  `local-reference-add`, `load` goes `PT24H` → `PT36H` (its one completing attempt
+  ran 22:25:50; no attempt of that build was observed hitting a walltime limit) and
+  `build_routing_index` goes `PT24H` → `PT12H` (7:34:02 and 8:04:07 are the only
+  two runs, at the cost of one more escalation rung above 24h). Memory is untouched
+  in all three: pegged at ReqMem on `load`, which bounds demand from below without
+  measuring it; never binding on `build_minimap2_index`; and unmeasured on
+  `build_routing_index`, which this only re-times.
 - **`ticket:doput` is now on the USER role ceiling (#484).** It was on the two admin
   ceilings and service accounts only, dating from when reference loading was the sole
   upload consumer. With host paths in `action_context` restricted to wet_lab_admin+, an
@@ -3214,6 +4050,31 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   comments (a new migration — the one that shipped them is merged). One assembly and one binner
   configuration, so this establishes that these tools preserve both shapes, not that a future
   version must.
+
+- **Work-ticket submission is callable without a request (#369).**
+  `routes.work_ticket.submit_work_ticket_core(app=, principal=, body=)` holds
+  `POST /work-ticket`'s gates, INSERT and dispatch, and the route calls it, so
+  the ENA batch driver submits tickets through the same audience and
+  disallow-without-delete checks. The compute-orchestrator 503 guard is one
+  `require_compute_backend_client(app)` used by both routes and the core.
+- **One human-user loader (#369).** `auth.principal.load_human_user` loads a
+  principal and refuses a missing, disabled or retired one with
+  `PrincipalUnusableError`, for callers with no request; the OIDC path maps it to
+  the same 401 detail as before.
+- **`insert_entity_to_study` takes `on_conflict` (#369).** `"raise"` (default)
+  or `"ignore"` (`ON CONFLICT DO NOTHING`), for linking an existing biosample to
+  another study.
+- **`httpfs` is installed and loaded with miint (#369).** `miint_install_sql` /
+  `miint_load_sql` include `httpfs`, which miint needs to reach the network.
+  `staging_is_current` reports a stage missing `httpfs` as stale, and
+  `make verify-deploy`'s `cp-miint` check LOADs it.
+- **`ingest_reads`' staging helpers are shared (#369).** Sorting, hardlinking,
+  per-slot DuckDB caps and the roster reader move to
+  `qiita_compute_orchestrator.read_staging`, used by `ingest_reads` and
+  `ingest_ena_reads`.
+- **`drain_running_dispatches` drains any tracked task set (#369).** New
+  `label` / `reconcile_note` parameters let shutdown drain the ENA batch tasks
+  with the same helper and timeout.
 
 - **`hifiasm_meta` is pinned, and an unrecognised GFA segment name now fails the `assemble`
   step (#517).** The pin is `hamtv0.3.5`, with both of the binary's internal version strings

@@ -49,7 +49,9 @@ _DEFAULT_CP_TO_CO_TOKEN_PATH = Path("/etc/qiita/cp-to-co.token")
 # so a 1000-shard build can't open ~1000 concurrent data-plane streams (the WOL3
 # incident). The default (mirrors the operator throttle that recovered reference
 # 16) lives in fanout_dispatch as the single source of truth; tune per deploy via
-# FANOUT_MAX_INFLIGHT once the data plane's headroom is known.
+# FANOUT_MAX_INFLIGHT once the data plane's headroom is known. A cohort gains
+# nothing above `dispatch._DISPATCH_CONCURRENCY` (8): its children dispatch
+# through the same shared process-wide slots, so they queue instead.
 _DEFAULT_FANOUT_MAX_INFLIGHT = DEFAULT_FANOUT_MAX_INFLIGHT
 
 

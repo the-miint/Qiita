@@ -19,23 +19,31 @@ description: >
   `qiita.genome` space, so the result is one table over both. Absent that key the
   behaviour is byte-identical to the reference-only form above.
 
+  The de novo arm's genomes are gated on their CheckM completeness / contamination
+  (`min_completeness` / `max_contamination`, both optional). The gate filters the map
+  the whole arm reads its genomes through; `analytic.denovo_map_statements` carries what
+  that reaches and what becomes of an excluded genome's reads. A run with any unscored
+  MAG/LCG subject is refused at submit rather than gated
+  (`runner/_feature_table.py`). Reference genomes carry no CheckM score and are not gated.
+
   Compute-on-demand by design: the table is deterministic but cohort-dependent
   (coverage pools over the sample set), so persisting would mean one artifact per
   sample-subset x threshold. No processing_idx / identity is minted, no DuckLake
   row is written, and the reference status is NOT transitioned (hence no
   success_status / register step) — this action's terminus is the emitted Parquet.
 
-  Inputs, three sources: the bulk `alignment` slice and the per-feature sequence
-  lengths STREAM from the data plane over Arrow Flight at job runtime (the job
-  mints its own short-TTL alignment DoGet ticket by work_ticket_idx; the CP
-  derives alignment_idx + the cohort from action_context). The one Postgres-only
-  input — the reference's `feature_idx -> genome_idx` map — is staged as a
-  workspace Parquet by the runner resolver (`runner/_feature_table.py`) before the
-  step loop; that resolver also validates the alignment's reference matches the
-  scope and refuses an incomplete cohort (any prep_sample not `completed` in
-  `alignment_sample`). `reference_idx` is the reference-scope scalar the framework
-  injects into the job (SCOPE_SCALARS_BY_KIND[reference]); only `coverage_threshold`
-  rides `params:`.
+  Inputs: the bulk `alignment` slice and the per-feature sequence lengths STREAM
+  from the data plane over Arrow Flight at job runtime (the job mints its own
+  short-TTL alignment DoGet ticket by work_ticket_idx; the CP derives alignment_idx
+  + the cohort from action_context). The reference's `feature_idx -> genome_idx`
+  map is staged as a workspace Parquet by the runner resolver
+  (`runner/_feature_table.py`) before the step loop; that resolver also validates
+  the alignment's reference matches the scope and refuses an incomplete cohort (any
+  prep_sample not `completed` in `alignment_sample`). The de novo arm adds two more
+  resolver-staged Parquets, one of them joining a lake read to a Postgres one.
+  `reference_idx` is the reference-scope scalar the framework injects into the job
+  (SCOPE_SCALARS_BY_KIND[reference]); `coverage_threshold` and the two quality bounds
+  ride `params:`.
 
 # reference:read — this action only READS reference metadata + the (host-depleted,
 # derived) alignment table to compute a transient table; it writes no reference
@@ -87,12 +95,26 @@ context_schema:
       type: number
       minimum: 0
       maximum: 1
+    # The de novo arm's quality gate, on CheckM's percentage scale. Both optional; an
+    # omitted key resolves to the job's `Inputs` default, the one place the literal
+    # lives. No `default:` here: two declared defaults can diverge, and nothing CP-side
+    # reads this one. `analytic.denovo_map_statements` carries what the gate does.
+    #
+    # Ignored by a reference-only ticket: a reference genome has no CheckM score.
+    min_completeness:
+      type: number
+      minimum: 0
+      maximum: 100
+    max_contamination:
+      type: number
+      minimum: 0
 
 steps:
   # The single native step. `genome_map_path` (the reference's feature->genome
   # map) is runner-bound before the loop (_resolve_feature_table_bindings, gated
-  # on this input + reference scope), and `denovo_genome_map_path` beside it when
-  # the context carries `denovo_alignment_idx`. `coverage_threshold` rides `params:`
+  # on this input + reference scope), and `denovo_genome_map_path` +
+  # `denovo_genome_quality_path` beside it when the context carries
+  # `denovo_alignment_idx`. `coverage_threshold` rides `params:`
   # (scalars can't ride `inputs:`). `reference_idx` + `work_ticket_idx` are
   # framework-injected. The job streams the alignment slice (minting its own
   # short-TTL DoGet by work_ticket_idx) + the reference lengths, runs the
@@ -104,12 +126,17 @@ steps:
     module: qiita_compute_orchestrator.jobs.estimate_feature_table
     inputs: [genome_map_path]
     # Bound only for a combined table, so declared optional: a reference-only
-    # ticket resolves no de novo map and the step must still be dispatchable.
-    optional_inputs: [denovo_genome_map_path]
+    # ticket resolves neither, and the step must still be dispatchable. The two
+    # are bound by one resolver pass, so the job refuses a ticket carrying the map
+    # without the quality rather than treating a whole run as unscored.
+    optional_inputs: [denovo_genome_map_path, denovo_genome_quality_path]
     # `denovo_processing_idx` is resolver-bound, not caller-supplied, and absent
-    # for a reference-only ticket — an unbound params key is skipped.
+    # for a reference-only ticket — an unbound params key is skipped. The two quality
+    # bounds are optional and skipped the same way.
     params: {coverage_threshold: coverage_threshold,
-             denovo_processing_idx: denovo_processing_idx}
+             denovo_processing_idx: denovo_processing_idx,
+             min_completeness: min_completeness,
+             max_contamination: max_contamination}
     outputs: [ogu_table]
     baseline_resources:
       cpu: 4

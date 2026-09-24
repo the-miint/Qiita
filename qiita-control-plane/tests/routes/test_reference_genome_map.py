@@ -1,4 +1,5 @@
-"""Route tests for GET /reference/{reference_idx}/genome-map.
+"""Route tests for GET /reference/{reference_idx}/genome-map and its uncapped
+Parquet sibling.
 
 The feature_idx → genome lookup the client-side feature-table recipe joins its
 alignment rows against. Unlike the genome-member read (one genome, many features)
@@ -8,14 +9,18 @@ silently dropped from the caller's roll-up, so a short map yields a wrong featur
 table rather than a partial one.
 
 The load-bearing test is `test_genome_map_agrees_with_export_member_genome` — the
-map and the Parquet the compute job already consumes must not disagree about
-which features have genomes.
+JSON map, the served Parquet, and the Parquet the compute job already consumes
+must not disagree about which features have genomes.
 """
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_REFERENCE_GENOME_MAP
+from qiita_common.api_paths import (
+    URL_REFERENCE_GENOME_MAP,
+    URL_REFERENCE_GENOME_MAP_PARQUET,
+)
 
 from qiita_control_plane.testing.db_seeds import (
     cleanup_reference_graph,
@@ -256,7 +261,21 @@ async def test_genome_map_agrees_with_export_member_genome(client, postgres_pool
         assert resp.status_code == 200, resp.text
         mapped = {(e["feature_idx"], e["genome_idx"]) for e in resp.json()["entries"]}
 
-        assert mapped == exported
+        # The third reader of the same row set: the Parquet body a client stages.
+        # It runs GENOME_MAP_ROWS_SQL, built from the same FROM/WHERE fragments
+        # the other two use, so this asserts the sharing holds end to end rather
+        # than trusting three docstrings to stay true.
+        pq_resp = await client.get(URL_REFERENCE_GENOME_MAP_PARQUET.format(reference_idx=ref))
+        assert pq_resp.status_code == 200, pq_resp.text
+        served = pq.read_table(pa.BufferReader(pa.py_buffer(pq_resp.content)))
+        as_parquet = set(
+            zip(
+                served.column("feature_idx").to_pylist(),
+                served.column("genome_idx").to_pylist(),
+            )
+        )
+
+        assert mapped == exported == as_parquet
         assert (orphan, g1) not in mapped and (orphan, g2) not in mapped
     finally:
         await cleanup_reference_graph(
@@ -287,4 +306,80 @@ async def test_genome_map_requires_auth(postgres_pool):
     app.state.pool = postgres_pool
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         resp = await ac.get(URL_REFERENCE_GENOME_MAP.format(reference_idx=1))
+    assert resp.status_code == 401, resp.text
+
+
+async def test_genome_map_parquet_serves_what_the_json_route_refuses(
+    client, postgres_pool, monkeypatch
+):
+    """ACCEPTANCE: above the JSON route's cap, Parquet still serves the whole map
+    and the JSON route's 413 is untouched.
+
+    The cap is monkeypatched rather than seeded past — 250,001 rows would make
+    this a slow test to assert a threshold, and the threshold is the same one
+    either way.
+    """
+    from qiita_control_plane.routes import reference as reference_routes
+
+    ref = await seed_bare_reference(postgres_pool, label="genome-map")
+    feats = [await seed_bare_feature(postgres_pool) for _ in range(3)]
+    genome, _ = await seed_genome(postgres_pool)
+    try:
+        for feat in feats:
+            await seed_feature_genome(postgres_pool, feature_idx=feat, genome_idx=genome)
+            await seed_reference_membership(postgres_pool, reference_idx=ref, feature_idx=feat)
+        monkeypatch.setattr(reference_routes, "GENOME_MAP_HARD_CAP", 1)
+
+        refused = await client.get(URL_REFERENCE_GENOME_MAP.format(reference_idx=ref))
+        assert refused.status_code == 413, refused.text
+        assert "3 entries" in refused.json()["detail"]
+
+        served = await client.get(URL_REFERENCE_GENOME_MAP_PARQUET.format(reference_idx=ref))
+        assert served.status_code == 200, served.text
+        table = pq.read_table(pa.BufferReader(pa.py_buffer(served.content)))
+        assert table.column("feature_idx").to_pylist() == sorted(feats)
+    finally:
+        await cleanup_reference_graph(
+            postgres_pool, reference_idx=ref, feature_idxs=feats, genome_idxs=[genome]
+        )
+
+
+async def test_genome_map_parquet_of_a_reference_with_no_genomes_is_typed_and_empty(
+    client, postgres_pool
+):
+    """A 16S reference legitimately has no genome-bearing features. That must be a
+    valid zero-row Parquet with the right column types, not an empty body — an
+    untyped or zero-byte file is what `read_parquet` chokes on at the client."""
+    ref = await seed_bare_reference(postgres_pool, label="genome-map")
+    feat = await seed_bare_feature(postgres_pool)
+    try:
+        await seed_reference_membership(postgres_pool, reference_idx=ref, feature_idx=feat)
+
+        resp = await client.get(URL_REFERENCE_GENOME_MAP_PARQUET.format(reference_idx=ref))
+        assert resp.status_code == 200, resp.text
+        table = pq.read_table(pa.BufferReader(pa.py_buffer(resp.content)))
+        assert table.num_rows == 0
+        assert table.schema.names == ["feature_idx", "genome_idx", "source", "source_id"]
+        assert table.schema.field("feature_idx").type == pa.int64()
+    finally:
+        await cleanup_reference_graph(
+            postgres_pool, reference_idx=ref, feature_idxs=[feat], genome_idxs=[]
+        )
+
+
+async def test_genome_map_parquet_unknown_reference_is_404(client):
+    """Same disclosure posture as the JSON route: an unknown reference is a 404,
+    distinguishable from a reference that genuinely maps nothing."""
+    resp = await client.get(URL_REFERENCE_GENOME_MAP_PARQUET.format(reference_idx=99_999_999))
+    assert resp.status_code == 404, resp.text
+
+
+async def test_genome_map_parquet_requires_auth(postgres_pool):
+    """Same gate as the JSON twin. The route serves the same rows under the same
+    scope, so an anonymous caller must get the same answer from both."""
+    from qiita_control_plane.main import app
+
+    app.state.pool = postgres_pool
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        resp = await ac.get(URL_REFERENCE_GENOME_MAP_PARQUET.format(reference_idx=1))
     assert resp.status_code == 401, resp.text

@@ -650,15 +650,9 @@ def test_every_library_primitive_step_declares_the_runner_contract_inputs(primit
 # worse defect, rejected unconditionally by the second test below, and nothing
 # here can absolve it.
 
-# Deliberate: the step's YAML carries the reasoning at `baseline_resources`, and
-# a new entry belongs here only with the same. `align_sharded` sizes miint's
-# shard concurrency off cpu, which is pinned to the ceiling by design, and its
-# memory is sized to the same budget. Only the memory arm is given up — walltime
-# keeps headroom (PT4H under PT8H), so a TIMEOUT still escalates, which is why
-# the entry names one axis and not both.
-_ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
-    "align:1.0.0": {"align_sharded": ("mem_gb",)},
-}
+# Deliberate: an entry belongs here only when the step's YAML carries the
+# reasoning at `baseline_resources`.
+_ESCALATION_ACCEPTS: dict[str, dict[str, tuple[str, ...]]] = {}
 
 # NOT accepts — a defect being tracked rather than fixed right now, listed so the
 # guard can land ahead of the re-sizing (which needs measured peak-RSS data per
@@ -788,8 +782,10 @@ def test_every_shipped_step_can_escalate_on_both_retry_axes():
     A pinned axis silently disables retry: the runner grows the escalation floor
     by a fixed factor and clamps it to the ceiling, so an equal pair leaves the
     grown value unchanged, which the retry loop reads as saturation and fails the
-    ticket PERMANENTLY on attempt 0. That is invisible at author time, in the
-    per-workflow unit tests above, and at `qiita-admin actions sync` — it
+    ticket PERMANENTLY on attempt 0. The mechanism is in `runner/_dispatch.py`
+    (`_escalated_mem_floor_after_oom` and the saturation check beside it). That is
+    invisible at author time, in the per-workflow unit tests above, and at
+    `qiita-admin actions sync` — it
     surfaces only in production, as a work ticket dead at retry_count=0 with
     RESOURCE_CEILING_EXHAUSTED.
 
@@ -1001,7 +997,7 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     Illumina families); and action_ceiling leaves escalation headroom
     above the largest profile.
 
-    Locks the YAML shape so the runner's A4 resolution branch (the
+    Locks the YAML shape so the runner's lookup-population resolution (the
     lookup vs flat split in qiita_control_plane.runner._dispatch_step)
     is exercised end-to-end the first time sync drops bcl-convert into
     qiita.action.
@@ -1050,7 +1046,7 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     assert convert.module is None
     # Lookup-population baseline_resources: from_step_output names the
     # upstream output file that carries the instrument key, and profiles
-    # covers exactly the three A4-supported Illumina families.
+    # covers exactly the three supported Illumina families.
     br = convert.baseline_resources
     assert br.from_step_output == "instrument_model"
     assert br.profiles is not None
@@ -1086,6 +1082,89 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     # The pool roster the ingest_reads step keys off (prep_sample_idx ↔
     # pool_item_id), embedded by submit-bcl-convert.
     assert bcl.context_schema["properties"]["sample_map"]["type"] == "array"
+
+
+def test_load_actions_loads_on_disk_download_ena_study_yaml():
+    """The actual on-disk `workflows/download-ena-study/1.0.0.yaml` loads as a
+    valid ActionDefinition — the ENA-fetch analog of bcl-convert:
+
+      * target_kind sequenced_pool (there is no `study` ScopeTargetKind);
+      * admin-only audience (not end-user-submittable), mirroring bcl-convert;
+      * context_schema REQUIRES `ena_study_accession`; `download_method` is
+        OPTIONAL and pinned to the single-value enum `["http"]` (no Aspera
+        key-staging in this compute env);
+      * steps `ingest_ena_reads` (module) -> `register-files`, in that order;
+      * the inert placeholder `workflows/download-ena-study/workflow.yaml`
+        (no top-level `action_id`, so the loader skipped it) is GONE now
+        that the real workflow has landed — this test's own `by_id` lookup
+        would otherwise still pass with a stale placeholder alongside, so
+        the placeholder's absence is asserted directly.
+    """
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "download-ena-study" in by_id, "workflows/download-ena-study/1.0.0.yaml must load"
+    dl = by_id["download-ena-study"]
+
+    assert dl.target_kind == ScopeTargetKind.SEQUENCED_POOL
+    assert dl.audience.service is False
+
+    from qiita_common.auth_constants import SystemRole
+
+    assert set(dl.audience.human_roles) == {SystemRole.WET_LAB_ADMIN, SystemRole.SYSTEM_ADMIN}
+
+    # Pin the submit helper's hardcoded action_id/version against the YAML the
+    # operator's deploy syncs into qiita.action — mirrors the bcl-convert pin
+    # above. A drift here would submit tickets against a non-existent action.
+    from qiita_control_plane.ena_import import (
+        DOWNLOAD_ENA_STUDY_ACTION_ID,
+        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    )
+
+    assert DOWNLOAD_ENA_STUDY_ACTION_ID == dl.action_id == "download-ena-study"
+    assert DOWNLOAD_ENA_STUDY_ACTION_VERSION == dl.version == "1.0.0"
+
+    step_names = [s.name for s in dl.steps]
+    assert step_names == ["ingest_ena_reads", "register-files"]
+
+    ingest = next(s for s in dl.steps if s.name == "ingest_ena_reads")
+    assert ingest.module == "qiita_compute_orchestrator.jobs.ingest_ena_reads"
+    assert ingest.container is None
+    assert ingest.inputs == ["ena_run_map", "reads_staging_root"]
+    assert ingest.params == {"download_method": "download_method"}
+    assert ingest.outputs == ["read_staging_dir"]
+
+    # download_method is OPTIONAL (not in `required`) and pinned to 'http'.
+    assert dl.context_schema["required"] == ["ena_study_accession"]
+    props = dl.context_schema["properties"]
+    assert props["ena_study_accession"]["type"] == "string"
+    assert props["download_method"]["enum"] == ["http"]
+
+    # The inert placeholder must be gone now that the real workflow has landed.
+    assert not (repo_root / "workflows" / "download-ena-study" / "workflow.yaml").exists()
+
+
+def test_download_ena_study_yaml_declares_ena_run_map_binding():
+    """Checks the YAML against the constant, not a second copy of the string:
+    input wiring matches by name, so a half-done rename only surfaces at
+    dispatch."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+    from qiita_control_plane.runner import ENA_RUN_MAP_BINDING
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    dl = next(a for a in actions if a.action_id == "download-ena-study")
+    ingest = next(s for s in dl.steps if s.name == "ingest_ena_reads")
+
+    assert ENA_RUN_MAP_BINDING in ingest.inputs
 
 
 def test_load_actions_loads_on_disk_read_mask_block_yaml():
@@ -1216,14 +1295,17 @@ def test_load_actions_loads_on_disk_estimate_feature_table_yaml():
     step = eft.steps[0]
     assert step.module == "qiita_compute_orchestrator.jobs.estimate_feature_table"
     assert step.inputs == ["genome_map_path"]
-    # The de novo arm's two bindings, both resolver-produced and both absent for a
-    # reference-only ticket — the map as an OPTIONAL input (a path), the assembly
-    # run as a params scalar (a scalar cannot ride `inputs:`). Declared required
-    # either way, the step would be undispatchable without a de novo arm.
-    assert step.optional_inputs == ["denovo_genome_map_path"]
+    # The de novo arm's three bindings, all resolver-produced and all absent for a
+    # reference-only ticket — the map and the per-genome quality as OPTIONAL inputs
+    # (paths), the assembly run as a params scalar (a scalar cannot ride `inputs:`).
+    # Declared required either way, the step would be undispatchable without a de
+    # novo arm.
+    assert step.optional_inputs == ["denovo_genome_map_path", "denovo_genome_quality_path"]
     assert step.params == {
         "coverage_threshold": "coverage_threshold",
         "denovo_processing_idx": "denovo_processing_idx",
+        "min_completeness": "min_completeness",
+        "max_contamination": "max_contamination",
     }
     assert step.outputs == ["ogu_table"]
     # reference_idx is framework-injected (REFERENCE scope scalar); binding it via
@@ -1235,6 +1317,19 @@ def test_load_actions_loads_on_disk_estimate_feature_table_yaml():
     # The de novo arm is opt-in: a reference-only ticket names no assembly.
     assert "denovo_alignment_idx" not in required
     assert "denovo_alignment_idx" in eft.context_schema["properties"]
+
+    # The quality gate is optional and carries NO schema `default:` — the literal lives
+    # at the job's `Inputs` (the `rype_w` shape), and a second copy here is what
+    # `runner._processing._mint_processing_idx` describes drifting. An omitted key is
+    # skipped by the params binding, which is how the job's default is reached.
+    properties = eft.context_schema["properties"]
+    for knob in ("min_completeness", "max_contamination"):
+        assert knob not in required, knob
+        assert knob in properties, knob
+        assert "default" not in properties[knob], knob
+    assert properties["min_completeness"]["maximum"] == 100
+    # No upper bound on contamination: `analytic.reconcile._validate_quality_gate` says why.
+    assert "maximum" not in properties["max_contamination"]
 
 
 def test_load_actions_handles_two_versions_of_same_action(tmp_path):

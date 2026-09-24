@@ -570,6 +570,132 @@ def test_membership_accession_join_keeps_features_with_no_manifest_match(tmp_pat
     assert rows == {100: "ACC1", 999: None}, "orphan feature survives with NULL accession"
 
 
+def _write_parquet(path, schema, rows):
+    import duckdb
+
+    with duckdb.connect(":memory:") as c:
+        c.execute(f"CREATE TEMP TABLE t ({schema})")
+        c.executemany(f"INSERT INTO t VALUES ({', '.join('?' for _ in rows[0])})", rows)
+        c.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+
+
+_GENOME_MAP_SCHEMA = "read_id VARCHAR, genome_source VARCHAR, genome_source_id VARCHAR"
+
+
+def _genome_map_and_manifest(tmp_path, map_rows, manifest_read_ids):
+    genome_map = tmp_path / "genome_map.parquet"
+    manifest = tmp_path / "manifest.parquet"
+    _write_parquet(genome_map, _GENOME_MAP_SCHEMA, map_rows)
+    _write_parquet(manifest, "read_id VARCHAR", [(r,) for r in manifest_read_ids])
+    return genome_map, manifest
+
+
+def test_check_genome_map_full_match_is_silent(tmp_path, caplog):
+    import logging
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map, manifest = _genome_map_and_manifest(
+        tmp_path,
+        [("READ1", "genbank", "G001"), ("READ2", "genbank", "G002")],
+        ["READ1", "READ2"],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert _check_genome_map(genome_map, manifest, "work_ticket 7") is False
+
+    assert caplog.records == []
+
+
+def test_check_genome_map_zero_match_names_unmatched_read_ids(tmp_path):
+    import pytest
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map, manifest = _genome_map_and_manifest(
+        tmp_path,
+        [("READX", "genbank", "G001"), ("READY", "genbank", "G002")],
+        ["READ1"],
+    )
+
+    with pytest.raises(ValueError, match=r"none of its 2 read_id\(s\).*READX, READY"):
+        _check_genome_map(genome_map, manifest, "work_ticket 7")
+
+
+def test_check_genome_map_partial_match_counts_read_ids_not_genomes(tmp_path, caplog):
+    """G001 keeps READ1, so it is still associated; its unmatched READ3 is counted."""
+    import logging
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map, manifest = _genome_map_and_manifest(
+        tmp_path,
+        [
+            ("READ1", "genbank", "G001"),
+            ("READ3", "genbank", "G001"),
+            ("READMISSING", "genbank", "G002"),
+        ],
+        ["READ1", "READ2"],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        _check_genome_map(genome_map, manifest, "work_ticket 7")
+
+    (record,) = caplog.records
+    assert record.getMessage() == (
+        "work_ticket 7: 2 of 3 genome-map read_id(s) are not sequence IDs in the reference "
+        "FASTA and get no genome association (e.g. READ3, READMISSING)"
+    )
+
+
+def test_check_genome_map_rejects_empty_map(tmp_path):
+    import duckdb
+    import pytest
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map = tmp_path / "genome_map.parquet"
+    manifest = tmp_path / "manifest.parquet"
+    with duckdb.connect(":memory:") as c:
+        c.execute(f"CREATE TEMP TABLE t ({_GENOME_MAP_SCHEMA})")
+        c.execute(f"COPY t TO '{genome_map}' (FORMAT PARQUET)")
+    _write_parquet(manifest, "read_id VARCHAR", [("READ1",)])
+
+    with pytest.raises(ValueError, match="genome map has no rows"):
+        _check_genome_map(genome_map, manifest, "work_ticket 7")
+
+
+def test_check_genome_map_requires_read_id_column(tmp_path):
+    import pytest
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map = tmp_path / "genome_map.parquet"
+    manifest = tmp_path / "manifest.parquet"
+    _write_parquet(
+        genome_map, "genome_source VARCHAR, genome_source_id VARCHAR", [("genbank", "G001")]
+    )
+    _write_parquet(manifest, "read_id VARCHAR", [("READ1",)])
+
+    with pytest.raises(ValueError, match=r"missing required column\(s\): \['read_id'\]"):
+        _check_genome_map(genome_map, manifest, "work_ticket 7")
+
+
+def test_check_genome_map_rejects_null_read_id(tmp_path):
+    import pytest
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map, manifest = _genome_map_and_manifest(
+        tmp_path,
+        [("READ1", "genbank", "G001"), (None, "genbank", "G002")],
+        ["READ1"],
+    )
+
+    with pytest.raises(ValueError, match=r"1 row\(s\) with a NULL read_id"):
+        _check_genome_map(genome_map, manifest, "work_ticket 7")
+
+
 def test_reap_staged_reads_none_root_is_noop():
     """CP-only/dev (no shared scratch) reaps nothing and never raises."""
     from qiita_control_plane.actions.sequenced_pool import reap_staged_reads
@@ -823,3 +949,71 @@ def test_warn_on_collapsed_records_leads_with_the_caller_s_scope(tmp_path, caplo
     message = caplog.records[0].getMessage()
     assert message.startswith("assembly run (prep_sample 7, processing 3): ")
     assert "c_fwd, c_rev" in message
+
+
+async def test_mint_phylogeny_edge_id_data_signs_and_dispatches_the_same_name(monkeypatch):
+    """The action name the CP signs must be the name the DP dispatches on. The two
+    live in different languages, so nothing but a test holds them together: the Rust
+    side pins its half against `REPLAY_SAFE_ACTIONS`, this pins ours."""
+    import json
+
+    from qiita_control_plane.actions import library as lib
+
+    captured: dict = {}
+
+    def _fake_do_action(action_type, data_plane_url, token, timeout_seconds=None):
+        captured["action_type"] = action_type
+        captured["timeout_seconds"] = timeout_seconds
+        captured["token"] = token
+        return [
+            _FakeResult(
+                json.dumps(
+                    {
+                        "reference_idx": 7,
+                        "phylogeny_rows": 9,
+                        "already_numbered_rows": 0,
+                        "minted_rows": 9,
+                    }
+                ).encode()
+            )
+        ]
+
+    monkeypatch.setattr(lib, "_do_action", _fake_do_action)
+
+    result = await lib.mint_phylogeny_edge_id_data(
+        reference_idx=7,
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://dp:50051",
+    )
+
+    assert captured["action_type"] == "mint_phylogeny_edge_id"
+    assert captured["timeout_seconds"] == lib._MINT_PHYLOGENY_EDGE_ID_DO_ACTION_TIMEOUT_S
+    assert _decode_action_payload(captured["token"]) == {
+        "action": "mint_phylogeny_edge_id",
+        "reference_idx": 7,
+    }
+    # The data plane's counts are relayed verbatim; the route decides what they mean.
+    assert result == {
+        "reference_idx": 7,
+        "phylogeny_rows": 9,
+        "already_numbered_rows": 0,
+        "minted_rows": 9,
+    }
+
+
+async def test_mint_phylogeny_edge_id_data_raises_when_the_data_plane_returns_nothing(
+    monkeypatch,
+):
+    """An empty result body means what the call changed is unknown, which is not a
+    thing to paper over with a zero."""
+    import pytest
+
+    from qiita_control_plane.actions import library as lib
+
+    monkeypatch.setattr(lib, "_do_action", lambda *a, **k: [])
+    with pytest.raises(RuntimeError, match="no result body"):
+        await lib.mint_phylogeny_edge_id_data(
+            reference_idx=7,
+            signing_key=b"\x00" * 32,
+            data_plane_url="grpc://dp:50051",
+        )

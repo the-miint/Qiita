@@ -150,10 +150,23 @@ steps:
              annotation_manifest, annotation_map]
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
+    # walltime sized from the one completing attempt of the reference-18 build
+    # (196,062 genomes), which ran 22:25:50. No attempt was observed hitting a WALLTIME
+    # limit: that one ran under a 48h SLURM limit whose origin the ticket does not
+    # record, and the other two failed on memory at 00:06:50 and 01:39:03. So this
+    # sizes a 22h26 duration against a 24h baseline, on n=1.
+    #
+    # PT36H is 1.6x that duration. It buys no extra escalation step — a TIMEOUT
+    # doubles and clamps to the PT48H action ceiling, so PT24H and PT36H both give
+    # exactly one retry at PT48H. What it buys is a smaller chance of needing it,
+    # which matters because `max_retries` is spent ticket-wide.
+    #
+    # mem_gb is untouched: RSS pegged at ReqMem in all three attempts, which bounds
+    # demand from below without measuring it.
     baseline_resources:
       cpu: 8
       mem_gb: 32
-      walltime: PT24H
+      walltime: PT36H
 
   - action: register-files
     inputs: [staging_dir]
@@ -180,13 +193,27 @@ steps:
     when: router_pending
     inputs: [shard_mapping]
     outputs: [routing_index_meta]
-    # Whole-reference rype build (sized like local-host-reference-add's
-    # build_rype_index — the local path allows a long walltime for genome-scale
-    # references); an OOM retry doubles mem to the 128 GB action ceiling.
+    # Whole-reference rype build; an OOM retry doubles mem to the 128 GB action
+    # ceiling. Memory is still sized like local-host-reference-add's build_rype_index;
+    # the walltime no longer matches that sibling, for the reason in the next
+    # paragraph.
+    #
+    # walltime sized over the only two runs there are: 7:34:02 (reference 16) and
+    # 8:04:07 (reference 18, 196,062 genomes), +6.6% for the larger. PT12H is 1.49x
+    # the longer of the two.
+    #
+    # The cost is one more rung: a build genuinely needing >24h now burns a timed-out
+    # 12h attempt and a timed-out 24h attempt before reaching the PT48H ceiling, where
+    # PT24H reached it in one — and `max_retries` is spent ticket-wide. Nothing in the
+    # n=2 population is near that, which is the whole of the argument for lowering.
+    #
+    # A 24h request in this PriorityTier=1 partition had SLURM's StartTime estimate
+    # five days out, but backfill placed the job 70 min after submit — so the queueing
+    # cost of the longer request measured 70 minutes, and is not why this changed.
     baseline_resources:
       cpu: 4
       mem_gb: 64
-      walltime: PT24H
+      walltime: PT12H
 
   - action: register-index
     when: router_pending

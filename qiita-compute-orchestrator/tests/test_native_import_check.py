@@ -159,7 +159,7 @@ def test_both_deploy_call_sites_invoke_the_same_module() -> None:
     `-P` is part of what is pinned: without it a probe launched from inside a
     source tree shadows the installed package it is checking. The compute side is
     asserted on the GENERATED script rather than the source, since the module name
-    reaches it through a shell variable.
+    reaches it as an argument to the script's own `run_module_probe`.
     """
     from qiita_compute_orchestrator.cli.compute_readiness import build_probe_script
 
@@ -168,8 +168,8 @@ def test_both_deploy_call_sites_invoke_the_same_module() -> None:
     assert f"-P -m {module}" in redeploy
 
     probe = build_probe_script(path_scratch="/scratch")
-    assert module in probe
-    assert '-P -m "$NATIVE_IMPORT_MOD"' in probe
+    assert f"run_module_probe {module}" in probe
+    assert '-P -m "$1"' in probe
 
 
 def test_the_compute_probe_reports_the_reason_not_a_bare_fail() -> None:
@@ -182,7 +182,7 @@ def test_the_compute_probe_reports_the_reason_not_a_bare_fail() -> None:
         build_probe_script,
     )
 
-    assert "err=$NATIVE_IMPORT_ERR" in build_probe_script(path_scratch="/scratch")
+    assert "native-import=fail err=$MODULE_PROBE_ERR" in build_probe_script(path_scratch="/scratch")
     (result,) = _parse_probe_log(
         "compute-readiness: native-import=fail err=RuntimeError: jobs.qc: ImportError\n"
     )
@@ -193,17 +193,19 @@ def test_the_compute_probe_reports_the_reason_not_a_bare_fail() -> None:
 def _run_compute_native_import_block(module: str) -> str:
     """Run the generated probe's native-import block against `module`.
 
-    The block is taken from `build_probe_script` rather than retyped, so what runs
-    here is what ships to the compute node.
+    The block is taken from `build_probe_script` rather than retyped — the shared
+    `run_module_probe` helper included, since that is where the capture the
+    assertions below are about now lives — so what runs here is what ships to the
+    compute node.
     """
     from qiita_compute_orchestrator.cli.compute_readiness import build_probe_script
 
     script = build_probe_script(path_scratch="/scratch")
-    start = script.index("NATIVE_IMPORT_MOD=")
-    block = script[start : script.index("\nfi\n", start) + 4]
-    block = block.replace(
-        "NATIVE_IMPORT_MOD=qiita_compute_orchestrator.native_import_check",
-        f"NATIVE_IMPORT_MOD={module}",
+    start = script.index("run_module_probe() {")
+    end = script.index("\nfi\n", script.index("native-import=fail", start)) + 4
+    block = script[start:end].replace(
+        "run_module_probe qiita_compute_orchestrator.native_import_check",
+        f"run_module_probe {module}",
     )
     return subprocess.run(
         ["bash", "-c", f"PYTHON={sys.executable}\n{block}"],

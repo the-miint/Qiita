@@ -13,7 +13,7 @@ a guard miss raises rather than silently overwriting, surfacing a corrupted
 progress sequence loudly (fail-fast). They accept either a pool or a live
 connection so a caller can fold a progress write into a larger transaction.
 
-Recovery (Phase 5) reads these rows via `load_step_progress` to decide,
+Recovery reads these rows via `load_step_progress` to decide,
 for a non-terminal ticket, which entries already completed (skip + rebuild
 `bound` from disk) and which to resume.
 """

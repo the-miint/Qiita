@@ -375,6 +375,33 @@ async def import_sequenced_prep_sample(
     )
 
 
+async def fetch_sequenced_sample_idxs_by_ena_run_accession(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    values: list[str],
+) -> dict[str, int]:
+    """Return `{ena_run_accession: sequenced_sample_idx}` for every value in
+    `values` that resolves to a qiita.sequenced_sample row.
+
+    Mirrors fetch_biosample_idxs_by_natural_key / fetch_sequencing_run_idxs_
+    by_instrument_run_id (biosample.py / sequencing_run.py): values absent
+    from the table are omitted from the returned map, so a caller detects a
+    miss by set-difference. ena_run_accession is UNIQUE
+    (sequenced_sample_ena_run_accession_unique) so each key maps to at most
+    one idx. Used by the ENA-import registration composer
+    (ena_import.registration) to skip a run a previous import already
+    registered -- the idempotent-re-import case.
+    """
+    if not values:
+        return {}
+    rows = await pool_or_conn.fetch(
+        "SELECT idx, ena_run_accession FROM qiita.sequenced_sample"
+        " WHERE ena_run_accession = ANY($1::text[])",
+        values,
+    )
+    return {r["ena_run_accession"]: r["idx"] for r in rows}
+
+
 async def fetch_sequenced_sample_idxs_for_run(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
@@ -445,6 +472,42 @@ async def fetch_sequenced_pool_samples(
         sequenced_pool_idx,
         limit,
         READ_MASK_ACTION_ID,
+    )
+    return list(rows)
+
+
+async def fetch_sequenced_pool_ena_run_roster(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    sequenced_pool_idx: int,
+) -> list[asyncpg.Record]:
+    """Return every active sequenced_sample in a pool as `(prep_sample_idx,
+    ena_run_accession)`, ordered by prep_sample_idx.
+
+    The `ingest_ena_reads` download-job's roster source: the CO has no DB
+    access, so the CP runner (`runner._read_ingest._stage_ena_run_roster`)
+    calls this before the step loop and stages the result as `ena_run_map.parquet`.
+    Unlike `fetch_sequenced_pool_samples` (the richer per-sample projection
+    submit-host-filter-pool fans out over, with its biosample join and
+    has_read_mask_ticket EXISTS), this is the minimal two-column projection the
+    download job needs -- no unrelated joins.
+
+    Deliberately does NOT filter `ena_run_accession IS NOT NULL`: a row with a
+    NULL run accession would silently vanish from the roster if filtered here,
+    and the caller must fail loud on that instead (a download-ena-study ticket
+    against a pool with a non-ENA-origin sample is a misconfiguration, not
+    something to skip quietly). Excludes sequenced_samples whose supertype
+    prep_sample row is retired, mirroring fetch_sequenced_pool_samples. An
+    empty pool returns an empty list; the caller (not this repo function)
+    decides that is fail-loud territory."""
+    rows = await pool_or_conn.fetch(
+        "SELECT ss.prep_sample_idx, ss.ena_run_accession"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE ss.sequenced_pool_idx = $1"
+        "   AND ps.retired = false"
+        " ORDER BY ss.prep_sample_idx",
+        sequenced_pool_idx,
     )
     return list(rows)
 

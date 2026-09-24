@@ -7,10 +7,17 @@ behaviour is pinned here rather than in either consumer's suite. Both writers of
 misread: the values land in nullable columns nothing else cross-checks.
 """
 
+import re
+from pathlib import Path
+
 import duckdb
 import pytest
 
 from qiita_common.assembly_constants import (
+    BIN_QUALITY_COLUMNS,
+    BIN_QUALITY_SCORE_COLUMNS,
+    BIN_QUALITY_SUBJECT_KEY,
+    BIN_QUALITY_TABLE,
     CONTIG_ATTRIBUTE_COLUMNS,
     CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
     contig_attribute_join,
@@ -191,3 +198,72 @@ def test_a_missing_depth_is_distinguishable_from_a_missing_sidecar(tmp_path):
         ("LCG", None, None, None, None),
         ("UNBINNED", None, None, None, None),
     ]
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _lake_bin_quality_ddl() -> list[tuple[str, str]]:
+    """The `bin_quality` columns as `(name, type)` in DDL order, read out of the data
+    plane's Rust source.
+
+    The two components cannot import each other, so the shared contract is a
+    constant here plus this parse. `projection_allowlist_matches_the_alignment_ddl`
+    does the same thing in the other direction for the alignment surface.
+    """
+    src = (REPO_ROOT / "qiita-data-plane" / "src" / "ducklake.rs").read_text()
+    marker = f"CREATE TABLE IF NOT EXISTS qiita_lake.{BIN_QUALITY_TABLE} ("
+    start = src.find(marker)
+    assert start != -1, f"the {BIN_QUALITY_TABLE} DDL moved; this test reads it out of ducklake.rs"
+    body = src[start + len(marker) :]
+    body = body[: body.index(")")]
+
+    columns = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("--"):
+            continue
+        parts = re.split(r"\s+", line.rstrip(","))
+        columns.append((parts[0], parts[1]))
+    return columns
+
+
+def test_bin_quality_columns_match_the_lake_ddl_exactly():
+    """`BIN_QUALITY_COLUMNS` is the schema `assembly_load` writes its staging Parquet
+    with; the DDL is the schema register-files loads it into. Name, TYPE and ORDER
+    all have to match — a Parquet whose columns are ordered or typed differently is a
+    load failure at the end of a multi-hour assembly, not a rename.
+
+    Equality, not containment: a column added to the lake and not here would leave
+    the writer emitting a narrower Parquet, and one dropped from the lake would leave
+    it emitting a column that no longer exists. Both are the same defect from
+    opposite sides.
+
+    Neither component can import the other, so this parse is the only mechanical link
+    between the writer's schema and the schema it writes into.
+    """
+    assert list(BIN_QUALITY_COLUMNS) == _lake_bin_quality_ddl()
+
+
+def test_the_columns_the_resolver_binds_are_bin_quality_columns():
+    """The two subsets the feature-table resolver names — the join key and the scores
+    it projects — have to be drawn from the table above.
+
+    Checked against the constant rather than the DDL directly: the test above already
+    ties that constant to the lake, so this one is about the subsets staying subsets
+    when someone edits either list.
+    """
+    declared = dict(BIN_QUALITY_COLUMNS)
+    missing = (set(BIN_QUALITY_SUBJECT_KEY) | set(BIN_QUALITY_SCORE_COLUMNS)) - set(declared)
+    assert not missing, f"the resolver binds {sorted(missing)}, which {BIN_QUALITY_TABLE} lacks"
+
+    # Types as well as names: what the resolver does with these columns is a JOIN
+    # against Arrow arrays built from Postgres rows, so a `kind VARCHAR -> BIGINT`
+    # drift would keep the name, bind through an implicit cast, and match nothing.
+    # `BIN_QUALITY_SUBJECT_KEY`'s own `_idx` rule is what the Arrow builder types
+    # from, so it is the rule checked here.
+    expected = {c: "DOUBLE" for c in BIN_QUALITY_SCORE_COLUMNS} | {
+        c: ("BIGINT" if c.endswith("_idx") else "VARCHAR") for c in BIN_QUALITY_SUBJECT_KEY
+    }
+    drifted = {c: (declared[c], want) for c, want in expected.items() if declared[c] != want}
+    assert not drifted, f"type drift on {BIN_QUALITY_TABLE} (got, expected): {drifted}"

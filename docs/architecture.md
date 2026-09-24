@@ -51,7 +51,7 @@ Three-level identity model, taxonomy, phylogeny, exclusion, aligner indices, hos
 
 ### [Arrow Flight Surface](architecture/flight.md)
 
-DoGet/DoPut/DoAction, compression, column projection, which mints are REST rather than Flight.
+DoGet/DoPut/DoAction, compression, column projection, which mints are REST rather than Flight, and when a control-plane read may ship a columnar body.
 
 - [Client Interfaces (Unresolved)](architecture/flight.md#client-interfaces-unresolved)
 - [Arrow Flight Operations (no custom .proto needed)](architecture/flight.md#arrow-flight-operations-no-custom-proto-needed)
@@ -63,6 +63,7 @@ Auth and data-access flow, upload and processing, work ticket lifecycle, the orc
 - [Auth & Data Access Flow](architecture/processing.md#auth--data-access-flow)
 - [Data Upload & Processing Workflow](architecture/processing.md#data-upload--processing-workflow)
 - [Work Ticket Lifecycle](architecture/processing.md#work-ticket-lifecycle)
+- [ENA Study Import](architecture/processing.md#ena-study-import)
 - [Compute Orchestrator](architecture/processing.md#compute-orchestrator)
 - [Health Checks](architecture/processing.md#health-checks)
 - [Work Ticket Queue](architecture/processing.md#work-ticket-queue)

@@ -118,6 +118,20 @@ GENOME_MAP_PAIRS_SQL = _GENOME_MAP_PAIRS_FROM + _GENOME_MAP_PAIRS_WHERE
 # 1M-member reference, for an answer that could not differ.
 _GENOME_SOURCE_JOIN = " JOIN qiita.genome g ON g.genome_idx = fg.genome_idx"
 
+# The four-column, ordered row set BOTH map forms serve — the capped JSON read
+# (this module's `fetch_genome_map`, which appends its LIMIT as `$2`) and the
+# uncapped Parquet body (`actions.library.genome_map_parquet`, which binds no
+# further placeholder). Shared as text for the reason `GENOME_MAP_PAIRS_SQL` is:
+# the two forms answer the same question, and a client that got a different
+# answer from each would have no way to tell which one built its feature table.
+GENOME_MAP_ROWS_SQL = (
+    "SELECT rm.feature_idx, fg.genome_idx, g.source, g.source_id"
+    + _GENOME_MAP_PAIRS_FROM
+    + _GENOME_SOURCE_JOIN
+    + _GENOME_MAP_PAIRS_WHERE
+    + " ORDER BY rm.feature_idx, fg.genome_idx"
+)
+
 
 async def fetch_genome_map(
     db: asyncpg.Pool | asyncpg.Connection, reference_idx: int, *, limit: int
@@ -136,15 +150,7 @@ async def fetch_genome_map(
     no churn. The many-to-many `feature_genome` means a shared plasmid yields one
     row per genome — this returns PAIRS, not features.
     """
-    return await db.fetch(
-        "SELECT rm.feature_idx, fg.genome_idx, g.source, g.source_id"
-        + _GENOME_MAP_PAIRS_FROM
-        + _GENOME_SOURCE_JOIN
-        + _GENOME_MAP_PAIRS_WHERE
-        + " ORDER BY rm.feature_idx, fg.genome_idx LIMIT $2",
-        reference_idx,
-        limit,
-    )
+    return await db.fetch(GENOME_MAP_ROWS_SQL + " LIMIT $2", reference_idx, limit)
 
 
 async def count_genome_map(db: asyncpg.Pool | asyncpg.Connection, reference_idx: int) -> int:

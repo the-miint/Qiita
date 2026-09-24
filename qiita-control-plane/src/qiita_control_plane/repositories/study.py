@@ -242,7 +242,7 @@ async def update_study(
     """
     return await update_row(
         conn,
-        table="study",
+        table="qiita.study",
         row_idx=study_idx,
         fields=fields,
         allowlist=STUDY_PATCHABLE_COLUMNS,
@@ -305,3 +305,168 @@ async def create_study(
     )
 
     return study_row
+
+
+class EnaStudyAccessionConflictError(Exception):
+    """Raised when an incoming (bioproject_accession, ena_study_accession)
+    pair resolves to two different qiita.study rows, or to one row whose
+    own recorded accession disagrees with it. A pair matching zero studies
+    is a miss, not an error -- the caller creates.
+    """
+
+    def __init__(
+        self,
+        *,
+        bioproject_accession: str,
+        ena_study_accession: str | None,
+        detail: str,
+    ) -> None:
+        self.bioproject_accession = bioproject_accession
+        self.ena_study_accession = ena_study_accession
+        super().__init__(
+            f"bioproject_accession={bioproject_accession!r},"
+            f" ena_study_accession={ena_study_accession!r}: {detail}"
+        )
+
+
+# Constraint names create_study's underlying INSERT can trip when a
+# concurrent caller wins the race for the same accession; used by
+# get_or_create_study_by_ena_accessions to distinguish "lost the create
+# race" from any other UniqueViolationError.
+_STUDY_ACCESSION_UNIQUE_CONSTRAINTS = frozenset(
+    {"study_bioproject_accession_unique", "study_ena_study_accession_unique"}
+)
+
+
+async def get_or_create_study_by_ena_accessions(
+    conn: asyncpg.Connection,
+    *,
+    bioproject_accession: str,
+    ena_study_accession: str | None,
+    owner_idx: int,
+    created_by_idx: int,
+    title: str,
+) -> tuple[asyncpg.Record, bool]:
+    """Race-safe find-or-create for an ENA-study import.
+
+    Positional accession mapping is the caller's responsibility (see
+    `ena_import.batch._process_one_study`): this function only
+    keys the lookup/insert on the two accession values it is handed --
+    it does not itself decide which resolved ENA field maps to which
+    column.
+
+    A blank ena_study_accession is absence, stored as NULL rather than
+    occupying the unique column.
+
+    Resolves an existing study by either accession before create, raising
+    EnaStudyAccessionConflictError on an ambiguous or contradicting pair. On a
+    miss, attempts create_study inside `async with conn.transaction():`
+    -- a real `BEGIN` if `conn` is not already inside a transaction, a
+    `SAVEPOINT` otherwise (asyncpg's `Connection.transaction()` detects
+    which; see `_sample_helpers.write_global_metadata_or_diagnose` for
+    the same nested-transaction pattern) -- and falls back to the same
+    resolver on `asyncpg.UniqueViolationError` from either
+    study_bioproject_accession_unique or study_ena_study_accession_unique.
+    create_study has no ON CONFLICT variant because it is a two-step
+    composer (INSERT + the owner's auto-granted study_access row), so a
+    plain `INSERT ... ON CONFLICT DO NOTHING RETURNING` cannot express
+    "reuse the existing row's access grant too" -- catch-and-refetch is
+    the race-safe shape available to a composer, not a single INSERT.
+
+    Returns (row, created): row is the same RETURNING/fetch_study column
+    shape either way; created is True only on the insert branch.
+    """
+    ena_study_accession = (ena_study_accession or "").strip() or None
+    existing_row = await _resolve_study_by_ena_accessions(
+        conn,
+        bioproject_accession=bioproject_accession,
+        ena_study_accession=ena_study_accession,
+    )
+    if existing_row is not None:
+        return existing_row, False
+
+    try:
+        async with conn.transaction():
+            row = await create_study(
+                conn,
+                owner_idx=owner_idx,
+                created_by_idx=created_by_idx,
+                title=title,
+                ena_study_accession=ena_study_accession,
+                bioproject_accession=bioproject_accession,
+            )
+        return row, True
+    except asyncpg.UniqueViolationError as exc:
+        if exc.constraint_name not in _STUDY_ACCESSION_UNIQUE_CONSTRAINTS:
+            raise
+        existing_row = await _resolve_study_by_ena_accessions(
+            conn,
+            bioproject_accession=bioproject_accession,
+            ena_study_accession=ena_study_accession,
+        )
+        if existing_row is None:
+            raise asyncpg.PostgresError(
+                "find-or-create on study(bioproject_accession="
+                f"{bioproject_accession!r}, ena_study_accession="
+                f"{ena_study_accession!r}) collided on insert but the"
+                " existing row is not visible"
+            ) from exc
+        return existing_row, False
+
+
+async def _resolve_study_by_ena_accessions(
+    conn: asyncpg.Connection,
+    *,
+    bioproject_accession: str,
+    ena_study_accession: str | None,
+) -> asyncpg.Record | None:
+    """Resolve one study row by either accession, or None on a miss.
+
+    Backs both the pre-check and the post-collision refetch in
+    get_or_create_study_by_ena_accessions -- one call for both, so they
+    can't drift -- and raises EnaStudyAccessionConflictError when the two
+    accessions resolve to different studies, or when the one study either
+    accession resolves to has a recorded accession that disagrees with it.
+    """
+    by_bioproject_idxs = await fetch_study_idxs_by_accession(
+        conn, values=[bioproject_accession], accession_field="bioproject_accession"
+    )
+    by_bioproject = by_bioproject_idxs.get(bioproject_accession)
+
+    by_ena = None
+    if ena_study_accession is not None:
+        by_ena_idxs = await fetch_study_idxs_by_accession(
+            conn, values=[ena_study_accession], accession_field="ena_study_accession"
+        )
+        by_ena = by_ena_idxs.get(ena_study_accession)
+
+    if by_bioproject is not None and by_ena is not None and by_bioproject != by_ena:
+        raise EnaStudyAccessionConflictError(
+            bioproject_accession=bioproject_accession,
+            ena_study_accession=ena_study_accession,
+            detail=(
+                f"bioproject_accession resolves to study {by_bioproject} while"
+                f" ena_study_accession resolves to study {by_ena}"
+            ),
+        )
+
+    existing_idx = by_bioproject if by_bioproject is not None else by_ena
+    if existing_idx is None:
+        return None
+
+    row = await fetch_study(conn, existing_idx)
+    row_bioproject = row["bioproject_accession"]
+    if row_bioproject is not None and row_bioproject != bioproject_accession:
+        raise EnaStudyAccessionConflictError(
+            bioproject_accession=bioproject_accession,
+            ena_study_accession=ena_study_accession,
+            detail=f"study {existing_idx} has bioproject_accession {row_bioproject!r}",
+        )
+    row_ena = row["ena_study_accession"]
+    if row_ena is not None and ena_study_accession is not None and row_ena != ena_study_accession:
+        raise EnaStudyAccessionConflictError(
+            bioproject_accession=bioproject_accession,
+            ena_study_accession=ena_study_accession,
+            detail=f"study {existing_idx} has ena_study_accession {row_ena!r}",
+        )
+    return row

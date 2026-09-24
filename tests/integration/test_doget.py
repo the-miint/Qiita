@@ -5,6 +5,8 @@ pre-built binary and lets it own schema creation. Test rows are seeded via
 a short-lived DuckDB connection after the data plane is live.
 """
 
+import time
+
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
@@ -112,10 +114,12 @@ def flight_client(data_plane):
     client.close()
 
 
-def _sign_ticket(table, filter_dict, secret_bytes):
+def _sign_ticket(table, filter_dict, secret_bytes, *, expiry_epoch=None):
     from qiita_control_plane.auth.tickets import sign_ticket
 
-    return sign_ticket(table=table, filter=filter_dict, secret=secret_bytes)
+    return sign_ticket(
+        table=table, filter=filter_dict, secret=secret_bytes, expiry_epoch=expiry_epoch
+    )
 
 
 def test_doget_reference_sequences(data_plane, flight_client):
@@ -146,6 +150,41 @@ def test_doget_tampered_ticket(data_plane, flight_client):
 
     with pytest.raises(flight.FlightUnauthenticatedError):
         flight_client.do_get(flight.Ticket(bytes(ticket_bytes))).read_all()
+
+
+def test_doget_expired_ticket_carries_the_text_the_cp_classifies_on(
+    data_plane, flight_client
+):
+    """An expired ticket must reach the caller as a string carrying BOTH markers the
+    control plane keys on (`runner/_upload.py::_DP_TICKET_EXPIRED_SIGNATURES`), which
+    is what routes it to a retriable DATA_PLANE_TRANSIENT instead of a permanent
+    BAD_INPUT. Four layers sit between the Rust `AuthError::Expired` and that string —
+    `Status::unauthenticated`, the gRPC trailer, pyarrow's exception, and its
+    `__str__` — and a unit test on a hand-written fixture cannot see any of them.
+
+    The control is the same ticket with a live expiry: it must succeed, so the failure
+    is the expiry and not the connection or the scope."""
+    from qiita_control_plane.runner._upload import _DP_TICKET_EXPIRED_SIGNATURES
+
+    filter_ = {"feature_idx": [SEED_FEATURE_IDXS[0]]}
+    live = _sign_ticket("reference_sequences", filter_, data_plane["secret"])
+    assert flight_client.do_get(flight.Ticket(live)).read_all().num_rows == 1
+
+    expired = _sign_ticket(
+        "reference_sequences",
+        filter_,
+        data_plane["secret"],
+        expiry_epoch=int(time.time()) - 60,
+    )
+    with pytest.raises(flight.FlightUnauthenticatedError) as exc:
+        flight_client.do_get(flight.Ticket(expired)).read_all()
+
+    text = str(exc.value).lower()
+    missing = [sig for sig in _DP_TICKET_EXPIRED_SIGNATURES if sig not in text]
+    assert not missing, (
+        f"the data plane's expired-ticket error no longer carries {missing}; "
+        f"the CP would classify it permanent. Got: {exc.value}"
+    )
 
 
 def test_doget_empty_result(data_plane, flight_client):

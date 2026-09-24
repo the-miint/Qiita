@@ -10,15 +10,33 @@ from typing import Literal, get_args
 
 import asyncpg
 
-# Tables that expose a PATCH route. The set is 1:1 with the tables
-# whose ETag is read from `updated_at`: a table that supports PATCH
-# exposes the matching ETag, and a table that does not is also not
-# ETag-readable. The table name is interpolated into the SQL, so the
-# set is a closed Literal — never widen by accepting caller input
-# directly. The runtime get_args() check inside each consumer rejects
-# any string the Literal does not cover, since Python does not enforce
-# Literal at runtime on its own.
-UpdatableTable = Literal["biosample", "study"]
+# Tables whose UPDATEs are composed by update_row below — membership
+# tracks a shared composer's callers (not a PATCH surface). The table
+# name is interpolated into the SQL, so the set is a closed Literal —
+# never widen by accepting caller input directly. The runtime get_args()
+# check inside each consumer rejects any string the Literal does not
+# cover, since Python does not enforce Literal at runtime on its own.
+UpdatableTable = Literal[
+    "qiita.biosample",
+    "qiita.biosample_study_field",
+    "qiita.prep_sample_study_field",
+    "qiita.study",
+]
+
+# pg advisory-lock keys are int4; mask a bigint (idx, cohort id) into positive
+# int4 before pairing it with a lock class. A wrap collision only serialises
+# two unrelated holders of the same key for a moment.
+INT4_MASK = 0x7FFF_FFFF
+
+# Registry of advisory-lock keys/classes, so a new one is allocated rather
+# than invented (each site also carries its own "distinct from" note):
+#   repositories.block             1-arg, hashtextextended(mask_idx:prep_sample_idx)
+#   repositories.sequencing_run    2-arg class POOL_RESOLVE_LOCK_CLASS (pool
+#                                  writes vs the download-roster read)
+#   fanout_dispatch                2-arg classes 0x0FA0_0001-3 (cohort kinds)
+#   actions.library                1-arg key 4_310_290_149 (exclusion sync)
+#   notify.sweeper                 1-arg key 4_310_290_147
+#   auth.cli_login_code_sweeper    1-arg key 4_310_290_148
 
 
 def require_transaction(conn: asyncpg.Connection) -> None:
@@ -75,7 +93,11 @@ async def update_row(
     jsonb_cols: frozenset[str] = frozenset(),
     repo_name: str,
 ) -> asyncpg.Record | None:
-    """Update the named columns on qiita.<table> row idx=row_idx, return the post-UPDATE row.
+    """Update the named columns on `table` row idx=row_idx, return the post-UPDATE row.
+
+    `table` is schema-qualified: the composer interpolates it verbatim rather
+    than assuming a schema, so a caller already holding a qualified name passes
+    it straight through.
 
     `fields` maps column name -> new value; only the listed keys are
     written, and explicit None sets the column to NULL. Unknown keys
@@ -122,7 +144,7 @@ async def update_row(
     # Single round trip: UPDATE ... RETURNING with the same column list
     # the per-repo fetch wrapper selects.
     return await conn.fetchrow(
-        f"UPDATE qiita.{table} SET {set_clause} WHERE idx = {row_param} RETURNING {returning_cols}",
+        f"UPDATE {table} SET {set_clause} WHERE idx = {row_param} RETURNING {returning_cols}",
         *values,
         row_idx,
     )

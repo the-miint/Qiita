@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from qiita_common.auth_constants import SystemRole
 from qiita_common.models import (
     GLOBAL_FIELD_IDX_ATTR,
+    NOT_SETTABLE_ON_LINKED_FIELD,
     STUDY_FIELD_IDX_ATTR,
     IdxsListResponse,
     MetadataEntry,
@@ -21,10 +22,12 @@ from qiita_common.models import (
     SampleGlobalFieldResponse,
     SampleMetadataWriteResponse,
     SampleStudyFieldCreateRequest,
+    SampleStudyFieldPatchRequest,
     SampleStudyFieldResponse,
     TerminologyTermRef,
     Tier,
     field_wire_name,
+    unique_in_study_rejection_reason,
 )
 
 from ..auth.guards import (
@@ -44,18 +47,24 @@ from ..repositories._sample_helpers import (
     MetadataParseError,
     MetadataRow,
     MetadataUnknownFieldsError,
+    MissingValueOnUniqueFieldError,
     OwnerSampleIdMetadataWriteError,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
     SlotOccupiedError,
     StudyFieldAlreadyExistsError,
     StudyFieldConflictError,
+    StudyUniqueValueConflictError,
     TransientWriteRaceError,
+    UniqueInStudyViolation,
+    classify_unique_in_study_violation,
     create_study_field_and_read_back,
     fetch_entity_is_linked_to_study,
     fetch_global_metadata,
     fetch_local_metadata,
     fetch_metadata_checklist_idx_by_name,
+    fetch_study_field,
+    update_study_field,
     write_sample_metadata,
 )
 from ..repositories.alignment_definition import alignment_definition_exists
@@ -85,10 +94,15 @@ ALIGNMENT_NOT_FOUND_DETAIL = "alignment not found"
 # Hard cap on a genome map, and the one place in the codebase where exceeding a cap
 # is a refusal rather than a truncation — see `get_reference_genome_map`. Sized from
 # a response-body budget rather than by borrowing another route's number: an entry
-# serializes to roughly 90 bytes of JSON, so this is a ~22 MB worst case, large but
-# deliverable in one body and far above any genome-bearing reference we roll up
-# today. The map that first trips it is the signal to build the streamed form, not
-# to raise this.
+# serializes to roughly 90 bytes of JSON, so this is a ~22 MB worst case — large
+# but deliverable in one body.
+#
+# **It does not bound the data, and both genome-bearing references on the deploy
+# are past it** (421,717 and 392,122 pairs). Raising it is not the answer: the
+# uncapped Parquet form is (`GET .../genome-map/parquet`, both maps), and
+# `actions.library._genome_map_parquet_body` carries why that form can drop the
+# cap where this one cannot. This number therefore stays where it is, bounding the
+# JSON representation alone.
 #
 # Shared by the reference map and the assembly-run map, which are the same read over
 # two feature spaces: two numbers here would let one route refuse what the other
@@ -248,6 +262,9 @@ def _attempted_label(value: object) -> str:
 # is not in a route's specific message map. Lifted here so the wording
 # stays identical across every route that falls back to it.
 GENERIC_FK_VIOLATION = "references a row that does not exist"
+# Fallback for a CHECK the wire models should have preempted. Both study-field
+# write surfaces fall back to it, so the wording lives here rather than at each.
+GENERIC_CHECK_VIOLATION = "violates a database constraint on"
 
 # The optimistic-concurrency header pair: every route that emits a version
 # stamp writes ETAG_HEADER, and every PATCH that gates on one reads
@@ -391,6 +408,8 @@ SAMPLE_METADATA_WRITE_ERRORS = (
     StudyFieldConflictError,
     DuplicateGlobalFieldTargetError,
     OwnerSampleIdMetadataWriteError,
+    StudyUniqueValueConflictError,
+    MissingValueOnUniqueFieldError,
     SlotOccupiedError,
     TransientWriteRaceError,
 )
@@ -402,9 +421,10 @@ async def raise_http_for_sample_metadata_write_error(
     """Map a sample-family metadata-write exception to its HTTPException.
 
     One exception maps to exactly one response, so the mapping cannot drift.
-    Parse, unknown-field, study-field-conflict, duplicate-global-target, and
-    owner-sample-id errors map to 422; a slot collision to 409 (diagnosed
-    against conn); a transient write race to 503. Always raises.
+    Parse, unknown-field, study-field-conflict, duplicate-global-target,
+    owner-sample-id, and missing-value-on-a-unique-field errors map to 422; a
+    slot collision and a study-local uniqueness collision to 409 (the former
+    diagnosed against conn); a transient write race to 503. Always raises.
     """
     if isinstance(exc, MetadataUnknownFieldsError):
         raise HTTPException(
@@ -444,6 +464,22 @@ async def raise_http_for_sample_metadata_write_error(
             detail=(
                 f"metadata field {exc.display_name!r} is an owner-sample-id field"
                 " and cannot be written as ordinary metadata"
+            ),
+        )
+    if isinstance(exc, StudyUniqueValueConflictError):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"metadata field {exc.display_name!r} is unique within this study"
+                f" and another sample already holds value {exc.attempted_value!r}"
+            ),
+        )
+    if isinstance(exc, MissingValueOnUniqueFieldError):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"metadata field {exc.display_name!r} is unique within this study"
+                " and cannot be given a missing-value marker"
             ),
         )
     if isinstance(exc, SlotOccupiedError):
@@ -560,6 +596,7 @@ async def create_and_map_study_field(
             required=body.required,
             terminology_idx=body.terminology_idx,
             tier_override=body.tier_override,
+            unique_in_study=body.unique_in_study,
         )
     except StudyFieldAlreadyExistsError:
         raise HTTPException(
@@ -579,9 +616,185 @@ async def create_and_map_study_field(
     except asyncpg.ForeignKeyViolationError:
         raise HTTPException(status_code=422, detail=GENERIC_FK_VIOLATION)
     except asyncpg.CheckViolationError:
-        raise HTTPException(status_code=422, detail=f"violates a database constraint on {noun}")
+        raise_generic_check_violation(noun)
 
     return map_study_field_row(row, spec=spec, response_model=response_model)
+
+
+def raise_generic_check_violation(noun: str) -> NoReturn:
+    """Raise the 422 for a CHECK the wire models were meant to preempt.
+
+    The last line of defense on a study-field write: reaching it means a body
+    passed validation and the database still refused the row.
+    """
+    raise HTTPException(status_code=422, detail=f"{GENERIC_CHECK_VIOLATION} {noun}")
+
+
+async def fetch_study_field_in_study(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    study_field_idx: int,
+    for_update: bool = False,
+) -> asyncpg.Record | None:
+    """Return one study-local field addressed under study_idx, or None.
+
+    A field that exists but belongs to another study answers None, the same as
+    one that does not exist: it is not where this path addresses it, and
+    answering differently would confirm it to a caller with no access to the
+    study holding it. for_update locks the row for the rest of the caller's
+    transaction.
+    """
+    row = await fetch_study_field(conn, spec=spec, idx=study_field_idx, for_update=for_update)
+    if row is not None and row["study_idx"] != study_idx:
+        return None
+    return row
+
+
+async def read_and_map_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    study_field_idx: int,
+    response_model: type[SampleStudyFieldResponse],
+) -> tuple[SampleStudyFieldResponse, datetime]:
+    """Read one study-local field and shape it into response_model.
+
+    Returns the response alongside the row's updated_at, which the caller turns
+    into the ETag its If-Match on a later edit must carry. Absent, and belonging
+    to another study, are both 404.
+    """
+    row = await fetch_study_field_in_study(
+        conn, spec=spec, study_idx=study_idx, study_field_idx=study_field_idx
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"{spec.entity_kind} field {study_field_idx} not found"
+        )
+    mapped = map_study_field_row(row, spec=spec, response_model=response_model)
+    return mapped, row["updated_at"]
+
+
+async def patch_and_map_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    study_field_idx: int,
+    body: SampleStudyFieldPatchRequest,
+    if_match: str | None,
+    response_model: type[SampleStudyFieldResponse],
+) -> SampleStudyFieldResponse:
+    """Edit one study-local field and shape the stored row into response_model.
+
+    Requires If-Match (428 without). Reads the row under a lock held to commit,
+    so a concurrent edit of the same field serializes here rather than racing
+    past the ETag check: absent is 404, a field belonging to another study is
+    also 404 (it exists, but not where this path addresses, and saying so
+    differently would confirm it), and a stale tag is 412.
+
+    Then the two shape rules, both against the stored row rather than the body,
+    since the body carries neither the field's type nor its link: a linked row
+    refuses the attributes it inherits, and unique_in_study refuses a shape it
+    cannot govern. Both are 422.
+
+    Write rejections: a display_name already used in the study is 409; enabling
+    uniqueness over values that already repeat is 409; over a value that is a
+    missing-value marker, 422. The last two are the field's existing data
+    refusing the new policy, so they name the field, not one value.
+
+    A change of uniqueness policy propagates to every value stored through the
+    field and touches each value's parent entity, so it locks on the order of
+    two rows per sample in the study until the caller's transaction commits.
+
+    The caller owns the transaction.
+    """
+    noun = spec.entity_kind
+    if_match = require_if_match(if_match)
+
+    row = await fetch_study_field_in_study(
+        conn, spec=spec, study_idx=study_idx, study_field_idx=study_field_idx, for_update=True
+    )
+    require_etag_match(row, if_match=if_match, label=f"{noun} field", row_idx=study_field_idx)
+
+    named = body.model_fields_set
+    if row[spec.study_field_global_fk_column] is not None:
+        inherited = [name for name in NOT_SETTABLE_ON_LINKED_FIELD if name in named]
+        if inherited:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{noun} field {study_field_idx} is linked to a global field;"
+                    f" {', '.join(inherited)} cannot be set on it"
+                ),
+            )
+
+    if body.unique_in_study:
+        reason = unique_in_study_rejection_reason(
+            data_type=row["data_type"],
+            is_globally_linked=row[spec.study_field_global_fk_column] is not None,
+        )
+        if reason is not None:
+            raise HTTPException(status_code=422, detail=reason)
+
+    fields = {name: getattr(body, name) for name in named}
+    try:
+        updated_row = await update_study_field(conn, spec=spec, idx=study_field_idx, fields=fields)
+    except asyncpg.UniqueViolationError as exc:
+        if classify_unique_in_study_violation(exc, spec=spec) is (
+            UniqueInStudyViolation.DUPLICATE_VALUE
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{noun} field {row['display_name']!r} cannot be made unique within"
+                    f" this study: two or more of its {noun}s already share a value"
+                ),
+            )
+        raise_for_unique_violation(
+            exc,
+            constraint_messages={
+                spec.study_field_display_name_unique_constraint: (
+                    f"a {noun} field of that name already exists on this study"
+                )
+            },
+            generic=f"violates a uniqueness constraint on {noun} field",
+        )
+    except asyncpg.CheckViolationError as exc:
+        if classify_unique_in_study_violation(exc, spec=spec) is (
+            UniqueInStudyViolation.MISSING_VALUE_MARKER
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{noun} field {row['display_name']!r} cannot be made unique within"
+                    f" this study: one of its {noun}s carries a missing-value marker"
+                ),
+            )
+        raise_generic_check_violation(noun)
+    except asyncpg.RaiseError:
+        # Publication freezes a field's uniqueness policy, in both directions:
+        # the conservative default while nothing publishes yet; see associated
+        # issue for details. Every other P0001 raiser on these metadata tables
+        # is scoped to the key and value columns, so a RaiseError on this
+        # policy-only write is the publication lock and nothing else.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{noun} field {row['display_name']!r} cannot change its uniqueness"
+                f" policy: one or more of its {noun}s has been published"
+            ),
+        )
+
+    # The row was locked from the preflight through this write, so an absent
+    # row here is corruption rather than a lost race.
+    if updated_row is None:
+        raise RuntimeError(
+            f"{spec.study_field_table} idx={study_field_idx} vanished under its own lock"
+        )
+    return map_study_field_row(updated_row, spec=spec, response_model=response_model)
 
 
 def map_study_field_row[T: SampleStudyFieldResponse](

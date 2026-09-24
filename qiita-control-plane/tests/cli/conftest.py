@@ -182,3 +182,18 @@ def cp_transport(upload_state, reference_state):
 
     transport = httpx.MockTransport(handler)
     return transport, calls
+
+
+def genome_map_table(entries):
+    """The genome map as the client now receives it — an Arrow table read out of a
+    Parquet body rather than a list of JSON entries.
+
+    Fixtures stay dicts because that is what a person reads; this is the single
+    place they become the shape `_stage_genome_map` and `_stage_denovo_genome_map`
+    actually take, so the two CLI test modules cannot disagree about it.
+    """
+    import pyarrow as pa
+
+    from qiita_control_plane.actions.library import GENOME_MAP_PARQUET_SCHEMA
+
+    return pa.Table.from_pylist(list(entries), schema=GENOME_MAP_PARQUET_SCHEMA)

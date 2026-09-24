@@ -26,10 +26,15 @@ from qiita_common.models import (
     derive_metadata_field_scope,
 )
 
-from . import require_transaction
+from . import require_transaction, update_row
 
 # Whether a colliding metadata write overwrites the existing value or raises.
 type MetadataConflictMode = Literal["raise", "upsert"]
+
+# Whether a colliding (entity, study) link row raises or is silently kept. A
+# link row has no value to overwrite — only existence — so its non-raising
+# mode is ON CONFLICT DO NOTHING, not "upsert".
+type LinkConflictMode = Literal["raise", "ignore"]
 
 # How the existing occupant of a metadata slot relates to an attempted write:
 # the two same-kind verdicts, then the two cross-kind ones (a typed value
@@ -246,6 +251,150 @@ class MetadataMissingRequiredFieldsError(Exception):
         self.missing_display_names = missing_display_names
         super().__init__(
             f"missing required {entity_kind} global field(s): {missing_display_names!r}"
+        )
+
+
+class UniqueInStudyViolation(StrEnum):
+    """Which study-local uniqueness rule a database error broke."""
+
+    DUPLICATE_VALUE = "duplicate_value"
+    MISSING_VALUE_MARKER = "missing_value_marker"
+
+
+# Columns a caller may edit on a {entity}_study_field row, mirroring the wire
+# shape of SampleStudyFieldPatchRequest, whose docstring carries why data_type
+# and the global-field link are excluded.
+STUDY_FIELD_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
+    {"display_name", "description", "required", "tier_override", "unique_in_study"}
+)
+
+
+class StudyUniqueValueConflictError(Exception):
+    """Raised when a *_metadata write would repeat a value already held
+    through the same unique_in_study field. Carries the field and the
+    rejected value so the caller learns which of its inputs collided.
+    """
+
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        display_name: str,
+        study_field_idx: int,
+        attempted_value: SampleMetadataValue,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.display_name = display_name
+        self.study_field_idx = study_field_idx
+        self.attempted_value = attempted_value
+        super().__init__(
+            f"{entity_kind} field {display_name!r} is unique within its study and"
+            f" already holds value {attempted_value!r}"
+        )
+
+
+class MissingValueOnUniqueFieldError(Exception):
+    """Raised when a *_metadata write would put a missing-value marker on a
+    unique_in_study field. Carries the field; there is no value to carry.
+    """
+
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        display_name: str,
+        study_field_idx: int,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.display_name = display_name
+        self.study_field_idx = study_field_idx
+        super().__init__(
+            f"{entity_kind} field {display_name!r} is unique within its study and"
+            f" cannot hold a missing-value marker"
+        )
+
+
+class StudyFieldNotUniqueInStudyError(Exception):
+    """Raised when a write that only makes sense against a study-locally
+    unique field resolves an existing field that does not declare the policy.
+
+    Carries the field so a caller can name it: the fix is to make that field
+    unique within its study, or to name a different field, and neither is a
+    decision this layer can take.
+    """
+
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        study_idx: int,
+        display_name: str,
+        study_field_idx: int,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.study_idx = study_idx
+        self.display_name = display_name
+        self.study_field_idx = study_field_idx
+        super().__init__(
+            f"{entity_kind} field {display_name!r} on study {study_idx} is not unique"
+            f" within the study"
+        )
+
+
+class StudyFieldUniqueInStudyError(Exception):
+    """Raised when a write whose value repeats across the study's entities
+    resolves an existing field that declares unique_in_study.
+
+    Carries the field so a caller can name it: the fix is to clear the policy
+    or to name a different field, and neither is a decision this layer can take.
+    """
+
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        study_idx: int,
+        display_name: str,
+        study_field_idx: int,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.study_idx = study_idx
+        self.display_name = display_name
+        self.study_field_idx = study_field_idx
+        super().__init__(
+            f"{entity_kind} field {display_name!r} on study {study_idx} declares its"
+            f" values unique within the study, so the same value cannot be written"
+            f" for every {entity_kind}"
+        )
+
+
+class StudyFieldDataTypeNotTextError(Exception):
+    """Raised when a write that can only put text through a field resolves an
+    existing field declaring some other data_type.
+
+    Carries the field so a caller can name it: the fix is to name a field that
+    stores text, and choosing one is not a decision this layer can take. The
+    value is never coerced into the declared type -- an identifier that has
+    been through a numeric round-trip is a different identifier.
+    """
+
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        study_idx: int,
+        display_name: str,
+        study_field_idx: int,
+        data_type: str,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.study_idx = study_idx
+        self.display_name = display_name
+        self.study_field_idx = study_field_idx
+        self.data_type = data_type
+        super().__init__(
+            f"{entity_kind} field {display_name!r} on study {study_idx} declares"
+            f" data_type {data_type!r}, not text"
         )
 
 
@@ -561,8 +710,17 @@ class EntityMetadataSpec:
     # table (biosample_global_field_idx / prep_sample_global_field_idx).
     # NULL on a purely-local row, non-NULL on a globally-linked one.
     study_field_global_fk_column: str
+    # UNIQUE (study_idx, display_name) on study_field_table.
+    study_field_display_name_unique_constraint: str
     global_field_unique_index_name: str
     local_unique_per_field_index_name: str
+    # The partial unique indexes enforcing a unique_in_study field's
+    # distinctness, one per eligible value column. A set rather than one field
+    # per column: which typed index caught a collision tells a caller nothing
+    # the field name and value do not already say.
+    unique_in_study_index_names: frozenset[str]
+    # The row CHECK refusing a missing-value marker on a unique_in_study field.
+    unique_in_study_no_missing_constraint: str
     # The per-study link table (biosample_to_study / prep_sample_to_study)
     # and the entity-id column on it (biosample_idx / prep_sample_idx).
     link_table: str
@@ -583,11 +741,13 @@ class EntityMetadataSpec:
 # constants and closed in-code mappings, never from caller input; values always
 # bind as $N placeholders.
 
-# The name a study-field read aliases its entity-specific global-FK column to,
-# so the Python access is the same whichever entity's table was queried. Shared
-# by the SELECT that emits it and every read that consumes it: a rename that
-# reached only one side would fail at runtime with a missing record key.
-FOUND_GLOBAL_FIELD_IDX_ALIAS = "found_global_field_idx"
+# The {entity}_study_field columns a globally-linked row leaves NULL because
+# they live on the global-field row, so every read COALESCEs them into their
+# effective values. tier_override is deliberately absent: the global row
+# carries default_tier, a distinct concept, so tier_override reads as stored.
+_STUDY_FIELD_INHERITED_COLUMNS: frozenset[str] = frozenset(
+    {"data_type", "required", "terminology_idx"}
+)
 
 # The columns a global-field lookup may key on. A closed mapping from the
 # public Literal to its SQL column name, so the interpolated identifier is
@@ -1120,7 +1280,8 @@ async def _fetch_slot_occupant(
     entity_idx: int,
     global_field_idx: int | None = None,
     study_field_idx: int | None = None,
-) -> Mapping[str, object]:
+    missing_ok: bool = False,
+) -> Mapping[str, object] | None:
     """Read the existing row occupying the metadata slot rejected by the
     unique constraint, joined to its source study_field to recover the
     contributing study and that field's own idx. Exactly one of
@@ -1161,11 +1322,17 @@ async def _fetch_slot_occupant(
     )
     row = await conn.fetchrow(sql, entity_idx, slot_value)
     if row is None:
-        # The unique constraint rejected the INSERT, yet the occupant is
-        # gone: a concurrent transaction deleted-and-committed it in the
-        # window between the savepoint rollback and this read. The slot is
-        # free again — a benign lost race, not schema corruption — so signal
-        # a retry rather than masquerading it as an invariant violation.
+        # An empty slot means one of two things, and only the caller knows
+        # which. Under missing_ok it is expected: the rejection came from a
+        # rule about the value rather than about the slot, so the caller's own
+        # slot was never occupied and None is the answer. Otherwise the slot
+        # index itself rejected the INSERT, so the occupant existed moments ago
+        # and a concurrent transaction deleted-and-committed it in the window
+        # between the savepoint rollback and this read — a benign lost race,
+        # not schema corruption, so signal a retry rather than masquerading it
+        # as an invariant violation.
+        if missing_ok:
+            return None
         raise TransientWriteRaceError(
             row_label=f"{spec.entity_kind}_metadata",
             slot_summary=(f"{spec.entity_kind}_idx={entity_idx}, {filter_column}={slot_value}"),
@@ -1261,22 +1428,17 @@ async def _refetch_conflicting_study_field(
     display_name: str,
 ) -> asyncpg.Record:
     """Re-read the *_study_field row at (study_idx, display_name) whose presence
-    made an ON CONFLICT DO NOTHING insert return nothing. Carries idx plus the
-    global FK under FOUND_GLOBAL_FIELD_IDX_ALIAS.
+    made an ON CONFLICT DO NOTHING insert return nothing, in the shape every
+    study-field read returns.
 
     Raises TransientWriteRaceError when the row is already gone: a concurrent
     transaction deleted-and-committed it between the conflict and this read, so
-    the slot is free again — a benign lost race, not schema corruption.
+    the slot is free again — a benign lost race, not schema corruption. That
+    miss-is-an-error contract is what separates this from fetch_study_field,
+    which reports an absent row as None.
     """
-    # f-string interpolation of identifiers is safe: spec fields are frozen
-    # module-level constants, never reached by caller input.
-    row = await conn.fetchrow(
-        f"SELECT idx, {spec.study_field_global_fk_column} AS {FOUND_GLOBAL_FIELD_IDX_ALIAS}"
-        f" FROM {spec.study_field_table}"
-        f" WHERE study_idx = $1 AND display_name = $2",
-        study_idx,
-        display_name,
-    )
+    sql = f"{_study_field_read_sql(spec)} WHERE sf.study_idx = $1 AND sf.display_name = $2"
+    row = await conn.fetchrow(sql, study_idx, display_name)
     if row is None:
         raise TransientWriteRaceError(
             row_label=f"{spec.entity_kind}_study_field",
@@ -1349,7 +1511,7 @@ async def _get_or_create_globally_linked_study_field(
     row = await _refetch_conflicting_study_field(
         conn, spec=spec, study_idx=study_idx, display_name=display_name
     )
-    found_global_field_idx = row[FOUND_GLOBAL_FIELD_IDX_ALIAS]
+    found_global_field_idx = row[spec.study_field_global_fk_column]
     if found_global_field_idx != global_field_idx:
         raise StudyFieldConflictError(
             entity_kind=spec.entity_kind,
@@ -1440,6 +1602,35 @@ async def _update_metadata(
         )
 
 
+def _raise_for_unique_in_study_violation(
+    exc: asyncpg.PostgresError,
+    *,
+    spec: EntityMetadataSpec,
+    display_name: str,
+    study_field_idx: int,
+    attempted_value: SampleMetadataValue,
+) -> None:
+    """Translate a study-local uniqueness rejection into its typed error.
+
+    Returns without raising when the rejection is neither uniqueness rule,
+    leaving the caller to decide what the exception means.
+    """
+    violation = classify_unique_in_study_violation(exc, spec=spec)
+    if violation is UniqueInStudyViolation.DUPLICATE_VALUE:
+        raise StudyUniqueValueConflictError(
+            entity_kind=spec.entity_kind,
+            display_name=display_name,
+            study_field_idx=study_field_idx,
+            attempted_value=attempted_value,
+        ) from exc
+    if violation is UniqueInStudyViolation.MISSING_VALUE_MARKER:
+        raise MissingValueOnUniqueFieldError(
+            entity_kind=spec.entity_kind,
+            display_name=display_name,
+            study_field_idx=study_field_idx,
+        ) from exc
+
+
 async def _insert_metadata_or_diagnose(
     conn: asyncpg.Connection,
     *,
@@ -1492,6 +1683,10 @@ async def _insert_metadata_or_diagnose(
         slot_kwargs = {"study_field_idx": study_field_idx}
         diagnostic_constraint_names = {spec.local_unique_per_field_index_name}
 
+    # Bound before the try: the except arms name it, and on the global path the
+    # mint inside the try can itself raise before the assignment is reached.
+    target_field_idx = study_field_idx
+
     # Typed INSERT inside a SAVEPOINT so a unique violation rolls back only the
     # nested savepoint, leaving the caller's outer transaction alive to
     # diagnose and (under upsert) overwrite the occupant below.
@@ -1536,10 +1731,31 @@ async def _insert_metadata_or_diagnose(
             outcome=FieldWriteOutcome.INSERTED,
         )
     except asyncpg.UniqueViolationError as exc:
-        # Only a diagnostic constraint drives the diagnostic path; any other
-        # UniqueViolation is the caller's problem and propagates unchanged.
-        if exc.constraint_name not in diagnostic_constraint_names:
+        # One INSERT can break the slot index and a study-local uniqueness
+        # index at once -- re-sending the value the caller's own row already
+        # holds breaks both -- and PostgreSQL reports only one of them, in an
+        # order it does not promise (index OID order, an artifact of the order
+        # the indexes were created in). So the reported name is not read as
+        # proof of what happened: both families fall through to the diagnosis
+        # below, which reads the slot and answers from what is actually there.
+        # The global path is unaffected either way, a globally-linked field
+        # being pinned to unique_in_study = false by its inheritance CHECK.
+        unique_in_study_rejected = classify_unique_in_study_violation(exc, spec=spec) is not None
+        if not unique_in_study_rejected and exc.constraint_name not in diagnostic_constraint_names:
+            # Neither family: the caller's problem, propagating unchanged.
             raise
+        insert_violation = exc
+    except asyncpg.CheckViolationError as exc:
+        # No ambiguity to resolve here: a CHECK is evaluated ahead of index
+        # insertion, so nothing else got the chance to reject as well.
+        _raise_for_unique_in_study_violation(
+            exc,
+            spec=spec,
+            display_name=display_name,
+            study_field_idx=target_field_idx,
+            attempted_value=value,
+        )
+        raise
 
     # Diagnose the occupant once; both the upsert decision and any raised error
     # read from this single diagnosis. Reached only via the controlled path
@@ -1548,8 +1764,20 @@ async def _insert_metadata_or_diagnose(
         conn,
         spec=spec,
         entity_idx=entity_idx,
+        missing_ok=unique_in_study_rejected,
         **slot_kwargs,
     )
+    if existing_row is None:
+        # Nothing in the caller's own slot, so the rejection was about the
+        # value rather than the slot: another entity in the study holds it.
+        _raise_for_unique_in_study_violation(
+            insert_violation,
+            spec=spec,
+            display_name=display_name,
+            study_field_idx=target_field_idx,
+            attempted_value=value,
+        )
+        raise insert_violation
     compare_result, existing_value, existing_missing_reason_idx = _diagnose_slot_occupant(
         data_type, existing_row, value
     )
@@ -1578,14 +1806,30 @@ async def _insert_metadata_or_diagnose(
             if existing_missing_reason_idx is not None
             else _resolve_typed_value_column(data_type)
         )
-        await _update_metadata(
-            conn,
-            spec=spec,
-            metadata_idx=existing_metadata_idx,
-            data_type=data_type,
-            value=value,
-            existing_value_column=existing_value_column,
-        )
+        # The overwrite is judged against the study-local uniqueness index on
+        # its own terms: the INSERT's rejection said only that this slot was
+        # taken, which the occupant read above has now explained, and says
+        # nothing about whether the new value collides with another entity's.
+        # The no-missing-value CHECK is not reachable here, being evaluated
+        # ahead of any index, so a missing marker always fails at the INSERT.
+        try:
+            await _update_metadata(
+                conn,
+                spec=spec,
+                metadata_idx=existing_metadata_idx,
+                data_type=data_type,
+                value=value,
+                existing_value_column=existing_value_column,
+            )
+        except asyncpg.UniqueViolationError as exc:
+            _raise_for_unique_in_study_violation(
+                exc,
+                spec=spec,
+                display_name=display_name,
+                study_field_idx=occupant_field_idx,
+                attempted_value=value,
+            )
+            raise
         return SampleMetadataWriteResult(
             metadata_idx=existing_metadata_idx,
             study_field_idx=occupant_field_idx,
@@ -1703,17 +1947,20 @@ async def _get_or_create_local_study_field(
     required: bool = False,
     terminology_idx: int | None = None,
     tier_override: Tier | None = None,
-) -> tuple[int, bool, int | None]:
+    unique_in_study: bool = False,
+) -> tuple[int, bool, asyncpg.Record]:
     """Find a {entity}_study_field by (study_idx, display_name); create
     purely-local on miss.
 
-    Returns (idx, created, global_field_idx). created is True on the insert
-    branch (always purely-local). global_field_idx is None for a purely-local
-    row and non-None when the lookup branch resolved an existing row that
-    turned out to be globally linked, so callers that require strict
-    local-only semantics can reject that resolution instead of silently
-    writing through it. Race-free under READ COMMITTED via INSERT ...
-    ON CONFLICT DO NOTHING + fallback SELECT.
+    Returns (idx, created, row). created is True on the insert branch (always
+    purely-local). row is the resolved definition in the shape every
+    study-field read returns, identical whichever branch produced it, so a
+    caller can judge what it got — whether the row is globally linked, what
+    type it carries, what policies it declares — rather than being told only
+    what this call asked for. A caller needing strict local-only semantics
+    rejects a linked resolution by reading the global FK off it. Race-free
+    under READ COMMITTED via INSERT ... ON CONFLICT DO NOTHING + fallback
+    SELECT.
     """
     # Both branches must observe the same snapshot; require a wrapping
     # transaction so the INSERT and the fallback SELECT cannot straddle
@@ -1725,14 +1972,14 @@ async def _get_or_create_local_study_field(
     # of the race does not raise. f-string interpolation of identifiers is
     # safe: spec fields are frozen module-level constants, never reached by
     # caller input.
-    idx = await conn.fetchval(
+    created_row = await conn.fetchrow(
         f"INSERT INTO {spec.study_field_table} ("
         f"    study_idx, display_name, description,"
         f"    data_type, required, terminology_idx, tier_override,"
-        f"    created_by_idx"
-        f") VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        f"    unique_in_study, created_by_idx"
+        f") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
         f" ON CONFLICT (study_idx, display_name) DO NOTHING"
-        f" RETURNING idx",
+        f" RETURNING {', '.join(_study_field_output_columns(spec))}",
         study_idx,
         display_name,
         description,
@@ -1740,20 +1987,48 @@ async def _get_or_create_local_study_field(
         required,
         terminology_idx,
         tier_override,
+        unique_in_study,
         created_by_idx,
     )
-    if idx is not None:
-        # Create branch — the row is purely-local by construction.
-        return idx, True, None
+    if created_row is not None:
+        # Create branch — the row is purely-local by construction, so the
+        # values RETURNING gives are already the effective ones and need none
+        # of the resolution a read performs.
+        return created_row["idx"], True, created_row
 
     # Lookup branch — fallback fires only on conflict; takes a fresh
     # snapshot under READ COMMITTED so it sees the row the concurrent
-    # winner committed. The resolved row's FK travels back to the caller so
-    # it can detect a globally-linked resolution.
+    # winner committed. The whole resolved row travels back so a caller can
+    # judge the definition it got, rather than only the link it carries.
     row = await _refetch_conflicting_study_field(
         conn, spec=spec, study_idx=study_idx, display_name=display_name
     )
-    return row["idx"], False, row[FOUND_GLOBAL_FIELD_IDX_ALIAS]
+    return row["idx"], False, row
+
+
+def _study_field_output_columns(spec: EntityMetadataSpec) -> tuple[str, ...]:
+    """The column names every {entity}_study_field row arrives under, in order.
+
+    One list drives two renderings: a read SELECTs them from the study-field
+    table, COALESCEing the inherited ones against the linked global field, and
+    a create RETURNINGs them straight off the new row. Both must produce the
+    same keys, so a column added here reaches both.
+    """
+    return (
+        "idx",
+        "study_idx",
+        spec.study_field_global_fk_column,
+        "display_name",
+        "description",
+        "data_type",
+        "required",
+        "terminology_idx",
+        "tier_override",
+        "unique_in_study",
+        "created_by_idx",
+        "created_at",
+        "updated_at",
+    )
 
 
 def _study_field_read_sql(spec: EntityMetadataSpec) -> str:
@@ -1771,19 +2046,14 @@ def _study_field_read_sql(spec: EntityMetadataSpec) -> str:
     # f-string interpolation of identifiers is safe: spec fields are frozen
     # module-level constants, never reached by caller input.
     fk_column = spec.study_field_global_fk_column
+    selected = ", ".join(
+        f"COALESCE(sf.{col}, gf.{col}) AS {col}"
+        if col in _STUDY_FIELD_INHERITED_COLUMNS
+        else f"sf.{col}"
+        for col in _study_field_output_columns(spec)
+    )
     return (
-        f"SELECT"
-        f"    sf.idx,"
-        f"    sf.study_idx,"
-        f"    sf.{fk_column},"
-        f"    sf.display_name,"
-        f"    sf.description,"
-        f"    COALESCE(sf.data_type, gf.data_type) AS data_type,"
-        f"    COALESCE(sf.required, gf.required) AS required,"
-        f"    COALESCE(sf.terminology_idx, gf.terminology_idx) AS terminology_idx,"
-        f"    sf.tier_override,"
-        f"    sf.created_by_idx,"
-        f"    sf.created_at"
+        f"SELECT {selected}"
         f" FROM {spec.study_field_table} sf"
         f" LEFT JOIN {spec.global_field_table} gf"
         f"     ON gf.idx = sf.{fk_column}"
@@ -1795,16 +2065,82 @@ async def fetch_study_field(
     *,
     spec: EntityMetadataSpec,
     idx: int,
+    for_update: bool = False,
 ) -> asyncpg.Record | None:
     """Return one {entity}_study_field row by idx, or None on miss.
 
     Values inherited from a linked global field arrive already resolved. The row
     names the global FK by its entity-specific column and the row's own idx as
     `idx`. Accepts either a pool or a connection.
+
+    for_update locks the study-field row for the rest of the caller's
+    transaction, so an edit preflight and the write that follows it cannot
+    straddle another writer's commit. It locks only the study-field row, not the
+    joined global field, and requires a connection inside a transaction, which
+    it enforces rather than assuming.
     """
-    sql = f"{_study_field_read_sql(spec)} WHERE sf.idx = $1"
+    if for_update:
+        # A lock taken outside a transaction is released by the autocommit that
+        # ends the statement, leaving the caller unprotected and uninformed.
+        require_transaction(pool_or_conn)
+    lock_clause = " FOR UPDATE OF sf" if for_update else ""
+    sql = f"{_study_field_read_sql(spec)} WHERE sf.idx = $1{lock_clause}"
     row = await pool_or_conn.fetchrow(sql, idx)
     return row
+
+
+async def update_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    idx: int,
+    fields: dict[str, object],
+) -> asyncpg.Record | None:
+    """Update the named columns on one {entity}_study_field row and return the
+    stored row, or None when no row matches.
+
+    Writes through the shared update composer, then re-reads: the composer's
+    RETURNING is a flat column list and cannot reproduce the join that resolves
+    a linked row's inherited values, so the returned Record comes from
+    fetch_study_field and carries the same shape every other read does.
+
+    The caller owns the transaction; the write and the re-read must see one
+    snapshot.
+    """
+    require_transaction(conn)
+    written_idx = await update_row(
+        conn,
+        table=spec.study_field_table,
+        row_idx=idx,
+        fields=fields,
+        allowlist=STUDY_FIELD_PATCHABLE_COLUMNS,
+        returning_cols="idx",
+        repo_name="update_study_field",
+    )
+    if written_idx is None:
+        return None
+    updated_row = await fetch_study_field(conn, spec=spec, idx=written_idx["idx"])
+    return updated_row
+
+
+def classify_unique_in_study_violation(
+    exc: asyncpg.PostgresError, *, spec: EntityMetadataSpec
+) -> UniqueInStudyViolation | None:
+    """Name which study-local uniqueness rule a database error broke, or None
+    when it broke neither.
+
+    Dispatches on the constraint name, never on message prose: these tables
+    carry several unique indexes and CHECKs, and answering for the wrong one
+    would name the wrong cause. Callers word their own response — the same
+    constraint means "this value is taken" to a write and "this field's existing
+    values are not distinct" to a policy change.
+    """
+    constraint_name = getattr(exc, "constraint_name", None)
+    if constraint_name in spec.unique_in_study_index_names:
+        return UniqueInStudyViolation.DUPLICATE_VALUE
+    if constraint_name == spec.unique_in_study_no_missing_constraint:
+        return UniqueInStudyViolation.MISSING_VALUE_MARKER
+    return None
 
 
 async def fetch_study_fields_for_study(
@@ -1860,6 +2196,7 @@ async def create_study_field(
     required: bool | None = None,
     terminology_idx: int | None = None,
     tier_override: Tier | None = None,
+    unique_in_study: bool | None = None,
 ) -> int:
     """Create one {entity}_study_field and return its idx, failing if the name
     is already used on the study.
@@ -1880,10 +2217,13 @@ async def create_study_field(
     # Globally-linked mode: the inherited columns live on the global-field row,
     # so the caller must omit them here — reject rather than silently drop.
     if global_field_idx is not None:
-        if any(x is not None for x in (data_type, required, terminology_idx, tier_override)):
+        if any(
+            x is not None
+            for x in (data_type, required, terminology_idx, tier_override, unique_in_study)
+        ):
             raise ValueError(
-                "data_type/required/terminology_idx/tier_override must be omitted "
-                "for a globally-linked study field"
+                "data_type/required/terminology_idx/tier_override/unique_in_study must be "
+                "omitted for a globally-linked study field"
             )
         idx, created = await _get_or_create_globally_linked_study_field(
             conn,
@@ -1915,6 +2255,7 @@ async def create_study_field(
             required=required if required is not None else False,
             terminology_idx=terminology_idx,
             tier_override=tier_override,
+            unique_in_study=unique_in_study if unique_in_study is not None else False,
         )
 
     # A row already at this name is an error here, not a silent reuse.
@@ -1940,6 +2281,7 @@ async def create_study_field_and_read_back(
     required: bool | None = None,
     terminology_idx: int | None = None,
     tier_override: Tier | None = None,
+    unique_in_study: bool | None = None,
 ) -> asyncpg.Record:
     """Create one {entity}_study_field and return the stored row, failing if
     the name is already used on the study.
@@ -1966,6 +2308,7 @@ async def create_study_field_and_read_back(
         required=required,
         terminology_idx=terminology_idx,
         tier_override=tier_override,
+        unique_in_study=unique_in_study,
     )
     created_row = await fetch_study_field(conn, spec=spec, idx=created_idx)
     # The row was just inserted inside this transaction, so a miss here means
@@ -1976,6 +2319,139 @@ async def create_study_field_and_read_back(
             f"{spec.study_field_table} idx={created_idx} vanished immediately after insert"
         )
     return created_row
+
+
+async def resolve_local_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    display_name: str,
+    created_by_idx: int,
+    description: str | None = None,
+    data_type: FieldDataType = FieldDataType.TEXT,
+    required: bool = False,
+    terminology_idx: int | None = None,
+    tier_override: Tier | None = None,
+    unique_in_study: bool = False,
+    enforce_unique_in_study: bool = False,
+) -> tuple[int, bool, asyncpg.Record]:
+    """Get-or-create a purely-local study field fit to receive the caller's
+    writes; return (study_field_idx, created, resolved row).
+
+    The row comes back resolved whichever branch produced it, so the caller can
+    judge what it got rather than being told only what this call asked for. A
+    resolution that contradicts the write is refused here, before any value
+    INSERT, with the typed error naming the field:
+
+      - a globally-linked row raises LocalWriteOnGloballyLinkedFieldError:
+        writing a local-only value through it would let the value compete in
+        the cross-study global slot, the opposite of local-only intent.
+      - when the caller writes text, a row declaring another data_type raises
+        StudyFieldDataTypeNotTextError: refused rather than coerced, because a
+        value that has been through a type round-trip is a different value.
+        (The field-contract trigger would reject the value anyway; this turns
+        its raw error into a typed one naming the field.)
+      - enforce_unique_in_study pins the resolved row's unique_in_study to
+        unique_in_study: a value whose meaning needs the policy raises
+        StudyFieldNotUniqueInStudyError when the row lacks it, a value every
+        entity of the study may share raises StudyFieldUniqueInStudyError when
+        the row declares it.
+
+    Requires a wrapping transaction: both get-or-create branches must share
+    one snapshot (see _get_or_create_local_study_field).
+    """
+    (
+        study_field_idx,
+        created,
+        resolved_row,
+    ) = await _get_or_create_local_study_field(
+        conn,
+        spec=spec,
+        study_idx=study_idx,
+        display_name=display_name,
+        created_by_idx=created_by_idx,
+        description=description,
+        data_type=data_type,
+        required=required,
+        terminology_idx=terminology_idx,
+        tier_override=tier_override,
+        unique_in_study=unique_in_study,
+    )
+    if resolved_row[spec.study_field_global_fk_column] is not None:
+        raise LocalWriteOnGloballyLinkedFieldError(
+            entity_kind=spec.entity_kind,
+            study_idx=study_idx,
+            display_name=display_name,
+            study_field_idx=study_field_idx,
+            found_global_field_idx=resolved_row[spec.study_field_global_fk_column],
+        )
+    if data_type == FieldDataType.TEXT and resolved_row["data_type"] != FieldDataType.TEXT:
+        raise StudyFieldDataTypeNotTextError(
+            entity_kind=spec.entity_kind,
+            study_idx=study_idx,
+            display_name=display_name,
+            study_field_idx=study_field_idx,
+            data_type=resolved_row["data_type"],
+        )
+    if enforce_unique_in_study and resolved_row["unique_in_study"] != unique_in_study:
+        if unique_in_study:
+            raise StudyFieldNotUniqueInStudyError(
+                entity_kind=spec.entity_kind,
+                study_idx=study_idx,
+                display_name=display_name,
+                study_field_idx=study_field_idx,
+            )
+        raise StudyFieldUniqueInStudyError(
+            entity_kind=spec.entity_kind,
+            study_idx=study_idx,
+            display_name=display_name,
+            study_field_idx=study_field_idx,
+        )
+    return study_field_idx, created, resolved_row
+
+
+async def write_local_metadata_on_resolved_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+    study_field_idx: int,
+    display_name: str,
+    data_type: FieldDataType,
+    value: SampleMetadataValue,
+    caller_idx: int,
+    study_field_created: bool = False,
+    on_conflict: MetadataConflictMode = "raise",
+) -> SampleMetadataWriteResult:
+    """Write one value against an already-resolved purely-local study field:
+    the per-value half of write_local_metadata_or_diagnose, for a caller that
+    resolved the field once (resolve_local_study_field) and writes it many
+    times, so the get-or-create runs once instead of per write.
+
+    The field's shape was judged at resolution; only the value slot is
+    diagnosed here, under the same on_conflict rules. The caller owns the
+    transaction. study_field_created is reported back in the result only --
+    write_local_metadata_or_diagnose forwards the flag its own get-or-create
+    returned.
+    """
+    require_transaction(conn)
+    # Insert-and-diagnose; the local path has no cross-study slot key, so
+    # global_field_idx stays None (which selects the per-field constraint).
+    return await _insert_metadata_or_diagnose(
+        conn,
+        spec=spec,
+        entity_idx=entity_idx,
+        study_idx=study_idx,
+        study_field_idx=study_field_idx,
+        study_field_created=study_field_created,
+        display_name=display_name,
+        data_type=data_type,
+        value=value,
+        caller_idx=caller_idx,
+        on_conflict=on_conflict,
+    )
 
 
 async def write_local_metadata_or_diagnose(
@@ -1993,9 +2469,9 @@ async def write_local_metadata_or_diagnose(
     tier_override: Tier | None = None,
     on_conflict: MetadataConflictMode = "raise",
 ) -> SampleMetadataWriteResult:
-    """Write one local (non-globally-linked) metadata row; on collision,
-    diagnose the existing occupant and either overwrite it (on_conflict=
-    "upsert") or raise a typed exception.
+    """Resolve the local study_field, then write one metadata row against it;
+    on a value-slot collision, diagnose the existing occupant and either
+    overwrite it (on_conflict="upsert") or raise a typed exception.
 
     Returns SampleMetadataWriteResult (carrying the write outcome) on success.
     The caller owns the outer transaction: any study_field row created here
@@ -2003,23 +2479,17 @@ async def write_local_metadata_or_diagnose(
     tier_override are forwarded to the study_field create branch only.
     UniqueViolations whose constraint_name is NOT
     spec.local_unique_per_field_index_name propagate unchanged.
-    LocalWriteOnGloballyLinkedFieldError and TransientWriteRaceError also
-    propagate. A purely-local slot is single-study by construction, so upsert
-    always overwrites the caller's own value here (no foreign-study case).
+    LocalWriteOnGloballyLinkedFieldError, StudyFieldDataTypeNotTextError (a
+    text write against a non-text field, refused here rather than by the
+    contract trigger), and TransientWriteRaceError also propagate. A
+    purely-local slot is single-study by construction, so upsert always
+    overwrites the caller's own value here (no foreign-study case).
     """
     # Fail-fast: the caller must own the transaction so the typed exception
     # rolls back any study_field row this function created before raising.
     require_transaction(conn)
 
-    # Get-or-create the local study_field. The third tuple element is the
-    # resolved row's global_field_idx; non-None means the row is globally
-    # linked, which contradicts the caller's local-only intent and triggers
-    # the strict-mode guard.
-    (
-        study_field_idx,
-        study_field_created,
-        resolved_global_field_idx,
-    ) = await _get_or_create_local_study_field(
+    study_field_idx, study_field_created, _ = await resolve_local_study_field(
         conn,
         spec=spec,
         study_idx=study_idx,
@@ -2030,31 +2500,17 @@ async def write_local_metadata_or_diagnose(
         terminology_idx=terminology_idx,
         tier_override=tier_override,
     )
-    if resolved_global_field_idx is not None:
-        # Strict-mode: the caller asked for local-only, but the resolved
-        # row is an existing field that is globally linked.
-        # Refuse the write before any metadata INSERT.
-        raise LocalWriteOnGloballyLinkedFieldError(
-            entity_kind=spec.entity_kind,
-            study_idx=study_idx,
-            display_name=display_name,
-            study_field_idx=study_field_idx,
-            found_global_field_idx=resolved_global_field_idx,
-        )
-
-    # Insert-and-diagnose; the local path has no cross-study slot key, so
-    # global_field_idx stays None (which selects the per-field constraint).
-    return await _insert_metadata_or_diagnose(
+    return await write_local_metadata_on_resolved_field(
         conn,
         spec=spec,
         entity_idx=entity_idx,
         study_idx=study_idx,
         study_field_idx=study_field_idx,
-        study_field_created=study_field_created,
         display_name=display_name,
         data_type=data_type,
         value=value,
         caller_idx=caller_idx,
+        study_field_created=study_field_created,
         on_conflict=on_conflict,
     )
 
@@ -2458,6 +2914,7 @@ async def insert_entity_to_study(
     entity_idx: int,
     study_idx: int,
     created_by_idx: int,
+    on_conflict: LinkConflictMode = "raise",
 ) -> None:
     """Insert one (entity, study) link row into spec.link_table.
 
@@ -2466,15 +2923,22 @@ async def insert_entity_to_study(
     Prep-sample inserts may be rejected (asyncpg.RaiseError) if the
     underlying biosample is not linked to the same study.
 
-    Raises asyncpg.UniqueViolationError if (entity_idx, study_idx) already
-    exists, asyncpg.ForeignKeyViolationError on bad refs.
+    on_conflict: "raise" (default) surfaces asyncpg.UniqueViolationError on
+    an existing (entity_idx, study_idx) row; "ignore" is ON CONFLICT DO
+    NOTHING against that same key. Either mode raises
+    asyncpg.ForeignKeyViolationError on bad refs.
     """
     # f-string interpolation of identifiers is safe: spec fields are frozen
     # module-level constants, never reached by caller input.
+    conflict_clause = (
+        f" ON CONFLICT ({spec.link_entity_key_column}, study_idx) DO NOTHING"
+        if on_conflict == "ignore"
+        else ""
+    )
     await conn.execute(
         f"INSERT INTO {spec.link_table} ("
         f"    {spec.link_entity_key_column}, study_idx, created_by_idx"
-        f") VALUES ($1, $2, $3)",
+        f") VALUES ($1, $2, $3)" + conflict_clause,
         entity_idx,
         study_idx,
         created_by_idx,

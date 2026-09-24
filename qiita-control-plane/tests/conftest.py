@@ -140,8 +140,7 @@ def build_case5_preflight(tmp_path):
     schema and the real `get_pacbio_sample_info`. The fixture leaves the biosample +
     project **bioproject** accessions NULL (they are populated upstream in
     production); `get_pacbio_sample_info` REQUIRES both and raises otherwise, so
-    `populate_accessions=True` sets them via plain sqlite (run_preflight's
-    `save_db_file` is avoided — it blocks in this harness). biosample -> BIO_<name>;
+    `populate_accessions=True` sets them via plain sqlite. biosample -> BIO_<name>;
     the single project's bioproject -> PRJNA<external_project_id>.
 
     `sheet_type` overrides the run's legacy sheet type, for building a well-formed

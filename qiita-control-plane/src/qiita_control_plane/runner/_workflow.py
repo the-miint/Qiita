@@ -104,6 +104,7 @@ from ._read_ingest import (
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
+    _stage_ena_run_roster_binding,
     _stage_shard_roster,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
@@ -348,6 +349,19 @@ async def run_workflow(
         if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
 
+        # ENA run-roster binding (download-ena-study workflow's
+        # `ingest_ena_reads` step): see _stage_ena_run_roster_binding for the
+        # live-read and declared-input-name rationale. Same inside-try
+        # placement as the resolvers above.
+        staged_roster = await _stage_ena_run_roster_binding(
+            pool,
+            action_steps=action.steps,
+            scope_target=scope_target,
+            workspace=workspace,
+        )
+        if staged_roster is not None:
+            bound.update(staged_roster)
+
         # Staged-read binding (read-mask workflows): `reads` is consumed by qc /
         # host_filter but produced by no step, so bind it from stored reads.
         # Inside-try so an un-ingested sample / empty block FAILs cleanly.
@@ -471,6 +485,8 @@ async def run_workflow(
                     action_context=bound,
                     reference_idx=scope_target["reference_idx"],
                     workspace=workspace,
+                    data_plane_url=data_plane_url,
+                    signing_key=signing_key,
                 )
             )
 

@@ -5,13 +5,16 @@ and what the roll-up to genome level leaves behind.
 whole cohort, or per `(sample, genome)`. The two are not symmetric; `CoverageScope`
 says why.
 
-miint signature (qiita-verified; see `docs/duckdb-miint.md`):
+miint signatures (see `docs/duckdb-miint.md`, which links upstream's contracts), both
+table macros:
 
-    genome_coverage(alignments, subject_total_length, subject_genome_id)  -- table macro
+    genome_coverage(alignments, subject_total_length, subject_genome_id)
       -> (genome_id, covered BIGINT, proportion_covered DOUBLE)
+    genome_coverage_per_sample(alignments, subject_total_length, subject_genome_id)
+      -> (sample_id, genome_id, covered BIGINT, proportion_covered DOUBLE)
 
-It takes NATIVE-INTEGER id columns — no `::VARCHAR` casts — and its three arguments
-are UNQUOTED relation names resolved on the caller's connection.
+They take NATIVE-INTEGER id columns — no `::VARCHAR` casts — and their three
+arguments are UNQUOTED relation names resolved on the caller's connection.
 """
 
 from __future__ import annotations
@@ -19,10 +22,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from .reconcile import denovo_map_join
 from .relations import (
     ALIGNMENT_TABLE,
     COVERAGE_ALIGNMENTS_VIEW,
+    DENOVO_ALIGNMENT_TABLE,
     DENOVO_COVERAGE_ALIGNMENTS_VIEW,
     DENOVO_MAP_TABLE,
     GENOME_LENGTHS_TABLE,
@@ -95,139 +98,107 @@ def coverage_filter_applies(coverage_threshold: float) -> bool:
     return coverage_threshold > 0.0
 
 
-def coverage_alignments_view_sql() -> str:
-    """The aligned intervals both coverage scopes measure, as the `alignments`
-    argument `genome_coverage` takes.
+def _alignments_view_sql(view: str, source: str) -> str:
+    """One arm's aligned intervals, as the `alignments` argument the coverage macros
+    take. `coverage_alignments_view_sql` and `denovo_coverage_alignments_view_sql` are
+    this with each arm's relations.
 
-    Carries `prep_sample_idx` even though the macro names only
-    `(reference, position, stop_position)`: the macro reads
-    `query_table(alignments)` and projects the three columns by name, so the extra
-    one is tolerated (probed against the mirror build) and per-sample can group by
-    it. One view therefore serves both scopes instead of two near-identical ones.
+    Renamed to the macros' column names: `reference` for the feature, and
+    `sample_id` for the prep_sample, which `genome_coverage_per_sample` groups on.
+    `genome_coverage` names only `(reference, position, stop_position)` and projects
+    them out of `query_table(alignments)` by name, so the extra column is tolerated
+    (probed against the mirror build). One view per arm therefore serves both scopes.
 
-    NULL coordinates are excluded. `compress_intervals` — which both scopes reach,
-    the pooled one inside the macro — drops such rows silently rather than
-    erroring, so filtering here is what makes the exclusion visible to a reader
-    rather than implicit in an aggregate's behaviour.
+    NULL coordinates are excluded. `compress_intervals`, which both macros run
+    internally, drops such rows silently rather than erroring, so filtering here is
+    what makes the exclusion visible to a reader rather than implicit in an
+    aggregate's behaviour.
 
     A VIEW, not a table: only this connection reads it, so materializing would
     duplicate the alignment slice in RAM.
     """
     return (
-        f"CREATE VIEW {COVERAGE_ALIGNMENTS_VIEW} AS "
-        f"SELECT prep_sample_idx, feature_idx AS reference, position, stop_position "
-        f"FROM {ALIGNMENT_TABLE} "
+        f"CREATE VIEW {view} AS "
+        f"SELECT prep_sample_idx AS sample_id, feature_idx AS reference, "
+        f"position, stop_position "
+        f"FROM {source} "
         f"WHERE position IS NOT NULL AND stop_position IS NOT NULL"
     )
 
 
-def _hand_rolled_ctes(
-    *, prefix: str, alignments: str, map_relation: str, map_join: str, by_sample: bool
-) -> str:
-    """`genome_coverage`'s own method, spelled out: `compress_intervals` per contig,
-    summed to the genome, over the full-length denominator the final SELECT divides
-    by. Returns the CTE definitions; `_hand_rolled_select` reads the last of them.
+def coverage_alignments_view_sql() -> str:
+    """The reference arm's aligned intervals; see `_alignments_view_sql`."""
+    return _alignments_view_sql(COVERAGE_ALIGNMENTS_VIEW, ALIGNMENT_TABLE)
 
-    One copy, reached from three places — the reference arm's per-sample scope and
-    the de novo arm's two. What each caller varies is where the intervals come from
-    (`alignments`), how the contig resolves to its genome (`map_relation` +
-    `map_join`), and whether the sample is a key of the result (`by_sample`).
-    `prefix` keeps two instantiations in one statement from colliding.
 
-    **`per_contig` groups by the sample in every case, `by_sample` or not.**
-    `compress_intervals` merges within one coordinate space; grouping without the
-    sample would merge two samples' intervals on a contig they share as though they
-    were one sample's, overstating coverage. `by_sample` decides only whether the
-    sample survives the roll-up to the genome — and for the de novo arm it makes no
-    difference to the numbers either way, a qiita genome belonging to exactly one
-    prep_sample.
+def denovo_coverage_alignments_view_sql() -> str:
+    """The de novo arm's aligned intervals; see `_alignments_view_sql`.
 
-    The per-contig merge precedes the genome roll-up for the same reason: grouping
-    straight to the genome would merge intervals from DIFFERENT contigs as though
-    they shared coordinates and understate every multi-contig genome.
+    A separate view rather than a `UNION ALL` with the reference one, because the two
+    reach their genome through different maps; the union happens in the survivor set,
+    after each arm has been rolled up through its own.
     """
-    sample_col = "p.prep_sample_idx, " if by_sample else ""
-    sample_key = "prep_sample_idx, " if by_sample else ""
-    return (
-        f"{prefix}per_contig AS ("
-        f"SELECT prep_sample_idx, reference, "
-        f"UNNEST(compress_intervals(position, stop_position)) AS ci "
-        f"FROM {alignments} GROUP BY prep_sample_idx, reference"
-        f"), {prefix}per_contig_genome AS ("
-        f"SELECT {sample_col}m.genome_id, "
-        f"SUM(p.ci.stop - p.ci.start) AS covered_internal "
-        f"FROM {prefix}per_contig p JOIN {map_relation} m "
-        f"ON p.reference = m.contig_id{map_join} "
-        f"GROUP BY {sample_col}m.genome_id, p.reference"
-        f"), {prefix}covered AS ("
-        f"SELECT {sample_key}genome_id, SUM(covered_internal) AS covered "
-        f"FROM {prefix}per_contig_genome GROUP BY {sample_key}genome_id"
-        f")"
-    )
+    return _alignments_view_sql(DENOVO_COVERAGE_ALIGNMENTS_VIEW, DENOVO_ALIGNMENT_TABLE)
 
 
-def _hand_rolled_select(*, prefix: str, by_sample: bool) -> str:
-    """The threshold test over `_hand_rolled_ctes`' last CTE, shaped to the scope.
+def _survivor_select(scope: CoverageScope, *, alignments: str, genome_map: str) -> str:
+    """One arm's threshold test for `scope`: that scope's macro over the arm's
+    intervals and contig->genome map, divided by `GENOME_LENGTHS_TABLE`, which holds
+    both arms' denominators.
 
-    Divides by the same `GENOME_LENGTHS_TABLE` full length and takes the same
-    `CAST(... AS DOUBLE)` the macro does internally — otherwise one threshold would
-    mean two different things depending on which branch produced a genome.
+    Per-sample renames the macro's `sample_id` back to `prep_sample_idx`, the key
+    `ogu_input_table_sql` joins the per-sample set on.
     """
-    sample_col = "c.prep_sample_idx, " if by_sample else ""
+    if scope is CoverageScope.POOLED:
+        columns, macro = "genome_id", "genome_coverage"
+    else:
+        columns, macro = "sample_id AS prep_sample_idx, genome_id", "genome_coverage_per_sample"
     return (
-        f"SELECT {sample_col}c.genome_id FROM {prefix}covered c "
-        f"JOIN {GENOME_LENGTHS_TABLE} l USING (genome_id) "
-        f"WHERE CAST(c.covered AS DOUBLE) / l.total_length >= ?"
-    )
-
-
-def _denovo_survivor_parts(scope: CoverageScope) -> tuple[str, str]:
-    """The de novo arm's `(ctes, select)` for `scope`.
-
-    Hand-rolled at BOTH scopes, where the reference arm hand-rolls only per-sample,
-    and not collapsible into `genome_coverage_per_sample` the way that one is: both
-    macros reduce their map to `SELECT DISTINCT contig_id, genome_id` and join on the
-    contig alone, so a map keyed on the sample as well cannot be expressed through
-    either. That is what the de novo arm needs — a content-addressed contig belongs
-    to a different genome in each sample that assembled it — so the grouping is not
-    the blocker here, the map's shape is.
-
-    Lives in `coverage` rather than `reconcile`, which otherwise owns the de novo
-    arm, because it needs `_hand_rolled_ctes` and `coverage` already imports
-    `reconcile` — moving it would close the cycle.
-    """
-    return (
-        _hand_rolled_ctes(
-            prefix="dn_",
-            alignments=DENOVO_COVERAGE_ALIGNMENTS_VIEW,
-            map_relation=DENOVO_MAP_TABLE,
-            map_join=denovo_map_join("p"),
-            by_sample=scope is CoverageScope.PER_SAMPLE,
-        ),
-        _hand_rolled_select(prefix="dn_", by_sample=scope is CoverageScope.PER_SAMPLE),
+        f"SELECT {columns} "
+        f"FROM {macro}({alignments}, {GENOME_LENGTHS_TABLE}, {genome_map}) "
+        f"WHERE proportion_covered >= ?"
     )
 
 
 def survivor_table_sql(scope: CoverageScope, *, combined: bool = False) -> str:
     """The survivor set for `scope`: what clears the breadth-of-coverage threshold.
-    Requires `COVERAGE_ALIGNMENTS_VIEW` and `GENOME_LENGTHS_TABLE`, plus the de novo
-    arm's own two when `combined`. The threshold is a bound parameter — execute with
-    `survivor_parameters(...)`, which knows how many the statement takes.
+    Requires `COVERAGE_ALIGNMENTS_VIEW` and `GENOME_LENGTHS_TABLE`, plus
+    `DENOVO_COVERAGE_ALIGNMENTS_VIEW` and `DENOVO_MAP_TABLE` when `combined`. The
+    threshold is a bound parameter — execute with `survivor_parameters(...)`, which
+    knows how many the statement takes.
 
     Creates `survivor_table_name(scope)`, whose shape differs per scope —
     `(genome_id)` for pooled, `(prep_sample_idx, genome_id)` for per-sample. That is
     why the name carries the scope: see `_SURVIVOR_TABLES`.
 
-    `POOLED` delegates to the `genome_coverage` macro. `PER_SAMPLE` cannot: the
-    macro has no sample key. It instead reproduces the macro's own method with one
-    more `GROUP BY` key (`_hand_rolled_ctes`), so a single threshold means the same
-    thing under either scope. This is what upstream means by the per-sample
-    dimension being "already expressible today" (duckdb-miint#217). Upstream's
-    `genome_coverage_per_sample` now exists and would collapse THIS branch to one
-    call; removal is tracked at the-miint/Qiita#454.
+    **The de novo arm passes its map to the macro without the prep_sample term that
+    `denovo_map_join` adds to the read-level joins against it.** The macros join on
+    the contig alone, and a contig mapped to two genomes counts toward both:
+    <https://the-miint.github.io/duckdb-miint/alignment_analysis/#genome-coverage>.
+    A contig two cohort prep_samples assembled — one content-addressed `feature_idx`
+    under each prep_sample's genome — is therefore credited to both genomes:
 
-    It would not collapse the de novo branches, which hand-roll for a different
-    reason — see `_denovo_survivor_parts`.
+    * pooled, that is the scope's definition: breadth over every prep_sample's
+      intervals, so every prep_sample's reads on the contig count toward each genome
+      holding it, as they do for a reference genome sharing a feature. With the
+      prep_sample term, a de novo genome would see only the reads of the prep_sample
+      that assembled it, and pooled breadth would equal per-sample breadth. `align_denovo`
+      aligns each prep_sample against only the contigs it assembled, so the other
+      prep_samples' reads a de novo genome gains are those on contigs they also
+      assembled. That includes a read whose own prep_sample has no genome for the
+      contig in the gated map: precedence leaves it on the reference arm for counting,
+      and its interval still adds to the de novo breadth here. The intervals merged
+      are positions on whichever copy of the contig the lake held when each
+      prep_sample's `align_denovo` ran. A contig and its reverse complement share one
+      `feature_idx`, and a later assembly run's copy replaces the stored one
+      (`flight_service::REPLACE_KEY_TABLES` in the data plane). A prep_sample aligned
+      before a run that stored the reverse complement keeps positions on the opposite
+      axis, and nothing re-aligns it, so pooled breadth on that contig can count one
+      stretch twice or merge two distinct stretches into one;
+    * per-sample, it adds `(prep_sample, genome)` pairs for the other prep_sample's
+      genome, and those never reach the table: `denovo_ogu_input_select_sql` maps each
+      read through the prep_sample term, so no read of that prep_sample is on that
+      genome.
 
     **`combined` adds the de novo arm as a UNION, one survivor set covering both.**
     Not two sets: `ogu_input_table_sql` joins the survivors once per arm, and two
@@ -240,34 +211,14 @@ def survivor_table_sql(scope: CoverageScope, *, combined: bool = False) -> str:
     different `qiita.genome` rows — so the distinct removes nothing; it is the
     cheap guard on a set whose duplicates would be silent.
     """
-    if scope is CoverageScope.POOLED:
-        reference = (
-            f"SELECT genome_id "
-            f"FROM genome_coverage("
-            f"{COVERAGE_ALIGNMENTS_VIEW}, {GENOME_LENGTHS_TABLE}, {MAP_TABLE}) "
-            f"WHERE proportion_covered >= ?"
+    arms = [_survivor_select(scope, alignments=COVERAGE_ALIGNMENTS_VIEW, genome_map=MAP_TABLE)]
+    if combined:
+        arms.append(
+            _survivor_select(
+                scope, alignments=DENOVO_COVERAGE_ALIGNMENTS_VIEW, genome_map=DENOVO_MAP_TABLE
+            )
         )
-        reference_ctes = ""
-    else:
-        reference = _hand_rolled_select(prefix="", by_sample=True)
-        reference_ctes = _hand_rolled_ctes(
-            prefix="",
-            alignments=COVERAGE_ALIGNMENTS_VIEW,
-            map_relation=MAP_TABLE,
-            map_join="",
-            by_sample=True,
-        )
-
-    if not combined:
-        head = f"WITH {reference_ctes} " if reference_ctes else ""
-        return f"CREATE TABLE {survivor_table_name(scope)} AS {head}{reference}"
-
-    # One WITH at the head of the statement, covering both UNION arms: SQL admits no
-    # second WITH after a set operator, and the pooled branch has no reference CTEs
-    # of its own to attach one to.
-    denovo_ctes, denovo = _denovo_survivor_parts(scope)
-    ctes = f"{reference_ctes}, {denovo_ctes}" if reference_ctes else denovo_ctes
-    return f"CREATE TABLE {survivor_table_name(scope)} AS WITH {ctes} {reference} UNION {denovo}"
+    return f"CREATE TABLE {survivor_table_name(scope)} AS " + " UNION ".join(arms)
 
 
 def survivor_parameters(coverage_threshold: float, *, combined: bool = False) -> list[float]:

@@ -661,3 +661,25 @@ async def test_resolver_oidc_with_no_verifier_returns_503(postgres_pool, jwks_ha
         token = jwks_harness.sign(_claims(jwks_harness, sub="no-verifier"))
         resp = await ac.get("/resolve", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 503
+
+
+async def test_build_human_user_401_detail_omits_principal_idx(postgres_pool):
+    """The 401 carries the bare reason; the principal idx stays in the exception
+    for background logs."""
+    from fastapi import HTTPException
+    from qiita_common.auth_constants import MSG_PRINCIPAL_DISABLED_OR_RETIRED
+
+    from qiita_control_plane.auth.principal import _build_human_user
+    from qiita_control_plane.testing.db_seeds import disable_principal, seed_user_principal
+
+    pidx = await seed_user_principal(postgres_pool, prefix="build-human", suffix="401")
+    try:
+        await disable_principal(postgres_pool, pidx)
+        with pytest.raises(HTTPException) as exc_info:
+            await _build_human_user(postgres_pool, pidx)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == MSG_PRINCIPAL_DISABLED_OR_RETIRED
+        assert str(pidx) in str(exc_info.value.__cause__)
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", pidx)
+        await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", pidx)

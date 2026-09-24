@@ -13,9 +13,15 @@
 # 0440 env files):  sudo deploy/verify.sh   (or: make verify-deploy)
 #
 # Read-only. Exit non-zero iff any ATTEMPTED check failed; absent env files
-# (first deploy) degrade to skip rows. Hatches: SKIP_HEALTH, SKIP_ACTIONS,
-# SKIP_COMPUTE_READINESS, SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_PREFLIGHT (the
-# last passes through to preflight.sh). See docs/runbooks/redeploy.md.
+# (first deploy) degrade to skip rows — except ena-reachability, which asks a
+# question the env file is optional to and runs either way (see below).
+#
+# Hatches, one per row: SKIP_HEALTH, SKIP_ACTIONS, SKIP_COMPUTE_READINESS,
+# SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_ENA_REACHABILITY, SKIP_PREFLIGHT (the
+# last passes through to preflight.sh). SKIP_ENA_REACHABILITY skips the
+# CONTROL-PLANE row only; its compute-node counterpart (probe/ena-from-compute)
+# rides the SLURM probe job and goes with SKIP_SLURM_PROBE, which also drops
+# native-import, the miint probes and shared-fs. See docs/runbooks/redeploy.md.
 
 set -euo pipefail
 
@@ -116,6 +122,11 @@ fi
 # workflow dies at submission. Nothing else fails when it is missing — the CP
 # boots and serves every other route — so without this check the gap is
 # invisible until someone submits an assembly.
+#
+# This also covers httpfs: `miint_load_sql` LOADs it with miint, so a staged
+# directory missing it fails here rather than at the first ENA import. LOAD never
+# downloads, so there is no fallback — fail the deploy instead, same reasoning as
+# the miint-gpl-boundary probe.
 if [ -n "${SKIP_CP_MIINT:-}" ]; then
     skip "cp-miint" "SKIP_CP_MIINT=1"
 elif [ -r "$CP_ENV" ]; then
@@ -125,12 +136,45 @@ elif [ -r "$CP_ENV" ]; then
         source /etc/qiita/control-plane.env; set +a
         exec '${CONTROL_PLANE_VENV}/bin/python' -c 'from qiita_control_plane.miint import connect_with_miint_staged; connect_with_miint_staged().close()'
     " 2>&1); then
-        pass "cp-miint" "control plane can LOAD miint (run as $QIITA_API_USER)"
+        pass "cp-miint" "control plane can LOAD miint + httpfs (run as $QIITA_API_USER)"
     else
-        fail "cp-miint" "control plane cannot LOAD miint — long-read-assembly will fail at submission: ${out}"
+        fail "cp-miint" "control plane cannot LOAD miint/httpfs — long-read-assembly fails at submission, ENA import at resolve: ${out}"
     fi
 else
     skip "cp-miint" "$CP_ENV absent (first deploy)"
+fi
+
+# --- 4b. ENA reachability from the control plane (as qiita-api) -----------
+# The control-plane half of the deploy's ENA egress check; the compute-node half
+# is the compute-readiness probe row `ena-from-compute`. Why the deploy asks at
+# all, and what a green row does and does not prove, is stated once on
+# qiita_compute_orchestrator.ena_reachability_check.
+#
+# HEAD the archive as the service user, with the unit's own environment sourced
+# so a proxy set there applies. No CP_ENV gate — a first deploy is the likeliest
+# host to be blocked, and the env file is optional to this question, so this row
+# does not degrade to a skip the way the ones above it do. -f, so a blocking
+# gateway's 403 block page reads as unreachable rather than as an answer; both
+# archive roots serve a HEAD 200 with no redirect. Capture curl's own message
+# into the row (as cp-miint does), or DNS, timeout, TLS and proxy failures all
+# read identically.
+if [ -n "${SKIP_ENA_REACHABILITY:-}" ]; then
+    skip "ena-reachability" "SKIP_ENA_REACHABILITY=1"
+elif sudo -u "$QIITA_API_USER" bash -c 'command -v curl >/dev/null 2>&1'; then
+    if out=$(sudo -u "$QIITA_API_USER" bash -c "
+        if [ -r '$CP_ENV' ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . '$CP_ENV'; set +a
+        fi
+        curl -fsS -m 15 -o /dev/null -I https://www.ebi.ac.uk
+    " 2>&1); then
+        pass "ena-reachability" "control plane can HEAD www.ebi.ac.uk (run as $QIITA_API_USER)"
+    else
+        fail "ena-reachability" "control plane cannot reach www.ebi.ac.uk over HTTPS — ENA import fails at resolve (run as $QIITA_API_USER): ${out}"
+    fi
+else
+    skip "ena-reachability" "curl not available to $QIITA_API_USER"
 fi
 
 # --- 5. Config/secret fingerprint summary (preflight) -----------------------

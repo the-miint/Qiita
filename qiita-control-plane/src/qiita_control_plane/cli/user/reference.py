@@ -286,10 +286,13 @@ def _write_genome_parquet(reader, target: Path) -> int:
     import pyarrow as pa  # noqa: PLC0415
     import pyarrow.compute as pc  # noqa: PLC0415
     import pyarrow.parquet as pq  # noqa: PLC0415
-    from qiita_common.parquet import ROW_GROUP_SIZE_BYTES  # noqa: PLC0415
+    from qiita_common.parquet import (  # noqa: PLC0415
+        PARQUET_COMPRESSION,
+        ROW_GROUP_SIZE_BYTES,
+    )
 
     def _write(partial: Path) -> int:
-        writer = pq.ParquetWriter(partial, reader.schema, compression="zstd")
+        writer = pq.ParquetWriter(partial, reader.schema, compression=PARQUET_COMPRESSION)
         seen: set[int] = set()
         try:
             buffer: list = []

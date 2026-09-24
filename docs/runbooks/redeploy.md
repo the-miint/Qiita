@@ -289,11 +289,11 @@ step above — run `make migrate` and re-run this command.
 ## 7. Verify
 
 ```bash
-# [admin] one command runs the three generic post-deploy checks with the
-#         correct run-as baked in for each — health aggregate, workflow
-#         actions list, and compute-readiness. Use this; do NOT hand-copy
-#         the individual invocations (that is how the compute-readiness
-#         run-as bug recurred every deploy — see below).
+# [admin] one command runs the generic post-deploy checks with the correct
+#         run-as baked in for each — health aggregate, workflow actions list,
+#         compute-readiness, the CP miint LOAD, and ENA reachability. Use this;
+#         do NOT hand-copy the individual invocations (that is how the
+#         compute-readiness run-as bug recurred every deploy — see below).
 sudo make -C ~/qiita-miint verify-deploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
 ```
 
@@ -308,7 +308,33 @@ env file it actually needs:
   **`compute-orchestrator.env`** (NOT `qiita-api`/`control-plane.env`): the
   command subprocesses into the orchestrator venv, reads `COMPUTE_BACKEND` /
   `SLURM*` from that env, and reads the `0400 qiita-orch` `co-to-cp.token` —
-  none of which `qiita-api` can reach.
+  none of which `qiita-api` can reach. Its SLURM probe job contributes the
+  `probe/*` rows, run on a compute node rather than the head node;
+- **cp-miint** — as `qiita-api` sourcing `control-plane.env`, LOADs miint +
+  httpfs from the staged `MIINT_EXTENSION_DIRECTORY`. Red means
+  `long-read-assembly` fails at submission and ENA import at resolve;
+- **ena-reachability** — as `qiita-api` sourcing `control-plane.env` when it is
+  readable, HEADs `https://www.ebi.ac.uk`. Red means outbound HTTPS from this
+  host to the ENA archives is blocked, so **every** ENA import fails at
+  metadata resolve. Its compute-node counterpart is the
+  `probe/ena-from-compute` row above, which HEADs `www.ebi.ac.uk` and
+  `ftp.sra.ebi.ac.uk` from a compute node and, red, means every import's
+  download step fails. Both answer for egress only — the fetch itself runs
+  through DuckDB httpfs, so a proxy or CA problem confined to httpfs still
+  surfaces first at the import.
+
+Then the `deploy/preflight.sh` fingerprint summary, as its own row.
+
+**Escape hatches.** Each row has one, set in the environment of the
+`make verify-deploy` call; use them only to get past a check you have already
+diagnosed, never to make a red deploy read green. `SKIP_HEALTH`, `SKIP_ACTIONS`,
+`SKIP_COMPUTE_READINESS`, `SKIP_CP_MIINT`, `SKIP_ENA_REACHABILITY`,
+`SKIP_PREFLIGHT` (passed through to `preflight.sh`), and `SKIP_SLURM_PROBE`,
+which drops the whole SLURM probe job — every `probe/*` row, including
+`ena-from-compute`, `native-import`, the miint probes and shared-fs. There is no
+per-row hatch on the compute side: `SKIP_ENA_REACHABILITY` skips the
+control-plane row only. A skipped row prints as `skip`, not `pass`, and
+`verify.sh` exits non-zero only on an *attempted* check that failed.
 
 If you need to run compute-readiness by hand (e.g. `make` is unavailable), the
 **correct** form is — matching [`first-deploy.md`](first-deploy.md) §10d:

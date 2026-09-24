@@ -29,6 +29,8 @@ from qiita_control_plane.cli.user import feature_table as ftc
 from qiita_control_plane.cli.user._helpers import _UNSET
 from qiita_control_plane.miint import connect_with_miint
 
+from .conftest import genome_map_table
+
 # One 1000 bp genome fully covered in sample 1, and one 10 000 bp genome each sample
 # covers 0.6% of — extending halves, so 1.2% pooled. At a 1% threshold that genome
 # survives pooled and fails per-sample, which is the only asymmetry the two scopes
@@ -38,6 +40,7 @@ _MAP_ENTRIES = [
     {"feature_idx": 20, "genome_idx": 200, "source": "refseq", "source_id": "GCF_200"},
 ]
 _LENGTHS = [(10, 1000), (20, 10000)]
+
 # (prep_sample_idx, sequence_idx, feature_idx, flags, position, stop_position, cigar)
 _ALIGNMENT = [
     (1, 1, 10, 0, 0, 500, "500="),
@@ -268,6 +271,13 @@ def _patched(
         return _ALIGNMENTS_BODY
 
     monkeypatch.setattr(ftc, "_fetch_pool_alignments", _alignments)
+    # An ACTIVE assembly run: every test here is about a run the caller may use, and
+    # `_refuse_deprecated_denovo_run` turning a deprecated one away is its own test.
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_processing",
+        lambda *a, **k: {"status": "active", "superseded_by": None},
+    )
     monkeypatch.setattr(
         ftc,
         "_fetch_alignment_cohort",
@@ -276,7 +286,7 @@ def _patched(
     monkeypatch.setattr(
         ftc,
         "_fetch_genome_map",
-        lambda *a, **k: _MAP_ENTRIES if map_entries is None else map_entries,
+        lambda *a, **k: genome_map_table(_MAP_ENTRIES if map_entries is None else map_entries),
     )
 
     def _exclusion(*args, **kwargs):
@@ -1500,7 +1510,7 @@ def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None):
                 request=httpx.Request("GET", "http://cp"),
                 response=httpx.Response(404),
             )
-        return the_map[prep_sample_idx]
+        return genome_map_table(the_map[prep_sample_idx])
 
     monkeypatch.setattr(ftc, "_fetch_assembly_genome_map", _assembly_map)
 
@@ -1554,6 +1564,51 @@ def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None):
     }
     monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
     return rec
+
+
+def test_the_client_refuses_a_deprecated_denovo_run(monkeypatch, tmp_path, capsys):
+    """The client driver applies the deprecation rule too, with the shared wording.
+
+    `feature_table.denovo_alignment_processing_idx` states why neither driver may be
+    the only one that checks. The score gate genuinely is server-only — `bin_quality`
+    is un-mintable over HTTP — but lifecycle status is an ordinary read, so a table
+    the CLI builds from a withdrawn assembly would be a divergence rather than a
+    documented limit.
+    """
+    _patched_combined(monkeypatch)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_processing",
+        lambda *a, **k: {"status": "deprecated", "superseded_by": 3},
+    )
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "deprecated" in err
+    # The replacement is named, which is the whole point of reading the row.
+    assert "assembly run 3 replaces it" in err
+    # Nothing is written: the refusal is before any staging.
+    assert not args.output.exists()
+
+
+def test_a_deprecated_denovo_run_with_no_replacement_says_so_client_side(
+    monkeypatch, tmp_path, capsys
+):
+    """`superseded_by` is optional on a deprecation, so the client gets the same
+    distinct message the resolver does rather than a reference to run `None`."""
+    _patched_combined(monkeypatch)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_processing",
+        lambda *a, **k: {"status": "deprecated", "superseded_by": None},
+    )
+    args = _namespace(tmp_path, denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "records no replacement" in err
+    assert "None" not in err
 
 
 def test_a_combined_build_counts_each_read_on_one_arm(monkeypatch, tmp_path):

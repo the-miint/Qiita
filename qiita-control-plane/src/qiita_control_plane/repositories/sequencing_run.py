@@ -32,7 +32,7 @@ from qiita_common.models import (
     WorkTicketState,
 )
 
-from . import gate_state_literal
+from . import INT4_MASK, gate_state_literal, require_transaction
 
 # Bound rather than typed as SQL literals, so a rename of the declared Literal
 # lights up this module at import instead of silently matching no rows. Same
@@ -59,6 +59,46 @@ class PayloadMismatch(Exception):
         self.field = field
         self.existing_value = existing_value
         self.supplied_value = supplied_value
+
+
+# pg_advisory_xact_lock(class, key) class for sequencing_run pool writes vs the
+# download-roster read; allocated in repositories/__init__'s registry, distinct
+# from fanout_dispatch's.
+POOL_RESOLVE_LOCK_CLASS = 0x0E4A_0001
+
+# How long either side waits on POOL_RESOLVE_LOCK_CLASS before giving up.
+# Deliberately chosen, not inherited: get_pool's 10s command_timeout would
+# bound the wait instead, and the registration side holds the lock for its
+# whole study transaction (~27ms per run measured, so 10s crosses at a few
+# hundred runs) — a size at which every roster read fails on first attempt.
+# A waiter that times out raises TimeoutError: the runner classifies that as
+# transient (FAILED/RETRIABLE, healed by a `/run` redrive) and registration
+# folds it into the accession's failure. Same reasoning as actions/library.py's
+# SET LOCAL lock_timeout. 90s covers thousands of runs at the measured rate.
+POOL_LOCK_WAIT_TIMEOUT_S = 90.0
+
+
+async def lock_sequencing_run(conn: asyncpg.Connection, *, sequencing_run_idx: int) -> None:
+    """Take the sequencing_run pool-write advisory lock (held to transaction commit).
+
+    Both sides of the download-roster race take this key:
+    `ena_import.registration` holds it from pool resolution until its runs
+    commit, and `runner._read_ingest._stage_ena_run_roster` holds it across the
+    roster read it does once at dispatch. Either a registration sees a covering
+    download ticket and keeps its runs out of that pool, or the roster read
+    waits for the registration's runs to commit: a run can no longer land in a
+    pool whose ticket has already read the roster.
+
+    Requires a wrapping transaction — in autocommit the lock is released with
+    the statement, silently protecting nothing — and waits at most
+    `POOL_LOCK_WAIT_TIMEOUT_S` for a competing holder."""
+    require_transaction(conn)
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        POOL_RESOLVE_LOCK_CLASS,
+        sequencing_run_idx & INT4_MASK,
+        timeout=POOL_LOCK_WAIT_TIMEOUT_S,
+    )
 
 
 async def insert_sequencing_run(
@@ -406,6 +446,35 @@ async def fetch_sequenced_pool(
         " extra_metadata, created_by_idx, created_at"
         " FROM qiita.sequenced_pool WHERE idx = $1",
         sequenced_pool_idx,
+    )
+
+
+async def list_sequenced_pools(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequencing_run_idx: int,
+    *,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """The pools of one run, ascending by idx, at most `limit` rows.
+
+    Stored columns only — no read-metric rollup. `fetch_sequenced_pool_read_metrics`
+    aggregates over every constituent sequenced_sample, so running it per row would
+    make a list of a run's pools cost a scan of the run's samples; the single-pool
+    read carries it for the one pool a caller picks out of this list.
+
+    The BYTEA `run_preflight_blob` is excluded, matching the single-pool read: only
+    the filename crosses the wire.
+
+    Unfiltered by caller — the route gates on the RUN (a caller who may see the run
+    may see which pools are on it), so there is no per-pool narrowing to apply here.
+    """
+    return await pool_or_conn.fetch(
+        "SELECT idx AS sequenced_pool_idx, sequencing_run_idx, run_preflight_filename,"
+        " extra_metadata, created_by_idx, created_at"
+        " FROM qiita.sequenced_pool WHERE sequencing_run_idx = $1"
+        " ORDER BY idx LIMIT $2",
+        sequencing_run_idx,
+        limit,
     )
 
 

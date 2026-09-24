@@ -155,8 +155,7 @@ def write_feature_sequence_chunks(
     because zstd-decode is 5-10× faster than zstd-encode. `threads=1`
     workarounds bring memory below the queue limit but the sort itself
     needs ~22 GiB peak on GG2 backbone, exceeding what a 30 GiB host
-    can offer with Postgres + Python + OS overhead. See
-    miint-localdocs/sequence-chunking-assessment.md for the benchmark.
+    can offer with Postgres + Python + OS overhead.
 
     **Batched shape.** Bin-pack features by chunk count into batches
     of ≤ `CHUNK_BUDGET_PER_BATCH` chunks (~3.2 GB raw per batch),
@@ -164,8 +163,13 @@ def write_feature_sequence_chunks(
     `ORDER BY (feature_idx, chunk_index)`. Batches walk feature_idx
     in ascending order, so the parts collectively form one globally-
     sorted dataset readable via `read_parquet(dir/part_*.parquet)`.
-    Per-batch peak memory is bounded by the in-memory sort over one
-    batch (~3.2 GB), well under the caller's DuckDB memory cap.
+    A batch holds ~3.2 GB of raw chunk bytes. That bounds the input to
+    the per-part sort, not the sort's working set: a caller has raised
+    `OutOfMemoryException` inside that `ORDER BY` against a DuckDB limit
+    several times the raw batch size, so that ratio is not sufficient.
+    `assembly_load`'s step baseline in
+    `workflows/long-read-assembly/1.0.1.yaml` carries the measured endpoints.
+    The ratio itself has not been measured.
 
     **Memory safety.** The per-batch COPY joins a `feature_map` subset
     pre-filtered to the batch's hashes (the `fmb` CTE), not the full

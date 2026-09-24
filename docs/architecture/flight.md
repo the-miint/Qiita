@@ -182,17 +182,72 @@ processing-specific, so the same sample under two alignments is two things. The
 map is the only artifact carrying both `export_id` and `prep_sample_idx`; that
 pairing is its entire purpose, and it is what must not be shipped onward.
 
-**Both ship JSON, and for the genome map that is a known limit rather than an
-oversight.** The genome map for a GG2-scale reference is millions of rows, so it
-**refuses with a 413**
-above its cap instead of truncating: a lookup table silently missing rows drops
-those features from the caller's roll-up, producing a *wrong* feature table
-rather than a partial one, and nobody checks a `truncated` flag on a map. The
-first real reference that trips that 413 is the trigger to build the streamed
-Parquet form (over the server-side cursor `export_member_genome` already uses) —
-which would be the control plane's first non-JSON response body, and is worth
-doing deliberately, with the held-connection cost measured, rather than
-pre-emptively.
+**The genome map ships in two forms, and the second is the only non-JSON body on
+an API data route** (the auth and landing routes already return HTML and
+redirects). The JSON form **refuses with a 413** above its cap
+instead of truncating: a lookup table silently missing rows drops those features
+from the caller's roll-up, producing a *wrong* feature table rather than a partial
+one, and nobody checks a `truncated` flag on a map. The Parquet form
+(`GET .../genome-map/parquet`, both maps) has no cap and needs none — completeness
+is structural rather than promised, because Parquet keeps its footer at the tail,
+so a body cut short fails to parse instead of reading back as a shorter map. A
+GG2-scale reference is millions of rows, and `routes/_helpers.GENOME_MAP_HARD_CAP`
+records which of the deploy's references already exceed it — which is what the
+second form exists for.
+
+**It is Parquet and not an Arrow IPC stream.** IPC is what Flight already carries
+and what the client already stages through `_registered`, so it is where a reader
+would start. An IPC stream cut at a record-batch boundary reads back short *and
+silent* — one batch of three comes back as a third of the rows with nothing raised.
+A cut
+landing mid-message does raise, so the silent case needs the cut to fall on a
+boundary; that is a narrower hazard than "any truncation", and it is still one no
+caller can detect. Parquet raises on both. A contract test pins each.
+
+**Per-request memory is now unbounded, and nothing bounds concurrent requests
+either.** `GENOME_MAP_HARD_CAP` incidentally capped what one JSON request could
+cost; the Parquet form removes that and replaces it with nothing, so the cost
+grows with the reference. Measured through the shipped path, peak RSS above
+baseline is ~100 MB at 392,122 pairs and ~379 MB at 10M, for bodies of 3.5 MB and
+81 MB. Roughly 60 MB of the first is the row-group buffer, which
+`_export_query_to_parquet` carries as an explicit trade against wire bytes.
+
+For scale against the route that has always been there: the JSON route materializes
+`GENOME_MAP_HARD_CAP + 1` rows before it can refuse, measured at ~290 MB above
+baseline — and then 413s, so it spends that to return nothing. **That cost is
+fixed by the cap and the Parquet route's is not**: at 392,122 pairs the Parquet
+route is the cheaper of the two, and by 10M it costs more than the JSON route ever
+will. Where the two cross lies between those points and has not been measured. What
+the Parquet route buys at 10M is an answer at all, where the JSON route at that size
+returns a 413. Neither route bounds how many concurrent readers there are.
+
+The body is built whole and the DB connection released before it is sent, rather
+than streamed from a live cursor: a streamed body would hold a pool connection for
+the length of the client's download, and `httpx` has no total-request timeout to
+bound that. The ceiling that binds first is the gateway's 60 s `proxy_read_timeout`
+on time-to-first-byte (`cli/_common.GATEWAY_READ_TIMEOUT_SECONDS` records the
+measurement); extrapolating the measured build time, a reference somewhere past
+10-20M pairs would reach it. Raising it would be an nginx change —
+`deploy/nginx/qiita.conf` sets no `proxy_read_timeout` on the REST location, where
+the gRPC location raises its own `grpc_read_timeout` to 3600s for the same reason.
+
+### When a control-plane read may ship a columnar body
+
+Three classes of read. The third exists so that "add a
+Parquet route" does not become the cheapest way to ship any bulk read, including
+ones whose columns *do* live in the lake and belong behind a signed ticket.
+
+| class | answer | mechanism | today |
+|---|---|---|---|
+| **Listing** — browsable, truncation is a valid answer | JSON + `truncated` | `cap_rows` | processing, mask, biosample, prep_sample, sequenced-pool |
+| **Bounded lookup** — complete-or-nothing, bounded by choosing a cap | JSON, 413 above cap | `GENOME_MAP_HARD_CAP` | the two genome maps' JSON form |
+| **Unbounded lookup** — complete-or-nothing, no natural bound | columnar body, no cap | buffered Parquet | the two genome maps' Parquet form |
+
+A columnar body is admissible only when all three hold: the read is
+complete-or-nothing, it has no bound the data can be trusted to respect, **and the
+data plane cannot resolve its columns**. If the columns live in the lake it is a
+Flight ticket, with no exception. `routes/_helpers.py` (`cap_rows`) draws the
+listing-vs-lookup line in prose.
 
 The genome map's row set is `export_member_genome`'s widened with the genome
 columns, deliberately: the compute side consumes that Parquet and the client
@@ -235,10 +290,12 @@ does not publish (`_published_genome_idxs`).
 
 **The analytic is SQL text in the `qiita_common.analytic` package, shared with the
 compute-orchestrator's `estimate_feature_table` job.** Two consumers run the same
-analytic and must not disagree about it; they differ only in where the inputs come from
-and how the result is written — which is why the package owns no connection and no
-streaming. Its docstrings are the single copy of *why* each step is shaped as it is;
-this section is the map, not a second copy. What a reader of the pipeline needs to know is that six of
+analytic and must not disagree about it; they differ in where the inputs come from and
+how the result is written — which is why the package owns no connection and no
+streaming — and in one thing more: the de novo arm's CheckM quality gate, which the
+server-side job applies and this pipeline cannot reach the scores for. The
+`analytic` package docstring carries that. Its docstrings are the single copy of
+*why* each step is shaped as it is; this section is the map, not a second copy. What a reader of the pipeline needs to know is that six of
 its properties are load-bearing rather than stylistic, and each is enforced and
 explained at exactly one place:
 

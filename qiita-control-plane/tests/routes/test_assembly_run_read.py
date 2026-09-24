@@ -21,7 +21,11 @@ import uuid
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_ASSEMBLY_GENOME_MAP, URL_ASSEMBLY_RUN_DOGET
+from qiita_common.api_paths import (
+    URL_ASSEMBLY_GENOME_MAP,
+    URL_ASSEMBLY_GENOME_MAP_PARQUET,
+    URL_ASSEMBLY_RUN_DOGET,
+)
 from qiita_common.assembly_constants import (
     ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
     ASSEMBLED_SEQUENCE_TABLE,
@@ -191,6 +195,12 @@ def _map_url(prep_sample_idx: int, processing_idx: int) -> str:
     )
 
 
+def _map_parquet_url(prep_sample_idx: int, processing_idx: int) -> str:
+    return URL_ASSEMBLY_GENOME_MAP_PARQUET.format(
+        prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+    )
+
+
 def _doget_url(prep_sample_idx: int, processing_idx: int) -> str:
     return URL_ASSEMBLY_RUN_DOGET.format(
         prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
@@ -327,6 +337,63 @@ async def test_genome_map_refuses_over_its_cap_rather_than_truncating(ctx, run, 
     resp = await ctx["admin"].get(_map_url(run["prep_sample_idx"], run["minted_run"]))
     assert resp.status_code == 413, resp.text
     assert str(len(run["pairs"])) in resp.json()["detail"]
+
+
+async def test_genome_map_parquet_serves_the_same_pairs_uncapped(ctx, run, monkeypatch):
+    """The Parquet form is the same rows, and unlike the JSON form it has no cap.
+
+    The cap is patched to 1 so both routes answer the same run in one test: the
+    JSON route refuses, the Parquet route serves the whole map. `ROWS_SQL` is
+    shared text, so this asserts that sharing rather than re-deriving the pairs.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    monkeypatch.setattr("qiita_control_plane.routes.assembly.GENOME_MAP_HARD_CAP", 1)
+    refused = await ctx["admin"].get(_map_url(run["prep_sample_idx"], run["minted_run"]))
+    assert refused.status_code == 413, refused.text
+
+    served = await ctx["admin"].get(_map_parquet_url(run["prep_sample_idx"], run["minted_run"]))
+    assert served.status_code == 200, served.text
+    table = pq.read_table(pa.BufferReader(pa.py_buffer(served.content)))
+    assert (
+        set(
+            zip(
+                table.column("feature_idx").to_pylist(),
+                table.column("genome_idx").to_pylist(),
+            )
+        )
+        == run["pairs"]
+    )
+
+
+async def test_genome_map_parquet_still_refuses_unminted_memberships(ctx, run):
+    """ACCEPTANCE: the 422 gate runs ahead of the body on the Parquet route too.
+
+    Dropping the cap does not drop the gate. A map short by a contig does not read
+    as short downstream — it reads as a genome that covered more of a smaller
+    length than it did — and no property of Parquet catches that, because the body
+    is complete and correct for the rows that exist. Both forms run
+    `_authorize_assembly_genome_map`, so the two cannot drift.
+    """
+    resp = await ctx["admin"].get(_map_parquet_url(run["prep_sample_idx"], run["unminted_run"]))
+    assert resp.status_code == 422, resp.text
+    assert "assembly-genome backfill" in resp.json()["detail"]
+
+
+async def test_genome_map_parquet_404s_a_run_that_never_assembled(ctx, run):
+    """Same answer as the JSON form: the client recipe reads this 404 as "no de
+    novo arm for this prep_sample" and degrades to reference-only."""
+    resp = await ctx["admin"].get(_map_parquet_url(run["prep_sample_idx"], 10**9))
+    assert resp.status_code == 404, resp.text
+
+
+async def test_genome_map_parquet_checks_access_before_existence(ctx, run):
+    """The disclosure order the JSON twin pins, on the new route: a caller with no
+    access to the prep_sample gets 403 for a run that does not exist, never a 404
+    that would confirm what does."""
+    resp = await ctx["user"].get(_map_parquet_url(run["prep_sample_idx"], 10**9))
+    assert resp.status_code == 403, resp.text
 
 
 # ---------------------------------------------------------------------------

@@ -482,6 +482,44 @@ class ReferenceExclusionSyncResponse(BaseModel):
     synced_feature_count: int
 
 
+class ReferencePhylogenyEdgeIdMintResponse(BaseModel):
+    """Result of POST /reference/{idx}/phylogeny/mint-edge-id.
+
+    `already_numbered_rows` counts what carried an `edge_id` before the call, so the
+    two 200 outcomes are distinguishable: `minted_rows == phylogeny_rows` numbered a
+    tree that had none, and `already_numbered_rows == phylogeny_rows` with
+    `minted_rows == 0` is a tree that already had one (a replay, or a tree loaded
+    from a decorated Newick). Anything between the two is refused, not reported —
+    see the route."""
+
+    reference_idx: Annotated[int, Field(gt=0)]
+    phylogeny_rows: Annotated[int, Field(ge=0)]
+    already_numbered_rows: Annotated[int, Field(ge=0)]
+    minted_rows: Annotated[int, Field(ge=0)]
+
+    @model_validator(mode="after")
+    def _counts_must_add_up(self) -> ReferencePhylogenyEdgeIdMintResponse:
+        """Neither count may exceed the tree, and the two together may not exceed it.
+
+        The route's own checks read the counts to choose a status; these bound what
+        the counts can be at all, so an arithmetically impossible reply raises here
+        and reaches the caller as the route's 502 rather than as a 200 whose body
+        does not add up.
+        """
+        if self.already_numbered_rows > self.phylogeny_rows:
+            raise ValueError(
+                f"already_numbered_rows {self.already_numbered_rows} exceeds"
+                f" phylogeny_rows {self.phylogeny_rows}"
+            )
+        if self.already_numbered_rows + self.minted_rows > self.phylogeny_rows:
+            raise ValueError(
+                f"already_numbered_rows {self.already_numbered_rows} +"
+                f" minted_rows {self.minted_rows} exceeds phylogeny_rows"
+                f" {self.phylogeny_rows}"
+            )
+        return self
+
+
 class ReferenceExclusionListItem(BaseModel):
     """One actively-blocked feature that appears in a given reference, with why +
     external ids. `direct_block` / `via_genome` are reported as MUTUALLY EXCLUSIVE:
@@ -536,8 +574,11 @@ class GenomeMapEntry(BaseModel):
 
 class GenomeMapResponse(BaseModel):
     """Returned by GET /reference/{reference_idx}/genome-map: the whole
-    reference's feature_idx → genome lookup, the translation the client-side
-    feature-table recipe joins its alignment rows against.
+    reference's feature_idx → genome lookup, rolling alignment rows up to genomes.
+
+    The same rows are served uncapped at `GET .../genome-map/parquet`, which is
+    what a caller refused by the 413 below should call instead — and what the
+    client-side feature-table recipe reads.
 
     One entry per (feature, genome) pair, ordered by (feature_idx, genome_idx). A
     feature shared across genomes (a plasmid) contributes one entry per genome, so
@@ -549,7 +590,8 @@ class GenomeMapResponse(BaseModel):
     short lookup table yields a WRONG feature table rather than a partial one. A
     200 is always the complete map, so the field could only ever be False — and a
     boolean that never varies is one a caller checks instead of the status
-    code."""
+    code. The Parquet form has no cap at all: `routes/_helpers.GENOME_MAP_HARD_CAP`
+    bounds this representation, not the data."""
 
     reference_idx: Annotated[int, Field(gt=0)]
     entries: list[GenomeMapEntry]
@@ -572,6 +614,7 @@ class AssemblyGenomeMapResponse(BaseModel):
     each prep_sample's reads to both genomes.
 
     Refuses over its cap the way its reference twin does, for the same reason, and
+    has the same uncapped Parquet sibling at `.../genome-map/parquet`, and
     carries no `truncated` for the same reason. 404s a run that never assembled —
     an unknown prep_sample, an unknown processing_idx, and a real pair that
     assembled nothing are one answer, matching the assembly DoGet routes."""

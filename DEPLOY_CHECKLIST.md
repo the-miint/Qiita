@@ -31,11 +31,28 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- `[admin]` `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>` now carries two ENA egress rows —
+  grep its output for both (#584):
+  - `ena-reachability` — the control-plane host HEADs `https://www.ebi.ac.uk`. Red means
+    outbound HTTPS to the archive is blocked from this host, so **every** ENA import fails at
+    metadata resolve. Hatch: `SKIP_ENA_REACHABILITY=1` (this row only).
+  - `probe/ena-from-compute` — a SLURM compute node HEADs `www.ebi.ac.uk` and
+    `ftp.sra.ebi.ac.uk`. Red means every import's read-download step fails. No per-row hatch;
+    it rides the SLURM probe job, so `SKIP_SLURM_PROBE=1` drops it along with every other
+    `probe/*` row.
+
+  These replace the manual "confirm outbound HTTPS to the ENA archives" host-setup step this
+  deploy's predecessor carried by hand. Green proves egress only: the fetch itself runs through
+  DuckDB httpfs, so a proxy or CA problem confined to httpfs still surfaces at the first import.
 
 ### 6. After the deploy verifies green
 
-_None yet._
+- **[operator] Mint `edge_id` on references loaded before this deploy.** Unless its Newick carried jplace `{N}` decorations, such a reference's `reference_phylogeny` rows carry `edge_id` NULL on every node (the loader mints it only from this deploy on), which a phylogenetic-placement index cannot join back to. One call per reference, `reference:write` (wet_lab_admin or system_admin); idempotent, so re-running is a no-op and a reference whose tree already carries numbering is left alone:
+  ```bash
+  curl -sS -X POST -H "Authorization: Bearer $QIITA_TOKEN" \
+    "https://qiita-miint.ucsd.edu/api/v1/reference/<reference_idx>/phylogeny/mint-edge-id"
+  ```
+  Expect `{"reference_idx": N, "phylogeny_rows": <tree size>, "already_numbered_rows": 0, "minted_rows": <tree size>}`. A `200` with `minted_rows: 0` and `already_numbered_rows == phylogeny_rows` means that tree already had its numbering — nothing to do. A `404` is an unknown `reference_idx`. A `409` means the reference exists but has no phylogeny rows, or its tree is partly numbered; both need a look before anything is written. A `502` is either the data plane being unreachable or a reply whose counts do not add up — read the detail: it says whether re-issuing is safe, and for a partially written tree it is not. Run it for **both** references currently in the lake — `18` (Web of Life 3, 392,123 rows) and `16` (452,189 rows); both carry `edge_id` NULL on every row, and a tree left unnumbered fails at placement time rather than at load. References loaded after this PR are numbered by `reference_load` itself and need no call. (#581)
 
 ### Notes (no host action)
 
