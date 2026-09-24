@@ -329,20 +329,20 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
        makes a retry converge instead of aborting on the first already-created sample.
     5. Fan out one `bam-to-parquet` ticket per sample (scope prep_sample,
        action_context {bam_path, expect_unaligned: true}). Per-sample resilient:
-       one sample's ticket failure is recorded and the fan-out continues. A 409
-       (sample already COMPLETED under disallow-without-delete, or already
-       in-flight) is recorded as SKIPPED — the convergence signal, not a failure —
-       so re-running to retry a failed sample never reports the finished ones as
-       failures. The command exits non-zero only if a real (non-409) failure
-       occurred (mirrors submit-host-filter-pool).
+       one prep_sample's ticket failure is recorded and the fan-out continues. A
+       409 (a ticket for that prep_sample already in flight) is recorded as
+       SKIPPED — the convergence signal, not a failure. The command exits non-zero
+       only if a real (non-409) failure occurred (mirrors submit-host-filter-pool).
 
     Convergent retry: find-or-create on the run + pool, create-missing on the
     roster (step 4), and the 409-as-skip fan-out (step 5) together mean re-running
-    the identical gesture after a partial failure reuses everything already made,
-    skips the already-done samples (exit 0), and only re-submits the still-missing
-    / previously-FAILED ones (the route resets a FAILED ticket). --force is the
-    separate, deliberate re-ingest path (it re-registers reads → lake duplicates),
-    NOT the retry route. All calls share one PAT.
+    the identical gesture after a partial failure reuses everything already made
+    and re-submits the rest. The in-flight gate blocks only non-terminal tickets,
+    so a prep_sample whose reads already loaded gets a fresh ticket, which stops
+    at the read-numbering step without storing anything (see
+    `sequence_range_retry.mint_or_reuse_sequence_range`). --force changes nothing
+    here: the COMPLETED-ticket gate it waives is sequenced_pool-scoped. All calls
+    share one PAT.
     """
     # The path is checked SERVER-side (POST /run-folder/inspect, below), not
     # here: it names the folder as the CLUSTER sees it, and a check against this

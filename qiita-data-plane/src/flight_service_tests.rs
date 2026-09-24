@@ -1447,17 +1447,20 @@ fn replace_key_tables_names_each_table_once() {
     }
 }
 
-/// `read` is deliberately NOT replace-keyed, so a second registration of a
-/// prep_sample's reads APPENDS rather than superseding.
+/// `read` is NOT replace-keyed, so a registration of a prep_sample's reads by a
+/// different ticket APPENDS rather than superseding. (A ticket's own earlier
+/// `read` rows are replaced, through `ticket_read_files_in_lake`, not through
+/// this table; `register_files_leaves_reads_another_ticket_registered` pins the
+/// end-to-end behaviour against a real catalog.)
 ///
 /// Pinned because three user-facing strings rest on it — the `--force` help on
 /// `submit-bcl-convert`, the 409 body that offers `force=true`, and the
 /// `force` field's OpenAPI description all state that a forced re-run stores
-/// the pool's reads a second time. That is only true while `read` is absent
-/// here: `ingest_reads` short-circuits on the durable per-prep_sample staging
-/// copy before it reaches the sequence-range mint, so nothing upstream stops
-/// the second registration either. Adding `read` to `REPLACE_KEY_TABLES` would
-/// make those three strings wrong, and this is what says so.
+/// the pool's reads a second time. A forced re-run is a second ticket, and
+/// `ingest_reads` short-circuits on the durable per-prep_sample staging copy
+/// before it reaches the sequence-range mint, so nothing upstream stops its
+/// registration either. Adding `read` to `REPLACE_KEY_TABLES` would make those
+/// three strings wrong, and this is what says so.
 #[test]
 fn read_is_not_replace_keyed_so_a_forced_rerun_appends() {
     assert!(

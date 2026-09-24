@@ -1024,15 +1024,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `submit-pacbio-ingest`. That order is forced: `_provision_run_pool_roster` resolves every
   pre-flight row against existing Qiita rows keyed on those two accessions and exits without
   side effects when either lookup misses, so a study minted without an accession cannot be
-  reached from a sheet at all. No runbook stated that prerequisite. The runbook also
-  generalizes the pre-flight pre-patching trap that was filed under PacBio: pool identity
-  is the SHA-256 of the blob's bytes and both gestures read those bytes before `open_db_file`
-  patches the file in place, so an unpatched submit followed by a re-run sends different bytes
-  under the same filename and is refused by `sequenced_pool_one_per_run_and_filename` — the
-  retry does not converge, on either platform. That 409 tells the caller to rename the
-  pre-flight, which is right for the case it was written for (two distinct pools colliding on
-  a name) and wrong for this one, where renaming mints the second pool the caller was trying
-  to avoid; the runbook says so.
+  reached from a sheet at all. No runbook stated that prerequisite. Pool identity is the
+  SHA-256 of the pre-flight's bytes, so a retry converges only if it submits the same file;
+  the runbook says to keep it unchanged. The 409 a same-name, different-bytes re-submit gets
+  (`sequenced_pool_one_per_run_and_filename`) told the caller to rename the pre-flight, which
+  is right for two distinct pools colliding on a name and wrong for one pool whose file was
+  edited after it was submitted, where renaming mints a second pool that only a system_admin
+  can remove. The server cannot tell the two apart, so the 409 now names both remedies.
 
 - **A published feature table's rows can now be labelled without our identifiers (#448).**
   `POST /exported-feature` mints the public handle for a feature-axis entity, the way
@@ -4273,11 +4271,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 - **`user-cli-quickstart.md` becomes `manual-sample-walkthrough.md`, the by-hand path only, and
   the landing page points at the new runbook (#461).** The old name claimed to be the quickstart
   for a procedure nobody should run on a live system; it exists to prove a deploy works and to
-  learn the CLI, and `getting-started.md` is the quickstart. Pre-opening the pre-flight file is
-  the one manual step the new runbook still has to document, tracked for removal in #470; the
-  other one it was written against — needing a machine that mounts the cluster — was removed by
-  #484 while this branch was open, so the runbook now states the ingest-root bound and the
-  `wet_lab_admin` requirement instead. It kept a full copy of login, profile, study and biosample
+  learn the CLI, and `getting-started.md` is the quickstart. Both manual steps it was first
+  written against were removed while this branch was open — needing a machine that mounts the
+  cluster by #484, so the runbook states the ingest-root bound and the `wet_lab_admin`
+  requirement instead, and hand-copying and pre-opening the pre-flight file by #541, so that
+  section is gone and the accession snippet uses `load_db_file` / `save_db_file`. It kept a full copy of login, profile, study and biosample
   creation, which the getting-started runbook now owns; what remains is what is unique to it —
   minting a run, pool and sequenced-sample yourself and loading reads you already hold with
   `qiita submit-reads`, which is the route an ordinary account now takes since naming a host path
