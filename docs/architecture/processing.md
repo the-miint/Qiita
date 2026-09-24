@@ -25,7 +25,7 @@ sequenceDiagram
     CP-->>C: signed Flight ticket for DoPut
 
     Note over C,DP: 2. Data upload
-    C->>NX: DoPut(signed_ticket) + JWT + FASTQ stream
+    C->>NX: DoPut(signed_ticket) + JWT + Arrow record-batch stream
     NX->>DP: route gRPC
     DP->>DP: verify JWT + ticket signature
     DP->>FS: write upload.parquet to PATH_SCRATCH/staging/uploads/<upload_idx>/
