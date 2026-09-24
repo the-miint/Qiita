@@ -115,7 +115,17 @@ reading your published data will try to resolve, and a made-up value resolves to
 nothing. The *identical* string then goes into the pre-flight file.
 
 The study is yours: you can do everything below on it without anyone granting you
-access.
+access. To let someone else in, they log in to Qiita once, then:
+
+```bash
+qiita study access grant --study-idx "$STUDY_IDX" --email colleague@example.org --tier member
+qiita study access list --study-idx "$STUDY_IDX"
+```
+
+`--tier` is `viewer`, `member`, or `admin`; adding biosamples and samples to the
+study needs `admin`. `qiita study access set-tier` and `revoke` take
+the `--principal-idx` that `list` shows. Who can change which rows is in
+[`auth.md`](../auth.md) under *Study access*.
 
 ## 3. Create the biosamples
 
@@ -170,8 +180,8 @@ qiita biosample create-field \
 `--data-type` is one of `text`, `numeric`, `boolean`, `date` or `terminology`, and
 the display name you give is the `KEY` you then pass to `--metadata`.
 
-Putting a biosample into a study you do not own needs access only an operator can
-grant — see [`auth.md`](../auth.md) under *User self-service*.
+Putting a biosample into a study you do not own needs `admin` access on it,
+granted by one of its admins with `qiita study access grant`.
 
 ## 4. Build the pre-flight file
 

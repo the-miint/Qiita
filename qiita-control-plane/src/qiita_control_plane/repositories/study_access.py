@@ -99,3 +99,128 @@ def _to_access_row(row: asyncpg.Record) -> CallerStudyAccessRow:
         access_tier=Tier(row["access_tier"]) if row["access_tier"] is not None else None,
         default_tier=Tier(row["default_tier"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# qiita.study_access rows (the grant surface)
+# ---------------------------------------------------------------------------
+
+# Every read below returns this column set, so the route maps rows one way.
+# `email` is NULL for a grantee with no qiita.user row (a service account
+# granted by hand); the FK is to qiita.principal, not qiita.user.
+_ACCESS_ROW_COLUMNS = (
+    "sa.study_idx, sa.principal_idx, u.email, sa.access_tier, sa.granted_by_idx, sa.granted_at"
+)
+
+
+class GranteeCandidate(NamedTuple):
+    """The principal a grant names by email, with the state a grant checks."""
+
+    principal_idx: int
+    disabled: bool
+    retired: bool
+
+
+async def fetch_grantee_by_email(
+    conn: asyncpg.Connection | asyncpg.Pool, *, email: str
+) -> GranteeCandidate | None:
+    """Resolve an email to the qiita.user principal carrying it, or None.
+
+    `qiita.user.email` is CITEXT, so the match is case-insensitive.
+    """
+    row = await conn.fetchrow(
+        "SELECT p.idx, p.disabled, p.retired"
+        " FROM qiita.user u JOIN qiita.principal p ON p.idx = u.principal_idx"
+        " WHERE u.email = $1",
+        email,
+    )
+    if row is None:
+        return None
+    return GranteeCandidate(
+        principal_idx=row["idx"], disabled=row["disabled"], retired=row["retired"]
+    )
+
+
+async def list_study_access(
+    conn: asyncpg.Connection | asyncpg.Pool, *, study_idx: int
+) -> list[asyncpg.Record]:
+    """Every study_access row on one study, highest tier first, then by email."""
+    return await conn.fetch(
+        f"SELECT {_ACCESS_ROW_COLUMNS}"
+        " FROM qiita.study_access sa"
+        " LEFT JOIN qiita.user u ON u.principal_idx = sa.principal_idx"
+        " WHERE sa.study_idx = $1"
+        " ORDER BY sa.access_tier DESC, u.email",
+        study_idx,
+    )
+
+
+async def fetch_study_access_row(
+    conn: asyncpg.Connection,
+    *,
+    study_idx: int,
+    principal_idx: int,
+    for_update: bool = False,
+) -> asyncpg.Record | None:
+    """One grantee's row on one study, or None. `for_update` locks it for the
+    rest of the caller's transaction, so a concurrent change or revoke of the
+    same row serializes behind this one and re-checks the tier it finds."""
+    lock = " FOR UPDATE OF sa" if for_update else ""
+    return await conn.fetchrow(
+        f"SELECT {_ACCESS_ROW_COLUMNS}"
+        " FROM qiita.study_access sa"
+        " LEFT JOIN qiita.user u ON u.principal_idx = sa.principal_idx"
+        f" WHERE sa.study_idx = $1 AND sa.principal_idx = $2{lock}",
+        study_idx,
+        principal_idx,
+    )
+
+
+async def insert_study_access(
+    conn: asyncpg.Connection,
+    *,
+    study_idx: int,
+    principal_idx: int,
+    access_tier: Tier,
+    granted_by_idx: int,
+) -> asyncpg.Record:
+    """Insert a grant and return it. Raises asyncpg.UniqueViolationError
+    (`study_access_unique_per_principal`) when the grantee already has a row."""
+    await conn.execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
+        " VALUES ($1, $2, $3::qiita.tier, $4)",
+        study_idx,
+        principal_idx,
+        access_tier,
+        granted_by_idx,
+    )
+    row = await fetch_study_access_row(conn, study_idx=study_idx, principal_idx=principal_idx)
+    if row is None:
+        raise RuntimeError(
+            f"study_access row ({study_idx}, {principal_idx}) missing right after its INSERT"
+        )
+    return row
+
+
+async def update_study_access_tier(
+    conn: asyncpg.Connection, *, study_idx: int, principal_idx: int, access_tier: Tier
+) -> None:
+    """Set an existing row's tier. The caller has already locked the row."""
+    await conn.execute(
+        "UPDATE qiita.study_access SET access_tier = $3::qiita.tier"
+        " WHERE study_idx = $1 AND principal_idx = $2",
+        study_idx,
+        principal_idx,
+        access_tier,
+    )
+
+
+async def delete_study_access(
+    conn: asyncpg.Connection, *, study_idx: int, principal_idx: int
+) -> None:
+    """Hard-delete a row (study_access keeps no revoked state)."""
+    await conn.execute(
+        "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
+        study_idx,
+        principal_idx,
+    )

@@ -21,6 +21,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Study access can be listed, granted, changed and revoked through the API and CLI
+  (#PR).** `GET/POST /study/{study_idx}/access` and `PATCH/DELETE
+  /study/{study_idx}/access/{principal_idx}`, with `qiita study access
+  list|grant|set-tier|revoke`, replace the operator `INSERT INTO qiita.study_access`.
+  A grant names the grantee by the email on their account, which must have logged in
+  once. `wet_lab_admin`+ manages any row; a study admin grants any tier and revokes
+  member/viewer rows; a member grants and revokes member/viewer; a viewer manages
+  nothing (`auth/study_access_policy.py`). Lists need `study:read`, changes
+  `study:write`. Each grant, tier change and revoke records an `auth_event`, so a
+  revoke leaves a record after the row is deleted (#579).
+
 - **A reference tree carries the edge numbering a placement joins back on (#581).**
   `read_newick` fills `edge_id` only from jplace `{N}` decorations, so a backbone
   loaded from an undecorated Newick carried NULL on every node. `krepp_index_create`

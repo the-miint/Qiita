@@ -343,13 +343,34 @@ The system principal (`idx=1`) is rejected by every mutation endpoint above (`di
 | `/api/v1/user/me` | GET | Returns the authenticated user's profile. `require_human` (rejects service-kind 403). |
 | `/api/v1/user/me` | PATCH | Updates profile fields (`affiliation`, `address`, `phone`, `orcid`, `receive_processing_emails`). Requires `self:profile`. `email` and status fields are absent from `UserUpdate` and are silently dropped — email-change requires re-verification via OIDC, status is admin-only. |
 
-What a user cannot self-serve is **access to someone else's study**. Creating
-a biosample, a prep_sample, or a sequenced_sample under a study you do not own
-requires an `ADMIN`-tier `qiita.study_access` row on it, and no route issues
-one: the owner's own row is auto-granted at study create
-(`repositories/study.py`), and every other row is inserted out-of-band by an
-operator (`INSERT INTO qiita.study_access (study_idx, principal_idx,
-access_tier, granted_by_idx)`).
+### Study access (`qiita.study_access`)
+
+Creating a biosample, a prep_sample, or a sequenced_sample under a study you do
+not own requires an `ADMIN`-tier `qiita.study_access` row on it. The owner's own
+row is auto-granted at study create (`repositories/study.py`); every other row
+goes through these routes (CLI: `qiita study access list|grant|set-tier|revoke`).
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/study/{study_idx}/access` | GET | Every row on the study, highest tier first, with each grantee's email. `study:read`. |
+| `/api/v1/study/{study_idx}/access` | POST | Grant `{email, access_tier}`. `study:write`. The email must belong to an account that has logged in once and is not disabled or retired (`422` otherwise); an existing row is `409` naming its tier. |
+| `/api/v1/study/{study_idx}/access/{principal_idx}` | PATCH | Change one row's tier. `study:write`. Setting the tier the row already has changes nothing. |
+| `/api/v1/study/{study_idx}/access/{principal_idx}` | DELETE | Remove one row and return it. `study:write`. |
+
+Who may do what is `auth/study_access_policy.py`, whose docstring carries the
+table: `wet_lab_admin`+ manages any row; a study `admin` (the owner included)
+grants any tier and revokes `member`/`viewer` rows; a `member` grants and revokes
+`member`/`viewer`; a `viewer` or a caller with no row manages nothing. Changing a
+tier needs both the revoke of the current tier and the grant of the new one. Only
+`wet_lab_admin`+ revokes or demotes an `admin` row, the owner's included; the owner
+keeps access without it through the owner bypass in `require_study_access`.
+
+Naming the grantee by email means any caller who may grant can learn whether an
+email has a Qiita account, from the `422`. Each grant, tier change and revoke
+records an `auth_event` (`study_access_grant`, `study_access_tier_change`,
+`study_access_revoke`) with the grantee as `principal_idx`, the caller as
+`actor_principal_idx`, and `study_idx` plus the tier(s) in `detail`; the revoke
+event is the only record left once the row is deleted.
 
 ### Reference exclusion (curation)
 

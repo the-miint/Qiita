@@ -34,6 +34,7 @@ from .sequenced_sample import (
 )
 from .sequencing_run import router as sequencing_router
 from .study import router as study_router
+from .study_access import router as study_access_router
 from .upload import router as upload_router
 from .user import router as user_router
 from .work_ticket import router as work_ticket_router
@@ -64,6 +65,7 @@ api_router.include_router(exported_feature_router)
 api_router.include_router(exported_processing_router)
 api_router.include_router(exported_identifier_router)
 api_router.include_router(study_router)
+api_router.include_router(study_access_router)
 api_router.include_router(run_folder_router)
 api_router.include_router(upload_router)
 api_router.include_router(user_router)

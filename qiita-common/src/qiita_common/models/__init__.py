@@ -305,7 +305,14 @@ from qiita_common.models.step import (
     StepStatusWire,
     StepSubmitRequest,
 )
-from qiita_common.models.study import StudyCreate, StudyPatchRequest, StudyResponse
+from qiita_common.models.study import (
+    StudyAccessGrant,
+    StudyAccessResponse,
+    StudyAccessTierUpdate,
+    StudyCreate,
+    StudyPatchRequest,
+    StudyResponse,
+)
 from qiita_common.models.terminology import (
     MAX_TERMINOLOGY_VERSION_LENGTH,
     VALID_TERMINOLOGY_STATUS_TRANSITIONS,
@@ -588,6 +595,9 @@ __all__ = [
     "StudyCreate",
     "StudyPatchRequest",
     "StudyResponse",
+    "StudyAccessGrant",
+    "StudyAccessResponse",
+    "StudyAccessTierUpdate",
     # Auth.
     "ApiTokenMintRequest",
     "ApiTokenMintResponse",

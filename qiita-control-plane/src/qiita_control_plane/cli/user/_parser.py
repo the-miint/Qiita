@@ -96,7 +96,13 @@ from .sequencing import (
     _handle_sequencing_run_create,
     _handle_sequencing_run_lookup,
 )
-from .study import _handle_study_create
+from .study import (
+    _handle_study_access_grant,
+    _handle_study_access_list,
+    _handle_study_access_revoke,
+    _handle_study_access_set_tier,
+    _handle_study_create,
+)
 from .ticket import (
     _handle_ticket_list,
     _handle_ticket_logs,
@@ -293,6 +299,65 @@ def _build_parser() -> argparse.ArgumentParser:
         patch_idx_arg="study_idx",
         patch_json_fields=("extra_metadata",),
     )
+
+    # Stored tiers only: 'public' is the absence of a row, so it is never granted.
+    grantable_tiers = tuple(t.value for t in Tier if t != Tier.PUBLIC)
+    p_study_access = p_study_sub.add_parser(
+        "access",
+        help="List, grant, change, and revoke who can access a study",
+    )
+    p_study_access_sub = p_study_access.add_subparsers(dest="study_access_cmd", required=True)
+
+    p_access_list = p_study_access_sub.add_parser(
+        "list",
+        help="List everyone with access to a study and their tier (GET /study/{S}/access)",
+    )
+    p_access_list.add_argument("--study-idx", type=int, required=True)
+    p_access_list.set_defaults(handler=_handle_study_access_list)
+
+    p_access_grant = p_study_access_sub.add_parser(
+        "grant",
+        help="Give someone access to a study (POST /study/{S}/access)",
+    )
+    p_access_grant.add_argument("--study-idx", type=int, required=True)
+    p_access_grant.add_argument(
+        "--email",
+        required=True,
+        help="the email on the person's Qiita account; they must have logged in once",
+    )
+    p_access_grant.add_argument(
+        "--tier", dest="access_tier", required=True, choices=grantable_tiers
+    )
+    p_access_grant.set_defaults(handler=_handle_study_access_grant)
+
+    p_access_set_tier = p_study_access_sub.add_parser(
+        "set-tier",
+        help="Change someone's tier on a study (PATCH /study/{S}/access/{P})",
+    )
+    p_access_set_tier.add_argument("--study-idx", type=int, required=True)
+    p_access_set_tier.add_argument(
+        "--principal-idx",
+        type=int,
+        required=True,
+        help="the person's principal_idx, as `qiita study access list` shows it",
+    )
+    p_access_set_tier.add_argument(
+        "--tier", dest="access_tier", required=True, choices=grantable_tiers
+    )
+    p_access_set_tier.set_defaults(handler=_handle_study_access_set_tier)
+
+    p_access_revoke = p_study_access_sub.add_parser(
+        "revoke",
+        help="Remove someone's access to a study (DELETE /study/{S}/access/{P})",
+    )
+    p_access_revoke.add_argument("--study-idx", type=int, required=True)
+    p_access_revoke.add_argument(
+        "--principal-idx",
+        type=int,
+        required=True,
+        help="the person's principal_idx, as `qiita study access list` shows it",
+    )
+    p_access_revoke.set_defaults(handler=_handle_study_access_revoke)
 
     p_biosample = sub.add_parser("biosample", help="Biosample operations")
     p_biosample_sub = p_biosample.add_subparsers(dest="biosample_cmd", required=True)

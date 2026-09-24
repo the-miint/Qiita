@@ -192,6 +192,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_STUDY_PREFIX",
         "PATH_STUDY_LOOKUP_BY_ACCESSION",
     ),
+    ("URL_STUDY_ACCESS", "PATH_STUDY_PREFIX", "PATH_STUDY_ACCESS"),
+    (
+        "URL_STUDY_ACCESS_BY_PRINCIPAL",
+        "PATH_STUDY_PREFIX",
+        "PATH_STUDY_ACCESS_BY_PRINCIPAL",
+    ),
     # /run-folder
     (
         "URL_RUN_FOLDER_INSPECT",

@@ -712,10 +712,16 @@ PATH_STUDY_BY_IDX = "/{study_idx}"
 # (ena_study_accession or bioproject_accession; default bioproject); same
 # body-vs-querystring rationale as the biosample lookup variants.
 PATH_STUDY_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
+# Per-study access rows (qiita.study_access): list/grant against the study,
+# change-tier/revoke against one grantee's row.
+PATH_STUDY_ACCESS = "/{study_idx}/access"
+PATH_STUDY_ACCESS_BY_PRINCIPAL = "/{study_idx}/access/{principal_idx}"
 
 URL_STUDY_PREFIX = f"{API_PREFIX}{PATH_STUDY_PREFIX}"
 URL_STUDY_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_STUDY_BY_IDX}"
 URL_STUDY_LOOKUP_BY_ACCESSION = f"{URL_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}"
+URL_STUDY_ACCESS = f"{URL_STUDY_PREFIX}{PATH_STUDY_ACCESS}"
+URL_STUDY_ACCESS_BY_PRINCIPAL = f"{URL_STUDY_PREFIX}{PATH_STUDY_ACCESS_BY_PRINCIPAL}"
 
 
 # =============================================================================
