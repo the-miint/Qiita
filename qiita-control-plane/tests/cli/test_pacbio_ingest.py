@@ -738,7 +738,7 @@ def test_submit_pacbio_ingest_skips_a_prep_sample_whose_ingest_completed(
 
 
 def test_submit_pacbio_ingest_a_failed_lookup_is_a_failure_not_a_submit(
-    monkeypatch, tmp_path, build_case5_preflight
+    monkeypatch, tmp_path, build_case5_preflight, capsys
 ):
     """If the completed-ingest lookup fails, the prep_sample is recorded as a
     failure and not submitted, and the run exits non-zero."""
@@ -759,6 +759,7 @@ def test_submit_pacbio_ingest_a_failed_lookup_is_a_failure_not_a_submit(
     with pytest.raises(SystemExit) as ei:
         main(_submit_args(run, db))
     assert ei.value.code == 1
+    assert "looking up its completed ingest: " in capsys.readouterr().err
     assert not [
         r
         for r in captured["requests"]
@@ -777,11 +778,8 @@ def test_submit_pacbio_ingest_new_prep_samples_are_not_looked_up(
     captured: dict = {}
     _stub_submit_flow(monkeypatch, captured)
     main(_submit_args(run, db))
-    assert not [
-        r
-        for r in captured["requests"]
-        if r["method"] == "GET" and r["url"].endswith("/work-ticket")
-    ]
+    ticket_calls = [r for r in captured["requests"] if r["url"].endswith("/work-ticket")]
+    assert [r["method"] for r in ticket_calls] == ["POST", "POST", "POST"]
 
 
 def test_read_preflight_rows_rejects_non_pacbio_sheet(build_case5_preflight):

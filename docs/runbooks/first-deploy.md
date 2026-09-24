@@ -1084,8 +1084,8 @@ triage host-side state first.
 
 ## 11. End-to-end smoke
 
-The smoke uses the `fastq-to-parquet` workflow against a tiny single-
-sample FASTQ. A single ticket touches every layer:
+The smoke uses the `fastq-to-parquet` workflow against a tiny FASTQ for one
+prep_sample. A single ticket touches every layer:
 
 - **Control plane** — validates the action, mints the per-sample
   `sequence_range`, persists the work ticket, transitions it to
@@ -1093,8 +1093,8 @@ sample FASTQ. A single ticket touches every layer:
 - **Orchestrator** — dispatches the native `fastq_to_parquet` step,
   calls back to the CP for the sequence_range mint, writes
   `reads.parquet` into the ticket's workspace.
-- **Both filesystems** — input FASTQ on `<scratch>` (the scratch root
-  from §8a), Parquet output under the workspace path on the same
+- **Both filesystems** — input FASTQ under one of the control plane's
+  `PATH_INGEST_ROOTS`, Parquet output under the workspace path on the
   shared FS.
 
 ### Recipe
@@ -1105,9 +1105,13 @@ against a study you will not use for real data.
 
 Steps 0-3 of [`getting-started.md`](getting-started.md) cover login through the
 biosample and leave you with `$STUDY_IDX` and `$BIOSAMPLE_IDX`. Then, as a
-`wet_lab_admin` or higher (naming a host path needs it), with a small FASTQ
-under one of `PATH_INGEST_ROOTS` whose name starts with the pool item id
-(`smoke_R1.fastq` below):
+`wet_lab_admin` or higher (naming a host path needs it; the operator account
+from step 6 is), with a small FASTQ whose name starts with the pool item id
+(`smoke_R1.fastq` below). The FASTQ must sit under one of the directories in
+`PATH_INGEST_ROOTS` in `/etc/qiita/control-plane.env` — the value copied from
+`.env.control-plane.example` in step 1 is a placeholder, so set it to your
+site's sequencing and staging directories before this step, or the submit is
+refused as a host path the compute cluster cannot use:
 
 ```bash
 RUN_IDX=$(qiita sequencing-run create \
@@ -1123,11 +1127,11 @@ PREP_SAMPLE_IDX=$(qiita sequenced-sample create \
     --prep-protocol-idx "$PROTOCOL_IDX" \
     --pool-item-id smoke \
     --primary-study-idx "$STUDY_IDX" | jq -r .prep_sample_idx)
-qiita ticket submit \
+WORK_TICKET_IDX=$(qiita ticket submit \
     --action-id fastq-to-parquet --action-version 1.3.0 \
     --prep-sample-idx "$PREP_SAMPLE_IDX" \
-    --context-json '{"fastq_path": "<scratch>/smoke/smoke_R1.fastq"}'
-WORK_TICKET_IDX=   # work_ticket_idx from the submit's output
+    --context-json '{"fastq_path": "<ingest-root>/smoke/smoke_R1.fastq"}' \
+    | jq -r .work_ticket_idx)
 qiita ticket status "$WORK_TICKET_IDX"
 ```
 
@@ -1135,13 +1139,14 @@ qiita ticket status "$WORK_TICKET_IDX"
 actions sync` enables only the newest). The submit is refused with a 422 if the
 FASTQ's name does not start with the `--pool-item-id` followed by `_` or `.`.
 
-This drives the smoke from a fresh user PAT through to a `COMPLETED` ticket
+This drives the smoke from the operator's PAT through to a `COMPLETED` ticket
 and a `reads.parquet` artifact. Most of that walk also runs unattended as
 `tests/integration/test_user_authoring_smoke.py` (`make test-integration`),
 which stands up a control plane and shells out to the real `qiita` CLI, so the
 flags the runbooks document are pinned against argparse drift. It stops short
 of the upload itself — streaming reads needs a data plane the fixture does not
-run, so it submits against upload slots minted directly. Compute service-account provisioning per
+run, so it submits against upload slots minted directly — and so it does not
+exercise the path-fed `fastq_path` submit this recipe uses. Compute service-account provisioning per
 [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md)
 is the one prerequisite that remains operator-side after step 10 —
 `qiita-admin actions sync` is now run automatically by
