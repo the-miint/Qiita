@@ -346,9 +346,9 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
     path already needs wet_lab_admin. A FAILED prep_sample's
     ticket is not reset by a submit either: the new ticket converges if the failed
     one never numbered the reads, and otherwise stops, naming `qiita ticket run`
-    for the failed one. There is no --force: the
-    COMPLETED-ticket gate it waives is sequenced_pool-scoped. All calls share one
-    PAT.
+    for the failed one. There is no --force: Illumina's `--force` waives a
+    sequenced_pool-scoped gate, and this command has none to waive; a deliberate
+    re-load goes through removing the pool. All calls share one PAT.
     """
     # The path is checked SERVER-side (POST /run-folder/inspect, below), not
     # here: it names the folder as the CLUSTER sees it, and a check against this
@@ -432,6 +432,24 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         # convergent-retry paragraph says why.
         failures: list[dict] = []
         skipped: list[dict] = []
+
+        def _row(entry: dict, **extra) -> dict:
+            return {
+                "pacbio_sample_idx": entry["pacbio_sample_idx"],
+                "prep_sample_idx": entry["prep_sample_idx"],
+                "barcode": entry["barcode"],
+                **extra,
+            }
+
+        def _failure(entry: dict, exc: httpx.HTTPError, context: str = "") -> dict:
+            if isinstance(exc, httpx.HTTPStatusError):
+                return _row(
+                    entry,
+                    status_code=exc.response.status_code,
+                    error=context + exc.response.text[:500],
+                )
+            return _row(entry, status_code=None, error=f"{context}{type(exc).__name__}: {exc}")
+
         for entry in per_sample:
             if entry["reused"]:
                 try:
@@ -449,33 +467,12 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                         },
                     )
                 except httpx.HTTPError as exc:
-                    response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
-                    failures.append(
-                        {
-                            "pacbio_sample_idx": entry["pacbio_sample_idx"],
-                            "prep_sample_idx": entry["prep_sample_idx"],
-                            "barcode": entry["barcode"],
-                            "status_code": response.status_code if response else None,
-                            "error": (
-                                "looking up its completed ingest: "
-                                + (
-                                    response.text[:500]
-                                    if response
-                                    else f"{type(exc).__name__}: {exc}"
-                                )
-                            ),
-                        }
-                    )
+                    failures.append(_failure(entry, exc, "looking up its completed ingest: "))
                     continue
                 if completed["tickets"]:
                     loaded_by = completed["tickets"][0]["work_ticket_idx"]
                     skipped.append(
-                        {
-                            "pacbio_sample_idx": entry["pacbio_sample_idx"],
-                            "prep_sample_idx": entry["prep_sample_idx"],
-                            "barcode": entry["barcode"],
-                            "reason": f"reads already loaded by ticket {loaded_by}",
-                        }
+                        _row(entry, reason=f"reads already loaded by ticket {loaded_by}")
                     )
                     continue
             ticket_body = WorkTicketCreateRequest(
@@ -498,35 +495,12 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                 if exc.response.status_code == 409:
                     # Already in flight — converged, not failed. Skip without
                     # contributing to the non-zero exit.
-                    skipped.append(
-                        {
-                            "pacbio_sample_idx": entry["pacbio_sample_idx"],
-                            "prep_sample_idx": entry["prep_sample_idx"],
-                            "barcode": entry["barcode"],
-                            "reason": exc.response.text[:500],
-                        }
-                    )
+                    skipped.append(_row(entry, reason=exc.response.text[:500]))
                     continue
-                failures.append(
-                    {
-                        "pacbio_sample_idx": entry["pacbio_sample_idx"],
-                        "prep_sample_idx": entry["prep_sample_idx"],
-                        "barcode": entry["barcode"],
-                        "status_code": exc.response.status_code,
-                        "error": exc.response.text[:500],
-                    }
-                )
+                failures.append(_failure(entry, exc))
                 continue
             except httpx.HTTPError as exc:
-                failures.append(
-                    {
-                        "pacbio_sample_idx": entry["pacbio_sample_idx"],
-                        "prep_sample_idx": entry["prep_sample_idx"],
-                        "barcode": entry["barcode"],
-                        "status_code": None,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
+                failures.append(_failure(entry, exc))
                 continue
             entry["work_ticket_idx"] = ticket_resp.get("work_ticket_idx")
 

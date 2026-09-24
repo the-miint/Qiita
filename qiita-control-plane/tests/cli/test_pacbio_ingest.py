@@ -299,6 +299,7 @@ def _stub_submit_flow(
     fail_ticket_when=None,
     conflict_ticket_when=None,
     completed_prep_samples=(),
+    lookup_fails=False,
 ) -> None:
     """Route each POST/GET of the submit flow to a canned response and record
     every request.
@@ -314,7 +315,7 @@ def _stub_submit_flow(
     roster = {"samples": list(existing_samples or [])}
 
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
-        captured["requests"].append({"method": method, "url": url, "json": json})
+        captured["requests"].append({"method": method, "url": url, "json": json, "params": params})
 
         def resp(status, body):
             return httpx.Response(status, json=body, request=httpx.Request(method, url))
@@ -359,6 +360,8 @@ def _stub_submit_flow(
             n = counter["sample"]
             return resp(201, {"prep_sample_idx": 100 + n, "sequenced_sample_idx": 200 + n})
         if method == "GET" and url.endswith("/work-ticket"):
+            if lookup_fails:
+                return resp(500, {"detail": "boom"})
             idx = int(params["prep_sample_idx"])
             tickets = [{"work_ticket_idx": 700 + idx}] if idx in completed_prep_samples else []
             return resp(200, {"tickets": tickets, "count": len(tickets), "truncated": False})
@@ -718,9 +721,67 @@ def test_submit_pacbio_ingest_skips_a_prep_sample_whose_ingest_completed(
         if r["method"] == "POST" and r["url"].endswith("/work-ticket")
     ]
     assert sorted(posted) == [301, 302]
+    # Other admins' tickets count, and only a COMPLETED one means the reads loaded.
+    lookups = [
+        r["params"]
+        for r in captured["requests"]
+        if r["method"] == "GET" and r["url"].endswith("/work-ticket")
+    ]
+    assert len(lookups) == 3
+    for params in lookups:
+        assert params["all"] == "true"
+        assert params["state"] == "completed"
+        assert params["action_id"] == "bam-to-parquet"
     out = capsys.readouterr().out
     assert "reads already loaded by ticket 1000" in out
     assert '"samples_skipped": 1' in out
+
+
+def test_submit_pacbio_ingest_a_failed_lookup_is_a_failure_not_a_submit(
+    monkeypatch, tmp_path, build_case5_preflight
+):
+    """If the completed-ingest lookup fails, the prep_sample is recorded as a
+    failure and not submitted, and the run exits non-zero."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+    existing = [
+        {
+            "sequenced_pool_item_id": str(i + 1),
+            "prep_sample_idx": 300 + i,
+            "sequenced_sample_idx": 400 + i,
+        }
+        for i in range(3)
+    ]
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured, existing_samples=existing, lookup_fails=True)
+    with pytest.raises(SystemExit) as ei:
+        main(_submit_args(run, db))
+    assert ei.value.code == 1
+    assert not [
+        r
+        for r in captured["requests"]
+        if r["method"] == "POST" and r["url"].endswith("/work-ticket")
+    ]
+
+
+def test_submit_pacbio_ingest_new_prep_samples_are_not_looked_up(
+    monkeypatch, tmp_path, build_case5_preflight
+):
+    """A prep_sample this run created cannot have tickets, so it gets no lookup."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured)
+    main(_submit_args(run, db))
+    assert not [
+        r
+        for r in captured["requests"]
+        if r["method"] == "GET" and r["url"].endswith("/work-ticket")
+    ]
 
 
 def test_read_preflight_rows_rejects_non_pacbio_sheet(build_case5_preflight):

@@ -328,9 +328,9 @@ damage what you already have.
 
 It gets a submission past a single refusal: on Illumina, submitting again over a
 run whose demultiplexing already completed is refused, and `--force` waives that.
-It needs a `wet_lab_admin` account. The PacBio command has no `--force`: once a
-prep_sample's job has completed, nothing refuses a PacBio re-submit, so there is
-no refusal to waive.
+It needs a `wet_lab_admin` account. The PacBio command has no `--force`: it
+skips a prep_sample whose reads are already loaded rather than refusing the
+submission, and loading them again on purpose goes through removing the pool.
 
 When would you want it? Only when you mean to store the run's reads a second
 time — nothing in this guide needs that, and the next paragraph is why.
