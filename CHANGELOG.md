@@ -3791,6 +3791,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **CLAUDE.md: read DuckLake data through the catalog, never `read_parquet` over its files
+  (#PR).** Ad-hoc scripts that globbed a table's Parquet read files the catalog does not
+  consider live — superseded `assembled_sequence_chunks` and `read_mask` runs left on disk —
+  and deduplicating did not recover the catalog's answer where the runs differed (#596).
+  CLAUDE.md now carries the rule and points at `docs/architecture/cross-cutting.md`, which
+  gains that case as a fifth reason and points at `scripts/lake-gc.sh` for when such files
+  accumulate.
+
 - **The ENA ingestion path names the `biosample_global_field` display names it writes as
   constants instead of literals (#589).** `collection date`, the three geographic-location
   fields, `depth`, and `host taxon id` are now `BIOSAMPLE_DISPLAY_*` in

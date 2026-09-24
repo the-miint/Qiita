@@ -90,6 +90,16 @@ The duckdb-miint extension is the **foundation** of the compute/data system, not
 
 The **control plane** also LOADs miint in-process (the masked-read streamer that feeds `long-read-assembly`), so `MIINT_EXTENSION_DIRECTORY` must be set in `control-plane.env` too, byte-identical to the CO's — `make preflight` compares them and `make verify-deploy`'s `cp-miint` check LOADs it. It is deliberately **not** fail-fast at CP boot (the CP serves every other route without it; only assembly tickets fail, naming the var via `require_staged_extension_directory()`), because taking the whole REST API down for one workflow's input binding is the wrong trade. Service-side connects are **LOAD-only, never INSTALL**: `qiita-api`'s home is `/dev/null`, so an INSTALL resolves `$HOME/.duckdb/extensions` and dies with `Can't find the home directory`.
 
+## Reading DuckLake data
+
+Read DuckLake tables only through the catalog — the data plane, or a `READ_ONLY` `ATTACH`
+of the DuckLake catalog (`make lake-shell` does this, for admin debugging) — never
+`read_parquet` over the lake's data path. That holds for one-off scripts and analyses as
+much as for code. If the catalog is not reachable where the work runs, stop rather than
+fall back to the files. The reasons are in
+[`docs/architecture/cross-cutting.md`](docs/architecture/cross-cutting.md), under
+*Data plane horizontal scaling*.
+
 ## Workflow runtimes
 
 A step in a workflow YAML must declare **exactly one** of `container:` or `module:`. The `module:` form (a native step) runs in the orchestrator's Python environment under SLURM and may only use dependencies that already ship in `qiita-compute-orchestrator`'s `pyproject.toml`; anything heavier (bioinformatics deps, system packages) belongs in a container.
