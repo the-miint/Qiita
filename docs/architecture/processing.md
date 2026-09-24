@@ -28,7 +28,7 @@ sequenceDiagram
     C->>NX: DoPut(signed_ticket) + JWT + FASTQ stream
     NX->>DP: route gRPC
     DP->>DP: verify JWT + ticket signature
-    DP->>FS: write FASTQ to PATH_SCRATCH/staging/uploads/<upload_idx>/
+    DP->>FS: write upload.parquet to PATH_SCRATCH/staging/uploads/<upload_idx>/
     DP-->>C: upload confirmed
 
     Note over DP,CP: 3. Upload complete callback
