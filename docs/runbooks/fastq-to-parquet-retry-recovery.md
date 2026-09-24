@@ -35,8 +35,12 @@ If the other ticket **failed or was cancelled**, the reason says so and names it
 Ticket M may have stored the reads before it failed — in a workflow version that
 registers them before later steps such as QC — so re-drive M rather than re-submitting,
 and leave ticket K failed. The message goes on to name `qiita delete-sequenced-pool
---force` for a deliberate re-load; the three things about that command below apply.
-Otherwise:
+--force` for a deliberate re-load; the three things about that command below apply. If
+`qiita ticket run M` answers that the action is no longer enabled, M cannot be re-driven,
+and a fresh submit stops at this same refusal.
+
+If ticket M is **still running**, the reason says so and names `qiita ticket status M`:
+wait for it rather than re-submitting. Otherwise:
 
 > `prep_sample N's reads were already loaded by ticket M, not by this one (ticket K).
 > Loading them again would store every read twice, so this step stopped without writing

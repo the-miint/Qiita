@@ -270,6 +270,24 @@ async def mint_or_reuse_sequence_range(
                         f"pool: {POOL_REMOVAL_RECOVERY}. Then submit again"
                     ),
                 ) from exc
+            if owner is not None and (
+                existing.minted_by_work_ticket_state in _REUSABLE_MINTER_STATES
+            ):
+                # The minter is still in flight, so its reads may not be stored yet;
+                # "already loaded" would be wrong, and so would the pool delete.
+                raise BackendFailure(
+                    kind=FailureKind.UNKNOWN_PERMANENT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=step_name,
+                    reason=(
+                        f"prep_sample {prep_sample_idx}'s read numbering was reserved "
+                        f"by ticket {owner}, which is still running "
+                        f"(state={existing.minted_by_work_ticket_state!r}), not by "
+                        f"this one (ticket {work_ticket_idx}), so this step stopped "
+                        f"without writing anything. Follow ticket {owner} with "
+                        f"`qiita ticket status {owner}` rather than submitting again"
+                    ),
+                ) from exc
             owner_detail = (
                 f"ticket {owner}" if owner is not None else "a ticket Qiita cannot identify"
             )

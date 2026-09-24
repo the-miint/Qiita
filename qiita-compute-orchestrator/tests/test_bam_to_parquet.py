@@ -417,6 +417,38 @@ def test_execute_points_at_a_redrive_when_the_other_minter_did_not_finish(
     assert not (tmp_path / "ws" / "read").exists()
 
 
+def test_execute_points_at_the_other_minter_while_it_is_still_running(monkeypatch, tmp_path):
+    """A range minted by another ticket that is still in flight is refused without
+    claiming the reads are loaded (they may not be yet) or offering the pool delete."""
+
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _running(*, http, prep_sample_idx):
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1001,
+            minted_by_work_ticket_idx=999,
+            minted_by_work_ticket_state=WorkTicketState.PROCESSING.value,
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _running)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "`qiita ticket status 999`" in ei.value.reason
+    assert "already loaded" not in ei.value.reason
+    assert "delete-sequenced-pool" not in ei.value.reason
+    assert not (tmp_path / "ws" / "read").exists()
+
+
 def test_execute_refuses_a_range_with_unknown_provenance(monkeypatch, tmp_path):
     """A NULL minted_by (a range predating the column, or one the backfill could not
     attribute) is treated as NOT-mine: fail closed. Reusing a range we cannot prove
