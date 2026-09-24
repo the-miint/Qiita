@@ -32,9 +32,11 @@ sequenceDiagram
     DP-->>C: upload confirmed
 
     Note over C,CP: 3. Upload done, work ticket submitted
-    C->>CP: POST /upload/{upload_idx}/done
+    C->>NX: POST /upload/{upload_idx}/done
+    NX->>CP: route REST
     CP->>PG_APP: upload pending → ready
-    C->>CP: POST /work-ticket (action_context names the upload_idx)
+    C->>NX: POST /work-ticket (action_context names the upload_idx)
+    NX->>CP: route REST
     CP->>PG_APP: create work ticket (PENDING)
 
     Note over CP,CO: 4. Compute submission (CP drives; CO stateless)
