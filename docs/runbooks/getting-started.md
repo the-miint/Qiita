@@ -314,8 +314,7 @@ covers the flags Illumina does not have, which protocol to choose, and why
   run, pool and prep_samples it already made and adds only what is missing.
 - **A job it queued failed:** re-drive that job with `qiita ticket run <idx>`
   (step 6), which resumes it at the first unfinished step. Running the command
-  again instead queues a new job, and if the failed one had already numbered a
-  prep_sample's reads, the new one stops there and tells you to re-drive the
+  again instead queues a new job, which may stop and tell you to re-drive the
   failed one.
 
 `--force` is not how you retry, and on Illumina it is the one thing here that can
@@ -347,7 +346,7 @@ failed — expect that rather than chasing it.
 qiita ticket list --active
 qiita ticket status <idx>
 qiita ticket logs <idx> --step-index 0
-qiita ticket run <idx>        # re-dispatch a failed job, resuming at the first unfinished step
+qiita ticket run <idx>        # re-drive a failed job, resuming at the first unfinished step
 qiita pool-completion --sequencing-run-idx <run> --sequenced-pool-idx <pool>
 ```
 

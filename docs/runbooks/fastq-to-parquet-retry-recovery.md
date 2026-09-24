@@ -29,18 +29,21 @@ If the other ticket **failed or was cancelled**, the reason says so and names it
 
 > ``prep_sample N's read numbering was reserved by ticket M, which did not finish
 > (state='failed'), not by this one (ticket K), so this step stopped without writing
-> anything. Re-drive that ticket with `qiita ticket run M` rather than submitting again``
+> anything; ticket M may already have stored the reads. To finish that load, re-drive it
+> with `qiita ticket run M`.``
 
-That is a re-submit over an unfinished job, not a re-load: re-drive ticket M, and leave
-ticket K failed. Otherwise:
+Ticket M may have stored the reads before it failed — fastq-to-parquet registers them
+before its QC and host-filter steps — so re-drive M rather than re-submitting, and leave
+ticket K failed. The message goes on to name the pool delete below, for a deliberate
+re-load. Otherwise:
 
 > `prep_sample N's reads were already loaded by ticket M, not by this one (ticket K).
 > Loading them again would store every read twice, so this step stopped without writing
 > anything.`
 
 Reuse is restricted to the **minting** ticket. A range minted by a *different* ticket
-that did not fail and was not cancelled means the prep_sample's reads are **already
-registered in the lake**, and reusing the range would register them a second time.
+means that ticket has registered, or may yet register, the prep_sample's reads, and
+reusing the range could register them a second time.
 DuckLake has no uniqueness, so that duplication would be silent and permanent — hence a
 hard, permanent refusal.
 

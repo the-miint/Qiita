@@ -250,10 +250,11 @@ async def mint_or_reuse_sequence_range(
             if owner is not None and (
                 existing.minted_by_work_ticket_state in REDRIVABLE_WORK_TICKET_STATES
             ):
-                # The minter failed or was cancelled, so this is a re-submit over a
-                # job that never finished, not over loaded reads. Re-driving the
-                # minter resumes it with its own range; removing the pool is not
-                # what this needs.
+                # The minter failed or was cancelled. Whether it registered the reads
+                # depends on where it stopped (fastq-to-parquet registers them before
+                # its QC and host-filter steps), so this cannot say. Re-driving the
+                # minter resumes it with its own range, which is what an interrupted
+                # load needs; a deliberate re-load still means removing the pool.
                 raise BackendFailure(
                     kind=FailureKind.UNKNOWN_PERMANENT,
                     stage=WorkTicketFailureStage.STEP_RUN,
@@ -263,8 +264,11 @@ async def mint_or_reuse_sequence_range(
                         f"by ticket {owner}, which did not finish "
                         f"(state={existing.minted_by_work_ticket_state!r}), not by "
                         f"this one (ticket {work_ticket_idx}), so this step stopped "
-                        "without writing anything. Re-drive that ticket with "
-                        f"`qiita ticket run {owner}` rather than submitting again"
+                        "without writing anything; ticket "
+                        f"{owner} may already have stored the reads. To finish that "
+                        f"load, re-drive it with `qiita ticket run {owner}`. Loading "
+                        "the reads again on purpose means removing the prep_sample's "
+                        f"pool: {POOL_REMOVAL_RECOVERY}. Then submit again"
                     ),
                 ) from exc
             owner_detail = (

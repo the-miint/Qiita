@@ -383,8 +383,9 @@ def test_execute_points_at_a_redrive_when_the_other_minter_did_not_finish(
     monkeypatch, tmp_path, minter_state
 ):
     """A range minted by another ticket that FAILED or was CANCELLED is still refused,
-    but the reason names that ticket's redrive: a re-submit over a job that never
-    finished is not a re-load of stored reads, and removing the pool is not the fix."""
+    and the reason names that ticket's redrive first: an interrupted load is finished
+    by re-driving it. The minter may or may not have stored the reads, so the reason
+    must not say they were loaded."""
 
     async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
         raise SequenceRangeAlreadyExists(prep_sample_idx, count)
@@ -409,8 +410,10 @@ def test_execute_points_at_a_redrive_when_the_other_minter_did_not_finish(
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert "`qiita ticket run 999`" in ei.value.reason
-    assert "already loaded" not in ei.value.reason
-    assert "delete-sequenced-pool" not in ei.value.reason
+    assert "were already loaded" not in ei.value.reason
+    assert ei.value.reason.index("qiita ticket run") < ei.value.reason.index(
+        "delete-sequenced-pool"
+    )
     assert not (tmp_path / "ws" / "read").exists()
 
 

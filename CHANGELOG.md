@@ -4250,7 +4250,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   COMPLETED ticket blocks the delete unless forced), through one `POOL_REMOVAL_RECOVERY`
   constant — there is no prep_sample delete. A read-numbering refusal over a range another
   ticket reserved no longer says the reads are loaded when that ticket failed or was
-  cancelled; it names `qiita ticket run` for that ticket instead of the pool delete. The
+  cancelled — it may have stored them or not — and names `qiita ticket run` for that
+  ticket first, ahead of the pool delete for a deliberate re-load. The
   runbooks now say to re-drive a failed job rather than re-run the submit, which queues a new
   ticket. A pure-unit Rust test pins that `read` is absent from `REPLACE_KEY_TABLES`, the
   table-level half of the `--force` claim. `fastq-to-parquet-retry-recovery.md` quotes the
