@@ -46,8 +46,10 @@
 # filenames. Nothing is copied at step end: the assembler writes here directly,
 # so the bytes are charged to the per-attempt ticket workspace.
 #
-# That workspace is not reclaimed: no sweep deletes ticket workspaces, so they —
-# and these trees — accumulate. This retains in place; it does not archive.
+# That workspace does not currently expire. docs/architecture/storage.md states
+# ephemeral per-ticket directories are deleted 45 days past the ticket's terminal
+# state, but no sweep implementing it exists in this repo, so workspaces — and
+# now these trees — accumulate. This retains in place; it does not archive.
 # Anything that must survive the sweep being implemented needs storage of its
 # own.
 #
