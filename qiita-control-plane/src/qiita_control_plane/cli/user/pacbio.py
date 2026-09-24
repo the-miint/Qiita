@@ -46,6 +46,7 @@ from qiita_common.models import (
     SequencedPoolCreateRequest,
     SequencingRunCreateRequest,
     WorkTicketCreateRequest,
+    WorkTicketState,
 )
 
 from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
@@ -338,9 +339,11 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
     roster (step 4), and the 409-as-skip fan-out (step 5) together mean re-running
     the identical gesture after a partial failure reuses everything already made
     and re-submits the rest. The in-flight gate blocks only non-terminal tickets,
-    so a prep_sample whose reads already loaded gets a fresh ticket, which stops
-    at the read-numbering step without storing anything (see
-    `sequence_range_retry.mint_or_reuse_sequence_range`). A FAILED prep_sample's
+    so a reused prep_sample with a COMPLETED bam-to-parquet ticket is SKIPPED
+    here: a fresh ticket would stop at the read-numbering step without storing
+    anything (see `sequence_range_retry.mint_or_reuse_sequence_range`). The
+    lookup uses `?all=true`, which the submitter can pass because naming the BAM
+    path already needs wet_lab_admin. A FAILED prep_sample's
     ticket is not reset by a submit either: the new ticket converges if the failed
     one never numbered the reads, and otherwise stops, naming `qiita ticket run`
     for the failed one. There is no --force: the
@@ -424,11 +427,57 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         # work already running. Recorded as SKIPPED and NOT counted toward the
         # non-zero exit, so re-running to retry one prep_sample does not report the
         # running ones as failures.
-        # A COMPLETED or FAILED prep_sample is admitted instead; the docstring's
-        # convergent-retry paragraph says where its new ticket stops.
+        # A reused prep_sample whose reads a COMPLETED ticket loaded is skipped
+        # before the POST; a FAILED one is admitted. The docstring's
+        # convergent-retry paragraph says why.
         failures: list[dict] = []
         skipped: list[dict] = []
         for entry in per_sample:
+            if entry["reused"]:
+                try:
+                    completed = _common.call(
+                        "GET",
+                        args.base_url,
+                        token,
+                        PATH_WORK_TICKET_PREFIX,
+                        params={
+                            "all": "true",
+                            "prep_sample_idx": entry["prep_sample_idx"],
+                            "action_id": _BAM_TO_PARQUET_ACTION_ID,
+                            "state": WorkTicketState.COMPLETED.value,
+                            "limit": 1,
+                        },
+                    )
+                except httpx.HTTPError as exc:
+                    response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
+                    failures.append(
+                        {
+                            "pacbio_sample_idx": entry["pacbio_sample_idx"],
+                            "prep_sample_idx": entry["prep_sample_idx"],
+                            "barcode": entry["barcode"],
+                            "status_code": response.status_code if response else None,
+                            "error": (
+                                "looking up its completed ingest: "
+                                + (
+                                    response.text[:500]
+                                    if response
+                                    else f"{type(exc).__name__}: {exc}"
+                                )
+                            ),
+                        }
+                    )
+                    continue
+                if completed["tickets"]:
+                    loaded_by = completed["tickets"][0]["work_ticket_idx"]
+                    skipped.append(
+                        {
+                            "pacbio_sample_idx": entry["pacbio_sample_idx"],
+                            "prep_sample_idx": entry["prep_sample_idx"],
+                            "barcode": entry["barcode"],
+                            "reason": f"reads already loaded by ticket {loaded_by}",
+                        }
+                    )
+                    continue
             ticket_body = WorkTicketCreateRequest(
                 action_id=_BAM_TO_PARQUET_ACTION_ID,
                 action_version=_BAM_TO_PARQUET_ACTION_VERSION,

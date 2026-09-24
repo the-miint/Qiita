@@ -1915,6 +1915,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **`qiita submit-pacbio-ingest` no longer re-queues prep_samples whose reads already
+  loaded (#461).** A re-run gave every such prep_sample a fresh `bam-to-parquet` ticket,
+  which then failed at read numbering; the runbooks told users to expect those failures.
+  The fan-out now looks up a COMPLETED `bam-to-parquet` ticket for each reused
+  prep_sample and reports it as `skipped`, naming that ticket.
+
 - **Work-ticket dispatch now has its own process-wide concurrency bound, so a burst of ticket submits can no longer starve the connection pool through dispatch alone (#598).**
   `_STUDY_CONCURRENCY` releases its permit at submit, but the fire-and-forget
   `schedule_dispatch` that submit starts keeps running, and acquiring connections, for

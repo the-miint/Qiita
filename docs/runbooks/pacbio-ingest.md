@@ -58,10 +58,8 @@ qiita submit-pacbio-ingest \
   and says so if the failed one had already numbered its reads. The pool is
   recognised by the exact contents of the pre-flight file, so submit the same
   file again. Changed contents under the same file name are refused; under a new
-  name they create a second pool. A prep_sample whose reads already loaded is
-  **not** skipped — it gets a fresh job, which then stops at the read-numbering
-  step because its reads are already numbered. That is safe (nothing is stored
-  twice) but it shows up as a failed job, so expect it and do not chase it.
+  name they create a second pool. A prep_sample whose reads a completed job
+  already loaded is reported `skipped` too, naming that job.
 
 ## `pool-completion` will not tell you the load finished
 

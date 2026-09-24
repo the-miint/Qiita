@@ -298,6 +298,7 @@ def _stub_submit_flow(
     existing_samples: list[dict] | None = None,
     fail_ticket_when=None,
     conflict_ticket_when=None,
+    completed_prep_samples=(),
 ) -> None:
     """Route each POST/GET of the submit flow to a canned response and record
     every request.
@@ -357,6 +358,10 @@ def _stub_submit_flow(
             counter["sample"] += 1
             n = counter["sample"]
             return resp(201, {"prep_sample_idx": 100 + n, "sequenced_sample_idx": 200 + n})
+        if method == "GET" and url.endswith("/work-ticket"):
+            idx = int(params["prep_sample_idx"])
+            tickets = [{"work_ticket_idx": 700 + idx}] if idx in completed_prep_samples else []
+            return resp(200, {"tickets": tickets, "count": len(tickets), "truncated": False})
         if url.endswith("/work-ticket"):
             if fail_ticket_when is not None and fail_ticket_when(json):
                 return resp(500, {"detail": "boom"})
@@ -657,10 +662,10 @@ def test_submit_pacbio_ingest_reused_sample_biosample_mismatch_fails(
 def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(
     monkeypatch, tmp_path, build_case5_preflight
 ):
-    """A real re-submit: the samples exist AND their ingest tickets already
-    COMPLETED (or are in-flight), so the work-ticket POSTs 409. Those are the
-    convergence signal, not failures — the command records them as skipped and
-    exits 0 (the operator must be able to tell already-done from a real failure)."""
+    """A real re-submit: the samples exist AND their ingest tickets are in
+    flight, so the work-ticket POSTs 409. Those are the convergence signal, not
+    failures — the command records them as skipped and exits 0 (the operator
+    must be able to tell already-running from a real failure)."""
     db = build_case5_preflight()
     run = tmp_path / "run"
     for bc in ("bc3011", "bc0112", "bc9992"):
@@ -680,6 +685,42 @@ def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(
     )
     rc = main(_submit_args(run, db))
     assert rc == 0  # all-already-done converges to success, not a failure exit
+
+
+def test_submit_pacbio_ingest_skips_a_prep_sample_whose_ingest_completed(
+    monkeypatch, tmp_path, build_case5_preflight, capsys
+):
+    """A re-run does not queue a ticket for a reused prep_sample that already has a
+    COMPLETED bam-to-parquet ticket: that ticket would stop at read numbering. It is
+    reported as skipped, naming the ticket; the others are still submitted."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+
+    existing = [
+        {
+            "sequenced_pool_item_id": str(i + 1),
+            "prep_sample_idx": 300 + i,
+            "sequenced_sample_idx": 400 + i,
+        }
+        for i in range(3)
+    ]
+    captured: dict = {}
+    _stub_submit_flow(
+        monkeypatch, captured, existing_samples=existing, completed_prep_samples={300}
+    )
+    assert main(_submit_args(run, db)) == 0
+
+    posted = [
+        r["json"]["scope_target"]["prep_sample_idx"]
+        for r in captured["requests"]
+        if r["method"] == "POST" and r["url"].endswith("/work-ticket")
+    ]
+    assert sorted(posted) == [301, 302]
+    out = capsys.readouterr().out
+    assert "reads already loaded by ticket 1000" in out
+    assert '"samples_skipped": 1' in out
 
 
 def test_read_preflight_rows_rejects_non_pacbio_sheet(build_case5_preflight):
