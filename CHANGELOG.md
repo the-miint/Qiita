@@ -3796,10 +3796,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   consider live — superseded `assembled_sequence_chunks` and `read_mask` runs left on disk —
   and deduplicating did not recover the catalog's answer where the runs differed (#596).
   CLAUDE.md now carries the rule — jobs and services read through the data plane, ad-hoc
-  inspection through `make lake-shell`'s read-only attach — and points at
-  `docs/architecture/cross-cutting.md`, whose
-  snapshot-visibility reason now covers that case and points at `scripts/lake-gc.sh` for
-  how such files arise.
+  inspection (one-off scripts included) through `make lake-shell`'s read-only attach — and
+  points at `docs/architecture/cross-cutting.md`, whose snapshot-visibility reason now
+  covers that case and points at `scripts/lake-gc.sh` for how such files arise.
 
 - **The ENA ingestion path names the `biosample_global_field` display names it writes as
   constants instead of literals (#589).** `collection date`, the three geographic-location

@@ -94,10 +94,10 @@ The **control plane** also LOADs miint in-process (the masked-read streamer that
 
 Read DuckLake tables only through the catalog, never `read_parquet` over the lake's data
 path (`PATH_PERSISTENT/ducklake/<table>/`). Code — jobs and services — reads through the
-data plane. Ad-hoc inspection by hand uses a `READ_ONLY` attach of the catalog,
-`make lake-shell`, which is admin-only and not a data-access path (see the header of
-[`scripts/lake-shell.sh`](scripts/lake-shell.sh)). If the catalog is not reachable where
-the work runs, stop rather than fall back to the files. The reasons are in
+data plane. Ad-hoc inspection by hand — a one-off script or analysis included — uses a
+`READ_ONLY` attach of the catalog, `make lake-shell`, which is admin-only and not a
+data-access path (see the header of [`scripts/lake-shell.sh`](scripts/lake-shell.sh)). If
+the catalog is not reachable where the work runs, stop rather than fall back to the files. The reasons are in
 [`docs/architecture/cross-cutting.md`](docs/architecture/cross-cutting.md), under *Data
 plane horizontal scaling*.
 
