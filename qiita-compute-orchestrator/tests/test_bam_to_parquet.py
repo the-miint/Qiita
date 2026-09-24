@@ -410,7 +410,11 @@ def test_execute_does_not_claim_the_reads_loaded_unless_the_other_minter_complet
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert "ticket 999" in ei.value.reason
     assert "were already loaded" not in ei.value.reason
-    assert f"state={minter_state!r}" in ei.value.reason
+    if minter_state is None:
+        assert "ticket 999, whose record is gone" in ei.value.reason
+    else:
+        assert f"ticket 999, which ended as {minter_state}" in ei.value.reason
+    assert "may already have been loaded" in ei.value.reason
     assert POOL_REMOVAL_RECOVERY in ei.value.reason
     assert "ticket run" not in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()

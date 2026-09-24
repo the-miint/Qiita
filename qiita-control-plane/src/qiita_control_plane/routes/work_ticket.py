@@ -129,8 +129,8 @@ _STEP_LOGS_DEFAULT_TAIL_LINES = 200
 _STEP_LOGS_MAX_TAIL_LINES = 5000
 _STEP_LOGS_MAX_TAIL_BYTES = 256 * 1024
 
-# /run applies to a PENDING ticket that was never dispatched and the two redrivable
-# terminal states (FAILED, CANCELLED). Everything else is refused. The
+# /run applies to a PENDING ticket that was never dispatched and the redrivable
+# terminal states (REDRIVABLE_WORK_TICKET_STATES). Everything else is refused. The
 # not-applicable set is the COMPLEMENT of the applicable set, so a new
 # WorkTicketState defaults to REFUSED — the safe direction; listing the refused
 # states positively would silently make a new state runnable.

@@ -52,13 +52,12 @@ reusing the range could register them a second time.
 DuckLake has no uniqueness, so that duplication would be silent and permanent — hence a
 hard, permanent refusal.
 
-If M ended any other way (`no_data`, or its ticket row is gone), the reason says the
-numbering was reserved, gives M's state, and says the reads may already have been
-loaded, rather than that they were; the recovery it names is the same.
-
-The same refusal fires when the minter is **unknown** (`minted_by_work_ticket_idx IS
-NULL` — a row the migration's backfill could not attribute unambiguously); it names "a
-ticket Qiita cannot identify" instead of a number. Read it the same way: assume the
+If M ended any other way, the reason says the numbering was reserved by "ticket M,
+which ended as no_data" or by "ticket M, whose record is gone", and that the reads may
+already have been loaded, rather than that they were. The same wording, naming "a
+ticket Qiita cannot identify", covers a minter that is **unknown**
+(`minted_by_work_ticket_idx IS NULL` — a row the migration's backfill could not
+attribute unambiguously). The recovery named is the same in every case: assume the
 prep_sample is already loaded.
 
 **If you see the "already loaded" refusal, the prep_sample is already ingested. Do not

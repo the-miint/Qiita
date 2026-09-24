@@ -291,28 +291,36 @@ async def mint_or_reuse_sequence_range(
                         f"`qiita ticket status {owner}` rather than submitting again"
                     ),
                 ) from exc
-            owner_detail = (
-                f"ticket {owner}" if owner is not None else "a ticket Qiita cannot identify"
-            )
+            state = existing.minted_by_work_ticket_state
             # Only a COMPLETED minter is known to have stored the reads; any other
-            # state that lands here (no_data, a ticket row that is gone) may have.
-            if existing.minted_by_work_ticket_state == WorkTicketState.COMPLETED.value:
-                finding = f"prep_sample {prep_sample_idx}'s reads were already loaded by "
-            else:
+            # minter that lands here (no_data, a ticket row that is gone, an
+            # unattributed range) may have.
+            if state == WorkTicketState.COMPLETED.value:
                 finding = (
-                    f"prep_sample {prep_sample_idx}'s read numbering was reserved "
-                    f"(state={existing.minted_by_work_ticket_state!r}), and its reads "
-                    "may already have been loaded, by "
+                    f"prep_sample {prep_sample_idx}'s reads were already loaded by ticket "
+                    f"{owner}, not by this one (ticket {work_ticket_idx}). Loading them "
+                    "again would store every read twice"
+                )
+            else:
+                if owner is None:
+                    minter = "a ticket Qiita cannot identify"
+                elif state is None:
+                    minter = f"ticket {owner}, whose record is gone"
+                else:
+                    minter = f"ticket {owner}, which ended as {state}"
+                finding = (
+                    f"prep_sample {prep_sample_idx}'s read numbering was reserved by "
+                    f"{minter}, not by this one (ticket {work_ticket_idx}); its reads may "
+                    "already have been loaded. Loading them again could store every read "
+                    "twice"
                 )
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
-                    f"{finding}{owner_detail}, not by this one (ticket {work_ticket_idx}). "
-                    "Loading them again would store every read twice, so this step "
-                    "stopped without writing anything. Loading them again on purpose "
-                    "means removing the prep_sample's pool: "
+                    f"{finding}, so this step stopped without writing anything. Loading "
+                    "them again on purpose means removing the prep_sample's pool: "
                     f"{POOL_REMOVAL_RECOVERY}. Then submit again"
                 ),
             ) from exc

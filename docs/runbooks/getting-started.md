@@ -315,8 +315,8 @@ covers the flags Illumina does not have, which protocol to choose, and why
 - **The command failed at your terminal:** run it again unchanged. It reuses the
   run, pool and prep_samples it already made and creates only what is missing.
   On Illumina it then refuses to queue demultiplexing again if that already
-  completed; on PacBio it queues a job for every prep_sample again (see the end of
-  this section).
+  completed; on PacBio it queues a job again for every prep_sample whose job is
+  not still running (see the end of this section).
 - **A job it queued failed:** re-drive that job with `qiita ticket run <idx>`
   (step 6), which resumes it at the first unfinished step. Running the command
   again instead queues a new job, which may stop and tell you to re-drive the

@@ -64,7 +64,7 @@ prep-protocol list` shows the numbers your site has, and
 `PROTOCOL_IDX` to the number you find there:
 
 ```bash
-PROTOCOL_IDX=<the idx from qiita prep-protocol list>
+PROTOCOL_IDX=   # the idx from `qiita prep-protocol list`
 PREP_SAMPLE_IDX=$(qiita sequenced-sample create \
     --run-idx "$RUN_IDX" \
     --pool-idx "$POOL_IDX" \
@@ -153,7 +153,7 @@ Step 4 already waited for the job and printed it. To look again later, take
 the ticket number from `work_ticket.work_ticket_idx` in that output:
 
 ```bash
-WORK_TICKET_IDX=<work_ticket.work_ticket_idx from step 4>
+WORK_TICKET_IDX=   # work_ticket.work_ticket_idx from step 4's output
 qiita ticket status "$WORK_TICKET_IDX"
 ```
 
