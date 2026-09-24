@@ -159,7 +159,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         raise FileNotFoundError(f"shard_mapping not found: {inputs.shard_mapping}")
 
     # Persistent router location under the derived-artifact root (PATH_DERIVED),
-    # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
+    # NOT the per-attempt scratch workspace. On SLURM the backend propagates
     # PATH_DERIVED into the job env so get_settings() resolves the real value. The
     # layout is owned by `derived_store` (shared with the reference-artifact purge
     # endpoint). One `.ryxdi` directory per reference (whole-reference router).

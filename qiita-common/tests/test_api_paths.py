@@ -21,8 +21,8 @@ def test_compute_upload_staging_path_matches_rust_layout():
     ``qiita-data-plane/src/flight_service.rs``. If you change one,
     change the other in the same commit; both sides will move together
     or not at all."""
-    assert compute_upload_staging_path(Path("/scratch/ephemeral/staging"), 42) == Path(
-        "/scratch/ephemeral/staging/uploads/42/upload.parquet"
+    assert compute_upload_staging_path(Path("/scratch/staging"), 42) == Path(
+        "/scratch/staging/uploads/42/upload.parquet"
     )
 
 

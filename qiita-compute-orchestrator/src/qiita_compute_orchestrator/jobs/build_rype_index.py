@@ -4,7 +4,7 @@ Reads the feature-keyed chunked sequences `reference_load` produced
 (`reference_sequence_chunks`: `feature_idx, chunk_index, chunk_data`), builds
 a single-bucket `(feature_idx, bucket_name)` mapping, and calls miint's
 `rype_index_create` to write a `.ryxdi` index to a PERSISTENT location under
-the shared filesystem (NOT the ephemeral workspace) — the index outlives the
+the shared filesystem (NOT the per-attempt scratch workspace) — the index outlives the
 work ticket and is consumed at host-filter time.
 
 For host filtering every feature goes to one bucket: the `.ryxdi` is a POSITIVE
@@ -193,7 +193,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     )
 
     # Persistent index location under the derived-artifact root (PATH_DERIVED),
-    # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
+    # NOT the per-attempt scratch workspace. On SLURM the backend propagates
     # PATH_DERIVED into the job env so get_settings() resolves the real value
     # here instead of the $TMPDIR/qiita/derived default. The layout is owned by
     # `derived_store` (the orchestrator's derived-storage convention, shared with

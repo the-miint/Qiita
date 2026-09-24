@@ -199,7 +199,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         read_target = chunks / "part_*.parquet" if chunks.is_dir() else chunks
 
     # Persistent index PREFIX under the derived-artifact root (PATH_DERIVED), NOT
-    # the ephemeral per-attempt workspace. bowtie2 writes multiple `.bt2` files
+    # the per-attempt scratch workspace. bowtie2 writes multiple `.bt2` files
     # under this prefix; the layout is owned by `derived_store` (shared with the
     # reference-artifact purge endpoint). A sharded build lands at
     # `.../bowtie2-shards/{shard_id}/index` (a per-shard subdir, the shape

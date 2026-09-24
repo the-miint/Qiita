@@ -19,10 +19,10 @@ sequenceDiagram
     participant FS as Shared<br/>Filesystem
 
     Note over C,CP: 1. Upload request
-    C->>NX: REST: "upload amplicon data for study 42, prep 7" + JWT
+    C->>NX: POST /upload + JWT
     NX->>CP: route REST
-    CP->>PG_APP: validate access, create work ticket (PENDING)
-    CP-->>C: signed Flight ticket for DoPut
+    CP->>PG_APP: mint upload row (pending)
+    CP-->>C: upload_idx + signed Flight ticket for DoPut
 
     Note over C,DP: 2. Data upload
     C->>NX: DoPut(signed_ticket) + JWT + Arrow record-batch stream
@@ -31,9 +31,11 @@ sequenceDiagram
     DP->>FS: write upload.parquet to PATH_SCRATCH/staging/uploads/<upload_idx>/
     DP-->>C: upload confirmed
 
-    Note over DP,CP: 3. Upload complete callback
-    DP->>CP: REST callback: upload complete, path=PATH_SCRATCH/staging/uploads/<upload_idx>/
-    CP->>PG_APP: update work ticket (UPLOADED)
+    Note over C,CP: 3. Upload done, work ticket submitted
+    C->>CP: POST /upload/{upload_idx}/done
+    CP->>PG_APP: upload pending → ready
+    C->>CP: POST /work-ticket (action_context names the upload_idx)
+    CP->>PG_APP: create work ticket (PENDING)
 
     Note over CP,CO: 4. Compute submission (CP drives; CO stateless)
     CP->>CO: POST /step/submit (work ticket X, step entry)
@@ -79,9 +81,9 @@ sequenceDiagram
 
 **Text flow:**
 
-1. **Upload request:** Client sends REST request to control plane with JWT. Control plane validates access, creates a work ticket (PENDING), and returns a signed Flight ticket authorizing a DoPut upload.
-2. **Data upload:** Client streams raw data (e.g., FASTQ) to the data plane via Arrow Flight DoPut through nginx. Data plane verifies JWT and ticket signature, writes data to the shared filesystem at a structured staging path.
-3. **Upload complete callback:** Data plane calls back to control plane with the staging path. Control plane updates the work ticket to UPLOADED.
+1. **Upload request:** Client calls `POST /upload` with its JWT. The control plane mints a `qiita.upload` row (`pending`) and returns its `upload_idx` with a signed Flight ticket authorizing one DoPut.
+2. **Data upload:** Client streams Arrow record batches to the data plane via Arrow Flight DoPut through nginx. The data plane verifies the JWT and ticket signature and writes `PATH_SCRATCH/staging/uploads/<upload_idx>/upload.parquet`.
+3. **Upload done, work ticket submitted:** The client calls `POST /upload/{upload_idx}/done` (`pending` → `ready`); the data plane does not call back. The client then submits a work ticket whose `action_context` names the `upload_idx`; the runner resolves it to the staged file before the first step and marks the upload `consumed` after the workflow succeeds (`runner/_upload.py`).
 4. **Compute submission:** Control plane calls `POST /step/submit`; the orchestrator `sbatch`es a SLURM job via slurmrestd. The job specifies a container image (e.g., `qiita-workflow-amplicon:v1.2.0`), input/output paths on the shared filesystem, and stdout/stderr log paths. SLURM jobs have no knowledge of the control plane — they are truly dumb (read input, process, write output, exit). The orchestrator returns a handle (SLURM job id + workspace paths) immediately; the CP persists it to `qiita.work_ticket_step` and updates the ticket to QUEUED. The orchestrator keeps no in-flight state.
 5. **Job monitoring:** The control plane polls `POST /step/status` (the orchestrator does a single slurmrestd read per call) at its own cadence. When the job transitions to RUNNING, the CP records it on `work_ticket_step` and updates the ticket to PROCESSING. A CO-unreachable error here is transient and retried in place, never failing the ticket.
 6. **SLURM execution:** The containerized workflow runs on the SLURM cluster, reading input from the staging path on the shared filesystem and writing Parquet results to the results path. Stdout/stderr are captured to log files on the shared filesystem.

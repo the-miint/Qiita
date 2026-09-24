@@ -3810,6 +3810,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `PATH_PERSISTENT/logs/`), reference source staging as `PATH_SCRATCH/references/staging/`,
   and the 45-day `/scratch/ephemeral/` retention is removed: no such directory or sweep
   exists, and `PATH_SCRATCH/ticket/` and `PATH_SCRATCH/staging/` are not reclaimed.
+  `processing.md`'s upload flow now matches the code: the client marks an upload done
+  (`POST /upload/{idx}/done`) and a work ticket names it later; the data plane does not
+  call back and there is no `UPLOADED` ticket state. The per-attempt workspace is no
+  longer called ephemeral in docs and code comments, and `assemble.sh`'s comment no
+  longer cites the 45-day retention (this rebuilds the `assemble` SIF at the next deploy).
 
 - **The ENA ingestion path names the `biosample_global_field` display names it writes as
   constants instead of literals (#589).** `collection date`, the three geographic-location

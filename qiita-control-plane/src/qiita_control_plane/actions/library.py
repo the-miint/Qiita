@@ -532,7 +532,7 @@ async def mint_features(
     # holds the feature_map temp table and the final COPY. Separate so the
     # open manifest reader and the per-batch INSERTs don't contend on one
     # connection's single in-flight query. `temp_directory` lets write_conn
-    # spill the temp table to the (ephemeral) workspace under memory pressure
+    # spill the temp table to the per-attempt workspace under memory pressure
     # rather than growing unbounded in the CP's RAM.
     read_conn = duckdb_connect()
     write_conn = duckdb_connect()

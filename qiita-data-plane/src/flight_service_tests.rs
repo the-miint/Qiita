@@ -5861,10 +5861,10 @@ async fn do_put_writes_multi_batch_stream() {
 
 #[test]
 fn staging_path_for_layout() {
-    let root = Path::new("/scratch/ephemeral/staging");
+    let root = Path::new("/scratch/staging");
     assert_eq!(
         staging_path_for(root, 42),
-        Path::new("/scratch/ephemeral/staging/uploads/42/upload.parquet")
+        Path::new("/scratch/staging/uploads/42/upload.parquet")
     );
 }
 

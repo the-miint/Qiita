@@ -79,7 +79,7 @@ Host references are ingested by the **`host-reference-add`** workflow (`workflow
 
 ### `.ryxdi` index layout and location
 
-The index is a miint rype `.ryxdi` — a **directory** (manifest + Parquet shards), not a single file — written by `build_rype_index` to a persistent path on the shared filesystem (NOT the ephemeral work-ticket workspace):
+The index is a miint rype `.ryxdi` — a **directory** (manifest + Parquet shards), not a single file — written by `build_rype_index` to a persistent path on the shared filesystem (NOT the per-attempt scratch workspace):
 
 ```
 {PATH_DERIVED}/references/{reference_idx}/rype/index.ryxdi/

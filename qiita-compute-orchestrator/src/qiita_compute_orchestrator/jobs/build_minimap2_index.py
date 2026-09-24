@@ -232,7 +232,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         read_target = chunks / "part_*.parquet" if chunks.is_dir() else chunks
 
     # Persistent index location under the derived-artifact root (PATH_DERIVED),
-    # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
+    # NOT the per-attempt scratch workspace. On SLURM the backend propagates
     # PATH_DERIVED into the job env so get_settings() resolves the real value.
     # The layout is owned by `derived_store` (shared with build_rype_index and
     # the reference-artifact purge endpoint). A sharded build lands at
