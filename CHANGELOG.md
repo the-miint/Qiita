@@ -3801,7 +3801,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   covers that case and points at `scripts/lake-gc.sh` for how such files arise. The
   neighbouring bullet on file protection said jobs write final outputs straight into
   `/data/parquet/<table>/` and that the data plane checks mode 440 before registering; it
-  now says what the code does — jobs write into their per-ticket workspace, the
+  now says that jobs write into their per-ticket workspace, the
   orchestrator checks the mode (`slurm/verify.py`), and the data plane moves each file
   into `PATH_PERSISTENT/ducklake/<table>/` when it registers it.
 

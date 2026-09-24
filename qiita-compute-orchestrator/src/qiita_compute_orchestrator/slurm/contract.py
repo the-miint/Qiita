@@ -14,8 +14,9 @@ from typing import Any
 
 from pydantic import BaseModel
 
-# Mode the data plane requires before it'll register a Parquet file.
-# Owner-and-group read, no write, no other. Both verifier and launcher
+# Mode every step output must carry: owner-and-group read, no write, no
+# other. `slurm/verify.py` fails a step whose outputs differ; the data plane
+# does not check it when it registers a file. Both verifier and launcher
 # read this value rather than re-typing 0o440 — drift between them
 # would make some valid outputs look like contract violations.
 EXPECTED_FILE_MODE: int = 0o440
