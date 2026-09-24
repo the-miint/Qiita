@@ -23,25 +23,23 @@ The control-plane user (`qiita-api`) connects to `qiita_miint` only; the data-pl
 Three shared filesystems, mounted on every host that runs Qiita components or SLURM workers. Each is an env-var **base root** the operator sets per component; the services derive fixed subdirs from it (no per-leaf env var):
 
 - **`PATH_PERSISTENT/`** — durable, backed up. System-of-record state. `PATH_PERSISTENT` is an env var the data plane reads directly; it derives the DuckLake data path as `PATH_PERSISTENT/ducklake`. The recommended runbook value is `/data` (see `docs/runbooks/first-deploy.md`); production deploys whose shared filesystem is mounted elsewhere override at deploy time. The data plane's fallback when `PATH_PERSISTENT` is unset is `$TMPDIR/qiita` — so DuckLake lands at `$TMPDIR/qiita/ducklake`, further falling back to `/tmp/qiita/ducklake` if `TMPDIR` itself is unset — a tmp-rooted default, never a production-looking path.
-- **`PATH_SCRATCH/`** — fast, working. The control plane derives `PATH_SCRATCH/ticket` (per-ticket workspaces) and `PATH_SCRATCH/staging` (DoPut upload staging); the data plane derives the same `PATH_SCRATCH/staging`, and the orchestrator derives the same `PATH_SCRATCH/ticket` (its readiness probe checks it). Recommended runbook value `/scratch`. Three-tier retention.
+- **`PATH_SCRATCH/`** — fast, working. The control plane derives `PATH_SCRATCH/ticket` (per-ticket workspaces) and `PATH_SCRATCH/staging` (DoPut upload staging); the data plane derives the same `PATH_SCRATCH/staging`, and the orchestrator derives the same `PATH_SCRATCH/ticket` (its readiness probe checks it). Recommended runbook value `/scratch`.
 - **`PATH_DERIVED/`** — built artifacts. The compute orchestrator derives `PATH_DERIVED/images`, the Apptainer SIF tier SLURM container steps resolve bare `container:` filenames against (required when `COMPUTE_BACKEND=slurm`). Recommended runbook value `/scratch/persistent`.
 
-Layout (showing the recommended runbook value `/data/` for brevity; substitute `PATH_PERSISTENT` in non-default deploys):
+Layout (`/scratch/` is the recommended runbook value for `PATH_SCRATCH`; substitute the configured roots in other deploys):
 
 ```
 PATH_PERSISTENT/                            durable, backed up
   ducklake/<table>/<filename>               DuckLake data path (flat per logical table; CRC sharding only if file count pressures the FS)
-  logs/<ticket_id>/step_n-<job>.{out,err}   archived SLURM stdout/stderr after job terminal state
 
 /scratch/                                   recommended PATH_SCRATCH (and PATH_DERIVED = /scratch/persistent)
-  ticket/<work_ticket_idx>/<step>/attempt-<N>/  per-ticket workspace: control-plane runner files, params.json, step outputs (output/ under SLURM); not reclaimed automatically
+  ticket/<work_ticket_idx>/<step>/attempt-<N>/  per-attempt workspace: input/params.json, output/ (step outputs), logs/{stdout,stderr}, tmp/; not reclaimed automatically
   staging/uploads/<upload_idx>/upload.parquet   DoPut upload staging; not reclaimed automatically
+  references/staging/<name>/<version>/     operator-staged reference source files (docs/reference-data-staging.md)
   persistent/                               shared FS, never auto-deleted; cluster purge exemption requested
     references/<reference_idx>/<aligner>/   built reference data that doesn't need local-SSD random access
   persistent-local/                         local SSD, never auto-deleted; cluster purge exemption requested
     references/<reference_idx>/<aligner>/   built reference data that needs local-SSD random access (e.g. aligner indices); rebuild-on-miss is the safety net
-  ephemeral/                                auto-deleted 45 days after ticket terminal state
-    references/incoming/<name>/<version>/   source FASTA staging during reference ingest
 ```
 
 Two persistent tiers under `/scratch/`:
@@ -55,7 +53,7 @@ Retention:
 
 - `PATH_PERSISTENT/` — never auto-deleted. Backed up by cluster policy.
 - `/scratch/persistent/` and `/scratch/persistent-local/` — never auto-deleted by us; cluster purge exemption requested for both. For aligner indices specifically, if the local-SSD copy is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
-- `/scratch/ephemeral/` — per-ticket directories are deleted 45 days after the ticket reaches a terminal state. The 45-day grace exists for post-mortem debugging.
+- `PATH_SCRATCH/ticket/` and `PATH_SCRATCH/staging/` — nothing reclaims them: no sweep deletes a ticket's workspace or an upload's staging directory after the ticket ends, so both grow with every ticket. Registration moves a registered file out of its output dir; everything else (inputs, logs, `tmp/`, outputs no step registered) stays.
 
 Same-FS preference: registration moves each file from the producing step's output dir under `PATH_SCRATCH/ticket/` into `PATH_PERSISTENT/ducklake/<table>/` by `rename`, falling back to copy + delete when the two are on different filesystems (`EXDEV`; `move_file` in `qiita-data-plane/src/flight_service.rs`). The fallback is not atomic and copies the whole file, so placing `PATH_SCRATCH` on the same filesystem as `PATH_PERSISTENT` keeps registration on the rename path ([`first-deploy.md`](../runbooks/first-deploy.md) §0.3).
 

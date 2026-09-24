@@ -37,7 +37,7 @@ graph TB
     subgraph storage ["Data Storage"]
         PG_APP["Postgres qiita_miint<br/>━━━━━━━━━━━━━━━━━━━<br/>Users, roles, studies<br/>Samples, preparations<br/>Work tickets, provenance<br/>References, genomes, features"]
         PG_DL["Postgres qiita_miint_lake<br/>━━━━━━━━━━━━━━━━━━━<br/>Snapshots, data files<br/>Schemas, partitions<br/>Inlined small inserts"]
-        FS["Shared Filesystem<br/>━━━━━━━━━━━━━━━━━━━<br/>/data — durable, backed up<br/>(parquet/, logs/)<br/>/scratch — working, three-tier<br/>(persistent/, persistent-local/, ephemeral/)"]
+        FS["Shared Filesystem<br/>━━━━━━━━━━━━━━━━━━━<br/>PATH_PERSISTENT — durable, backed up<br/>(ducklake/)<br/>PATH_SCRATCH — working<br/>(ticket/, staging/)<br/>PATH_DERIVED — built artifacts"]
     end
 
     %% Client connections

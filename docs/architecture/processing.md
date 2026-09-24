@@ -53,7 +53,7 @@ sequenceDiagram
     SL->>FS: read PATH_SCRATCH/staging/uploads/<upload_idx>/
     SL->>SL: run amplicon processing workflow
     SL->>FS: write PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<N>/output/ (mode 440)
-    SL->>FS: stdout/stderr → /data/logs/ticket_001/step_n-98765.{out,err}
+    SL->>FS: stdout/stderr → PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<N>/logs/{stdout,stderr}
 
     Note over CP,CO: 7. Completion detection & file registration (CP-driven)
     CP->>CO: POST /step/status (handle)
@@ -272,7 +272,7 @@ A gate failure after exit code 0 is a permanent failure — the container return
 - Reports results back to control plane via REST callback after all steps pass
 - Shared filesystem assumed for all data I/O
 
-**Job logging:** SLURM captures stdout/stderr to files on the shared filesystem at `/data/logs/{study_id}/{prep_id}/{ticket_id}/step_{n}-{slurm_job_id}.{out,err}`. All step log paths are recorded on the work ticket.
+**Job logging:** SLURM captures stdout/stderr to `logs/stdout` and `logs/stderr` in the step attempt's workspace, `PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<N>/`. The path is derived from the workspace, not stored on the ticket; `GET /work-ticket/{idx}/step/{step_index}/logs` (`qiita ticket logs`) serves a bounded tail.
 
 **Workflow containerization:** Apptainer/Singularity for HPC compatibility. (Apptainer is the Linux Foundation continuation of Singularity; the `singularity` command is typically aliased to `apptainer`.)
 - Container images per workflow step, versioned (e.g., `qiita-workflow-amplicon:v1.2.0`)

@@ -3805,7 +3805,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   orchestrator checks the mode (`slurm/verify.py`), and the data plane moves each file
   into `PATH_PERSISTENT/ducklake/<table>/` when it registers it. The same claims are
   corrected in `processing.md` (sequence diagram, orchestrator section, step-output
-  paths), `storage.md` (layout, same-filesystem note) and `overview.md`.
+  paths), `storage.md` (layout, same-filesystem note) and `overview.md`. Step logs are
+  documented where the orchestrator writes them (`<attempt>/logs/`, not an archive under
+  `PATH_PERSISTENT/logs/`), reference source staging as `PATH_SCRATCH/references/staging/`,
+  and the 45-day `/scratch/ephemeral/` retention is removed: no such directory or sweep
+  exists, and `PATH_SCRATCH/ticket/` and `PATH_SCRATCH/staging/` are not reclaimed.
 
 - **The ENA ingestion path names the `biosample_global_field` display names it writes as
   constants instead of literals (#589).** `collection date`, the three geographic-location
