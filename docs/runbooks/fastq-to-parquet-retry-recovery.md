@@ -32,10 +32,11 @@ If the other ticket **failed or was cancelled**, the reason says so and names it
 > anything; ticket M may already have stored the reads. To finish that load, re-drive it
 > with `qiita ticket run M`.``
 
-Ticket M may have stored the reads before it failed — fastq-to-parquet registers them
-before its QC and host-filter steps — so re-drive M rather than re-submitting, and leave
-ticket K failed. The message goes on to name the pool delete below, for a deliberate
-re-load. Otherwise:
+Ticket M may have stored the reads before it failed — in a workflow version that
+registers them before later steps such as QC — so re-drive M rather than re-submitting,
+and leave ticket K failed. The message goes on to name `qiita delete-sequenced-pool
+--force` for a deliberate re-load; the three things about that command below apply.
+Otherwise:
 
 > `prep_sample N's reads were already loaded by ticket M, not by this one (ticket K).
 > Loading them again would store every read twice, so this step stopped without writing
@@ -52,7 +53,8 @@ NULL` — a row the migration's backfill could not attribute unambiguously); it 
 ticket Qiita cannot identify" instead of a number. Read it the same way: assume the
 prep_sample is already loaded.
 
-**If you see this, the prep_sample is already ingested. Do not force it through.** A
+**If you see the "already loaded" refusal, the prep_sample is already ingested. Do not
+force it through.** A
 deliberate re-ingest means destroying what is there first, and the pool is the only unit
 that can be destroyed: `qiita delete-sequenced-pool --force`, then resubmit.
 

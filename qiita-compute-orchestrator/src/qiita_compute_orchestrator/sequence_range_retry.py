@@ -251,8 +251,7 @@ async def mint_or_reuse_sequence_range(
                 existing.minted_by_work_ticket_state in REDRIVABLE_WORK_TICKET_STATES
             ):
                 # The minter failed or was cancelled. Whether it registered the reads
-                # depends on where it stopped (fastq-to-parquet registers them before
-                # its QC and host-filter steps), so this cannot say. Re-driving the
+                # depends on where it stopped, so this cannot say. Re-driving the
                 # minter resumes it with its own range, which is what an interrupted
                 # load needs; a deliberate re-load still means removing the pool.
                 raise BackendFailure(
