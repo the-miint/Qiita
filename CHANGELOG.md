@@ -4232,10 +4232,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   one — the detail that says which call failed. The `force` explanation now lives in
   `qiita_common.work_ticket_constants` and is consumed by the CLI flags, the 409 body and
   the wire model's field description, because four copies had to be edited to fix it once.
-  In the CLI help, error bodies and failure reasons this PR touches, objects are named by kind
-  — `biosample` or `prep_sample`, never a bare "sample" — outside the control-plane code that
-  is deliberately generic over both; the rest of the user CLI's `--help` still says bare
-  "sample" in roughly forty places and wants its own sweep.
+  The user CLI's help and descriptions name objects by kind — `biosample`, `prep_sample`
+  or `sequenced_sample`, never a bare "sample" — outside external terms (ENA's sample
+  accession, the pre-flight's sample sheet and sample table), as do the error bodies and
+  failure reasons this PR touches; control-plane code that is generic over both kinds keeps
+  "sample".
 
 - **`--force`, the read-numbering refusals and the retry advice name a remedy their reader
   can act on (#461).** A forced re-run of a `sequenced_pool` action stores the pool's reads a
