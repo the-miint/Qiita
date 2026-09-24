@@ -1099,18 +1099,44 @@ sample FASTQ. A single ticket touches every layer:
 
 ### Recipe
 
-End-to-end execution runs through the end-user `qiita` CLI
-(`qiita login` / `qiita study create` / `qiita biosample create` /
-`qiita sequencing-run create` / `qiita sequenced-pool create` /
-`qiita sequenced-sample create` / `qiita ticket submit` /
-`qiita ticket status`). Steps 0-3 of
-[`docs/runbooks/getting-started.md`](getting-started.md) cover login through
-the biosample; [`docs/runbooks/manual-sample-walkthrough.md`](manual-sample-walkthrough.md)
-carries it from there to a `COMPLETED` ticket.
+This registers one prep_sample by hand to prove the deploy works. It is not how
+data comes in — [`getting-started.md`](getting-started.md) is — so run it once,
+against a study you will not use for real data.
 
-Together the two drive the smoke from a fresh user PAT through to a
-`COMPLETED` ticket and a `reads.parquet` artifact, with verification
-commands at each layer. Most of that walk also runs unattended as
+Steps 0-3 of [`getting-started.md`](getting-started.md) cover login through the
+biosample and leave you with `$STUDY_IDX` and `$BIOSAMPLE_IDX`. Then, as a
+`wet_lab_admin` or higher (naming a host path needs it), with a small FASTQ
+under one of `PATH_INGEST_ROOTS` whose name starts with the pool item id
+(`smoke_R1.fastq` below):
+
+```bash
+RUN_IDX=$(qiita sequencing-run create \
+    --instrument-run-id "SMOKE-$(date +%Y%m%d)" \
+    --platform illumina | jq -r .sequencing_run_idx)
+POOL_IDX=$(qiita sequenced-pool create --run-idx "$RUN_IDX" | jq -r .sequenced_pool_idx)
+qiita prep-protocol list        # pick short_read_metagenomics
+PROTOCOL_IDX=   # its idx from the list above
+PREP_SAMPLE_IDX=$(qiita sequenced-sample create \
+    --run-idx "$RUN_IDX" \
+    --pool-idx "$POOL_IDX" \
+    --biosample-idx "$BIOSAMPLE_IDX" \
+    --prep-protocol-idx "$PROTOCOL_IDX" \
+    --pool-item-id smoke \
+    --primary-study-idx "$STUDY_IDX" | jq -r .prep_sample_idx)
+qiita ticket submit \
+    --action-id fastq-to-parquet --action-version 1.3.0 \
+    --prep-sample-idx "$PREP_SAMPLE_IDX" \
+    --context-json '{"fastq_path": "<scratch>/smoke/smoke_R1.fastq"}'
+WORK_TICKET_IDX=   # work_ticket_idx from the submit's output
+qiita ticket status "$WORK_TICKET_IDX"
+```
+
+`--action-version` must name the version this deploy enabled (`qiita-admin
+actions sync` enables only the newest). The submit is refused with a 422 if the
+FASTQ's name does not start with the `--pool-item-id` followed by `_` or `.`.
+
+This drives the smoke from a fresh user PAT through to a `COMPLETED` ticket
+and a `reads.parquet` artifact. Most of that walk also runs unattended as
 `tests/integration/test_user_authoring_smoke.py` (`make test-integration`),
 which stands up a control plane and shells out to the real `qiita` CLI, so the
 flags the runbooks document are pinned against argparse drift. It stops short

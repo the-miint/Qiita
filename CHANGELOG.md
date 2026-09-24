@@ -4266,29 +4266,24 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   table-level half of the `--force` claim. `fastq-to-parquet-retry-recovery.md` quotes the
   current failure reasons.
 
-- **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`,
-  `manual-sample-walkthrough.md` and `pacbio-ingest.md` are what a person with samples reads, so
-  no longer explain themselves in route paths, guard-function names, column constraints and HTTP
-  status codes. What a reader has to *do* differently is unchanged and every mechanism that
-  changes an outcome is still stated — in terms of what they will see. Identifiers they type or
-  read back (CLI flags, ticket states, pre-flight column names, `skipped`) stay verbatim.
+- **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`
+  and `pacbio-ingest.md` are what a person with samples reads, so no longer explain themselves
+  in route paths, guard-function names, column constraints and HTTP status codes. What a reader
+  has to *do* differently is unchanged and every mechanism that changes an outcome is still
+  stated — in terms of what they will see. Identifiers they type or read back (CLI flags, ticket
+  states, pre-flight column names, `skipped`) stay verbatim.
 
-- **`user-cli-quickstart.md` becomes `manual-sample-walkthrough.md`, the by-hand path only, and
-  the landing page points at the new runbook (#461).** The old name claimed to be the quickstart
-  for a procedure nobody should run on a live system; it exists to prove a deploy works and to
-  learn the CLI, and `getting-started.md` is the quickstart. Both manual steps it was first
-  written against have been removed — needing a machine that mounts the
-  cluster by #484, so the runbook states the ingest-root bound and the `wet_lab_admin`
-  requirement instead, and hand-copying and pre-opening the pre-flight file by #541, so that
-  section is gone and the accession snippet uses `load_db_file` / `save_db_file`. It kept a full copy of login, profile, study and biosample
-  creation, which the getting-started runbook now owns; what remains is what is unique to it —
-  minting a run, pool and sequenced-sample yourself and loading reads you already hold with
-  `qiita submit-reads`, which is the route an ordinary account now takes since naming a host path
-  became `wet_lab_admin`-or-higher. `pacbio-ingest.md` likewise drops where-to-run-the-CLI,
-  the pre-flight
-  writability trap and the `--force` rule, keeping only what has no Illumina counterpart. The
-  `study_access` grant mechanism moves to `docs/auth.md`, which owns the auth surface, and both
-  runbooks point at it rather than spelling out the INSERT.
+- **`user-cli-quickstart.md` is removed; `getting-started.md` is the quickstart and the landing
+  page points at it (#461).** The old page walked one prep_sample in by hand, which nobody
+  should do on a live system; its only remaining use was the post-deploy smoke, so that recipe
+  now lives in `first-deploy.md` §11, written for the operator (a path-fed `qiita ticket
+  submit`). Its login, profile, study and biosample steps are owned by `getting-started.md`.
+  `qiita submit-reads` is unchanged and is documented by its `--help` and the `docs/auth.md`
+  command table. `pacbio-ingest.md` drops where-to-run-the-CLI, the pre-flight writability trap
+  and the `--force` rule, keeping only what has no Illumina counterpart; the accession snippet
+  uses `load_db_file` / `save_db_file`. The `study_access` grant mechanism moves to
+  `docs/auth.md`, which owns the auth surface, and the runbooks point at it rather than
+  spelling out the INSERT.
 
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that

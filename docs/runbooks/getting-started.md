@@ -374,10 +374,6 @@ page they will work from.
 
 ## Not covered here
 
-- **One prep_sample at a time, with no pre-flight file** — registering a run, a
-  pool and a prep_sample by hand and loading reads you already hold, from the
-  machine you are typing on (`qiita submit-reads`) or from the cluster:
-  [`manual-sample-walkthrough.md`](manual-sample-walkthrough.md).
 - **What happens to the reads next** — read masking (host-filtering among it),
   alignment and feature tables: `qiita submit-host-filter-pool`, `submit-block-mask-pool`,
   `submit-align-pool`, `feature-table build`.
