@@ -460,8 +460,8 @@ PATH_MASK_DEFINITION_STATUS = "/{mask_idx}/status"
 # sample. Distinct from the route above: config lifecycle and run lifecycle are
 # different questions (see qiita_common.models.MaskDefinitionStatus).
 PATH_MASK_DEFINITION_SAMPLE_STATUS = "/{mask_idx}/sample-status"
-# GET the per-insert SynDNA read counts of the selected samples under the mask — a
-# study reader's export (Tier.VIEWER on every linked study), not a roster read.
+# GET the per-insert SynDNA read counts of the selected prep_samples under the mask.
+# Who may read it is on the route (routes/read_masked.py).
 PATH_MASK_DEFINITION_SYNDNA_READ_COUNT = "/{mask_idx}/syndna-read-count"
 
 URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"

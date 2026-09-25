@@ -1,21 +1,22 @@
-"""Write qiita.syndna_read_count for samples masked before the read-mask workflow
+"""Write qiita.syndna_read_count for prep_samples masked before the read-mask workflow
 persisted it.
 
 A read-mask ticket's `syndna` step leaves its alignment in the ticket's scratch
-workspace; the `persist-syndna-read-count` action now reduces it to per-insert
-counts before the gate flips. Samples whose mask completed earlier have a
-'completed' gate and no count rows, and the export refuses them.
+workspace, and the `persist-syndna-read-count` action reduces it to per-insert
+counts before the gate flips. A prep_sample whose mask completed without that action
+has a 'completed' gate and no count rows, and the export refuses it.
 
-**Re-reads the scratch file the step left, and nothing else.** The file is found the
-way the runner itself re-finds a completed step's output on resume: the ticket's
+**Re-reads the scratch file the step left, and nothing else.** The ticket's
 COMPLETED `work_ticket_step` row for `syndna` gives the attempt, and that attempt's
-`output/manifest.json` names the file bound to `alignment`. The counting and the
-write are `actions.library.persist_syndna_read_count` — the function the workflow
-calls — so a backfilled row and a workflow-written row cannot differ.
+`output/manifest.json` names the file bound to `alignment`; the path is joined as
+the manifest gives it, with none of the orchestrator verifier's checks, because the
+manifest is our own step's output. The counting and the write are
+`actions.library.persist_syndna_read_count` — the function the workflow calls — so a
+backfilled row and a workflow-written row cannot differ.
 
-**Residue, not a guess.** A sample whose ticket, step row, manifest or file cannot be
-found is listed with the reason and left alone: scratch workspaces are not permanent,
-and the only other source for the counts is a re-mask.
+**Residue, not a guess.** A prep_sample whose ticket, step row, manifest or file
+cannot be found is listed with the reason and left alone: scratch workspaces are not
+permanent, and the only other source for the counts is a re-mask.
 
 Contract per this package: dry-run by default, and idempotent — a pair with count
 rows is out of the query.
@@ -41,7 +42,7 @@ _SYNDNA_STEP = "syndna"
 _ALIGNMENT_BINDING = "alignment"
 _MANIFEST_NAME = "manifest.json"
 
-# Every completed (mask, sample) pair under a SynDNA mask with no count rows, with the
+# Every completed (mask, prep_sample) pair under a SynDNA mask with no count rows, with the
 # newest completed read-mask ticket for the pair and the attempt its `syndna` step
 # completed on (NULL when either is missing — residue).
 _UNCOUNTED_SQL = f"""
@@ -79,7 +80,7 @@ SELECT ms.mask_idx, ms.prep_sample_idx, t.work_ticket_idx, s.attempt
 
 @dataclass(frozen=True, slots=True)
 class Pair:
-    """One uncounted (mask, sample) pair, with the file to count or why there is none."""
+    """One uncounted (mask, prep_sample) pair, with the file to count or why there is none."""
 
     mask_idx: int
     prep_sample_idx: int

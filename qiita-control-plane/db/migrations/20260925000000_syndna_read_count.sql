@@ -34,5 +34,8 @@ COMMENT ON TABLE qiita.syndna_read_count IS
     'reference, zeros included: no rows means not counted. Completion is the '
     'mask_sample gate, not the presence of rows.';
 
+-- The PK leads with mask_idx; this serves the prep_sample CASCADE.
+CREATE INDEX syndna_read_count_prep_sample_idx ON qiita.syndna_read_count (prep_sample_idx);
+
 -- migrate:down
 DROP TABLE IF EXISTS qiita.syndna_read_count;

@@ -145,8 +145,7 @@ steps:
     # `alignment` is the alignment the step used to build the mask, emitted verbatim
     # rather than discarded — the old step reduced each read to a boolean and threw the
     # coordinates away, which is exactly what made per-insert quantification impossible.
-    # persist-syndna-read-count consumes it (per-insert read counts); a
-    # coverage-depth consumer is still to come. The name is shared with
+    # persist-syndna-read-count consumes it. The name is shared with
     # align_sharded's `alignment` output, but the SCHEMAS differ (syndna's subject
     # is the whole plasmid, so it carries `parent_feature_idx` and no mate/
     # alignment_idx columns; align_sharded's subject is the feature itself), so a

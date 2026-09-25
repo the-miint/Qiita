@@ -21,7 +21,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **A study reader can export per-sample SynDNA insert read counts as BIOM or Parquet
+- **A study reader can export per-prep_sample SynDNA insert read counts as BIOM or Parquet
   (#TBD).** The read-mask workflow's new `persist-syndna-read-count` action (gated on
   `syndna_enabled`, before `finalize-mask-sample`) reduces the `syndna` step's
   alignment output to the number of reads with a mapped primary alignment to each
@@ -30,12 +30,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   reference, zeros included, to the new `qiita.syndna_read_count`.
   `GET /mask-definition/{mask_idx}/syndna-read-count` serves a selection by study,
   pool and/or prep_samples, all-or-nothing at `Tier.VIEWER` on every linked study
-  (wet_lab_admin+ bypass), refusing a mask without SynDNA and any selected sample not
+  (wet_lab_admin+ bypass), refusing a mask without SynDNA and any selected prep_sample not
   completed or not counted. `qiita mask syndna-read-count` writes it as BIOM (default)
-  or `--format parquet`, samples named by biosample accession (`--prefix-pool` for
+  or `--format parquet`, each prep_sample's column named by biosample accession (`--prefix-pool` for
   `<sequenced_pool_idx>_<accession>`; a shared name is refused) and inserts by the
   recorded FASTA header or, with `--feature-names species`, the taxonomy's species
-  rank. `qiita-admin backfill syndna-read-count` writes the counts for samples masked
+  rank. `qiita-admin backfill syndna-read-count` writes the counts for prep_samples masked
   earlier from the `syndna` step output left in each ticket's scratch workspace,
   listing those whose file is gone.
 - **A viewer can export an assembly run's LCGs and MAGs as FASTA with their metadata

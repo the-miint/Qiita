@@ -43,7 +43,7 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-- `[operator]` Write the SynDNA read counts for samples masked before this deploy, from the `syndna` step output left in each read-mask ticket's scratch workspace. With `DATABASE_URL` and `PATH_SCRATCH` exported (as for any `qiita-admin backfill`): `qiita-admin backfill syndna-read-count` (dry run; lists samples whose file is gone), then `qiita-admin backfill syndna-read-count --execute`. Samples it lists as gone can only be counted by a re-mask. Run it soon after the deploy: the files are only as durable as the scratch workspace. (#TBD)
+- `[operator]` Write the SynDNA read counts for prep_samples masked before this deploy, from the `syndna` step output left in each read-mask ticket's scratch workspace. With `DATABASE_URL` and `PATH_SCRATCH` exported (as for any `qiita-admin backfill`): `qiita-admin backfill syndna-read-count` (dry run; lists prep_samples whose file is gone), then `qiita-admin backfill syndna-read-count --execute`. prep_samples it lists as gone can only be counted by a re-mask. Run it soon after the deploy: the files are only as durable as the scratch workspace. (#TBD)
 
 ### Notes (no host action)
 

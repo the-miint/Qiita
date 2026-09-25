@@ -529,12 +529,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_backfill_syndna = p_backfill_sub.add_parser(
         "syndna-read-count",
-        help="Write per-insert SynDNA read counts for samples masked before they were persisted",
+        help="Count SynDNA insert reads for prep_samples masked before counts were persisted",
         description=(
-            "For every sample whose mask completed under a SynDNA mask with no rows in"
+            "For every prep_sample completed under a SynDNA mask with no rows in"
             " qiita.syndna_read_count, count the reads aligned to each insert from the"
             " syndna step's alignment file in the read-mask ticket's scratch workspace,"
-            " and write them. A sample whose file is gone is listed and skipped; a"
+            " and write them. A prep_sample whose file is gone is listed and skipped; a"
             " re-mask is then its only source. Idempotent; dry-run by default. Needs"
             " DATABASE_URL and PATH_SCRATCH."
         ),
@@ -1371,22 +1371,22 @@ def _handle_backfill_syndna_read_count(
         return 1
 
     writable, residue = plan.writable(), plan.residue()
-    print(f"uncounted samples : {len(plan.pairs)}")
-    print(f"with a file       : {len(writable)}")
-    print(f"without one       : {len(residue)}")
+    print(f"uncounted prep_samples : {len(plan.pairs)}")
+    print(f"with a file           : {len(writable)}")
+    print(f"without one           : {len(residue)}")
     for pair in residue:
         print(f"  mask {pair.mask_idx} prep_sample {pair.prep_sample_idx}: {pair.reason}")
 
     if not plan.pairs:
-        print("\nnothing to do — every completed SynDNA-masked sample has counts.")
+        print("\nnothing to do — every completed SynDNA-masked prep_sample has counts.")
         return 0
 
     if args.execute:
-        print(f"\nwrote counts for {written} sample(s)")
+        print(f"\nwrote counts for {written} prep_sample(s)")
     else:
         print(
             f"\nDRY RUN — nothing written. Pass --execute to write counts for"
-            f" {len(writable)} sample(s)."
+            f" {len(writable)} prep_sample(s)."
         )
     return 0
 

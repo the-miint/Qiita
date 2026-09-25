@@ -11,12 +11,11 @@ Thin clients: each of those verbs is one GET, printed verbatim, so a new
 server-side field reaches the user without a CLI change.
 
 `qiita mask syndna-read-count` is the one that writes a file: the per-insert SynDNA
-read counts of a selection of samples, as BIOM (default) or Parquet, named by public
-identifiers only.
+read counts of a selection of prep_samples, as BIOM (default) or Parquet, named by
+public identifiers only.
 """
 
 import argparse
-import base64
 import contextlib
 import sys
 from collections.abc import Sequence
@@ -26,13 +25,12 @@ from qiita_common.analytic import LABELLED_RELATION, biom_copy_sql, parquet_copy
 from qiita_common.api_paths import (
     PATH_MASK_DEFINITION_PREFIX,
     PATH_MASK_DEFINITION_SYNDNA_READ_COUNT,
-    PATH_REFERENCE_DOGET,
-    PATH_REFERENCE_PREFIX,
 )
 from qiita_common.models import SyndnaReadCountResponse
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 
 from .. import _common
+from .feature_table import TABLE_FORMATS, _create_reference_doget_ticket, _staged_stream
 
 
 def _list_mask_definitions(
@@ -116,9 +114,10 @@ def _handle_mask_samples(args: argparse.Namespace, parser: argparse.ArgumentPars
     )
 
 
-# The two table formats. The same relation is written either way; BIOM drops zero
+# The feature table's two formats, with BIOM the default here: classic Qiita publishes
+# this table as syndna.biom. The same relation is written either way; BIOM drops zero
 # cells (it is sparse), Parquet keeps them.
-SYNDNA_TABLE_FORMATS = ("biom", "parquet")
+SYNDNA_TABLE_FORMATS = TABLE_FORMATS
 DEFAULT_SYNDNA_TABLE_FORMAT = "biom"
 
 # Where an insert's public name comes from: the FASTA header the reference load
@@ -153,12 +152,12 @@ def _get_syndna_read_count(
 
 
 def syndna_sample_names(response: SyndnaReadCountResponse, *, prefix_pool: bool) -> list[str]:
-    """Each sample's name in the file, in `response.samples` order: its biosample
-    accession, or `<sequenced_pool_idx>_<accession>` under `prefix_pool`.
+    """Each prep_sample's column name in the file, in `response.samples` order: its
+    biosample accession, or `<sequenced_pool_idx>_<accession>` under `prefix_pool`.
 
-    Raises when a sample has no accession (or, under `prefix_pool`, no pool), or when
-    two samples would share a name — the BIOM writer sums duplicate cells without a
-    trace, so a collision would silently merge two samples.
+    Raises when a prep_sample has no accession (or, under `prefix_pool`, no pool), or
+    when two would share a name — the BIOM writer sums duplicate cells without a
+    trace, so a collision would silently merge two prep_samples.
     """
     names: list[str] = []
     owners: dict[str, list[int]] = {}
@@ -186,7 +185,7 @@ def syndna_sample_names(response: SyndnaReadCountResponse, *, prefix_pool: bool)
             else "; pass --prefix-pool, or narrow with --prep-sample-idx"
         )
         raise ValueError(
-            f"{len(shared)} sample name(s) would be shared, e.g. {name!r} by prep_samples"
+            f"{len(shared)} column name(s) would be shared, e.g. {name!r} by prep_samples"
             f" {idxs}{hint}"
         )
     return names
@@ -223,16 +222,14 @@ def _fetch_species(
     """feature_idx → `species` over the reference's exclusion-aware taxonomy."""
     import pyarrow.flight as flight  # noqa: PLC0415
 
-    path = f"{PATH_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET.format(reference_idx=reference_idx)}"
-    resp = _common.call("POST", base_url, token, path, json={"table": TAXONOMY_SOURCE_TABLE})
-    ticket = base64.b64decode(resp["ticket"])
-    with flight.FlightClient(data_plane_url) as client:
-        reader = client.do_get(flight.Ticket(ticket)).to_reader()
-        con.register("syndna_taxonomy", reader)
-        try:
-            rows = con.execute("SELECT feature_idx, species FROM syndna_taxonomy").fetchall()
-        finally:
-            con.unregister("syndna_taxonomy")
+    ticket = _create_reference_doget_ticket(
+        base_url, token, reference_idx=reference_idx, table=TAXONOMY_SOURCE_TABLE
+    )
+    with (
+        flight.FlightClient(data_plane_url) as client,
+        _staged_stream(con, client, ticket, relation="syndna_taxonomy") as source,
+    ):
+        rows = con.execute(f"SELECT feature_idx, species FROM {source}").fetchall()
     return {int(feature_idx): species for feature_idx, species in rows}
 
 
@@ -266,6 +263,7 @@ def write_syndna_table(
         con.executemany(f"INSERT INTO {LABELLED_RELATION} VALUES (?, ?, ?)", rows)
     partial = output.with_name(output.name + ".partial")
     partial.unlink(missing_ok=True)
+    # Required by the Parquet COPY's options; see qiita_common.parquet.
     con.execute("SET preserve_insertion_order=false")
     try:
         con.execute(parquet_copy_sql(partial) if fmt == "parquet" else biom_copy_sql(partial))

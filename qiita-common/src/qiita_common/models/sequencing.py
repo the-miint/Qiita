@@ -1120,8 +1120,8 @@ class SyndnaInsert(BaseModel):
 
 
 class SyndnaReadCountSample(BaseModel):
-    """One sample's per-insert read counts, in `SyndnaReadCountResponse.inserts`
-    order. `sequenced_pool_idx` is None for a sample that was never pooled."""
+    """One prep_sample's per-insert read counts, in `SyndnaReadCountResponse.inserts`
+    order. `sequenced_pool_idx` is None for a prep_sample that was never pooled."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None = None
@@ -1132,7 +1132,7 @@ class SyndnaReadCountSample(BaseModel):
 class SyndnaReadCountResponse(BaseModel):
     """Returned by GET /api/v1/mask-definition/{mask_idx}/syndna-read-count.
 
-    Every selected sample is 'completed' under the mask and counted; the route
+    Every selected prep_sample is 'completed' under the mask and counted; the route
     refuses rather than returning a partial table. The counts are reads with a
     mapped primary alignment to each insert, ungated (see qiita.syndna_read_count).
     """

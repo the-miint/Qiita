@@ -144,6 +144,17 @@ async def test_pool_and_prep_sample_filters_select_and_intersect(ctx):
     assert [s["prep_sample_idx"] for s in both.json()["samples"]] == [ps1, ps2]
 
 
+async def test_a_study_the_caller_cannot_read_is_refused_before_the_roster(ctx):
+    """An empty selection must not answer 404 to a caller with no role on the study:
+    that would say whether the study has prep_samples under the mask."""
+    mask_idx = await _seed_syndna_mask(ctx)
+    study_idx = await _seed_study(ctx, owner_idx=ctx["admin_session"]["principal_idx"], suffix="n")
+
+    resp = await ctx["user"].get(_url(mask_idx), params={"study_idx": study_idx})
+
+    assert resp.status_code == 403, resp.text
+
+
 async def test_a_caller_without_viewer_on_a_linked_study_is_refused(ctx):
     mask_idx = await _seed_syndna_mask(ctx)
     readable = await _viewer_study(ctx)

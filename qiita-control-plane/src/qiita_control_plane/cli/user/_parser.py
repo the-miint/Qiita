@@ -855,23 +855,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mask_syndna = p_mask_sub.add_parser(
         "syndna-read-count",
         help=(
-            "Write the reads aligned to each SynDNA insert per sample under one mask,"
+            "Write the reads aligned to each SynDNA insert per prep_sample under one mask,"
             " as BIOM or Parquet (GET /mask-definition/{mask_idx}/syndna-read-count)"
         ),
         description=(
             "Counts are reads with a mapped primary alignment to each insert of the"
             " mask's SynDNA reference, ungated — the table classic Qiita publishes as"
             " syndna.biom. The selection filters intersect; name at least one. Needs"
-            " viewer (or above) on every study each selected sample is linked to, and"
-            " every selected sample completed under the mask. Samples are named by"
-            " biosample accession; the export refuses two samples that would share a"
-            " name."
+            " viewer (or above) on every study each selected prep_sample is linked to,"
+            " and every selected prep_sample completed under the mask. Each"
+            " prep_sample's column is named by its biosample accession; the export"
+            " refuses two prep_samples that would share a name."
         ),
     )
     p_mask_syndna.add_argument("--mask-idx", type=int, required=True)
-    p_mask_syndna.add_argument("--study-idx", type=int, help="Samples linked to this study")
+    p_mask_syndna.add_argument("--study-idx", type=int, help="prep_samples linked to this study")
     p_mask_syndna.add_argument(
-        "--sequenced-pool-idx", type=int, help="Samples on this sequenced_pool"
+        "--sequenced-pool-idx", type=int, help="prep_samples on this sequenced_pool"
     )
     p_mask_syndna.add_argument(
         "--prep-sample-idx",
@@ -895,8 +895,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prefix-pool",
         action="store_true",
         help=(
-            "Name samples <sequenced_pool_idx>_<accession>, so one biosample on two"
-            " pools gets two columns"
+            "Name each prep_sample's column <sequenced_pool_idx>_<accession>, so one"
+            " biosample on two pools gets two columns"
         ),
     )
     p_mask_syndna.add_argument(

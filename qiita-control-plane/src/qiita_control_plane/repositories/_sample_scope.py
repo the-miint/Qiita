@@ -1,10 +1,8 @@
 """The per-sample narrowing every gate-roster read applies.
 
-Several reads answer the same shape of question over a gate — which samples are
-masked under a `mask_idx` (`repositories.mask_definition`, and the SynDNA export
-roster in `repositories.syndna_read_count`), which are assembled under a
-`processing_idx` (`repositories.processing`) — and all of them have to narrow the
-sample set identically: exclude entity-retired prep_samples, optional
+Every gate-roster read answers the same shape of question — which prep_samples
+hold a gate row under one identity (a `mask_idx`, a `processing_idx`) — and all of
+them have to narrow the sample set identically: exclude entity-retired prep_samples, optional
 `sequenced_pool_idx` / `study_idx` / `prep_sample_idx` filters, and the per-study visibility
 policy for a caller below the bypass role. This module owns that one copy;
 no reader restates it.
