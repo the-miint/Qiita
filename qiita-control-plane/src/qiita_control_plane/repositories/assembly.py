@@ -26,9 +26,9 @@ from qiita_common.models import AssemblySampleState
 from . import gate_state_literal, require_transaction
 
 # The `assembly_sample` states, asserted against the Literal so a renamed member fails
-# at import rather than matching no rows — the one copy every Python comparison against
-# the gate imports. The SQL in this module still spells the labels inline. A consumer of
-# contigs proceeds on `completed` alone (`no_data` being "nothing to consume");
+# at import rather than matching no rows. Every comparison against the gate uses these —
+# the Python ones import them, and this module's SQL binds them. A consumer of contigs
+# proceeds on `completed` alone (`no_data` being "nothing to consume");
 # `fetch_assembly_sample_state` is the contract.
 ASSEMBLY_SAMPLE_COMPLETED = gate_state_literal("completed", AssemblySampleState)
 ASSEMBLY_SAMPLE_NO_DATA = gate_state_literal("no_data", AssemblySampleState)
@@ -208,11 +208,13 @@ async def create_assembly_sample_pending(
     require_transaction(conn)
     await conn.execute(
         "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'pending')"
-        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = 'pending'"
-        "   WHERE qiita.assembly_sample.state = 'no_data'",
+        " VALUES ($1, $2, $3)"
+        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = $3"
+        "   WHERE qiita.assembly_sample.state = $4",
         processing_idx,
         prep_sample_idx,
+        ASSEMBLY_SAMPLE_PENDING,
+        ASSEMBLY_SAMPLE_NO_DATA,
     )
 
 
@@ -266,12 +268,14 @@ async def upsert_assembly_sample_completed(
     require_transaction(conn)
     written = await conn.fetchval(
         "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'completed')"
-        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = 'completed'"
-        "   WHERE qiita.assembly_sample.state <> 'invalidated'"
+        " VALUES ($1, $2, $3)"
+        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = $3"
+        "   WHERE qiita.assembly_sample.state <> $4"
         " RETURNING prep_sample_idx",
         processing_idx,
         prep_sample_idx,
+        ASSEMBLY_SAMPLE_COMPLETED,
+        ASSEMBLY_SAMPLE_INVALIDATED,
     )
     if written is None:
         raise AssemblySampleInvalidated(
@@ -313,12 +317,15 @@ async def upsert_assembly_sample_no_data(
     require_transaction(conn)
     written = await conn.fetchval(
         "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'no_data')"
-        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = 'no_data'"
-        "   WHERE qiita.assembly_sample.state NOT IN ('completed', 'invalidated')"
+        " VALUES ($1, $2, $3)"
+        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = $3"
+        "   WHERE qiita.assembly_sample.state NOT IN ($4, $5)"
         " RETURNING prep_sample_idx",
         processing_idx,
         prep_sample_idx,
+        ASSEMBLY_SAMPLE_NO_DATA,
+        ASSEMBLY_SAMPLE_COMPLETED,
+        ASSEMBLY_SAMPLE_INVALIDATED,
     )
     if written is not None:
         return None

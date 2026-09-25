@@ -25,8 +25,8 @@ from . import gate_state_literal, require_transaction
 from .alignment_definition import list_completed_alignment_samples
 
 # The `mask_sample` states, asserted against the Literal so a renamed member fails at
-# import rather than matching no rows — the one copy every Python comparison against the
-# gate imports. The SQL in this module still spells the labels inline. A consumer of a
+# import rather than matching no rows. Every comparison against the gate uses these —
+# the Python ones import them, and this module's SQL binds them. A consumer of a
 # pass-set proceeds on `completed` alone; `fetch_mask_sample_state` is the contract.
 MASK_SAMPLE_PENDING = gate_state_literal("pending", MaskSampleState)
 MASK_SAMPLE_COMPLETED = gate_state_literal("completed", MaskSampleState)
@@ -164,9 +164,9 @@ async def create_mask_sample_pending(
         raise ValueError("create_mask_sample_pending requires at least one prep_sample_idx")
     await conn.executemany(
         "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'pending')"
+        " VALUES ($1, $2, $3)"
         " ON CONFLICT (mask_idx, prep_sample_idx) DO NOTHING",
-        [(mask_idx, ps) for ps in prep_sample_idxs],
+        [(mask_idx, ps, MASK_SAMPLE_PENDING) for ps in prep_sample_idxs],
     )
 
 
@@ -320,12 +320,14 @@ async def finalize_mask_sample(
     pass-set; see the exception for the operator's path forward."""
     require_transaction(conn)
     updated = await conn.fetchval(
-        "UPDATE qiita.mask_sample SET state = 'completed'"
+        "UPDATE qiita.mask_sample SET state = $3"
         " WHERE mask_idx = $1 AND prep_sample_idx = $2"
-        "   AND state NOT IN ('completed', 'invalidated')"
+        "   AND state NOT IN ($3, $4)"
         " RETURNING prep_sample_idx",
         mask_idx,
         prep_sample_idx,
+        MASK_SAMPLE_COMPLETED,
+        MASK_SAMPLE_INVALIDATED,
     )
     if updated is None:
         await _raise_if_invalidated(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
@@ -353,12 +355,14 @@ async def upsert_mask_sample_completed(
     require_transaction(conn)
     written = await conn.fetchval(
         "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'completed')"
-        " ON CONFLICT (mask_idx, prep_sample_idx) DO UPDATE SET state = 'completed'"
-        "   WHERE qiita.mask_sample.state <> 'invalidated'"
+        " VALUES ($1, $2, $3)"
+        " ON CONFLICT (mask_idx, prep_sample_idx) DO UPDATE SET state = $3"
+        "   WHERE qiita.mask_sample.state <> $4"
         " RETURNING prep_sample_idx",
         mask_idx,
         prep_sample_idx,
+        MASK_SAMPLE_COMPLETED,
+        MASK_SAMPLE_INVALIDATED,
     )
     if written is None:
         await _raise_if_invalidated(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
