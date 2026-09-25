@@ -27,8 +27,8 @@ EXPECTED_FILE_MODE: int = 0o440
 MANIFEST_FILENAME: str = STEP_MANIFEST_FILENAME
 
 # Filename SlurmBackend writes inside $QIITA_INPUT_PATH and the launcher
-# (jobs/__main__.py) reads. Same drift-prevention rationale as
-# MANIFEST_FILENAME.
+# (jobs/__main__.py) reads. A constant so a rename moves the writer and the
+# reader together.
 JOB_PARAMS_FILENAME: str = "params.json"
 
 

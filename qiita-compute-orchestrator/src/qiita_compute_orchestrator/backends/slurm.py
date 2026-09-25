@@ -26,7 +26,7 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
-from qiita_common.actions import BaselineResources
+from qiita_common.actions import STEP_LOGS_SUBDIR, STEP_OUTPUT_SUBDIR, BaselineResources
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.duckdb_miint import miint_job_env
 from qiita_common.log_tail import contains_oom_signature, read_text_tail
@@ -409,8 +409,8 @@ class SlurmBackend(ComputeBackend):
         #   <workspace>/logs/    SLURM stdout / stderr land here
         #   <workspace>/tmp/     the container's TMPDIR (see below)
         input_path = workspace / "input"
-        output_path = workspace / "output"
-        logs_path = workspace / "logs"
+        output_path = workspace / STEP_OUTPUT_SUBDIR
+        logs_path = workspace / STEP_LOGS_SUBDIR
         # `apptainer exec --containall` gives the container a *tmpfs* /tmp sized by
         # the host's `sessiondir max size` — 64 MiB on the live deploy — and scrubs
         # the environment, so TMPDIR is unset and a bare `mktemp -d` lands there.

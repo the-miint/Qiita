@@ -8,7 +8,7 @@ runner on resume, the step-logs route, the admin backfills — derives the path 
 
 from pathlib import Path
 
-from qiita_common.actions import STEP_MANIFEST_FILENAME
+from qiita_common.actions import STEP_LOGS_SUBDIR, STEP_MANIFEST_FILENAME, STEP_OUTPUT_SUBDIR
 
 # The per-ticket workspace root's name under PATH_SCRATCH.
 WORK_TICKET_SUBDIR = "ticket"
@@ -35,9 +35,9 @@ def step_attempt_dir(ticket_dir: Path, step_name: str, attempt: int) -> Path:
 
 def step_output_dir(attempt_dir: Path) -> Path:
     """Where the attempt writes its outputs and `STEP_MANIFEST_FILENAME`."""
-    return attempt_dir / "output"
+    return attempt_dir / STEP_OUTPUT_SUBDIR
 
 
 def step_logs_dir(attempt_dir: Path) -> Path:
     """Where the attempt's stdout and stderr land."""
-    return attempt_dir / "logs"
+    return attempt_dir / STEP_LOGS_SUBDIR

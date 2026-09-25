@@ -62,6 +62,12 @@ NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 # qiita_common and keeps its own copy.
 STEP_MANIFEST_FILENAME = "manifest.json"
 
+# The two directories inside a step attempt's workspace that both components
+# name: the orchestrator creates them at submit and the control plane rebuilds
+# the paths on resume and reads the logs.
+STEP_OUTPUT_SUBDIR = "output"
+STEP_LOGS_SUBDIR = "logs"
+
 # The runner binding name the minted processing_idx travels under. A step names it
 # as the value side of a `params:` pair (`processing_idx: processing_idx` ->
 # <job>.Inputs.processing_idx), which both signals the runner to mint the run
