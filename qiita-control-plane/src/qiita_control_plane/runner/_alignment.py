@@ -35,8 +35,14 @@ from ..repositories.alignment_definition import (
     fetch_alignment_definition_by_idx,
     mint_alignment_definition,
 )
-from ..repositories.assembly import fetch_assembly_sample_state
+from ..repositories.assembly import (
+    ASSEMBLY_SAMPLE_COMPLETED,
+    ASSEMBLY_SAMPLE_INVALIDATED,
+    ASSEMBLY_SAMPLE_NO_DATA,
+    fetch_assembly_sample_state,
+)
 from ..repositories.block import (
+    MASK_SAMPLE_COMPLETED,
     create_alignment_sample_pending,
     fetch_mask_sample_state,
 )
@@ -225,7 +231,7 @@ async def _require_assembly_subject(
     state = await fetch_assembly_sample_state(
         pool, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
     )
-    if state == "completed":
+    if state == ASSEMBLY_SAMPLE_COMPLETED:
         return
     if state is None:
         raise _submission_bad_input(
@@ -236,14 +242,14 @@ async def _require_assembly_subject(
             "Either way the remedy is the same — re-submit long-read-assembly for this "
             "sample, which is admitted and writes the row."
         )
-    if state == "no_data":
+    if state == ASSEMBLY_SAMPLE_NO_DATA:
         raise StepNoData(
             reason=(
                 f"assembly run {processing_idx} produced no contigs for prep_sample "
                 f"{prep_sample_idx}; there is nothing to align against"
             ),
         )
-    if state == "invalidated":
+    if state == ASSEMBLY_SAMPLE_INVALIDATED:
         raise _submission_bad_input(
             f"assembly run {processing_idx} for prep_sample {prep_sample_idx} was "
             "invalidated: it assembled contigs and someone withdrew them, so they are "
@@ -278,7 +284,7 @@ async def _require_masked_query(pool: asyncpg.Pool, *, mask_idx: int, prep_sampl
     own read stream for the same reason.
     """
     state = await fetch_mask_sample_state(pool, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
-    if state != "completed":
+    if state != MASK_SAMPLE_COMPLETED:
         raise _submission_bad_input(
             f"{ALIGN_MASK_IDX_BINDING} {mask_idx} is not masked-complete for prep_sample "
             f"{prep_sample_idx} (mask_sample.state={state!r}); its pass-set is the query "

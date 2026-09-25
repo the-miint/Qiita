@@ -25,12 +25,14 @@ from qiita_common.models import AssemblySampleState
 
 from . import gate_state_literal, require_transaction
 
-# The two `assembly_sample` states a consumer of contigs may proceed on, asserted
-# against the Literal so a renamed member fails at import rather than matching no
-# rows. Every other value, and absence, is a refusal — `fetch_assembly_sample_state`
-# is the contract that says which is which.
+# The `assembly_sample` states, asserted against the Literal so a renamed member fails
+# at import rather than matching no rows — the one copy every reader and writer of the
+# gate compares against. A consumer of contigs proceeds on `completed` alone (`no_data`
+# being "nothing to consume"); `fetch_assembly_sample_state` is the contract.
 ASSEMBLY_SAMPLE_COMPLETED = gate_state_literal("completed", AssemblySampleState)
 ASSEMBLY_SAMPLE_NO_DATA = gate_state_literal("no_data", AssemblySampleState)
+ASSEMBLY_SAMPLE_PENDING = gate_state_literal("pending", AssemblySampleState)
+ASSEMBLY_SAMPLE_INVALIDATED = gate_state_literal("invalidated", AssemblySampleState)
 
 
 def assembly_genome_source_id(

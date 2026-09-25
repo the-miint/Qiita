@@ -152,6 +152,14 @@ CONTIG_ATTRIBUTES_FILE = "contig_attributes.tsv"
 #                for absence of signal rather than a measured zero.
 CONTIG_ATTRIBUTE_COLUMNS = ("contig_id", "raw_name", "circularity", "depth", "mult")
 
+# The `circularity` values the entrypoints normalize to, as the readers compare them.
+# The writers run inside the assembly image, where this package is not installed, and
+# spell the same set themselves (`myloasm_split._KNOWN_CIRCULARITY`, and assemble.sh's
+# hifiasm_meta arm, which writes only yes and no).
+CIRCULARITY_YES = "yes"
+CIRCULARITY_POSSIBLY = "possibly"
+CIRCULARITY_NO = "no"
+
 # The two attribute columns DuckDB must not be left to sniff. `mult` is empty on
 # EVERY row a hifiasm_meta assembly writes (it has no counterpart to myloasm's
 # k-mer multiplicity), and `depth` on any S-line carrying no `dp:f` tag. An

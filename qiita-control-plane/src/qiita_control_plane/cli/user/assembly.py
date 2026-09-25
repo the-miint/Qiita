@@ -40,6 +40,7 @@ from qiita_common.assembly_constants import (
     ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
     ASSEMBLED_SEQUENCE_TABLE,
     BIN_QUALITY_TABLE,
+    CIRCULARITY_YES,
     KIND_LCG,
     KIND_MAG,
     KIND_UNBINNED,
@@ -240,7 +241,7 @@ def _select_genomes(con, args: argparse.Namespace, *, accession: str) -> None:
         " WITH g AS ("
         "   SELECT m.kind, m.bin_id, sum(s.sequence_length_bp) AS length_bp,"
         "          count(*) AS n_contigs,"
-        "          count(*) FILTER (WHERE m.circularity = 'yes') AS n_circular,"
+        "          count(*) FILTER (WHERE m.circularity = ?) AS n_circular,"
         "          sum(m.depth * s.sequence_length_bp) FILTER (WHERE m.depth IS NOT NULL)"
         "            / sum(s.sequence_length_bp) FILTER (WHERE m.depth IS NOT NULL) AS depth"
         "     FROM membership m JOIN seqlen s USING (feature_idx)"
@@ -249,7 +250,7 @@ def _select_genomes(con, args: argparse.Namespace, *, accession: str) -> None:
         "        q.strain_heterogeneity, q.marker_lineage"
         "   FROM g LEFT JOIN quality q USING (kind, bin_id)"
         "  WHERE " + " AND ".join(where),
-        [accession, *params],
+        [CIRCULARITY_YES, accession, *params],
     )
     con.execute(
         "CREATE TEMP TABLE member_sel AS"

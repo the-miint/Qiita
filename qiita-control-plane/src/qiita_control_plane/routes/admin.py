@@ -60,6 +60,7 @@ from ..auth.tickets import sign_ticket
 from ..auth.token import mint_api_token
 from ..block_read import READ_MASKED_TABLE
 from ..deps import TxConnFactory, get_db_pool, get_flight_signing_key, get_tx_conn_factory
+from ..repositories.block import MASK_SAMPLE_COMPLETED
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["admin"])
 
@@ -722,7 +723,7 @@ async def create_masked_read_export_ticket(
         body.mask_idx,
         body.prep_sample_idx,
     )
-    if mask_state != "completed":
+    if mask_state != MASK_SAMPLE_COMPLETED:
         raise HTTPException(
             status_code=409,
             detail={

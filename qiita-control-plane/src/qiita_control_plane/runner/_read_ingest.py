@@ -20,7 +20,7 @@ from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
 from ..block_read import READ_MASKED_TABLE
 from ..host_filter_resolver import is_control_sample
 from ..miint import connect_with_miint_staged
-from ..repositories.block import fetch_mask_sample_state
+from ..repositories.block import MASK_SAMPLE_COMPLETED, fetch_mask_sample_state
 from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
 from ..repositories.sequenced_sample import fetch_sequenced_pool_ena_run_roster
 from ..repositories.sequencing_run import lock_sequencing_run
@@ -617,7 +617,7 @@ async def _resolve_staged_masked_reads(
     gate_state = await fetch_mask_sample_state(
         pool, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
     )
-    if gate_state != "completed":
+    if gate_state != MASK_SAMPLE_COMPLETED:
         raise _submission_bad_input(
             f"mask_idx {mask_idx} is not masked-complete for prep_sample {prep_sample_idx} "
             f"(mask_sample.state={gate_state!r}); no completed read-mask exists for this "

@@ -46,6 +46,7 @@ from .dispatch import schedule_dispatch
 from .fanout_dispatch import align_block_cohort, top_up_dispatch
 from .repositories.alignment_definition import mint_alignment_definition
 from .repositories.block import (
+    MASK_SAMPLE_COMPLETED,
     add_block_members,
     create_alignment_sample_pending,
     create_block,
@@ -403,7 +404,7 @@ async def plan_and_submit_alignments(
     to_consider = [
         (s, mask_idx)
         for s in all_samples
-        if gate_state_by_prep_sample.get(s.prep_sample_idx) == "completed"
+        if gate_state_by_prep_sample.get(s.prep_sample_idx) == MASK_SAMPLE_COMPLETED
     ]
     skipped_mask_incomplete = len(gate_state_by_prep_sample) - len(to_consider)
 

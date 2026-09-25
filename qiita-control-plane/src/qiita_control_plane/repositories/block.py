@@ -19,9 +19,18 @@ from collections.abc import Sequence
 
 import asyncpg
 from qiita_common.actions import BLOCK_MASK_ACTION_ID
+from qiita_common.models import MaskSampleState
 
-from . import require_transaction
+from . import gate_state_literal, require_transaction
 from .alignment_definition import list_completed_alignment_samples
+
+# The `mask_sample` states, asserted against the Literal so a renamed member fails at
+# import rather than matching no rows — the one copy every reader and writer of the
+# gate compares against. A consumer of a pass-set proceeds on `completed` alone;
+# `fetch_mask_sample_state` is the contract.
+MASK_SAMPLE_PENDING = gate_state_literal("pending", MaskSampleState)
+MASK_SAMPLE_COMPLETED = gate_state_literal("completed", MaskSampleState)
+MASK_SAMPLE_INVALIDATED = gate_state_literal("invalidated", MaskSampleState)
 
 
 async def create_block(conn: asyncpg.Connection) -> int:
@@ -287,7 +296,7 @@ async def _raise_if_invalidated(
         mask_idx,
         prep_sample_idx,
     )
-    if state == "invalidated":
+    if state == MASK_SAMPLE_INVALIDATED:
         raise MaskSampleInvalidated(mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
 
 

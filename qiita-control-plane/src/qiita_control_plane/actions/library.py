@@ -69,6 +69,8 @@ from ..repositories.assembly import (
     upsert_assembly_sample_completed,
 )
 from ..repositories.block import (
+    MASK_SAMPLE_COMPLETED,
+    MASK_SAMPLE_INVALIDATED,
     MaskSampleInvalidated,
     fetch_block_members,
     finalize_alignment_sample,
@@ -2845,11 +2847,11 @@ async def reconcile_block(
                     f"prep_sample={prep_sample_idx}); it must be materialized PENDING "
                     "at plan time before any block runs"
                 )
-            if state == "completed":
+            if state == MASK_SAMPLE_COMPLETED:
                 # Already finalized (idempotent re-run, or a concurrent block
                 # finalizer won this sample's race) — nothing to do.
                 continue
-            if state == "invalidated":
+            if state == MASK_SAMPLE_INVALIDATED:
                 # The pair was withdrawn. Skipped BEFORE _finalize_sample_metrics,
                 # which writes this sample's counts onto sequenced_sample: those
                 # counts would describe a pass-set no consumer may read. The

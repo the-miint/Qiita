@@ -27,19 +27,12 @@ from qiita_common.actions import (
 )
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
-    MaskSampleState,
     Platform,
     WorkTicketState,
 )
 
-from . import INT4_MASK, gate_state_literal, require_transaction
-
-# Bound rather than typed as SQL literals, so a rename of the declared Literal
-# lights up this module at import instead of silently matching no rows. Same
-# shape as `mask_definition`'s leading binds.
-_GATE_COMPLETED = gate_state_literal("completed", MaskSampleState)
-_GATE_INVALIDATED = gate_state_literal("invalidated", MaskSampleState)
-_GATE_PENDING = gate_state_literal("pending", MaskSampleState)
+from . import INT4_MASK, require_transaction
+from .block import MASK_SAMPLE_COMPLETED, MASK_SAMPLE_INVALIDATED, MASK_SAMPLE_PENDING
 
 
 class PayloadMismatch(Exception):
@@ -818,11 +811,11 @@ async def fetch_sequenced_pool_completion(
         list(NON_TERMINAL_WORK_TICKET_STATES),
         WorkTicketState.NO_DATA.value,
         WorkTicketState.FAILED.value,
-        _GATE_COMPLETED,
-        _GATE_INVALIDATED,
+        MASK_SAMPLE_COMPLETED,
+        MASK_SAMPLE_INVALIDATED,
         WorkTicketState.COMPLETED.value,
         WorkTicketState.CANCELLED.value,
-        _GATE_PENDING,
+        MASK_SAMPLE_PENDING,
     )
 
 

@@ -159,9 +159,9 @@ def gate_state_literal(value: str, declared: object) -> str:
     rows — the failure mode a gate query has, where a typo returns an empty
     result rather than an error.
 
-    Shared by every repository module that binds gate states as query
-    parameters (`mask_definition`, `processing`), so the two cannot drift into
-    two spellings of the same assertion.
+    Each gate's states are asserted once, beside the gate's contract
+    (`repositories.block` for `mask_sample`, `repositories.assembly` for
+    `assembly_sample`), and every other module imports those constants.
     """
     members = get_args(declared)
     if value not in members:

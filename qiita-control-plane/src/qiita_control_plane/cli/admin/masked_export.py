@@ -21,6 +21,7 @@ from qiita_common.flight_constants import ipc_compression_headers
 from qiita_common.parquet import PARQUET_COMPRESSION, ROW_GROUP_SIZE_BYTES
 
 from qiita_control_plane.miint import connect_with_miint
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 
 from .. import _common
 
@@ -290,7 +291,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     # whole export up front, mirroring the accession check. Only 'completed' is
     # exportable: a 'pending' row (a covering block in flight) or NO row (absence
     # is not exempt) both mean the read_masked pass-set would be absent or partial.
-    not_complete = sorted(s["prep_sample_idx"] for s in samples if s["mask_state"] != "completed")
+    not_complete = sorted(
+        s["prep_sample_idx"] for s in samples if s["mask_state"] != MASK_SAMPLE_COMPLETED
+    )
     if not_complete:
         print(
             f"error: {len(not_complete)} sample(s) on sequenced_pool {pool_idx} are not "

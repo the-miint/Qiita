@@ -92,7 +92,7 @@ from ..deps import (
     get_flight_signing_key,
     get_tx_conn_factory,
 )
-from ..repositories.block import fetch_mask_sample_state
+from ..repositories.block import MASK_SAMPLE_COMPLETED, fetch_mask_sample_state
 from ..repositories.mask_definition import (
     MaskDefinitionDeprecated,
     MaskDefinitionNotFound,
@@ -103,16 +103,15 @@ from ..repositories.mask_definition import (
     set_mask_sample_states,
     transition_mask_definition_status,
 )
-from ._helpers import cap_rows, gate_roster_narrowing_idx
+from ._helpers import GATE_ROSTER_HARD_CAP, cap_rows, gate_roster_narrowing_idx
 
 _MSG_MASK_NOT_FOUND = "Mask definition not found"
 
 # Hard caps on the two mask reads. The mask list is bounded by how many distinct
-# read-filtering configs the fleet has minted; the roster by a pool's sample
-# count. Both return `truncated` rather than paginating — a caller that hits
-# either cap should narrow with a filter.
+# read-filtering configs the fleet has minted; the roster by GATE_ROSTER_HARD_CAP.
+# Both return `truncated` rather than paginating — a caller that hits either cap
+# should narrow with a filter.
 _MASK_LIST_HARD_CAP = 1_000
-_MASK_PREP_SAMPLE_HARD_CAP = 100_000
 
 
 mask_definition_router = APIRouter(prefix=PATH_MASK_DEFINITION_PREFIX, tags=["mask-definition"])
@@ -317,9 +316,9 @@ async def list_mask_prep_samples_route(
             mask_idx,
             sequenced_pool_idx=sequenced_pool_idx,
             visible_to_principal_idx=gate_roster_narrowing_idx(caller),
-            limit=_MASK_PREP_SAMPLE_HARD_CAP + 1,
+            limit=GATE_ROSTER_HARD_CAP + 1,
         ),
-        _MASK_PREP_SAMPLE_HARD_CAP,
+        GATE_ROSTER_HARD_CAP,
     )
     samples = [MaskPrepSample.model_validate(dict(row)) for row in rows]
     return MaskPrepSampleListResponse(
@@ -520,7 +519,7 @@ async def create_read_masked_doget_ticket(
         mask_state = await fetch_mask_sample_state(
             conn, mask_idx=body.mask_idx, prep_sample_idx=body.prep_sample_idx
         )
-    if mask_state != "completed":
+    if mask_state != MASK_SAMPLE_COMPLETED:
         raise HTTPException(
             status_code=409,
             detail={

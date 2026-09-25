@@ -1158,10 +1158,10 @@ def gate_roster_narrowing_idx(caller: HumanUser) -> int | None:
     return caller.principal_idx
 
 
-# Hard cap on a per-(identity, prep_sample) gate roster: the /processing roster and the
-# /assembly export roster, both bounded by one run's prep_sample count. The /processing
-# roster returns `truncated` above it; the export roster refuses instead, because its
-# caller writes one file set from the whole roster.
+# Hard cap on a per-(identity, prep_sample) gate roster: the /mask-definition and
+# /processing rosters and the /assembly export roster, each bounded by one identity's
+# prep_sample count. The first two return `truncated` above it; the export roster
+# refuses instead, because its caller writes one file set from the whole roster.
 GATE_ROSTER_HARD_CAP = 100_000
 
 

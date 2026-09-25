@@ -710,7 +710,7 @@ async def test_study_owner_sees_the_sample_without_a_study_access_row(ctx):
 async def test_roster_reports_truncation_at_the_cap(ctx, monkeypatch):
     """The reads over-fetch by one so a full page is distinguishable from a cut
     one. Cap of 1 keeps the seeding to two samples."""
-    monkeypatch.setattr("qiita_control_plane.routes.read_masked._MASK_PREP_SAMPLE_HARD_CAP", 1)
+    monkeypatch.setattr("qiita_control_plane.routes.read_masked.GATE_ROSTER_HARD_CAP", 1)
     mask_idx = await _seed_mask(ctx)
     owner_idx = ctx["admin_session"]["principal_idx"]
     for _ in range(2):
