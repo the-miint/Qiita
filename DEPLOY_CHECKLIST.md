@@ -23,7 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-- `[operator]` `make migrate` applies `20260925000000_syndna_read_count.sql` (new table `qiita.syndna_read_count`; no data change). (#TBD)
+- `[operator]` `make migrate` applies `20260925000000_syndna_read_count.sql` (new table `qiita.syndna_read_count`; no data change). (#621)
 
 ### 4. Deploy
 
@@ -35,7 +35,7 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-- `[operator]` Write the SynDNA read counts for prep_samples masked before this deploy, from the `syndna` step output left in each read-mask ticket's scratch workspace. With `DATABASE_URL` and `PATH_SCRATCH` exported (as for any `qiita-admin backfill`): `qiita-admin backfill syndna-read-count` (dry run; lists prep_samples whose file is gone), then `qiita-admin backfill syndna-read-count --execute`. prep_samples it lists as gone can only be counted by a re-mask. Run it soon after the deploy: the files are only as durable as the scratch workspace. (#TBD)
+- `[operator]` Write the SynDNA read counts for prep_samples masked before this deploy, from the `syndna` step output left in each read-mask ticket's scratch workspace. With `DATABASE_URL` and `PATH_SCRATCH` exported (as for any `qiita-admin backfill`): `qiita-admin backfill syndna-read-count` (dry run; lists prep_samples whose file is gone), then `qiita-admin backfill syndna-read-count --execute`. prep_samples it lists as gone can only be counted by a re-mask. Run it soon after the deploy: the files are only as durable as the scratch workspace. (#621)
 
 ### Notes (no host action)
 
