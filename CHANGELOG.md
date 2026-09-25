@@ -1926,7 +1926,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
-- **The `reference_load` tests pin the host RAM they assume (#615).** Off SLURM,
+- **The `reference_load` tests pin the host RAM they assume (#616).** Off SLURM,
   `load`'s DuckDB limit is detected RAM minus its 8-thread headroom (#606), which is
   1 GB on the 7 GB macOS runner, and `read_jplace` asks DuckDB 1.5.4 for about
   1.8 GiB even for a 327-byte file (its macro passes `maximum_object_size=1000000000`
