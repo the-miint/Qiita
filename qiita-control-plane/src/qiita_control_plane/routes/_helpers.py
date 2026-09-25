@@ -107,11 +107,6 @@ ALIGNMENT_NOT_FOUND_DETAIL = "alignment not found"
 # Shared by the reference map and the assembly-run map, which are the same read over
 # two feature spaces: two numbers here would let one route refuse what the other
 # serves for no reason a caller could see.
-#
-# The assembly membership read (`routes/assembly.py`) bounds its JSON by this number
-# too, as the same run's other per-contig read. Its entries carry more fields than a
-# map entry, so its worst-case body is larger than the figure above; that size has
-# not been measured.
 GENOME_MAP_HARD_CAP = 250_000
 
 
@@ -1161,6 +1156,13 @@ def gate_roster_narrowing_idx(caller: HumanUser) -> int | None:
     if caller.has_role_at_least(SystemRole.WET_LAB_ADMIN):
         return None
     return caller.principal_idx
+
+
+# Hard cap on a per-(identity, prep_sample) gate roster: the /processing roster and the
+# /assembly export roster, both bounded by one run's sample count. The /processing
+# roster returns `truncated` above it; the export roster refuses instead, because its
+# caller writes one file set from the whole roster.
+GATE_ROSTER_HARD_CAP = 100_000
 
 
 def cap_rows[T](rows: list[T], cap: int) -> tuple[list[T], bool]:

@@ -1,7 +1,7 @@
 """qiita user CLI — `qiita assembly export`: one assembly run's genomes as FASTA.
 
 Composes the per-run reads a VIEWER holds into files on the caller's machine: the
-export roster names the samples, and per sample the membership read (Postgres) says
+export roster names the prep_samples, and per prep_sample the membership read (Postgres) says
 which contig belongs to which subject, while three run-scoped DoGet streams carry
 the contig lengths, the CheckM rows and the contig bytes. Nothing is computed
 server-side.
@@ -11,8 +11,9 @@ Output, under `--output-dir`:
 * one `<biosample accession>_<bin_id>.fasta.gz` per selected genome, its records
   named `<genome>_<n>`, longest first;
 * `genomes.tsv` — one row per genome: length, contig count, the count of contigs the
-  assembler called circular (`circularity = yes`), GC over the A/C/G/T bases,
-  length-weighted depth, and the CheckM columns;
+  assembler called circular (`circularity = yes`), GC over the A/C/G/T bases, depth
+  weighted by length over the contigs that report one (a contig with no reported depth
+  is in neither sum; `contigs.tsv` shows which), and the CheckM columns;
 * `contigs.tsv` — one row per record: its header, genome, length and the assembler's
   report, including `raw_name`, the assembler's own contig name.
 
@@ -43,8 +44,11 @@ from qiita_common.assembly_constants import (
     KIND_UNBINNED,
 )
 from qiita_common.chunking import reassemble_chunks_expr
+from qiita_common.models import AssemblySampleState
 from qiita_common.parquet import PARQUET_MEDIA_TYPE
 
+from ...repositories import gate_state_literal
+from ...repositories.assembly import ASSEMBLY_SAMPLE_COMPLETED, ASSEMBLY_SAMPLE_NO_DATA
 from .. import _common
 
 EXPORT_KINDS = (KIND_LCG, KIND_MAG, KIND_UNBINNED)
@@ -59,6 +63,12 @@ CONTIGS_TSV = "contigs.tsv"
 # is inlined into the COPY that writes it, so anything outside this set is refused
 # rather than escaped.
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+# The two gate states a roster prep_sample is refused on; `completed` and `no_data` are the
+# repository's constants.
+_STATE_PENDING = gate_state_literal("pending", AssemblySampleState)
+_STATE_INVALIDATED = gate_state_literal("invalidated", AssemblySampleState)
 
 
 class ExportRefused(ValueError):
@@ -79,7 +89,7 @@ def _fetch_roster(
     sequenced_pool_idx: int | None,
     study_idx: int | None,
 ) -> list[dict]:
-    """GET the samples under the run that the caller may read, narrowed by the one
+    """GET the prep_samples under the run that the caller may read, narrowed by the one
     filter given."""
     sub_path = PATH_ASSEMBLY_PREP_SAMPLE.format(processing_idx=processing_idx)
     return _common.call(
@@ -153,26 +163,28 @@ def _stage_run_table(con, flight_client, ticket: bytes, *, relation: str, table_
 
 
 def _check_roster(samples: list[dict], *, processing_idx: int) -> tuple[list[dict], list[dict]]:
-    """Split the roster into the samples to export and the ones that assembled
+    """Split the roster into the prep_samples to export and the ones that assembled
     nothing; refuse a roster the export cannot name or cannot trust.
 
-    A `pending` or `invalidated` sample is refused rather than skipped: its contigs
+    A `pending` or `invalidated` prep_sample is refused rather than skipped: its contigs
     are not to be consumed, and leaving it out would make a pool or study export
     short with nothing in the files to say so.
     """
     if not samples:
         raise ExportRefused(
-            f"no sample under processing {processing_idx} that you can read matches these filters"
+            f"no prep_sample under processing {processing_idx} that you can read matches"
+            " these filters"
         )
-    unusable = [s for s in samples if s["assembly_state"] in ("pending", "invalidated")]
+    unusable = [s for s in samples if s["assembly_state"] in (_STATE_PENDING, _STATE_INVALIDATED)]
     if unusable:
         listed = ", ".join(f"{s['prep_sample_idx']} ({s['assembly_state']})" for s in unusable)
         raise ExportRefused(
-            f"{len(unusable)} sample(s) under processing {processing_idx} are not completed:"
-            f" {listed}. Narrow the export with --prep-sample-idx, or wait for them."
+            f"{len(unusable)} prep_sample(s) under processing {processing_idx} are not"
+            f" completed: {listed}. Narrow the export with --prep-sample-idx, or wait for"
+            " them."
         )
-    done = [s for s in samples if s["assembly_state"] == "completed"]
-    empty = [s for s in samples if s["assembly_state"] == "no_data"]
+    done = [s for s in samples if s["assembly_state"] == ASSEMBLY_SAMPLE_COMPLETED]
+    empty = [s for s in samples if s["assembly_state"] == ASSEMBLY_SAMPLE_NO_DATA]
     unnamed = [s["prep_sample_idx"] for s in done if not s["biosample_accession"]]
     if unnamed:
         raise ExportRefused(
@@ -211,9 +223,8 @@ def _select_genomes(con, args: argparse.Namespace, *, accession: str) -> None:
     The completeness and contamination bounds exclude a subject CheckM did not score:
     a bound is a claim about a score, and an absent score does not meet it.
     """
-    kinds = ", ".join(f"'{k}'" for k in args.kind)
-    where = [f"g.kind IN ({kinds})"]
-    params: list = []
+    where = ["list_contains(?, g.kind)"]
+    params: list = [list(args.kind)]
     for column, op, value in (
         ("g.length_bp", ">=", args.min_bp),
         ("g.length_bp", "<=", args.max_bp),
@@ -259,6 +270,11 @@ def _check_streams_match_membership(con, *, prep_sample_idx: int) -> None:
     the same run identity the two can name different contigs. Neither side is the one
     to trust alone: a listed contig with no bytes would drop from its genome, and a
     streamed contig with no membership would belong to no genome.
+
+    The comparison is of contig sets, not of subjects. A re-run that moved a contig the
+    lake still holds from one bin to another leaves both rows in Postgres, and this
+    check passes; the export then writes that contig into both genomes. The rows alone
+    cannot tell that apart from a contig two subjects of one run really share.
     """
     (listed_only, streamed_only) = con.execute(
         "SELECT"
@@ -311,19 +327,20 @@ def _sql_str(value: str) -> str:
 def _write_sample(
     con, *, accession: str, output_dir: Path, pairs: list[tuple[Path, Path]], names: set[str]
 ) -> int:
-    """Write each selected genome of the staged sample to its FASTA partial and add
+    """Write each selected genome of the staged prep_sample to its FASTA partial and add
     its rows to the two output tables. Returns the number of genomes written."""
-    genomes = con.execute(
-        "SELECT genome, n_contigs FROM genome_sel ORDER BY kind, bin_id"
-    ).fetchall()
-    for genome, n_contigs in genomes:
+    genomes = [
+        g for (g,) in con.execute("SELECT genome FROM genome_sel ORDER BY kind, bin_id").fetchall()
+    ]
+    for genome in genomes:
         if not _NAME_RE.match(genome):
             raise ExportRefused(f"genome name {genome!r} cannot be used in a file name")
         if genome in names:
             raise ExportRefused(
                 f"two genomes in this export are both named {genome!r}: the name is"
                 " <biosample accession>_<bin_id>, and it repeats across the selected"
-                " samples or kinds. Export them separately."
+                " prep_samples or kinds. Export them separately, each into its own"
+                " --output-dir."
             )
         names.add(genome)
         final = output_dir / f"{genome}.fasta.gz"
@@ -331,15 +348,13 @@ def _write_sample(
             raise FileExistsError(f"{final} already exists; nothing is overwritten")
         partial = final.with_name(final.name + ".partial")
         pairs.append((partial, final))
-        (written,) = con.execute(
+        con.execute(
             "COPY (SELECT ms.contig AS read_id, c.sequence AS sequence1"
             "        FROM member_sel ms JOIN contig c USING (feature_idx)"
             f"      WHERE ms.genome = '{_sql_str(genome)}'"
             "      ORDER BY ms.sequence_length_bp DESC, ms.feature_idx)"
             f" TO '{_sql_str(str(partial))}' (FORMAT FASTA, COMPRESSION 'gzip')"
-        ).fetchone()
-        if written != n_contigs:
-            raise ExportRefused(f"{genome}: wrote {written} of {n_contigs} record(s)")
+        )
     con.execute(
         "INSERT INTO genome_out"
         " SELECT g.genome, ? , g.kind, g.bin_id, g.length_bp, g.n_contigs, g.n_circular,"
@@ -449,7 +464,7 @@ def _write_tables(con, *, output_dir: Path, pairs: list[tuple[Path, Path]]) -> N
 
 def run_export(args: argparse.Namespace, token: str, con, flight_client) -> tuple[int, int, list]:
     """The export, on an open miint connection and Flight client. Returns
-    `(genomes written, samples exported, samples that assembled nothing)`."""
+    `(genomes written, prep_samples exported, prep_samples that assembled nothing)`."""
     output_dir: Path = args.output_dir
     if not output_dir.is_dir():
         raise FileNotFoundError(f"--output-dir {output_dir} is not a directory")
@@ -525,7 +540,7 @@ def _handle_assembly_export(args: argparse.Namespace, parser: argparse.ArgumentP
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    print(f"wrote {genomes} genome(s) from {exported} sample(s) to {args.output_dir}")
+    print(f"wrote {genomes} genome(s) from {exported} prep_sample(s) to {args.output_dir}")
     print(f"per-genome metadata: {args.output_dir / GENOMES_TSV}")
     print(f"per-contig metadata: {args.output_dir / CONTIGS_TSV}")
     if empty:

@@ -5,8 +5,8 @@ membership rows, and the roster of runs a caller may export.
 ``POST /assembly/{prep_sample_idx}/{processing_idx}/ticket/doget`` both sign an
 Ed25519 Flight DoGet ticket for the contig sequences ONE assembly run produced — a
 ``(prep_sample_idx, processing_idx)`` pair — on the data plane's
-``assembled_sequence`` / ``assembled_sequence_chunks`` tables. Same signed filter,
-same surfaces; they differ in who may ask and how the run is authorized, the way
+``assembled_sequence`` / ``assembled_sequence_chunks`` tables, with the same signed
+filter; they differ in who may ask and how the run is authorized, the way
 ``/alignment``'s two mints do (``Scope.ASSEMBLY_DOGET`` carries the argument).
 
 The human mint also signs ``bin_quality`` for the run: per-subject CheckM, which the
@@ -95,7 +95,7 @@ from ..repositories.assembly import (
     fetch_assembly_sample_state,
 )
 from ..repositories.processing import fetch_processing_by_idx
-from ._helpers import GENOME_MAP_HARD_CAP, authorize_prep_sample_cohort
+from ._helpers import GATE_ROSTER_HARD_CAP, GENOME_MAP_HARD_CAP, authorize_prep_sample_cohort
 
 ASSEMBLY_DOGET_TABLES = frozenset({ASSEMBLED_SEQUENCE_TABLE, ASSEMBLED_SEQUENCE_CHUNKS_TABLE})
 # What the HUMAN mint signs: the two sequence surfaces plus the run's CheckM rows.
@@ -103,9 +103,11 @@ ASSEMBLY_DOGET_TABLES = frozenset({ASSEMBLED_SEQUENCE_TABLE, ASSEMBLED_SEQUENCE_
 # feature-table resolver) signs it in-process for a whole cohort.
 ASSEMBLY_RUN_DOGET_TABLES = ASSEMBLY_DOGET_TABLES | {BIN_QUALITY_TABLE}
 
-# The export roster refuses above this rather than truncating; the model says why.
-# The /processing roster's cap, since both bound one run's sample count.
-_ASSEMBLY_ROSTER_HARD_CAP = 100_000
+# The membership read's JSON cap, sized to the genome map's body budget
+# (`GENOME_MAP_HARD_CAP` in `routes/_helpers.py`): an entry with a myloasm-style
+# `raw_name` serializes to 187 bytes against the map entry's ~90, measured over
+# 250,000 entries (46.8 MB), so this many rows is ~22 MB. The Parquet sibling has no cap.
+ASSEMBLY_MEMBERSHIP_HARD_CAP = 120_000
 
 assembly_router = APIRouter(prefix=PATH_ASSEMBLY_PREFIX, tags=["assembly"])
 
@@ -225,9 +227,9 @@ async def create_assembly_run_doget_ticket(
     scientist-facing counterpart of the work-ticket mint above.
 
     Human-callable (``assembly:doget``, on every role ceiling and on no service
-    ceiling — that scope carries why, and why it is not a widening of what an
-    assembly ticket returns). The caller must hold ``Tier.VIEWER`` on every study
-    the run's prep_sample is still linked to.
+    ceiling — that scope carries why, and what it opens beyond the service
+    route: ``bin_quality``, via ``ASSEMBLY_RUN_DOGET_TABLES``). The caller must hold
+    ``Tier.VIEWER`` on every study the run's prep_sample is still linked to.
 
     **Access is checked BEFORE existence, which inverts the alignment mint's
     ladder.** There the 404 is about an ``alignment_definition`` — a global object
@@ -437,8 +439,8 @@ async def get_assembly_membership(
     per-contig report.
 
     The genome map's gates minus its mintedness 422: these rows carry no
-    ``genome_idx``, so an unminted row is not a gap in them. 413 above the cap,
-    for the reason the genome map gives.
+    ``genome_idx``, so an unminted row is not a gap in them. 413 above
+    ``ASSEMBLY_MEMBERSHIP_HARD_CAP``, for the reason the genome map gives.
     """
     await _authorize_assembly_run_read(
         pool, caller=caller, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
@@ -447,9 +449,9 @@ async def get_assembly_membership(
         pool,
         prep_sample_idx=prep_sample_idx,
         processing_idx=processing_idx,
-        limit=GENOME_MAP_HARD_CAP + 1,
+        limit=ASSEMBLY_MEMBERSHIP_HARD_CAP + 1,
     )
-    if len(rows) > GENOME_MAP_HARD_CAP:
+    if len(rows) > ASSEMBLY_MEMBERSHIP_HARD_CAP:
         total = await count_assembly_membership(
             pool, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
         )
@@ -458,7 +460,7 @@ async def get_assembly_membership(
             detail=(
                 f"membership of prep_sample_idx={prep_sample_idx},"
                 f" processing_idx={processing_idx} has {total} rows, over the"
-                f" {GENOME_MAP_HARD_CAP} maximum this endpoint serves; use"
+                f" {ASSEMBLY_MEMBERSHIP_HARD_CAP} maximum this endpoint serves; use"
                 " .../membership/parquet."
             ),
         )
@@ -484,7 +486,7 @@ async def list_assembly_export_roster(
     ),
     prep_sample_idx: int | None = Query(default=None, gt=0, description="Only this sample."),
 ) -> AssemblyExportRosterResponse:
-    """The samples gated under one run that the caller may read, each with its gate
+    """The prep_samples gated under one run that the caller may read, each with its gate
     state and biosample accession — what `qiita assembly export` walks.
 
     **The read tier, where the /processing roster uses the submit tier.** That roster
@@ -512,14 +514,14 @@ async def list_assembly_export_roster(
         sequenced_pool_idx=sequenced_pool_idx,
         study_idx=study_idx,
         prep_sample_idx=prep_sample_idx,
-        limit=_ASSEMBLY_ROSTER_HARD_CAP + 1,
+        limit=GATE_ROSTER_HARD_CAP + 1,
     )
-    if len(rows) > _ASSEMBLY_ROSTER_HARD_CAP:
+    if len(rows) > GATE_ROSTER_HARD_CAP:
         raise HTTPException(
             status_code=413,
             detail=(
-                f"processing {processing_idx} has more than {_ASSEMBLY_ROSTER_HARD_CAP}"
-                " samples under these filters; narrow with sequenced_pool_idx or study_idx"
+                f"processing {processing_idx} has more than {GATE_ROSTER_HARD_CAP}"
+                " prep_samples under these filters; narrow with sequenced_pool_idx or study_idx"
             ),
         )
     access = await filter_prep_samples_caller_can_read(

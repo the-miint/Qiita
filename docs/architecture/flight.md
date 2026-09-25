@@ -182,9 +182,9 @@ processing-specific, so the same sample under two alignments is two things. The
 map is the only artifact carrying both `export_id` and `prep_sample_idx`; that
 pairing is its entire purpose, and it is what must not be shipped onward.
 
-**The genome map ships in two forms, and the second is the only non-JSON body on
-an API data route** (the auth and landing routes already return HTML and
-redirects). The JSON form **refuses with a 413** above its cap
+**The genome map ships in two forms, and the second is a Parquet body rather than
+JSON** — as is the assembly membership read's `.../membership/parquet`, built the
+same way. The JSON form **refuses with a 413** above its cap
 instead of truncating: a lookup table silently missing rows drops those features
 from the caller's roll-up, producing a *wrong* feature table rather than a partial
 one, and nobody checks a `truncated` flag on a map. The Parquet form

@@ -29,13 +29,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   heterogeneity/lineage) and `contigs.tsv` (header, genome, length and the assembler's
   `raw_name`, `circularity`, `depth`, `mult`). Filters: `--kind` (default LCG and MAG),
   `--min-bp`/`--max-bp`, `--min-completeness`/`--max-contamination`. It refuses and
-  writes nothing on a pending or invalidated sample, a sample with no accession, a
-  genome name repeated in one export, a run whose Postgres membership and streamed
+  writes nothing on a pending or invalidated prep_sample, a prep_sample whose biosample
+  has no accession, a genome name repeated in one export, a run whose Postgres membership and streamed
   contigs differ, or a record whose reassembled length is not its
   `sequence_length_bp`. Three reads back it: `GET
   /assembly/{prep_sample_idx}/{processing_idx}/membership[/parquet]` (every kind, with
   the assembler's per-contig attributes), `GET /assembly/{processing_idx}/prep-sample`
-  (the samples the caller may read, at `Tier.VIEWER`; the `/processing` roster narrows
+  (the prep_samples the caller may read, at `Tier.VIEWER`; the `/processing` roster narrows
   at `Tier.ADMIN`), and `bin_quality` on the human run mint `POST
   /assembly/{prep_sample_idx}/{processing_idx}/ticket/doget`, which it was previously
   absent from. The service-account mint still does not sign `bin_quality`.

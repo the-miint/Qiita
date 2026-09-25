@@ -26,7 +26,7 @@ _SEQ = {
     101: "ATGCGTACGTTAGCCGATAGGCTTACGATCGA",  # LCG, 32 bp
     102: "GGGCCCATATATGCGCTTTTAAGC",  # bin.1
     103: "ACGTACCAGT",  # bin.1 and bin.2
-    104: "TTTTGGGGCCCCAAAAT",  # bin.2
+    104: "TTTTGgggNNCCAAAAT",  # bin.2; an ambiguity code and soft-masked bases
     105: "GATTACA",  # UNBINNED
 }
 
@@ -203,7 +203,9 @@ def _tsv(path) -> list[dict]:
 
 
 def _gc(seq: str) -> float:
-    return sum(seq.count(b) for b in "GC") / len(seq)
+    """G+C over the A/C/G/T bases, case-insensitive; an ambiguity code is in neither."""
+    upper = seq.upper()
+    return sum(upper.count(b) for b in "GC") / sum(upper.count(b) for b in "ACGT")
 
 
 def test_each_genome_gets_its_contigs_once_and_whole(served, tmp_path):
@@ -244,6 +246,9 @@ def test_metadata_describes_each_genome_without_internal_identifiers(served, tmp
     assert (float(bin1["completeness"]), float(bin1["contamination"])) == (95.0, 1.0)
     assert bin1["fasta"] == "SAMEA1_bin.1.fasta.gz"
     assert int(genomes["SAMEA1_u7ctg"]["n_circular"]) == 1
+    assert float(genomes["SAMEA1_bin.2"]["gc"]) == pytest.approx(_gc(_SEQ[104] + _SEQ[103]))
+    # 104 reports no depth, so bin.2's depth is 103's alone rather than diluted by it.
+    assert float(genomes["SAMEA1_bin.2"]["depth"]) == 20.0
 
     contigs = _tsv(tmp_path / "contigs.tsv")
     assert [c["contig"] for c in contigs if c["genome"] == "SAMEA1_bin.2"] == [
@@ -329,7 +334,7 @@ def test_a_repeated_quality_row_is_refused(served, tmp_path):
         pytest.param([_sample(11, state="invalidated")], "not completed", id="invalidated"),
         pytest.param([_sample(11, accession=None)], "no biosample accession", id="unnamed"),
         pytest.param([_sample(11, accession="SAM/1")], "file name", id="unsafe-name"),
-        pytest.param([], "no sample", id="empty"),
+        pytest.param([], "no prep_sample", id="empty"),
     ],
 )
 def test_roster_refusals(served, tmp_path, roster, match):
@@ -382,7 +387,7 @@ def test_the_command_exits_1_on_a_refusal_and_names_it(served, tmp_path, monkeyp
 
     served["roster"] = [_sample(11)]
     assert main(argv) == 0
-    assert "wrote 3 genome(s) from 1 sample(s)" in capsys.readouterr().out
+    assert "wrote 3 genome(s) from 1 prep_sample(s)" in capsys.readouterr().out
 
 
 class _Closing:

@@ -257,7 +257,7 @@ async def test_membership_parquet_serves_the_same_rows_uncapped(ctx, export, mon
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    monkeypatch.setattr("qiita_control_plane.routes.assembly.GENOME_MAP_HARD_CAP", 1)
+    monkeypatch.setattr("qiita_control_plane.routes.assembly.ASSEMBLY_MEMBERSHIP_HARD_CAP", 1)
     a, p = export["samples"]["a"], export["p"]
     refused = await ctx["viewer"].get(_membership_url(a, p))
     assert refused.status_code == 413, refused.text
@@ -394,6 +394,6 @@ async def test_roster_404s_an_unknown_run(ctx, export):
 
 
 async def test_roster_refuses_over_its_cap_rather_than_truncating(ctx, export, monkeypatch):
-    monkeypatch.setattr("qiita_control_plane.routes.assembly._ASSEMBLY_ROSTER_HARD_CAP", 1)
+    monkeypatch.setattr("qiita_control_plane.routes.assembly.GATE_ROSTER_HARD_CAP", 1)
     resp = await ctx["admin"].get(_roster_url(export["p"]))
     assert resp.status_code == 413, resp.text
