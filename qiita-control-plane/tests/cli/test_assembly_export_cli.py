@@ -203,7 +203,9 @@ def _tsv(path) -> list[dict]:
 
 
 def _gc(seq: str) -> float:
-    """G+C over the A/C/G/T bases, case-insensitive; an ambiguity code is in neither."""
+    """G+C over the A/C/G/T bases, case-insensitive; an ambiguity code is in neither.
+    The export's own definition, restated because miint has no composition scalar
+    to call instead (duckdb-miint#282)."""
     upper = seq.upper()
     return sum(upper.count(b) for b in "GC") / sum(upper.count(b) for b in "ACGT")
 
