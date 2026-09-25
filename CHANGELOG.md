@@ -1926,6 +1926,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **The `reference_load` tests pin the host RAM they assume (#615).** Off SLURM,
+  `load`'s DuckDB limit is detected RAM minus its 8-thread headroom (#606), which is
+  1 GB on the 7 GB macOS runner, and `read_jplace` asks for about 1.8 GiB whatever
+  the file size (its macro passes `maximum_object_size=1000000000` to `read_json`), so
+  `test_placements_lifted_writer_maps_fragment_to_feature_idx` failed with an
+  out-of-memory error on macOS CI. Under SLURM, where production runs `load` with
+  `mem_gb: 32`, the limit is 26 GB and nothing changes.
+
 - **A native job's DuckDB memory cap is bounded by the RAM the host actually has (#606).**
   Off SLURM there was no ceiling: `resolve_duckdb_memory_gb` returned the job's
   literal unchanged, so the `load` step handed DuckDB a 31 GB `memory_limit` on
