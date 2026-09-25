@@ -22,7 +22,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Added
 
 - **A viewer can export an assembly run's LCGs and MAGs as FASTA with their metadata
-  (#617).** `qiita assembly export --processing-idx N` with one of `--prep-sample-idx`,
+  (#620).** `qiita assembly export --processing-idx N` with one of `--prep-sample-idx`,
   `--sequenced-pool-idx` or `--study-idx` writes one gzipped FASTA per genome, named
   `<biosample accession>_<bin_id>`, plus `genomes.tsv` (length, contig and circular
   counts, GC, length-weighted depth, CheckM completeness/contamination/strain
