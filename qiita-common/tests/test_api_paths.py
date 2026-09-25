@@ -446,6 +446,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_MASK_DEFINITION_PREFIX",
         "PATH_MASK_DEFINITION_SAMPLE_STATUS",
     ),
+    (
+        "URL_MASK_DEFINITION_SYNDNA_READ_COUNT",
+        "PATH_MASK_DEFINITION_PREFIX",
+        "PATH_MASK_DEFINITION_SYNDNA_READ_COUNT",
+    ),
     # /processing (assembly run identity + its lifecycle)
     (
         "URL_PROCESSING_BY_IDX",

@@ -145,12 +145,12 @@ steps:
     # `alignment` is the alignment the step used to build the mask, emitted verbatim
     # rather than discarded — the old step reduced each read to a boolean and threw the
     # coordinates away, which is exactly what made per-insert quantification impossible.
-    # Emitted as groundwork for a coverage-measurement consumer (deferred): no step
-    # consumes this binding yet. The name is shared with align_sharded's `alignment`
-    # output so a future consumer can bind either — but the SCHEMAS differ (syndna's
-    # subject is the whole plasmid, so it carries `parent_feature_idx` and no mate/
-    # alignment_idx columns; align_sharded's subject is the feature itself), so that
-    # consumer still has to know which producer it is reading.
+    # persist-syndna-read-count consumes it (per-insert read counts); a
+    # coverage-depth consumer is still to come. The name is shared with
+    # align_sharded's `alignment` output, but the SCHEMAS differ (syndna's subject
+    # is the whole plasmid, so it carries `parent_feature_idx` and no mate/
+    # alignment_idx columns; align_sharded's subject is the feature itself), so a
+    # consumer has to know which producer it is reading.
     outputs: [partial_mask, alignment]
     baseline_resources:
       cpu: 4
@@ -290,6 +290,15 @@ steps:
   # DuckLake storage, so this read of the staging path must happen first.
   - action: persist-read-metrics
     inputs: [read_mask]
+    outputs: []
+
+  # Persist the reads aligned to each SynDNA insert (ungated, mapped-primary)
+  # from the syndna step's `alignment` output into qiita.syndna_read_count.
+  # Gated with the step that produces its input. Before finalize-mask-sample, so
+  # a 'completed' gate never advertises a sample whose counts are missing.
+  - action: persist-syndna-read-count
+    when: syndna_enabled
+    inputs: [alignment]
     outputs: []
 
   # Load the final mask into the DuckLake `read_mask` table. read_mask_staging_dir

@@ -1,12 +1,13 @@
 """The per-sample narrowing every gate-roster read applies.
 
-Two reads answer the same shape of question over two different gates — which
-samples are masked under a `mask_idx` (`repositories.mask_definition`), which are
-assembled under a `processing_idx` (`repositories.processing`) — and both have to
-narrow the sample set identically: exclude entity-retired prep_samples, optional
+Several reads answer the same shape of question over a gate — which samples are
+masked under a `mask_idx` (`repositories.mask_definition`, and the SynDNA export
+roster in `repositories.syndna_read_count`), which are assembled under a
+`processing_idx` (`repositories.processing`) — and all of them have to narrow the
+sample set identically: exclude entity-retired prep_samples, optional
 `sequenced_pool_idx` / `study_idx` / `prep_sample_idx` filters, and the per-study visibility
 policy for a caller below the bypass role. This module owns that one copy;
-neither reader restates it.
+no reader restates it.
 
 Every fragment correlates on `{alias}.prep_sample_idx`, where `{alias}` is the
 caller's gate CTE. Nothing else about the gate is assumed.
@@ -80,9 +81,9 @@ def sample_scope_sql(
     caller holding the bypass role, or for one that applies its own read gate to the
     rows returned — it means "see every sample".
     """
-    # `alias` is interpolated into SQL, not bound. Both callers pass a module
+    # `alias` is interpolated into SQL, not bound. Every caller passes a module
     # constant, so nothing reaches this from a request today; the check is what
-    # keeps that true of a third caller.
+    # keeps that true of the next caller.
     if not alias.isidentifier():
         raise ValueError(f"roster alias must be a bare SQL identifier, got {alias!r}")
     clauses = " AND " + _SAMPLE_NOT_RETIRED.format(alias=alias)

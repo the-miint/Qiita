@@ -176,14 +176,15 @@ _ROSTER_ALIAS = "msk"
 # CHECK constraint in the 20260804000000 migration; adding a value changes both.
 ADAPTER_HASH_SCHEME_SEQUENCE_HASH = "sequence_hash_v1"
 
-# The two `params` keys addressing the adapter identity inside the blob
-# `runner._mask._build_mask_params` produces. They live here, not next to that
-# builder, because this module and the re-key backfill both address the path
-# without going through it — the scheme stamp below, the backfill's SQL, and its
-# params rewrite — and the repository is what every one of them already imports.
-# A rename in the builder has to reach these.
+# `params` keys inside the blob `runner._mask._build_mask_params` produces. They
+# live here, not next to that builder, because readers address the paths without
+# going through it — the adapter scheme stamp below, the re-key backfill's SQL and
+# params rewrite, and the SynDNA read-count reads — and the repository is what
+# every one of them already imports. A rename in the builder has to reach these.
 RESOLVED_QC_KEY = "resolved_qc"
 ADAPTER_SET_HASH_KEY = "adapter_set_hash"
+RESOLVED_SYNDNA_KEY = "resolved_syndna"
+SYNDNA_REFERENCE_IDX_KEY = "reference_idx"
 # The same path as a Postgres jsonb text accessor:
 # `params->'resolved_qc'->>'adapter_set_hash'`.
 ADAPTER_SET_HASH_JSON_PATH = f"'{RESOLVED_QC_KEY}'->>'{ADAPTER_SET_HASH_KEY}'"

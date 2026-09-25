@@ -51,7 +51,10 @@ from ...backfill.host_taxon import (
     plan_backfill,
 )
 from ...backfill.mask_adapter_hash import RekeyPlan, apply_rekey, plan_rekey
-from ...config import _parse_optional_positive_int_env
+from ...backfill.syndna_read_count import BackfillPlan as SyndnaBackfillPlan
+from ...backfill.syndna_read_count import apply_backfill as apply_syndna_backfill
+from ...backfill.syndna_read_count import plan_backfill as plan_syndna_backfill
+from ...config import WORK_TICKET_SUBDIR, _parse_optional_positive_int_env
 from .. import _common
 from .._reference_exclusion import add_admin_exclusion_subparsers
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS, open_admin_pool
@@ -523,6 +526,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Write the genomes and stamps (default: dry-run, report only, no writes).",
     )
     p_backfill_genome.set_defaults(handler=_handle_backfill_assembly_genome)
+
+    p_backfill_syndna = p_backfill_sub.add_parser(
+        "syndna-read-count",
+        help="Write per-insert SynDNA read counts for samples masked before they were persisted",
+        description=(
+            "For every sample whose mask completed under a SynDNA mask with no rows in"
+            " qiita.syndna_read_count, count the reads aligned to each insert from the"
+            " syndna step's alignment file in the read-mask ticket's scratch workspace,"
+            " and write them. A sample whose file is gone is listed and skipped; a"
+            " re-mask is then its only source. Idempotent; dry-run by default. Needs"
+            " DATABASE_URL and PATH_SCRATCH."
+        ),
+    )
+    p_backfill_syndna.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write the counts (default: dry-run, report only, no writes).",
+    )
+    p_backfill_syndna.set_defaults(handler=_handle_backfill_syndna_read_count)
 
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
@@ -1305,6 +1327,66 @@ def _handle_backfill_assembly_genome(
         print(
             f"\nDRY RUN — nothing written. Pass --execute to mint"
             f" {plan.genomes_to_mint} genome(s) and stamp {plan.rows_to_stamp} row(s)."
+        )
+    return 0
+
+
+async def _backfill_syndna_read_count(
+    database_url: str, *, ticket_root: Path, execute: bool
+) -> tuple[SyndnaBackfillPlan, int]:
+    """Plan, report, and (with `execute`) apply the SynDNA read-count backfill.
+    Returns `(plan, written)`; `written` is 0 on a dry run."""
+    pool = await open_admin_pool(database_url)
+    try:
+        plan = await plan_syndna_backfill(pool, ticket_root=ticket_root)
+        if not execute:
+            return plan, 0
+        return plan, await apply_syndna_backfill(pool, plan)
+    finally:
+        await pool.close()
+
+
+def _handle_backfill_syndna_read_count(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+    scratch = os.environ.get("PATH_SCRATCH")
+    if not scratch or not Path(scratch).is_absolute():
+        print("error: PATH_SCRATCH must be set to an absolute path", file=sys.stderr)
+        return 2
+
+    try:
+        plan, written = asyncio.run(
+            _backfill_syndna_read_count(
+                database_url,
+                ticket_root=Path(scratch) / WORK_TICKET_SUBDIR,
+                execute=args.execute,
+            )
+        )
+    except (RuntimeError, ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    writable, residue = plan.writable(), plan.residue()
+    print(f"uncounted samples : {len(plan.pairs)}")
+    print(f"with a file       : {len(writable)}")
+    print(f"without one       : {len(residue)}")
+    for pair in residue:
+        print(f"  mask {pair.mask_idx} prep_sample {pair.prep_sample_idx}: {pair.reason}")
+
+    if not plan.pairs:
+        print("\nnothing to do — every completed SynDNA-masked sample has counts.")
+        return 0
+
+    if args.execute:
+        print(f"\nwrote counts for {written} sample(s)")
+    else:
+        print(
+            f"\nDRY RUN — nothing written. Pass --execute to write counts for"
+            f" {len(writable)} sample(s)."
         )
     return 0
 

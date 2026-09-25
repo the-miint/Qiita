@@ -1392,6 +1392,28 @@ def test_load_actions_read_mask_finalizes_gate_after_register_files():
     assert names.index("persist-read-metrics") < names.index("register-files")
 
 
+def test_load_actions_read_mask_persists_syndna_counts_before_the_gate():
+    """`persist-syndna-read-count` consumes the `syndna` step's `alignment`, is gated
+    on the same `when:` as that step, and runs before `finalize-mask-sample` — so a
+    'completed' gate under a SynDNA mask implies the counts are written, which the
+    export route relies on to call a missing count a backfill case."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    steps = {a.action_id: a for a in load_actions(repo_root / "workflows")}["read-mask"].steps
+    names = [s.name for s in steps]
+    persist = steps[names.index("persist-syndna-read-count")]
+    syndna = steps[names.index("syndna")]
+
+    assert persist.inputs == ["alignment"]
+    assert "alignment" in syndna.outputs
+    assert persist.when == syndna.when == "syndna_enabled"
+    assert names.index("syndna") < names.index("persist-syndna-read-count")
+    assert names.index("persist-syndna-read-count") < names.index("finalize-mask-sample")
+
+
 def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
     """The mask-model fastq-to-parquet (1.3.0) mints a mask_idx and writes read_mask
     exactly like read-mask, so it owes the SAME first-class completion gate: its last

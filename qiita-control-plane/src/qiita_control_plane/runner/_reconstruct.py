@@ -635,6 +635,28 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.PERSIST_SYNDNA_READ_COUNT:
+        # Per-insert SynDNA read counts from the `syndna` step's alignment output.
+        # mask_idx from the ticket (runner-bound for the prep_sample branch), the
+        # sample from the scope target. Runs before finalize-mask-sample, so a
+        # 'completed' gate implies the counts are written.
+        if entry.inputs != ["alignment"]:
+            raise RuntimeError(
+                f"persist-syndna-read-count expects inputs [alignment]; got {entry.inputs!r}"
+            )
+        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+            raise RuntimeError(
+                "persist-syndna-read-count requires a prep_sample-scoped ticket; "
+                f"got {scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.PERSIST_SYNDNA_READ_COUNT](
+            pool,
+            mask_idx=bound[MASK_IDX_BINDING],
+            prep_sample_idx=scope_target["prep_sample_idx"],
+            alignment_path=Path(bound["alignment"]),
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.FINALIZE_MASK_SAMPLE:
         # Terminal step of the per-sample read-mask workflow: record this sample's
         # masking as completed in the mask_sample gate (the per-sample twin of

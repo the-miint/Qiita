@@ -2278,6 +2278,75 @@ async def test_run_action_primitive_finalize_mask_sample_dispatches(monkeypatch,
     assert recorded == {"mask_idx": 77, "prep_sample_idx": 5}
 
 
+async def test_run_action_primitive_persist_syndna_read_count_dispatches(monkeypatch, tmp_path):
+    """The persist-syndna-read-count arm passes the runner-bound mask_idx, the scope
+    target's prep_sample_idx and the `alignment` binding's path."""
+    from pathlib import Path
+
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_persist(pool, *, mask_idx, prep_sample_idx, alignment_path):
+        recorded.update(
+            mask_idx=mask_idx, prep_sample_idx=prep_sample_idx, alignment_path=alignment_path
+        )
+        return 10
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.PERSIST_SYNDNA_READ_COUNT, fake_persist)
+
+    entry = WorkflowAction(
+        kind="action", name="persist-syndna-read-count", inputs=["alignment"], outputs=[]
+    )
+    alignment = tmp_path / "syndna_alignment.parquet"
+    out = await _run_action_primitive(
+        None,
+        entry,
+        {"mask_idx": 77, "alignment": str(alignment)},
+        tmp_path,
+        {"kind": "prep_sample", "prep_sample_idx": 5},
+        work_ticket_idx=9,
+        signing_key=b"sekret",
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {}
+    assert recorded == {"mask_idx": 77, "prep_sample_idx": 5, "alignment_path": Path(alignment)}
+
+
+@pytest.mark.parametrize(
+    ("inputs", "scope", "match"),
+    [
+        (["read_mask"], {"kind": "prep_sample", "prep_sample_idx": 5}, "expects inputs"),
+        (["alignment"], {"kind": "block", "block_idx": 42}, "prep_sample-scoped"),
+    ],
+)
+async def test_run_action_primitive_persist_syndna_read_count_rejects_a_bad_entry(
+    tmp_path, inputs, scope, match
+):
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(
+        kind="action", name="persist-syndna-read-count", inputs=inputs, outputs=[]
+    )
+    with pytest.raises(RuntimeError, match=match):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"mask_idx": 1, "alignment": "x", "read_mask": "x"},
+            tmp_path,
+            scope,
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
+
+
 async def test_run_action_primitive_finalize_mask_sample_rejects_non_prep_sample_scope(tmp_path):
     """finalize-mask-sample is only meaningful for a prep_sample-scoped ticket; a
     block- or otherwise-scoped ticket is a contract error, surfaced loudly."""

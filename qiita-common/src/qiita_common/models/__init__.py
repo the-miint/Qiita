@@ -284,6 +284,9 @@ from qiita_common.models.sequencing import (
     SequencingRunLookupByInstrumentRunIdResponse,
     SequencingRunResponse,
     StudyScopedSequencedSampleResponse,
+    SyndnaInsert,
+    SyndnaReadCountResponse,
+    SyndnaReadCountSample,
     merge_qc_reports,
 )
 from qiita_common.models.step import (
@@ -680,6 +683,9 @@ __all__ = [
     "MaskedReadExportTicketRequest",
     "MaskPrepSample",
     "MaskPrepSampleListResponse",
+    "SyndnaInsert",
+    "SyndnaReadCountResponse",
+    "SyndnaReadCountSample",
     "MaskDefinitionStatus",
     "MaskDefinitionStatusUpdate",
     "MaskSampleState",

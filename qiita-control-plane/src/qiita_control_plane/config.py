@@ -155,6 +155,12 @@ def _parse_optional_positive_int_env(var: str) -> int | None:
     return _parse_positive_int_env(var, default=1)
 
 
+# The per-ticket workspace root's name under PATH_SCRATCH. Readers that locate a
+# ticket's files outside a running service (the admin backfills) derive the root
+# from this rather than retyping it.
+WORK_TICKET_SUBDIR = "ticket"
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     database_url: str
@@ -336,7 +342,7 @@ class Settings:
         scratch = Path(scratch_raw)
         if not scratch.is_absolute():
             raise RuntimeError(f"PATH_SCRATCH must be an absolute path, got {scratch_raw!r}")
-        ws_root = scratch / "ticket"
+        ws_root = scratch / WORK_TICKET_SUBDIR
         upload_root = scratch / "staging"
 
         # Colon-separated roots a submitter may name a host path under.

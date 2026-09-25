@@ -106,3 +106,34 @@ qiita --base-url https://<host> reference list --active --index-type minimap2   
 Then submit: `qiita submit-host-filter-pool --sequencing-run-idx R \
 --sequenced-pool-idx P --syndna-reference-idx <idx>` (PacBio absquant pools
 require it; it is rejected on a non-absquant pool).
+
+## Export the per-insert read counts
+
+Each completed `read-mask` ticket under a SynDNA mask writes, per sample, the number
+of reads with a mapped primary alignment to each member of the reference — ungated,
+so not the `spikein_read_count_r1r2` total — into `qiita.syndna_read_count`. A study
+reader exports them as the table classic Qiita published as `syndna.biom`:
+
+```bash
+qiita mask syndna-read-count --mask-idx M --study-idx S --output syndna.biom
+```
+
+Select by `--study-idx`, `--sequenced-pool-idx` or `--prep-sample-idx` (repeatable;
+the filters intersect). `--format parquet` writes the same values with the zero cells
+kept. Samples are named by biosample accession; `--prefix-pool` names them
+`<sequenced_pool_idx>_<accession>` when one biosample was sequenced on two pools.
+Inserts are named by the FASTA header the load recorded, or with `--feature-names
+species --data-plane-url U` by the taxonomy's `species` rank.
+
+Samples masked before the counts were persisted are refused with a pointer to the
+backfill, which an operator runs on the deploy host with `DATABASE_URL` and
+`PATH_SCRATCH` set:
+
+```bash
+qiita-admin backfill syndna-read-count            # dry run: what it would write, and what it cannot
+qiita-admin backfill syndna-read-count --execute
+```
+
+It reads each sample's `syndna` step output from the read-mask ticket's scratch
+workspace. A sample whose file is gone is listed and skipped; a re-mask is then the
+only source of its counts.

@@ -14,6 +14,8 @@ from ..repositories.mask_definition import (
     ADAPTER_HASH_SCHEME_SEQUENCE_HASH,
     ADAPTER_SET_HASH_KEY,
     RESOLVED_QC_KEY,
+    RESOLVED_SYNDNA_KEY,
+    SYNDNA_REFERENCE_IDX_KEY,
     MaskDefinitionDeprecated,
     mint_mask_definition,
 )
@@ -286,7 +288,7 @@ def _resolved_syndna(action_context: Mapping[str, Any]) -> dict[str, Any] | None
     if not action_context.get("syndna_enabled"):
         return None
     return {
-        "reference_idx": action_context.get("syndna_reference_idx"),
+        SYNDNA_REFERENCE_IDX_KEY: action_context.get("syndna_reference_idx"),
         "aligner": _SYNDNA_ALIGNER,
         "preset": _SYNDNA_MM2_PRESET,
         "identity_method": _SYNDNA_IDENTITY_METHOD,
@@ -375,7 +377,7 @@ def _build_mask_params(
             ADAPTER_SET_HASH_KEY: adapter_set_hash,
         },
         "resolved_lima": resolved_lima,
-        "resolved_syndna": resolved_syndna,
+        RESOLVED_SYNDNA_KEY: resolved_syndna,
     }
 
 

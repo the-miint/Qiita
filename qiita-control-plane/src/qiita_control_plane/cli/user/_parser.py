@@ -66,7 +66,16 @@ from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_expor
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
 from .feature_table import DEFAULT_TABLE_FORMAT, TABLE_FORMATS, _handle_feature_table_build
-from .mask import _handle_mask_list, _handle_mask_samples, _handle_mask_show
+from .mask import (
+    DEFAULT_FEATURE_NAME_SOURCE,
+    DEFAULT_SYNDNA_TABLE_FORMAT,
+    FEATURE_NAME_SOURCES,
+    SYNDNA_TABLE_FORMATS,
+    _handle_mask_list,
+    _handle_mask_samples,
+    _handle_mask_show,
+    _handle_mask_syndna_read_count,
+)
 from .pacbio import _handle_submit_pacbio_ingest
 from .pool import (
     _handle_delete_sequenced_pool,
@@ -842,6 +851,73 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Only prep_samples on this sequenced_pool",
     )
     p_mask_samples.set_defaults(handler=_handle_mask_samples)
+
+    p_mask_syndna = p_mask_sub.add_parser(
+        "syndna-read-count",
+        help=(
+            "Write the reads aligned to each SynDNA insert per sample under one mask,"
+            " as BIOM or Parquet (GET /mask-definition/{mask_idx}/syndna-read-count)"
+        ),
+        description=(
+            "Counts are reads with a mapped primary alignment to each insert of the"
+            " mask's SynDNA reference, ungated — the table classic Qiita publishes as"
+            " syndna.biom. The selection filters intersect; name at least one. Needs"
+            " viewer (or above) on every study each selected sample is linked to, and"
+            " every selected sample completed under the mask. Samples are named by"
+            " biosample accession; the export refuses two samples that would share a"
+            " name."
+        ),
+    )
+    p_mask_syndna.add_argument("--mask-idx", type=int, required=True)
+    p_mask_syndna.add_argument("--study-idx", type=int, help="Samples linked to this study")
+    p_mask_syndna.add_argument(
+        "--sequenced-pool-idx", type=int, help="Samples on this sequenced_pool"
+    )
+    p_mask_syndna.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        action="append",
+        help="This prep_sample (repeatable)",
+    )
+    p_mask_syndna.add_argument(
+        "--output", type=Path, required=True, help="Table file to write; must not exist"
+    )
+    p_mask_syndna.add_argument(
+        "--format",
+        choices=SYNDNA_TABLE_FORMATS,
+        default=DEFAULT_SYNDNA_TABLE_FORMAT,
+        help=(
+            f"Table format (default: {DEFAULT_SYNDNA_TABLE_FORMAT}). The same values"
+            " either way; BIOM omits zero cells."
+        ),
+    )
+    p_mask_syndna.add_argument(
+        "--prefix-pool",
+        action="store_true",
+        help=(
+            "Name samples <sequenced_pool_idx>_<accession>, so one biosample on two"
+            " pools gets two columns"
+        ),
+    )
+    p_mask_syndna.add_argument(
+        "--feature-names",
+        choices=FEATURE_NAME_SOURCES,
+        default=DEFAULT_FEATURE_NAME_SOURCE,
+        help=(
+            "Name inserts by the FASTA header the reference load recorded (accession,"
+            " the default) or by the reference taxonomy's species rank (needs"
+            " --data-plane-url)"
+        ),
+    )
+    p_mask_syndna.add_argument(
+        "--data-plane-url",
+        help=(
+            "gRPC URL of the data plane, for --feature-names species. From off the"
+            " deploy host use the public TLS edge (e.g."
+            " grpc+tls://qiita.example.com:443)."
+        ),
+    )
+    p_mask_syndna.set_defaults(handler=_handle_mask_syndna_read_count)
 
     # `processing list` / `show` / `samples` — the mask twin. See
     # `cli/user/processing.py` for which identity these discover and why.

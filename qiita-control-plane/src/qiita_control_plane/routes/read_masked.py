@@ -60,6 +60,7 @@ from qiita_common.api_paths import (
     PATH_MASK_DEFINITION_ROOT,
     PATH_MASK_DEFINITION_SAMPLE_STATUS,
     PATH_MASK_DEFINITION_STATUS,
+    PATH_MASK_DEFINITION_SYNDNA_READ_COUNT,
     PATH_READ_MASKED_DOGET,
     PATH_READ_MASKED_PREFIX,
 )
@@ -78,10 +79,18 @@ from qiita_common.models import (
     MaskSampleStatusUpdate,
     MaskSampleStatusUpdateResponse,
     ReadMaskedDoGetTicketRequest,
+    SyndnaInsert,
+    SyndnaReadCountResponse,
+    SyndnaReadCountSample,
 )
 
 from ..actions.library import delete_mask_data
-from ..auth.guards import require_human, require_scope, require_service_with_scope
+from ..auth.guards import (
+    COHORT_MIN_TIER,
+    require_human,
+    require_scope,
+    require_service_with_scope,
+)
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..block_read import READ_MASKED_TABLE
@@ -103,7 +112,19 @@ from ..repositories.mask_definition import (
     set_mask_sample_states,
     transition_mask_definition_status,
 )
-from ._helpers import GATE_ROSTER_HARD_CAP, cap_rows, gate_roster_narrowing_idx
+from ..repositories.syndna_read_count import (
+    fetch_mask_syndna_reference,
+    fetch_syndna_export_roster,
+    fetch_syndna_inserts,
+    fetch_syndna_read_counts,
+)
+from ._helpers import (
+    GATE_ROSTER_HARD_CAP,
+    authorize_prep_sample_cohort,
+    cap_rows,
+    first_few,
+    gate_roster_narrowing_idx,
+)
 
 _MSG_MASK_NOT_FOUND = "Mask definition not found"
 
@@ -326,6 +347,138 @@ async def list_mask_prep_samples_route(
         count=len(samples),
         truncated=truncated,
         sequenced_pool_idx=sequenced_pool_idx,
+    )
+
+
+@mask_definition_router.get(PATH_MASK_DEFINITION_SYNDNA_READ_COUNT)
+async def get_syndna_read_count_route(
+    mask_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    study_idx: int | None = Query(default=None, gt=0, description="Samples linked to this study."),
+    sequenced_pool_idx: int | None = Query(
+        default=None, gt=0, description="Samples on this sequenced_pool."
+    ),
+    prep_sample_idx: list[int] | None = Query(
+        default=None, description="These prep_samples (repeatable)."
+    ),
+) -> SyndnaReadCountResponse:
+    """The per-insert SynDNA read counts of the selected samples under one mask —
+    what `qiita mask syndna-read-count` writes as BIOM or Parquet.
+
+    The filters intersect, and at least one is required. The selection is every
+    non-retired sample with a gate row under the mask that matches them.
+
+    **All-or-nothing, never narrowed**, because the response is a table: the caller
+    needs ``Tier.VIEWER`` on every study each selected sample is linked to (403
+    otherwise; wet_lab_admin and above bypass), and every selected sample must be
+    'completed' under the mask and counted (409 otherwise). Named prep_samples are
+    authorized before any lookup, so a 403 rather than a 409 answers a sample the
+    caller cannot read.
+
+    404 when the mask does not exist or nothing matches; 409 when the mask ran without
+    SynDNA; 413 above the roster cap.
+    """
+    if study_idx is None and sequenced_pool_idx is None and not prep_sample_idx:
+        raise HTTPException(
+            status_code=422,
+            detail="name at least one of study_idx, sequenced_pool_idx, prep_sample_idx",
+        )
+    named = sorted(set(prep_sample_idx or []))
+    if named:
+        await authorize_prep_sample_cohort(
+            pool, caller=caller, prep_sample_idx=named, min_tier=COHORT_MIN_TIER
+        )
+    mask = await fetch_mask_syndna_reference(pool, mask_idx)
+    if mask is None:
+        raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
+    reference_idx = mask["reference_idx"]
+    if reference_idx is None:
+        raise HTTPException(
+            status_code=409, detail=f"mask {mask_idx} ran without SynDNA; it counted nothing"
+        )
+    rows = await fetch_syndna_export_roster(
+        pool,
+        mask_idx,
+        study_idx=study_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+        prep_sample_idxs=named or None,
+        limit=GATE_ROSTER_HARD_CAP + 1,
+    )
+    if len(rows) > GATE_ROSTER_HARD_CAP:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"more than {GATE_ROSTER_HARD_CAP} samples under mask {mask_idx} match;"
+                " narrow with study_idx, sequenced_pool_idx or prep_sample_idx"
+            ),
+        )
+    unmasked = sorted(set(named) - {r["prep_sample_idx"] for r in rows})
+    if unmasked:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(unmasked)} named prep_sample(s) are not masked under mask {mask_idx}"
+                f" or do not match the other filters (e.g. {first_few(unmasked)})"
+            ),
+        )
+    if not rows:
+        raise HTTPException(
+            status_code=404, detail=f"no sample masked under mask {mask_idx} matches"
+        )
+    selected = [r["prep_sample_idx"] for r in rows]
+    await authorize_prep_sample_cohort(
+        pool, caller=caller, prep_sample_idx=selected, min_tier=COHORT_MIN_TIER
+    )
+    incomplete = [r["prep_sample_idx"] for r in rows if r["state"] != MASK_SAMPLE_COMPLETED]
+    if incomplete:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(incomplete)} selected sample(s) are not completed under mask"
+                f" {mask_idx} (e.g. {first_few(incomplete)})"
+            ),
+        )
+
+    inserts = await fetch_syndna_inserts(pool, reference_idx)
+    order = {r["feature_idx"]: i for i, r in enumerate(inserts)}
+    counts: dict[int, list[int | None]] = {ps: [None] * len(inserts) for ps in selected}
+    for c in await fetch_syndna_read_counts(pool, mask_idx, selected):
+        position = order.get(c["feature_idx"])
+        if position is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"stored counts for prep_sample {c['prep_sample_idx']} name feature"
+                    f" {c['feature_idx']}, which is not in SynDNA reference {reference_idx}"
+                ),
+            )
+        counts[c["prep_sample_idx"]][position] = c["read_count"]
+    uncounted = [ps for ps in selected if None in counts[ps]]
+    if uncounted:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(uncounted)} selected sample(s) have no SynDNA read counts under mask"
+                f" {mask_idx} (e.g. {first_few(uncounted)}); they were masked before counts"
+                " were persisted — ask an operator to run"
+                " `qiita-admin backfill syndna-read-count`"
+            ),
+        )
+    return SyndnaReadCountResponse(
+        mask_idx=mask_idx,
+        reference_idx=reference_idx,
+        inserts=[SyndnaInsert.model_validate(dict(r)) for r in inserts],
+        samples=[
+            SyndnaReadCountSample(
+                prep_sample_idx=r["prep_sample_idx"],
+                biosample_accession=r["biosample_accession"],
+                sequenced_pool_idx=r["sequenced_pool_idx"],
+                read_counts=counts[r["prep_sample_idx"]],
+            )
+            for r in rows
+        ],
     )
 
 

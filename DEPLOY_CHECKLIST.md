@@ -23,11 +23,19 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `[operator]` `make migrate` applies `20260925000000_syndna_read_count.sql` (new table `qiita.syndna_read_count`; no data change). (#TBD)
 
 ### 4. Deploy
 
-_None yet._
+- `[operator]` **Before the restart**, confirm no read-mask ticket is stopped between `register-files` and `finalize-mask-sample`. The read-mask workflow gains an entry (`persist-syndna-read-count`) ahead of `register-files`, and resume matches completed steps by position, so such a ticket would resume against the wrong entries. This must return 0 rows; if it does not, redrive those tickets to `completed` on the current code first (#TBD):
+
+  ```sql
+  SELECT wt.work_ticket_idx, wt.state
+    FROM qiita.work_ticket wt
+    JOIN qiita.work_ticket_step s ON s.work_ticket_idx = wt.work_ticket_idx
+   WHERE wt.action_id = 'read-mask' AND wt.state <> 'completed'
+     AND s.step_name = 'register-files' AND s.state = 'completed';
+  ```
 
 ### 5. Verify
 
@@ -35,7 +43,7 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-_None yet._
+- `[operator]` Write the SynDNA read counts for samples masked before this deploy, from the `syndna` step output left in each read-mask ticket's scratch workspace. With `DATABASE_URL` and `PATH_SCRATCH` exported (as for any `qiita-admin backfill`): `qiita-admin backfill syndna-read-count` (dry run; lists samples whose file is gone), then `qiita-admin backfill syndna-read-count --execute`. Samples it lists as gone can only be counted by a re-mask. Run it soon after the deploy: the files are only as durable as the scratch workspace. (#TBD)
 
 ### Notes (no host action)
 

@@ -1111,6 +1111,49 @@ class MaskPrepSampleListResponse(BaseModel):
     sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
 
 
+class SyndnaInsert(BaseModel):
+    """One insert of a mask's SynDNA reference. `accession` is the FASTA header the
+    reference load recorded, None where the load predates it."""
+
+    feature_idx: Annotated[int, Field(gt=0)]
+    accession: str | None = None
+
+
+class SyndnaReadCountSample(BaseModel):
+    """One sample's per-insert read counts, in `SyndnaReadCountResponse.inserts`
+    order. `sequenced_pool_idx` is None for a sample that was never pooled."""
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    biosample_accession: str | None = None
+    sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+    read_counts: list[Annotated[int, Field(ge=0)]]
+
+
+class SyndnaReadCountResponse(BaseModel):
+    """Returned by GET /api/v1/mask-definition/{mask_idx}/syndna-read-count.
+
+    Every selected sample is 'completed' under the mask and counted; the route
+    refuses rather than returning a partial table. The counts are reads with a
+    mapped primary alignment to each insert, ungated (see qiita.syndna_read_count).
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    reference_idx: Annotated[int, Field(gt=0)]
+    inserts: list[SyndnaInsert]
+    samples: list[SyndnaReadCountSample]
+
+    @model_validator(mode="after")
+    def _counts_follow_inserts(self) -> SyndnaReadCountResponse:
+        width = len(self.inserts)
+        for sample in self.samples:
+            if len(sample.read_counts) != width:
+                raise ValueError(
+                    f"prep_sample {sample.prep_sample_idx} carries"
+                    f" {len(sample.read_counts)} counts for {width} inserts"
+                )
+        return self
+
+
 class MaskDefinitionStatusUpdate(BaseModel):
     """Body for PATCH /api/v1/mask-definition/{mask_idx}/status.
 

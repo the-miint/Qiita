@@ -169,6 +169,10 @@ class LibraryPrimitive(StrEnum):
     # See qiita_control_plane.actions.library.finalize_shard.
     FINALIZE_SHARD = "finalize-shard"
     PERSIST_READ_METRICS = "persist-read-metrics"
+    # Read-mask: the per-insert SynDNA read counts from the `syndna` step's
+    # alignment, into qiita.syndna_read_count. See
+    # qiita_control_plane.actions.library.persist_syndna_read_count.
+    PERSIST_SYNDNA_READ_COUNT = "persist-syndna-read-count"
     PERSIST_QC_REPORT = "persist-qc-report"
     # Block-compute: idempotent block replace. Runs immediately BEFORE
     # register-files in the bulk-block read-mask workflow — deletes this block's
@@ -456,6 +460,9 @@ PATH_MASK_DEFINITION_STATUS = "/{mask_idx}/status"
 # sample. Distinct from the route above: config lifecycle and run lifecycle are
 # different questions (see qiita_common.models.MaskDefinitionStatus).
 PATH_MASK_DEFINITION_SAMPLE_STATUS = "/{mask_idx}/sample-status"
+# GET the per-insert SynDNA read counts of the selected samples under the mask — a
+# study reader's export (Tier.VIEWER on every linked study), not a roster read.
+PATH_MASK_DEFINITION_SYNDNA_READ_COUNT = "/{mask_idx}/syndna-read-count"
 
 URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
 URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
@@ -463,6 +470,9 @@ URL_MASK_DEFINITION_PREP_SAMPLE = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFIN
 URL_MASK_DEFINITION_STATUS = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_STATUS}"
 URL_MASK_DEFINITION_SAMPLE_STATUS = (
     f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_SAMPLE_STATUS}"
+)
+URL_MASK_DEFINITION_SYNDNA_READ_COUNT = (
+    f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_SYNDNA_READ_COUNT}"
 )
 
 # =============================================================================
