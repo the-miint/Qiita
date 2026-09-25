@@ -26,8 +26,9 @@ from qiita_common.models import AssemblySampleState
 from . import gate_state_literal, require_transaction
 
 # The `assembly_sample` states, asserted against the Literal so a renamed member fails
-# at import rather than matching no rows. Every comparison against the gate uses these —
-# the Python ones import them, and this module's SQL binds them. A consumer of contigs
+# at import rather than matching no rows. The service's comparisons against the gate
+# import them and this module's SQL binds them; the user CLI, which imports nothing
+# from `repositories`, checks its own pair against the Literal. A consumer of contigs
 # proceeds on `completed` alone (`no_data` being "nothing to consume");
 # `fetch_assembly_sample_state` is the contract.
 ASSEMBLY_SAMPLE_COMPLETED = gate_state_literal("completed", AssemblySampleState)

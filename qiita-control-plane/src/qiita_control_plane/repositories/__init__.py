@@ -161,7 +161,7 @@ def gate_state_literal(value: str, declared: object) -> str:
 
     Each gate's states are asserted once, beside the gate's contract
     (`repositories.block` for `mask_sample`, `repositories.assembly` for
-    `assembly_sample`), and every other module imports those constants.
+    `assembly_sample`), and the service's other modules import those constants.
     """
     members = get_args(declared)
     if value not in members:
