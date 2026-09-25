@@ -356,6 +356,8 @@ def _write_sample(
             "      ORDER BY ms.sequence_length_bp DESC, ms.feature_idx)"
             f" TO '{_sql_str(str(partial))}' (FORMAT FASTA, COMPRESSION 'gzip')"
         )
+    # GC is G+C over A/C/G/T, case-insensitive, in plain SQL: miint has no composition
+    # scalar (duckdb-miint#282).
     con.execute(
         "INSERT INTO genome_out"
         " SELECT g.genome, ? , g.kind, g.bin_id, g.length_bp, g.n_contigs, g.n_circular,"

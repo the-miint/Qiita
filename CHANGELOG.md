@@ -26,7 +26,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `--sequenced-pool-idx` or `--study-idx` writes one gzipped FASTA per genome, named
   `<biosample accession>_<bin_id>`, plus `genomes.tsv` (length, contig and circular
   counts, GC, length-weighted depth, CheckM completeness/contamination/strain
-  heterogeneity/lineage) and `contigs.tsv` (header, genome, length and the assembler's
+  heterogeneity/lineage; GC is computed in plain SQL because miint has no composition
+  scalar, duckdb-miint#282) and `contigs.tsv` (header, genome, length and the assembler's
   `raw_name`, `circularity`, `depth`, `mult`). Filters: `--kind` (default LCG and MAG),
   `--min-bp`/`--max-bp`, `--min-completeness`/`--max-contamination`. It refuses and
   writes nothing on a pending or invalidated prep_sample, a prep_sample whose biosample
