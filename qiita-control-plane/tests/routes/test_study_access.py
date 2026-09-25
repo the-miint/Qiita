@@ -480,7 +480,7 @@ async def _wait_until_blocked_by(pool, blocker, task: asyncio.Task) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _REQUEST_TIMEOUT_S
     while loop.time() < deadline:
-        assert not task.done(), f"request finished without waiting: {task.result()}"
+        assert not task.done(), "request finished without waiting on the held lock"
         waiting = await pool.fetchval(
             "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
             blocker_pid,
@@ -495,7 +495,7 @@ async def _cancel(task: asyncio.Task | None) -> None:
     if task is not None and not task.done():
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
+            await asyncio.wait_for(task, _REQUEST_TIMEOUT_S)
 
 
 async def test_change_waits_for_a_concurrent_change_and_checks_the_committed_tier(ctx):
@@ -581,6 +581,8 @@ async def test_crossed_changes_deadlock_and_the_request_gets_409(ctx):
         tr = other.transaction()
         await tr.start()
         try:
+            # Setting deadlock_timeout needs a privileged role; the test DB
+            # connects as a superuser (docker compose and the host-Postgres action).
             await other.execute("SET LOCAL deadlock_timeout = '60s'")
             await other.execute(
                 "SELECT 1 FROM qiita.study_access"
