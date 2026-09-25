@@ -5,7 +5,7 @@ from typing import Annotated, ClassVar
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from qiita_common.models._base import PatchRequestModel
-from qiita_common.models.reference import Tier
+from qiita_common.models.reference import STORABLE_ACCESS_TIERS, Tier
 
 # Column-length budgets mirror the qiita.study schema; keeping the limits
 # here lets Pydantic reject oversized inputs before they hit Postgres.
@@ -107,8 +107,8 @@ class StudyResponse(BaseModel):
 
 def _reject_public_tier(tier: Tier) -> Tier:
     """`public` is the implicit tier of a caller with no row, never a stored
-    value (the `study_access_no_public_tier` CHECK); reject it before the DB."""
-    if tier == Tier.PUBLIC:
+    value; reject it before the DB."""
+    if tier not in STORABLE_ACCESS_TIERS:
         raise ValueError("access_tier cannot be 'public'; revoke the row instead")
     return tier
 

@@ -176,6 +176,20 @@ async def fetch_study_access_row(
     )
 
 
+async def lock_caller_study_access_row(
+    conn: asyncpg.Connection, *, study_idx: int, principal_idx: int
+) -> None:
+    """Share-lock the caller's own row on the study, if they have one, for the
+    rest of the transaction. A concurrent change or revoke of that row waits
+    until this transaction ends; one that already committed is what the next
+    read sees."""
+    await conn.execute(
+        "SELECT 1 FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2 FOR SHARE",
+        study_idx,
+        principal_idx,
+    )
+
+
 async def insert_study_access(
     conn: asyncpg.Connection,
     *,

@@ -210,6 +210,10 @@ class Tier(StrEnum):
     ADMIN = "admin"
 
 
+# The tiers a `study_access` row can carry (`study_access_no_public_tier`).
+STORABLE_ACCESS_TIERS: frozenset[Tier] = frozenset({Tier.VIEWER, Tier.MEMBER, Tier.ADMIN})
+
+
 ReferenceKind = Literal["sequence_reference", "taxonomy_authority", "artifact_sequence_set"]
 """Kinds of reference, mirroring the `qiita.reference.kind` TEXT/CHECK column
 (NOT a Postgres ENUM — see the reference migrations). `artifact_sequence_set` is

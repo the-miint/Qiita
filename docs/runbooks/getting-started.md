@@ -122,8 +122,8 @@ qiita study access grant --study-idx "$STUDY_IDX" --email colleague@example.org 
 qiita study access list --study-idx "$STUDY_IDX"
 ```
 
-`--tier` is `viewer`, `member`, or `admin`; adding biosamples and samples to the
-study needs `admin`. `qiita study access set-tier` and `revoke` take
+`--tier` is `viewer`, `member`, or `admin`; creating biosamples, prep_samples or
+sequenced_samples in the study needs `admin`. `qiita study access set-tier` and `revoke` take
 the `--principal-idx` that `list` shows. Who can change which rows is in
 [`auth.md`](../auth.md) under *Study access*.
 
@@ -181,7 +181,8 @@ qiita biosample create-field \
 the display name you give is the `KEY` you then pass to `--metadata`.
 
 Putting a biosample into a study you do not own needs `admin` access on it,
-granted by one of its admins with `qiita study access grant`.
+granted with `qiita study access grant` by one of the study's admins or by a
+`wet_lab_admin`.
 
 ## 4. Build the pre-flight file
 

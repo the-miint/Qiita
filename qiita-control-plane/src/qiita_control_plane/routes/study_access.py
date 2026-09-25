@@ -3,8 +3,16 @@
 Who may do what is `auth.study_access_policy`; this module applies it. Every
 mutation records an `auth_event` in the same transaction, because a revoke
 hard-deletes the row and would otherwise leave no trace of who removed whom.
+
+A mutation share-locks the caller's own row before reading their standing, so
+a concurrent revoke or demotion of the caller either finishes first (and this
+request sees it) or waits for this one. Change-tier and revoke then lock the
+target row for update. Two callers changing each other's rows at once lock in
+opposite orders; Postgres aborts one with a deadlock, returned as a 409.
 """
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 import asyncpg
@@ -35,6 +43,7 @@ from ..repositories.study_access import (
     fetch_study_access_row,
     insert_study_access,
     list_study_access,
+    lock_caller_study_access_row,
     update_study_access_tier,
 )
 
@@ -47,6 +56,7 @@ _MSG_NO_ACCOUNT = (
 _MSG_ACCOUNT_INACTIVE = "that account is disabled or retired"
 _MSG_CANNOT_LIST = "listing study access requires member access or higher on the study"
 _MSG_CANNOT_MANAGE = "managing study access requires member access or higher on the study"
+_MSG_CONCURRENT = "another access change on this study ran at the same time; retry"
 
 
 def _response(row: asyncpg.Record) -> StudyAccessResponse:
@@ -63,6 +73,26 @@ async def _standing(
     if row is None:
         raise HTTPException(status_code=404, detail=f"study {study_idx} not found")
     return policy.standing_of(caller, row)
+
+
+@asynccontextmanager
+async def _mutation_tx(tx: TxConnFactory) -> AsyncIterator[asyncpg.Connection]:
+    """The route's transaction, with a lock-order deadlock returned as a 409."""
+    try:
+        async with tx() as conn:
+            yield conn
+    except asyncpg.DeadlockDetectedError:
+        raise HTTPException(status_code=409, detail=_MSG_CONCURRENT)
+
+
+async def _locked_standing(
+    conn: asyncpg.Connection, *, caller: Principal, study_idx: int
+) -> policy.Standing:
+    """`_standing`, after share-locking the caller's own row (module docstring)."""
+    await lock_caller_study_access_row(
+        conn, study_idx=study_idx, principal_idx=caller.principal_idx
+    )
+    return await _standing(conn, caller=caller, study_idx=study_idx)
 
 
 def _require_can_manage(standing: policy.Standing) -> None:
@@ -111,8 +141,8 @@ async def grant_study_access(
     email or it is disabled or retired; 409 when the grantee already has a
     row (change it with PATCH).
     """
-    async with tx() as conn:
-        standing = await _standing(conn, caller=caller, study_idx=study_idx)
+    async with _mutation_tx(tx) as conn:
+        standing = await _locked_standing(conn, caller=caller, study_idx=study_idx)
         if not policy.can_grant(standing, body.access_tier):
             raise HTTPException(
                 status_code=403,
@@ -137,12 +167,14 @@ async def grant_study_access(
             existing = await fetch_study_access_row(
                 conn, study_idx=study_idx, principal_idx=grantee.principal_idx
             )
-            current = existing["access_tier"] if existing is not None else "unknown"
+            if existing is None:
+                # Revoked between our INSERT's conflict and this read.
+                raise HTTPException(status_code=409, detail=_MSG_CONCURRENT)
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"that account already has {current!r} access on study {study_idx};"
-                    " change the tier instead"
+                    f"that account already has {existing['access_tier']!r} access on"
+                    f" study {study_idx}; change the tier instead"
                 ),
             )
         await record_event(
@@ -164,15 +196,14 @@ async def change_study_access_tier(
     caller: Principal = Depends(require_scope(Scope.STUDY_WRITE)),
 ) -> StudyAccessResponse:
     """Change one grantee's tier. Allowed iff the caller may revoke the row's
-    current tier and grant the new one. Setting the tier it already has
-    returns the row unchanged and records nothing."""
-    async with tx() as conn:
-        standing = await _standing(conn, caller=caller, study_idx=study_idx)
+    current tier and grant the new one. Setting the tier it already has, when
+    the caller could have changed it, returns the row unchanged and records
+    nothing."""
+    async with _mutation_tx(tx) as conn:
+        standing = await _locked_standing(conn, caller=caller, study_idx=study_idx)
         _require_can_manage(standing)
         row = await _locked_row(conn, study_idx=study_idx, principal_idx=principal_idx)
         current = Tier(row["access_tier"])
-        if current == body.access_tier:
-            return _response(row)
         if not policy.can_change_tier(standing, current=current, new=body.access_tier):
             raise HTTPException(
                 status_code=403,
@@ -181,6 +212,8 @@ async def change_study_access_tier(
                     f" to {str(body.access_tier)!r}"
                 ),
             )
+        if current == body.access_tier:
+            return _response(row)
         await update_study_access_tier(
             conn, study_idx=study_idx, principal_idx=principal_idx, access_tier=body.access_tier
         )
@@ -206,10 +239,11 @@ async def revoke_study_access(
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     caller: Principal = Depends(require_scope(Scope.STUDY_WRITE)),
 ) -> StudyAccessResponse:
-    """Delete one grantee's row and return it as it was. Revoking the owner's row leaves the owner's
-    access in place (the owner bypass in `require_study_access`)."""
-    async with tx() as conn:
-        standing = await _standing(conn, caller=caller, study_idx=study_idx)
+    """Delete one grantee's row and return it as it was. Revoking the owner's
+    row leaves the owner's access in place (the owner bypass in
+    `require_study_access`)."""
+    async with _mutation_tx(tx) as conn:
+        standing = await _locked_standing(conn, caller=caller, study_idx=study_idx)
         _require_can_manage(standing)
         row = await _locked_row(conn, study_idx=study_idx, principal_idx=principal_idx)
         current = Tier(row["access_tier"])

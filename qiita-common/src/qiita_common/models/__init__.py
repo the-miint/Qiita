@@ -171,6 +171,7 @@ from qiita_common.models.reference import (
     INDEX_TYPE_RYPE_ROUTER,
     MAX_EXPORTED_FEATURE_ENTITIES,
     READ_MASK_BUCKET,
+    STORABLE_ACCESS_TIERS,
     VALID_STATUS_TRANSITIONS,
     AssemblyGenomeMapResponse,
     ExportedFeature,
@@ -491,6 +492,7 @@ __all__ = [
     "ReferenceStatus",
     "ReferenceStatusUpdate",
     "Tier",
+    "STORABLE_ACCESS_TIERS",
     # Terminology.
     "MAX_TERMINOLOGY_VERSION_LENGTH",
     "TerminologyFilename",

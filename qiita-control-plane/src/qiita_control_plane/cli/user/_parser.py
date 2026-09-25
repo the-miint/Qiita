@@ -34,6 +34,7 @@ from qiita_common.api_paths import (
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
+    STORABLE_ACCESS_TIERS,
     BiosamplePatchRequest,
     BiosampleStudyFieldCreateRequest,
     FieldDataType,
@@ -300,8 +301,7 @@ def _build_parser() -> argparse.ArgumentParser:
         patch_json_fields=("extra_metadata",),
     )
 
-    # Stored tiers only: 'public' is the absence of a row, so it is never granted.
-    grantable_tiers = tuple(t.value for t in Tier if t != Tier.PUBLIC)
+    grantable_tiers = tuple(t.value for t in Tier if t in STORABLE_ACCESS_TIERS)
     p_study_access = p_study_sub.add_parser(
         "access",
         help="List, grant, change, and revoke who can access a study",

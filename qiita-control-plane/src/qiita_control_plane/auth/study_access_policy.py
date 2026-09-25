@@ -21,7 +21,7 @@ because `require_study_access` lets the owner through without one.
 from enum import StrEnum
 
 from qiita_common.auth_constants import SystemRole
-from qiita_common.models import Tier
+from qiita_common.models import STORABLE_ACCESS_TIERS, Tier
 
 from ..repositories.study_access import CallerStudyAccessRow
 from .principal import Principal
@@ -40,7 +40,7 @@ class Standing(StrEnum):
     NONE = "none"  # no row
 
 
-_ALL_GRANTABLE = frozenset({Tier.ADMIN, Tier.MEMBER, Tier.VIEWER})
+_ALL_GRANTABLE = STORABLE_ACCESS_TIERS
 _MEMBER_AND_VIEWER = frozenset({Tier.MEMBER, Tier.VIEWER})
 
 _CAN_LIST = frozenset({Standing.STAFF, Standing.ADMIN, Standing.MEMBER})

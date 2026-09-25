@@ -1,7 +1,4 @@
-"""qiita user CLI — study subcommand.
-
-Split out of the former single-file ``cli.user`` module; behavior unchanged.
-"""
+"""qiita user CLI — study subcommands: create, and access list/grant/set-tier/revoke."""
 
 import argparse
 
