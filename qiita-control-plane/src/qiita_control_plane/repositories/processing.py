@@ -21,8 +21,8 @@ are the twin of the mask ones in `repositories.mask_definition`, and are deliber
 not merged with them: the two gates carry different state sets, so the skip rules and
 the response buckets differ, and a merged writer would have to interpolate the table
 and key column into a lifecycle UPDATE for a saving of about thirty lines. What IS
-shared is factored out — the narrowing predicate (`_sample_scope`) and the gate's state
-constants (`repositories.assembly`).
+shared is factored out — the narrowing predicate (`_sample_scope`). The gate's state
+constants are `repositories.assembly`'s.
 """
 
 import json

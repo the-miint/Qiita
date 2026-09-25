@@ -107,10 +107,9 @@ from ._helpers import GATE_ROSTER_HARD_CAP, cap_rows, gate_roster_narrowing_idx
 
 _MSG_MASK_NOT_FOUND = "Mask definition not found"
 
-# Hard caps on the two mask reads. The mask list is bounded by how many distinct
-# read-filtering configs the fleet has minted; the roster by GATE_ROSTER_HARD_CAP.
-# Both return `truncated` rather than paginating — a caller that hits either cap
-# should narrow with a filter.
+# Hard cap on the mask list, bounded by how many distinct read-filtering configs the
+# fleet has minted. It returns `truncated` rather than paginating; a caller that hits
+# it should narrow with a filter. The roster's cap is GATE_ROSTER_HARD_CAP.
 _MASK_LIST_HARD_CAP = 1_000
 
 

@@ -25,9 +25,9 @@ from . import gate_state_literal, require_transaction
 from .alignment_definition import list_completed_alignment_samples
 
 # The `mask_sample` states, asserted against the Literal so a renamed member fails at
-# import rather than matching no rows — the one copy every reader and writer of the
-# gate compares against. A consumer of a pass-set proceeds on `completed` alone;
-# `fetch_mask_sample_state` is the contract.
+# import rather than matching no rows — the one copy every Python comparison against the
+# gate imports. The SQL in this module still spells the labels inline. A consumer of a
+# pass-set proceeds on `completed` alone; `fetch_mask_sample_state` is the contract.
 MASK_SAMPLE_PENDING = gate_state_literal("pending", MaskSampleState)
 MASK_SAMPLE_COMPLETED = gate_state_literal("completed", MaskSampleState)
 MASK_SAMPLE_INVALIDATED = gate_state_literal("invalidated", MaskSampleState)

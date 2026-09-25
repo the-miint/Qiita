@@ -74,9 +74,6 @@ class MaskDefinitionDeprecated(Exception):
         super().__init__(detail)
 
 
-# The roster CTE below synthesizes only `pending` and `completed`; `invalidated` can
-# only be read off an existing mask_sample row.
-
 # Per-(mask, sample) masking state.
 #
 # The gate table (`qiita.mask_sample`) is the primary source: both masking paths
@@ -318,6 +315,8 @@ async def list_mask_definitions(
     length > cap means the set exceeded the cap.
     """
     args: list = [*_MASKED_SAMPLE_ARGS]
+    # Not a leading bind: the roster CTE synthesizes only `pending` and `completed`,
+    # and `invalidated` can only be read off an existing mask_sample row.
     args.append(MASK_SAMPLE_INVALIDATED)
     invalidated_param = f"${len(args)}"
     scope, narrowed = sample_scope_sql(
