@@ -1374,10 +1374,10 @@ def test_load_actions_read_mask_audience_is_admin_only():
 
 
 def test_load_actions_read_mask_finalizes_gate_after_register_files():
-    """`finalize-mask-sample` (the per-sample mask_sample completion writer) must be
-    the LAST step and run strictly AFTER `register-files`: the gate must not read
-    'completed' until the masked reads are durable in DuckLake. Pins the terminal
-    ordering so a reorder that flips the gate before register-files surfaces here."""
+    """`finalize-mask-sample` (the per-sample mask_sample completion writer) must run
+    strictly AFTER `register-files`: the gate must not read 'completed' until the
+    masked reads are durable in DuckLake. Pins that ordering so a reorder that flips
+    the gate before register-files surfaces here."""
     from pathlib import Path
 
     from qiita_control_plane.actions import load_actions
@@ -1391,7 +1391,7 @@ def test_load_actions_read_mask_finalizes_gate_after_register_files():
     assert names.index("persist-read-metrics") < names.index("register-files")
 
 
-def test_load_actions_read_mask_persists_syndna_counts_before_the_gate():
+def test_load_actions_read_mask_persists_syndna_counts_after_the_gate():
     """`persist-syndna-read-count` consumes the `syndna` step's `alignment`, is gated
     on the same `when:` as that step, and is the last entry: appended rather than
     inserted, so no earlier entry's position moved for a ticket resumed across the

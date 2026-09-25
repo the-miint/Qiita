@@ -313,9 +313,9 @@ steps:
 
   # Persist the reads aligned to each SynDNA insert (ungated, mapped-primary)
   # from the syndna step's `alignment` output into qiita.syndna_read_count.
-  # Gated with the step that produces its input. Last, so adding it shifted no
-  # earlier entry's position (resume matches completed steps by position). Until
-  # it has run, a 'completed' sample has no counts and the export refuses it.
+  # Gated with the step that produces its input. Resume matches completed steps
+  # by position, so a new entry goes after the existing ones, never between them.
+  # Until this has run, a 'completed' sample has no counts and the export refuses it.
   - action: persist-syndna-read-count
     when: syndna_enabled
     inputs: [alignment]

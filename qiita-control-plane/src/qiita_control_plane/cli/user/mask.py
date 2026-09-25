@@ -122,9 +122,8 @@ DEFAULT_SYNDNA_TABLE_FORMAT = "biom"
 
 # Where an insert's public name comes from: the `species` rank of the reference's
 # taxonomy (DuckLake, over a reference DoGet), or the FASTA header the reference load
-# recorded (Postgres, in the route's response). Species by default: a reference loaded
-# before the load recorded headers has none, and the SynDNA insert reference's
-# taxonomy carries each insert's header as its species.
+# recorded (Postgres, in the route's response). Why species is the default, and how to
+# load a reference for it, is in docs/runbooks/spike-in-reference.md.
 FEATURE_NAME_SOURCES = ("species", "accession")
 DEFAULT_FEATURE_NAME_SOURCE = "species"
 

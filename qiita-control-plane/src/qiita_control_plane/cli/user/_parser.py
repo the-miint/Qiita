@@ -912,8 +912,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mask_syndna.add_argument(
         "--data-plane-url",
         help=(
-            "gRPC URL of the data plane, needed for --feature-names species. From off the"
-            " deploy host use the public TLS edge (e.g."
+            "gRPC URL of the data plane; needed for --feature-names species, the"
+            " default. From off the deploy host use the public TLS edge (e.g."
             " grpc+tls://qiita.example.com:443)."
         ),
     )

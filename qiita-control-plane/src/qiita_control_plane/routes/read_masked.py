@@ -485,8 +485,9 @@ async def get_syndna_read_count_route(
             detail=(
                 f"{len(uncounted)} selected prep_sample(s) have no SynDNA read counts under"
                 f" mask {mask_idx} (e.g. {first_few(uncounted)}). Either the masking"
-                " ticket has not yet written them (retry once it completes, or redrive it"
-                " if it failed), or the prep_sample was masked before counts were"
+                " ticket has not yet written them (retry once it completes, or ask an"
+                " operator to redrive it if it failed), or the prep_sample was masked"
+                " before counts were"
                 " persisted (ask an operator to run `qiita-admin backfill"
                 " syndna-read-count`)"
             ),
