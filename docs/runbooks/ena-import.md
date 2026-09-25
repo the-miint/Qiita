@@ -116,6 +116,15 @@ A control-plane restart re-drives every accession still `pending`, `resolving` o
 accessions fail with that reason instead, and a re-import by an active admin picks
 them up.
 
+`qiita submit-ena-import ACCESSION [ACCESSION ...]` (or `--from-file FILE`, one accession per
+line, blank lines and `#` comments skipped) drives the batch endpoints above. It
+validates every accession locally before submitting — one bad shape refuses the whole
+call — then by default polls to terminal, printing each item's state change and
+exiting `1` if any item ends `failed`; `--no-watch` returns right after submit.
+`qiita ena-import-status IDX` reads a batch's current state and always exits `0` once
+the read itself succeeds. See the REST bullets above for the state set and what each
+field means.
+
 The actual read download runs as the `download-ena-study` workflow
 (`workflows/download-ena-study/1.0.0.yaml`), the same `qiita ticket status` /
 `qiita ticket logs` / `qiita ticket run` commands used for any other workflow apply to

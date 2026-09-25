@@ -65,6 +65,7 @@ from .alignment import _handle_alignment_cohort, _handle_alignment_list
 from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_export
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
+from .ena_import import _handle_ena_import_status, _handle_submit_ena_import
 from .feature_table import DEFAULT_TABLE_FORMAT, TABLE_FORMATS, _handle_feature_table_build
 from .mask import (
     DEFAULT_FEATURE_NAME_SOURCE,
@@ -1778,6 +1779,60 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Max seconds to wait for the work_ticket under --watch (default: 86400)",
     )
     p_submit_reads.set_defaults(handler=_handle_submit_reads)
+
+    p_ena_import = sub.add_parser(
+        "submit-ena-import",
+        help="Submit a batch ENA study import (POST /ena-import-batch)",
+        description=(
+            "Submit one or more INSDC STUDY accessions (PRJNA/PRJEB/PRJDB/ERP/SRP/DRP)"
+            " for import: each becomes one qiita.study, with its runs registered and"
+            " downloaded via the download-ena-study workflow. Accessions may be given"
+            " positionally or via --from-file (one per line; blank lines and"
+            " '#'-prefixed comments are skipped). Requires wet_lab_admin or"
+            " system_admin."
+        ),
+    )
+    p_ena_import.add_argument(
+        "accessions",
+        nargs="*",
+        help="INSDC STUDY accession(s), e.g. PRJEB11419. Not valid with --from-file.",
+    )
+    p_ena_import.add_argument(
+        "--from-file",
+        type=Path,
+        help="Read accessions from FILE instead of the positional arguments, one per line.",
+    )
+    p_ena_import.add_argument(
+        "--no-watch",
+        action="store_true",
+        help="Submit the batch and exit without polling. Default polls until every item"
+        " is terminal.",
+    )
+    p_ena_import.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds between batch polls under --watch (default: 2.0)",
+    )
+    p_ena_import.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=24 * 3600,
+        help="Max seconds to wait for every item to reach a terminal state under --watch"
+        " (default: 86400)",
+    )
+    p_ena_import.set_defaults(handler=_handle_submit_ena_import)
+
+    p_ena_import_status = sub.add_parser(
+        "ena-import-status",
+        help="Read a batch ENA import's status (GET /ena-import-batch/{idx})",
+    )
+    p_ena_import_status.add_argument(
+        "ena_import_batch_idx",
+        type=int,
+        help="Batch idx returned by `qiita submit-ena-import`.",
+    )
+    p_ena_import_status.set_defaults(handler=_handle_ena_import_status)
 
     p_submit_pacbio = sub.add_parser(
         "submit-pacbio-ingest",

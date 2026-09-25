@@ -21,6 +21,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`qiita submit-ena-import` / `qiita ena-import-status` submit and watch a batch ENA
+  study import from the CLI (#TBD).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
+  `--from-file`, one accession per line) validates every accession locally, `POST`s
+  `/ena-import-batch`, and by default polls to terminal — printing each item's state
+  change and exiting `1` if any item ends `failed`; `--no-watch` returns right after
+  submit. `ena-import-status IDX` reads a batch's current state. Both require
+  wet_lab_admin or system_admin, matching the routes' own gate.
+
 - **A study reader can export per-prep_sample SynDNA insert read counts as BIOM or Parquet
   (#621).** The read-mask workflow's new `persist-syndna-read-count` action (gated on
   `syndna_enabled`, appended after `finalize-mask-sample`) reduces the `syndna` step's
@@ -3867,10 +3875,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
-- **INSDC accession validation moved into `qiita-common` (#623).** `EnaAccessionKind`,
+- **INSDC accession validation moved into `qiita-common` (#TBD).** `EnaAccessionKind`,
   `InvalidEnaAccessionError`, `detect_accession_kind`, and `validate_study_accession` now
   live in `qiita_common.ena_accession`, not `qiita_control_plane.ena_import.accession` —
-  the CLI's accession checks (`qiita ena-import`) need them without importing the
+  the CLI's accession checks (`qiita submit-ena-import`) need them without importing the
   control plane. `qiita_control_plane.ena_import` re-exports the same names.
 
 - **CLAUDE.md: read DuckLake data through the catalog, never `read_parquet` over its files
