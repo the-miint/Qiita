@@ -120,11 +120,13 @@ def _handle_mask_samples(args: argparse.Namespace, parser: argparse.ArgumentPars
 SYNDNA_TABLE_FORMATS = TABLE_FORMATS
 DEFAULT_SYNDNA_TABLE_FORMAT = "biom"
 
-# Where an insert's public name comes from: the FASTA header the reference load
-# recorded (Postgres, in the route's response), or the `species` rank of the
-# reference's taxonomy (DuckLake, over a reference DoGet).
-FEATURE_NAME_SOURCES = ("accession", "species")
-DEFAULT_FEATURE_NAME_SOURCE = "accession"
+# Where an insert's public name comes from: the `species` rank of the reference's
+# taxonomy (DuckLake, over a reference DoGet), or the FASTA header the reference load
+# recorded (Postgres, in the route's response). Species by default: a reference loaded
+# before the load recorded headers has none, and the SynDNA insert reference's
+# taxonomy carries each insert's header as its species.
+FEATURE_NAME_SOURCES = ("species", "accession")
+DEFAULT_FEATURE_NAME_SOURCE = "species"
 
 
 def _get_syndna_read_count(
@@ -286,7 +288,10 @@ def _handle_mask_syndna_read_count(
     if args.study_idx is None and args.sequenced_pool_idx is None and not args.prep_sample_idx:
         parser.error("name at least one of --study-idx, --sequenced-pool-idx, --prep-sample-idx")
     if args.feature_names == "species" and not args.data_plane_url:
-        parser.error("--feature-names species reads the reference taxonomy; pass --data-plane-url")
+        parser.error(
+            "--feature-names species (the default) reads the reference taxonomy;"
+            " pass --data-plane-url, or --feature-names accession"
+        )
     try:
         token = _common.read_token()
         response = _get_syndna_read_count(

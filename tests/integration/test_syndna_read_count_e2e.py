@@ -1,6 +1,6 @@
 """`qiita mask syndna-read-count` end to end: a study VIEWER, the real control plane
-(the route and its gate) and, for `--feature-names species`, the real data plane
-(a reference DoGet of the taxonomy).
+(the route and its gate) and, for the default `--feature-names species`, the real data
+plane (a reference DoGet of the taxonomy).
 
 The counts are seeded as the read-mask action writes them; the action itself is
 covered in the control plane's DB tier.
@@ -179,23 +179,16 @@ async def test_a_viewer_exports_the_table_in_both_formats_and_namings(
             ]
         )
 
+    dp = ("--data-plane-url", f"grpc://{LOOPBACK_HOST}:{data_plane['port']}")
     biom = tmp_path / "syndna.biom"
-    assert _export(biom) == 0, capsys.readouterr().err
-    # BIOM is sparse: the zero cell is absent.
-    assert _cells(biom, "read_biom") == [(acc, "synDNA_16SrRNA_seq_1_gc=0.26", 12.0)]
+    assert _export(biom, *dp) == 0, capsys.readouterr().err
+    # Species by default; BIOM is sparse, so the zero cell is absent.
+    assert _cells(biom, "read_biom") == [(acc, "syn one", 12.0)]
 
     parquet = tmp_path / "syndna.parquet"
-    rc = _export(
-        parquet,
-        "--format",
-        "parquet",
-        "--feature-names",
-        "species",
-        "--data-plane-url",
-        f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
-    )
+    rc = _export(parquet, "--format", "parquet", "--feature-names", "accession")
     assert rc == 0, capsys.readouterr().err
     assert _cells(parquet, "read_parquet") == [
-        (acc, "syn one", 12.0),
-        (acc, "syn two", 0.0),
+        (acc, "synDNA_16SrRNA_seq_1_gc=0.26", 12.0),
+        (acc, "synDNA_16SrRNA_seq_2_gc=0.36", 0.0),
     ]

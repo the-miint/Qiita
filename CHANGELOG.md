@@ -34,8 +34,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   completed or not counted. `qiita mask syndna-read-count` writes it as BIOM (default)
   or `--format parquet`, each prep_sample's `sample_id` is its biosample accession (`--prefix-pool` for
   `<sequenced_pool_idx>_<accession>`; a shared name is refused) and inserts by the
-  recorded FASTA header or, with `--feature-names species`, the taxonomy's species
-  rank. `qiita-admin backfill syndna-read-count` writes the counts for prep_samples masked
+  taxonomy's species rank over a reference DoGet or, with `--feature-names accession`,
+  the recorded FASTA header. `qiita-admin backfill syndna-read-count` writes the counts for prep_samples masked
   earlier from the `syndna` step output left in each ticket's scratch workspace,
   listing those whose file is gone.
 - **A viewer can export an assembly run's LCGs and MAGs as FASTA with their metadata

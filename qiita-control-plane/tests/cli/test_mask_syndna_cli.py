@@ -115,30 +115,32 @@ def _run(monkeypatch, tmp_path, *extra, response=_TWO):
     )
 
 
-def test_main_writes_a_biom_by_default(monkeypatch, tmp_path, capsys):
-    out = tmp_path / "syndna.biom"
-    assert _run(monkeypatch, tmp_path, "--study-idx", "1", "--output", str(out)) == 0
-    assert {r[0] for r in _cells(out, "biom")} == {"SAMEA1", "SAMEA2"}
-    assert "2 sample(s) x 2 insert(s)" in capsys.readouterr().out
-
-
-def test_main_refuses_a_collision_and_writes_nothing(monkeypatch, tmp_path, capsys):
-    out = tmp_path / "syndna.biom"
-    collide = _response([(1, "SAMEA1", 40, [1, 0]), (2, "SAMEA1", 41, [0, 1])])
-    assert _run(monkeypatch, tmp_path, "--study-idx", "1", "--output", str(out), response=collide)
-    assert "--prefix-pool" in capsys.readouterr().err
-    assert not out.exists()
-
-
-def test_species_names_are_read_from_the_reference_taxonomy(monkeypatch, tmp_path):
-    taxonomy = pa.table({"feature_idx": [11, 12], "species": ["s1", "s2"]})
+def _fake_species(monkeypatch, names=("s1", "s2")):
+    taxonomy = pa.table({"feature_idx": [11, 12], "species": list(names)})
 
     def fake_species(base_url, token, con, data_plane_url, reference_idx):
         assert reference_idx == 17
+        assert data_plane_url == "grpc://dp:50051"
         con.register("t", taxonomy)
         return dict(con.execute("SELECT feature_idx, species FROM t").fetchall())
 
     monkeypatch.setattr(mx, "_fetch_species", fake_species)
+
+
+_DP = ("--data-plane-url", "grpc://dp:50051")
+
+
+def test_main_writes_a_biom_named_by_species_by_default(monkeypatch, tmp_path, capsys):
+    _fake_species(monkeypatch)
+    out = tmp_path / "syndna.biom"
+    assert _run(monkeypatch, tmp_path, "--study-idx", "1", "--output", str(out), *_DP) == 0
+    cells = _cells(out, "biom")
+    assert {r[0] for r in cells} == {"SAMEA1", "SAMEA2"}
+    assert {r[1] for r in cells} == {"s1", "s2"}
+    assert "2 sample(s) x 2 insert(s)" in capsys.readouterr().out
+
+
+def test_accession_names_need_no_data_plane(monkeypatch, tmp_path):
     out = tmp_path / "syndna.parquet"
     rc = _run(
         monkeypatch,
@@ -150,19 +152,36 @@ def test_species_names_are_read_from_the_reference_taxonomy(monkeypatch, tmp_pat
         "--format",
         "parquet",
         "--feature-names",
-        "species",
-        "--data-plane-url",
-        "grpc://dp:50051",
+        "accession",
     )
     assert rc == 0
-    assert {r[1] for r in _cells(out, "parquet")} == {"s1", "s2"}
+    assert {r[1] for r in _cells(out, "parquet")} == {_H1, _H2}
+
+
+def test_main_refuses_a_collision_and_writes_nothing(monkeypatch, tmp_path, capsys):
+    _fake_species(monkeypatch)
+    out = tmp_path / "syndna.biom"
+    collide = _response([(1, "SAMEA1", 40, [1, 0]), (2, "SAMEA1", 41, [0, 1])])
+    assert _run(
+        monkeypatch, tmp_path, "--study-idx", "1", "--output", str(out), *_DP, response=collide
+    )
+    assert "--prefix-pool" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_one_species_shared_by_every_insert_is_refused(monkeypatch, tmp_path, capsys):
+    """A plasmid reference whose taxonomy names every member `synthetic construct`
+    must not merge them into one row."""
+    _fake_species(monkeypatch, names=("synthetic construct", "synthetic construct"))
+    out = tmp_path / "syndna.biom"
+    assert _run(monkeypatch, tmp_path, "--study-idx", "1", "--output", str(out), *_DP)
+    assert "share the name" in capsys.readouterr().err
+    assert not out.exists()
 
 
 def test_species_without_a_data_plane_url_and_no_selector_are_usage_errors(monkeypatch, tmp_path):
     out = str(tmp_path / "x.biom")
     with pytest.raises(SystemExit):
-        _run(
-            monkeypatch, tmp_path, "--study-idx", "1", "--output", out, "--feature-names", "species"
-        )
+        _run(monkeypatch, tmp_path, "--study-idx", "1", "--output", out)
     with pytest.raises(SystemExit):
-        _run(monkeypatch, tmp_path, "--output", out)
+        _run(monkeypatch, tmp_path, "--output", out, *_DP)

@@ -904,15 +904,15 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=FEATURE_NAME_SOURCES,
         default=DEFAULT_FEATURE_NAME_SOURCE,
         help=(
-            "Name inserts by the FASTA header the reference load recorded (accession,"
-            " the default) or by the reference taxonomy's species rank (needs"
-            " --data-plane-url)"
+            "Name inserts by the reference taxonomy's species rank (species, the"
+            " default; needs --data-plane-url) or by the FASTA header the reference"
+            " load recorded (accession)"
         ),
     )
     p_mask_syndna.add_argument(
         "--data-plane-url",
         help=(
-            "gRPC URL of the data plane, for --feature-names species. From off the"
+            "gRPC URL of the data plane, needed for --feature-names species. From off the"
             " deploy host use the public TLS edge (e.g."
             " grpc+tls://qiita.example.com:443)."
         ),

@@ -115,15 +115,18 @@ so not the `spikein_read_count_r1r2` total — into `qiita.syndna_read_count`. A
 reader exports them as the table classic Qiita published as `syndna.biom`:
 
 ```bash
-qiita mask syndna-read-count --mask-idx M --study-idx S --output syndna.biom
+qiita mask syndna-read-count --mask-idx M --study-idx S --output syndna.biom \
+  --data-plane-url grpc+tls://<host>:443
 ```
 
 Select by `--study-idx`, `--sequenced-pool-idx` or `--prep-sample-idx` (repeatable;
 the filters intersect). `--format parquet` writes the same values with the zero cells
 kept. Each prep_sample's `sample_id` is its biosample accession; `--prefix-pool` makes it
 `<sequenced_pool_idx>_<accession>` when one biosample was sequenced on two pools.
-Inserts are named by the FASTA header the load recorded, or with `--feature-names
-species --data-plane-url U` by the taxonomy's `species` rank.
+Inserts are named by the taxonomy's `species` rank, read from the data plane (hence
+`--data-plane-url`); load the insert reference with each insert's FASTA header as its
+species. `--feature-names accession` names them by the header the load recorded
+instead, which a reference loaded before headers were recorded does not have.
 
 prep_samples masked before the counts were persisted are refused with a pointer to the
 backfill, which an operator runs on the deploy host with `DATABASE_URL` and
