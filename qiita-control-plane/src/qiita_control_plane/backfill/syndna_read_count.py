@@ -35,12 +35,12 @@ from qiita_common.models import StepProgressState, WorkTicketState
 from ..actions.library import persist_syndna_read_count
 from ..repositories.block import MASK_SAMPLE_COMPLETED
 from ..repositories.syndna_read_count import SYNDNA_REFERENCE_SQL
+from ..workspace import STEP_MANIFEST_FILENAME, step_attempt_dir, ticket_workspace
 
 # The read-mask entry that writes the alignment, and the output binding it writes it
 # under — the names in workflows/read-mask/<version>.yaml.
 _SYNDNA_STEP = "syndna"
 _ALIGNMENT_BINDING = "alignment"
-_MANIFEST_NAME = "manifest.json"
 
 # Every completed (mask, prep_sample) pair under a SynDNA mask with no count rows, with the
 # newest completed read-mask ticket for the pair and the attempt its `syndna` step
@@ -101,7 +101,7 @@ class BackfillPlan:
 
 def _alignment_from_manifest(attempt_dir: Path) -> tuple[Path | None, str | None]:
     """The file the attempt's manifest binds to `alignment`, or why it cannot be had."""
-    manifest = attempt_dir / "output" / _MANIFEST_NAME
+    manifest = attempt_dir / "output" / STEP_MANIFEST_FILENAME
     if not manifest.is_file():
         return None, f"no manifest at {manifest}"
     outputs = json.loads(manifest.read_text()).get("outputs", {})
@@ -135,8 +135,8 @@ async def plan_backfill(pool: asyncpg.Pool, *, ticket_root: Path) -> BackfillPla
         elif r["attempt"] is None:
             reason = f"ticket {r['work_ticket_idx']} has no completed {_SYNDNA_STEP!r} step"
         else:
-            attempt_dir = (
-                ticket_root / str(r["work_ticket_idx"]) / _SYNDNA_STEP / f"attempt-{r['attempt']}"
+            attempt_dir = step_attempt_dir(
+                ticket_workspace(ticket_root, r["work_ticket_idx"]), _SYNDNA_STEP, r["attempt"]
             )
             path, reason = _alignment_from_manifest(attempt_dir)
         pairs.append(Pair(r["mask_idx"], r["prep_sample_idx"], path, reason))

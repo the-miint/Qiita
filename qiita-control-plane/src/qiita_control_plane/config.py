@@ -9,6 +9,7 @@ from pathlib import Path
 from qiita_common.config import require_env
 
 from .fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+from .workspace import WORK_TICKET_SUBDIR
 
 # Local@domain.tld shape check for CONTACT_EMAIL. Deliberately loose —
 # the real test is whether mail reaches the address. See from_env().
@@ -153,12 +154,6 @@ def _parse_optional_positive_int_env(var: str) -> int | None:
     if os.environ.get(var) is None:
         return None
     return _parse_positive_int_env(var, default=1)
-
-
-# The per-ticket workspace root's name under PATH_SCRATCH. Readers that locate a
-# ticket's files outside a running service (the admin backfills) derive the root
-# from this rather than retyping it.
-WORK_TICKET_SUBDIR = "ticket"
 
 
 @dataclass(frozen=True, slots=True)

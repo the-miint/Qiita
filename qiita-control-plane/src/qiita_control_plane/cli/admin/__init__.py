@@ -54,7 +54,8 @@ from ...backfill.mask_adapter_hash import RekeyPlan, apply_rekey, plan_rekey
 from ...backfill.syndna_read_count import BackfillPlan as SyndnaBackfillPlan
 from ...backfill.syndna_read_count import apply_backfill as apply_syndna_backfill
 from ...backfill.syndna_read_count import plan_backfill as plan_syndna_backfill
-from ...config import WORK_TICKET_SUBDIR, _parse_optional_positive_int_env
+from ...config import _parse_optional_positive_int_env
+from ...workspace import WORK_TICKET_SUBDIR
 from .. import _common
 from .._reference_exclusion import add_admin_exclusion_subparsers
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS, open_admin_pool

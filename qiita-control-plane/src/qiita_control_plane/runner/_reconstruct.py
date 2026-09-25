@@ -46,6 +46,7 @@ from ..shard_orchestration import (
     expected_shard_index_types,
     plan_and_submit_shards,
 )
+from ..workspace import step_attempt_dir
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
 from ._mask import MASK_IDX_BINDING
 from ._read_ingest import (
@@ -171,7 +172,7 @@ async def _reconstruct_completed_outputs(
     recovery is a SLURM-backend concern (local steps are synchronous and don't
     survive a restart mid-flight), so this returns its outputs empty — a
     downstream consumer that needs a missing binding fails loudly via KeyError."""
-    attempt_workspace = workspace / entry.name / f"attempt-{completed.attempt}"
+    attempt_workspace = step_attempt_dir(workspace, entry.name, completed.attempt)
     if isinstance(entry, WorkflowAction):
         if entry.name == LibraryPrimitive.PLAN_SHARDS:
             return await _reconstruct_plan_shards_outputs(pool, scope_target, attempt_workspace)

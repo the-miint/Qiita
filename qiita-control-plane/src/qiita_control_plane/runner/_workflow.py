@@ -31,6 +31,7 @@ from qiita_common.models import (
 from .. import step_progress
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
 from ..repositories.mask_definition import fetch_mask_definition_by_idx
+from ..workspace import step_attempt_dir, ticket_workspace
 from ._alignment import (
     ALIGN_MASK_IDX_BINDING,
     ASSEMBLY_PROCESSING_IDX_BINDING,
@@ -201,7 +202,7 @@ async def run_workflow(
     bound: dict[str, Any] = dict(work_ticket["action_context"] or {})
     scope_target = _build_scope_target(work_ticket)
     max_retries: int = work_ticket["max_retries"]
-    workspace = work_ticket_workspace_root / str(work_ticket_idx)
+    workspace = ticket_workspace(work_ticket_workspace_root, work_ticket_idx)
     action: ActionDefinition | None = None
     index: int | None = None
     uploads_to_consume: list[int] = []
@@ -1061,7 +1062,7 @@ async def _run_entry_with_retry(
             backend_client, entry, bound, scope_target, work_ticket_idx=work_ticket_idx
         )
     while True:
-        attempt_workspace = workspace / entry.name / f"attempt-{attempt}"
+        attempt_workspace = step_attempt_dir(workspace, entry.name, attempt)
         # Only a LIVE attempt is adoptable. `attempt` restarts at 0 on every
         # invocation, so a restart-recovery resume of a step that failed at
         # attempt N and escalated to N+1 lands back on N first — and

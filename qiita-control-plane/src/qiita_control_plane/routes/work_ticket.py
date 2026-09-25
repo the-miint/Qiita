@@ -119,6 +119,7 @@ from ..ingest_path import IngestPathError, named_host_paths, resolve_ingest_path
 from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
 from ..step_progress import load_step_progress
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
+from ..workspace import step_attempt_dir, ticket_workspace
 from ._helpers import cap_rows
 
 _log = logging.getLogger(__name__)
@@ -1575,7 +1576,10 @@ async def get_work_ticket_step_logs(
             detail=f"step_name {chosen.step_name!r} is not a valid path segment",
         )
     logs_dir = (
-        ticket_root / str(work_ticket_idx) / chosen.step_name / f"attempt-{chosen.attempt}" / "logs"
+        step_attempt_dir(
+            ticket_workspace(ticket_root, work_ticket_idx), chosen.step_name, chosen.attempt
+        )
+        / "logs"
     )
     stdout, stdout_truncated = read_text_tail(
         logs_dir / "stdout", max_lines=tail_lines, max_bytes=_STEP_LOGS_MAX_TAIL_BYTES
