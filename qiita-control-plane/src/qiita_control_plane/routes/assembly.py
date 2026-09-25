@@ -89,12 +89,11 @@ from ..repositories.assembly import (
     count_assembly_genome_map,
     count_assembly_membership,
     count_assembly_membership_without_genome,
-    fetch_assembly_export_roster,
     fetch_assembly_genome_map,
     fetch_assembly_membership,
     fetch_assembly_sample_state,
 )
-from ..repositories.processing import fetch_processing_by_idx
+from ..repositories.processing import fetch_processing_by_idx, fetch_processing_prep_samples
 from ._helpers import GATE_ROSTER_HARD_CAP, GENOME_MAP_HARD_CAP, authorize_prep_sample_cohort
 
 ASSEMBLY_DOGET_TABLES = frozenset({ASSEMBLED_SEQUENCE_TABLE, ASSEMBLED_SEQUENCE_CHUNKS_TABLE})
@@ -103,10 +102,9 @@ ASSEMBLY_DOGET_TABLES = frozenset({ASSEMBLED_SEQUENCE_TABLE, ASSEMBLED_SEQUENCE_
 # feature-table resolver) signs it in-process for a whole cohort.
 ASSEMBLY_RUN_DOGET_TABLES = ASSEMBLY_DOGET_TABLES | {BIN_QUALITY_TABLE}
 
-# The membership read's JSON cap, sized to the genome map's body budget
-# (`GENOME_MAP_HARD_CAP` in `routes/_helpers.py`): an entry with a myloasm-style
-# `raw_name` serializes to 187 bytes against the map entry's ~90, measured over
-# 250,000 entries (46.8 MB), so this many rows is ~22 MB. The Parquet sibling has no cap.
+# The membership read's JSON cap, sized to `GENOME_MAP_HARD_CAP`'s body budget
+# (`routes/_helpers.py`) at this read's entry size: 187 bytes with a myloasm-style
+# `raw_name`, measured over 250,000 entries. The Parquet sibling has no cap.
 ASSEMBLY_MEMBERSHIP_HARD_CAP = 120_000
 
 assembly_router = APIRouter(prefix=PATH_ASSEMBLY_PREFIX, tags=["assembly"])
@@ -479,12 +477,12 @@ async def list_assembly_export_roster(
     caller: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
     sequenced_pool_idx: int | None = Query(
-        default=None, gt=0, description="Only samples on this sequenced_pool."
+        default=None, gt=0, description="Only prep_samples on this sequenced_pool."
     ),
     study_idx: int | None = Query(
-        default=None, gt=0, description="Only samples linked to this study."
+        default=None, gt=0, description="Only prep_samples linked to this study."
     ),
-    prep_sample_idx: int | None = Query(default=None, gt=0, description="Only this sample."),
+    prep_sample_idx: int | None = Query(default=None, gt=0, description="Only this prep_sample."),
 ) -> AssemblyExportRosterResponse:
     """The prep_samples gated under one run that the caller may read, each with its gate
     state and biosample accession — what `qiita assembly export` walks.
@@ -508,9 +506,10 @@ async def list_assembly_export_roster(
         )
     if await fetch_processing_by_idx(pool, processing_idx) is None:
         raise HTTPException(status_code=404, detail=f"processing {processing_idx} not found")
-    rows = await fetch_assembly_export_roster(
+    rows = await fetch_processing_prep_samples(
         pool,
-        processing_idx=processing_idx,
+        processing_idx,
+        visible_to_principal_idx=None,
         sequenced_pool_idx=sequenced_pool_idx,
         study_idx=study_idx,
         prep_sample_idx=prep_sample_idx,

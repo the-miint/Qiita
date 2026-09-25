@@ -24,7 +24,6 @@ from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import AssemblySampleState
 
 from . import gate_state_literal, require_transaction
-from ._sample_scope import sample_scope_sql
 
 # The two `assembly_sample` states a consumer of contigs may proceed on, asserted
 # against the Literal so a renamed member fails at import rather than matching no
@@ -668,59 +667,4 @@ async def count_assembly_membership(
         " WHERE prep_sample_idx = $1 AND processing_idx = $2",
         prep_sample_idx,
         processing_idx,
-    )
-
-
-# The gate table's alias in the export roster query, which `sample_scope_sql`
-# correlates on.
-_ROSTER_ALIAS = "asm"
-
-
-async def fetch_assembly_export_roster(
-    db: asyncpg.Pool | asyncpg.Connection,
-    *,
-    processing_idx: int,
-    sequenced_pool_idx: int | None,
-    study_idx: int | None,
-    prep_sample_idx: int | None,
-    limit: int,
-) -> list[asyncpg.Record]:
-    """At most `limit` non-retired prep_samples gated under `processing_idx`,
-    ascending, each with its gate state and biosample accession, narrowed by each
-    filter that is not None.
-
-    The /processing roster's query (`repositories.processing.fetch_processing_prep_samples`)
-    with a `study_idx` filter and **without the caller narrowing**: the route applies
-    the per-study read gate to what this returns, so that gate has one definition
-    (`auth.guards.filter_prep_samples_caller_can_read`) rather than a SQL copy beside
-    it. `study_idx` matches an active link only, the links that gate reads.
-    """
-    args: list = [processing_idx]
-    scope, _narrowed = sample_scope_sql(
-        alias=_ROSTER_ALIAS,
-        args=args,
-        sequenced_pool_idx=sequenced_pool_idx,
-        prep_sample_idx=prep_sample_idx,
-        visible_to_principal_idx=None,
-    )
-    if study_idx is not None:
-        args.append(study_idx)
-        scope += (
-            " AND EXISTS (SELECT 1 FROM qiita.prep_sample_to_study pts"
-            f" WHERE pts.prep_sample_idx = {_ROSTER_ALIAS}.prep_sample_idx"
-            f" AND pts.retired = false AND pts.study_idx = ${len(args)})"
-        )
-    args.append(limit)
-    return await db.fetch(
-        f"SELECT {_ROSTER_ALIAS}.prep_sample_idx,"
-        f"       {_ROSTER_ALIAS}.state AS assembly_state,"
-        "        bs.biosample_accession"
-        f"   FROM qiita.assembly_sample {_ROSTER_ALIAS}"
-        f"   JOIN qiita.prep_sample ps ON ps.idx = {_ROSTER_ALIAS}.prep_sample_idx"
-        "   JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
-        f"  WHERE {_ROSTER_ALIAS}.processing_idx = $1"
-        f"{scope}"
-        f"  ORDER BY {_ROSTER_ALIAS}.prep_sample_idx"
-        f"  LIMIT ${len(args)}",
-        *args,
     )

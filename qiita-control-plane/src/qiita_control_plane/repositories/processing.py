@@ -234,10 +234,16 @@ async def fetch_processing_prep_samples(
     *,
     visible_to_principal_idx: int | None,
     sequenced_pool_idx: int | None = None,
+    study_idx: int | None = None,
+    prep_sample_idx: int | None = None,
     limit: int,
 ) -> list[asyncpg.Record]:
     """Return up to `limit` samples assembled under `processing_idx`, ascending by
     prep_sample_idx, each with its gate state.
+
+    Two routes read this: the /processing roster, narrowed to the caller in SQL, and
+    the /assembly export roster, which passes `visible_to_principal_idx=None` and
+    applies the read-tier gate to the rows itself.
 
     `visible_to_principal_idx` has no default, for the reason given on
     `list_processing`.
@@ -258,8 +264,9 @@ async def fetch_processing_prep_samples(
         alias=_ROSTER_ALIAS,
         args=args,
         sequenced_pool_idx=sequenced_pool_idx,
-        prep_sample_idx=None,
+        prep_sample_idx=prep_sample_idx,
         visible_to_principal_idx=visible_to_principal_idx,
+        study_idx=study_idx,
     )
     args.append(limit)
     query = (

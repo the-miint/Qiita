@@ -4,7 +4,7 @@ Two reads answer the same shape of question over two different gates — which
 samples are masked under a `mask_idx` (`repositories.mask_definition`), which are
 assembled under a `processing_idx` (`repositories.processing`) — and both have to
 narrow the sample set identically: exclude entity-retired prep_samples, optional
-`sequenced_pool_idx` / `prep_sample_idx` filters, and the per-study visibility
+`sequenced_pool_idx` / `study_idx` / `prep_sample_idx` filters, and the per-study visibility
 policy for a caller below the bypass role. This module owns that one copy;
 neither reader restates it.
 
@@ -64,6 +64,7 @@ def sample_scope_sql(
     sequenced_pool_idx: int | None,
     prep_sample_idx: int | None,
     visible_to_principal_idx: int | None,
+    study_idx: int | None = None,
 ) -> tuple[str, bool]:
     """Build the roster-narrowing clauses, appending each bound value to `args`.
     Returns (sql, narrowed), where `narrowed` is True iff a caller-supplied
@@ -72,11 +73,12 @@ def sample_scope_sql(
     The SQL is ANDed onto a query whose FROM carries the roster CTE aliased
     `alias`. The retirement exclusion is unconditional and does not count as a
     narrowing — it bounds both reads identically rather than reflecting anything
-    the caller asked for. The three that do: `sequenced_pool_idx` joins through
-    qiita.sequenced_sample, `prep_sample_idx` matches directly, and
-    `visible_to_principal_idx` applies the per-study predicate. Pass None for
-    `visible_to_principal_idx` only for a caller holding the bypass role — it
-    means "see every sample".
+    the caller asked for. The four that do: `sequenced_pool_idx` joins through
+    qiita.sequenced_sample, `study_idx` through an active qiita.prep_sample_to_study
+    link, `prep_sample_idx` matches directly, and `visible_to_principal_idx` applies
+    the per-study predicate. Pass None for `visible_to_principal_idx` only for a
+    caller holding the bypass role, or for one that applies its own read gate to the
+    rows returned — it means "see every sample".
     """
     # `alias` is interpolated into SQL, not bound. Both callers pass a module
     # constant, so nothing reaches this from a request today; the check is what
@@ -92,6 +94,14 @@ def sample_scope_sql(
             f" AND EXISTS (SELECT 1 FROM qiita.sequenced_sample ss"
             f"              WHERE ss.prep_sample_idx = {alias}.prep_sample_idx"
             f"                AND ss.sequenced_pool_idx = ${len(args)})"
+        )
+    if study_idx is not None:
+        narrowed = True
+        args.append(study_idx)
+        clauses += (
+            f" AND EXISTS (SELECT 1 FROM qiita.prep_sample_to_study pts_f"
+            f"              WHERE pts_f.prep_sample_idx = {alias}.prep_sample_idx"
+            f"                AND pts_f.retired = false AND pts_f.study_idx = ${len(args)})"
         )
     if prep_sample_idx is not None:
         narrowed = True

@@ -28,6 +28,7 @@ import re
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import get_args
 
 from qiita_common.api_paths import (
     PATH_ASSEMBLY_MEMBERSHIP_PARQUET,
@@ -47,8 +48,6 @@ from qiita_common.chunking import reassemble_chunks_expr
 from qiita_common.models import AssemblySampleState
 from qiita_common.parquet import PARQUET_MEDIA_TYPE
 
-from ...repositories import gate_state_literal
-from ...repositories.assembly import ASSEMBLY_SAMPLE_COMPLETED, ASSEMBLY_SAMPLE_NO_DATA
 from .. import _common
 
 EXPORT_KINDS = (KIND_LCG, KIND_MAG, KIND_UNBINNED)
@@ -65,10 +64,12 @@ CONTIGS_TSV = "contigs.tsv"
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
-# The two gate states a roster prep_sample is refused on; `completed` and `no_data` are the
-# repository's constants.
-_STATE_PENDING = gate_state_literal("pending", AssemblySampleState)
-_STATE_INVALIDATED = gate_state_literal("invalidated", AssemblySampleState)
+# The two gate states the export proceeds on: `completed` is exported, `no_data` is
+# reported and skipped. Every other state is refused. Checked against the wire type so a
+# renamed member fails at import rather than refusing every prep_sample.
+_STATE_COMPLETED, _STATE_NO_DATA = "completed", "no_data"
+if not {_STATE_COMPLETED, _STATE_NO_DATA} <= set(get_args(AssemblySampleState)):
+    raise ImportError(f"AssemblySampleState no longer has {_STATE_COMPLETED!r}/{_STATE_NO_DATA!r}")
 
 
 class ExportRefused(ValueError):
@@ -166,16 +167,16 @@ def _check_roster(samples: list[dict], *, processing_idx: int) -> tuple[list[dic
     """Split the roster into the prep_samples to export and the ones that assembled
     nothing; refuse a roster the export cannot name or cannot trust.
 
-    A `pending` or `invalidated` prep_sample is refused rather than skipped: its contigs
-    are not to be consumed, and leaving it out would make a pool or study export
-    short with nothing in the files to say so.
+    Any state but `completed` and `no_data` is refused rather than skipped — `pending`
+    and `invalidated` today: its contigs are not to be consumed, and leaving it out
+    would make a pool or study export short with nothing in the files to say so.
     """
     if not samples:
         raise ExportRefused(
             f"no prep_sample under processing {processing_idx} that you can read matches"
             " these filters"
         )
-    unusable = [s for s in samples if s["assembly_state"] in (_STATE_PENDING, _STATE_INVALIDATED)]
+    unusable = [s for s in samples if s["assembly_state"] not in (_STATE_COMPLETED, _STATE_NO_DATA)]
     if unusable:
         listed = ", ".join(f"{s['prep_sample_idx']} ({s['assembly_state']})" for s in unusable)
         raise ExportRefused(
@@ -183,8 +184,8 @@ def _check_roster(samples: list[dict], *, processing_idx: int) -> tuple[list[dic
             f" completed: {listed}. Narrow the export with --prep-sample-idx, or wait for"
             " them."
         )
-    done = [s for s in samples if s["assembly_state"] == ASSEMBLY_SAMPLE_COMPLETED]
-    empty = [s for s in samples if s["assembly_state"] == ASSEMBLY_SAMPLE_NO_DATA]
+    done = [s for s in samples if s["assembly_state"] == _STATE_COMPLETED]
+    empty = [s for s in samples if s["assembly_state"] == _STATE_NO_DATA]
     unnamed = [s["prep_sample_idx"] for s in done if not s["biosample_accession"]]
     if unnamed:
         raise ExportRefused(

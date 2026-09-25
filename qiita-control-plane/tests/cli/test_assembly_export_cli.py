@@ -332,6 +332,8 @@ def test_a_repeated_quality_row_is_refused(served, tmp_path):
     [
         pytest.param([_sample(11), _sample(12, state="pending")], "not completed", id="pending"),
         pytest.param([_sample(11, state="invalidated")], "not completed", id="invalidated"),
+        # A state the export does not know is refused, not silently left out.
+        pytest.param([_sample(11, state="archived")], "not completed", id="unknown-state"),
         pytest.param([_sample(11, accession=None)], "no biosample accession", id="unnamed"),
         pytest.param([_sample(11, accession="SAM/1")], "file name", id="unsafe-name"),
         pytest.param([], "no prep_sample", id="empty"),
