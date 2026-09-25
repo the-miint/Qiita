@@ -896,7 +896,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Make each prep_sample's sample_id <sequenced_pool_idx>_<accession>, so one"
-            " biosample on two pools gets two"
+            " biosample on two pools gets two sample_ids"
         ),
     )
     p_mask_syndna.add_argument(

@@ -379,7 +379,7 @@ async def get_syndna_read_count_route(
     'completed' under the mask and counted (409 otherwise). A named study and named
     prep_samples are authorized before any lookup, so a 403 rather than a 404 or 409
     answers a selector the caller cannot read (a study that does not exist selects
-    nothing, so 404). A pool-only selection is authorized on
+    nothing: 404, or 409 when prep_samples are also named). A pool-only selection is authorized on
     the prep_samples it resolves to, so its 404 / 413 say whether the pool has any
     under the mask.
 

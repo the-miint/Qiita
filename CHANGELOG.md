@@ -32,7 +32,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   pool and/or prep_samples, all-or-nothing at `Tier.VIEWER` on every linked study
   (wet_lab_admin+ bypass), refusing a mask without SynDNA and any selected prep_sample not
   completed or not counted. `qiita mask syndna-read-count` writes it as BIOM (default)
-  or `--format parquet`, each prep_sample's `sample_id` its biosample accession (`--prefix-pool` for
+  or `--format parquet`, each prep_sample's `sample_id` is its biosample accession (`--prefix-pool` for
   `<sequenced_pool_idx>_<accession>`; a shared name is refused) and inserts by the
   recorded FASTA header or, with `--feature-names species`, the taxonomy's species
   rank. `qiita-admin backfill syndna-read-count` writes the counts for prep_samples masked
