@@ -864,8 +864,8 @@ def _build_parser() -> argparse.ArgumentParser:
             " syndna.biom. The selection filters intersect; name at least one. Needs"
             " viewer (or above) on every study each selected prep_sample is linked to,"
             " and every selected prep_sample completed under the mask. Each"
-            " prep_sample's column is named by its biosample accession; the export"
-            " refuses two prep_samples that would share a name."
+            " prep_sample's sample_id is its biosample accession; the export refuses"
+            " two prep_samples that would share one."
         ),
     )
     p_mask_syndna.add_argument("--mask-idx", type=int, required=True)
@@ -895,8 +895,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prefix-pool",
         action="store_true",
         help=(
-            "Name each prep_sample's column <sequenced_pool_idx>_<accession>, so one"
-            " biosample on two pools gets two columns"
+            "Make each prep_sample's sample_id <sequenced_pool_idx>_<accession>, so one"
+            " biosample on two pools gets two"
         ),
     )
     p_mask_syndna.add_argument(

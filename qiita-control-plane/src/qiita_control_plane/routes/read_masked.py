@@ -87,7 +87,7 @@ from qiita_common.models import (
 from ..actions.library import delete_mask_data
 from ..auth.guards import (
     COHORT_MIN_TIER,
-    filter_studies_caller_can_read,
+    require_caller_has_tier_on_all_studies,
     require_human,
     require_scope,
     require_service_with_scope,
@@ -378,7 +378,8 @@ async def get_syndna_read_count_route(
     otherwise; wet_lab_admin and above bypass), and every selected prep_sample must be
     'completed' under the mask and counted (409 otherwise). A named study and named
     prep_samples are authorized before any lookup, so a 403 rather than a 404 or 409
-    answers a selector the caller cannot read. A pool-only selection is authorized on
+    answers a selector the caller cannot read (a study that does not exist selects
+    nothing, so 404). A pool-only selection is authorized on
     the prep_samples it resolves to, so its 404 / 413 say whether the pool has any
     under the mask.
 
@@ -393,13 +394,9 @@ async def get_syndna_read_count_route(
         )
     named = sorted(set(prep_sample_idx or []))
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
-        if study_idx is not None and study_idx not in await filter_studies_caller_can_read(
-            conn, caller=caller, study_idxs=[study_idx], min_tier=COHORT_MIN_TIER
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail=f"requires study access at tier {str(COHORT_MIN_TIER)!r} or higher"
-                f" on study {study_idx}",
+        if study_idx is not None:
+            await require_caller_has_tier_on_all_studies(
+                conn, caller=caller, study_idxs=[study_idx], min_tier=COHORT_MIN_TIER
             )
         if named:
             await authorize_prep_sample_cohort(

@@ -365,7 +365,7 @@ def _patched(
         return _LENGTHS_TICKET
 
     monkeypatch.setattr(ftc, "_create_alignment_doget_ticket", _alignment_ticket)
-    monkeypatch.setattr(ftc, "_create_reference_doget_ticket", _reference_ticket)
+    monkeypatch.setattr(ftc, "create_reference_doget_ticket", _reference_ticket)
 
     rows = _ALIGNMENT if alignment is None else alignment
     readers = {

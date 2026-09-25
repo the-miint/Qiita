@@ -120,7 +120,7 @@ qiita mask syndna-read-count --mask-idx M --study-idx S --output syndna.biom
 
 Select by `--study-idx`, `--sequenced-pool-idx` or `--prep-sample-idx` (repeatable;
 the filters intersect). `--format parquet` writes the same values with the zero cells
-kept. Each prep_sample's column is named by its biosample accession; `--prefix-pool` names it
+kept. Each prep_sample's `sample_id` is its biosample accession; `--prefix-pool` makes it
 `<sequenced_pool_idx>_<accession>` when one biosample was sequenced on two pools.
 Inserts are named by the FASTA header the load recorded, or with `--feature-names
 species --data-plane-url U` by the taxonomy's `species` rank.

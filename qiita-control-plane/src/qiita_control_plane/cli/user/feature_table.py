@@ -85,7 +85,7 @@ _EXCLUSION_SOURCE = "reference_exclusion_response"
 _DENOVO_GENOME_MAP_SOURCE = "denovo_genome_map_response"
 
 # The relations each Flight stream is registered as, for the duration of the one
-# CREATE that drains it (see `_staged_stream`).
+# CREATE that drains it (see `staged_stream`).
 _ALIGNMENT_STREAM = "alignment_stream"
 _LENGTHS_STREAM = "reference_lengths_stream"
 _DENOVO_ALIGNMENT_STREAM = "denovo_alignment_stream"
@@ -369,7 +369,7 @@ def _create_assembly_run_doget_ticket(
     return base64.b64decode(resp["ticket"])
 
 
-def _create_reference_doget_ticket(
+def create_reference_doget_ticket(
     base_url: str, token: str, *, reference_idx: int, table: str
 ) -> bytes:
     """Mint a whole-reference DoGet ticket for one of the reference's lake tables.
@@ -541,12 +541,12 @@ def _registered(con, relation: str, obj) -> Iterator[str]:
 
 
 @contextlib.contextmanager
-def _staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Iterator[str]:
+def staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Iterator[str]:
     """`_registered` over a Flight DoGet stream.
 
     DuckDB pulls the Arrow stream lazily as the query scans `relation`, so the rows are
-    never buffered in Python — the reason each caller below runs exactly one
-    materializing CREATE inside the block and lets the relation go.
+    never buffered in Python — the reason each caller reads the relation exactly once
+    inside the block and lets it go.
 
     **Scanning this relation logs one Arrow "input buffer was poorly aligned" warning per
     projected column (apache/arrow#37195), and no `ensure_alignment` read option removes
@@ -568,7 +568,7 @@ def _stage_from_stream(con, flight_client, ticket: bytes, *, relation: str, tabl
     which genomes survive, and reopening a client later would break the invariant that
     the client lives only for the streams.
     """
-    with _staged_stream(con, flight_client, ticket, relation=relation) as source:
+    with staged_stream(con, flight_client, ticket, relation=relation) as source:
         con.execute(table_sql(source))
 
 
@@ -622,7 +622,7 @@ def _stage_alignment(con, flight_client, ticket: bytes, *, gate: ft.AlignmentGat
     the gate would drop, and a Flight stream cannot be scanned twice. The diagnostics
     therefore run after the stream is released, off the materialized copy.
     """
-    with _staged_stream(con, flight_client, ticket, relation=_ALIGNMENT_STREAM) as source:
+    with staged_stream(con, flight_client, ticket, relation=_ALIGNMENT_STREAM) as source:
         con.execute(
             ft.alignment_table_sql(source)
             if gate is None
@@ -1284,7 +1284,7 @@ def _run_build(
             _stage_from_stream(
                 con,
                 flight_client,
-                _create_reference_doget_ticket(
+                create_reference_doget_ticket(
                     args.base_url, token, reference_idx=reference_idx, table=table
                 ),
                 relation=relation,
@@ -1353,7 +1353,7 @@ def _run_build(
             # `analytic.reconcile.denovo_alignment_statements`. The de novo slice takes
             # no gate: `--circular-gate` is refused alongside this flag, and the CIGAR
             # gate would judge it on a rule align_denovo already applied.
-            with _staged_stream(
+            with staged_stream(
                 con,
                 flight_client,
                 _create_alignment_doget_ticket(

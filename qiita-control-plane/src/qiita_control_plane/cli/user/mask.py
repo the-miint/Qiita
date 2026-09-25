@@ -30,7 +30,7 @@ from qiita_common.models import SyndnaReadCountResponse
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 
 from .. import _common
-from .feature_table import TABLE_FORMATS, _create_reference_doget_ticket, _staged_stream
+from .feature_table import TABLE_FORMATS, create_reference_doget_ticket, staged_stream
 
 
 def _list_mask_definitions(
@@ -152,7 +152,7 @@ def _get_syndna_read_count(
 
 
 def syndna_sample_names(response: SyndnaReadCountResponse, *, prefix_pool: bool) -> list[str]:
-    """Each prep_sample's column name in the file, in `response.samples` order: its
+    """Each prep_sample's `sample_id` in the file, in `response.samples` order: its
     biosample accession, or `<sequenced_pool_idx>_<accession>` under `prefix_pool`.
 
     Raises when a prep_sample has no accession (or, under `prefix_pool`, no pool), or
@@ -185,7 +185,7 @@ def syndna_sample_names(response: SyndnaReadCountResponse, *, prefix_pool: bool)
             else "; pass --prefix-pool, or narrow with --prep-sample-idx"
         )
         raise ValueError(
-            f"{len(shared)} column name(s) would be shared, e.g. {name!r} by prep_samples"
+            f"{len(shared)} sample_id(s) would be shared, e.g. {name!r} by prep_samples"
             f" {idxs}{hint}"
         )
     return names
@@ -222,12 +222,12 @@ def _fetch_species(
     """feature_idx → `species` over the reference's exclusion-aware taxonomy."""
     import pyarrow.flight as flight  # noqa: PLC0415
 
-    ticket = _create_reference_doget_ticket(
+    ticket = create_reference_doget_ticket(
         base_url, token, reference_idx=reference_idx, table=TAXONOMY_SOURCE_TABLE
     )
     with (
         flight.FlightClient(data_plane_url) as client,
-        _staged_stream(con, client, ticket, relation="syndna_taxonomy") as source,
+        staged_stream(con, client, ticket, relation="syndna_taxonomy") as source,
     ):
         rows = con.execute(f"SELECT feature_idx, species FROM {source}").fetchall()
     return {int(feature_idx): species for feature_idx, species in rows}
