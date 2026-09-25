@@ -22,7 +22,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Added
 
 - **Study access can be listed, granted, changed and revoked through the API and CLI
-  (#PR).** `GET/POST /study/{study_idx}/access` and `PATCH/DELETE
+  (#614).** `GET/POST /study/{study_idx}/access` and `PATCH/DELETE
   /study/{study_idx}/access/{principal_idx}`, with `qiita study access
   list|grant|set-tier|revoke`, replace the operator `INSERT INTO qiita.study_access`.
   A grant names the grantee by the email on their account, which must have logged in
