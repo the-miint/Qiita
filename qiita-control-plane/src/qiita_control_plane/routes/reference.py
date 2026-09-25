@@ -911,8 +911,8 @@ _DOGET_ALLOWED_TABLES = frozenset(
         # constants for the same reason as the block-read pair above.
         ASSEMBLED_SEQUENCE_TABLE,
         ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
-        # Per-subject assembly quality. The one entry here that no route signs —
-        # the exclusion below says what that rests on.
+        # Per-subject assembly quality, signed by the human assembly run mint
+        # (routes/assembly.py) and in-process by the feature-table resolver.
         BIN_QUALITY_TABLE,
     }
 )
@@ -929,12 +929,13 @@ _DOGET_ALLOWED_TABLES = frozenset(
 # `reference_taxonomy_visible`, so external taxonomy reads also go through the
 # exclusion view.
 #
-# `bin_quality` is excluded with no route behind it AT ALL: the feature-table
-# resolver mints its ticket in-process (`runner/_feature_table.py`), the way the
-# adapter and shard-roster resolvers mint theirs, and it is absent from
-# `ASSEMBLY_DOGET_TABLES` too. Excluding it here is therefore what leaves it
-# un-mintable over HTTP by anyone, which
-# `test_doget_bin_quality_not_signable_via_reference_route` pins.
+# `bin_quality` is excluded for the reason the assembly surfaces are: its rows are
+# keyed on one assembly run, and the route that signs it over HTTP is the human
+# assembly run mint (`ASSEMBLY_RUN_DOGET_TABLES`), which authorizes that run's
+# prep_sample first. The feature-table resolver signs it in-process
+# (`runner/_feature_table.py`). Excluding it here keeps a reference-scoped ticket
+# from naming it, which `test_doget_bin_quality_not_signable_via_reference_route`
+# pins.
 _REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
     {
         READ_MASKED_TABLE,

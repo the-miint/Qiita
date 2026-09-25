@@ -62,6 +62,7 @@ from ._helpers import (
     _proportion_or_none_arg,
 )
 from .alignment import _handle_alignment_cohort, _handle_alignment_list
+from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_export
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
 from .feature_table import DEFAULT_TABLE_FORMAT, TABLE_FORMATS, _handle_feature_table_build
@@ -888,6 +889,76 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Only prep_samples on this sequenced_pool",
     )
     p_processing_samples.set_defaults(handler=_handle_processing_samples)
+
+    # `assembly export` — one run's genomes as FASTA plus metadata, composed from the
+    # reads a VIEWER holds. See `cli/user/assembly.py` for what it writes.
+    p_assembly = sub.add_parser("assembly", help="Assembly-run output (read-only)")
+    p_assembly_sub = p_assembly.add_subparsers(dest="assembly_cmd", required=True)
+    p_assembly_export = p_assembly_sub.add_parser(
+        "export",
+        help=(
+            "Write one assembly run's genomes as gzipped FASTA, one file per genome,"
+            " with genomes.tsv and contigs.tsv beside them"
+        ),
+    )
+    p_assembly_export.add_argument("--processing-idx", type=int, required=True)
+    scope = p_assembly_export.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--prep-sample-idx", type=int, help="Export this prep_sample's genomes")
+    scope.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help="Export every prep_sample on this pool that you can read",
+    )
+    scope.add_argument(
+        "--study-idx", type=int, help="Export every prep_sample in this study that you can read"
+    )
+    p_assembly_export.add_argument(
+        "--kind",
+        action="append",
+        choices=EXPORT_KINDS,
+        help=(
+            "Genome kind to export; repeat for several. Default:"
+            f" {' and '.join(DEFAULT_EXPORT_KINDS)}. UNBINNED writes one file per residue"
+            " contig."
+        ),
+    )
+    p_assembly_export.add_argument(
+        "--min-bp", type=int, help="Only genomes at least this long (sum of contig lengths)"
+    )
+    p_assembly_export.add_argument(
+        "--max-bp", type=int, help="Only genomes at most this long (sum of contig lengths)"
+    )
+    p_assembly_export.add_argument(
+        "--min-completeness",
+        type=float,
+        help=(
+            "Only genomes CheckM scored at least this complete (percent);"
+            " unscored genomes are excluded"
+        ),
+    )
+    p_assembly_export.add_argument(
+        "--max-contamination",
+        type=float,
+        help=(
+            "Only genomes CheckM scored at most this contaminated (percent);"
+            " unscored genomes are excluded"
+        ),
+    )
+    p_assembly_export.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="An existing directory. Nothing in it is overwritten, and a failure writes nothing.",
+    )
+    p_assembly_export.add_argument(
+        "--data-plane-url",
+        required=True,
+        help=(
+            "gRPC URL of the data plane the contigs stream from"
+            " (e.g. grpc+tls://qiita.example.com:443, or grpc://<host>:50051 on-host)."
+        ),
+    )
+    p_assembly_export.set_defaults(handler=_handle_assembly_export)
 
     # `alignment list` / `cohort` — the discovery a user needs before building a
     # feature table: an --alignment-idx is otherwise unobtainable, and the cohort is

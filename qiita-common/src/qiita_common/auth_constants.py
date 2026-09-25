@@ -98,9 +98,10 @@ class Scope(StrEnum):
     # What it opens to a human PAT is `assembled_sequence` /
     # `assembled_sequence_chunks`: contigs assembled from the `read_masked`
     # pass-set, which TICKET_DOGET already classes as not raw human/host reads —
-    # so this widens WHO may ask for an assembly, never WHAT an assembly ticket
-    # returns. The privacy-sensitive neighbours (READ_MASKED_DOGET, READ_DOGET)
-    # are for the read surfaces and are untouched by it.
+    # plus `bin_quality`, the run's per-subject CheckM rows, which the service
+    # route does not sign (its privacy argument is on the data plane's
+    # `ALLOWED_TABLES` entry). The privacy-sensitive neighbours (READ_MASKED_DOGET,
+    # READ_DOGET) are for the read surfaces and are untouched by it.
     ASSEMBLY_DOGET = "assembly:doget"
     # DoGet against the data plane's masked-read surface (`read_masked`).
     # Deliberately distinct from the generic TICKET_DOGET above: masked reads are

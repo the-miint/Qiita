@@ -63,6 +63,7 @@ from ..miint import duckdb_connect
 from ..repositories.assembly import (
     ASSEMBLY_GENOME_MAP_PAIRS_SQL,
     ASSEMBLY_GENOME_MAP_ROWS_SQL,
+    ASSEMBLY_MEMBERSHIP_ROWS_SQL,
     assembly_genome_source_id,
     insert_assembly_membership_rows,
     upsert_assembly_sample_completed,
@@ -1463,6 +1464,37 @@ async def assembly_genome_map_parquet(
         sql=ASSEMBLY_GENOME_MAP_ROWS_SQL,
         params=([prep_sample_idx], processing_idx),
     )
+
+
+# The membership Parquet's columns, in `ASSEMBLY_MEMBERSHIP_ROWS_SQL`'s order.
+ASSEMBLY_MEMBERSHIP_PARQUET_SCHEMA = pa.schema(
+    [
+        ("feature_idx", pa.int64()),
+        ("kind", pa.string()),
+        ("bin_id", pa.string()),
+        ("raw_name", pa.string()),
+        ("circularity", pa.string()),
+        ("depth", pa.float64()),
+        ("mult", pa.float64()),
+    ]
+)
+
+
+async def assembly_membership_parquet(
+    pool: asyncpg.Pool, *, prep_sample_idx: int, processing_idx: int
+) -> bytes:
+    """One assembly run's membership rows as a Parquet body, uncapped — built the
+    way `_genome_map_parquet_body` builds a map, for the reasons it gives."""
+    sink = pa.BufferOutputStream()
+    await _export_query_to_parquet(
+        pool,
+        sql=ASSEMBLY_MEMBERSHIP_ROWS_SQL,
+        params=(prep_sample_idx, processing_idx),
+        schema=ASSEMBLY_MEMBERSHIP_PARQUET_SCHEMA,
+        sink=sink,
+        compression=PARQUET_COMPRESSION,
+    )
+    return sink.getvalue().to_pybytes()
 
 
 async def export_assembly_member_genome(

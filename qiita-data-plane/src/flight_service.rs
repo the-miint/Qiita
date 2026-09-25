@@ -348,7 +348,8 @@ const ALLOWED_TABLES: &[&str] = &[
     "assembled_sequence",
     "assembled_sequence_chunks",
     // Per-subject CheckM quality for one assembly run, read by the feature-table
-    // resolver to attach completeness/contamination to the genomes it stages.
+    // resolver to attach completeness/contamination to the genomes it stages, and
+    // by a human through the control plane's assembly run mint.
     //
     // PRIVACY: it holds no sequence and no read — one row per assembled subject
     // carrying marker lineage, completeness, contamination, strain heterogeneity,
@@ -362,10 +363,11 @@ const ALLOWED_TABLES: &[&str] = &[
     // `bin_id` is CheckM's Bin Id column, a refined bin's FASTA stem for a MAG but
     // the ASSEMBLER'S CONTIG ID for an LCG or an UNBINNED row (the orchestrator's
     // `assembly_load` job states this), so for those kinds a row does name a contig
-    // — in the assembler's id namespace, not the minted `feature_idx` one. And its
-    // reach is not the reach of `assembled_sequence`: that surface is minted one
-    // prep_sample per ticket behind a per-principal route gate, where this is a
-    // whole-cohort read signed in-process with no route in front of it.
+    // — in the assembler's id namespace, not the minted `feature_idx` one, and a
+    // human who can mint this for a run can also mint that run's contigs. Its
+    // reach has two forms: the human mint signs one prep_sample per ticket behind
+    // the same per-principal gate as `assembled_sequence`, and the feature-table
+    // resolver signs a whole cohort in-process with no route in front of it.
     //
     // `assembly_membership` stays out regardless: it maps a run to its contigs in
     // the MINTED namespace, which is the join into the shared feature space this

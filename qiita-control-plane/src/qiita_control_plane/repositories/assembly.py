@@ -620,3 +620,100 @@ async def count_assembly_membership_without_genome(
         processing_idx,
     )
     return {r["prep_sample_idx"]: r["n"] for r in rows}
+
+
+# =============================================================================
+# The export reads: every membership row of one run, and the readable roster
+# =============================================================================
+
+# One run's membership rows, every kind, with the assembler's report — the row set
+# both membership forms serve (the capped JSON read appends its LIMIT as `$3`; the
+# uncapped Parquet body binds nothing further). No `genome_idx` and no kind
+# allowlist, which are the two things that separate it from the genome map: an
+# export names a subject by `(kind, bin_id)`, and a residue contig is a subject a
+# person may want to look at even though no feature table counts it.
+#
+# The Postgres copy, which keeps a superseded row where the lake's copy replaced it
+# (`routes/assembly.py` module docstring). A consumer pairing these rows with the
+# run's streamed contigs compares the two feature sets rather than trusting either.
+ASSEMBLY_MEMBERSHIP_ROWS_SQL = (
+    "SELECT feature_idx, kind, bin_id, raw_name, circularity, depth, mult"
+    " FROM qiita.assembly_membership"
+    " WHERE prep_sample_idx = $1 AND processing_idx = $2"
+    " ORDER BY kind, bin_id, feature_idx"
+)
+
+
+async def fetch_assembly_membership(
+    db: asyncpg.Pool | asyncpg.Connection,
+    *,
+    prep_sample_idx: int,
+    processing_idx: int,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """At most `limit` of one run's membership rows, in `ASSEMBLY_MEMBERSHIP_ROWS_SQL`
+    order."""
+    return await db.fetch(
+        ASSEMBLY_MEMBERSHIP_ROWS_SQL + " LIMIT $3", prep_sample_idx, processing_idx, limit
+    )
+
+
+async def count_assembly_membership(
+    db: asyncpg.Pool | asyncpg.Connection, *, prep_sample_idx: int, processing_idx: int
+) -> int:
+    """How many rows `fetch_assembly_membership` would return uncapped."""
+    return await db.fetchval(
+        "SELECT count(*) FROM qiita.assembly_membership"
+        " WHERE prep_sample_idx = $1 AND processing_idx = $2",
+        prep_sample_idx,
+        processing_idx,
+    )
+
+
+async def fetch_assembly_export_roster(
+    db: asyncpg.Pool | asyncpg.Connection,
+    *,
+    processing_idx: int,
+    sequenced_pool_idx: int | None,
+    study_idx: int | None,
+    prep_sample_idx: int | None,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """At most `limit` non-retired prep_samples gated under `processing_idx`,
+    ascending, each with its gate state and biosample accession, narrowed by each
+    filter that is not None.
+
+    **Not narrowed to the caller.** The route applies the per-study read gate to
+    what this returns, so the gate has one definition
+    (`auth.guards.filter_prep_samples_caller_can_read`) rather than a SQL copy
+    beside it. `study_idx` matches an active link only, the links that gate reads.
+    """
+    args: list = [processing_idx]
+    where = " WHERE a.processing_idx = $1"
+    if sequenced_pool_idx is not None:
+        args.append(sequenced_pool_idx)
+        where += (
+            " AND EXISTS (SELECT 1 FROM qiita.sequenced_sample ss"
+            " WHERE ss.prep_sample_idx = a.prep_sample_idx"
+            f" AND ss.sequenced_pool_idx = ${len(args)})"
+        )
+    if study_idx is not None:
+        args.append(study_idx)
+        where += (
+            " AND EXISTS (SELECT 1 FROM qiita.prep_sample_to_study pts"
+            " WHERE pts.prep_sample_idx = a.prep_sample_idx AND pts.retired = false"
+            f" AND pts.study_idx = ${len(args)})"
+        )
+    if prep_sample_idx is not None:
+        args.append(prep_sample_idx)
+        where += f" AND a.prep_sample_idx = ${len(args)}"
+    args.append(limit)
+    return await db.fetch(
+        "SELECT a.prep_sample_idx, a.state AS assembly_state, bs.biosample_accession"
+        " FROM qiita.assembly_sample a"
+        " JOIN qiita.prep_sample ps ON ps.idx = a.prep_sample_idx AND ps.retired = false"
+        " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        + where
+        + f" ORDER BY a.prep_sample_idx LIMIT ${len(args)}",
+        *args,
+    )

@@ -36,10 +36,10 @@ KIND_UNBINNED = "UNBINNED"  # a noLCG contig that no refined bin claimed
 ASSEMBLED_SEQUENCE_TABLE = "assembled_sequence"
 ASSEMBLED_SEQUENCE_CHUNKS_TABLE = "assembled_sequence_chunks"
 
-# Per-subject CheckM quality for one assembly run. On both DoGet allowlists but
-# behind no route — the feature-table resolver signs it in-process; the exclusion
-# comment in `routes/reference.py` states what that rests on, and the
-# `ALLOWED_TABLES` entry in `flight_service.rs` carries the privacy argument.
+# Per-subject CheckM quality for one assembly run. On both DoGet allowlists;
+# signed over HTTP only by the human assembly run mint (`routes/assembly.py`) and
+# in-process by the feature-table resolver. The `ALLOWED_TABLES` entry in
+# `flight_service.rs` carries the privacy argument.
 BIN_QUALITY_TABLE = "bin_quality"
 
 # The two quality columns the feature-table arm reads. A named pair rather than a

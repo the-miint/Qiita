@@ -393,8 +393,9 @@ async def test_doget_assembly_surfaces_in_cp_allowlist():
     mirrors the data plane's ALLOWED_TABLES — and the junction must NOT be.
 
     `bin_quality` is on that allowlist and not on this route's: the data plane
-    serves it and the feature-table resolver signs it in-process. Asserting both
-    halves here is what makes the second one deliberate rather than an omission."""
+    serves it, the feature-table resolver signs it in-process, and the human run
+    mint signs it for one run. Asserting both halves here is what makes the second
+    one deliberate rather than an omission."""
     from qiita_control_plane.routes.reference import _DOGET_ALLOWED_TABLES
 
     assert ASSEMBLED_SEQUENCE_TABLE in _DOGET_ALLOWED_TABLES
@@ -414,11 +415,11 @@ async def test_doget_assembly_not_signable_via_reference_route():
 
 
 async def test_doget_bin_quality_not_signable_via_reference_route():
-    """`bin_quality` is on `_DOGET_ALLOWED_TABLES` and behind NO route, which is the
-    only reason it is not requestable: `_REFERENCE_DOGET_TABLES` is derived by
-    SUBTRACTION from that allowlist, so a table added to the superset and forgotten
-    in the subtraction becomes signable through the generic reference route by
-    default. That default is what this pins."""
+    """`bin_quality` is on `_DOGET_ALLOWED_TABLES` and signable only through the
+    human assembly run mint, scoped to one run: `_REFERENCE_DOGET_TABLES` is derived
+    by SUBTRACTION from that allowlist, so a table added to the superset and
+    forgotten in the subtraction becomes signable through the generic reference
+    route by default, with no run scope. That default is what this pins."""
     from qiita_control_plane.routes.reference import _REFERENCE_DOGET_TABLES
 
     assert BIN_QUALITY_TABLE not in _REFERENCE_DOGET_TABLES

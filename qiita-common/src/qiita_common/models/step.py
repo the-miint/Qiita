@@ -372,9 +372,9 @@ class AssemblyRunDoGetTicketRequest(BaseModel):
 
     The scientist-facing counterpart of ``AssemblyDoGetTicketRequest``: the run is
     named in the PATH, so the only thing left for the body is which surface to
-    read. Same closed ``table`` set, same signed filter, same data-plane
-    resolution — the two routes differ in who may ask and how the run is
-    authorized, never in what a ticket returns (``Scope.ASSEMBLY_DOGET``).
+    read. Same signed filter, same data-plane resolution. The closed ``table`` set
+    is the service route's plus ``bin_quality`` (``ASSEMBLY_RUN_DOGET_TABLES`` in
+    the route).
 
     Deliberately not a subclass of its twin: the identifiers moving from body to
     path is the whole difference, and inheriting the pair back in would let a

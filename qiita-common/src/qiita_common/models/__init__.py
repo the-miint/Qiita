@@ -151,6 +151,7 @@ from qiita_common.models.prep_sample import (
     PrepSampleStudyFieldResponse,
 )
 from qiita_common.models.processing import (
+    AssemblyExportRosterResponse,
     AssemblySampleState,
     AssemblySampleStatusUpdate,
     AssemblySampleStatusUpdateResponse,
@@ -174,6 +175,8 @@ from qiita_common.models.reference import (
     STORABLE_ACCESS_TIERS,
     VALID_STATUS_TRANSITIONS,
     AssemblyGenomeMapResponse,
+    AssemblyMembershipEntry,
+    AssemblyMembershipResponse,
     ExportedFeature,
     ExportedFeatureRequest,
     ExportedFeatureResponse,
@@ -467,6 +470,8 @@ __all__ = [
     "ExportedFeatureRequest",
     "ExportedFeatureResponse",
     "AssemblyGenomeMapResponse",
+    "AssemblyMembershipEntry",
+    "AssemblyMembershipResponse",
     "GenomeMapEntry",
     "GenomeMapResponse",
     "GenomeSource",
@@ -683,6 +688,7 @@ __all__ = [
     "MaskStateSource",
     # Processing-run identity and its lifecycle (the assembly twin of the mask
     # lifecycle names above).
+    "AssemblyExportRosterResponse",
     "AssemblySampleState",
     "AssemblySampleStatusUpdate",
     "AssemblySampleStatusUpdateResponse",

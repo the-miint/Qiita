@@ -629,6 +629,44 @@ class AssemblyGenomeMapResponse(BaseModel):
     count: Annotated[int, Field(ge=0)]
 
 
+class AssemblyMembershipEntry(BaseModel):
+    """One `qiita.assembly_membership` row of one assembly run: which subject
+    (`kind`, `bin_id`) a contig belongs to, and the assembler's report on it.
+
+    The four attributes are NULL for a run assembled before the assembler's report
+    was captured. Their meaning is the COMMENT ON COLUMN of the Postgres table.
+    """
+
+    feature_idx: int
+    kind: str
+    bin_id: str
+    raw_name: str | None = None
+    circularity: str | None = None
+    depth: float | None = None
+    mult: float | None = None
+
+
+class AssemblyMembershipResponse(BaseModel):
+    """Returned by GET /assembly/{prep_sample_idx}/{processing_idx}/membership:
+    every membership row of one run, every kind included, ordered by
+    (kind, bin_id, feature_idx).
+
+    The genome map's sibling, over a wider row set: the map admits only the kinds
+    a feature table rolls up and needs every row genome-minted, while this one
+    serves UNBINNED contigs too and does not read `genome_idx` at all. A contig in
+    two subjects of the run is two entries.
+
+    Refuses over its cap with a 413 rather than truncating, and has an uncapped
+    Parquet sibling at `.../membership/parquet`, for the reason
+    `AssemblyGenomeMapResponse` gives.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    processing_idx: Annotated[int, Field(gt=0)]
+    entries: list[AssemblyMembershipEntry]
+    count: Annotated[int, Field(ge=0)]
+
+
 # Upper bound on the entities a caller names in one exported-feature request,
 # counted ACROSS both kinds. Chosen for the same reason as the prep_sample cohort
 # cap in models/_base.py — request-payload size — but not shared with it: that one

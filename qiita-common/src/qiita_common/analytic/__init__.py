@@ -7,11 +7,11 @@ composing the analytic-export routes). They differ in everything *around* the
 analytic — where the inputs come from, how the result is written — so the SQL lives
 here and the streaming and I/O stay with each caller.
 
-They disagree about the analytic in exactly one place, and it is a reachability limit
-rather than a choice: `denovo_map_statements` gates the de novo arm on CheckM scores and
-the client cannot reach `bin_quality` — no route signs a ticket for it, which the
-exclusion in `routes/reference.py` states — so a client-built combined table calls
-`denovo_map_table_sql` ungated.
+They disagree about the analytic in exactly one place: `denovo_map_statements` gates
+the de novo arm on CheckM scores, and a client-built combined table calls
+`denovo_map_table_sql` ungated. The client recipe does not read `bin_quality`. The human
+assembly run mint signs it one prep_sample per ticket, and the recipe has not been
+changed to fetch it.
 
 **Plain SQL text, so nothing here needs a connection of its own.** Callers execute
 these statements on a connection that has miint loaded. (Same shape as `chunking.py`'s

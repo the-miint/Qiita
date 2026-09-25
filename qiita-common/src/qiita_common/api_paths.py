@@ -555,10 +555,11 @@ URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
 # =============================================================================
 # /assembly/* — one assembly run's contigs, and its feature -> genome map
 # =============================================================================
-# The two DoGet routes sign the same ticket for the same data plane surfaces
-# (`assembled_sequence` / `assembled_sequence_chunks`), scoped to ONE assembly
-# run — a `(prep_sample_idx, processing_idx)` pair — and differ only in who may
-# ask and how the pair is authorized. The split mirrors /alignment's exactly, for
+# The two DoGet routes sign the same ticket for the data plane surfaces
+# (`assembled_sequence` / `assembled_sequence_chunks`, and on the human route
+# `bin_quality`), scoped to ONE assembly run — a `(prep_sample_idx,
+# processing_idx)` pair — and differ in who may ask and how the pair is
+# authorized. The split mirrors /alignment's exactly, for
 # the reason Scope.ALIGNMENT_DOGET states there.
 #
 #   PATH_ASSEMBLY_DOGET      service-account-only (Scope.TICKET_DOGET). The job
@@ -574,7 +575,13 @@ URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
 #
 # PATH_ASSEMBLY_GENOME_MAP is not a ticket at all — `genome_idx` exists only in
 # Postgres, so it is a control-plane read, the assembly twin of
-# PATH_REFERENCE_GENOME_MAP.
+# PATH_REFERENCE_GENOME_MAP. PATH_ASSEMBLY_MEMBERSHIP is its sibling over every
+# kind, carrying the assembler's per-contig attributes instead of the genome.
+#
+# PATH_ASSEMBLY_PREP_SAMPLE is the export roster: the samples assembled under one
+# run that the caller may READ, at the tier the reads above check. The
+# /processing roster answers a different question (which samples the caller may
+# submit against) at a higher tier.
 
 PATH_ASSEMBLY_PREFIX = "/assembly"
 PATH_ASSEMBLY_DOGET = "/ticket/doget"
@@ -583,12 +590,18 @@ PATH_ASSEMBLY_GENOME_MAP = "/{prep_sample_idx}/{processing_idx}/genome-map"
 # The Parquet form, uncapped — the de novo twin of
 # PATH_REFERENCE_GENOME_MAP_PARQUET, which carries why it is a segment.
 PATH_ASSEMBLY_GENOME_MAP_PARQUET = "/{prep_sample_idx}/{processing_idx}/genome-map/parquet"
+PATH_ASSEMBLY_MEMBERSHIP = "/{prep_sample_idx}/{processing_idx}/membership"
+PATH_ASSEMBLY_MEMBERSHIP_PARQUET = "/{prep_sample_idx}/{processing_idx}/membership/parquet"
+PATH_ASSEMBLY_PREP_SAMPLE = "/{processing_idx}/prep-sample"
 
 URL_ASSEMBLY_PREFIX = f"{API_PREFIX}{PATH_ASSEMBLY_PREFIX}"
 URL_ASSEMBLY_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_DOGET}"
 URL_ASSEMBLY_RUN_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_RUN_DOGET}"
 URL_ASSEMBLY_GENOME_MAP = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP}"
 URL_ASSEMBLY_GENOME_MAP_PARQUET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP_PARQUET}"
+URL_ASSEMBLY_MEMBERSHIP = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_MEMBERSHIP}"
+URL_ASSEMBLY_MEMBERSHIP_PARQUET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_MEMBERSHIP_PARQUET}"
+URL_ASSEMBLY_PREP_SAMPLE = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_PREP_SAMPLE}"
 
 
 # =============================================================================

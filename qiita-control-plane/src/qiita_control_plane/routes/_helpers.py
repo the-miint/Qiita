@@ -91,8 +91,8 @@ async def require_reference_exists(pool: asyncpg.Pool, reference_idx: int) -> No
 ALIGNMENT_NOT_FOUND_DETAIL = "alignment not found"
 
 
-# Hard cap on a genome map, and the one place in the codebase where exceeding a cap
-# is a refusal rather than a truncation — see `get_reference_genome_map`. Sized from
+# Hard cap on a genome map, where exceeding the cap is a refusal rather than a
+# truncation — see `get_reference_genome_map`. Sized from
 # a response-body budget rather than by borrowing another route's number: an entry
 # serializes to roughly 90 bytes of JSON, so this is a ~22 MB worst case — large
 # but deliverable in one body.
@@ -107,6 +107,11 @@ ALIGNMENT_NOT_FOUND_DETAIL = "alignment not found"
 # Shared by the reference map and the assembly-run map, which are the same read over
 # two feature spaces: two numbers here would let one route refuse what the other
 # serves for no reason a caller could see.
+#
+# The assembly membership read (`routes/assembly.py`) bounds its JSON by this number
+# too, as the same run's other per-contig read. Its entries carry more fields than a
+# map entry, so its worst-case body is larger than the figure above; that size has
+# not been measured.
 GENOME_MAP_HARD_CAP = 250_000
 
 
