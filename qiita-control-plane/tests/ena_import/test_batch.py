@@ -455,7 +455,7 @@ async def test_create_ena_import_batch_seeds_pending_items(
 async def test_create_ena_import_batch_rejects_invalid_accession_writes_nothing(
     postgres_pool, admin_principal, batch_cleanup
 ):
-    from qiita_control_plane.ena_import.accession import InvalidEnaAccessionError
+    from qiita_common.ena_accession import InvalidEnaAccessionError
 
     good = unique_accession("PRJNA")
     bad = "SAMN0000001"  # a SAMPLE accession, not a study accession

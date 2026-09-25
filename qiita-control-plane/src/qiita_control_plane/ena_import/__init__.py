@@ -11,7 +11,12 @@ download workflow + CO job (`ingest_ena_reads`) plus `submit`'s ticket builder;
 and the batch driver that fans this out across studies.
 """
 
-from .accession import EnaAccessionKind, InvalidEnaAccessionError, detect_accession_kind
+from qiita_common.ena_accession import (
+    EnaAccessionKind,
+    InvalidEnaAccessionError,
+    detect_accession_kind,
+)
+
 from .attribute_mapping import map_ena_attributes
 from .batch import (
     BatchImportItemHandle,

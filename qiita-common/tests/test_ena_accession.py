@@ -1,4 +1,4 @@
-"""Tests for INSDC accession-type detection and validation (`ena_import.accession`)."""
+"""Tests for INSDC accession-type detection and validation (`qiita_common.ena_accession`)."""
 
 import pytest
 
@@ -8,7 +8,7 @@ import pytest
     ["PRJEB11419", "PRJNA555783", "PRJDB4321", "ERP012803", "SRP012345", "DRP001234"],
 )
 def test_detect_accession_kind_study(accession):
-    from qiita_control_plane.ena_import.accession import EnaAccessionKind, detect_accession_kind
+    from qiita_common.ena_accession import EnaAccessionKind, detect_accession_kind
 
     assert detect_accession_kind(accession) is EnaAccessionKind.STUDY
 
@@ -18,21 +18,21 @@ def test_detect_accession_kind_study(accession):
     ["SAMEA3610311", "SAMN01821487", "SAME1234567", "SAMD00123456"],
 )
 def test_detect_accession_kind_sample(accession):
-    from qiita_control_plane.ena_import.accession import EnaAccessionKind, detect_accession_kind
+    from qiita_common.ena_accession import EnaAccessionKind, detect_accession_kind
 
     assert detect_accession_kind(accession) is EnaAccessionKind.SAMPLE
 
 
 @pytest.mark.parametrize("accession", ["ERR1074767", "SRR1234567", "DRR1234567"])
 def test_detect_accession_kind_run(accession):
-    from qiita_control_plane.ena_import.accession import EnaAccessionKind, detect_accession_kind
+    from qiita_common.ena_accession import EnaAccessionKind, detect_accession_kind
 
     assert detect_accession_kind(accession) is EnaAccessionKind.RUN
 
 
 @pytest.mark.parametrize("accession", ["ERX1111111", "SRX1234567", "DRX1234567"])
 def test_detect_accession_kind_experiment(accession):
-    from qiita_control_plane.ena_import.accession import EnaAccessionKind, detect_accession_kind
+    from qiita_common.ena_accession import EnaAccessionKind, detect_accession_kind
 
     assert detect_accession_kind(accession) is EnaAccessionKind.EXPERIMENT
 
@@ -40,7 +40,7 @@ def test_detect_accession_kind_experiment(accession):
 def test_detect_accession_kind_rejects_ers():
     """`ERS*` is NOT a sample prefix in miint (SAMN/SAME/SAMD only); accepting it
     would let a pre-validated accession fail opaquely later in `read_ena`."""
-    from qiita_control_plane.ena_import.accession import (
+    from qiita_common.ena_accession import (
         InvalidEnaAccessionError,
         detect_accession_kind,
     )
@@ -50,7 +50,7 @@ def test_detect_accession_kind_rejects_ers():
 
 
 def test_detect_accession_kind_rejects_empty():
-    from qiita_control_plane.ena_import.accession import (
+    from qiita_common.ena_accession import (
         InvalidEnaAccessionError,
         detect_accession_kind,
     )
@@ -60,7 +60,7 @@ def test_detect_accession_kind_rejects_empty():
 
 
 def test_detect_accession_kind_rejects_blank():
-    from qiita_control_plane.ena_import.accession import (
+    from qiita_common.ena_accession import (
         InvalidEnaAccessionError,
         detect_accession_kind,
     )
@@ -71,7 +71,7 @@ def test_detect_accession_kind_rejects_blank():
 
 @pytest.mark.parametrize("accession", ["FOO123", "NOTANACCESSION", "12345"])
 def test_detect_accession_kind_rejects_unknown_prefix(accession):
-    from qiita_control_plane.ena_import.accession import (
+    from qiita_common.ena_accession import (
         InvalidEnaAccessionError,
         detect_accession_kind,
     )
@@ -81,13 +81,13 @@ def test_detect_accession_kind_rejects_unknown_prefix(accession):
 
 
 def test_validate_study_accession_returns_trimmed():
-    from qiita_control_plane.ena_import.accession import validate_study_accession
+    from qiita_common.ena_accession import validate_study_accession
 
     assert validate_study_accession("  PRJEB11419  ") == "PRJEB11419"
 
 
 def test_validate_study_accession_rejects_non_study_kind():
-    from qiita_control_plane.ena_import.accession import (
+    from qiita_common.ena_accession import (
         InvalidEnaAccessionError,
         validate_study_accession,
     )
@@ -97,7 +97,7 @@ def test_validate_study_accession_rejects_non_study_kind():
 
 
 def test_validate_study_accession_rejects_invalid_shape():
-    from qiita_control_plane.ena_import.accession import (
+    from qiita_common.ena_accession import (
         InvalidEnaAccessionError,
         validate_study_accession,
     )

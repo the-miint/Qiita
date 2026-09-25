@@ -34,6 +34,7 @@ from typing import Any
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, status
+from qiita_common.ena_accession import validate_study_accession
 from qiita_common.models import WorkTicketState
 from qiita_common.models.ena_import import (
     BatchImportItem,
@@ -57,7 +58,6 @@ from ..repositories.ena_import_batch import (
     update_ena_import_batch_item_study_created,
 )
 from ..repositories.study import get_or_create_study_by_ena_accessions
-from .accession import validate_study_accession
 from .miint_resolver import MiintEnaResolver
 from .registration import (
     EnaRunRegistrationStatus,

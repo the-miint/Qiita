@@ -3867,6 +3867,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **INSDC accession validation moved into `qiita-common` (#623).** `EnaAccessionKind`,
+  `InvalidEnaAccessionError`, `detect_accession_kind`, and `validate_study_accession` now
+  live in `qiita_common.ena_accession`, not `qiita_control_plane.ena_import.accession` —
+  the CLI's accession checks (`qiita ena-import`) need them without importing the
+  control plane. `qiita_control_plane.ena_import` re-exports the same names.
+
 - **CLAUDE.md: read DuckLake data through the catalog, never `read_parquet` over its files
   (#611).** Ad-hoc scripts that globbed a table's Parquet read files the catalog does not
   consider live — superseded `assembled_sequence_chunks` and `read_mask` runs left on disk —

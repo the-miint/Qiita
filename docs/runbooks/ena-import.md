@@ -206,4 +206,4 @@ covers, what a green one does *not* prove, and which hatch skips which are in
 
 An unresolvable accession (malformed, or one ENA does not recognize) fails loud with
 an actionable message rather than resolving to a silent empty result — see
-`ena_import.accession` for the accepted prefix sets per accession kind.
+`qiita_common.ena_accession` for the accepted prefix sets per accession kind.
