@@ -46,7 +46,7 @@ from ..shard_orchestration import (
     expected_shard_index_types,
     plan_and_submit_shards,
 )
-from ..workspace import step_attempt_dir
+from ..workspace import step_attempt_dir, step_logs_dir, step_output_dir
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
 from ._mask import MASK_IDX_BINDING
 from ._read_ingest import (
@@ -184,8 +184,8 @@ async def _reconstruct_completed_outputs(
         step_name=entry.name,
         slurm_job_id=completed.slurm_job_id,
         job_name=completed.job_name,
-        output_path=str(attempt_workspace / "output"),
-        logs_path=str(attempt_workspace / "logs"),
+        output_path=str(step_output_dir(attempt_workspace)),
+        logs_path=str(step_logs_dir(attempt_workspace)),
     )
     status = StepStatusWire(status=StepStatus.COMPLETED, raw_state="RECOVERED")
     raw_outputs = await _result_with_infra_retry(

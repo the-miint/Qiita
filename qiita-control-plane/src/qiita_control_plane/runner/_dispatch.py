@@ -35,6 +35,7 @@ from .. import step_progress
 from ..actions.reference import (
     IllegalStatusTransition,
 )
+from ..workspace import step_logs_dir, step_output_dir
 from ._base import (
     _INFRA_UNREACHABLE_KINDS,
     _clear_transient_retry,
@@ -808,8 +809,8 @@ async def _adopt_or_submit(
             step_name=entry.name,
             slurm_job_id=existing.slurm_job_id,
             job_name=existing.job_name,
-            output_path=str(workspace / "output"),
-            logs_path=str(workspace / "logs"),
+            output_path=str(step_output_dir(workspace)),
+            logs_path=str(step_logs_dir(workspace)),
         )
 
     # Resume-only orphan adoption: a 'submitting' row with no job id but a
@@ -850,8 +851,8 @@ async def _adopt_or_submit(
                 step_name=entry.name,
                 slurm_job_id=found.slurm_job_id,
                 job_name=existing.job_name,
-                output_path=str(workspace / "output"),
-                logs_path=str(workspace / "logs"),
+                output_path=str(step_output_dir(workspace)),
+                logs_path=str(step_logs_dir(workspace)),
             )
     n = 0
     while True:

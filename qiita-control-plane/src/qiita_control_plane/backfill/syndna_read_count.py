@@ -35,7 +35,12 @@ from qiita_common.models import StepProgressState, WorkTicketState
 from ..actions.library import persist_syndna_read_count
 from ..repositories.block import MASK_SAMPLE_COMPLETED
 from ..repositories.syndna_read_count import SYNDNA_REFERENCE_SQL
-from ..workspace import STEP_MANIFEST_FILENAME, step_attempt_dir, ticket_workspace
+from ..workspace import (
+    STEP_MANIFEST_FILENAME,
+    step_attempt_dir,
+    step_output_dir,
+    ticket_workspace,
+)
 
 # The read-mask entry that writes the alignment, and the output binding it writes it
 # under — the names in workflows/read-mask/<version>.yaml.
@@ -101,14 +106,14 @@ class BackfillPlan:
 
 def _alignment_from_manifest(attempt_dir: Path) -> tuple[Path | None, str | None]:
     """The file the attempt's manifest binds to `alignment`, or why it cannot be had."""
-    manifest = attempt_dir / "output" / STEP_MANIFEST_FILENAME
+    manifest = step_output_dir(attempt_dir) / STEP_MANIFEST_FILENAME
     if not manifest.is_file():
         return None, f"no manifest at {manifest}"
     outputs = json.loads(manifest.read_text()).get("outputs", {})
     relative = outputs.get(_ALIGNMENT_BINDING)
     if relative is None:
         return None, f"{manifest} binds no {_ALIGNMENT_BINDING!r} output"
-    path = attempt_dir / "output" / relative
+    path = step_output_dir(attempt_dir) / relative
     if not path.is_file():
         return None, f"{path} is gone"
     return path, None

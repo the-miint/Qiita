@@ -119,7 +119,7 @@ from ..ingest_path import IngestPathError, named_host_paths, resolve_ingest_path
 from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
 from ..step_progress import load_step_progress
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
-from ..workspace import step_attempt_dir, ticket_workspace
+from ..workspace import step_attempt_dir, step_logs_dir, ticket_workspace
 from ._helpers import cap_rows
 
 _log = logging.getLogger(__name__)
@@ -1509,7 +1509,7 @@ async def get_work_ticket_step_logs(
 ) -> WorkTicketStepLogs:
     """Read a bounded tail of a step attempt's stdout/stderr.
 
-    The logs live under `PATH_SCRATCH/ticket/<idx>/<step>/attempt-<n>/logs/`,
+    The logs live in the attempt's `logs/` directory (layout: `workspace.py`),
     owned `qiita-orch:qiita-pipeline` (mode 2770). The CP service account is in
     `qiita-pipeline`, so it reads them straight off shared scratch
     and serves the tail here — letting an operator diagnose an OOM / bad input
@@ -1575,11 +1575,10 @@ async def get_work_ticket_step_logs(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"step_name {chosen.step_name!r} is not a valid path segment",
         )
-    logs_dir = (
+    logs_dir = step_logs_dir(
         step_attempt_dir(
             ticket_workspace(ticket_root, work_ticket_idx), chosen.step_name, chosen.attempt
         )
-        / "logs"
     )
     stdout, stdout_truncated = read_text_tail(
         logs_dir / "stdout", max_lines=tail_lines, max_bytes=_STEP_LOGS_MAX_TAIL_BYTES

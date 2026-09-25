@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import BaseModel
+from qiita_common.actions import STEP_MANIFEST_FILENAME
 
 # Mode every step output must carry: owner-and-group read, no write, no
 # other. `slurm/verify.py` fails a step whose outputs differ; the data plane
@@ -21,11 +22,9 @@ from pydantic import BaseModel
 # would make some valid outputs look like contract violations.
 EXPECTED_FILE_MODE: int = 0o440
 
-# Filename the producer writes inside $QIITA_OUTPUT_PATH (final act
-# before chmod; its presence is the completion marker). The verifier
-# reads it; the launcher writes it. Constant here so a rename touches
-# both sites at once.
-MANIFEST_FILENAME: str = "manifest.json"
+# Filename the producer writes inside $QIITA_OUTPUT_PATH; defined in
+# qiita_common so the control plane reads the same name.
+MANIFEST_FILENAME: str = STEP_MANIFEST_FILENAME
 
 # Filename SlurmBackend writes inside $QIITA_INPUT_PATH and the launcher
 # (jobs/__main__.py) reads. Same drift-prevention rationale as

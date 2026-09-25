@@ -8,14 +8,19 @@ runner on resume, the step-logs route, the admin backfills — derives the path 
 
 from pathlib import Path
 
+from qiita_common.actions import STEP_MANIFEST_FILENAME
+
 # The per-ticket workspace root's name under PATH_SCRATCH.
 WORK_TICKET_SUBDIR = "ticket"
 
-# The manifest a step writes into its `output/` directory, naming each declared
-# output. Defined by the orchestrator (`qiita_compute_orchestrator.slurm.contract.
-# MANIFEST_FILENAME`), which the control plane does not import; this is the control
-# plane's one copy.
-STEP_MANIFEST_FILENAME = "manifest.json"
+__all__ = [
+    "STEP_MANIFEST_FILENAME",
+    "WORK_TICKET_SUBDIR",
+    "step_attempt_dir",
+    "step_logs_dir",
+    "step_output_dir",
+    "ticket_workspace",
+]
 
 
 def ticket_workspace(workspace_root: Path, work_ticket_idx: int) -> Path:
@@ -26,3 +31,13 @@ def ticket_workspace(workspace_root: Path, work_ticket_idx: int) -> Path:
 def step_attempt_dir(ticket_dir: Path, step_name: str, attempt: int) -> Path:
     """One attempt of one step, under `ticket_workspace(...)`."""
     return ticket_dir / step_name / f"attempt-{attempt}"
+
+
+def step_output_dir(attempt_dir: Path) -> Path:
+    """Where the attempt writes its outputs and `STEP_MANIFEST_FILENAME`."""
+    return attempt_dir / "output"
+
+
+def step_logs_dir(attempt_dir: Path) -> Path:
+    """Where the attempt's stdout and stderr land."""
+    return attempt_dir / "logs"

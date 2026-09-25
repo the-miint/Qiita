@@ -54,6 +54,14 @@ from qiita_common.models import (
 # belongs at the layers that actually import / dispatch.
 NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 
+# Filename a step writes inside its output directory, naming each declared output
+# (the producer's final act before chmod; its presence is the completion marker).
+# The orchestrator's launcher writes it and its verifier reads it; the control
+# plane reads it where it finds a step's files outside the runner (the admin
+# backfills). `workflows/_shared/manifest_writer.py` runs in containers without
+# qiita_common and keeps its own copy.
+STEP_MANIFEST_FILENAME = "manifest.json"
+
 # The runner binding name the minted processing_idx travels under. A step names it
 # as the value side of a `params:` pair (`processing_idx: processing_idx` ->
 # <job>.Inputs.processing_idx), which both signals the runner to mint the run
