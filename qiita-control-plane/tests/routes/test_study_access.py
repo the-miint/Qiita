@@ -10,6 +10,7 @@ set by making it the owner or by inserting its row directly.
 """
 
 import asyncio
+import contextlib
 import json
 import secrets
 
@@ -462,8 +463,8 @@ async def test_two_grants_to_the_same_account_yield_one_201_and_one_409(ctx):
     assert await _tier(ctx, study_idx, grantee) == Tier.MEMBER
 
 
-# Long enough for a lock wait and Postgres's default 1 s deadlock_timeout; a test
-# whose request never returns fails here instead of hanging the suite.
+# Bounds every wait below, so a request that never returns fails the test
+# instead of hanging the suite.
 _REQUEST_TIMEOUT_S = 15
 
 
@@ -471,11 +472,30 @@ async def _finish(task: asyncio.Task):
     return await asyncio.wait_for(task, _REQUEST_TIMEOUT_S)
 
 
-async def _blocked(task: asyncio.Task) -> bool:
-    """Whether `task` is still waiting after the other side's lock has had time
-    to be contended."""
-    await asyncio.sleep(0.3)
-    return not task.done()
+async def _wait_until_blocked_by(pool, blocker, task: asyncio.Task) -> None:
+    """Return once some backend is waiting on a lock `blocker` holds (the
+    request under test is the only candidate), rather than after a fixed sleep
+    that would not show the request ever reached the lock."""
+    blocker_pid = blocker.get_server_pid()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _REQUEST_TIMEOUT_S
+    while loop.time() < deadline:
+        assert not task.done(), f"request finished without waiting: {task.result()}"
+        waiting = await pool.fetchval(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            blocker_pid,
+        )
+        if waiting:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("request never waited on the held lock")
+
+
+async def _cancel(task: asyncio.Task | None) -> None:
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
 
 async def test_change_waits_for_a_concurrent_change_and_checks_the_committed_tier(ctx):
@@ -485,21 +505,28 @@ async def test_change_waits_for_a_concurrent_change_and_checks_the_committed_tie
     grantee, _ = await _seed_person(ctx, "g")
     await _insert_row(ctx, study_idx, grantee, Tier.VIEWER)
 
+    task, committed = None, False
     async with ctx["pool"].acquire() as other:
         tr = other.transaction()
         await tr.start()
-        await other.execute(
-            "UPDATE qiita.study_access SET access_tier = 'admin'"
-            " WHERE study_idx = $1 AND principal_idx = $2",
-            study_idx,
-            grantee,
-        )
-        task = asyncio.create_task(
-            ctx["user"].patch(_url(study_idx, grantee), json={"access_tier": Tier.MEMBER})
-        )
-        assert await _blocked(task)
-        await tr.commit()
-        resp = await _finish(task)
+        try:
+            await other.execute(
+                "UPDATE qiita.study_access SET access_tier = 'admin'"
+                " WHERE study_idx = $1 AND principal_idx = $2",
+                study_idx,
+                grantee,
+            )
+            task = asyncio.create_task(
+                ctx["user"].patch(_url(study_idx, grantee), json={"access_tier": Tier.MEMBER})
+            )
+            await _wait_until_blocked_by(ctx["pool"], other, task)
+            await tr.commit()
+            committed = True
+            resp = await _finish(task)
+        finally:
+            await _cancel(task)
+            if not committed:
+                await tr.rollback()
 
     assert resp.status_code == 403, resp.text
     assert await _tier(ctx, study_idx, grantee) == Tier.ADMIN
@@ -512,20 +539,27 @@ async def test_grant_waits_for_a_concurrent_revoke_of_the_caller(ctx):
     study_idx = await _study_with_caller_at(ctx, Tier.MEMBER)
     grantee, email = await _seed_person(ctx, "g")
 
+    task, committed = None, False
     async with ctx["pool"].acquire() as other:
         tr = other.transaction()
         await tr.start()
-        await other.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
-            study_idx,
-            caller,
-        )
-        task = asyncio.create_task(
-            ctx["user"].post(_url(study_idx), json={"email": email, "access_tier": Tier.VIEWER})
-        )
-        assert await _blocked(task)
-        await tr.commit()
-        resp = await _finish(task)
+        try:
+            await other.execute(
+                "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
+                study_idx,
+                caller,
+            )
+            task = asyncio.create_task(
+                ctx["user"].post(_url(study_idx), json={"email": email, "access_tier": Tier.VIEWER})
+            )
+            await _wait_until_blocked_by(ctx["pool"], other, task)
+            await tr.commit()
+            committed = True
+            resp = await _finish(task)
+        finally:
+            await _cancel(task)
+            if not committed:
+                await tr.rollback()
 
     assert resp.status_code == 403, resp.text
     assert await _tier(ctx, study_idx, grantee) is None
@@ -534,17 +568,20 @@ async def test_grant_waits_for_a_concurrent_revoke_of_the_caller(ctx):
 async def test_crossed_changes_deadlock_and_the_request_gets_409(ctx):
     """The request share-locks the caller's row, then waits to update B's row,
     which another transaction has share-locked; that transaction then tries to
-    update the caller's row. Postgres aborts one side; the request, which began
-    waiting first, is the one that detects the cycle."""
+    update the caller's row. Postgres runs its deadlock check in whichever
+    waiter reaches `deadlock_timeout` first and aborts that one; the other
+    transaction raises its own timeout so the request is the one aborted."""
     caller = ctx["user_session"]["principal_idx"]
     study_idx = await _study_with_caller_at(ctx, Tier.MEMBER)
     b, _ = await _seed_person(ctx, "b")
     await _insert_row(ctx, study_idx, b, Tier.MEMBER)
 
+    task = crossing = None
     async with ctx["pool"].acquire() as other:
         tr = other.transaction()
         await tr.start()
         try:
+            await other.execute("SET LOCAL deadlock_timeout = '60s'")
             await other.execute(
                 "SELECT 1 FROM qiita.study_access"
                 " WHERE study_idx = $1 AND principal_idx = $2 FOR SHARE",
@@ -552,7 +589,8 @@ async def test_crossed_changes_deadlock_and_the_request_gets_409(ctx):
                 b,
             )
             task = asyncio.create_task(ctx["user"].delete(_url(study_idx, b)))
-            assert await _blocked(task)
+            # Waiting on B's row means the request already share-locked the caller's.
+            await _wait_until_blocked_by(ctx["pool"], other, task)
             crossing = asyncio.create_task(
                 other.execute(
                     "UPDATE qiita.study_access SET access_tier = 'viewer'"
@@ -564,6 +602,8 @@ async def test_crossed_changes_deadlock_and_the_request_gets_409(ctx):
             resp = await _finish(task)
             await asyncio.wait_for(crossing, _REQUEST_TIMEOUT_S)
         finally:
+            await _cancel(task)
+            await _cancel(crossing)
             await tr.rollback()
 
     assert resp.status_code == 409, resp.text

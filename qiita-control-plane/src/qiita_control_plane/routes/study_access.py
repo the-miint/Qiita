@@ -139,7 +139,8 @@ async def grant_study_access(
 
     403 when the caller may not grant that tier; 422 when no account uses the
     email or it is disabled or retired; 409 when the grantee already has a
-    row (change it with PATCH).
+    row (change it with PATCH), or when a concurrent change got in the way
+    (retry).
     """
     async with _mutation_tx(tx) as conn:
         standing = await _locked_standing(conn, caller=caller, study_idx=study_idx)

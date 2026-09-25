@@ -362,8 +362,8 @@ Who may list, grant, change and revoke is the table in the
 
 Naming the grantee by email means any caller who may grant (a study `member` or
 higher) can learn from the `422`s whether an email has a Qiita account, and whether
-that account is disabled or retired. Two requests that change each other's
-callers' rows at the same moment can deadlock; one gets a `409` to retry
+that account is disabled or retired. Two callers changing each other's rows at
+the same moment can deadlock; one gets a `409` to retry
 (`routes/study_access.py`). Each grant, tier change and revoke records an
 `auth_event` (`study_access_grant`, `study_access_tier_change`,
 `study_access_revoke`; `detail` carries `study_idx` and the tier(s)), for the
