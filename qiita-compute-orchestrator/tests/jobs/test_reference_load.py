@@ -33,13 +33,14 @@ _REFERENCE_LOAD_LOGGER = "qiita_compute_orchestrator.jobs.reference_load"
 def _host_ram_backs_the_load_literal(monkeypatch):
     """Run `load` off SLURM on a host big enough for its memory literal.
 
-    Off SLURM `load`'s DuckDB limit is bounded by detected RAM minus its
-    8-thread headroom (`resolve_duckdb_memory_gb`), so on a 7 GB runner it is
-    1 GB. `read_jplace` asks for about 1.8 GiB whatever the file size — its
-    macro passes `maximum_object_size=1000000000` to DuckDB's `read_json`
-    (miint `src/include/miint_macros.hpp`) — and fails under a limit that
-    small. Pinning RAM keeps these tests about what `load` writes, not about
-    the machine they run on; the RAM bound is tested in test_miint_memory.py."""
+    Off SLURM, `resolve_duckdb_memory_gb` bounds `load`'s DuckDB limit by
+    detected RAM, and on a small runner that bound falls below what
+    `read_jplace` needs: its macro passes `maximum_object_size=1000000000` to
+    DuckDB's `read_json`
+    (https://github.com/the-miint/duckdb-miint/blob/96630a5/src/include/miint_macros.hpp),
+    which on DuckDB 1.5.4 asks for about 1.8 GiB even for a 327-byte jplace.
+    Pinning RAM keeps these tests about what `load` writes, not about the
+    machine they run on; the RAM bound has tests of its own."""
     monkeypatch.delenv("SLURM_MEM_PER_NODE", raising=False)
     monkeypatch.setattr("qiita_compute_orchestrator.miint.detected_ram_gb", lambda: 64)
 
