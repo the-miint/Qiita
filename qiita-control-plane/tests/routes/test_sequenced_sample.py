@@ -12,9 +12,13 @@ Pydantic body validation including the primary-in-secondary rejection,
 the (run, pool) path-consistency 422, owner eligibility 422,
 unknown-metadata-field 422, missing biosample-link 422, duplicate
 sequenced_pool_item_id 409, and full transaction rollback on
-trigger-raised failures.
+trigger-raised failures. Also covers the import route's sequencing_run
+advisory-lock critical section: the staged-roster 409, the lock-timeout
+503, lock serialization against a held key, and a native insert landing
+in the roster a concurrent staging read produces.
 """
 
+import asyncio
 import secrets
 
 import pytest
@@ -31,20 +35,30 @@ from qiita_common.api_paths import (
     URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
-from qiita_common.models import FieldDataType, Platform
+from qiita_common.models import FieldDataType, Platform, ScopeTargetKind, WorkTicketState
 
+from qiita_control_plane.ena_import.submit import (
+    DOWNLOAD_ENA_STUDY_ACTION_ID,
+    DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+)
 from qiita_control_plane.main import app
+from qiita_control_plane.repositories import INT4_MASK
 from qiita_control_plane.repositories._sample_helpers import (
     _get_or_create_globally_linked_study_field,
 )
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.sequencing_run import POOL_RESOLVE_LOCK_CLASS
+from qiita_control_plane.routes import sequenced_sample as sequenced_sample_routes
+from qiita_control_plane.runner import ENA_RUN_MAP_BINDING, _stage_ena_run_roster
 from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_HUMAN_TERM_ID,
+    delete_action_if_created,
     fetch_missing_value_reason_idx,
     fetch_ncbi_taxonomy_term,
     fetch_seeded_metagenome_term,
     retire_prep_sample_to_study_link,
+    seed_action_if_absent,
     seed_biosample,
     seed_biosample_to_study_link,
     seed_host_filter_profile,
@@ -54,6 +68,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_global_field,
     seed_user_principal,
 )
+from qiita_control_plane.testing.unique_names import unique_accession
 
 from .conftest import (
     OWNER_INELIGIBILITY_KINDS,
@@ -91,6 +106,7 @@ async def _cleanup_tracked(pool, created: dict) -> None:
       prep_sample_study_field (bulk-scoped to test-owned studies)
       prep_sample_to_study (composite PK)
       sequenced_sample
+      work_ticket
       prep_sample
       sequenced_pool
       sequencing_run
@@ -130,6 +146,12 @@ async def _cleanup_tracked(pool, created: dict) -> None:
             "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
             created["reference"],
         )
+    # work_ticket's PK is work_ticket_idx (not idx), so delete_idxs does not
+    # apply; its rows must go before the pool/principal they reference.
+    await pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+        created["work_ticket"],
+    )
     await delete_idxs(pool, "prep_sample", created["prep_sample"])
     await delete_idxs(pool, "sequenced_pool", created["sequenced_pool"])
     await delete_idxs(pool, "sequencing_run", created["sequencing_run"])
@@ -184,8 +206,11 @@ async def _cleanup_tracked(pool, created: dict) -> None:
 async def ctx(role_keyed_clients):
     """Per-test fixture: route-keyed clients plus a `created` tracker for
     FK-reverse teardown over every table the composer writes (plus its
-    inputs the test seeds)."""
+    inputs the test seeds). Also seeds the download-ena-study action row
+    that a staged-roster work_ticket FKs, and removes it afterwards iff
+    this test created it."""
     created: dict = {
+        "work_ticket": [],
         "prep_sample_metadata": [],
         "biosample_metadata": [],
         "biosample_study_field": [],
@@ -205,8 +230,20 @@ async def ctx(role_keyed_clients):
         "user_principals": [],
         "service_account_principals": [],
     }
+    download_action_created = await seed_action_if_absent(
+        role_keyed_clients["pool"],
+        action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
+        version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+        target_kind=ScopeTargetKind.SEQUENCED_POOL.value,
+    )
     yield {**role_keyed_clients, "created": created}
     await _cleanup_tracked(role_keyed_clients["pool"], created)
+    await delete_action_if_created(
+        role_keyed_clients["pool"],
+        action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
+        version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+        created=download_action_created,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4296,3 +4333,365 @@ async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
             }
         }
     }
+
+
+# ===========================================================================
+# Sequencing-run lock + staged-roster reject on the native import
+# ===========================================================================
+
+
+async def _seed_roster_case(ctx, suffix: str) -> tuple[int, int, int, int, int]:
+    """Seed one roster test's precondition chain: run, pool, study, a
+    biosample linked to the study, and the prep-protocol idx, all tracked for
+    FK-reverse teardown. The wet_lab_admin principal owns every row, so the
+    default POST passes the route's ownership and study-admin gates."""
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, suffix)
+    study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix=suffix)
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    return run_idx, pool_idx, study_idx, bs_idx, protocol_idx
+
+
+def _roster_case_body(
+    ctx,
+    *,
+    study_idx: int,
+    bs_idx: int,
+    protocol_idx: int,
+    suffix: str,
+    accession: str | None = None,
+) -> dict:
+    """The happy-path POST body for one roster case; `accession` sets
+    ena_run_accession when the case needs one (roster staging refuses a pool
+    row without it)."""
+    body = {
+        "biosample_idx": bs_idx,
+        "prep_protocol_idx": protocol_idx,
+        "owner_idx": ctx["wet_session"]["principal_idx"],
+        "sequenced_pool_item_id": _unique_item_id(suffix),
+        "primary_study_idx": study_idx,
+    }
+    if accession is not None:
+        body["ena_run_accession"] = accession
+    return body
+
+
+async def _seed_download_ticket(ctx, *, pool_idx: int, state: str) -> int:
+    """Direct-INSERT one download-ena-study work_ticket on the pool; track it
+    for teardown (its sequenced_pool_idx FK is RESTRICT). A failed ticket
+    carries the failure surface work_ticket_failure_consistent demands; every
+    other state keeps those columns NULL."""
+    failed = state == WorkTicketState.FAILED.value
+    ticket_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx, scope_target_kind,"
+        "  sequenced_pool_idx, state, failure_type, failure_stage, failure_reason)"
+        " VALUES ($1, $2, $3, $4::qiita.scope_target_kind, $5,"
+        "         $6::qiita.work_ticket_state, $7::qiita.failure_type,"
+        "         $8::qiita.work_ticket_failure_stage, $9)"
+        " RETURNING work_ticket_idx",
+        DOWNLOAD_ENA_STUDY_ACTION_ID,
+        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+        ctx["wet_session"]["principal_idx"],
+        ScopeTargetKind.SEQUENCED_POOL.value,
+        pool_idx,
+        state,
+        "permanent" if failed else None,
+        "submission" if failed else None,
+        "seeded failure" if failed else None,
+    )
+    ctx["created"]["work_ticket"].append(ticket_idx)
+    return ticket_idx
+
+
+async def _observed_waiter_on_run_lock(pool, run_idx: int) -> None:
+    """Poll pg_stat_activity joined to pg_locks until a backend is observed
+    WAITING (an ungranted advisory lock) on (POOL_RESOLVE_LOCK_CLASS,
+    run_idx). Callers bound the poll with asyncio.wait_for."""
+    while await pool.fetchval(
+        "SELECT NOT EXISTS (SELECT 1 FROM pg_stat_activity a"
+        " JOIN pg_locks l ON l.pid = a.pid"
+        " WHERE a.wait_event_type = 'Lock' AND l.locktype = 'advisory'"
+        "   AND NOT l.granted AND l.classid = $1 AND l.objid = $2)",
+        POOL_RESOLVE_LOCK_CLASS,
+        run_idx & INT4_MASK,
+    ):
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        WorkTicketState.PROCESSING.value,
+        WorkTicketState.COMPLETED.value,
+        WorkTicketState.NO_DATA.value,
+    ],
+)
+async def test_import_rejects_when_pool_roster_already_staged(ctx, state):
+    """The pool's latest download ticket in a roster-read state refuses the
+    POST with 409 whose detail names the pool idx, the ticket idx, and the
+    state; the transaction rolls back, so no prep_sample or sequenced_sample
+    row survives the refusal."""
+    run_idx, pool_idx, study_idx, bs_idx, protocol_idx = await _seed_roster_case(ctx, "roster-rej")
+    ticket_idx = await _seed_download_ticket(ctx, pool_idx=pool_idx, state=state)
+    prep_before = await ctx["pool"].fetchval("SELECT count(*) FROM qiita.prep_sample")
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        **_roster_case_body(
+            ctx,
+            study_idx=study_idx,
+            bs_idx=bs_idx,
+            protocol_idx=protocol_idx,
+            suffix="ROSTER-REJ",
+            accession=unique_accession("ERR"),
+        ),
+    )
+
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert f"sequenced_pool {pool_idx}" in detail
+    assert str(ticket_idx) in detail
+    assert f"'{state}'" in detail
+    assert (
+        await ctx["pool"].fetchval(
+            "SELECT count(*) FROM qiita.sequenced_sample WHERE sequenced_pool_idx = $1",
+            pool_idx,
+        )
+        == 0
+    )
+    assert await ctx["pool"].fetchval("SELECT count(*) FROM qiita.prep_sample") == prep_before
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        WorkTicketState.PENDING.value,
+        WorkTicketState.QUEUED.value,
+        WorkTicketState.FAILED.value,
+        WorkTicketState.CANCELLED.value,
+        None,
+    ],
+    ids=[
+        WorkTicketState.PENDING.value,
+        WorkTicketState.QUEUED.value,
+        WorkTicketState.FAILED.value,
+        WorkTicketState.CANCELLED.value,
+        "no-ticket",
+    ],
+)
+async def test_import_allowed_states(ctx, state):
+    """States that do not mean the roster was read stay open: pending/queued
+    (the read has not run yet; the shared lock closes that window), failed or
+    cancelled (the next dispatch re-reads the roster live), and a pool with no
+    download ticket at all each accept the sample with 201."""
+    run_idx, pool_idx, study_idx, bs_idx, protocol_idx = await _seed_roster_case(
+        ctx, "roster-allow"
+    )
+    if state is not None:
+        await _seed_download_ticket(ctx, pool_idx=pool_idx, state=state)
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        **_roster_case_body(
+            ctx,
+            study_idx=study_idx,
+            bs_idx=bs_idx,
+            protocol_idx=protocol_idx,
+            suffix="ROSTER-ALLOW",
+            accession=unique_accession("ERR"),
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+
+
+@pytest.mark.parametrize(
+    "older, newer, expected",
+    [
+        (WorkTicketState.PROCESSING.value, WorkTicketState.FAILED.value, 201),
+        (WorkTicketState.FAILED.value, WorkTicketState.COMPLETED.value, 409),
+    ],
+    ids=["staged-then-failed", "failed-then-staged"],
+)
+async def test_import_latest_download_ticket_wins(ctx, older, newer, expected):
+    """Only the pool's newest download ticket judges the roster: a processing
+    ticket superseded by a newer failed one leaves the pool open (201), while
+    a failed ticket superseded by a newer completed one refuses it (409)."""
+    run_idx, pool_idx, study_idx, bs_idx, protocol_idx = await _seed_roster_case(
+        ctx, "roster-latest"
+    )
+    await _seed_download_ticket(ctx, pool_idx=pool_idx, state=older)
+    await _seed_download_ticket(ctx, pool_idx=pool_idx, state=newer)
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        **_roster_case_body(
+            ctx,
+            study_idx=study_idx,
+            bs_idx=bs_idx,
+            protocol_idx=protocol_idx,
+            suffix="ROSTER-LATEST",
+            accession=unique_accession("ERR"),
+        ),
+    )
+    assert resp.status_code == expected, resp.text
+
+
+async def test_import_waits_out_held_sequencing_run_lock(ctx):
+    """The route takes its sequencing_run advisory key before inserting: a raw
+    connection holds (POOL_RESOLVE_LOCK_CLASS, run_idx) open, the POST fires
+    as a task, and the test polls pg_stat_activity/pg_locks until the route's
+    backend is observed WAITING on that key (bounded wait). The raw
+    transaction then exits (commit or rollback), releasing the lock, and the
+    POST must complete 201."""
+    run_idx, pool_idx, study_idx, bs_idx, protocol_idx = await _seed_roster_case(ctx, "roster-lock")
+    body = _roster_case_body(
+        ctx,
+        study_idx=study_idx,
+        bs_idx=bs_idx,
+        protocol_idx=protocol_idx,
+        suffix="ROSTER-LOCK",
+        accession=unique_accession("ERR"),
+    )
+    conn = await ctx["pool"].acquire()
+    post_task = None
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock($1, $2)",
+                POOL_RESOLVE_LOCK_CLASS,
+                run_idx & INT4_MASK,
+            )
+            post_task = asyncio.create_task(
+                _post_sequenced_sample(ctx["wet"], ctx, run_idx, pool_idx, **body)
+            )
+            await asyncio.wait_for(_observed_waiter_on_run_lock(ctx["pool"], run_idx), timeout=10)
+    finally:
+        await ctx["pool"].release(conn)
+        if post_task is not None:
+            resp = await asyncio.wait_for(post_task, timeout=30)
+    assert resp.status_code == 201, resp.text
+
+
+async def test_native_insert_lands_in_staged_roster(ctx, monkeypatch, tmp_path):
+    """A native insert racing the download roster read lands in the staged
+    roster. One sample is registered and committed first; a second POST is
+    then parked inside the composer (gated) while it holds the run's advisory
+    lock, and _stage_ena_run_roster is launched alongside. The test polls
+    pg_locks until staging is observed WAITING on the route's key (bounded
+    wait), releases the gate, and asserts the POST answered 201 and the staged
+    ena_run_map.parquet carries the new sample's ena_run_accession next to the
+    pre-existing one."""
+    run_idx, pool_idx, study_idx, bs_idx, protocol_idx = await _seed_roster_case(ctx, "roster-race")
+    pre_accession = unique_accession("ERR")
+    pre_resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        **_roster_case_body(
+            ctx,
+            study_idx=study_idx,
+            bs_idx=bs_idx,
+            protocol_idx=protocol_idx,
+            suffix="ROSTER-PRE",
+            accession=pre_accession,
+        ),
+    )
+    assert pre_resp.status_code == 201, pre_resp.text
+
+    gate_reached = asyncio.Event()
+    release_gate = asyncio.Event()
+    orig_import = sequenced_sample_routes.import_sequenced_prep_sample
+
+    async def gated_import(*args, **kwargs):
+        gate_reached.set()
+        await release_gate.wait()
+        return await orig_import(*args, **kwargs)
+
+    monkeypatch.setattr(sequenced_sample_routes, "import_sequenced_prep_sample", gated_import)
+
+    new_accession = unique_accession("ERR")
+    post_task = asyncio.create_task(
+        _post_sequenced_sample(
+            ctx["wet"],
+            ctx,
+            run_idx,
+            pool_idx,
+            **_roster_case_body(
+                ctx,
+                study_idx=study_idx,
+                bs_idx=bs_idx,
+                protocol_idx=protocol_idx,
+                suffix="ROSTER-NEW",
+                accession=new_accession,
+            ),
+        )
+    )
+    stage_task = None
+    try:
+        await asyncio.wait_for(gate_reached.wait(), timeout=10)
+        stage_task = asyncio.create_task(
+            _stage_ena_run_roster(
+                ctx["pool"],
+                pool_idx,
+                sequencing_run_idx=run_idx,
+                workspace=tmp_path / "ws",
+            )
+        )
+        await asyncio.wait_for(_observed_waiter_on_run_lock(ctx["pool"], run_idx), timeout=10)
+    finally:
+        release_gate.set()
+        tasks = [post_task] + ([stage_task] if stage_task is not None else [])
+        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=30)
+    assert not any(isinstance(result, BaseException) for result in results), results
+    post_resp, bindings = results
+    assert post_resp.status_code == 201, post_resp.text
+
+    import pyarrow.parquet as pq
+
+    staged_path = tmp_path / "ws" / "ena_run_map.parquet"
+    assert bindings == {ENA_RUN_MAP_BINDING: staged_path}
+    staged_accessions = pq.read_table(staged_path).column("ena_run_accession").to_pylist()
+    assert pre_accession in staged_accessions
+    assert new_accession in staged_accessions
+
+
+async def test_import_lock_timeout_maps_to_503(ctx, monkeypatch):
+    """A lock wait that exhausts the bounded wait surfaces as TimeoutError;
+    the route maps it to 503 naming the sequencing_run (busy, retry) instead
+    of letting it escape as a 500. lock_sequencing_run is monkeypatched in
+    the routes.sequenced_sample namespace to raise TimeoutError directly."""
+    run_idx, pool_idx, study_idx, bs_idx, protocol_idx = await _seed_roster_case(ctx, "roster-busy")
+
+    async def raising_lock(conn, *, sequencing_run_idx: int) -> None:
+        raise TimeoutError("simulated lock wait timeout")
+
+    monkeypatch.setattr(sequenced_sample_routes, "lock_sequencing_run", raising_lock)
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        **_roster_case_body(
+            ctx,
+            study_idx=study_idx,
+            bs_idx=bs_idx,
+            protocol_idx=protocol_idx,
+            suffix="ROSTER-BUSY",
+            accession=unique_accession("ERR"),
+        ),
+    )
+    assert resp.status_code == 503, resp.text
+    assert f"sequencing_run {run_idx}" in resp.json()["detail"]

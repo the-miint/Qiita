@@ -1963,6 +1963,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Native sequenced-sample import now locks its sequencing run and refuses pools whose download roster is already staged** — the POST route takes #602's sequencing_run advisory lock around the insert and 409s when the pool's latest download-ena-study ticket has already read its run roster, closing the silent never-downloaded gap for manual adds (#627).
+
 - **The `reference_load` tests pin the host RAM they assume (#616).** Off SLURM,
   `load`'s DuckDB limit is detected RAM minus its 8-thread headroom (#606), which is
   1 GB on the 7 GB macOS runner, and `read_jplace` asks DuckDB 1.5.4 for about

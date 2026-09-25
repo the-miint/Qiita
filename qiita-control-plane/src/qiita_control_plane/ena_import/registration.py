@@ -164,6 +164,60 @@ async def fetch_download_pool_states(
     )
 
 
+_ROSTER_READ_DOWNLOAD_TICKET_STATES = frozenset(
+    {
+        WorkTicketState.PROCESSING.value,
+        WorkTicketState.COMPLETED.value,
+        WorkTicketState.NO_DATA.value,
+    }
+)
+
+
+def download_ticket_read_roster(work_ticket_state: str | None) -> bool:
+    """Whether a pool's latest download ticket has read, or is reading, the
+    pool's run roster -- refuse a native sequenced-sample add into that pool.
+
+    The roster read itself records nothing DB-side: `_stage_ena_run_roster`
+    runs a live SELECT under `lock_sequencing_run` and writes the roster only
+    to the ticket's workspace file, so "already read" is not directly
+    queryable. The download ticket's lifecycle state is the closest queryable
+    trace: `run_workflow` transitions the ticket to PROCESSING before the
+    staging read runs, so processing/completed/no_data imply the read has run
+    or is running. pending/queued are excluded because the read has not run
+    yet -- and the shared sequencing_run lock closes that window (the roster
+    read waits for an in-flight native insert to commit, so it picks that
+    sample up). failed/cancelled are excluded because the next dispatch
+    re-reads the roster live, the same rule `download_ticket_covers_pool`
+    documents via `_RESUBMITTABLE_DOWNLOAD_TICKET_STATES`. The proxy can
+    false-reject conservatively: a ticket flipped to PROCESSING whose read has
+    not completed yet refuses an add even though the read would still include
+    it -- a loud 409 that fails safe rather than a silently missed download.
+    """
+    return work_ticket_state in _ROSTER_READ_DOWNLOAD_TICKET_STATES
+
+
+async def staged_roster_download_ticket(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    sequencing_run_idx: int,
+    sequenced_pool_idx: int,
+) -> asyncpg.Record | None:
+    """The pool's latest download-ena-study ticket when its run roster has (or
+    is being) read, else None.
+
+    Run-scoped read filtered to `sequenced_pool_idx` -- the same shape
+    `ena_import.batch._covering_download_ticket_idx` composes. The returned
+    row carries `work_ticket_idx` / `work_ticket_state` so the caller can name
+    the offending ticket to the submitter; see `download_ticket_read_roster`
+    for why the ticket state answers for the roster-read state."""
+    for pool_state in await fetch_download_pool_states(pool_or_conn, sequencing_run_idx):
+        if pool_state["sequenced_pool_idx"] == sequenced_pool_idx and (
+            download_ticket_read_roster(pool_state["work_ticket_state"])
+        ):
+            return pool_state
+    return None
+
+
 @dataclass(frozen=True)
 class CreatedPool:
     """One `(platform, sequenced_pool_idx, sequencing_run_idx)` triple on a

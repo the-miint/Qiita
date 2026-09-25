@@ -72,6 +72,7 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
+from ..ena_import.registration import staged_roster_download_ticket
 from ..host_filter_resolver import resolve_host_filter_many
 from ..preflight import (
     PacbioProtocol,
@@ -92,6 +93,7 @@ from ..repositories.sequenced_sample import (
 from ..repositories.sequencing_run import (
     fetch_sequenced_pool_preflight,
     fetch_sequencing_run_platform,
+    lock_sequencing_run,
 )
 from ._helpers import (
     ETAG_HEADER,
@@ -177,6 +179,7 @@ _SEQUENCED_SAMPLE_GENERIC_UNIQUE_VIOLATION = "conflicts with an existing sequenc
     status_code=201,
 )
 async def import_sequenced_sample_from_run(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
     sequenced_pool_idx: Annotated[int, Field(gt=0)],
     body: SequencedSampleCreateRequest,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
@@ -193,6 +196,19 @@ async def import_sequenced_sample_from_run(
     strings. The body-level multi-study admin-access check runs first
     inside the transaction so a forbidden study fails before the
     owner-eligibility lookup pulls more data.
+
+    After the authz/state gates the route takes the sequencing_run advisory
+    lock (`lock_sequencing_run`, validated against the path's run by the
+    require_sequenced_pool_in_run dependency) and holds it until this
+    transaction commits, serializing the insert against a concurrent ENA
+    registration and the download roster read. Under that lock it refuses a
+    pool whose latest download-ena-study ticket has read -- or is reading --
+    its run roster, with a 409 naming the pool, ticket, and state: a sample
+    added after the roster read would be left out of the download. The proxy
+    rationale for judging the read by the ticket's state lives in
+    `download_ticket_read_roster`'s docstring. A lock wait that exhausts the
+    bounded wait answers 503 (busy, retry) instead of surfacing the wait's
+    TimeoutError as a 500.
     """
     async with tx() as conn:
         await require_caller_has_admin_on_all_studies(
@@ -215,6 +231,33 @@ async def import_sequenced_sample_from_run(
         metadata_checklist_idx = await resolve_metadata_checklist_idx(
             conn, body.metadata_checklist_name
         )
+
+        try:
+            await lock_sequencing_run(conn, sequencing_run_idx=sequencing_run_idx)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"sequencing_run {sequencing_run_idx} is busy with an ENA import"
+                    " or roster read; retry shortly"
+                ),
+            ) from exc
+        staged_ticket = await staged_roster_download_ticket(
+            conn,
+            sequencing_run_idx=sequencing_run_idx,
+            sequenced_pool_idx=sequenced_pool_idx,
+        )
+        if staged_ticket is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"sequenced_pool {sequenced_pool_idx} cannot take a new sample:"
+                    f" its download ticket {staged_ticket['work_ticket_idx']} is in state"
+                    f" '{staged_ticket['work_ticket_state']}', so this pool's run roster"
+                    " has been (or is being) read and the sample would be left out of"
+                    " the download"
+                ),
+            )
 
         # Map known composer-side errors and DB-level violations to user-
         # friendly responses. Typed catches first so their detail wins.
