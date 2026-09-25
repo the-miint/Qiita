@@ -667,10 +667,10 @@ async def test_superseded_by_round_trips_and_a_re_deprecate_replaces_it(
 
 
 async def test_the_sequenced_pool_filter_narrows_both_reads(postgres_pool, client, lifecycle):
-    """The one `sample_scope_sql` arm carrying its own subquery bind, and the only
-    one no test reached. Its `$N` differs per caller because the list and the
-    roster seed `args` to different depths, so a numbering slip shows up here and
-    nowhere else.
+    """A `sample_scope_sql` arm carrying its own subquery bind (the `study_idx` arm
+    is the other; the export roster's tests reach it), and one no other test
+    reached. Its `$N` differs per caller because the list and the roster seed `args`
+    to different depths, so a numbering slip shows up here and nowhere else.
 
     Both directions are asserted: the pool the sample is on returns it, a pool it
     is not on excludes it. Without the negative half a filter the SQL ignored

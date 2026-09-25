@@ -71,8 +71,8 @@ from ._helpers import GATE_ROSTER_HARD_CAP, cap_rows, gate_roster_narrowing_idx
 _MSG_PROCESSING_NOT_FOUND = "Processing run not found"
 
 # Hard caps on the two reads. The run list is bounded by how many distinct
-# assembly param sets the fleet has minted; the roster by a pool's prep_sample count
-# (GATE_ROSTER_HARD_CAP).
+# assembly param sets the fleet has minted; the roster by GATE_ROSTER_HARD_CAP, whose
+# comment says what bounds it.
 # Both return `truncated` rather than paginating — a caller that hits either cap
 # should narrow with a filter. Same values as the mask twin, which bounds the same
 # two shapes.
