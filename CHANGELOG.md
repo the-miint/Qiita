@@ -23,7 +23,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 - **A study reader can export per-prep_sample SynDNA insert read counts as BIOM or Parquet
   (#TBD).** The read-mask workflow's new `persist-syndna-read-count` action (gated on
-  `syndna_enabled`, before `finalize-mask-sample`) reduces the `syndna` step's
+  `syndna_enabled`, appended after `finalize-mask-sample`) reduces the `syndna` step's
   alignment output to the number of reads with a mapped primary alignment to each
   insert — ungated, the quantity classic Qiita publishes as `syndna.biom`, not the
   gated `spikein_read_count_r1r2` — and writes one row per insert of the mask's SynDNA

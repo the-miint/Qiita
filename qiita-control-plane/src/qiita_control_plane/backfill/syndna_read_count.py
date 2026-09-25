@@ -3,8 +3,8 @@ persisted it.
 
 A read-mask ticket's `syndna` step leaves its alignment in the ticket's scratch
 workspace, and the `persist-syndna-read-count` action reduces it to per-insert
-counts before the gate flips. A prep_sample whose mask completed without that action
-has a 'completed' gate and no count rows, and the export refuses it.
+counts. A prep_sample whose mask completed without that action has a 'completed'
+gate and no count rows, and the export refuses it.
 
 **Re-reads the scratch file the step left, and nothing else.** The ticket's
 COMPLETED `work_ticket_step` row for `syndna` gives the attempt, and that attempt's

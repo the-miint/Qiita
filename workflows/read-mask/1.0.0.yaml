@@ -291,15 +291,6 @@ steps:
     inputs: [read_mask]
     outputs: []
 
-  # Persist the reads aligned to each SynDNA insert (ungated, mapped-primary)
-  # from the syndna step's `alignment` output into qiita.syndna_read_count.
-  # Gated with the step that produces its input. Before finalize-mask-sample, so
-  # a 'completed' gate never advertises a sample whose counts are missing.
-  - action: persist-syndna-read-count
-    when: syndna_enabled
-    inputs: [alignment]
-    outputs: []
-
   # Load the final mask into the DuckLake `read_mask` table. read_mask_staging_dir
   # holds read_mask.parquet, which register-files maps to the `read_mask` table.
   # Moves the parquet out of staging — must run after persist-read-metrics (which
@@ -314,10 +305,20 @@ steps:
   # per-sample twin of the block workflow's reconcile-block gate flip; consumers
   # (masked-read export, long-read-assembly input, alignment) read this gate and
   # require 'completed'. No file inputs: mask_idx from the ticket, prep_sample_idx
-  # from the scope target. MUST run last — after register-files makes the masked
-  # reads durable — so 'completed' never advertises reads that aren't in DuckLake.
+  # from the scope target. MUST run after register-files makes the masked reads
+  # durable, so 'completed' never advertises reads that aren't in DuckLake.
   - action: finalize-mask-sample
     inputs: []
+    outputs: []
+
+  # Persist the reads aligned to each SynDNA insert (ungated, mapped-primary)
+  # from the syndna step's `alignment` output into qiita.syndna_read_count.
+  # Gated with the step that produces its input. Last, so adding it shifted no
+  # earlier entry's position (resume matches completed steps by position). Until
+  # it has run, a 'completed' sample has no counts and the export refuses it.
+  - action: persist-syndna-read-count
+    when: syndna_enabled
+    inputs: [alignment]
     outputs: []
 
 # Ceiling must stay strictly ABOVE every step baseline on the escalating axes

@@ -638,8 +638,7 @@ async def _run_action_primitive(
     if entry.name == LibraryPrimitive.PERSIST_SYNDNA_READ_COUNT:
         # Per-insert SynDNA read counts from the `syndna` step's alignment output.
         # mask_idx from the ticket (runner-bound for the prep_sample branch), the
-        # sample from the scope target. Runs before finalize-mask-sample, so a
-        # 'completed' gate implies the counts are written.
+        # sample from the scope target.
         if entry.inputs != ["alignment"]:
             raise RuntimeError(
                 f"persist-syndna-read-count expects inputs [alignment]; got {entry.inputs!r}"

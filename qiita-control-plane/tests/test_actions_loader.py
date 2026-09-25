@@ -1386,7 +1386,6 @@ def test_load_actions_read_mask_finalizes_gate_after_register_files():
     by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
     names = [s.name for s in by_id["read-mask"].steps]
 
-    assert names[-1] == "finalize-mask-sample"
     assert names.index("register-files") < names.index("finalize-mask-sample")
     # persist-read-metrics still reads the local parquet before register-files moves it.
     assert names.index("persist-read-metrics") < names.index("register-files")
@@ -1394,9 +1393,9 @@ def test_load_actions_read_mask_finalizes_gate_after_register_files():
 
 def test_load_actions_read_mask_persists_syndna_counts_before_the_gate():
     """`persist-syndna-read-count` consumes the `syndna` step's `alignment`, is gated
-    on the same `when:` as that step, and runs before `finalize-mask-sample` — so a
-    'completed' gate under a SynDNA mask implies the counts are written, which the
-    export route relies on to call a missing count a backfill case."""
+    on the same `when:` as that step, and is the last entry: appended rather than
+    inserted, so no earlier entry's position moved for a ticket resumed across the
+    deploy (resume matches completed steps by position)."""
     from pathlib import Path
 
     from qiita_control_plane.actions import load_actions
@@ -1411,7 +1410,7 @@ def test_load_actions_read_mask_persists_syndna_counts_before_the_gate():
     assert "alignment" in syndna.outputs
     assert persist.when == syndna.when == "syndna_enabled"
     assert names.index("syndna") < names.index("persist-syndna-read-count")
-    assert names.index("persist-syndna-read-count") < names.index("finalize-mask-sample")
+    assert names[-2:] == ["finalize-mask-sample", "persist-syndna-read-count"]
 
 
 def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():

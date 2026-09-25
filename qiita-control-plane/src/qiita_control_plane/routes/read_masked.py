@@ -437,8 +437,17 @@ async def get_syndna_read_count_route(
                 ),
             )
         if not rows:
+            filters = ", ".join(
+                f"{name}={value}"
+                for name, value in (
+                    ("study_idx", study_idx),
+                    ("sequenced_pool_idx", sequenced_pool_idx),
+                )
+                if value is not None
+            )
             raise HTTPException(
-                status_code=404, detail=f"no prep_sample masked under mask {mask_idx} matches"
+                status_code=404,
+                detail=f"no prep_sample is masked under mask {mask_idx} with {filters}",
             )
         selected = [r["prep_sample_idx"] for r in rows]
         await authorize_prep_sample_cohort(
@@ -475,9 +484,11 @@ async def get_syndna_read_count_route(
             status_code=409,
             detail=(
                 f"{len(uncounted)} selected prep_sample(s) have no SynDNA read counts under"
-                f" mask {mask_idx} (e.g. {first_few(uncounted)}); they were masked before"
-                " counts were persisted — ask an operator to run"
-                " `qiita-admin backfill syndna-read-count`"
+                f" mask {mask_idx} (e.g. {first_few(uncounted)}). Either the masking"
+                " ticket has not yet written them (retry once it completes, or redrive it"
+                " if it failed), or the prep_sample was masked before counts were"
+                " persisted (ask an operator to run `qiita-admin backfill"
+                " syndna-read-count`)"
             ),
         )
     return SyndnaReadCountResponse(

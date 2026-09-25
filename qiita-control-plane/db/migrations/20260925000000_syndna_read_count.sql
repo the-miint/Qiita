@@ -7,15 +7,14 @@
 -- read hit is not in `read_mask`. This table keeps that breakdown — the number of
 -- reads with a mapped primary alignment to each insert, ungated by the step's
 -- identity / aligned-fraction cut — written by the `persist-syndna-read-count`
--- action before the sample's mask_sample gate flips to 'completed'.
+-- action, the read-mask workflow's last entry.
 --
 -- One row per insert of the mask's SynDNA reference, zeros included, so a
 -- (mask_idx, prep_sample_idx) with no rows means "not counted", never "no
 -- SynDNA reads".
 --
--- References mask_definition and prep_sample rather than mask_sample: the action
--- writes before finalize-mask-sample creates the gate row. Completion is still
--- the gate's value; a reader checks mask_sample, not the presence of rows here.
+-- Completion is the mask_sample gate's value; a reader checks it, not the
+-- presence of rows here, and refuses a completed sample that has none.
 CREATE TABLE qiita.syndna_read_count (
     mask_idx         BIGINT NOT NULL REFERENCES qiita.mask_definition(mask_idx) ON DELETE CASCADE,
     -- CASCADE, as assembly_membership: derived per-sample output, removed with the

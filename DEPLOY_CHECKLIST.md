@@ -27,15 +27,7 @@ _None yet._
 
 ### 4. Deploy
 
-- `[operator]` **Before the restart**, confirm no read-mask ticket is stopped between `register-files` and `finalize-mask-sample`. The read-mask workflow gains an entry (`persist-syndna-read-count`) ahead of `register-files`, and resume matches completed steps by position, so such a ticket would resume against the wrong entries. This must return 0 rows; if it does not, redrive those tickets to `completed` on the current code first (#TBD):
-
-  ```sql
-  SELECT wt.work_ticket_idx, wt.state
-    FROM qiita.work_ticket wt
-    JOIN qiita.work_ticket_step s ON s.work_ticket_idx = wt.work_ticket_idx
-   WHERE wt.action_id = 'read-mask' AND wt.state <> 'completed'
-     AND s.step_name = 'register-files' AND s.state = 'completed';
-  ```
+_None yet._
 
 ### 5. Verify
 
