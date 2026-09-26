@@ -100,6 +100,7 @@ from ._helpers import (
     patch_and_map_study_field,
     raise_for_unique_violation,
     raise_http_for_sample_metadata_write_error,
+    raise_transient_retry,
     read_and_map_study_field,
     read_study_scoped_entity,
     require_etag_match,
@@ -306,6 +307,15 @@ async def import_biosample(
                 exc.constraint_name, f"{GENERIC_CHECK_VIOLATION} biosample"
             )
             raise HTTPException(status_code=422, detail=detail)
+        except asyncpg.DeadlockDetectedError:
+            # The import writes values through fields a study admin may be
+            # redeclaring at the same time, which can leave the two
+            # transactions waiting on each other; the database breaks the tie
+            # by aborting one. No biosample was created.
+            raise_transient_retry(
+                "a concurrent edit of one of this study's fields interrupted the"
+                " import; nothing was stored — resubmit the identical request"
+            )
 
     return BiosampleImportResponse(
         biosample_idx=result.biosample_idx,

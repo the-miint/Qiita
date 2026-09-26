@@ -6,9 +6,14 @@ both entities' routes; a case that needs one entity's own bindings belongs in
 that entity's own module instead.
 """
 
+from decimal import Decimal
+
+import asyncpg
 import pytest
 import pytest_asyncio
+from qiita_common.models import FieldDataType
 
+from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.testing.db_seeds import seed_terminology
 from qiita_control_plane.testing.unique_names import unique_field_name
 
@@ -29,6 +34,10 @@ from .conftest import (
 )
 
 pytestmark = pytest.mark.db
+
+# The two shapes of lock contention a study-field edit answers as transient: a
+# wait that ran out, and a tie the database broke by aborting this side.
+CONTENTION_ERRORS = [asyncpg.LockNotAvailableError, asyncpg.DeadlockDetectedError]
 
 
 @pytest_asyncio.fixture
@@ -261,6 +270,20 @@ async def _etag(ctx, surface, study_field_idx):
     return await etag_for_row(ctx["pool"], table=table, row_idx=study_field_idx)
 
 
+async def _stored_values(ctx, surface, study_field_idx):
+    """Every value stored through one field, as (value_text, value_numeric)
+    pairs ordered by row, so an assertion states which column holds the value
+    rather than only what the value reads as.
+    """
+    spec = surface.metadata_spec
+    rows = await ctx["pool"].fetch(
+        f"SELECT value_text, value_numeric FROM {spec.metadata_table}"
+        f" WHERE {spec.study_field_idx_column} = $1 ORDER BY idx",
+        study_field_idx,
+    )
+    return [(row["value_text"], row["value_numeric"]) for row in rows]
+
+
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
 @pytest.mark.parametrize("case", STUDY_FIELD_CREATE_AUTHZ_CASES)
 async def test_patch_study_field_authz(
@@ -446,8 +469,11 @@ async def test_patch_study_field_unique_on_closed_value_set_422(ctx, surface):
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
-@pytest.mark.parametrize("attribute", ["unique_in_study", "required"])
-async def test_patch_study_field_inherited_attribute_on_linked_422(ctx, surface, attribute):
+@pytest.mark.parametrize(
+    "attribute,value",
+    [("unique_in_study", True), ("required", True), ("data_type", "text")],
+)
+async def test_patch_study_field_inherited_attribute_on_linked_422(ctx, surface, attribute, value):
     """Tests the case where an attribute the global field owns is set on a
     linked row: it is refused, since the linked row stores none of them.
     """
@@ -471,7 +497,7 @@ async def test_patch_study_field_inherited_attribute_on_linked_422(ctx, surface,
         study_idx=study_idx,
         study_field_idx=field_idx,
         if_match=await _etag(ctx, surface, field_idx),
-        **{attribute: True},
+        **{attribute: value},
     )
 
     assert resp.status_code == 422, resp.text
@@ -809,3 +835,308 @@ async def test_patch_study_field_resends_unique_on_published_sample(ctx, surface
     assert resp.status_code == 200, resp.text
     assert resp.json()["display_name"] == renamed
     assert await _stored_unique_in_study(ctx, surface, field_idx) is True
+
+
+# =============================================================================
+# Widening a field's declared type to text
+# =============================================================================
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_widens_to_text(ctx, surface):
+    """Tests the case where a numeric field is redeclared text: the value it
+    already holds is carried into value_text rather than stranded, the body
+    reports the new type, and the ETag moves.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "wid-ok")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="numeric")
+    await seed_sample_with_value(
+        ctx,
+        surface,
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        value=Decimal("1.50"),
+        data_type=FieldDataType.NUMERIC,
+    )
+    before = await _etag(ctx, surface, field_idx)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=before,
+        data_type="text",
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data_type"] == "text"
+    assert resp.headers["ETag"] != before
+    assert await _stored_values(ctx, surface, field_idx) == [("1.50", None)]
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_widens_and_enables_unique_in_study(ctx, surface):
+    """Tests the case where one request widens a boolean field and declares it
+    unique: eligibility is judged against the type the field ends at, not the
+    closed value set it started from.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "wid-uniq")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="boolean")
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        data_type="text",
+        unique_in_study=True,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data_type"] == "text"
+    assert resp.json()["unique_in_study"] is True
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_widen_terminology_422(ctx, surface):
+    """Tests the case where a terminology field is asked to become text: its
+    values are references into a controlled vocabulary with no text form, so
+    the request is refused rather than guessed at.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "wid-term")
+    terminology_idx = await seed_terminology(ctx["pool"], name=unique_field_name("widen-term"))
+    ctx["created"]["terminology"].append(terminology_idx)
+    field_idx = await _seed_editable_field(
+        ctx,
+        surface,
+        study_idx=study_idx,
+        data_type="terminology",
+        terminology_idx=terminology_idx,
+    )
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        data_type="text",
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "cannot be widened" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize("target", ["numeric", "boolean", "date", "terminology"])
+async def test_patch_study_field_narrowing_target_422(ctx, surface, target):
+    """Tests the case where a caller names any target but text: only widening
+    is expressible, so the body is refused before the route runs.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "wid-narrow")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        data_type=target,
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_widen_already_text_unchanged(ctx, surface):
+    """Tests the case where a text field is asked to become text: the state
+    asked for already holds, so nothing is written and the caller's tag stays
+    good, keeping a retry harmless.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "wid-noop")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx)
+    before = await _etag(ctx, surface, field_idx)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=before,
+        data_type="text",
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data_type"] == "text"
+    assert resp.headers["ETag"] == before
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_widen_published_409(ctx, surface):
+    """Tests the case where a field's values sit on a published sample: the
+    move would rewrite frozen rows, so the widen is refused whole and the
+    declaration is left alone.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "wid-pub")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="numeric")
+    await seed_sample_with_value(
+        ctx,
+        surface,
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        value=Decimal("2"),
+        data_type=FieldDataType.NUMERIC,
+        publish=True,
+    )
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        data_type="text",
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert await _stored_values(ctx, surface, field_idx) == [(None, Decimal("2"))]
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_widen_retired_link_409(ctx, surface):
+    """Tests the case where a field's values sit on a sample whose link to the
+    study has been retired: the move is an ordinary write those rows refuse, so
+    the widen is refused whole and names retirement rather than publication.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "wid-ret")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="numeric")
+    await seed_sample_with_value(
+        ctx,
+        surface,
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        value=Decimal("2"),
+        data_type=FieldDataType.NUMERIC,
+        retire_link=True,
+    )
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        data_type="text",
+    )
+
+    assert resp.status_code == 409, resp.text
+    # The clause, not the whole message: what is under test is which of the two
+    # freezes the answer names, not the wording around it.
+    assert "no longer linked to this study" in resp.json()["detail"]
+    assert await _stored_values(ctx, surface, field_idx) == [(None, Decimal("2"))]
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize("error", CONTENTION_ERRORS, ids=lambda cls: cls.__name__)
+async def test_patch_study_field_widen_contention_503(ctx, surface, error, monkeypatch):
+    """Tests the case where the widen cannot have the metadata table, its wait
+    running out or the database aborting it to break a tie with a concurrent
+    write: the caller is told the condition is transient rather than receiving
+    an unclassified failure.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "wid-cont")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="numeric")
+
+    async def _contended(conn, **kwargs):
+        raise error("contended")
+
+    monkeypatch.setattr(route_helpers, "widen_study_field_to_text", _contended)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        data_type="text",
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.headers["Retry-After"] == "1"
+
+
+# same-pattern-ok: the sibling of the widen case above, differing only in which
+# call is made to fail and which policy the body sends; this repo marks route
+# twins rather than factoring them behind a helper.
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize("error", CONTENTION_ERRORS, ids=lambda cls: cls.__name__)
+async def test_patch_study_field_unique_contention_503(ctx, surface, error, monkeypatch):
+    """Tests the case where the uniqueness propagation cannot have the metadata
+    table, its wait running out or the database aborting it to break a tie with
+    a concurrent write: the caller is told the condition is transient rather
+    than receiving an unclassified failure.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "uniq-cont")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="text")
+
+    async def _contended(conn, **kwargs):
+        raise error("contended")
+
+    monkeypatch.setattr(route_helpers, "update_study_field", _contended)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        unique_in_study=True,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.headers["Retry-After"] == "1"
+
+
+# same-pattern-ok: the third of the sibling set above, differing only in which
+# call is made to fail; this repo marks route twins rather than factoring them
+# behind a helper.
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize("error", CONTENTION_ERRORS, ids=lambda cls: cls.__name__)
+async def test_patch_study_field_row_read_contention_503(ctx, surface, error, monkeypatch):
+    """Tests the case where the field's own row cannot be locked for the edit,
+    the bound the locking keys put in force having run out against another edit
+    of the same field: the caller is told the condition is transient rather
+    than receiving an unclassified failure.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "read-cont")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="text")
+
+    async def _contended(conn, **kwargs):
+        raise error("contended")
+
+    monkeypatch.setattr(route_helpers, "fetch_study_field_in_study", _contended)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        unique_in_study=True,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.headers["Retry-After"] == "1"

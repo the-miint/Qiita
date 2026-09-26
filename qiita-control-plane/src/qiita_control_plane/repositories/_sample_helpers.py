@@ -261,9 +261,11 @@ class UniqueInStudyViolation(StrEnum):
     MISSING_VALUE_MARKER = "missing_value_marker"
 
 
-# Columns a caller may edit on a {entity}_study_field row, mirroring the wire
-# shape of SampleStudyFieldPatchRequest, whose docstring carries why data_type
-# and the global-field link are excluded.
+# Columns a caller may edit on a {entity}_study_field row through the plain
+# column write. Narrower than the edit body: data_type is settable on the wire
+# but is carried by widen_study_field_to_text, which moves the stored values in
+# the same transaction, and a bare flip of the declaration here is what that
+# function exists to prevent. The global-field link is on neither.
 STUDY_FIELD_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
     {"display_name", "description", "required", "tier_override", "unique_in_study"}
 )
@@ -2121,6 +2123,49 @@ async def update_study_field(
         return None
     updated_row = await fetch_study_field(conn, spec=spec, idx=written_idx["idx"])
     return updated_row
+
+
+async def widen_study_field_to_text(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_field_idx: int,
+) -> int:
+    """Declare one study-local field `text`, moving every value stored through
+    it into value_text, and return how many metadata rows moved.
+
+    Thin wrapper over qiita.widen_study_field_to_text, which owns the ordering
+    the two writes require and decides for itself whether the field may be
+    widened, having read the stored row under a lock. A field already declared
+    text is already in the target state: nothing is written and the count is
+    zero. A field whose type is not the study's to change, or whose values have
+    no text form, is refused by an asyncpg.RaiseError whose DETAIL carries a
+    `widen` key naming which; anything else it raises propagates unclassified.
+
+    A move excludes concurrent metadata writers, so the caller must have bounded
+    its wait for them: with lock_timeout unset the move raises
+    ObjectNotInPrerequisiteStateError and writes nothing, and when the bound
+    expires it raises LockNotAvailableError, likewise leaving the field as it
+    was. The second is a subclass of the first, so a caller telling the two
+    apart must catch it first or match on SQLSTATE. Neither the no-op nor a
+    refusal takes the lock or needs the bound.
+
+    The caller owns the transaction, and must still be in it when the returned
+    count is acted on: a move holds the field row, the metadata table against
+    concurrent writers, and up to two rows per value moved -- the metadata row
+    and its parent sample -- all for its remainder.
+    """
+    require_transaction(conn)
+    # The two tables bind as regclass, so a name that resolves to no table is
+    # refused by the cast rather than reaching a statement.
+    n_moved = await conn.fetchval(
+        "SELECT qiita.widen_study_field_to_text($1::regclass, $2::regclass, $3, $4)",
+        spec.study_field_table,
+        spec.metadata_table,
+        spec.study_field_idx_column,
+        study_field_idx,
+    )
+    return n_moved
 
 
 def classify_unique_in_study_violation(

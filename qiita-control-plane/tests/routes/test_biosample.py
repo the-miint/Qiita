@@ -5,6 +5,7 @@ from datetime import date
 from decimal import Decimal
 from typing import get_args
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -22,6 +23,8 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import BiosampleAccessionField, FieldDataType
 
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from qiita_control_plane.routes import _helpers as route_helpers
+from qiita_control_plane.routes import biosample as routes_biosample
 from qiita_control_plane.testing.db_seeds import (
     fetch_seeded_metagenome_term,
     retire_biosample,
@@ -4355,3 +4358,67 @@ async def test_import_biosample_allows_same_owner_id_in_another_study(ctx):
             owner_biosample_id_value="Sample 1",
         )
         assert resp.status_code == 201, resp.text
+
+
+# same-pattern-ok: the sibling of the study-field deadlock cases in
+# test_sample_field.py, differing only in which route is driven and which call
+# is made to deadlock; this repo marks route twins rather than factoring them.
+async def test_patch_biosample_metadata_deadlock_503(ctx, monkeypatch):
+    """Tests the case where the database breaks a lock tie against a concurrent
+    field edit by aborting the metadata write: the caller is told the condition
+    is transient rather than receiving an unclassified failure.
+    """
+    study_idx, display_name, _ = await _seed_study_with_unique_field(ctx, suffix="md-dead")
+    biosample_idx = await seed_biosample(
+        ctx["pool"],
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample"].append(biosample_idx)
+    await seed_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=biosample_idx,
+        study_idx=study_idx,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_to_study"].append((biosample_idx, study_idx))
+
+    async def _deadlock(conn, **kwargs):
+        raise asyncpg.DeadlockDetectedError("deadlock detected")
+
+    monkeypatch.setattr(route_helpers, "write_sample_metadata", _deadlock)
+
+    resp = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, biosample_idx, {display_name: "anything"}
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.headers["Retry-After"] == "1"
+
+
+# same-pattern-ok: as above, on the import route rather than the metadata PATCH.
+async def test_post_biosample_deadlock_503(ctx, monkeypatch):
+    """Tests the case where the database breaks a lock tie against a concurrent
+    field edit by aborting the import: the caller is told the condition is
+    transient rather than receiving an unclassified failure.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="imp-dead"
+    )
+
+    async def _deadlock(conn, **kwargs):
+        raise asyncpg.DeadlockDetectedError("deadlock detected")
+
+    monkeypatch.setattr(routes_biosample, "import_biosample_from_owner_biosample_id", _deadlock)
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=unique_field_name(),
+        owner_biosample_id_value="IMP-DEAD-1",
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.headers["Retry-After"] == "1"

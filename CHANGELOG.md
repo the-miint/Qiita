@@ -21,6 +21,31 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A study-local sample field can be widened to text, taking its stored values
+  with it (#628).** A field minted as numeric, boolean, or date could not be redeclared once
+  values existed: the field-contract check runs when a metadata row is written, not when
+  a definition changes, so a bare flip would leave every stored value in a column the
+  declaration no longer names and reads would return NULL for all of them. The new
+  `qiita.widen_study_field_to_text` declares the field text and moves its values into
+  `value_text` in one transaction, rendering each in the form the write path stores so a
+  widened value re-parses unchanged. It serves both sample stacks. What it refuses is what
+  can never be done -- a field whose type belongs to the global registry, and terminology,
+  which has no text form -- each tagged in the error DETAIL; a field already text is a
+  no-op returning zero rather than a conflict. Uniqueness enforcement passes from the
+  numeric or date partial index to the text one and still holds, since distinct values
+  render to distinct text. A move locks the metadata table against concurrent writers,
+  without which a write already in flight would land in the column the declaration is
+  about to stop naming -- unreadable, with nothing raised -- and it refuses to run for a
+  caller that has not bounded its wait for that lock. Neither the no-op nor a refusal
+  takes the lock. `PATCH /api/v1/study/{study_idx}/biosample-field/{study_field_idx}` and its
+  prep-sample twin reach it: the edit body now accepts `data_type`, whose only permitted
+  value is `text`, so narrowing stays inexpressible and is refused before the route runs.
+  The access bar is the one the route already had -- study admin, or `wet_lab_admin`.
+  Widening runs before a `unique_in_study` sent in the same body, so a field that becomes
+  text is judged eligible as text rather than as the closed value set it left. A field
+  whose values sit on published samples, or on samples whose link to the study has been
+  retired, cannot be widened at all, and the answer says which.
+
 - **A study reader can export per-prep_sample SynDNA insert read counts as BIOM or Parquet
   (#621).** The read-mask workflow's new `persist-syndna-read-count` action (gated on
   `syndna_enabled`, appended after `finalize-mask-sample`) reduces the `syndna` step's
@@ -3864,6 +3889,28 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **Declaring a sample field unique within its study no longer lets a concurrent write
+  slip past the new policy (#628).** The propagation that mirrors the policy onto the
+  field's stored values read only what was committed, so a metadata write already in
+  flight landed carrying the old policy -- outside the uniqueness indexes, and staying
+  there until that row was written again. The propagation now locks the metadata table
+  against concurrent writers while it tightens a field, so such a write either commits
+  first and is judged by the new policy, or waits and reads it. The lock is bounded: the
+  PATCH gives up after three seconds and answers 503 rather than stalling every metadata
+  write in the system, and the propagation refuses to run at all for a caller that has
+  set no bound. Relaxing a field's policy is unchanged, taking no lock. Holding a table
+  lock while holding the field's own row is the opposite order from the one a write
+  inserting a value through that field acquires them in, so the two can be found waiting
+  on each other and one is aborted to break the tie; the same is true of a widen, which
+  takes the same lock. Whichever side loses answers 503 with a Retry-After hint rather
+  than failing unclassified -- the study-field edit routes, the metadata-write routes,
+  and the biosample and sequenced-sample import routes alike. That bound covers the edit's
+  read of the field's own row as well, so an edit held off by another edit of the same
+  field now answers 503 too rather than the unclassified 500 it gave before. Only a write
+  that inserts a value through a field for the first time can be a party to this: an
+  overwrite of an existing value does not re-check the field reference and so takes no
+  lock on it.
 
 - **CLAUDE.md: read DuckLake data through the catalog, never `read_parquet` over its files
   (#611).** Ad-hoc scripts that globbed a table's Parquet read files the catalog does not
