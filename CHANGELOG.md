@@ -22,7 +22,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Added
 
 - **A study-local sample field can be widened to text, taking its stored values
-  with it (#N).** A field minted as numeric, boolean, or date could not be redeclared once
+  with it (#628).** A field minted as numeric, boolean, or date could not be redeclared once
   values existed: the field-contract check runs when a metadata row is written, not when
   a definition changes, so a bare flip would leave every stored value in a column the
   declaration no longer names and reads would return NULL for all of them. The new
@@ -3891,7 +3891,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Changed
 
 - **Declaring a sample field unique within its study no longer lets a concurrent write
-  slip past the new policy (#N).** The propagation that mirrors the policy onto the
+  slip past the new policy (#628).** The propagation that mirrors the policy onto the
   field's stored values read only what was committed, so a metadata write already in
   flight landed carrying the old policy -- outside the uniqueness indexes, and staying
   there until that row was written again. The propagation now locks the metadata table
