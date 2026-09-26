@@ -36,6 +36,7 @@ from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_ME
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
+    retire_biosample_to_study_link,
     retire_prep_sample_to_study_link,
     retire_principal,
     seed_biosample_global_field,
@@ -416,6 +417,16 @@ PREP_SAMPLE_FIELD_SURFACE = SampleFieldSurface(
 )
 SAMPLE_FIELD_SURFACES = (BIOSAMPLE_FIELD_SURFACE, PREP_SAMPLE_FIELD_SURFACE)
 
+# The value column each declared type is written through, which the metadata
+# field-contract trigger requires a row to match. Terminology is absent: its
+# value is a term reference, which no caller here seeds.
+VALUE_COLUMN_FOR_DATA_TYPE = {
+    FieldDataType.TEXT: "value_text",
+    FieldDataType.NUMERIC: "value_numeric",
+    FieldDataType.BOOLEAN: "value_boolean",
+    FieldDataType.DATE: "value_date",
+}
+
 
 async def seed_sample_with_value(
     ctx,
@@ -423,20 +434,26 @@ async def seed_sample_with_value(
     *,
     study_idx: int,
     study_field_idx: int,
-    value: str | None = None,
+    value: object | None = None,
+    data_type: FieldDataType = FieldDataType.TEXT,
     missing_reason_name: str | None = None,
     publish: bool = False,
+    retire_link: bool = False,
 ) -> int:
-    """Seed one sample of `surface`'s entity holding a text value through
+    """Seed one sample of `surface`'s entity holding one value through
     study_field_idx, and return that sample's idx.
 
-    Exactly one of value / missing_reason_name carries the row's content.
-    publish flips is_published on the prep_sample's study link, freezing every
-    row that prep reaches against further UPDATE.
+    Exactly one of value / missing_reason_name carries the row's content, and
+    data_type picks the column the value is written through, which must be the
+    type the field was declared with. publish flips is_published on the
+    prep_sample's study link, freezing every row that prep reaches against
+    further UPDATE. retire_link retires the seeded sample's own link to the
+    study, which freezes its values against a rewrite for a different reason.
     """
     assert (value is None) != (missing_reason_name is None), (
         "seed exactly one of value / missing_reason_name"
     )
+    value_column = VALUE_COLUMN_FOR_DATA_TYPE[data_type]
     pool = ctx["pool"]
     spec = surface.metadata_spec
     owner_idx = ctx["wet_session"]["principal_idx"]
@@ -476,7 +493,7 @@ async def seed_sample_with_value(
     metadata_idx = await pool.fetchval(
         f"INSERT INTO {spec.metadata_table}"
         f" ({spec.entity_key_column}, {spec.study_field_idx_column},"
-        " value_text, value_missing_reason_idx, created_by_idx)"
+        f" {value_column}, value_missing_reason_idx, created_by_idx)"
         " VALUES ($1, $2, $3, $4, $5) RETURNING idx",
         entity_idx,
         study_field_idx,
@@ -495,6 +512,24 @@ async def seed_sample_with_value(
             prep_sample_idx,
             study_idx,
         )
+
+    if retire_link:
+        # After the row exists: the same guard refuses a write through a
+        # retired link, so retiring first would refuse this seed's own INSERT.
+        if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
+            await retire_biosample_to_study_link(
+                pool,
+                biosample_idx=biosample_idx,
+                study_idx=study_idx,
+                retired_by_idx=owner_idx,
+            )
+        else:
+            await retire_prep_sample_to_study_link(
+                pool,
+                prep_sample_idx=prep_sample_idx,
+                study_idx=study_idx,
+                retired_by_idx=owner_idx,
+            )
 
     return entity_idx
 

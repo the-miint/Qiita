@@ -60,7 +60,7 @@ qiita/
 │   │           ├── biosample.py             # biosample import + study-scoped metadata / field routes
 │   │           ├── host_filter_profile.py   # read-only host-filter profile catalog
 │   │           ├── prep_protocol.py         # prep-protocol discovery for the bcl-convert flow
-│   │           ├── prep_sample.py           # prep-sample reads, retirement, study-local field create
+│   │           ├── prep_sample.py           # prep-sample reads, retirement, study-local field CRUD
 │   │           ├── read.py                  # block-read DoGet ticket minting
 │   │           ├── read_masked.py           # mask_idx minting + masked-read DoGet ticket
 │   │           ├── reference.py             # reference CRUD, membership, genome/feature minting

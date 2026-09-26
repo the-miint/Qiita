@@ -17,6 +17,7 @@ trigger-raised failures.
 
 import secrets
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -39,6 +40,7 @@ from qiita_control_plane.repositories._sample_helpers import (
 )
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+from qiita_control_plane.routes import sequenced_sample as routes_sequenced_sample
 from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_HUMAN_TERM_ID,
     fetch_missing_value_reason_idx,
@@ -4296,3 +4298,41 @@ async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
             }
         }
     }
+
+
+# same-pattern-ok: the sibling of the biosample import deadlock case in
+# test_biosample.py, differing only in which route is driven and which call is
+# made to deadlock; this repo marks route twins rather than factoring them.
+async def test_import_sequenced_sample_deadlock_503(ctx, monkeypatch):
+    """Tests the case where the database breaks a lock tie against a concurrent
+    field edit by aborting the import: the caller is told the condition is
+    transient rather than receiving an unclassified failure.
+    """
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "deadlock")
+    study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="dead")
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        study_idx=study_idx,
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    async def _deadlock(conn, **kwargs):
+        raise asyncpg.DeadlockDetectedError("deadlock detected")
+
+    monkeypatch.setattr(routes_sequenced_sample, "import_sequenced_prep_sample", _deadlock)
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("DEADLOCK"),
+        primary_study_idx=study_idx,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.headers["Retry-After"] == "1"

@@ -49,6 +49,7 @@ from ..repositories._sample_helpers import (
     MetadataUnknownFieldsError,
     MissingValueOnUniqueFieldError,
     OwnerSampleIdMetadataWriteError,
+    SampleEntityKind,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
     SlotOccupiedError,
@@ -65,12 +66,42 @@ from ..repositories._sample_helpers import (
     fetch_metadata_checklist_idx_by_name,
     fetch_study_field,
     update_study_field,
+    widen_study_field_to_text,
     write_sample_metadata,
 )
 from ..repositories.alignment_definition import alignment_definition_exists
 from ..repositories.block import list_incomplete_alignment_samples
 
 REFERENCE_NOT_FOUND_DETAIL = "Reference not found"
+
+# Bounds every lock wait in a PATCH that locks the metadata table -- declaring
+# a field unique, or widening one. The edit is the operation that must give up
+# rather than the write path it would otherwise stall: long enough for an
+# ordinary write already in flight to clear, short enough that a stalled bulk
+# import cannot hold the PATCH open. Both operations refuse to run at all with
+# no bound in force, so this is also what keeps the API path out of that
+# refusal.
+METADATA_LOCK_TIMEOUT_MS = 3_000
+
+# Study-field edit keys whose handling can lock the metadata table against
+# concurrent writers -- tightening unique_in_study, and widening a field --
+# and which therefore need the bound above in force before the edit takes its
+# first lock. Neither waits on how much data the field carries: a widen of a
+# field holding no values takes the table lock just the same. Membership is
+# judged on the key the body names rather than on what it asks for, the bound
+# having to be set before the row is read and so ahead of knowing which way
+# the key goes. A locking key left out of this set reaches its table lock with
+# no bound in force and is refused there.
+_METADATA_LOCKING_PATCH_FIELDS = frozenset({"unique_in_study", "data_type"})
+
+# The `widen` DETAIL values qiita.widen_study_field_to_text tags its raises
+# with. Two name a shape that can never be widened; the third names an idx that
+# is on no row, which is a broken precondition rather than an answer. Spelled in
+# the migration that raises them, so a rename there without one here degrades
+# silently to the unclassified arm rather than failing.
+_WIDEN_REFUSAL_UNWIDENABLE_TYPE = "unwidenable_type"
+_WIDEN_REFUSAL_GLOBALLY_LINKED = "globally_linked"
+_WIDEN_REFUSAL_NOT_FOUND = "not_found"
 
 
 async def require_reference_exists(pool: asyncpg.Pool, reference_idx: int) -> None:
@@ -554,6 +585,15 @@ async def write_and_map_sample_metadata(
         if detail_fields.get("trigger") == spec.metadata_retired_link_trigger:
             raise HTTPException(status_code=404, detail=unlinked_detail)
         raise
+    except asyncpg.DeadlockDetectedError:
+        # Writing a value through a field an edit is concurrently redeclaring
+        # can leave the two transactions waiting on each other, and the
+        # database breaks the tie by aborting one. Nothing was written, and
+        # the tie does not recur on its own.
+        raise_transient_retry(
+            "a concurrent edit of one of these fields interrupted the write;"
+            " nothing was stored — resubmit the identical request"
+        )
     return SampleMetadataWriteResponse(
         results={
             # scope is derived from internal_name on the wire model, so it is
@@ -677,6 +717,83 @@ async def read_and_map_study_field(
     return mapped, row["updated_at"]
 
 
+async def _widen_study_field_or_raise(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_field_idx: int,
+    display_name: str,
+    noun: SampleEntityKind,
+) -> None:
+    """Redeclare one study-local field as text, carrying its stored values with
+    it, and translate the refusals that raises into answers.
+
+    A type with no text form is 422: the shape can never be widened, so the
+    request is wrong rather than early. A globally linked field is 422 for the
+    same reason the linked-attribute rule gives, and is translated here so the
+    answer stays the reason rather than an unclassified failure if that rule
+    ever stops running first. Values the move is not allowed to rewrite are
+    409, naming whichever of publication or a retired study link refused them,
+    and contention for the metadata table is 503. An idx that is on no row is a
+    broken precondition rather than an answer, and raises.
+    """
+    try:
+        await widen_study_field_to_text(conn, spec=spec, study_field_idx=study_field_idx)
+    except asyncpg.RaiseError as exc:
+        detail_fields = parse_kv_detail(exc.detail)
+        widen_reason = detail_fields.get("widen")
+        if widen_reason == _WIDEN_REFUSAL_NOT_FOUND:
+            raise RuntimeError(
+                f"{spec.study_field_table} idx={study_field_idx} vanished between"
+                " its own lock and the widen"
+            ) from exc
+        if widen_reason == _WIDEN_REFUSAL_UNWIDENABLE_TYPE:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{noun} field {display_name!r} cannot be widened to text:"
+                    " its values are references into a controlled vocabulary"
+                ),
+            ) from exc
+        if widen_reason == _WIDEN_REFUSAL_GLOBALLY_LINKED:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{noun} field {study_field_idx} is linked to a global field;"
+                    " data_type cannot be set on it"
+                ),
+            ) from exc
+        if detail_fields.get("trigger") == spec.metadata_retired_link_trigger:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{noun} field {display_name!r} cannot be widened to text:"
+                    f" one or more of its {noun}s is no longer linked to this study"
+                ),
+            ) from exc
+        # No `widen` tag and no trigger this code knows: on these rows a P0001
+        # carrying no DETAIL is the publication lock. The field-contract raiser
+        # is not a candidate, the declaration being flipped to text before the
+        # values move, so it judges each moved value against the type it is
+        # arriving as.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{noun} field {display_name!r} cannot be widened to text:"
+                f" one or more of its {noun}s has been published"
+            ),
+        ) from exc
+    except asyncpg.LockNotAvailableError, asyncpg.DeadlockDetectedError:
+        # Two shapes of the same contention: the move either waited out its
+        # bound for the metadata table, or was picked by the database to
+        # break a tie with a write already holding it. Neither wrote
+        # anything, and both clear once the other transaction ends.
+        raise_transient_retry(
+            f"{noun} field {display_name!r} could not be widened to text:"
+            " metadata writes are in flight; re-issue the request to retry"
+        )
+
+
 async def patch_and_map_study_field(
     conn: asyncpg.Connection,
     *,
@@ -695,31 +812,54 @@ async def patch_and_map_study_field(
     also 404 (it exists, but not where this path addresses, and saying so
     differently would confirm it), and a stale tag is 412.
 
-    Then the two shape rules, both against the stored row rather than the body,
-    since the body carries neither the field's type nor its link: a linked row
-    refuses the attributes it inherits, and unique_in_study refuses a shape it
-    cannot govern. Both are 422.
+    Then the two shape rules, both 422. A linked row refuses the attributes it
+    inherits, judged against the stored row because the body carries no link to
+    judge from. unique_in_study refuses a shape it cannot govern, judged against
+    the type the field ends this request at: a widen in the same body runs
+    first, so a field that becomes text is weighed as text.
 
     Write rejections: a display_name already used in the study is 409; enabling
     uniqueness over values that already repeat is 409; over a value that is a
     missing-value marker, 422. The last two are the field's existing data
-    refusing the new policy, so they name the field, not one value.
+    refusing the new policy, so they name the field, not one value. A widen of
+    a type with no text form is 422; of a field whose values sit on samples
+    that are published, or whose link to this study is retired, 409, either
+    freezing them against the move.
 
     A change of uniqueness policy propagates to every value stored through the
-    field and touches each value's parent entity, so it locks on the order of
-    two rows per sample in the study until the caller's transaction commits.
+    field and touches each value's parent sample, so it locks up to two rows
+    per value the field carries until the caller's transaction commits -- the
+    metadata row and that sample, which several of the field's values may
+    share. Tightening, and a widen, each also lock the metadata table against
+    concurrent writers for that span. Every lock this path waits on is bounded
+    once either is asked for, the field's own row included, and every wait that
+    runs out answers 503 with nothing written.
 
     The caller owns the transaction.
     """
     noun = spec.entity_kind
     if_match = require_if_match(if_match)
+    named = body.model_fields_set
 
-    row = await fetch_study_field_in_study(
-        conn, spec=spec, study_idx=study_idx, study_field_idx=study_field_idx, for_update=True
-    )
+    # Bound the waits before taking the first of the locks these keys cause.
+    if named & _METADATA_LOCKING_PATCH_FIELDS:
+        await conn.execute(f"SET LOCAL lock_timeout = '{METADATA_LOCK_TIMEOUT_MS}ms'")
+
+    try:
+        row = await fetch_study_field_in_study(
+            conn, spec=spec, study_idx=study_idx, study_field_idx=study_field_idx, for_update=True
+        )
+    except asyncpg.LockNotAvailableError, asyncpg.DeadlockDetectedError:
+        # The bound set above covers this read too, and a concurrent edit of
+        # the same field holds its row to that edit's commit -- long enough to
+        # outlast the bound when the other side is moving values. Same class of
+        # contention as the two below, so the same answer.
+        raise_transient_retry(
+            f"{noun} field {study_field_idx} could not be read for editing:"
+            " another edit of it is in flight; re-issue the request to retry"
+        )
     require_etag_match(row, if_match=if_match, label=f"{noun} field", row_idx=study_field_idx)
 
-    named = body.model_fields_set
     if row[spec.study_field_global_fk_column] is not None:
         inherited = [name for name in NOT_SETTABLE_ON_LINKED_FIELD if name in named]
         if inherited:
@@ -731,15 +871,39 @@ async def patch_and_map_study_field(
                 ),
             )
 
+    # The widen runs ahead of the uniqueness rule below so that rule is judged
+    # against the type the field ends at. Anything raised past this point
+    # unwinds it with the rest of the caller's transaction.
+    effective_data_type = row["data_type"]
+    if body.data_type is not None:
+        await _widen_study_field_or_raise(
+            conn,
+            spec=spec,
+            study_field_idx=study_field_idx,
+            display_name=row["display_name"],
+            noun=noun,
+        )
+        effective_data_type = body.data_type
+
     if body.unique_in_study:
         reason = unique_in_study_rejection_reason(
-            data_type=row["data_type"],
+            data_type=effective_data_type,
             is_globally_linked=row[spec.study_field_global_fk_column] is not None,
         )
         if reason is not None:
             raise HTTPException(status_code=422, detail=reason)
 
-    fields = {name: getattr(body, name) for name in named}
+    # data_type is carried by the widen above, never by the column write: the
+    # study-field update allowlist omits it, and a bare flip of the declaration
+    # is what the widen exists to prevent.
+    fields = {name: getattr(body, name) for name in named - {"data_type"}}
+    if not fields:
+        reread_row = await fetch_study_field(conn, spec=spec, idx=study_field_idx)
+        updated_row = require_locked_study_field_row(
+            reread_row, spec=spec, study_field_idx=study_field_idx
+        )
+        return map_study_field_row(updated_row, spec=spec, response_model=response_model)
+
     try:
         updated_row = await update_study_field(conn, spec=spec, idx=study_field_idx, fields=fields)
     except asyncpg.UniqueViolationError as exc:
@@ -779,7 +943,10 @@ async def patch_and_map_study_field(
         # the conservative default while nothing publishes yet; see associated
         # issue for details. Every other P0001 raiser on these metadata tables
         # is scoped to the key and value columns, so a RaiseError on this
-        # policy-only write is the publication lock and nothing else.
+        # policy-only write is the publication lock and nothing else. A widen's
+        # own refusals never reach here, being answered where the widen runs,
+        # and the propagation trigger's refusal carries SQLSTATE 55000 to stay
+        # out of this branch.
         raise HTTPException(
             status_code=409,
             detail=(
@@ -787,13 +954,20 @@ async def patch_and_map_study_field(
                 f" policy: one or more of its {noun}s has been published"
             ),
         )
-
-    # The row was locked from the preflight through this write, so an absent
-    # row here is corruption rather than a lost race.
-    if updated_row is None:
-        raise RuntimeError(
-            f"{spec.study_field_table} idx={study_field_idx} vanished under its own lock"
+    except asyncpg.LockNotAvailableError, asyncpg.DeadlockDetectedError:
+        # The propagation either could not get the metadata table quiet within
+        # the bound, or was picked by the database to break a tie with a write
+        # already holding it. Either way metadata writes were in flight,
+        # nothing is written, and the condition is transient: the caller
+        # retries.
+        raise_transient_retry(
+            f"{noun} field {row['display_name']!r} could not change its uniqueness"
+            " policy: metadata writes are in flight; re-issue the request to retry"
         )
+
+    updated_row = require_locked_study_field_row(
+        updated_row, spec=spec, study_field_idx=study_field_idx
+    )
     return map_study_field_row(updated_row, spec=spec, response_model=response_model)
 
 
@@ -914,6 +1088,25 @@ def require_etag_match(
         raise HTTPException(status_code=404, detail=f"{label} {row_idx} not found")
     if if_match != etag_for_updated_at(row["updated_at"]):
         raise HTTPException(status_code=412, detail="If-Match did not match")
+
+
+def require_locked_study_field_row(
+    row: asyncpg.Record | None,
+    *,
+    spec: EntityMetadataSpec,
+    study_field_idx: int,
+) -> asyncpg.Record:
+    """Return the row, refusing the None a row held under a lock cannot be.
+
+    A re-read of a row locked to commit earlier in the same transaction comes
+    back None only under corruption, so it is raised on by name here rather
+    than mapped to an answer or left to fail shapelessly further down.
+    """
+    if row is None:
+        raise RuntimeError(
+            f"{spec.study_field_table} idx={study_field_idx} vanished under its own lock"
+        )
+    return row
 
 
 async def detail_for_slot_collision(
@@ -1085,32 +1278,47 @@ def detail_for_biosample_link_rejection(detail_fields: dict[str, str]) -> str:
     )
 
 
-# Retry-After is advisory; the race self-resolves the instant the
-# concurrent delete commits, so a 1-second hint is generous. Sent as a
-# string because that is the on-the-wire header value.
-_TRANSIENT_WRITE_RACE_RETRY_AFTER = "1"
+# Retry-After is advisory, and this is a floor rather than an estimate: it
+# says the caller may come straight back, not that the way will be clear when
+# they do. Some conditions answered through raise_transient_retry are already
+# over by the time the answer is written; a wait that ran out against a bulk
+# import is not, and that caller pays for a further attempt or two rather than
+# being held here. Sent as a string because that is the on-the-wire header
+# value.
+_TRANSIENT_RETRY_AFTER = "1"
 
 
-def raise_for_transient_write_race(exc: TransientWriteRaceError) -> None:
-    """Translate a lost write race into a 503 retry response.
+def raise_transient_retry(detail: str) -> None:
+    """Answer a transient condition the identical request can retry.
 
-    Both metadata-writing routes call this so the status, wording, and
-    Retry-After hint stay identical across endpoints. The occupant that
-    triggered the unique violation was concurrently deleted before it
-    could be diagnosed, so the slot is free again and the same request
-    will succeed on resubmission — 503 (transient) with Retry-After, not
-    409 (the state is not actually in conflict) and not 500.
+    Every caller states its own cause in `detail`; the status and the
+    Retry-After hint are decided here so they cannot drift between the
+    endpoints that answer for the same class of condition. 503 (transient),
+    not 409 (the state is not actually in conflict) and not 500 (the request
+    was not wrong and will likely succeed as sent).
 
     Never returns; always raises HTTPException.
     """
     raise HTTPException(
         status_code=503,
-        detail=(
-            f"a concurrent delete raced your {exc.row_label} write"
-            f" ({exc.slot_summary}); the slot is now free —"
-            f" resubmit the identical request"
-        ),
-        headers={"Retry-After": _TRANSIENT_WRITE_RACE_RETRY_AFTER},
+        detail=detail,
+        headers={"Retry-After": _TRANSIENT_RETRY_AFTER},
+    )
+
+
+def raise_for_transient_write_race(exc: TransientWriteRaceError) -> None:
+    """Translate a lost write race into a 503 retry response.
+
+    The occupant that triggered the unique violation was concurrently
+    deleted before it could be diagnosed, so the slot is free again and the
+    same request will succeed on resubmission.
+
+    Never returns; always raises HTTPException.
+    """
+    raise_transient_retry(
+        f"a concurrent delete raced your {exc.row_label} write"
+        f" ({exc.slot_summary}); the slot is now free —"
+        f" resubmit the identical request"
     )
 
 

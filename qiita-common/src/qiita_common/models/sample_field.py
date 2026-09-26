@@ -6,7 +6,7 @@ fields that carry its entity-qualified name on the wire; every other column,
 and the purely-local vs globally-linked mode coupling, lives here.
 """
 
-from typing import Annotated, ClassVar
+from typing import Annotated, ClassVar, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
@@ -66,8 +66,9 @@ def unique_in_study_rejection_reason(
     values. Text, numeric, and date are eligible.
 
     Callers supply the shape from wherever they hold it — a request body on a
-    create, the stored row on an edit — so the rule is stated here and nowhere
-    else.
+    create, and on an edit the type the field ends that request at, which the
+    stored row gives unless the same body redeclared it — so the rule is stated
+    here and nowhere else.
     """
     if is_globally_linked:
         return "unique_in_study is unavailable on a globally-linked field"
@@ -184,14 +185,18 @@ class SampleStudyFieldPatchRequest(PatchRequestModel):
     """Body for a study-local field edit — the columns a study may change on a
     definition it already minted.
 
-    data_type and the global-field link are absent on purpose: changing either
-    rewrites the meaning of every value already stored through the field.
+    The global-field link is absent on purpose: changing it rewrites the
+    meaning of every value already stored through the field. data_type admits
+    exactly one target, text, into which a stored numeric, boolean, or date
+    can be carried without losing what it said; the route moves those values as
+    it changes the declaration. A terminology value has no such form and is
+    refused there. Narrowing stays inexpressible, since any other target can
+    fail to hold a value already stored.
 
-    unique_in_study is accepted here without a type check, because this body
-    carries no data_type to check it against — the field's stored shape decides,
-    so the route applies unique_in_study_rejection_reason to the row it read.
-    required and tier_override are likewise only meaningful on a purely-local
-    row, which the route establishes from the same row.
+    unique_in_study is checked against the type the field ends this request at,
+    which a widen in the same body may have changed. required and tier_override
+    are only meaningful on a purely-local row, which the route establishes from
+    the row it read.
     """
 
     # Not "columns declared NOT NULL": required is nullable on a study-field
@@ -199,7 +204,7 @@ class SampleStudyFieldPatchRequest(PatchRequestModel):
     # These are the fields an explicit null says nothing with, so sending one
     # is a malformed request rather than an erasure.
     NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset(
-        {"display_name", "required", "unique_in_study"}
+        {"display_name", "required", "unique_in_study", "data_type"}
     )
 
     display_name: NonBlankName | None = None
@@ -207,3 +212,4 @@ class SampleStudyFieldPatchRequest(PatchRequestModel):
     required: bool | None = None
     tier_override: Tier | None = None
     unique_in_study: bool | None = None
+    data_type: Literal[FieldDataType.TEXT] | None = None

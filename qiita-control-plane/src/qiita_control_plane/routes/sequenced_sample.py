@@ -106,6 +106,7 @@ from ._helpers import (
     metadata_entries_from_rows,
     parse_kv_detail,
     raise_http_for_sample_metadata_write_error,
+    raise_transient_retry,
     read_study_scoped_entity,
     resolve_linked_study_entity,
     resolve_metadata_checklist_idx,
@@ -265,6 +266,15 @@ async def import_sequenced_sample_from_run(
                     detail=detail_for_biosample_link_rejection(detail_fields),
                 )
             raise
+        except asyncpg.DeadlockDetectedError:
+            # The import writes values through fields a study admin may be
+            # redeclaring at the same time, which can leave the two
+            # transactions waiting on each other; the database breaks the tie
+            # by aborting one. No sequenced sample was created.
+            raise_transient_retry(
+                "a concurrent edit of one of this study's fields interrupted the"
+                " import; nothing was stored — resubmit the identical request"
+            )
 
     return SequencedSampleCreateResponse(
         prep_sample_idx=result.prep_sample_idx,

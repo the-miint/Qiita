@@ -25,6 +25,16 @@ _None yet._
 
 - `[operator]` `make migrate` applies `20260925000000_syndna_read_count.sql` (new table `qiita.syndna_read_count`; no data change). (#621)
 
+- **[operator] Between `make migrate` and the bucket-4 restart, a study-field edit that
+  declares a field unique answers 500 (#N).** `20260918000000_unique_in_study_propagation_lock.sql`
+  makes the propagation refuse a caller that has set no `lock_timeout`, and the control plane
+  still running at that point does not set one — only the build this deploy installs does. The
+  window is the gap between the two steps, and nothing has to be done about it beyond not
+  reporting the 500 as a regression: `PATCH /api/v1/study/{S}/biosample-field/{F}` (and its
+  prep-sample twin) carrying `unique_in_study: true` recovers on the restart, with no partial
+  state left behind. That file and `20260915000000_sample_field_widen_fn.sql` only create or
+  replace functions, so neither adds a lock window on the metadata tables to size.
+
 ### 4. Deploy
 
 _None yet._
@@ -39,7 +49,19 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **A hand-written `UPDATE ... SET unique_in_study = true`, or a hand-written
+  `SELECT qiita.widen_study_field_to_text(...)`, now fails unless the session sets
+  `lock_timeout` first (#N).** Both lock the metadata table against concurrent writers
+  and refuse an unbounded wait for it, which would queue every metadata write until
+  someone noticed. Run `SET LOCAL lock_timeout = '3s';` in the same transaction. The
+  deployed API path sets it for itself; the bucket-3 note covers the window before the
+  restart in which the running one does not.
+
+- **The study-field edit route accepts a new body key, `data_type` (#N).** Its only
+  permitted value is `text`, which redeclares the field and carries its stored values
+  into `value_text`. No client has to change, and the route's access bar is unchanged;
+  clients that reject unknown response keys are unaffected, since the response shape
+  already carried `data_type`.
 
 ## Deployed history
 
