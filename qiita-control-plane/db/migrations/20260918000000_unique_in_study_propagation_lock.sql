@@ -72,11 +72,13 @@ $$ LANGUAGE plpgsql;
 COMMENT ON FUNCTION qiita.tg_propagate_unique_in_study() IS
     'Mirrors a study field''s unique_in_study into the denormalized column on '
     'every metadata row written through that field. Tightening locks the '
-    'metadata table against concurrent writers for the caller''s transaction '
-    'and refuses to run without a bounded lock_timeout, raising SQLSTATE 55000; '
-    'relaxing takes no lock. A flip a study''s existing data cannot satisfy is '
-    'rejected by the partial unique indexes or the no-missing-value CHECK, '
-    'which rolls the flip back.';
+    'metadata table against concurrent writers for the caller''s transaction, '
+    'and refuses to take that lock without a bounded lock_timeout, raising '
+    'SQLSTATE 55000 in its place; the row lock the triggering UPDATE takes is '
+    'already held by then and is the caller''s to bound. Relaxing takes no '
+    'lock. A flip a study''s existing data cannot satisfy is rejected by the '
+    'partial unique indexes or the no-missing-value CHECK, which rolls the '
+    'flip back.';
 
 
 -- migrate:down
