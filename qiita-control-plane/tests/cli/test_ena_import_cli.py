@@ -218,6 +218,47 @@ def test_handler_refuses_a_missing_file(tmp_path, capsys):
     assert str(missing) in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        "PRJEB11419  # soil study",
+        "PRJEB1,PRJNA2",
+        "PRJEB1 PRJNA2",
+        "PRJEB1\tPRJNA2",
+    ],
+)
+def test_handler_refuses_a_from_file_line_that_is_not_a_single_accession(
+    bad_line, tmp_path, capsys
+):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    accession_file = tmp_path / "accessions.txt"
+    accession_file.write_text(f"{bad_line}\n")
+    parser = _build_parser()
+    ns = parser.parse_args(["submit-ena-import", "--from-file", str(accession_file)])
+    with pytest.raises(SystemExit) as exc_info:
+        ns.handler(ns, parser)
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "line 1" in err
+    assert str(accession_file) in err
+
+
+def test_handler_refuses_a_bad_line_naming_its_physical_line_after_a_comment_and_a_blank(
+    tmp_path, capsys
+):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    accession_file = tmp_path / "accessions.txt"
+    accession_file.write_text("# comment\n\nPRJEB1,PRJNA2\n")
+    parser = _build_parser()
+    ns = parser.parse_args(["submit-ena-import", "--from-file", str(accession_file)])
+    with pytest.raises(SystemExit) as exc_info:
+        ns.handler(ns, parser)
+    assert exc_info.value.code == 2
+    assert "line 3" in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # Accession validation, before any HTTP call
 # ---------------------------------------------------------------------------

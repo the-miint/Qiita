@@ -1795,7 +1795,8 @@ def _build_parser() -> argparse.ArgumentParser:
             " for import: each becomes one qiita.study, with its runs registered and"
             " downloaded via the download-ena-study workflow. Accessions may be given"
             " positionally or via --from-file (one per line; blank lines and"
-            " '#'-prefixed comments are skipped). Requires wet_lab_admin or"
+            " whole-line '#' comments are skipped — a line may not carry an inline"
+            " comment or more than one accession). Requires wet_lab_admin or"
             " system_admin."
         ),
     )

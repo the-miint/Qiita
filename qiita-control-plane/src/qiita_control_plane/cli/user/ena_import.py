@@ -29,12 +29,24 @@ from .. import _common
 
 
 def _read_accessions_from_file(path: Path) -> list[str]:
+    """Read one accession per non-blank, non-comment line. A whole-line `#`
+    is the only comment form — trailing text after an accession, or more
+    than one accession on a line, is refused by physical line number rather
+    than silently POSTed as-is."""
     try:
         lines = path.read_text().splitlines()
     except OSError as exc:
         raise ValueError(f"--from-file {path}: {exc}") from exc
-    stripped = (line.strip() for line in lines)
-    accessions = [line for line in stripped if line and not line.startswith("#")]
+    accessions = []
+    for lineno, raw_line in enumerate(lines, start=1):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if any(ch.isspace() for ch in stripped) or "," in stripped or "#" in stripped:
+            raise ValueError(
+                f"--from-file {path} line {lineno}: expected a single accession, got {stripped!r}"
+            )
+        accessions.append(stripped)
     if not accessions:
         raise ValueError(f"--from-file {path} contains no accessions")
     return accessions
