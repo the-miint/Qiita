@@ -2,7 +2,7 @@
 and reads into Qiita.
 
 Layers: the metadata resolver (`MiintEnaResolver`, miint `read_ena` /
-`read_ena_attributes`, plus accession validation); the registration path
+`read_ena_attributes`); the registration path
 (`platform_mapping` / `protocol_mapping` and
 `registration.register_ena_study`, the composer that turns resolved metadata
 into study/biosample/prep_sample/sequenced_sample rows); metadata harmonization

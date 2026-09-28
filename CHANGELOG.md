@@ -23,11 +23,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 - **`qiita submit-ena-import` / `qiita ena-import-status` submit and watch a batch ENA
   study import from the CLI (#629).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
-  `--from-file`, one accession per line) validates every accession locally, `POST`s
-  `/ena-import-batch`, and by default polls to terminal — printing each item's state
-  change and exiting `1` if any item ends `failed`; `--no-watch` returns right after
-  submit. `ena-import-status IDX` reads a batch's current state. Both require
-  wet_lab_admin or system_admin, matching the routes' own gate.
+  `--from-file`, one accession per line — a whole-line `#` comment only; a trailing
+  comment or more than one accession on a line is refused, naming the line number)
+  validates every accession locally, `POST`s `/ena-import-batch`, and by default polls
+  to terminal with bounded `--poll-interval-seconds` / `--timeout-seconds` flags —
+  printing each item's state change and exiting `1` if any item ends `failed` or the
+  watch times out (naming every still-pending accession and its last known state); a
+  transient error while polling is retried until the deadline instead of failing the
+  watch. `--no-watch` returns right after submit; Ctrl-C exits `130`, naming the batch
+  to poll if it had already been created. `ena-import-status IDX` reads a batch's
+  current state. Both require wet_lab_admin or system_admin, matching the routes' own
+  gate.
 
 - **A study reader can export per-prep_sample SynDNA insert read counts as BIOM or Parquet
   (#621).** The read-mask workflow's new `persist-syndna-read-count` action (gated on
@@ -3879,7 +3885,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `InvalidEnaAccessionError`, `detect_accession_kind`, and `validate_study_accession` now
   live in `qiita_common.ena_accession`, not `qiita_control_plane.ena_import.accession` —
   the CLI's accession checks (`qiita submit-ena-import`) need them without importing the
-  control plane. `qiita_control_plane.ena_import` re-exports the same names.
+  control plane. `qiita_control_plane.ena_import` still re-exports the first three.
+  `qiita_common.models.ena_import` also gained `TERMINAL_BATCH_ITEM_STATES`, named beside
+  `BatchItemState` the way `TERMINAL_WORK_TICKET_STATES` sits beside `WorkTicketState`.
 
 - **CLAUDE.md: read DuckLake data through the catalog, never `read_parquet` over its files
   (#611).** Ad-hoc scripts that globbed a table's Parquet read files the catalog does not
