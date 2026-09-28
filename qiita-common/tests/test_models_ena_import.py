@@ -78,6 +78,12 @@ def test_batch_import_response_shape():
     assert resp.items[0].ena_study_accession == "PRJEB1234"
 
 
+def test_terminal_batch_item_states_matches_enum_order():
+    from qiita_common.models.ena_import import TERMINAL_BATCH_ITEM_STATES, BatchItemState
+
+    assert TERMINAL_BATCH_ITEM_STATES == (BatchItemState.DONE.value, BatchItemState.FAILED.value)
+
+
 def test_batch_import_status_shape():
     from qiita_common.models.ena_import import (
         BatchImportItem,

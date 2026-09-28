@@ -23,11 +23,9 @@ from qiita_common.api_paths import (
     URL_ENA_IMPORT_BATCH_PREFIX,
 )
 from qiita_common.ena_accession import InvalidEnaAccessionError, validate_study_accession
-from qiita_common.models.ena_import import BatchItemState
+from qiita_common.models.ena_import import TERMINAL_BATCH_ITEM_STATES, BatchItemState
 
 from .. import _common
-
-_TERMINAL_STATES = (BatchItemState.DONE, BatchItemState.FAILED)
 
 
 def _read_accessions_from_file(path: Path) -> list[str]:
@@ -95,7 +93,7 @@ async def _watch_ena_import_batch(
             if last_states.get(accession) != item["state"]:
                 last_states[accession] = item["state"]
                 _report_state_change(batch_idx, item)
-        if all(item["state"] in _TERMINAL_STATES for item in items):
+        if all(item["state"] in TERMINAL_BATCH_ITEM_STATES for item in items):
             return body
         if time.monotonic() >= deadline:
             raise TimeoutError(

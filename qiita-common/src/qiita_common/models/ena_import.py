@@ -34,6 +34,14 @@ class BatchItemState(StrEnum):
     FAILED = "failed"
 
 
+# Named beside BatchItemState, mirroring TERMINAL_WORK_TICKET_STATES, so a
+# watch loop imports a shared tuple instead of a private per-caller copy.
+TERMINAL_BATCH_ITEM_STATES: tuple[str, ...] = (
+    BatchItemState.DONE.value,
+    BatchItemState.FAILED.value,
+)
+
+
 class BatchImportRequest(BaseModel):
     """Body for `POST /api/v1/ena-import-batch`.
 
