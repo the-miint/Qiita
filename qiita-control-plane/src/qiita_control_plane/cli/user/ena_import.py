@@ -74,33 +74,67 @@ async def _watch_ena_import_batch(
     http: Any,
     token: str,
     batch_idx: int,
+    seed_items: list[dict],
     *,
     poll_interval_seconds: float,
     timeout_seconds: float,
 ) -> dict:
-    """Poll until every item is `done` or `failed`. Raises TimeoutError after
-    `timeout_seconds`; returns the final status body otherwise."""
+    """Poll until every item is `done` or `failed`.
+
+    A `RequestError` or 5xx response is retried until `timeout_seconds`
+    elapses, logging one stderr line per retry; any other status is fatal
+    and propagates. Raises TimeoutError naming each still-pending accession's
+    last known state — from the last successful poll, or `seed_items` if none
+    succeeded — otherwise returns the final status body.
+    """
+    import httpx as _httpx
+
     url = URL_ENA_IMPORT_BATCH_BY_IDX.format(ena_import_batch_idx=batch_idx)
     deadline = time.monotonic() + timeout_seconds
     last_states: dict[str, str] = {}
+    last_items = seed_items
     while True:
-        resp = await http.get(url, headers={"Authorization": f"Bearer {token}"})
-        resp.raise_for_status()
+        try:
+            resp = await http.get(url, headers={"Authorization": f"Bearer {token}"})
+            resp.raise_for_status()
+        except _httpx.RequestError as exc:
+            cause = repr(exc)
+        except _httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500:
+                raise
+            cause = f"http error {exc.response.status_code}"
+        else:
+            cause = None
+
+        if cause is not None:
+            if time.monotonic() >= deadline:
+                break
+            print(f"ena_import_batch {batch_idx}: {cause}, retrying", file=sys.stderr)
+            await asyncio.sleep(max(0.0, min(poll_interval_seconds, deadline - time.monotonic())))
+            continue
+
         body = resp.json()
-        items = body["items"]
-        for item in items:
+        last_items = body["items"]
+        for item in last_items:
             accession = item["ena_study_accession"]
             if last_states.get(accession) != item["state"]:
                 last_states[accession] = item["state"]
                 _report_state_change(batch_idx, item)
-        if all(item["state"] in TERMINAL_BATCH_ITEM_STATES for item in items):
+        if all(item["state"] in TERMINAL_BATCH_ITEM_STATES for item in last_items):
             return body
         if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"ena_import_batch {batch_idx} did not reach a terminal state"
-                f" within {timeout_seconds:.0f}s"
-            )
-        await asyncio.sleep(poll_interval_seconds)
+            break
+        await asyncio.sleep(max(0.0, min(poll_interval_seconds, deadline - time.monotonic())))
+
+    pending = ", ".join(
+        f"{item['ena_study_accession']} (last state: {item['state']!r})"
+        for item in last_items
+        if item["state"] not in TERMINAL_BATCH_ITEM_STATES
+    )
+    raise TimeoutError(
+        f"ena_import_batch {batch_idx} did not reach a terminal state"
+        f" within {timeout_seconds:.0f}s; still pending: {pending}"
+    )
 
 
 async def do_submit_ena_import(
@@ -140,6 +174,7 @@ async def do_submit_ena_import(
         http,
         token,
         body["ena_import_batch_idx"],
+        body["items"],
         poll_interval_seconds=poll_interval_seconds,
         timeout_seconds=timeout_seconds,
     )

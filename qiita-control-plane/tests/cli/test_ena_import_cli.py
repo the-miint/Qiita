@@ -529,12 +529,134 @@ def test_first_watch_get_stale_scope_403_shows_relogin_prompt(
     assert "qiita login" in capsys.readouterr().err
 
 
-def test_watch_times_out_naming_the_batch(monkeypatch, patch_async_client, capsys):
+# ---------------------------------------------------------------------------
+# Watch loop: transient-error retry, fatal errors, and the timeout message
+# ---------------------------------------------------------------------------
+
+
+def test_watch_retries_transient_503_then_succeeds(monkeypatch, patch_async_client, capsys):
     from qiita_control_plane.cli.user._parser import _build_parser
 
     post_body = {"ena_import_batch_idx": 9, "items": [_item("PRJEB11419", "pending")]}
-    get_bodies = [{"ena_import_batch_idx": 9, "items": [_item("PRJEB11419", "resolving")]}]
-    handler, calls = _make_handler(post_body=post_body, get_bodies=get_bodies)
+    get_responses = [
+        httpx.Response(503, text="upstream restarting"),
+        httpx.Response(
+            200, json={"ena_import_batch_idx": 9, "items": [_item("PRJEB11419", "done")]}
+        ),
+    ]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "POST":
+            return httpx.Response(202, json=post_body)
+        return get_responses.pop(0)
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "submit-ena-import",
+            "PRJEB11419",
+            "--poll-interval-seconds",
+            "0.001",
+        ]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 0
+    assert calls == ["POST", "GET", "GET"]
+    assert "503" in capsys.readouterr().err
+
+
+def test_watch_retries_connect_error_then_succeeds(monkeypatch, patch_async_client, capsys):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    post_body = {"ena_import_batch_idx": 9, "items": [_item("PRJEB11419", "pending")]}
+    get_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, json=post_body)
+        get_calls["n"] += 1
+        if get_calls["n"] == 1:
+            raise httpx.ConnectError("reset", request=request)
+        return httpx.Response(
+            200, json={"ena_import_batch_idx": 9, "items": [_item("PRJEB11419", "done")]}
+        )
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "submit-ena-import",
+            "PRJEB11419",
+            "--poll-interval-seconds",
+            "0.001",
+        ]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 0
+    assert get_calls["n"] == 2
+
+
+def test_watch_fatal_404_stops_after_one_poll(monkeypatch, patch_async_client, capsys):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    post_body = {"ena_import_batch_idx": 9, "items": [_item("PRJEB11419", "pending")]}
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "POST":
+            return httpx.Response(202, json=post_body)
+        return httpx.Response(404, json={"detail": "batch not found"})
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "submit-ena-import",
+            "PRJEB11419",
+            "--poll-interval-seconds",
+            "0.001",
+        ]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 1
+    assert calls == ["POST", "GET"]
+    assert "http error 404" in capsys.readouterr().err
+
+
+def test_watch_retries_503_forever_until_zero_timeout_fires(
+    monkeypatch, patch_async_client, capsys
+):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    post_body = {"ena_import_batch_idx": 9, "items": [_item("PRJEB11419", "pending")]}
+    get_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, json=post_body)
+        get_calls["n"] += 1
+        assert get_calls["n"] <= 5, "watch loop kept retrying past its deadline"
+        return httpx.Response(503, text="still restarting")
+
     patch_async_client(httpx.MockTransport(handler))
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
 
@@ -555,10 +677,57 @@ def test_watch_times_out_naming_the_batch(monkeypatch, patch_async_client, capsy
 
     assert rc == 1
     err = capsys.readouterr().err
+    assert "PRJEB11419" in err
+    assert "did not reach a terminal state" in err
+
+
+def test_watch_times_out_naming_the_batch(monkeypatch, patch_async_client, capsys):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    post_body = {
+        "ena_import_batch_idx": 9,
+        "items": [_item("PRJEB11419", "pending"), _item("PRJNA555783", "pending")],
+    }
+    get_bodies = [
+        {
+            "ena_import_batch_idx": 9,
+            "items": [
+                _item("PRJEB11419", "done"),
+                _item("PRJNA555783", "resolving"),
+            ],
+        }
+    ]
+    handler, calls = _make_handler(post_body=post_body, get_bodies=get_bodies)
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "submit-ena-import",
+            "PRJEB11419",
+            "PRJNA555783",
+            "--poll-interval-seconds",
+            "0.001",
+            "--timeout-seconds",
+            "0",
+        ]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 1
+    err = capsys.readouterr().err
     # The submit announcement — naming the batch idx — is already on stderr
     # by the time the timeout fires.
     assert "ena_import_batch 9" in err
-    assert "did not reach a terminal state" in err
+    timeout_line = next(
+        line for line in err.splitlines() if "did not reach a terminal state" in line
+    )
+    assert "PRJNA555783" in timeout_line
+    assert "resolving" in timeout_line
+    assert "PRJEB11419" not in timeout_line
 
 
 # ---------------------------------------------------------------------------
