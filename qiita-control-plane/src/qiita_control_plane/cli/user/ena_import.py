@@ -114,15 +114,23 @@ async def do_submit_ena_import(
 ) -> dict:
     """POST the batch and, by default, watch it to terminal. Injected client
     so tests drive this without a live control plane, matching
-    `do_submit_reads`."""
+    `do_submit_reads`.
+
+    A non-202 response raises HTTPStatusError (rather than a plain
+    RuntimeError) so the handler routes it through the same stale-scope /
+    body-echo helper as every other HTTP error here."""
+    import httpx as _httpx
+
     resp = await http.post(
         URL_ENA_IMPORT_BATCH_PREFIX,
         headers={"Authorization": f"Bearer {token}"},
         json={"accessions": accessions},
     )
     if resp.status_code != 202:
-        raise RuntimeError(
-            f"POST {URL_ENA_IMPORT_BATCH_PREFIX} expected 202, got {resp.status_code}: {resp.text}"
+        raise _httpx.HTTPStatusError(
+            f"POST {URL_ENA_IMPORT_BATCH_PREFIX} expected 202, got {resp.status_code}",
+            request=resp.request,
+            response=resp,
         )
     body = resp.json()
     _announce(body["ena_import_batch_idx"])
@@ -189,10 +197,10 @@ def _handle_submit_ena_import(args: argparse.Namespace, parser: argparse.Argumen
             )
         )
     except _httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
         return 1
     except _httpx.RequestError as exc:
-        print(f"error: could not reach the control plane: {exc!r}", file=sys.stderr)
+        _common.print_request_error(exc)
         return 1
     except (RuntimeError, ValueError, TimeoutError) as exc:
         print(f"error: {exc}", file=sys.stderr)

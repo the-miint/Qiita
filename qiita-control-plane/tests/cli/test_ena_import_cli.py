@@ -390,6 +390,109 @@ def test_non_202_submit_response_surfaces_status_and_body(
     assert "nope" in err
 
 
+def test_non_202_submit_response_shows_stale_scope_prompt_not_expected_202(
+    monkeypatch, patch_async_client, capsys
+):
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403, headers={STALE_TOKEN_SCOPE_HEADER: "1"}, json={"detail": "forbidden"}
+        )
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        ["--base-url", "https://q.example.test", "submit-ena-import", "PRJEB11419"]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "qiita login" in err
+    assert "expected 202" not in err
+
+
+def test_non_202_submit_response_200_surfaces_status(monkeypatch, patch_async_client, capsys):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"detail": "not the expected 202"})
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        ["--base-url", "https://q.example.test", "submit-ena-import", "PRJEB11419"]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 1
+    assert "200" in capsys.readouterr().err
+
+
+def test_post_connect_error_names_url_and_base_url_flag(monkeypatch, patch_async_client, capsys):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("reset", request=request)
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        ["--base-url", "https://q.example.test", "submit-ena-import", "PRJEB11419"]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "https://q.example.test/api/v1/ena-import-batch" in err
+    assert "--base-url" in err
+
+
+def test_first_watch_get_stale_scope_403_shows_relogin_prompt(
+    monkeypatch, patch_async_client, capsys
+):
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    post_body = {"ena_import_batch_idx": 5, "items": [_item("PRJEB11419", "pending")]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, json=post_body)
+        return httpx.Response(
+            403, headers={STALE_TOKEN_SCOPE_HEADER: "1"}, json={"detail": "forbidden"}
+        )
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "submit-ena-import",
+            "PRJEB11419",
+            "--poll-interval-seconds",
+            "0.001",
+        ]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 1
+    assert "qiita login" in capsys.readouterr().err
+
+
 def test_watch_times_out_naming_the_batch(monkeypatch, patch_async_client, capsys):
     from qiita_control_plane.cli.user._parser import _build_parser
 
@@ -454,6 +557,49 @@ def test_ena_import_status_issues_get_against_the_idx(monkeypatch):
         f"https://q.example.test{URL_ENA_IMPORT_BATCH_BY_IDX.format(ena_import_batch_idx=5)}"
     )
     assert captured["json"] is None
+
+
+def test_ena_import_status_non_200_surfaces_status_and_body(monkeypatch, capsys):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        request = httpx.Request(method, url)
+        return httpx.Response(500, json={"detail": "boom"}, request=request)
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://q.example.test", "ena-import-status", "5"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "500" in err
+    assert "boom" in err
+
+
+def test_ena_import_status_stale_scope_403_shows_relogin_prompt(monkeypatch, capsys):
+    from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        request = httpx.Request(method, url)
+        return httpx.Response(
+            403,
+            headers={STALE_TOKEN_SCOPE_HEADER: "1"},
+            json={"detail": "forbidden"},
+            request=request,
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://q.example.test", "ena-import-status", "5"])
+
+    assert rc == 1
+    assert "qiita login" in capsys.readouterr().err
 
 
 def test_ena_import_status_requires_idx(capsys):
