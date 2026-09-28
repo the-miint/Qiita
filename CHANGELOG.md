@@ -22,7 +22,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Added
 
 - **`qiita submit-ena-import` / `qiita ena-import-status` submit and watch a batch ENA
-  study import from the CLI (#TBD).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
+  study import from the CLI (#629).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
   `--from-file`, one accession per line) validates every accession locally, `POST`s
   `/ena-import-batch`, and by default polls to terminal — printing each item's state
   change and exiting `1` if any item ends `failed`; `--no-watch` returns right after
@@ -3875,7 +3875,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
-- **INSDC accession validation moved into `qiita-common` (#TBD).** `EnaAccessionKind`,
+- **INSDC accession validation moved into `qiita-common` (#629).** `EnaAccessionKind`,
   `InvalidEnaAccessionError`, `detect_accession_kind`, and `validate_study_accession` now
   live in `qiita_common.ena_accession`, not `qiita_control_plane.ena_import.accession` —
   the CLI's accession checks (`qiita submit-ena-import`) need them without importing the
