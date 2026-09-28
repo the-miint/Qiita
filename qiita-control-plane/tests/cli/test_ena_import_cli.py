@@ -91,6 +91,42 @@ def test_parser_defaults_and_flags(argv_extra, expected):
         assert getattr(ns, key) == value
 
 
+@pytest.mark.parametrize(
+    ("flag", "raw"),
+    [
+        ("--poll-interval-seconds", "0"),
+        ("--poll-interval-seconds", "-5"),
+        ("--poll-interval-seconds", "nan"),
+        ("--poll-interval-seconds", "inf"),
+        ("--timeout-seconds", "-1"),
+        ("--timeout-seconds", "nan"),
+        ("--timeout-seconds", "inf"),
+    ],
+)
+def test_parser_rejects_out_of_range_watch_flags(flag, raw, capsys):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    with pytest.raises(SystemExit) as exc_info:
+        _build_parser().parse_args(["submit-ena-import", "PRJEB11419", flag, raw])
+    assert exc_info.value.code == 2
+    assert flag in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("flag", "raw", "expected"),
+    [
+        ("--timeout-seconds", "0", 0.0),
+        ("--poll-interval-seconds", "0.5", 0.5),
+    ],
+)
+def test_parser_accepts_boundary_watch_flags(flag, raw, expected):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    ns = _build_parser().parse_args(["submit-ena-import", "PRJEB11419", flag, raw])
+    dest = flag.lstrip("-").replace("-", "_")
+    assert getattr(ns, dest) == expected
+
+
 def test_handler_refuses_no_source(capsys):
     from qiita_control_plane.cli.user._parser import _build_parser
 
@@ -265,7 +301,7 @@ def test_watch_polls_until_all_items_terminal(monkeypatch, patch_async_client, c
             "submit-ena-import",
             "PRJEB11419",
             "--poll-interval-seconds",
-            "0",
+            "0.001",
         ]
     )
     rc = ns.handler(ns, parser)
@@ -309,7 +345,7 @@ def test_watch_exits_1_when_any_item_failed(monkeypatch, patch_async_client, cap
             "PRJEB11419",
             "PRJNA555783",
             "--poll-interval-seconds",
-            "0",
+            "0.001",
         ]
     )
     rc = ns.handler(ns, parser)
@@ -358,7 +394,7 @@ def test_watch_exits_0_when_a_done_item_has_failed_ena_runs(
             "submit-ena-import",
             "PRJEB11419",
             "--poll-interval-seconds",
-            "0",
+            "0.001",
         ]
     )
     rc = ns.handler(ns, parser)
@@ -510,7 +546,7 @@ def test_watch_times_out_naming_the_batch(monkeypatch, patch_async_client, capsy
             "submit-ena-import",
             "PRJEB11419",
             "--poll-interval-seconds",
-            "0",
+            "0.001",
             "--timeout-seconds",
             "0",
         ]

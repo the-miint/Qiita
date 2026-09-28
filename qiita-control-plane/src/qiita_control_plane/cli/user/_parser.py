@@ -58,6 +58,8 @@ from ._helpers import (
     _handle_read,
     _handle_study_field_create,
     _lane_arg,
+    _non_negative_seconds_arg,
+    _positive_seconds_arg,
     _proportion_arg,
     _proportion_or_none_arg,
 )
@@ -205,6 +207,11 @@ def _add_field_list_subcommands(
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    # Local import: `..reference_load` pulls in TERMINAL_WORK_TICKET_STATES at
+    # its own module level, which must stay out of `cli.user`'s eager import
+    # closure (test_cli_venv_import_check.py).
+    from ..reference_load import DEFAULT_POLL_INTERVAL_SECONDS, DEFAULT_POLL_TIMEOUT_SECONDS
+
     parser = argparse.ArgumentParser(prog="qiita", description="Qiita end-user CLI")
     _common.add_base_url_arg(parser)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1810,16 +1817,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ena_import.add_argument(
         "--poll-interval-seconds",
-        type=float,
-        default=2.0,
-        help="Seconds between batch polls under --watch (default: 2.0)",
+        type=_positive_seconds_arg,
+        default=DEFAULT_POLL_INTERVAL_SECONDS,
+        help="Seconds between batch polls under --watch (default: %(default)s)",
     )
     p_ena_import.add_argument(
         "--timeout-seconds",
-        type=float,
-        default=24 * 3600,
+        type=_non_negative_seconds_arg,
+        default=DEFAULT_POLL_TIMEOUT_SECONDS,
         help="Max seconds to wait for every item to reach a terminal state under --watch"
-        " (default: 86400)",
+        " (default: %(default)s)",
     )
     p_ena_import.set_defaults(handler=_handle_submit_ena_import)
 
