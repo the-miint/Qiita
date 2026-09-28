@@ -576,6 +576,38 @@ def parse_kv_pairs(
     return result
 
 
+def print_http_status_error(resp: httpx.Response) -> None:
+    """Print a non-2xx response to stderr: a stale-scope 403 (flagged by the
+    server via `STALE_TOKEN_SCOPE_HEADER`) gets a clean re-login prompt;
+    every other status echoes `http error N: body`.
+    """
+    if resp.status_code == 403 and resp.headers.get(STALE_TOKEN_SCOPE_HEADER):
+        print(
+            "error: your access token predates a scope your role now grants.\n"
+            "Run `qiita login` to mint a fresh token with your full role scopes,"
+            " then retry.",
+            file=sys.stderr,
+        )
+        return
+    print(f"http error {resp.status_code}: {resp.text}", file=sys.stderr)
+
+
+def print_request_error(exc: httpx.RequestError) -> None:
+    """Print a transport-level failure (no HTTP response at all) to stderr,
+    naming the target URL so a wrong --base-url / $QIITA_CONTROL_PLANE_URL
+    is easy to spot.
+    """
+    try:
+        target = str(exc.request.url)
+    except RuntimeError:
+        target = "the control plane"
+    print(
+        f"error: could not reach {target}: {exc!r}. Is the control plane"
+        " running? Check --base-url / $QIITA_CONTROL_PLANE_URL.",
+        file=sys.stderr,
+    )
+
+
 def run_http_subcommand(
     fn: Callable[[str], dict | list],
     render: Callable[[dict | list], None] | None = None,
@@ -601,39 +633,10 @@ def run_http_subcommand(
     try:
         body = fn(token)
     except httpx.HTTPStatusError as exc:
-        # A stale-scope 403 — the token predates a scope the caller's role now
-        # grants (or was deliberately minted below the ceiling) — is flagged by
-        # the server with a machine-readable header. Recognize it and surface a
-        # clean, actionable re-login prompt instead of dumping the raw JSON
-        # envelope. Every other HTTP error keeps the generic body echo.
-        if exc.response.status_code == 403 and exc.response.headers.get(STALE_TOKEN_SCOPE_HEADER):
-            print(
-                "error: your access token predates a scope your role now grants.\n"
-                "Run `qiita login` to mint a fresh token with your full role scopes,"
-                " then retry.",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        print_http_status_error(exc.response)
         return 1
     except httpx.RequestError as exc:
-        # No HTTP response at all — the most common cause is a control plane
-        # that isn't running, or a wrong --base-url / $QIITA_CONTROL_PLANE_URL.
-        # HTTPStatusError above is a *response*
-        # and is not a RequestError, so the two branches are disjoint. Surface a
-        # friendly, actionable message naming the target instead of dumping a
-        # transport-layer traceback. httpx sets `.request` on errors raised while
-        # sending, but guard the access (it raises if somehow unset) so the
-        # error path itself can't throw.
-        try:
-            target = str(exc.request.url)
-        except RuntimeError:
-            target = "the control plane"
-        print(
-            f"error: could not reach {target}: {exc!r}. Is the control plane"
-            " running? Check --base-url / $QIITA_CONTROL_PLANE_URL.",
-            file=sys.stderr,
-        )
+        print_request_error(exc)
         return 1
     if render is not None:
         render(body)
