@@ -62,6 +62,7 @@ from ._helpers import (
     _proportion_or_none_arg,
 )
 from .alignment import _handle_alignment_cohort, _handle_alignment_list
+from .amplicon import _handle_submit_golay_demux
 from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_export
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
@@ -1856,6 +1857,103 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_submit_pacbio.set_defaults(handler=_handle_submit_pacbio_ingest)
+
+    p_submit_golay = sub.add_parser(
+        "submit-golay-demux",
+        help=(
+            "Bundled operator gesture for the golay-demux workflow (Rapid 16S):"
+            " mint (or reuse) a sequencing-run row, attach a sequenced-pool with"
+            " the preflight blob, and submit ONE pool-scoped golay-demux ticket"
+            " over the multiplexed FASTQ."
+        ),
+        description=(
+            "Submit a golay-demux work-ticket end-to-end. 16S EMP data arrives as a"
+            " multiplexed FASTQ set (I1 Golay index + R1 [+ R2]) that still needs"
+            " demultiplexing, so — unlike bcl-convert (demuxed by sample-sheet index)"
+            " or PacBio (per-barcode uBAM) — the whole pool goes to one demux ticket."
+            " The per-sample Golay barcode_map is read from the preflight's"
+            " amplicon_sample rows and carried in action_context. Run + pool are"
+            " find-or-create and the per-sample roster is create-missing, so a re-run"
+            " after a partial failure converges without operator cleanup."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--index-reads-path",
+        type=Path,
+        required=True,
+        help=(
+            "Absolute path to the multiplexed I1 barcode FASTQ (12-nt Golay indexes)."
+            " Passed through as action_context.index_reads_path; the compute node"
+            " reads it at the same absolute path."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--forward-reads-path",
+        type=Path,
+        required=True,
+        help=(
+            "Absolute path to the multiplexed R1 forward FASTQ, paired to I1 by"
+            " record order. Passed through as action_context.forward_reads_path."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--reverse-reads-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional absolute path to the multiplexed R2 FASTQ (EMP includes it;"
+            " carried as sequence2/qual2). Passed as action_context.reverse_reads_path"
+            " when set."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--preflight-blob",
+        type=Path,
+        required=True,
+        help=(
+            "Path to the local kl-run-preflight SQLite file. The CLI reads it"
+            " (refuses empty), builds the Golay barcode_map from its amplicon_sample"
+            " rows, and attaches the blob to the sequenced-pool row. Same"
+            " content-addressed pool find-or-create as submit-bcl-convert."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--instrument-run-id",
+        default=None,
+        help=(
+            "Override the sequencing-run identifier. Defaults to the preflight's"
+            " processing_run.external_run_id (the single source of truth); pass this"
+            " only to override, or when that column is NULL."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--instrument-model",
+        default=None,
+        help=(
+            "Override the instrument model recorded on the sequencing-run row."
+            " Defaults to the preflight's processing_run.instrument_type."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--prep-protocol-idx",
+        type=int,
+        required=True,
+        help=(
+            "Qiita prep_protocol_idx to FK every per-sample row to. Applied"
+            " uniformly across the pool (the preflight carries no Qiita prep_protocol"
+            " identifier), mirroring submit-bcl-convert."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Re-submit even when a COMPLETED golay-demux ticket already exists for"
+            " this pool (a re-run re-registers the pool's reads into the lake —"
+            " DuckLake has no uniqueness). Requires wet_lab_admin or system_admin."
+        ),
+    )
+    p_submit_golay.set_defaults(handler=_handle_submit_golay_demux)
 
     p_delete_pool = sub.add_parser(
         "delete-sequenced-pool",

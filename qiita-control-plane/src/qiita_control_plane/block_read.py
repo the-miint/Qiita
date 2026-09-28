@@ -19,6 +19,11 @@ Choosing between them is safety-critical, not cosmetic: streaming raw reads to a
 align job would realign non-host-depleted, un-QC'd (human-containing) reads. See
 ``resolve_block_read_scope`` for why the discriminator is ``action_context`` and
 not the ``work_ticket.alignment_idx`` column.
+
+A pool-scoped ticket (amplicon's ``denoise``) reuses the ``read_block`` selector
+through this same rule — no alignment_idx, no mask_idx, so it resolves to raw
+``read`` rows — but its members are the whole pool's live prep_samples, not a
+block's (``routes/read.py`` supplies them from ``fetch_pool_members``).
 """
 
 from typing import Any

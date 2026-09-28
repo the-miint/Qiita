@@ -21,6 +21,30 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Rapid 16S amplicon processing: `golay-demux` + `amplicon` workflows (#244).**
+  Two workflows bring EMP-style 16S into Qiita. `golay-demux` (ingest) Golay-barcode
+  demultiplexes a pool's multiplexed FASTQ (R1 + I1 + optional R2) into per-sample reads
+  in the DuckLake `read` table — the analogue of bcl-convert for runs that arrive
+  already-converted-but-multiplexed; the [24,12,8] Golay decode cloud is generated
+  in-job (no vendored table / operator path). `amplicon` (process) denoises a pool's
+  stored reads with deblur (trim → dereplicate → SortMeRNA 16S pre-filter → UCHIME
+  chimera → MAFFT → deblur), **reference-agnostically**: every ASV gets a `feature_idx`
+  from its canonical sequence hash and per-sample counts land in the new DuckLake
+  `amplicon_membership` table (`prep_sample_idx, processing_idx, feature_idx, count`).
+  The ASV sequences themselves are stored too (`amplicon_sequence` +
+  `amplicon_sequence_chunks`, keyed by feature_idx, mirroring the assembly tables),
+  so an ASV is never recomputed to read back.
+  16S reads are not masked — the `denoise` step **streams** the pool's raw reads from the
+  data plane at runtime (a pool-scoped `read_block` DoGet); the runner stages nothing (the
+  stream spills transiently to the job workspace); the
+  SortMeRNA reference is materialized from a loaded `sequence_reference` (by reference_idx,
+  off fixed paths). A same-pool re-run is refused pending an explicit delete/`--force`.
+  The ASV-reference-match (e.g. GG2) feature table (exact ASV match, not similarity-based
+  closed-reference) is **derived on demand** by intersecting feature_idx with a
+  reference's membership — never stored (a tracked follow-up). The
+  deblur step works around [duckdb-miint#194](https://github.com/the-miint/duckdb-miint/issues/194)
+  (MAFFT litters `order`/`pre`/`trace` into the CWD on some strategies) by running MAFFT
+  in a per-job scratch dir (`miint.mafft_scratch_cwd`).
 - **A study reader can export per-prep_sample SynDNA insert read counts as BIOM or Parquet
   (#621).** The read-mask workflow's new `persist-syndna-read-count` action (gated on
   `syndna_enabled`, appended after `finalize-mask-sample`) reduces the `syndna` step's

@@ -115,6 +115,26 @@ def duckdb_tmp_dir(workspace: Path) -> Iterator[Path]:
         shutil.rmtree(duckdb_tmp, ignore_errors=True)
 
 
+@contextmanager
+def mafft_scratch_cwd(base: Path) -> Iterator[Path]:
+    """run with CWD in `<base>/.mafft` so MAFFT's scratch (order/pre/trace) lands
+    there. MAFFT's create_tmpdir honors $TMPDIR but is skipped on the FFTNS2 and
+    PARTTREE strategies, which then litter the CWD (data-dependent). removed on exit.
+
+    chdir is process-global, so the body must be synchronous miint work using
+    absolute paths. workaround for duckdb-miint#194 (open); see
+    docs/duckdb-miint.md's Open upstream gaps."""
+    scratch = base / ".mafft"
+    scratch.mkdir(parents=True, exist_ok=True)
+    prev = Path.cwd()
+    os.chdir(scratch)
+    try:
+        yield scratch
+    finally:
+        os.chdir(prev)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def apply_duckdb_settings(
     conn: duckdb.DuckDBPyConnection,
     duckdb_tmp: Path,
