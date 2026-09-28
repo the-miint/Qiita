@@ -772,6 +772,63 @@ def test_watch_times_out_naming_the_batch(monkeypatch, patch_async_client, capsy
 
 
 # ---------------------------------------------------------------------------
+# Ctrl-C
+# ---------------------------------------------------------------------------
+
+
+def test_ctrl_c_during_watch_prints_status_pointer_and_exits_130(
+    monkeypatch, patch_async_client, capsys
+):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    post_body = {"ena_import_batch_idx": 9, "items": [_item("PRJEB11419", "pending")]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, json=post_body)
+        raise KeyboardInterrupt
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        ["--base-url", "https://q.example.test", "submit-ena-import", "PRJEB11419"]
+    )
+    try:
+        rc = ns.handler(ns, parser)
+    except KeyboardInterrupt:
+        pytest.fail("KeyboardInterrupt escaped the handler instead of exiting 130")
+
+    assert rc == 130
+    assert "qiita ena-import-status 9" in capsys.readouterr().err
+
+
+def test_ctrl_c_during_post_exits_130_naming_uncertain_batch(
+    monkeypatch, patch_async_client, capsys
+):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise KeyboardInterrupt
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        ["--base-url", "https://q.example.test", "submit-ena-import", "PRJEB11419"]
+    )
+    try:
+        rc = ns.handler(ns, parser)
+    except KeyboardInterrupt:
+        pytest.fail("KeyboardInterrupt escaped the handler instead of exiting 130")
+
+    assert rc == 130
+    assert "may still have been created" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
 # ena-import-status
 # ---------------------------------------------------------------------------
 

@@ -13,6 +13,7 @@ import asyncio
 import json
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -157,6 +158,7 @@ async def do_submit_ena_import(
     watch: bool,
     poll_interval_seconds: float,
     timeout_seconds: float,
+    on_submitted: Callable[[int], None] = _announce,
 ) -> dict:
     """POST the batch and, by default, watch it to terminal. Injected client
     so tests drive this without a live control plane, matching
@@ -164,7 +166,9 @@ async def do_submit_ena_import(
 
     A non-202 response raises HTTPStatusError (rather than a plain
     RuntimeError) so the handler routes it through the same stale-scope /
-    body-echo helper as every other HTTP error here."""
+    body-echo helper as every other HTTP error here. `on_submitted` replaces
+    the direct `_announce` call so a caller (the handler's Ctrl-C guard) can
+    also record the idx once the POST succeeds."""
     import httpx as _httpx
 
     resp = await http.post(
@@ -179,7 +183,7 @@ async def do_submit_ena_import(
             response=resp,
         )
     body = resp.json()
-    _announce(body["ena_import_batch_idx"])
+    on_submitted(body["ena_import_batch_idx"])
     if not watch:
         return body
     return await _watch_ena_import_batch(
@@ -200,6 +204,7 @@ async def _run_submit_ena_import(
     watch: bool,
     poll_interval_seconds: float,
     timeout_seconds: float,
+    on_submitted: Callable[[int], None],
 ) -> dict:
     import httpx as _httpx
 
@@ -213,6 +218,7 @@ async def _run_submit_ena_import(
             watch=watch,
             poll_interval_seconds=poll_interval_seconds,
             timeout_seconds=timeout_seconds,
+            on_submitted=on_submitted,
         )
 
 
@@ -232,6 +238,12 @@ def _handle_submit_ena_import(args: argparse.Namespace, parser: argparse.Argumen
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    submitted_idx: list[int] = []
+
+    def _on_submitted(batch_idx: int) -> None:
+        submitted_idx.append(batch_idx)
+        _announce(batch_idx)
+
     try:
         result = asyncio.run(
             _run_submit_ena_import(
@@ -241,8 +253,21 @@ def _handle_submit_ena_import(args: argparse.Namespace, parser: argparse.Argumen
                 watch=not args.no_watch,
                 poll_interval_seconds=args.poll_interval_seconds,
                 timeout_seconds=args.timeout_seconds,
+                on_submitted=_on_submitted,
             )
         )
+    except KeyboardInterrupt:
+        if submitted_idx:
+            print(
+                f"interrupted; poll with `qiita ena-import-status {submitted_idx[0]}`",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "interrupted before the server answered; a batch may still have been created",
+                file=sys.stderr,
+            )
+        return 130
     except _httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
         return 1
