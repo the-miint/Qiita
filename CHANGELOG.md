@@ -76,6 +76,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   text is judged eligible as text rather than as the closed value set it left. A field
   whose values sit on published samples, or on samples whose link to the study has been
   retired, cannot be widened at all, and the answer says which.
+
+- **ENA import refuses non-public studies and excludes non-public runs (#PR).** Every
+  resolved study and run now carries ENA's `status` (`public`/`suppressed`); a
+  suppressed study, or a study with no public runs, fails the accession before
+  anything is written, and an individual suppressed run within an otherwise-public
+  study is `excluded` (a new `EnaRunRegistrationStatus`), isolated from its siblings
+  exactly like an unmappable platform. An ENA status this codebase doesn't recognize
+  fails loudly rather than being treated as public.
+
 - **`qiita submit-ena-import` / `qiita ena-import-status` submit and watch a batch ENA
   study import from the CLI (#629).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
   `--from-file`, one accession per line — a whole-line `#` comment only; a trailing

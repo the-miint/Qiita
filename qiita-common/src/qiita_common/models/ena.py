@@ -4,18 +4,36 @@
 `read_ena` returns typed columns (duckdb-miint#178): numeric fields arrive as
 `int | None`, and per-file fields arrive as `list[...]`. These models validate
 the typed data at construction.
+
+`status` is required on both `EnaStudyHeader` and `EnaRunRecord`: ENA's Portal
+`/search` endpoint (what `read_ena` queries) returns only public records by
+default, but a record can transition after being fetched, and an unrecognized
+value must fail loud rather than default to "assume public".
 """
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, Field, field_validator
+
+
+class EnaStatus(StrEnum):
+    """ENA's per-record publication status, as reported by `read_ena`'s
+    `status` field. Only these two values are recognized -- anything else
+    (ENA's Portal API also defines `private`) fails Pydantic validation rather
+    than being silently treated as public."""
+
+    PUBLIC = "public"
+    SUPPRESSED = "suppressed"
 
 
 class EnaStudyHeader(BaseModel):
     """One study's header metadata — `read_ena(accession, result='study')`.
-    Field set matches `ENAParser::DefaultFields("study")`."""
+    Field set matches `ENAParser::DefaultFields("study")` plus `status`."""
 
     study_accession: str = Field(min_length=1)
+    status: EnaStatus
     secondary_study_accession: str | None = None
     study_title: str | None = None
     study_description: str | None = None
@@ -48,6 +66,7 @@ class EnaRunRecord(BaseModel):
     # DDBJ-brokered samples (SAMD01818724).
     sample_alias: str | None = None
     study_accession: str = Field(min_length=1)
+    status: EnaStatus
     library_layout: str | None = None
     library_strategy: str | None = None
     library_source: str | None = None

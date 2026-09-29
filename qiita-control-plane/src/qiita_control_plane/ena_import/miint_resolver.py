@@ -24,15 +24,24 @@ _RUN_FIELDS = (
     "run_accession,experiment_accession,sample_accession,sample_alias,study_accession,"
     "library_layout,library_strategy,library_source,library_selection,"
     "instrument_platform,"
-    "fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count"
+    "fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count,status"
+)
+
+# ENAParser::DefaultFields("study") plus `status`, which Portal's search results
+# don't include by default.
+_STUDY_FIELDS = (
+    "study_accession,secondary_study_accession,study_title,study_description,"
+    "center_name,first_public,last_updated,scientific_name,tax_id,status"
 )
 
 
 def _query_ena_study_header(accession: str) -> tuple[list[str], list[tuple]]:
-    """`read_ena(accession, result='study')` — one row, the study header."""
+    """`read_ena(accession, result='study', fields=...)` — one row, the study
+    header, restricted to `_STUDY_FIELDS`."""
     with connect_with_miint_staged() as con:
         rel = con.execute(
-            "SELECT * FROM read_ena($accession, result='study')", {"accession": accession}
+            "SELECT * FROM read_ena($accession, result='study', fields=$fields)",
+            {"accession": accession, "fields": _STUDY_FIELDS},
         )
         return [d[0] for d in rel.description], rel.fetchall()
 
@@ -72,14 +81,20 @@ class MiintEnaResolver:
         accession = validate_study_accession(accession)
         columns, rows = _query_ena_study_header(accession)
         if not rows:
-            raise EnaAccessionNotFoundError(f"no ENA study found for accession {accession!r}")
+            raise EnaAccessionNotFoundError(
+                f"no public ENA study found for {accession!r}"
+                " (nonexistent, or not yet/no longer public)"
+            )
         return EnaStudyHeader(**dict(zip(columns, rows[0], strict=True)))
 
     def resolve_ena_runs(self, accession: str) -> list[EnaRunRecord]:
         accession = validate_study_accession(accession)
         columns, rows = _query_ena_runs(accession)
         if not rows:
-            raise EnaAccessionNotFoundError(f"no ENA runs found for study {accession!r}")
+            raise EnaAccessionNotFoundError(
+                f"no public ENA runs found for study {accession!r}"
+                " (nonexistent, or not yet/no longer public)"
+            )
         return [EnaRunRecord(**dict(zip(columns, row, strict=True))) for row in rows]
 
     def resolve_sample_attributes(self, accession: str) -> list[EnaSampleAttributes]:

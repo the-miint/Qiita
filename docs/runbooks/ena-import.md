@@ -98,6 +98,25 @@ conflict — is recorded on that accession alone; it never aborts the batch or i
 sibling accessions. Poll with `qiita ena-import-status IDX` to see each accession's
 state and, on failure, the reason.
 
+### Non-public studies and runs
+
+ENA reports a `status` (`public` or `suppressed`) on every study and run; any other
+value fails the accession loudly rather than being treated as public. A **suppressed
+study** fails the whole accession before anything is written, naming its status
+(`study PRJ... is suppressed`). A study with **no public runs at all** fails the same
+way (`no public runs`), before the study is even resolved or created. Within an
+otherwise-public study, an individual **suppressed run** is `excluded` — isolated from
+its siblings exactly like an unmappable platform, carrying a `failure_reason` naming
+the run and its status, and contributing no `biosample`/`prep_sample`/`sequenced_sample`
+rows. An item whose runs are all `excluded` and/or `failed` (no run reaches
+`registered`/`skipped_already_present`) still fails with "every run failed to
+register", naming every excluded or failed run.
+
+ENA Portal's `/search` endpoint (what resolution queries) returns only public records
+by default, so this mostly guards against a record changing status after being
+fetched, or an ENA status this codebase does not yet recognize — it is not expected to
+trigger often in practice.
+
 ### REST surface
 
 - `POST /api/v1/ena-import-batch` — body: `{accessions: [...]}`. Returns `202` immediately with a batch
@@ -142,12 +161,13 @@ it once submitted.
 Every ENA-imported biosample is bound to the **ERC000011** checklist (the ENA default
 sample checklist) — the same shared checklist model every other metadata path in
 Qiita uses. `GET /api/v1/ena-import-batch/{idx}` returns an `ena_runs` array per item,
-one entry per ENA run carrying its `status` and a `failure_reason` when it failed. A
+one entry per ENA run carrying its `status` (`registered` / `skipped_already_present` /
+`excluded` / `failed`) and a `failure_reason` when `failed` or `excluded`. A
 harmonization error (an unparseable value, or a cross-study metadata slot collision)
 fails the run, surfacing as that run's `status: failed` + `failure_reason`, isolated
-per-run exactly like an unmappable platform. A checklist-required field ENA did not
-supply is not itself an error — the checklist binding, not enforcement, is what
-harmonization records.
+per-run exactly like an unmappable platform or a suppressed run (see *Non-public
+studies and runs* above). A checklist-required field ENA did not supply is not itself
+an error — the checklist binding, not enforcement, is what harmonization records.
 
 **A sample with zero ENA attributes is a legitimate, common result, not an import
 failure.** Real ENA/DDBJ samples sometimes carry no `<SAMPLE_ATTRIBUTE>` elements at

@@ -1,5 +1,5 @@
 {
-  "_source": "recorded from https://www.ebi.ac.uk/ena/portal/api/search?result=read_run&query=study_accession=\"PRJNA48739\"&fields=run_accession,experiment_accession,sample_accession,study_accession,library_layout,library_strategy,library_source,library_selection,instrument_platform,fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count&limit=0&format=tsv on 2026-07-21 (instrument_platform column added during registration work, re-recorded same date)",
+  "_source": "recorded from https://www.ebi.ac.uk/ena/portal/api/search?result=read_run&query=study_accession=\"PRJNA48739\"&fields=run_accession,experiment_accession,sample_accession,study_accession,library_layout,library_strategy,library_source,library_selection,instrument_platform,fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count,status&limit=0&format=tsv on 2026-07-21 (instrument_platform column added during registration work, re-recorded same date; status column added 2026-09-29, re-recorded same live study)",
   "columns": [
     "run_accession",
     "experiment_accession",
@@ -15,7 +15,8 @@
     "fastq_bytes",
     "fastq_md5",
     "read_count",
-    "base_count"
+    "base_count",
+    "status"
   ],
   "rows": [
     [
@@ -33,7 +34,8 @@
       [89054035],
       ["791595268ae7a965664652bde3444a2b"],
       298966,
-      158722947
+      158722947,
+      "public"
     ],
     [
       "SRR096343",
@@ -50,7 +52,8 @@
       [5686490, 22054785, 24627105],
       ["9dbbfcd6b19ac17ba166959c912ad9f3", "b7aefae0806e3d29f29c8d2ac0686a92", "00c8c44e0faf783fac38598e21315fdf"],
       238252,
-      87391853
+      87391853,
+      "public"
     ]
   ]
 }

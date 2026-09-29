@@ -46,13 +46,14 @@ _RUN_COLUMNS = (
     "fastq_md5",
     "read_count",
     "base_count",
+    "status",
 )
 
 
 def _fake_study_header(accession: str) -> tuple[list[str], list[tuple]]:
     return (
-        ["study_accession", "secondary_study_accession", "study_title"],
-        [(accession, None, f"title for {accession}")],
+        ["study_accession", "secondary_study_accession", "study_title", "status"],
+        [(accession, None, f"title for {accession}", "public")],
     )
 
 
@@ -73,6 +74,7 @@ def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
         [],
         None,
         None,
+        "public",
     )
     return list(_RUN_COLUMNS), [row]
 

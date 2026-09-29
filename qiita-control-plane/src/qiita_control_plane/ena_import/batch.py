@@ -36,6 +36,7 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, status
 from qiita_common.ena_accession import validate_study_accession
 from qiita_common.models import WorkTicketState
+from qiita_common.models.ena import EnaStatus
 from qiita_common.models.ena_import import (
     BatchImportItem,
     BatchImportStatus,
@@ -97,6 +98,12 @@ _TERMINAL_SUCCESS_STATES = frozenset(
 )
 _TERMINAL_UNSUCCESSFUL_STATES = frozenset(
     {WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value}
+)
+
+# A run counts toward "this study registered something downloadable" only in
+# these two states -- EXCLUDED (non-public) and FAILED do not.
+_SUCCESSFUL_RUN_REGISTRATION_STATUSES = frozenset(
+    {EnaRunRegistrationStatus.REGISTERED, EnaRunRegistrationStatus.SKIPPED_ALREADY_PRESENT}
 )
 
 
@@ -233,6 +240,23 @@ async def _process_one_study(
             resolver.resolve_sample_attributes, item.ena_study_accession
         )
 
+        if study_header.status is not EnaStatus.PUBLIC:
+            await _set_item_state(
+                pool,
+                item.idx,
+                BatchItemState.FAILED,
+                failure_reason=f"study {item.ena_study_accession} is {study_header.status.value}",
+            )
+            return
+        if not any(run.status is EnaStatus.PUBLIC for run in ena_runs):
+            await _set_item_state(
+                pool,
+                item.idx,
+                BatchItemState.FAILED,
+                failure_reason="no public runs",
+            )
+            return
+
         # Resolve the study BEFORE registering anything, so an import into a
         # study we did not create fails with nothing written.
         async with pool.acquire() as conn, conn.transaction():
@@ -296,16 +320,16 @@ async def _process_one_study(
             )
             return
 
-        if not any(o.status is not EnaRunRegistrationStatus.FAILED for o in result.ena_runs):
-            # Pools exist (a platform mapped), but every run then failed inside
-            # register_ena_study (protocol mapping, harmonization, or a DB error),
-            # so the pools hold no sequenced_sample rows. Submitting downloads
-            # against them would report success over an all-failed study. Terminal
-            # `failed`; the per-run reasons are already persisted on `ena_run_outcomes`.
+        if not any(o.status in _SUCCESSFUL_RUN_REGISTRATION_STATUSES for o in result.ena_runs):
+            # Pools exist (a platform mapped), but every run then failed or was
+            # excluded (non-public) inside register_ena_study, so the pools hold
+            # no sequenced_sample rows. Submitting downloads against them would
+            # report success over an all-failed study. Terminal `failed`; the
+            # per-run reasons are already persisted on `ena_run_outcomes`.
             reasons = "; ".join(
                 f"{o.run_accession}: {o.failure_reason}"
                 for o in result.ena_runs
-                if o.status is EnaRunRegistrationStatus.FAILED
+                if o.status not in _SUCCESSFUL_RUN_REGISTRATION_STATUSES
             )
             await _set_item_state(
                 pool,

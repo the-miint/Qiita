@@ -13,4 +13,8 @@ from __future__ import annotations
 class EnaAccessionNotFoundError(RuntimeError):
     """A well-formed, validated accession resolved to zero rows from ENA. Raised
     rather than returning an empty list so an operator sees a clear "not found"
-    reason instead of a silent no-op import."""
+    reason instead of a silent no-op import.
+
+    ENA Portal's `/search` endpoint (what `read_ena` queries) returns only
+    public records, so zero rows is ambiguous between "does not exist" and
+    "exists but is not public" -- the message says so rather than picking one."""

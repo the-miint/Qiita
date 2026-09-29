@@ -60,17 +60,18 @@ _RUN_COLUMNS = (
     "fastq_md5",
     "read_count",
     "base_count",
+    "status",
 )
 
 
-def _fake_study_header(accession: str) -> tuple[list[str], list[tuple]]:
+def _fake_study_header(accession: str, *, status: str = "public") -> tuple[list[str], list[tuple]]:
     return (
-        ["study_accession", "secondary_study_accession", "study_title"],
-        [(accession, None, f"title for {accession}")],
+        ["study_accession", "secondary_study_accession", "study_title", "status"],
+        [(accession, None, f"title for {accession}", status)],
     )
 
 
-def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
+def _fake_runs(accession: str, *, status: str = "public") -> tuple[list[str], list[tuple]]:
     row = (
         f"SRR-{accession}",
         f"SRX-{accession}",
@@ -87,6 +88,7 @@ def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
         [],
         None,
         None,
+        status,
     )
     return list(_RUN_COLUMNS), [row]
 
@@ -676,6 +678,7 @@ def _make_shared_sample_fakes(shared_sample_accession: str):
             [],
             None,
             None,
+            "public",
         )
         return list(_RUN_COLUMNS), [row]
 
@@ -1237,6 +1240,200 @@ async def test_process_one_study_all_runs_failed_reaches_terminal_failed(
     await _cleanup_study(postgres_pool, accession)
 
 
+# ---------------------------------------------------------------------------
+# Non-public studies and runs (Q1: refuse a suppressed study; exclude a
+# suppressed run; fail loud on a status this codebase doesn't recognize).
+# ---------------------------------------------------------------------------
+
+
+async def test_process_one_study_suppressed_study_fails_before_any_write(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A suppressed study must fail the item before `get_or_create_study_by_ena_accessions`
+    even runs -- nothing (no study, no run, no ticket) is written."""
+    monkeypatch.setattr(
+        _QUERY_STUDY, lambda accession: _fake_study_header(accession, status="suppressed")
+    )
+
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool, accessions=[accession], principal=admin_principal
+    )
+    batch_cleanup.append(batch_idx)
+
+    task = schedule_ena_import_batch(batch_app, items=items, principal=admin_principal)
+    await task
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, study_idx, failure_reason FROM qiita.ena_import_batch_item WHERE idx = $1",
+        items[0].idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert item_row["study_idx"] is None
+    assert f"study {accession} is suppressed" in item_row["failure_reason"]
+
+    study_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.study WHERE bioproject_accession = $1", accession
+    )
+    assert study_count == 0
+
+
+async def test_process_one_study_all_runs_suppressed_fails_before_any_write(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A study whose every run is suppressed must fail before the study is even
+    resolved/created -- there is nothing public left to import."""
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: _fake_runs(accession, status="suppressed"))
+
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool, accessions=[accession], principal=admin_principal
+    )
+    batch_cleanup.append(batch_idx)
+
+    task = schedule_ena_import_batch(batch_app, items=items, principal=admin_principal)
+    await task
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, study_idx, failure_reason FROM qiita.ena_import_batch_item WHERE idx = $1",
+        items[0].idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert item_row["study_idx"] is None
+    assert "no public runs" in item_row["failure_reason"]
+
+    study_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.study WHERE bioproject_accession = $1", accession
+    )
+    assert study_count == 0
+
+
+async def test_process_one_study_one_suppressed_run_excluded_other_registered(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A study with one public and one suppressed run registers the public one
+    and reports the suppressed one `excluded`, with no sequenced_sample for it."""
+    accession = unique_accession("PRJNA")
+
+    def _mixed_runs(a):
+        _, (ok_row,) = _fake_runs(a, status="public")
+        suppressed_row = list(ok_row)
+        run_i = list(_RUN_COLUMNS).index("run_accession")
+        exp_i = list(_RUN_COLUMNS).index("experiment_accession")
+        sample_i = list(_RUN_COLUMNS).index("sample_accession")
+        status_i = list(_RUN_COLUMNS).index("status")
+        suppressed_row[run_i] = f"SRR-{a}-suppressed"
+        suppressed_row[exp_i] = f"SRX-{a}-suppressed"
+        suppressed_row[sample_i] = f"SAMN-{a}-suppressed"
+        suppressed_row[status_i] = "suppressed"
+        return list(_RUN_COLUMNS), [ok_row, tuple(suppressed_row)]
+
+    monkeypatch.setattr(_QUERY_RUNS, _mixed_runs)
+
+    batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    status_result = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+    item = status_result.items[0]
+    assert item.state == BatchItemState.DOWNLOADING
+    by_accession = {r.run_accession: r for r in item.ena_runs}
+    ok_outcome = by_accession[f"SRR-{accession}"]
+    assert ok_outcome.status == EnaRunRegistrationStatus.REGISTERED.value
+
+    excluded_outcome = by_accession[f"SRR-{accession}-suppressed"]
+    assert excluded_outcome.status == EnaRunRegistrationStatus.EXCLUDED.value
+    assert excluded_outcome.failure_reason is not None
+    assert "suppressed" in excluded_outcome.failure_reason
+
+    orphan_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
+        f"SRR-{accession}-suppressed",
+    )
+    assert orphan_count == 0
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_process_one_study_unknown_status_item_fails_naming_value(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A status ENA reports that this codebase doesn't model must fail the item
+    loudly (via the model's own ValidationError, caught by _process_one_study's
+    outer handler), naming the offending value -- never silently treated as
+    public."""
+    monkeypatch.setattr(
+        _QUERY_STUDY, lambda accession: _fake_study_header(accession, status="cancelled")
+    )
+
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool, accessions=[accession], principal=admin_principal
+    )
+    batch_cleanup.append(batch_idx)
+
+    task = schedule_ena_import_batch(batch_app, items=items, principal=admin_principal)
+    await task
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason FROM qiita.ena_import_batch_item WHERE idx = $1",
+        items[0].idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert "cancelled" in item_row["failure_reason"]
+
+
+async def test_process_one_study_mixed_excluded_and_failed_every_run_failed_message(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A study with one suppressed (excluded) run and one run that maps a
+    platform (a pool IS created) but then fails harmonization has no
+    successful run either way -- terminal `failed`, and the reasons string
+    names both."""
+    accession = unique_accession("PRJNA")
+
+    def _mixed_runs(a):
+        _, (template,) = _fake_runs(a, status="public")
+        run_i = list(_RUN_COLUMNS).index("run_accession")
+        exp_i = list(_RUN_COLUMNS).index("experiment_accession")
+        sample_i = list(_RUN_COLUMNS).index("sample_accession")
+        status_i = list(_RUN_COLUMNS).index("status")
+
+        suppressed_row = list(template)
+        suppressed_row[run_i] = f"SRR-{a}-suppressed"
+        suppressed_row[exp_i] = f"SRX-{a}-suppressed"
+        suppressed_row[sample_i] = f"SAMN-{a}-suppressed"
+        suppressed_row[status_i] = "suppressed"
+
+        bad_harmonization_row = list(template)
+        bad_harmonization_row[run_i] = f"SRR-{a}-badharm"
+        bad_harmonization_row[exp_i] = f"SRX-{a}-badharm"
+        bad_harmonization_row[sample_i] = f"SAMN-{a}-badharm"
+
+        return list(_RUN_COLUMNS), [tuple(suppressed_row), tuple(bad_harmonization_row)]
+
+    def _bad_latitude_attrs(a):
+        return [(f"SAMN-{a}-badharm", {"geographic location (latitude)": "not-a-number"})]
+
+    monkeypatch.setattr(_QUERY_RUNS, _mixed_runs)
+    monkeypatch.setattr(_QUERY_ATTRS, _bad_latitude_attrs)
+
+    batch_idx, _items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason, download_work_ticket_idxs"
+        " FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert "every run failed to register" in item_row["failure_reason"]
+    assert f"SRR-{accession}-suppressed" in item_row["failure_reason"]
+    assert f"SRR-{accession}-badharm" in item_row["failure_reason"]
+    assert list(item_row["download_work_ticket_idxs"]) == []
+
+    await _cleanup_study(postgres_pool, accession)
+
+
 async def test_reconcile_redrives_registered_item_stranded_before_submit(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
 ):
@@ -1467,8 +1664,8 @@ async def test_import_refuses_a_study_no_import_created_matched_by_secondary_acc
     monkeypatch.setattr(
         _QUERY_STUDY,
         lambda accession: (
-            ["study_accession", "secondary_study_accession", "study_title"],
-            [(fresh_bioproject, accession, f"title for {accession}")],
+            ["study_accession", "secondary_study_accession", "study_title", "status"],
+            [(fresh_bioproject, accession, f"title for {accession}", "public")],
         ),
     )
 
