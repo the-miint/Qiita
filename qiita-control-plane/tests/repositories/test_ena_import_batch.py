@@ -20,6 +20,7 @@ from qiita_control_plane.repositories.ena_import_batch import (
     ena_import_created_study,
     fetch_ena_import_batch_items,
     fetch_inflight_ena_import_batch_items,
+    fetch_pool_latest_download_ticket,
     fetch_sequenced_pool_download_states,
     fetch_work_ticket_states_for_idxs,
     insert_ena_import_batch,
@@ -347,7 +348,8 @@ async def test_fetch_inflight_ena_import_batch_items_filters_by_state(eib):
 
 
 # ---------------------------------------------------------------------------
-# fetch_sequenced_pool_download_states / fetch_work_ticket_states_for_idxs
+# fetch_sequenced_pool_download_states / fetch_pool_latest_download_ticket /
+# fetch_work_ticket_states_for_idxs
 # ---------------------------------------------------------------------------
 
 
@@ -443,6 +445,48 @@ async def test_fetch_sequenced_pool_download_states_reports_latest_ticket(sequen
             "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
             [older_idx, latest_idx],
         )
+
+
+async def test_fetch_pool_latest_download_ticket_reports_newest(sequenced_pool_ctx):
+    ctx = sequenced_pool_ctx
+    older_idx = await _seed_work_ticket(ctx, state="completed")
+    newest_idx = await _seed_work_ticket(ctx, state="cancelled")
+    try:
+        ticket = await fetch_pool_latest_download_ticket(
+            ctx["pool"],
+            sequenced_pool_idx=ctx["sequenced_pool_idx"],
+            action_id=ctx["action_id"],
+            action_version=ctx["version"],
+        )
+        assert ticket["work_ticket_idx"] == newest_idx
+        assert ticket["work_ticket_state"] == "cancelled"
+
+        # Another action's tickets on the same pool are not this action's.
+        other = await fetch_pool_latest_download_ticket(
+            ctx["pool"],
+            sequenced_pool_idx=ctx["sequenced_pool_idx"],
+            action_id="some-other-action",
+            action_version=ctx["version"],
+        )
+        assert other is None
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+            [older_idx, newest_idx],
+        )
+
+
+async def test_fetch_pool_latest_download_ticket_none_for_untouched_pool(sequenced_pool_ctx):
+    ctx = sequenced_pool_ctx
+    assert (
+        await fetch_pool_latest_download_ticket(
+            ctx["pool"],
+            sequenced_pool_idx=ctx["sequenced_pool_idx"],
+            action_id=ctx["action_id"],
+            action_version=ctx["version"],
+        )
+        is None
+    )
 
 
 async def test_fetch_work_ticket_states_for_idxs(sequenced_pool_ctx):

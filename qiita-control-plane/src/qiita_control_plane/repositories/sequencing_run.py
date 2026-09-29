@@ -59,38 +59,48 @@ class PayloadMismatch(Exception):
 # from fanout_dispatch's.
 POOL_RESOLVE_LOCK_CLASS = 0x0E4A_0001
 
-# How long either side waits on POOL_RESOLVE_LOCK_CLASS before giving up.
-# Deliberately chosen, not inherited: get_pool's 10s command_timeout would
-# bound the wait instead, and the registration side holds the lock for its
-# whole study transaction (~27ms per run measured, so 10s crosses at a few
-# hundred runs) — a size at which every roster read fails on first attempt.
-# A waiter that times out raises TimeoutError: the runner classifies that as
-# transient (FAILED/RETRIABLE, healed by a `/run` redrive) and registration
-# folds it into the accession's failure. Same reasoning as actions/library.py's
-# SET LOCAL lock_timeout. 90s covers thousands of runs at the measured rate.
+# Default wait on POOL_RESOLVE_LOCK_CLASS for background waiters (the
+# registration composer, the runner's roster read) that hold no HTTP client
+# open. Deliberately chosen, not inherited: get_pool's 10s command_timeout
+# would bound the wait instead, and the registration side holds the lock for
+# its whole study transaction (~27ms per run measured, so 10s crosses at a
+# few hundred runs) — a size at which every roster read fails on first
+# attempt. A waiter that times out raises TimeoutError: the runner classifies
+# that as transient (FAILED/RETRIABLE, healed by a `/run` redrive) and
+# registration folds it into the accession's failure. Same reasoning as
+# actions/library.py's SET LOCAL lock_timeout. 90s covers thousands of runs
+# at the measured rate. A caller holding an HTTP client's own wait budget
+# passes its own `timeout` instead of inheriting this one.
 POOL_LOCK_WAIT_TIMEOUT_S = 90.0
 
 
-async def lock_sequencing_run(conn: asyncpg.Connection, *, sequencing_run_idx: int) -> None:
+async def lock_sequencing_run(
+    conn: asyncpg.Connection, *, sequencing_run_idx: int, timeout: float | None = None
+) -> None:
     """Take the sequencing_run pool-write advisory lock (held to transaction commit).
 
-    Both sides of the download-roster race take this key:
-    `ena_import.registration` holds it from pool resolution until its runs
-    commit, and `runner._read_ingest._stage_ena_run_roster` holds it across the
-    roster read it does once at dispatch. Either a registration sees a covering
-    download ticket and keeps its runs out of that pool, or the roster read
-    waits for the registration's runs to commit: a run can no longer land in a
-    pool whose ticket has already read the roster.
+    Three holders take this key: `ena_import.registration` from pool
+    resolution until its runs commit, `routes.sequenced_sample`'s native
+    insert around its own write, and `runner._read_ingest._stage_ena_run_roster`
+    across the roster read it does once at dispatch. Whichever of the first
+    two lands first, the roster read waits behind it and so either sees a
+    covering download ticket and is kept out of that pool, or commits before
+    the read starts and is picked up by it: a run or a native sample can no
+    longer land in a pool whose ticket has already read the roster.
 
     Requires a wrapping transaction — in autocommit the lock is released with
-    the statement, silently protecting nothing — and waits at most
-    `POOL_LOCK_WAIT_TIMEOUT_S` for a competing holder."""
+    the statement, silently protecting nothing. Waits at most `timeout`
+    seconds for a competing holder; `timeout=None` resolves to
+    `POOL_LOCK_WAIT_TIMEOUT_S`, read here rather than defaulted on the
+    signature so a caller that leaves it unset always sees the current
+    value."""
     require_transaction(conn)
+    wait_timeout = POOL_LOCK_WAIT_TIMEOUT_S if timeout is None else timeout
     await conn.execute(
         "SELECT pg_advisory_xact_lock($1, $2)",
         POOL_RESOLVE_LOCK_CLASS,
         sequencing_run_idx & INT4_MASK,
-        timeout=POOL_LOCK_WAIT_TIMEOUT_S,
+        timeout=wait_timeout,
     )
 
 

@@ -4,6 +4,7 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 """
 
 import argparse
+import math
 import sqlite3
 from pathlib import Path
 
@@ -130,6 +131,36 @@ def _proportion_arg(raw: str) -> float:
         raise argparse.ArgumentTypeError(f"must be a proportion in [0, 1], got {raw!r}") from None
     if not 0.0 <= value <= 1.0:
         raise argparse.ArgumentTypeError(f"must be a proportion in [0, 1], got {value}")
+    return value
+
+
+def _positive_seconds_arg(raw: str) -> float:
+    """argparse `type` for a poll interval: finite and > 0, so a zero or
+    negative value can't spin the watch loop in a tight, deadline-blind loop.
+    """
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be a positive number of seconds, got {raw!r}"
+        ) from None
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive number of seconds, got {value}")
+    return value
+
+
+def _non_negative_seconds_arg(raw: str) -> float:
+    """argparse `type` for a timeout: finite and >= 0. Non-finite would let
+    `time.monotonic() >= deadline` never fire and the watch never time out.
+    """
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be a non-negative number of seconds, got {raw!r}"
+        ) from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"must be a non-negative number of seconds, got {value}")
     return value
 
 

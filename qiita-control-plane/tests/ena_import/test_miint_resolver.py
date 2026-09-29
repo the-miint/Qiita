@@ -112,7 +112,8 @@ def test_resolve_study_header_zero_rows_is_not_found(monkeypatch):
 
 
 def test_resolve_study_header_rejects_non_study_accession(monkeypatch):
-    from qiita_control_plane.ena_import.accession import InvalidEnaAccessionError
+    from qiita_common.ena_accession import InvalidEnaAccessionError
+
     from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
     monkeypatch.setattr(_QUERY_STUDY, lambda accession: pytest.fail("must not query"))
@@ -165,7 +166,8 @@ def test_resolve_sample_attributes_zero_rows_returns_empty_list(monkeypatch):
 
 
 def test_resolve_runs_rejects_empty_accession(monkeypatch):
-    from qiita_control_plane.ena_import.accession import InvalidEnaAccessionError
+    from qiita_common.ena_accession import InvalidEnaAccessionError
+
     from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
     monkeypatch.setattr(_QUERY_RUNS, lambda accession: pytest.fail("must not query"))

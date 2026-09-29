@@ -2,7 +2,7 @@
 and reads into Qiita.
 
 Layers: the metadata resolver (`MiintEnaResolver`, miint `read_ena` /
-`read_ena_attributes`, plus accession validation); the registration path
+`read_ena_attributes`); the registration path
 (`platform_mapping` / `protocol_mapping` and
 `registration.register_ena_study`, the composer that turns resolved metadata
 into study/biosample/prep_sample/sequenced_sample rows); metadata harmonization
@@ -11,7 +11,12 @@ download workflow + CO job (`ingest_ena_reads`) plus `submit`'s ticket builder;
 and the batch driver that fans this out across studies.
 """
 
-from .accession import EnaAccessionKind, InvalidEnaAccessionError, detect_accession_kind
+from qiita_common.ena_accession import (
+    EnaAccessionKind,
+    InvalidEnaAccessionError,
+    detect_accession_kind,
+)
+
 from .attribute_mapping import map_ena_attributes
 from .batch import (
     BatchImportItemHandle,

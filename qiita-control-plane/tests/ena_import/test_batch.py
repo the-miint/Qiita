@@ -455,7 +455,7 @@ async def test_create_ena_import_batch_seeds_pending_items(
 async def test_create_ena_import_batch_rejects_invalid_accession_writes_nothing(
     postgres_pool, admin_principal, batch_cleanup
 ):
-    from qiita_control_plane.ena_import.accession import InvalidEnaAccessionError
+    from qiita_common.ena_accession import InvalidEnaAccessionError
 
     good = unique_accession("PRJNA")
     bad = "SAMN0000001"  # a SAMPLE accession, not a study accession
@@ -1695,7 +1695,9 @@ async def test_submit_conflict_reuses_the_ticket_a_concurrent_batch_submitted(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
 ):
     """Two batches can both read a pool as uncovered; the second's submit then
-    409s and must reuse the first's in-flight ticket, not fail the item."""
+    409s and must reuse the first's in-flight ticket, not fail the item. The
+    conflict recovery reads that one pool's ticket directly rather than
+    re-running the run-wide fetch."""
     from qiita_control_plane.ena_import import batch as batch_module
 
     accession = unique_accession("PRJNA")
@@ -1704,6 +1706,9 @@ async def test_submit_conflict_reuses_the_ticket_a_concurrent_batch_submitted(
     )
     batch_cleanup.append(first_idx)
     (first_ticket,) = await _item_ticket_idxs(postgres_pool, first_items[0].idx)
+    expected_pool_idx = await postgres_pool.fetchval(
+        "SELECT sequenced_pool_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", first_ticket
+    )
 
     real_fetch = batch_module.fetch_download_pool_states
     reads = 0
@@ -1718,12 +1723,23 @@ async def test_submit_conflict_reuses_the_ticket_a_concurrent_batch_submitted(
 
     monkeypatch.setattr(batch_module, "fetch_download_pool_states", stale_first_read)
 
+    real_pool_ticket = batch_module.fetch_pool_download_ticket
+    pool_ticket_calls: list[int] = []
+
+    async def counting_pool_ticket(pool_or_conn, *, sequenced_pool_idx):
+        pool_ticket_calls.append(sequenced_pool_idx)
+        return await real_pool_ticket(pool_or_conn, sequenced_pool_idx=sequenced_pool_idx)
+
+    monkeypatch.setattr(batch_module, "fetch_pool_download_ticket", counting_pool_ticket)
+
     second_idx, second_items = await _drive_one_study(
         batch_app, postgres_pool, admin_principal, accession
     )
     batch_cleanup.append(second_idx)
 
-    assert reads == 2
+    # Conflict recovery reads only the conflicted pool, never the run-wide states.
+    assert reads == 1
+    assert pool_ticket_calls == [expected_pool_idx]
     item_row = await postgres_pool.fetchrow(
         "SELECT state, failure_reason, download_work_ticket_idxs"
         " FROM qiita.ena_import_batch_item WHERE idx = $1",

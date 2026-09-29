@@ -131,6 +131,7 @@ from qiita_common.models.ena import (
     EnaStudyHeader,
 )
 from qiita_common.models.ena_import import (
+    TERMINAL_BATCH_ITEM_STATES,
     BatchImportItem,
     BatchImportRequest,
     BatchImportResponse,
@@ -596,6 +597,7 @@ __all__ = [
     "EnaSampleAttributes",
     "EnaStudyHeader",
     # Batch ENA import.
+    "TERMINAL_BATCH_ITEM_STATES",
     "BatchImportItem",
     "BatchImportRequest",
     "BatchImportResponse",

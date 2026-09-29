@@ -62,6 +62,7 @@ from qiita_control_plane.repositories.biosample import (
 )
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.ena_import_batch import (
+    fetch_pool_latest_download_ticket,
     fetch_sequenced_pool_download_states,
 )
 from qiita_control_plane.repositories.prep_protocol import fetch_prep_protocol_idx_by_name
@@ -159,6 +160,40 @@ async def fetch_download_pool_states(
     return await fetch_sequenced_pool_download_states(
         pool_or_conn,
         sequencing_run_idx=sequencing_run_idx,
+        action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
+        action_version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    )
+
+
+_ROSTER_READ_DOWNLOAD_TICKET_STATES = frozenset(
+    {
+        WorkTicketState.PROCESSING.value,
+        WorkTicketState.COMPLETED.value,
+        WorkTicketState.NO_DATA.value,
+        WorkTicketState.QUEUED.value,
+    }
+)
+
+
+def download_ticket_read_roster(work_ticket_state: str | None) -> bool:
+    """Whether a pool's latest download ticket has read, or is reading, the
+    pool's run roster: processing/completed/no_data/queued (queued only
+    follows a staged ticket's retry requeue, never precedes the first read).
+    pending/None precede the read. failed/cancelled count as not-read since
+    the next dispatch re-reads the roster live -- but a `/run` redrive of a
+    ticket that already completed `ingest_ena_reads` fast-forwards straight
+    over the re-staged roster, so a sample added while failed can still be
+    missed."""
+    return work_ticket_state in _ROSTER_READ_DOWNLOAD_TICKET_STATES
+
+
+async def fetch_pool_download_ticket(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, *, sequenced_pool_idx: int
+) -> asyncpg.Record | None:
+    """`fetch_pool_latest_download_ticket` for the download-ena-study action."""
+    return await fetch_pool_latest_download_ticket(
+        pool_or_conn,
+        sequenced_pool_idx=sequenced_pool_idx,
         action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
         action_version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
     )

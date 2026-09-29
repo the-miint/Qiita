@@ -58,6 +58,8 @@ from ._helpers import (
     _handle_read,
     _handle_study_field_create,
     _lane_arg,
+    _non_negative_seconds_arg,
+    _positive_seconds_arg,
     _proportion_arg,
     _proportion_or_none_arg,
 )
@@ -65,6 +67,7 @@ from .alignment import _handle_alignment_cohort, _handle_alignment_list
 from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_export
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
+from .ena_import import _handle_ena_import_status, _handle_submit_ena_import
 from .feature_table import DEFAULT_TABLE_FORMAT, TABLE_FORMATS, _handle_feature_table_build
 from .mask import (
     DEFAULT_FEATURE_NAME_SOURCE,
@@ -204,6 +207,11 @@ def _add_field_list_subcommands(
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    # Local import: `..reference_load` pulls in TERMINAL_WORK_TICKET_STATES at
+    # its own module level, which must stay out of `cli.user`'s eager import
+    # closure (test_cli_venv_import_check.py).
+    from ..reference_load import DEFAULT_POLL_INTERVAL_SECONDS, DEFAULT_POLL_TIMEOUT_SECONDS
+
     parser = argparse.ArgumentParser(prog="qiita", description="Qiita end-user CLI")
     _common.add_base_url_arg(parser)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1778,6 +1786,61 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Max seconds to wait for the work_ticket under --watch (default: 86400)",
     )
     p_submit_reads.set_defaults(handler=_handle_submit_reads)
+
+    p_ena_import = sub.add_parser(
+        "submit-ena-import",
+        help="Submit a batch ENA study import (POST /ena-import-batch)",
+        description=(
+            "Submit one or more INSDC STUDY accessions (PRJNA/PRJEB/PRJDB/ERP/SRP/DRP)"
+            " for import: each becomes one qiita.study, with its runs registered and"
+            " downloaded via the download-ena-study workflow. Accessions may be given"
+            " positionally or via --from-file (one per line; blank lines and"
+            " whole-line '#' comments are skipped — a line may not carry an inline"
+            " comment or more than one accession). Requires wet_lab_admin or"
+            " system_admin."
+        ),
+    )
+    p_ena_import.add_argument(
+        "accessions",
+        nargs="*",
+        help="INSDC STUDY accession(s), e.g. PRJEB11419. Not valid with --from-file.",
+    )
+    p_ena_import.add_argument(
+        "--from-file",
+        type=Path,
+        help="Read accessions from FILE instead of the positional arguments, one per line.",
+    )
+    p_ena_import.add_argument(
+        "--no-watch",
+        action="store_true",
+        help="Submit the batch and exit without polling. Default polls until every item"
+        " is terminal.",
+    )
+    p_ena_import.add_argument(
+        "--poll-interval-seconds",
+        type=_positive_seconds_arg,
+        default=DEFAULT_POLL_INTERVAL_SECONDS,
+        help="Seconds between batch polls under --watch (default: %(default)s)",
+    )
+    p_ena_import.add_argument(
+        "--timeout-seconds",
+        type=_non_negative_seconds_arg,
+        default=DEFAULT_POLL_TIMEOUT_SECONDS,
+        help="Max seconds to wait for every item to reach a terminal state under --watch"
+        " (default: %(default)s)",
+    )
+    p_ena_import.set_defaults(handler=_handle_submit_ena_import)
+
+    p_ena_import_status = sub.add_parser(
+        "ena-import-status",
+        help="Read a batch ENA import's status (GET /ena-import-batch/{idx})",
+    )
+    p_ena_import_status.add_argument(
+        "ena_import_batch_idx",
+        type=int,
+        help="Batch idx returned by `qiita submit-ena-import`.",
+    )
+    p_ena_import_status.set_defaults(handler=_handle_ena_import_status)
 
     p_submit_pacbio = sub.add_parser(
         "submit-pacbio-ingest",

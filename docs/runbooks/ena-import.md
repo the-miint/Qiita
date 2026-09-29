@@ -71,7 +71,10 @@ and only the new ones are added. A download ticket reads its pool's run list onc
 it starts, so new runs never join a pool whose download is in flight or finished — they
 go into a new pool with its own ticket, and the accession reports `done` only once every
 pool's download has. A re-import is also how to retry a failed or cancelled download.
-Nothing schedules this — it is an operator gesture.
+Nothing schedules this — it is an operator gesture. A native `POST .../sequenced-sample`
+add to a pool whose download has already read (or is reading) its roster is refused the
+same way, 409: create a new `sequenced_pool` on the run and submit its own
+`download-ena-study` ticket instead.
 
 An import will only add to a study **an import created**. A study Qiita created
 natively and later deposited to ENA carries a `bioproject_accession` too, so
@@ -92,8 +95,8 @@ recorded value, then re-import.
 
 A failure in any one accession — an unmappable platform, a resolver error, a database
 conflict — is recorded on that accession alone; it never aborts the batch or its
-sibling accessions. Poll the batch's own status endpoint to see each accession's state
-and, on failure, the reason.
+sibling accessions. Poll with `qiita ena-import-status IDX` to see each accession's
+state and, on failure, the reason.
 
 ### REST surface
 
@@ -112,6 +115,22 @@ A control-plane restart re-drives every accession still `pending`, `resolving` o
 `registered`, unless the batch's submitter has since been disabled or retired: those
 accessions fail with that reason instead, and a re-import by an active admin picks
 them up.
+
+`qiita submit-ena-import ACCESSION [ACCESSION ...]` (or `--from-file FILE`, one accession
+per line — blank lines and whole-line `#` comments are skipped, but a line may not
+carry a trailing comment or more than one accession) drives the batch endpoints above.
+It validates every accession locally before submitting — one bad shape refuses the
+whole call — then by default polls to terminal with `--poll-interval-seconds` (default
+2s) between polls up to `--timeout-seconds` (default 86400s); `--no-watch` returns
+right after submit. A transient failure while polling — a dropped connection or a 5xx —
+is retried until the timeout instead of failing the watch; any other HTTP error is
+fatal. Exit codes: `0` every item reached `done`; `1` an item ended `failed`, the watch
+timed out (naming each still-pending accession and its last known state), an HTTP
+error, or no token was found; `2` bad input (a malformed accession, a bad `--from-file`
+line, an out-of-range flag); `130` Ctrl-C, naming the batch to poll if the POST had
+already succeeded. `qiita ena-import-status IDX` reads a batch's current state and
+always exits `0` once the read itself succeeds. See the REST bullets above for the
+state set and what each field means.
 
 The actual read download runs as the `download-ena-study` workflow
 (`workflows/download-ena-study/1.0.0.yaml`), the same `qiita ticket status` /
@@ -203,4 +222,4 @@ covers, what a green one does *not* prove, and which hatch skips which are in
 
 An unresolvable accession (malformed, or one ENA does not recognize) fails loud with
 an actionable message rather than resolving to a silent empty result — see
-`ena_import.accession` for the accepted prefix sets per accession kind.
+`qiita_common.ena_accession` for the accepted prefix sets per accession kind.

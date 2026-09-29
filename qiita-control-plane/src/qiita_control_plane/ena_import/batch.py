@@ -34,6 +34,7 @@ from typing import Any
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, status
+from qiita_common.ena_accession import validate_study_accession
 from qiita_common.models import WorkTicketState
 from qiita_common.models.ena_import import (
     BatchImportItem,
@@ -57,13 +58,13 @@ from ..repositories.ena_import_batch import (
     update_ena_import_batch_item_study_created,
 )
 from ..repositories.study import get_or_create_study_by_ena_accessions
-from .accession import validate_study_accession
 from .miint_resolver import MiintEnaResolver
 from .registration import (
     EnaRunRegistrationStatus,
     EnaStudyRegistrationResult,
     download_ticket_covers_pool,
     fetch_download_pool_states,
+    fetch_pool_download_ticket,
     register_ena_study,
 )
 from .submit import build_download_ena_study_ticket
@@ -347,7 +348,7 @@ async def _process_one_study(
                             raise
                         # A concurrent batch submitted this pool's ticket after our read.
                         ticket_idx = await _covering_download_ticket_idx(
-                            pool, sequencing_run_idx, pool_state["sequenced_pool_idx"]
+                            pool, pool_state["sequenced_pool_idx"]
                         )
                         if ticket_idx is None:
                             raise
@@ -375,14 +376,10 @@ async def _process_one_study(
         await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=str(exc))
 
 
-async def _covering_download_ticket_idx(
-    pool: asyncpg.Pool, sequencing_run_idx: int, sequenced_pool_idx: int
-) -> int | None:
-    for pool_state in await fetch_download_pool_states(pool, sequencing_run_idx):
-        if pool_state["sequenced_pool_idx"] == sequenced_pool_idx and download_ticket_covers_pool(
-            pool_state["work_ticket_state"]
-        ):
-            return pool_state["work_ticket_idx"]
+async def _covering_download_ticket_idx(pool: asyncpg.Pool, sequenced_pool_idx: int) -> int | None:
+    ticket = await fetch_pool_download_ticket(pool, sequenced_pool_idx=sequenced_pool_idx)
+    if ticket is not None and download_ticket_covers_pool(ticket["work_ticket_state"]):
+        return ticket["work_ticket_idx"]
     return None
 
 

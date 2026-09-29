@@ -48,6 +48,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   text is judged eligible as text rather than as the closed value set it left. A field
   whose values sit on published samples, or on samples whose link to the study has been
   retired, cannot be widened at all, and the answer says which.
+- **`qiita submit-ena-import` / `qiita ena-import-status` submit and watch a batch ENA
+  study import from the CLI (#629).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
+  `--from-file`, one accession per line — a whole-line `#` comment only; a trailing
+  comment or more than one accession on a line is refused, naming the line number)
+  validates every accession locally, `POST`s `/ena-import-batch`, and by default polls
+  to terminal with bounded `--poll-interval-seconds` / `--timeout-seconds` flags —
+  printing each item's state change and exiting `1` if any item ends `failed` or the
+  watch times out (naming every still-pending accession and its last known state); a
+  transient error while polling is retried until the deadline instead of failing the
+  watch. `--no-watch` returns right after submit; Ctrl-C exits `130`, naming the batch
+  to poll if it had already been created. `ena-import-status IDX` reads a batch's
+  current state. Both require wet_lab_admin or system_admin, matching the routes' own
+  gate.
 
 - **A study reader can export per-prep_sample SynDNA insert read counts as BIOM or Parquet
   (#621).** The read-mask workflow's new `persist-syndna-read-count` action (gated on
@@ -1991,6 +2004,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Native sequenced-sample import now locks its sequencing run and refuses pools whose download roster is already staged** — the POST route takes #602's sequencing_run advisory lock around the insert and 409s (covering a queued download ticket too) when the pool's latest download-ena-study ticket has already read its run roster, naming the run and telling the caller to add the sample to a new pool instead. The lock wait is bounded at 5s, well under the CLI's own HTTP timeout, and a wait that exhausts it answers 503 with Retry-After rather than an unbounded hang (#627).
+
 - **The `reference_load` tests pin the host RAM they assume (#616).** Off SLURM,
   `load`'s DuckDB limit is detected RAM minus its 8-thread headroom (#606), which is
   1 GB on the 7 GB macOS runner, and `read_jplace` asks DuckDB 1.5.4 for about
@@ -3918,6 +3933,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   that does not match its field's type now carries a structured DETAIL identifying it, so
   a route tells it from the other rejections sharing its SQLSTATE instead of reading every
   untagged one as a publication lock.
+- **INSDC accession validation moved into `qiita-common` (#629).** `EnaAccessionKind`,
+  `InvalidEnaAccessionError`, `detect_accession_kind`, and `validate_study_accession` now
+  live in `qiita_common.ena_accession`, not `qiita_control_plane.ena_import.accession` —
+  the CLI's accession checks (`qiita submit-ena-import`) need them without importing the
+  control plane. `qiita_control_plane.ena_import` still re-exports the first three.
+  `qiita_common.models.ena_import` also gained `TERMINAL_BATCH_ITEM_STATES`, named beside
+  `BatchItemState` the way `TERMINAL_WORK_TICKET_STATES` sits beside `WorkTicketState`.
 
 - **CLAUDE.md: read DuckLake data through the catalog, never `read_parquet` over its files
   (#611).** Ad-hoc scripts that globbed a table's Parquet read files the catalog does not

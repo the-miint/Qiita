@@ -164,6 +164,27 @@ async def fetch_sequenced_pool_download_states(
     )
 
 
+async def fetch_pool_latest_download_ticket(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    sequenced_pool_idx: int,
+    action_id: str,
+    action_version: str,
+) -> asyncpg.Record | None:
+    """One pool's newest ticket for the action (`work_ticket_idx` /
+    `work_ticket_state`), or None if it has none -- the single-pool sibling
+    of `fetch_sequenced_pool_download_states`'s run-wide LATERAL join."""
+    return await pool_or_conn.fetchrow(
+        "SELECT work_ticket_idx, state::text AS work_ticket_state"
+        " FROM qiita.work_ticket"
+        " WHERE action_id = $2 AND action_version = $3 AND sequenced_pool_idx = $1"
+        " ORDER BY work_ticket_idx DESC LIMIT 1",
+        sequenced_pool_idx,
+        action_id,
+        action_version,
+    )
+
+
 async def fetch_inflight_ena_import_batch_items(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
 ) -> list[asyncpg.Record]:

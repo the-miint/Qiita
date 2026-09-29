@@ -72,6 +72,7 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
+from ..ena_import.registration import download_ticket_read_roster, fetch_pool_download_ticket
 from ..host_filter_resolver import resolve_host_filter_many
 from ..preflight import (
     PacbioProtocol,
@@ -92,6 +93,7 @@ from ..repositories.sequenced_sample import (
 from ..repositories.sequencing_run import (
     fetch_sequenced_pool_preflight,
     fetch_sequencing_run_platform,
+    lock_sequencing_run,
 )
 from ._helpers import (
     ETAG_HEADER,
@@ -172,12 +174,18 @@ _SEQUENCED_SAMPLE_PATCH_UNIQUE_MESSAGES: dict[str, str] = {
 }
 _SEQUENCED_SAMPLE_GENERIC_UNIQUE_VIOLATION = "conflicts with an existing sequenced_sample"
 
+# Bounded under the CLI's CLI_HTTP_TIMEOUT_SECONDS (10s) so a lock wait this
+# route loses still answers before the client's own socket read times out.
+_ROSTER_LOCK_WAIT_TIMEOUT_S = 5.0
+_ROSTER_LOCK_RETRY_AFTER_S = str(int(_ROSTER_LOCK_WAIT_TIMEOUT_S))
+
 
 @router.post(
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
     status_code=201,
 )
 async def import_sequenced_sample_from_run(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
     sequenced_pool_idx: Annotated[int, Field(gt=0)],
     body: SequencedSampleCreateRequest,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
@@ -194,6 +202,19 @@ async def import_sequenced_sample_from_run(
     strings. The body-level multi-study admin-access check runs first
     inside the transaction so a forbidden study fails before the
     owner-eligibility lookup pulls more data.
+
+    After the authz/state gates the route takes the sequencing_run advisory
+    lock (`lock_sequencing_run`, validated against the path's run by the
+    require_sequenced_pool_in_run dependency -- see its docstring for the
+    other holders and the race it closes) and holds it until this
+    transaction commits. Under that lock it refuses a pool whose latest
+    download-ena-study ticket has read -- or is reading -- its run roster,
+    with a 409 naming the pool, ticket, state, and run: a sample added after
+    the roster read would be left out of the download. The proxy rationale
+    for judging the read by the ticket's state lives in
+    `download_ticket_read_roster`'s docstring. A lock wait bounded below the
+    CLI's HTTP timeout that exhausts answers 503 with Retry-After instead of
+    surfacing the wait's TimeoutError as a 500.
     """
     async with tx() as conn:
         await require_caller_has_admin_on_all_studies(
@@ -216,6 +237,35 @@ async def import_sequenced_sample_from_run(
         metadata_checklist_idx = await resolve_metadata_checklist_idx(
             conn, body.metadata_checklist_name
         )
+
+        try:
+            await lock_sequencing_run(
+                conn, sequencing_run_idx=sequencing_run_idx, timeout=_ROSTER_LOCK_WAIT_TIMEOUT_S
+            )
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"sequencing_run {sequencing_run_idx} is busy with an ENA import"
+                    " or roster read; retry shortly"
+                ),
+                headers={"Retry-After": _ROSTER_LOCK_RETRY_AFTER_S},
+            ) from exc
+        pool_ticket = await fetch_pool_download_ticket(conn, sequenced_pool_idx=sequenced_pool_idx)
+        roster_state = pool_ticket["work_ticket_state"] if pool_ticket is not None else None
+        staged_ticket = pool_ticket if download_ticket_read_roster(roster_state) else None
+        if staged_ticket is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"sequenced_pool {sequenced_pool_idx} cannot take a new sample: its"
+                    f" latest download ticket {staged_ticket['work_ticket_idx']} is"
+                    f" '{staged_ticket['work_ticket_state']}', so this sample would be left"
+                    " out of that download. Add it to a new sequenced_pool on"
+                    f" sequencing_run {sequencing_run_idx} and submit a download-ena-study"
+                    " ticket for that pool."
+                ),
+            )
 
         # Map known composer-side errors and DB-level violations to user-
         # friendly responses. Typed catches first so their detail wins.
