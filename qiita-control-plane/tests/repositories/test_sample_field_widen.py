@@ -19,7 +19,12 @@ from qiita_control_plane.repositories._sample_helpers import (
     parse_text_for_data_type,
     widen_study_field_to_text,
 )
-from qiita_control_plane.routes._helpers import parse_kv_detail
+from qiita_control_plane.routes._helpers import (
+    _WIDEN_REFUSAL_GLOBALLY_LINKED,
+    _WIDEN_REFUSAL_NOT_FOUND,
+    _WIDEN_REFUSAL_UNWIDENABLE_TYPE,
+    parse_kv_detail,
+)
 from qiita_control_plane.testing.db_seeds import seed_terminology
 
 from .conftest import (
@@ -51,10 +56,16 @@ _VALUE_COLUMNS = (
 # The widenable types, each with a stored value and the text it must become.
 # The expected text is the form the write path stores, so a widened value
 # re-parses to itself -- asserted below rather than assumed.
+# The two bounding dates are there because the client library encodes them as
+# the infinite bounds, which the plain date rendering answers NULL for. Their
+# expected text is derived rather than typed, so it cannot drift from the value
+# under test.
 _WIDENABLE_CASES = [
     (FieldDataType.NUMERIC, Decimal("1.50"), "1.50"),
     (FieldDataType.BOOLEAN, True, "true"),
     (FieldDataType.DATE, date(2026, 3, 7), "2026-03-07"),
+    (FieldDataType.DATE, date.max, date.max.isoformat()),
+    (FieldDataType.DATE, date.min, date.min.isoformat()),
 ]
 
 # Short enough that a widen held off by a writer this test never releases fails
@@ -301,7 +312,10 @@ async def test_widen_study_field_to_text_globally_linked(ctx, spec):
 
     detail = await _widen_refusal(ctx, spec, field_idx)
 
-    assert detail == {"widen": "globally_linked", "study_field_idx": str(field_idx)}
+    assert detail == {
+        "widen": _WIDEN_REFUSAL_GLOBALLY_LINKED,
+        "study_field_idx": str(field_idx),
+    }
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
@@ -323,9 +337,9 @@ async def test_widen_study_field_to_text_terminology(ctx, spec):
     detail = await _widen_refusal(ctx, spec, field_idx)
 
     assert detail == {
-        "widen": "unwidenable_type",
+        "widen": _WIDEN_REFUSAL_UNWIDENABLE_TYPE,
         "study_field_idx": str(field_idx),
-        "data_type": "terminology",
+        "data_type": FieldDataType.TERMINOLOGY.value,
     }
 
 
@@ -341,7 +355,10 @@ async def test_widen_study_field_to_text_absent_field(ctx, spec):
 
     detail = await _widen_refusal(ctx, spec, absent_idx)
 
-    assert detail == {"widen": "not_found", "study_field_idx": str(absent_idx)}
+    assert detail == {
+        "widen": _WIDEN_REFUSAL_NOT_FOUND,
+        "study_field_idx": str(absent_idx),
+    }
 
 
 # =============================================================================
@@ -418,13 +435,13 @@ async def test_widen_study_field_to_text_no_lock_before_early_returns(ctx, spec)
     assert outcomes == {
         "already_text": 0,
         "globally_linked": {
-            "widen": "globally_linked",
+            "widen": _WIDEN_REFUSAL_GLOBALLY_LINKED,
             "study_field_idx": str(linked_field_idx),
         },
         "terminology": {
-            "widen": "unwidenable_type",
+            "widen": _WIDEN_REFUSAL_UNWIDENABLE_TYPE,
             "study_field_idx": str(term_field_idx),
-            "data_type": "terminology",
+            "data_type": FieldDataType.TERMINOLOGY.value,
         },
     }
 

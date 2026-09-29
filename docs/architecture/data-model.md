@@ -95,6 +95,8 @@ The guardrail that keeps this coherent is the uniqueness on globally-linked valu
 
 A study-local field's global link may be **added** (a local→global upgrade propagates the link onto the field's existing values, gated by the per-entity uniqueness index, and requires `unique_in_study` to be false, since only a purely-local field may carry that policy) but never **rebound** to a different global field, nor **unlinked** while values exist; the propagate trigger rejects both, and the correct move is to create a new study-local field.
 
+A purely-local field's `data_type` may be **widened to `text`**, and to nothing else: `qiita.widen_study_field_to_text` redeclares the field and moves every value stored through it into `value_text` in one transaction, so no value is left in a column the declaration no longer names. Narrowing is not expressible, a globally-linked field's type is the registry's rather than the study's, and `terminology` has no text form. Both the widen and a `unique_in_study` tightening lock the metadata table against concurrent writers for the caller's transaction, and refuse to run at all without a bounded `lock_timeout`; relaxing `unique_in_study` takes no lock.
+
 ### Metadata visibility tiers (not yet enforced)
 
 The schema models per-field and per-value access tiers, but no code reads or enforces them yet. Every metadata read and write today ignores these columns entirely; visibility is instead controlled coarsely, at the route's `require_study_access` tier gate. Building the enforcement described here is outstanding work.

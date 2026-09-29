@@ -4304,9 +4304,9 @@ async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
 # test_biosample.py, differing only in which route is driven and which call is
 # made to deadlock; this repo marks route twins rather than factoring them.
 async def test_import_sequenced_sample_deadlock_503(ctx, monkeypatch):
-    """Tests the case where the database breaks a lock tie against a concurrent
-    field edit by aborting the import: the caller is told the condition is
-    transient rather than receiving an unclassified failure.
+    """Tests the case where the database aborts the import to break a lock
+    tie: the caller is told the condition is transient rather than receiving an
+    unclassified failure.
     """
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "deadlock")
     study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="dead")

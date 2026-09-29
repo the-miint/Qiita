@@ -187,11 +187,10 @@ class SampleStudyFieldPatchRequest(PatchRequestModel):
 
     The global-field link is absent on purpose: changing it rewrites the
     meaning of every value already stored through the field. data_type admits
-    exactly one target, text, into which a stored numeric, boolean, or date
-    can be carried without losing what it said; the route moves those values as
-    it changes the declaration. A terminology value has no such form and is
-    refused there. Narrowing stays inexpressible, since any other target can
-    fail to hold a value already stored.
+    exactly one target, text; the route moves the stored values as it changes
+    the declaration, and qiita.widen_study_field_to_text states why the two are
+    inseparable and why no other target is offered. A terminology value has no
+    text form and is refused there.
 
     unique_in_study is checked against the type the field ends this request at,
     which a widen in the same body may have changed. required and tier_override

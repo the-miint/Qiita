@@ -308,10 +308,6 @@ async def import_biosample(
             )
             raise HTTPException(status_code=422, detail=detail)
         except asyncpg.DeadlockDetectedError:
-            # The import writes values through fields a study admin may be
-            # redeclaring at the same time, which can leave the two
-            # transactions waiting on each other; the database breaks the tie
-            # by aborting one. No biosample was created.
             raise_transient_retry(
                 "a concurrent edit of one of this study's fields interrupted the"
                 " import; nothing was stored — resubmit the identical request"

@@ -4,20 +4,13 @@
 -- SERIALIZE unique_in_study PROPAGATION AGAINST METADATA WRITERS
 -- =============================================================================
 --
--- The propagation trigger previously left a window open: a metadata INSERT in
--- flight read the pre-flip flag through the contract trigger and landed
--- carrying it -- outside the partial unique indexes and the no-missing-value
--- CHECK -- and stayed that way until that row itself was written again. The
--- trigger now takes a table lock that conflicts with every concurrent writer,
--- so an INSERT either commits before the propagation reads (and is caught by
--- the indexes, rejecting the flip) or cannot start until the flip's
--- transaction has ended (and reads the new policy).
---
--- 20260910010000_study_field_updated_at_unique_propagation.sql weighs that
--- same window against a FOR SHARE on the field row and decides to leave it
--- open. It is closed here, by a different mechanism, so that file's reasoning
--- is superseded rather than current; it is not edited because it has already
--- been applied.
+-- The propagation takes a table lock that conflicts with every concurrent
+-- writer, so a metadata INSERT either commits before the propagation reads
+-- the field's values -- and is caught by the partial unique indexes or the
+-- no-missing-value CHECK, rejecting the flip -- or cannot start until the
+-- flip's transaction has ended, and reads the new policy. Without it such an
+-- INSERT lands carrying the pre-flip flag, outside both, and stays that way
+-- until that row itself is written again.
 --
 -- Only false -> true is locked. Relaxing a constraint cannot violate one, so
 -- nothing has to be serialized against it.
@@ -25,10 +18,10 @@
 -- The lock mode, its dependence on the writer running at READ COMMITTED, its
 -- table-wide cost, and why the bound is the caller's rather than a value
 -- chosen here are all stated on the same lock in
--- 20260915000000_sample_field_widen_fn.sql and are not repeated here. The
--- timeout the API path supplies, and why it is the size it is, live on the
--- constant in routes/_helpers.py. A migration that tightens fields in bulk is
--- such a caller and must set its own bound; dbmate supplies none.
+-- qiita.widen_study_field_to_text and are not repeated here. The timeout the
+-- API path supplies lives on the constant in routes/_helpers.py. A migration
+-- that tightens fields in bulk is such a caller and must set its own bound;
+-- dbmate supplies none.
 
 CREATE OR REPLACE FUNCTION qiita.tg_propagate_unique_in_study() RETURNS trigger AS $$
 DECLARE

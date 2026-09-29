@@ -22,6 +22,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import BiosampleAccessionField, FieldDataType
 
+from qiita_control_plane.repositories import _sample_helpers as sample_helpers
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.routes import biosample as routes_biosample
@@ -3280,12 +3281,13 @@ async def _patch_biosample_metadata(
     )
 
 
-async def _seed_study_with_unique_field(ctx, *, suffix, unique_in_study=True):
-    """Seed a wet-owned study carrying one purely-local text field. Returns
+async def _seed_study_with_unique_field(ctx, *, suffix, unique_in_study=True, data_type="text"):
+    """Seed a wet-owned study carrying one purely-local field. Returns
     (study_idx, display_name, study_field_idx).
 
     unique_in_study False seeds the field without the policy, for a test that
-    writes values first and switches the policy on afterwards.
+    writes values first and switches the policy on afterwards. data_type picks
+    the declared type, for a test that needs one a widen can move.
     """
     wet_idx = ctx["wet_session"]["principal_idx"]
     study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix=suffix)
@@ -3294,7 +3296,7 @@ async def _seed_study_with_unique_field(ctx, *, suffix, unique_in_study=True):
         URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
         json={
             "display_name": display_name,
-            "data_type": "text",
+            "data_type": data_type,
             "unique_in_study": unique_in_study,
         },
     )
@@ -4364,9 +4366,9 @@ async def test_import_biosample_allows_same_owner_id_in_another_study(ctx):
 # test_sample_field.py, differing only in which route is driven and which call
 # is made to deadlock; this repo marks route twins rather than factoring them.
 async def test_patch_biosample_metadata_deadlock_503(ctx, monkeypatch):
-    """Tests the case where the database breaks a lock tie against a concurrent
-    field edit by aborting the metadata write: the caller is told the condition
-    is transient rather than receiving an unclassified failure.
+    """Tests the case where the database aborts the metadata write to break a
+    lock tie: the caller is told the condition is transient rather than
+    receiving an unclassified failure.
     """
     study_idx, display_name, _ = await _seed_study_with_unique_field(ctx, suffix="md-dead")
     biosample_idx = await seed_biosample(
@@ -4396,11 +4398,74 @@ async def test_patch_biosample_metadata_deadlock_503(ctx, monkeypatch):
     assert resp.headers["Retry-After"] == "1"
 
 
+async def test_patch_biosample_metadata_redeclared_field_409(ctx, monkeypatch):
+    """Tests the case where the field a value is being written through is
+    widened to text after this request chose its value column but before the
+    row lands: the write is refused, nothing is stored, and the answer says the
+    field changed shape rather than reporting an unclassified failure.
+
+    The refusal is the database's -- the real widen commits and the real
+    contract trigger rejects the row. What the patch decides is only when the
+    widen lands, there being no seam in the route between the two steps.
+    """
+    study_idx, display_name, field_idx = await _seed_study_with_unique_field(
+        ctx, suffix="md-redecl", unique_in_study=False, data_type="numeric"
+    )
+    biosample_idx = await seed_biosample(
+        ctx["pool"],
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample"].append(biosample_idx)
+    await seed_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=biosample_idx,
+        study_idx=study_idx,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_to_study"].append((biosample_idx, study_idx))
+
+    widen_committed = False
+    original_preflight = sample_helpers.preflight_sample_metadata
+
+    async def _widen_after_preflight(conn, **kwargs):
+        nonlocal widen_committed
+        resolved = await original_preflight(conn, **kwargs)
+        # Its own connection, so the redeclaration is committed and visible to
+        # the write below rather than riding this request's transaction.
+        async with ctx["pool"].acquire() as editor, editor.transaction():
+            await editor.execute(
+                f"SET LOCAL lock_timeout = '{route_helpers.METADATA_LOCK_TIMEOUT_MS}ms'"
+            )
+            await sample_helpers.widen_study_field_to_text(
+                editor, spec=BIOSAMPLE_METADATA_SPEC, study_field_idx=field_idx
+            )
+        widen_committed = True
+        return resolved
+
+    monkeypatch.setattr(sample_helpers, "preflight_sample_metadata", _widen_after_preflight)
+
+    resp = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, biosample_idx, {display_name: "2.5"}
+    )
+
+    # Without this the patch could stop being reached and the test would pass
+    # having staged no redeclaration at all.
+    assert widen_committed
+    assert resp.status_code == 409, resp.text
+    assert "redeclared" in resp.json()["detail"]
+    stored = await ctx["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_metadata WHERE biosample_study_field_idx = $1",
+        field_idx,
+    )
+    assert stored == 0
+
+
 # same-pattern-ok: as above, on the import route rather than the metadata PATCH.
 async def test_post_biosample_deadlock_503(ctx, monkeypatch):
-    """Tests the case where the database breaks a lock tie against a concurrent
-    field edit by aborting the import: the caller is told the condition is
-    transient rather than receiving an unclassified failure.
+    """Tests the case where the database aborts the import to break a lock
+    tie: the caller is told the condition is transient rather than receiving an
+    unclassified failure.
     """
     study_idx = await _seed_study(
         ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="imp-dead"

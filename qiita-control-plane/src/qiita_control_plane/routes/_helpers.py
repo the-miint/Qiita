@@ -75,12 +75,8 @@ from ..repositories.block import list_incomplete_alignment_samples
 REFERENCE_NOT_FOUND_DETAIL = "Reference not found"
 
 # Bounds every lock wait in a PATCH that locks the metadata table -- declaring
-# a field unique, or widening one. The edit is the operation that must give up
-# rather than the write path it would otherwise stall: long enough for an
-# ordinary write already in flight to clear, short enough that a stalled bulk
-# import cannot hold the PATCH open. Both operations refuse to run at all with
-# no bound in force, so this is also what keeps the API path out of that
-# refusal.
+# a field unique, or widening one. Both operations refuse to run at all with no
+# bound in force, so this is also what keeps the API path out of that refusal.
 METADATA_LOCK_TIMEOUT_MS = 3_000
 
 # Study-field edit keys whose handling can lock the metadata table against
@@ -96,9 +92,10 @@ _METADATA_LOCKING_PATCH_FIELDS = frozenset({"unique_in_study", "data_type"})
 
 # The `widen` DETAIL values qiita.widen_study_field_to_text tags its raises
 # with. Two name a shape that can never be widened; the third names an idx that
-# is on no row, which is a broken precondition rather than an answer. Spelled in
-# the migration that raises them, so a rename there without one here degrades
-# silently to the unclassified arm rather than failing.
+# is on no row, which is a broken precondition rather than an answer. Also
+# spelled in the migration that raises them, which cannot import these; the
+# widen tests assert the raised DETAIL against these names, so a rename on
+# either side fails there rather than degrading to the unclassified arm.
 _WIDEN_REFUSAL_UNWIDENABLE_TYPE = "unwidenable_type"
 _WIDEN_REFUSAL_GLOBALLY_LINKED = "globally_linked"
 _WIDEN_REFUSAL_NOT_FOUND = "not_found"
@@ -584,12 +581,22 @@ async def write_and_map_sample_metadata(
         detail_fields = parse_kv_detail(exc.detail)
         if detail_fields.get("trigger") == spec.metadata_retired_link_trigger:
             raise HTTPException(status_code=404, detail=unlinked_detail)
+        # The field's declared type changed between this write's preflight,
+        # which chose the value column, and the write itself. 409 rather than
+        # 503: the field is not momentarily busy, it is a different shape than
+        # the request was built against, and a resubmission is parsed against
+        # the new one rather than repeating this outcome.
+        if detail_fields.get("trigger") == spec.metadata_field_contract_trigger:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"a {spec.entity_kind} field named in this request was redeclared"
+                    " while it was in flight; nothing was stored — resubmit to write"
+                    " the values against the field's current type"
+                ),
+            ) from exc
         raise
     except asyncpg.DeadlockDetectedError:
-        # Writing a value through a field an edit is concurrently redeclaring
-        # can leave the two transactions waiting on each other, and the
-        # database breaks the tie by aborting one. Nothing was written, and
-        # the tie does not recur on its own.
         raise_transient_retry(
             "a concurrent edit of one of these fields interrupted the write;"
             " nothing was stored — resubmit the identical request"
@@ -748,11 +755,14 @@ async def _widen_study_field_or_raise(
                 " its own lock and the widen"
             ) from exc
         if widen_reason == _WIDEN_REFUSAL_UNWIDENABLE_TYPE:
+            # The type comes from the DETAIL rather than being named here, so
+            # the answer stays true of whichever type the refusal was for.
             raise HTTPException(
                 status_code=422,
                 detail=(
                     f"{noun} field {display_name!r} cannot be widened to text:"
-                    " its values are references into a controlled vocabulary"
+                    f" values of type {detail_fields.get('data_type')!r} have no"
+                    " text form"
                 ),
             ) from exc
         if widen_reason == _WIDEN_REFUSAL_GLOBALLY_LINKED:
@@ -771,11 +781,17 @@ async def _widen_study_field_or_raise(
                     f" one or more of its {noun}s is no longer linked to this study"
                 ),
             ) from exc
+        # The move renders each value into the column the new declaration
+        # names, so the contract rejecting one means a value had no renderable
+        # form -- a defect in this function, not an answer for the caller.
+        # Raising keeps it that way rather than dressing it as a refusal.
+        if detail_fields.get("trigger") == spec.metadata_field_contract_trigger:
+            raise RuntimeError(
+                f"{spec.study_field_table} idx={study_field_idx} moved a value the"
+                " field contract then rejected"
+            ) from exc
         # No `widen` tag and no trigger this code knows: on these rows a P0001
-        # carrying no DETAIL is the publication lock. The field-contract raiser
-        # is not a candidate, the declaration being flipped to text before the
-        # values move, so it judges each moved value against the type it is
-        # arriving as.
+        # carrying no DETAIL is the publication lock.
         raise HTTPException(
             status_code=409,
             detail=(
@@ -786,8 +802,7 @@ async def _widen_study_field_or_raise(
     except asyncpg.LockNotAvailableError, asyncpg.DeadlockDetectedError:
         # Two shapes of the same contention: the move either waited out its
         # bound for the metadata table, or was picked by the database to
-        # break a tie with a write already holding it. Neither wrote
-        # anything, and both clear once the other transaction ends.
+        # break a tie with a write already holding it.
         raise_transient_retry(
             f"{noun} field {display_name!r} could not be widened to text:"
             " metadata writes are in flight; re-issue the request to retry"
@@ -894,8 +909,7 @@ async def patch_and_map_study_field(
             raise HTTPException(status_code=422, detail=reason)
 
     # data_type is carried by the widen above, never by the column write: the
-    # study-field update allowlist omits it, and a bare flip of the declaration
-    # is what the widen exists to prevent.
+    # study-field update allowlist omits it.
     fields = {name: getattr(body, name) for name in named - {"data_type"}}
     if not fields:
         reread_row = await fetch_study_field(conn, spec=spec, idx=study_field_idx)
@@ -957,9 +971,7 @@ async def patch_and_map_study_field(
     except asyncpg.LockNotAvailableError, asyncpg.DeadlockDetectedError:
         # The propagation either could not get the metadata table quiet within
         # the bound, or was picked by the database to break a tie with a write
-        # already holding it. Either way metadata writes were in flight,
-        # nothing is written, and the condition is transient: the caller
-        # retries.
+        # already holding it.
         raise_transient_retry(
             f"{noun} field {row['display_name']!r} could not change its uniqueness"
             " policy: metadata writes are in flight; re-issue the request to retry"
@@ -1296,6 +1308,10 @@ def raise_transient_retry(detail: str) -> None:
     endpoints that answer for the same class of condition. 503 (transient),
     not 409 (the state is not actually in conflict) and not 500 (the request
     was not wrong and will likely succeed as sent).
+
+    A deadlock reaching here is one the database chose to break, from whatever
+    lock ordering produced it; nothing the losing transaction attempted was
+    written, and the tie does not recur on its own.
 
     Never returns; always raises HTTPException.
     """

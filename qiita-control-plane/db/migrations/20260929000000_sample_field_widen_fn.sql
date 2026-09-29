@@ -66,8 +66,16 @@ BEGIN
     -- The primary key comes back alongside the type purely to report presence:
     -- EXECUTE leaves FOUND untouched, and data_type is itself NULL on a row
     -- that exists and is globally linked, so neither can stand in for it.
+    --
+    -- FOR NO KEY UPDATE, not FOR UPDATE since the latter conflicts with the
+    -- FOR KEY SHARE an FK check takes on this row, so under FOR UPDATE a
+    -- concurrent metadata write would block here while already holding the metadata
+    -- table, which the move below then asks for -- a cycle the database would
+    -- break by aborting one side. This is unnecessary since nothing this function
+    -- does changes a key column. A caller that already holds this row takes nothing
+    -- new here; the lock is load-bearing only for one that does not.
     EXECUTE format(
-        'SELECT idx, data_type FROM %s WHERE idx = $1 FOR UPDATE',
+        'SELECT idx, data_type FROM %s WHERE idx = $1 FOR NO KEY UPDATE',
         p_study_field_table
     ) INTO v_found_idx, v_data_type USING p_study_field_idx;
 
@@ -109,6 +117,12 @@ BEGIN
     -- Postgres renders a numeric in the text form it stores, and a boolean as
     -- the two words the text parser accepts. to_char rather than a cast for a
     -- date, whose cast output follows the DateStyle setting.
+    --
+    -- The client library encodes the first and last dates it can represent as the
+    -- infinite bounds. to_char answers NULL for both, which would empty the row's
+    -- only populated value column, so the arms render the text that reads back as
+    -- the date the caller sent.
+    --
     -- 'terminology' is absent deliberately: its value is a reference into a
     -- controlled vocabulary, with no text form that is not either an opaque id
     -- or a label that may be revised.
@@ -121,7 +135,12 @@ BEGIN
             v_value_expr := 'value_boolean::text';
         WHEN 'date' THEN
             v_source_col := 'value_date';
-            v_value_expr := 'to_char(value_date, ''YYYY-MM-DD'')';
+            v_value_expr :=
+                'CASE'
+                '  WHEN value_date =  ''infinity''::date THEN ''9999-12-31'''
+                '  WHEN value_date = ''-infinity''::date THEN ''0001-01-01'''
+                '  ELSE to_char(value_date, ''YYYY-MM-DD'')'
+                'END';
         ELSE
             RAISE EXCEPTION 'data_type % cannot be widened to text', v_data_type
               USING DETAIL = format(

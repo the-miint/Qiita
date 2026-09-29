@@ -903,9 +903,10 @@ async def test_patch_study_field_widens_and_enables_unique_in_study(ctx, surface
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
 async def test_patch_study_field_widen_terminology_422(ctx, surface):
-    """Tests the case where a terminology field is asked to become text: its
-    values are references into a controlled vocabulary with no text form, so
-    the request is refused rather than guessed at.
+    """Tests the case where a terminology field is asked to become text: the
+    type has no text form, so the request is refused rather than guessed at,
+    and the answer names the type it refused rather than describing the one
+    type that reaches this arm today.
     """
     study_idx = await _study_with_admin_grant(ctx, "wid-term")
     terminology_idx = await seed_terminology(ctx["pool"], name=unique_field_name("widen-term"))
@@ -929,7 +930,9 @@ async def test_patch_study_field_widen_terminology_422(ctx, surface):
     )
 
     assert resp.status_code == 422, resp.text
-    assert "cannot be widened" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert "cannot be widened" in detail
+    assert FieldDataType.TERMINOLOGY.value in detail
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
@@ -1140,3 +1143,80 @@ async def test_patch_study_field_row_read_contention_503(ctx, surface, error, mo
 
     assert resp.status_code == 503, resp.text
     assert resp.headers["Retry-After"] == "1"
+
+
+# Short enough that a write blocked on the field row fails within the test
+# rather than stalling the suite until the request's own timeout.
+CONTENDED_WRITE_LOCK_TIMEOUT = "1000ms"
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_study_field_widen_admits_a_concurrent_write(ctx, surface, monkeypatch):
+    """Tests the case where a value is written through a field while that
+    field's widen holds its row: the write is not made to wait on the row, so
+    the two cannot block each other, and the value it stored is carried into
+    value_text by the move rather than stranded in the column the declaration
+    stops naming.
+
+    The error, if any, comes from the database: the patched call runs the real
+    widen, and the writer is a real second connection taking real locks. What
+    the patch decides is only when the writer acts, which the route offers no
+    seam for on its own.
+    """
+    spec = surface.metadata_spec
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _study_with_admin_grant(ctx, "admits")
+    holder_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="text")
+    target_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="numeric")
+    entity_idx = await seed_sample_with_value(
+        ctx, surface, study_idx=study_idx, study_field_idx=holder_idx, value="held"
+    )
+
+    nowait_sql = f"SELECT idx FROM {spec.study_field_table} WHERE idx = $1 FOR UPDATE NOWAIT"
+    insert_sql = (
+        f"INSERT INTO {spec.metadata_table} ({spec.entity_key_column},"
+        f" {spec.study_field_idx_column}, value_numeric, created_by_idx)"
+        " VALUES ($1, $2, $3, $4) RETURNING idx"
+    )
+    seam_ran = False
+    original_widen = route_helpers.widen_study_field_to_text
+
+    async def _write_then_widen(conn, **kwargs):
+        nonlocal seam_ran
+        seam_ran = True
+
+        # The route's preflight is holding the field row at this point, so a
+        # mode that conflicts with it is refused. Without this the writer below
+        # could pass for the wrong reason -- no lock held at all.
+        async with ctx["pool"].acquire() as probe, probe.transaction():
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                await probe.fetchval(nowait_sql, target_idx)
+
+        # The fact under test: this INSERT takes FOR KEY SHARE on the row the
+        # preflight holds, and must not be made to wait for it.
+        async with ctx["pool"].acquire() as writer, writer.transaction():
+            await writer.execute(f"SET LOCAL lock_timeout = '{CONTENDED_WRITE_LOCK_TIMEOUT}'")
+            metadata_idx = await writer.fetchval(
+                insert_sql, entity_idx, target_idx, Decimal("2.5"), owner_idx
+            )
+        ctx["created"][spec.metadata_table.removeprefix("qiita.")].append(metadata_idx)
+
+        return await original_widen(conn, **kwargs)
+
+    monkeypatch.setattr(route_helpers, "widen_study_field_to_text", _write_then_widen)
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=target_idx,
+        if_match=await _etag(ctx, surface, target_idx),
+        data_type="text",
+    )
+
+    # Without this the patch could stop being reached -- the route no longer
+    # calling it, say -- and the test would pass having staged nothing.
+    assert seam_ran
+    assert resp.status_code == 200, resp.text
+    assert await _stored_values(ctx, surface, target_idx) == [("2.5", None)]

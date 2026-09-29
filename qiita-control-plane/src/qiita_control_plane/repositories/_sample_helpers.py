@@ -263,9 +263,8 @@ class UniqueInStudyViolation(StrEnum):
 
 # Columns a caller may edit on a {entity}_study_field row through the plain
 # column write. Narrower than the edit body: data_type is settable on the wire
-# but is carried by widen_study_field_to_text, which moves the stored values in
-# the same transaction, and a bare flip of the declaration here is what that
-# function exists to prevent. The global-field link is on neither.
+# but is carried by qiita.widen_study_field_to_text, which states why it cannot
+# be written here. The global-field link is on neither.
 STUDY_FIELD_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
     {"display_name", "description", "required", "tier_override", "unique_in_study"}
 )
@@ -732,6 +731,10 @@ class EntityMetadataSpec:
     # caller tells that rejection from any other trigger sharing its SQLSTATE.
     # Renaming the function in a migration means changing this in lockstep.
     metadata_retired_link_trigger: str
+    # Name of the DB function the metadata table's field-contract triggers run,
+    # tagged and kept in lockstep the same way. It rejects a row whose
+    # populated value column does not match its field's declared type.
+    metadata_field_contract_trigger: str
     # The boolean *_metadata column marking an owner-sample-id row, for
     # entities that carry one (is_owner_biosample_id on biosample); None when
     # the entity has no owner-sample-id concept. When set, generic metadata
@@ -2075,17 +2078,19 @@ async def fetch_study_field(
     names the global FK by its entity-specific column and the row's own idx as
     `idx`. Accepts either a pool or a connection.
 
-    for_update locks the study-field row for the rest of the caller's
-    transaction, so an edit preflight and the write that follows it cannot
-    straddle another writer's commit. It locks only the study-field row, not the
-    joined global field, and requires a connection inside a transaction, which
-    it enforces rather than assuming.
+    for_update claims the study-field row for the rest of the caller's
+    transaction, excluding another edit of it, and a delete of it, so two edits
+    cannot both clear the same ETag. It deliberately does not exclude a
+    concurrent metadata write through the field: why that matters is stated on
+    the same lock in qiita.widen_study_field_to_text. It locks only the
+    study-field row, not the joined global field, and requires a connection
+    inside a transaction, which it enforces rather than assuming.
     """
     if for_update:
         # A lock taken outside a transaction is released by the autocommit that
         # ends the statement, leaving the caller unprotected and uninformed.
         require_transaction(pool_or_conn)
-    lock_clause = " FOR UPDATE OF sf" if for_update else ""
+    lock_clause = " FOR NO KEY UPDATE OF sf" if for_update else ""
     sql = f"{_study_field_read_sql(spec)} WHERE sf.idx = $1{lock_clause}"
     row = await pool_or_conn.fetchrow(sql, idx)
     return row

@@ -23,16 +23,16 @@ _None yet._
 
 ### 3. Migrations
 
-- `[operator]` `make migrate` applies `20260925000000_syndna_read_count.sql` (new table `qiita.syndna_read_count`; no data change). (#621)
+- `[operator]` `make migrate` applies `20260925000000_syndna_read_count.sql` (new table `qiita.syndna_read_count`; no data change) (#621), then `20260929000000_sample_field_widen_fn.sql`, `20260929000001_unique_in_study_propagation_lock.sql` and `20260929000002_metadata_field_contract_error_detail.sql` (all three create or replace functions; no data change). (#628)
 
 - **[operator] Between `make migrate` and the bucket-4 restart, a study-field edit that
-  declares a field unique answers 500 (#628).** `20260918000000_unique_in_study_propagation_lock.sql`
+  declares a field unique answers 500 (#628).** `20260929000001_unique_in_study_propagation_lock.sql`
   makes the propagation refuse a caller that has set no `lock_timeout`, and the control plane
   still running at that point does not set one — only the build this deploy installs does. The
   window is the gap between the two steps, and nothing has to be done about it beyond not
   reporting the 500 as a regression: `PATCH /api/v1/study/{S}/biosample-field/{F}` (and its
   prep-sample twin) carrying `unique_in_study: true` recovers on the restart, with no partial
-  state left behind. That file and `20260915000000_sample_field_widen_fn.sql` only create or
+  state left behind. That file and `20260929000000_sample_field_widen_fn.sql` only create or
   replace functions, so neither adds a lock window on the metadata tables to size.
 
 ### 4. Deploy

@@ -28,10 +28,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   declaration no longer names and reads would return NULL for all of them. The new
   `qiita.widen_study_field_to_text` declares the field text and moves its values into
   `value_text` in one transaction, rendering each in the form the write path stores so a
-  widened value re-parses unchanged. It serves both sample stacks. What it refuses is what
+  widened value re-parses unchanged -- including a date of `9999-12-31` or `0001-01-01`,
+  which the client library encodes as the infinite bounds and which the plain date
+  rendering answers NULL for. It serves both sample stacks. What it refuses is what
   can never be done -- a field whose type belongs to the global registry, and terminology,
-  which has no text form -- each tagged in the error DETAIL; a field already text is a
-  no-op returning zero rather than a conflict. Uniqueness enforcement passes from the
+  which has no text form -- each tagged in the error DETAIL, and the refusal names the
+  type it refused rather than describing the one type that reaches it today; a field
+  already text is a no-op returning zero rather than a conflict. Uniqueness enforcement passes from the
   numeric or date partial index to the text one and still holds, since distinct values
   render to distinct text. A move locks the metadata table against concurrent writers,
   without which a write already in flight would land in the column the declaration is
@@ -3899,18 +3902,22 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   first and is judged by the new policy, or waits and reads it. The lock is bounded: the
   PATCH gives up after three seconds and answers 503 rather than stalling every metadata
   write in the system, and the propagation refuses to run at all for a caller that has
-  set no bound. Relaxing a field's policy is unchanged, taking no lock. Holding a table
-  lock while holding the field's own row is the opposite order from the one a write
-  inserting a value through that field acquires them in, so the two can be found waiting
-  on each other and one is aborted to break the tie; the same is true of a widen, which
-  takes the same lock. Whichever side loses answers 503 with a Retry-After hint rather
-  than failing unclassified -- the study-field edit routes, the metadata-write routes,
-  and the biosample and sequenced-sample import routes alike. That bound covers the edit's
-  read of the field's own row as well, so an edit held off by another edit of the same
-  field now answers 503 too rather than the unclassified 500 it gave before. Only a write
-  that inserts a value through a field for the first time can be a party to this: an
-  overwrite of an existing value does not re-check the field reference and so takes no
-  lock on it.
+  set no bound. Relaxing a field's policy is unchanged, taking no lock. An edit claims
+  the field's own row in the weakest mode that excludes another edit of it, which leaves
+  a write inserting a value through that field free to proceed rather than queueing
+  behind the edit; the two can therefore no longer be found waiting on each other, and a
+  value stored while a widen is in flight is carried into text by that widen instead of
+  costing one of the two transactions. A wait that runs out still answers 503 with a
+  Retry-After hint rather than failing unclassified -- the study-field edit routes, the
+  metadata-write routes, and the biosample and sequenced-sample import routes alike. The
+  bound covers the edit's read of the field's own row as well, so an edit held off by
+  another edit of the same field answers 503 too rather than the unclassified 500 it gave
+  before. A metadata write whose field is widened after the write has chosen its value
+  column but before the row lands is refused with 409 naming the redeclaration, where it
+  previously failed unclassified: the rejection the database raises for a value column
+  that does not match its field's type now carries a structured DETAIL identifying it, so
+  a route tells it from the other rejections sharing its SQLSTATE instead of reading every
+  untagged one as a publication lock.
 
 - **CLAUDE.md: read DuckLake data through the catalog, never `read_parquet` over its files
   (#611).** Ad-hoc scripts that globbed a table's Parquet read files the catalog does not

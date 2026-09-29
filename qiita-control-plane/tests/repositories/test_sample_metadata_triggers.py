@@ -398,6 +398,41 @@ async def test_reject_if_link_retired_detail_identifies_the_trigger_on_insert(ct
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_apply_field_contract_detail_identifies_the_trigger(ctx, spec):
+    """Tests the case where a value is written into a column its field's
+    declared type does not name: the rejection carries the raising function,
+    the field, and the type that was expected, so a route tells it from the
+    other guards sharing its SQLSTATE rather than reading it as one of them.
+
+    One statement kind is enough: both the INSERT and the UPDATE triggers run
+    the same function, so the DETAIL they carry is the same.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await _create_plain_field(
+        ctx, spec, suffix="contract", data_type=FieldDataType.NUMERIC
+    )
+
+    # value_text through a numeric field: the one shape the contract rejects.
+    with pytest.raises(asyncpg.RaiseError) as excinfo:
+        await ctx["pool"].execute(
+            f"INSERT INTO {spec.metadata_table} ({spec.entity_key_column},"
+            f" {spec.study_field_idx_column}, value_text, created_by_idx)"
+            " VALUES ($1, $2, $3, $4)",
+            entity_idx,
+            field_idx,
+            "not a number",
+            ctx["principal_idx"],
+        )
+
+    expected_detail = {
+        "trigger": spec.metadata_field_contract_trigger,
+        spec.study_field_idx_column: str(field_idx),
+        "data_type": FieldDataType.NUMERIC.value,
+    }
+    assert parse_kv_detail(excinfo.value.detail) == expected_detail
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
 async def test_reject_if_link_retired_allows_value_update_on_active_link(ctx, spec):
     """Tests the case where a metadata value is overwritten while the link is
     still active: the guard does not over-reject the ordinary upsert.
