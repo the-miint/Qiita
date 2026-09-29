@@ -77,7 +77,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   whose values sit on published samples, or on samples whose link to the study has been
   retired, cannot be widened at all, and the answer says which.
 
-- **ENA import refuses non-public studies and excludes non-public runs (#PR).** Every
+- **ENA import refuses non-public studies and excludes non-public runs (#634).** Every
   resolved study and run now carries ENA's `status` (`public`/`suppressed`); a
   suppressed study, or a study with no public runs, fails the accession before
   anything is written, and an individual suppressed run within an otherwise-public
