@@ -79,6 +79,10 @@ SELECT ms.mask_idx, ms.prep_sample_idx, t.work_ticket_idx, s.attempt
          SELECT 1 FROM qiita.syndna_read_count c
           WHERE c.mask_idx = ms.mask_idx AND c.prep_sample_idx = ms.prep_sample_idx
        )
+   AND NOT EXISTS (
+         SELECT 1 FROM qiita.sequenced_sample ss
+          WHERE ss.prep_sample_idx = ms.prep_sample_idx AND ss.ena_status IS NOT NULL
+       )
  ORDER BY ms.mask_idx, ms.prep_sample_idx
 """
 

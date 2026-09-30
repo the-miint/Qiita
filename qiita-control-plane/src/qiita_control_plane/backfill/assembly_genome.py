@@ -44,12 +44,19 @@ _CHUNK_SIZE = 5_000
 
 # Every un-minted subject, with the contig count it speaks for. `bin_id` is NOT NULL
 # on the table, so no COALESCE is needed. Unordered: nothing reads the sequence, and
-# the apply matches rows by key rather than by position.
+# the apply matches rows by key rather than by position. Excludes a prep_sample whose
+# sequenced_sample is ENA-flagged -- a run ENA no longer reports available gets no new
+# genome minted.
 _UNMINTED_SUBJECTS_SQL = (
-    "SELECT prep_sample_idx, processing_idx, kind, bin_id, count(*) AS contig_count"
-    "  FROM qiita.assembly_membership"
-    " WHERE genome_idx IS NULL"
-    " GROUP BY prep_sample_idx, processing_idx, kind, bin_id"
+    "SELECT am.prep_sample_idx, am.processing_idx, am.kind, am.bin_id,"
+    "       count(*) AS contig_count"
+    "  FROM qiita.assembly_membership am"
+    " WHERE am.genome_idx IS NULL"
+    "   AND NOT EXISTS ("
+    "     SELECT 1 FROM qiita.sequenced_sample ss"
+    "      WHERE ss.prep_sample_idx = am.prep_sample_idx AND ss.ena_status IS NOT NULL"
+    "   )"
+    " GROUP BY am.prep_sample_idx, am.processing_idx, am.kind, am.bin_id"
 )
 
 

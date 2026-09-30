@@ -141,13 +141,16 @@ async def fetch_sequenced_pool_download_states(
     action_version: str,
 ) -> list[asyncpg.Record]:
     """Every sequenced_pool on `sequencing_run_idx`, oldest first, with
-    `has_sequenced_sample` (any active one) and its latest ticket for the action
-    (`work_ticket_idx` / `work_ticket_state`, NULL when it has none)."""
+    `has_sequenced_sample` (any active, non-ENA-flagged one) and its latest
+    ticket for the action (`work_ticket_idx` / `work_ticket_state`, NULL when
+    it has none). A pool whose only runs are ENA-flagged reads as having none,
+    so a re-import does not submit or reuse a download ticket against it."""
     return await pool_or_conn.fetch(
         "SELECT sp.idx AS sequenced_pool_idx,"
         "       EXISTS (SELECT 1 FROM qiita.sequenced_sample ss"
         "               JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
-        "               WHERE ss.sequenced_pool_idx = sp.idx AND ps.retired = false)"
+        "               WHERE ss.sequenced_pool_idx = sp.idx AND ps.retired = false"
+        "                 AND ss.ena_status IS NULL)"
         "         AS has_sequenced_sample,"
         "       wt.work_ticket_idx, wt.state::text AS work_ticket_state"
         " FROM qiita.sequenced_pool sp"

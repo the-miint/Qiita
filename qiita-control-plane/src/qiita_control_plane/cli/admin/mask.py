@@ -84,16 +84,23 @@ async def _select_purge_failed_candidates(
     pool: asyncpg.Pool, *, action_ids: tuple[str, ...], limit: int | None
 ) -> list[asyncpg.Record]:
     """Failed tickets for the chosen action(s) carrying the move-then-read
-    failure signature, with everything needed to resubmit. Ordered by
-    work_ticket_idx so a --limit slice is stable across runs."""
+    failure signature, with everything needed to resubmit. Excludes a
+    candidate whose prep_sample now carries an ENA-flagged sequenced_sample --
+    resubmitting would re-download a run ENA no longer reports available.
+    Ordered by work_ticket_idx so a --limit slice is stable across runs."""
     query = (
-        "SELECT work_ticket_idx, action_id, action_version, scope_target_kind,"
-        "       prep_sample_idx, action_context, originator_principal_idx, mask_idx"
-        "  FROM qiita.work_ticket"
-        " WHERE state = 'failed'"
-        "   AND action_id = ANY($1::text[])"
-        "   AND failure_reason LIKE '%' || $2 || '%'"
-        " ORDER BY work_ticket_idx"
+        "SELECT wt.work_ticket_idx, wt.action_id, wt.action_version,"
+        "       wt.scope_target_kind, wt.prep_sample_idx, wt.action_context,"
+        "       wt.originator_principal_idx, wt.mask_idx"
+        "  FROM qiita.work_ticket wt"
+        " WHERE wt.state = 'failed'"
+        "   AND wt.action_id = ANY($1::text[])"
+        "   AND wt.failure_reason LIKE '%' || $2 || '%'"
+        "   AND NOT EXISTS ("
+        "     SELECT 1 FROM qiita.sequenced_sample ss"
+        "      WHERE ss.prep_sample_idx = wt.prep_sample_idx AND ss.ena_status IS NOT NULL"
+        "   )"
+        " ORDER BY wt.work_ticket_idx"
     )
     args: list = [list(action_ids), _READ_MASK_PARQUET_NOT_FOUND]
     if limit is not None:

@@ -171,3 +171,26 @@ async def test_plans_each_pair_to_its_file_or_a_reason_and_applies(world):
     # Idempotent: the counted pair is out of the next plan; the residue stays.
     again = _mine(await plan_backfill(pool, ticket_root=world["ticket_root"]), mask_idx)
     assert set(again) == {no_ticket, no_step, gone, unbound}
+
+
+async def test_flagged_prep_sample_excluded_from_plan(world):
+    """A prep_sample whose sequenced_sample is ENA-flagged is left out of the
+    plan entirely -- not even as residue."""
+    pool, mask_idx = world["pool"], world["mask_idx"]
+    flagged, attempt_dir = await world["masked_sample"](attempt=1)
+    _write_output(attempt_dir, [(flagged, 1, world["inserts"][0])])
+    owner = await pool.fetchval(
+        "SELECT created_by_idx FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
+    )
+    await pool.execute(
+        "INSERT INTO qiita.sequenced_sample"
+        "  (prep_sample_idx, created_by_idx, ena_status, ena_availability_checked_at)"
+        " VALUES ($1, $2, 'suppressed', now())",
+        flagged,
+        owner,
+    )
+    try:
+        mine = _mine(await plan_backfill(pool, ticket_root=world["ticket_root"]), mask_idx)
+        assert flagged not in mine
+    finally:
+        await pool.execute("DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = $1", flagged)

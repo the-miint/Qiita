@@ -48,6 +48,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   text is judged eligible as text rather than as the closed value set it left. A field
   whose values sit on published samples, or on samples whose link to the study has been
   retired, cannot be widened at all, and the answer says which.
+
+- **ENA import refuses non-public studies and flags held runs ENA later withdraws
+  (#634).** A suppressed study, or one with no public runs, fails before anything is
+  written, and a suppressed run in a public study is `excluded`. On re-import, runs Qiita
+  holds that the Portal no longer returns are checked against ENA's Browser API (a
+  workaround for duckdb-miint#289): a non-public run is flagged
+  (`sequenced_sample.ena_status`) and skipped wherever retired samples are, and the flag
+  clears once the run is public again. An unknown status, or any Browser API error
+  including a 500, fails the item and writes no flag. Reads of a sample by its own id are
+  not gated, and in-flight work for a newly flagged run is logged, not cancelled.
+
 - **`qiita submit-ena-import` / `qiita ena-import-status` submit and watch a batch ENA
   study import from the CLI (#629).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
   `--from-file`, one accession per line — a whole-line `#` comment only; a trailing

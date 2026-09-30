@@ -410,6 +410,45 @@ async def test_backfill_stamps_unminted_rows_and_then_reports_nothing(postgres_p
         await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)
 
 
+async def test_flagged_sequenced_sample_excluded_from_backfill_plan(postgres_pool, tmp_path):
+    """A prep_sample whose sequenced_sample is ENA-flagged is left out of the
+    backfill plan entirely."""
+    principal_idx, prep, proc, ref, feats, paths = await _setup(
+        postgres_pool, tmp_path, label="agm-flagged"
+    )
+    run_idx = pool_idx = None
+    try:
+        await lib.write_assembly_membership(postgres_pool, prep, proc, *paths)
+        await postgres_pool.execute(
+            "UPDATE qiita.assembly_membership SET genome_idx = NULL WHERE prep_sample_idx = $1",
+            prep,
+        )
+        await postgres_pool.execute("DELETE FROM qiita.genome WHERE prep_sample_idx = $1", prep)
+
+        run_idx, pool_idx, _ss_idx = await seed_sequenced_sample_subtype(
+            postgres_pool,
+            prep_sample_idx=prep,
+            owner_idx=principal_idx,
+            sequenced_pool_item_id=f"item-{secrets.token_hex(4)}",
+        )
+        await postgres_pool.execute(
+            "UPDATE qiita.sequenced_sample SET ena_status = 'suppressed',"
+            " ena_availability_checked_at = now() WHERE prep_sample_idx = $1",
+            prep,
+        )
+
+        plan = await plan_backfill(postgres_pool)
+        assert [s for s in plan.subjects if s.prep_sample_idx == prep] == []
+    finally:
+        if pool_idx is not None:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = $1", prep
+            )
+            await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+            await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+        await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)
+
+
 async def test_the_pool_delete_order_is_what_unblocks_a_prep_sample(postgres_pool, tmp_path):
     """The cascade contract, as the schema enforces it.
 

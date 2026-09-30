@@ -9,8 +9,10 @@ import json
 from pathlib import Path
 
 import pytest
-from qiita_common.models.ena import EnaRunRecord, EnaSampleAttributes, EnaStudyHeader
+from pydantic import ValidationError
+from qiita_common.models.ena import EnaRunRecord, EnaSampleAttributes, EnaStatus, EnaStudyHeader
 
+from qiita_control_plane.ena_import import miint_resolver
 from qiita_control_plane.ena_import.resolver import EnaAccessionNotFoundError
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -35,6 +37,7 @@ def assert_prjna48739_study_header(header: EnaStudyHeader) -> None:
     assert header.center_name == "Institute for Genome Sciences"
     assert header.scientific_name == "Streptococcus pneumoniae GA17570"
     assert header.tax_id == 760791
+    assert header.status is EnaStatus.PUBLIC
 
 
 def assert_prjna48739_runs(runs: list[EnaRunRecord]) -> None:
@@ -55,6 +58,7 @@ def assert_prjna48739_runs(runs: list[EnaRunRecord]) -> None:
     assert single.fastq_md5 == ["791595268ae7a965664652bde3444a2b"]
     assert single.read_count == 298966
     assert single.base_count == 158722947
+    assert single.status is EnaStatus.PUBLIC
 
     paired = by_accession["SRR096343"]
     assert paired.library_layout == "PAIRED"
@@ -103,12 +107,17 @@ def test_resolve_study_header_maps_fields(monkeypatch):
 
 
 def test_resolve_study_header_zero_rows_is_not_found(monkeypatch):
+    """PRJEB99999999 is a genuine zero-row Portal response (see the fixture's
+    `_source`), not a synthetic one -- proving the not-found path against a
+    real "doesn't exist" shape, including the `status` column now always
+    requested."""
     from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
-    monkeypatch.setattr(_QUERY_STUDY, lambda accession: (["study_accession"], []))
+    columns, rows = _load_fixture("study_header_not_found.json")
+    monkeypatch.setattr(_QUERY_STUDY, lambda accession: (columns, rows))
 
-    with pytest.raises(EnaAccessionNotFoundError, match="PRJEB00000000"):
-        MiintEnaResolver().resolve_study_header("PRJEB00000000")
+    with pytest.raises(EnaAccessionNotFoundError, match="PRJEB99999999"):
+        MiintEnaResolver().resolve_study_header("PRJEB99999999")
 
 
 def test_resolve_study_header_rejects_non_study_accession(monkeypatch):
@@ -140,6 +149,77 @@ def test_resolve_runs_zero_rows_is_not_found(monkeypatch):
 
     with pytest.raises(EnaAccessionNotFoundError, match="PRJEB00000000"):
         MiintEnaResolver().resolve_ena_runs("PRJEB00000000")
+
+
+def test_resolve_runs_includes_a_suppressed_run(monkeypatch):
+    """A non-public run is not filtered here -- the resolver's job is to report
+    ENA's status faithfully; refusing/excluding it is the batch driver's and
+    registration's job."""
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    columns, rows = _load_fixture("ena_runs_suppressed.json")
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: (columns, rows))
+
+    runs = MiintEnaResolver().resolve_ena_runs("PRJNA48739")
+
+    assert len(runs) == 1
+    assert runs[0].status is EnaStatus.SUPPRESSED
+
+
+def test_resolve_runs_rejects_an_unrecognized_status(monkeypatch):
+    """A status value outside EnaStatus's recognized vocabulary must fail loud
+    via Pydantic, not silently pass through as public."""
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    columns, rows = _load_fixture("ena_runs_unknown_status.json")
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: (columns, rows))
+
+    with pytest.raises(ValidationError):
+        MiintEnaResolver().resolve_ena_runs("PRJNA48739")
+
+
+class _FakeCapturingConnection:
+    """Fakes `connect_with_miint_staged()`'s context-manager + `execute` shape,
+    capturing the last call's SQL params so a test can assert on what fields
+    were requested without a live DuckDB+miint session."""
+
+    def __init__(self) -> None:
+        self.captured_params: dict | None = None
+
+    def __enter__(self) -> _FakeCapturingConnection:
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def execute(self, _sql: str, params: dict) -> _FakeCapturingConnection:
+        self.captured_params = params
+        return self
+
+    @property
+    def description(self) -> list[tuple[str]]:
+        return [("study_accession",)]
+
+    def fetchall(self) -> list[tuple]:
+        return []
+
+
+def test_query_ena_study_header_requests_exactly_the_model_fields(monkeypatch):
+    fake = _FakeCapturingConnection()
+    monkeypatch.setattr(miint_resolver, "connect_with_miint_staged", lambda: fake)
+
+    miint_resolver._query_ena_study_header("PRJNA48739")
+
+    assert fake.captured_params["fields"].split(",") == list(EnaStudyHeader.model_fields)
+
+
+def test_query_ena_runs_requests_exactly_the_model_fields(monkeypatch):
+    fake = _FakeCapturingConnection()
+    monkeypatch.setattr(miint_resolver, "connect_with_miint_staged", lambda: fake)
+
+    miint_resolver._query_ena_runs("PRJNA48739")
+
+    assert fake.captured_params["fields"].split(",") == list(EnaRunRecord.model_fields)
 
 
 def test_resolve_sample_attributes_pivots_by_sample(monkeypatch):

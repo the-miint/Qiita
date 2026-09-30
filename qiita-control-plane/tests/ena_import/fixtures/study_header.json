@@ -1,5 +1,5 @@
 {
-  "_source": "recorded from https://www.ebi.ac.uk/ena/portal/api/search?result=study&query=study_accession=\"PRJNA48739\"&fields=study_accession,secondary_study_accession,study_title,study_description,center_name,first_public,last_updated,scientific_name,tax_id&limit=0&format=tsv on 2026-07-21",
+  "_source": "recorded from https://www.ebi.ac.uk/ena/portal/api/search?result=study&query=study_accession=\"PRJNA48739\"&fields=study_accession,secondary_study_accession,study_title,study_description,center_name,first_public,last_updated,scientific_name,tax_id,status&limit=0&format=tsv on 2026-09-29 (status column added, re-recorded same live study)",
   "columns": [
     "study_accession",
     "secondary_study_accession",
@@ -9,7 +9,8 @@
     "first_public",
     "last_updated",
     "scientific_name",
-    "tax_id"
+    "tax_id",
+    "status"
   ],
   "rows": [
     [
@@ -21,7 +22,8 @@
       "2013-05-31",
       "2026-05-04",
       "Streptococcus pneumoniae GA17570",
-      760791
+      760791,
+      "public"
     ]
   ]
 }

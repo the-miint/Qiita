@@ -10,12 +10,12 @@ this module's own tracked set `app.state.running_ena_import_batches` (mirroring
 
 The task (`_run_batch`) processes every item under the process-wide bound
 `_STUDY_CONCURRENCY`. Each item (`_process_one_study`): resolve
-(blocking calls under `asyncio.to_thread`) -> `register_ena_study` -> one
-`download-ena-study` ticket per pool holding the study's runs, reused when one
-already covers the pool and otherwise submitted in-process through
-`submit_work_ticket_core` with the BATCH's submitting principal (so the ticket's
-audience gate is enforced against a real principal). One accession's failure
-marks only that item `failed`.
+(blocking calls under `asyncio.to_thread`) -> `_reconcile_held_run_availability`
+-> `register_ena_study` -> one `download-ena-study` ticket per pool holding
+the study's runs, reused when one already covers the pool and otherwise
+submitted in-process through `submit_work_ticket_core` with the BATCH's
+submitting principal (so the ticket's audience gate is enforced against a
+real principal). One accession's failure marks only that item `failed`.
 
 `reconcile_inflight_batches` (from `main.py` lifespan startup) re-drives every
 item still `pending`/`resolving`/`registered` after a CP restart --
@@ -36,6 +36,7 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, status
 from qiita_common.ena_accession import validate_study_accession
 from qiita_common.models import WorkTicketState
+from qiita_common.models.ena import EnaStatus
 from qiita_common.models.ena_import import (
     BatchImportItem,
     BatchImportStatus,
@@ -57,16 +58,26 @@ from ..repositories.ena_import_batch import (
     update_ena_import_batch_item_state,
     update_ena_import_batch_item_study_created,
 )
-from ..repositories.study import get_or_create_study_by_ena_accessions
+from ..repositories.sequenced_sample import (
+    fetch_held_ena_run_accessions_for_study,
+    fetch_non_terminal_work_tickets_for_sequenced_sample,
+    update_sequenced_sample_ena_status,
+)
+from ..repositories.study import (
+    fetch_study_idx_by_either_ena_accession,
+    get_or_create_study_by_ena_accessions,
+)
+from .availability import EnaAvailabilityClient
 from .miint_resolver import MiintEnaResolver
 from .registration import (
+    EnaRunRegistrationOutcome,
     EnaRunRegistrationStatus,
-    EnaStudyRegistrationResult,
     download_ticket_covers_pool,
     fetch_download_pool_states,
     fetch_pool_download_ticket,
     register_ena_study,
 )
+from .resolver import EnaAccessionNotFoundError
 from .submit import build_download_ena_study_ticket
 
 _log = logging.getLogger(__name__)
@@ -97,6 +108,12 @@ _TERMINAL_SUCCESS_STATES = frozenset(
 )
 _TERMINAL_UNSUCCESSFUL_STATES = frozenset(
     {WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value}
+)
+
+# A run counts toward "this study registered something downloadable" only in
+# these two states -- EXCLUDED (non-public) and FAILED do not.
+_SUCCESSFUL_RUN_REGISTRATION_STATUSES = frozenset(
+    {EnaRunRegistrationStatus.REGISTERED, EnaRunRegistrationStatus.SKIPPED_ALREADY_PRESENT}
 )
 
 
@@ -149,7 +166,7 @@ async def _set_item_state(
         )
 
 
-def _ena_run_outcomes(result: EnaStudyRegistrationResult) -> list[dict[str, Any]]:
+def _ena_run_outcomes(outcomes: list[EnaRunRegistrationOutcome]) -> list[dict[str, Any]]:
     """Per-run outcomes for the item's `ena_run_outcomes` JSONB column."""
     return [
         {
@@ -157,7 +174,7 @@ def _ena_run_outcomes(result: EnaStudyRegistrationResult) -> list[dict[str, Any]
             "status": o.status.value,
             "failure_reason": o.failure_reason,
         }
-        for o in result.ena_runs
+        for o in outcomes
     ]
 
 
@@ -209,6 +226,139 @@ async def _mark_item_downloading(pool: asyncpg.Pool, item_idx: int) -> None:
         )
 
 
+async def _log_non_terminal_tickets_for_flagged_run(
+    pool: asyncpg.Pool,
+    *,
+    ena_run_accession: str,
+    prep_sample_idx: int,
+    sequenced_pool_idx: int | None,
+) -> None:
+    """Log (never cancel) every non-terminal work_ticket touching a run this
+    call just flagged, so an operator can act through
+    `POST /work-ticket/cancel` -- the flag alone does not stop work already
+    in flight against the run (see `ena_import.batch` module docstring)."""
+    tickets = await fetch_non_terminal_work_tickets_for_sequenced_sample(
+        pool, prep_sample_idx=prep_sample_idx, sequenced_pool_idx=sequenced_pool_idx
+    )
+    for t in tickets:
+        _log.warning(
+            "ena run %s flagged unavailable with work_ticket %d (action=%s, state=%s) still"
+            " non-terminal; not auto-cancelled -- cancel via POST /work-ticket/cancel"
+            " {sequenced_pool_idx=%s}",
+            ena_run_accession,
+            t["work_ticket_idx"],
+            t["action_id"],
+            t["state"],
+            sequenced_pool_idx,
+        )
+
+
+async def _reconcile_held_run_availability(
+    pool: asyncpg.Pool, *, study_idx: int, portal_run_accessions: frozenset[str]
+) -> list[EnaRunRegistrationOutcome]:
+    """Re-check every run this study already holds that the Portal's fresh
+    response (`portal_run_accessions`) no longer names, and clear the flag on
+    any held run the Portal DOES still return as public.
+
+    The Portal `/search` endpoint never reports a non-public run at all (see
+    `qiita_common.models.ena`), so a held run missing from a fresh response is
+    a CANDIDATE -- it may be suppressed, withdrawn, or simply not retrievable
+    -- and the Browser API (`EnaAvailabilityClient`) is the only source that
+    says which. Every candidate is looked up before any write: if the client
+    raises (an HTTP error other than 500, an unrecognized status, or an
+    unparseable body), this function raises too and writes nothing, so the
+    caller's failed item leaves every flag exactly as it found them. Once
+    every lookup succeeds, every set/clear lands in one transaction.
+
+    Returns one `EnaRunRegistrationOutcome` (`FLAGGED_UNAVAILABLE`) per run
+    newly flagged or re-confirmed unavailable -- not per run merely checked or
+    cleared, so a report distinguishes "still fine" from "flagged".
+    """
+    held = await fetch_held_ena_run_accessions_for_study(pool, study_idx=study_idx)
+    candidates = [r for r in held if r["ena_run_accession"] not in portal_run_accessions]
+    reappeared = [
+        r
+        for r in held
+        if r["ena_run_accession"] in portal_run_accessions and r["ena_status"] is not None
+    ]
+    if not candidates and not reappeared:
+        return []
+
+    new_status_by_accession: dict[str, str | None] = {}
+    if candidates:
+        async with EnaAvailabilityClient() as client:
+            for row in candidates:
+                new_status_by_accession[row["ena_run_accession"]] = await client.check_run(
+                    row["ena_run_accession"]
+                )
+
+    outcomes: list[EnaRunRegistrationOutcome] = []
+    async with pool.acquire() as conn, conn.transaction():
+        for row in candidates:
+            new_status = new_status_by_accession[row["ena_run_accession"]]
+            await update_sequenced_sample_ena_status(
+                conn, ena_run_accession=row["ena_run_accession"], ena_status=new_status
+            )
+            if new_status is not None:
+                outcomes.append(
+                    EnaRunRegistrationOutcome(
+                        run_accession=row["ena_run_accession"],
+                        status=EnaRunRegistrationStatus.FLAGGED_UNAVAILABLE,
+                        failure_reason=new_status,
+                    )
+                )
+        for row in reappeared:
+            await update_sequenced_sample_ena_status(
+                conn, ena_run_accession=row["ena_run_accession"], ena_status=None
+            )
+
+    # Logged after commit, outside the write transaction: a cancel decision is
+    # the operator's, not blocking on it here.
+    for row in candidates:
+        if new_status_by_accession[row["ena_run_accession"]] is not None:
+            await _log_non_terminal_tickets_for_flagged_run(
+                pool,
+                ena_run_accession=row["ena_run_accession"],
+                prep_sample_idx=row["prep_sample_idx"],
+                sequenced_pool_idx=row["sequenced_pool_idx"],
+            )
+    return outcomes
+
+
+async def _handle_absent_study(
+    pool: asyncpg.Pool, item: BatchImportItemHandle, exc: EnaAccessionNotFoundError
+) -> None:
+    """`resolve_study_header` found zero rows for this accession -- the study
+    itself is gone from the Portal (suppressed, withdrawn, or never existed).
+
+    If Qiita never held a study for this accession, or held one this codebase
+    did not create by import, this is the pre-existing "not found" / "not ours
+    to touch" failure and nothing else to do. Otherwise every run the held
+    study still carries is a candidate (the Portal named none of them either),
+    so they are checked and flagged/cleared exactly as a normal re-import's
+    missing runs would be, and the item still fails -- an absent study cannot
+    register anything new -- naming which held runs were (re-)confirmed
+    unavailable.
+    """
+    study_idx = await fetch_study_idx_by_either_ena_accession(pool, item.ena_study_accession)
+    if study_idx is None or not await _study_created_by_an_import(pool, study_idx):
+        await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=str(exc))
+        return
+
+    flagged = await _reconcile_held_run_availability(
+        pool, study_idx=study_idx, portal_run_accessions=frozenset()
+    )
+    await _set_item_registered(
+        pool, item.idx, study_idx=study_idx, ena_run_outcomes=_ena_run_outcomes(flagged)
+    )
+    if flagged:
+        reasons = "; ".join(f"{o.run_accession}: {o.failure_reason}" for o in flagged)
+        failure_reason = f"{exc} (held runs re-checked: {reasons})"
+    else:
+        failure_reason = str(exc)
+    await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=failure_reason)
+
+
 async def _process_one_study(
     app: FastAPI,
     pool: asyncpg.Pool,
@@ -225,13 +375,38 @@ async def _process_one_study(
     try:
         await _set_item_state(pool, item.idx, BatchItemState.RESOLVING)
         resolver = MiintEnaResolver()
-        study_header = await asyncio.to_thread(
-            resolver.resolve_study_header, item.ena_study_accession
-        )
+        try:
+            study_header = await asyncio.to_thread(
+                resolver.resolve_study_header, item.ena_study_accession
+            )
+        except EnaAccessionNotFoundError as exc:
+            # The Portal reports zero rows for the study itself -- distinct
+            # from "resolves, but not public" below. If Qiita already holds
+            # this study, its held runs are re-checked before the item fails.
+            await _handle_absent_study(pool, item, exc)
+            return
         ena_runs = await asyncio.to_thread(resolver.resolve_ena_runs, item.ena_study_accession)
         sample_attributes = await asyncio.to_thread(
             resolver.resolve_sample_attributes, item.ena_study_accession
         )
+
+        if study_header.status is not EnaStatus.PUBLIC:
+            await _set_item_state(
+                pool,
+                item.idx,
+                BatchItemState.FAILED,
+                failure_reason=f"study {item.ena_study_accession} is {study_header.status.value}",
+            )
+            return
+        if not any(run.status is EnaStatus.PUBLIC for run in ena_runs):
+            reasons = "; ".join(f"{run.run_accession} is {run.status.value}" for run in ena_runs)
+            await _set_item_state(
+                pool,
+                item.idx,
+                BatchItemState.FAILED,
+                failure_reason=f"no public runs: {reasons}",
+            )
+            return
 
         # Resolve the study BEFORE registering anything, so an import into a
         # study we did not create fails with nothing written.
@@ -264,6 +439,20 @@ async def _process_one_study(
             )
             return
 
+        # A re-import: runs this study already holds that the Portal's fresh
+        # response above no longer names are candidates for the ENA
+        # availability flag; a held run the Portal DOES still return has any
+        # existing flag cleared. Runs before register_ena_study so a Browser
+        # API failure here fails the item before anything new is written --
+        # held runs are rows Qiita already has, so this does not depend on
+        # register_ena_study having run. Disjoint from register_ena_study's
+        # outcomes below (which only cover runs the Portal returned), so the
+        # two lists concatenate with no overlap.
+        flagged = await _reconcile_held_run_availability(
+            pool,
+            study_idx=study_idx,
+            portal_run_accessions=frozenset(r.run_accession for r in ena_runs),
+        )
         result = await register_ena_study(
             pool,
             study_idx=study_idx,
@@ -277,7 +466,7 @@ async def _process_one_study(
             pool,
             item.idx,
             study_idx=result.study_idx,
-            ena_run_outcomes=_ena_run_outcomes(result),
+            ena_run_outcomes=_ena_run_outcomes(flagged) + _ena_run_outcomes(result.ena_runs),
         )
 
         if not result.created_pools:
@@ -296,16 +485,16 @@ async def _process_one_study(
             )
             return
 
-        if not any(o.status is not EnaRunRegistrationStatus.FAILED for o in result.ena_runs):
-            # Pools exist (a platform mapped), but every run then failed inside
-            # register_ena_study (protocol mapping, harmonization, or a DB error),
-            # so the pools hold no sequenced_sample rows. Submitting downloads
-            # against them would report success over an all-failed study. Terminal
-            # `failed`; the per-run reasons are already persisted on `ena_run_outcomes`.
+        if not any(o.status in _SUCCESSFUL_RUN_REGISTRATION_STATUSES for o in result.ena_runs):
+            # Pools exist (a platform mapped), but every run then failed or was
+            # excluded (non-public) inside register_ena_study, so the pools hold
+            # no sequenced_sample rows. Submitting downloads against them would
+            # report success over an all-failed study. Terminal `failed`; the
+            # per-run reasons are already persisted on `ena_run_outcomes`.
             reasons = "; ".join(
                 f"{o.run_accession}: {o.failure_reason}"
                 for o in result.ena_runs
-                if o.status is EnaRunRegistrationStatus.FAILED
+                if o.status not in _SUCCESSFUL_RUN_REGISTRATION_STATUSES
             )
             await _set_item_state(
                 pool,

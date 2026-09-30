@@ -10,9 +10,11 @@ import asyncio
 import json
 import uuid
 
+import httpx
 import pytest
 import pytest_asyncio
 from qiita_common.auth_constants import MSG_PRINCIPAL_DISABLED_OR_RETIRED, SystemRole
+from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
 from qiita_common.models.ena_import import BatchItemState
 
 from qiita_control_plane.auth.principal import HumanUser
@@ -21,6 +23,7 @@ from qiita_control_plane.ena_import import (
     DOWNLOAD_ENA_STUDY_ACTION_ID,
     DOWNLOAD_ENA_STUDY_ACTION_VERSION,
 )
+from qiita_control_plane.ena_import.availability import EnaAvailabilityClient
 from qiita_control_plane.ena_import.batch import (
     build_ena_import_study_semaphore,
     create_ena_import_batch,
@@ -60,17 +63,18 @@ _RUN_COLUMNS = (
     "fastq_md5",
     "read_count",
     "base_count",
+    "status",
 )
 
 
-def _fake_study_header(accession: str) -> tuple[list[str], list[tuple]]:
+def _fake_study_header(accession: str, *, status: str = "public") -> tuple[list[str], list[tuple]]:
     return (
-        ["study_accession", "secondary_study_accession", "study_title"],
-        [(accession, None, f"title for {accession}")],
+        ["study_accession", "secondary_study_accession", "study_title", "status"],
+        [(accession, None, f"title for {accession}", status)],
     )
 
 
-def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
+def _fake_runs(accession: str, *, status: str = "public") -> tuple[list[str], list[tuple]]:
     row = (
         f"SRR-{accession}",
         f"SRX-{accession}",
@@ -87,6 +91,7 @@ def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
         [],
         None,
         None,
+        status,
     )
     return list(_RUN_COLUMNS), [row]
 
@@ -676,6 +681,7 @@ def _make_shared_sample_fakes(shared_sample_accession: str):
             [],
             None,
             None,
+            "public",
         )
         return list(_RUN_COLUMNS), [row]
 
@@ -1237,6 +1243,200 @@ async def test_process_one_study_all_runs_failed_reaches_terminal_failed(
     await _cleanup_study(postgres_pool, accession)
 
 
+# ---------------------------------------------------------------------------
+# Non-public studies and runs: refuse a suppressed study; exclude a suppressed
+# run; fail loud on a status this codebase doesn't recognize.
+# ---------------------------------------------------------------------------
+
+
+async def test_process_one_study_suppressed_study_fails_before_any_write(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A suppressed study must fail the item before `get_or_create_study_by_ena_accessions`
+    even runs -- nothing (no study, no run, no ticket) is written."""
+    monkeypatch.setattr(
+        _QUERY_STUDY, lambda accession: _fake_study_header(accession, status="suppressed")
+    )
+
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool, accessions=[accession], principal=admin_principal
+    )
+    batch_cleanup.append(batch_idx)
+
+    task = schedule_ena_import_batch(batch_app, items=items, principal=admin_principal)
+    await task
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, study_idx, failure_reason FROM qiita.ena_import_batch_item WHERE idx = $1",
+        items[0].idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert item_row["study_idx"] is None
+    assert f"study {accession} is suppressed" in item_row["failure_reason"]
+
+    study_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.study WHERE bioproject_accession = $1", accession
+    )
+    assert study_count == 0
+
+
+async def test_process_one_study_all_runs_suppressed_fails_before_any_write(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A study whose every run is suppressed must fail before the study is even
+    resolved/created -- there is nothing public left to import."""
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: _fake_runs(accession, status="suppressed"))
+
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool, accessions=[accession], principal=admin_principal
+    )
+    batch_cleanup.append(batch_idx)
+
+    task = schedule_ena_import_batch(batch_app, items=items, principal=admin_principal)
+    await task
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, study_idx, failure_reason FROM qiita.ena_import_batch_item WHERE idx = $1",
+        items[0].idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert item_row["study_idx"] is None
+    assert item_row["failure_reason"] == f"no public runs: SRR-{accession} is suppressed"
+
+    study_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.study WHERE bioproject_accession = $1", accession
+    )
+    assert study_count == 0
+
+
+async def test_process_one_study_one_suppressed_run_excluded_other_registered(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A study with one public and one suppressed run registers the public one
+    and reports the suppressed one `excluded`, with no sequenced_sample for it."""
+    accession = unique_accession("PRJNA")
+
+    def _mixed_runs(a):
+        _, (ok_row,) = _fake_runs(a, status="public")
+        suppressed_row = list(ok_row)
+        run_i = list(_RUN_COLUMNS).index("run_accession")
+        exp_i = list(_RUN_COLUMNS).index("experiment_accession")
+        sample_i = list(_RUN_COLUMNS).index("sample_accession")
+        status_i = list(_RUN_COLUMNS).index("status")
+        suppressed_row[run_i] = f"SRR-{a}-suppressed"
+        suppressed_row[exp_i] = f"SRX-{a}-suppressed"
+        suppressed_row[sample_i] = f"SAMN-{a}-suppressed"
+        suppressed_row[status_i] = "suppressed"
+        return list(_RUN_COLUMNS), [ok_row, tuple(suppressed_row)]
+
+    monkeypatch.setattr(_QUERY_RUNS, _mixed_runs)
+
+    batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    status_result = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+    item = status_result.items[0]
+    assert item.state == BatchItemState.DOWNLOADING
+    by_accession = {r.run_accession: r for r in item.ena_runs}
+    ok_outcome = by_accession[f"SRR-{accession}"]
+    assert ok_outcome.status == EnaRunRegistrationStatus.REGISTERED.value
+
+    excluded_outcome = by_accession[f"SRR-{accession}-suppressed"]
+    assert excluded_outcome.status == EnaRunRegistrationStatus.EXCLUDED.value
+    assert excluded_outcome.failure_reason is not None
+    assert "suppressed" in excluded_outcome.failure_reason
+
+    orphan_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
+        f"SRR-{accession}-suppressed",
+    )
+    assert orphan_count == 0
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_process_one_study_unknown_status_item_fails_naming_value(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A status ENA reports that this codebase doesn't model must fail the item
+    loudly (via the model's own ValidationError, caught by _process_one_study's
+    outer handler), naming the offending value -- never silently treated as
+    public."""
+    monkeypatch.setattr(
+        _QUERY_STUDY, lambda accession: _fake_study_header(accession, status="cancelled")
+    )
+
+    accession = unique_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool, accessions=[accession], principal=admin_principal
+    )
+    batch_cleanup.append(batch_idx)
+
+    task = schedule_ena_import_batch(batch_app, items=items, principal=admin_principal)
+    await task
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason FROM qiita.ena_import_batch_item WHERE idx = $1",
+        items[0].idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert "cancelled" in item_row["failure_reason"]
+
+
+async def test_process_one_study_mixed_excluded_and_failed_every_run_failed_message(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A study with one suppressed (excluded) run and one run that maps a
+    platform (a pool IS created) but then fails harmonization has no
+    successful run either way -- terminal `failed`, and the reasons string
+    names both."""
+    accession = unique_accession("PRJNA")
+
+    def _mixed_runs(a):
+        _, (template,) = _fake_runs(a, status="public")
+        run_i = list(_RUN_COLUMNS).index("run_accession")
+        exp_i = list(_RUN_COLUMNS).index("experiment_accession")
+        sample_i = list(_RUN_COLUMNS).index("sample_accession")
+        status_i = list(_RUN_COLUMNS).index("status")
+
+        suppressed_row = list(template)
+        suppressed_row[run_i] = f"SRR-{a}-suppressed"
+        suppressed_row[exp_i] = f"SRX-{a}-suppressed"
+        suppressed_row[sample_i] = f"SAMN-{a}-suppressed"
+        suppressed_row[status_i] = "suppressed"
+
+        bad_harmonization_row = list(template)
+        bad_harmonization_row[run_i] = f"SRR-{a}-badharm"
+        bad_harmonization_row[exp_i] = f"SRX-{a}-badharm"
+        bad_harmonization_row[sample_i] = f"SAMN-{a}-badharm"
+
+        return list(_RUN_COLUMNS), [tuple(suppressed_row), tuple(bad_harmonization_row)]
+
+    def _bad_latitude_attrs(a):
+        return [(f"SAMN-{a}-badharm", {"geographic location (latitude)": "not-a-number"})]
+
+    monkeypatch.setattr(_QUERY_RUNS, _mixed_runs)
+    monkeypatch.setattr(_QUERY_ATTRS, _bad_latitude_attrs)
+
+    batch_idx, _items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason, download_work_ticket_idxs"
+        " FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert "every run failed to register" in item_row["failure_reason"]
+    assert f"SRR-{accession}-suppressed" in item_row["failure_reason"]
+    assert f"SRR-{accession}-badharm" in item_row["failure_reason"]
+    assert list(item_row["download_work_ticket_idxs"]) == []
+
+    await _cleanup_study(postgres_pool, accession)
+
+
 async def test_reconcile_redrives_registered_item_stranded_before_submit(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
 ):
@@ -1467,8 +1667,8 @@ async def test_import_refuses_a_study_no_import_created_matched_by_secondary_acc
     monkeypatch.setattr(
         _QUERY_STUDY,
         lambda accession: (
-            ["study_accession", "secondary_study_accession", "study_title"],
-            [(fresh_bioproject, accession, f"title for {accession}")],
+            ["study_accession", "secondary_study_accession", "study_title", "status"],
+            [(fresh_bioproject, accession, f"title for {accession}", "public")],
         ),
     )
 
@@ -1972,3 +2172,405 @@ async def test_concurrency_bound_is_shared_across_batches(
         for _, _, accessions in batches:
             for accession in accessions:
                 await _cleanup_study(postgres_pool, accession)
+
+
+# ---------------------------------------------------------------------------
+# ENA availability re-check on re-import: a run Qiita already holds that the
+# Portal's fresh response no longer names is checked against the Browser API
+# and flagged/cleared; the study itself being absent is a variant of the same
+# detection.
+# ---------------------------------------------------------------------------
+
+
+def _empty_study_header(accession: str) -> tuple[list[str], list[tuple]]:
+    """Zero rows -- the shape `MiintEnaResolver.resolve_study_header` turns
+    into `EnaAccessionNotFoundError`."""
+    return ["study_accession", "secondary_study_accession", "study_title", "status"], []
+
+
+class _FakeAvailabilityClient:
+    """Network-free stand-in for `EnaAvailabilityClient`, injected by
+    monkeypatching the name `ena_import.batch` imports it under. `results`
+    maps run_accession -> the value `check_run` should return; a lookup for a
+    run not in `results` is a test bug (KeyError), not a silent None.
+
+    `raise_after_calls`, if given, lets the first N calls succeed normally and
+    raises on every call after that -- for proving a multi-candidate re-import
+    writes no flags at all when a later lookup fails, not just the one that
+    failed."""
+
+    def __init__(
+        self,
+        results: dict[str, str | None] | None = None,
+        *,
+        raises: Exception | None = None,
+        raise_after_calls: int | None = None,
+    ):
+        self._results = results or {}
+        self._raises = raises
+        self._raise_after_calls = raise_after_calls
+        self._calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def check_run(self, run_accession: str) -> str | None:
+        self._calls += 1
+        if self._raise_after_calls is not None and self._calls > self._raise_after_calls:
+            raise RuntimeError(f"boom after {self._raise_after_calls} call(s)")
+        if self._raises is not None:
+            raise self._raises
+        return self._results[run_accession]
+
+
+def _patch_availability_client(monkeypatch, **kwargs):
+    monkeypatch.setattr(
+        "qiita_control_plane.ena_import.batch.EnaAvailabilityClient",
+        lambda: _FakeAvailabilityClient(**kwargs),
+    )
+
+
+async def _ena_status(postgres_pool, run_accession: str) -> str | None:
+    return await postgres_pool.fetchval(
+        "SELECT ena_status FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
+        run_accession,
+    )
+
+
+async def test_reimport_flags_a_held_run_the_portal_stopped_returning(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    accession = unique_accession("PRJNA")
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
+    first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(first_idx)
+    held_run = f"SRR-{accession}-1"
+    assert await _ena_status(postgres_pool, held_run) is None
+
+    # The Portal now returns only a new run -- run "1" is a candidate.
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("2", "ILLUMINA")]))
+    _patch_availability_client(monkeypatch, results={held_run: "suppressed"})
+    second_idx, second_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(second_idx)
+
+    assert await _ena_status(postgres_pool, held_run) == "suppressed"
+    status = await fetch_batch_status(postgres_pool, batch_idx=second_idx)
+    flagged = [o for o in status.items[0].ena_runs if o.run_accession == held_run]
+    assert len(flagged) == 1
+    assert flagged[0].status == EnaRunRegistrationStatus.FLAGGED_UNAVAILABLE.value
+    assert flagged[0].failure_reason == "suppressed"
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_reimport_clears_flag_when_public_again(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    accession = unique_accession("PRJNA")
+    monkeypatch.setattr(
+        _QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA"), ("2", "ILLUMINA")])
+    )
+    first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(first_idx)
+    held_run = f"SRR-{accession}-1"
+    await postgres_pool.execute(
+        "UPDATE qiita.sequenced_sample SET ena_status = 'suppressed',"
+        " ena_availability_checked_at = now()"
+        " WHERE ena_run_accession = $1",
+        held_run,
+    )
+
+    # The Portal reports both runs again -- run "1" reappeared, so its flag clears
+    # with no Browser API lookup.
+    second_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(second_idx)
+
+    assert await _ena_status(postgres_pool, held_run) is None
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_reimport_absent_study_flags_held_runs_and_fails_naming_why(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    accession = unique_accession("PRJNA")
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
+    first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(first_idx)
+    held_run = f"SRR-{accession}-1"
+
+    monkeypatch.setattr(_QUERY_STUDY, lambda a: _empty_study_header(a))
+    _patch_availability_client(monkeypatch, results={held_run: "withdrawn"})
+    second_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(second_idx)
+
+    assert await _ena_status(postgres_pool, held_run) == "withdrawn"
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        second_idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert "held runs re-checked" in item_row["failure_reason"]
+    assert held_run in item_row["failure_reason"]
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_reimport_availability_check_failure_writes_no_flags(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """Any Browser API failure -- a non-200 response or an unparseable body --
+    fails the item and leaves every held run's flag exactly as found."""
+    accession = unique_accession("PRJNA")
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
+    first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(first_idx)
+    held_run = f"SRR-{accession}-1"
+
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("2", "ILLUMINA")]))
+    _patch_availability_client(monkeypatch, raises=RuntimeError("boom"))
+    second_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(second_idx)
+
+    assert await _ena_status(postgres_pool, held_run) is None
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        second_idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert "boom" in item_row["failure_reason"]
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_reimport_availability_failure_registers_no_new_run(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A held run's Browser API lookup failing must fail the item before
+    `register_ena_study` writes anything -- a new public run the same
+    re-import would otherwise register must not land either, or the item's
+    audit trail would undercount what was durably written."""
+    accession = unique_accession("PRJNA")
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
+    first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(first_idx)
+    held_run = f"SRR-{accession}-1"
+    new_run = f"SRR-{accession}-2"
+
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("2", "ILLUMINA")]))
+    _patch_availability_client(monkeypatch, raises=RuntimeError("boom"))
+    second_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(second_idx)
+
+    assert await _ena_status(postgres_pool, held_run) is None
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT idx FROM qiita.sequenced_sample WHERE ena_run_accession = $1", new_run
+        )
+        is None
+    )
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason, ena_run_outcomes FROM qiita.ena_import_batch_item"
+        " WHERE batch_idx = $1",
+        second_idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert "boom" in item_row["failure_reason"]
+    assert json.loads(item_row["ena_run_outcomes"]) == []
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_reimport_held_run_http_500_fails_with_no_flags(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """End-to-end through the real `EnaAvailabilityClient` (no `_FakeAvailabilityClient`
+    stand-in): a held run's Browser API summary returning HTTP 500 fails the
+    re-import with a clear reason and writes no flag, exactly like any other
+    HTTP error -- there is no `not_retrievable` flag to write."""
+    accession = unique_accession("PRJNA")
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
+    first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(first_idx)
+    held_run = f"SRR-{accession}-1"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"{}")
+
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("2", "ILLUMINA")]))
+    monkeypatch.setattr(
+        "qiita_control_plane.ena_import.batch.EnaAvailabilityClient",
+        lambda: EnaAvailabilityClient(
+            http_client=httpx.AsyncClient(
+                base_url="https://www.ebi.ac.uk/ena/browser/api",
+                transport=httpx.MockTransport(handler),
+            )
+        ),
+    )
+    second_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(second_idx)
+
+    assert await _ena_status(postgres_pool, held_run) is None
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        second_idx,
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+    assert "500" in item_row["failure_reason"]
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_reimport_availability_check_partial_failure_writes_no_flags(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """Two held runs are candidates; the Browser API check succeeds for the
+    first and raises on the second. Neither flag is written -- every lookup
+    must succeed before any write lands, not just the ones checked before the
+    failure (see `batch._reconcile_held_run_availability`)."""
+    accession = unique_accession("PRJNA")
+    monkeypatch.setattr(
+        _QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA"), ("2", "ILLUMINA")])
+    )
+    first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(first_idx)
+    held_run_1 = f"SRR-{accession}-1"
+    held_run_2 = f"SRR-{accession}-2"
+
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("3", "ILLUMINA")]))
+    _patch_availability_client(
+        monkeypatch,
+        results={held_run_1: "suppressed", held_run_2: "suppressed"},
+        raise_after_calls=1,
+    )
+    second_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(second_idx)
+
+    assert await _ena_status(postgres_pool, held_run_1) is None
+    assert await _ena_status(postgres_pool, held_run_2) is None
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state FROM qiita.ena_import_batch_item WHERE batch_idx = $1", second_idx
+    )
+    assert item_row["state"] == BatchItemState.FAILED.value
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_reimport_flagged_run_stays_in_its_pool(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """Flagging is a read-time exclusion, not a deletion or retirement -- the
+    row and its pool membership are untouched."""
+    accession = unique_accession("PRJNA")
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
+    first_idx, first_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(first_idx)
+    held_run = f"SRR-{accession}-1"
+    before = await postgres_pool.fetchrow(
+        "SELECT idx, sequenced_pool_idx, prep_sample_idx FROM qiita.sequenced_sample"
+        " WHERE ena_run_accession = $1",
+        held_run,
+    )
+
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("2", "ILLUMINA")]))
+    _patch_availability_client(monkeypatch, results={held_run: "suppressed"})
+    second_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(second_idx)
+
+    after = await postgres_pool.fetchrow(
+        "SELECT idx, sequenced_pool_idx, prep_sample_idx, ena_status FROM qiita.sequenced_sample"
+        " WHERE ena_run_accession = $1",
+        held_run,
+    )
+    assert after["idx"] == before["idx"]
+    assert after["sequenced_pool_idx"] == before["sequenced_pool_idx"]
+    assert after["prep_sample_idx"] == before["prep_sample_idx"]
+    assert after["ena_status"] == "suppressed"
+    ps_retired = await postgres_pool.fetchval(
+        "SELECT retired FROM qiita.prep_sample WHERE idx = $1", after["prep_sample_idx"]
+    )
+    assert ps_retired is False
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_reimport_logs_non_terminal_ticket_for_flagged_run(
+    batch_app,
+    postgres_pool,
+    admin_principal,
+    download_ena_study_action,
+    batch_cleanup,
+    monkeypatch,
+    caplog,
+):
+    """A flagged run is not auto-cancelled; any non-terminal work_ticket
+    touching its pool is logged for an operator to act on."""
+    accession = unique_accession("PRJNA")
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
+    first_idx, first_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(first_idx)
+    held_run = f"SRR-{accession}-1"
+    (first_ticket,) = await _item_ticket_idxs(postgres_pool, first_items[0].idx)
+    ticket_state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", first_ticket
+    )
+    assert ticket_state in NON_TERMINAL_WORK_TICKET_STATES  # precondition: still in flight
+
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("2", "ILLUMINA")]))
+    _patch_availability_client(monkeypatch, results={held_run: "suppressed"})
+    with caplog.at_level("WARNING"):
+        second_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(second_idx)
+
+    assert any(
+        held_run in record.message and str(first_ticket) in record.message
+        for record in caplog.records
+    )
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_flagged_only_pool_gets_no_download_ticket_in_the_batch_flow(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """`fetch_download_pool_states` (`has_sequenced_sample`) is read per
+    sequencing_run, so a re-import that opens a NEW pool for a new run also
+    re-reads every OLDER pool sharing that run. A pool whose only sample was
+    just flagged must not surface a download ticket in the batch flow -- only
+    the new pool's ticket does."""
+    accession = unique_accession("PRJNA")
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
+    first_idx, first_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(first_idx)
+    held_run = f"SRR-{accession}-1"
+    (first_ticket,) = await _item_ticket_idxs(postgres_pool, first_items[0].idx)
+
+    # Run "1" is now a candidate (missing from the Portal); run "2" is new and
+    # needs its own pool, since the first pool's ticket (still pending) covers it.
+    monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("2", "ILLUMINA")]))
+    _patch_availability_client(monkeypatch, results={held_run: "suppressed"})
+    second_idx, second_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(second_idx)
+
+    assert await _ena_status(postgres_pool, held_run) == "suppressed"
+    ticket_idxs = await _item_ticket_idxs(postgres_pool, second_items[0].idx)
+    assert first_ticket not in ticket_idxs
+    assert len(ticket_idxs) == 1
+    assert await _ticket_pool_run_accessions(postgres_pool, ticket_idxs[0]) == {
+        f"SRR-{accession}-2"
+    }
+
+    await _cleanup_study(postgres_pool, accession)

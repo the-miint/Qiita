@@ -16,6 +16,7 @@ from qiita_common.models import FieldDataType
 from qiita_common.models.ena import (
     EnaRunRecord,
     EnaSampleAttributes,
+    EnaStatus,
     EnaStudyHeader,
 )
 
@@ -46,10 +47,14 @@ pytestmark = pytest.mark.db
 
 
 def _study_header(
-    *, study_accession: str, secondary_study_accession: str | None = None
+    *,
+    study_accession: str,
+    secondary_study_accession: str | None = None,
+    status: EnaStatus = EnaStatus.PUBLIC,
 ) -> EnaStudyHeader:
     return EnaStudyHeader(
         study_accession=study_accession,
+        status=status,
         secondary_study_accession=secondary_study_accession,
         study_title=f"title for {study_accession}",
     )
@@ -67,6 +72,7 @@ def _run(
     library_source: str | None = "GENOMIC",
     library_selection: str | None = None,
     instrument_platform: str | None = "ILLUMINA",
+    status: EnaStatus = EnaStatus.PUBLIC,
 ) -> EnaRunRecord:
     return EnaRunRecord(
         run_accession=run_accession,
@@ -74,6 +80,7 @@ def _run(
         sample_accession=sample_accession,
         sample_alias=sample_alias,
         study_accession=study_accession,
+        status=status,
         library_layout=library_layout,
         library_strategy=library_strategy,
         library_source=library_source,
@@ -1782,3 +1789,81 @@ async def test_all_unmappable_platform_study_all_failed_no_runs_or_pools(reg):
         f"{study_accession}:%",
     )
     assert run_count == 0
+
+
+async def test_non_public_run_isolated_others_registered(reg):
+    """A suppressed run is excluded before platform mapping even runs -- given an
+    unmappable `instrument_platform`, it must still come back `EXCLUDED`, not
+    `FAILED`, pinning that the status check precedes platform mapping."""
+    study_accession = unique_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+    ok_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+        instrument_platform="ILLUMINA",
+    )
+    suppressed_sample_accession = unique_accession("SAMN")
+    suppressed_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=suppressed_sample_accession,
+        study_accession=study_accession,
+        instrument_platform="CAPILLARY",
+        status=EnaStatus.SUPPRESSED,
+    )
+
+    result = await _register(reg, study_header=header, ena_runs=[ok_run, suppressed_run])
+
+    outcomes_by_accession = {o.run_accession: o for o in result.ena_runs}
+    ok_outcome = outcomes_by_accession[ok_run.run_accession]
+    assert ok_outcome.status == EnaRunRegistrationStatus.REGISTERED
+    assert ok_outcome.sequenced_sample_idx is not None
+
+    excluded_outcome = outcomes_by_accession[suppressed_run.run_accession]
+    assert excluded_outcome.status == EnaRunRegistrationStatus.EXCLUDED
+    assert excluded_outcome.failure_reason is not None
+    assert suppressed_run.run_accession in excluded_outcome.failure_reason
+    assert "suppressed" in excluded_outcome.failure_reason
+
+    # No orphan rows for the excluded run -- it never reaches a per-run write.
+    orphan_sequenced_sample_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
+        suppressed_run.run_accession,
+    )
+    assert orphan_sequenced_sample_count == 0
+    orphan_biosample_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample WHERE ena_sample_accession = $1",
+        suppressed_sample_accession,
+    )
+    assert orphan_biosample_count == 0
+
+
+async def test_all_non_public_runs_study_all_excluded_no_runs_or_pools(reg):
+    study_accession = unique_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+    suppressed_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+        status=EnaStatus.SUPPRESSED,
+    )
+
+    result = await _register(reg, study_header=header, ena_runs=[suppressed_run])
+
+    assert {o.status for o in result.ena_runs} == {EnaRunRegistrationStatus.EXCLUDED}
+    assert result.created_pools == []
+
+    run_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.sequencing_run WHERE instrument_run_id LIKE $1",
+        f"{study_accession}:%",
+    )
+    assert run_count == 0
+
+    field_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.prep_sample_study_field WHERE study_idx = $1",
+        result.study_idx,
+    )
+    assert field_count == 0

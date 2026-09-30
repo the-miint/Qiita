@@ -13,4 +13,7 @@ from __future__ import annotations
 class EnaAccessionNotFoundError(RuntimeError):
     """A well-formed, validated accession resolved to zero rows from ENA. Raised
     rather than returning an empty list so an operator sees a clear "not found"
-    reason instead of a silent no-op import."""
+    reason instead of a silent no-op import.
+
+    Zero rows can mean "does not exist" or "not public" (see
+    `qiita_common.models.ena`), so the message names both."""

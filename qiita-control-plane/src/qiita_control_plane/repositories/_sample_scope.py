@@ -2,7 +2,8 @@
 
 Every gate-roster read answers the same shape of question — which prep_samples
 hold a gate row under one identity (a `mask_idx`, a `processing_idx`) — and all of
-them have to narrow the sample set identically: exclude entity-retired prep_samples, optional
+them have to narrow the sample set identically: exclude entity-retired prep_samples
+and ENA-flagged sequenced_samples, optional
 `sequenced_pool_idx` / `study_idx` / `prep_sample_idx` filters, and the per-study visibility
 policy for a caller below the bypass role. This module owns that one copy;
 no reader restates it.
@@ -55,6 +56,21 @@ _SAMPLE_NOT_RETIRED = """
     )
 """
 
+# A prep_sample's sequenced_sample subtype (if it has one) must not be flagged
+# unavailable by ENA -- covers every gate-roster read this module serves the
+# same way retirement does; this module is not itself the submission gate (see
+# fetch_sequenced_pool_samples / block_planner._enumerate_pool_samples for
+# that). NOT EXISTS rather than a join: most gates cover every processing_kind,
+# and a non-sequenced prep_sample has no sequenced_sample row to match against,
+# so it must pass unaffected.
+_SEQUENCED_SAMPLE_NOT_FLAGGED = """
+    NOT EXISTS (
+        SELECT 1 FROM qiita.sequenced_sample ss_ena
+         WHERE ss_ena.prep_sample_idx = {alias}.prep_sample_idx
+           AND ss_ena.ena_status IS NOT NULL
+    )
+"""
+
 
 def sample_scope_sql(
     *,
@@ -85,6 +101,7 @@ def sample_scope_sql(
     if not alias.isidentifier():
         raise ValueError(f"roster alias must be a bare SQL identifier, got {alias!r}")
     clauses = " AND " + _SAMPLE_NOT_RETIRED.format(alias=alias)
+    clauses += " AND " + _SEQUENCED_SAMPLE_NOT_FLAGGED.format(alias=alias)
     narrowed = False
     if sequenced_pool_idx is not None:
         narrowed = True
