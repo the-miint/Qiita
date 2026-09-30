@@ -1,7 +1,7 @@
 """Integration tests for the biosample routes."""
 
 import secrets
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import date
 from decimal import Decimal
 from typing import get_args
@@ -79,6 +79,10 @@ _ELIGIBILITY_DETAIL = "owner is not eligible to own biosamples"
 # builder name the field without threading it through the driver.
 _AUTHZ_FIELD_NAME = "Authz Unique Id"
 _AUTHZ_FIELD_VALUE = "Sample 1"
+
+# What a by-unique-field resolution case stages: the study it seeded, and the
+# (field name, value) pair its route should be sent.
+SetupResult = tuple[int, str, str]
 
 
 # ---------------------------------------------------------------------------
@@ -1465,11 +1469,11 @@ async def _seed_link_to_study(ctx, *, study_idx, owner_idx):
 
 
 async def _seed_authz_sample(ctx, study_idx):
-    """Seed the linked biosample an access case addresses.
+    """Seed one biosample and link it to the study.
 
-    Owned by the wet_lab_admin whichever principal the case makes the study's
-    owner, since the study-scoped routes gate on study access rather than on
-    who owns the sample.
+    It is owned by the wet_lab_admin no matter which principal owns the study,
+    since the study-scoped routes gate on study access rather than on who owns
+    the sample.
     """
     return await _seed_link_to_study(
         ctx, study_idx=study_idx, owner_idx=ctx["wet_session"]["principal_idx"]
@@ -2335,6 +2339,7 @@ async def test_get_biosample_in_study_authz(ctx, case, no_biosample_read_client)
         seed_sample=_seed_authz_sample,
         send=_send,
         success_status=200,
+        required_scope="biosample:read",
     )
 
 
@@ -3950,6 +3955,7 @@ async def test_patch_biosample_metadata_authz(ctx, case, no_biosample_write_patc
         seed_sample=_seed_authz_sample_with_unique_value,
         send=_send,
         success_status=200,
+        required_scope="biosample:write",
     )
 
 
@@ -4495,6 +4501,27 @@ async def test_lookup_biosample_in_study_by_unique_field(ctx, data_type, value):
     assert resp.headers["ETag"] == expected_etag
 
 
+async def test_lookup_biosample_in_study_by_unique_field_numeric_ignores_scale(ctx):
+    """Tests the case where a numeric value is looked up in a different scale
+    from the one stored: the comparison is the value column's own numeric
+    equality, so a trailing zero resolves the same sample.
+
+    Scale is the one spelling the write path preserves -- notation is
+    canonicalized, so "+32.87" and "3.287e1" would resolve even against a plain
+    text comparison. Only a differing scale tells the two apart.
+    """
+    study_idx, display_name, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="lookup-scale", value="32.87", data_type="numeric"
+    )
+
+    resp = await _lookup_by_unique_field(ctx["wet"], study_idx, display_name, "32.870")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["biosample_idx"] == bs_idx
+    # The stored spelling is untouched by having been found under another one.
+    assert resp.json()["local_metadata"][display_name]["value"] == "32.87"
+
+
 async def test_lookup_biosample_in_study_by_unique_field_matches_by_idx_read(ctx):
     """Tests the case where the same biosample is fetched both ways: the
     by-unique-field response body is the by-idx response body, so the two
@@ -4583,6 +4610,14 @@ async def _setup_wrong_case(ctx, case):
     return study_idx, display_name, "sample 1"
 
 
+async def _setup_wrong_case_field_name(ctx, case):
+    """The stored field's name, sent in a different case."""
+    study_idx, display_name, _ = await _seed_biosample_carrying_unique_value(
+        ctx, suffix=case, value="Sample 1"
+    )
+    return study_idx, display_name.upper(), "Sample 1"
+
+
 async def _setup_other_study(ctx, case):
     """A second study with a same-named unique field and no such value."""
     _, display_name, _ = await _seed_biosample_carrying_unique_value(
@@ -4622,12 +4657,13 @@ async def _setup_retired_link(ctx, case):
 # The detail fragment is not decoration. Three cases expect 422, and a write
 # whose resolution wrongly SUCCEEDED would also answer 422 from its metadata
 # body -- so status alone would pass those cases for the wrong reason.
-_UNIQUE_FIELD_RESOLUTION: dict[str, tuple[Callable, int, str]] = {
+_UNIQUE_FIELD_RESOLUTION: dict[str, tuple[Callable[..., Awaitable[SetupResult]], int, str]] = {
     "unknown_field": (_setup_unknown_field, 422, "does not exist on study"),
     "not_unique_field": (_setup_not_unique_field, 422, "not unique within the study"),
     "unparseable_value": (_setup_unparseable_value, 422, "could not parse metadata field"),
     "no_match": (_setup_no_match, 404, "through field"),
     "wrong_case": (_setup_wrong_case, 404, "through field"),
+    "wrong_case_field_name": (_setup_wrong_case_field_name, 422, "does not exist on study"),
     "other_study": (_setup_other_study, 404, "through field"),
     "retired_link": (_setup_retired_link, 404, "is not linked to study"),
 }
@@ -4689,6 +4725,7 @@ async def test_lookup_biosample_in_study_by_unique_field_authz(ctx, case, no_bio
         seed_sample=_seed_authz_sample_with_unique_value,
         send=_send,
         success_status=200,
+        required_scope="biosample:read",
     )
 
 
@@ -4899,4 +4936,101 @@ async def test_patch_biosample_metadata_by_unique_field_authz(
         seed_sample=_seed_authz_sample_with_unique_value,
         send=_send,
         success_status=200,
+        required_scope="biosample:write",
     )
+
+
+async def _seed_widenable_unique_field(ctx, *, suffix, value):
+    """Seed a study whose unique_in_study field is numeric, and a biosample
+    carrying `value` through it. Returns
+    (study_idx, display_name, study_field_idx, biosample_idx).
+
+    Numeric rather than text so a widen to text has a column to move the value
+    out of, which is what makes a resolution staged against the pre-widen
+    data_type miss.
+    """
+    study_idx, display_name, field_idx = await _seed_study_with_unique_field(
+        ctx, suffix=suffix, data_type="numeric"
+    )
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+    written = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {display_name: value})
+    assert written.status_code == 200, written.text
+    await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
+    return study_idx, display_name, field_idx, bs_idx
+
+
+def _widen_before_resolution_query(ctx, field_idx, staged):
+    """Wrap the resolver's value query so a widen commits just before it runs.
+
+    The widen rides its own connection, so it is committed and visible to the
+    query below while that query still carries the data_type its caller read in
+    an earlier statement -- the stale-resolution window itself.
+    """
+    original = route_helpers.fetch_entity_idx_by_unique_field_value
+
+    async def _wrapped(conn, **kwargs):
+        if not staged["widened"]:
+            async with ctx["pool"].acquire() as editor, editor.transaction():
+                await editor.execute(
+                    f"SET LOCAL lock_timeout = '{route_helpers.METADATA_LOCK_TIMEOUT_MS}ms'"
+                )
+                await sample_helpers.widen_study_field_to_text(
+                    editor, spec=BIOSAMPLE_METADATA_SPEC, study_field_idx=field_idx
+                )
+            staged["widened"] = True
+        return await original(conn, **kwargs)
+
+    return _wrapped
+
+
+async def test_patch_biosample_metadata_by_unique_field_widen_race_503(ctx, monkeypatch):
+    """Tests the case where a widen commits between the two statements that
+    resolve the identifying pair: the value has moved out of the column the
+    first statement chose, so the miss is an artifact of the redeclaration
+    rather than an absent sample, and the route answers a retryable 503 rather
+    than a 404 the caller cannot tell from a genuine one.
+    """
+    study_idx, display_name, field_idx, _ = await _seed_widenable_unique_field(
+        ctx, suffix="uniq-widen-race", value="32.87"
+    )
+    staged = {"widened": False}
+    monkeypatch.setattr(
+        route_helpers,
+        "fetch_entity_idx_by_unique_field_value",
+        _widen_before_resolution_query(ctx, field_idx, staged),
+    )
+
+    resp = await _patch_by_unique_field(ctx["wet"], study_idx, display_name, "32.87")
+
+    # Without this the route could stop reaching the query and the test would
+    # pass having staged no redeclaration at all.
+    assert staged["widened"]
+    assert resp.status_code == 503, resp.text
+    assert "redeclared" in resp.json()["detail"]
+    assert resp.headers["Retry-After"]
+
+
+async def test_lookup_biosample_in_study_by_unique_field_widen_race_200(ctx, monkeypatch):
+    """Tests the case where the same widen commits mid-resolution on the lookup
+    route: its one REPEATABLE READ snapshot spans both statements, so the value
+    is still in the column the first statement chose and the pair resolves.
+
+    Control for the write route's 503 above: same seam, same widen, and the
+    transaction the handler runs in is the only difference between them.
+    """
+    study_idx, display_name, field_idx, bs_idx = await _seed_widenable_unique_field(
+        ctx, suffix="uniq-widen-snap", value="32.87"
+    )
+    staged = {"widened": False}
+    monkeypatch.setattr(
+        route_helpers,
+        "fetch_entity_idx_by_unique_field_value",
+        _widen_before_resolution_query(ctx, field_idx, staged),
+    )
+
+    resp = await _lookup_by_unique_field(ctx["wet"], study_idx, display_name, "32.87")
+
+    assert staged["widened"]
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["biosample_idx"] == bs_idx

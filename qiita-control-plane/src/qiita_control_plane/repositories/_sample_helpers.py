@@ -885,16 +885,16 @@ async def fetch_entity_idx_by_unique_field_value(
     """Return the entity idx carrying `value` through the given study field, or
     None when no row does.
 
-    The caller must have established that the field declares unique_in_study;
-    without it two entities may hold the same value and this returns an
-    arbitrary one of them. Under the flag the partial unique index over
-    (study_field_idx, value_<type>) makes at most one row match, so the answer
-    is total.
+    The caller must have established that the field declares unique_in_study.
+    Without it every row under the field carries the flag false, so the term
+    below filters them all out and this returns None rather than a match. Under
+    the flag the partial unique index over (study_field_idx, value_<type>) makes
+    at most one row match, so the answer is total.
 
     No study_idx term is needed: a study field belongs to exactly one study, so
     naming the field already scopes the search to it. Matching is whatever the
-    value column's type does — case-sensitive for text, numeric equality for
-    numerics — which is the same comparison the unique index enforces.
+    value column's type does — case-sensitive for text, typed equality for
+    numeric and date — which is the same comparison the unique index enforces.
 
     Retired entities and retired study links are NOT excluded: they keep
     holding their value, and the index keeps enforcing it, so resolution stays
@@ -903,10 +903,8 @@ async def fetch_entity_idx_by_unique_field_value(
     # Closed-set lookup; a data_type with no typed column reaches the write and
     # read guards as NotImplementedError rather than matching NULL here.
     value_column = GLOBAL_METADATA_VALUE_COLUMN[data_type]
-    # The unique_in_study term restates what the caller already established, so
-    # it selects no differently -- it is here to spell the partial index's own
-    # predicate, which the planner needs in order to use that index. The row
-    # column is trigger-maintained from the field's, so the two cannot disagree.
+    # The unique_in_study term spells the partial index's own predicate, which
+    # the planner needs in order to use that index.
     row = await pool_or_conn.fetchrow(
         f"SELECT {spec.entity_key_column}"
         f" FROM {spec.metadata_table}"

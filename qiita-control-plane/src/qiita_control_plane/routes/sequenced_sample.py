@@ -769,7 +769,7 @@ async def patch_sequenced_sample_metadata(
     async with tx() as conn:
         # metadata_idx_column is the supertype prep_sample_idx the join carries:
         # a sequenced_sample's metadata lives on its prep_sample.
-        return await resolve_and_write_study_scoped_metadata(
+        written = await resolve_and_write_study_scoped_metadata(
             conn,
             spec=PREP_SAMPLE_METADATA_SPEC,
             fetch_row=fetch_sequenced_sample_with_prep_sample,
@@ -781,6 +781,7 @@ async def patch_sequenced_sample_metadata(
             caller_idx=user.principal_idx,
             global_internal_names=body.global_internal_names,
         )
+    return written
 
 
 @sequenced_sample_router.get(PATH_SEQUENCED_SAMPLE_BY_IDX)

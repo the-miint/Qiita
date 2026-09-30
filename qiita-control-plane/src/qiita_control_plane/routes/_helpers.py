@@ -456,11 +456,6 @@ async def resolve_and_write_study_scoped_metadata(
     entity_idx is the idx the caller named and is what every message reports.
     Metadata keys on the metadata_idx_column value instead: the entity's own
     idx for a direct entity, a supertype idx for a subtype.
-
-    There is no optimistic-concurrency control here: a concurrent same-study,
-    same-field write is last-writer-wins. The per-slot upsert is race-safe
-    against cross-study collisions (409) but does not serialize same-study
-    rewrites.
     """
     _row, metadata_entity_idx = await resolve_linked_study_entity(
         conn,
@@ -499,11 +494,12 @@ async def resolve_study_entity_by_unique_field(
     """Resolve the study's own name for a sample to that sample's idx.
 
     display_name names one of the study's fields and value is what that field
-    carries on the wanted sample. The field must declare unique_in_study: that
-    is what makes the pair name one sample rather than several, so a field
-    without it is refused (422) instead of resolved arbitrarily. A name the
-    study does not use is likewise 422, as is a value that will not parse as
-    the field's data type. A well-formed pair matching no sample is 404.
+    carries on the wanted sample. The field must declare unique_in_study; one
+    that does not is refused (422), as is a name the study does not use and a
+    value that will not parse as the field's data type. A well-formed pair
+    matching no sample is 404, unless the field was redeclared to another data
+    type while this was resolving it, which makes the miss an artifact of the
+    redeclaration and answers 503.
 
     Resolution ignores retirement, so a retired sample or a retired study link
     still resolves; the caller applies its own gate afterwards and decides what
@@ -545,6 +541,17 @@ async def resolve_study_entity_by_unique_field(
         value=parsed_value,
     )
     if entity_idx is None:
+        # The column just queried was chosen from a data_type read in an earlier
+        # statement, and this runs at READ COMMITTED for a write, so a widen can
+        # have moved the values out of it in between. Re-read before answering:
+        # a miss that is an artifact of the redeclaration is retryable, where an
+        # absent sample is not, and the two are indistinguishable as a 404.
+        current = await fetch_study_field(conn, spec=spec, idx=field_row.idx)
+        if current is not None and current["data_type"] != field_row.data_type:
+            raise_transient_retry(
+                f"{noun} field {display_name!r} was redeclared while this request was"
+                " resolving it; re-issue the request to retry"
+            )
         raise HTTPException(
             status_code=404,
             detail=(

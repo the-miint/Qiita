@@ -75,6 +75,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     _update_metadata,
     create_study_field,
     create_study_field_and_read_back,
+    fetch_entity_idx_by_unique_field_value,
     fetch_entity_is_linked_to_study,
     fetch_global_fields,
     fetch_global_fields_by_keys,
@@ -115,12 +116,15 @@ from .conftest import (
     _create_biosample_with_link,
     _create_linked_entity_for_spec,
     _create_local_field,
+    _create_plain_field,
     _create_prep_sample_with_link,
     _seed_global_field_for_spec,
     _seed_secondary_studies_for_entity,
     _seed_study,
     _seed_unlinked_entity_for_spec,
+    _set_unique_in_study,
     _track_to_study_link,
+    _write_value,
 )
 
 pytestmark = pytest.mark.db
@@ -6791,3 +6795,137 @@ async def test_fetch_global_fields_orders_by_internal_name(ctx, spec):
         },
     ]
     assert seeded == expected
+
+
+# ---------------------------------------------------------------------------
+# fetch_entity_idx_by_unique_field_value (spec-parameterized over both entities)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_unique_value(ctx, spec, *, suffix, value):
+    """Seed a linked entity carrying `value` through a unique_in_study text
+    field. Returns (field_idx, entity_idx).
+
+    The value is written before the policy is switched on, so the propagation
+    trigger is what stamps the metadata row's denormalized flag -- the same
+    path a real study takes when it declares an existing field unique.
+    """
+    field_idx = await _create_plain_field(ctx, spec, suffix=suffix)
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value=value,
+    )
+    await _set_unique_in_study(ctx, spec, field_idx, True)
+    return field_idx, entity_idx
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_entity_idx_by_unique_field_value(ctx, spec):
+    """Tests the case where a unique_in_study field carries the value on one
+    entity: the fetch returns that entity's idx, and a value no entity carries
+    through the field returns None.
+    """
+    field_idx, entity_idx = await _seed_unique_value(ctx, spec, suffix="uniq-hit", value="Sample 1")
+
+    async with ctx["pool"].acquire() as conn:
+        found = await fetch_entity_idx_by_unique_field_value(
+            conn,
+            spec=spec,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="Sample 1",
+        )
+        missed = await fetch_entity_idx_by_unique_field_value(
+            conn,
+            spec=spec,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="Sample 2",
+        )
+
+    assert found == entity_idx
+    assert missed is None
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_entity_idx_by_unique_field_value_not_unique_returns_none(ctx, spec):
+    """Tests the case where the field does not declare unique_in_study: every
+    metadata row under it carries the flag false, so the query's own
+    unique_in_study term filters them all out and the answer is None rather
+    than an arbitrary match.
+
+    This is what makes the term load-bearing: without it the same call would
+    return the entity, so a caller that skipped the flag check would act on a
+    value that may repeat.
+    """
+    field_idx = await _create_plain_field(ctx, spec, suffix="uniq-unflagged")
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value="Sample 1",
+    )
+
+    async with ctx["pool"].acquire() as conn:
+        found = await fetch_entity_idx_by_unique_field_value(
+            conn,
+            spec=spec,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="Sample 1",
+        )
+
+    assert found is None
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_entity_idx_by_unique_field_value_scoped_to_its_field(ctx, spec):
+    """Tests the case where two unique_in_study fields in the same study carry
+    the same value: each resolves only through its own field, so naming the
+    field is what scopes the search and no study_idx term is needed.
+    """
+    first_field, first_entity = await _seed_unique_value(
+        ctx, spec, suffix="uniq-scope-a", value="Shared"
+    )
+    second_field, second_entity = await _seed_unique_value(
+        ctx, spec, suffix="uniq-scope-b", value="Shared"
+    )
+
+    async with ctx["pool"].acquire() as conn:
+        via_first = await fetch_entity_idx_by_unique_field_value(
+            conn,
+            spec=spec,
+            study_field_idx=first_field,
+            data_type=FieldDataType.TEXT,
+            value="Shared",
+        )
+        via_second = await fetch_entity_idx_by_unique_field_value(
+            conn,
+            spec=spec,
+            study_field_idx=second_field,
+            data_type=FieldDataType.TEXT,
+            value="Shared",
+        )
+
+    assert via_first == first_entity
+    assert via_second == second_entity

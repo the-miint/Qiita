@@ -584,9 +584,7 @@ async def lookup_biosample_in_study_by_unique_field(
     The named field must exist on the study and must declare unique_in_study
     (otherwise 422, since its values could name several samples), and the value
     must parse as the field's data type (otherwise 422). A well-formed pair
-    naming no sample is 404. Matching is case-sensitive on both the field name
-    and the value, following the study field's key and the unique index over
-    the stored value.
+    naming no sample is 404.
 
     Access and the remaining refusals are those of the by-idx read: Tier.ADMIN
     study access with a wet_lab_admin+ role bypass as an interim stand-in until
@@ -664,6 +662,9 @@ async def get_biosample_in_study(
         )
 
 
+# Keep this ahead of the {biosample_idx} form below: both are PATCH on the same
+# path shape, and the literal segment is unreachable once the parameterized one
+# is registered first.
 @router.patch(PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD)
 async def patch_biosample_metadata_by_unique_field(
     study_idx: Annotated[int, Field(gt=0)],
@@ -687,7 +688,9 @@ async def patch_biosample_metadata_by_unique_field(
     unique_in_study -- without it the value could name several samples, so the
     write is refused (422) rather than applied to an arbitrary one -- and the
     value must parse as that field's data type (422). A well-formed pair naming
-    no sample is 404. Matching is case-sensitive on both halves.
+    no sample is 404, except where the field was redeclared to another data type
+    while the pair was resolving: the miss is then an artifact of that, and the
+    answer is 503 to retry.
 
     The identifying field may also appear in the metadata body. Resolution runs
     first, so such a write renames the sample under the value that found it,
@@ -701,6 +704,8 @@ async def patch_biosample_metadata_by_unique_field(
 
     There is NO If-Match on this route, exactly as on the by-idx write: a
     concurrent same-study, same-field write is last-writer-wins.
+    A value moved to another sample between the pair resolving and the
+    write landing is a known rare possible problem; see github issue.
     """
     async with tx() as conn:
         biosample_idx = await resolve_study_entity_by_unique_field(
@@ -776,7 +781,7 @@ async def patch_biosample_metadata(
     of band.
     """
     async with tx() as conn:
-        return await resolve_and_write_study_scoped_metadata(
+        written = await resolve_and_write_study_scoped_metadata(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             fetch_row=fetch_biosample,
@@ -788,6 +793,7 @@ async def patch_biosample_metadata(
             caller_idx=user.principal_idx,
             global_internal_names=body.global_internal_names,
         )
+    return written
 
 
 # Roles that may bypass the per-biosample owner / linked-study-access check.

@@ -484,9 +484,10 @@ class SampleUniqueFieldRef(BaseModel):
     still carry content, so a name or value written with stray padding resolves
     the same as its unpadded spelling.
 
-    Matching is case-sensitive on both halves, following the study field's
-    (study_idx, display_name) key and the partial unique index over the stored
-    value.
+    unique_field_display_name matches the stored name exactly, case included.
+    unique_field_value is compared as the field's own data type: text matches
+    case-sensitively; numeric and date match on value, so "32.870" resolves a
+    sample storing 32.87.
     """
 
     model_config = ConfigDict(extra="forbid")

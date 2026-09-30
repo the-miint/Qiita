@@ -913,6 +913,7 @@ async def assert_study_scoped_sample_authz(
     seed_sample,
     send,
     success_status: int,
+    required_scope: str,
 ) -> None:
     """Drive one access case of a study-scoped sample route and assert its status.
 
@@ -923,7 +924,10 @@ async def assert_study_scoped_sample_authz(
     the sample the route addresses and returns its idx, and
     `send(client, study_idx, sample_idx)` issues the request, so one driver
     serves routes with different verbs and bodies. `no_scope_client` is a PAT
-    client lacking the route's own scope.
+    client lacking the route's own scope, and `required_scope` is the scope it
+    lacks: the missing-scope row asserts the refusal names it, so a route wired
+    to a different scope inside the caller's ceiling is not mistaken for a
+    correctly-wired one.
 
     The unauthenticated case drives the ASGI app directly, since every role
     client carries a token by construction.
@@ -950,6 +954,10 @@ async def assert_study_scoped_sample_authz(
     assert resp.status_code == (success_status if expected_status is None else expected_status), (
         resp.text
     )
+    # Status alone does not say which scope was missing, and every scope in the
+    # caller's role ceiling would refuse this client just as flatly.
+    if client_key == "no_scope":
+        assert required_scope in resp.json()["detail"], resp.text
 
 
 # ---------------------------------------------------------------------------

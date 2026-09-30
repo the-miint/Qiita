@@ -29,8 +29,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   appear in the body — resolution runs first, so such a write renames the sample under
   the value that found it, which is the only way to correct a mistyped id. The
   owner-biosample-id field is the exception: it identifies, but writing it stays a 422.
-  A retired biosample is 409 here, where the matching read answers 404. Access, and
-  every other refusal, are the by-idx write's.
+  A retired biosample is 409 here, where the matching read answers 404. A field
+  redeclared to another data type while the pair is resolving answers 503 to retry,
+  rather than the 404 the caller could not tell from a sample that is genuinely absent.
+  Access, and every other refusal, are the by-idx write's.
 - **Read a biosample by the study's own name for it —
   `POST /api/v1/study/{study_idx}/biosample/by-unique-field` (#N).** Returns the same
   study-scoped view as the by-idx read, for a caller holding a `unique_in_study`
@@ -41,9 +43,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   must declare `unique_in_study` — without it the value could name several samples, so
   the lookup is refused (422) rather than resolved arbitrarily — and the value must
   parse as the field's data type (422); a well-formed pair naming no sample is 404.
-  Matching is case-sensitive on both halves, following the study field's key and the
-  partial unique index over the stored value. The access bar, and the 404 on a retired
-  sample or retired study link, are those of the by-idx read.
+  The access bar, and the 404 on a retired sample or retired study link, are those of
+  the by-idx read.
 - **A study-local sample field can be widened to text, taking its stored values
   with it (#628).** A field minted as numeric, boolean, or date could not be redeclared once
   values existed: the field-contract check runs when a metadata row is written, not when
