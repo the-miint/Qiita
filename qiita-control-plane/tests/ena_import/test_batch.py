@@ -1241,8 +1241,8 @@ async def test_process_one_study_all_runs_failed_reaches_terminal_failed(
 
 
 # ---------------------------------------------------------------------------
-# Non-public studies and runs (Q1: refuse a suppressed study; exclude a
-# suppressed run; fail loud on a status this codebase doesn't recognize).
+# Non-public studies and runs: refuse a suppressed study; exclude a suppressed
+# run; fail loud on a status this codebase doesn't recognize.
 # ---------------------------------------------------------------------------
 
 
@@ -1300,7 +1300,7 @@ async def test_process_one_study_all_runs_suppressed_fails_before_any_write(
     )
     assert item_row["state"] == BatchItemState.FAILED.value
     assert item_row["study_idx"] is None
-    assert "no public runs" in item_row["failure_reason"]
+    assert item_row["failure_reason"] == f"no public runs: SRR-{accession} is suppressed"
 
     study_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.study WHERE bioproject_accession = $1", accession

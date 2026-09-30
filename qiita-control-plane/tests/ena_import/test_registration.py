@@ -1792,9 +1792,9 @@ async def test_all_unmappable_platform_study_all_failed_no_runs_or_pools(reg):
 
 
 async def test_non_public_run_isolated_others_registered(reg):
-    """A suppressed run is excluded before platform mapping even runs -- isolated
-    from its siblings exactly like an unmappable platform, but as its own
-    `EXCLUDED` status naming the run's ENA status, not `FAILED`."""
+    """A suppressed run is excluded before platform mapping even runs -- given an
+    unmappable `instrument_platform`, it must still come back `EXCLUDED`, not
+    `FAILED`, pinning that the status check precedes platform mapping."""
     study_accession = unique_accession("PRJNA")
     header = _study_header(study_accession=study_accession)
     ok_run = _run(
@@ -1810,7 +1810,7 @@ async def test_non_public_run_isolated_others_registered(reg):
         experiment_accession=unique_accession("SRX"),
         sample_accession=suppressed_sample_accession,
         study_accession=study_accession,
-        instrument_platform="ILLUMINA",
+        instrument_platform="CAPILLARY",
         status=EnaStatus.SUPPRESSED,
     )
 
@@ -1861,3 +1861,9 @@ async def test_all_non_public_runs_study_all_excluded_no_runs_or_pools(reg):
         f"{study_accession}:%",
     )
     assert run_count == 0
+
+    field_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.prep_sample_study_field WHERE study_idx = $1",
+        result.study_idx,
+    )
+    assert field_count == 0

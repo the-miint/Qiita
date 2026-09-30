@@ -204,22 +204,22 @@ class _FakeCapturingConnection:
         return []
 
 
-def test_query_ena_study_header_requests_status(monkeypatch):
+def test_query_ena_study_header_requests_exactly_the_model_fields(monkeypatch):
     fake = _FakeCapturingConnection()
     monkeypatch.setattr(miint_resolver, "connect_with_miint_staged", lambda: fake)
 
     miint_resolver._query_ena_study_header("PRJNA48739")
 
-    assert "status" in fake.captured_params["fields"].split(",")
+    assert fake.captured_params["fields"].split(",") == list(EnaStudyHeader.model_fields)
 
 
-def test_query_ena_runs_requests_status(monkeypatch):
+def test_query_ena_runs_requests_exactly_the_model_fields(monkeypatch):
     fake = _FakeCapturingConnection()
     monkeypatch.setattr(miint_resolver, "connect_with_miint_staged", lambda: fake)
 
     miint_resolver._query_ena_runs("PRJNA48739")
 
-    assert "status" in fake.captured_params["fields"].split(",")
+    assert fake.captured_params["fields"].split(",") == list(EnaRunRecord.model_fields)
 
 
 def test_resolve_sample_attributes_pivots_by_sample(monkeypatch):

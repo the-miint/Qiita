@@ -249,11 +249,12 @@ async def _process_one_study(
             )
             return
         if not any(run.status is EnaStatus.PUBLIC for run in ena_runs):
+            reasons = "; ".join(f"{run.run_accession} is {run.status.value}" for run in ena_runs)
             await _set_item_state(
                 pool,
                 item.idx,
                 BatchItemState.FAILED,
-                failure_reason="no public runs",
+                failure_reason=f"no public runs: {reasons}",
             )
             return
 

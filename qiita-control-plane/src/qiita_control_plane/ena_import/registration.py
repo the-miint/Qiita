@@ -293,7 +293,7 @@ async def register_ena_study(
         # Outside the transaction below: the field rows are per-study
         # constants that survive a failed attempt (see _ensure_library_fields).
         library_field_idxs: dict[str, int] = {}
-        if any(ena_run.run_accession not in already_present for ena_run in ena_runs):
+        if any(acc not in already_present for acc in platform_by_accession):
             library_field_idxs = await _ensure_library_fields(
                 conn, study_idx=study_idx, created_by_idx=caller_idx
             )

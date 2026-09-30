@@ -15,6 +15,5 @@ class EnaAccessionNotFoundError(RuntimeError):
     rather than returning an empty list so an operator sees a clear "not found"
     reason instead of a silent no-op import.
 
-    ENA Portal's `/search` endpoint (what `read_ena` queries) returns only
-    public records, so zero rows is ambiguous between "does not exist" and
-    "exists but is not public" -- the message says so rather than picking one."""
+    Zero rows can mean "does not exist" or "not public" (see
+    `qiita_common.models.ena`), so the message names both."""

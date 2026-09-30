@@ -108,14 +108,14 @@ way (`no public runs`), before the study is even resolved or created. Within an
 otherwise-public study, an individual **suppressed run** is `excluded` — isolated from
 its siblings exactly like an unmappable platform, carrying a `failure_reason` naming
 the run and its status, and contributing no `biosample`/`prep_sample`/`sequenced_sample`
-rows. An item whose runs are all `excluded` and/or `failed` (no run reaches
-`registered`/`skipped_already_present`) still fails with "every run failed to
-register", naming every excluded or failed run.
+rows. When a pool was created (at least one run's platform mapped) but every run in
+the item still ends up `excluded` and/or `failed` — none reaches
+`registered`/`skipped_already_present` — the item fails with "every run failed to
+register", naming every excluded or failed run; if no platform ever mapped, no pool
+exists and the item instead fails with "no run mapped to a downloadable pool".
 
-ENA Portal's `/search` endpoint (what resolution queries) returns only public records
-by default, so this mostly guards against a record changing status after being
-fetched, or an ENA status this codebase does not yet recognize — it is not expected to
-trigger often in practice.
+Resolution only sees public records (see `qiita_common.models.ena`), so these checks
+rarely fire in practice; they enforce the rule rather than assume it.
 
 ### REST surface
 

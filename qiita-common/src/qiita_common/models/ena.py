@@ -5,10 +5,10 @@
 `int | None`, and per-file fields arrive as `list[...]`. These models validate
 the typed data at construction.
 
-`status` is required on both `EnaStudyHeader` and `EnaRunRecord`: ENA's Portal
+`status` is required on both `EnaStudyHeader` and `EnaRunRecord`: ENA Portal's
 `/search` endpoint (what `read_ena` queries) returns only public records by
-default, but a record can transition after being fetched, and an unrecognized
-value must fail loud rather than default to "assume public".
+default, so a non-`public` value in a returned row, or one this codebase does
+not recognize, must fail loud rather than default to "assume public".
 """
 
 from __future__ import annotations
@@ -19,10 +19,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class EnaStatus(StrEnum):
-    """ENA's per-record publication status, as reported by `read_ena`'s
-    `status` field. Only these two values are recognized -- anything else
-    (ENA's Portal API also defines `private`) fails Pydantic validation rather
-    than being silently treated as public."""
+    """ENA's per-record availability status, as `read_ena` reports it."""
 
     PUBLIC = "public"
     SUPPRESSED = "suppressed"

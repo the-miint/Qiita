@@ -18,21 +18,9 @@ from qiita_control_plane.miint import connect_with_miint_staged
 
 from .resolver import EnaAccessionNotFoundError
 
-# Explicit fields for read_run: only the columns EnaRunRecord models, not read_ena's
-# full default set (which also carries sample-descriptive fields out of scope here).
-_RUN_FIELDS = (
-    "run_accession,experiment_accession,sample_accession,sample_alias,study_accession,"
-    "library_layout,library_strategy,library_source,library_selection,"
-    "instrument_platform,"
-    "fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count,status"
-)
-
-# ENAParser::DefaultFields("study") plus `status`, which Portal's search results
-# don't include by default.
-_STUDY_FIELDS = (
-    "study_accession,secondary_study_accession,study_title,study_description,"
-    "center_name,first_public,last_updated,scientific_name,tax_id,status"
-)
+# Requested fields mirror the model exactly, so a field added to one is added to both.
+_RUN_FIELDS = ",".join(EnaRunRecord.model_fields)
+_STUDY_FIELDS = ",".join(EnaStudyHeader.model_fields)
 
 
 def _query_ena_study_header(accession: str) -> tuple[list[str], list[tuple]]:
