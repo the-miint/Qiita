@@ -117,6 +117,12 @@ class EnaRunRegistrationStatus(StrEnum):
     SKIPPED_ALREADY_PRESENT = "skipped_already_present"
     EXCLUDED = "excluded"
     FAILED = "failed"
+    # A run this study already holds, that a re-import found ENA no longer
+    # reports as public -- distinct from EXCLUDED (never registered) so a
+    # batch report separates "never imported" from "imported, now
+    # unavailable". Set by ena_import.batch, not this module: this file only
+    # registers runs the Portal returns.
+    FLAGGED_UNAVAILABLE = "flagged_unavailable"
 
 
 @dataclass(frozen=True)

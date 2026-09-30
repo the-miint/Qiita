@@ -108,6 +108,26 @@ async def fetch_study_idxs_by_accession(
     return {r[accession_field]: r["idx"] for r in rows}
 
 
+async def fetch_study_idx_by_either_ena_accession(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    accession: str,
+) -> int | None:
+    """Return the study_idx whose `bioproject_accession` or `ena_study_accession`
+    equals `accession`, or None.
+
+    For a caller that only has one accession of unknown kind -- e.g. a batch
+    item's `ena_study_accession`, which validates as either a BioProject or a
+    secondary study accession (`qiita_common.ena_accession`) -- and does not
+    yet know which column it would have landed in. Unlike
+    `get_or_create_study_by_ena_accessions`, this never creates a row and does
+    not require both accessions.
+    """
+    return await pool_or_conn.fetchval(
+        "SELECT idx FROM qiita.study WHERE bioproject_accession = $1 OR ena_study_accession = $1",
+        accession,
+    )
+
+
 async def insert_study(
     conn: asyncpg.Connection,
     *,

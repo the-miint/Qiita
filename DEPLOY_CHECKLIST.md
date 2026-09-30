@@ -28,6 +28,7 @@ _None yet._
 ### 3. Migrations
 
 - `[operator]` `make migrate` applies `20260929000000_sample_field_widen_fn.sql`, `20260929000001_unique_in_study_propagation_lock.sql` and `20260929000002_metadata_field_contract_error_detail.sql` (all three create or replace functions; no data change). (#628)
+- `[operator]` `make migrate` applies `20260930000000_sequenced_sample_ena_status.sql` (two nullable columns on `qiita.sequenced_sample`; no data change). (#634)
 
 - **[operator] Between `make migrate` and the bucket-4 restart, a study-field edit that
   declares a field unique answers 500 (#628).** `20260929000001_unique_in_study_propagation_lock.sql`

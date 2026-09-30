@@ -31,6 +31,7 @@ from qiita_control_plane.repositories.sequencing_run import (
     fetch_sequenced_pool_completion,
     fetch_sequenced_pool_demux_state,
     fetch_sequenced_pool_read_mask_coverage,
+    fetch_sequenced_pool_read_mask_ticket_state_counts,
 )
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
@@ -161,7 +162,7 @@ async def pool_ctx(postgres_pool):
             _default_mask.append(await mint_mask())
         return _default_mask[0]
 
-    async def add_sample(*, retired=False):
+    async def add_sample(*, retired=False, ena_status=None):
         bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(
             postgres_pool, owner_idx=owner_idx
         )
@@ -180,6 +181,13 @@ async def pool_ctx(postgres_pool):
                 " retired_at = now(), retire_reason = 'test' WHERE idx = $1",
                 ps_idx,
                 owner_idx,
+            )
+        if ena_status is not None:
+            await postgres_pool.execute(
+                "UPDATE qiita.sequenced_sample SET ena_status = $2,"
+                " ena_availability_checked_at = now() WHERE idx = $1",
+                ss_idx,
+                ena_status,
             )
         samples.append((bs_idx, ps_idx, ss_idx))
         return ps_idx
@@ -530,6 +538,39 @@ async def test_retired_sample_excluded(pool_ctx):
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
     assert row["sample_count"] == 1
     assert row["samples_completed"] == 1
+
+
+async def test_flagged_sample_excluded(pool_ctx):
+    """An ENA-flagged prep_sample contributes to no bucket, even with a
+    COMPLETED ticket — the same exclusion as a retired one."""
+    ps_active = await pool_ctx["add_sample"]()
+    await pool_ctx["add_ticket"](ps_active, "completed")
+    ps_flagged = await pool_ctx["add_sample"](ena_status="suppressed")
+    await pool_ctx["add_ticket"](ps_flagged, "completed")
+    row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert row["sample_count"] == 1
+    assert row["samples_completed"] == 1
+
+
+async def test_flagged_sample_excluded_from_read_mask_ticket_state_counts(pool_ctx):
+    ps_active = await pool_ctx["add_sample"]()
+    await pool_ctx["add_ticket"](ps_active, "completed")
+    ps_flagged = await pool_ctx["add_sample"](ena_status="suppressed")
+    await pool_ctx["add_ticket"](ps_flagged, "completed")
+    counts = await fetch_sequenced_pool_read_mask_ticket_state_counts(
+        pool_ctx["pool"], pool_ctx["pool_idx"]
+    )
+    assert counts == {"completed": 1}
+
+
+async def test_flagged_sample_excluded_from_read_mask_coverage(pool_ctx):
+    ps_active = await pool_ctx["add_sample"]()
+    await pool_ctx["add_ticket"](ps_active, "completed")
+    ps_flagged = await pool_ctx["add_sample"](ena_status="suppressed")
+    await pool_ctx["add_ticket"](ps_flagged, "completed")
+    coverage = await fetch_sequenced_pool_read_mask_coverage(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert coverage["sample_count"] == 1
+    assert coverage["samples_with_ticket"] == 1
 
 
 # ---------------------------------------------------------------------------

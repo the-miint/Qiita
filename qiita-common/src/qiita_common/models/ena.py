@@ -13,7 +13,7 @@ not recognize, must fail loud rather than default to "assume public".
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -23,6 +23,49 @@ class EnaStatus(StrEnum):
 
     PUBLIC = "public"
     SUPPRESSED = "suppressed"
+
+
+class EnaBrowserStatus(IntEnum):
+    """Numeric `status` values ENA's Browser API (`summary/{accession}`) reports.
+
+    This is a *different* status surface from `EnaStatus` above: the Portal
+    `/search` endpoint `read_ena` queries never returns a non-public record at
+    all, so re-checking a run Qiita already holds has to go through the Browser
+    API instead, which reports every record regardless of status.
+
+    Verified live (2026-09-30): `PRJEB1` and `ERR000130` both report `5` with
+    `statusDescription: "suppressed"`; `SRR096342` reports `4` /
+    `"public"`. ENA documents four further statuses -- private, permanently
+    suppressed, temporarily suppressed, replaced, withdrawn -- but no numeric
+    code for any of them has turned up in a live response, and the Browser
+    API's own OpenAPI spec declares `status` a bare `int32` with no enum.
+    Guessing a code that later collides with a different real status would
+    silently misclassify a run, so `parse_ena_browser_status` raises on
+    anything outside this set rather than extending it speculatively.
+    """
+
+    PUBLIC = 4
+    SUPPRESSED = 5
+
+
+class UnknownEnaBrowserStatusError(RuntimeError):
+    """The Browser API reported a numeric `status` this codebase does not
+    recognize (see `EnaBrowserStatus`). Raised rather than guessed at."""
+
+
+def parse_ena_browser_status(*, status: int, description: str) -> str | None:
+    """Map one Browser API `(status, statusDescription)` pair to the value
+    `sequenced_sample.ena_status` should hold: `None` for `PUBLIC` (available),
+    else ENA's own `description` verbatim. Raises `UnknownEnaBrowserStatusError`
+    for any `status` code not in `EnaBrowserStatus`."""
+    try:
+        parsed = EnaBrowserStatus(status)
+    except ValueError:
+        raise UnknownEnaBrowserStatusError(
+            f"ENA Browser API reported status={status!r} ({description!r}), which"
+            " this codebase does not recognize -- see EnaBrowserStatus"
+        ) from None
+    return None if parsed is EnaBrowserStatus.PUBLIC else description
 
 
 class EnaStudyHeader(BaseModel):

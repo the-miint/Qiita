@@ -346,3 +346,28 @@ def test_ena_sample_attributes_defaults_to_empty_map():
 
     attrs = EnaSampleAttributes(sample_accession="SAMEA3610311")
     assert attrs.attributes == {}
+
+
+# ---------------------------------------------------------------------------
+# parse_ena_browser_status -- the Browser API's numeric status, distinct from
+# the Portal-sourced EnaStatus above.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_ena_browser_status_public_is_none():
+    from qiita_common.models.ena import parse_ena_browser_status
+
+    assert parse_ena_browser_status(status=4, description="public") is None
+
+
+def test_parse_ena_browser_status_suppressed_returns_description():
+    from qiita_common.models.ena import parse_ena_browser_status
+
+    assert parse_ena_browser_status(status=5, description="suppressed") == "suppressed"
+
+
+def test_parse_ena_browser_status_unrecognized_code_raises():
+    from qiita_common.models.ena import UnknownEnaBrowserStatusError, parse_ena_browser_status
+
+    with pytest.raises(UnknownEnaBrowserStatusError):
+        parse_ena_browser_status(status=1, description="received")

@@ -50,7 +50,7 @@ async def pool_ctx(postgres_pool):
     )
     samples: list[tuple[int, int, int]] = []
 
-    async def add_sample(*, with_reports=False, retired=False):
+    async def add_sample(*, with_reports=False, retired=False, ena_status=None):
         bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(
             postgres_pool, owner_idx=owner_idx
         )
@@ -77,6 +77,13 @@ async def pool_ctx(postgres_pool):
                 " retired_at = now(), retire_reason = 'test' WHERE idx = $1",
                 ps_idx,
                 owner_idx,
+            )
+        if ena_status is not None:
+            await postgres_pool.execute(
+                "UPDATE qiita.sequenced_sample SET ena_status = $2,"
+                " ena_availability_checked_at = now() WHERE idx = $1",
+                ss_idx,
+                ena_status,
             )
         samples.append((bs_idx, ps_idx, ss_idx))
         return ps_idx
@@ -118,5 +125,14 @@ async def test_retired_sample_excluded(pool_ctx):
     rollup's retired exclusion so sample_count and this list agree."""
     ps_live = await pool_ctx["add_sample"](with_reports=True)
     await pool_ctx["add_sample"](with_reports=True, retired=True)
+    rows = await fetch_sequenced_pool_sample_qc_reports(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert [r["prep_sample_idx"] for r in rows] == [ps_live]
+
+
+async def test_flagged_sample_excluded(pool_ctx):
+    """An ENA-flagged sequenced_sample is omitted entirely, the same as a
+    retired one."""
+    ps_live = await pool_ctx["add_sample"](with_reports=True)
+    await pool_ctx["add_sample"](with_reports=True, ena_status="suppressed")
     rows = await fetch_sequenced_pool_sample_qc_reports(pool_ctx["pool"], pool_ctx["pool_idx"])
     assert [r["prep_sample_idx"] for r in rows] == [ps_live]
