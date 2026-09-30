@@ -1,6 +1,7 @@
 """Integration tests for the biosample routes."""
 
 import secrets
+from collections.abc import Callable
 from datetime import date
 from decimal import Decimal
 from typing import get_args
@@ -13,10 +14,12 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_BY_STUDY_AND_IDX,
+    URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_LIST_BY_STUDY,
     URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
     URL_BIOSAMPLE_METADATA_BY_STUDY,
+    URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
@@ -50,6 +53,7 @@ from .conftest import (
     STUDY_FIELD_CREATE_AUTHZ_CASES,
     STUDY_FIELD_CREATE_CONFLICT_CASES,
     STUDY_FIELD_LIST_AUTHZ_CASES,
+    STUDY_SCOPED_SAMPLE_AUTHZ_CASES,
     IneligibilityKind,
     _grant_study_access,
     _seed_study,
@@ -58,6 +62,7 @@ from .conftest import (
     assert_study_field_create_conflict,
     assert_study_field_get_authz,
     assert_study_field_list_authz,
+    assert_study_scoped_sample_authz,
     delete_idxs,
     etag_for_row,
     post_study_field,
@@ -69,6 +74,11 @@ pytestmark = pytest.mark.db
 
 _SEED_PREFIX = "bs-route"
 _ELIGIBILITY_DETAIL = "owner is not eligible to own biosamples"
+# One display_name for every access-matrix study. display_name is unique per
+# study, so reusing it across them costs nothing and lets the matrix's request
+# builder name the field without threading it through the driver.
+_AUTHZ_FIELD_NAME = "Authz Unique Id"
+_AUTHZ_FIELD_VALUE = "Sample 1"
 
 
 # ---------------------------------------------------------------------------
@@ -1454,6 +1464,44 @@ async def _seed_link_to_study(ctx, *, study_idx, owner_idx):
     return bs_idx
 
 
+async def _seed_authz_sample(ctx, study_idx):
+    """Seed the linked biosample an access case addresses.
+
+    Owned by the wet_lab_admin whichever principal the case makes the study's
+    owner, since the study-scoped routes gate on study access rather than on
+    who owns the sample.
+    """
+    return await _seed_link_to_study(
+        ctx, study_idx=study_idx, owner_idx=ctx["wet_session"]["principal_idx"]
+    )
+
+
+async def _seed_authz_sample_with_unique_value(ctx, study_idx):
+    """Seed the unique field and the biosample every access case addresses.
+
+    Done as the bypass-role client so the seed succeeds whichever principal the
+    case under test makes the study's owner.
+    """
+    created = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={
+            "display_name": _AUTHZ_FIELD_NAME,
+            "data_type": "text",
+            "unique_in_study": True,
+        },
+    )
+    assert created.status_code == 201, created.text
+    ctx["created"]["biosample_study_field"].append(created.json()["biosample_study_field_idx"])
+
+    bs_idx = await _seed_authz_sample(ctx, study_idx)
+    written = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {_AUTHZ_FIELD_NAME: _AUTHZ_FIELD_VALUE}
+    )
+    assert written.status_code == 200, written.text
+    await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
+    return bs_idx
+
+
 async def test_list_biosample_idxs_anonymous_401(ctx):
     # No Authorization header → require_human chain raises 401.
     from qiita_control_plane.main import app
@@ -2268,85 +2316,26 @@ async def test_get_biosample_in_study_admin_tier_returns_response(ctx):
     assert rj == expected
 
 
-@pytest.mark.parametrize("tier", ["viewer", "member"])
-async def test_get_biosample_in_study_below_admin_tier_403(ctx, tier):
-    """Tests the case where a regular user's study access is below the ADMIN
-    clamp (viewer or member): the study-scoped GET is 403.
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+async def test_get_biosample_in_study_authz(ctx, case, no_biosample_read_client):
+    """Tests the case where each row of the study-scoped sample access matrix
+    calls the by-idx read: the ADMIN clamp, the role bypass, the scope check,
+    the unauthenticated refusal, and the missing-study 404 all hold.
     """
-    wet_idx = ctx["wet_session"]["principal_idx"]
-    user_idx = ctx["user_session"]["principal_idx"]
-    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix=f"get-{tier}")
-    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
-    await _grant_study_access(
-        ctx, study_idx=study_idx, principal_idx=user_idx, tier=tier, granted_by_idx=wet_idx
-    )
 
-    resp = await ctx["user"].get(
-        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
-    )
-    assert resp.status_code == 403, resp.text
-
-
-async def test_get_biosample_in_study_no_access_403(ctx):
-    """Tests the case where a regular user has no study_access row on the study
-    (public-by-absence, below the ADMIN clamp): the GET is 403.
-    """
-    wet_idx = ctx["wet_session"]["principal_idx"]
-    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="get-noaccess")
-    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
-
-    resp = await ctx["user"].get(
-        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
-    )
-    assert resp.status_code == 403, resp.text
-
-
-async def test_get_biosample_in_study_anonymous_401(ctx):
-    """Tests the case where no Authorization header is sent: require_human
-    rejects with 401 before any study or biosample read.
-    """
-    from qiita_control_plane.main import app
-
-    app.state.pool = ctx["pool"]
-    wet_idx = ctx["wet_session"]["principal_idx"]
-    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="get-anon")
-    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
-        resp = await anon.get(
-            URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
+    async def _send(client, study_idx, sample_idx):
+        return await client.get(
+            URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=sample_idx)
         )
-    assert resp.status_code == 401
 
-
-async def test_get_biosample_in_study_missing_scope_403(ctx, no_biosample_read_client):
-    """Tests the case where the caller's PAT omits Scope.BIOSAMPLE_READ:
-    require_scope rejects with 403 before any DB read.
-    """
-    wet_idx = ctx["wet_session"]["principal_idx"]
-    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="get-noscope")
-    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
-
-    resp = await no_biosample_read_client.get(
-        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
+    await assert_study_scoped_sample_authz(
+        ctx,
+        case=case,
+        no_scope_client=no_biosample_read_client,
+        seed_sample=_seed_authz_sample,
+        send=_send,
+        success_status=200,
     )
-    assert resp.status_code == 403
-    assert "biosample:read" in resp.json()["detail"]
-
-
-async def test_get_biosample_in_study_nonexistent_study_404(ctx):
-    """Tests the case where study_idx does not exist: require_study_exists
-    returns 404 even for the wet_lab_admin whose role bypasses the tier check.
-    """
-    max_study = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
-    max_bs = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.biosample")
-
-    resp = await ctx["wet"].get(
-        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(
-            study_idx=max_study + 100_000, biosample_idx=max_bs + 100_000
-        )
-    )
-    assert resp.status_code == 404, resp.text
 
 
 async def test_get_biosample_in_study_not_linked_404(ctx):
@@ -3287,7 +3276,8 @@ async def _seed_study_with_unique_field(ctx, *, suffix, unique_in_study=True, da
 
     unique_in_study False seeds the field without the policy, for a test that
     writes values first and switches the policy on afterwards. data_type picks
-    the declared type, for a test that needs one a widen can move.
+    the declared type: a caller can exercise the numeric and date value columns
+    as well as the text one, or start a field at a type a widen can move.
     """
     wet_idx = ctx["wet_session"]["principal_idx"]
     study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix=suffix)
@@ -3938,65 +3928,29 @@ async def test_patch_biosample_metadata_retired_409(ctx):
     assert "retired" in resp.json()["detail"]
 
 
-async def test_patch_biosample_metadata_anonymous_401(ctx):
-    """Tests the case where no Authorization header is sent: 401 before any read."""
-    from qiita_control_plane.main import app
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+async def test_patch_biosample_metadata_authz(ctx, case, no_biosample_write_patch_client):
+    """Tests the case where each row of the study-scoped sample access matrix
+    calls the metadata write: the ADMIN clamp, the role bypass, the scope
+    check, the unauthenticated refusal, and the missing-study 404 all hold.
 
-    app.state.pool = ctx["pool"]
-    wet_idx = ctx["wet_session"]["principal_idx"]
-    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="patch-anon")
-    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+    The allowed rows rewrite the value the seed already wrote, so a permitted
+    call answers 200 without depending on what the write does to the slot.
+    """
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
-        resp = await anon.patch(
-            URL_BIOSAMPLE_METADATA_BY_STUDY.format(study_idx=study_idx, biosample_idx=bs_idx),
-            json={"metadata": {"F": "x"}},
+    async def _send(client, study_idx, sample_idx):
+        return await _patch_biosample_metadata(
+            client, study_idx, sample_idx, {_AUTHZ_FIELD_NAME: _AUTHZ_FIELD_VALUE}
         )
-    assert resp.status_code == 401
 
-
-async def test_patch_biosample_metadata_missing_scope_403(ctx, no_biosample_write_patch_client):
-    """Tests the case where the caller's PAT omits Scope.BIOSAMPLE_WRITE: 403
-    before any DB read.
-    """
-    wet_idx = ctx["wet_session"]["principal_idx"]
-    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="patch-noscope")
-    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
-
-    resp = await _patch_biosample_metadata(
-        no_biosample_write_patch_client, study_idx, bs_idx, {"F": "x"}
+    await assert_study_scoped_sample_authz(
+        ctx,
+        case=case,
+        no_scope_client=no_biosample_write_patch_client,
+        seed_sample=_seed_authz_sample_with_unique_value,
+        send=_send,
+        success_status=200,
     )
-    assert resp.status_code == 403
-    assert "biosample:write" in resp.json()["detail"]
-
-
-@pytest.mark.parametrize("tier", ["viewer", "member"])
-async def test_patch_biosample_metadata_below_admin_tier_403(ctx, tier):
-    """Tests the case where a regular user's study access is below the ADMIN
-    clamp (viewer or member): the write is 403.
-    """
-    wet_idx = ctx["wet_session"]["principal_idx"]
-    user_idx = ctx["user_session"]["principal_idx"]
-    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix=f"patch-{tier}")
-    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
-    await _grant_study_access(
-        ctx, study_idx=study_idx, principal_idx=user_idx, tier=tier, granted_by_idx=wet_idx
-    )
-
-    resp = await _patch_biosample_metadata(ctx["user"], study_idx, bs_idx, {"F": "x"})
-    assert resp.status_code == 403, resp.text
-
-
-async def test_patch_biosample_metadata_no_access_403(ctx):
-    """Tests the case where a regular user has no study_access row on the study:
-    the write is 403.
-    """
-    wet_idx = ctx["wet_session"]["principal_idx"]
-    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="patch-noaccess")
-    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
-
-    resp = await _patch_biosample_metadata(ctx["user"], study_idx, bs_idx, {"F": "x"})
-    assert resp.status_code == 403, resp.text
 
 
 async def test_patch_biosample_metadata_admin_tier_writes(ctx):
@@ -4487,3 +4441,462 @@ async def test_post_biosample_deadlock_503(ctx, monkeypatch):
 
     assert resp.status_code == 503, resp.text
     assert resp.headers["Retry-After"] == "1"
+
+
+# ===========================================================================
+# POST /api/v1/study/{study_idx}/biosample/by-unique-field
+# ===========================================================================
+
+
+async def _lookup_by_unique_field(client, study_idx, display_name, value):
+    """POST the by-unique-field lookup with the given identifying pair."""
+    return await client.post(
+        URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD.format(study_idx=study_idx),
+        json={"unique_field_display_name": display_name, "unique_field_value": value},
+    )
+
+
+async def _seed_biosample_carrying_unique_value(ctx, *, suffix, value, data_type="text"):
+    """Seed a study with one unique_in_study field and a biosample carrying
+    `value` through it. Returns (study_idx, display_name, biosample_idx).
+    """
+    study_idx, display_name, _ = await _seed_study_with_unique_field(
+        ctx, suffix=suffix, data_type=data_type
+    )
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+    written = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {display_name: value})
+    assert written.status_code == 200, written.text
+    await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
+    return study_idx, display_name, bs_idx
+
+
+@pytest.mark.parametrize(
+    ("data_type", "value"),
+    [("text", "Sample 1"), ("numeric", "32.87"), ("date", "2026-03-04")],
+)
+async def test_lookup_biosample_in_study_by_unique_field(ctx, data_type, value):
+    """Tests the case where a study's own name for a sample resolves it: the
+    response is that biosample's study-scoped view, carrying the value under
+    the field it was written through and an ETag the caller can reuse. Runs
+    once per data type the unique_in_study policy accepts.
+    """
+    study_idx, display_name, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix=f"lookup-{data_type}", value=value, data_type=data_type
+    )
+
+    resp = await _lookup_by_unique_field(ctx["wet"], study_idx, display_name, value)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["biosample_idx"] == bs_idx
+    assert body["local_metadata"][display_name]["value"] == value
+    expected_etag = await etag_for_row(ctx["pool"], table="qiita.biosample", row_idx=bs_idx)
+    assert resp.headers["ETag"] == expected_etag
+
+
+async def test_lookup_biosample_in_study_by_unique_field_matches_by_idx_read(ctx):
+    """Tests the case where the same biosample is fetched both ways: the
+    by-unique-field response body is the by-idx response body, so the two
+    routes are one view reached by two addresses.
+    """
+    study_idx, display_name, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="lookup-same", value="Sample 1"
+    )
+
+    by_field = await _lookup_by_unique_field(ctx["wet"], study_idx, display_name, "Sample 1")
+    by_idx = await ctx["wet"].get(
+        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
+    )
+
+    assert by_field.status_code == 200, by_field.text
+    assert by_idx.status_code == 200, by_idx.text
+    assert by_field.json() == by_idx.json()
+    assert by_field.headers["ETag"] == by_idx.headers["ETag"]
+
+
+async def test_lookup_biosample_in_study_by_unique_field_strips_padding(ctx):
+    """Tests the case where the identifying pair arrives with surrounding
+    whitespace: both halves strip at the wire, so a padded spelling resolves
+    the same sample as its unpadded one.
+    """
+    study_idx, display_name, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="lookup-pad", value="Sample 1"
+    )
+
+    resp = await _lookup_by_unique_field(
+        ctx["wet"], study_idx, f"  {display_name}  ", "  Sample 1  "
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["biosample_idx"] == bs_idx
+
+
+# ---------------------------------------------------------------------------
+# Resolution refusals shared by every by-unique-field route
+# ---------------------------------------------------------------------------
+
+
+async def _setup_unknown_field(ctx, case):
+    """A study whose fields do not include the name the caller will send."""
+    study_idx, _, _ = await _seed_biosample_carrying_unique_value(
+        ctx, suffix=case, value="Sample 1"
+    )
+    return study_idx, unique_field_name("Absent"), "Sample 1"
+
+
+async def _setup_not_unique_field(ctx, case):
+    """A field holding the value but not declaring unique_in_study."""
+    study_idx, display_name, _ = await _seed_study_with_unique_field(
+        ctx, suffix=case, unique_in_study=False
+    )
+    bs_idx = await _seed_authz_sample(ctx, study_idx)
+    written = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {display_name: "Sample 1"}
+    )
+    assert written.status_code == 200, written.text
+    await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
+    return study_idx, display_name, "Sample 1"
+
+
+async def _setup_unparseable_value(ctx, case):
+    """A numeric field, sent a value that is not a number."""
+    study_idx, display_name, _ = await _seed_biosample_carrying_unique_value(
+        ctx, suffix=case, value="32.87", data_type="numeric"
+    )
+    return study_idx, display_name, "not-a-number"
+
+
+async def _setup_no_match(ctx, case):
+    """A usable field, sent a value no sample in the study carries."""
+    study_idx, display_name, _ = await _seed_biosample_carrying_unique_value(
+        ctx, suffix=case, value="Sample 1"
+    )
+    return study_idx, display_name, "Sample 2"
+
+
+async def _setup_wrong_case(ctx, case):
+    """The stored value, sent in a different case."""
+    study_idx, display_name, _ = await _seed_biosample_carrying_unique_value(
+        ctx, suffix=case, value="Sample 1"
+    )
+    return study_idx, display_name, "sample 1"
+
+
+async def _setup_other_study(ctx, case):
+    """A second study with a same-named unique field and no such value."""
+    _, display_name, _ = await _seed_biosample_carrying_unique_value(
+        ctx, suffix=f"{case}-a", value="Sample 1"
+    )
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    other_study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix=f"{case}-b")
+    created = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=other_study_idx),
+        json={"display_name": display_name, "data_type": "text", "unique_in_study": True},
+    )
+    assert created.status_code == 201, created.text
+    ctx["created"]["biosample_study_field"].append(created.json()["biosample_study_field_idx"])
+    return other_study_idx, display_name, "Sample 1"
+
+
+async def _setup_retired_link(ctx, case):
+    """The value still resolves, but its sample's study link is retired."""
+    study_idx, display_name, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix=case, value="Sample 1"
+    )
+    await retire_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=bs_idx,
+        study_idx=study_idx,
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    return study_idx, display_name, "Sample 1"
+
+
+# case -> (setup, expected status, expected detail fragment). Every by-unique-field
+# route resolves its sample through one helper, so these refusals are one
+# behaviour reached by several verbs rather than a behaviour per route. A case
+# whose routes disagree does not belong here: a retired biosample is 404 on a
+# read and 409 on a write, so it stays a per-route test below.
+#
+# The detail fragment is not decoration. Three cases expect 422, and a write
+# whose resolution wrongly SUCCEEDED would also answer 422 from its metadata
+# body -- so status alone would pass those cases for the wrong reason.
+_UNIQUE_FIELD_RESOLUTION: dict[str, tuple[Callable, int, str]] = {
+    "unknown_field": (_setup_unknown_field, 422, "does not exist on study"),
+    "not_unique_field": (_setup_not_unique_field, 422, "not unique within the study"),
+    "unparseable_value": (_setup_unparseable_value, 422, "could not parse metadata field"),
+    "no_match": (_setup_no_match, 404, "through field"),
+    "wrong_case": (_setup_wrong_case, 404, "through field"),
+    "other_study": (_setup_other_study, 404, "through field"),
+    "retired_link": (_setup_retired_link, 404, "is not linked to study"),
+}
+UNIQUE_FIELD_RESOLUTION_CASES = tuple(_UNIQUE_FIELD_RESOLUTION)
+
+
+async def _assert_unique_field_resolution(ctx, *, case, send):
+    """Drive one shared resolution case and assert its status and reason.
+
+    `send(client, study_idx, display_name, value)` issues the route's own
+    request, so one driver serves every route that addresses a sample this way.
+    """
+    setup, expected_status, expected_detail = _UNIQUE_FIELD_RESOLUTION[case]
+    study_idx, display_name, value = await setup(ctx, case)
+
+    resp = await send(ctx["wet"], study_idx, display_name, value)
+
+    assert resp.status_code == expected_status, resp.text
+    assert expected_detail in resp.json()["detail"], resp.text
+
+
+@pytest.mark.parametrize("case", UNIQUE_FIELD_RESOLUTION_CASES)
+async def test_lookup_biosample_in_study_by_unique_field_resolution(ctx, case):
+    """Tests the case where each shared resolution case reaches the lookup."""
+    await _assert_unique_field_resolution(ctx, case=case, send=_lookup_by_unique_field)
+
+
+async def test_lookup_biosample_in_study_by_unique_field_retired_biosample_404(ctx):
+    """Tests the case where the resolved biosample is itself retired: the read
+    answers 404, matching the by-idx read's retired carve-out.
+    """
+    study_idx, display_name, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="lookup-retbs", value="Sample 1"
+    )
+    await retire_biosample(
+        ctx["pool"], biosample_idx=bs_idx, retired_by_idx=ctx["wet_session"]["principal_idx"]
+    )
+
+    resp = await _lookup_by_unique_field(ctx["wet"], study_idx, display_name, "Sample 1")
+
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+async def test_lookup_biosample_in_study_by_unique_field_authz(ctx, case, no_biosample_read_client):
+    """Tests the case where each row of the study-scoped sample access matrix
+    calls the lookup: the route enforces the same bar as its by-idx twin.
+    """
+
+    async def _send(client, study_idx, sample_idx):
+        return await _lookup_by_unique_field(
+            client, study_idx, _AUTHZ_FIELD_NAME, _AUTHZ_FIELD_VALUE
+        )
+
+    await assert_study_scoped_sample_authz(
+        ctx,
+        case=case,
+        no_scope_client=no_biosample_read_client,
+        seed_sample=_seed_authz_sample_with_unique_value,
+        send=_send,
+        success_status=200,
+    )
+
+
+# ===========================================================================
+# PATCH /api/v1/study/{study_idx}/biosample/by-unique-field/metadata
+# ===========================================================================
+
+
+async def _patch_by_unique_field(client, study_idx, display_name, value, metadata=None):
+    """PATCH the by-unique-field metadata route.
+
+    `metadata` defaults to a one-key probe body, for the cases that expect the
+    request to be refused during resolution and so never reach the write.
+    """
+    return await client.patch(
+        URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD.format(study_idx=study_idx),
+        json={
+            "unique_field_display_name": display_name,
+            "unique_field_value": value,
+            "metadata": metadata if metadata is not None else {"Probe Field": "x"},
+        },
+    )
+
+
+@pytest.mark.parametrize("case", UNIQUE_FIELD_RESOLUTION_CASES)
+async def test_patch_biosample_metadata_by_unique_field_resolution(ctx, case):
+    """Tests the case where each shared resolution case reaches the write."""
+    await _assert_unique_field_resolution(ctx, case=case, send=_patch_by_unique_field)
+
+
+async def test_patch_biosample_metadata_by_unique_field(ctx):
+    """Tests the case where a study's own name for a sample addresses a write:
+    the value lands on that biosample and the response reports the idx it
+    resolved to alongside the per-field result.
+    """
+    study_idx, id_field, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="wpatch-ok", value="Sample 1"
+    )
+    target_field = f"Target {secrets.token_hex(4)}"
+    target_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=study_idx,
+        display_name=target_field,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(target_idx)
+
+    resp = await _patch_by_unique_field(
+        ctx["wet"], study_idx, id_field, "Sample 1", metadata={target_field: "LVAL"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
+    expected = {
+        "biosample_idx": bs_idx,
+        "results": {
+            target_field: {
+                "scope": "local",
+                "outcome": "inserted",
+                "value": "LVAL",
+                "internal_name": None,
+            }
+        },
+    }
+    assert resp.json() == expected
+
+
+async def test_patch_biosample_metadata_by_unique_field_matches_by_idx_write(ctx):
+    """Tests the case where the same write is issued both ways: the
+    by-unique-field response is the by-idx response plus the resolved
+    biosample_idx, so the two addresses share one write path.
+    """
+    study_idx, id_field, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="wpatch-parity", value="Sample 1"
+    )
+    target_field = f"Target {secrets.token_hex(4)}"
+    target_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        study_idx=study_idx,
+        display_name=target_field,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(target_idx)
+
+    by_idx = await _patch_biosample_metadata(ctx["wet"], study_idx, bs_idx, {target_field: "LVAL"})
+    assert by_idx.status_code == 200, by_idx.text
+    await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], bs_idx, study_idx, [])
+
+    # Re-writing the same value is UNCHANGED through either address, so the two
+    # bodies are comparable without the second write racing the first.
+    by_idx_again = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {target_field: "LVAL"}
+    )
+    by_field = await _patch_by_unique_field(
+        ctx["wet"], study_idx, id_field, "Sample 1", metadata={target_field: "LVAL"}
+    )
+
+    assert by_idx_again.status_code == 200, by_idx_again.text
+    assert by_field.status_code == 200, by_field.text
+    assert by_field.json() == by_idx_again.json() | {"biosample_idx": bs_idx}
+
+
+async def test_patch_biosample_metadata_by_unique_field_renames_identifying_value(ctx):
+    """Tests the case where the identifying field is itself written: resolution
+    runs first, so the sample is found under its old value and left carrying
+    the new one -- the only way to correct a mistyped id.
+    """
+    study_idx, id_field, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="wpatch-rename", value="Sample 1"
+    )
+
+    resp = await _patch_by_unique_field(
+        ctx["wet"], study_idx, id_field, "Sample 1", metadata={id_field: "Sample 1 fixed"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["results"][id_field]["value"] == "Sample 1 fixed"
+    # The old value no longer names the sample, and the new one does.
+    stale = await _lookup_by_unique_field(ctx["wet"], study_idx, id_field, "Sample 1")
+    assert stale.status_code == 404, stale.text
+    renamed = await _lookup_by_unique_field(ctx["wet"], study_idx, id_field, "Sample 1 fixed")
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["biosample_idx"] == bs_idx
+
+
+async def test_patch_biosample_metadata_by_unique_field_owner_id_identifies_not_written(ctx):
+    """Tests the case where the owner-biosample-id field is the identifier: it
+    is unique_in_study so it resolves the sample, but naming it in the body is
+    the same 422 the by-idx write gives, since it is changed only through its
+    own surface.
+    """
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="wpatch-ownerid")
+    owner_field = unique_field_name("OwnerId")
+    created = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=wet_idx,
+        owner_biosample_id_field_name=owner_field,
+        owner_biosample_id_value="OWNER-1",
+    )
+    assert created.status_code == 201, created.text
+
+    resp = await _patch_by_unique_field(
+        ctx["wet"], study_idx, owner_field, "OWNER-1", metadata={owner_field: "OWNER-2"}
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "owner-sample-id field" in resp.json()["detail"]
+
+
+async def test_patch_biosample_metadata_by_unique_field_retired_biosample_409(ctx):
+    """Tests the case where the resolved biosample is retired: unlike the read,
+    which answers 404, a write answers 409 -- its metadata cannot be written.
+    """
+    study_idx, id_field, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="wpatch-retbs", value="Sample 1"
+    )
+    await retire_biosample(
+        ctx["pool"], biosample_idx=bs_idx, retired_by_idx=ctx["wet_session"]["principal_idx"]
+    )
+
+    resp = await _patch_by_unique_field(ctx["wet"], study_idx, id_field, "Sample 1")
+
+    assert resp.status_code == 409, resp.text
+    assert "retired" in resp.json()["detail"]
+
+
+async def test_patch_biosample_metadata_by_unique_field_empty_metadata_422(ctx):
+    """Tests the case where the metadata dict is empty: the wire boundary
+    refuses it before the route resolves anything.
+    """
+    study_idx, id_field, _ = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="wpatch-empty", value="Sample 1"
+    )
+
+    resp = await _patch_by_unique_field(ctx["wet"], study_idx, id_field, "Sample 1", metadata={})
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+async def test_patch_biosample_metadata_by_unique_field_authz(
+    ctx, case, no_biosample_write_patch_client
+):
+    """Tests the case where each row of the study-scoped sample access matrix
+    calls the by-unique-field write: it enforces the same bar as its by-idx
+    twin. The allowed rows rewrite the value the seed already wrote, so a
+    permitted call answers 200 without depending on the write's outcome.
+    """
+
+    async def _send(client, study_idx, sample_idx):
+        return await _patch_by_unique_field(
+            client,
+            study_idx,
+            _AUTHZ_FIELD_NAME,
+            _AUTHZ_FIELD_VALUE,
+            metadata={_AUTHZ_FIELD_NAME: _AUTHZ_FIELD_VALUE},
+        )
+
+    await assert_study_scoped_sample_authz(
+        ctx,
+        case=case,
+        no_scope_client=no_biosample_write_patch_client,
+        seed_sample=_seed_authz_sample_with_unique_value,
+        send=_send,
+        success_status=200,
+    )

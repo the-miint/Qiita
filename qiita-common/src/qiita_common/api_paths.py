@@ -896,6 +896,17 @@ PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 # anchor on the /study router (the caller is authorized on the study).
 PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
 PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
+# The same study-scoped view, for a caller holding a study's own unique id for the
+# sample instead of its idx: a unique-in-study field's display_name and the
+# value it carries. POST (not GET) because the identifying value lives in the
+# body — it can be the owner's own sample name, which is restricted and
+# sometimes carries PII, so it must stay out of URLs and access logs.
+PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD = "/{study_idx}/biosample/by-unique-field"
+# The metadata upsert under that same addressing, so a caller who never holds an
+# idx can complete a read-modify-write. It must be declared to FastAPI ahead of
+# the {biosample_idx} form above: both are PATCH on the same path shape, and the
+# literal segment is unreachable if the parameterized route registers first.
+PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD = "/{study_idx}/biosample/by-unique-field/metadata"
 # Create a study-local biosample field definition (POST). The study-scoped mint
 # hangs off the /study router (the caller is authorized on the study); the
 # by-idx path addresses a single definition under it, to read (GET) or edit
@@ -921,6 +932,10 @@ URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
 URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
+URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
+URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD = (
+    f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD}"
+)
 URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
 URL_BIOSAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"

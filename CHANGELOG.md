@@ -21,6 +21,29 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Write a biosample's metadata by the study's own name for it —
+  `PATCH /api/v1/study/{study_idx}/biosample/by-unique-field/metadata` (#N).** The
+  by-idx metadata write, addressed by a `unique_in_study` field's `display_name` and
+  the value it carries, so a read-modify-write never has to handle a `biosample_idx`;
+  the response adds the idx the pair resolved to. The identifying field may itself
+  appear in the body — resolution runs first, so such a write renames the sample under
+  the value that found it, which is the only way to correct a mistyped id. The
+  owner-biosample-id field is the exception: it identifies, but writing it stays a 422.
+  A retired biosample is 409 here, where the matching read answers 404. Access, and
+  every other refusal, are the by-idx write's.
+- **Read a biosample by the study's own name for it —
+  `POST /api/v1/study/{study_idx}/biosample/by-unique-field` (#N).** Returns the same
+  study-scoped view as the by-idx read, for a caller holding a `unique_in_study`
+  field's `display_name` and the value that field carries rather than a
+  `biosample_idx`. POST rather than GET because the identifying value can be the
+  owner's own name for the sample, which is restricted and sometimes carries PII, so
+  it stays out of URLs and access logs. The named field must exist on the study and
+  must declare `unique_in_study` — without it the value could name several samples, so
+  the lookup is refused (422) rather than resolved arbitrarily — and the value must
+  parse as the field's data type (422); a well-formed pair naming no sample is 404.
+  Matching is case-sensitive on both halves, following the study field's key and the
+  partial unique index over the stored value. The access bar, and the 404 on a retired
+  sample or retired study link, are those of the by-idx read.
 - **A study-local sample field can be widened to text, taking its stored values
   with it (#628).** A field minted as numeric, boolean, or date could not be redeclared once
   values existed: the field-contract check runs when a metadata row is written, not when

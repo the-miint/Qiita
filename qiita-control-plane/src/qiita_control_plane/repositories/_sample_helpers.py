@@ -139,6 +139,10 @@ class FieldRow:
     field). internal_name is that global field's stable identifier — its own for
     a *_global_field row, the linked global's for a globally-linked *_study_field
     row, and None on a purely-local field.
+
+    unique_in_study is None on a *_global_field row: the column lives on
+    *_study_field only, because the guarantee it names is scoped to one study
+    and a global field spans every study linked to it.
     """
 
     idx: int
@@ -150,6 +154,7 @@ class FieldRow:
     # field can equal its own FK by coincidence.
     global_field_idx: int | None
     internal_name: str | None
+    unique_in_study: bool | None = None
 
     def __post_init__(self) -> None:
         _assert_global_link_consistent(self.global_field_idx, self.internal_name)
@@ -770,6 +775,10 @@ def _field_rows_by_key(
     """Key field-lookup rows by the named column, wrapping each in FieldRow.
     Each row must carry key_column plus idx, display_name, data_type,
     terminology_idx, global_field_idx, and internal_name columns.
+
+    unique_in_study is read with a default because only the study-field read
+    selects it; a global-field row leaves it None, which is the value that
+    column's absence means.
     """
     return {
         r[key_column]: FieldRow(
@@ -779,6 +788,7 @@ def _field_rows_by_key(
             terminology_idx=r["terminology_idx"],
             global_field_idx=r["global_field_idx"],
             internal_name=r["internal_name"],
+            unique_in_study=r.get("unique_in_study"),
         )
         for r in rows
     }
@@ -836,6 +846,9 @@ async def fetch_study_fields_by_display_names(
     the row's FK, None on a purely-local field, and internal_name comes from the
     linked global field, None for the same reason. Names with no matching row are
     absent from the returned dict; empty input short-circuits with no DB call.
+
+    unique_in_study comes back as the row stores it, so a caller can tell
+    whether the field's values are guaranteed distinct within the study.
     """
     # Materialize so emptiness is detectable and the param can be passed as ANY.
     names = list(display_names)
@@ -850,7 +863,8 @@ async def fetch_study_fields_by_display_names(
         f"SELECT sf.idx, sf.display_name,"
         f" COALESCE(sf.data_type, gf.data_type) AS data_type,"
         f" COALESCE(sf.terminology_idx, gf.terminology_idx) AS terminology_idx,"
-        f" sf.{fk_column} AS global_field_idx, gf.internal_name"
+        f" sf.{fk_column} AS global_field_idx, gf.internal_name,"
+        f" sf.unique_in_study"
         f" FROM {spec.study_field_table} sf"
         f" LEFT JOIN {spec.global_field_table} gf ON gf.idx = sf.{fk_column}"
         f" WHERE sf.study_idx = $1 AND sf.display_name = ANY($2::text[])",
@@ -858,6 +872,51 @@ async def fetch_study_fields_by_display_names(
         names,
     )
     return _field_rows_by_key(rows, key_column="display_name")
+
+
+async def fetch_entity_idx_by_unique_field_value(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_field_idx: int,
+    data_type: FieldDataType,
+    value: str | Decimal | date | bool,
+) -> int | None:
+    """Return the entity idx carrying `value` through the given study field, or
+    None when no row does.
+
+    The caller must have established that the field declares unique_in_study;
+    without it two entities may hold the same value and this returns an
+    arbitrary one of them. Under the flag the partial unique index over
+    (study_field_idx, value_<type>) makes at most one row match, so the answer
+    is total.
+
+    No study_idx term is needed: a study field belongs to exactly one study, so
+    naming the field already scopes the search to it. Matching is whatever the
+    value column's type does — case-sensitive for text, numeric equality for
+    numerics — which is the same comparison the unique index enforces.
+
+    Retired entities and retired study links are NOT excluded: they keep
+    holding their value, and the index keeps enforcing it, so resolution stays
+    total and retirement is the caller's decision to make afterwards.
+    """
+    # Closed-set lookup; a data_type with no typed column reaches the write and
+    # read guards as NotImplementedError rather than matching NULL here.
+    value_column = GLOBAL_METADATA_VALUE_COLUMN[data_type]
+    # The unique_in_study term restates what the caller already established, so
+    # it selects no differently -- it is here to spell the partial index's own
+    # predicate, which the planner needs in order to use that index. The row
+    # column is trigger-maintained from the field's, so the two cannot disagree.
+    row = await pool_or_conn.fetchrow(
+        f"SELECT {spec.entity_key_column}"
+        f" FROM {spec.metadata_table}"
+        f" WHERE {spec.study_field_idx_column} = $1"
+        f"   AND {value_column} = $2"
+        f"   AND unique_in_study",
+        study_field_idx,
+        value,
+    )
+    return None if row is None else row[spec.entity_key_column]
 
 
 async def fetch_missing_value_reason_idxs_by_names(

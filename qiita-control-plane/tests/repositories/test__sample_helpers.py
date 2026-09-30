@@ -2221,6 +2221,7 @@ async def test_fetch_study_fields_by_display_names_returns_local_and_linked(ctx,
             terminology_idx=None,
             global_field_idx=None,
             internal_name=None,
+            unique_in_study=False,
         ),
         linked_name: FieldRow(
             idx=linked_idx,
@@ -2229,6 +2230,7 @@ async def test_fetch_study_fields_by_display_names_returns_local_and_linked(ctx,
             terminology_idx=None,
             global_field_idx=global_field.idx,
             internal_name=global_field.internal_name,
+            unique_in_study=False,
         ),
     }
     assert result == expected

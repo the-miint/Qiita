@@ -877,6 +877,82 @@ async def assert_study_field_create_conflict(
 
 
 # ---------------------------------------------------------------------------
+# Study-scoped sample routes: shared access matrix
+# ---------------------------------------------------------------------------
+
+
+# case -> (study owner, tier granted to the regular user, calling client,
+# expected status) for the study-scoped sample routes. The same ADMIN floor as
+# the field table above, plus an unauthenticated row and both sub-admin tiers:
+# viewer and member are listed separately because each pins the floor from a
+# different side. "anon" names the unauthenticated client the driver builds
+# rather than one the caller supplies.
+_STUDY_SCOPED_SAMPLE_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
+    "owner": ("user", None, "user", None),
+    "admin_grant": ("wet", "admin", "user", None),
+    "wet_lab_admin_bypass": ("user", None, "wet", None),
+    "no_access": ("wet", None, "user", 403),
+    "below_admin_viewer": ("wet", "viewer", "user", 403),
+    "below_admin_member": ("wet", "member", "user", 403),
+    "missing_scope": ("user", None, "no_scope", 403),
+    "anonymous": ("user", None, "anon", 401),
+    "nonexistent_study": (None, None, "wet", 404),
+}
+STUDY_SCOPED_SAMPLE_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_AUTHZ)
+
+# Path idx for the case whose study does not exist: no sample is seeded, and
+# the study gate answers before anything reads this.
+_UNUSED_SAMPLE_IDX = 1
+
+
+async def assert_study_scoped_sample_authz(
+    ctx,
+    *,
+    case: str,
+    no_scope_client,
+    seed_sample,
+    send,
+    success_status: int,
+) -> None:
+    """Drive one access case of a study-scoped sample route and assert its status.
+
+    `case` names a row of `_STUDY_SCOPED_SAMPLE_AUTHZ`, which fixes the study's
+    ownership, any grant to the regular user, the calling client, and the
+    expected status; a None status means the case is allowed and
+    `success_status` is expected instead. `seed_sample(ctx, study_idx)` seeds
+    the sample the route addresses and returns its idx, and
+    `send(client, study_idx, sample_idx)` issues the request, so one driver
+    serves routes with different verbs and bodies. `no_scope_client` is a PAT
+    client lacking the route's own scope.
+
+    The unauthenticated case drives the ASGI app directly, since every role
+    client carries a token by construction.
+    """
+    owner_key, grant_tier, client_key, expected_status = _STUDY_SCOPED_SAMPLE_AUTHZ[case]
+    study_idx = await _seed_authz_case_study(
+        ctx, owner_key=owner_key, grant_tier=grant_tier, case=case
+    )
+    # A case with no study has nothing to hang a sample off; the study gate
+    # answers before the route reads the sample either way.
+    sample_idx = _UNUSED_SAMPLE_IDX if owner_key is None else await seed_sample(ctx, study_idx)
+
+    if client_key == "anon":
+        # Deferred like every other reference to the app in this file: importing
+        # it constructs the FastAPI application.
+        from qiita_control_plane.main import app
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+            resp = await send(anon, study_idx, sample_idx)
+    else:
+        client = {"user": ctx["user"], "wet": ctx["wet"], "no_scope": no_scope_client}[client_key]
+        resp = await send(client, study_idx, sample_idx)
+
+    assert resp.status_code == (success_status if expected_status is None else expected_status), (
+        resp.text
+    )
+
+
+# ---------------------------------------------------------------------------
 # Generic FK-reverse delete helper
 # ---------------------------------------------------------------------------
 
