@@ -15,7 +15,15 @@ def test_detect_accession_kind_study(accession):
 
 @pytest.mark.parametrize(
     "accession",
-    ["SAMEA3610311", "SAMN01821487", "SAME1234567", "SAMD00123456"],
+    [
+        "SAMEA3610311",
+        "SAMEG70402",
+        "SAMN01821487",
+        "SAMNA0001",
+        "SAME1234567",
+        "SAMD00123456",
+        "SAMDA0001",
+    ],
 )
 def test_detect_accession_kind_sample(accession):
     from qiita_common.ena_accession import EnaAccessionKind, detect_accession_kind
@@ -78,6 +86,59 @@ def test_detect_accession_kind_rejects_unknown_prefix(accession):
 
     with pytest.raises(InvalidEnaAccessionError, match="does not match a known"):
         detect_accession_kind(accession)
+
+
+@pytest.mark.parametrize(
+    "accession",
+    [
+        "PRJEB",
+        "PRJEBxyz",
+        "PRJEB11419,PRJNA1",
+        "PRJEB11419 PRJNA1",
+        "PRJEB١٢٣",
+        "SAMN",
+        "SAMEA",
+        "SAMEAB123",
+        "SAMEa123",
+        "ERR12a",
+        "SRX",
+    ],
+)
+def test_detect_accession_kind_rejects_malformed_shape(accession):
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        detect_accession_kind,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError, match="does not match a known"):
+        detect_accession_kind(accession)
+
+
+def test_malformed_accession_message_asks_for_digits():
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        detect_accession_kind,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError) as exc_info:
+        detect_accession_kind("PRJEB")
+    message = str(exc_info.value)
+    assert "followed by digits, e.g. PRJEB11419" in message
+    assert "SAMN/SAME/SAMD, optionally followed by one letter" in message
+
+
+@pytest.mark.parametrize(
+    "accession",
+    ["PRJEB", "PRJEB11419,PRJNA1", "PRJEB11419 PRJNA1"],
+)
+def test_validate_study_accession_rejects_malformed_shape(accession):
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        validate_study_accession,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError):
+        validate_study_accession(accession)
 
 
 def test_validate_study_accession_returns_trimmed():

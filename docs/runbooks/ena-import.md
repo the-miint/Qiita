@@ -220,6 +220,16 @@ control-plane host and `probe/ena-from-compute` from a compute node. What each r
 covers, what a green one does *not* prove, and which hatch skips which are in
 [`redeploy.md` §7](redeploy.md#7-verify).
 
-An unresolvable accession (malformed, or one ENA does not recognize) fails loud with
-an actionable message rather than resolving to a silent empty result — see
-`qiita_common.ena_accession` for the accepted prefix sets per accession kind.
+An accession must be one of these prefixes followed by digits, e.g. `PRJEB11419`:
+
+| Kind | Prefixes |
+|---|---|
+| study | `PRJNA`, `PRJEB`, `PRJDB`, `ERP`, `SRP`, `DRP` |
+| sample | `SAMN`, `SAME`, `SAMD`, optionally followed by one letter (`SAMEA`, `SAMEG`) |
+| run | `SRR`, `ERR`, `DRR` |
+| experiment | `SRX`, `ERX`, `DRX` |
+
+Submit takes study accessions only; anything else, including a well-formed sample or
+run, is refused at submit (CLI exit 2, HTTP 422) and no batch is created. An accession
+of the right shape that ENA does not recognize fails loud with an actionable message
+rather than resolving to a silent empty result.

@@ -2004,6 +2004,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **`qiita submit-ena-import` and `POST /ena-import-batch` refuse a malformed accession
+  at submit (#635).** The shared validator checked only the prefix, so a bare `PRJEB`,
+  `PRJEBxyz` or `PRJEB11419,PRJNA1` was accepted and then failed item by item in the
+  background resolve. An accession must now be a known prefix followed by digits (a
+  sample prefix may carry one letter, as in `SAMEA` or `SAMEG`, per ENA's accession
+  guide); anything else exits 2 or answers 422 before a batch is created
+  (duckdb-miint#288).
+
 - **Native sequenced-sample import now locks its sequencing run and refuses pools whose download roster is already staged** — the POST route takes #602's sequencing_run advisory lock around the insert and 409s (covering a queued download ticket too) when the pool's latest download-ena-study ticket has already read its run roster, naming the run and telling the caller to add the sample to a new pool instead. The lock wait is bounded at 5s, well under the CLI's own HTTP timeout, and a wait that exhausts it answers 503 with Retry-After rather than an unbounded hang (#627).
 
 - **The `reference_load` tests pin the host RAM they assume (#616).** Off SLURM,

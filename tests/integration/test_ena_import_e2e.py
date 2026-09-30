@@ -39,7 +39,10 @@ from qiita_control_plane.repositories.sequenced_sample import (
     fetch_sequenced_pool_ena_run_roster,
 )
 from qiita_control_plane.testing.db_seeds import seed_user_principal
-from qiita_control_plane.testing.unique_names import unique_accession
+from qiita_control_plane.testing.unique_names import (
+    unique_accession,
+    unique_ena_accession,
+)
 
 _DOWNLOAD_ENA_STUDY_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "download-ena-study" / "1.0.0.yaml"
@@ -447,7 +450,7 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
     Then re-runs the batch driver's per-study step a second time and
     asserts registration-level idempotency (no new study/biosample, no
     duplicate reads)."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     shared_sample_accession = unique_accession("SAMN")
     fake_runs, fake_attrs = _make_two_runs_sharing_one_sample(shared_sample_accession)
     monkeypatch.setattr(_QUERY_STUDY, _fake_study_header)

@@ -36,7 +36,10 @@ from qiita_control_plane.testing.db_seeds import (
     seed_user_principal,
 )
 from qiita_control_plane.testing.postgres import POSTGRES_POOL_MAX_SIZE
-from qiita_control_plane.testing.unique_names import unique_accession
+from qiita_control_plane.testing.unique_names import (
+    unique_accession,
+    unique_ena_accession,
+)
 
 pytestmark = pytest.mark.db
 
@@ -426,7 +429,7 @@ async def batch_cleanup(postgres_pool):
 async def test_create_ena_import_batch_seeds_pending_items(
     postgres_pool, admin_principal, batch_cleanup
 ):
-    accessions = [unique_accession("PRJNA"), unique_accession("PRJEB")]
+    accessions = [unique_ena_accession("PRJNA"), unique_ena_accession("PRJEB")]
     batch_idx, items = await create_ena_import_batch(
         postgres_pool,
         accessions=accessions,
@@ -457,7 +460,7 @@ async def test_create_ena_import_batch_rejects_invalid_accession_writes_nothing(
 ):
     from qiita_common.ena_accession import InvalidEnaAccessionError
 
-    good = unique_accession("PRJNA")
+    good = unique_ena_accession("PRJNA")
     bad = "SAMN0000001"  # a SAMPLE accession, not a study accession
 
     with pytest.raises(InvalidEnaAccessionError):
@@ -481,7 +484,7 @@ async def test_create_ena_import_batch_rejects_invalid_accession_writes_nothing(
 async def test_process_one_study_registers_and_submits_download_ticket(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession],
@@ -531,7 +534,7 @@ async def test_process_one_study_empty_sample_attributes_registers_not_failed(
     SAMD01818724). An empty resolve result must register normally, never fail the item."""
     monkeypatch.setattr(_QUERY_ATTRS, lambda accession: [])
 
-    accession = unique_accession("PRJDB")
+    accession = unique_ena_accession("PRJDB")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession],
@@ -603,7 +606,7 @@ async def test_process_one_study_rejects_non_audience_principal_no_ticket_create
         retired=False,
     )
 
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession],
@@ -693,8 +696,8 @@ async def test_batch_dedupes_shared_biosample_across_two_items(
     monkeypatch.setattr(_QUERY_RUNS, fake_runs)
     monkeypatch.setattr(_QUERY_ATTRS, fake_attrs)
 
-    accession_a = unique_accession("PRJNA")
-    accession_b = unique_accession("PRJEB")
+    accession_a = unique_ena_accession("PRJNA")
+    accession_b = unique_ena_accession("PRJEB")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession_a, accession_b],
@@ -747,8 +750,8 @@ async def test_batch_dedupes_shared_biosample_across_two_items(
 async def test_run_batch_isolates_per_study_failure(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
 ):
-    ok_accession = unique_accession("PRJNA")
-    bad_accession = unique_accession("PRJEB")
+    ok_accession = unique_ena_accession("PRJNA")
+    bad_accession = unique_ena_accession("PRJEB")
 
     real_query_runs = __import__(
         "qiita_control_plane.ena_import.miint_resolver", fromlist=["_query_ena_runs"]
@@ -802,7 +805,7 @@ async def test_run_batch_isolates_per_study_failure(
 async def test_fetch_batch_status_rolls_up_downloading_to_done(
     postgres_pool, admin_principal, download_ena_study_action, dummy_reference_idx, batch_cleanup
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession],
@@ -844,7 +847,7 @@ async def test_fetch_batch_status_rolls_up_downloading_to_done(
 async def test_fetch_batch_status_rolls_up_in_flight_ticket_to_downloading(
     postgres_pool, admin_principal, download_ena_study_action, dummy_reference_idx, batch_cleanup
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession],
@@ -885,7 +888,7 @@ async def test_fetch_batch_status_rolls_up_in_flight_ticket_to_downloading(
 async def test_fetch_batch_status_rolls_up_failed_ticket_without_failing_batch(
     postgres_pool, admin_principal, download_ena_study_action, dummy_reference_idx, batch_cleanup
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession],
@@ -947,7 +950,7 @@ async def test_fetch_batch_status_missing_batch_returns_none(postgres_pool):
 async def test_reconcile_inflight_batches_redrives_pending_items(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, _items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession],
@@ -990,7 +993,7 @@ async def test_reconcile_inflight_batches_refuses_disabled_principal(
 ):
     """A batch whose admin was DISABLED after submission is not re-driven on their
     behalf: the item fails with the reason, no study or ticket is created."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, _items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession],
@@ -1032,7 +1035,7 @@ async def test_reconcile_inflight_batches_refuses_retired_principal(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
 ):
     """Same guard, retired instead of disabled -- failed identically."""
-    accession = unique_accession("PRJEB")
+    accession = unique_ena_accession("PRJEB")
     batch_idx, _items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession],
@@ -1067,7 +1070,7 @@ async def test_create_ena_import_batch_dedupes_repeated_accession(
 ):
     """A repeated accession in one request fans out a single item, not two
     concurrent items registering the same study."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession, accession],
@@ -1097,7 +1100,7 @@ async def test_process_one_study_zero_pools_reaches_terminal_failed(
 
     monkeypatch.setattr(_QUERY_RUNS, _fake_runs_unmappable)
 
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession],
@@ -1130,7 +1133,7 @@ async def test_fetch_batch_status_missing_ticket_row_stays_downloading(
     """A ticket idx with no matching work_ticket row yields state None in the
     rollup -- not terminal-success -- so the item stays `downloading`, never
     reads as `done`."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool,
         accessions=[accession],
@@ -1179,7 +1182,7 @@ async def test_process_one_study_surfaces_per_run_outcomes(
 ):
     """GET /ena-import-batch/{idx} carries per-run outcomes: each run's status,
     which the driver used to compute and store."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, _items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(batch_idx)
 
@@ -1209,7 +1212,7 @@ async def test_process_one_study_all_runs_failed_reaches_terminal_failed(
 
     monkeypatch.setattr(_QUERY_ATTRS, _bad_latitude_attrs)
 
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, _items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(batch_idx)
 
@@ -1243,7 +1246,7 @@ async def test_reconcile_redrives_registered_item_stranded_before_submit(
     """A crash in the registered->downloading window leaves the item at `registered`
     with no tickets. reconcile must re-drive it -- previously it stranded because
     the filter matched pending/resolving only."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(batch_idx)
 
@@ -1281,7 +1284,7 @@ async def test_reconcile_registered_item_reuses_already_submitted_ticket(
     """Re-driving a `registered` item that already submitted its ticket must REUSE
     it, not re-submit -- a sequenced_pool re-submit would 409 and wrongly fail the
     whole item. Exactly one ticket, no duplicate."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(batch_idx)
 
@@ -1334,7 +1337,7 @@ async def test_interrupted_item_keeps_the_record_of_the_study_it_created(
 
     monkeypatch.setattr(batch_module, "register_ena_study", _cancelled)
 
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool, accessions=[accession], principal=admin_principal
     )
@@ -1373,7 +1376,7 @@ async def test_item_failed_after_creating_its_study_does_not_block_reimport(
         raise RuntimeError("boom")
 
     monkeypatch.setattr(batch_module, "register_ena_study", _boom)
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     first_idx, first_items = await _drive_one_study(
         batch_app, postgres_pool, admin_principal, accession
     )
@@ -1407,7 +1410,7 @@ async def test_import_refuses_a_study_no_import_created(
     bioproject_accession too, so the accession lookup matches it. Importing must
     refuse rather than merge ENA samples into curated data -- and refuse before
     writing anything."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     async with postgres_pool.acquire() as conn, conn.transaction():
         native = await create_study(
             conn,
@@ -1452,7 +1455,7 @@ async def test_import_refuses_a_study_no_import_created_matched_by_secondary_acc
     """Same guard as `test_import_refuses_a_study_no_import_created`, but the
     native study is matched via ena_study_accession (bioproject_accession
     NULL) rather than bioproject_accession."""
-    ena_accession = unique_accession("ERP")
+    ena_accession = unique_ena_accession("ERP")
     async with postgres_pool.acquire() as conn, conn.transaction():
         native = await create_study(
             conn,
@@ -1463,7 +1466,7 @@ async def test_import_refuses_a_study_no_import_created_matched_by_secondary_acc
         )
     native_idx = native["idx"]
 
-    fresh_bioproject = unique_accession("PRJEB")
+    fresh_bioproject = unique_ena_accession("PRJEB")
     monkeypatch.setattr(
         _QUERY_STUDY,
         lambda accession: (
@@ -1507,7 +1510,7 @@ async def test_import_allows_a_study_an_earlier_batch_created(
     """The guard must not block the ongoing-bioproject case: an accession a
     previous batch imported is re-importable, which is how a study that gains
     runs over time picks them up."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     first_idx, first_items = await _drive_one_study(
         batch_app, postgres_pool, admin_principal, accession
     )
@@ -1578,7 +1581,7 @@ async def test_reimport_puts_new_runs_in_a_new_pool_once_the_old_download_comple
     read at dispatch, and a resubmit would re-register the old reads), so a
     re-import's new runs get their own pool and ticket, and the item reports
     `done` only once that ticket completes too."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, first_items = await _drive_one_study(
         batch_app, postgres_pool, admin_principal, accession
@@ -1614,7 +1617,7 @@ async def test_reimport_puts_new_runs_in_a_new_pool_once_the_old_download_comple
 async def test_reimport_with_no_new_runs_reuses_the_completed_ticket(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     first_idx, first_items = await _drive_one_study(
         batch_app, postgres_pool, admin_principal, accession
     )
@@ -1654,7 +1657,7 @@ async def test_reimport_resubmits_a_download_that_did_not_complete(
     batch_cleanup,
     ended_state,
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     first_idx, first_items = await _drive_one_study(
         batch_app, postgres_pool, admin_principal, accession
     )
@@ -1700,7 +1703,7 @@ async def test_submit_conflict_reuses_the_ticket_a_concurrent_batch_submitted(
     re-running the run-wide fetch."""
     from qiita_control_plane.ena_import import batch as batch_module
 
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     first_idx, first_items = await _drive_one_study(
         batch_app, postgres_pool, admin_principal, accession
     )
@@ -1765,7 +1768,7 @@ async def test_platform_whose_runs_all_failed_gets_no_ticket(
 ):
     """A failed platform must neither submit a ticket that can only fail on an empty
     pool nor drag the item to `failed` when the other platform downloads."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(
         _QUERY_RUNS, lambda a: _fake_run_rows(a, [("ok", "ILLUMINA"), ("bad", "OXFORD_NANOPORE")])
     )
@@ -1793,7 +1796,7 @@ async def test_platform_whose_runs_all_failed_gets_no_ticket(
 async def test_fetch_batch_status_rolls_up_cancelled_ticket_to_failed(
     postgres_pool, admin_principal, download_ena_study_action, dummy_reference_idx, batch_cleanup
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool, accessions=[accession], principal=admin_principal
     )
@@ -1834,7 +1837,7 @@ async def test_redrive_drops_a_ticket_it_replaced(
 ):
     """A ticket that failed before a restart is replaced on re-drive, and must not
     stay on the item to roll it up as `failed` once its replacement completes."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(batch_idx)
     (failed_ticket,) = await _item_ticket_idxs(postgres_pool, items[0].idx)
@@ -1915,7 +1918,7 @@ async def test_concurrency_bound_is_shared_across_batches(
 
     batches: list[tuple[int, list, list[str]]] = []
     for _ in range(num_batches):
-        accessions = [unique_accession("PRJNA") for _ in range(items_per_batch)]
+        accessions = [unique_ena_accession("PRJNA") for _ in range(items_per_batch)]
         batch_idx, items = await create_ena_import_batch(
             postgres_pool, accessions=accessions, principal=admin_principal
         )
