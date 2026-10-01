@@ -68,6 +68,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     StudyFieldAlreadyExistsError,
     StudyFieldConflictError,
     TransientWriteRaceError,
+    ValueRewriteOnUniqueFieldError,
     _fetch_slot_occupant,
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
@@ -1430,10 +1431,15 @@ async def test_write_local_metadata_or_diagnose_raises_duplicate_value(ctx):
 
 
 async def test_write_local_metadata_or_diagnose_upsert_outcomes_on_unique_field(ctx):
-    """Tests the case where upserts run through a unique_in_study field, where
-    one INSERT can break the slot index and the study-local uniqueness index
-    together: the outcome follows what occupies the caller's own slot, never
-    whichever of the two indexes PostgreSQL happened to name.
+    """Tests the case where upserts run through a unique_in_study field: the
+    value is minted once, a write offering a different one is refused rather
+    than overwriting it, and a re-send of what is already stored is reported
+    untouched.
+
+    The re-send is the case one INSERT breaks the slot index and the
+    study-local uniqueness index together, and the outcome follows what
+    occupies the caller's own slot, never whichever of the two indexes
+    PostgreSQL happened to name.
     """
     bs_idx = await _create_biosample_with_link(ctx)
     display_name = unique_field_name("unique_upsert")
@@ -1464,10 +1470,11 @@ async def test_write_local_metadata_or_diagnose_upsert_outcomes_on_unique_field(
         )
 
     inserted = await _upsert("A")
-    updated = await _upsert("B")
+    with pytest.raises(ValueRewriteOnUniqueFieldError):
+        await _upsert("B")
     # The re-send breaks both indexes at once: the slot holds the caller's own
     # row, and that row holds the very value being written.
-    unchanged = await _upsert("B")
+    unchanged = await _upsert("A")
 
     assert inserted == SampleMetadataWriteResult(
         metadata_idx=inserted.metadata_idx,
@@ -1475,17 +1482,98 @@ async def test_write_local_metadata_or_diagnose_upsert_outcomes_on_unique_field(
         study_field_created=False,
         outcome=FieldWriteOutcome.INSERTED,
     )
-    assert updated == SampleMetadataWriteResult(
-        metadata_idx=inserted.metadata_idx,
-        study_field_idx=field_idx,
-        study_field_created=False,
-        outcome=FieldWriteOutcome.UPDATED,
-    )
     assert unchanged == SampleMetadataWriteResult(
         metadata_idx=inserted.metadata_idx,
         study_field_idx=field_idx,
         study_field_created=False,
         outcome=FieldWriteOutcome.UNCHANGED,
+    )
+    row = await _fetch_metadata_row(ctx["pool"], inserted.metadata_idx)
+    assert row["value_text"] == "A"
+
+
+async def test_write_local_metadata_or_diagnose_non_unique_value_rewrite_still_upserts(ctx):
+    """Tests the case where an upsert changes a stored value through a field
+    that declares no uniqueness policy: the refusal is keyed on the policy, so
+    without it the overwrite proceeds and reports UPDATED.
+
+    Control for the refusal above; without it that test could pass because
+    upsert stopped overwriting anything at all.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    display_name = unique_field_name("plain_upsert")
+
+    async def _upsert(value):
+        return await _commit_local_write(
+            ctx,
+            bs_idx=bs_idx,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            data_type=FieldDataType.TEXT,
+            value=value,
+            on_conflict="upsert",
+        )
+
+    inserted = await _upsert("A")
+    updated = await _upsert("B")
+
+    assert updated == SampleMetadataWriteResult(
+        metadata_idx=inserted.metadata_idx,
+        study_field_idx=inserted.study_field_idx,
+        study_field_created=False,
+        outcome=FieldWriteOutcome.UPDATED,
+    )
+    row = await _fetch_metadata_row(ctx["pool"], inserted.metadata_idx)
+    assert row["value_text"] == "B"
+
+
+async def test_write_local_metadata_or_diagnose_unique_value_rewrite_after_relax(ctx):
+    """Tests the case where the field's uniqueness policy is cleared in SQL
+    between the two writes: the refusal reads the policy as it stands, so the
+    rewrite that was refused under the flag proceeds once it is gone.
+
+    This is the route around the refusal, and it is deliberate — SQL is where
+    such a correction belongs.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    display_name = unique_field_name("uniq_relaxed")
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+            required=False,
+            unique_in_study=True,
+        )
+    ctx["created"]["biosample_study_field"].append(field_idx)
+
+    async def _upsert(value):
+        return await _commit_local_write(
+            ctx,
+            bs_idx=bs_idx,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            data_type=FieldDataType.TEXT,
+            value=value,
+            on_conflict="upsert",
+        )
+
+    inserted = await _upsert("A")
+    with pytest.raises(ValueRewriteOnUniqueFieldError):
+        await _upsert("B")
+
+    await _set_unique_in_study(ctx, BIOSAMPLE_METADATA_SPEC, field_idx, False)
+    relaxed = await _upsert("B")
+
+    assert relaxed == SampleMetadataWriteResult(
+        metadata_idx=inserted.metadata_idx,
+        study_field_idx=field_idx,
+        study_field_created=False,
+        outcome=FieldWriteOutcome.UPDATED,
     )
     row = await _fetch_metadata_row(ctx["pool"], inserted.metadata_idx)
     assert row["value_text"] == "B"

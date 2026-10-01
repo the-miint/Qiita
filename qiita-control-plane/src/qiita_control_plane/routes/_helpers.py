@@ -58,6 +58,7 @@ from ..repositories._sample_helpers import (
     StudyUniqueValueConflictError,
     TransientWriteRaceError,
     UniqueInStudyViolation,
+    ValueRewriteOnUniqueFieldError,
     classify_unique_in_study_violation,
     create_study_field_and_read_back,
     fetch_entity_idx_by_unique_field_value,
@@ -572,6 +573,7 @@ SAMPLE_METADATA_WRITE_ERRORS = (
     OwnerSampleIdMetadataWriteError,
     StudyUniqueValueConflictError,
     MissingValueOnUniqueFieldError,
+    ValueRewriteOnUniqueFieldError,
     SlotOccupiedError,
     TransientWriteRaceError,
 )
@@ -584,9 +586,10 @@ async def raise_http_for_sample_metadata_write_error(
 
     One exception maps to exactly one response, so the mapping cannot drift.
     Parse, unknown-field, study-field-conflict, duplicate-global-target,
-    owner-sample-id, and missing-value-on-a-unique-field errors map to 422; a
-    slot collision and a study-local uniqueness collision to 409 (the former
-    diagnosed against conn); a transient write race to 503. Always raises.
+    owner-sample-id, missing-value-on-a-unique-field, and
+    value-rewrite-on-a-unique-field errors map to 422; a slot collision and a
+    study-local uniqueness collision to 409 (the former diagnosed against
+    conn); a transient write race to 503. Always raises.
     """
     if isinstance(exc, MetadataUnknownFieldsError):
         raise HTTPException(
@@ -642,6 +645,18 @@ async def raise_http_for_sample_metadata_write_error(
             detail=(
                 f"metadata field {exc.display_name!r} is unique within this study"
                 " and cannot be given a missing-value marker"
+            ),
+        )
+    if isinstance(exc, ValueRewriteOnUniqueFieldError):
+        # Deliberately not phrased like the uniqueness collision above: that
+        # one reports another sample holding the value, where this refuses the
+        # change whoever holds what.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"metadata field {exc.display_name!r} declares unique_in_study;"
+                f" the value {exc.stored_value!r} already stored through it"
+                " cannot be changed"
             ),
         )
     if isinstance(exc, SlotOccupiedError):
@@ -967,6 +982,11 @@ async def patch_and_map_study_field(
     the type the field ends this request at: a widen in the same body runs
     first, so a field that becomes text is weighed as text.
 
+    A rule of a different kind, also 422: unique_in_study is declared here but
+    never withdrawn, so a body clearing it on a field that carries it is
+    refused. Only the transition is refused -- a body re-sending the stored
+    value has nothing to withdraw and lands.
+
     Write rejections: a display_name already used in the study is 409; enabling
     uniqueness over values that already repeat is 409; over a value that is a
     missing-value marker, 422. The last two are the field's existing data
@@ -1033,6 +1053,19 @@ async def patch_and_map_study_field(
             noun=noun,
         )
         effective_data_type = body.data_type
+
+    # Declared through this API but never withdrawn: clearing the policy would
+    # let the values it protects be rewritten freely, which is the one way a
+    # stored unique value could still move from one sample to another.
+    if body.unique_in_study is False and row["unique_in_study"]:
+        stored_display_name = row["display_name"]
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{noun} field {stored_display_name!r} declares unique_in_study;"
+                " the policy cannot be withdrawn"
+            ),
+        )
 
     if body.unique_in_study:
         reason = unique_in_study_rejection_reason(

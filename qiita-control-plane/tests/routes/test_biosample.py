@@ -4477,6 +4477,47 @@ async def _seed_biosample_carrying_unique_value(ctx, *, suffix, value, data_type
     return study_idx, display_name, bs_idx
 
 
+# same-pattern-ok: per-entity route coverage; a shared factory would hide which
+# handler answered
+async def test_patch_biosample_metadata_unique_field_rewrite_422(ctx):
+    """Tests the case where the by-idx write changes a value stored through a
+    unique_in_study field: the refusal reaches this route too, so addressing
+    the sample by idx is not a way around it.
+    """
+    study_idx, display_name, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="idx-rewrite", value="Sample 1"
+    )
+
+    resp = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {display_name: "Sample 2"}
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "cannot be changed" in resp.json()["detail"]
+    stored = await _lookup_by_unique_field(ctx["wet"], study_idx, display_name, "Sample 1")
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["biosample_idx"] == bs_idx
+
+
+# same-pattern-ok: per-entity route coverage; a shared factory would hide which
+# handler answered
+async def test_patch_biosample_metadata_unique_field_resend_200(ctx):
+    """Tests the case where the by-idx write re-sends the value already stored
+    through a unique_in_study field: there is nothing to change, so the write
+    lands untouched rather than tripping the refusal.
+    """
+    study_idx, display_name, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="idx-resend", value="Sample 1"
+    )
+
+    resp = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {display_name: "Sample 1"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["results"][display_name]["outcome"] == "unchanged"
+
+
 @pytest.mark.parametrize(
     ("data_type", "value"),
     [("text", "Sample 1"), ("numeric", "32.87"), ("date", "2026-03-04")],
@@ -4830,10 +4871,10 @@ async def test_patch_biosample_metadata_by_unique_field_matches_by_idx_write(ctx
     assert by_field.json() == by_idx_again.json() | {"biosample_idx": bs_idx}
 
 
-async def test_patch_biosample_metadata_by_unique_field_renames_identifying_value(ctx):
-    """Tests the case where the identifying field is itself written: resolution
-    runs first, so the sample is found under its old value and left carrying
-    the new one -- the only way to correct a mistyped id.
+async def test_patch_biosample_metadata_by_unique_field_refuses_identifying_rewrite(ctx):
+    """Tests the case where the identifying field is itself written with a
+    different value: the write is refused, so the value that resolved the
+    sample still names it afterwards.
     """
     study_idx, id_field, bs_idx = await _seed_biosample_carrying_unique_value(
         ctx, suffix="wpatch-rename", value="Sample 1"
@@ -4843,14 +4884,33 @@ async def test_patch_biosample_metadata_by_unique_field_renames_identifying_valu
         ctx["wet"], study_idx, id_field, "Sample 1", metadata={id_field: "Sample 1 fixed"}
     )
 
+    assert resp.status_code == 422, resp.text
+    assert "cannot be changed" in resp.json()["detail"]
+    # The pair that addressed the sample still addresses it, and the value the
+    # write offered names nothing.
+    unmoved = await _lookup_by_unique_field(ctx["wet"], study_idx, id_field, "Sample 1")
+    assert unmoved.status_code == 200, unmoved.text
+    assert unmoved.json()["biosample_idx"] == bs_idx
+    absent = await _lookup_by_unique_field(ctx["wet"], study_idx, id_field, "Sample 1 fixed")
+    assert absent.status_code == 404, absent.text
+
+
+async def test_patch_biosample_metadata_by_unique_field_identifying_resend_200(ctx):
+    """Tests the case where the identifying field is written with the value it
+    already holds: the pair resolves, nothing changes, and the no-op is not
+    mistaken for a rewrite.
+    """
+    study_idx, id_field, bs_idx = await _seed_biosample_carrying_unique_value(
+        ctx, suffix="wpatch-resend", value="Sample 1"
+    )
+
+    resp = await _patch_by_unique_field(
+        ctx["wet"], study_idx, id_field, "Sample 1", metadata={id_field: "Sample 1"}
+    )
+
     assert resp.status_code == 200, resp.text
-    assert resp.json()["results"][id_field]["value"] == "Sample 1 fixed"
-    # The old value no longer names the sample, and the new one does.
-    stale = await _lookup_by_unique_field(ctx["wet"], study_idx, id_field, "Sample 1")
-    assert stale.status_code == 404, stale.text
-    renamed = await _lookup_by_unique_field(ctx["wet"], study_idx, id_field, "Sample 1 fixed")
-    assert renamed.status_code == 200, renamed.text
-    assert renamed.json()["biosample_idx"] == bs_idx
+    assert resp.json()["biosample_idx"] == bs_idx
+    assert resp.json()["results"][id_field]["outcome"] == "unchanged"
 
 
 async def test_patch_biosample_metadata_by_unique_field_owner_id_identifies_not_written(ctx):

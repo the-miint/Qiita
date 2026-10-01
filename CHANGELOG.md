@@ -33,9 +33,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   by-idx metadata write, addressed by a `unique_in_study` field's `display_name` and
   the value it carries, so a read-modify-write never has to handle a `biosample_idx`;
   the response adds the idx the pair resolved to. The identifying field may itself
-  appear in the body — resolution runs first, so such a write renames the sample under
-  the value that found it, which is the only way to correct a mistyped id. The
-  owner-biosample-id field is the exception: it identifies, but writing it stays a 422.
+  appear in the body, but only carrying the value it already holds; offering a
+  different one is a 422, as it is on every metadata route. The owner-biosample-id
+  field is a 422 either way, being written only through its own surface.
   A retired biosample is 409 here, where the matching read answers 404. A field
   redeclared to another data type while the pair is resolving answers 503 to retry,
   rather than the 404 the caller could not tell from a sample that is genuinely absent.
@@ -3939,6 +3939,20 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **A value stored through a `unique_in_study` sample field can no longer be changed
+  through the REST API (#639).** Such a value is used to name the sample within its
+  study, so overwriting it hands that name to a different sample and silently
+  mis-targets any later write addressed by the old value. Every metadata route now
+  answers 422 instead, on biosamples and prep samples alike; writing the value for the
+  first time, re-sending the value already stored, and writing fields with no
+  uniqueness policy are all unaffected. Correcting such a value is a database
+  operation, deliberately — it is not something a request performs.
+- **A sample field's `unique_in_study` policy can be declared through the REST API but
+  no longer withdrawn (#639).** Clearing the policy would let the values it protects be
+  rewritten freely and then re-protected, which was the one remaining way a stored
+  value could move between samples. A body clearing the policy on a field that carries
+  it answers 422; declaring it, and re-sending the policy a field already has, are
+  unchanged.
 - **Declaring a sample field unique within its study no longer lets a concurrent write
   slip past the new policy (#628).** The propagation that mirrors the policy onto the
   field's stored values read only what was committed, so a metadata write already in

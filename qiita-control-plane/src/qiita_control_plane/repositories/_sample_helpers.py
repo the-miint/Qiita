@@ -320,6 +320,35 @@ class MissingValueOnUniqueFieldError(Exception):
         )
 
 
+class ValueRewriteOnUniqueFieldError(Exception):
+    """Raised when a *_metadata write would change a value already stored
+    through a unique_in_study field. Carries the field, what it holds, and
+    what the write offered.
+    """
+
+    # same-pattern-ok: one refusal condition per type, so the type-dispatched
+    # HTTP mapping stays one-to-one
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        display_name: str,
+        study_field_idx: int,
+        stored_value: object,
+        attempted_value: object,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.display_name = display_name
+        self.study_field_idx = study_field_idx
+        self.stored_value = stored_value
+        self.attempted_value = attempted_value
+        super().__init__(
+            f"{entity_kind} field {display_name!r} declares unique_in_study;"
+            f" the value {stored_value!r} stored through it cannot be changed"
+            f" to {attempted_value!r}"
+        )
+
+
 class StudyFieldNotUniqueInStudyError(Exception):
     """Raised when a write that only makes sense against a study-locally
     unique field resolves an existing field that does not declare the policy.
@@ -1375,7 +1404,8 @@ async def _fetch_slot_occupant(
         f"SELECT m.idx AS existing_metadata_idx,"
         f" {METADATA_VALUE_COLUMNS_SELECT},"
         f" f.study_idx AS contributing_study_idx,"
-        f" f.idx AS contributing_study_field_idx"
+        f" f.idx AS contributing_study_field_idx,"
+        f" f.unique_in_study"
         f" FROM {spec.metadata_table} m"
         f" JOIN {spec.study_field_table} f"
         f" ON f.idx = m.{spec.study_field_idx_column}"
@@ -1860,6 +1890,18 @@ async def _insert_metadata_or_diagnose(
                 study_field_created=False,
                 outcome=FieldWriteOutcome.UNCHANGED,
             )
+        # A value stored through a unique_in_study field is what identifies the
+        # sample within the study, so changing it moves that identity onto
+        # another row and mis-targets every write addressed by the old value.
+        if existing_row["unique_in_study"]:
+            raise ValueRewriteOnUniqueFieldError(
+                entity_kind=spec.entity_kind,
+                display_name=display_name,
+                study_field_idx=occupant_field_idx,
+                stored_value=existing_value,
+                attempted_value=value,
+            )
+
         # Different value, or a missing↔typed kind change: overwrite in place.
         # The occupant's populated column is the missing-reason column when it
         # holds a missing reason, otherwise the field's typed column.
@@ -1868,12 +1910,12 @@ async def _insert_metadata_or_diagnose(
             if existing_missing_reason_idx is not None
             else _resolve_typed_value_column(data_type)
         )
-        # The overwrite is judged against the study-local uniqueness index on
-        # its own terms: the INSERT's rejection said only that this slot was
-        # taken, which the occupant read above has now explained, and says
-        # nothing about whether the new value collides with another entity's.
-        # The no-missing-value CHECK is not reachable here, being evaluated
-        # ahead of any index, so a missing marker always fails at the INSERT.
+        # Only a field carrying no uniqueness policy reaches here, the refusal
+        # above having taken the rest, so the study-local uniqueness index has
+        # nothing to say about this overwrite. The handler below stays for a
+        # caller that reaches this write by some other route. The
+        # no-missing-value CHECK is likewise unreachable, being evaluated ahead
+        # of any index, so a missing marker always fails at the INSERT.
         try:
             await _update_metadata(
                 conn,

@@ -692,10 +692,12 @@ async def patch_biosample_metadata_by_unique_field(
     while the pair was resolving: the miss is then an artifact of that, and the
     answer is 503 to retry.
 
-    The identifying field may also appear in the metadata body. Resolution runs
-    first, so such a write renames the sample under the value that found it,
-    which is the only way to correct a mistyped id. The owner-biosample-id
-    field is the exception: it identifies, but writing it is a 422.
+    The identifying field may appear in the metadata body, but only carrying
+    the value it already holds, which changes nothing. Offering a different one
+    is a 422: a value stored through a unique_in_study field is what names the
+    sample, and the write that would hand that name to another sample is
+    refused. The owner-biosample-id field is a 422 either way, being written
+    only through its own surface.
 
     Access and the remaining refusals are the by-idx write's: Tier.ADMIN study
     access with a wet_lab_admin+ role bypass as an interim stand-in until
@@ -703,9 +705,9 @@ async def patch_biosample_metadata_by_unique_field(
     409, and a retired study link answering 404.
 
     There is NO If-Match on this route, exactly as on the by-idx write: a
-    concurrent same-study, same-field write is last-writer-wins.
-    A value moved to another sample between the pair resolving and the
-    write landing is a known rare possible problem; see github issue.
+    concurrent same-study, same-field write is last-writer-wins. The pair
+    itself cannot go stale while the request is in flight, no API path being
+    able to move a stored value from one sample to another.
     """
     async with tx() as conn:
         biosample_idx = await resolve_study_entity_by_unique_field(
