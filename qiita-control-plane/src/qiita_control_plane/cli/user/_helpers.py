@@ -6,6 +6,7 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 import argparse
 import math
 import sqlite3
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
@@ -92,6 +93,23 @@ def _build_body(
     except ValidationError as exc:
         msgs = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
         parser.error(f"invalid {model_cls.__name__}: {msgs}")
+
+
+def _fold_flag_values(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    flag_names: Iterable[str],
+    parse_fn: Callable[..., dict | None],
+) -> None:
+    """Re-parse each named repeatable flag on `args`, in place.
+
+    `parse_fn` takes the raw value, the parser, and the originating flag
+    spelling, and errors out (exit 2) rather than returning on bad input.
+    Callers run this before body construction so validation sees a dict.
+    """
+    for name in flag_names:
+        raw = getattr(args, name)
+        setattr(args, name, parse_fn(raw, parser, flag=f"--{name.replace('_', '-')}"))
 
 
 # ---------------------------------------------------------------------------
@@ -197,21 +215,22 @@ def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
     return _common.run_http_subcommand(lambda t: _common.call("GET", args.base_url, t, path))
 
 
-def _handle_study_field_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Mint a study-local field definition on one study (POST).
+def _handle_study_scoped_call(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Call a study-scoped route that carries a request body.
 
-    The per-command `set_defaults` supplies `study_field_model` (the request
-    model, whose mode coupling is enforced at body construction so an invalid
-    flag combination exits 2 without a request) and `study_field_path` (a
-    subpath template filled from --study-idx).
+    The per-command `set_defaults` supplies the verb, the subpath template
+    filled from --study-idx, the request model the flags map to, and the
+    names of any repeatable KEY=VALUE flags. Both the fold and the body
+    construction precede the token read, so invalid flags exit 2 without a
+    request going out.
     """
-
-    def _run(token: str) -> dict:
-        body = _build_body(args.study_field_model, args, parser)
-        path = args.study_field_path.format(study_idx=args.study_idx)
-        return _common.call("POST", args.base_url, token, path, json=body)
-
-    return _common.run_http_subcommand(_run)
+    _fold_flag_values(args, parser, args.study_call_kv_flags, _common.parse_kv_pairs)
+    body = _build_body(args.study_call_model, args, parser)
+    path = args.study_call_path.format(study_idx=args.study_idx)
+    method = args.study_call_method
+    return _common.run_http_subcommand(
+        lambda t: _common.call(method, args.base_url, t, path, json=body)
+    )
 
 
 def _handle_patch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -224,14 +243,7 @@ def _handle_patch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     empty update (no field flags) fails the model's at-least-one-field
     rule and exits 2.
     """
-    for field in args.patch_json_fields:
-        setattr(
-            args,
-            field,
-            _common.parse_json_arg(
-                getattr(args, field), parser, flag=f"--{field.replace('_', '-')}"
-            ),
-        )
+    _fold_flag_values(args, parser, args.patch_json_fields, _common.parse_json_arg)
     body = _build_body(args.patch_model, args, parser)
     idx_arg = args.patch_idx_arg
     path = args.patch_path.format(**{idx_arg: getattr(args, idx_arg)})

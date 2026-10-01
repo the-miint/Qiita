@@ -21,6 +21,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
+  reach the by-unique-field surface from the CLI (#N).** Read a study's view of a
+  biosample, and upsert this study's metadata on it, naming the sample by a
+  `unique_in_study` field's `display_name` and the value it carries rather than by an
+  idx. The identifying pair travels in the body, so a value that may carry PII stays
+  out of URLs; metadata is written with repeatable `--metadata KEY=VALUE`, which
+  refuses a repeated key rather than letting the last one silently win.
 - **Write a biosample's metadata by the study's own name for it —
   `PATCH /api/v1/study/{study_idx}/biosample/by-unique-field/metadata` (#N).** The
   by-idx metadata write, addressed by a `unique_in_study` field's `display_name` and
