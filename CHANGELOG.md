@@ -21,6 +21,18 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **The control plane can open a miint ENA (Webin V2) submission session (#N).** The first
+  piece of depositing studies and biosamples to ENA: `ena_submission.EnaSubmissionCatalog`
+  registers a Webin secret and attaches the `ena` catalog over the service-side, LOAD-only
+  miint connect, and tears both down on exit. The endpoint is an environment selector --
+  `test` or `production`, never a URL -- and is checked against that set before a connection is
+  opened, so an invalid value fails with this package's own error rather than a DuckDB binder
+  error from inside setup. The session is the first DuckDB connection in the control-plane
+  service to bound its own `threads` and `memory_limit`, since it runs inside the process that
+  serves the REST API. Submitting itself comes later; this lands the boundary and its tests.
+  Alongside it, `qiita_common.sql.sql_string_literal` replaces the three private copies of the
+  same SQL string-literal escaper in the control-plane CLI modules.
+
 - **A study-local sample field can be widened to text, taking its stored values
   with it (#628).** A field minted as numeric, boolean, or date could not be redeclared once
   values existed: the field-contract check runs when a metadata row is written, not when

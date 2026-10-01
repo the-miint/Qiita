@@ -19,6 +19,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.flight_constants import ipc_compression_headers
 from qiita_common.parquet import PARQUET_COMPRESSION, ROW_GROUP_SIZE_BYTES
+from qiita_common.sql import sql_string_literal
 
 from qiita_control_plane.miint import connect_with_miint
 from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
@@ -30,11 +31,6 @@ from .. import _common
 # so reject anything outside [A-Za-z0-9._-] — that excludes '/' (path traversal)
 # and "'" (SQL-string break). ENA/NCBI accessions are alphanumeric in practice.
 _SAFE_ACCESSION = re.compile(r"^[A-Za-z0-9._-]+$")
-
-
-def _sql_str(path: Path) -> str:
-    """Escape a filesystem path for inlining as a DuckDB SQL string literal."""
-    return str(path).replace("'", "''")
 
 
 # The read_masked macro's columns, in the verbatim order the miint FORMAT FASTQ
@@ -159,7 +155,7 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
         _commit_partials(
             lambda: con.execute(
                 f"COPY (SELECT {_READ_MASKED_COLUMNS} FROM masked) "
-                f"TO '{_sql_str(target)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
+                f"TO {sql_string_literal(target)} (FORMAT FASTQ, COMPRESSION 'gzip')"
             ),
             pairs,
         )

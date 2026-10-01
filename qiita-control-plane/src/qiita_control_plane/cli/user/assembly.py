@@ -48,6 +48,7 @@ from qiita_common.assembly_constants import (
 from qiita_common.chunking import reassemble_chunks_expr
 from qiita_common.models import AssemblySampleState
 from qiita_common.parquet import PARQUET_MEDIA_TYPE
+from qiita_common.sql import sql_string_literal
 
 from .. import _common
 
@@ -322,10 +323,6 @@ def _check_contigs(con, *, prep_sample_idx: int) -> None:
         )
 
 
-def _sql_str(value: str) -> str:
-    return value.replace("'", "''")
-
-
 def _write_sample(
     con, *, accession: str, output_dir: Path, pairs: list[tuple[Path, Path]], names: set[str]
 ) -> int:
@@ -353,9 +350,9 @@ def _write_sample(
         con.execute(
             "COPY (SELECT ms.contig AS read_id, c.sequence AS sequence1"
             "        FROM member_sel ms JOIN contig c USING (feature_idx)"
-            f"      WHERE ms.genome = '{_sql_str(genome)}'"
+            f"      WHERE ms.genome = {sql_string_literal(genome)}"
             "      ORDER BY ms.sequence_length_bp DESC, ms.feature_idx)"
-            f" TO '{_sql_str(str(partial))}' (FORMAT FASTA, COMPRESSION 'gzip')"
+            f" TO {sql_string_literal(partial)} (FORMAT FASTA, COMPRESSION 'gzip')"
         )
     # GC is G+C over A/C/G/T, case-insensitive, in plain SQL: miint has no composition
     # scalar (duckdb-miint#282).
@@ -462,7 +459,7 @@ def _write_tables(con, *, output_dir: Path, pairs: list[tuple[Path, Path]]) -> N
         pairs.append((partial, final))
         con.execute(
             f"COPY (SELECT * FROM {table} ORDER BY {order})"
-            f" TO '{_sql_str(str(partial))}' (FORMAT CSV, DELIMITER '\t', HEADER)"
+            f" TO {sql_string_literal(partial)} (FORMAT CSV, DELIMITER '\t', HEADER)"
         )
 
 

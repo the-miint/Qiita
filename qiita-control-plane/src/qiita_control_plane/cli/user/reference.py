@@ -24,6 +24,7 @@ from qiita_common.models import (
     ReferenceStatus,
     WorkTicketState,
 )
+from qiita_common.sql import sql_string_literal
 
 from .. import _common
 
@@ -224,11 +225,6 @@ def _serializable(obj):
 _EXPORT_FORMATS = ("fasta", "parquet")
 
 
-def _sql_str(path: Path) -> str:
-    """Escape a filesystem path for inlining as a DuckDB SQL string literal."""
-    return str(path).replace("'", "''")
-
-
 def _resolve_genome_members(base_url: str, token: str, *, reference_idx: int, genome_idx: int):
     """GET a genome's member features (feature_idx + the reference's accession)
     within one reference, via the genome-member resolver route. Returns the list
@@ -323,7 +319,7 @@ def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Pa
 
     The header (accession) is carried as DATA (a registered column), never inlined
     into the COPY SQL — so it presents no SQL-injection surface; only the output
-    path is inlined (escaped via `_sql_str`). A feature with a NULL accession (a
+    path is inlined, as a quoted SQL literal. A feature with a NULL accession (a
     non-FASTA ingest, or a pre-accession-column row) falls back to a
     `feature_<idx>` header so the FASTA stays valid and traceable.
 
@@ -358,7 +354,7 @@ def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Pa
                 "   FROM chunks c JOIN accession_map m USING (feature_idx)"
                 "  GROUP BY c.feature_idx, m.accession"
                 "  ORDER BY c.feature_idx)"
-                f" TO '{_sql_str(partial)}' (FORMAT FASTA, COMPRESSION 'gzip')"
+                f" TO {sql_string_literal(partial)} (FORMAT FASTA, COMPRESSION 'gzip')"
             ).fetchone()
             return count
 
