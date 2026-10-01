@@ -1055,6 +1055,8 @@ _NON_BLANK_TEXT_FIELDS = [
         "description",
         {"display_name": "pH", "data_type": FieldDataType.NUMERIC},
     ),
+    ("SampleUniqueFieldRef", "unique_field_display_name", {"unique_field_value": "Sample 1"}),
+    ("SampleUniqueFieldRef", "unique_field_value", {"unique_field_display_name": "Sample Id"}),
 ]
 
 

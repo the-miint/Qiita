@@ -473,6 +473,56 @@ class SampleMetadataWriteResponse(BaseModel):
     results: dict[str, MetadataFieldWriteResult]
 
 
+class SampleUniqueFieldRef(BaseModel):
+    """The (field, value) pair naming one biosample inside a study.
+
+    unique_field_display_name is a biosample_study_field display_name as the
+    study spells it; unique_field_value is the value that field carries on the
+    sample being named. The field must declare unique_in_study, which is what
+    makes the pair resolve to at most one biosample — a field without it is
+    refused rather than resolved arbitrarily. Both strip on the way in and must
+    still carry content, so a name or value written with stray padding resolves
+    the same as its unpadded spelling.
+
+    unique_field_display_name matches the stored name exactly, case included.
+    unique_field_value is compared as the field's own data type: text matches
+    case-sensitively; numeric and date match on value, so "32.870" resolves a
+    sample storing 32.87.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    unique_field_display_name: NonBlankText
+    unique_field_value: NonBlankText
+
+
+class SampleMetadataWriteByUniqueFieldRequest(SampleUniqueFieldRef, SampleMetadataWriteRequest):
+    """Body for a study-scoped metadata write that names its sample by a
+    unique-in-study field rather than by an idx.
+
+    Carries the identifying pair alongside the metadata to write, under the
+    same rules each half already has: the pair resolves the sample, and the
+    metadata dict is upserted against the study's existing fields.
+
+    The identifying field may itself appear in metadata. Resolution runs
+    first, so such a write renames the sample under the value that found it --
+    the only way to correct a mistyped id -- and the response reports the new
+    value. The owner-biosample-id field is the exception: it identifies, but
+    writing it is refused, since it is changed only through its own surface.
+    """
+
+
+class BiosampleMetadataWriteByUniqueFieldResponse(SampleMetadataWriteResponse):
+    """Returned by the biosample metadata write addressed by a unique field.
+
+    Adds the biosample_idx the identifying pair resolved to, so a caller that
+    named its sample by the study's own id learns the idx the write landed on
+    and can address the idx-keyed routes with it.
+    """
+
+    biosample_idx: Annotated[int, Field(gt=0)]
+
+
 # The two qiita.biosample accession columns a lookup may key on; each value is
 # the literal Postgres column name it selects.
 BiosampleAccessionField = Literal["biosample_accession", "ena_sample_accession"]

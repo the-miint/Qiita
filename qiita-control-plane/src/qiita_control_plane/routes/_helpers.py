@@ -58,13 +58,17 @@ from ..repositories._sample_helpers import (
     StudyUniqueValueConflictError,
     TransientWriteRaceError,
     UniqueInStudyViolation,
+    ValueRewriteOnUniqueFieldError,
     classify_unique_in_study_violation,
     create_study_field_and_read_back,
+    fetch_entity_idx_by_unique_field_value,
     fetch_entity_is_linked_to_study,
     fetch_global_metadata,
     fetch_local_metadata,
     fetch_metadata_checklist_idx_by_name,
     fetch_study_field,
+    fetch_study_fields_by_display_names,
+    parse_text_for_data_type,
     update_study_field,
     widen_study_field_to_text,
     write_sample_metadata,
@@ -427,6 +431,137 @@ async def read_study_scoped_entity(
     return row, global_metadata, local_metadata
 
 
+async def resolve_and_write_study_scoped_metadata(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    fetch_row: Callable[[asyncpg.Connection, int], Awaitable[asyncpg.Record | None]],
+    entity_idx: int,
+    metadata_idx_column: str,
+    study_idx: int,
+    noun: str,
+    metadata: Mapping[str, str],
+    caller_idx: int,
+    global_internal_names: bool = False,
+) -> SampleMetadataWriteResponse:
+    """Gate a study-scoped sample for writing, then upsert this study's
+    metadata on it.
+
+    The entity must be linked to the study: a nonexistent entity_idx and one
+    with no non-retired link share a 404, so a caller never learns the state of
+    an entity outside their study. A retired entity is 409 -- its metadata
+    cannot be written -- checked only once the link passes. A link retired
+    between that check and the write is refused by the database and answers the
+    same 404, so the status does not depend on which of the two noticed.
+
+    entity_idx is the idx the caller named and is what every message reports.
+    Metadata keys on the metadata_idx_column value instead: the entity's own
+    idx for a direct entity, a supertype idx for a subtype.
+    """
+    _row, metadata_entity_idx = await resolve_linked_study_entity(
+        conn,
+        spec=spec,
+        fetch_row=fetch_row,
+        entity_idx=entity_idx,
+        metadata_idx_column=metadata_idx_column,
+        study_idx=study_idx,
+        noun=noun,
+        retired_status=409,
+        retired_detail=f"{noun} {entity_idx} is retired",
+    )
+    return await write_and_map_sample_metadata(
+        conn,
+        spec=spec,
+        entity_idx=metadata_entity_idx,
+        study_idx=study_idx,
+        metadata=metadata,
+        caller_idx=caller_idx,
+        unlinked_detail=detail_for_unlinked_entity(
+            noun=noun, entity_idx=entity_idx, study_idx=study_idx
+        ),
+        global_internal_names=global_internal_names,
+    )
+
+
+async def resolve_study_entity_by_unique_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    display_name: str,
+    value: str,
+    noun: str,
+) -> int:
+    """Resolve the study's own name for a sample to that sample's idx.
+
+    display_name names one of the study's fields and value is what that field
+    carries on the wanted sample. The field must declare unique_in_study; one
+    that does not is refused (422), as is a name the study does not use and a
+    value that will not parse as the field's data type. A well-formed pair
+    matching no sample is 404, unless the field was redeclared to another data
+    type while this was resolving it, which makes the miss an artifact of the
+    redeclaration and answers 503.
+
+    Resolution ignores retirement, so a retired sample or a retired study link
+    still resolves; the caller applies its own gate afterwards and decides what
+    retirement means for the operation it is performing.
+    """
+    field_rows = await fetch_study_fields_by_display_names(
+        conn, spec=spec, study_idx=study_idx, display_names=[display_name]
+    )
+    field_row = field_rows.get(display_name)
+    if field_row is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{noun} field {display_name!r} does not exist on study {study_idx}",
+        )
+
+    # Without the flag the value may repeat, and picking one of the matches
+    # would silently act on a sample the caller did not mean.
+    if not field_row.unique_in_study:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{noun} field {display_name!r} is not unique within the study,"
+                " so its values cannot identify a single sample"
+            ),
+        )
+
+    # Parse against the field's type so the comparison below is the one the
+    # unique index enforces, rather than a text match against a typed column.
+    try:
+        parsed_value = parse_text_for_data_type(display_name, field_row.data_type, value)
+    except MetadataParseError as exc:
+        await raise_http_for_sample_metadata_write_error(conn, exc)
+
+    entity_idx = await fetch_entity_idx_by_unique_field_value(
+        conn,
+        spec=spec,
+        study_field_idx=field_row.idx,
+        data_type=field_row.data_type,
+        value=parsed_value,
+    )
+    if entity_idx is None:
+        # The column just queried was chosen from a data_type read in an earlier
+        # statement, and this runs at READ COMMITTED for a write, so a widen can
+        # have moved the values out of it in between. Re-read before answering:
+        # a miss that is an artifact of the redeclaration is retryable, where an
+        # absent sample is not, and the two are indistinguishable as a 404.
+        current = await fetch_study_field(conn, spec=spec, idx=field_row.idx)
+        if current is not None and current["data_type"] != field_row.data_type:
+            raise_transient_retry(
+                f"{noun} field {display_name!r} was redeclared while this request was"
+                " resolving it; re-issue the request to retry"
+            )
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no {noun} on study {study_idx} carries {value!r} through field {display_name!r}"
+            ),
+        )
+    return entity_idx
+
+
 # Sample-family metadata-write exceptions carrying one shared HTTP mapping.
 # Entity-specific errors (owner-id-field-collision, required-field, asyncpg) are
 # excluded — they are mapped per entity, not here.
@@ -438,6 +573,7 @@ SAMPLE_METADATA_WRITE_ERRORS = (
     OwnerSampleIdMetadataWriteError,
     StudyUniqueValueConflictError,
     MissingValueOnUniqueFieldError,
+    ValueRewriteOnUniqueFieldError,
     SlotOccupiedError,
     TransientWriteRaceError,
 )
@@ -450,9 +586,10 @@ async def raise_http_for_sample_metadata_write_error(
 
     One exception maps to exactly one response, so the mapping cannot drift.
     Parse, unknown-field, study-field-conflict, duplicate-global-target,
-    owner-sample-id, and missing-value-on-a-unique-field errors map to 422; a
-    slot collision and a study-local uniqueness collision to 409 (the former
-    diagnosed against conn); a transient write race to 503. Always raises.
+    owner-sample-id, missing-value-on-a-unique-field, and
+    value-rewrite-on-a-unique-field errors map to 422; a slot collision and a
+    study-local uniqueness collision to 409 (the former diagnosed against
+    conn); a transient write race to 503. Always raises.
     """
     if isinstance(exc, MetadataUnknownFieldsError):
         raise HTTPException(
@@ -508,6 +645,18 @@ async def raise_http_for_sample_metadata_write_error(
             detail=(
                 f"metadata field {exc.display_name!r} is unique within this study"
                 " and cannot be given a missing-value marker"
+            ),
+        )
+    if isinstance(exc, ValueRewriteOnUniqueFieldError):
+        # Deliberately not phrased like the uniqueness collision above: that
+        # one reports another sample holding the value, where this refuses the
+        # change whoever holds what.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"metadata field {exc.display_name!r} declares unique_in_study;"
+                f" the value {exc.stored_value!r} already stored through it"
+                " cannot be changed"
             ),
         )
     if isinstance(exc, SlotOccupiedError):
@@ -833,6 +982,11 @@ async def patch_and_map_study_field(
     the type the field ends this request at: a widen in the same body runs
     first, so a field that becomes text is weighed as text.
 
+    A rule of a different kind, also 422: unique_in_study is declared here but
+    never withdrawn, so a body clearing it on a field that carries it is
+    refused. Only the transition is refused -- a body re-sending the stored
+    value has nothing to withdraw and lands.
+
     Write rejections: a display_name already used in the study is 409; enabling
     uniqueness over values that already repeat is 409; over a value that is a
     missing-value marker, 422. The last two are the field's existing data
@@ -899,6 +1053,19 @@ async def patch_and_map_study_field(
             noun=noun,
         )
         effective_data_type = body.data_type
+
+    # Declared through this API but never withdrawn: clearing the policy would
+    # let the values it protects be rewritten freely, which is the one way a
+    # stored unique value could still move from one sample to another.
+    if body.unique_in_study is False and row["unique_in_study"]:
+        stored_display_name = row["display_name"]
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{noun} field {stored_display_name!r} declares unique_in_study;"
+                " the policy cannot be withdrawn"
+            ),
+        )
 
     if body.unique_in_study:
         reason = unique_in_study_rejection_reason(

@@ -68,6 +68,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     StudyFieldAlreadyExistsError,
     StudyFieldConflictError,
     TransientWriteRaceError,
+    ValueRewriteOnUniqueFieldError,
     _fetch_slot_occupant,
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
@@ -75,6 +76,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     _update_metadata,
     create_study_field,
     create_study_field_and_read_back,
+    fetch_entity_idx_by_unique_field_value,
     fetch_entity_is_linked_to_study,
     fetch_global_fields,
     fetch_global_fields_by_keys,
@@ -115,12 +117,15 @@ from .conftest import (
     _create_biosample_with_link,
     _create_linked_entity_for_spec,
     _create_local_field,
+    _create_plain_field,
     _create_prep_sample_with_link,
     _seed_global_field_for_spec,
     _seed_secondary_studies_for_entity,
     _seed_study,
     _seed_unlinked_entity_for_spec,
+    _set_unique_in_study,
     _track_to_study_link,
+    _write_value,
 )
 
 pytestmark = pytest.mark.db
@@ -1426,10 +1431,15 @@ async def test_write_local_metadata_or_diagnose_raises_duplicate_value(ctx):
 
 
 async def test_write_local_metadata_or_diagnose_upsert_outcomes_on_unique_field(ctx):
-    """Tests the case where upserts run through a unique_in_study field, where
-    one INSERT can break the slot index and the study-local uniqueness index
-    together: the outcome follows what occupies the caller's own slot, never
-    whichever of the two indexes PostgreSQL happened to name.
+    """Tests the case where upserts run through a unique_in_study field: the
+    value is minted once, a write offering a different one is refused rather
+    than overwriting it, and a re-send of what is already stored is reported
+    untouched.
+
+    The re-send is the case one INSERT breaks the slot index and the
+    study-local uniqueness index together, and the outcome follows what
+    occupies the caller's own slot, never whichever of the two indexes
+    PostgreSQL happened to name.
     """
     bs_idx = await _create_biosample_with_link(ctx)
     display_name = unique_field_name("unique_upsert")
@@ -1460,10 +1470,11 @@ async def test_write_local_metadata_or_diagnose_upsert_outcomes_on_unique_field(
         )
 
     inserted = await _upsert("A")
-    updated = await _upsert("B")
+    with pytest.raises(ValueRewriteOnUniqueFieldError):
+        await _upsert("B")
     # The re-send breaks both indexes at once: the slot holds the caller's own
     # row, and that row holds the very value being written.
-    unchanged = await _upsert("B")
+    unchanged = await _upsert("A")
 
     assert inserted == SampleMetadataWriteResult(
         metadata_idx=inserted.metadata_idx,
@@ -1471,17 +1482,98 @@ async def test_write_local_metadata_or_diagnose_upsert_outcomes_on_unique_field(
         study_field_created=False,
         outcome=FieldWriteOutcome.INSERTED,
     )
-    assert updated == SampleMetadataWriteResult(
-        metadata_idx=inserted.metadata_idx,
-        study_field_idx=field_idx,
-        study_field_created=False,
-        outcome=FieldWriteOutcome.UPDATED,
-    )
     assert unchanged == SampleMetadataWriteResult(
         metadata_idx=inserted.metadata_idx,
         study_field_idx=field_idx,
         study_field_created=False,
         outcome=FieldWriteOutcome.UNCHANGED,
+    )
+    row = await _fetch_metadata_row(ctx["pool"], inserted.metadata_idx)
+    assert row["value_text"] == "A"
+
+
+async def test_write_local_metadata_or_diagnose_non_unique_value_rewrite_still_upserts(ctx):
+    """Tests the case where an upsert changes a stored value through a field
+    that declares no uniqueness policy: the refusal is keyed on the policy, so
+    without it the overwrite proceeds and reports UPDATED.
+
+    Control for the refusal above; without it that test could pass because
+    upsert stopped overwriting anything at all.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    display_name = unique_field_name("plain_upsert")
+
+    async def _upsert(value):
+        return await _commit_local_write(
+            ctx,
+            bs_idx=bs_idx,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            data_type=FieldDataType.TEXT,
+            value=value,
+            on_conflict="upsert",
+        )
+
+    inserted = await _upsert("A")
+    updated = await _upsert("B")
+
+    assert updated == SampleMetadataWriteResult(
+        metadata_idx=inserted.metadata_idx,
+        study_field_idx=inserted.study_field_idx,
+        study_field_created=False,
+        outcome=FieldWriteOutcome.UPDATED,
+    )
+    row = await _fetch_metadata_row(ctx["pool"], inserted.metadata_idx)
+    assert row["value_text"] == "B"
+
+
+async def test_write_local_metadata_or_diagnose_unique_value_rewrite_after_relax(ctx):
+    """Tests the case where the field's uniqueness policy is cleared in SQL
+    between the two writes: the refusal reads the policy as it stands, so the
+    rewrite that was refused under the flag proceeds once it is gone.
+
+    This is the route around the refusal, and it is deliberate — SQL is where
+    such a correction belongs.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    display_name = unique_field_name("uniq_relaxed")
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TEXT,
+            required=False,
+            unique_in_study=True,
+        )
+    ctx["created"]["biosample_study_field"].append(field_idx)
+
+    async def _upsert(value):
+        return await _commit_local_write(
+            ctx,
+            bs_idx=bs_idx,
+            study_idx=ctx["study_idx"],
+            display_name=display_name,
+            data_type=FieldDataType.TEXT,
+            value=value,
+            on_conflict="upsert",
+        )
+
+    inserted = await _upsert("A")
+    with pytest.raises(ValueRewriteOnUniqueFieldError):
+        await _upsert("B")
+
+    await _set_unique_in_study(ctx, BIOSAMPLE_METADATA_SPEC, field_idx, False)
+    relaxed = await _upsert("B")
+
+    assert relaxed == SampleMetadataWriteResult(
+        metadata_idx=inserted.metadata_idx,
+        study_field_idx=field_idx,
+        study_field_created=False,
+        outcome=FieldWriteOutcome.UPDATED,
     )
     row = await _fetch_metadata_row(ctx["pool"], inserted.metadata_idx)
     assert row["value_text"] == "B"
@@ -2221,6 +2313,7 @@ async def test_fetch_study_fields_by_display_names_returns_local_and_linked(ctx,
             terminology_idx=None,
             global_field_idx=None,
             internal_name=None,
+            unique_in_study=False,
         ),
         linked_name: FieldRow(
             idx=linked_idx,
@@ -2229,6 +2322,7 @@ async def test_fetch_study_fields_by_display_names_returns_local_and_linked(ctx,
             terminology_idx=None,
             global_field_idx=global_field.idx,
             internal_name=global_field.internal_name,
+            unique_in_study=False,
         ),
     }
     assert result == expected
@@ -6789,3 +6883,137 @@ async def test_fetch_global_fields_orders_by_internal_name(ctx, spec):
         },
     ]
     assert seeded == expected
+
+
+# ---------------------------------------------------------------------------
+# fetch_entity_idx_by_unique_field_value (spec-parameterized over both entities)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_unique_value(ctx, spec, *, suffix, value):
+    """Seed a linked entity carrying `value` through a unique_in_study text
+    field. Returns (field_idx, entity_idx).
+
+    The value is written before the policy is switched on, so the propagation
+    trigger is what stamps the metadata row's denormalized flag -- the same
+    path a real study takes when it declares an existing field unique.
+    """
+    field_idx = await _create_plain_field(ctx, spec, suffix=suffix)
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value=value,
+    )
+    await _set_unique_in_study(ctx, spec, field_idx, True)
+    return field_idx, entity_idx
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_entity_idx_by_unique_field_value(ctx, spec):
+    """Tests the case where a unique_in_study field carries the value on one
+    entity: the fetch returns that entity's idx, and a value no entity carries
+    through the field returns None.
+    """
+    field_idx, entity_idx = await _seed_unique_value(ctx, spec, suffix="uniq-hit", value="Sample 1")
+
+    async with ctx["pool"].acquire() as conn:
+        found = await fetch_entity_idx_by_unique_field_value(
+            conn,
+            spec=spec,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="Sample 1",
+        )
+        missed = await fetch_entity_idx_by_unique_field_value(
+            conn,
+            spec=spec,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="Sample 2",
+        )
+
+    assert found == entity_idx
+    assert missed is None
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_entity_idx_by_unique_field_value_not_unique_returns_none(ctx, spec):
+    """Tests the case where the field does not declare unique_in_study: every
+    metadata row under it carries the flag false, so the query's own
+    unique_in_study term filters them all out and the answer is None rather
+    than an arbitrary match.
+
+    This is what makes the term load-bearing: without it the same call would
+    return the entity, so a caller that skipped the flag check would act on a
+    value that may repeat.
+    """
+    field_idx = await _create_plain_field(ctx, spec, suffix="uniq-unflagged")
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=entity_idx,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value="Sample 1",
+    )
+
+    async with ctx["pool"].acquire() as conn:
+        found = await fetch_entity_idx_by_unique_field_value(
+            conn,
+            spec=spec,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.TEXT,
+            value="Sample 1",
+        )
+
+    assert found is None
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_entity_idx_by_unique_field_value_scoped_to_its_field(ctx, spec):
+    """Tests the case where two unique_in_study fields in the same study carry
+    the same value: each resolves only through its own field, so naming the
+    field is what scopes the search and no study_idx term is needed.
+    """
+    first_field, first_entity = await _seed_unique_value(
+        ctx, spec, suffix="uniq-scope-a", value="Shared"
+    )
+    second_field, second_entity = await _seed_unique_value(
+        ctx, spec, suffix="uniq-scope-b", value="Shared"
+    )
+
+    async with ctx["pool"].acquire() as conn:
+        via_first = await fetch_entity_idx_by_unique_field_value(
+            conn,
+            spec=spec,
+            study_field_idx=first_field,
+            data_type=FieldDataType.TEXT,
+            value="Shared",
+        )
+        via_second = await fetch_entity_idx_by_unique_field_value(
+            conn,
+            spec=spec,
+            study_field_idx=second_field,
+            data_type=FieldDataType.TEXT,
+            value="Shared",
+        )
+
+    assert via_first == first_entity
+    assert via_second == second_entity

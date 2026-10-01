@@ -13,9 +13,11 @@ from qiita_common.analytic import (
 )
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
+    PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
     PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX,
     PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
+    PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     PATH_BIOSAMPLE_PREFIX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX,
@@ -41,6 +43,8 @@ from qiita_common.models import (
     Platform,
     PrepSampleStudyFieldCreateRequest,
     ProcessingStatus,
+    SampleMetadataWriteByUniqueFieldRequest,
+    SampleUniqueFieldRef,
     SequencedSamplePatchRequest,
     StudyPatchRequest,
     Tier,
@@ -56,7 +60,7 @@ from ._helpers import (
     _UNSET,
     _handle_patch,
     _handle_read,
-    _handle_study_field_create,
+    _handle_study_scoped_call,
     _lane_arg,
     _non_negative_seconds_arg,
     _positive_seconds_arg,
@@ -124,6 +128,38 @@ from .ticket import (
     _handle_ticket_status,
     _handle_ticket_submit,
 )
+
+
+def _add_global_internal_names_arg(subparser: argparse.ArgumentParser) -> None:
+    """Declare the opt-in that reinterprets --metadata KEYs for global fields."""
+    subparser.add_argument(
+        "--global-internal-names",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Interpret --metadata KEYs for global fields as their internal_name"
+            " rather than display_name (local fields stay display-name-keyed)"
+        ),
+    )
+
+
+def _add_unique_field_args(subparser: argparse.ArgumentParser) -> None:
+    """Declare the flags that name one sample by a unique-in-study field."""
+    subparser.add_argument("--study-idx", type=int, required=True)
+    subparser.add_argument(
+        "--unique-field-display-name",
+        required=True,
+        help=(
+            "display_name of the study-local field that identifies the sample;"
+            " it must declare unique_in_study"
+        ),
+    )
+    subparser.add_argument(
+        "--unique-field-value",
+        required=True,
+        help="the value that field carries on the wanted sample",
+    )
 
 
 def _add_study_field_create_args(subparser: argparse.ArgumentParser, *, entity_noun: str) -> None:
@@ -425,16 +461,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--matrix-tube-id",
         help="Matrix-tube identifier (digits only); validated server-side",
     )
-    p_biosample_create.add_argument(
-        "--global-internal-names",
-        action="store_const",
-        const=True,
-        default=None,
-        help=(
-            "Interpret --metadata KEYs for global fields as their internal_name"
-            " rather than display_name (local fields stay display-name-keyed)"
-        ),
-    )
+    _add_global_internal_names_arg(p_biosample_create)
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
 
     biosample_study_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
@@ -445,9 +472,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_study_field_create_args(p_biosample_create_field, entity_noun="biosample")
     p_biosample_create_field.set_defaults(
-        handler=_handle_study_field_create,
-        study_field_model=BiosampleStudyFieldCreateRequest,
-        study_field_path=biosample_study_field_path,
+        handler=_handle_study_scoped_call,
+        study_call_method="POST",
+        study_call_path=biosample_study_field_path,
+        study_call_model=BiosampleStudyFieldCreateRequest,
+        study_call_kv_flags=(),
     )
 
     _add_field_list_subcommands(
@@ -457,6 +486,54 @@ def _build_parser() -> argparse.ArgumentParser:
         global_field_path=(
             f"{PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT}"
         ),
+    )
+
+    biosample_unique_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
+    biosample_unique_field_metadata_path = (
+        f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD}"
+    )
+
+    p_biosample_get_by_field = p_biosample_sub.add_parser(
+        "get-by-unique-field",
+        help=(
+            "Fetch a study's view of a biosample by the study's own id for it"
+            " (POST /study/{S}/biosample/by-unique-field)"
+        ),
+    )
+    _add_unique_field_args(p_biosample_get_by_field)
+    p_biosample_get_by_field.set_defaults(
+        handler=_handle_study_scoped_call,
+        study_call_method="POST",
+        study_call_path=biosample_unique_field_path,
+        study_call_model=SampleUniqueFieldRef,
+        study_call_kv_flags=(),
+    )
+
+    p_biosample_patch_md_by_field = p_biosample_sub.add_parser(
+        "patch-metadata-by-unique-field",
+        help=(
+            "Upsert a study's metadata on the biosample its own id names"
+            " (PATCH /study/{S}/biosample/by-unique-field/metadata)"
+        ),
+    )
+    _add_unique_field_args(p_biosample_patch_md_by_field)
+    p_biosample_patch_md_by_field.add_argument(
+        "--metadata",
+        action="append",
+        required=True,
+        metavar="KEY=VALUE",
+        help=(
+            "Metadata entry to write; repeat for multiple. KEY is a field"
+            " display_name; the route parses VALUE into the field's data type."
+        ),
+    )
+    _add_global_internal_names_arg(p_biosample_patch_md_by_field)
+    p_biosample_patch_md_by_field.set_defaults(
+        handler=_handle_study_scoped_call,
+        study_call_method="PATCH",
+        study_call_path=biosample_unique_field_metadata_path,
+        study_call_model=SampleMetadataWriteByUniqueFieldRequest,
+        study_call_kv_flags=("metadata",),
     )
 
     biosample_by_idx_path = f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
@@ -716,13 +793,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--ena-run-accession",
         help="ENA run accession (ERR…), if this sequenced_sample already has one",
     )
-    p_seqsample_create.add_argument(
-        "--global-internal-names",
-        action="store_const",
-        const=True,
-        default=None,
-        help=("Interpret --metadata KEYs as global-field internal_names rather than display_names"),
-    )
+    _add_global_internal_names_arg(p_seqsample_create)
     p_seqsample_create.set_defaults(handler=_handle_sequenced_sample_create)
 
     p_seqsample_patch = p_seqsample_sub.add_parser(
@@ -778,9 +849,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_study_field_create_args(p_prepsample_create_field, entity_noun="prep_sample")
     p_prepsample_create_field.set_defaults(
-        handler=_handle_study_field_create,
-        study_field_model=PrepSampleStudyFieldCreateRequest,
-        study_field_path=prep_sample_study_field_path,
+        handler=_handle_study_scoped_call,
+        study_call_method="POST",
+        study_call_path=prep_sample_study_field_path,
+        study_call_model=PrepSampleStudyFieldCreateRequest,
+        study_call_kv_flags=(),
     )
 
     _add_field_list_subcommands(

@@ -139,6 +139,10 @@ class FieldRow:
     field). internal_name is that global field's stable identifier — its own for
     a *_global_field row, the linked global's for a globally-linked *_study_field
     row, and None on a purely-local field.
+
+    unique_in_study is None on a *_global_field row: the column lives on
+    *_study_field only, because the guarantee it names is scoped to one study
+    and a global field spans every study linked to it.
     """
 
     idx: int
@@ -150,6 +154,7 @@ class FieldRow:
     # field can equal its own FK by coincidence.
     global_field_idx: int | None
     internal_name: str | None
+    unique_in_study: bool | None = None
 
     def __post_init__(self) -> None:
         _assert_global_link_consistent(self.global_field_idx, self.internal_name)
@@ -312,6 +317,35 @@ class MissingValueOnUniqueFieldError(Exception):
         super().__init__(
             f"{entity_kind} field {display_name!r} is unique within its study and"
             f" cannot hold a missing-value marker"
+        )
+
+
+class ValueRewriteOnUniqueFieldError(Exception):
+    """Raised when a *_metadata write would change a value already stored
+    through a unique_in_study field. Carries the field, what it holds, and
+    what the write offered.
+    """
+
+    # same-pattern-ok: one refusal condition per type, so the type-dispatched
+    # HTTP mapping stays one-to-one
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        display_name: str,
+        study_field_idx: int,
+        stored_value: object,
+        attempted_value: object,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.display_name = display_name
+        self.study_field_idx = study_field_idx
+        self.stored_value = stored_value
+        self.attempted_value = attempted_value
+        super().__init__(
+            f"{entity_kind} field {display_name!r} declares unique_in_study;"
+            f" the value {stored_value!r} stored through it cannot be changed"
+            f" to {attempted_value!r}"
         )
 
 
@@ -770,6 +804,10 @@ def _field_rows_by_key(
     """Key field-lookup rows by the named column, wrapping each in FieldRow.
     Each row must carry key_column plus idx, display_name, data_type,
     terminology_idx, global_field_idx, and internal_name columns.
+
+    unique_in_study is read with a default because only the study-field read
+    selects it; a global-field row leaves it None, which is the value that
+    column's absence means.
     """
     return {
         r[key_column]: FieldRow(
@@ -779,6 +817,7 @@ def _field_rows_by_key(
             terminology_idx=r["terminology_idx"],
             global_field_idx=r["global_field_idx"],
             internal_name=r["internal_name"],
+            unique_in_study=r.get("unique_in_study"),
         )
         for r in rows
     }
@@ -836,6 +875,9 @@ async def fetch_study_fields_by_display_names(
     the row's FK, None on a purely-local field, and internal_name comes from the
     linked global field, None for the same reason. Names with no matching row are
     absent from the returned dict; empty input short-circuits with no DB call.
+
+    unique_in_study comes back as the row stores it, so a caller can tell
+    whether the field's values are guaranteed distinct within the study.
     """
     # Materialize so emptiness is detectable and the param can be passed as ANY.
     names = list(display_names)
@@ -850,7 +892,8 @@ async def fetch_study_fields_by_display_names(
         f"SELECT sf.idx, sf.display_name,"
         f" COALESCE(sf.data_type, gf.data_type) AS data_type,"
         f" COALESCE(sf.terminology_idx, gf.terminology_idx) AS terminology_idx,"
-        f" sf.{fk_column} AS global_field_idx, gf.internal_name"
+        f" sf.{fk_column} AS global_field_idx, gf.internal_name,"
+        f" sf.unique_in_study"
         f" FROM {spec.study_field_table} sf"
         f" LEFT JOIN {spec.global_field_table} gf ON gf.idx = sf.{fk_column}"
         f" WHERE sf.study_idx = $1 AND sf.display_name = ANY($2::text[])",
@@ -858,6 +901,49 @@ async def fetch_study_fields_by_display_names(
         names,
     )
     return _field_rows_by_key(rows, key_column="display_name")
+
+
+async def fetch_entity_idx_by_unique_field_value(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_field_idx: int,
+    data_type: FieldDataType,
+    value: str | Decimal | date | bool,
+) -> int | None:
+    """Return the entity idx carrying `value` through the given study field, or
+    None when no row does.
+
+    The caller must have established that the field declares unique_in_study.
+    Without it every row under the field carries the flag false, so the term
+    below filters them all out and this returns None rather than a match. Under
+    the flag the partial unique index over (study_field_idx, value_<type>) makes
+    at most one row match, so the answer is total.
+
+    No study_idx term is needed: a study field belongs to exactly one study, so
+    naming the field already scopes the search to it. Matching is whatever the
+    value column's type does — case-sensitive for text, typed equality for
+    numeric and date — which is the same comparison the unique index enforces.
+
+    Retired entities and retired study links are NOT excluded: they keep
+    holding their value, and the index keeps enforcing it, so resolution stays
+    total and retirement is the caller's decision to make afterwards.
+    """
+    # Closed-set lookup; a data_type with no typed column reaches the write and
+    # read guards as NotImplementedError rather than matching NULL here.
+    value_column = GLOBAL_METADATA_VALUE_COLUMN[data_type]
+    # The unique_in_study term spells the partial index's own predicate, which
+    # the planner needs in order to use that index.
+    row = await pool_or_conn.fetchrow(
+        f"SELECT {spec.entity_key_column}"
+        f" FROM {spec.metadata_table}"
+        f" WHERE {spec.study_field_idx_column} = $1"
+        f"   AND {value_column} = $2"
+        f"   AND unique_in_study",
+        study_field_idx,
+        value,
+    )
+    return None if row is None else row[spec.entity_key_column]
 
 
 async def fetch_missing_value_reason_idxs_by_names(
@@ -1318,7 +1404,8 @@ async def _fetch_slot_occupant(
         f"SELECT m.idx AS existing_metadata_idx,"
         f" {METADATA_VALUE_COLUMNS_SELECT},"
         f" f.study_idx AS contributing_study_idx,"
-        f" f.idx AS contributing_study_field_idx"
+        f" f.idx AS contributing_study_field_idx,"
+        f" f.unique_in_study"
         f" FROM {spec.metadata_table} m"
         f" JOIN {spec.study_field_table} f"
         f" ON f.idx = m.{spec.study_field_idx_column}"
@@ -1803,6 +1890,18 @@ async def _insert_metadata_or_diagnose(
                 study_field_created=False,
                 outcome=FieldWriteOutcome.UNCHANGED,
             )
+        # A value stored through a unique_in_study field is what identifies the
+        # sample within the study, so changing it moves that identity onto
+        # another row and mis-targets every write addressed by the old value.
+        if existing_row["unique_in_study"]:
+            raise ValueRewriteOnUniqueFieldError(
+                entity_kind=spec.entity_kind,
+                display_name=display_name,
+                study_field_idx=occupant_field_idx,
+                stored_value=existing_value,
+                attempted_value=value,
+            )
+
         # Different value, or a missing↔typed kind change: overwrite in place.
         # The occupant's populated column is the missing-reason column when it
         # holds a missing reason, otherwise the field's typed column.
@@ -1811,12 +1910,12 @@ async def _insert_metadata_or_diagnose(
             if existing_missing_reason_idx is not None
             else _resolve_typed_value_column(data_type)
         )
-        # The overwrite is judged against the study-local uniqueness index on
-        # its own terms: the INSERT's rejection said only that this slot was
-        # taken, which the occupant read above has now explained, and says
-        # nothing about whether the new value collides with another entity's.
-        # The no-missing-value CHECK is not reachable here, being evaluated
-        # ahead of any index, so a missing marker always fails at the INSERT.
+        # Only a field carrying no uniqueness policy reaches here, the refusal
+        # above having taken the rest, so the study-local uniqueness index has
+        # nothing to say about this overwrite. The handler below stays for a
+        # caller that reaches this write by some other route. The
+        # no-missing-value CHECK is likewise unreachable, being evaluated ahead
+        # of any index, so a missing marker always fails at the INSERT.
         try:
             await _update_metadata(
                 conn,

@@ -21,6 +21,37 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
+  reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
+  biosample, and upsert this study's metadata on it, naming the sample by a
+  `unique_in_study` field's `display_name` and the value it carries rather than by an
+  idx. The identifying pair travels in the body, so a value that may carry PII stays
+  out of URLs; metadata is written with repeatable `--metadata KEY=VALUE`, which
+  refuses a repeated key rather than letting the last one silently win.
+- **Write a biosample's metadata by the study's own name for it —
+  `PATCH /api/v1/study/{study_idx}/biosample/by-unique-field/metadata` (#639).** The
+  by-idx metadata write, addressed by a `unique_in_study` field's `display_name` and
+  the value it carries, so a read-modify-write never has to handle a `biosample_idx`;
+  the response adds the idx the pair resolved to. The identifying field may itself
+  appear in the body, but only carrying the value it already holds; offering a
+  different one is a 422, as it is on every metadata route. The owner-biosample-id
+  field is a 422 either way, being written only through its own surface.
+  A retired biosample is 409 here, where the matching read answers 404. A field
+  redeclared to another data type while the pair is resolving answers 503 to retry,
+  rather than the 404 the caller could not tell from a sample that is genuinely absent.
+  Access, and every other refusal, are the by-idx write's.
+- **Read a biosample by the study's own name for it —
+  `POST /api/v1/study/{study_idx}/biosample/by-unique-field` (#639).** Returns the same
+  study-scoped view as the by-idx read, for a caller holding a `unique_in_study`
+  field's `display_name` and the value that field carries rather than a
+  `biosample_idx`. POST rather than GET because the identifying value can be the
+  owner's own name for the sample, which is restricted and sometimes carries PII, so
+  it stays out of URLs and access logs. The named field must exist on the study and
+  must declare `unique_in_study` — without it the value could name several samples, so
+  the lookup is refused (422) rather than resolved arbitrarily — and the value must
+  parse as the field's data type (422); a well-formed pair naming no sample is 404.
+  The access bar, and the 404 on a retired sample or retired study link, are those of
+  the by-idx read.
 - **A study-local sample field can be widened to text, taking its stored values
   with it (#628).** A field minted as numeric, boolean, or date could not be redeclared once
   values existed: the field-contract check runs when a metadata row is written, not when
@@ -3908,6 +3939,20 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **A value stored through a `unique_in_study` sample field can no longer be changed
+  through the REST API (#639).** Such a value is used to name the sample within its
+  study, so overwriting it hands that name to a different sample and silently
+  mis-targets any later write addressed by the old value. Every metadata route now
+  answers 422 instead, on biosamples and prep samples alike; writing the value for the
+  first time, re-sending the value already stored, and writing fields with no
+  uniqueness policy are all unaffected. Correcting such a value is a database
+  operation, deliberately — it is not something a request performs.
+- **A sample field's `unique_in_study` policy can be declared through the REST API but
+  no longer withdrawn (#639).** Clearing the policy would let the values it protects be
+  rewritten freely and then re-protected, which was the one remaining way a stored
+  value could move between samples. A body clearing the policy on a field that carries
+  it answers 422; declaring it, and re-sending the policy a field already has, are
+  unchanged.
 - **Declaring a sample field unique within its study no longer lets a concurrent write
   slip past the new policy (#628).** The propagation that mirrors the policy onto the
   field's stored values read only what was committed, so a metadata write already in
