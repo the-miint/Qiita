@@ -21,17 +21,24 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **The control plane can open a miint ENA (Webin V2) submission session (#N).** The first
-  piece of depositing studies and biosamples to ENA: `ena_submission.EnaSubmissionCatalog`
-  registers a Webin secret and attaches the `ena` catalog over the service-side, LOAD-only
-  miint connect, and tears both down on exit. The endpoint is an environment selector --
-  `test` or `production`, never a URL -- and is checked against that set before a connection is
-  opened, so an invalid value fails with this package's own error rather than a DuckDB binder
-  error from inside setup. The session is the first DuckDB connection in the control-plane
-  service to bound its own `threads` and `memory_limit`, since it runs inside the process that
-  serves the REST API. Submitting itself comes later; this lands the boundary and its tests.
-  Alongside it, `qiita_common.sql.sql_string_literal` replaces the three private copies of the
-  same SQL string-literal escaper in the control-plane CLI modules.
+- **The control plane can deposit studies and biosamples to ENA (#N).**
+  `ena_submission.EnaSubmissionCatalog` opens a miint Webin V2 session — registering the secret,
+  attaching the `ena` catalog over the service-side LOAD-only connect, and tearing both down on
+  exit — then inserts projects and samples and hands back the accessions ENA assigns. One
+  `EnaObjectSpec` per object declares what a submission carries, so a column absent from it is
+  never sent rather than sent as NULL; `scientific_name` is left out deliberately, since ENA
+  derives it from the taxon id. Samples go as one envelope, accepted or rejected whole, each
+  row's accessions matched back to it by alias. A rejection is classified into the three shapes
+  that need different handling — already deposited, alias collision, failed checklist validation
+  — each carrying what that path reports, so a caller can record an existing accession against
+  the right row, resubmit, or fix the metadata without re-parsing a message. Blank aliases and
+  checklists, and a repeated alias within one batch, are refused before anything is sent. The
+  endpoint is an environment selector, `test` or `production` and never a URL, checked before a
+  connection opens; the session bounds its own `threads` and `memory_limit`, since it runs inside
+  the process serving the REST API.
+
+- **`qiita_common.sql.sql_string_literal` replaces the three private copies of the same SQL
+  string-literal escaper in the control-plane CLI modules (#N).**
 
 - **A study-local sample field can be widened to text, taking its stored values
   with it (#628).** A field minted as numeric, boolean, or date could not be redeclared once
