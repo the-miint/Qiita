@@ -86,10 +86,10 @@ def _render_value(value: SampleMetadataValue, *, field_name: str) -> str:
         return value.name
     if isinstance(value, str):
         return value
-    # str(Decimal) keeps plain decimal notation; a float would give `1e-05` for
-    # a small magnitude and binary noise for others.
+    # Fixed-point to prevent exponent notation for Decimal values,
+    # as ENA's coordinate fields expect fixed-point notation.
     if isinstance(value, Decimal):
-        return str(value)
+        return format(value, "f")
     if isinstance(value, date):
         return value.isoformat()
     # No field any seeded checklist requires is boolean or terminology-typed, so

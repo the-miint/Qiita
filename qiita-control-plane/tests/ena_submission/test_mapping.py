@@ -225,12 +225,13 @@ def test_map_biosample_to_ena_sample_row_missing_value():
 
 
 def test_map_biosample_to_ena_sample_row_small_numeric():
-    """Tests the case where a numeric value is small enough that a float would
-    render in scientific notation: it is submitted in plain decimal, because
-    ENA parses the text and `1e-05` is not a number to it."""
+    """Tests the case where a numeric value is small enough that Decimal itself
+    renders it in exponent notation: it is submitted in plain decimal. The
+    value is below the magnitude where that switchover happens, so a rendering
+    that relied on str(Decimal) would fail here."""
     requirements = [_DEPTH]
     metadata = _taxon_metadata() | {
-        "depth_m": _metadata_row("depth_m", Decimal("0.00001"), FieldDataType.NUMERIC),
+        "depth_m": _metadata_row("depth_m", Decimal("0.0000001"), FieldDataType.NUMERIC),
     }
 
     result = map_biosample_to_ena_sample_row(
@@ -243,7 +244,7 @@ def test_map_biosample_to_ena_sample_row_small_numeric():
 
     expected = _expected_sample(
         checklist=_ENA_DEFAULT,
-        attributes={"depth": "0.00001"},
+        attributes={"depth": "0.0000001"},
         attribute_units={"depth": "m"},
     )
     assert result == expected
