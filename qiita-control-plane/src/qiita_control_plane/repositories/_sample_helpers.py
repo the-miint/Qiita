@@ -400,13 +400,13 @@ class StudyFieldDataTypeNotTextError(Exception):
 
 
 class MetadataChecklistUnknownError(Exception):
-    """Raised when a metadata_checklist name has no matching
-    qiita.metadata_checklist row. Carries the unknown name.
+    """Raised when a metadata_checklist lookup matches no row. Carries the
+    value looked up, which is a name or an idx depending on the lookup.
     """
 
-    def __init__(self, name: str) -> None:
-        self.name = name
-        super().__init__(f"unknown metadata_checklist name: {name!r}")
+    def __init__(self, identifier: str | int) -> None:
+        self.identifier = identifier
+        super().__init__(f"unknown metadata_checklist: {identifier!r}")
 
 
 class StudyFieldConflictError(Exception):
@@ -940,6 +940,65 @@ async def fetch_metadata_checklist_idx_by_name(
     if idx is None:
         raise MetadataChecklistUnknownError(name)
     return idx
+
+
+@dataclass(frozen=True)
+class ChecklistRequirementRow:
+    """One field a checklist requires, paired with the biosample field holding it.
+
+    `checklist_field_name` is the publisher's own name for the field and is
+    what goes on the wire; `internal_name` is the Qiita global field supplying
+    the value. `unit` is the unit that value is submitted in, None for a field
+    that takes none.
+    """
+
+    checklist_field_name: str
+    internal_name: str
+    unit: str | None
+
+
+async def fetch_biosample_checklist_requirements(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    metadata_checklist_idx: int,
+) -> list[ChecklistRequirementRow]:
+    """Return the biosample-side fields `metadata_checklist_idx` requires.
+
+    Resolves the checklist's own rows only. Prep-sample-side requirements are
+    excluded. An idx matching no checklist raises rather than returning empty.
+    """
+    # Driven from metadata_checklist so a missing checklist and a checklist with
+    # no biosample-side requirement are told apart in one round trip: no rows at
+    # all versus rows whose requirement columns are null.
+    rows = await pool_or_conn.fetch(
+        "SELECT cf.name AS checklist_field_name,"
+        "       bgf.internal_name,"
+        "       r.unit"
+        "  FROM qiita.metadata_checklist mc"
+        "  LEFT JOIN qiita.metadata_checklist_requirement r"
+        "         ON r.metadata_checklist_idx = mc.idx"
+        "        AND r.biosample_global_field_idx IS NOT NULL"
+        "  LEFT JOIN qiita.checklist_field cf ON cf.idx = r.checklist_field_idx"
+        "  LEFT JOIN qiita.biosample_global_field bgf"
+        "         ON bgf.idx = r.biosample_global_field_idx"
+        " WHERE mc.idx = $1"
+        # Ordered for legible output when reading these rows by hand; no
+        # caller depends on it.
+        " ORDER BY cf.name",
+        metadata_checklist_idx,
+    )
+    if not rows:
+        raise MetadataChecklistUnknownError(metadata_checklist_idx)
+    requirements = [
+        ChecklistRequirementRow(
+            checklist_field_name=r["checklist_field_name"],
+            internal_name=r["internal_name"],
+            unit=r["unit"],
+        )
+        for r in rows
+        if r["checklist_field_name"] is not None
+    ]
+    return requirements
 
 
 def _decode_metadata_value(

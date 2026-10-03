@@ -47,6 +47,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     MAX_PG_NUMERIC_INTEGER_DIGITS,
     MAX_PG_NUMERIC_SCALE_DIGITS,
     METADATA_VALUE_COLUMNS_SELECT,
+    ChecklistRequirementRow,
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
     DuplicateGlobalFieldTargetError,
@@ -55,6 +56,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     FieldRow,
     GlobalMetadataRow,
     LocalWriteOnGloballyLinkedFieldError,
+    MetadataChecklistUnknownError,
     MetadataParseError,
     MetadataRow,
     MetadataUnknownFieldsError,
@@ -75,11 +77,13 @@ from qiita_control_plane.repositories._sample_helpers import (
     _update_metadata,
     create_study_field,
     create_study_field_and_read_back,
+    fetch_biosample_checklist_requirements,
     fetch_entity_is_linked_to_study,
     fetch_global_fields,
     fetch_global_fields_by_keys,
     fetch_global_metadata,
     fetch_local_metadata,
+    fetch_metadata_checklist_idx_by_name,
     fetch_missing_value_reason_idxs_by_names,
     fetch_study_field,
     fetch_study_fields_by_display_names,
@@ -6789,3 +6793,179 @@ async def test_fetch_global_fields_orders_by_internal_name(ctx, spec):
         },
     ]
     assert seeded == expected
+
+
+# ---------------------------------------------------------------------------
+# fetch_biosample_checklist_requirements
+# ---------------------------------------------------------------------------
+# Compared as sets: the exact order depends on the database's collation, which
+# is not a contract worth pinning.
+
+
+async def test_fetch_biosample_checklist_requirements(postgres_pool):
+    """Tests the case where a checklist requires fields with and without units:
+    every seeded requirement comes back, each paired with the biosample field
+    supplying its value, and only the fields that declare a unit carry one."""
+    checklist_idx = await fetch_metadata_checklist_idx_by_name(postgres_pool, "ERC000024")
+
+    result = await fetch_biosample_checklist_requirements(
+        postgres_pool, metadata_checklist_idx=checklist_idx
+    )
+
+    expected = {
+        ChecklistRequirementRow(
+            checklist_field_name="collection date",
+            internal_name="collection_date",
+            unit=None,
+        ),
+        ChecklistRequirementRow(
+            checklist_field_name="geographic location (country and/or sea)",
+            internal_name="geographic_location_country_or_sea",
+            unit=None,
+        ),
+        ChecklistRequirementRow(
+            checklist_field_name="geographic location (latitude)",
+            internal_name="geographic_location_latitude",
+            unit="DD",
+        ),
+        ChecklistRequirementRow(
+            checklist_field_name="geographic location (longitude)",
+            internal_name="geographic_location_longitude",
+            unit="DD",
+        ),
+        ChecklistRequirementRow(
+            checklist_field_name="broad-scale environmental context",
+            internal_name="broad_scale_environmental_context_verbatim",
+            unit=None,
+        ),
+        ChecklistRequirementRow(
+            checklist_field_name="local environmental context",
+            internal_name="local_environmental_context_verbatim",
+            unit=None,
+        ),
+        ChecklistRequirementRow(
+            checklist_field_name="environmental medium",
+            internal_name="environmental_medium_verbatim",
+            unit=None,
+        ),
+        ChecklistRequirementRow(
+            checklist_field_name="depth",
+            internal_name="depth_m",
+            unit="m",
+        ),
+    }
+    assert set(result) == expected
+
+
+async def test_fetch_biosample_checklist_requirements_root_checklist(postgres_pool):
+    """Tests the case where the checklist is the root one: it requires only its
+    own two fields, and none of the descendants' are returned -- the parent link
+    records lineage, not an inherited field set."""
+    checklist_idx = await fetch_metadata_checklist_idx_by_name(postgres_pool, "ERC000011")
+
+    result = await fetch_biosample_checklist_requirements(
+        postgres_pool, metadata_checklist_idx=checklist_idx
+    )
+
+    expected = {
+        ChecklistRequirementRow(
+            checklist_field_name="collection date",
+            internal_name="collection_date",
+            unit=None,
+        ),
+        ChecklistRequirementRow(
+            checklist_field_name="geographic location (country and/or sea)",
+            internal_name="geographic_location_country_or_sea",
+            unit=None,
+        ),
+    }
+    assert set(result) == expected
+
+
+async def test_fetch_biosample_checklist_requirements_excludes_prep_sample(postgres_pool):
+    """Tests the case where a checklist carries a prep-sample-side requirement
+    alongside its biosample ones: only the biosample-side rows come back, so a
+    prep-sample row cannot reach a caller asking for biosample fields."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Pattern 1: nothing commits. No migration seeds a prep-sample-side
+            # requirement, so the row the filter excludes has to be made here.
+            checklist_idx = await fetch_metadata_checklist_idx_by_name(conn, "ERC000011")
+            prep_field_idx = await conn.fetchval(
+                "SELECT idx FROM qiita.prep_sample_global_field ORDER BY idx LIMIT 1"
+            )
+            assert prep_field_idx is not None, "no prep-sample global field to bind"
+            checklist_field_idx = await conn.fetchval(
+                "INSERT INTO qiita.checklist_field (name) VALUES ($1) RETURNING idx",
+                f"probe prep field {secrets.token_hex(4)}",
+            )
+            await conn.execute(
+                "INSERT INTO qiita.metadata_checklist_requirement"
+                " (metadata_checklist_idx, prep_sample_global_field_idx,"
+                "  checklist_field_idx)"
+                " VALUES ($1, $2, $3)",
+                checklist_idx,
+                prep_field_idx,
+                checklist_field_idx,
+            )
+
+            result = await fetch_biosample_checklist_requirements(
+                conn, metadata_checklist_idx=checklist_idx
+            )
+
+            expected = {
+                ChecklistRequirementRow(
+                    checklist_field_name="collection date",
+                    internal_name="collection_date",
+                    unit=None,
+                ),
+                ChecklistRequirementRow(
+                    checklist_field_name="geographic location (country and/or sea)",
+                    internal_name="geographic_location_country_or_sea",
+                    unit=None,
+                ),
+            }
+            assert set(result) == expected
+        finally:
+            await tr.rollback()
+
+
+async def test_fetch_biosample_checklist_requirements_none_on_biosample_side(postgres_pool):
+    """Tests the case where the checklist exists but requires nothing of the
+    biosample: the read returns empty rather than raising, which is what
+    separates it from an idx matching no checklist at all."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Pattern 1: nothing commits. Every seeded checklist has biosample
+            # requirements, so a bare one has to be made here.
+            bare_idx = await conn.fetchval(
+                "INSERT INTO qiita.metadata_checklist (name) VALUES ($1) RETURNING idx",
+                f"PROBE{secrets.token_hex(4)}",
+            )
+
+            result = await fetch_biosample_checklist_requirements(
+                conn, metadata_checklist_idx=bare_idx
+            )
+
+            assert result == []
+        finally:
+            await tr.rollback()
+
+
+async def test_fetch_biosample_checklist_requirements_unknown_checklist(postgres_pool):
+    """Tests the case where the idx matches no checklist: the read raises rather
+    than returning empty, so an empty list cannot be mistaken for a checklist
+    that exists and happens to require nothing."""
+    known_idx = await fetch_metadata_checklist_idx_by_name(postgres_pool, "ERC000014")
+    unknown_idx = -known_idx
+
+    with pytest.raises(MetadataChecklistUnknownError) as exc_info:
+        await fetch_biosample_checklist_requirements(
+            postgres_pool, metadata_checklist_idx=unknown_idx
+        )
+
+    assert exc_info.value.identifier == unknown_idx

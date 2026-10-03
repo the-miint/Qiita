@@ -21,6 +21,22 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Qiita metadata maps into ENA submission bodies, driven by what each checklist requires (#N).**
+  A new `checklist_field` table names a published checklist's fields in the publisher's own
+  vocabulary, and `metadata_checklist_field` — renamed `metadata_checklist_requirement`, since a
+  row is one requirement a checklist places — now links each to the Qiita field supplying its
+  value and the unit it is submitted in. The five seeded ENA checklists get their mandatory
+  fields, verified against ENA's published definitions: each checklist carries its own full set
+  rather than inheriting one, because a parent records lineage, not an inherited field set, and
+  two checklists currently supported by ENA (although not qiita-miint) require none of their parent's fields. `ena_submission.mapping` builds
+  a study's project body and a biosample's sample body from that, sending every field the
+  checklist requires and nothing else. Values Qiita holds for unrequired fields stay home; a
+  required field the biosample lacks fails there, naming the field, rather than taking down the
+  whole envelope at submit. Three new text biosample fields — `env_broad_scale`,
+  `env_local_scale`, `env_medium` — hold the environmental contexts as supplied, since the
+  existing three resolve against ENVO and what submitters write for them is free text that no
+  ontology matches. The import path that populates them lands separately.
+
 - **The control plane can deposit studies and biosamples to ENA (#N).**
   `ena_submission.EnaSubmissionCatalog` opens a miint Webin V2 session — registering the secret,
   attaching the `ena` catalog over the service-side LOAD-only connect, and tearing both down on
