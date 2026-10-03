@@ -21,7 +21,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **Qiita metadata maps into ENA submission bodies, driven by what each checklist requires (#N).**
+- **Qiita metadata maps into ENA submission bodies, driven by what each checklist requires (#642).**
   A new `checklist_field` table names a published checklist's fields in the publisher's own
   vocabulary, and `metadata_checklist_field` — renamed `metadata_checklist_requirement`, since a
   row is one requirement a checklist places — now links each to the Qiita field supplying its
@@ -37,7 +37,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   existing three resolve against ENVO and what submitters write for them is free text that no
   ontology matches. The import path that populates them lands separately.
 
-- **The control plane can deposit studies and biosamples to ENA (#N).**
+- **The control plane can deposit studies and biosamples to ENA (#642).**
   `ena_submission.EnaSubmissionCatalog` opens a miint Webin V2 session — registering the secret,
   attaching the `ena` catalog over the service-side LOAD-only connect, and tearing both down on
   exit — then inserts projects and samples and hands back the accessions ENA assigns. One
@@ -54,7 +54,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   the process serving the REST API.
 
 - **`qiita_common.sql.sql_string_literal` replaces the three private copies of the same SQL
-  string-literal escaper in the control-plane CLI modules (#N).**
+  string-literal escaper in the control-plane CLI modules (#642).**
 
 - **A study-local sample field can be widened to text, taking its stored values
   with it (#628).** A field minted as numeric, boolean, or date could not be redeclared once
