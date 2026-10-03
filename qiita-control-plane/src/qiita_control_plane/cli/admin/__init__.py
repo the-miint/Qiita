@@ -97,7 +97,6 @@ from .masked_export import (
     _handle_masked_read_export,
     _parquet_row_count,
     _peek_paired,
-    _sql_str,
     _write_masked_sample,
 )
 from .owner_id import (
@@ -1444,7 +1443,6 @@ __all__ = [
     "_resubmit_work_ticket",
     "_select_purge_failed_candidates",
     "_set_system_role",
-    "_sql_str",
     "_sync_actions",
     "_token_revoke_all",
     "_validate_force_fail_args",

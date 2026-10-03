@@ -1055,9 +1055,11 @@ async def resolve_metadata_checklist_idx(
     try:
         return await fetch_metadata_checklist_idx_by_name(conn, name)
     except MetadataChecklistUnknownError as exc:
+        # The identifier is a name because this resolves by name; the detail
+        # says so. A lookup that raises with an idx needs its own message.
         raise HTTPException(
             status_code=422,
-            detail=f"metadata_checklist_name {exc.name!r} does not reference an existing checklist",  # noqa: E501
+            detail=f"metadata_checklist_name {exc.identifier!r} does not reference an existing checklist",  # noqa: E501
         )
 
 
