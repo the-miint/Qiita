@@ -49,6 +49,33 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   deblur step works around [duckdb-miint#194](https://github.com/the-miint/duckdb-miint/issues/194)
   (MAFFT litters `order`/`pre`/`trace` into the CWD on some strategies) by running MAFFT
   in a per-job scratch dir (`miint.mafft_scratch_cwd`).
+- **A study-local sample field can be widened to text, taking its stored values
+  with it (#628).** A field minted as numeric, boolean, or date could not be redeclared once
+  values existed: the field-contract check runs when a metadata row is written, not when
+  a definition changes, so a bare flip would leave every stored value in a column the
+  declaration no longer names and reads would return NULL for all of them. The new
+  `qiita.widen_study_field_to_text` declares the field text and moves its values into
+  `value_text` in one transaction, rendering each in the form the write path stores so a
+  widened value re-parses unchanged -- including a date of `9999-12-31` or `0001-01-01`,
+  which the client library encodes as the infinite bounds and which the plain date
+  rendering answers NULL for. It serves both sample stacks. What it refuses is what
+  can never be done -- a field whose type belongs to the global registry, and terminology,
+  which has no text form -- each tagged in the error DETAIL, and the refusal names the
+  type it refused rather than describing the one type that reaches it today; a field
+  already text is a no-op returning zero rather than a conflict. Uniqueness enforcement passes from the
+  numeric or date partial index to the text one and still holds, since distinct values
+  render to distinct text. A move locks the metadata table against concurrent writers,
+  without which a write already in flight would land in the column the declaration is
+  about to stop naming -- unreadable, with nothing raised -- and it refuses to run for a
+  caller that has not bounded its wait for that lock. Neither the no-op nor a refusal
+  takes the lock. `PATCH /api/v1/study/{study_idx}/biosample-field/{study_field_idx}` and its
+  prep-sample twin reach it: the edit body now accepts `data_type`, whose only permitted
+  value is `text`, so narrowing stays inexpressible and is refused before the route runs.
+  The access bar is the one the route already had -- study admin, or `wet_lab_admin`.
+  Widening runs before a `unique_in_study` sent in the same body, so a field that becomes
+  text is judged eligible as text rather than as the closed value set it left. A field
+  whose values sit on published samples, or on samples whose link to the study has been
+  retired, cannot be widened at all, and the answer says which.
 - **`qiita submit-ena-import` / `qiita ena-import-status` submit and watch a batch ENA
   study import from the CLI (#629).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
   `--from-file`, one accession per line — a whole-line `#` comment only; a trailing
@@ -3908,6 +3935,31 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **Declaring a sample field unique within its study no longer lets a concurrent write
+  slip past the new policy (#628).** The propagation that mirrors the policy onto the
+  field's stored values read only what was committed, so a metadata write already in
+  flight landed carrying the old policy -- outside the uniqueness indexes, and staying
+  there until that row was written again. The propagation now locks the metadata table
+  against concurrent writers while it tightens a field, so such a write either commits
+  first and is judged by the new policy, or waits and reads it. The lock is bounded: the
+  PATCH gives up after three seconds and answers 503 rather than stalling every metadata
+  write in the system, and the propagation refuses to run at all for a caller that has
+  set no bound. Relaxing a field's policy is unchanged, taking no lock. An edit claims
+  the field's own row in the weakest mode that excludes another edit of it, which leaves
+  a write inserting a value through that field free to proceed rather than queueing
+  behind the edit; the two can therefore no longer be found waiting on each other, and a
+  value stored while a widen is in flight is carried into text by that widen instead of
+  costing one of the two transactions. A wait that runs out still answers 503 with a
+  Retry-After hint rather than failing unclassified -- the study-field edit routes, the
+  metadata-write routes, and the biosample and sequenced-sample import routes alike. The
+  bound covers the edit's read of the field's own row as well, so an edit held off by
+  another edit of the same field answers 503 too rather than the unclassified 500 it gave
+  before. A metadata write whose field is widened after the write has chosen its value
+  column but before the row lands is refused with 409 naming the redeclaration, where it
+  previously failed unclassified: the rejection the database raises for a value column
+  that does not match its field's type now carries a structured DETAIL identifying it, so
+  a route tells it from the other rejections sharing its SQLSTATE instead of reading every
+  untagged one as a publication lock.
 - **INSDC accession validation moved into `qiita-common` (#629).** `EnaAccessionKind`,
   `InvalidEnaAccessionError`, `detect_accession_kind`, and `validate_study_accession` now
   live in `qiita_common.ena_accession`, not `qiita_control_plane.ena_import.accession` —

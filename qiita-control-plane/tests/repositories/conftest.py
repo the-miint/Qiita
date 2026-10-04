@@ -22,6 +22,8 @@ from qiita_common.models import FieldDataType
 from qiita_control_plane.repositories._sample_helpers import (
     FieldRow,
     SampleEntityKind,
+    _get_or_create_local_study_field,
+    _insert_metadata,
     insert_entity_to_study,
 )
 from qiita_control_plane.repositories.biosample import insert_biosample
@@ -34,6 +36,98 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_prep_sample,
 )
 from qiita_control_plane.testing.unique_names import unique_field_name
+
+# Both stacks run every test parameterized over this; pytest reports ids as
+# [biosample] / [prep_sample].
+SPECS = [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC]
+
+# Declaring a field unique and widening one both lock the metadata table, and
+# neither runs without a bound on that wait. Any bound satisfies it; this one
+# only has to outlast an uncontended operation, so it tracks nothing in
+# production.
+METADATA_WRITE_LOCK_TIMEOUT = "3s"
+
+
+def _spec_id(spec):
+    """Pytest id for the parametrize decorator: spec.entity_kind value."""
+    return spec.entity_kind.value
+
+
+def _bare_table_name(qualified_table):
+    """Return the table name alone from a spec field naming it `schema.table`.
+
+    The cleanup buckets are keyed by bare table name while the spec fields carry
+    the qualified form, so the two are bridged in one place rather than at each
+    key.
+    """
+    return qualified_table.split(".")[-1]
+
+
+def _study_field_tracking_key(spec):
+    """Cleanup-dict key for the *_study_field rows seeded by a test."""
+    return _bare_table_name(spec.study_field_table)
+
+
+def _metadata_tracking_key(spec):
+    """Cleanup-dict key for the *_metadata rows seeded by a test."""
+    return _bare_table_name(spec.metadata_table)
+
+
+# ---------------------------------------------------------------------------
+# Study-field and metadata seeding, parameterized over the entity spec
+# ---------------------------------------------------------------------------
+
+
+async def _create_plain_field(
+    ctx, spec, *, suffix, data_type=FieldDataType.TEXT, terminology_idx=None
+):
+    """Create a purely-local study field with no uniqueness policy. Returns
+    the field idx. terminology_idx is required when data_type is terminology
+    and refused otherwise, per the field row's own coupling.
+    """
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=unique_field_name(suffix),
+            created_by_idx=ctx["principal_idx"],
+            data_type=data_type,
+            required=False,
+            terminology_idx=terminology_idx,
+        )
+    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
+    return field_idx
+
+
+async def _set_unique_in_study(ctx, spec, field_idx, value):
+    """Flip a study field's unique_in_study, driving the propagation trigger."""
+    # One transaction so the bound reaches the propagation; a SET LOCAL issued
+    # on its own would land in a separate implicit transaction and do nothing.
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        await conn.execute(f"SET LOCAL lock_timeout = '{METADATA_WRITE_LOCK_TIMEOUT}'")
+        await conn.execute(
+            f"UPDATE {spec.study_field_table} SET unique_in_study = $1 WHERE idx = $2",
+            value,
+            field_idx,
+        )
+
+
+async def _write_value(ctx, spec, *, entity_idx, field_idx, data_type, value):
+    """Write one metadata row and track it for cleanup. Returns the row idx."""
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        meta_idx = await _insert_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_field_idx=field_idx,
+            data_type=data_type,
+            value=value,
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][_metadata_tracking_key(spec)].append(meta_idx)
+    return meta_idx
+
 
 # ---------------------------------------------------------------------------
 # Pool-based seed helpers (Pattern 2 — committed rows, FK-reverse cleanup)

@@ -261,9 +261,10 @@ class UniqueInStudyViolation(StrEnum):
     MISSING_VALUE_MARKER = "missing_value_marker"
 
 
-# Columns a caller may edit on a {entity}_study_field row, mirroring the wire
-# shape of SampleStudyFieldPatchRequest, whose docstring carries why data_type
-# and the global-field link are excluded.
+# Columns a caller may edit on a {entity}_study_field row through the plain
+# column write. Narrower than the edit body: data_type is settable on the wire
+# but is carried by qiita.widen_study_field_to_text, which states why it cannot
+# be written here. The global-field link is on neither.
 STUDY_FIELD_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
     {"display_name", "description", "required", "tier_override", "unique_in_study"}
 )
@@ -730,6 +731,10 @@ class EntityMetadataSpec:
     # caller tells that rejection from any other trigger sharing its SQLSTATE.
     # Renaming the function in a migration means changing this in lockstep.
     metadata_retired_link_trigger: str
+    # Name of the DB function the metadata table's field-contract triggers run,
+    # tagged and kept in lockstep the same way. It rejects a row whose
+    # populated value column does not match its field's declared type.
+    metadata_field_contract_trigger: str
     # The boolean *_metadata column marking an owner-sample-id row, for
     # entities that carry one (is_owner_biosample_id on biosample); None when
     # the entity has no owner-sample-id concept. When set, generic metadata
@@ -2073,17 +2078,19 @@ async def fetch_study_field(
     names the global FK by its entity-specific column and the row's own idx as
     `idx`. Accepts either a pool or a connection.
 
-    for_update locks the study-field row for the rest of the caller's
-    transaction, so an edit preflight and the write that follows it cannot
-    straddle another writer's commit. It locks only the study-field row, not the
-    joined global field, and requires a connection inside a transaction, which
-    it enforces rather than assuming.
+    for_update claims the study-field row for the rest of the caller's
+    transaction, excluding another edit of it, and a delete of it, so two edits
+    cannot both clear the same ETag. It deliberately does not exclude a
+    concurrent metadata write through the field: why that matters is stated on
+    the same lock in qiita.widen_study_field_to_text. It locks only the
+    study-field row, not the joined global field, and requires a connection
+    inside a transaction, which it enforces rather than assuming.
     """
     if for_update:
         # A lock taken outside a transaction is released by the autocommit that
         # ends the statement, leaving the caller unprotected and uninformed.
         require_transaction(pool_or_conn)
-    lock_clause = " FOR UPDATE OF sf" if for_update else ""
+    lock_clause = " FOR NO KEY UPDATE OF sf" if for_update else ""
     sql = f"{_study_field_read_sql(spec)} WHERE sf.idx = $1{lock_clause}"
     row = await pool_or_conn.fetchrow(sql, idx)
     return row
@@ -2121,6 +2128,49 @@ async def update_study_field(
         return None
     updated_row = await fetch_study_field(conn, spec=spec, idx=written_idx["idx"])
     return updated_row
+
+
+async def widen_study_field_to_text(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_field_idx: int,
+) -> int:
+    """Declare one study-local field `text`, moving every value stored through
+    it into value_text, and return how many metadata rows moved.
+
+    Thin wrapper over qiita.widen_study_field_to_text, which owns the ordering
+    the two writes require and decides for itself whether the field may be
+    widened, having read the stored row under a lock. A field already declared
+    text is already in the target state: nothing is written and the count is
+    zero. A field whose type is not the study's to change, or whose values have
+    no text form, is refused by an asyncpg.RaiseError whose DETAIL carries a
+    `widen` key naming which; anything else it raises propagates unclassified.
+
+    A move excludes concurrent metadata writers, so the caller must have bounded
+    its wait for them: with lock_timeout unset the move raises
+    ObjectNotInPrerequisiteStateError and writes nothing, and when the bound
+    expires it raises LockNotAvailableError, likewise leaving the field as it
+    was. The second is a subclass of the first, so a caller telling the two
+    apart must catch it first or match on SQLSTATE. Neither the no-op nor a
+    refusal takes the lock or needs the bound.
+
+    The caller owns the transaction, and must still be in it when the returned
+    count is acted on: a move holds the field row, the metadata table against
+    concurrent writers, and up to two rows per value moved -- the metadata row
+    and its parent sample -- all for its remainder.
+    """
+    require_transaction(conn)
+    # The two tables bind as regclass, so a name that resolves to no table is
+    # refused by the cast rather than reaching a statement.
+    n_moved = await conn.fetchval(
+        "SELECT qiita.widen_study_field_to_text($1::regclass, $2::regclass, $3, $4)",
+        spec.study_field_table,
+        spec.metadata_table,
+        spec.study_field_idx_column,
+        study_field_idx,
+    )
+    return n_moved
 
 
 def classify_unique_in_study_violation(

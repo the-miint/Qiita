@@ -1489,7 +1489,7 @@ def test_sample_study_field_patch_request_rejects_empty_body():
         SampleStudyFieldPatchRequest()
 
 
-@pytest.mark.parametrize("field_name", ["display_name", "required", "unique_in_study"])
+@pytest.mark.parametrize("field_name", ["display_name", "required", "unique_in_study", "data_type"])
 def test_sample_study_field_patch_request_rejects_explicit_null_on_not_null(field_name):
     """Tests the case where a patch body sends an explicit null for a column
     the database declares NOT NULL: the wire refuses it.

@@ -21,6 +21,7 @@ in the roster a concurrent staging read produces.
 import asyncio
 import secrets
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -4767,3 +4768,41 @@ async def test_import_lock_timeout_maps_to_503(ctx, monkeypatch):
     body["sequenced_pool_item_id"] = body["sequenced_pool_item_id"] + "-retry"
     resp2 = await _post_sequenced_sample(ctx["wet"], ctx, run_idx, pool_idx, **body)
     assert resp2.status_code == 201, resp2.text
+
+
+# same-pattern-ok: the sibling of the biosample import deadlock case in
+# test_biosample.py, differing only in which route is driven and which call is
+# made to deadlock; this repo marks route twins rather than factoring them.
+async def test_import_sequenced_sample_deadlock_503(ctx, monkeypatch):
+    """Tests the case where the database aborts the import to break a lock
+    tie: the caller is told the condition is transient rather than receiving an
+    unclassified failure.
+    """
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "deadlock")
+    study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="dead")
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        study_idx=study_idx,
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    async def _deadlock(conn, **kwargs):
+        raise asyncpg.DeadlockDetectedError("deadlock detected")
+
+    monkeypatch.setattr(sequenced_sample_routes, "import_sequenced_prep_sample", _deadlock)
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("DEADLOCK"),
+        primary_study_idx=study_idx,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.headers["Retry-After"] == "1"
