@@ -2084,6 +2084,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **An ENA study whose sample repeats an attribute tag no longer fails at resolve (#650).**
+  `read_ena_attributes` can return a tag more than once (for example `BioSampleModel` or
+  `ENA-FIRST-PUBLIC`), which made the per-sample map fail with `Map keys must be unique`
+  and the whole study fail. A tag with one value is stored as before. A tag with several
+  values is kept study-local as a JSON array of its sorted distinct values (for example
+  `["10", "5"]`), never on a typed global field, even when the tag has a handler such as
+  `depth` or `collection_date`. An empty `<VALUE>` (NULL) is ignored.
+
 - **`qiita submit-ena-import` and `POST /ena-import-batch` refuse a malformed accession
   at submit (#635).** The shared validator checked only the prefix, so a bare `PRJEB`,
   `PRJEBxyz` or `PRJEB11419,PRJNA1` was accepted and then failed item by item in the

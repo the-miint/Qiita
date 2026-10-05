@@ -289,7 +289,9 @@ Metadata resolution and read download both go through `duckdb-miint` table funct
 not a hand-rolled ENA client:
 
 - `read_ena` — study header + run list.
-- `read_ena_attributes` — per-sample attributes, grouped into one map per sample.
+- `read_ena_attributes` — per-sample attributes, one map per sample. A tag with one value is
+  stored as is. A tag ENA repeats with several values is stored study-local as a JSON array of
+  its sorted distinct values (`["10", "5"]`), never on a typed global field.
 - `read_ena_sequences` — the actual read download, called by the `ingest_ena_reads`
   compute job once a pool's runs are registered.
 
