@@ -10,7 +10,7 @@ import sys
 import asyncpg
 from qiita_common.api_paths import (
     PATH_ADMIN_PREFIX,
-    PATH_ADMIN_PRINCIPAL,
+    PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
     PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
@@ -74,17 +74,34 @@ async def _set_system_role(database_url: str, email: str, role: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _nonblank_reason(value: str) -> str:
+    """argparse `type=` for --reason: the audit event must say why."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must not be blank")
+    return value
+
+
 def _principal_set_role(base_url: str, token: str, email: str, role: str, reason: str) -> dict:
     """Resolve `email` to its principal, then PATCH its system_role through the
-    admin route, which records the change (with `reason`) in the audit log."""
+    admin route, which records the change (with `reason`) in the audit log.
+
+    Refuses (RuntimeError) a disabled or retired principal, and sends nothing
+    when the principal already holds `role`, so no `from == to` event is written.
+    """
     found = _common.call(
-        "GET",
+        "POST",
         base_url,
         token,
-        f"{PATH_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL}",
-        params={"email": email},
+        f"{PATH_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL}",
+        json={"email": email},
     )
     principal_idx = found["principal_idx"]
+    for flag in ("disabled", "retired"):
+        if found[flag]:
+            raise RuntimeError(f"{email} is {flag}; refusing to change its role")
+    result = {"principal_idx": principal_idx, "email": email, "from": found["system_role"]}
+    if found["system_role"] == role:
+        return {**result, "to": role, "changed": False}
     _common._request(
         "PATCH",
         base_url,
@@ -92,12 +109,7 @@ def _principal_set_role(base_url: str, token: str, email: str, role: str, reason
         f"{PATH_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE.format(principal_idx=principal_idx)}",
         json={"system_role": role, "reason": reason},
     )
-    return {
-        "principal_idx": principal_idx,
-        "email": found["email"],
-        "from": found["system_role"],
-        "to": role,
-    }
+    return {**result, "to": role, "changed": True}
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +132,10 @@ def _handle_set_system_role(args: argparse.Namespace, parser: argparse.ArgumentP
 
 
 def _handle_principal_set_role(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    return _common.run_http_subcommand(
-        lambda t: _principal_set_role(args.base_url, t, args.email, args.role, args.reason)
-    )
+    try:
+        return _common.run_http_subcommand(
+            lambda t: _principal_set_role(args.base_url, t, args.email, args.role, args.reason)
+        )
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1

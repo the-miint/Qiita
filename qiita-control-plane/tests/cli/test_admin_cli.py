@@ -16,7 +16,7 @@ import argparse
 import httpx
 import pytest
 from qiita_common.api_paths import (
-    URL_ADMIN_PRINCIPAL,
+    URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
     URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
     URL_ADMIN_PRINCIPAL_SYSTEM_ROLE,
     URL_ADMIN_STUDY_OWNER_BIOSAMPLE_ID,
@@ -123,44 +123,101 @@ def test_token_revoke_all_calls_correct_url(monkeypatch):
     assert body["revoked_token_idxs"] == [1, 2]
 
 
+def _fake_lookup_then_patch(calls, *, system_role="user", disabled=False, retired=False):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        calls.append((method, url, json))
+        if method == "POST":
+            body = {
+                "principal_idx": 42,
+                "system_role": system_role,
+                "disabled": disabled,
+                "retired": retired,
+            }
+            return httpx.Response(200, json=body, request=httpx.Request(method, url))
+        return httpx.Response(204, request=httpx.Request(method, url))
+
+    return fake_request
+
+
 def test_principal_set_role_looks_up_then_patches(monkeypatch):
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli import admin as cli
 
     calls = []
-
-    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
-        calls.append((method, url, params, json))
-        if method == "GET":
-            body = {
-                "principal_idx": 42,
-                "email": "pi@example.com",
-                "system_role": "user",
-                "disabled": False,
-                "retired": False,
-            }
-            return httpx.Response(200, json=body, request=httpx.Request(method, url))
-        return httpx.Response(204, request=httpx.Request(method, url))
-
-    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setattr(_common.httpx, "request", _fake_lookup_then_patch(calls))
     result = cli._principal_set_role(
         "http://localhost:8080", "qk_admin", "PI@example.com", "wet_lab_admin", "lab lead"
     )
     assert calls == [
-        ("GET", f"http://localhost:8080{URL_ADMIN_PRINCIPAL}", {"email": "PI@example.com"}, None),
+        (
+            "POST",
+            f"http://localhost:8080{URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL}",
+            {"email": "PI@example.com"},
+        ),
         (
             "PATCH",
             f"http://localhost:8080{URL_ADMIN_PRINCIPAL_SYSTEM_ROLE.format(principal_idx=42)}",
-            None,
             {"system_role": "wet_lab_admin", "reason": "lab lead"},
         ),
     ]
     assert result == {
         "principal_idx": 42,
-        "email": "pi@example.com",
+        "email": "PI@example.com",
         "from": "user",
         "to": "wet_lab_admin",
+        "changed": True,
     }
+
+
+def test_principal_set_role_same_role_sends_no_patch(monkeypatch):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    calls = []
+    monkeypatch.setattr(
+        _common.httpx, "request", _fake_lookup_then_patch(calls, system_role="wet_lab_admin")
+    )
+    result = cli._principal_set_role(
+        "http://localhost:8080", "qk_admin", "pi@example.com", "wet_lab_admin", "again"
+    )
+    assert [c[0] for c in calls] == ["POST"]
+    assert result["changed"] is False
+
+
+@pytest.mark.parametrize("flag", ["disabled", "retired"])
+def test_principal_set_role_refuses_inactive_principal(monkeypatch, capsys, flag):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    calls = []
+    monkeypatch.setattr(_common.httpx, "request", _fake_lookup_then_patch(calls, **{flag: True}))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    rc = cli.main(
+        ["principal", "set-role", "--email", "x@example.com", "--role", "user", "--reason", "r"]
+    )
+    assert rc == 1
+    assert [c[0] for c in calls] == ["POST"]
+    assert flag in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("reason", ["", "   "])
+def test_principal_set_role_rejects_blank_reason(reason):
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            [
+                "principal",
+                "set-role",
+                "--email",
+                "x@example.com",
+                "--role",
+                "user",
+                "--reason",
+                reason,
+            ]
+        )
+    assert exc.value.code == 2
 
 
 def test_principal_set_role_unknown_email_does_not_patch(monkeypatch, capsys):
@@ -190,7 +247,7 @@ def test_principal_set_role_unknown_email_does_not_patch(monkeypatch, capsys):
         ]
     )
     assert rc == 1
-    assert methods == ["GET"]
+    assert methods == ["POST"]
 
 
 def test_main_login_dispatches_to_do_login(monkeypatch):

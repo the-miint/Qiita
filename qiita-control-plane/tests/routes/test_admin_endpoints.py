@@ -6,8 +6,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
     URL_ADMIN_AUDIT,
-    URL_ADMIN_PRINCIPAL,
     URL_ADMIN_PRINCIPAL_DISABLED,
+    URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
     URL_ADMIN_PRINCIPAL_RETIRED,
     URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
     URL_ADMIN_PRINCIPAL_SYSTEM_ROLE,
@@ -399,6 +399,20 @@ async def test_patch_principal_system_role_writes_audit_event(admin_client, post
     assert rows[-1]["actor_principal_idx"] == admin_idx
 
 
+async def test_patch_principal_system_role_refuses_self(admin_client, postgres_pool):
+    admin_token, admin_idx = await _admin_token(postgres_pool, admin_client)
+    resp = await admin_client.patch(
+        URL_ADMIN_PRINCIPAL_SYSTEM_ROLE.format(principal_idx=admin_idx),
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"system_role": SystemRole.USER, "reason": "oops"},
+    )
+    assert resp.status_code == 403
+    role = await postgres_pool.fetchval(
+        "SELECT system_role FROM qiita.principal WHERE idx = $1", admin_idx
+    )
+    assert role == SystemRole.SYSTEM_ADMIN
+
+
 async def test_patch_principal_system_role_admin_only(admin_client, postgres_pool):
     from qiita_control_plane.auth.token import mint_api_token
 
@@ -421,53 +435,80 @@ async def test_patch_principal_system_role_admin_only(admin_client, postgres_poo
 
 
 # ---------------------------------------------------------------------------
-# GET /admin/principal?email=
+# POST /admin/principal/lookup-by-email
 # ---------------------------------------------------------------------------
 
 
-async def test_get_principal_by_email_case_insensitive(admin_client, postgres_pool):
+async def _lookup(client, token, email):
+    return await client.post(
+        URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
+        headers={"Authorization": f"Bearer {token}"},
+        json={"email": email},
+    )
+
+
+async def test_lookup_principal_by_email_case_insensitive(admin_client, postgres_pool):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     target = await _seed_human(postgres_pool, email="lookup-target@example.com")
     _track(admin_client, target)
-    resp = await admin_client.get(
-        URL_ADMIN_PRINCIPAL,
-        headers={"Authorization": f"Bearer {admin_token}"},
-        params={"email": "Lookup-Target@Example.com"},
-    )
+    resp = await _lookup(admin_client, admin_token, "Lookup-Target@Example.com")
     assert resp.status_code == 200
     assert resp.json() == {
         "principal_idx": target,
-        "email": "lookup-target@example.com",
         "system_role": SystemRole.USER,
         "disabled": False,
         "retired": False,
     }
 
 
-async def test_get_principal_by_email_unknown_is_404(admin_client, postgres_pool):
+async def test_lookup_principal_by_email_unknown_is_404(admin_client, postgres_pool):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
-    resp = await admin_client.get(
-        URL_ADMIN_PRINCIPAL,
-        headers={"Authorization": f"Bearer {admin_token}"},
-        params={"email": "never-logged-in@example.com"},
-    )
+    resp = await _lookup(admin_client, admin_token, "never-logged-in@example.com")
     assert resp.status_code == 404
 
 
-async def test_get_principal_by_email_admin_only(admin_client, postgres_pool):
+async def test_lookup_principal_by_email_rejects_malformed_email(admin_client, postgres_pool):
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+    resp = await _lookup(admin_client, admin_token, "a\x00b@x.org")
+    assert resp.status_code == 422
+
+
+async def test_lookup_principal_by_email_requires_admin_user_scope(admin_client, postgres_pool):
+    """A system_admin whose token lacks admin:user is refused on the scope alone."""
     from qiita_control_plane.auth.token import mint_api_token
 
-    pidx = await _seed_human(postgres_pool, email="not-admin-lookup@example.com")
+    pidx = await _seed_human(
+        postgres_pool, email="narrow-admin@example.com", role=SystemRole.SYSTEM_ADMIN
+    )
     _track(admin_client, pidx)
     plaintext, _ = await mint_api_token(
         postgres_pool, principal_idx=pidx, label="x", scopes=[Scope.SELF_PROFILE]
     )
-    resp = await admin_client.get(
-        URL_ADMIN_PRINCIPAL,
-        headers={"Authorization": f"Bearer {plaintext}"},
-        params={"email": "not-admin-lookup@example.com"},
-    )
+    resp = await _lookup(admin_client, plaintext, "narrow-admin@example.com")
     assert resp.status_code == 403
+    assert resp.json()["detail"].startswith("missing required scope 'admin:user'")
+
+
+async def test_lookup_principal_by_email_requires_system_admin_role(admin_client, postgres_pool):
+    """A wet_lab_admin whose token carries admin:user is refused on the role alone.
+
+    The resolver intersects the token with the role's ceiling, which drops
+    admin:user, so both guards would refuse this caller.
+    """
+    from qiita_control_plane.auth.token import mint_api_token
+
+    pidx = await _seed_human(
+        postgres_pool, email="wla-lookup@example.com", role=SystemRole.WET_LAB_ADMIN
+    )
+    _track(admin_client, pidx)
+    plaintext, _ = await mint_api_token(
+        postgres_pool, principal_idx=pidx, label="x", scopes=[Scope.ADMIN_USER]
+    )
+    resp = await _lookup(admin_client, plaintext, "wla-lookup@example.com")
+    assert resp.status_code == 403
+    # The scope guard would also 403 here, with a different detail; the detail
+    # is what shows the role guard answered.
+    assert resp.json()["detail"].startswith("requires system_role")
 
 
 # ---------------------------------------------------------------------------

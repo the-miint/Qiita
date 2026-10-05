@@ -12,6 +12,7 @@ from qiita_common.auth_constants import (
     SERVICE_TOKEN_MAX_TTL_DAYS,
     SystemRole,
 )
+from qiita_common.models._base import LookupEmail
 
 # ============================================================================
 # Auth: API token mint / list models
@@ -191,11 +192,19 @@ class PrincipalSystemRoleUpdate(BaseModel):
     reason: str | None = None
 
 
+class PrincipalLookupRequest(BaseModel):
+    """Body for POST /api/v1/admin/principal/lookup-by-email. A body, not a
+    query parameter, so the email stays out of access logs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: LookupEmail
+
+
 class PrincipalLookupResponse(BaseModel):
-    """Body for GET /api/v1/admin/principal?email=."""
+    """Response for POST /api/v1/admin/principal/lookup-by-email."""
 
     principal_idx: Annotated[int, Field(gt=0)]
-    email: str
     system_role: SystemRole
     disabled: bool
     retired: bool

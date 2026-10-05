@@ -114,9 +114,11 @@ _ACCESS_ROW_COLUMNS = (
 
 
 class GranteeCandidate(NamedTuple):
-    """The principal a grant names by email, with the state a grant checks."""
+    """The principal an email names, with the state a grant or a role change
+    checks."""
 
     principal_idx: int
+    system_role: str
     disabled: bool
     retired: bool
 
@@ -129,7 +131,7 @@ async def fetch_grantee_by_email(
     `qiita.user.email` is CITEXT, so the match is case-insensitive.
     """
     row = await conn.fetchrow(
-        "SELECT p.idx, p.disabled, p.retired"
+        "SELECT p.idx, p.system_role, p.disabled, p.retired"
         " FROM qiita.user u JOIN qiita.principal p ON p.idx = u.principal_idx"
         " WHERE u.email = $1",
         email,
@@ -137,7 +139,10 @@ async def fetch_grantee_by_email(
     if row is None:
         return None
     return GranteeCandidate(
-        principal_idx=row["idx"], disabled=row["disabled"], retired=row["retired"]
+        principal_idx=row["idx"],
+        system_role=row["system_role"],
+        disabled=row["disabled"],
+        retired=row["retired"],
     )
 
 

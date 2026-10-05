@@ -15,8 +15,8 @@ from qiita_common.api_paths import (
     PATH_ADMIN_AUDIT,
     PATH_ADMIN_MASKED_READ_EXPORT_TICKET,
     PATH_ADMIN_PREFIX,
-    PATH_ADMIN_PRINCIPAL,
     PATH_ADMIN_PRINCIPAL_DISABLED,
+    PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
     PATH_ADMIN_PRINCIPAL_RETIRED,
     PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
     PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE,
@@ -42,6 +42,7 @@ from qiita_common.models import (
     OwnerBiosampleIdExportResponse,
     OwnerBiosampleIdRow,
     PrincipalDisabledUpdate,
+    PrincipalLookupRequest,
     PrincipalLookupResponse,
     PrincipalRetiredUpdate,
     PrincipalSystemRoleUpdate,
@@ -63,6 +64,7 @@ from ..auth.token import mint_api_token
 from ..block_read import READ_MASKED_TABLE
 from ..deps import TxConnFactory, get_db_pool, get_flight_signing_key, get_tx_conn_factory
 from ..repositories.block import MASK_SAMPLE_COMPLETED
+from ..repositories.study_access import fetch_grantee_by_email
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["admin"])
 
@@ -173,29 +175,24 @@ async def create_service_account(
 
 
 # ---------------------------------------------------------------------------
-# GET /admin/principal?email=
+# POST /admin/principal/lookup-by-email
 # ---------------------------------------------------------------------------
 
 
-@router.get(PATH_ADMIN_PRINCIPAL)
-async def get_principal_by_email(
-    email: str = Query(min_length=1),
+@router.post(PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL)
+async def lookup_principal_by_email(
+    body: PrincipalLookupRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> PrincipalLookupResponse:
-    """Resolve a human user's email (case-insensitive, CITEXT) to the
-    principal the `/principal/{idx}/...` mutations take. 404 when no user
-    has that email — they have not logged in yet."""
-    row = await pool.fetchrow(
-        "SELECT u.principal_idx, u.email, p.system_role, p.disabled, p.retired"
-        " FROM qiita.user u JOIN qiita.principal p ON p.idx = u.principal_idx"
-        " WHERE u.email = $1",
-        email,
-    )
-    if row is None:
+    """Resolve a human user's email to the principal the
+    `/principal/{idx}/...` mutations take. 404 when no user has that email —
+    they have not logged in yet."""
+    found = await fetch_grantee_by_email(pool, email=body.email)
+    if found is None:
         raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
-    return PrincipalLookupResponse(**dict(row))
+    return PrincipalLookupResponse(**found._asdict())
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +351,9 @@ async def set_principal_system_role(
     Pydantic's SystemRole StrEnum narrows it before we hit the DB."""
     if principal_idx == SYSTEM_PRINCIPAL_IDX:
         raise HTTPException(status_code=403, detail="cannot modify system principal's role")
+
+    if actor.principal_idx == principal_idx:
+        raise HTTPException(status_code=403, detail="admin cannot change their own role")
 
     async with tx() as conn:
         old_role = await conn.fetchval(
