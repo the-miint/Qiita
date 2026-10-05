@@ -21,6 +21,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- `qiita-admin principal set-role --email E --role R --reason T` changes an
+  existing user's system role through the audited
+  `PATCH /admin/principal/{idx}/system-role` route, resolving the email via a new
+  `GET /admin/principal?email=` lookup (system_admin + `admin:user`). Unlike the
+  direct-DB `set-system-role` bootstrap path, the change lands in the audit log
+  with its reason.
 - **Rapid 16S amplicon processing: `golay-demux` + `amplicon` workflows (#244).**
   Two workflows bring EMP-style 16S into Qiita. `golay-demux` (ingest) converts a pool's
   Illumina 16S run with bcl-convert using a no-index dummy sheet built from RunInfo.xml

@@ -6,6 +6,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
     URL_ADMIN_AUDIT,
+    URL_ADMIN_PRINCIPAL,
     URL_ADMIN_PRINCIPAL_DISABLED,
     URL_ADMIN_PRINCIPAL_RETIRED,
     URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
@@ -415,6 +416,56 @@ async def test_patch_principal_system_role_admin_only(admin_client, postgres_poo
         URL_ADMIN_PRINCIPAL_SYSTEM_ROLE.format(principal_idx=target),
         headers={"Authorization": f"Bearer {plaintext}"},
         json={"system_role": SystemRole.SYSTEM_ADMIN},
+    )
+    assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/principal?email=
+# ---------------------------------------------------------------------------
+
+
+async def test_get_principal_by_email_case_insensitive(admin_client, postgres_pool):
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+    target = await _seed_human(postgres_pool, email="lookup-target@example.com")
+    _track(admin_client, target)
+    resp = await admin_client.get(
+        URL_ADMIN_PRINCIPAL,
+        headers={"Authorization": f"Bearer {admin_token}"},
+        params={"email": "Lookup-Target@Example.com"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "principal_idx": target,
+        "email": "lookup-target@example.com",
+        "system_role": SystemRole.USER,
+        "disabled": False,
+        "retired": False,
+    }
+
+
+async def test_get_principal_by_email_unknown_is_404(admin_client, postgres_pool):
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+    resp = await admin_client.get(
+        URL_ADMIN_PRINCIPAL,
+        headers={"Authorization": f"Bearer {admin_token}"},
+        params={"email": "never-logged-in@example.com"},
+    )
+    assert resp.status_code == 404
+
+
+async def test_get_principal_by_email_admin_only(admin_client, postgres_pool):
+    from qiita_control_plane.auth.token import mint_api_token
+
+    pidx = await _seed_human(postgres_pool, email="not-admin-lookup@example.com")
+    _track(admin_client, pidx)
+    plaintext, _ = await mint_api_token(
+        postgres_pool, principal_idx=pidx, label="x", scopes=[Scope.SELF_PROFILE]
+    )
+    resp = await admin_client.get(
+        URL_ADMIN_PRINCIPAL,
+        headers={"Authorization": f"Bearer {plaintext}"},
+        params={"email": "not-admin-lookup@example.com"},
     )
     assert resp.status_code == 403
 

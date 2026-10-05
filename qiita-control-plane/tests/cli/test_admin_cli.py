@@ -16,7 +16,9 @@ import argparse
 import httpx
 import pytest
 from qiita_common.api_paths import (
+    URL_ADMIN_PRINCIPAL,
     URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
+    URL_ADMIN_PRINCIPAL_SYSTEM_ROLE,
     URL_ADMIN_STUDY_OWNER_BIOSAMPLE_ID,
     URL_AUTH_WHOAMI,
 )
@@ -119,6 +121,76 @@ def test_token_revoke_all_calls_correct_url(monkeypatch):
     )
     assert captured["auth"] == f"{BEARER_PREFIX}qk_admin"
     assert body["revoked_token_idxs"] == [1, 2]
+
+
+def test_principal_set_role_looks_up_then_patches(monkeypatch):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    calls = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        calls.append((method, url, params, json))
+        if method == "GET":
+            body = {
+                "principal_idx": 42,
+                "email": "pi@example.com",
+                "system_role": "user",
+                "disabled": False,
+                "retired": False,
+            }
+            return httpx.Response(200, json=body, request=httpx.Request(method, url))
+        return httpx.Response(204, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    result = cli._principal_set_role(
+        "http://localhost:8080", "qk_admin", "PI@example.com", "wet_lab_admin", "lab lead"
+    )
+    assert calls == [
+        ("GET", f"http://localhost:8080{URL_ADMIN_PRINCIPAL}", {"email": "PI@example.com"}, None),
+        (
+            "PATCH",
+            f"http://localhost:8080{URL_ADMIN_PRINCIPAL_SYSTEM_ROLE.format(principal_idx=42)}",
+            None,
+            {"system_role": "wet_lab_admin", "reason": "lab lead"},
+        ),
+    ]
+    assert result == {
+        "principal_idx": 42,
+        "email": "pi@example.com",
+        "from": "user",
+        "to": "wet_lab_admin",
+    }
+
+
+def test_principal_set_role_unknown_email_does_not_patch(monkeypatch, capsys):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    methods = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        methods.append(method)
+        return httpx.Response(
+            404, json={"detail": "principal not found"}, request=httpx.Request(method, url)
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    rc = cli.main(
+        [
+            "principal",
+            "set-role",
+            "--email",
+            "nobody@example.com",
+            "--role",
+            "user",
+            "--reason",
+            "x",
+        ]
+    )
+    assert rc == 1
+    assert methods == ["GET"]
 
 
 def test_main_login_dispatches_to_do_login(monkeypatch):

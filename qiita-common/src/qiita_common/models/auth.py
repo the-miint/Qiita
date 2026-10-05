@@ -191,6 +191,16 @@ class PrincipalSystemRoleUpdate(BaseModel):
     reason: str | None = None
 
 
+class PrincipalLookupResponse(BaseModel):
+    """Body for GET /api/v1/admin/principal?email=."""
+
+    principal_idx: Annotated[int, Field(gt=0)]
+    email: str
+    system_role: SystemRole
+    disabled: bool
+    retired: bool
+
+
 class AuthEventResponse(BaseModel):
     """One row from GET /api/v1/admin/audit."""
 

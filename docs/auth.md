@@ -324,6 +324,7 @@ All routes require `system_role >= system_admin` AND the appropriate `admin:*` s
 | Route | Method | Notes |
 |---|---|---|
 | `/api/v1/admin/service-account` | POST | Creates a service-account-kind principal and mints its initial token. Scopes are required (no implicit ceiling — workers don't fit the human hierarchy) and validated against `SERVICE_ACCOUNT_SCOPE_CEILING`. 409 on duplicate `name`. Requires `admin:service_account`. |
+| `/api/v1/admin/principal?email=E` | GET | Resolve a human user's email (case-insensitive) to `{principal_idx, email, system_role, disabled, retired}` — the handle the `/principal/{idx}/...` mutations below take. 404 when no user has that email (they have not logged in yet). Requires `admin:user`. |
 | `/api/v1/admin/principal/{idx}/disabled` | PATCH | Toggle disabled. `disabled=true` requires `reason`; `false` is the round-trip back to active. Cannot transition retired→disabled (DB CHECK). Requires `admin:user`. |
 | `/api/v1/admin/principal/{idx}/retired` | PATCH | Retire (terminal). DB trigger auto-revokes all the principal's active tokens. Refuses if the actor is the target (no zero-active-admins). Requires `admin:user`. |
 | `/api/v1/admin/principal/{idx}/system-role` | PATCH | Set `system_role`. Audit event records `from`/`to`/`reason`. Requires `admin:user`. |
@@ -440,6 +441,7 @@ Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproj
 | Subcommand | Path | Notes |
 |---|---|---|
 | `set-system-role --email X --role Y` | direct DB | Bootstrap path — sets `qiita.principal.system_role` by email lookup against `qiita.user`. Refuses to operate on `idx=1`. The user must have logged in via AuthRocket at least once (which is what creates their `principal+user` rows). |
+| `principal set-role --email X --role Y --reason R` | HTTP | Resolves the email via `GET /api/v1/admin/principal`, then calls `PATCH /api/v1/admin/principal/{idx}/system-role`, so the change is audited with its reason. Requires a PAT carrying `admin:user`. `--help` says when the change reaches the user's existing tokens. Prefer this over `set-system-role` once a `system_admin` exists. |
 | `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. PAT read from `QIITA_TOKEN` env or `~/.qiita/token` (mode 0600 expected). |
 | `token revoke-all --principal-idx N` | HTTP | Calls `POST /api/v1/admin/principal/{N}/revoke-all-tokens`. |
 | `login` | HTTP | Drives the LoginRocket Web flow end-to-end. Spawns a localhost loopback HTTP server, opens the browser to `/api/v1/auth/login?cli=1&port=N`, captures the one-time code from the redirect, exchanges it at `/api/v1/auth/cli-exchange`, and writes the PAT to `--token-file` (default `~/.qiita/token`, mode 0600). On timeout or error, prints an actionable message and exits non-zero. |

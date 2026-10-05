@@ -15,6 +15,7 @@ from qiita_common.api_paths import (
     PATH_ADMIN_AUDIT,
     PATH_ADMIN_MASKED_READ_EXPORT_TICKET,
     PATH_ADMIN_PREFIX,
+    PATH_ADMIN_PRINCIPAL,
     PATH_ADMIN_PRINCIPAL_DISABLED,
     PATH_ADMIN_PRINCIPAL_RETIRED,
     PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
@@ -41,6 +42,7 @@ from qiita_common.models import (
     OwnerBiosampleIdExportResponse,
     OwnerBiosampleIdRow,
     PrincipalDisabledUpdate,
+    PrincipalLookupResponse,
     PrincipalRetiredUpdate,
     PrincipalSystemRoleUpdate,
     RevokeAllTokensResponse,
@@ -168,6 +170,32 @@ async def create_service_account(
         expires_at=expires_at,
         created_at=datetime.now(UTC),
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/principal?email=
+# ---------------------------------------------------------------------------
+
+
+@router.get(PATH_ADMIN_PRINCIPAL)
+async def get_principal_by_email(
+    email: str = Query(min_length=1),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
+) -> PrincipalLookupResponse:
+    """Resolve a human user's email (case-insensitive, CITEXT) to the
+    principal the `/principal/{idx}/...` mutations take. 404 when no user
+    has that email — they have not logged in yet."""
+    row = await pool.fetchrow(
+        "SELECT u.principal_idx, u.email, p.system_role, p.disabled, p.retired"
+        " FROM qiita.user u JOIN qiita.principal p ON p.idx = u.principal_idx"
+        " WHERE u.email = $1",
+        email,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
+    return PrincipalLookupResponse(**dict(row))
 
 
 # ---------------------------------------------------------------------------
