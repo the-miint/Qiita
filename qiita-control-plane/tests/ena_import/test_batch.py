@@ -1262,7 +1262,7 @@ async def test_process_one_study_suppressed_study_fails_before_any_write(
         _QUERY_STUDY, lambda accession: _fake_study_header(accession, status="suppressed")
     )
 
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool, accessions=[accession], principal=admin_principal
     )
@@ -1292,7 +1292,7 @@ async def test_process_one_study_all_runs_suppressed_fails_before_any_write(
     resolved/created -- there is nothing public left to import."""
     monkeypatch.setattr(_QUERY_RUNS, lambda accession: _fake_runs(accession, status="suppressed"))
 
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool, accessions=[accession], principal=admin_principal
     )
@@ -1320,7 +1320,7 @@ async def test_process_one_study_one_suppressed_run_excluded_other_registered(
 ):
     """A study with one public and one suppressed run registers the public one
     and reports the suppressed one `excluded`, with no sequenced_sample for it."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
 
     def _mixed_runs(a):
         _, (ok_row,) = _fake_runs(a, status="public")
@@ -1372,7 +1372,7 @@ async def test_process_one_study_unknown_status_item_fails_naming_value(
         _QUERY_STUDY, lambda accession: _fake_study_header(accession, status="cancelled")
     )
 
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, items = await create_ena_import_batch(
         postgres_pool, accessions=[accession], principal=admin_principal
     )
@@ -1396,7 +1396,7 @@ async def test_process_one_study_mixed_excluded_and_failed_every_run_failed_mess
     platform (a pool IS created) but then fails harmonization has no
     successful run either way -- terminal `failed`, and the reasons string
     names both."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
 
     def _mixed_runs(a):
         _, (template,) = _fake_runs(a, status="public")
@@ -2250,7 +2250,7 @@ async def _ena_status(postgres_pool, run_accession: str) -> str | None:
 async def test_reimport_flags_a_held_run_the_portal_stopped_returning(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(first_idx)
@@ -2278,7 +2278,7 @@ async def test_reimport_flags_a_held_run_the_portal_stopped_returning(
 async def test_reimport_clears_flag_when_public_again(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(
         _QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA"), ("2", "ILLUMINA")])
     )
@@ -2305,7 +2305,7 @@ async def test_reimport_clears_flag_when_public_again(
 async def test_reimport_absent_study_flags_held_runs_and_fails_naming_why(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(first_idx)
@@ -2333,7 +2333,7 @@ async def test_reimport_availability_check_failure_writes_no_flags(
 ):
     """Any Browser API failure -- a non-200 response or an unparseable body --
     fails the item and leaves every held run's flag exactly as found."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(first_idx)
@@ -2362,7 +2362,7 @@ async def test_reimport_availability_failure_registers_no_new_run(
     `register_ena_study` writes anything -- a new public run the same
     re-import would otherwise register must not land either, or the item's
     audit trail would undercount what was durably written."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(first_idx)
@@ -2400,7 +2400,7 @@ async def test_reimport_held_run_http_500_fails_with_no_flags(
     stand-in): a held run's Browser API summary returning HTTP 500 fails the
     re-import with a clear reason and writes no flag, exactly like any other
     HTTP error -- there is no `not_retrievable` flag to write."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(first_idx)
@@ -2440,7 +2440,7 @@ async def test_reimport_availability_check_partial_failure_writes_no_flags(
     first and raises on the second. Neither flag is written -- every lookup
     must succeed before any write lands, not just the ones checked before the
     failure (see `batch._reconcile_held_run_availability`)."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(
         _QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA"), ("2", "ILLUMINA")])
     )
@@ -2473,7 +2473,7 @@ async def test_reimport_flagged_run_stays_in_its_pool(
 ):
     """Flagging is a read-time exclusion, not a deletion or retirement -- the
     row and its pool membership are untouched."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, first_items = await _drive_one_study(
         batch_app, postgres_pool, admin_principal, accession
@@ -2519,7 +2519,7 @@ async def test_reimport_logs_non_terminal_ticket_for_flagged_run(
 ):
     """A flagged run is not auto-cancelled; any non-terminal work_ticket
     touching its pool is logged for an operator to act on."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, first_items = await _drive_one_study(
         batch_app, postgres_pool, admin_principal, accession
@@ -2554,7 +2554,7 @@ async def test_flagged_only_pool_gets_no_download_ticket_in_the_batch_flow(
     re-reads every OLDER pool sharing that run. A pool whose only sample was
     just flagged must not surface a download ticket in the batch flow -- only
     the new pool's ticket does."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, first_items = await _drive_one_study(
         batch_app, postgres_pool, admin_principal, accession
@@ -2611,7 +2611,7 @@ async def test_reimport_early_exit_still_checks_held_runs(
     """Every exit that fails a re-import before registration still re-checks
     the held runs: the Portal drops non-public runs, so "every run suppressed"
     arrives as one of these."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(first_idx)
@@ -2640,7 +2640,7 @@ async def test_reimport_early_exit_still_checks_held_runs(
 async def test_reimport_keeps_flagged_outcomes_when_registration_then_fails(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(first_idx)
@@ -2670,7 +2670,7 @@ async def test_reimport_reports_a_held_run_its_completed_download_never_fetched(
     """Run 1 was flagged before its pool's download read the roster, the
     download completed without it, and ENA then re-released it. Nothing will
     download it, so the re-import says so instead of `skipped_already_present`."""
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     both = lambda a: _fake_run_rows(a, [("1", "ILLUMINA"), ("3", "ILLUMINA")])  # noqa: E731
     monkeypatch.setattr(_QUERY_RUNS, both)
     first_idx, first_items = await _drive_one_study(
@@ -2717,7 +2717,7 @@ async def test_reimport_reports_a_held_run_its_completed_download_never_fetched(
 async def test_reimport_does_not_clear_a_flag_for_a_run_returned_as_non_public(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
 ):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     monkeypatch.setattr(_QUERY_RUNS, lambda a: _fake_run_rows(a, [("1", "ILLUMINA")]))
     first_idx, _ = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(first_idx)
