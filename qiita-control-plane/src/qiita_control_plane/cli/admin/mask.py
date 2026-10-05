@@ -17,6 +17,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
+from ...repositories._sample_scope import SEQUENCED_SAMPLE_NOT_FLAGGED
 from .. import _common
 
 # ---------------------------------------------------------------------------
@@ -96,10 +97,7 @@ async def _select_purge_failed_candidates(
         " WHERE wt.state = 'failed'"
         "   AND wt.action_id = ANY($1::text[])"
         "   AND wt.failure_reason LIKE '%' || $2 || '%'"
-        "   AND NOT EXISTS ("
-        "     SELECT 1 FROM qiita.sequenced_sample ss"
-        "      WHERE ss.prep_sample_idx = wt.prep_sample_idx AND ss.ena_status IS NOT NULL"
-        "   )"
+        f"   AND {SEQUENCED_SAMPLE_NOT_FLAGGED.format(alias='wt')}"
         " ORDER BY wt.work_ticket_idx"
     )
     args: list = [list(action_ids), _READ_MASK_PARQUET_NOT_FOUND]

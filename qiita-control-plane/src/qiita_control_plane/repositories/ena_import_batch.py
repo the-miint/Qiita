@@ -99,6 +99,25 @@ async def update_ena_import_batch_item_registered(
     )
 
 
+async def update_ena_import_batch_item_run_outcomes(
+    conn: asyncpg.Connection,
+    *,
+    item_idx: int,
+    study_idx: int,
+    ena_run_outcomes: list[dict[str, Any]],
+) -> None:
+    """Record per-run outcomes on an item without changing its state, so a
+    flag already committed stays visible if the item later fails."""
+    await conn.execute(
+        "UPDATE qiita.ena_import_batch_item"
+        " SET study_idx = $2, ena_run_outcomes = $3::jsonb"
+        " WHERE idx = $1",
+        item_idx,
+        study_idx,
+        json.dumps(ena_run_outcomes),
+    )
+
+
 async def append_ena_import_batch_item_download_ticket(
     conn: asyncpg.Connection, *, item_idx: int, ticket_idx: int
 ) -> None:
@@ -165,6 +184,33 @@ async def fetch_sequenced_pool_download_states(
         action_id,
         action_version,
     )
+
+
+async def fetch_sequenced_samples_missed_by_completed_download(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    sequenced_sample_idxs: list[int],
+    action_id: str,
+    action_version: str,
+) -> set[int]:
+    """The `sequenced_sample_idxs` with no stored reads whose pool's latest
+    ticket for the action completed. A completed download stored every run on
+    the roster it read, so such a run was off that roster and nothing will
+    fetch it."""
+    rows = await pool_or_conn.fetch(
+        "SELECT ss.idx FROM qiita.sequenced_sample ss"
+        " WHERE ss.idx = ANY($1::bigint[])"
+        "   AND NOT EXISTS (SELECT 1 FROM qiita.sequence_range sr"
+        "                   WHERE sr.prep_sample_idx = ss.prep_sample_idx)"
+        "   AND (SELECT wt.state FROM qiita.work_ticket wt"
+        "        WHERE wt.action_id = $2 AND wt.action_version = $3"
+        "          AND wt.sequenced_pool_idx = ss.sequenced_pool_idx"
+        "        ORDER BY wt.work_ticket_idx DESC LIMIT 1) = 'completed'",
+        sequenced_sample_idxs,
+        action_id,
+        action_version,
+    )
+    return {r["idx"] for r in rows}
 
 
 async def fetch_pool_latest_download_ticket(

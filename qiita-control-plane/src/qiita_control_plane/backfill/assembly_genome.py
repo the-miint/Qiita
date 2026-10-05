@@ -31,6 +31,7 @@ import asyncpg
 from qiita_common.models import GenomeSource
 
 from ..actions.library import upsert_genomes
+from ..repositories._sample_scope import SEQUENCED_SAMPLE_NOT_FLAGGED
 from ..repositories.assembly import assembly_genome_source_id
 
 # Subjects per transaction. Both siblings in this package take one transaction per
@@ -52,10 +53,7 @@ _UNMINTED_SUBJECTS_SQL = (
     "       count(*) AS contig_count"
     "  FROM qiita.assembly_membership am"
     " WHERE am.genome_idx IS NULL"
-    "   AND NOT EXISTS ("
-    "     SELECT 1 FROM qiita.sequenced_sample ss"
-    "      WHERE ss.prep_sample_idx = am.prep_sample_idx AND ss.ena_status IS NOT NULL"
-    "   )"
+    f"   AND {SEQUENCED_SAMPLE_NOT_FLAGGED.format(alias='am')}"
     " GROUP BY am.prep_sample_idx, am.processing_idx, am.kind, am.bin_id"
 )
 

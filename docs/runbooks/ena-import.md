@@ -123,34 +123,49 @@ A run Qiita already holds can stop being public between imports: ENA suppresses,
 withdraws, or replaces it. The Portal endpoint that resolution uses only ever
 returns public records, so it cannot report this itself — **re-importing the
 same study**
-checks it. Every held run the fresh Portal response no longer names is looked up
-individually against ENA's Browser API (`summary/{accession}`), which reports
-every run's status regardless of availability:
+checks it. Every held run the fresh Portal response no longer names as public is
+looked up against ENA's Browser API (`summary/{accession}`), which reports every
+run's status regardless of availability. Runs are asked for in batches; a batch
+that returns HTTP 500 is re-asked one run at a time, because one run ENA can't
+serve fails the whole batch. Each request is retried once on a transport error or
+a 5xx.
 
-- **Public** (or the run reappears in the Portal's fresh response) clears any
-  existing flag.
+- **Public** (or the run reappears as public in the Portal's fresh response)
+  clears any existing flag.
 - **Any other status ENA reports** flags the run, storing ENA's own status text on
   `sequenced_sample.ena_status`, and a `flagged_unavailable` outcome on the batch
-  item naming it.
-- **Any Browser API error — including HTTP 500** (observed live for both a
-  nonexistent accession and, per ENA's docs, a withdrawn run; the two are
+  item naming it. The outcome is recorded as soon as the flag commits, so it stays
+  on the item even if a later step fails it.
+- **A run that still errors on its own — including HTTP 500** (observed live for
+  both a nonexistent accession and, per ENA's docs, a withdrawn run; the two are
   indistinguishable from this endpoint alone) **— fails the whole item and writes
-  no flags**, the same as any other HTTP error: a 500 is not evidence a run is
-  unavailable, and an availability check never leaves a run half-updated.
+  no flags**: a 500 is not evidence a run is unavailable, and an availability
+  check never leaves a run half-updated.
 - **A status this codebase does not recognize** fails the item the same way.
 
-If the study itself has gone the same way — the Portal returns nothing for the
-accession at all, but Qiita already holds a study created by an earlier import —
-its held runs are still checked and flagged/cleared the same way, and the item
-fails naming which runs were (re-)confirmed unavailable, since there is nothing
-new to register.
+**A study blocked by one run.** A held run that keeps returning 500 fails every
+re-import of its study before anything new registers. Check the run on the ENA
+Browser by hand; if ENA has withdrawn it, retire its prep_sample
+(`qiita prep-sample retire --prep-sample-idx N --reason "withdrawn from ENA"`). A
+retired run is not re-checked, so the next re-import proceeds.
+
+The same check runs when a re-import has nothing new to register: the study is
+absent from the Portal, is not public, or has no public runs. The Portal drops
+non-public runs, so "every run suppressed" arrives this way. If Qiita holds a
+study created by an earlier import, its held runs are checked and flagged or
+cleared, and the item fails naming any it flagged.
+
+**A held run nothing will download.** A run flagged before its pool's download
+read the roster is left off that download. If ENA later releases it again, the
+flag clears, but the pool's download has already completed. The re-import reports
+such a run `held_not_downloaded` instead of `skipped_already_present`. There is no
+automatic retry for it yet.
 
 **The exclusion rule: a flagged run is skipped wherever a sample-selecting query
-already filters out a retired prep_sample** — the read-metric, QC-report,
-completion, sample-exceptions, and read-mask-coverage rollups; the masked-read and
-owner-id (pool-mode) exports; `has_sequenced_sample`, so a pool whose only runs are
-flagged gets no download ticket; `mask purge-failed`'s candidate selection; and the
-SynDNA and assembly-genome backfills. It is not deleted or retired, so it stays
+already filters out a retired prep_sample.** That includes the download roster,
+the block planners, the run, pool and study rosters, the amplicon pool roster, the
+rollups and exports, `has_sequenced_sample` (so a pool whose only runs are flagged
+gets no download ticket), `mask purge-failed` and the backfills. It is not deleted or retired, so it stays
 visible on the sample's own record and reappears the moment a later re-import finds
 it public again. Two things do **not** filter it, deliberately: a route that reads
 a sample by its own id (`read_masked`, alignment/assembly DoGets, the per-sample
@@ -213,9 +228,9 @@ Every ENA-imported biosample is bound to the **ERC000011** checklist (the ENA de
 sample checklist) — the same shared checklist model every other metadata path in
 Qiita uses. `GET /api/v1/ena-import-batch/{idx}` returns an `ena_runs` array per item,
 one entry per ENA run carrying its `status` (`registered` / `skipped_already_present` /
-`excluded` / `failed` / `flagged_unavailable` — the last from a re-import's ENA
-availability re-check, see above) and a `failure_reason` when `failed`, `excluded`, or
-`flagged_unavailable`. A
+`excluded` / `failed` / `flagged_unavailable` / `held_not_downloaded` — the last two
+from a re-import's ENA availability re-check, see above) and a `failure_reason` on
+every status but `registered` and `skipped_already_present`. A
 harmonization error (an unparseable value, or a cross-study metadata slot collision)
 fails the run, surfacing as that run's `status: failed` + `failure_reason`, isolated
 per-run exactly like an unmappable platform or a suppressed run (see *Non-public

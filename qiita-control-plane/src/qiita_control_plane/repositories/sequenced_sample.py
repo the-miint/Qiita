@@ -664,10 +664,9 @@ async def update_sequenced_sample_ena_status(
     """Set (or clear, when `ena_status` is None) the ENA availability flag on
     the sequenced_sample carrying `ena_run_accession`, stamping
     `ena_availability_checked_at`. A no-op UPDATE (zero rows matched) is not an
-    error here -- the caller resolved the run accession from
-    `fetch_held_ena_run_accessions_for_study` moments earlier, inside the same
-    transaction, so a miss would mean the row disappeared concurrently, which
-    this table's schema (RESTRICT everywhere) does not allow.
+    error: the caller read the run from `fetch_held_ena_run_accessions_for_study`
+    before its Browser API lookups, in a separate transaction, and a row a pool
+    delete removed in between has nothing left to flag.
     """
     await conn.execute(
         "UPDATE qiita.sequenced_sample"

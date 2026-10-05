@@ -33,6 +33,7 @@ from qiita_common.actions import READ_MASK_ACTION_ID
 from qiita_common.models import StepProgressState, WorkTicketState
 
 from ..actions.library import persist_syndna_read_count
+from ..repositories._sample_scope import SEQUENCED_SAMPLE_NOT_FLAGGED
 from ..repositories.block import MASK_SAMPLE_COMPLETED
 from ..repositories.syndna_read_count import SYNDNA_REFERENCE_SQL
 from ..workspace import (
@@ -79,10 +80,7 @@ SELECT ms.mask_idx, ms.prep_sample_idx, t.work_ticket_idx, s.attempt
          SELECT 1 FROM qiita.syndna_read_count c
           WHERE c.mask_idx = ms.mask_idx AND c.prep_sample_idx = ms.prep_sample_idx
        )
-   AND NOT EXISTS (
-         SELECT 1 FROM qiita.sequenced_sample ss
-          WHERE ss.prep_sample_idx = ms.prep_sample_idx AND ss.ena_status IS NOT NULL
-       )
+   AND {SEQUENCED_SAMPLE_NOT_FLAGGED.format(alias="ms")}
  ORDER BY ms.mask_idx, ms.prep_sample_idx
 """
 

@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import asyncpg
@@ -51,10 +51,12 @@ from ..repositories.ena_import_batch import (
     ena_import_created_study,
     fetch_ena_import_batch_items,
     fetch_inflight_ena_import_batch_items,
+    fetch_sequenced_samples_missed_by_completed_download,
     fetch_work_ticket_states_for_idxs,
     insert_ena_import_batch,
     insert_ena_import_batch_item,
     update_ena_import_batch_item_registered,
+    update_ena_import_batch_item_run_outcomes,
     update_ena_import_batch_item_state,
     update_ena_import_batch_item_study_created,
 )
@@ -78,7 +80,11 @@ from .registration import (
     register_ena_study,
 )
 from .resolver import EnaAccessionNotFoundError
-from .submit import build_download_ena_study_ticket
+from .submit import (
+    DOWNLOAD_ENA_STUDY_ACTION_ID,
+    DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    build_download_ena_study_ticket,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -113,7 +119,11 @@ _TERMINAL_UNSUCCESSFUL_STATES = frozenset(
 # A run counts toward "this study registered something downloadable" only in
 # these two states -- EXCLUDED (non-public) and FAILED do not.
 _SUCCESSFUL_RUN_REGISTRATION_STATUSES = frozenset(
-    {EnaRunRegistrationStatus.REGISTERED, EnaRunRegistrationStatus.SKIPPED_ALREADY_PRESENT}
+    {
+        EnaRunRegistrationStatus.REGISTERED,
+        EnaRunRegistrationStatus.SKIPPED_ALREADY_PRESENT,
+        EnaRunRegistrationStatus.HELD_NOT_DOWNLOADED,
+    }
 )
 
 
@@ -257,16 +267,16 @@ async def _reconcile_held_run_availability(
     pool: asyncpg.Pool, *, study_idx: int, portal_run_accessions: frozenset[str]
 ) -> list[EnaRunRegistrationOutcome]:
     """Re-check every run this study already holds that the Portal's fresh
-    response (`portal_run_accessions`) no longer names, and clear the flag on
-    any held run the Portal DOES still return as public.
+    response no longer names as public (`portal_run_accessions`), and clear the
+    flag on any held run it does.
 
     The Portal `/search` endpoint never reports a non-public run at all (see
     `qiita_common.models.ena`), so a held run missing from a fresh response is
     a CANDIDATE -- it may be suppressed, withdrawn, or simply not retrievable
     -- and the Browser API (`EnaAvailabilityClient`) is the only source that
     says which. Every candidate is looked up before any write: if the client
-    raises (an HTTP error other than 500, an unrecognized status, or an
-    unparseable body), this function raises too and writes nothing, so the
+    raises (an HTTP error, an unrecognized status, or an unparseable
+    body), this function raises too and writes nothing, so the
     caller's failed item leaves every flag exactly as it found them. Once
     every lookup succeeds, every set/clear lands in one transaction.
 
@@ -287,10 +297,9 @@ async def _reconcile_held_run_availability(
     new_status_by_accession: dict[str, str | None] = {}
     if candidates:
         async with EnaAvailabilityClient() as client:
-            for row in candidates:
-                new_status_by_accession[row["ena_run_accession"]] = await client.check_run(
-                    row["ena_run_accession"]
-                )
+            new_status_by_accession = await client.check_runs(
+                [row["ena_run_accession"] for row in candidates]
+            )
 
     outcomes: list[EnaRunRegistrationOutcome] = []
     async with pool.acquire() as conn, conn.transaction():
@@ -325,38 +334,80 @@ async def _reconcile_held_run_availability(
     return outcomes
 
 
-async def _handle_absent_study(
-    pool: asyncpg.Pool, item: BatchImportItemHandle, exc: EnaAccessionNotFoundError
-) -> None:
-    """`resolve_study_header` found zero rows for this accession -- the study
-    itself is gone from the Portal (suppressed, withdrawn, or never existed).
-
-    If Qiita never held a study for this accession, or held one this codebase
-    did not create by import, this is the pre-existing "not found" / "not ours
-    to touch" failure and nothing else to do. Otherwise every run the held
-    study still carries is a candidate (the Portal named none of them either),
-    so they are checked and flagged/cleared exactly as a normal re-import's
-    missing runs would be, and the item still fails -- an absent study cannot
-    register anything new -- naming which held runs were (re-)confirmed
-    unavailable.
-    """
-    study_idx = await fetch_study_idx_by_either_ena_accession(pool, item.ena_study_accession)
-    if study_idx is None or not await _study_created_by_an_import(pool, study_idx):
-        await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=str(exc))
-        return
-
+async def _reconcile_and_record(
+    pool: asyncpg.Pool,
+    item: BatchImportItemHandle,
+    *,
+    study_idx: int,
+    portal_run_accessions: frozenset[str],
+) -> list[EnaRunRegistrationOutcome]:
+    """`_reconcile_held_run_availability`, then record its outcomes on the item
+    at once: the flags are already committed, so the item must show them even
+    if a later step fails it."""
     flagged = await _reconcile_held_run_availability(
-        pool, study_idx=study_idx, portal_run_accessions=frozenset()
+        pool, study_idx=study_idx, portal_run_accessions=portal_run_accessions
     )
-    await _set_item_registered(
-        pool, item.idx, study_idx=study_idx, ena_run_outcomes=_ena_run_outcomes(flagged)
-    )
-    if flagged:
-        reasons = "; ".join(f"{o.run_accession}: {o.failure_reason}" for o in flagged)
-        failure_reason = f"{exc} (held runs re-checked: {reasons})"
-    else:
-        failure_reason = str(exc)
+    async with pool.acquire() as conn:
+        await update_ena_import_batch_item_run_outcomes(
+            conn,
+            item_idx=item.idx,
+            study_idx=study_idx,
+            ena_run_outcomes=_ena_run_outcomes(flagged),
+        )
+    return flagged
+
+
+async def _fail_after_held_run_check(
+    pool: asyncpg.Pool,
+    item: BatchImportItemHandle,
+    failure_reason: str,
+    *,
+    portal_run_accessions: frozenset[str],
+) -> None:
+    """Fail an item with nothing new to register: the study is absent, not
+    public, or has no public runs. The Portal drops non-public runs, so "every
+    run suppressed" arrives as one of these; an import-created study's held
+    runs are re-checked first, and the failure names any flagged."""
+    study_idx = await fetch_study_idx_by_either_ena_accession(pool, item.ena_study_accession)
+    if study_idx is not None and await _study_created_by_an_import(pool, study_idx):
+        flagged = await _reconcile_and_record(
+            pool, item, study_idx=study_idx, portal_run_accessions=portal_run_accessions
+        )
+        if flagged:
+            reasons = "; ".join(f"{o.run_accession}: {o.failure_reason}" for o in flagged)
+            failure_reason = f"{failure_reason} (held runs re-checked: {reasons})"
     await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=failure_reason)
+
+
+async def _mark_runs_held_not_downloaded(
+    pool: asyncpg.Pool, outcomes: list[EnaRunRegistrationOutcome]
+) -> list[EnaRunRegistrationOutcome]:
+    """Report a held run its pool's completed download never fetched as
+    `HELD_NOT_DOWNLOADED` rather than `SKIPPED_ALREADY_PRESENT`."""
+    held = [
+        o.sequenced_sample_idx
+        for o in outcomes
+        if o.status is EnaRunRegistrationStatus.SKIPPED_ALREADY_PRESENT
+        and o.sequenced_sample_idx is not None
+    ]
+    if not held:
+        return outcomes
+    missed = await fetch_sequenced_samples_missed_by_completed_download(
+        pool,
+        sequenced_sample_idxs=held,
+        action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
+        action_version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+    )
+    return [
+        replace(
+            o,
+            status=EnaRunRegistrationStatus.HELD_NOT_DOWNLOADED,
+            failure_reason="held with no reads; its pool's download completed without it",
+        )
+        if o.sequenced_sample_idx in missed
+        else o
+        for o in outcomes
+    ]
 
 
 async def _process_one_study(
@@ -380,33 +431,39 @@ async def _process_one_study(
                 resolver.resolve_study_header, item.ena_study_accession
             )
         except EnaAccessionNotFoundError as exc:
-            # The Portal reports zero rows for the study itself -- distinct
-            # from "resolves, but not public" below. If Qiita already holds
-            # this study, its held runs are re-checked before the item fails.
-            await _handle_absent_study(pool, item, exc)
+            await _fail_after_held_run_check(
+                pool, item, str(exc), portal_run_accessions=frozenset()
+            )
             return
-        ena_runs = await asyncio.to_thread(resolver.resolve_ena_runs, item.ena_study_accession)
-        sample_attributes = await asyncio.to_thread(
-            resolver.resolve_sample_attributes, item.ena_study_accession
+        try:
+            ena_runs = await asyncio.to_thread(resolver.resolve_ena_runs, item.ena_study_accession)
+            no_runs_reason = None
+        except EnaAccessionNotFoundError as exc:
+            ena_runs, no_runs_reason = [], str(exc)
+        public_run_accessions = frozenset(
+            run.run_accession for run in ena_runs if run.status is EnaStatus.PUBLIC
         )
 
         if study_header.status is not EnaStatus.PUBLIC:
-            await _set_item_state(
+            await _fail_after_held_run_check(
                 pool,
-                item.idx,
-                BatchItemState.FAILED,
-                failure_reason=f"study {item.ena_study_accession} is {study_header.status.value}",
+                item,
+                f"study {item.ena_study_accession} is {study_header.status.value}",
+                portal_run_accessions=public_run_accessions,
             )
             return
-        if not any(run.status is EnaStatus.PUBLIC for run in ena_runs):
+        if not public_run_accessions:
             reasons = "; ".join(f"{run.run_accession} is {run.status.value}" for run in ena_runs)
-            await _set_item_state(
+            await _fail_after_held_run_check(
                 pool,
-                item.idx,
-                BatchItemState.FAILED,
-                failure_reason=f"no public runs: {reasons}",
+                item,
+                no_runs_reason or f"no public runs: {reasons}",
+                portal_run_accessions=public_run_accessions,
             )
             return
+        sample_attributes = await asyncio.to_thread(
+            resolver.resolve_sample_attributes, item.ena_study_accession
+        )
 
         # Resolve the study BEFORE registering anything, so an import into a
         # study we did not create fails with nothing written.
@@ -448,10 +505,8 @@ async def _process_one_study(
         # register_ena_study having run. Disjoint from register_ena_study's
         # outcomes below (which only cover runs the Portal returned), so the
         # two lists concatenate with no overlap.
-        flagged = await _reconcile_held_run_availability(
-            pool,
-            study_idx=study_idx,
-            portal_run_accessions=frozenset(r.run_accession for r in ena_runs),
+        flagged = await _reconcile_and_record(
+            pool, item, study_idx=study_idx, portal_run_accessions=public_run_accessions
         )
         result = await register_ena_study(
             pool,
@@ -462,11 +517,12 @@ async def _process_one_study(
             owner_idx=principal.principal_idx,
             caller_idx=principal.principal_idx,
         )
+        run_outcomes = await _mark_runs_held_not_downloaded(pool, result.ena_runs)
         await _set_item_registered(
             pool,
             item.idx,
             study_idx=result.study_idx,
-            ena_run_outcomes=_ena_run_outcomes(flagged) + _ena_run_outcomes(result.ena_runs),
+            ena_run_outcomes=_ena_run_outcomes(flagged) + _ena_run_outcomes(run_outcomes),
         )
 
         if not result.created_pools:

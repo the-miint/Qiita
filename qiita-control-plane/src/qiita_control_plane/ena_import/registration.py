@@ -123,6 +123,10 @@ class EnaRunRegistrationStatus(StrEnum):
     # unavailable". Set by ena_import.batch, not this module: this file only
     # registers runs the Portal returns.
     FLAGGED_UNAVAILABLE = "flagged_unavailable"
+    # A held run with no stored reads whose pool's download already completed
+    # without it (it was flagged when that download read its roster). Nothing
+    # schedules its download; set by ena_import.batch.
+    HELD_NOT_DOWNLOADED = "held_not_downloaded"
 
 
 @dataclass(frozen=True)
@@ -130,8 +134,9 @@ class EnaRunRegistrationOutcome:
     """One ENA run's registration outcome.
 
     `prep_sample_idx` is set only on `REGISTERED`; `sequenced_sample_idx` on
-    both `REGISTERED` and `SKIPPED_ALREADY_PRESENT`; `failure_reason` on
-    `FAILED` and `EXCLUDED`. `harmonization` is set (non-`FAILED`,
+    `REGISTERED`, `SKIPPED_ALREADY_PRESENT` and `HELD_NOT_DOWNLOADED`;
+    `failure_reason` on `FAILED`, `EXCLUDED`, `FLAGGED_UNAVAILABLE` and
+    `HELD_NOT_DOWNLOADED`. `harmonization` is set (non-`FAILED`,
     non-`EXCLUDED`) only when this call newly created the biosample --
     write-once: a reused/re-imported biosample carries `None` because no
     harmonization write ran.

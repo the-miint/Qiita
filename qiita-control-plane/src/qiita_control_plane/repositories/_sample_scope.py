@@ -63,7 +63,7 @@ _SAMPLE_NOT_RETIRED = """
 # that). NOT EXISTS rather than a join: most gates cover every processing_kind,
 # and a non-sequenced prep_sample has no sequenced_sample row to match against,
 # so it must pass unaffected.
-_SEQUENCED_SAMPLE_NOT_FLAGGED = """
+SEQUENCED_SAMPLE_NOT_FLAGGED = """
     NOT EXISTS (
         SELECT 1 FROM qiita.sequenced_sample ss_ena
          WHERE ss_ena.prep_sample_idx = {alias}.prep_sample_idx
@@ -101,7 +101,7 @@ def sample_scope_sql(
     if not alias.isidentifier():
         raise ValueError(f"roster alias must be a bare SQL identifier, got {alias!r}")
     clauses = " AND " + _SAMPLE_NOT_RETIRED.format(alias=alias)
-    clauses += " AND " + _SEQUENCED_SAMPLE_NOT_FLAGGED.format(alias=alias)
+    clauses += " AND " + SEQUENCED_SAMPLE_NOT_FLAGGED.format(alias=alias)
     narrowed = False
     if sequenced_pool_idx is not None:
         narrowed = True

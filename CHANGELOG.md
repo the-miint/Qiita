@@ -80,12 +80,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 - **ENA import refuses non-public studies and flags held runs ENA later withdraws
   (#634).** A suppressed study, or one with no public runs, fails before anything is
   written, and a suppressed run in a public study is `excluded`. On re-import, runs Qiita
-  holds that the Portal no longer returns are checked against ENA's Browser API (a
-  workaround for duckdb-miint#289): a non-public run is flagged
+  holds that the Portal no longer returns as public are checked against ENA's Browser
+  API (a workaround for duckdb-miint#289), including when the study itself is absent,
+  not public, or has no public runs: a non-public run is flagged
   (`sequenced_sample.ena_status`) and skipped wherever retired samples are, and the flag
-  clears once the run is public again. An unknown status, or any Browser API error
-  including a 500, fails the item and writes no flag. Reads of a sample by its own id are
-  not gated, and in-flight work for a newly flagged run is logged, not cancelled.
+  clears once the run is public again. The flags are recorded on the item as soon as
+  they commit. Lookups are batched, a batch that returns 500 is re-asked run by run, and
+  each request is retried once on a transport error or 5xx; a run that still fails, or
+  an unknown status, fails the item and writes no flag. A held run whose pool's
+  download completed without it is reported `held_not_downloaded`. Reads of a sample by
+  its own id are not gated, and in-flight work for a newly flagged run is logged, not
+  cancelled.
 
 - **`qiita submit-ena-import` / `qiita ena-import-status` submit and watch a batch ENA
   study import from the CLI (#629).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
