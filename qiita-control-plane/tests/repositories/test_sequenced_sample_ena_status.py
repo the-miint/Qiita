@@ -19,6 +19,7 @@ from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADA
 from qiita_control_plane.repositories.prep_sample import insert_prep_sample
 from qiita_control_plane.repositories.sequence_range import mint_sequence_range
 from qiita_control_plane.repositories.sequenced_sample import (
+    fetch_pool_members,
     fetch_sequenced_pool_ena_run_roster,
     fetch_sequenced_pool_samples,
     fetch_sequenced_sample_idxs_for_run,
@@ -305,5 +306,31 @@ async def test_enumerate_pool_samples_excludes_flagged(postgres_pool):
 
             samples = await _enumerate_pool_samples(conn, pool_idx)
             assert [s.prep_sample_idx for s in samples] == [healthy_ps]
+        finally:
+            await tr.rollback()
+
+
+async def test_fetch_pool_members_excludes_flagged(postgres_pool):
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            _, pool_idx = await _seed_pool(conn, owner)
+            healthy_ps, _ = await _seed_sample(conn, owner, sequenced_pool_idx=pool_idx)
+            flagged_ps, _ = await _seed_sample(
+                conn, owner, sequenced_pool_idx=pool_idx, ena_status="suppressed"
+            )
+            for ps_idx in (healthy_ps, flagged_ps):
+                await mint_sequence_range(
+                    conn,
+                    prep_sample_idx=ps_idx,
+                    count=10,
+                    principal_idx=owner,
+                    work_ticket_idx=None,
+                )
+
+            members = await fetch_pool_members(conn, pool_idx)
+            assert [m[0] for m in members] == [healthy_ps]
         finally:
             await tr.rollback()
