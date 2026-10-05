@@ -37,6 +37,100 @@ fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
 /// below pin DuckLake's own rewrites to the same layout.
 const CHUNK_ROW_GROUP_SIZE: u64 = 16384;
 
+/// How long boot keeps re-running the catalog setup while other data-plane
+/// processes run theirs against the same catalog. A backstop: in the measured
+/// 4-process boots (see CONCURRENT_SETUP_MARKERS) every process was up within
+/// seconds, so exhausting it means something other than a concurrent boot is wrong.
+const BOOT_SETUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Errors a data-plane boot raises when another data plane is setting up the same
+/// catalog at the same moment. Measured by starting 4 data-plane processes
+/// together (DuckDB 1.5.4, ducklake d318a545, Postgres 17):
+///
+/// * against an existing catalog, `set_catalog_options`' UPDATE of
+///   `ducklake_metadata` fails with SQLSTATE 40001, "could not serialize access due
+///   to concurrent update";
+/// * against an empty catalog, DuckLake's own `CREATE TABLE ducklake_metadata`
+///   during ATTACH fails on a duplicate `pg_type` key;
+/// * DuckLake rejects the COMMIT of an `ensure_*` statement with "Transaction
+///   conflict - attempting to create table … / create view … / drop macro … - but
+///   another transaction has … already".
+///
+/// In each case another process's setup got there first, and re-running the setup
+/// converges.
+const CONCURRENT_SETUP_MARKERS: &[&str] = &[
+    "could not serialize access due to concurrent update",
+    "duplicate key value violates unique constraint",
+    "Transaction conflict - attempting to",
+];
+
+/// Whether a failed setup attempt was another data plane's concurrent setup.
+fn is_concurrent_setup_conflict(message: &str) -> bool {
+    CONCURRENT_SETUP_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+/// Attach the catalog and create its tables, once, at boot.
+///
+/// Every data plane runs this when it starts, and a deploy or a reboot starts all
+/// of a host's instances together. Each attempt uses a fresh connection and runs
+/// the whole setup from the top; an attempt that fails with a
+/// `CONCURRENT_SETUP_MARKERS` error is re-run after a backoff
+/// (`flight_service::lake_commit_backoff`, with `salt`) until `BOOT_SETUP_BUDGET`
+/// is spent. Any other error is returned at once.
+pub fn setup_catalog(
+    catalog_connstr: &str,
+    data_path: &str,
+    salt: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + BOOT_SETUP_BUDGET;
+    let mut attempt: u32 = 0;
+    loop {
+        let error = match setup_catalog_once(catalog_connstr, data_path) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let message = error.to_string();
+        if !is_concurrent_setup_conflict(&message) {
+            return Err(error);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "catalog setup kept failing with a concurrent-setup error for {}s \
+                 ({} attempts), longer than concurrent boots take to settle; last \
+                 error: {message}",
+                BOOT_SETUP_BUDGET.as_secs(),
+                attempt.saturating_add(1),
+            )
+            .into());
+        }
+        eprintln!("catalog setup conflicted with another data plane's; retrying: {message}");
+        std::thread::sleep(crate::flight_service::lake_commit_backoff(attempt, salt));
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+/// One attempt of `setup_catalog`, on its own connection.
+fn setup_catalog_once(
+    catalog_connstr: &str,
+    data_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::open_in_memory()?;
+    connect_ducklake(&conn, catalog_connstr, data_path)?;
+    set_catalog_options(&conn)?;
+    ensure_reference_tables(&conn)?;
+    ensure_read_tables(&conn)?;
+    ensure_alignment_tables(&conn)?;
+    ensure_assembly_tables(&conn)?;
+    // The row concurrent registrations into the replace-keyed tables contend
+    // for. Seeded here so no request path has to create it.
+    ensure_registration_lock(&conn)?;
+    // Must run after reference + alignment tables — the `_visible` views join them.
+    ensure_exclusion_tables(&conn)?;
+    Ok(())
+}
+
 /// Connect to DuckLake backed by a Postgres catalog.
 ///
 /// Attaches the DuckLake catalog as `qiita_lake` in the DuckDB session.
@@ -806,6 +900,37 @@ mod tests {
     use arrow_schema::DataType;
     use serial_test::serial;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn concurrent_setup_conflicts_are_retried() {
+        // Messages as the measured concurrent boots raised them
+        // (CONCURRENT_SETUP_MARKERS), with per-run ids shortened.
+        for message in [
+            "Invalid Error: Failed to insert config option in DuckLake: Failed to execute \
+             query \"UPDATE \"public\".\"ducklake_metadata\" SET ...\": ERROR:  could not \
+             serialize access due to concurrent update",
+            "Invalid Error: Failed to initialize DuckLake: Failed to execute query \"CREATE \
+             TABLE \"public\".\"ducklake_metadata\"(...);\": ERROR:  duplicate key value \
+             violates unique constraint \"pg_type_typname_nsp_index\"",
+            "TransactionContext Error: Failed to commit: Failed to commit DuckLake \
+             transaction.\nTransaction conflict - attempting to create table \"bin_quality\" \
+             in schema \"main\" - but this table has been created by another transaction \
+             already",
+        ] {
+            assert!(is_concurrent_setup_conflict(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn other_setup_errors_are_not_retried() {
+        // A catalog that cannot be reached fails the boot at once rather than
+        // after BOOT_SETUP_BUDGET.
+        assert!(!is_concurrent_setup_conflict(
+            "IO Error: Failed to attach DuckLake MetaData \"__ducklake_metadata_qiita_lake\" \
+             at path + \"postgres:dbname=lake host=localhost port=5498\": Unable to connect \
+             to Postgres: connection refused"
+        ));
+    }
 
     /// Atomic counter to generate unique test IDs across parallel tests.
     static TEST_ID: AtomicU64 = AtomicU64::new(800_000);

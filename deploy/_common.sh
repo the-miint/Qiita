@@ -264,6 +264,425 @@ read_env_var() {
     ( set +eu; set -a; source "$env_file" >/dev/null 2>&1; set +a; printf '%s' "${!var:-}" )
 }
 
+# Does the env file assign KEY at all, even to an empty value? read_env_var cannot
+# tell "unset" from "set to empty"; a caller that must reject an empty assignment
+# asks this first. $1 = env file, $2 = KEY.
+env_file_sets_var() {
+    local env_file="$1" var="$2"
+    # shellcheck disable=SC1090,SC1091
+    ( set +eu; set -a; source "$env_file" >/dev/null 2>&1; set +a; [ -n "${!var+x}" ] )
+}
+
+# --- Data-plane topology ------------------------------------------------------
+# Which data-plane instances this host runs, which other hosts' data planes nginx
+# also balances to, and which address the local instances listen on are host
+# settings in $DP_ENV:
+#
+#   QIITA_DATA_PLANE_PORTS      this host's instances, e.g. "50051 50052". Each port
+#                               is the instance specifier of qiita-data-plane@.service.
+#                               Default 50051.
+#   QIITA_DATA_PLANE_PEERS      data planes on other hosts, as host:port. Default none.
+#   QIITA_DATA_PLANE_BIND_HOST  the address this host's instances listen on. Default
+#                               127.0.0.1.
+#
+# activate.sh renders the nginx upstream from them and enables/restarts one unit per
+# port on every deploy; verify.sh health-checks the rendered members. Because they
+# live in the file, a routine `make redeploy` reproduces the topology the host was
+# given. PORTS and PEERS can be overridden for one deploy by setting them in the
+# deploy's environment; BIND_HOST cannot (see qiita_data_plane_bind_host).
+# docs/runbooks/data-plane-scaling.md is the operator procedure.
+
+# The port of the loopback listener nginx serves the qiita_data_plane upstream on
+# for on-host clients.
+QIITA_DATA_PLANE_LB_PORT=50050
+
+# Succeeds when $DP_ENV is absent or unreadable (the defaults apply) or parses as
+# shell. read_env_var discards the file's errors, so without this an unclosed quote
+# would read every topology key as unset and deploy the default topology.
+qiita_dp_env_parses() {
+    [ -r "$DP_ENV" ] || return 0
+    bash -n "$DP_ENV" 2>/dev/null && return 0
+    echo "ERROR: $DP_ENV does not parse as shell (bash -n), so the data-plane topology cannot be read from it" >&2
+    return 1
+}
+
+# Is $1 a plain TCP port (1-65535), written without a leading zero? $2 is a
+# caller-supplied label used verbatim in the error. A leading zero is refused
+# because `050051` and `50051` would name two systemd units for one port.
+qiita_valid_tcp_port() {
+    local port="$1" label="$2"
+    case "$port" in
+        ''|*[!0-9]*)
+            echo "ERROR: $label is not a number" >&2
+            return 1
+            ;;
+        0*)
+            echo "ERROR: $label is not a valid TCP port (1-65535, no leading zero)" >&2
+            return 1
+            ;;
+    esac
+    if [ "$port" -gt 65535 ]; then
+        echo "ERROR: $label is not a valid TCP port (1-65535, no leading zero)" >&2
+        return 1
+    fi
+}
+
+# Is $1 exactly four decimal octets, each 0-255 and written without a leading zero?
+# A leading zero is refused because glibc's inet_aton reads `010` as octal 8, so
+# nginx and the data plane could disagree about which address `010.0.0.1` names.
+qiita_is_ipv4_literal() {
+    local addr="$1" o1 o2 o3 o4 o
+    # Exactly four dot-separated runs of digits, nothing before or after.
+    [[ "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r o1 o2 o3 o4 <<<"$addr"
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$o" in
+            0?*) return 1 ;;
+        esac
+        # Length first: `[` prints "integer expression expected" past int64.
+        if [ "${#o}" -gt 3 ] || [ "$o" -gt 255 ]; then
+            return 1
+        fi
+    done
+}
+
+# The local instance ports, whitespace-separated: the deploy's environment when
+# QIITA_DATA_PLANE_PORTS is set there, else $DP_ENV, else 50051. Each port becomes a
+# systemd unit name, an nginx `server` line and a health-check target, so a
+# malformed list fails here rather than rendering broken config. Also refused: the
+# loopback listener's port, which nginx binds, and a repeated port, which would
+# render one member twice.
+qiita_data_plane_ports() {
+    local ports="" port seen=" "
+    qiita_dp_env_parses || return 1
+    if [ -n "${QIITA_DATA_PLANE_PORTS+x}" ]; then
+        ports=$QIITA_DATA_PLANE_PORTS
+    else
+        [ -r "$DP_ENV" ] && ports=$(read_env_var "$DP_ENV" QIITA_DATA_PLANE_PORTS)
+        [ -n "${ports//[[:space:]]/}" ] || ports=50051
+    fi
+    # All whitespace, not just spaces: a tab-only value would otherwise validate
+    # nothing and be echoed back as the list.
+    [ -n "${ports//[[:space:]]/}" ] || { echo "ERROR: QIITA_DATA_PLANE_PORTS is empty" >&2; return 1; }
+    for port in $ports; do
+        qiita_valid_tcp_port "$port" "QIITA_DATA_PLANE_PORTS entry '$port'" || return 1
+        if [ "$port" = "$QIITA_DATA_PLANE_LB_PORT" ]; then
+            echo "ERROR: QIITA_DATA_PLANE_PORTS entry '$port' is the port nginx's loopback listener binds" >&2
+            return 1
+        fi
+        case "$seen" in
+            *" $port "*)
+                echo "ERROR: QIITA_DATA_PLANE_PORTS lists '$port' more than once" >&2
+                return 1
+                ;;
+        esac
+        seen+="$port "
+    done
+    printf '%s' "$ports"
+}
+
+# Data planes on other hosts, as a space-separated `host:port` list: the deploy's
+# environment when QIITA_DATA_PLANE_PEERS is set there, else $DP_ENV, else none.
+# Upstream members only — this deploy neither starts, restarts, nor upgrades them.
+# PORTS and PEERS are separate lists because only PORTS names systemd units here.
+#
+# Each entry is written verbatim into an nginx `server` directive, so the shape is
+# validated: a stray `;` or `}` would otherwise inject config. A host made only of
+# digits and dots must be a valid IPv4 address — nginx would otherwise either fail
+# to resolve it at config load (`999.999.999.999`) or accept an abbreviated form as
+# a different address (`1.2.3` is 1.2.0.3).
+qiita_data_plane_peers() {
+    local peers="" peer host port
+    qiita_dp_env_parses || return 1
+    if [ -n "${QIITA_DATA_PLANE_PEERS+x}" ]; then
+        peers=$QIITA_DATA_PLANE_PEERS
+    elif [ -r "$DP_ENV" ]; then
+        peers=$(read_env_var "$DP_ENV" QIITA_DATA_PLANE_PEERS)
+    fi
+    [ -n "${peers//[[:space:]]/}" ] || { printf ''; return 0; }
+    for peer in $peers; do
+        case "$peer" in
+            # Bracketed IPv6 literal: [::1]:50051
+            \[*\]:*)
+                host="${peer%]:*}]"
+                port="${peer##*]:}"
+                case "${host:1:${#host}-2}" in
+                    ''|*[!0-9A-Fa-f:]*)
+                        echo "ERROR: QIITA_DATA_PLANE_PEERS entry '$peer' has a malformed IPv6 host" >&2
+                        return 1
+                        ;;
+                esac
+                ;;
+            # DNS name or IPv4, exactly one colon.
+            *:*:*)
+                echo "ERROR: QIITA_DATA_PLANE_PEERS entry '$peer' has more than one ':'" \
+                     "(bracket an IPv6 literal, e.g. [::1]:50051)" >&2
+                return 1
+                ;;
+            *:*)
+                host="${peer%:*}"
+                port="${peer##*:}"
+                case "$host" in
+                    ''|*[!A-Za-z0-9._-]*)
+                        echo "ERROR: QIITA_DATA_PLANE_PEERS entry '$peer' has a malformed host" >&2
+                        return 1
+                        ;;
+                    *[!0-9.]*) ;;
+                    *)
+                        qiita_is_ipv4_literal "$host" || {
+                            echo "ERROR: QIITA_DATA_PLANE_PEERS entry '$peer' is not a valid IPv4 address" >&2
+                            return 1
+                        }
+                        ;;
+                esac
+                ;;
+            *)
+                echo "ERROR: QIITA_DATA_PLANE_PEERS entry '$peer' is not host:port" >&2
+                return 1
+                ;;
+        esac
+        qiita_valid_tcp_port "$port" "QIITA_DATA_PLANE_PEERS entry '$peer' port '$port'" || return 1
+    done
+    printf '%s' "$peers"
+}
+
+# The address this host's instances listen on: QIITA_DATA_PLANE_BIND_HOST in $DP_ENV,
+# else 127.0.0.1. Read from the file only, never the deploy's environment:
+# qiita-data-plane@.service builds LISTEN_ADDR from the same key through
+# EnvironmentFile=, so a value the deploy saw but the file lacks would render
+# upstream members no instance listens on. An IPv4 address naming one interface,
+# not 0.0.0.0: traffic between nginx and the instances is unencrypted (see
+# deploy/nginx/qiita.conf). A host other than 127.0.0.1 is how a peer host's
+# instances become reachable from the host that balances to them.
+qiita_data_plane_bind_host() {
+    local host=""
+    qiita_dp_env_parses || return 1
+    if [ -r "$DP_ENV" ] && env_file_sets_var "$DP_ENV" QIITA_DATA_PLANE_BIND_HOST; then
+        host=$(read_env_var "$DP_ENV" QIITA_DATA_PLANE_BIND_HOST)
+        [ -n "$host" ] || { echo "ERROR: QIITA_DATA_PLANE_BIND_HOST is set but empty in $DP_ENV" >&2; return 1; }
+    else
+        host=127.0.0.1
+    fi
+    qiita_is_ipv4_literal "$host" || {
+        echo "ERROR: QIITA_DATA_PLANE_BIND_HOST '$host' in $DP_ENV is not an IPv4 address" >&2
+        return 1
+    }
+    [ "$host" != 0.0.0.0 ] || {
+        echo "ERROR: QIITA_DATA_PLANE_BIND_HOST must name one interface, not 0.0.0.0" >&2
+        return 1
+    }
+    printf '%s' "$host"
+}
+
+# Abort unless a peer's host resolves. $1 = a validated `host:port` entry.
+#
+# nginx resolves an upstream hostname when it loads the config. activate.sh calls
+# this before installing anything; its `nginx -t` would catch the same name, but
+# only after the new code is installed.
+#
+# An IP literal needs no lookup: `getent hosts` exits non-zero for an IPv4 address
+# with no PTR record and for a bracketed IPv6 literal (glibc 2.39, Rocky 10), which
+# would reject a valid peer.
+qiita_assert_peer_resolves() {
+    local peer="$1" host
+    case "$peer" in
+        \[*\]:*) return 0 ;;                       # bracketed IPv6 literal
+        *:*)     host="${peer%:*}" ;;
+        *)       echo "ERROR: '$peer' is not host:port" >&2; return 1 ;;
+    esac
+    if qiita_is_ipv4_literal "$host"; then
+        return 0
+    fi
+    # getent is glibc — present on the Linux deploy hosts, absent on a macOS dev
+    # box. Skipped when absent: this check only moves an nginx config-load failure
+    # earlier.
+    if ! command -v getent >/dev/null 2>&1; then
+        echo "NOTE: getent unavailable — cannot pre-resolve peer '$host'" >&2
+        return 0
+    fi
+    if ! getent hosts "$host" >/dev/null 2>&1; then
+        echo "ERROR: QIITA_DATA_PLANE_PEERS host '$host' does not resolve" >&2
+        return 1
+    fi
+}
+
+# The deployed nginx config.
+QIITA_NGINX_CONF=/etc/nginx/conf.d/qiita.conf
+
+# The certificate and key the 443 server block in deploy/nginx/qiita.conf names;
+# without them `nginx -t` fails.
+QIITA_NGINX_TLS_CERT=/etc/ssl/certs/qiita.crt
+QIITA_NGINX_TLS_KEY=/etc/ssl/private/qiita.key
+qiita_nginx_tls_present() {
+    [ -r "$QIITA_NGINX_TLS_CERT" ] && [ -r "$QIITA_NGINX_TLS_KEY" ]
+}
+
+# Render the nginx config template $1 into $2: the server name $3, the loopback
+# listener's port, and the qiita_data_plane upstream — one member per local port in
+# $5 at the bind host $4, then each peer in $6, verbatim. $4-$6 come from the
+# validators above. Fails if any `__QIITA_…__` placeholder survives.
+#
+# The upstream is spliced in with `sed /pattern/r` because it is multi-line. sed
+# writes to a new file rather than editing in place, so the same function runs
+# under GNU sed on the deploy host and BSD sed on a macOS dev box.
+#
+# Each step checks its own status: qiita_render_and_test_nginx_conf calls this as
+# `… || {…}`, where bash ignores errexit for the whole body, so an unchecked `sed`
+# on a missing template would install an empty file, which `nginx -t` accepts
+# (nginx 1.26.3, Rocky 10).
+qiita_render_nginx_conf() {
+    local template="$1" dest="$2" server_name="$3" bind_host="$4" ports="$5" peers="$6"
+    local members port peer lines=""
+    # Built in a variable and written once, so the write's status is the one checked.
+    for port in $ports; do
+        lines+="    server $bind_host:$port;"$'\n'
+    done
+    for peer in $peers; do
+        lines+="    server $peer;"$'\n'
+    done
+    members=$(mktemp) || return 1
+    if ! printf '%s' "$lines" >"$members"; then
+        rm -f "$members"
+        return 1
+    fi
+    if ! sed -e "s/__QIITA_HOSTNAME__/${server_name}/g" \
+        -e "s/__QIITA_DATA_PLANE_LB_PORT__/${QIITA_DATA_PLANE_LB_PORT}/g" \
+        -e "/__QIITA_DATA_PLANE_UPSTREAM__/r $members" \
+        -e "/__QIITA_DATA_PLANE_UPSTREAM__/d" \
+        "$template" >"$dest.tmp"; then
+        echo "ERROR: could not render $template; $dest left as it was" >&2
+        rm -f "$members" "$dest.tmp"
+        return 1
+    fi
+    rm -f "$members"
+    if grep -n '__QIITA_[A-Z_]*__' "$dest.tmp" >&2; then
+        echo "ERROR: placeholder left unrendered in $template (lines above)" >&2
+        rm -f "$dest.tmp"
+        return 1
+    fi
+    mv "$dest.tmp" "$dest"
+}
+
+# qiita_render_nginx_conf with the same arguments, then `nginx -t`. When nginx
+# rejects the rendered file, the file it replaced is put back (or the new one
+# removed, if there was none) and this fails: nginx refuses to start on a config
+# `nginx -t` rejects, so a rejected file left in conf.d would stop nginx at its next
+# start. The copy is `$2.previous`, a name nginx's conf.d/*.conf include skips.
+qiita_render_and_test_nginx_conf() {
+    local dest="$2" previous="$2.previous"
+    if [ -e "$dest" ]; then
+        cp -p "$dest" "$previous" || return 1
+    fi
+    qiita_render_nginx_conf "$@" || { rm -f "$previous"; return 1; }
+    if nginx -t; then
+        rm -f "$previous"
+        return 0
+    fi
+    if [ -e "$previous" ]; then
+        mv "$previous" "$dest"
+        echo "ERROR: nginx -t rejected the rendered $dest; the file it replaced is back in place" >&2
+    else
+        rm -f "$dest"
+        echo "ERROR: nginx -t rejected the rendered $dest; removed it (there was no previous file)" >&2
+    fi
+    return 1
+}
+
+# The data-plane upstream members in a rendered config, one per line. $1 = config
+# path (default $QIITA_NGINX_CONF). verify.sh health-checks these rather than
+# re-deriving the list from $DP_ENV or the environment, so it checks the last render
+# activate.sh kept (qiita_render_and_test_nginx_conf covers a rejected one). That is
+# what nginx serves unless the deploy stopped between the render and its `systemctl
+# reload nginx`, skipped the reload for lack of TLS material, or the reload did not
+# apply: `systemctl reload nginx` returns 0 when the config passes `nginx -t` but the
+# running master cannot apply it, such as a listen address it cannot bind, and nginx
+# keeps serving the old config (nginx 1.26.3, Rocky 10).
+#
+# Three outcomes, kept distinct:
+#   0 — members on stdout.
+#   1 — no config to read (first deploy, before nginx was configured). The caller
+#       falls back to the $DP_ENV lists.
+#   2 — the config is there but no members parsed (block renamed, file truncated).
+#       The caller must not fall back: the fallback yields the single default port
+#       whatever the host runs, so a broken parse would pass as one green row.
+qiita_data_plane_rendered_members() {
+    local conf="${1:-$QIITA_NGINX_CONF}" members
+    [ -r "$conf" ] || return 1
+    # Bounded to the qiita_data_plane block: qiita_control_plane is a sibling
+    # upstream in the same file. $2, not the rest of the line: a `server` line may
+    # carry parameters (`server 127.0.0.1:50051 max_fails=3;`).
+    members=$(awk '
+        /^[[:space:]]*upstream[[:space:]]+qiita_data_plane[[:space:]]*\{/ { inblock = 1; next }
+        inblock && /^[[:space:]]*\}/                                      { inblock = 0 }
+        inblock && /^[[:space:]]*server[[:space:]]/ {
+            addr = $2
+            sub(/;.*$/, "", addr)
+            if (addr != "") print addr
+        }
+    ' "$conf")
+    if [ -z "$members" ]; then
+        echo "ERROR: $conf has no 'upstream qiita_data_plane' members" >&2
+        return 2
+    fi
+    printf '%s\n' "$members"
+}
+
+# verify.sh's row label for upstream member $1, given this host's bind host $2:
+# a local instance by port, a peer by host:port.
+qiita_data_plane_member_label() {
+    case "$1" in
+        "$2":*) printf 'health/data-plane@%s' "${1##*:}" ;;
+        *)      printf 'health/data-plane-peer@%s' "$1" ;;
+    esac
+}
+
+# Whether SELinux lets nginx bind the loopback listener's port. On the stock Rocky
+# 10 targeted policy (selinux-policy 42.1.18) the port is in the 32768-60999 range
+# labelled ephemeral_port_t, which the nginx domain (httpd_t) may bind only when the
+# nis_enabled or httpd_enable_ftp_server boolean is on, and both default off.
+# Labelling the port http_port_t lets it bind. Prints a one-line reason; returns
+#   0 — SELinux absent or not enforcing, or the port is labelled http_port_t
+#   1 — enforcing and the port is not labelled http_port_t
+#   2 — enforcing, but `semanage port -l` failed (it needs root)
+#   3 — enforcing, and semanage is not installed
+qiita_selinux_lb_port_state() {
+    local mode listing
+    if ! command -v getenforce >/dev/null 2>&1; then
+        echo "getenforce not found (SELinux not installed)"
+        return 0
+    fi
+    mode=$(getenforce)
+    if [ "$mode" != Enforcing ]; then
+        echo "SELinux $mode"
+        return 0
+    fi
+    if ! command -v semanage >/dev/null 2>&1; then
+        echo "SELinux Enforcing and semanage not found (dnf install policycoreutils-python-utils)"
+        return 3
+    fi
+    if ! listing=$(semanage port -l 2>/dev/null); then
+        echo "SELinux Enforcing and 'semanage port -l' failed (run as root)"
+        return 2
+    fi
+    # A row reads `http_port_t   tcp   50050, 80, 81, 443, 5671-5672`.
+    if awk -v p="$QIITA_DATA_PLANE_LB_PORT" '
+        $1 == "http_port_t" && $2 == "tcp" {
+            for (i = 3; i <= NF; i++) {
+                item = $i; sub(/,$/, "", item)
+                n = split(item, r, "-")
+                if (n == 1 && item + 0 == p) found = 1
+                if (n == 2 && p >= r[1] + 0 && p <= r[2] + 0) found = 1
+            }
+        }
+        END { exit !found }
+    ' <<<"$listing"; then
+        echo "SELinux Enforcing and tcp/$QIITA_DATA_PLANE_LB_PORT is labelled http_port_t"
+        return 0
+    fi
+    echo "SELinux Enforcing and tcp/$QIITA_DATA_PLANE_LB_PORT is not labelled http_port_t"
+    return 1
+}
+
 # Split the password out of a libpq connection string — key=value form
 # ("host=… user=… password=…") or postgres:// URI form — so a caller can hand it
 # to libpq through PGPASSFILE instead of leaving it in a SQL file or, worse, on a

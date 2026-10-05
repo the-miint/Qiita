@@ -60,15 +60,59 @@ else
     else
         fail "health/compute-orchestrator" "localhost:8081/health unreachable"
     fi
-    if command -v grpcurl >/dev/null 2>&1; then
-        if grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check >/dev/null 2>&1; then
-            pass "health/data-plane" "gRPC localhost:50051 Health/Check OK"
-        else
-            fail "health/data-plane" "gRPC localhost:50051 Health/Check failed"
-        fi
+fi
+
+# --- 1b. Data-plane upstream members ----------------------------------------
+# Outside the branch above. The aggregate `https://<host>/health` reaches whichever
+# one member nginx balanced it to, so it stays green with every other instance
+# down; each member is checked here directly.
+if [ -n "${SKIP_HEALTH:-}" ]; then
+    skip "health/data-plane-upstream" "SKIP_HEALTH=1"
+elif command -v grpcurl >/dev/null 2>&1; then
+    # Assigned before use, not iterated as `for x in $(f)`: that form swallows f's
+    # failure, so a malformed list would iterate zero times and verify could exit 0
+    # having checked nothing. The assignment trips errexit.
+    dp_bind_host=$(qiita_data_plane_bind_host)
+    # Members from the rendered nginx config; see qiita_data_plane_rendered_members
+    # for why, and for its three return codes.
+    dp_members=$(qiita_data_plane_rendered_members) && dp_rc=0 || dp_rc=$?
+    if [ "$dp_rc" -eq 1 ]; then
+        # No config rendered yet (first deploy): the $DP_ENV lists are the only source.
+        dp_ports=$(qiita_data_plane_ports)
+        dp_peers=$(qiita_data_plane_peers)
+        dp_members=""
+        for dp_port in $dp_ports; do dp_members+="${dp_bind_host}:${dp_port}"$'\n'; done
+        for dp_peer in $dp_peers; do dp_members+="${dp_peer}"$'\n'; done
+        echo "  data-plane members from $DP_ENV (no rendered nginx upstream yet)"
+    elif [ "$dp_rc" -ne 0 ]; then
+        fail "health/data-plane-upstream" "could not read upstream members from $QIITA_NGINX_CONF"
+        dp_members=""
     else
-        skip "health/data-plane" "grpcurl not on PATH (run 'make verify-health' to auto-fetch it)"
+        echo "  data-plane members from the rendered nginx upstream"
     fi
+    while IFS= read -r dp_member; do
+        [ -n "$dp_member" ] || continue
+        dp_label=$(qiita_data_plane_member_label "$dp_member" "$dp_bind_host")
+        # </dev/null: the loop body inherits the here-string as stdin, so a command
+        # here that reads stdin would consume the remaining members.
+        if grpcurl -plaintext "$dp_member" grpc.health.v1.Health/Check </dev/null >/dev/null 2>&1; then
+            pass "$dp_label" "gRPC $dp_member Health/Check OK"
+        else
+            fail "$dp_label" "gRPC $dp_member Health/Check failed"
+        fi
+    done <<<"$dp_members"
+    # nginx's loopback listener in front of the same upstream. Skipped without the
+    # TLS files: activate.sh then skips the nginx reload, so the listener is not up.
+    lb="127.0.0.1:${QIITA_DATA_PLANE_LB_PORT}"
+    if ! qiita_nginx_tls_present; then
+        skip "health/data-plane-lb" "$lb not checked — nginx not reloaded (no TLS material)"
+    elif grpcurl -plaintext "$lb" grpc.health.v1.Health/Check >/dev/null 2>&1; then
+        pass "health/data-plane-lb" "gRPC $lb (nginx → upstream) Health/Check OK"
+    else
+        fail "health/data-plane-lb" "gRPC $lb (nginx → upstream) Health/Check failed"
+    fi
+else
+    skip "health/data-plane-upstream" "grpcurl not on PATH (run 'make verify-health' to auto-fetch it)"
 fi
 
 # --- 2. Workflow actions list (as qiita-api, control-plane.env) -------------

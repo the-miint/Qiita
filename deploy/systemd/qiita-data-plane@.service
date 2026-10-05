@@ -14,9 +14,15 @@ User=qiita-data
 # path to e.g. StateDirectory=qiita-data-%i and update HOME= accordingly.
 StateDirectory=qiita-data/%i
 Environment=HOME=/var/lib/qiita-data/%i
-Environment=LISTEN_ADDR=127.0.0.1:%i
+Environment=QIITA_DATA_PLANE_BIND_HOST=127.0.0.1
 EnvironmentFile=/etc/qiita/data-plane.env
-ExecStart=/opt/qiita/data-plane/qiita-data-plane
+# LISTEN_ADDR is set on the command line: a variable in EnvironmentFile= overrides
+# the same variable in Environment= whatever their order in this file (systemd 257),
+# so a LISTEN_ADDR in the shared data-plane.env would otherwise put every instance
+# on one address. The port is the instance specifier. The bind host defaults to
+# 127.0.0.1 above; data-plane.env overrides it (qiita_data_plane_bind_host in
+# deploy/_common.sh).
+ExecStart=/usr/bin/env LISTEN_ADDR=${QIITA_DATA_PLANE_BIND_HOST}:%i /opt/qiita/data-plane/qiita-data-plane
 Restart=on-failure
 
 [Install]

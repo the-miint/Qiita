@@ -37,6 +37,10 @@ on your `[admin]` account**:
 sudo make -C /home/qiita/qiita-miint redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
 ```
 
+The data-plane instances, peers and bind address come from
+`/etc/qiita/data-plane.env`, so this command carries no scaling variables; see
+[`data-plane-scaling.md`](data-plane-scaling.md).
+
 `deploy/redeploy.sh` drives steps 2–8 in order: pull (as the operator) →
 print buckets 1 & 2 and pause for you to apply them (only when they hold real
 steps — see below) → `preflight` → migration gate → `local-deploy.sh` → native

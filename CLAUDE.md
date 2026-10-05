@@ -31,7 +31,7 @@ make lint
 # Database migrations (auto-installs dbmate)
 make migrate
 
-# Deploy (prints systemd + nginx instructions; does not sudo)
+# Build, then print the admin deploy command (local-deploy.sh / redeploy); does not sudo
 make deploy
 make verify-health         # auto-installs grpcurl; localhost-only health curls
 

@@ -231,5 +231,15 @@ else
     skip "connstr/ducklake" "data-plane.env absent (first deploy)"
 fi
 
+# --- SELinux: nginx binds the data-plane loopback listener ------------------
+# See qiita_selinux_lb_port_state for the policy facts and the return codes.
+selinux_reason=$(qiita_selinux_lb_port_state) && selinux_rc=0 || selinux_rc=$?
+case "$selinux_rc" in
+    0) pass "selinux/lb-port" "$selinux_reason" ;;
+    1) fail "selinux/lb-port" "$selinux_reason — run: semanage port -a -t http_port_t -p tcp $QIITA_DATA_PLANE_LB_PORT" ;;
+    2) skip "selinux/lb-port" "$selinux_reason" ;;
+    *) fail "selinux/lb-port" "$selinux_reason" ;;
+esac
+
 echo "preflight: ${n_pass} pass, ${n_fail} fail, ${n_skip} skip"
 [ "$n_fail" -eq 0 ]
