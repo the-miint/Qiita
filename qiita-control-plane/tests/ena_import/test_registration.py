@@ -1795,7 +1795,7 @@ async def test_non_public_run_isolated_others_registered(reg):
     """A suppressed run is excluded before platform mapping even runs -- given an
     unmappable `instrument_platform`, it must still come back `EXCLUDED`, not
     `FAILED`, pinning that the status check precedes platform mapping."""
-    study_accession = unique_accession("PRJNA")
+    study_accession = unique_ena_accession("PRJNA")
     header = _study_header(study_accession=study_accession)
     ok_run = _run(
         run_accession=unique_accession("SRR"),
@@ -1841,7 +1841,7 @@ async def test_non_public_run_isolated_others_registered(reg):
 
 
 async def test_all_non_public_runs_study_all_excluded_no_runs_or_pools(reg):
-    study_accession = unique_accession("PRJNA")
+    study_accession = unique_ena_accession("PRJNA")
     header = _study_header(study_accession=study_accession)
     suppressed_run = _run(
         run_accession=unique_accession("SRR"),
