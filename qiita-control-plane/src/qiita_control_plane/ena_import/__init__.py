@@ -18,6 +18,7 @@ from qiita_common.ena_accession import (
 )
 
 from .attribute_mapping import map_ena_attributes
+from .availability import BROWSER_API_BASE_URL, EnaAvailabilityClient
 from .batch import (
     BatchImportItemHandle,
     create_ena_import_batch,
@@ -47,12 +48,14 @@ from .submit import (
 )
 
 __all__ = [
+    "BROWSER_API_BASE_URL",
     "DOWNLOAD_ENA_STUDY_ACTION_ID",
     "DOWNLOAD_ENA_STUDY_ACTION_VERSION",
     "BatchImportItemHandle",
     "CreatedPool",
     "EnaAccessionKind",
     "EnaAccessionNotFoundError",
+    "EnaAvailabilityClient",
     "EnaRunRegistrationOutcome",
     "EnaRunRegistrationStatus",
     "EnaStudyRegistrationResult",

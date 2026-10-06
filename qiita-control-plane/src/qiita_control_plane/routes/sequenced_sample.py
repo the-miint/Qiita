@@ -103,16 +103,14 @@ from ._helpers import (
     build_idxs_list_response,
     cap_rows,
     detail_for_biosample_link_rejection,
-    detail_for_unlinked_entity,
     etag_for_updated_at,
     metadata_entries_from_rows,
     parse_kv_detail,
     raise_http_for_sample_metadata_write_error,
     raise_transient_retry,
     read_study_scoped_entity,
-    resolve_linked_study_entity,
+    resolve_and_write_study_scoped_metadata,
     resolve_metadata_checklist_idx,
-    write_and_map_sample_metadata,
 )
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequenced-sample"])
@@ -769,10 +767,9 @@ async def patch_sequenced_sample_metadata(
     of band.
     """
     async with tx() as conn:
-        # Gate on the study link (nonexistent + unlinked share one 404) and
-        # retirement (409 for a write); metadata keys on the supertype
-        # prep_sample_idx the join carries.
-        _row, prep_sample_idx = await resolve_linked_study_entity(
+        # metadata_idx_column is the supertype prep_sample_idx the join carries:
+        # a sequenced_sample's metadata lives on its prep_sample.
+        written = await resolve_and_write_study_scoped_metadata(
             conn,
             spec=PREP_SAMPLE_METADATA_SPEC,
             fetch_row=fetch_sequenced_sample_with_prep_sample,
@@ -780,28 +777,11 @@ async def patch_sequenced_sample_metadata(
             metadata_idx_column="prep_sample_idx",
             study_idx=study_idx,
             noun="sequenced_sample",
-            retired_status=409,
-            retired_detail=f"sequenced_sample {sequenced_sample_idx} is retired",
-        )
-        # Upsert and shape via the shared write body (the no-If-Match
-        # lost-update caveat lives at its call site).
-        response = await write_and_map_sample_metadata(
-            conn,
-            spec=PREP_SAMPLE_METADATA_SPEC,
-            entity_idx=prep_sample_idx,
-            study_idx=study_idx,
             metadata=body.metadata,
             caller_idx=user.principal_idx,
-            # The write keys on the supertype prep_sample_idx; a link the
-            # database refuses still answers under the requested idx.
-            unlinked_detail=detail_for_unlinked_entity(
-                noun="sequenced_sample",
-                entity_idx=sequenced_sample_idx,
-                study_idx=study_idx,
-            ),
             global_internal_names=body.global_internal_names,
         )
-    return response
+    return written
 
 
 @sequenced_sample_router.get(PATH_SEQUENCED_SAMPLE_BY_IDX)

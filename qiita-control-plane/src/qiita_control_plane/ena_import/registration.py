@@ -47,6 +47,7 @@ from qiita_common.models import FieldDataType, Platform, WorkTicketState
 from qiita_common.models.ena import (
     EnaRunRecord,
     EnaSampleAttributes,
+    EnaStatus,
     EnaStudyHeader,
 )
 
@@ -114,7 +115,18 @@ class EnaRunRegistrationStatus(StrEnum):
 
     REGISTERED = "registered"
     SKIPPED_ALREADY_PRESENT = "skipped_already_present"
+    EXCLUDED = "excluded"
     FAILED = "failed"
+    # A run this study already holds, that a re-import found ENA no longer
+    # reports as public -- distinct from EXCLUDED (never registered) so a
+    # batch report separates "never imported" from "imported, now
+    # unavailable". Set by ena_import.batch, not this module: this file only
+    # registers runs the Portal returns.
+    FLAGGED_UNAVAILABLE = "flagged_unavailable"
+    # A held run with no stored reads whose pool's download already completed
+    # without it (it was flagged when that download read its roster). Nothing
+    # schedules its download; set by ena_import.batch.
+    HELD_NOT_DOWNLOADED = "held_not_downloaded"
 
 
 @dataclass(frozen=True)
@@ -122,10 +134,12 @@ class EnaRunRegistrationOutcome:
     """One ENA run's registration outcome.
 
     `prep_sample_idx` is set only on `REGISTERED`; `sequenced_sample_idx` on
-    both `REGISTERED` and `SKIPPED_ALREADY_PRESENT`; `failure_reason` only on
-    `FAILED`. `harmonization` is set (non-`FAILED`) only when this call newly
-    created the biosample -- write-once: a reused/re-imported biosample carries
-    `None` because no harmonization write ran.
+    `REGISTERED`, `SKIPPED_ALREADY_PRESENT` and `HELD_NOT_DOWNLOADED`;
+    `failure_reason` on `FAILED`, `EXCLUDED`, `FLAGGED_UNAVAILABLE` and
+    `HELD_NOT_DOWNLOADED`. `harmonization` is set (non-`FAILED`,
+    non-`EXCLUDED`) only when this call newly created the biosample --
+    write-once: a reused/re-imported biosample carries `None` because no
+    harmonization write ran.
     """
 
     run_accession: str
@@ -236,7 +250,9 @@ async def register_ena_study(
     decides whether importing into it is allowed, so this never creates one.
 
     Never raises for a per-run failure (see `EnaRunRegistrationOutcome`); an
-    unmappable `instrument_platform` is one such isolated per-run failure.
+    unmappable `instrument_platform` is one such isolated per-run failure, and a
+    non-public run (`status` other than `PUBLIC`) is excluded the same way,
+    before platform mapping even runs.
     It does raise -- before any run is written -- when a study-local field at
     one of the four `library_*` display names cannot hold these values (see
     `_ensure_library_fields`), so the whole accession fails loudly rather
@@ -262,6 +278,13 @@ async def register_ena_study(
         outcomes_by_accession: dict[str, EnaRunRegistrationOutcome] = {}
         platform_by_accession: dict[str, Platform] = {}
         for ena_run in ena_runs:
+            if ena_run.status is not EnaStatus.PUBLIC:
+                outcomes_by_accession[ena_run.run_accession] = EnaRunRegistrationOutcome(
+                    run_accession=ena_run.run_accession,
+                    status=EnaRunRegistrationStatus.EXCLUDED,
+                    failure_reason=f"run {ena_run.run_accession} is {ena_run.status.value}",
+                )
+                continue
             try:
                 platform = map_ena_platform(ena_run.instrument_platform)
             except UnmappableEnaPlatformError as exc:
@@ -281,7 +304,7 @@ async def register_ena_study(
         # Outside the transaction below: the field rows are per-study
         # constants that survive a failed attempt (see _ensure_library_fields).
         library_field_idxs: dict[str, int] = {}
-        if any(ena_run.run_accession not in already_present for ena_run in ena_runs):
+        if any(acc not in already_present for acc in platform_by_accession):
             library_field_idxs = await _ensure_library_fields(
                 conn, study_idx=study_idx, created_by_idx=caller_idx
             )

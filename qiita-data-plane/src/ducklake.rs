@@ -775,6 +775,50 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// per-sample ASV feature counts from a deblur run: feature membership plus
+/// abundance, keyed by `processing_idx` (the run) and `feature_idx` (the ASV);
+/// plus the ASV sequences themselves (`amplicon_sequence` +
+/// `amplicon_sequence_chunks`, keyed by feature_idx, mirroring the assembly
+/// tables) so an ASV never has to be recomputed to read back. the derived
+/// closed-reference feature table aggregates membership; it is never itself
+/// stored. membership is replace-keyed on `(prep_sample_idx, processing_idx)`
+/// and the sequence tables on `feature_idx` in
+/// `flight_service::REPLACE_KEY_TABLES`, so a re-run replaces its own rows.
+pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_membership (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            feature_idx BIGINT NOT NULL,
+            count BIGINT NOT NULL
+        );
+
+        -- One row per UNIQUE ASV (content-hash deduped), keyed by feature_idx.
+        -- Mirrors assembled_sequence: length here, bytes in the chunks table.
+        CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_sequence (
+            feature_idx BIGINT NOT NULL,
+            sequence_hash UUID NOT NULL,
+            sequence_length_bp BIGINT NOT NULL
+        );
+
+        -- The ASV bytes in 64 KB chunks (reassemble with
+        -- string_agg(chunk_data, '' ORDER BY chunk_index)). Mirrors
+        -- assembled_sequence_chunks; loaded multi-file (a <table>/ subdir of parts).
+        CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_sequence_chunks (
+            feature_idx BIGINT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            chunk_data VARCHAR NOT NULL
+        );",
+    )?;
+    // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk
+    // writer uses (see CHUNK_ROW_GROUP_SIZE).
+    conn.execute_batch(&format!(
+        "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
+         table_name => 'amplicon_sequence_chunks');"
+    ))?;
+    Ok(())
+}
+
 /// Create the one row that registrations into the replace-keyed tables
 /// serialize on, and seed it.
 ///
@@ -1483,6 +1527,23 @@ mod tests {
             vec![feat_kept],
             "alignment_visible persists + anti-joins after reattach"
         );
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_amplicon_tables_is_idempotent() {
+        let conn = setup_conn();
+        ensure_amplicon_tables(&conn).expect("first ensure_amplicon_tables");
+        ensure_amplicon_tables(&conn).expect("second ensure_amplicon_tables (idempotent)");
+        let mut stmt = conn
+            .prepare(
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_name = 'amplicon_membership'",
+            )
+            .unwrap();
+        let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(n, 1, "amplicon_membership table should exist exactly once");
     }
 
     #[test]

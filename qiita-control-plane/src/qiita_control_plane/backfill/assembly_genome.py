@@ -31,6 +31,7 @@ import asyncpg
 from qiita_common.models import GenomeSource
 
 from ..actions.library import upsert_genomes
+from ..repositories._sample_scope import SEQUENCED_SAMPLE_NOT_FLAGGED
 from ..repositories.assembly import assembly_genome_source_id
 
 # Subjects per transaction. Both siblings in this package take one transaction per
@@ -44,12 +45,16 @@ _CHUNK_SIZE = 5_000
 
 # Every un-minted subject, with the contig count it speaks for. `bin_id` is NOT NULL
 # on the table, so no COALESCE is needed. Unordered: nothing reads the sequence, and
-# the apply matches rows by key rather than by position.
+# the apply matches rows by key rather than by position. Excludes a prep_sample whose
+# sequenced_sample is ENA-flagged -- a run ENA no longer reports available gets no new
+# genome minted.
 _UNMINTED_SUBJECTS_SQL = (
-    "SELECT prep_sample_idx, processing_idx, kind, bin_id, count(*) AS contig_count"
-    "  FROM qiita.assembly_membership"
-    " WHERE genome_idx IS NULL"
-    " GROUP BY prep_sample_idx, processing_idx, kind, bin_id"
+    "SELECT am.prep_sample_idx, am.processing_idx, am.kind, am.bin_id,"
+    "       count(*) AS contig_count"
+    "  FROM qiita.assembly_membership am"
+    " WHERE am.genome_idx IS NULL"
+    f"   AND {SEQUENCED_SAMPLE_NOT_FLAGGED.format(alias='am')}"
+    " GROUP BY am.prep_sample_idx, am.processing_idx, am.kind, am.bin_id"
 )
 
 

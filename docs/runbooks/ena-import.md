@@ -98,6 +98,91 @@ conflict — is recorded on that accession alone; it never aborts the batch or i
 sibling accessions. Poll with `qiita ena-import-status IDX` to see each accession's
 state and, on failure, the reason.
 
+### Non-public studies and runs
+
+ENA reports a `status` (`public` or `suppressed`) on every study and run; any other
+value fails the accession loudly rather than being treated as public. A **suppressed
+study** fails the whole accession before anything is written, naming its status
+(`study PRJ... is suppressed`). A study with **no public runs at all** fails the same
+way (`no public runs`), before the study is even resolved or created. Within an
+otherwise-public study, an individual **suppressed run** is `excluded` — isolated from
+its siblings exactly like an unmappable platform, carrying a `failure_reason` naming
+the run and its status, and contributing no `biosample`/`prep_sample`/`sequenced_sample`
+rows. When a pool was created (at least one run's platform mapped) but every run in
+the item still ends up `excluded` and/or `failed` — none reaches
+`registered`/`skipped_already_present` — the item fails with "every run failed to
+register", naming every excluded or failed run; if no platform ever mapped, no pool
+exists and the item instead fails with "no run mapped to a downloadable pool".
+
+Resolution only sees public records (see `qiita_common.models.ena`), so these checks
+rarely fire in practice; they enforce the rule rather than assume it.
+
+### ENA availability re-check on re-import
+
+A run Qiita already holds can stop being public between imports: ENA suppresses,
+withdraws, or replaces it. The Portal endpoint that resolution uses only ever
+returns public records, so it cannot report this itself — **re-importing the
+same study**
+checks it. Every held run the fresh Portal response no longer names as public is
+looked up against ENA's Browser API (`summary/{accession}`), which reports every
+run's status regardless of availability. Runs are asked for in batches; a batch
+that returns HTTP 500 is re-asked one run at a time, because one run ENA can't
+serve fails the whole batch. Each request is retried once on a transport error or
+a 5xx.
+
+- **Public** (or the run reappears as public in the Portal's fresh response)
+  clears any existing flag.
+- **Any other status ENA reports** flags the run, storing ENA's own status text on
+  `sequenced_sample.ena_status`, and a `flagged_unavailable` outcome on the batch
+  item naming it. The outcome is recorded as soon as the flag commits, so it stays
+  on the item even if a later step fails it.
+- **A run that still errors on its own — including HTTP 500** (observed live for
+  both a nonexistent accession and, per ENA's docs, a withdrawn run; the two are
+  indistinguishable from this endpoint alone) **— fails the whole item and writes
+  no flags**: a 500 is not evidence a run is unavailable, and an availability
+  check never leaves a run half-updated.
+- **A status this codebase does not recognize** fails the item the same way.
+
+**A study blocked by one run.** A held run that keeps returning 500 fails every
+re-import of its study before anything new registers. Check the run on the ENA
+Browser by hand; if ENA has withdrawn it, retire its prep_sample
+(`qiita prep-sample retire --prep-sample-idx N --reason "withdrawn from ENA"`). A
+retired run is not re-checked, so the next re-import proceeds.
+
+The same check runs when a re-import has nothing new to register: the study is
+absent from the Portal, is not public, or has no public runs. The Portal drops
+non-public runs, so "every run suppressed" arrives this way. If Qiita holds a
+study created by an earlier import, its held runs are checked and flagged or
+cleared, and the item fails naming any it flagged.
+
+**A held run nothing will download.** A run flagged before its pool's download
+read the roster is left off that download. If ENA later releases it again, the
+flag clears, but the pool's download has already completed. The re-import reports
+such a run `held_not_downloaded` instead of `skipped_already_present`. There is no
+automatic retry for it yet.
+
+**The exclusion rule: a flagged run is skipped wherever a sample-selecting query
+already filters out a retired prep_sample.** That includes the download roster,
+the block planners, the run, pool and study rosters, the amplicon pool roster, the
+rollups and exports, `has_sequenced_sample` (so a pool whose only runs are flagged
+gets no download ticket), `mask purge-failed` and the backfills. It is not deleted or retired, so it stays
+visible on the sample's own record and reappears the moment a later re-import finds
+it public again. Two things do **not** filter it, deliberately: a route that reads
+a sample by its own id (`read_masked`, alignment/assembly DoGets, the per-sample
+masked-export ticket) is not gated on `retired` either and is not gated on the flag;
+and pool delete plus the `ena_run_accession` re-registration dedupe must keep
+seeing a flagged row to work at all.
+
+**Nothing is cancelled automatically.** Flagging logs (does not act on) any
+non-terminal work ticket still touching the run's pool or sample, naming the
+ticket so an operator can cancel it through the existing
+`POST /api/v1/work-ticket/cancel` filter if the work is no longer wanted.
+
+**Limits:** detection only happens on re-import — there is no periodic recheck of
+a study nobody has re-submitted. An `export_id` minted before a run was flagged
+stays valid; a published identifier does not change because ENA's availability
+did.
+
 ### REST surface
 
 - `POST /api/v1/ena-import-batch` — body: `{accessions: [...]}`. Returns `202` immediately with a batch
@@ -142,12 +227,15 @@ it once submitted.
 Every ENA-imported biosample is bound to the **ERC000011** checklist (the ENA default
 sample checklist) — the same shared checklist model every other metadata path in
 Qiita uses. `GET /api/v1/ena-import-batch/{idx}` returns an `ena_runs` array per item,
-one entry per ENA run carrying its `status` and a `failure_reason` when it failed. A
+one entry per ENA run carrying its `status` (`registered` / `skipped_already_present` /
+`excluded` / `failed` / `flagged_unavailable` / `held_not_downloaded` — the last two
+from a re-import's ENA availability re-check, see above) and a `failure_reason` on
+every status but `registered` and `skipped_already_present`. A
 harmonization error (an unparseable value, or a cross-study metadata slot collision)
 fails the run, surfacing as that run's `status: failed` + `failure_reason`, isolated
-per-run exactly like an unmappable platform. A checklist-required field ENA did not
-supply is not itself an error — the checklist binding, not enforcement, is what
-harmonization records.
+per-run exactly like an unmappable platform or a suppressed run (see *Non-public
+studies and runs* above). A checklist-required field ENA did not supply is not itself
+an error — the checklist binding, not enforcement, is what harmonization records.
 
 **A sample with zero ENA attributes is a legitimate, common result, not an import
 failure.** Real ENA/DDBJ samples sometimes carry no `<SAMPLE_ATTRIBUTE>` elements at
@@ -220,6 +308,16 @@ control-plane host and `probe/ena-from-compute` from a compute node. What each r
 covers, what a green one does *not* prove, and which hatch skips which are in
 [`redeploy.md` §7](redeploy.md#7-verify).
 
-An unresolvable accession (malformed, or one ENA does not recognize) fails loud with
-an actionable message rather than resolving to a silent empty result — see
-`qiita_common.ena_accession` for the accepted prefix sets per accession kind.
+An accession must be one of these prefixes followed by digits, e.g. `PRJEB11419`:
+
+| Kind | Prefixes |
+|---|---|
+| study | `PRJNA`, `PRJEB`, `PRJDB`, `ERP`, `SRP`, `DRP` |
+| sample | `SAMN`, `SAME`, `SAMD`, optionally followed by one letter (`SAMEA`, `SAMEG`) |
+| run | `SRR`, `ERR`, `DRR` |
+| experiment | `SRX`, `ERX`, `DRX` |
+
+Submit takes study accessions only; anything else, including a well-formed sample or
+run, is refused at submit (CLI exit 2, HTTP 422) and no batch is created. An accession
+of the right shape that ENA does not recognize fails loud with an actionable message
+rather than resolving to a silent empty result.

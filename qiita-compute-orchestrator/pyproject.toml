@@ -28,7 +28,7 @@ dependencies = [
     # silently swap in. The control plane pins the same SHA (it imports
     # `get_illumina_sample_info` from the same release) so a re-vendor
     # is a coordinated bump; an integration parity test enforces parity.
-    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@d3b82bfb1e0dcbf3e2ce7866fd3d9b67d061c57b",
+    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@03ee9e3b86132b97d42298380a43d9e52eaaad23",
 ]
 
 [dependency-groups]

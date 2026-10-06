@@ -52,6 +52,7 @@ async def pool_ctx(postgres_pool):
         quality_filtered=None,
         spikein=None,
         retired=False,
+        ena_status=None,
         biosample_accession=None,
         ena_sample_accession=None,
         ena_experiment_accession=None,
@@ -103,6 +104,13 @@ async def pool_ctx(postgres_pool):
                 " retired_at = now(), retire_reason = 'test' WHERE idx = $1",
                 ps_idx,
                 owner_idx,
+            )
+        if ena_status is not None:
+            await postgres_pool.execute(
+                "UPDATE qiita.sequenced_sample SET ena_status = $2,"
+                " ena_availability_checked_at = now() WHERE idx = $1",
+                ss_idx,
+                ena_status,
             )
         samples.append((bs_idx, ps_idx, ss_idx))
         return ss_idx
@@ -261,6 +269,19 @@ async def test_retired_sample_excluded_from_sums_and_counts(pool_ctx):
     await pool_ctx["add_sample"](raw=5000, biological=4000, quality_filtered=3000, retired=True)
     row = await fetch_sequenced_pool_read_metrics(pool_ctx["pool"], pool_ctx["pool_idx"])
     assert row["raw_read_count_r1r2"] == 1000  # retired 5000 excluded
+    assert row["sample_count"] == 1
+    assert row["samples_with_metrics"] == 1
+
+
+async def test_flagged_sample_excluded_from_sums_and_counts(pool_ctx):
+    """An ENA-flagged sequenced_sample contributes to neither the sums nor
+    either count, the same as a retired one."""
+    await pool_ctx["add_sample"](raw=1000, biological=900, quality_filtered=850)
+    await pool_ctx["add_sample"](
+        raw=5000, biological=4000, quality_filtered=3000, ena_status="suppressed"
+    )
+    row = await fetch_sequenced_pool_read_metrics(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert row["raw_read_count_r1r2"] == 1000  # flagged 5000 excluded
     assert row["sample_count"] == 1
     assert row["samples_with_metrics"] == 1
 

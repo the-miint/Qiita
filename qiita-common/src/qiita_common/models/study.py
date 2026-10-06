@@ -4,7 +4,7 @@ from typing import Annotated, ClassVar
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
-from qiita_common.models._base import PatchRequestModel
+from qiita_common.models._base import LookupEmail, PatchRequestModel
 from qiita_common.models.reference import STORABLE_ACCESS_TIERS, Tier
 
 # Column-length budgets mirror the qiita.study schema; keeping the limits
@@ -117,15 +117,12 @@ class StudyAccessGrant(BaseModel):
     """Body for POST /api/v1/study/{study_idx}/access — grant a tier.
 
     The grantee is named by the email on their qiita.user row; they must
-    have logged in once so that row exists. The email is only looked up, never
-    stored, so it is checked for shape alone: `EmailStr` would refuse addresses
-    an account can already carry (it rejects special-use domains such as
-    `.local`).
+    have logged in once so that row exists.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    email: Annotated[str, Field(max_length=320, pattern=r"^[^@\s]+@[^@\s]+$")]
+    email: LookupEmail
     access_tier: Tier
 
     _no_public = field_validator("access_tier")(_reject_public_tier)

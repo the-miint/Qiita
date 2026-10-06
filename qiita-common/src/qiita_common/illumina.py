@@ -105,6 +105,77 @@ class InstrumentRunInfo(NamedTuple):
     instrument_model: str
 
 
+class IlluminaRead(NamedTuple):
+    """One ``<Read>`` from RunInfo.xml: its cycle count and whether it is an index."""
+
+    num_cycles: int
+    is_indexed: bool
+
+
+def read_run_reads(bcl_input_dir: Path) -> tuple[IlluminaRead, ...]:
+    """Return the ordered ``<Reads>`` structure from a run folder's RunInfo.xml.
+
+    Raises ``ValueError`` when RunInfo.xml is absent/malformed or carries no
+    reads. Used to build the amplicon dummy sample sheet (`build_amplicon_dummy_
+    sample_sheet`), whose Reads/OverrideCycles are a function of this geometry.
+    """
+    runinfo_path = bcl_input_dir / RUNINFO_FILENAME
+    if not runinfo_path.is_file():
+        raise ValueError(f"RunInfo.xml not found at top level of {bcl_input_dir}")
+    try:
+        root = ET.parse(runinfo_path).getroot()
+    except ET.ParseError as exc:
+        raise ValueError(f"{runinfo_path} is not well-formed XML: {exc}") from exc
+    reads = [
+        IlluminaRead(int(r.get("NumCycles", "0")), r.get("IsIndexedRead") == "Y")
+        for r in root.findall("./Run/Reads/Read")
+    ]
+    if not reads or any(r.num_cycles <= 0 for r in reads):
+        raise ValueError(f"{runinfo_path} has no usable <Reads> structure")
+    return tuple(reads)
+
+
+def build_amplicon_dummy_sample_sheet(reads: tuple[IlluminaRead, ...], sample_id: str) -> str:
+    """Return the bcl-convert no-index dummy sample sheet for an amplicon run.
+
+    Mirrors qp-knight-lab-processing's ``generate_dummy_sample_sheet``: one
+    placeholder sample with empty indices (so every read lands in Undetermined),
+    the two template reads' cycle counts, and OverrideCycles that mask the index
+    cycles while ``CreateFastqForIndexReads`` still emits them as a FASTQ, which is
+    what carries the in-index Golay barcode out to golay_demux.
+    """
+    template = [r for r in reads if not r.is_indexed]
+    index = [r for r in reads if r.is_indexed]
+    if len(template) != 2 or len(index) not in (1, 2):
+        raise ValueError(
+            f"expected 2 template reads and 1-2 index reads, got {len(template)} and {len(index)}"
+        )
+    non_index_cycles = template[0].num_cycles
+    masked = ";".join(f"N{r.num_cycles}" for r in index)
+    override_cycles = f"Y{non_index_cycles};{masked};Y{non_index_cycles}"
+    lines = [
+        "[Header]",
+        "IEMFileVersion,4",
+        "Workflow,GenerateFASTQ",
+        "Application,FASTQ Only",
+        "",
+        "[Reads]",
+        str(non_index_cycles),
+        str(non_index_cycles),
+        "",
+        "[Settings]",
+        f"OverrideCycles,{override_cycles}",
+        "MaskShortReads,1",
+        "CreateFastqForIndexReads,1",
+        "",
+        "[Data]",
+        "Sample_ID,Sample_Plate,Sample_Well,I7_Index_ID,index,I5_Index_ID,index2",
+        f"{sample_id},,,,,,",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def read_instrument_run_info(bcl_input_dir: Path) -> InstrumentRunInfo:
     """Read ``RunInfo.xml`` at the top of a BCL run folder and return the
     instrument run ID and resolved model name.

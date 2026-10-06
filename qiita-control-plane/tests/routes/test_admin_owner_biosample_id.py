@@ -193,6 +193,53 @@ async def test_pool_filtered_export(ctx, seeded):
     assert row["owner_biosample_id"] == "OWNER-A"
 
 
+async def test_pool_filtered_export_excludes_flagged(ctx, seeded):
+    """A pool sample whose ENA run is flagged is excluded from the pool-filtered
+    export, the same as a retired one — only bs_a (healthy) surfaces."""
+    pool = ctx["pool"]
+    owner = ctx["admin_session"]["principal_idx"]
+    token = secrets.token_hex(4)
+
+    bs_d = await seed_biosample(pool, owner_idx=owner, created_by_idx=owner)
+    await seed_biosample_to_study_link(
+        pool, biosample_idx=bs_d, study_idx=seeded["study_idx"], created_by_idx=owner
+    )
+    ps_d = await seed_sequenced_prep_sample(pool, biosample_idx=bs_d, owner_idx=owner)
+    await pool.execute(
+        "INSERT INTO qiita.prep_sample_to_study (prep_sample_idx, study_idx, created_by_idx)"
+        " VALUES ($1, $2, $3)",
+        ps_d,
+        seeded["study_idx"],
+        owner,
+    )
+    ss_d = await pool.fetchval(
+        "INSERT INTO qiita.sequenced_sample"
+        "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx,"
+        "   ena_status, ena_availability_checked_at)"
+        " VALUES ($1, $2, $3, $4, 'suppressed', now()) RETURNING idx",
+        ps_d,
+        seeded["pool_idx"],
+        f"item-d-{token}",
+        owner,
+    )
+    try:
+        resp = await ctx["admin"].get(
+            _url(seeded["study_idx"]), params={"sequenced_pool_idx": seeded["pool_idx"]}
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["row_count"] == 1
+        assert body["rows"][0]["biosample_idx"] == seeded["bs_a"]
+    finally:
+        await pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_d)
+        await pool.execute(
+            "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1", ps_d
+        )
+        await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps_d)
+        await pool.execute("DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1", bs_d)
+        await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs_d)
+
+
 async def test_regular_user_403(ctx, seeded):
     resp = await ctx["user"].get(_url(seeded["study_idx"]))
     assert resp.status_code == 403

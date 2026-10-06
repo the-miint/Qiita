@@ -18,8 +18,10 @@ from qiita_common.api_paths import (
     URL_AUTH_WHOAMI,
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
+    URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
     URL_BIOSAMPLE_LIST_BY_STUDY,
+    URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_PROTOCOL_PREFIX,
     URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
@@ -5279,3 +5281,246 @@ def test_submit_align_pool_server_refusal_is_surfaced(monkeypatch, capsys):
         responses=[(409, {"detail": "samples already have an alignment gate"})],
     )
     assert _run_submit_align_pool() != 0
+
+
+# ---------------------------------------------------------------------------
+# qiita biosample get-by-unique-field / patch-metadata-by-unique-field
+# ---------------------------------------------------------------------------
+
+
+_BIOSAMPLE_BY_UNIQUE_FIELD_RESPONSE = {"biosample_idx": 99, "local_metadata": {}}
+_BIOSAMPLE_METADATA_WRITE_RESPONSE = {"biosample_idx": 99, "results": {}}
+
+_UNIQUE_FIELD_ARGS = [
+    "--study-idx",
+    "7",
+    "--unique-field-display-name",
+    "host subject id",
+    "--unique-field-value",
+    "HS-0042",
+]
+
+
+def test_biosample_get_by_unique_field(monkeypatch):
+    """The read posts the identifying pair as the whole body, so the value
+    never reaches a URL; the study idx is the only thing filling the path."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_BY_UNIQUE_FIELD_RESPONSE, status=200)
+
+    rc = main(
+        ["--base-url", "https://q.example.test", "biosample", "get-by-unique-field"]
+        + _UNIQUE_FIELD_ARGS
+    )
+
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == (
+        f"https://q.example.test{URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD.format(study_idx=7)}"
+    )
+    assert captured["json"] == {
+        "unique_field_display_name": "host subject id",
+        "unique_field_value": "HS-0042",
+    }
+
+
+def test_biosample_patch_metadata_by_unique_field(monkeypatch):
+    """The write PATCHes the identifying pair alongside the metadata dict the
+    repeated KEY=VALUE flags fold into."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_METADATA_WRITE_RESPONSE, status=200)
+
+    rc = main(
+        ["--base-url", "https://q.example.test", "biosample", "patch-metadata-by-unique-field"]
+        + _UNIQUE_FIELD_ARGS
+        + [
+            "--metadata",
+            "geographic location (latitude)=32.87",
+            "--metadata",
+            "collection date=2026-03-04",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["method"] == "PATCH"
+    assert captured["url"] == (
+        f"https://q.example.test{URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD.format(study_idx=7)}"
+    )
+    assert captured["json"] == {
+        "unique_field_display_name": "host subject id",
+        "unique_field_value": "HS-0042",
+        "metadata": {
+            "geographic location (latitude)": "32.87",
+            "collection date": "2026-03-04",
+        },
+    }
+
+
+def test_biosample_patch_metadata_by_unique_field_value_containing_equals(monkeypatch):
+    """Only the first '=' splits a KEY=VALUE entry, so a value carrying one
+    survives intact rather than being truncated or rejected."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_METADATA_WRITE_RESPONSE, status=200)
+
+    rc = main(
+        ["--base-url", "https://q.example.test", "biosample", "patch-metadata-by-unique-field"]
+        + _UNIQUE_FIELD_ARGS
+        + ["--metadata", "note=a=b"]
+    )
+
+    assert rc == 0
+    assert captured["json"]["metadata"] == {"note": "a=b"}
+
+
+def test_biosample_patch_metadata_by_unique_field_duplicate_key_exits_2(monkeypatch, capsys):
+    """A repeated KEY is a typo, not a last-wins overwrite: the CLI refuses
+    before any request goes out."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_METADATA_WRITE_RESPONSE, status=200)
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["--base-url", "https://q.example.test", "biosample", "patch-metadata-by-unique-field"]
+            + _UNIQUE_FIELD_ARGS
+            + ["--metadata", "depth=1", "--metadata", "depth=2"]
+        )
+
+    assert exc.value.code == 2
+    assert captured["requests"] == []
+    err = capsys.readouterr().err
+    assert "--metadata" in err
+    assert "repeated" in err
+
+
+def test_biosample_patch_metadata_by_unique_field_global_internal_names_opt_in(monkeypatch):
+    """Tests the case where the opt-in is omitted and where it is passed:
+    omitted it stays off the wire so the server default applies; passed it
+    travels as true."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_METADATA_WRITE_RESPONSE, status=200)
+
+    base = (
+        [
+            "--base-url",
+            "https://q.example.test",
+            "biosample",
+            "patch-metadata-by-unique-field",
+        ]
+        + _UNIQUE_FIELD_ARGS
+        + ["--metadata", "host_taxon_id=9606"]
+    )
+
+    assert main(base) == 0
+    assert "global_internal_names" not in captured["json"]
+
+    assert main(base + ["--global-internal-names"]) == 0
+    assert captured["json"]["global_internal_names"] is True
+
+
+def test_biosample_patch_metadata_by_unique_field_requires_metadata(monkeypatch, capsys):
+    """The write has nothing to do without at least one metadata entry, so the
+    flag is required and its absence exits 2 before any request."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_METADATA_WRITE_RESPONSE, status=200)
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["--base-url", "https://q.example.test", "biosample", "patch-metadata-by-unique-field"]
+            + _UNIQUE_FIELD_ARGS
+        )
+
+    assert exc.value.code == 2
+    assert captured["requests"] == []
+    assert "the following arguments are required: --metadata" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("omitted", ["--unique-field-display-name", "--unique-field-value"])
+def test_biosample_get_by_unique_field_requires_identifying_pair(monkeypatch, capsys, omitted):
+    """Tests the case where one half of the identifying pair is missing:
+    either half's absence exits 2 before any request, rather than sending a
+    partial lookup. The flag name on stderr is what separates the argparse
+    refusal from the body-validation one that would otherwise also exit 2."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_BY_UNIQUE_FIELD_RESPONSE, status=200)
+
+    # Drop the flag and the value that follows it from the flat argv list.
+    drop_at = _UNIQUE_FIELD_ARGS.index(omitted)
+    kept = _UNIQUE_FIELD_ARGS[:drop_at] + _UNIQUE_FIELD_ARGS[drop_at + 2 :]
+
+    with pytest.raises(SystemExit) as exc:
+        main(["--base-url", "https://q.example.test", "biosample", "get-by-unique-field"] + kept)
+
+    assert exc.value.code == 2
+    assert captured["requests"] == []
+    assert f"the following arguments are required: {omitted}" in capsys.readouterr().err
+
+
+def test_biosample_get_by_unique_field_requires_study_idx(monkeypatch, capsys):
+    """Tests the case where --study-idx is missing: the study is the only
+    thing filling the path template, so its absence must refuse rather than
+    dial a path with a placeholder left unresolved."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_BY_UNIQUE_FIELD_RESPONSE, status=200)
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "--base-url",
+                "https://q.example.test",
+                "biosample",
+                "get-by-unique-field",
+                "--unique-field-display-name",
+                "host subject id",
+                "--unique-field-value",
+                "HS-0042",
+            ]
+        )
+
+    assert exc.value.code == 2
+    assert captured["requests"] == []
+    assert "the following arguments are required: --study-idx" in capsys.readouterr().err
+
+
+def test_biosample_get_by_unique_field_rejects_blank_value(monkeypatch, capsys):
+    """Tests the case where the value is present but blank: argparse accepts
+    it, so the refusal comes from body construction instead, and must still
+    land before any request."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_BY_UNIQUE_FIELD_RESPONSE, status=200)
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "--base-url",
+                "https://q.example.test",
+                "biosample",
+                "get-by-unique-field",
+                "--study-idx",
+                "7",
+                "--unique-field-display-name",
+                "host subject id",
+                "--unique-field-value",
+                "   ",
+            ]
+        )
+
+    assert exc.value.code == 2
+    assert captured["requests"] == []
+    assert "unique_field_value" in capsys.readouterr().err

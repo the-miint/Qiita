@@ -550,6 +550,39 @@ async def test_align_plan_skips_sample_with_no_gate_row(ctx, planned):
         await db.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs)
 
 
+async def test_align_plan_flagged_sample_excluded_not_counted_no_reads(ctx, planned):
+    """An ENA-flagged pool sample with no reads is excluded from the plan
+    entirely -- it is not counted in `samples_skipped_no_reads`, the same as a
+    retired sample isn't."""
+    await _seed_align_action(planned["db"])
+    db = planned["db"]
+    owner = planned["owner"]
+    # A third in-pool sample: no reads AND flagged.
+    bs, ps = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
+    try:
+        await db.execute(
+            "INSERT INTO qiita.sequenced_sample"
+            "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx,"
+            "   ena_status, ena_availability_checked_at)"
+            " VALUES ($1, $2, $3, $4, 'suppressed', now())",
+            ps,
+            planned["pool_idx"],
+            f"flagged-{ps}",
+            owner,
+        )
+        resp = await ctx["wet"].post(_url(planned), json=_body(planned))
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        # The two gated samples plan; the flagged sample is excluded entirely,
+        # not counted as skipped_no_reads.
+        assert body["samples_planned"] == 2
+        assert body["samples_skipped_no_reads"] == 0
+    finally:
+        await db.execute("DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = $1", ps)
+        await db.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps)
+        await db.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs)
+
+
 async def test_align_plan_resubmit_over_completed_409(ctx, planned):
     """Re-planning a pool whose samples already carry an alignment gate is a 409;
     only_missing then skips them and returns 202 with nothing new planned."""

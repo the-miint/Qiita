@@ -11,6 +11,7 @@ and stable is what a column-drift guard needs, not a growing crowdsourced projec
 """
 
 import pytest
+from qiita_common.models.ena import EnaStatus
 
 from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
@@ -25,6 +26,7 @@ def test_miint_resolver_resolves_a_real_small_stable_study():
     assert header.study_accession == _STUDY_ACCESSION
     assert header.secondary_study_accession
     assert header.study_title
+    assert header.status is EnaStatus.PUBLIC
 
     runs = resolver.resolve_ena_runs(_STUDY_ACCESSION)
     assert len(runs) >= 2
@@ -38,6 +40,7 @@ def test_miint_resolver_resolves_a_real_small_stable_study():
         assert run.fastq_md5
         assert run.read_count is not None
         assert run.base_count is not None
+        assert run.status is EnaStatus.PUBLIC
 
     attrs = resolver.resolve_sample_attributes(_STUDY_ACCESSION)
     assert len(attrs) >= 1

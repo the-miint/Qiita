@@ -164,13 +164,14 @@ async def test_create_study_field_defaults_unique_in_study_false(ctx, surface):
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
-@pytest.mark.parametrize("data_type", ["boolean", "terminology"])
-async def test_create_study_field_rejects_unique_on_closed_value_set(ctx, surface, data_type):
-    """Tests the case where a field over a closed value set asks for study-local
-    uniqueness: the wire model refuses it before the database is reached, and
-    says which rule was broken rather than reporting a database rejection.
+@pytest.mark.parametrize("data_type", ["boolean", "terminology", "numeric", "date"])
+async def test_create_study_field_rejects_unique_on_ineligible_type(ctx, surface, data_type):
+    """Tests the case where a field of a type that cannot carry the policy asks
+    for study-local uniqueness: the wire model refuses it before the database is
+    reached, and says which rule was broken rather than reporting a database
+    rejection.
     """
-    study_idx = await _study_with_admin_grant(ctx, "uis-closed")
+    study_idx = await _study_with_admin_grant(ctx, "uis-inelig")
     # A terminology field is rejected for want of terminology_idx before
     # uniqueness is considered, so supply one to reach the rule under test.
     extra = {}
@@ -447,12 +448,13 @@ async def test_patch_study_field_enables_unique_in_study(ctx, surface):
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
-async def test_patch_study_field_unique_on_closed_value_set_422(ctx, surface):
-    """Tests the case where uniqueness is asked for on a boolean field: the
-    stored type decides, since the body carries no type of its own.
+@pytest.mark.parametrize("data_type", ["boolean", "numeric", "date"])
+async def test_patch_study_field_unique_on_ineligible_type_422(ctx, surface, data_type):
+    """Tests the case where uniqueness is asked for on a field whose type cannot
+    carry it: the stored type decides, since the body carries no type of its own.
     """
-    study_idx = await _study_with_admin_grant(ctx, "pat-bool")
-    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="boolean")
+    study_idx = await _study_with_admin_grant(ctx, "pat-inelig")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type=data_type)
 
     resp = await patch_study_field(
         ctx,
@@ -759,17 +761,16 @@ async def test_patch_study_field_enable_unique_over_missing_marker_422(ctx, surf
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
-@pytest.mark.parametrize("target", [True, False], ids=["enable", "disable"])
-async def test_patch_study_field_unique_on_published_sample_409(ctx, surface, target):
-    """Tests the case where a field the caller wants to repolicy already holds
-    a value on a published sample: publication freezes the policy in both
-    directions, and the refusal names publication rather than reaching the
-    caller as a 500.
+async def test_patch_study_field_unique_on_published_sample_409(ctx, surface):
+    """Tests the case where a field the caller wants to declare unique already
+    holds a value on a published sample: publication freezes the policy, and
+    the refusal names publication rather than reaching the caller as a 500.
+
+    Only the declaring direction reaches publication. Clearing the policy is
+    refused before the write, which the relax test below pins.
     """
     study_idx = await _study_with_admin_grant(ctx, "uniq-pub")
-    field_idx = await _seed_editable_field(
-        ctx, surface, study_idx=study_idx, unique_in_study=not target
-    )
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, unique_in_study=False)
     await seed_sample_with_value(
         ctx,
         surface,
@@ -786,12 +787,79 @@ async def test_patch_study_field_unique_on_published_sample_409(ctx, surface, ta
         study_idx=study_idx,
         study_field_idx=field_idx,
         if_match=await _etag(ctx, surface, field_idx),
-        unique_in_study=target,
+        unique_in_study=True,
     )
 
     assert resp.status_code == 409, resp.text
     assert "published" in resp.json()["detail"]
-    assert await _stored_unique_in_study(ctx, surface, field_idx) is (not target)
+    assert await _stored_unique_in_study(ctx, surface, field_idx) is False
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize("publish", [False, True], ids=["unpublished", "published"])
+async def test_patch_study_field_relax_unique_in_study_422(ctx, surface, publish):
+    """Tests the case where an edit would clear a field's uniqueness policy:
+    the API declares the policy but never withdraws it, so the edit is refused
+    and the stored policy is untouched.
+
+    The published arm pins the order: this refusal answers before publication
+    does, because it is judged ahead of the write the publication lock guards.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "uniq-relax")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, unique_in_study=True)
+    await seed_sample_with_value(
+        ctx,
+        surface,
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        value="Sample 1",
+        publish=publish,
+    )
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        unique_in_study=False,
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "cannot be withdrawn" in resp.json()["detail"]
+    assert await _stored_unique_in_study(ctx, surface, field_idx) is True
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize("stored", [False, True], ids=["plain", "unique"])
+async def test_patch_study_field_unique_in_study_no_op_allowed(ctx, surface, stored):
+    """Tests the case where an edit re-sends the policy the field already
+    carries: there is no transition to refuse, so the edit lands.
+
+    Without this, the relax refusal could be reading the body alone and
+    refusing every `false` a client re-sends with the rest of a field.
+    """
+    study_idx = await _study_with_admin_grant(ctx, "uniq-noop-flag")
+    field_idx = await _seed_editable_field(
+        ctx, surface, study_idx=study_idx, unique_in_study=stored
+    )
+    renamed = unique_field_name("Renamed")
+
+    resp = await patch_study_field(
+        ctx,
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        display_name=renamed,
+        unique_in_study=stored,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["display_name"] == renamed
+    assert await _stored_unique_in_study(ctx, surface, field_idx) is stored
 
 
 async def _stored_unique_in_study(ctx, surface, study_field_idx):

@@ -42,3 +42,4 @@ localdocs/
 .claude/*
 !.claude/commands/
 !.claude/settings.json
+test-data/

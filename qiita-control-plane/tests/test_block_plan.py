@@ -595,6 +595,51 @@ async def test_plan_excludes_retired_samples(pooled, planapp):
     assert no_member == 0
 
 
+async def test_plan_excludes_flagged_samples(pooled, planapp):
+    """An ENA-flagged sequenced_sample is not planned at all — no block_member,
+    no gate — and is NOT counted as skipped-no-reads, the same as a retired one."""
+    pool = pooled["pool"]
+    await pooled["add_sample"](reads=50)  # active
+    flagged_ps = await pooled["add_sample"](reads=50)
+    await pool.execute(
+        "UPDATE qiita.sequenced_sample SET ena_status = 'suppressed',"
+        " ena_availability_checked_at = now() WHERE prep_sample_idx = $1",
+        flagged_ps,
+    )
+
+    summary, _ = await _plan(pooled, planapp)
+    assert summary["samples_planned"] == 1  # only the active sample
+    assert summary["samples_skipped_no_reads"] == 0  # flagged ≠ no-reads
+    assert summary["blocks_created"] == 1
+
+    no_gate = await pool.fetchval(
+        "SELECT count(*) FROM qiita.mask_sample WHERE prep_sample_idx = $1", flagged_ps
+    )
+    assert no_gate == 0
+    no_member = await pool.fetchval(
+        "SELECT count(*) FROM qiita.block_member WHERE prep_sample_idx = $1", flagged_ps
+    )
+    assert no_member == 0
+
+
+async def test_plan_flagged_sample_with_no_reads_not_double_counted(pooled, planapp):
+    """A flagged sample that ALSO has no reads is excluded entirely -- it must
+    not inflate `samples_skipped_no_reads`, whose own query has the same
+    ena_status exclusion as `_enumerate_pool_samples`."""
+    await pooled["add_sample"](reads=50)  # active
+    flagged_ps = await pooled["add_sample"](reads=0)  # flagged AND no sequence_range
+    await pooled["pool"].execute(
+        "UPDATE qiita.sequenced_sample SET ena_status = 'suppressed',"
+        " ena_availability_checked_at = now() WHERE prep_sample_idx = $1",
+        flagged_ps,
+    )
+
+    summary, _ = await _plan(pooled, planapp)
+    assert summary["samples_planned"] == 1
+    assert summary["samples_skipped_no_reads"] == 0
+    assert summary["blocks_created"] == 1
+
+
 # ---------------------------------------------------------------------------
 # per-sample host-filter resolution (force_decision=None) — the point of this change
 # ---------------------------------------------------------------------------

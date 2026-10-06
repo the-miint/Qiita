@@ -354,13 +354,14 @@ async def plan_and_submit_alignments(
     all_samples = await _enumerate_pool_samples(pool, sequenced_pool_idx)
 
     # ACTIVE pool samples whose reads were never ingested (no sequence_range) can't
-    # be tiled — report them (mirrors block_planner). Retired samples are already
-    # excluded from all_samples, so this count matches the active set.
+    # be tiled — report them (mirrors block_planner). Retired and flagged samples
+    # are already excluded from all_samples, so this count matches the active set.
     skipped_no_reads = await pool.fetchval(
         "SELECT count(*) FROM qiita.sequenced_sample ss"
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         "  LEFT JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
         " WHERE ss.sequenced_pool_idx = $1 AND ps.retired = false"
+        "   AND ss.ena_status IS NULL"
         "   AND sr.prep_sample_idx IS NULL",
         sequenced_pool_idx,
     )

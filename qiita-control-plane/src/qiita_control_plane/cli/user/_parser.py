@@ -13,9 +13,11 @@ from qiita_common.analytic import (
 )
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
+    PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
     PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX,
     PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
+    PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     PATH_BIOSAMPLE_PREFIX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX,
@@ -41,6 +43,8 @@ from qiita_common.models import (
     Platform,
     PrepSampleStudyFieldCreateRequest,
     ProcessingStatus,
+    SampleMetadataWriteByUniqueFieldRequest,
+    SampleUniqueFieldRef,
     SequencedSamplePatchRequest,
     StudyPatchRequest,
     Tier,
@@ -56,7 +60,7 @@ from ._helpers import (
     _UNSET,
     _handle_patch,
     _handle_read,
-    _handle_study_field_create,
+    _handle_study_scoped_call,
     _lane_arg,
     _non_negative_seconds_arg,
     _positive_seconds_arg,
@@ -64,6 +68,7 @@ from ._helpers import (
     _proportion_or_none_arg,
 )
 from .alignment import _handle_alignment_cohort, _handle_alignment_list
+from .amplicon import _handle_submit_golay_demux
 from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_export
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
@@ -124,6 +129,38 @@ from .ticket import (
     _handle_ticket_status,
     _handle_ticket_submit,
 )
+
+
+def _add_global_internal_names_arg(subparser: argparse.ArgumentParser) -> None:
+    """Declare the opt-in that reinterprets --metadata KEYs for global fields."""
+    subparser.add_argument(
+        "--global-internal-names",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Interpret --metadata KEYs for global fields as their internal_name"
+            " rather than display_name (local fields stay display-name-keyed)"
+        ),
+    )
+
+
+def _add_unique_field_args(subparser: argparse.ArgumentParser) -> None:
+    """Declare the flags that name one biosample by a unique-in-study field."""
+    subparser.add_argument("--study-idx", type=int, required=True)
+    subparser.add_argument(
+        "--unique-field-display-name",
+        required=True,
+        help=(
+            "display_name of the study-local field that identifies the biosample;"
+            " it must declare unique_in_study"
+        ),
+    )
+    subparser.add_argument(
+        "--unique-field-value",
+        required=True,
+        help="the value that field carries on the wanted biosample",
+    )
 
 
 def _add_study_field_create_args(subparser: argparse.ArgumentParser, *, entity_noun: str) -> None:
@@ -425,16 +462,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--matrix-tube-id",
         help="Matrix-tube identifier (digits only); validated server-side",
     )
-    p_biosample_create.add_argument(
-        "--global-internal-names",
-        action="store_const",
-        const=True,
-        default=None,
-        help=(
-            "Interpret --metadata KEYs for global fields as their internal_name"
-            " rather than display_name (local fields stay display-name-keyed)"
-        ),
-    )
+    _add_global_internal_names_arg(p_biosample_create)
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
 
     biosample_study_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
@@ -445,9 +473,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_study_field_create_args(p_biosample_create_field, entity_noun="biosample")
     p_biosample_create_field.set_defaults(
-        handler=_handle_study_field_create,
-        study_field_model=BiosampleStudyFieldCreateRequest,
-        study_field_path=biosample_study_field_path,
+        handler=_handle_study_scoped_call,
+        study_call_method="POST",
+        study_call_path=biosample_study_field_path,
+        study_call_model=BiosampleStudyFieldCreateRequest,
+        study_call_kv_flags=(),
     )
 
     _add_field_list_subcommands(
@@ -457,6 +487,54 @@ def _build_parser() -> argparse.ArgumentParser:
         global_field_path=(
             f"{PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT}"
         ),
+    )
+
+    biosample_unique_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
+    biosample_unique_field_metadata_path = (
+        f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD}"
+    )
+
+    p_biosample_get_by_field = p_biosample_sub.add_parser(
+        "get-by-unique-field",
+        help=(
+            "Fetch a study's view of a biosample by the study's own id for it"
+            " (POST /study/{S}/biosample/by-unique-field)"
+        ),
+    )
+    _add_unique_field_args(p_biosample_get_by_field)
+    p_biosample_get_by_field.set_defaults(
+        handler=_handle_study_scoped_call,
+        study_call_method="POST",
+        study_call_path=biosample_unique_field_path,
+        study_call_model=SampleUniqueFieldRef,
+        study_call_kv_flags=(),
+    )
+
+    p_biosample_patch_md_by_field = p_biosample_sub.add_parser(
+        "patch-metadata-by-unique-field",
+        help=(
+            "Upsert a study's metadata on the biosample its own id names"
+            " (PATCH /study/{S}/biosample/by-unique-field/metadata)"
+        ),
+    )
+    _add_unique_field_args(p_biosample_patch_md_by_field)
+    p_biosample_patch_md_by_field.add_argument(
+        "--metadata",
+        action="append",
+        required=True,
+        metavar="KEY=VALUE",
+        help=(
+            "Metadata entry to write; repeat for multiple. KEY is a field"
+            " display_name; the route parses VALUE into the field's data type."
+        ),
+    )
+    _add_global_internal_names_arg(p_biosample_patch_md_by_field)
+    p_biosample_patch_md_by_field.set_defaults(
+        handler=_handle_study_scoped_call,
+        study_call_method="PATCH",
+        study_call_path=biosample_unique_field_metadata_path,
+        study_call_model=SampleMetadataWriteByUniqueFieldRequest,
+        study_call_kv_flags=("metadata",),
     )
 
     biosample_by_idx_path = f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
@@ -716,13 +794,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--ena-run-accession",
         help="ENA run accession (ERR…), if this sequenced_sample already has one",
     )
-    p_seqsample_create.add_argument(
-        "--global-internal-names",
-        action="store_const",
-        const=True,
-        default=None,
-        help=("Interpret --metadata KEYs as global-field internal_names rather than display_names"),
-    )
+    _add_global_internal_names_arg(p_seqsample_create)
     p_seqsample_create.set_defaults(handler=_handle_sequenced_sample_create)
 
     p_seqsample_patch = p_seqsample_sub.add_parser(
@@ -778,9 +850,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_study_field_create_args(p_prepsample_create_field, entity_noun="prep_sample")
     p_prepsample_create_field.set_defaults(
-        handler=_handle_study_field_create,
-        study_field_model=PrepSampleStudyFieldCreateRequest,
-        study_field_path=prep_sample_study_field_path,
+        handler=_handle_study_scoped_call,
+        study_call_method="POST",
+        study_call_path=prep_sample_study_field_path,
+        study_call_model=PrepSampleStudyFieldCreateRequest,
+        study_call_kv_flags=(),
     )
 
     _add_field_list_subcommands(
@@ -1919,6 +1993,66 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_submit_pacbio.set_defaults(handler=_handle_submit_pacbio_ingest)
+
+    p_submit_golay = sub.add_parser(
+        "submit-golay-demux",
+        help=(
+            "Bundled operator gesture for the golay-demux workflow (Rapid 16S):"
+            " mint (or reuse) a sequencing-run row, attach a sequenced-pool with"
+            " the preflight blob, and submit ONE pool-scoped golay-demux ticket"
+            " over the run resolved from --instrument-run-id."
+        ),
+        description=(
+            "Submit a golay-demux work-ticket end-to-end. The run folder is resolved"
+            " from --instrument-run-id server-side; the ticket converts it with a"
+            " no-index dummy sheet (every read to Undetermined, the Golay I1 emitted)"
+            " and demuxes on the Golay barcode. The per-sample Golay barcode_map is"
+            " read from the preflight's amplicon_sample rows and carried in"
+            " action_context. Run + pool are find-or-create and the per-sample roster"
+            " is create-missing, so a re-run after a partial failure converges without"
+            " operator cleanup."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--instrument-run-id",
+        required=True,
+        help=(
+            "The sequencing run id (the BCL run-folder name / RunInfo.xml <Run Id>)."
+            " The control plane resolves it to the run folder and reads the instrument"
+            " identity from RunInfo.xml; the submitter never names a host path."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--preflight-blob",
+        type=Path,
+        required=True,
+        help=(
+            "Path to the local kl-run-preflight SQLite file. The CLI reads it"
+            " (refuses empty), builds the Golay barcode_map from its amplicon_sample"
+            " rows, and attaches the blob to the sequenced-pool row. Same"
+            " content-addressed pool find-or-create as submit-bcl-convert."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--prep-protocol-idx",
+        type=int,
+        required=True,
+        help=(
+            "Qiita prep_protocol_idx to FK every per-sample row to. Applied"
+            " uniformly across the pool (the preflight carries no Qiita prep_protocol"
+            " identifier), mirroring submit-bcl-convert."
+        ),
+    )
+    p_submit_golay.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Re-submit even when a COMPLETED golay-demux ticket already exists for"
+            " this pool (a re-run re-registers the pool's reads into the lake —"
+            " DuckLake has no uniqueness). Requires wet_lab_admin or system_admin."
+        ),
+    )
+    p_submit_golay.set_defaults(handler=_handle_submit_golay_demux)
 
     p_delete_pool = sub.add_parser(
         "delete-sequenced-pool",

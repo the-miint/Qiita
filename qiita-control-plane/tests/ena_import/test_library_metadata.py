@@ -19,6 +19,7 @@ def _record(**overrides) -> EnaRunRecord:
         "experiment_accession": "SRX1",
         "sample_accession": "SAMN1",
         "study_accession": "PRJNA1",
+        "status": "public",
         "library_strategy": "WGS",
         "library_source": "GENOMIC",
         "library_selection": None,

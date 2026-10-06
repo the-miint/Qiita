@@ -64,6 +64,8 @@ def write_sorted_reads(
     duckdb_tmp: Path,
     memory_gb: int,
     threads: int,
+    local_index_sql: str = "sequence_index",
+    where_sql: str | None = None,
 ) -> None:
     """Second pass: read the staged intermediate, assign the minted
     `sequence_idx`, and write the durable `read.parquet` at `out_path` sorted by
@@ -71,6 +73,16 @@ def write_sorted_reads(
     when the caller staged `intermediate_path`. `sequence_idx_start` is the
     inclusive mint start; `sequence_index` is the staged intermediate's
     1-based per-run/per-file row index.
+
+    `local_index_sql` is the per-sample 1-based row index expression: ingest_reads
+    and ingest_ena_reads pass the default `sequence_index` (their intermediate is
+    already per-sample), while golay_demux passes
+    `ROW_NUMBER() OVER (ORDER BY sequence_index)` because its demux intermediate is
+    POOLED (numbered across all samples) and each sample's slice must be re-numbered
+    densely. `where_sql` restricts a pooled intermediate to one sample's slice
+    (golay: `prep_sample_idx = <int>`), None for an already-per-sample source. Both
+    are trusted, caller-built SQL fragments (not user input); a caller interpolating
+    a value MUST cast it (golay uses an int).
 
     Sorts by `sequence_idx` alone: `prep_sample_idx` is a constant literal for
     the whole sample (cardinality 1), so adding it to the sort key orders
@@ -88,6 +100,7 @@ def write_sorted_reads(
     OOM-kill / walltime cut mid-COPY would otherwise leave a truncated
     `read.parquet` that the next attempt skips and registers as the full read
     set."""
+    where_clause = f" WHERE {where_sql}" if where_sql else ""
     partial_path = out_path.parent / f"{out_path.name}.partial"
     partial = validate_parquet_path(partial_path)
     try:
@@ -96,9 +109,9 @@ def write_sorted_reads(
             conn.execute(
                 "COPY ( SELECT "
                 "  ?::BIGINT AS prep_sample_idx,"
-                "  sequence_index + ? - 1 AS sequence_idx,"
+                f"  {local_index_sql} + ? - 1 AS sequence_idx,"
                 "  read_id, sequence1, qual1, sequence2, qual2 "
-                "FROM read_parquet(?) "
+                f"FROM read_parquet(?){where_clause} "
                 "ORDER BY sequence_idx ) "
                 f"TO '{partial}' ({PARQUET_OPTS})",
                 [prep_sample_idx, sequence_idx_start, str(intermediate_path)],

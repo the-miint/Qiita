@@ -5,8 +5,10 @@ processing_idx minted here; the third write is the terminal
 
 A processing_idx is minted before the step loop (like mask_idx) from the run's
 canonical params — the workflow + version + the inputs and knobs that change the
-RESULT: the mask_idx that selects WHICH reads are assembled, and the assembler.
-Same params -> same processing_idx (idempotent re-run); different params -> a
+RESULT: for assembly the mask_idx that selects WHICH reads are assembled and the
+assembler; for amplicon the trim, sortmerna_reference_idx, and orient_primer (plus
+the primer only when orienting). Same params -> same processing_idx (idempotent
+re-run); different params -> a
 distinct id, so a re-run's bins never collide with a prior run's, and assembling a
 DIFFERENT mask's pass-set is a distinct identity rather than a false duplicate that
 disallow-without-delete would wrongly block.
@@ -60,7 +62,10 @@ def _build_processing_params(
 ) -> dict[str, Any]:
     """The canonical params a processing_idx hashes — the SINGLE source of truth
     for the run's identity shape. RESULT-AFFECTING inputs only (non-result params
-    like threads/mem never enter the hash):
+    like threads/mem never enter the hash). Each candidate is entered only when the
+    workflow binds it (None dropped), so assembly hashes {mask_idx, assembler} and
+    amplicon hashes {trim, primer, orient_primer, sortmerna_reference_idx} without
+    polluting each other:
 
       - mask_idx: WHICH masked pass-set is assembled. This is the gating input
         predicate — assembling mask A vs mask B for the same sample+assembler must
@@ -88,13 +93,28 @@ def _build_processing_params(
     change no output — a comment or a pinned-version bump is enough — orphaning the
     artifacts stored against the old processing_idx. The granularity is also
     per-image, so editing one tool's def would re-mint runs whose assembly is
-    byte-identical."""
-    return {
-        "workflow": action_id,
-        "version": action_version,
+    byte-identical.
+
+    sortmerna_reference_idx is the stable reference_idx, not the materialized path."""
+    candidates: dict[str, Any] = {
         "mask_idx": bound.get(MASK_IDX_BINDING),
         "assembler": bound.get(ASSEMBLER_BINDING) or assembler_default,
     }
+    # amplicon knobs, gated on `trim` (amplicon-required, assembly never binds it) so
+    # they never enter an assembly identity. orient_primer's default (off) is applied
+    # here, and primer is hashed ONLY when orienting — otherwise it's a no-op knob
+    # (`_set_session_vars` ignores it) and an omitted-vs-explicit primer must not
+    # split the identity.
+    if bound.get("trim") is not None:
+        orient = bool(bound.get("orient_primer"))
+        candidates["trim"] = bound.get("trim")
+        candidates["sortmerna_reference_idx"] = bound.get("sortmerna_reference_idx")
+        candidates["orient_primer"] = orient
+        if orient:
+            candidates["primer"] = bound.get("primer")
+    params: dict[str, Any] = {"workflow": action_id, "version": action_version}
+    params.update({k: v for k, v in candidates.items() if v is not None})
+    return params
 
 
 async def _mint_processing_idx(
@@ -136,7 +156,8 @@ async def _mint_processing_idx(
         # the operator nothing. Same shape as the mask twin in `_mask.py`.
         raise _submission_bad_input(exc.detail) from exc
     bindings: dict[str, Any] = {PROCESSING_IDX_BINDING: row["processing_idx"]}
-    if params["assembler"] is not None:
+    # absent for non-assembly workflows; only bind when it was hashed.
+    if params.get("assembler") is not None:
         bindings[ASSEMBLER_BINDING] = params["assembler"]
     return bindings
 

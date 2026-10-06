@@ -32,6 +32,8 @@ import pytest
 from qiita_common.api_paths import URL_UPLOAD_PREFIX
 from qiita_common.models import WorkTicketState
 
+from qiita_control_plane.testing.unique_names import unique_ena_accession
+
 # 1.3.0, not 1.0.0: this smoke submits UPLOAD HANDLES (a USER may not name a
 # host path), and `fastq_upload_idx` only exists in the widened schema.
 _FASTQ_TO_PARQUET_VERSION = "1.3.0"
@@ -196,7 +198,7 @@ async def test_user_authoring_smoke_via_cli(
             "--title",
             f"user-cli-smoke-{uuid.uuid4()}",
             "--bioproject-accession",
-            f"PRJNA-smoke-{run_tag}",
+            unique_ena_accession("PRJNA"),
         )
         study_idx = study["study_idx"]
         created_study_idxs.append(study_idx)

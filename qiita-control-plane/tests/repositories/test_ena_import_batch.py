@@ -37,7 +37,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
     seed_user_principal,
 )
-from qiita_control_plane.testing.unique_names import unique_accession
+from qiita_control_plane.testing.unique_names import unique_ena_accession
 
 pytestmark = pytest.mark.db
 
@@ -82,7 +82,7 @@ async def _new_batch_item(eib, *, accession: str | None = None) -> tuple[int, in
     """insert_ena_import_batch + insert_ena_import_batch_item in one
     transaction, mirroring `ena_import.batch.create_ena_import_batch`'s own
     loop. Tracked for the `eib` fixture's teardown."""
-    accession = accession or unique_accession("PRJNA")
+    accession = accession or unique_ena_accession("PRJNA")
     pool = eib["pool"]
     async with pool.acquire() as conn, conn.transaction():
         batch_idx = await insert_ena_import_batch(
@@ -101,7 +101,7 @@ async def _new_batch_item(eib, *, accession: str | None = None) -> tuple[int, in
 
 
 async def test_insert_ena_import_batch_and_item_creates_rows(eib):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, item_idx = await _new_batch_item(eib, accession=accession)
 
     batch_row = await eib["pool"].fetchrow(
@@ -134,7 +134,7 @@ async def test_insert_ena_import_batch_item_requires_transaction(eib):
     async with eib["pool"].acquire() as conn:
         with pytest.raises(RuntimeError):
             await insert_ena_import_batch_item(
-                conn, batch_idx=batch_idx, ena_study_accession=unique_accession("PRJNA")
+                conn, batch_idx=batch_idx, ena_study_accession=unique_ena_accession("PRJNA")
             )
 
 
@@ -187,7 +187,7 @@ async def _seed_study(eib) -> int:
             owner_idx=eib["principal_idx"],
             created_by_idx=eib["principal_idx"],
             title="eib repo test study",
-            bioproject_accession=unique_accession("PRJNA"),
+            bioproject_accession=unique_ena_accession("PRJNA"),
         )
     eib["created_studies"].append(row["idx"])
     return row["idx"]
@@ -305,7 +305,7 @@ async def test_fetch_ena_import_batch_items_orders_by_idx(eib):
         batch_idx = await insert_ena_import_batch(
             conn, submitted_by_principal_idx=eib["principal_idx"]
         )
-        accessions = [unique_accession("PRJNA") for _ in range(3)]
+        accessions = [unique_ena_accession("PRJNA") for _ in range(3)]
         item_idxs = [
             await insert_ena_import_batch_item(conn, batch_idx=batch_idx, ena_study_accession=a)
             for a in accessions

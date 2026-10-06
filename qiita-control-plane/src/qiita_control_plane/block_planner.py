@@ -290,6 +290,8 @@ async def _enumerate_pool_samples(
     prep_samples are excluded too (`ps.retired = false`), matching the per-sample
     roster query fetch_sequenced_pool_samples that submit-host-filter-pool + the
     pool status endpoints use — the block plan must not re-mask a retired sample.
+    A flagged sequenced_sample (`ena_status IS NOT NULL`) is excluded the same
+    way — ENA no longer reports the run available, so it must not be masked.
     Unordered: `tile_partition` sorts by sequence_idx_start itself, so it owns the
     tiling determinism and a producer-side ORDER BY would be redundant DB work."""
     rows = await conn.fetch(
@@ -299,7 +301,8 @@ async def _enumerate_pool_samples(
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         "  JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
         " WHERE ss.sequenced_pool_idx = $1"
-        "   AND ps.retired = false",
+        "   AND ps.retired = false"
+        "   AND ss.ena_status IS NULL",
         sequenced_pool_idx,
     )
     return [
@@ -560,13 +563,15 @@ async def plan_and_submit_blocks(
 
     # ACTIVE pool samples whose reads were never ingested (no sequence_range)
     # can't be tiled — report them so the operator sees the gap rather than a
-    # silent drop. Retired samples are excluded (they are not planned at all), so
-    # this count matches the active set _enumerate_pool_samples draws from.
+    # silent drop. Retired and flagged samples are excluded (they are not
+    # planned at all), so this count matches the active set
+    # _enumerate_pool_samples draws from.
     skipped_no_reads = await pool.fetchval(
         "SELECT count(*) FROM qiita.sequenced_sample ss"
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         "  LEFT JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
         " WHERE ss.sequenced_pool_idx = $1 AND ps.retired = false"
+        "   AND ss.ena_status IS NULL"
         "   AND sr.prep_sample_idx IS NULL",
         sequenced_pool_idx,
     )

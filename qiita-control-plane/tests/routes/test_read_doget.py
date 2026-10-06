@@ -385,8 +385,8 @@ async def test_read_doget_block_with_no_members_422(ctx):
         await _cleanup_block_ticket(ctx["pool"], wt_idx, *rest)
 
 
-async def test_read_doget_non_block_ticket_422(ctx):
-    """The per-sample read path does not use this route; only a block has members."""
+async def test_read_doget_non_block_or_pool_ticket_422(ctx):
+    """Only block- and sequenced_pool-scoped tickets have members; anything else 422s."""
     ref_idx = await ctx["pool"].fetchval(
         "INSERT INTO qiita.reference (name, version, kind, is_host, created_by_idx)"
         " VALUES ($1, '1.0', 'sequence_reference', false,"
@@ -421,7 +421,8 @@ async def test_read_doget_non_block_ticket_422(ctx):
     try:
         resp = await ctx["sa"].post(URL_READ_DOGET, json={"work_ticket_idx": wt_idx})
         assert resp.status_code == 422, resp.text
-        assert "block-scoped" in resp.json()["detail"]
+        detail = resp.json()["detail"]
+        assert "not block or pool" in detail and "reference" in detail
     finally:
         await ctx["pool"].execute(
             "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx

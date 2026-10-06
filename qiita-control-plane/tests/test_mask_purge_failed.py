@@ -207,6 +207,34 @@ async def test_selector_finds_matching_and_ignores_others(seeded):
     assert completed not in found
 
 
+async def test_selector_excludes_flagged_prep_sample(seeded):
+    """A candidate whose prep_sample now carries an ENA-flagged sequenced_sample
+    is not resubmitted -- resubmitting read-mask against a run ENA no longer
+    reports available would re-download it."""
+    pool = seeded["pool"]
+    await pool.execute(
+        "UPDATE qiita.sequenced_sample SET ena_status = 'suppressed',"
+        " ena_availability_checked_at = now() WHERE prep_sample_idx = $1",
+        seeded["prep_sample_idx"],
+    )
+    mask = await _seed_mask(pool, seeded["principal_idx"])
+    seeded["masks"].append(mask)
+    match = await _seed_ticket(
+        pool,
+        action_id=seeded["action_id"],
+        version=seeded["version"],
+        principal_idx=seeded["principal_idx"],
+        prep_sample_idx=seeded["prep_sample_idx"],
+        state="failed",
+        mask_idx=mask,
+        failure_reason="step persist-read-metrics: read_mask parquet not found at /staging/x",
+    )
+    seeded["tickets"].append(match)
+
+    rows = await admin._select_purge_failed_candidates(pool, action_ids=("read-mask",), limit=None)
+    assert match not in {r["work_ticket_idx"] for r in rows}
+
+
 # ---------------------------------------------------------------------------
 # (b) shared-mask guard
 # ---------------------------------------------------------------------------

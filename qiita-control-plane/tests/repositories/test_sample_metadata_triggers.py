@@ -20,12 +20,12 @@ from pathlib import Path
 import asyncpg
 import pytest
 from qiita_common.models import FieldDataType, MissingReasonRef
-from qiita_common.models.biosample import FieldWriteOutcome
 
 from qiita_control_plane.repositories._sample_helpers import (
     MissingValueOnUniqueFieldError,
     StudyUniqueValueConflictError,
     UniqueInStudyViolation,
+    ValueRewriteOnUniqueFieldError,
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
     _insert_metadata,
@@ -1401,15 +1401,16 @@ async def _seed_unique_field(ctx, spec, *, suffix):
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
 async def test_upsert_onto_duplicate_value_raises_typed_error(ctx, spec):
     # Tests the case where a sample that already holds a value is overwritten
-    # to a value another sample in the study holds: the overwrite trips the
-    # uniqueness index the insert never reached, and is translated the same way.
+    # to a value another sample in the study holds: the refusal is the policy
+    # on the sample's own stored value, which answers before the collision with
+    # the other sample can be reached.
     display_name, field_idx = await _seed_unique_field(ctx, spec, suffix="upsert-dup")
     holder_idx = await _create_linked_entity_for_spec(ctx, spec)
     writer_idx = await _create_linked_entity_for_spec(ctx, spec)
     await _write_local(ctx, spec, entity_idx=holder_idx, display_name=display_name, value="TAKEN")
     await _write_local(ctx, spec, entity_idx=writer_idx, display_name=display_name, value="MINE")
 
-    with pytest.raises(StudyUniqueValueConflictError) as excinfo:
+    with pytest.raises(ValueRewriteOnUniqueFieldError) as excinfo:
         await _write_local(
             ctx,
             spec,
@@ -1421,32 +1422,35 @@ async def test_upsert_onto_duplicate_value_raises_typed_error(ctx, spec):
 
     assert excinfo.value.display_name == display_name
     assert excinfo.value.study_field_idx == field_idx
+    assert excinfo.value.stored_value == "MINE"
     assert excinfo.value.attempted_value == "TAKEN"
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
-async def test_upsert_onto_free_value_overwrites(ctx, spec):
-    # Control for the two cases above: the same overwrite path succeeds when
-    # the new value collides with nothing, so their failures are the
-    # uniqueness rules and not the overwrite itself.
+async def test_upsert_onto_free_value_refused(ctx, spec):
+    # Tests the case where the overwrite collides with nothing at all: the
+    # refusal is the stored value's own policy, so a free value is refused the
+    # same way a taken one is, and the stored value survives.
     display_name, _ = await _seed_unique_field(ctx, spec, suffix="upsert-free")
     writer_idx = await _create_linked_entity_for_spec(ctx, spec)
-    await _write_local(ctx, spec, entity_idx=writer_idx, display_name=display_name, value="MINE")
-
-    result = await _write_local(
-        ctx,
-        spec,
-        entity_idx=writer_idx,
-        display_name=display_name,
-        value="FRESH",
-        on_conflict="upsert",
+    first = await _write_local(
+        ctx, spec, entity_idx=writer_idx, display_name=display_name, value="MINE"
     )
 
-    assert result.outcome is FieldWriteOutcome.UPDATED
+    with pytest.raises(ValueRewriteOnUniqueFieldError):
+        await _write_local(
+            ctx,
+            spec,
+            entity_idx=writer_idx,
+            display_name=display_name,
+            value="FRESH",
+            on_conflict="upsert",
+        )
+
     stored = await ctx["pool"].fetchval(
-        f"SELECT value_text FROM {spec.metadata_table} WHERE idx = $1", result.metadata_idx
+        f"SELECT value_text FROM {spec.metadata_table} WHERE idx = $1", first.metadata_idx
     )
-    assert stored == "FRESH"
+    assert stored == "MINE"
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)

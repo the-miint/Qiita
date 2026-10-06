@@ -14,12 +14,14 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_BY_STUDY,
     PATH_BIOSAMPLE_BY_STUDY_AND_IDX,
+    PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
     PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX,
     PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
     PATH_BIOSAMPLE_METADATA_BY_STUDY,
+    PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     PATH_BIOSAMPLE_PREFIX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
@@ -34,6 +36,7 @@ from qiita_common.models import (
     BiosampleLookupByAccessionResponse,
     BiosampleLookupByMatrixTubeIdRequest,
     BiosampleLookupByMatrixTubeIdResponse,
+    BiosampleMetadataWriteByUniqueFieldResponse,
     BiosamplePatchRequest,
     BiosampleResponse,
     BiosampleStudyFieldCreateRequest,
@@ -41,9 +44,11 @@ from qiita_common.models import (
     IdxsListResponse,
     MetadataChecklistRef,
     MetadataEntry,
+    SampleMetadataWriteByUniqueFieldRequest,
     SampleMetadataWriteRequest,
     SampleMetadataWriteResponse,
     SampleStudyFieldPatchRequest,
+    SampleUniqueFieldRef,
     StudyScopedBiosampleResponse,
     Tier,
 )
@@ -92,7 +97,8 @@ from ._helpers import (
     SAMPLE_METADATA_WRITE_ERRORS,
     build_idxs_list_response,
     create_and_map_study_field,
-    detail_for_unlinked_entity,
+    detail_for_retired_unique_field_entity,
+    detail_for_unique_field_miss,
     etag_for_updated_at,
     map_global_field_row,
     map_study_field_row,
@@ -105,10 +111,10 @@ from ._helpers import (
     read_study_scoped_entity,
     require_etag_match,
     require_if_match,
+    resolve_and_write_study_scoped_metadata,
     resolve_idxs_by_natural_key,
-    resolve_linked_study_entity,
     resolve_metadata_checklist_idx,
-    write_and_map_sample_metadata,
+    resolve_study_entity_by_unique_field,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["biosample"])
@@ -519,6 +525,104 @@ async def list_biosample_idxs_in_study(
     )
 
 
+async def _read_study_scoped_biosample(
+    conn: asyncpg.Connection,
+    *,
+    study_idx: int,
+    biosample_idx: int,
+    response: Response,
+    caller_system_role: SystemRole,
+    not_found_detail: str | None = None,
+) -> StudyScopedBiosampleResponse:
+    """Read one study's view of a biosample and stamp the response's ETag.
+
+    Gates on the study link and retirement, reads both metadata scopes, and
+    shapes the result. The caller supplies an open connection so the whole read
+    lands in one snapshot, and must already have resolved biosample_idx by
+    whatever means its own surface offers. A surface that resolved it from
+    something other than an idx passes not_found_detail to word the gate's 404
+    in those same terms.
+    """
+    row, global_metadata, local_metadata = await read_study_scoped_entity(
+        conn,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        fetch_row=fetch_biosample,
+        entity_idx=biosample_idx,
+        metadata_idx_column="idx",
+        study_idx=study_idx,
+        noun="biosample",
+        not_found_detail=not_found_detail,
+    )
+
+    # Set the ETag header so callers can use it as the If-Match value on a
+    # subsequent PATCH; the value is opaque-by-contract.
+    response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
+
+    return _study_scoped_response_from_row(
+        row,
+        global_metadata=global_metadata,
+        local_metadata=local_metadata,
+        caller_system_role=caller_system_role,
+    )
+
+
+@router.post(PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD)
+async def lookup_biosample_in_study_by_unique_field(
+    study_idx: Annotated[int, Field(gt=0)],
+    body: SampleUniqueFieldRef,
+    response: Response,
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> StudyScopedBiosampleResponse:
+    """Return one study's view of the biosample the study's own name identifies.
+
+    The same response as the by-idx read, for a caller holding a
+    unique-in-study field's display_name and the value it carries rather than a
+    biosample_idx. POST rather than GET because that value can be the owner's
+    own name for the sample, which is restricted and sometimes carries PII; the
+    body keeps it out of URLs and access logs.
+
+    The named field must exist on the study and must declare unique_in_study
+    (otherwise 422, since its values could name several samples). A well-formed
+    pair naming no sample is 404.
+
+    Access and the remaining refusals are those of the by-idx read: Tier.ADMIN
+    study access with a wet_lab_admin+ role bypass as an interim stand-in until
+    per-field visibility-tier enforcement lands, and a retired biosample or
+    retired link answering 404.
+    """
+    # One REPEATABLE READ snapshot spanning resolution and the read, so the
+    # value that resolved the idx and the row read back cannot straddle a
+    # concurrent writer's commit.
+    async with snapshot() as conn:
+        biosample_idx = await resolve_study_entity_by_unique_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            display_name=body.unique_field_display_name,
+            value=body.unique_field_value,
+            noun="biosample",
+        )
+        return await _read_study_scoped_biosample(
+            conn,
+            study_idx=study_idx,
+            biosample_idx=biosample_idx,
+            response=response,
+            caller_system_role=user.system_role,
+            not_found_detail=detail_for_unique_field_miss(
+                noun="biosample",
+                study_idx=study_idx,
+                display_name=body.unique_field_display_name,
+                value=body.unique_field_value,
+            ),
+        )
+
+
 @router.get(PATH_BIOSAMPLE_BY_STUDY_AND_IDX)
 async def get_biosample_in_study(
     study_idx: Annotated[int, Field(gt=0)],
@@ -558,11 +662,74 @@ async def get_biosample_in_study(
     column; the value is a quoted ISO 8601 timestamp and is opaque by contract.
     """
     # One REPEATABLE READ snapshot so the row read, the link check, and both
-    # metadata reads cannot disagree about a concurrent writer's commit. The
-    # shared helper fetches the row, gates on the study link (nonexistent and
-    # unlinked share one 404) and retirement, and reads both metadata scopes.
+    # metadata reads cannot disagree about a concurrent writer's commit.
     async with snapshot() as conn:
-        row, global_metadata, local_metadata = await read_study_scoped_entity(
+        return await _read_study_scoped_biosample(
+            conn,
+            study_idx=study_idx,
+            biosample_idx=biosample_idx,
+            response=response,
+            caller_system_role=user.system_role,
+        )
+
+
+# Keep this ahead of the {biosample_idx} form below: both are PATCH on the same
+# path shape, and the literal segment is unreachable once the parameterized one
+# is registered first.
+@router.patch(PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD)
+async def patch_biosample_metadata_by_unique_field(
+    study_idx: Annotated[int, Field(gt=0)],
+    body: SampleMetadataWriteByUniqueFieldRequest,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> BiosampleMetadataWriteByUniqueFieldResponse:
+    """Upsert this study's metadata on the biosample the study's own id names.
+
+    The by-idx metadata write, for a caller holding a unique-in-study field's
+    display_name and the value it carries instead of a biosample_idx, so a
+    read-modify-write never has to handle one. The response adds the
+    biosample_idx the pair resolved to.
+
+    The identifying field must exist on the study and must declare
+    unique_in_study -- without it the value could name several samples, so the
+    write is refused (422) rather than applied to an arbitrary one. A
+    well-formed pair naming no sample is 404.
+
+    The identifying field may appear in the metadata body, but only carrying
+    the value it already holds, which changes nothing. Offering a different one
+    is a 422: a value stored through a unique_in_study field is what names the
+    sample, and the write that would hand that name to another sample is
+    refused. The owner-biosample-id field is a 422 either way, being written
+    only through its own surface.
+
+    Access and the remaining refusals are the by-idx write's: Tier.ADMIN study
+    access with a wet_lab_admin+ role bypass as an interim stand-in until
+    per-field visibility-tier enforcement lands, a retired biosample answering
+    409, and a retired study link answering 404.
+
+    There is NO If-Match on this route, exactly as on the by-idx write: a
+    concurrent same-study, same-field write is last-writer-wins. Within one
+    request the pair cannot go stale: resolution and the write share a
+    transaction, and no API path moves a stored value from one biosample to
+    another. Across requests it can: a field edit may rename a field, so a
+    display_name a caller still holds could resolve to a different field, or to
+    none.
+    """
+    async with tx() as conn:
+        biosample_idx = await resolve_study_entity_by_unique_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            display_name=body.unique_field_display_name,
+            value=body.unique_field_value,
+            noun="biosample",
+        )
+        written = await resolve_and_write_study_scoped_metadata(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             fetch_row=fetch_biosample,
@@ -570,17 +737,24 @@ async def get_biosample_in_study(
             metadata_idx_column="idx",
             study_idx=study_idx,
             noun="biosample",
+            metadata=body.metadata,
+            caller_idx=user.principal_idx,
+            global_internal_names=body.global_internal_names,
+            unlinked_detail=detail_for_unique_field_miss(
+                noun="biosample",
+                study_idx=study_idx,
+                display_name=body.unique_field_display_name,
+                value=body.unique_field_value,
+            ),
+            retired_detail=detail_for_retired_unique_field_entity(
+                noun="biosample",
+                study_idx=study_idx,
+                display_name=body.unique_field_display_name,
+                value=body.unique_field_value,
+            ),
         )
-
-    # Set the ETag header so callers can use it as the If-Match value on a
-    # subsequent PATCH; the value is opaque-by-contract.
-    response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
-
-    return _study_scoped_response_from_row(
-        row,
-        global_metadata=global_metadata,
-        local_metadata=local_metadata,
-        caller_system_role=user.system_role,
+    return BiosampleMetadataWriteByUniqueFieldResponse(
+        results=written.results, biosample_idx=biosample_idx
     )
 
 
@@ -632,10 +806,7 @@ async def patch_biosample_metadata(
     of band.
     """
     async with tx() as conn:
-        # Gate on the study link (nonexistent + unlinked share one 404) and
-        # retirement (409 for a write); metadata_entity_idx is the biosample's
-        # own idx here (a subtype entity would key metadata on a supertype idx).
-        _row, metadata_entity_idx = await resolve_linked_study_entity(
+        written = await resolve_and_write_study_scoped_metadata(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             fetch_row=fetch_biosample,
@@ -643,24 +814,11 @@ async def patch_biosample_metadata(
             metadata_idx_column="idx",
             study_idx=study_idx,
             noun="biosample",
-            retired_status=409,
-            retired_detail=f"biosample {biosample_idx} is retired",
-        )
-        # Upsert and shape via the shared write body (owner-id write refused
-        # -> 422; the no-If-Match lost-update caveat lives at its call site).
-        response = await write_and_map_sample_metadata(
-            conn,
-            spec=BIOSAMPLE_METADATA_SPEC,
-            entity_idx=metadata_entity_idx,
-            study_idx=study_idx,
             metadata=body.metadata,
             caller_idx=user.principal_idx,
-            unlinked_detail=detail_for_unlinked_entity(
-                noun="biosample", entity_idx=biosample_idx, study_idx=study_idx
-            ),
             global_internal_names=body.global_internal_names,
         )
-    return response
+    return written
 
 
 # Roles that may bypass the per-biosample owner / linked-study-access check.

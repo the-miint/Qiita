@@ -268,6 +268,7 @@ def test_handler_refuses_a_bad_line_naming_its_physical_line_after_a_comment_and
     ("accession", "expected_message"),
     [
         ("NOTANACCESSION", "does not match a known"),
+        ("PRJEB", "does not match a known"),
         ("SRR1234567", "not a study accession"),
     ],
 )

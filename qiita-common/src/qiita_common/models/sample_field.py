@@ -18,12 +18,9 @@ from qiita_common.models.reference import FieldDataType, Tier
 STUDY_FIELD_IDX_ATTR = "study_field_idx"
 GLOBAL_FIELD_IDX_ATTR = "global_field_idx"
 
-# The value kinds a unique-in-study field may carry. A closed value set would
-# cap the study at as many samples as the set has values, so boolean and
-# terminology are excluded. Tracks the *_study_field data-type eligibility CHECK.
-UNIQUE_IN_STUDY_DATA_TYPES = frozenset(
-    {FieldDataType.TEXT, FieldDataType.NUMERIC, FieldDataType.DATE}
-)
+# The value kinds a unique-in-study field may carry through the wire
+# (not necessarily the same as what the database may store)
+UNIQUE_IN_STUDY_DATA_TYPES = frozenset({FieldDataType.TEXT})
 
 # Attributes a globally-linked study field may not carry, for three different
 # reasons: data_type / required / terminology_idx live on the global-field row
@@ -61,9 +58,8 @@ def unique_in_study_rejection_reason(
 
     A globally-linked field is refused because one metadata row through a global
     field is shared by every study linked to it, so no single study owns the
-    grouping the flag would enforce. A closed value set (boolean, terminology)
-    is refused because it would cap the study at as many samples as the set has
-    values. Text, numeric, and date are eligible.
+    grouping the flag would enforce. Types not included in UNIQUE_IN_STUDY_DATA_TYPES
+    are ineligible.
 
     Callers supply the shape from wherever they hold it — a request body on a
     create, and on an edit the type the field ends that request at, which the

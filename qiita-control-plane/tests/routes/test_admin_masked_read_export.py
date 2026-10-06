@@ -77,11 +77,12 @@ def _decode_ticket_expiry(ticket_b64: str) -> int:
 
 @pytest_asyncio.fixture
 async def seeded(ctx):
-    """Seed one sequenced_pool with three samples:
+    """Seed one sequenced_pool with four samples:
 
       - A: has a biosample_accession; in the pool.
       - B: no accession (None) — surfaced, not dropped; same pool.
       - C: retired prep_sample; same pool — must be excluded from the manifest.
+      - D: ENA-flagged sequenced_sample; same pool — must be excluded too.
 
     Plus a mask_definition. FK-reverse cleanup at teardown.
     """
@@ -133,6 +134,20 @@ async def seeded(ctx):
         owner,
     )
 
+    # Sample D — ENA-flagged sequenced_sample; same pool. Excluded from the roster.
+    bs_d = await seed_biosample(pool, owner_idx=owner, created_by_idx=owner)
+    ps_d = await seed_sequenced_prep_sample(pool, biosample_idx=bs_d, owner_idx=owner)
+    ss_d = await pool.fetchval(
+        "INSERT INTO qiita.sequenced_sample"
+        "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx,"
+        "   ena_status, ena_availability_checked_at)"
+        " VALUES ($1, $2, $3, $4, 'suppressed', now()) RETURNING idx",
+        ps_d,
+        pool_idx,
+        f"item-d-{token}",
+        owner,
+    )
+
     async with pool.acquire() as conn:
         mask = await mint_mask_definition(
             conn,
@@ -152,21 +167,23 @@ async def seeded(ctx):
         "acc_a": acc_a,
         "ps_b": ps_b,
         "ps_c": ps_c,
+        "ps_d": ps_d,
     }
 
     # mask_sample rows (a test may insert them to exercise the completion gate)
     # FK into BOTH prep_sample and mask_definition, so drop them first.
     await pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
     await pool.execute(
-        "DELETE FROM qiita.sequenced_sample WHERE idx = ANY($1::bigint[])", [ss_a, ss_b, ss_c]
+        "DELETE FROM qiita.sequenced_sample WHERE idx = ANY($1::bigint[])",
+        [ss_a, ss_b, ss_c, ss_d],
     )
     await pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
     await pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", [ps_a, ps_b, ps_c]
+        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", [ps_a, ps_b, ps_c, ps_d]
     )
     await pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", [bs_a, bs_b, bs_c]
+        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", [bs_a, bs_b, bs_c, bs_d]
     )
     await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
 
@@ -233,7 +250,7 @@ async def test_manifest_happy_path(ctx, seeded):
     assert body["mask_idx"] == seeded["mask_idx"]
 
     by_prep = {s["prep_sample_idx"]: s for s in body["samples"]}
-    # Retired sample C excluded; A and B present.
+    # Retired sample C and flagged sample D excluded; A and B present.
     assert set(by_prep) == {seeded["ps_a"], seeded["ps_b"]}
     assert by_prep[seeded["ps_a"]]["biosample_accession"] == seeded["acc_a"]
     # B has no accession yet — surfaced as null, not dropped (CLI fails loudly).
