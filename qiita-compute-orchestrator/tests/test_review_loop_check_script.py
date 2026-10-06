@@ -182,8 +182,13 @@ def test_the_published_block_shapes_pass_once_the_sha_is_filled_in(repo, source)
 
 
 def test_a_long_description_does_not_hide_the_section(repo):
-    """Larger than a pipe buffer: the section check must not depend on a writer
-    surviving `grep -q` exiting early."""
-    body = _BLOCK.format(sha=repo["first"]) + "\n" + ("x" * 1000 + "\n") * 400
+    """The section check must not depend on a writer surviving `grep -q` exiting early.
+
+    100 KB is under Linux's 128 KiB cap on one environment string (400 KB raised E2BIG
+    there) and over a pipe buffer. Measured with a body this size against the piped
+    form of the script: macOS reported the section missing; Linux did not in the one
+    run made, so this pins the fix on macOS and is only a smoke test on Linux.
+    """
+    body = _BLOCK.format(sha=repo["first"]) + "\n" + ("x" * 999 + "\n") * 100
     result = _run(repo, body)
     assert result.returncode == 0, result.stderr

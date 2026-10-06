@@ -16,9 +16,9 @@ set -euo pipefail
 fail() {
     {
         echo "ERROR: $1"
-        echo "Run the qiita-review skill on the branch and paste the block it prints under"
-        echo "'## Reviewer loop' in the PR description. If the loop cannot be run for this PR,"
-        echo "add the 'no-agent-review' label and say why under that heading."
+        echo "Run the qiita-review skill on the branch and replace the '## Reviewer loop'"
+        echo "section of the PR description with the block it prints. If the loop cannot be"
+        echo "run for this PR, add the 'no-agent-review' label and say why under that heading."
     } >&2
     exit 1
 }
