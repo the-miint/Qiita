@@ -174,10 +174,25 @@ incomplete.
 
 ## Reviewing a branch
 
-Code review of pending changes runs the `qiita-review` skill — it owns the loop (review,
-fix, re-review to convergence), the disposition ledger, and the stop rule. The rules
-themselves live in `.claude/agents/qiita-reviewer.md`. One pass is not a review: the
-fixes change the diff, and the next pass reads what the fixes wrote.
+**Every PR runs the reviewer loop on its own changes before it is opened, and its
+description says what the loop left open.** The `qiita-review` skill
+(`.claude/skills/qiita-review/`) owns the loop — review, fix, re-review to convergence —
+with a disposition ledger and a stop rule. The rules it applies live in
+`.claude/agents/qiita-reviewer.md`. One pass is not a review: the fixes change the
+diff, and the next pass reads what the fixes wrote.
+
+The loop ends by printing a `## Reviewer loop` block for the PR description: the commit
+it reviewed, and each finding it declined (with the reason), deferred (with the issue),
+or left unprobed. `.github/pull_request_template.md` carries the heading. The
+`review-loop-check` CI job fails a PR whose description lacks the block or whose
+"Reviewed at" is not one of the PR's own commits; the `no-agent-review` label opts out,
+for a PR whose author cannot run the loop or that has nothing for it to read. The check
+establishes that the block is present, not that the loop ran — the block is the
+author's statement, and a human reviewer reads it as one.
+
+When a human review turns up a pattern the agent missed, fold it into the agent file in
+the PR that fixes the instance: a rule or a bullet under the rule that owns it, a
+Trigger-map row so it can fire, and no names, quotes or PR numbers.
 
 ## Operator-facing changes (DEPLOY_CHECKLIST.md)
 

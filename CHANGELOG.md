@@ -21,6 +21,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **The branch reviewer is in the repo, and a PR description records its run (#PRNUM).**
+  `.claude/agents/qiita-reviewer.md` (the rules) and `.claude/skills/qiita-review/` (the
+  review, fix, re-review loop) were per-developer files that `CLAUDE.md` already pointed
+  at; both are now tracked. The loop ends by printing a `## Reviewer loop` block — the
+  commit reviewed and what was declined, deferred or left unprobed — which the new PR
+  template carries. The `review-loop-check` job (`scripts/check-review-loop.sh`) fails a
+  PR whose description lacks the block or names a commit that is not one of the PR's
+  own; the `no-agent-review` label opts out.
 - **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
   reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
   biosample, and upsert this study's metadata on it, naming the sample by a

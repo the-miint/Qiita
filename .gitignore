@@ -39,7 +39,14 @@ localdocs/
 # the shared agent-facing config, so every dev's agent behaves the same:
 #   commands/      — /deploy-note, /deploy-archive
 #   settings.json  — shared config; settings.local.json stays per-dev and ignored
+#   agents/qiita-reviewer.md + skills/qiita-review/ — the branch review loop
 .claude/*
 !.claude/commands/
 !.claude/settings.json
+!.claude/agents/
+.claude/agents/*
+!.claude/agents/qiita-reviewer.md
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/qiita-review/
 test-data/
