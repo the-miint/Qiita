@@ -484,10 +484,8 @@ class SampleUniqueFieldRef(BaseModel):
     still carry content, so a name or value written with stray padding resolves
     the same as its unpadded spelling.
 
-    unique_field_display_name matches the stored name exactly, case included.
-    unique_field_value is compared as the field's own data type: text matches
-    case-sensitively; numeric and date match on value, so "32.870" resolves a
-    sample storing 32.87.
+    unique_field_display_name matches the stored name exactly, case included,
+    and unique_field_value matches the stored value the same way.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -504,11 +502,12 @@ class SampleMetadataWriteByUniqueFieldRequest(SampleUniqueFieldRef, SampleMetada
     same rules each half already has: the pair resolves the sample, and the
     metadata dict is upserted against the study's existing fields.
 
-    The identifying field may itself appear in metadata. Resolution runs
-    first, so such a write renames the sample under the value that found it --
-    the only way to correct a mistyped id -- and the response reports the new
-    value. The owner-biosample-id field is the exception: it identifies, but
-    writing it is refused, since it is changed only through its own surface.
+    The identifying field may itself appear in metadata, but only carrying the
+    value it already holds, which changes nothing. Offering a different one is
+    refused: a value stored through a unique_in_study field is what names the
+    sample, and handing that name to another sample is not a write this surface
+    performs. The owner-biosample-id field is refused either way, being changed
+    only through its own surface.
     """
 
 

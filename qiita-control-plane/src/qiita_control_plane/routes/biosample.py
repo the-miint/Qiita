@@ -97,6 +97,8 @@ from ._helpers import (
     SAMPLE_METADATA_WRITE_ERRORS,
     build_idxs_list_response,
     create_and_map_study_field,
+    detail_for_retired_unique_field_entity,
+    detail_for_unique_field_miss,
     etag_for_updated_at,
     map_global_field_row,
     map_study_field_row,
@@ -530,13 +532,16 @@ async def _read_study_scoped_biosample(
     biosample_idx: int,
     response: Response,
     caller_system_role: SystemRole,
+    not_found_detail: str | None = None,
 ) -> StudyScopedBiosampleResponse:
     """Read one study's view of a biosample and stamp the response's ETag.
 
     Gates on the study link and retirement, reads both metadata scopes, and
     shapes the result. The caller supplies an open connection so the whole read
     lands in one snapshot, and must already have resolved biosample_idx by
-    whatever means its own surface offers.
+    whatever means its own surface offers. A surface that resolved it from
+    something other than an idx passes not_found_detail to word the gate's 404
+    in those same terms.
     """
     row, global_metadata, local_metadata = await read_study_scoped_entity(
         conn,
@@ -546,6 +551,7 @@ async def _read_study_scoped_biosample(
         metadata_idx_column="idx",
         study_idx=study_idx,
         noun="biosample",
+        not_found_detail=not_found_detail,
     )
 
     # Set the ETag header so callers can use it as the If-Match value on a
@@ -582,9 +588,8 @@ async def lookup_biosample_in_study_by_unique_field(
     body keeps it out of URLs and access logs.
 
     The named field must exist on the study and must declare unique_in_study
-    (otherwise 422, since its values could name several samples), and the value
-    must parse as the field's data type (otherwise 422). A well-formed pair
-    naming no sample is 404.
+    (otherwise 422, since its values could name several samples). A well-formed
+    pair naming no sample is 404.
 
     Access and the remaining refusals are those of the by-idx read: Tier.ADMIN
     study access with a wet_lab_admin+ role bypass as an interim stand-in until
@@ -609,6 +614,12 @@ async def lookup_biosample_in_study_by_unique_field(
             biosample_idx=biosample_idx,
             response=response,
             caller_system_role=user.system_role,
+            not_found_detail=detail_for_unique_field_miss(
+                noun="biosample",
+                study_idx=study_idx,
+                display_name=body.unique_field_display_name,
+                value=body.unique_field_value,
+            ),
         )
 
 
@@ -686,11 +697,8 @@ async def patch_biosample_metadata_by_unique_field(
 
     The identifying field must exist on the study and must declare
     unique_in_study -- without it the value could name several samples, so the
-    write is refused (422) rather than applied to an arbitrary one -- and the
-    value must parse as that field's data type (422). A well-formed pair naming
-    no sample is 404, except where the field was redeclared to another data type
-    while the pair was resolving: the miss is then an artifact of that, and the
-    answer is 503 to retry.
+    write is refused (422) rather than applied to an arbitrary one. A
+    well-formed pair naming no sample is 404.
 
     The identifying field may appear in the metadata body, but only carrying
     the value it already holds, which changes nothing. Offering a different one
@@ -705,9 +713,12 @@ async def patch_biosample_metadata_by_unique_field(
     409, and a retired study link answering 404.
 
     There is NO If-Match on this route, exactly as on the by-idx write: a
-    concurrent same-study, same-field write is last-writer-wins. The pair
-    itself cannot go stale while the request is in flight, no API path being
-    able to move a stored value from one sample to another.
+    concurrent same-study, same-field write is last-writer-wins. Within one
+    request the pair cannot go stale: resolution and the write share a
+    transaction, and no API path moves a stored value from one biosample to
+    another. Across requests it can: a field edit may rename a field, so a
+    display_name a caller still holds could resolve to a different field, or to
+    none.
     """
     async with tx() as conn:
         biosample_idx = await resolve_study_entity_by_unique_field(
@@ -729,6 +740,18 @@ async def patch_biosample_metadata_by_unique_field(
             metadata=body.metadata,
             caller_idx=user.principal_idx,
             global_internal_names=body.global_internal_names,
+            unlinked_detail=detail_for_unique_field_miss(
+                noun="biosample",
+                study_idx=study_idx,
+                display_name=body.unique_field_display_name,
+                value=body.unique_field_value,
+            ),
+            retired_detail=detail_for_retired_unique_field_entity(
+                noun="biosample",
+                study_idx=study_idx,
+                display_name=body.unique_field_display_name,
+                value=body.unique_field_value,
+            ),
         )
     return BiosampleMetadataWriteByUniqueFieldResponse(
         results=written.results, biosample_idx=biosample_idx

@@ -63,14 +63,16 @@ _None yet._
   clients that reject unknown response keys are unaffected, since the response shape
   already carried `data_type`.
 
-- **Two writes that used to succeed now answer 422 (#639).** Changing a value already
-  stored through a `unique_in_study` sample field, on any metadata route; and clearing
-  that policy from a field through the study-field edit route. A client that corrects a
-  sample's identifier by re-sending it with new text will start seeing 422 and needs a
-  database operation instead. No study carries a user-declared `unique_in_study` field
-  yet, so nothing stored today is affected. Writing such a value for the first time,
-  re-sending the value already stored, re-sending the policy a field already has, and
-  declaring the policy on a field that lacks it all behave as before.
+- **Three writes that used to succeed now answer 422 (#639).** Changing a value already
+  stored through a `unique_in_study` sample field, on any metadata route; clearing that
+  policy from a field through the study-field edit route; and attempting to declare
+  it on a `numeric` or `date` field. A client that corrects a sample's identifier by
+  re-sending it with new text will start seeing 422 and needs a database operation
+  instead, described in [`docs/architecture/data-model.md`](docs/architecture/data-model.md).
+  No study carries a user-declared `unique_in_study` field yet, so nothing stored today is
+  affected. Writing such a value for the first time, re-sending the value already stored,
+  re-sending the policy a field already has, and declaring the policy on a text field that
+  lacks it all behave as before.
 
 ## Deployed history
 

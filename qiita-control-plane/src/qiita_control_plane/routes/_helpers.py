@@ -359,6 +359,50 @@ def detail_for_unlinked_entity(*, noun: str, entity_idx: int, study_idx: int) ->
     return f"{noun} {entity_idx} is not linked to study {study_idx}"
 
 
+def _unique_field_pair_clause(*, noun: str, study_idx: int, display_name: str, value: str) -> str:
+    """The clause naming a sample by the study's own name for it.
+
+    Shared by every answer that addresses a sample this way, so the outcomes
+    differ only in what they say about the sample, never in how they identify
+    it.
+    """
+    return f"{noun} on study {study_idx} carrying {value!r} through field {display_name!r}"
+
+
+def detail_for_unique_field_miss(
+    *, noun: str, study_idx: int, display_name: str, value: str
+) -> str:
+    """Build the HTTP-404 detail for an identifying pair that reaches no sample
+    the caller may act on.
+
+    One wording for every such outcome -- no sample carries the value, or the
+    one that does has a retired study link -- so the answer never distinguishes
+    them and never reports an idx the caller did not send. A read folds a
+    retired sample in here as well; a write answers 409 instead. Returns the
+    bare string; the caller wraps it in HTTPException with status 404.
+    """
+    clause = _unique_field_pair_clause(
+        noun=noun, study_idx=study_idx, display_name=display_name, value=value
+    )
+    return f"there is no {clause}"
+
+
+def detail_for_retired_unique_field_entity(
+    *, noun: str, study_idx: int, display_name: str, value: str
+) -> str:
+    """Build the HTTP-409 detail for an identifying pair whose sample is retired.
+
+    A write separates a retired sample from one it cannot reach, where a read
+    does not, so this says what the miss wording deliberately will not -- still
+    without reporting an idx the caller did not send. Returns the bare string;
+    the caller wraps it in HTTPException with status 409.
+    """
+    clause = _unique_field_pair_clause(
+        noun=noun, study_idx=study_idx, display_name=display_name, value=value
+    )
+    return f"the {clause} is retired"
+
+
 async def resolve_linked_study_entity(
     conn: asyncpg.Connection,
     *,
@@ -370,6 +414,7 @@ async def resolve_linked_study_entity(
     noun: str,
     retired_status: int,
     retired_detail: str,
+    unlinked_detail: str,
 ) -> tuple[asyncpg.Record, int]:
     """Fetch a study-scoped entity and gate it on its study link + retirement.
 
@@ -379,7 +424,10 @@ async def resolve_linked_study_entity(
     unlinked one share the "not linked" 404 so existence never leaks across the
     study boundary; retirement is checked only after the link passes and raises
     retired_status/retired_detail (a read passes 404, a write passes 409).
-    Returns the (non-None) row plus its metadata/link idx.
+    Both details are the caller's to word, since only the caller knows what it
+    named the entity by: an idx-keyed route reports that idx, where one that
+    resolved the entity from something else must not report an idx its caller
+    never sent. Returns the (non-None) row plus its metadata/link idx.
     """
     row = await fetch_row(conn, entity_idx)
     metadata_entity_idx = None if row is None else row[metadata_idx_column]
@@ -387,12 +435,7 @@ async def resolve_linked_study_entity(
         conn, spec=spec, entity_idx=metadata_entity_idx, study_idx=study_idx
     )
     if not linked:
-        raise HTTPException(
-            status_code=404,
-            detail=detail_for_unlinked_entity(
-                noun=noun, entity_idx=entity_idx, study_idx=study_idx
-            ),
-        )
+        raise HTTPException(status_code=404, detail=unlinked_detail)
     if row["retired"]:
         raise HTTPException(status_code=retired_status, detail=retired_detail)
     return row, metadata_entity_idx
@@ -407,13 +450,24 @@ async def read_study_scoped_entity(
     metadata_idx_column: str,
     study_idx: int,
     noun: str,
+    not_found_detail: str | None = None,
 ) -> tuple[asyncpg.Record, dict[str, MetadataEntry], dict[str, MetadataEntry]]:
     """Fetch a study-scoped entity for reading and return its metadata.
 
     Gates via resolve_linked_study_entity with a read's 404-on-retired, then
-    reads the entity's global and study-local metadata. Returns the (non-None)
-    row plus the two MetadataEntry dicts.
+    reads the entity's global and study-local metadata. not_found_detail words
+    both of those 404s at once -- on a read, unlinked and retired are one
+    answer -- for a caller that named the entity by something other than its
+    idx. Returns the (non-None) row plus the two MetadataEntry dicts.
     """
+    retired_detail = (
+        f"{noun} {entity_idx} not found" if not_found_detail is None else not_found_detail
+    )
+    unlinked_detail = (
+        detail_for_unlinked_entity(noun=noun, entity_idx=entity_idx, study_idx=study_idx)
+        if not_found_detail is None
+        else not_found_detail
+    )
     row, metadata_entity_idx = await resolve_linked_study_entity(
         conn,
         spec=spec,
@@ -423,7 +477,8 @@ async def read_study_scoped_entity(
         study_idx=study_idx,
         noun=noun,
         retired_status=404,
-        retired_detail=f"{noun} {entity_idx} not found",
+        retired_detail=retired_detail,
+        unlinked_detail=unlinked_detail,
     )
     global_metadata, local_metadata = await read_global_and_local_entries(
         conn, spec=spec, entity_idx=metadata_entity_idx, study_idx=study_idx
@@ -443,6 +498,8 @@ async def resolve_and_write_study_scoped_metadata(
     metadata: Mapping[str, str],
     caller_idx: int,
     global_internal_names: bool = False,
+    unlinked_detail: str | None = None,
+    retired_detail: str | None = None,
 ) -> SampleMetadataWriteResponse:
     """Gate a study-scoped sample for writing, then upsert this study's
     metadata on it.
@@ -454,10 +511,21 @@ async def resolve_and_write_study_scoped_metadata(
     between that check and the write is refused by the database and answers the
     same 404, so the status does not depend on which of the two noticed.
 
-    entity_idx is the idx the caller named and is what every message reports.
-    Metadata keys on the metadata_idx_column value instead: the entity's own
-    idx for a direct entity, a supertype idx for a subtype.
+    entity_idx is the idx the caller named and is what every message reports,
+    unless unlinked_detail and retired_detail word the 404 and the 409 instead
+    -- which a caller that named the entity by something other than its idx
+    passes, the defaults naming an idx it never sent. Metadata keys on the
+    metadata_idx_column value instead: the entity's own idx for a direct
+    entity, a supertype idx for a subtype.
     """
+    reported_retired_detail = (
+        f"{noun} {entity_idx} is retired" if retired_detail is None else retired_detail
+    )
+    reported_unlinked_detail = (
+        detail_for_unlinked_entity(noun=noun, entity_idx=entity_idx, study_idx=study_idx)
+        if unlinked_detail is None
+        else unlinked_detail
+    )
     _row, metadata_entity_idx = await resolve_linked_study_entity(
         conn,
         spec=spec,
@@ -467,7 +535,8 @@ async def resolve_and_write_study_scoped_metadata(
         study_idx=study_idx,
         noun=noun,
         retired_status=409,
-        retired_detail=f"{noun} {entity_idx} is retired",
+        retired_detail=reported_retired_detail,
+        unlinked_detail=reported_unlinked_detail,
     )
     return await write_and_map_sample_metadata(
         conn,
@@ -476,9 +545,7 @@ async def resolve_and_write_study_scoped_metadata(
         study_idx=study_idx,
         metadata=metadata,
         caller_idx=caller_idx,
-        unlinked_detail=detail_for_unlinked_entity(
-            noun=noun, entity_idx=entity_idx, study_idx=study_idx
-        ),
+        unlinked_detail=reported_unlinked_detail,
         global_internal_names=global_internal_names,
     )
 
@@ -496,11 +563,8 @@ async def resolve_study_entity_by_unique_field(
 
     display_name names one of the study's fields and value is what that field
     carries on the wanted sample. The field must declare unique_in_study; one
-    that does not is refused (422), as is a name the study does not use and a
-    value that will not parse as the field's data type. A well-formed pair
-    matching no sample is 404, unless the field was redeclared to another data
-    type while this was resolving it, which makes the miss an artifact of the
-    redeclaration and answers 503.
+    that does not is refused (422), as is a name the study does not use. A
+    well-formed pair matching no sample is 404.
 
     Resolution ignores retirement, so a retired sample or a retired study link
     still resolves; the caller applies its own gate afterwards and decides what
@@ -523,16 +587,14 @@ async def resolve_study_entity_by_unique_field(
             status_code=422,
             detail=(
                 f"{noun} field {display_name!r} is not unique within the study,"
-                " so its values cannot identify a single sample"
+                f" so its values cannot identify a single {noun}"
             ),
         )
 
-    # Parse against the field's type so the comparison below is the one the
-    # unique index enforces, rather than a text match against a typed column.
-    try:
-        parsed_value = parse_text_for_data_type(display_name, field_row.data_type, value)
-    except MetadataParseError as exc:
-        await raise_http_for_sample_metadata_write_error(conn, exc)
+    # Parse against the field's type so the value handed to the query below is
+    # in the form the column stores. A unique_in_study field is text, which
+    # parses to itself, so this cannot fail.
+    parsed_value = parse_text_for_data_type(display_name, field_row.data_type, value)
 
     entity_idx = await fetch_entity_idx_by_unique_field_value(
         conn,
@@ -542,21 +604,10 @@ async def resolve_study_entity_by_unique_field(
         value=parsed_value,
     )
     if entity_idx is None:
-        # The column just queried was chosen from a data_type read in an earlier
-        # statement, and this runs at READ COMMITTED for a write, so a widen can
-        # have moved the values out of it in between. Re-read before answering:
-        # a miss that is an artifact of the redeclaration is retryable, where an
-        # absent sample is not, and the two are indistinguishable as a 404.
-        current = await fetch_study_field(conn, spec=spec, idx=field_row.idx)
-        if current is not None and current["data_type"] != field_row.data_type:
-            raise_transient_retry(
-                f"{noun} field {display_name!r} was redeclared while this request was"
-                " resolving it; re-issue the request to retry"
-            )
         raise HTTPException(
             status_code=404,
-            detail=(
-                f"no {noun} on study {study_idx} carries {value!r} through field {display_name!r}"
+            detail=detail_for_unique_field_miss(
+                noun=noun, study_idx=study_idx, display_name=display_name, value=value
             ),
         )
     return entity_idx

@@ -145,20 +145,20 @@ def _add_global_internal_names_arg(subparser: argparse.ArgumentParser) -> None:
 
 
 def _add_unique_field_args(subparser: argparse.ArgumentParser) -> None:
-    """Declare the flags that name one sample by a unique-in-study field."""
+    """Declare the flags that name one biosample by a unique-in-study field."""
     subparser.add_argument("--study-idx", type=int, required=True)
     subparser.add_argument(
         "--unique-field-display-name",
         required=True,
         help=(
-            "display_name of the study-local field that identifies the sample;"
+            "display_name of the study-local field that identifies the biosample;"
             " it must declare unique_in_study"
         ),
     )
     subparser.add_argument(
         "--unique-field-value",
         required=True,
-        help="the value that field carries on the wanted sample",
+        help="the value that field carries on the wanted biosample",
     )
 
 

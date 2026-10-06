@@ -36,9 +36,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   appear in the body, but only carrying the value it already holds; offering a
   different one is a 422, as it is on every metadata route. The owner-biosample-id
   field is a 422 either way, being written only through its own surface.
-  A retired biosample is 409 here, where the matching read answers 404. A field
-  redeclared to another data type while the pair is resolving answers 503 to retry,
-  rather than the 404 the caller could not tell from a sample that is genuinely absent.
+  A retired biosample is 409 here, where the matching read answers 404.
   Access, and every other refusal, are the by-idx write's.
 - **Read a biosample by the study's own name for it —
   `POST /api/v1/study/{study_idx}/biosample/by-unique-field` (#639).** Returns the same
@@ -48,8 +46,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   owner's own name for the sample, which is restricted and sometimes carries PII, so
   it stays out of URLs and access logs. The named field must exist on the study and
   must declare `unique_in_study` — without it the value could name several samples, so
-  the lookup is refused (422) rather than resolved arbitrarily — and the value must
-  parse as the field's data type (422); a well-formed pair naming no sample is 404.
+  the lookup is refused (422) rather than resolved arbitrarily; a well-formed pair
+  naming no sample is 404.
   The access bar, and the 404 on a retired sample or retired study link, are those of
   the by-idx read.
 - **A study-local sample field can be widened to text, taking its stored values
@@ -232,8 +230,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `biosample_study_field` / `prep_sample_study_field` makes the database reject a
   duplicate value within the study and reject a missing-value marker outright.
   It is settable on create and on edit, comes back on every field read,
-  and is refused for a globally-linked field and for the closed value sets (boolean,
-  terminology) with a per-field 422 naming the rule. Enforcement follows the current
+  and is refused for a globally-linked field and for every data type but `text`,
+  with a per-field 422 naming the rule. Enforcement follows the current
   policy rather than the one the field was minted with: a trigger mirrors a change
   onto every metadata row already written through the field. Switching it on over
   values that already repeat answers 409, over a sample with a missing value answers
@@ -3939,6 +3937,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **`qiita biosample create-field` validates its flags before reading the auth token
+  (#639).** An invalid flag combination now exits 2 naming the flag, where it previously
+  reported a missing token first and left the real problem to be found on the retry. The
+  request itself is unchanged, and a valid invocation behaves exactly as before.
+- **Only a `text` sample field may declare `unique_in_study` (#639).** A value reaches
+  the API as a string, and text-type data keeps a single spelling per value, whereas scale is
+  a pitfall for data defined as numeric: for example, `32.87` and `32.870` are one
+  value to the uniqueness index and two to a write, leaving no one spelling by which a
+  caller can name a sample. `numeric` and `date` now answer the same per-field 422 that
+  `boolean` and `terminology` already did, on create and on edit alike. Two refusals on
+  the by-unique-field routes go with them, both of which needed a non-text field to
+  happen: an identifying value that would not parse, and the retryable 503 for a field
+  redeclared mid-resolution.
 - **A value stored through a `unique_in_study` sample field can no longer be changed
   through the REST API (#639).** Such a value is used to name the sample within its
   study, so overwriting it hands that name to a different sample and silently
@@ -3946,7 +3957,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   answers 422 instead, on biosamples and prep samples alike; writing the value for the
   first time, re-sending the value already stored, and writing fields with no
   uniqueness policy are all unaffected. Correcting such a value is a database
-  operation, deliberately — it is not something a request performs.
+  operation, deliberately — it is not something a request performs;
+  [`docs/architecture/data-model.md`](docs/architecture/data-model.md) says which
+  operation and what still polices it.
 - **A sample field's `unique_in_study` policy can be declared through the REST API but
   no longer withdrawn (#639).** Clearing the policy would let the values it protects be
   rewritten freely and then re-protected, which was the one remaining way a stored

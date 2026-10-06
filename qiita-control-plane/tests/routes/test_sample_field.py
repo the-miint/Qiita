@@ -164,13 +164,14 @@ async def test_create_study_field_defaults_unique_in_study_false(ctx, surface):
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
-@pytest.mark.parametrize("data_type", ["boolean", "terminology"])
-async def test_create_study_field_rejects_unique_on_closed_value_set(ctx, surface, data_type):
-    """Tests the case where a field over a closed value set asks for study-local
-    uniqueness: the wire model refuses it before the database is reached, and
-    says which rule was broken rather than reporting a database rejection.
+@pytest.mark.parametrize("data_type", ["boolean", "terminology", "numeric", "date"])
+async def test_create_study_field_rejects_unique_on_ineligible_type(ctx, surface, data_type):
+    """Tests the case where a field of a type that cannot carry the policy asks
+    for study-local uniqueness: the wire model refuses it before the database is
+    reached, and says which rule was broken rather than reporting a database
+    rejection.
     """
-    study_idx = await _study_with_admin_grant(ctx, "uis-closed")
+    study_idx = await _study_with_admin_grant(ctx, "uis-inelig")
     # A terminology field is rejected for want of terminology_idx before
     # uniqueness is considered, so supply one to reach the rule under test.
     extra = {}
@@ -447,12 +448,13 @@ async def test_patch_study_field_enables_unique_in_study(ctx, surface):
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
-async def test_patch_study_field_unique_on_closed_value_set_422(ctx, surface):
-    """Tests the case where uniqueness is asked for on a boolean field: the
-    stored type decides, since the body carries no type of its own.
+@pytest.mark.parametrize("data_type", ["boolean", "numeric", "date"])
+async def test_patch_study_field_unique_on_ineligible_type_422(ctx, surface, data_type):
+    """Tests the case where uniqueness is asked for on a field whose type cannot
+    carry it: the stored type decides, since the body carries no type of its own.
     """
-    study_idx = await _study_with_admin_grant(ctx, "pat-bool")
-    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type="boolean")
+    study_idx = await _study_with_admin_grant(ctx, "pat-inelig")
+    field_idx = await _seed_editable_field(ctx, surface, study_idx=study_idx, data_type=data_type)
 
     resp = await patch_study_field(
         ctx,
