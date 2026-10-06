@@ -15,7 +15,7 @@ A question that needs a probe leaves your report as a **Verification handoff** e
 **Cost discipline:**
 - Get the diff once. Work from the changed-path list.
 - Open a sibling file only for a rule that fired or a PR-level check, and read only the span you need. `CLAUDE.md` ("Don't whole-file-read the big files") names the modules this matters for.
-- Review inline by default; fan out only at 3–4 families (below), and pass this posture to every subagent.
+- Review inline unless **How to run** directs a fan-out, and pass this posture to every subagent.
 
 ## How to run
 

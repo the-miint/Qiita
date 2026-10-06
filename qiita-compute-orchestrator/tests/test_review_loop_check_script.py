@@ -1,7 +1,8 @@
 """`scripts/check-review-loop.sh` — the PR-description check behind `review-loop-check`.
 
-Each test builds a throwaway repository with one base commit and two PR commits, so
-"is this sha one of the PR's own commits" is decided by real git ancestry.
+Each test builds a throwaway repository — a base commit, a PR branch two commits ahead
+of it, and one commit on a third branch — so "is this sha one of the PR's own commits"
+is decided by real git ancestry.
 """
 
 from __future__ import annotations
@@ -48,7 +49,8 @@ def _git(repo: Path, *args: str) -> str:
 
 @pytest.fixture
 def repo(tmp_path: Path) -> dict[str, str]:
-    """A repo with `base` (one commit) and a PR branch two commits ahead of it."""
+    """A repo with `base` (one commit), a `pr` branch two commits ahead of it (checked
+    out), and an `elsewhere` branch holding a commit that is on neither."""
     _git(tmp_path, "init", "-q", "-b", "base")
     _git(tmp_path, "config", "user.email", "t@example.org")
     _git(tmp_path, "config", "user.name", "t")
@@ -176,4 +178,12 @@ def test_the_published_block_shapes_pass_once_the_sha_is_filled_in(repo, source)
         line, f"- Reviewed at: {repo['second']} · rounds: 1 · stopped: nothing new"
     )
     result = _run(repo, filled)
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_long_description_does_not_hide_the_section(repo):
+    """Larger than a pipe buffer: the section check must not depend on a writer
+    surviving `grep -q` exiting early."""
+    body = _BLOCK.format(sha=repo["first"]) + "\n" + ("x" * 1000 + "\n") * 400
+    result = _run(repo, body)
     assert result.returncode == 0, result.stderr

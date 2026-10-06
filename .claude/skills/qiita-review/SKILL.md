@@ -10,8 +10,8 @@ the fixes then change the diff, and the next pass reads what the fixes wrote. Th
 skill owns that loop. The rules, the trigger map, and the report format live in
 `.claude/agents/qiita-reviewer.md` — do not restate them here or in your prompts.
 
-**You are the caller.** The reviewer is read-only by design (no `Edit`/`Write` in its
-toolset) and cannot run tests or probes. Everything it hands back that requires
+**You are the caller.** The reviewer is read-only by design: its instructions rule
+out running tests, running probes and editing files. Everything it hands back that requires
 *doing* — applying a fix, running `make test`, building a conda env for a
 `[needs-probe]` — is yours.
 
@@ -156,7 +156,8 @@ between a clean stop and a forgotten one.
 A PR records that this loop ran and what it left open. `review-loop-check` in CI fails
 a PR whose description lacks the block (the `no-agent-review` label opts out; see
 `CLAUDE.md`, "Reviewing a branch"). After the prose list, print the block filled in from
-the ledger, ready to paste under the PR template's heading:
+the ledger. It replaces the template's whole `## Reviewer loop` section, heading
+included:
 
 ```markdown
 ## Reviewer loop

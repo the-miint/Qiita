@@ -9,7 +9,8 @@
 ## Reviewer loop
 
 <!--
-Run the `qiita-review` skill on the branch and paste the block it prints here.
+Run the `qiita-review` skill on the branch and replace this section, heading included,
+with the block it prints.
 `review-loop-check` reads this section. A PR that cannot run the loop carries the
 `no-agent-review` label and says why in this section.
 -->

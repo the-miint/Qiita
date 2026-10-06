@@ -29,14 +29,17 @@ esac
 
 # The section runs from its heading to the next level-2 heading or the end. CRs are
 # dropped because GitHub stores descriptions with CRLF line endings.
-body=$(printf '%s\n' "${PR_BODY:-}" | tr -d '\r')
-printf '%s\n' "$body" | grep -q '^## Reviewer loop[[:space:]]*$' \
+# Here-strings, not pipes: under pipefail a `grep -q` that exits on its first match
+# can leave the writer killed by SIGPIPE, which would read as "no match".
+body=${PR_BODY:-}
+body=${body//$'\r'/}
+grep -q '^## Reviewer loop[[:space:]]*$' <<<"$body" \
     || fail "the PR description has no '## Reviewer loop' section."
-section=$(printf '%s\n' "$body" \
-    | awk '/^## Reviewer loop[[:space:]]*$/ {on=1; next} /^## / {on=0} on')
+section=$(awk '/^## Reviewer loop[[:space:]]*$/ {on=1; next} /^## / {on=0} on' <<<"$body")
 
-sha=$(printf '%s\n' "$section" \
-    | sed -n 's/^- Reviewed at:[[:space:]]*`\{0,1\}\([0-9a-f]\{7,40\}\)`\{0,1\}.*/\1/p' | head -n 1)
+sha=$(sed -n 's/^- Reviewed at:[[:space:]]*`\{0,1\}\([0-9a-f]\{7,40\}\)`\{0,1\}.*/\1/p' \
+    <<<"$section")
+sha=${sha%%$'\n'*}
 [ -n "$sha" ] || fail "'- Reviewed at:' does not name a commit sha."
 
 git cat-file -e "${sha}^{commit}" 2>/dev/null \
@@ -56,7 +59,7 @@ if git merge-base --is-ancestor "$sha" "$base"; then
 fi
 
 for heading in "Fixed:" "Declined:" "Deferred:" "Not probed:"; do
-    printf '%s\n' "$section" | grep -q "^- ${heading}" \
+    grep -q "^- ${heading}" <<<"$section" \
         || fail "the Reviewer loop section has no '- ${heading}' line."
 done
 
