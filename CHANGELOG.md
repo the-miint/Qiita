@@ -21,7 +21,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **The branch reviewer is in the repo, and a PR description records its run (#PRNUM).**
+- **The branch reviewer is in the repo, and a PR description records its run (#655).**
   `.claude/agents/qiita-reviewer.md` (the rules) and `.claude/skills/qiita-review/` (the
   review, fix, re-review loop) were per-developer files that `CLAUDE.md` already pointed
   at; both are now tracked. The loop ends by printing a `## Reviewer loop` block — the
