@@ -21,14 +21,14 @@ _None yet._
 
 - `[operator]` **Confirm the mirror publishes the DuckDB 1.5.5 miint build** before the
   restart — every component now runs 1.5.5, and the stage step fetches from here
-  (verified present when this was written). (#chore/duckdb-1.5.5)
+  (verified present when this was written). (#651)
   ```bash
   curl -fsSI https://ftp.microbio.me/pub/miint/v1.5.5/linux_amd64/miint.duckdb_extension.gz | head -1   # expect 200
   ```
 - `[admin]` **Install the DuckDB 1.5.5 CLI for `make lake-shell` / `scripts/lake-gc.sh`.**
   They must run the version the data plane links, but check only that a `duckdb` is on
   `PATH`, so a stale 1.5.4 CLI would run silently. Replace any per-account copy in
-  `~/.local/bin` the same way. (#chore/duckdb-1.5.5)
+  `~/.local/bin` the same way. (#651)
   ```bash
   ( cd "$(mktemp -d)" \
     && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip \
@@ -49,7 +49,7 @@ _None yet._
 - **Both staged miint builds are present, and the rebuilt `long-read-assembly` images carry
   DuckDB 1.5.5** — a splitter finds miint only under its own DuckDB version's directory,
   and `v1.5.4/` still serves the frozen 1.0.0 checkm image (see Notes). Expect
-  `DUCKDB_155_OK`. (#chore/duckdb-1.5.5)
+  `DUCKDB_155_OK`. (#651)
   ```bash
   sudo -u qiita-orch bash -c 'set -a; . /etc/qiita/compute-orchestrator.env; set +a
   for v in 1.5.5 1.5.4; do
@@ -69,7 +69,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- **DuckDB 1.5.4 → 1.5.5 everywhere.** (#chore/duckdb-1.5.5)
+- **DuckDB 1.5.4 → 1.5.5 everywhere.** (#651)
   - The redeploy's miint stage re-stages miint and httpfs into
     `MIINT_EXTENSION_DIRECTORY/v1.5.5/` by itself: `stage-miint --check` sees the version
     change, so no `FORCE_STAGE_MIINT`. `make verify-deploy`'s `compute-readiness` and

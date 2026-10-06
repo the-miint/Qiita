@@ -2085,7 +2085,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Fixed
 
 - **A DoGet whose query fails partway through now ends in an error, not a clean end of
-  stream (#PRNUM).** The data plane read its streaming result with the `duckdb` crate's
+  stream (#651).** The data plane read its streaming result with the `duckdb` crate's
   Arrow iterator, which could not report a failed chunk fetch, so a client received a
   truncated table that looked complete. It now fetches with the crate's fallible `step`
   (public as of `duckdb` 1.10505.0), and the failure reaches the client as the stream's
@@ -4004,7 +4004,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Changed
 
 - **DuckDB 1.5.4 → 1.5.5 across every component, and every DuckDB pin is now exact
-  (#PRNUM).** The team miint mirror now builds against DuckDB 1.5.5 (its 1.5.4 builds stopped
+  (#651).** The team miint mirror now builds against DuckDB 1.5.5 (its 1.5.4 builds stopped
   updating on Sep 11), so the data-plane crate (`=1.10505.0`), the four Python components
   (`duckdb==1.5.5`) and their locks, the CI libduckdb default, the CLI the lake scripts
   require, and the long-read-assembly `assemble`/`checkm` images move together. The Python
