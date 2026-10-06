@@ -18,7 +18,7 @@ fail() {
         echo "ERROR: $1"
         echo "Run the qiita-review skill on the branch and paste the block it prints under"
         echo "'## Reviewer loop' in the PR description. If the loop cannot be run for this PR,"
-        echo "add the 'no-agent-review' label and say why in the description."
+        echo "add the 'no-agent-review' label and say why under that heading."
     } >&2
     exit 1
 }
@@ -29,9 +29,11 @@ esac
 
 # The section runs from its heading to the next level-2 heading or the end. CRs are
 # dropped because GitHub stores descriptions with CRLF line endings.
-section=$(printf '%s\n' "${PR_BODY:-}" | tr -d '\r' \
+body=$(printf '%s\n' "${PR_BODY:-}" | tr -d '\r')
+printf '%s\n' "$body" | grep -q '^## Reviewer loop[[:space:]]*$' \
+    || fail "the PR description has no '## Reviewer loop' section."
+section=$(printf '%s\n' "$body" \
     | awk '/^## Reviewer loop[[:space:]]*$/ {on=1; next} /^## / {on=0} on')
-[ -n "$section" ] || fail "the PR description has no '## Reviewer loop' section."
 
 sha=$(printf '%s\n' "$section" \
     | sed -n 's/^- Reviewed at:[[:space:]]*`\{0,1\}\([0-9a-f]\{7,40\}\)`\{0,1\}.*/\1/p' | head -n 1)
@@ -41,6 +43,12 @@ git cat-file -e "${sha}^{commit}" 2>/dev/null \
     || fail "'Reviewed at: ${sha}' is not a commit in this repository."
 head="${HEAD_SHA:-HEAD}"
 base="${BASE_SHA:-origin/main}"
+# `merge-base --is-ancestor` exits 128 on a ref it cannot resolve, which an `if`
+# reads the same as "not an ancestor". Resolve both first.
+for ref in "$head" "$base"; do
+    git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null \
+        || { echo "ERROR: cannot resolve '${ref}' in this checkout." >&2; exit 2; }
+done
 git merge-base --is-ancestor "$sha" "$head" \
     || fail "'Reviewed at: ${sha}' is not on this branch."
 if git merge-base --is-ancestor "$sha" "$base"; then

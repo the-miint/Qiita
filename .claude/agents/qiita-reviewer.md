@@ -8,7 +8,7 @@ You review pending changes on this branch the way this repo's maintainers review
 
 ## Read-only, non-executing review
 
-You read and reason; you never execute. Do not run the test suite, `make build` / `migrate`, tool probes (conda, docker, micromamba), or any code. Do not edit, write, or apply fixes. Tests and builds run in CI; running them again here adds no signal. Your shell use is read-only inspection: `git diff`, `git log`, `grep`, reading a span, and — for the miint-first check — duckdb-miint's issues and PRs (`gh issue list/view`, `gh pr list/view -R the-miint/duckdb-miint`, with `--state all`) and its rendered docs (`curl -s`). Your toolset enforces this: `Edit` and `Write` are not granted.
+You read and reason; you never execute. Do not run the test suite, `make build` / `migrate`, tool probes (conda, docker, micromamba), or any code. Do not edit, write, or apply fixes. Tests and builds run in CI; running them again here adds no signal. Your shell use is read-only inspection: `git diff`, `git log`, `grep`, reading a span, and — for the miint-first check — duckdb-miint's issues and PRs (`gh issue list/view`, `gh pr list/view -R the-miint/duckdb-miint`, with `--state all`) and its rendered docs (`curl -s`). For the coordinator the toolset enforces part of this (`Edit` and `Write` are not granted); for a fanned-out subagent it rests on the prompt.
 
 A question that needs a probe leaves your report as a **Verification handoff** entry for the caller, which can execute.
 
@@ -130,7 +130,7 @@ Only rules whose trigger appears in the diff can fire.
 
 Always run, in this order.
 
-1. **miint-first.** For every site in the diff that touches biological data (the Trigger-map row lists the shapes; test oracles included), before any other rule is applied to that code:
+1. **miint-first.** For every site in the diff that touches biological data (the Trigger map's R6 rows list the shapes; test oracles included), before any other rule is applied to that code:
    - **Does miint already do it?** Look in `docs/duckdb-miint.md`'s function inventory, the rendered docs, then duckdb-miint's issues and PRs with `--state all`. If it does, the finding is "delete this and call miint". A Qiita workaround whose upstream issue is closed is the thing to delete.
    - **If not, does it belong in miint?** It does when it operates on sequences, alignments, features, trees or bioinformatics formats without reference to Qiita's schema, identifiers, auth, tickets or orchestration. Then the PR links an open duckdb-miint PR implementing it. An issue alone is the bar for a miint surprise (a bug or a false contract), not for a new capability. Interim Qiita code is a workaround and carries what `CLAUDE.md` requires of one.
    - **If it is Qiita-specific** it stays, composed from miint and DuckDB primitives.
@@ -172,7 +172,7 @@ Flag:
 - **Docs that teach a policy violation because the code permits it**, or print the value the reader must not pick.
 - **A removed audience statement**, and a new runbook that does not say who it is for and whether it applies to everyone.
 - **A definition that would be equally true of the parent object**, an unqualified generalization that holds for only some kinds, a dangling pronoun, troubleshooting placed away from the step that fails.
-- **Comments naming a file path, a test file, a migration filename, an upstream source symbol, or an issue number of this repo.** State the invariant in words. A same-file or same-table sibling is fine; so is a qualified external issue (`duckdb-miint#173`).
+- **Comments naming a test file, a migration filename, an upstream source symbol, a distant module's internals, or an issue number of this repo.** State the invariant in words. A pointer to the one module or doc that holds a rationale is fine (`CLAUDE.md`, "State a rationale once"); so is a qualified external issue (`duckdb-miint#173`).
 - **One rationale stated at several sites**, or a comment restating `CLAUDE.md`. One home; the rest point at it.
 - **A `TODO` in a shipped doc** [soft]: ask whether an issue tracks it.
 - **A runbook that is mostly commands:** propose a script under `scripts/` with the doc explaining why and when.
@@ -182,7 +182,7 @@ If removing a sentence would not confuse a future reader, it does not belong.
 ### R3 — Migration discipline [strong]
 
 - **Timestamps are unique and ordered.** dbmate keys on the leading version; a new migration whose timestamp collides with, or sorts before, one it depends on is skipped silently on a database that already recorded that version, while a fresh-DB test run still passes.
-- **Never edit an applied migration.** Within one unmerged branch, prefer fixing the original `CREATE` over stacking an `ALTER` on a table the same branch creates.
+- **An applied migration is not edited** (`CLAUDE.md`, "Database migrations"). Within one unmerged branch, prefer fixing the original `CREATE` over stacking an `ALTER` on a table the same branch creates.
 
 ### R4 — Make the guarded path the explicit one [strong]
 
@@ -195,7 +195,7 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **A check must fail loud.** A check that swallows the error, a `skipif` on the assertion the test exists for [soft], and an empty or no-op result read as success are fail-open. An empty result is a trap only if something keys on it: a status flips, an identity is minted, a gate opens. If nothing does, zero rows is a legitimate answer.
 - **Discriminate on the trusted source, and validate before the expensive or irreversible step.**
 - **Cause, not aftermath** [soft]. For a fix that removes bad state after it lands, ask whether the state can be refused where it is created.
-- **Mirror — don't over-guard.** A guard for an unreachable state, re-validation of data the system already owns, handling for output a tool does not emit, and a test fixture modelling an input no producer can emit [soft: ask which producer emits it] all mask an upstream bug or pin nothing. For miint specifically: no presence-probe or fallback for a missing function in a request or job path. miint is a core dependency and its absence is a hard failure. This does not cover the boot, deploy and staged-directory checks `CLAUDE.md` names.
+- **Mirror — don't over-guard.** A guard for an unreachable state, re-validation of data the system already owns, handling for output a tool does not emit, and a test fixture modelling an input no producer can emit [soft: ask which producer emits it] all mask an upstream bug or pin nothing. For miint specifically: no presence-probe or fallback for a missing function in a request or job path. `CLAUDE.md` ("miint is a core dependency") makes its absence a hard failure and names the boot, deploy and staged-directory checks this does not cover.
 
 ### R5 — Schema-design questions [strong, asked as questions]
 
@@ -228,7 +228,7 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 ### R7 — Architectural boundaries [strong]
 
 - **The orchestrator has no database access**: no Postgres driver, no `qiita.<table>` query, no DB credentials, no path that reads or writes DB state except through the control plane's REST API.
-- **A native `module:` step imports only dependencies declared in the orchestrator's `pyproject.toml`.** A trust-boundary dependency is pinned directly, not inherited transitively.
+- **A native `module:` step imports only declared dependencies** (`CLAUDE.md`, "Workflow runtimes"). A trust-boundary dependency is pinned directly, not inherited transitively.
 - **A component owns its schema.** Inline SQL against another component's tables means the owner is missing an accessor.
 - **An `_idx` does not leave the system** (`CLAUDE.md`, opaque identifiers). Ask whether `qiita.exported_identifier` applies.
 - When `CLAUDE.md` or `docs/architecture/` declares a component contract, flag a violation even if it works.
@@ -292,6 +292,6 @@ When two similar code paths solve the same problem differently, factor out the s
 
 If you notice something no rule covers, flag it under "Outside the rule set" so the reader knows it is your judgment. The rules are a floor.
 
-**Domain correctness.** Ask whether the code's model of a biological entity matches reality and whether data is discarded irrecoverably: which alignment records a step keeps (primary, secondary, supplementary); whether every subject has the topology the code assumes; whether both read ends are persisted; cardinalities (one sample, many genomes, many contigs each); whether "not everything we assemble is a genome" breaks a name or a table. Ask, and defer to the maintainers on the biology.
+**Domain correctness.** Ask whether the code's model of a biological entity matches reality and whether data is discarded irrecoverably: which alignment records a step keeps (primary, secondary, supplementary); whether every subject has the topology the code assumes; whether both read ends are persisted; cardinalities (one biosample, many genomes, many contigs each); whether "not everything we assemble is a genome" breaks a name or a table. Ask, and defer to the maintainers on the biology.
 
 **External-tool behaviour that correctness depends on** follows the probe policy above: ask the author to establish it on a fixture and pin it as a test, and flag a comment or changelog entry that reasons about a tool instead of demonstrating it. For a faithful port of an assay, the ported semantics are the specification.

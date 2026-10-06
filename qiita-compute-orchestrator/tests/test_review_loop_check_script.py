@@ -12,7 +12,10 @@ from pathlib import Path
 
 import pytest
 
-_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "check-review-loop.sh"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SCRIPT = _REPO_ROOT / "scripts" / "check-review-loop.sh"
+_PR_TEMPLATE = _REPO_ROOT / ".github" / "pull_request_template.md"
+_SKILL = _REPO_ROOT / ".claude" / "skills" / "qiita-review" / "SKILL.md"
 
 _BLOCK = """## Summary
 
@@ -35,7 +38,10 @@ Something.
 
 def _git(repo: Path, *args: str) -> str:
     out = subprocess.run(
-        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+        ["git", "-C", str(repo), "-c", "commit.gpgsign=false", *args],
+        check=True,
+        capture_output=True,
+        text=True,
     )
     return out.stdout.strip()
 
@@ -54,17 +60,25 @@ def repo(tmp_path: Path) -> dict[str, str]:
         _git(tmp_path, "add", "f")
         _git(tmp_path, "commit", "-q", "-m", name)
         shas[name] = _git(tmp_path, "rev-parse", "--short", "HEAD")
+    # A commit that exists in the repository but is on neither branch.
+    _git(tmp_path, "checkout", "-q", "-b", "elsewhere", "base")
+    (tmp_path / "f").write_text("elsewhere")
+    _git(tmp_path, "commit", "-q", "-am", "elsewhere")
+    shas["elsewhere"] = _git(tmp_path, "rev-parse", "--short", "HEAD")
+    _git(tmp_path, "checkout", "-q", "pr")
     shas["path"] = str(tmp_path)
     return shas
 
 
-def _run(repo: dict[str, str], body: str, labels: str = "") -> subprocess.CompletedProcess:
+def _run(
+    repo: dict[str, str], body: str, labels: str = "", base: str = "base"
+) -> subprocess.CompletedProcess:
     env = {
         **os.environ,
         "PR_BODY": body,
         "LABELS": labels,
         "HEAD_SHA": "pr",
-        "BASE_SHA": "base",
+        "BASE_SHA": base,
     }
     return subprocess.run(
         ["bash", str(_SCRIPT)], cwd=repo["path"], env=env, capture_output=True, text=True
@@ -122,3 +136,44 @@ def test_a_later_section_does_not_supply_the_block(repo):
     """Only lines under the heading count; the same lines under another heading do not."""
     body = _BLOCK.format(sha=repo["first"]).replace("## Reviewer loop", "## Something else")
     assert _run(repo, body).returncode == 1
+
+
+def test_refuses_a_commit_that_is_not_on_the_branch(repo):
+    result = _run(repo, _BLOCK.format(sha=repo["elsewhere"]))
+    assert result.returncode == 1
+    assert "is not on this branch" in result.stderr
+
+
+def test_an_empty_section_is_reported_as_unfilled_not_missing(repo):
+    result = _run(repo, "## Summary\n\n## Reviewer loop\n\n\n## Notes\n")
+    assert result.returncode == 1
+    assert "does not name a commit sha" in result.stderr
+
+
+def test_an_unresolvable_base_is_an_error_not_a_pass(repo):
+    """With the base unresolved, a base-branch sha must not slip through."""
+    result = _run(repo, _BLOCK.format(sha=repo["base"]), base="no-such-ref")
+    assert result.returncode == 2
+    assert "cannot resolve 'no-such-ref'" in result.stderr
+
+
+def _skill_block() -> str:
+    """The fenced example under the skill's PR-body heading."""
+    text = _SKILL.read_text()
+    start = text.index("```markdown\n", text.index("## Then write the PR-body block"))
+    return text[start + len("```markdown\n") : text.index("```", start + 3)]
+
+
+@pytest.mark.parametrize(
+    "source", [_PR_TEMPLATE.read_text, _skill_block], ids=["pr-template", "skill-example"]
+)
+def test_the_published_block_shapes_pass_once_the_sha_is_filled_in(repo, source):
+    """The template and the skill each carry a copy of the block; both must be what the
+    script accepts, with only the sha placeholder replaced."""
+    text = source()
+    line = next(ln for ln in text.splitlines() if ln.startswith("- Reviewed at:"))
+    filled = text.replace(
+        line, f"- Reviewed at: {repo['second']} · rounds: 1 · stopped: nothing new"
+    )
+    result = _run(repo, filled)
+    assert result.returncode == 0, result.stderr

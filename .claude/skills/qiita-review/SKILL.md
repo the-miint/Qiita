@@ -28,8 +28,8 @@ Independence is the default; you steer through the **prompt**, not through the a
 memory. What you carry across rounds is the ledger, not the reviewer.
 
 **`SendMessage` is for steering a reviewer within its own round**, where its context is
-the point — a send resumes an agent from its transcript, so it still holds the diff it
-read and the spans it opened. Use it to:
+the point — it continues the same agent, which still holds the diff it read and the
+spans it opened. Use it to:
 
 - hand back probe results it asked for, so it re-tags `[needs-probe]` → `[verified]`
   or drops the finding;
@@ -99,7 +99,7 @@ inherits the ledger rather than re-deriving it.
 
 ## Cost discipline
 
-The reviewer has its own (get the diff once, no whole-file reads). Yours:
+The reviewer has its own, in the agent file. Yours:
 
 - **Scope the prompt — this is the lever.** A fresh reviewer is only expensive if you
   let it re-read the branch. Round 2+ names the changed paths and the rules still in
@@ -107,12 +107,10 @@ The reviewer has its own (get the diff once, no whole-file reads). Yours:
   have to cost a second full-branch pass.
 - **The ledger is a token cut, not just bookkeeping.** A decline the reviewer can see
   is a decline it does not re-derive.
-- **There is no way to compact a subagent.** `/compact` acts on the main conversation
-  and is the user's to invoke; no tool reaches a subagent's context. Per-round spawns
-  keep each reviewer's context short on their own, which is the point — a long-lived
-  reviewer thread has no compaction escape hatch.
-- **Don't fan out from here.** The reviewer decides its own fan-out (0–2 families
-  inline, 3–4 parallel). A second layer of subagents on top duplicates its work.
+- **Keep each reviewer short-lived.** A reviewer carried across rounds accumulates every
+  diff and span it has read. Per-round spawns keep each one's context to a single round.
+- **Don't fan out from here.** The reviewer decides its own fan-out. A second layer of
+  subagents on top duplicates its work.
 
 ## Report each round
 
@@ -145,8 +143,8 @@ diff:
 - **Separate what is pre-existing from what this branch introduced.** A reviewer
   inheriting the list needs to know which items the PR is answerable for.
 
-The reviewer owes you the raw material for all three — a reason, a refutation target,
-and pre-existing-or-not are on its **Scope discipline**. What is yours is the shape:
+The reviewer owes you the raw material for all three — a reason and pre-existing-or-not
+are on its **Scope discipline**, a refutation target on its **Verification handoff**. What is yours is the shape:
 grouping, brevity, and writing it for someone who has not read the diff.
 
 Keep it short — a few grouped lines, not a report. If nothing is open, say that in one
