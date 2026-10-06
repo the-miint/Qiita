@@ -32,7 +32,9 @@ arrow-ipc = { version = "58", features = ["zstd"] }
 # gymnastics, so the parquet crate from the arrow-rs ecosystem is the
 # cleanest path. Keep version pinned to arrow-* major.
 parquet = "58"
-duckdb = { version = "1.10504.0" }
+# Exact, and equal to every other DuckDB pin: see
+# qiita-common/tests/test_duckdb_version_sync.py.
+duckdb = { version = "=1.10505.0" }
 # Pin the feature set explicitly (these are v2's current defaults) so a future
 # upstream default-feature change can't silently alter behavior on a bare
 # `cargo update`. `rand_core` is deliberately omitted — the data plane only ever

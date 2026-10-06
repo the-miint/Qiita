@@ -19,7 +19,22 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- `[operator]` **Confirm the mirror publishes the DuckDB 1.5.5 miint build** before the
+  restart — every component now runs 1.5.5, and the stage step fetches from here
+  (verified present when this was written). (#chore/duckdb-1.5.5)
+  ```bash
+  curl -fsSI https://ftp.microbio.me/pub/miint/v1.5.5/linux_amd64/miint.duckdb_extension.gz | head -1   # expect 200
+  ```
+- `[admin]` **Install the DuckDB 1.5.5 CLI for `make lake-shell` / `scripts/lake-gc.sh`.**
+  They must run the version the data plane links, but check only that a `duckdb` is on
+  `PATH`, so a stale 1.5.4 CLI would run silently. Replace any per-account copy in
+  `~/.local/bin` the same way. (#chore/duckdb-1.5.5)
+  ```bash
+  ( cd "$(mktemp -d)" \
+    && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip \
+    && unzip -q duckdb_cli-linux-amd64.zip && sudo install -m 0755 duckdb /usr/local/bin/duckdb )
+  sudo -u qiita-data /usr/local/bin/duckdb --version   # expect v1.5.5
+  ```
 
 ### 3. Migrations
 
@@ -31,7 +46,22 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- **Both staged miint builds are present, and the rebuilt `long-read-assembly` images carry
+  DuckDB 1.5.5** — a splitter finds miint only under its own DuckDB version's directory,
+  and `v1.5.4/` still serves the frozen 1.0.0 checkm image (see Notes). Expect
+  `DUCKDB_155_OK`. (#chore/duckdb-1.5.5)
+  ```bash
+  sudo -u qiita-orch bash -c 'set -a; . /etc/qiita/compute-orchestrator.env; set +a
+  for v in 1.5.5 1.5.4; do
+    test -s "$MIINT_EXTENSION_DIRECTORY/v$v/linux_amd64/miint.duckdb_extension" \
+      || { echo "no staged miint for DuckDB $v"; exit 1; }
+  done
+  cd /tmp && for s in long-read-assembly-assemble-1.0.0.sif long-read-assembly-checkm-1.0.1.sif; do
+    apptainer exec --no-home "${PATH_DERIVED}/images/$s" \
+      python3 -c "import duckdb; print(duckdb.__version__)" | grep -Fxq 1.5.5 \
+      || { echo "$s is not on DuckDB 1.5.5"; exit 1; }
+  done && echo DUCKDB_155_OK'
+  ```
 
 ### 6. After the deploy verifies green
 
@@ -39,7 +69,22 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **DuckDB 1.5.4 → 1.5.5 everywhere.** (#chore/duckdb-1.5.5)
+  - The redeploy's miint stage re-stages miint and httpfs into
+    `MIINT_EXTENSION_DIRECTORY/v1.5.5/` by itself: `stage-miint --check` sees the version
+    change, so no `FORCE_STAGE_MIINT`. `make verify-deploy`'s `compute-readiness` and
+    `cp-miint` checks LOAD the new build.
+  - The `assemble` and `checkm` (`-1.0.1`) SIFs auto-rebuild on deploy to pick up 1.5.5.
+  - **Keep `MIINT_EXTENSION_DIRECTORY/v1.5.4/`.** `long-read-assembly` 1.0.0's checkm step
+    still runs the frozen `long-read-assembly-checkm-1.0.0.sif` (no build spec since 1.0.1),
+    on DuckDB 1.5.4, and LOADs miint from there. Staging never removes an old version dir.
+  - On first start each data-plane instance installs the 1.5.5 `ducklake` and `postgres`
+    extensions under its `HOME` (`/var/lib/qiita-data/<port>`), so it needs to reach
+    extensions.duckdb.org, as on every DuckDB bump. DuckLake moves `d318a545` → `d8a1881e`:
+    bug fixes, no catalog-schema migration.
+  - **A DoGet whose query fails after batches have streamed now ends in an error status**,
+    where it used to end like a complete result. A client that reads such a stream to the
+    end now raises instead of silently holding a truncated table.
 
 ## Deployed history
 

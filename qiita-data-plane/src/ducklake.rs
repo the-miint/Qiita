@@ -331,7 +331,7 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         -- invariant (routes/read_masked.py) stays as defence in depth but is no
         -- longer the only thing between a mis-signed ticket and every study's reads.
         --
-        -- Needs DuckDB >= 1.5 (we pin libduckdb 1.5.4): on 1.4 this CREATE fails
+        -- Needs DuckDB >= 1.5: on 1.4 this CREATE fails
         -- outright with `DuckLake does not support functions`, so the parameterized
         -- form is not available on an older engine at all.
         --
@@ -2074,14 +2074,8 @@ mod tests {
         }
 
         let ordered = |sql: &str| -> (usize, usize, usize) {
-            let schema = {
-                let mut probe = conn
-                    .prepare(&format!("SELECT * FROM ({sql}) AS _p LIMIT 0"))
-                    .expect("prepare probe");
-                probe.query_arrow([]).expect("probe").get_schema()
-            };
             let mut stmt = conn.prepare(sql).expect("prepare");
-            let stream = stmt.stream_arrow([], schema).expect("stream_arrow");
+            let stream = stmt.stream_arrow([]).expect("stream_arrow");
             let mut seen = Vec::new();
             let mut batches = 0usize;
             for batch in stream {

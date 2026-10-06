@@ -2084,6 +2084,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **A DoGet whose query fails partway through now ends in an error, not a clean end of
+  stream (#PRNUM).** The data plane read its streaming result with the `duckdb` crate's
+  Arrow iterator, which could not report a failed chunk fetch, so a client received a
+  truncated table that looked complete. It now fetches with the crate's fallible `step`
+  (public as of `duckdb` 1.10505.0), and the failure reaches the client as the stream's
+  final item. The zero-row schema probe each DoGet ran first is gone too: the streaming
+  result now reports its own schema before the first fetch.
 - **`qiita submit-ena-import` and `POST /ena-import-batch` refuse a malformed accession
   at submit (#635).** The shared validator checked only the prefix, so a bare `PRJEB`,
   `PRJEBxyz` or `PRJEB11419,PRJNA1` was accepted and then failed item by item in the
@@ -3996,6 +4003,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **DuckDB 1.5.4 → 1.5.5 across every component, and every DuckDB pin is now exact
+  (#PRNUM).** The team miint mirror now builds against DuckDB 1.5.5 (its 1.5.4 builds stopped
+  updating on Sep 11), so the data-plane crate (`=1.10505.0`), the four Python components
+  (`duckdb==1.5.5`) and their locks, the CI libduckdb default, the CLI the lake scripts
+  require, and the long-read-assembly `assemble`/`checkm` images move together. The Python
+  pins were floors and the crate a caret range, so a fresh resolve could land on DuckDB
+  1.5.6, for which the mirror has no miint build. `test_duckdb_version_sync` now also holds
+  the deploy CLI version, each `pyproject.toml` pin and each `uv.lock` to the crate. The
+  bundled DuckLake moves `d318a545` → `d8a1881e`: bug fixes, no catalog-schema change.
 - **`qiita biosample create-field` validates its flags before reading the auth token
   (#639).** An invalid flag combination now exits 2 naming the flag, where it previously
   reported a missing token first and left the real problem to be found on the retry. The

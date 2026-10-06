@@ -382,10 +382,9 @@ qiita_lake_data_path() { printf '%s/ducklake' "$1"; }
 
 # --- DuckDB CLI + pgpass plumbing, shared by scripts/lake-*.sh ---------------
 
-# The DuckDB CLI must match the version the data plane links (duckdb crate
-# 1.10504.0 == DuckDB 1.5.4): the ducklake extension is versioned with DuckDB,
-# and a newer one may want to migrate the catalog schema it opens.
-QIITA_DUCKDB_VERSION="1.5.4"
+# The DuckDB CLI must match the version the data plane links — held equal to its
+# `duckdb` crate by qiita-common/tests/test_duckdb_version_sync.py, which says why.
+QIITA_DUCKDB_VERSION="1.5.5"
 
 # Resolve the duckdb CLI into DUCKDB_BIN, or exit with install instructions.
 # Two install sites because the callers run as different accounts: a human with

@@ -1219,6 +1219,100 @@ async fn stream_ducklake_batches_propagates_query_error() {
     );
 }
 
+/// Run `send_query_batches` on a fresh single-threaded in-memory connection,
+/// draining its channel as a client would. Returns the batches received and the
+/// helper's own result.
+fn drain_send_query_batches(sql: &'static str) -> (Vec<RecordBatch>, Result<(), Status>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(DOGET_BATCH_CHANNEL_DEPTH);
+    let producer = std::thread::spawn(move || {
+        let conn = Connection::open_in_memory().unwrap();
+        // One thread, so chunks are produced in row order and a late row's
+        // failure cannot surface before the earlier chunks are fetched.
+        conn.execute_batch("SET threads = 1").unwrap();
+        send_query_batches(&conn, sql, "probe", &tx)
+    });
+    let mut batches = Vec::new();
+    while let Some(item) = rx.blocking_recv() {
+        batches.push(item.expect("the helper sends only Ok items; errors are its return value"));
+    }
+    (
+        batches,
+        producer.join().expect("the producer must not panic"),
+    )
+}
+
+// A chunk that fails to fetch AFTER batches have gone out must come back as an
+// error, so the client never mistakes a truncated result for a whole one. The
+// failing row is the last of 2M: DuckDB buffers only ~1 MiB of a streaming
+// result ahead of the consumer, so the earlier chunks are fetched first.
+#[test]
+fn send_query_batches_surfaces_a_mid_stream_failure() {
+    let (batches, result) = drain_send_query_batches(
+        "SELECT CASE WHEN i < 1999999 THEN i ELSE error('mid-stream boom') END AS v \
+         FROM range(2000000) t(i)",
+    );
+    assert!(
+        !batches.is_empty(),
+        "the failure must come after some batches, or this does not test mid-stream"
+    );
+    let status = result.expect_err("a mid-stream failure must be an error, not a clean end");
+    assert!(
+        status.message().contains("mid-stream boom"),
+        "the error names the cause: {}",
+        status.message()
+    );
+}
+
+// The trailing `Err` that `stream_ducklake_batches` sends after a mid-stream
+// failure must reach the client AFTER the batches before it, not be dropped by the
+// Flight encoder, and not cost the client those batches either.
+#[tokio::test]
+async fn flight_encoder_delivers_batches_then_a_trailing_error() {
+    let batch = RecordBatch::try_from_iter([(
+        "v",
+        Arc::new(arrow_array::Int64Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+    )])
+    .unwrap();
+    let items: Vec<Result<RecordBatch, FlightError>> = vec![
+        Ok(batch),
+        Err(FlightError::ExternalError(Box::new(std::io::Error::other(
+            "mid-stream boom",
+        )))),
+    ];
+    let mut decoded =
+        FlightDataDecoder::new(FlightDataEncoderBuilder::new().build(stream::iter(items)));
+    let mut rows = 0;
+    let err = loop {
+        match decoded.next().await {
+            Some(Ok(msg)) => {
+                if let DecodedPayload::RecordBatch(b) = msg.payload {
+                    rows += b.num_rows();
+                }
+            }
+            Some(Err(e)) => break e,
+            None => panic!("the stream ended cleanly; the trailing error was lost"),
+        }
+    };
+    assert_eq!(rows, 2, "the batches before the error reach the client");
+    assert!(err.to_string().contains("mid-stream boom"), "{err}");
+}
+
+// A zero-row result still yields exactly one empty batch carrying the schema.
+#[test]
+fn send_query_batches_emits_one_schema_batch_for_an_empty_result() {
+    let (batches, result) = drain_send_query_batches("SELECT 1::BIGINT AS a, 'x' AS b WHERE false");
+    result.expect("an empty result is not an error");
+    assert_eq!(batches.len(), 1, "one schema batch");
+    assert_eq!(batches[0].num_rows(), 0);
+    let names: Vec<_> = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+}
+
 // Regression (data-plane lake-file placement): when `register_files`
 // moves an externally-produced Parquet into managed lake storage, it must
 // NEVER overwrite a file already present there. The reference-load job

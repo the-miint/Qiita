@@ -12,7 +12,7 @@ dependencies = [
     # LocalBackend uses DuckDB+miint in-process to stand in for SLURM in
     # dev/test. SlurmBackend won't need it, but the orchestrator runs both
     # backends from the same image, so the dep stays.
-    "duckdb>=1.5.4",
+    "duckdb==1.5.5",
     # The sharded reference-index build steps (build_routing_index,
     # build_minimap2_index, build_bowtie2_index) are `module:` (native) steps that
     # stream reference chunks from the data plane over Arrow Flight via
