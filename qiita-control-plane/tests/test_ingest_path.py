@@ -12,6 +12,7 @@ from qiita_control_plane.ingest_path import (
     host_path_keys,
     named_host_paths,
     resolve_ingest_path,
+    resolve_run_folder,
 )
 
 # ---------------------------------------------------------------------------
@@ -320,6 +321,53 @@ def test_missing_beats_permission_when_the_parent_is_readable(tmp_path):
     (tmp_path / "open").mkdir()
     with pytest.raises(IngestPathError):
         resolve_ingest_path(str(tmp_path / "open" / "nope"), roots=(tmp_path,))
+
+
+# ---------------------------------------------------------------------------
+# resolve_run_folder — run id -> folder
+# ---------------------------------------------------------------------------
+
+_RUN_ID = "20260925_SL00377_0008_ASC2267726-SC3"
+
+
+def test_resolves_run_id_to_child_folder(tmp_path):
+    run = tmp_path / _RUN_ID
+    run.mkdir()
+    assert resolve_run_folder(_RUN_ID, roots=(tmp_path,)) == run
+
+
+def test_resolves_run_id_across_several_roots(tmp_path):
+    first = tmp_path / "miseq"
+    second = tmp_path / "novaseq"
+    first.mkdir()
+    (second / _RUN_ID).mkdir(parents=True)
+    assert resolve_run_folder(_RUN_ID, roots=(first, second)) == second / _RUN_ID
+
+
+def test_rejects_run_id_with_no_match(tmp_path):
+    with pytest.raises(IngestPathError, match="no run folder matches"):
+        resolve_run_folder(_RUN_ID, roots=(tmp_path,))
+
+
+def test_rejects_run_id_matching_a_file_not_a_dir(tmp_path):
+    (tmp_path / _RUN_ID).write_bytes(b"")
+    with pytest.raises(IngestPathError, match="no run folder matches"):
+        resolve_run_folder(_RUN_ID, roots=(tmp_path,))
+
+
+def test_rejects_ambiguous_run_id_under_two_roots(tmp_path):
+    first = tmp_path / "a"
+    second = tmp_path / "b"
+    (first / _RUN_ID).mkdir(parents=True)
+    (second / _RUN_ID).mkdir(parents=True)
+    with pytest.raises(IngestPathError, match="more than one root"):
+        resolve_run_folder(_RUN_ID, roots=(first, second))
+
+
+@pytest.mark.parametrize("run_id", ["", "a/b", "..", ".", "../etc"])
+def test_rejects_run_id_that_is_not_a_bare_name(tmp_path, run_id):
+    with pytest.raises(IngestPathError, match="bare folder name"):
+        resolve_run_folder(run_id, roots=(tmp_path,))
 
 
 # ---------------------------------------------------------------------------

@@ -10,10 +10,13 @@ from __future__ import annotations
 import pytest
 
 from qiita_common.illumina import (
+    IlluminaRead,
     InstrumentRunInfo,
     _instrument_model_from_serial,
+    build_amplicon_dummy_sample_sheet,
     load_instrument_prefix_table,
     read_instrument_run_info,
+    read_run_reads,
 )
 
 # A minimal RunInfo.xml shaped like a real Illumina file. ``version_attrs``
@@ -232,3 +235,75 @@ def test_read_instrument_run_info_rejects_unknown_prefix(tmp_path):
     bcl_input_dir = _write_runinfo(tmp_path / "run", serial="ZZZZZ999")
     with pytest.raises(ValueError, match="unknown instrument serial prefix"):
         read_instrument_run_info(bcl_input_dir)
+
+
+# ---------------------------------------------------------------------------
+# read_run_reads / build_amplicon_dummy_sample_sheet
+# ---------------------------------------------------------------------------
+
+# 151 / 12(index) / 151 — the real Rapid 16S MiSeq geometry, index = Golay barcode.
+_READS_XML = (
+    '<Read Number="1" NumCycles="151" IsIndexedRead="N"/>'
+    '<Read Number="2" NumCycles="12" IsIndexedRead="Y"/>'
+    '<Read Number="3" NumCycles="151" IsIndexedRead="N"/>'
+)
+
+
+def _write_runinfo_with_reads(bcl_input_dir, reads_xml=_READS_XML):
+    bcl_input_dir.mkdir(parents=True, exist_ok=True)
+    (bcl_input_dir / "RunInfo.xml").write_text(
+        f'<RunInfo Version="6"><Run Id="r" Number="8"><Instrument>SL00377</Instrument>'
+        f"<Reads>{reads_xml}</Reads></Run></RunInfo>",
+        encoding="utf-8",
+    )
+    return bcl_input_dir
+
+
+def test_read_run_reads_parses_geometry(tmp_path):
+    reads = read_run_reads(_write_runinfo_with_reads(tmp_path / "run"))
+    assert reads == (
+        IlluminaRead(151, False),
+        IlluminaRead(12, True),
+        IlluminaRead(151, False),
+    )
+
+
+def test_read_run_reads_rejects_missing_reads(tmp_path):
+    bcl_input_dir = _write_runinfo(tmp_path / "run")  # template has no <Reads>
+    with pytest.raises(ValueError, match="no usable <Reads>"):
+        read_run_reads(bcl_input_dir)
+
+
+def test_build_amplicon_dummy_sample_sheet_mirrors_spp():
+    reads = (IlluminaRead(151, False), IlluminaRead(12, True), IlluminaRead(151, False))
+    sheet = build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")
+    assert "OverrideCycles,Y151;N12;Y151" in sheet
+    assert "CreateFastqForIndexReads,1" in sheet
+    assert "MaskShortReads,1" in sheet
+    assert "[Reads]\n151\n151" in sheet
+    # one placeholder sample, empty indices -> everything to Undetermined
+    assert sheet.rstrip().endswith("run_SMPL1,,,,,,")
+
+
+def test_build_amplicon_dummy_sample_sheet_handles_dual_index():
+    reads = (
+        IlluminaRead(151, False),
+        IlluminaRead(8, True),
+        IlluminaRead(8, True),
+        IlluminaRead(151, False),
+    )
+    sheet = build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")
+    assert "OverrideCycles,Y151;N8;N8;Y151" in sheet
+
+
+@pytest.mark.parametrize(
+    "reads",
+    [
+        (IlluminaRead(151, False),),  # only one template read
+        (IlluminaRead(151, False), IlluminaRead(151, False)),  # no index read
+        (IlluminaRead(151, False), IlluminaRead(151, False), IlluminaRead(151, False)),
+    ],
+)
+def test_build_amplicon_dummy_sample_sheet_rejects_abnormal_reads(reads):
+    with pytest.raises(ValueError, match="2 template reads and 1-2 index reads"):
+        build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")

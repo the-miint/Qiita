@@ -33,7 +33,30 @@ def _inspect_run_folder(
             token,
             f"{PATH_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}",
             json=RunFolderInspectRequest(path=str(run_folder), platform=platform).model_dump(
-                mode="json"
+                mode="json", exclude_none=True
+            ),
+        )
+    )
+
+
+def _resolve_run_folder(
+    base_url: str, token: str, run_id: str, platform: Platform
+) -> RunFolderInspectResponse:
+    """Resolve a run folder from its run id on the control plane.
+
+    Like `_inspect_run_folder`, but the submitter names a run id rather than a
+    host path; the CP scans its configured roots for the matching folder and
+    returns the resolved path plus the same instrument facts. The submitter never
+    handles a filesystem path.
+    """
+    return RunFolderInspectResponse.model_validate(
+        _common.call(
+            "POST",
+            base_url,
+            token,
+            f"{PATH_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}",
+            json=RunFolderInspectRequest(run_id=run_id, platform=platform).model_dump(
+                mode="json", exclude_none=True
             ),
         )
     )

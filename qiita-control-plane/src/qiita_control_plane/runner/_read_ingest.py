@@ -45,6 +45,9 @@ _log = logging.getLogger(__name__)
 # durable copies under.
 
 SAMPLE_MAP_BINDING = "sample_map"
+# golay-demux's per-sample barcode roster, materialized to a parquet like
+# `sample_map`. each entry carries its own barcodes_are_rc flag.
+BARCODE_MAP_BINDING = "barcode_map"
 STAGED_READS_BINDING = "reads"
 # A workflow that consumes ready-for-consumption reads (assembly) declares
 # `masked_reads_fastq`; the runner STREAMS the `read_masked` pass-set for a
@@ -299,6 +302,24 @@ async def _resolve_sample_map(action_context: dict[str, Any], workspace: Path) -
     return {SAMPLE_MAP_BINDING: out}
 
 
+def _write_barcode_map_parquet(roster: list[dict[str, Any]], out_path: Path) -> None:
+    """write the barcode roster to a parquet for the golay_demux step."""
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    prep = [int(r["prep_sample_idx"]) for r in roster]
+    barcodes = [str(r["barcode"]) for r in roster]
+    rc = [bool(r["barcodes_are_rc"]) for r in roster]
+    table = pa.table(
+        {
+            "prep_sample_idx": pa.array(prep, type=pa.int64()),
+            "barcode": pa.array(barcodes, type=pa.string()),
+            "barcodes_are_rc": pa.array(rc, type=pa.bool_()),
+        }
+    )
+    pq.write_table(table, str(out_path))
+
+
 def _write_ena_run_map_parquet(roster: list[tuple[int, str]], out_path: Path) -> None:
     """Write the `{prep_sample_idx, ena_run_accession}` roster to a Parquet
     `(prep_sample_idx BIGINT, ena_run_accession VARCHAR)` for the
@@ -316,6 +337,23 @@ def _write_ena_run_map_parquet(roster: list[tuple[int, str]], out_path: Path) ->
         }
     )
     pq.write_table(table, str(out_path))
+
+
+async def _resolve_barcode_map(action_context: dict[str, Any], workspace: Path) -> dict[str, Path]:
+    """materialize the golay-demux barcode roster to a parquet. mirrors
+    `_resolve_sample_map`; BAD_INPUT on a missing or empty roster.
+
+    TODO(sample-sheet-provenance): the submitter hand-builds this roster today. each
+    field (prep_sample_idx, barcode, barcodes_are_rc) is a sample-sheet fact a
+    preflight blob could carry, so a transposed roster can't silently route one
+    sample's reads under another's prep_sample_idx. tracked in Qiita#250."""
+    roster = action_context.get(BARCODE_MAP_BINDING)
+    if not roster:
+        raise _submission_bad_input("golay-demux requires a non-empty barcode_map")
+    workspace.mkdir(parents=True, exist_ok=True)
+    out = workspace / "barcode_map.parquet"
+    _write_barcode_map_parquet(roster, out)
+    return {BARCODE_MAP_BINDING: out}
 
 
 async def _stage_ena_run_roster(

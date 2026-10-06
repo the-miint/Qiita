@@ -207,3 +207,24 @@ def resolve_ingest_path(raw: str, *, roots: tuple[Path, ...]) -> Path:
             roots=roots,
         ) from None
     return lexical
+
+
+def resolve_run_folder(run_id: str, *, roots: tuple[Path, ...]) -> Path:
+    """Resolve a sequencing run's folder from its `instrument_run_id`.
+
+    Scans each root for a child directory named `run_id` (the RunInfo.xml
+    `<Run Id>`, which is the folder basename) and returns the single match,
+    passed through `resolve_ingest_path` for the same containment and existence
+    guarantees a submitted path gets. Raises `IngestPathError` on a run id that
+    is not a bare folder name, no match, or an ambiguous match under >1 root.
+    """
+    if not run_id or "/" in run_id or run_id in (".", ".."):
+        raise IngestPathError("run id must be a bare folder name", path=run_id, roots=roots)
+    matches = [root / run_id for root in roots if (root / run_id).is_dir()]
+    if not matches:
+        raise IngestPathError("no run folder matches this run id", path=run_id, roots=roots)
+    if len({str(m) for m in matches}) > 1:
+        raise IngestPathError(
+            "run id matches a folder under more than one root", path=run_id, roots=roots
+        )
+    return resolve_ingest_path(str(matches[0]), roots=roots)

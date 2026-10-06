@@ -73,6 +73,80 @@ def test_build_processing_params_shape_and_assembler_default():
     )
 
 
+def test_amplicon_params_carry_only_amplicon_knobs():
+    """An amplicon run hashes trim/sortmerna_reference_idx/orient_primer and NOT the
+    assembly knobs. primer is dropped when orient_primer is off (a no-op knob then),
+    so the two families never pollute each other's identity."""
+    amplicon = _build_processing_params(
+        "amplicon",
+        "1.0.0",
+        {
+            "trim": 150,
+            "primer": "GTGYCAGCMGCCGCGGTAA",
+            "orient_primer": False,
+            "sortmerna_reference_idx": 3,
+        },
+    )
+    assert amplicon == {
+        "workflow": "amplicon",
+        "version": "1.0.0",
+        "trim": 150,
+        "orient_primer": False,
+        "sortmerna_reference_idx": 3,
+    }
+    # No assembly knobs leaked in, and primer is not hashed when orient is off.
+    assert "mask_idx" not in amplicon and "assembler" not in amplicon
+    assert "primer" not in amplicon
+
+
+def test_amplicon_omitted_and_defaulted_knobs_hash_identically():
+    """The idempotency fix: omitting the optional knobs and passing their defaults
+    describe the same analysis, so they must produce the same params. primer is a
+    no-op when orient is off; orient defaults off."""
+    required_only = _build_processing_params(
+        "amplicon", "1.0.0", {"trim": 150, "sortmerna_reference_idx": 3}
+    )
+    with_defaults = _build_processing_params(
+        "amplicon",
+        "1.0.0",
+        {
+            "trim": 150,
+            "sortmerna_reference_idx": 3,
+            "primer": "GTGYCAGCMGCCGCGGTAA",
+            "orient_primer": False,
+        },
+    )
+    assert required_only == with_defaults
+
+
+def test_amplicon_orient_on_hashes_the_primer():
+    """When orient_primer is on, primer IS result-affecting and enters the hash."""
+    off = _build_processing_params("amplicon", "1.0.0", {"trim": 150, "sortmerna_reference_idx": 3})
+    on = _build_processing_params(
+        "amplicon",
+        "1.0.0",
+        {
+            "trim": 150,
+            "sortmerna_reference_idx": 3,
+            "orient_primer": True,
+            "primer": "GTGYCAGCMGCCGCGGTAA",
+        },
+    )
+    assert on != off
+    assert on["orient_primer"] is True and on["primer"] == "GTGYCAGCMGCCGCGGTAA"
+
+
+def test_amplicon_trim_and_reference_are_part_of_the_identity():
+    """Different truncation length OR different SortMeRNA reference -> distinct
+    params (distinct processing_idx): both change the denoised result."""
+    base = {"trim": 150, "primer": "GTGYCAGCMGCCGCGGTAA", "sortmerna_reference_idx": 3}
+    trim_a = _build_processing_params("amplicon", "1.0.0", {**base, "trim": 150})
+    trim_b = _build_processing_params("amplicon", "1.0.0", {**base, "trim": 100})
+    assert trim_a != trim_b
+    ref_b = _build_processing_params("amplicon", "1.0.0", {**base, "sortmerna_reference_idx": 4})
+    assert trim_a != ref_b
+
+
 def test_mask_idx_is_part_of_the_identity():
     """mask_idx is the gating input predicate: the same sample+assembler assembled
     from two different masks must yield DISTINCT params (distinct processing_idx),

@@ -94,6 +94,16 @@ NonBlankName = Annotated[NonBlankText, Field(max_length=MAX_NAME_LENGTH)]
 # would collide. Absent means NULL, never empty text.
 AccessionText = Annotated[NonBlankText, Field(max_length=MAX_ACCESSION_LENGTH)]
 
+# An email naming an existing qiita.user, which is only looked up, never stored,
+# so it is checked for shape alone: `EmailStr` would refuse addresses an account
+# can already carry (it rejects special-use domains such as `.local`). Control
+# characters are excluded because Postgres refuses a NUL in text with an error,
+# not a non-match.
+LookupEmail = Annotated[
+    str,
+    Field(max_length=320, pattern=r"^[^@\s\x00-\x1f\x7f]+@[^@\s\x00-\x1f\x7f]+$"),
+]
+
 
 def _fraction_passing_quality_filter(
     raw_read_count_r1r2: int | None, quality_filtered_read_count_r1r2: int | None

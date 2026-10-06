@@ -128,9 +128,9 @@ qiita/
 │       └── test_system_gg2_backbone.py  # @pytest.mark.system; real GG2 backbone
 ├── workflows/
 │   ├── amplicon/
-│   │   ├── Apptainer.def           # container definition (single image for all steps)
-│   │   ├── workflow.yaml           # ordered steps: name, type (map|reduce), entrypoint, resources
-│   │   └── scripts/                # per-step entrypoints and helpers
+│   │   └── 1.0.0.yaml              # versioned amplicon denoise workflow
+│   ├── golay-demux/
+│   │   └── 1.0.0.yaml              # versioned bcl-convert + Golay demux workflow
 │   └── reference-add/
 │       └── 1.0.0.yaml              # versioned reference-ingest workflow
 ├── deploy/
@@ -215,9 +215,6 @@ test-workflows:
 		exit 0; \
 	fi; \
 	set -ex; \
-	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def; \
-	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"; \
-	rm -f /tmp/qiita-workflow-smoke.sif; \
 	smoke_derived=$$(mktemp -d); trap 'rm -rf "$$smoke_derived"' EXIT; \
 	mkdir -p "$$smoke_derived/images"; \
 	PATH_DERIVED="$$smoke_derived" bash scripts/build-sif.sh _sif-build-smoke

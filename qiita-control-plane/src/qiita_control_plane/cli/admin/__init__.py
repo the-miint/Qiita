@@ -14,8 +14,9 @@ reaches the system and whether the auth model can gate it:
                  auth system can't help (no admin exists yet, the API is
                  down, or you're recovering state).
 
-`token revoke-all` is HTTP+PAT and by the rule could live in `qiita`; it
-stays here for operator discoverability, not because the split forces it.
+`token revoke-all` and `principal set-role` are HTTP+PAT and by the rule could
+live in `qiita`; they stay here for operator discoverability (beside
+`set-system-role`, in set-role's case), not because the split forces them.
 
 For the subcommand list and per-flag details, run `qiita-admin --help` (or
 `qiita-admin <subcommand> --help`) — the argparse help is the ground truth, so
@@ -106,7 +107,14 @@ from .owner_id import (
     _handle_owner_biosample_id,
     _write_owner_biosample_id_tsv,
 )
-from .role import _VALID_ROLE_VALUES, _handle_set_system_role, _set_system_role
+from .role import (
+    _VALID_ROLE_VALUES,
+    _handle_principal_set_role,
+    _handle_set_system_role,
+    _nonblank_reason,
+    _principal_set_role,
+    _set_system_role,
+)
 from .terminology import (
     DEFAULT_ROBOT_COMMAND_LINE,
     DEFAULT_ROBOT_EXPORT_FILENAME,
@@ -129,7 +137,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_role = sub.add_parser(
         "set-system-role",
-        help="Direct-DB role update (bootstrap path)",
+        help="Direct-DB role update, unaudited (bootstrap path; prefer `principal set-role`)",
     )
     p_role.add_argument("--email", required=True)
     p_role.add_argument(
@@ -138,6 +146,22 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=list(_VALID_ROLE_VALUES),
     )
     p_role.set_defaults(handler=_handle_set_system_role)
+
+    p_principal = sub.add_parser("principal", help="Principal administration (system_admin)")
+    p_principal_sub = p_principal.add_subparsers(dest="principal_cmd", required=True)
+    p_set_role = p_principal_sub.add_parser(
+        "set-role",
+        help="Change a user's system role via PATCH /admin/principal/{idx}/system-role"
+        " (system_admin, admin:user; audited). A demotion applies to the user's"
+        " existing tokens at once; a promotion reaches them only on a token minted"
+        " after it, so the user must `qiita login` again.",
+    )
+    p_set_role.add_argument("--email", required=True)
+    p_set_role.add_argument("--role", required=True, choices=list(_VALID_ROLE_VALUES))
+    p_set_role.add_argument(
+        "--reason", required=True, type=_nonblank_reason, help="Recorded in the audit event"
+    )
+    p_set_role.set_defaults(handler=_handle_principal_set_role)
 
     p_whoami = sub.add_parser("whoami", help="Print the authenticated principal")
     p_whoami.set_defaults(handler=_handle_whoami)
@@ -1431,6 +1455,7 @@ __all__ = [
     "_handle_mask_purge_failed",
     "_handle_masked_read_export",
     "_handle_owner_biosample_id",
+    "_handle_principal_set_role",
     "_handle_set_system_role",
     "_handle_ticket_force_fail",
     "_handle_token_revoke_all",
@@ -1443,6 +1468,8 @@ __all__ = [
     "_purge_failed",
     "_resubmit_work_ticket",
     "_select_purge_failed_candidates",
+    "_nonblank_reason",
+    "_principal_set_role",
     "_set_system_role",
     "_sql_str",
     "_sync_actions",

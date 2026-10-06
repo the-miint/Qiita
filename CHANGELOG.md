@@ -50,6 +50,42 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   naming no sample is 404.
   The access bar, and the 404 on a retired sample or retired study link, are those of
   the by-idx read.
+- `qiita-admin principal set-role --email E --role R --reason T` changes an
+  existing user's system role through the audited
+  `PATCH /admin/principal/{idx}/system-role` route, resolving the email via a new
+  `POST /admin/principal/lookup-by-email` (system_admin + `admin:user`). Unlike the
+  direct-DB `set-system-role` bootstrap path, the change lands in the audit log
+  with its reason. The PATCH now refuses an admin changing their own role, and
+  the study-access grant's email check now rejects control characters, which
+  previously surfaced as a 500 (#648).
+- **Rapid 16S amplicon processing: `golay-demux` + `amplicon` workflows (#244).**
+  Two workflows bring EMP-style 16S into Qiita. `golay-demux` (ingest) converts a pool's
+  Illumina 16S run with bcl-convert using a no-index dummy sheet built from RunInfo.xml
+  (every read to Undetermined, the Golay I1 emitted as a FASTQ), then Golay-barcode
+  demultiplexes the Undetermined I1/R1/R2 into per-sample reads in the DuckLake `read`
+  table; the [24,12,8] Golay decode cloud is generated in-job (no vendored table /
+  operator path). A run is submitted by id — `qiita submit-golay-demux
+  --instrument-run-id <id>` — which the control plane resolves to the BCL run folder
+  against `PATH_INGEST_ROOTS`, so the submitter never names a host path. `amplicon`
+  (process) denoises a pool's
+  stored reads with deblur (trim → dereplicate → SortMeRNA 16S pre-filter → UCHIME
+  chimera → MAFFT → deblur), **reference-agnostically**: every ASV gets a `feature_idx`
+  from its canonical sequence hash and per-sample counts land in the new DuckLake
+  `amplicon_membership` table (`prep_sample_idx, processing_idx, feature_idx, count`).
+  The ASV sequences themselves are stored too (`amplicon_sequence` +
+  `amplicon_sequence_chunks`, keyed by feature_idx, mirroring the assembly tables),
+  so an ASV is never recomputed to read back.
+  16S reads are not masked — the `denoise` step **streams** the pool's raw reads from the
+  data plane at runtime (a pool-scoped `read_block` DoGet); the runner stages nothing (the
+  stream spills transiently to the job workspace); the
+  SortMeRNA reference is materialized from a loaded `sequence_reference` (by reference_idx,
+  off fixed paths). A same-pool re-run is refused pending an explicit delete/`--force`.
+  The ASV-reference-match (e.g. GG2) feature table (exact ASV match, not similarity-based
+  closed-reference) is **derived on demand** by intersecting feature_idx with a
+  reference's membership — never stored (a tracked follow-up). The
+  deblur step works around [duckdb-miint#194](https://github.com/the-miint/duckdb-miint/issues/194)
+  (MAFFT litters `order`/`pre`/`trace` into the CWD on some strategies) by running MAFFT
+  in a per-job scratch dir (`miint.mafft_scratch_cwd`).
 - **A study-local sample field can be widened to text, taking its stored values
   with it (#628).** A field minted as numeric, boolean, or date could not be redeclared once
   values existed: the field-contract check runs when a metadata row is written, not when
@@ -77,6 +113,22 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   text is judged eligible as text rather than as the closed value set it left. A field
   whose values sit on published samples, or on samples whose link to the study has been
   retired, cannot be widened at all, and the answer says which.
+
+- **ENA import refuses non-public studies and flags held runs ENA later withdraws
+  (#634).** A suppressed study, or one with no public runs, fails before anything is
+  written, and a suppressed run in a public study is `excluded`. On re-import, runs Qiita
+  holds that the Portal no longer returns as public are checked against ENA's Browser
+  API (a workaround for duckdb-miint#289), including when the study itself is absent,
+  not public, or has no public runs: a non-public run is flagged
+  (`sequenced_sample.ena_status`) and skipped wherever retired samples are, and the flag
+  clears once the run is public again. The flags are recorded on the item as soon as
+  they commit. Lookups are batched, a batch that returns 500 is re-asked run by run, and
+  each request is retried once on a transport error or 5xx; a run that still fails, or
+  an unknown status, fails the item and writes no flag. A held run whose pool's
+  download completed without it is reported `held_not_downloaded`. Reads of a sample by
+  its own id are not gated, and in-flight work for a newly flagged run is logged, not
+  cancelled.
+
 - **`qiita submit-ena-import` / `qiita ena-import-status` submit and watch a batch ENA
   study import from the CLI (#629).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
   `--from-file`, one accession per line — a whole-line `#` comment only; a trailing
@@ -90,7 +142,6 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   to poll if it had already been created. `ena-import-status IDX` reads a batch's
   current state. Both require wet_lab_admin or system_admin, matching the routes' own
   gate.
-
 - **A study reader can export per-prep_sample SynDNA insert read counts as BIOM or Parquet
   (#621).** The read-mask workflow's new `persist-syndna-read-count` action (gated on
   `syndna_enabled`, appended after `finalize-mask-sample`) reduces the `syndna` step's
@@ -2032,6 +2083,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **`qiita submit-ena-import` and `POST /ena-import-batch` refuse a malformed accession
+  at submit (#635).** The shared validator checked only the prefix, so a bare `PRJEB`,
+  `PRJEBxyz` or `PRJEB11419,PRJNA1` was accepted and then failed item by item in the
+  background resolve. An accession must now be a known prefix followed by digits (a
+  sample prefix may carry one letter, as in `SAMEA` or `SAMEG`, per ENA's accession
+  guide); anything else exits 2 or answers 422 before a batch is created
+  (duckdb-miint#288).
 
 - **Native sequenced-sample import now locks its sequencing run and refuses pools whose download roster is already staged** — the POST route takes #602's sequencing_run advisory lock around the insert and 409s (covering a queued download ticket too) when the pool's latest download-ena-study ticket has already read its run roster, naming the run and telling the caller to add the sample to a new pool instead. The lock wait is bounded at 5s, well under the CLI's own HTTP timeout, and a wait that exhausts it answers 503 with Retry-After rather than an unbounded hang (#627).
 

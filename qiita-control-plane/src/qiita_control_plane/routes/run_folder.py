@@ -43,7 +43,7 @@ from ..auth.guards import require_role_at_least
 from ..auth.principal import Principal
 from ..config import Settings
 from ..deps import get_settings
-from ..ingest_path import IngestPathError, resolve_ingest_path
+from ..ingest_path import IngestPathError, resolve_ingest_path, resolve_run_folder
 
 router = APIRouter(prefix=PATH_RUN_FOLDER_PREFIX, tags=["run-folder"])
 
@@ -259,7 +259,10 @@ async def inspect_run_folder(
     path, and the two gates would be inconsistent otherwise.
     """
     try:
-        run_folder = resolve_ingest_path(body.path, roots=settings.path_ingest_roots)
+        if body.run_id is not None:
+            run_folder = resolve_run_folder(body.run_id, roots=settings.path_ingest_roots)
+        else:
+            run_folder = resolve_ingest_path(body.path, roots=settings.path_ingest_roots)
     except IngestPathError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

@@ -16,6 +16,7 @@ from qiita_common.api_paths import (
     PATH_ADMIN_MASKED_READ_EXPORT_TICKET,
     PATH_ADMIN_PREFIX,
     PATH_ADMIN_PRINCIPAL_DISABLED,
+    PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
     PATH_ADMIN_PRINCIPAL_RETIRED,
     PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
     PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE,
@@ -41,6 +42,8 @@ from qiita_common.models import (
     OwnerBiosampleIdExportResponse,
     OwnerBiosampleIdRow,
     PrincipalDisabledUpdate,
+    PrincipalLookupRequest,
+    PrincipalLookupResponse,
     PrincipalRetiredUpdate,
     PrincipalSystemRoleUpdate,
     RevokeAllTokensResponse,
@@ -61,6 +64,7 @@ from ..auth.token import mint_api_token
 from ..block_read import READ_MASKED_TABLE
 from ..deps import TxConnFactory, get_db_pool, get_flight_signing_key, get_tx_conn_factory
 from ..repositories.block import MASK_SAMPLE_COMPLETED
+from ..repositories.study_access import fetch_grantee_by_email
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["admin"])
 
@@ -168,6 +172,27 @@ async def create_service_account(
         expires_at=expires_at,
         created_at=datetime.now(UTC),
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/principal/lookup-by-email
+# ---------------------------------------------------------------------------
+
+
+@router.post(PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL)
+async def lookup_principal_by_email(
+    body: PrincipalLookupRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
+) -> PrincipalLookupResponse:
+    """Resolve a human user's email to the principal the
+    `/principal/{idx}/...` mutations take. 404 when no user has that email —
+    they have not logged in yet."""
+    found = await fetch_grantee_by_email(pool, email=body.email)
+    if found is None:
+        raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
+    return PrincipalLookupResponse(**found._asdict())
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +351,9 @@ async def set_principal_system_role(
     Pydantic's SystemRole StrEnum narrows it before we hit the DB."""
     if principal_idx == SYSTEM_PRINCIPAL_IDX:
         raise HTTPException(status_code=403, detail="cannot modify system principal's role")
+
+    if actor.principal_idx == principal_idx:
+        raise HTTPException(status_code=403, detail="admin cannot change their own role")
 
     async with tx() as conn:
         old_role = await conn.fetchval(
@@ -506,8 +534,11 @@ _OWNER_ID_STUDY_SQL = (
 # link, because a pool's samples are scoped to their prep_sample. Mirrors the
 # study-mode retirement handling: only the per-study link (psts.retired) is
 # filtered; entity-level prep_sample.retired / biosample.retired are
-# intentionally included (see the route docstring). Carries the prep_sample_idx
-# and ENA experiment/run accessions in addition to the biosample columns.
+# intentionally included (see the route docstring). An ENA-flagged
+# sequenced_sample (ss.ena_status IS NOT NULL) IS excluded -- a run ENA no
+# longer reports available must not surface in an export. Carries the
+# prep_sample_idx and ENA experiment/run accessions in addition to the
+# biosample columns.
 _OWNER_ID_POOL_SQL = (
     "SELECT b.idx AS biosample_idx,"
     "       b.biosample_accession,"
@@ -525,6 +556,7 @@ _OWNER_ID_POOL_SQL = (
     "  LEFT JOIN qiita.biosample_metadata m"
     "    ON m.biosample_idx = b.idx AND m.is_owner_biosample_id = true"
     " WHERE ss.sequenced_pool_idx = $2"
+    "   AND ss.ena_status IS NULL"
     " ORDER BY ss.prep_sample_idx"
 )
 
@@ -563,6 +595,11 @@ async def export_owner_biosample_id(
     reconciliation, notification) needs the withdrawn ones too. The two modes
     treat retirement identically — each filters its own study-membership link
     and neither filters the entity-level flag.
+
+    Pool mode additionally excludes an ENA-flagged sequenced_sample
+    (`sequenced_sample.ena_status IS NOT NULL`): a run ENA no longer reports
+    available is skipped here the same as everywhere a pool's active roster is
+    read, even though this is a governance export.
     """
     if await pool.fetchval("SELECT 1 FROM qiita.study WHERE idx = $1", study_idx) is None:
         raise HTTPException(status_code=404, detail=f"no study with idx={study_idx}")
@@ -619,14 +656,15 @@ async def export_owner_biosample_id(
 # minting), not the download — a multi-hour single-sample stream is unaffected.
 _EXPORT_TICKET_TTL_SECONDS = 3600
 
-# Roster of a sequenced_pool's non-retired samples to export: the prep_sample_idx
-# (the read_masked join key) + biosample_accession (the filename's leading part;
-# NULL until NCBI submission, surfaced so the export fails loudly rather than
-# silently dropping the sample) + the per-(mask_idx, prep_sample) completion gate
-# state (LEFT JOIN mask_sample — NULL when no gate row exists for this
-# (mask_idx, prep_sample); NULL means "not masked-complete under this mask", NOT an
-# exempt sample — gate contract in `fetch_mask_sample_state`). The pool-wide
-# run/pool idxs live on the manifest. `$2` is the mask_idx the manifest is scoped to.
+# Roster of a sequenced_pool's non-retired, non-ENA-flagged samples to export:
+# the prep_sample_idx (the read_masked join key) + biosample_accession (the
+# filename's leading part; NULL until NCBI submission, surfaced so the export
+# fails loudly rather than silently dropping the sample) + the per-(mask_idx,
+# prep_sample) completion gate state (LEFT JOIN mask_sample — NULL when no gate
+# row exists for this (mask_idx, prep_sample); NULL means "not masked-complete
+# under this mask", NOT an exempt sample — gate contract in
+# `fetch_mask_sample_state`). The pool-wide run/pool idxs live on the manifest.
+# `$2` is the mask_idx the manifest is scoped to.
 _MASKED_EXPORT_ROSTER_SQL = (
     "SELECT ss.prep_sample_idx, bs.biosample_accession, msamp.state AS mask_state"
     "  FROM qiita.sequenced_sample ss"
@@ -635,6 +673,7 @@ _MASKED_EXPORT_ROSTER_SQL = (
     "  LEFT JOIN qiita.mask_sample msamp"
     "    ON msamp.prep_sample_idx = ss.prep_sample_idx AND msamp.mask_idx = $2"
     " WHERE ss.sequenced_pool_idx = $1 AND ps.retired = false"
+    "   AND ss.ena_status IS NULL"
     " ORDER BY ss.prep_sample_idx"
 )
 
@@ -648,9 +687,10 @@ async def export_masked_read_manifest(
     mask_idx: int = Query(gt=0),
 ) -> MaskedReadExportManifest:
     """Roster manifest for a per-pool masked-read export: one row per
-    non-retired sample on the pool, each with the filename parts the
-    qiita-admin masked-read-export CLI needs. The caller then mints a per-sample
-    DoGet ticket and streams that sample's read_masked rows from the data plane.
+    non-retired, non-ENA-flagged sample on the pool, each with the filename
+    parts the qiita-admin masked-read-export CLI needs. The caller then mints a
+    per-sample DoGet ticket and streams that sample's read_masked rows from the
+    data plane.
 
     Gated by system_admin PLUS admin:masked_read_export — the first human
     masked-read pull. `mask_idx` is mandatory (the data plane keys read_masked

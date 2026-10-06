@@ -276,6 +276,115 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
     assert len({s.entrypoint for s in container_steps}) == 4
 
 
+def test_load_actions_loads_on_disk_amplicon_yaml():
+    """`workflows/amplicon/1.0.0.yaml` loads with the reference-agnostic Rapid 16S
+    shape: sequenced_pool-scoped; context REQUIRES sortmerna_reference_idx + trim;
+    the step chain is denoise (module; STREAMS the pool's reads — declares no reads
+    input) → mint-features → amplicon_load (module; threads processing_idx) →
+    register-files."""
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "amplicon" in by_id, "workflows/amplicon/1.0.0.yaml must load"
+    amplicon = by_id["amplicon"]
+
+    # sequenced_pool scope subjects a re-submit to the pool COMPLETED gate; a
+    # --force re-run is safe because amplicon_membership is replace-keyed on
+    # (prep_sample_idx, processing_idx), so it replaces rather than doubling.
+    assert amplicon.target_kind == ScopeTargetKind.SEQUENCED_POOL
+    assert amplicon.version == "1.0.0"
+    assert amplicon.context_schema["required"] == ["sortmerna_reference_idx", "trim"]
+
+    assert [s.name for s in amplicon.steps] == [
+        "denoise",
+        "mint-features",
+        "amplicon_load",
+        "register-files",
+    ]
+
+    denoise = next(s for s in amplicon.steps if s.name == "denoise")
+    assert denoise.module == "qiita_compute_orchestrator.jobs.amplicon_deblur"
+    # No reads input — the pool's reads STREAM at runtime (the absence is the signal).
+    assert "pool_reads" not in denoise.inputs and "reads" not in denoise.inputs
+    assert denoise.inputs == ["sortmerna_ref"]
+    assert denoise.params == {"primer": "primer", "trim": "trim", "orient_primer": "orient_primer"}
+    # asv_chunks carries the ASV bytes so amplicon_load can store the sequences.
+    assert denoise.outputs == ["asv_counts", "manifest", "asv_chunks"]
+
+    # mint-features binds the manifest by the literal name the dispatcher pins.
+    mint = next(s for s in amplicon.steps if s.name == "mint-features")
+    assert mint.inputs == ["manifest"]
+
+    load_step = next(s for s in amplicon.steps if s.name == "amplicon_load")
+    assert load_step.module == "qiita_compute_orchestrator.jobs.amplicon_load"
+    # manifest + asv_chunks feed the ASV sequence tables alongside the counts.
+    assert load_step.inputs == ["asv_counts", "feature_map", "manifest", "asv_chunks"]
+    # processing_idx via params -> runner mints the run identity before the loop.
+    assert load_step.params == {"processing_idx": "processing_idx"}
+    # Pure native + library primitives; no container steps.
+    assert not [s for s in amplicon.steps if getattr(s, "container", None)]
+
+
+def test_every_mint_features_entry_binds_manifest():
+    """The dispatcher pins mint-features to `inputs == ["manifest"]`
+    (_reconstruct.py); a workflow naming the binding anything else fails at submit,
+    not load. Pin it here so a mismatch is caught in the unit tier."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    for a in actions:
+        for s in a.steps:
+            if getattr(s, "name", None) == "mint-features":
+                assert s.inputs == ["manifest"], f"{a.action_id}: mint-features got {s.inputs!r}"
+
+
+def test_load_actions_loads_on_disk_golay_demux_yaml():
+    """`workflows/golay-demux/1.0.0.yaml` loads with the ingest shape:
+    sequenced_pool-scoped; context REQUIRES bcl_input_dir + amplicon + barcode_map
+    (no golay_table_path — the decode cloud is generated in-job); the step chain is
+    bcl_convert_prep → bcl_convert → golay_demux → register-files."""
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "golay-demux" in by_id, "workflows/golay-demux/1.0.0.yaml must load"
+    golay = by_id["golay-demux"]
+
+    assert golay.target_kind == ScopeTargetKind.SEQUENCED_POOL
+    assert golay.version == "1.0.0"
+    assert golay.context_schema["required"] == [
+        "bcl_input_dir",
+        "amplicon",
+        "barcode_map",
+    ]
+    # The vendored golay table is gone — the cloud is generated in-job.
+    assert "golay_table_path" not in golay.context_schema["properties"]
+
+    # bcl-convert (dummy no-index sheet) is now in-workflow, then the demux.
+    assert [s.name for s in golay.steps] == [
+        "bcl_convert_prep",
+        "bcl_convert",
+        "golay_demux",
+        "register-files",
+    ]
+
+    demux = next(s for s in golay.steps if s.name == "golay_demux")
+    assert demux.module == "qiita_compute_orchestrator.jobs.golay_demux"
+    assert "golay_table_path" not in demux.inputs
+    assert "convert_dir" in demux.inputs
+
+
 def test_load_actions_loads_on_disk_host_reference_add_yaml():
     """The actual on-disk `workflows/host-reference-add/1.0.0.yaml` loads as a
     valid ActionDefinition with the host-indexing shape:

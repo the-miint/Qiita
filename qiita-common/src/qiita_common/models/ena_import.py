@@ -58,9 +58,10 @@ class EnaRunImportOutcome(BaseModel):
     """One ENA run's registration outcome within a batch item, surfaced on
     `GET /api/v1/ena-import-batch/{idx}`.
 
-    `status` is the `EnaRunRegistrationStatus` value
-    (`registered` / `skipped_already_present` / `failed`). `failure_reason` is
-    set only on `failed`.
+    `status` is the `EnaRunRegistrationStatus` value (`registered` /
+    `skipped_already_present` / `excluded` / `failed` / `flagged_unavailable` /
+    `held_not_downloaded`). `failure_reason` is set on every status but the
+    first two.
     """
 
     run_accession: str

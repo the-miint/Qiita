@@ -22,7 +22,7 @@ from qiita_control_plane.ena_import import (
     DOWNLOAD_ENA_STUDY_ACTION_VERSION,
 )
 from qiita_control_plane.ena_import.batch import build_ena_import_study_semaphore
-from qiita_control_plane.testing.unique_names import unique_accession
+from qiita_control_plane.testing.unique_names import unique_ena_accession
 
 pytestmark = pytest.mark.db
 
@@ -46,13 +46,14 @@ _RUN_COLUMNS = (
     "fastq_md5",
     "read_count",
     "base_count",
+    "status",
 )
 
 
 def _fake_study_header(accession: str) -> tuple[list[str], list[tuple]]:
     return (
-        ["study_accession", "secondary_study_accession", "study_title"],
-        [(accession, None, f"title for {accession}")],
+        ["study_accession", "secondary_study_accession", "study_title", "status"],
+        [(accession, None, f"title for {accession}", "public")],
     )
 
 
@@ -73,6 +74,7 @@ def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
         [],
         None,
         None,
+        "public",
     )
     return list(_RUN_COLUMNS), [row]
 
@@ -369,7 +371,7 @@ async def test_submit_returns_202_with_pending_items(
     """POST N accessions -> 202 with N pending items; N studies get registered
     by the background task."""
     token, _ = admin_token
-    accessions = [unique_accession("PRJNA"), unique_accession("PRJEB")]
+    accessions = [unique_ena_accession("PRJNA"), unique_ena_accession("PRJEB")]
 
     resp = await eib_client.post(
         URL_ENA_IMPORT_BATCH_PREFIX,
@@ -401,7 +403,7 @@ async def test_submit_requires_admin_role(eib_client, regular_token):
     token, _ = regular_token
     resp = await eib_client.post(
         URL_ENA_IMPORT_BATCH_PREFIX,
-        json={"accessions": [unique_accession("PRJNA")]},
+        json={"accessions": [unique_ena_accession("PRJNA")]},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 403, resp.text
@@ -419,7 +421,7 @@ async def test_submit_rejects_empty_accessions(eib_client, admin_token):
 
 async def test_submit_rejects_malformed_accession(eib_client, admin_token, postgres_pool):
     token, _ = admin_token
-    good = unique_accession("PRJNA")
+    good = unique_ena_accession("PRJNA")
     resp = await eib_client.post(
         URL_ENA_IMPORT_BATCH_PREFIX,
         json={"accessions": [good, "SAMN0000001"]},
@@ -433,6 +435,25 @@ async def test_submit_rejects_malformed_accession(eib_client, admin_token, postg
     assert count == 0
 
 
+async def test_submit_rejects_bare_prefix_without_creating_batch(
+    eib_client, admin_token, postgres_pool
+):
+    token, pidx = admin_token
+    resp = await eib_client.post(
+        URL_ENA_IMPORT_BATCH_PREFIX,
+        json={"accessions": [unique_ena_accession("PRJNA"), "PRJEB"]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "followed by digits" in resp.json()["detail"]
+
+    count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.ena_import_batch WHERE submitted_by_principal_idx = $1",
+        pidx,
+    )
+    assert count == 0
+
+
 @pytest.mark.parametrize("unknown_field", ["backend", "source"])
 async def test_submit_rejects_unknown_request_fields(eib_client, admin_token, unknown_field):
     """`BatchImportRequest` pins extra="forbid" like every other *Request model
@@ -441,7 +462,7 @@ async def test_submit_rejects_unknown_request_fields(eib_client, admin_token, un
     token, _ = admin_token
     resp = await eib_client.post(
         URL_ENA_IMPORT_BATCH_PREFIX,
-        json={"accessions": [unique_accession("PRJNA")], unknown_field: "whatever"},
+        json={"accessions": [unique_ena_accession("PRJNA")], unknown_field: "whatever"},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 422, resp.text
@@ -456,7 +477,7 @@ async def test_submit_503_when_compute_backend_unconfigured(eib_client, admin_to
         token, _ = admin_token
         resp = await eib_client.post(
             URL_ENA_IMPORT_BATCH_PREFIX,
-            json={"accessions": [unique_accession("PRJNA")]},
+            json={"accessions": [unique_ena_accession("PRJNA")]},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 503
@@ -472,8 +493,8 @@ async def test_submit_503_when_compute_backend_unconfigured(eib_client, admin_to
 async def test_submit_isolates_per_study_failure_and_reports_per_item(
     eib_client, postgres_pool, admin_token, download_ena_study_action, monkeypatch
 ):
-    ok_accession = unique_accession("PRJNA")
-    bad_accession = unique_accession("PRJEB")
+    ok_accession = unique_ena_accession("PRJNA")
+    bad_accession = unique_ena_accession("PRJEB")
 
     real_query_runs = __import__(
         "qiita_control_plane.ena_import.miint_resolver", fromlist=["_query_ena_runs"]
