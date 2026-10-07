@@ -308,42 +308,253 @@ clean:
 ```yaml
 # .github/workflows/ci.yml
 name: CI
-on: [push, pull_request]
+on:
+  # Scope push to long-lived branches only. PR branches get a single
+  # pull_request run — avoids the duplicate push+PR runs (and the PR-only
+  # gates showing up as "Skipped" on a meaningless push-event run).
+  push:
+    branches: [main]
+  # `labeled` is here so adding the `ci-macos` label re-runs CI with the macOS
+  # matrix (see the config job) — the default types don't fire on a label change.
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  lint:
+  # Which OSes the matrix jobs fan out over. macOS runners are ~6-15× slower than
+  # Ubuntu for this suite and dominate PR wall-clock, while the deploy target is
+  # Linux — so PRs run Ubuntu-only for fast feedback and macOS coverage runs on
+  # every push to main (post-merge).
+  #
+  # The gap that leaves: a defect only macOS can see is found AFTER merge, with
+  # main already red. The test DB is isolated per xdist WORKER, so a test leaking
+  # rows into the shared DB only collides with an innocent test when the runner's
+  # core count co-locates them on one worker — which is precisely a bug the Ubuntu
+  # matrix cannot see. Label a PR `ci-macos` to fan out over macOS BEFORE merging;
+  # use it for anything touching shared test fixtures or cross-test DB state.
+  #
+  # Emitted as a JSON array string for `fromJSON` in each matrix below.
+  config:
     runs-on: ubuntu-latest
+    outputs:
+      os: ${{ steps.os.outputs.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: make lint
+      - id: os
+        env:
+          WANT_MACOS: ${{ github.event_name != 'pull_request'
+            || contains(github.event.pull_request.labels.*.name, 'ci-macos') }}
+        run: |
+          if [ "$WANT_MACOS" = "true" ]; then
+            echo 'os=["ubuntu-latest", "macos-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'os=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi
 
-  test-unit:
-    runs-on: ubuntu-latest
+  lint-python:
+    needs: config
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.config.outputs.os) }}
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - run: make lint-python
+
+  # Lint and test the Rust workspace in one job: clippy/fmt and the test build
+  # share a checkout, toolchain, and warm rust-cache, and a single job avoids
+  # two concurrent jobs racing to write the same cache. lint runs first, so a
+  # clippy/fmt failure still stops the job before the test compile (matching the
+  # old test-rust -> lint-rust dependency). The one gating change: test-workflows
+  # now waits on this whole job (lint + test) rather than the lint alone.
+  rust:
+    needs: config
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.config.outputs.os) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - run: make test
+        with:
+          # Defensive: lint needs both. dtolnay defaults already include
+          # them, but pinning the request makes the intent explicit so a
+          # future default change can't silently drop one.
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: qiita-data-plane
+          prefix-key: "v1"  # bump to invalidate stale bundled-feature cache
+          # macOS preinstalls a `cargo` shim that is actually rustup-init,
+          # and ~/.cargo/bin/ isn't first on PATH. Caching that directory
+          # can shadow the toolchain dtolnay just installed and break
+          # `cargo clippy` on cache restore. Disable bin caching here.
+          cache-bin: false
+      - uses: ./.github/actions/setup-libduckdb
+        with:
+          runtime-libpath: "true"   # cargo test dlopens libduckdb
+          cache-extensions: "true"
+      - run: make lint-rust
+      - run: make test-rust
+
+  test-python:
+    needs: [config, lint-python]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.config.outputs.os) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - run: make test-python
+
+  test-control-plane-with-db:
+    needs: [config, lint-python]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.config.outputs.os) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - uses: ./.github/actions/setup-host-postgres
+        if: runner.os == 'macOS'
+      - run: make test-control-plane-with-db
 
   test-integration:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_PASSWORD: test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    needs: [config, test-python, rust]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.config.outputs.os) }}
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      # make test-integration builds the data-plane debug binary and the Rust
+      # DuckLake test binary, which without a cargo cache recompiles ~all deps
+      # (incl. the duckdb crate) cold — ~80s, the single largest slice of this
+      # job. Pin the toolchain + warm rust-cache + provide libduckdb (same setup
+      # as the `rust` job) so that compile is incremental on repeat runs.
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: qiita-data-plane
+          prefix-key: "v1"  # bump to invalidate stale bundled-feature cache
+          cache-bin: false  # see the rust job for rationale
+      - uses: ./.github/actions/setup-libduckdb
+        with:
+          runtime-libpath: "true"   # spawned data-plane + cargo test dlopen libduckdb
+          cache-extensions: "true"
+      - uses: ./.github/actions/setup-host-postgres
+        if: runner.os == 'macOS'
+        with:
+          ducklake: "true"
       - run: make test-integration
+
+  test-workflows:
+    needs: [lint-python, rust]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: ~/.apptainer/cache
+          key: apptainer-${{ runner.os }}-ubuntu-24.04
+      - name: Install Apptainer
+        run: |
+          APPTAINER_VERSION=1.4.5
+          sudo apt-get install -y fuse2fs uidmap
+          wget -q https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer_${APPTAINER_VERSION}_amd64.deb
+          sudo dpkg -i apptainer_${APPTAINER_VERSION}_amd64.deb
+          rm apptainer_${APPTAINER_VERSION}_amd64.deb
+      - run: make test-workflows
+
+  # Enforces the DEPLOY_CHECKLIST.md "## Pending deploy" fold (CLAUDE.md "Operator-facing
+  # changes"). If a PR touches an operator-impacting surface but never edits
+  # DEPLOY_CHECKLIST.md, it almost certainly forgot to run /deploy-note. Heuristic, not
+  # content-aware — the 'no-deploy-note' label opts out a PR that genuinely needs
+  # no operator action. No Claude involved; pure git diff.
+  deploy-note-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Require a Pending-deploy fold for operator-impacting changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          case ",$LABELS," in *,no-deploy-note,*)
+            echo "Skipped: 'no-deploy-note' label present."; exit 0;;
+          esac
+          git fetch --quiet origin "$BASE_REF"
+          changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
+          # High-signal operator-impacting surfaces. A change here almost always
+          # means env / migration / workflow / scope action on the deploy host.
+          impacting=$(printf '%s\n' "$changed" | grep -E \
+            -e '\.env\..*\.example$' \
+            -e '^qiita-control-plane/db/migrations/' \
+            -e '^workflows/' \
+            -e '^qiita-control-plane/src/qiita_control_plane/auth/scopes\.py$' || true)
+          if [ -z "$impacting" ]; then
+            echo "No operator-impacting changes — deploy-note fold not required."
+            exit 0
+          fi
+          echo "Operator-impacting files changed:"; printf '%s\n' "$impacting" | sed 's/^/  /'
+          if printf '%s\n' "$changed" | grep -qx 'DEPLOY_CHECKLIST.md'; then
+            echo "DEPLOY_CHECKLIST.md updated — assuming the steps were folded into ## Pending deploy."
+            exit 0
+          fi
+          {
+            echo "ERROR: this PR changes operator-impacting surfaces (above) but does not touch DEPLOY_CHECKLIST.md."
+            echo "Fold the operator steps into the '## Pending deploy' buckets — run /deploy-note on this branch."
+            echo "If this PR genuinely needs no operator action (a migration the dbmate flow handles on its"
+            echo "own, a workflow with no new env/scope, etc.), add the 'no-deploy-note' label to say so."
+          } >&2
+          exit 1
+
+  # Every PR records what it changed in CHANGELOG.md (the per-change log, distinct
+  # from the operator deploy checklist DEPLOY_CHECKLIST.md). Pure git diff, no
+  # Claude. A PR that genuinely warrants no entry (typo, CI-only, the changelog
+  # tooling itself) opts out with the 'no-changelog' label.
+  changelog-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Require a CHANGELOG.md entry
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          case ",$LABELS," in *,no-changelog,*)
+            echo "Skipped: 'no-changelog' label present."; exit 0;;
+          esac
+          git fetch --quiet origin "$BASE_REF"
+          changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
+          if printf '%s\n' "$changed" | grep -qx 'CHANGELOG.md'; then
+            echo "CHANGELOG.md updated."
+            exit 0
+          fi
+          {
+            echo "ERROR: this PR does not touch CHANGELOG.md."
+            echo "Add an entry under '## [Unreleased]' describing what changed, tagged (#N)."
+            echo "If this PR genuinely needs no changelog entry (typo, CI-only change, etc.),"
+            echo "add the 'no-changelog' label to opt out."
+          } >&2
+          exit 1
 ```
