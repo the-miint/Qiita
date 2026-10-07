@@ -2,9 +2,9 @@
 handle a published artifact carries in place of our minted identifiers.
 """
 
-from collections.abc import Sequence
-
 import asyncpg
+
+from ._exported_identifier_helpers import IncompleteMintError, missing_from
 
 # Every caller-visible column, plus the accessions that ride along for
 # information. Both accessions are LEFT-joined and nullable: an unaccessioned
@@ -28,31 +28,6 @@ _SELECT_LIVE = (
     "   AND NOT ei.retired"
     " ORDER BY ei.prep_sample_idx"
 )
-
-
-class IncompleteMintError(RuntimeError):
-    """The mint came back short of the cohort it was asked for.
-
-    Carries the missing `prep_sample_idx` values so the route can say which.
-    """
-
-    def __init__(self, missing: list[int]) -> None:
-        self.missing = missing
-        super().__init__(
-            f"{len(missing)} prep_sample(s) have no live exported identifier after"
-            f" minting: {missing}"
-        )
-
-
-def _missing_from(rows: Sequence[asyncpg.Record], prep_sample_idxs: Sequence[int]) -> list[int]:
-    """Cohort members with no row in `rows`, ascending.
-
-    A separate function because it is the only part of the mint that can be
-    exercised without racing two transactions against each other, and the thing it
-    guards is the response's headline promise.
-    """
-    returned = {row["prep_sample_idx"] for row in rows}
-    return sorted(idx for idx in set(prep_sample_idxs) if idx not in returned)
 
 
 async def mint_exported_identifiers(
@@ -98,7 +73,7 @@ async def mint_exported_identifiers(
         )
         rows = await conn.fetch(_SELECT_LIVE, alignment_idx, prep_sample_idxs)
 
-    missing = _missing_from(rows, prep_sample_idxs)
+    missing = missing_from(rows, prep_sample_idxs, key="prep_sample_idx")
     if missing:
-        raise IncompleteMintError(missing)
+        raise IncompleteMintError(missing, kind="prep_sample")
     return rows

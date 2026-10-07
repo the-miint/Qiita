@@ -17,6 +17,7 @@ from qiita_control_plane.repositories.study_access import (
     CallerStudyAccessRow,
     fetch_caller_study_access,
 )
+from qiita_control_plane.testing.db_seeds import seed_study
 
 pytestmark = pytest.mark.db
 
@@ -39,22 +40,14 @@ async def _seed_user(pool, *, suffix: str) -> int:
     return pidx
 
 
-async def _seed_study(pool, *, owner_idx: int) -> int:
-    """Insert a minimal qiita.study row owned by owner_idx, return its idx."""
-    return await pool.fetchval(
-        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
-        " VALUES ($1, $2, $1) RETURNING idx",
-        owner_idx,
-        f"sa-{secrets.token_hex(4)}",
-    )
-
-
 @pytest_asyncio.fixture
 async def ctx(postgres_pool):
     """Seed a caller-user, an owner-user, and a study owned by the owner."""
     caller_idx = await _seed_user(postgres_pool, suffix="caller")
     owner_idx = await _seed_user(postgres_pool, suffix="owner")
-    study_idx = await _seed_study(postgres_pool, owner_idx=owner_idx)
+    study_idx = await seed_study(
+        postgres_pool, owner_idx=owner_idx, title=f"sa-{secrets.token_hex(4)}"
+    )
 
     yield {
         "pool": postgres_pool,

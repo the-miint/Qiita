@@ -46,6 +46,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
     seed_sequenced_sample_subtype,
     seed_service_principal,
+    seed_study,
     seed_user_principal,
 )
 from qiita_control_plane.testing.unique_names import unique_field_name
@@ -334,11 +335,10 @@ async def _seed_study(ctx, *, owner_idx: int, suffix: str) -> int:
     The title is uniquified with `suffix` plus a random token so concurrent
     tests never collide.
     """
-    study_idx = await ctx["pool"].fetchval(
-        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
-        " VALUES ($1, $2, $1) RETURNING idx",
-        owner_idx,
-        f"route-study-{suffix}-{secrets.token_hex(4)}",
+    study_idx = await seed_study(
+        ctx["pool"],
+        owner_idx=owner_idx,
+        title=f"route-study-{suffix}-{secrets.token_hex(4)}",
     )
     ctx["created"]["study"].append(study_idx)
     return study_idx
@@ -963,23 +963,6 @@ async def assert_study_scoped_sample_authz(
 # ---------------------------------------------------------------------------
 # Generic FK-reverse delete helper
 # ---------------------------------------------------------------------------
-
-
-async def delete_idxs(pool, table: str, idxs) -> None:
-    """Bulk-delete by idx; tolerates a bare int or an iterable; empty is a no-op.
-
-    Used by per-route `_cleanup_tracked` to drop test-created rows in
-    FK-reverse order. The table name is interpolated, so callers must pass
-    a static schema-qualified suffix (e.g., 'study', not user-input).
-    """
-    if isinstance(idxs, int):
-        idxs = [idxs]
-    if not idxs:
-        return
-    await pool.execute(
-        f"DELETE FROM qiita.{table} WHERE idx = ANY($1::bigint[])",
-        idxs,
-    )
 
 
 async def etag_for_row(pool, *, table: UpdatableTable, row_idx: int) -> str:

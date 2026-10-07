@@ -30,6 +30,7 @@ from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADA
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.routes import biosample as routes_biosample
 from qiita_control_plane.testing.db_seeds import (
+    delete_idxs,
     fetch_seeded_metagenome_term,
     retire_biosample,
     retire_biosample_to_study_link,
@@ -63,7 +64,6 @@ from .conftest import (
     assert_study_field_get_authz,
     assert_study_field_list_authz,
     assert_study_scoped_sample_authz,
-    delete_idxs,
     etag_for_row,
     post_study_field,
     resolve_ineligible_owner_idx,

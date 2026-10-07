@@ -28,6 +28,7 @@ from qiita_common.models import ScopeTargetKind
 
 from qiita_control_plane.testing.db_seeds import (
     delete_action_if_created,
+    delete_idxs,
     seed_action_if_absent,
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
@@ -37,7 +38,6 @@ from qiita_control_plane.testing.db_seeds import (
 from .conftest import (  # noqa: F401
     _grant_study_access,
     _seed_study,
-    delete_idxs,
     role_keyed_clients,
 )
 

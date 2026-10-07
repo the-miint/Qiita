@@ -51,6 +51,25 @@ NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
 SEEDED_TERMINOLOGY_LOADED_AT = datetime(2026, 1, 15, 12, 30, 0, tzinfo=UTC)
 
 
+async def delete_idxs(pool: asyncpg.Pool, table: str, idxs) -> None:
+    """Delete rows by idx from qiita.<table>.
+
+    `idxs` may be a scalar int or an iterable of ints; an empty iterable is a
+    no-op. The scalar form is normalised so callers can pass a single
+    auto-seeded idx without wrapping it in a list. `table` is interpolated into
+    the statement, so it must be a literal the caller wrote, never input.
+    """
+    # Normalize a bare int into a one-element list so callers can pass either.
+    if isinstance(idxs, int):
+        idxs = [idxs]
+    if not idxs:
+        return
+    await pool.execute(
+        f"DELETE FROM qiita.{table} WHERE idx = ANY($1::bigint[])",
+        idxs,
+    )
+
+
 async def fetch_ncbi_taxonomy_term(pool: asyncpg.Pool, term_id: str) -> asyncpg.Record | None:
     """Return a seeded NCBI Taxonomy term row (idx, term_id, label,
     terminology_idx) by its term_id, or None when the migration did not seed it.
@@ -423,6 +442,74 @@ async def seed_biosample(
         owner_idx,
         created_by_idx,
     )
+
+
+async def seed_study(
+    pool: asyncpg.Pool,
+    *,
+    owner_idx: int,
+    title: str,
+    created_by_idx: int | None = None,
+) -> int:
+    """Insert a minimal qiita.study row; return its idx.
+
+    `created_by_idx` defaults to `owner_idx`. Only the NOT-NULL columns are
+    populated; every other column carries its schema default.
+    """
+    author_idx = owner_idx if created_by_idx is None else created_by_idx
+    study_idx = await pool.fetchval(
+        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
+        " VALUES ($1, $2, $3) RETURNING idx",
+        owner_idx,
+        title,
+        author_idx,
+    )
+    return study_idx
+
+
+async def seed_exported_entity_probe(
+    pool: asyncpg.Pool,
+    *,
+    prefix: str,
+    study_count: int,
+) -> tuple[int, list[int], int]:
+    """Insert one principal owning `study_count` studies and one biosample;
+    return (principal_idx, study_idxs, biosample_idx).
+    """
+    # A user-kind principal: qiita.biosample.owner_idx is guarded by a role-typed
+    # FK trigger that rejects a service account.
+    principal_idx = await seed_user_principal(pool, prefix=prefix, suffix="probe")
+    study_idxs = [
+        await seed_study(pool, owner_idx=principal_idx, title=f"{prefix} probe {position}")
+        for position in range(study_count)
+    ]
+    biosample_idx = await seed_biosample(
+        pool, owner_idx=principal_idx, created_by_idx=principal_idx
+    )
+    return principal_idx, study_idxs, biosample_idx
+
+
+async def cleanup_exported_entity_probe(
+    pool: asyncpg.Pool,
+    *,
+    principal_idx: int,
+    study_idxs: list[int],
+    biosample_idx: int,
+) -> None:
+    """Delete what seed_exported_entity_probe inserted, handle rows included."""
+    # The handle rows first: both FKs are RESTRICT, so a parent cannot go while one
+    # still names it.
+    await pool.execute(
+        "DELETE FROM qiita.exported_entity"
+        " WHERE study_idx = ANY($1::bigint[]) OR biosample_idx = $2",
+        study_idxs,
+        biosample_idx,
+    )
+    await delete_idxs(pool, "biosample", biosample_idx)
+    await delete_idxs(pool, "study", study_idxs)
+    # qiita.user is keyed by principal_idx, not idx, so it is not a delete_idxs call.
+    await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
+    await delete_idxs(pool, "principal", principal_idx)
 
 
 async def seed_sequenced_prep_sample(

@@ -31,6 +31,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_feature_genome,
     seed_genome,
     seed_sequenced_sample_subtype,
+    seed_study,
 )
 
 pytestmark = pytest.mark.db
@@ -68,22 +69,15 @@ def _install_settings(app):
     )
 
 
-async def _seed_study(pool, owner_idx):
-    return await pool.fetchval(
-        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
-        " VALUES ($1, $2, $1) RETURNING idx",
-        owner_idx,
-        f"pool-del-{secrets.token_hex(4)}",
-    )
-
-
 async def _seed_pool_with_sample(pool, owner_idx):
     """Seed a full study → biosample → prep_sample → run → pool →
     sequenced_sample chain plus the two study links the triggers need.
 
     Returns a dict of every idx so the cascade's per-table effects can be
     asserted and a blocked delete can be cleaned up FK-reverse."""
-    study_idx = await _seed_study(pool, owner_idx)
+    study_idx = await seed_study(
+        pool, owner_idx=owner_idx, title=f"pool-del-{secrets.token_hex(4)}"
+    )
     biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
         pool, owner_idx=owner_idx
     )

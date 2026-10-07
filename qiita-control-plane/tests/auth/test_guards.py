@@ -16,6 +16,8 @@ from fastapi import HTTPException
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import Tier
 
+from qiita_control_plane.testing.db_seeds import seed_study
+
 
 def _human(*, role=SystemRole.USER, scopes=frozenset(), profile_complete=True):
     from qiita_control_plane.auth.principal import HumanUser
@@ -400,15 +402,6 @@ async def _seed_user_for_study(pool, *, suffix: str, role: SystemRole = SystemRo
     return pidx
 
 
-async def _seed_study_for_test(pool, *, owner_idx: int) -> int:
-    return await pool.fetchval(
-        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
-        " VALUES ($1, $2, $1) RETURNING idx",
-        owner_idx,
-        f"req-sa-{secrets.token_hex(4)}",
-    )
-
-
 def _human_with_idx(principal_idx: int, role: SystemRole = SystemRole.USER):
     """HumanUser pinned to a given principal_idx. Required for DB tests
     where the synthesised principal must match a real seeded user."""
@@ -430,7 +423,9 @@ async def study_access_ctx(postgres_pool):
     """Seed a caller-user, an owner-user, and a study owned by the owner."""
     caller_idx = await _seed_user_for_study(postgres_pool, suffix="caller")
     owner_idx = await _seed_user_for_study(postgres_pool, suffix="owner")
-    study_idx = await _seed_study_for_test(postgres_pool, owner_idx=owner_idx)
+    study_idx = await seed_study(
+        postgres_pool, owner_idx=owner_idx, title=f"req-sa-{secrets.token_hex(4)}"
+    )
 
     yield {
         "pool": postgres_pool,
@@ -1124,8 +1119,10 @@ async def test_filter_studies_returns_only_the_readable_subset(study_access_ctx)
     readable = study_access_ctx["study_idx"]
     # A second study the caller holds nothing on. Seeded here rather than in the
     # fixture so the fixture stays shared with the raising-gate tests.
-    unreadable = await _seed_study_for_test(
-        study_access_ctx["pool"], owner_idx=study_access_ctx["owner_idx"]
+    unreadable = await seed_study(
+        study_access_ctx["pool"],
+        owner_idx=study_access_ctx["owner_idx"],
+        title=f"req-sa-{secrets.token_hex(4)}",
     )
     caller = _human_with_idx(study_access_ctx["caller_idx"])
     try:

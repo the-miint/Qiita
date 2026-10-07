@@ -21,6 +21,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Studies and biosamples can be named publicly without exposing an internal identifier (#N).**
+  A new `qiita.exported_entity` table mints a permanent handle — `QS<n>` for a study, `QB<n>` for
+  a biosample — so anything crossing the Qiita boundary can name one without carrying its `*_idx`.
+  Postgres composes the handle as a generated column, so no caller can supply one and none can be
+  edited after publication. It carries no retirement columns: both parents are referenced
+  `ON DELETE RESTRICT` and neither has a purge path, so a handle cannot be detached from what it
+  names, and a retired entity's state is read from the entity rather than copied. The migration
+  records the four conditions an entity must satisfy to belong in the table.
+
 - **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
   reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
   biosample, and upsert this study's metadata on it, naming the sample by a

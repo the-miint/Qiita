@@ -36,6 +36,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 
 from qiita_control_plane.testing.db_seeds import (
+    delete_idxs,
     seed_service_principal,
     seed_user_principal,
 )
@@ -46,7 +47,6 @@ from .conftest import (
     IneligibilityKind,
     _grant_study_access,
     assert_owner_ineligibility_422,
-    delete_idxs,
     etag_for_row,
     resolve_ineligible_owner_idx,
 )

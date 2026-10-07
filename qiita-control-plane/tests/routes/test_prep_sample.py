@@ -14,6 +14,7 @@ from qiita_common.models import FieldDataType
 
 from qiita_control_plane.main import app
 from qiita_control_plane.testing.db_seeds import (
+    delete_idxs,
     fetch_seeded_metagenome_term,
     retire_prep_sample_to_study_link,
     seed_biosample,
@@ -34,7 +35,6 @@ from .conftest import (
     assert_study_field_create_conflict,
     assert_study_field_get_authz,
     assert_study_field_list_authz,
-    delete_idxs,
     post_study_field,
 )
 

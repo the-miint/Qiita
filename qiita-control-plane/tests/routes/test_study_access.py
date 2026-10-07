@@ -21,9 +21,9 @@ from qiita_common.auth_constants import AuthEventType, Scope
 from qiita_common.models import Tier
 
 from qiita_control_plane.routes.study_access import _MSG_ACCOUNT_INACTIVE, _MSG_CONCURRENT
-from qiita_control_plane.testing.db_seeds import seed_user_principal
+from qiita_control_plane.testing.db_seeds import delete_idxs, seed_user_principal
 
-from .conftest import _grant_study_access, _seed_study, delete_idxs
+from .conftest import _grant_study_access, _seed_study
 
 pytestmark = pytest.mark.db
 

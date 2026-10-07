@@ -14,14 +14,13 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.main import app
-from qiita_control_plane.testing.db_seeds import seed_terminology
+from qiita_control_plane.testing.db_seeds import delete_idxs, seed_terminology
 
 from .conftest import (
     BIOSAMPLE_FIELD_SURFACE,
     PREP_SAMPLE_FIELD_SURFACE,
     SampleFieldSurface,
     _seed_field_global,
-    delete_idxs,
     sibling_field_surface,
 )
 

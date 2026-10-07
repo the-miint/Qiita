@@ -25,19 +25,11 @@ from qiita_control_plane.testing.db_seeds import (
     retire_prep_sample_to_study_link,
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
+    seed_study,
     seed_user_principal,
 )
 
 pytestmark = pytest.mark.db
-
-
-async def _seed_study(pool, *, owner_idx: int) -> int:
-    return await pool.fetchval(
-        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
-        " VALUES ($1, $2, $1) RETURNING idx",
-        owner_idx,
-        f"batched-links-{secrets.token_hex(4)}",
-    )
 
 
 @pytest_asyncio.fixture
@@ -50,8 +42,12 @@ async def links(postgres_pool):
     """
     suffix = secrets.token_hex(4)
     principal_idx = await seed_user_principal(postgres_pool, prefix="batch-links", suffix=suffix)
-    study_1 = await _seed_study(postgres_pool, owner_idx=principal_idx)
-    study_2 = await _seed_study(postgres_pool, owner_idx=principal_idx)
+    study_1 = await seed_study(
+        postgres_pool, owner_idx=principal_idx, title=f"batched-links-{secrets.token_hex(4)}"
+    )
+    study_2 = await seed_study(
+        postgres_pool, owner_idx=principal_idx, title=f"batched-links-{secrets.token_hex(4)}"
+    )
 
     samples = []
     for _ in range(3):

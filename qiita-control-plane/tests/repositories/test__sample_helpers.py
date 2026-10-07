@@ -110,6 +110,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_global_field,
     seed_local_study_field,
     seed_prep_sample_global_field,
+    seed_study,
 )
 from qiita_control_plane.testing.unique_names import unique_field_name
 
@@ -121,7 +122,6 @@ from .conftest import (
     _create_prep_sample_with_link,
     _seed_global_field_for_spec,
     _seed_secondary_studies_for_entity,
-    _seed_study,
     _seed_unlinked_entity_for_spec,
     _set_unique_in_study,
     _track_to_study_link,
@@ -195,8 +195,8 @@ async def _create_second_study_and_link_biosample(ctx, bs_idx):
     Used by the two different-study collision tests.
     """
     # Second study owned by the ctx principal so role-typed FK triggers pass.
-    second_study_idx = await _seed_study(
-        ctx["pool"], ctx["principal_idx"], f"second-{secrets.token_hex(4)}"
+    second_study_idx = await seed_study(
+        ctx["pool"], owner_idx=ctx["principal_idx"], title=f"second-{secrets.token_hex(4)}"
     )
     ctx["created"]["studies"].append(second_study_idx)
     async with ctx["pool"].acquire() as conn:
@@ -2353,8 +2353,8 @@ async def test_fetch_study_fields_by_display_names_scoped_to_study(ctx, spec):
             )
     ctx["created"][study_field_key].append(field_idx)
 
-    other_study_idx = await _seed_study(
-        ctx["pool"], ctx["principal_idx"], f"other-{secrets.token_hex(4)}"
+    other_study_idx = await seed_study(
+        ctx["pool"], owner_idx=ctx["principal_idx"], title=f"other-{secrets.token_hex(4)}"
     )
     ctx["created"]["studies"].append(other_study_idx)
 

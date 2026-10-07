@@ -63,6 +63,7 @@ from qiita_control_plane.runner import ENA_RUN_MAP_BINDING, _stage_ena_run_roste
 from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_HUMAN_TERM_ID,
     delete_action_if_created,
+    delete_idxs,
     fetch_missing_value_reason_idx,
     fetch_ncbi_taxonomy_term,
     fetch_seeded_metagenome_term,
@@ -86,7 +87,6 @@ from .conftest import (
     _seed_study,
     assert_owner_ineligibility_422,
     assert_submission_error_cleared_on_new_attempt,
-    delete_idxs,
     resolve_ineligible_owner_idx,
     unique_instrument_id,
 )

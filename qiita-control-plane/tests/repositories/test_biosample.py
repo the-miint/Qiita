@@ -50,6 +50,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_global_field,
     seed_globally_linked_study_field,
     seed_local_study_field,
+    seed_study,
     track_biosample_metadata_outputs,
 )
 from qiita_control_plane.testing.unique_names import (
@@ -58,10 +59,7 @@ from qiita_control_plane.testing.unique_names import (
     unique_matrix_tube_id,
 )
 
-from .conftest import (
-    _create_biosample_with_link,
-    _seed_study,
-)
+from .conftest import _create_biosample_with_link
 
 pytestmark = pytest.mark.db
 
@@ -610,8 +608,8 @@ async def test_import_biosample_from_owner_biosample_id_uses_independent_field_p
     # Seed a second study owned by the same principal so the same display_name
     # can appear in both. The biosample_study_field UNIQUE (study_idx,
     # display_name) constraint is study-scoped, so two rows must result.
-    second_study_idx = await _seed_study(
-        ctx["pool"], ctx["principal_idx"], f"bs-extra-{secrets.token_hex(4)}"
+    second_study_idx = await seed_study(
+        ctx["pool"], owner_idx=ctx["principal_idx"], title=f"bs-extra-{secrets.token_hex(4)}"
     )
     ctx["created"]["studies"].append(second_study_idx)
 

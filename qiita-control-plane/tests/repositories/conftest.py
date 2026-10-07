@@ -30,10 +30,12 @@ from qiita_control_plane.repositories.biosample import insert_biosample
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.testing.db_seeds import (
+    delete_idxs,
     seed_biosample_global_field,
     seed_local_study_field,
     seed_prep_sample_global_field,
     seed_sequenced_prep_sample,
+    seed_study,
 )
 from qiita_control_plane.testing.unique_names import unique_field_name
 
@@ -163,16 +165,6 @@ async def _seed_user(pool, principal_idx, email):
     )
 
 
-async def _seed_study(pool, owner_idx, title):
-    """Insert a minimal qiita.study row, return its idx."""
-    return await pool.fetchval(
-        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
-        " VALUES ($1, $2, $1) RETURNING idx",
-        owner_idx,
-        title,
-    )
-
-
 async def _seed_metadata_checklist(pool, name):
     """Insert a minimal qiita.metadata_checklist row, return its idx."""
     return await pool.fetchval(
@@ -186,24 +178,6 @@ async def _seed_metadata_checklist(pool, name):
 # ---------------------------------------------------------------------------
 
 
-async def _delete_idxs(pool, table, idxs):
-    """Delete rows by idx from qiita.<table>.
-
-    `idxs` may be a scalar int or an iterable of ints; an empty iterable
-    is a no-op. The scalar form is normalised so callers can pass a single
-    auto-seeded idx without wrapping in a list.
-    """
-    # Normalize a bare int into a one-element list so callers can pass either.
-    if isinstance(idxs, int):
-        idxs = [idxs]
-    if not idxs:
-        return
-    await pool.execute(
-        f"DELETE FROM qiita.{table} WHERE idx = ANY($1::bigint[])",
-        idxs,
-    )
-
-
 async def _cleanup_tracked(pool, created):
     """FK-reverse cleanup of every row tracked in `created`.
 
@@ -214,9 +188,9 @@ async def _cleanup_tracked(pool, created):
     common biosample surface.
     """
     # Sweep the EAV value rows first; they reference everything else.
-    await _delete_idxs(pool, "biosample_metadata", created["biosample_metadata"])
+    await delete_idxs(pool, "biosample_metadata", created["biosample_metadata"])
     # Field rows reference biosample_global_field and terminology.
-    await _delete_idxs(pool, "biosample_study_field", created["biosample_study_field"])
+    await delete_idxs(pool, "biosample_study_field", created["biosample_study_field"])
     for bs, st in created["biosample_to_study"]:
         await pool.execute(
             "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
@@ -227,8 +201,8 @@ async def _cleanup_tracked(pool, created):
     # the composite-keyed link, then the prep_sample itself — which must
     # go before its biosample (prep_sample.biosample_idx FK) is swept just
     # below. prep_sample_to_study is composite-keyed like biosample_to_study.
-    await _delete_idxs(pool, "prep_sample_metadata", created["prep_sample_metadata"])
-    await _delete_idxs(pool, "prep_sample_study_field", created["prep_sample_study_field"])
+    await delete_idxs(pool, "prep_sample_metadata", created["prep_sample_metadata"])
+    await delete_idxs(pool, "prep_sample_study_field", created["prep_sample_study_field"])
     for ps, st in created["prep_sample_to_study"]:
         await pool.execute(
             "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
@@ -239,23 +213,23 @@ async def _cleanup_tracked(pool, created):
     # RESTRICT, so they must go before the prep_sample sweep below. Tests
     # that don't seed a subtype leave this list empty and the call is a
     # no-op via _delete_idxs.
-    await _delete_idxs(pool, "sequenced_sample", created["sequenced_sample"])
-    await _delete_idxs(pool, "prep_sample", created["prep_sample"])
-    await _delete_idxs(pool, "biosample", created["biosample"])
+    await delete_idxs(pool, "sequenced_sample", created["sequenced_sample"])
+    await delete_idxs(pool, "prep_sample", created["prep_sample"])
+    await delete_idxs(pool, "biosample", created["biosample"])
     # study_access references study with ON DELETE RESTRICT, so any
     # study_access rows seeded by tests must go before the auto-seeded
     # study row deletion at the end of the fixture.
-    await _delete_idxs(pool, "study_access", created["study_access"])
+    await delete_idxs(pool, "study_access", created["study_access"])
     # biosample_global_field and terminology_term both reference terminology;
     # missing_value_reason has no inbound refs left after biosample_metadata.
-    await _delete_idxs(pool, "biosample_global_field", created["biosample_global_field"])
+    await delete_idxs(pool, "biosample_global_field", created["biosample_global_field"])
     # prep_sample_study_field and prep_sample_metadata were swept above, so
     # prep_sample_global_field has no inbound refs left at this tier.
-    await _delete_idxs(pool, "prep_sample_global_field", created["prep_sample_global_field"])
-    await _delete_idxs(pool, "terminology_term", created["terminology_term"])
-    await _delete_idxs(pool, "missing_value_reason", created["missing_value_reason"])
-    await _delete_idxs(pool, "terminology", created["terminology"])
-    await _delete_idxs(pool, "study", created["studies"])
+    await delete_idxs(pool, "prep_sample_global_field", created["prep_sample_global_field"])
+    await delete_idxs(pool, "terminology_term", created["terminology_term"])
+    await delete_idxs(pool, "missing_value_reason", created["missing_value_reason"])
+    await delete_idxs(pool, "terminology", created["terminology"])
+    await delete_idxs(pool, "study", created["studies"])
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +264,7 @@ async def ctx(postgres_pool):
         postgres_pool, f"bs-owner-{token}", created_by_idx=principal_idx
     )
     await _seed_user(postgres_pool, biosample_owner_idx, f"bs-owner-{token}@test.local")
-    study_idx = await _seed_study(postgres_pool, principal_idx, f"bs-{token}")
+    study_idx = await seed_study(postgres_pool, owner_idx=principal_idx, title=f"bs-{token}")
     checklist_name = f"bs-checklist-{token}"
     checklist_idx = await _seed_metadata_checklist(postgres_pool, checklist_name)
 
@@ -329,8 +303,8 @@ async def ctx(postgres_pool):
 
     # Sweep test-populated rows then the auto-seeded support rows.
     await _cleanup_tracked(postgres_pool, created)
-    await _delete_idxs(postgres_pool, "metadata_checklist", checklist_idx)
-    await _delete_idxs(postgres_pool, "study", study_idx)
+    await delete_idxs(postgres_pool, "metadata_checklist", checklist_idx)
+    await delete_idxs(postgres_pool, "study", study_idx)
     # qiita.user → qiita.principal is ON DELETE RESTRICT, so the user rows
     # must go before the principals they reference. The role-typed
     # user_no_delete_if_study_owner and user_no_delete_if_biosample_owner
@@ -343,7 +317,7 @@ async def ctx(postgres_pool):
     # principal FK is DEFERRABLE INITIALLY DEFERRED, so deleting both rows in
     # one statement is fine — the biosample_owner_idx → principal_idx
     # reference is checked at commit, after both rows are gone.
-    await _delete_idxs(postgres_pool, "principal", [biosample_owner_idx, principal_idx])
+    await delete_idxs(postgres_pool, "principal", [biosample_owner_idx, principal_idx])
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +464,9 @@ async def _seed_secondary_studies_for_entity(ctx, spec, entity_idx, count):
     # Seed each study and its (optional) biosample link.
     new_study_idxs: list[int] = []
     for _ in range(count):
-        st_idx = await _seed_study(ctx["pool"], ctx["principal_idx"], f"sec-{secrets.token_hex(4)}")
+        st_idx = await seed_study(
+            ctx["pool"], owner_idx=ctx["principal_idx"], title=f"sec-{secrets.token_hex(4)}"
+        )
         ctx["created"]["studies"].append(st_idx)
         new_study_idxs.append(st_idx)
         if biosample_idx is not None:
