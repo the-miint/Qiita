@@ -296,7 +296,9 @@ def _checkm_pins() -> dict[str, str]:
     m = re.search(r'^\s*CHECKM_PINS="([^"]*)"$', _CHECKM_DEF.read_text(), re.MULTILINE)
     assert m, "checkm.def no longer sets CHECKM_PINS"
     entries = m.group(1).split()
-    malformed = [e for e in entries if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*==[^=\s]+", e)]
+    malformed = [
+        e for e in entries if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*==[A-Za-z0-9._+!]+", e)
+    ]
     assert not malformed, f"CHECKM_PINS entries must be exact `tool==version`: {malformed}"
     return dict(e.split("==", 1) for e in entries)
 
@@ -333,4 +335,6 @@ def test_checkm_spec_verifies_the_pinned_checkm_version() -> None:
         f"VERIFY_CMD must check the pinned CheckM exactly: {cmd.group(1)!r}"
     )
     assert re.search(match.group(1), f"checkm-genome=={pinned}")
-    assert not re.search(match.group(1), "checkm-genome==1.2.4")
+    # What VERIFY_CMD prints when the pin is absent: nothing, or grep's own error.
+    assert not re.search(match.group(1), "")
+    assert not re.search(match.group(1), "grep: /opt/qiita/checkm.pins: No such file or directory")

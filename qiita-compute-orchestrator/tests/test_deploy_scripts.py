@@ -1054,7 +1054,7 @@ def _lake_gc_env(tmp_path, *, writable: bool = True) -> dict:
     [
         ("echo 'v1.0.0 (stub) 0'", "printed 'v1.0.0 (stub) 0'"),
         (":", "printed 'nothing'"),
-        ("echo 'cannot execute binary file' >&2; exit 126", "cannot execute binary file"),
+        ("echo 'cannot execute binary file' >&2; exit 126", "printed 'cannot execute binary file'"),
     ],
     ids=["other-version", "silent", "unrunnable"],
 )

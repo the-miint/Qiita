@@ -75,8 +75,8 @@ From: mambaorg/micromamba:1.5.8
     # Pinned: completeness and contamination depend on all four, and an edit to
     # any of checkm.env's HASH_INPUTS rebuilds this image, so an unpinned solve
     # would re-score MAGs under the same workflow version with whatever bioconda
-    # carries that day. `==`, because conda reads `tool=X` as `X.*` and would take
-    # the next patch release. %test checks that every pin resolved.
+    # carries that day. Each pin is an exact `==` version, and %test checks that
+    # every one resolved.
     #
     # Expect a loud, HARMLESS error from checkm-genome's conda post-link script:
     # it tries to `wget` the ~1.4 GB reference DB into the env and fails because
