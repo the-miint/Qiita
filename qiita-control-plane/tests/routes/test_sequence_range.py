@@ -579,9 +579,9 @@ async def test_get_sa_reads_range_in_study_no_human_granted(ctx, foreign_prep_sa
 
 
 async def test_get_sa_with_mint_scope_returns_row(ctx):
-    """The compute SA holds sequence_range:mint but NOT prep_sample:read; the
-    GET's mint-scope arm lets it read back the range it minted. This is the
-    ingest_reads reuse path — without it, the SA would 403 here."""
+    """The compute SA holds sequence_range:mint but not prep_sample:read; that
+    scope alone lets it read a range back. This is the ingest_reads reuse path
+    — without it, the SA would 403 here."""
     post_resp = await ctx["sa"].post(
         URL_SEQUENCE_RANGE_PREFIX,
         json={

@@ -24,8 +24,9 @@ instead of failing. This is what lets the runner's OOM memory-escalation pay off
 The GET endpoint accepts `sequence_range:mint` (as well as
 `prep_sample:read`), so the compute service-account — scope-minimal at
 `sequence_range:mint` per
-docs/runbooks/compute-service-account-provisioning.md — can read back
-its own range without holding `prep_sample:read`.
+docs/runbooks/compute-service-account-provisioning.md — can read a
+prep_sample's range back, whichever ticket minted it, without holding
+`prep_sample:read`.
 
 Both helpers stay transport-agnostic: they raise typed exceptions /
 return None and never reach for `BackendFailure` or runner-level
