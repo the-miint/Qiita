@@ -136,8 +136,9 @@ async def get_sequence_range_route(
 ) -> SequenceRange:
     """Return the sequence_range row for `prep_sample_idx`, or 404.
 
-    SECURITY: the two scopes admit two kinds of caller (which principals can
-    hold each is in `auth/scopes.py`), and they are gated differently.
+    SECURITY: the two scopes admit two kinds of caller — humans hold
+    `prep_sample:read`, service accounts `sequence_range:mint` (the ceilings
+    are in `auth/scopes.py`) — and they are gated differently.
 
     A caller without `sequence_range:mint` must also pass
     `authorize_prep_sample_cohort` at `COHORT_MIN_TIER`. The check runs before
@@ -150,7 +151,7 @@ async def get_sequence_range_route(
     back whichever ticket minted it. The caller can already mint for any
     prep_sample.
 
-    The 200 body gives, to a caller who passes:
+    The response gives, to a caller who passes:
 
     - **Read count** for the prep_sample
       (`sequence_idx_stop - sequence_idx_start + 1`).
@@ -161,7 +162,7 @@ async def get_sequence_range_route(
     - **Relative mint order** across prep_samples (compare
       `sequence_idx_start`).
 
-    It carries no study membership, biosample metadata, sequence content or
+    The 200 body carries no study membership, biosample metadata, sequence content or
     submitter identity. The 403 detail is `prep_sample_access_denied_detail`'s.
     """
     if not caller.has_scope(str(Scope.SEQUENCE_RANGE_MINT)):
