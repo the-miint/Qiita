@@ -9,6 +9,7 @@ separate dicts; this module holds no SQL.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 from qiita_common.models import BIOSAMPLE_DISPLAY_HOST_TAXON_ID
@@ -35,7 +36,7 @@ class HarmonizationResult:
 
 
 def build_biosample_metadata(
-    attributes: dict[str, str],
+    attributes: dict[str, list[str]],
 ) -> tuple[dict[str, str], dict[str, str], HarmonizationResult]:
     """Split one BioSample's ENA attributes into `(global_metadata,
     local_metadata, result)` for the import.
@@ -43,8 +44,20 @@ def build_biosample_metadata(
     The two dicts cannot be merged: an unmapped tag is often spelled exactly
     like a global field the mapping declined (ENA's environmental-context tags
     are), and the import resolves any key naming a global to that global.
+
+    A tag with several values never reaches a typed handler: it is kept study-local as
+    a JSON array.
     """
-    mapped, unmapped = map_ena_attributes(attributes)
+    mapped, unmapped = map_ena_attributes(
+        {tag: values[0] for tag, values in attributes.items() if len(values) == 1}
+    )
+    unmapped.update(
+        {
+            tag: json.dumps(sorted(values), ensure_ascii=False)
+            for tag, values in attributes.items()
+            if len(values) != 1
+        }
+    )
     global_metadata = {**mapped, BIOSAMPLE_DISPLAY_HOST_TAXON_ID: HOST_TAXON_ID_UNKNOWN}
     return (
         global_metadata,

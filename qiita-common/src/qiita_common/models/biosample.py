@@ -13,6 +13,7 @@ from pydantic import (
     ConfigDict,
     Field,
     computed_field,
+    field_validator,
     model_validator,
 )
 
@@ -119,6 +120,95 @@ class BiosampleImportResponse(BaseModel):
     biosample_idx: Annotated[int, Field(gt=0)]
     owner_id_biosample_study_field_idx: Annotated[int, Field(gt=0)]
     owner_id_biosample_study_field_created: bool
+
+
+# Size caps for one bulk biosample import. A batch runs in one request and one
+# transaction, so it must finish inside the gateway's 60 s read timeout, fit
+# nginx's default 1 MiB request body on the REST location, and not hold the
+# per-owner insert lock (taken by each biosample INSERT until commit) for long.
+# Cost tracks metadata VALUES, not rows: measured at ~1.4 ms per value (a
+# 75-column sheet row takes ~106 ms), and a real sheet runs ~34 bytes per value.
+# 15,000 values is therefore ~21 s and ~0.5 MiB; the row cap bounds batches of
+# very narrow rows. A sheet over either cap is sent in several requests.
+BIOSAMPLE_BULK_IMPORT_MAX_ROWS = 2_000
+BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES = 15_000
+
+
+class BiosampleBulkImportRequest(BaseModel):
+    """Body for POST /api/v1/study/{study_idx}/biosample/bulk.
+
+    One `rows` entry per biosample, each the SAME shape as the single-biosample
+    import — so a sheet of N biosamples loads in one call instead of N, one row per
+    biosample and one text cell per (biosample, field). The route applies the rows
+    in ONE transaction — all succeed or nothing is written — and a failing row is
+    named by its index (counting from 0) so the caller can fix the sheet and
+    resubmit. See `BiosampleImportRequest` for the per-row contract (text-valued
+    metadata keyed on a field display_name, owner id, accessions,
+    matrix_tube_id).
+
+    A batch is one sheet from one owner: every row names the same `owner_idx`
+    and the same `owner_biosample_id_field_name`. One owner means the batch
+    takes one per-owner insert lock, so two concurrent batches cannot take two
+    owners' locks in opposite orders and deadlock; one id field means a sheet's
+    id column becomes one unique field on the study, not several. Sizes are
+    capped by `BIOSAMPLE_BULK_IMPORT_MAX_ROWS` and
+    `BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[BiosampleImportRequest] = Field(min_length=1)
+
+    @field_validator("rows", mode="before")
+    @classmethod
+    def _cap_batch_size(cls, rows: object) -> object:
+        """Refuse an oversized batch on counts alone, before any row is parsed."""
+        if not isinstance(rows, list):
+            return rows
+        if len(rows) > BIOSAMPLE_BULK_IMPORT_MAX_ROWS:
+            raise ValueError(
+                f"at most {BIOSAMPLE_BULK_IMPORT_MAX_ROWS} rows per request, got"
+                f" {len(rows)}; send the sheet in several requests"
+            )
+        values = sum(
+            len(row["metadata"])
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("metadata"), dict)
+        )
+        if values > BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES:
+            raise ValueError(
+                f"at most {BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES} metadata values"
+                f" per request, got {values} across {len(rows)} rows; send the sheet"
+                " in several requests"
+            )
+        return rows
+
+    @model_validator(mode="after")
+    def _one_owner_and_one_id_field(self) -> BiosampleBulkImportRequest:
+        first = self.rows[0]
+        for i, row in enumerate(self.rows):
+            if row.owner_idx != first.owner_idx:
+                raise ValueError(
+                    f"every row must name the same owner_idx: row 0 has"
+                    f" {first.owner_idx}, row {i} has {row.owner_idx} (rows count from 0)"
+                )
+            if row.owner_biosample_id_field_name != first.owner_biosample_id_field_name:
+                raise ValueError(
+                    "every row must name the same owner_biosample_id_field_name: row 0"
+                    f" has {first.owner_biosample_id_field_name!r}, row {i} has"
+                    f" {row.owner_biosample_id_field_name!r} (rows count from 0)"
+                )
+        return self
+
+
+class BiosampleBulkImportResponse(BaseModel):
+    """Returned by the bulk import on success: one `BiosampleImportResponse` per
+    input row, in request order (the batch is all-or-nothing, so a 2xx means every
+    row was created)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    results: list[BiosampleImportResponse]
 
 
 class OwnerBiosampleIdRow(BaseModel):

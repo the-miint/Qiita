@@ -283,7 +283,10 @@ def _mixs_sample_attributes(sample_accession: str, **overrides: str) -> EnaSampl
         "host": "Homo sapiens",
     }
     attributes.update(overrides)
-    return EnaSampleAttributes(sample_accession=sample_accession, attributes=attributes)
+    return EnaSampleAttributes(
+        sample_accession=sample_accession,
+        attributes={tag: [value] for tag, value in attributes.items()},
+    )
 
 
 async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
@@ -509,13 +512,13 @@ async def test_underscore_mixs_tags_harmonize_to_correct_global_fields(reg):
     attrs = EnaSampleAttributes(
         sample_accession=sample_accession,
         attributes={
-            "collection_date": "2021-11-15",
+            "collection_date": ["2021-11-15"],
             # Real observed shape: PRJDB40386's SAMD01820063.
-            "geo_loc_name": "Japan:Shinga, Ritsumeikan University BKC",
-            "lat_lon": "35.6895 N 139.6917 E",
-            "depth": "10",
+            "geo_loc_name": ["Japan:Shinga, Ritsumeikan University BKC"],
+            "lat_lon": ["35.6895 N 139.6917 E"],
+            "depth": ["10"],
             # Underscore form of the ENVO-typed triad -- stays unmapped/local.
-            "env_broad_scale": "marine biome",
+            "env_broad_scale": ["marine biome"],
         },
     )
 
@@ -570,6 +573,52 @@ async def test_underscore_mixs_tags_harmonize_to_correct_global_fields(reg):
         # No sample_alias on this run, so the accession stands in as the owner id.
         "ena sample id": sample_accession,
     }
+
+
+async def test_repeated_handled_tags_register_as_study_local_json_arrays(reg):
+    study_accession = unique_ena_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+    sample_accession = unique_accession("SAMN")
+    run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=sample_accession,
+        study_accession=study_accession,
+    )
+    attrs = EnaSampleAttributes(
+        sample_accession=sample_accession,
+        attributes={
+            "collection_date": ["2017", "2019-06-01"],
+            "depth": ["10", "5"],
+            "geo_loc_name": ["Argentina"],
+        },
+    )
+
+    result = await _register(reg, study_header=header, ena_runs=[run], sample_attributes=[attrs])
+
+    assert result.ena_runs[0].status == EnaRunRegistrationStatus.REGISTERED
+    biosample_idx = await reg["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
+    )
+    global_names = await reg["pool"].fetch(
+        "SELECT gf.display_name FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_global_field gf ON gf.idx = bm.global_field_idx"
+        " WHERE bm.biosample_idx = $1",
+        biosample_idx,
+    )
+    assert {r["display_name"] for r in global_names} == {
+        "geographic location (country and/or sea)",
+        "host taxon id",
+    }
+    local_rows = await reg["pool"].fetch(
+        "SELECT bsf.display_name, bm.value_text FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_study_field bsf ON bsf.idx = bm.biosample_study_field_idx"
+        " WHERE bm.biosample_idx = $1 AND bm.global_field_idx IS NULL",
+        biosample_idx,
+    )
+    local = {r["display_name"]: r["value_text"] for r in local_rows}
+    assert local["collection_date"] == '["2017", "2019-06-01"]'
+    assert local["depth"] == '["10", "5"]'
 
 
 async def test_blank_sample_alias_falls_back_to_the_accession(reg):

@@ -129,9 +129,10 @@ the `--principal-idx` that `list` shows. Who can change which rows is in
 
 ## 3. Create the biosamples
 
-A biosample is the physical sample itself, independent of any sequencing. One
-command per biosample — there is no bulk import yet, so for a plate this is a
-loop over the biosamples on it.
+A biosample is the physical sample itself, independent of any sequencing. The
+CLI creates one per command, so for a plate this is a loop over the biosamples on
+it. The API also takes a whole sheet in one all-or-nothing request,
+`POST /api/v1/study/{idx}/biosample/bulk`, which has no CLI command yet.
 
 ```bash
 BIOSAMPLE_IDX=$(qiita biosample create \

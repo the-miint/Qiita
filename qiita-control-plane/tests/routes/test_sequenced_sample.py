@@ -26,6 +26,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
+    URL_SEQUENCED_POOL_BY_STUDY,
     URL_SEQUENCED_SAMPLE_BY_IDX,
     URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX,
     URL_SEQUENCED_SAMPLE_FROM_RUN,
@@ -4806,3 +4807,296 @@ async def test_import_sequenced_sample_deadlock_503(ctx, monkeypatch):
 
     assert resp.status_code == 503, resp.text
     assert resp.headers["Retry-After"] == "1"
+
+
+# ===========================================================================
+# GET /study/{study_idx}/sequenced-pool — the study-first pool listing
+# ===========================================================================
+
+
+async def _seed_ss_in_pool(ctx, *, study_idx, run_idx, pool_idx, suffix):
+    """Land one sequenced_sample for `study_idx` in a GIVEN (run, pool), so a
+    test can place several samples in the same pool. Returns the composer JSON.
+    """
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id(suffix.upper()),
+        primary_study_idx=study_idx,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+async def test_list_sequenced_pools_in_study_groups_samples_to_distinct_pools(ctx):
+    # Three samples in one pool collapse to a single row whose sample_count is 3.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-one"
+    )
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pools-one")
+    for n in range(3):
+        await _seed_ss_in_pool(
+            ctx, study_idx=study_idx, run_idx=run_idx, pool_idx=pool_idx, suffix=f"p1-{n}"
+        )
+
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_idx))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["study_idx"] == study_idx
+    assert body["count"] == 1
+    assert body["truncated"] is False
+    assert len(body["sequenced_pool"]) == 1
+    row = body["sequenced_pool"][0]
+    assert row["sequenced_pool_idx"] == pool_idx
+    assert row["sequencing_run_idx"] == run_idx
+    assert row["sample_count"] == 3
+    # run_preflight_filename is run-level operator metadata and is withheld from
+    # this viewer-tier study surface.
+    assert "run_preflight_filename" not in row
+    # _seed_run_and_pool leaves instrument_model unset.
+    assert row["instrument_model"] is None
+
+
+async def test_list_sequenced_pools_in_study_sample_count_excludes_other_studies(ctx):
+    # One pool holds this study's sample AND another study's two samples; the
+    # row's sample_count counts only this study's. Fails if the COUNT loses its
+    # pts.study_idx = $1 scope (it would report 3).
+    study_a = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-xsa"
+    )
+    study_b = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-xsb"
+    )
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pools-xs")
+    await _seed_ss_in_pool(ctx, study_idx=study_a, run_idx=run_idx, pool_idx=pool_idx, suffix="xsa")
+    await _seed_ss_in_pool(
+        ctx, study_idx=study_b, run_idx=run_idx, pool_idx=pool_idx, suffix="xsb1"
+    )
+    await _seed_ss_in_pool(
+        ctx, study_idx=study_b, run_idx=run_idx, pool_idx=pool_idx, suffix="xsb2"
+    )
+
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_a))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 1
+    row = body["sequenced_pool"][0]
+    assert row["sequenced_pool_idx"] == pool_idx
+    # Only study_a's one sample, not the three the pool holds across studies.
+    assert row["sample_count"] == 1
+
+
+async def test_list_sequenced_pools_in_study_excludes_not_yet_pooled_samples(ctx):
+    # A sequenced_sample not yet in a pool (sequenced_pool_idx IS NULL) contributes
+    # no row: the INNER JOIN on sequenced_pool drops it, while a pooled sample stays.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-null"
+    )
+    run_keep, pool_keep = await _seed_run_and_pool(ctx, "null-keep")
+    run_drop, pool_drop = await _seed_run_and_pool(ctx, "null-drop")
+    await _seed_ss_in_pool(
+        ctx, study_idx=study_idx, run_idx=run_keep, pool_idx=pool_keep, suffix="nk"
+    )
+    dropped = await _seed_ss_in_pool(
+        ctx, study_idx=study_idx, run_idx=run_drop, pool_idx=pool_drop, suffix="nd"
+    )
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequenced_sample SET sequenced_pool_idx = NULL,"
+        " sequenced_pool_item_id = NULL WHERE idx = $1",
+        dropped["sequenced_sample_idx"],
+    )
+
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_idx))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 1
+    assert body["sequenced_pool"][0]["sequenced_pool_idx"] == pool_keep
+
+
+async def test_list_sequenced_pools_in_study_spans_multiple_pools_and_runs_newest_first(ctx):
+    # Two runs, with two pools on the first run; ordering is run DESC then pool
+    # DESC, and each pool reports only this study's sample it holds.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-multi"
+    )
+    run_a, pool_a1 = await _seed_run_and_pool(ctx, "multi-a")
+    pool_a2 = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.sequenced_pool"
+        " (sequencing_run_idx, run_preflight_blob, run_preflight_filename, created_by_idx)"
+        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        run_a,
+        b"\x03\x04\x05",  # distinct blob: one pool per (run, preflight hash)
+        "preflight-multi-a2.sqlite",
+        ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["sequenced_pool"].append(pool_a2)
+    run_b, pool_b1 = await _seed_run_and_pool(ctx, "multi-b")
+    # Give run_b a non-null instrument_model to prove it surfaces.
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequencing_run SET instrument_model = 'Illumina MiSeq' WHERE idx = $1",
+        run_b,
+    )
+
+    await _seed_ss_in_pool(ctx, study_idx=study_idx, run_idx=run_a, pool_idx=pool_a1, suffix="ma1")
+    await _seed_ss_in_pool(ctx, study_idx=study_idx, run_idx=run_a, pool_idx=pool_a2, suffix="ma2")
+    await _seed_ss_in_pool(ctx, study_idx=study_idx, run_idx=run_b, pool_idx=pool_b1, suffix="mb1")
+
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_idx))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 3
+    pairs = [(p["sequencing_run_idx"], p["sequenced_pool_idx"]) for p in body["sequenced_pool"]]
+    # run DESC, then pool DESC within a run.
+    assert pairs == sorted(pairs, reverse=True)
+    assert (run_b, pool_b1) == pairs[0]
+    by_pool = {p["sequenced_pool_idx"]: p for p in body["sequenced_pool"]}
+    assert by_pool[pool_b1]["instrument_model"] == "Illumina MiSeq"
+    assert all(p["sample_count"] == 1 for p in body["sequenced_pool"])
+
+
+async def test_list_sequenced_pools_in_study_excludes_retired_and_flagged(ctx):
+    # A pool is listed only while it holds a qualifying sample: retiring the
+    # link, retiring the prep_sample, or flagging ena_status each drops the pool.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-excl"
+    )
+    owner_idx = ctx["user_session"]["principal_idx"]
+    _run_keep, pool_keep = await _seed_run_and_pool(ctx, "excl-keep")
+    run_link, pool_link = await _seed_run_and_pool(ctx, "excl-link")
+    run_prep, pool_prep = await _seed_run_and_pool(ctx, "excl-prep")
+    run_ena, pool_ena = await _seed_run_and_pool(ctx, "excl-ena")
+
+    keep = await _seed_ss_in_pool(
+        ctx, study_idx=study_idx, run_idx=_run_keep, pool_idx=pool_keep, suffix="keep"
+    )
+    link = await _seed_ss_in_pool(
+        ctx, study_idx=study_idx, run_idx=run_link, pool_idx=pool_link, suffix="link"
+    )
+    prep = await _seed_ss_in_pool(
+        ctx, study_idx=study_idx, run_idx=run_prep, pool_idx=pool_prep, suffix="prep"
+    )
+    ena = await _seed_ss_in_pool(
+        ctx, study_idx=study_idx, run_idx=run_ena, pool_idx=pool_ena, suffix="ena"
+    )
+
+    await retire_prep_sample_to_study_link(
+        ctx["pool"],
+        prep_sample_idx=link["prep_sample_idx"],
+        study_idx=study_idx,
+        retired_by_idx=owner_idx,
+    )
+    await _retire_prep_sample(
+        ctx["pool"], prep_sample_idx=prep["prep_sample_idx"], retired_by_idx=owner_idx
+    )
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequenced_sample SET ena_status = 'suppressed' WHERE idx = $1",
+        ena["sequenced_sample_idx"],
+    )
+
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_idx))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 1
+    assert [p["sequenced_pool_idx"] for p in body["sequenced_pool"]] == [pool_keep]
+    assert keep["sequenced_sample_idx"]  # the kept sample is the one still linked
+
+
+async def test_list_sequenced_pools_in_study_viewer_access_allowed(ctx):
+    # The whole point: a plain viewer (not wet_lab_admin) can read the pools.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["admin_session"]["principal_idx"], suffix="pools-viewer"
+    )
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="viewer",
+        granted_by_idx=ctx["admin_session"]["principal_idx"],
+    )
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pv")
+    await _seed_ss_in_pool(
+        ctx, study_idx=study_idx, run_idx=run_idx, pool_idx=pool_idx, suffix="pv"
+    )
+
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_idx))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["count"] == 1
+
+
+async def test_list_sequenced_pools_in_study_empty_study_returns_zero(ctx):
+    # A study with no sequenced samples returns an empty list, not an error.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-empty"
+    )
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_idx))
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "study_idx": study_idx,
+        "sequenced_pool": [],
+        "count": 0,
+        "truncated": False,
+    }
+
+
+async def test_list_sequenced_pools_in_study_no_access_403(ctx):
+    # Regular user with no grant is below the viewer minimum → 403.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["admin_session"]["principal_idx"], suffix="pools-noaccess"
+    )
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_idx))
+    assert resp.status_code == 403
+
+
+async def test_list_sequenced_pools_in_study_missing_scope_403(ctx, no_study_read_client):
+    # A PAT without Scope.STUDY_READ is rejected before the tier check.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-noscope"
+    )
+    resp = await no_study_read_client.get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_idx))
+    assert resp.status_code == 403
+    assert "study:read" in resp.json()["detail"]
+
+
+async def test_list_sequenced_pools_in_study_nonexistent_study_404(ctx):
+    # require_study_exists fires before the empty-list read.
+    max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=max_idx + 1))
+    assert resp.status_code == 404
+
+
+async def test_list_sequenced_pools_in_study_anonymous_401(ctx):
+    app.state.pool = ctx["pool"]
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-anon"
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_idx))
+    assert resp.status_code == 401
+
+
+async def test_list_sequenced_pools_in_study_truncates_over_cap(ctx, monkeypatch):
+    # With the cap lowered to 1, a study spanning two pools reports the first and
+    # flags truncation.
+    monkeypatch.setattr("qiita_control_plane.routes.sequenced_sample._SEQUENCED_POOL_HARD_CAP", 1)
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-trunc"
+    )
+    run_a, pool_a = await _seed_run_and_pool(ctx, "trunc-a")
+    run_b, pool_b = await _seed_run_and_pool(ctx, "trunc-b")
+    await _seed_ss_in_pool(ctx, study_idx=study_idx, run_idx=run_a, pool_idx=pool_a, suffix="ta")
+    await _seed_ss_in_pool(ctx, study_idx=study_idx, run_idx=run_b, pool_idx=pool_b, suffix="tb")
+
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_idx))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 1
+    assert body["truncated"] is True

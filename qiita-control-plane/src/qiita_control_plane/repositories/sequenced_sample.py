@@ -624,6 +624,50 @@ async def fetch_sequenced_sample_idxs_for_study(
     return [r["idx"] for r in rows]
 
 
+async def fetch_sequenced_pools_for_study(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    study_idx: int,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """Return up to `limit` distinct sequenced_pools a study's active
+    sequenced_samples sit in, newest run/pool first.
+
+    The study-first join the run-centric pool routes never expose: walks the
+    same prep_sample_to_study -> sequenced_sample path as
+    fetch_sequenced_sample_idxs_for_study (and the SAME exclusions -- retired
+    links, retired supertype prep_samples, ena_status-flagged samples), then
+    groups to the distinct pool. `sample_count` is how many of this study's
+    qualifying samples fall in each pool (not the pool's full size -- a pool can
+    hold other studies' samples). The INNER JOIN on sequenced_pool drops samples
+    not yet in a pool (sequenced_pool_idx IS NULL). Each pool carries its run's
+    `instrument_model` (platform). Callers that need to detect truncation pass
+    `limit = cap + 1`; a returned length > cap means the study spans more pools
+    than the cap. Accepts a pool or a connection, mirroring
+    fetch_sequenced_sample_idxs_for_study.
+    """
+    return await pool_or_conn.fetch(
+        "SELECT sp.idx AS sequenced_pool_idx, sp.sequencing_run_idx,"
+        "       sr.instrument_model, sp.created_at,"
+        "       COUNT(DISTINCT ss.idx) AS sample_count"
+        " FROM qiita.prep_sample_to_study pts"
+        " JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = pts.prep_sample_idx"
+        " JOIN qiita.prep_sample ps ON ps.idx = pts.prep_sample_idx"
+        " JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
+        " JOIN qiita.sequencing_run sr ON sr.idx = sp.sequencing_run_idx"
+        " WHERE pts.study_idx = $1"
+        "   AND pts.retired = false"
+        "   AND ps.retired = false"
+        "   AND ss.ena_status IS NULL"
+        " GROUP BY sp.idx, sp.sequencing_run_idx,"
+        "          sr.instrument_model, sp.created_at"
+        " ORDER BY sp.sequencing_run_idx DESC, sp.idx DESC"
+        " LIMIT $2",
+        study_idx,
+        limit,
+    )
+
+
 async def fetch_held_ena_run_accessions_for_study(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,

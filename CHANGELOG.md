@@ -21,6 +21,35 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **The branch reviewer is in the repo, and a PR description records its run (#655).**
+  `.claude/agents/qiita-reviewer.md` (the rules) and `.claude/skills/qiita-review/` (the
+  review, fix, re-review loop) were per-developer files that `CLAUDE.md` already pointed
+  at; both are now tracked. The loop ends by printing a `## Reviewer loop` block — the
+  commit reviewed and what was declined, deferred or left unprobed — which the new PR
+  template carries. The `review-loop-check` job (`scripts/check-review-loop.sh`) fails a
+  PR whose description lacks the block or names a commit that is not one of the PR's
+  own; the `no-agent-review` label opts out.
+- **Bulk biosample import — `POST /api/v1/study/{study_idx}/biosample/bulk` (#656).**
+  Creates many biosamples in one all-or-nothing transaction: a single failing row
+  rolls the whole batch back, and the error (whatever status that row produced —
+  422, 409 or 503) names the row by its index, counting from 0, and its
+  `owner_biosample_id_value`, so a partial import can never leave a study
+  half-populated. Each row is the single-biosample create's body and carries its
+  full validation. A batch is one owner and one owner-id field, and is capped at
+  2,000 rows and 15,000 metadata values, so it fits the gateway's request-size
+  limit and read timeout; a larger sheet is sent in several requests. No CLI
+  command or client calls it yet. A single import that waits too long behind
+  another import for the same owner now answers a retryable 503, not a 500.
+- **List a study's sequenced pools: `GET /api/v1/study/{study_idx}/sequenced-pool` (#665).**
+  The distinct sequenced_pools a study's active samples sit in (newest run/pool
+  first), each with its run's `instrument_model` and the study's `sample_count` in
+  that pool. Viewer-tier, the same exclusions as the study's sequenced-sample
+  listing (retired links/prep_samples, ena_status-flagged samples); the run-level
+  `run_preflight_filename` is withheld, as the run-first pool list gates it behind
+  run ownership. The pool routes are otherwise run-first — a `sequenced_pool_idx` was
+  obtainable only by already knowing its run; this is the study-first join that
+  makes a study's pools (and the pool-scoped processing routes behind them)
+  reachable without walking the run.
 - **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
   reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
   biosample, and upsert this study's metadata on it, naming the sample by a
@@ -2091,6 +2120,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   (public as of `duckdb` 1.10505.0), and the failure reaches the client as the stream's
   final item. The zero-row schema probe each DoGet ran first is gone too: the streaming
   result now reports its own schema before the first fetch.
+- **An ENA study whose sample repeats an attribute tag no longer fails at resolve (#650).**
+  `read_ena_attributes` can return a tag more than once (for example `BioSampleModel` or
+  `ENA-FIRST-PUBLIC`), which made the per-sample map fail with `Map keys must be unique`
+  and the whole study fail. A tag with one value is stored as before. A tag with several
+  values is kept study-local as a JSON array of its sorted distinct values (for example
+  `["10", "5"]`), never on a typed global field, even when the tag has a handler such as
+  `depth` or `collection_date`. An empty `<VALUE>` (NULL) is ignored.
+
 - **`qiita submit-ena-import` and `POST /ena-import-batch` refuse a malformed accession
   at submit (#635).** The shared validator checked only the prefix, so a bare `PRJEB`,
   `PRJEBxyz` or `PRJEB11419,PRJNA1` was accepted and then failed item by item in the
