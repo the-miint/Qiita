@@ -288,7 +288,7 @@ That function also decides the **orphan** case, and decides it differently from 
 
 **The authoring routes deliberately use three different shapes**, because the resources differ in what "ownership" means:
 
-- **biosample POST** (`/study/{idx}/biosample`) — `require_study_access(min_tier=ADMIN)`. A biosample is study-scoped; the natural gate is tier-on-that-study.
+- **biosample POST** (`/study/{idx}/biosample`, and the bulk `/study/{idx}/biosample/bulk`) — `require_study_access(min_tier=ADMIN)`. A biosample is study-scoped; the natural gate is tier-on-that-study.
 - **sequencing-run POST** — no resource gate at all (only scope + complete-profile). A run is an instrument-level container with no parent resource to inherit access from; any user who can write prep-samples may stand one up.
 - **sequenced-pool / sequenced-sample POST** — `require_caller_owns_run` / `require_caller_owns_pool` (caller-creator), because a run/pool has a creator but no tier surface; the sample composer additionally runs `require_caller_has_admin_on_all_studies` over the body's primary + secondary studies.
 

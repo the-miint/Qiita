@@ -1,5 +1,6 @@
 """Integration tests for the biosample routes."""
 
+import re
 import secrets
 from collections.abc import Awaitable, Callable
 from datetime import date
@@ -11,6 +12,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
+    URL_BIOSAMPLE_BULK_BY_STUDY,
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_BY_STUDY_AND_IDX,
@@ -4741,7 +4743,9 @@ async def test_lookup_biosample_in_study_by_unique_field_retired_biosample_404(c
 
     assert resp.status_code == 404, resp.text
     assert "through field" in resp.json()["detail"], resp.text
-    assert str(bs_idx) not in resp.json()["detail"], resp.text
+    # The resolved idx must not leak; match on a word boundary so an unrelated
+    # number that merely contains these digits does not false-fail the assertion.
+    assert re.search(rf"\b{bs_idx}\b", resp.json()["detail"]) is None, resp.text
 
 
 @pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
@@ -4999,3 +5003,326 @@ async def test_patch_biosample_metadata_by_unique_field_authz(
         success_status=200,
         required_scope="biosample:write",
     )
+
+
+# ===========================================================================
+# Bulk import — the wetlab front door (POST /study/{idx}/biosample/bulk)
+# ===========================================================================
+
+
+async def _post_biosamples_bulk(client, ctx, study_idx: int, rows: list[dict]):
+    """POST the bulk route and, on 201, track every created row for FK-reverse
+    cleanup — the bulk mirror of `_post_biosample`. host_taxon_id (a REQUIRED
+    field) is injected per row as a missing-value marker unless the row set it."""
+    prepared = []
+    for row in rows:
+        metadata = dict(row.get("metadata") or {})
+        host_key = "host_taxon_id" if row.get("global_internal_names") else "host taxon id"
+        if host_key not in metadata:
+            metadata[host_key] = "not applicable"
+        prepared.append({**row, "metadata": metadata})
+    resp = await client.post(
+        URL_BIOSAMPLE_BULK_BY_STUDY.format(study_idx=study_idx), json={"rows": prepared}
+    )
+    if resp.status_code == 201:
+        host_gf_idx = await ctx["pool"].fetchval(
+            "SELECT idx FROM qiita.biosample_global_field WHERE internal_name = 'host_taxon_id'"
+        )
+        for result in resp.json()["results"]:
+            bs_idx = result["biosample_idx"]
+            ctx["created"]["biosample"].append(bs_idx)
+            ctx["created"]["biosample_to_study"].append((bs_idx, study_idx))
+            if result["owner_id_biosample_study_field_created"]:
+                ctx["created"]["biosample_study_field"].append(
+                    result["owner_id_biosample_study_field_idx"]
+                )
+            owner_meta = await ctx["pool"].fetchval(
+                "SELECT idx FROM qiita.biosample_metadata"
+                " WHERE biosample_idx = $1 AND is_owner_biosample_id = true",
+                bs_idx,
+            )
+            if owner_meta is not None:
+                ctx["created"]["biosample_metadata"].append(owner_meta)
+            await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [host_gf_idx])
+    return resp
+
+
+async def test_bulk_import_creates_all_rows(ctx):
+    """A plate's worth of samples in one all-or-nothing call: every row becomes a
+    biosample, and results come back in request order."""
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="bulk-ok")
+    field_name = unique_field_name("BulkId")
+    rows = [
+        {
+            "owner_idx": wet_idx,
+            "owner_biosample_id_field_name": field_name,
+            "owner_biosample_id_value": f"BULK-{i}",
+        }
+        for i in range(3)
+    ]
+
+    resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
+    assert resp.status_code == 201, resp.text
+
+    results = resp.json()["results"]
+    assert len(results) == 3
+    assert all(r["biosample_idx"] > 0 for r in results)
+    # The owner-id field is created once (first row) and reused thereafter.
+    assert [r["owner_id_biosample_study_field_created"] for r in results] == [True, False, False]
+
+    count = await ctx["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
+    )
+    assert count == 3
+
+
+def _bulk_rows(owner_idx: int, field_name: str, values: list[str]) -> list[dict]:
+    return [
+        {
+            "owner_idx": owner_idx,
+            "owner_biosample_id_field_name": field_name,
+            "owner_biosample_id_value": value,
+        }
+        for value in values
+    ]
+
+
+async def test_bulk_import_is_atomic_and_names_the_failing_row(ctx):
+    """A bad row rolls the WHOLE batch back, and the error names it.
+
+    Row 2's owner id is a missing-value marker, which the composer refuses only
+    once rows 0 and 1 are written; the batch is all-or-nothing, so none of them,
+    nor the owner-id field row 0 created, may persist."""
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="bulk-atomic")
+    rows = _bulk_rows(wet_idx, unique_field_name("BulkId"), ["A", "B", "not applicable"])
+
+    resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"].startswith(
+        "row 2 (counting from 0; owner_biosample_id_value='not applicable'): "
+    )
+
+    links = await ctx["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
+    )
+    fields = await ctx["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_study_field WHERE study_idx = $1", study_idx
+    )
+    assert (links, fields) == (0, 0)
+
+
+async def test_bulk_import_refuses_a_repeated_owner_id_naming_both_rows(ctx):
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="bulk-dup")
+    rows = _bulk_rows(wet_idx, unique_field_name("BulkId"), ["DUP", "OK", "DUP"])
+
+    resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"].startswith("rows 0 and 2 (counting from 0) both give")
+    links = await ctx["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
+    )
+    assert links == 0
+
+
+async def test_bulk_import_refuses_several_owners(ctx):
+    """One owner per batch: two concurrent batches each spanning two owners
+    could otherwise take the owners' insert locks in opposite orders."""
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="bulk-owners")
+    rows = _bulk_rows(wet_idx, unique_field_name("BulkId"), ["A", "B"])
+    rows[1]["owner_idx"] = ctx["admin_session"]["principal_idx"]
+
+    resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
+    assert resp.status_code == 422, resp.text
+    assert "same owner_idx" in resp.text and "row 1" in resp.text
+
+
+async def test_bulk_import_refuses_several_owner_id_fields(ctx):
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="bulk-fields")
+    rows = _bulk_rows(wet_idx, unique_field_name("BulkId"), ["SAME", "X"])
+    rows[1]["owner_biosample_id_field_name"] = unique_field_name("OtherId")
+
+    resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
+    assert resp.status_code == 422, resp.text
+    assert "same owner_biosample_id_field_name" in resp.text
+    fields = await ctx["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_study_field WHERE study_idx = $1", study_idx
+    )
+    assert fields == 0
+
+
+@pytest.mark.parametrize("too_many", ["rows", "values"])
+async def test_bulk_import_over_a_size_cap_is_a_small_422(ctx, too_many):
+    """Refused on counts alone, and the 422 does not echo the oversized batch."""
+    from qiita_common.models.biosample import (
+        BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES,
+        BIOSAMPLE_BULK_IMPORT_MAX_ROWS,
+    )
+
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix=f"bulk-cap-{too_many}")
+    if too_many == "rows":
+        n, keys = BIOSAMPLE_BULK_IMPORT_MAX_ROWS + 1, 0
+    else:
+        keys = 100
+        n = BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES // keys + 1
+    rows = _bulk_rows(wet_idx, "id", [f"v{i}" for i in range(n)])
+    for row in rows:
+        row["metadata"] = {f"k{k}": "x" for k in range(keys)}
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_BULK_BY_STUDY.format(study_idx=study_idx), json={"rows": rows}
+    )
+    assert resp.status_code == 422, resp.text[:300]
+    assert len(resp.content) < 2048
+    assert "send the sheet in several requests" in resp.text
+
+
+async def test_bulk_import_transient_failure_keeps_retry_after(ctx, monkeypatch):
+    """A deadlock on any row is the batch's, not the row's: 503 with the
+    Retry-After the single route sends, and no row prefix."""
+    real = routes_biosample.import_biosample_from_owner_biosample_id
+    calls = 0
+
+    async def deadlock_on_second(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise asyncpg.DeadlockDetectedError("probe")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(
+        routes_biosample, "import_biosample_from_owner_biosample_id", deadlock_on_second
+    )
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="bulk-retry")
+    rows = _bulk_rows(wet_idx, unique_field_name("BulkId"), ["A", "B"])
+
+    resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
+    assert resp.status_code == 503, resp.text
+    assert resp.headers.get("Retry-After")
+    assert not resp.json()["detail"].startswith("row ")
+
+
+async def test_import_waiting_on_the_owner_lock_past_the_timeout_is_a_503(ctx, postgres_url):
+    """Each biosample INSERT takes pg_advisory_xact_lock(owner_idx) until commit.
+    With that lock held elsewhere, both import routes wait past the pool's
+    command timeout and must answer the retryable 503, not a 500."""
+    from qiita_control_plane.db import get_pool
+    from qiita_control_plane.main import app
+
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="bulk-lockwait")
+    field_name = unique_field_name("BulkId")
+    holder = await ctx["pool"].acquire()
+    short_pool = await get_pool(postgres_url, command_timeout=1)
+    saved_pool, app.state.pool = app.state.pool, short_pool
+    try:
+        holder_tx = holder.transaction()
+        await holder_tx.start()
+        await holder.execute("SELECT pg_advisory_xact_lock($1)", wet_idx)
+        single = await ctx["wet"].post(
+            URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx),
+            json={
+                **_bulk_rows(wet_idx, field_name, ["S"])[0],
+                "metadata": {"host taxon id": "not applicable"},
+            },
+        )
+        bulk = await _post_biosamples_bulk(
+            ctx["wet"], ctx, study_idx, _bulk_rows(wet_idx, field_name, ["B"])
+        )
+        await holder_tx.rollback()
+    finally:
+        app.state.pool = saved_pool
+        await short_pool.close()
+        await ctx["pool"].release(holder)
+
+    assert single.status_code == 503, single.text
+    assert single.headers.get("Retry-After")
+    assert "another import for this biosample owner" in single.json()["detail"]
+    assert bulk.status_code == 503, bulk.text
+    assert bulk.headers.get("Retry-After")
+
+
+async def test_bulk_import_unexpected_error_names_the_row(ctx, monkeypatch):
+    """A failure that is not mapped to an HTTP status stays a 500 with its
+    traceback, carrying a note that names the row."""
+    real = routes_biosample.import_biosample_from_owner_biosample_id
+    calls = 0
+
+    async def fail_on_second(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("probe")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(
+        routes_biosample, "import_biosample_from_owner_biosample_id", fail_on_second
+    )
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="bulk-500")
+
+    with pytest.raises(RuntimeError, match="probe") as caught:
+        await _post_biosamples_bulk(
+            ctx["wet"], ctx, study_idx, _bulk_rows(wet_idx, unique_field_name("BulkId"), ["A", "B"])
+        )
+    assert any("failed at row 1" in note for note in caught.value.__notes__)
+
+
+async def test_bulk_import_regular_user_no_access_403(ctx):
+    """Same access gate as the single import: a regular user with no ADMIN access
+    to the study is refused."""
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="bulk-noaccess"
+    )
+    resp = await _post_biosamples_bulk(
+        ctx["user"],
+        ctx,
+        study_idx,
+        [
+            {
+                "owner_idx": ctx["user_session"]["principal_idx"],
+                "owner_biosample_id_field_name": unique_field_name("BulkId"),
+                "owner_biosample_id_value": "X",
+            }
+        ],
+    )
+    assert resp.status_code == 403, resp.text
+    assert "admin" in resp.json()["detail"]
+
+
+async def test_bulk_import_without_biosample_write_scope_403(ctx, no_biosample_write_client):
+    """A PAT that omits biosample:write is rejected before any write."""
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="bulk-noscope"
+    )
+    resp = await no_biosample_write_client.post(
+        URL_BIOSAMPLE_BULK_BY_STUDY.format(study_idx=study_idx),
+        json={
+            "rows": [
+                {
+                    "owner_idx": ctx["user_session"]["principal_idx"],
+                    "owner_biosample_id_field_name": unique_field_name("BulkId"),
+                    "owner_biosample_id_value": "X",
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 403
+    assert "biosample:write" in resp.json()["detail"]
+
+
+async def test_bulk_import_empty_rows_422(ctx):
+    """An empty batch is refused by the request model (rows has min_length=1)."""
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="bulk-empty"
+    )
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_BULK_BY_STUDY.format(study_idx=study_idx), json={"rows": []}
+    )
+    assert resp.status_code == 422, resp.text

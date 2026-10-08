@@ -894,6 +894,8 @@ URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
 #   • GET/PATCH /biosample/{biosample_idx}          → its own prefix
 
 PATH_BIOSAMPLE_BY_STUDY = "/{study_idx}/biosample"
+# Bulk import: a sheet's biosamples in one all-or-nothing POST.
+PATH_BIOSAMPLE_BULK_BY_STUDY = "/{study_idx}/biosample/bulk"
 PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 # Study-scoped single biosample: a GET view carrying this study's local
 # metadata alongside the global metadata, and a metadata upsert PATCH. Both
@@ -933,6 +935,7 @@ PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"
+URL_BIOSAMPLE_BULK_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BULK_BY_STUDY}"
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
 URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"

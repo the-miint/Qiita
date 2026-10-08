@@ -93,6 +93,8 @@ from qiita_common.models.biosample import (
     NCBI_TAXONOMY_NAME,
     TERMINOLOGY_TERM_VALUE_COLUMN,
     BiosampleAccessionField,
+    BiosampleBulkImportRequest,
+    BiosampleBulkImportResponse,
     BiosampleGlobalFieldResponse,
     BiosampleImportRequest,
     BiosampleImportResponse,
@@ -558,6 +560,8 @@ __all__ = [
     # Biosample.
     "BiosampleAccessionField",
     "BiosampleGlobalFieldResponse",
+    "BiosampleBulkImportRequest",
+    "BiosampleBulkImportResponse",
     "BiosampleImportRequest",
     "BiosampleImportResponse",
     "BiosampleLookupByAccessionRequest",
