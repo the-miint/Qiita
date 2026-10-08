@@ -4023,6 +4023,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **`GET /sequence-range/{prep_sample_idx}` checks per-study access for a human caller
+  (#NNN).** A `prep_sample:read` caller now needs `viewer` or higher on every study the
+  prep_sample is linked to (`wet_lab_admin` and above bypass), the rule the other
+  single-prep_sample reads apply. A caller without it gets `403` whether or not a range
+  exists, and for an unknown or unlinked prep_sample. The `sequence_range:mint` arm the
+  compute service account uses is unchanged, and so is the response body.
 - **`qiita biosample create-field` validates its flags before reading the auth token
   (#639).** An invalid flag combination now exits 2 naming the flag, where it previously
   reported a missing token first and left the real problem to be found on the retry. The

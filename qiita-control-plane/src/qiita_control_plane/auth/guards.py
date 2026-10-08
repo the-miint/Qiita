@@ -232,11 +232,12 @@ def require_any_scope(*scopes: str) -> Callable[..., Principal]:
     none of the scopes are present.
 
     Use for a route reachable by two distinct capabilities. The motivating
-    case is `GET /sequence-range/{idx}`: a `prep_sample:read` human reads
-    any sample's range, AND the `sequence_range:mint` minter reads back its
-    own range on the ingest retry path (it deliberately does not hold
-    `prep_sample:read`). Accepts Scope members or bare strings; normalised
-    so the 403 detail renders the plain values.
+    case is `GET /sequence-range/{idx}`: a `prep_sample:read` human reads a
+    sample's range, AND the `sequence_range:mint` minter reads a range back
+    on the ingest retry path (it does not hold `prep_sample:read`). This
+    guard decides scope only; that route adds its own per-row check for the
+    human. Accepts Scope members or bare strings; normalised so the 403
+    detail renders the plain values.
     """
     scope_strs = tuple(str(s) for s in scopes)
 

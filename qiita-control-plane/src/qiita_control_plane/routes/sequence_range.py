@@ -7,12 +7,10 @@ read from Settings.max_sequence_mint_count (so a runaway compute step
 can't burn an unbounded slice of the sequence_idx space).
 
 GET /sequence-range/{prep_sample_idx} reads the row back. Gated on
-`prep_sample:read` OR `sequence_range:mint` (either-or): any caller who
-can see the prep_sample can see its allocated range, AND the minter can
-read back the range it just minted. The latter is what makes the
-ingest_reads retry path transparent — a step that minted then crashed
-before the durable write reuses the existing range on retry instead of
-failing on the one-shot mint contract.
+`prep_sample:read` OR `sequence_range:mint` (either-or). A
+`prep_sample:read` caller is additionally held to per-study read access on
+the prep_sample; a `sequence_range:mint` caller is not. The access rule and
+its reasons are on `get_sequence_range_route`.
 
 Why a dedicated REST router (not a `LibraryPrimitive` dispatch like
 `MINT_FEATURES` in `actions/library.py`): sequence-range allocation is
@@ -32,13 +30,14 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 from qiita_common.models import SequenceRange, SequenceRangeMintRequest
 
-from ..auth.guards import require_any_scope, require_service_with_scope
+from ..auth.guards import COHORT_MIN_TIER, require_any_scope, require_service_with_scope
 from ..auth.principal import Principal, ServiceAccount
 from ..deps import TxConnFactory, get_db_pool, get_settings, get_tx_conn_factory
 from ..repositories.sequence_range import (
     fetch_sequence_range_by_prep_sample_idx,
     mint_sequence_range,
 )
+from ._helpers import authorize_prep_sample_cohort
 
 router = APIRouter(prefix=PATH_SEQUENCE_RANGE_PREFIX, tags=["sequence-range"])
 
@@ -134,47 +133,45 @@ async def mint_sequence_range_route(
 async def get_sequence_range_route(
     prep_sample_idx: int,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    _scope: Principal = Depends(
+    caller: Principal = Depends(
         require_any_scope(Scope.PREP_SAMPLE_READ, Scope.SEQUENCE_RANGE_MINT)
     ),
 ) -> SequenceRange:
     """Return the sequence_range row for `prep_sample_idx`, or 404.
 
-    SECURITY: gated by `prep_sample:read` OR `sequence_range:mint` — no
-    per-row ACL. Any caller holding either scope can fetch the row for any
-    prep_sample_idx. The `sequence_range:mint` arm lets the compute SA
-    (which holds mint but deliberately not `prep_sample:read`) read back
-    its own range on the ingest_reads retry path; the disclosure set below
-    is the same one the minter already learns by minting. Concrete
-    information exposed to such a caller:
+    SECURITY: the two scopes admit two kinds of caller, and they are gated
+    differently.
+
+    A `prep_sample:read` caller (every human role; no service account can hold
+    it) must also pass `authorize_prep_sample_cohort` at `COHORT_MIN_TIER` —
+    the same per-study rule the other single-prep_sample reads apply. The check
+    runs before the row is fetched, so a caller without access gets 403 for a
+    minted, an unminted and a non-existent prep_sample alike.
+
+    A `sequence_range:mint` caller (service accounts only) is not gated per
+    row. Every job presents the same compute service-account token, so the
+    request does not identify the calling work_ticket, and
+    `mint_or_reuse_sequence_range` reads back ranges minted by OTHER tickets to
+    tell the operator which ticket holds the range and in what state. The
+    caller can already mint for any prep_sample.
+
+    The row exposes, to a caller who passes:
 
     - **Read count** for the prep_sample
-      (`sequence_idx_stop - sequence_idx_start + 1`) — a
-      sequencing-depth signal.
-    - **Mint timestamp** (`created_at`) — when phase 3 of the
-      ingest workflow ran.
-    - **Processing-state existence** (200 vs 404) — whether this
-      prep_sample has been minted at all (i.e., processed at least
-      through phase 3).
-    - **Relative chronological order** across samples (compare
-      `sequence_idx_start` values) — leaks the order in which samples
-      were minted even without the timestamp.
+      (`sequence_idx_stop - sequence_idx_start + 1`).
+    - **Mint timestamp** (`created_at`).
+    - **Processing-state existence** (200 vs 404) — whether a range has been
+      minted at all.
+    - **Relative mint order** across samples (compare `sequence_idx_start`).
 
-    What is NOT exposed: study membership, biosample metadata,
-    sequence content, the submitter's identity, or whether the
-    work_ticket ultimately succeeded (the sequence_range row persists
-    after a step failure).
-
-    Accepted in v1 because the disclosure set above is processing-
-    metadata-adjacent, not study/biosample-content. Two hardening
-    options remain open: a row-level ACL gate
-    (limit reads to the prep_sample's owner + admins) and a response-
-    surface trim (drop `created_at` from the wire model). The compute
-    orchestrator consumes this endpoint on the ingest_reads retry path
-    (range reuse) via the `sequence_range:mint` arm, so a future
-    row-level ACL must keep the minter able to read back its own
-    freshly-minted range.
+    Not exposed: study membership, biosample metadata, sequence content, the
+    submitter's identity, or whether the work_ticket ultimately succeeded (the
+    row persists after a step failure).
     """
+    if not caller.has_scope(str(Scope.SEQUENCE_RANGE_MINT)):
+        await authorize_prep_sample_cohort(
+            pool, caller=caller, prep_sample_idx=[prep_sample_idx], min_tier=COHORT_MIN_TIER
+        )
     row = await fetch_sequence_range_by_prep_sample_idx(pool, prep_sample_idx)
     if row is None:
         raise HTTPException(

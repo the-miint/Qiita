@@ -39,7 +39,11 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **`GET /api/v1/sequence-range/{prep_sample_idx}` now answers `403` to a human caller
+  without `viewer` on every study the prep_sample is linked to
+  (#fix/sequence-range-get-row-acl).** It answered `200` or `404` to any `prep_sample:read`
+  holder before. `wet_lab_admin` and above are unaffected, and so is the compute service
+  account's `sequence_range:mint` read-back; the response body is unchanged.
 
 ## Deployed history
 
