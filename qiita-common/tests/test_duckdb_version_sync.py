@@ -9,7 +9,7 @@ instead of letting it ship.
 
 Every pin is exact, never a floor. miint is built per DuckDB release, and both the
 mirror and the staged extension directory are laid out by DuckDB version (see
-`qiita_compute_orchestrator.miint_staging._extension_url`), so a resolve free to move
+`qiita_compute_orchestrator.miint_staging`), so a resolve free to move
 to a newer DuckDB can land on one with no miint build at all. A lockfile protects
 only the environments synced from it.
 

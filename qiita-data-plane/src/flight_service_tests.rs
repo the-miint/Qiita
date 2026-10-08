@@ -991,100 +991,6 @@ fn delete_pool_reads_drops_target_idempotently() {
     ));
 }
 
-// DoGet round-trip for read_masked: drive do_get's own producer
-// (`send_query_batches`, including its empty-result branch) against fixture data,
-// and assert the UTINYINT[] qual column survives as an Arrow List of UInt8 — the
-// one read-path behavior the reference tables don't cover (they have no list
-// columns).
-#[test]
-#[serial_test::serial]
-#[cfg(feature = "integration")]
-fn read_masked_doget_roundtrips_utinyint_array() {
-    use arrow_schema::DataType;
-
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
-    let conn = Connection::open_in_memory().unwrap();
-    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-    ducklake::ensure_read_tables(&conn).unwrap();
-
-    // Unique ids so leftover rows never collide with other serial tests.
-    let prep: i64 = 920_000;
-    let mask: i64 = 920_001;
-    let seq: i64 = 920_010;
-
-    conn.execute_batch(&format!(
-        "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};
-         DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep};
-         INSERT INTO qiita_lake.read \
-             (prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2) VALUES \
-             ({prep}, {seq}, 'r', 'ACGTAC', [5,6,7,8,9,10]::UTINYINT[], NULL, NULL);
-         INSERT INTO qiita_lake.read_mask \
-             (mask_idx, prep_sample_idx, sequence_idx, reason, left_trim1, right_trim1) VALUES \
-             ({mask}, {prep}, {seq}, 'pass', 1, 1);"
-    ))
-    .unwrap();
-
-    // do_get's producer for read_masked; one fixture row fits the channel unread.
-    let run = |filter: &auth::TicketFilter| -> Vec<arrow_array::RecordBatch> {
-        let (sql, table) = build_query("read_masked", filter, &[], &[]).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(DOGET_BATCH_CHANNEL_DEPTH);
-        send_query_batches(&conn, &sql, &table, &tx).unwrap();
-        drop(tx);
-        std::iter::from_fn(|| rx.blocking_recv())
-            .map(|item| item.unwrap())
-            .collect()
-    };
-
-    // Non-empty: the qual1 column is an Arrow List whose items are UInt8.
-    let mut filter = auth::TicketFilter::new();
-    filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(mask)]);
-    filter.insert(
-        "prep_sample_idx".to_string(),
-        vec![serde_json::Value::from(prep)],
-    );
-    let batches = run(&filter);
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 1, "one pass read should round-trip");
-
-    let schema = batches[0].schema();
-    let qual1 = schema.field_with_name("qual1").unwrap();
-    let item_type = match qual1.data_type() {
-        DataType::List(item) | DataType::LargeList(item) => item.data_type().clone(),
-        other => panic!("qual1 should be an Arrow List, got: {other:?}"),
-    };
-    assert_eq!(
-        item_type,
-        DataType::UInt8,
-        "UTINYINT[] must round-trip as a List of UInt8"
-    );
-
-    // Empty-result branch: a mask_idx with no rows yields exactly one empty
-    // batch carrying the schema (do_get's RecordBatch::new_empty path).
-    let mut empty_filter = auth::TicketFilter::new();
-    empty_filter.insert(
-        "mask_idx".to_string(),
-        vec![serde_json::Value::from(mask + 999_999)],
-    );
-    empty_filter.insert(
-        "prep_sample_idx".to_string(),
-        vec![serde_json::Value::from(prep)],
-    );
-    let empty = run(&empty_filter);
-    assert_eq!(empty.len(), 1, "empty result still yields one schema batch");
-    assert_eq!(empty[0].num_rows(), 0, "the schema batch has no rows");
-    assert!(
-        empty[0].schema().field_with_name("qual1").is_ok(),
-        "empty batch carries the full read_masked schema"
-    );
-
-    // Cleanup.
-    let _ = conn.execute_batch(&format!(
-        "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};
-         DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep};"
-    ));
-}
-
 // The streaming DoGet helper: runs the query in streaming mode inside a
 // blocking task and hands batches back over a bounded channel (do_get's body).
 // Pins that it streams every row, preserves the UTINYINT[] -> List<UInt8>
@@ -1252,6 +1158,11 @@ fn send_query_batches_surfaces_a_mid_stream_failure() {
     assert!(
         status.message().contains("mid-stream boom"),
         "the error names the cause: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("query failed mid-stream"),
+        "the error says the failure came after batches went out: {}",
         status.message()
     );
 }

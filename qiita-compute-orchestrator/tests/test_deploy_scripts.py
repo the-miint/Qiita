@@ -1049,16 +1049,26 @@ def _lake_gc_env(tmp_path, *, writable: bool = True) -> dict:
 
 
 @pytest.mark.parametrize("script", _LAKE_SCRIPTS, ids=lambda p: p.name)
-@pytest.mark.parametrize("reported", ["v1.0.0 (stub) 0", ""], ids=["other-version", "silent"])
+@pytest.mark.parametrize(
+    ("stub", "shown"),
+    [
+        ("echo 'v1.0.0 (stub) 0'", "printed 'v1.0.0 (stub) 0'"),
+        (":", "printed 'nothing'"),
+        ("echo 'cannot execute binary file' >&2; exit 126", "cannot execute binary file"),
+    ],
+    ids=["other-version", "silent", "unrunnable"],
+)
 def test_lake_script_refuses_a_duckdb_cli_of_another_version(
-    tmp_path: Path, script: Path, reported: str
+    tmp_path: Path, script: Path, stub: str, shown: str
 ) -> None:
-    """The CLI must be the DuckDB the data plane links (deploy/_common.sh says why),
-    and a binary that cannot say which version it is gets no benefit of the doubt."""
+    """The CLI must be the DuckDB the data plane links (deploy/_common.sh says why). A
+    binary that cannot say which version it is gets no benefit of the doubt, and the
+    refusal shows what it did print — stderr included, so an unrunnable one says why."""
     env = _lake_gc_env(tmp_path)
-    Path(env["QIITA_DUCKDB_BIN"]).write_text(f"#!/bin/sh\necho '{reported}'\nexit 0\n")
+    Path(env["QIITA_DUCKDB_BIN"]).write_text(f"#!/bin/sh\n{stub}\n")
     result = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
     assert result.returncode != 0, f"a mismatched CLI was accepted:\n{result.stdout}"
+    assert shown in result.stderr, result.stderr
     assert f"v{_required_duckdb_cli_version()}" in result.stderr, result.stderr
     assert not (tmp_path / "captured.sql").exists(), "SQL ran on the wrong CLI"
 

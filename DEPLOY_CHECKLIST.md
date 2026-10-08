@@ -44,8 +44,8 @@ _None yet._
   sudo -u qiita-orch bash -c 'set -a; . /etc/qiita/compute-orchestrator.env; set +a
   cd /tmp && apptainer exec --no-home "${PATH_DERIVED}/images/long-read-assembly-checkm-1.0.1.sif" \
     ls /opt/conda/envs/checkm/conda-meta' \
-    | sed -n -E 's/^(checkm-genome|pplacer|hmmer|prodigal)-([^-]+)-[^-]+\.json$/\1=\2/p' | sort
-  # expect exactly: checkm-genome=1.2.5  hmmer=3.4  pplacer=1.1.alpha22  prodigal=2.6.3
+    | sed -n -E 's/^(checkm-genome|pplacer|hmmer|prodigal)-([^-]+)-[^-]+\.json$/\1==\2/p' | sort
+  # expect exactly: checkm-genome==1.2.5  hmmer==3.4  pplacer==1.1.alpha22  prodigal==2.6.3
   ```
 
 ### 3. Migrations
