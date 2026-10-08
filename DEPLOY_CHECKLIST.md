@@ -20,8 +20,7 @@ _None yet._
 ### 2. One-time host setup
 
 - `[operator]` **Confirm the mirror publishes the DuckDB 1.5.5 miint build** before the
-  restart — every component now runs 1.5.5, and the stage step fetches from here
-  (verified present when this was written). (#651)
+  restart — every component now runs 1.5.5, and the stage step fetches from here. (#651)
   ```bash
   curl -fsSI https://ftp.microbio.me/pub/miint/v1.5.5/linux_amd64/miint.duckdb_extension.gz | head -1   # expect 200
   ```
@@ -60,9 +59,9 @@ _None yet._
 ### 5. Verify
 
 - **Both staged miint builds are present, and the rebuilt `long-read-assembly` images carry
-  DuckDB 1.5.5** — a splitter finds miint only under its own DuckDB version's directory,
-  and `v1.5.4/` still serves the frozen 1.0.0 checkm image (see Notes). Expect
-  `DUCKDB_155_OK`. (#651)
+  DuckDB 1.5.5** — the assemble and checkm steps load miint only from their own DuckDB
+  version's directory, and `v1.5.4/` still serves the frozen 1.0.0 checkm image (see
+  Notes). Expect `DUCKDB_155_OK`. (#651)
   ```bash
   sudo -u qiita-orch bash -c 'set -a; . /etc/qiita/compute-orchestrator.env; set +a
   for v in 1.5.5 1.5.4; do
@@ -89,10 +88,13 @@ _None yet._
     `cp-miint` checks LOAD the new build.
   - The `assemble` and `checkm` (`-1.0.1`) SIFs auto-rebuild on deploy to pick up 1.5.5.
     `checkm`'s tools are now pinned, and its build fails if a solve drifts off them.
-  - **Long-read-assembly work started between the bucket-4 restart and the redeploy's miint
-    stage (step 5/8) fails at LOAD.** The services come up on DuckDB 1.5.5 before
-    `v1.5.5/` is staged, so a masked-read stream or native job that starts in that window
-    finds no miint for its version. Resubmit anything that failed there.
+  - **Work that loads miint between the bucket-4 deploy and the redeploy's miint stage
+    (step 5/8) fails at LOAD.** `v1.5.5/` is staged last, after everything that moves to
+    1.5.5: step 4 rebuilds the long-read-assembly images and restarts the services, and
+    step 5 refreshes the SLURM native venv before it stages. In that window, a
+    long-read-assembly ticket (its read export, its assemble and checkm steps) and any
+    native job that loads miint find no miint for their version. Resubmit anything that
+    failed there.
   - **Keep `MIINT_EXTENSION_DIRECTORY/v1.5.4/`.** `long-read-assembly` 1.0.0's checkm step
     still runs the frozen `long-read-assembly-checkm-1.0.0.sif` (no build spec since 1.0.1),
     on DuckDB 1.5.4, and LOADs miint from there. Staging never removes an old version dir.

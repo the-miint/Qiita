@@ -4051,8 +4051,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   the deploy CLI version, and every tracked `pyproject.toml` (any dependency table) and
   `uv.lock`, to the crate. The lake scripts now refuse a DuckDB CLI of any other version.
   The long-read-assembly `checkm` image, which this bump rebuilds, now pins CheckM, pplacer,
-  hmmer and prodigal, so the rebuild cannot re-resolve them. The bundled DuckLake moves
-  `d318a545` → `d8a1881e`: bug fixes, no catalog-schema change.
+  hmmer and prodigal, so the rebuild cannot re-resolve them. The DuckLake extension
+  DuckDB 1.5.5 installs moves `d318a545` → `d8a1881e`: bug fixes, and a catalog created
+  under 1.5.4 keeps its schema and version.
 - **`qiita biosample create-field` validates its flags before reading the auth token
   (#639).** An invalid flag combination now exits 2 naming the flag, where it previously
   reported a missing token first and left the real problem to be found on the retry. The

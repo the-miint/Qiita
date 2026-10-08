@@ -388,7 +388,7 @@ QIITA_DUCKDB_VERSION="1.5.5"
 
 # Resolve the duckdb CLI into DUCKDB_BIN and require exactly v${QIITA_DUCKDB_VERSION},
 # or exit with install instructions. Exact, because the CLI opens the data plane's
-# catalog with the ducklake extension of its OWN version — a newer one may migrate
+# catalog with the ducklake extension of its own version — a newer one may migrate
 # the catalog schema under the running data plane — and lake-shell LOADs the miint
 # staged for its own version. A binary that reports no version is refused too.
 # Two install sites because the callers run as different accounts: a human with
@@ -399,10 +399,11 @@ qiita_resolve_duckdb_bin() {
     if [ -z "${DUCKDB_BIN}" ]; then
         problem="no duckdb CLI on PATH."
     else
-        # The first word of `duckdb --version`, e.g. `v1.5.5 (Variegata) d8cdaa33fd`.
-        reported=$("${DUCKDB_BIN}" --version 2>/dev/null | awk 'NR == 1 { print $1 }') || true
-        [ "${reported}" = "v${QIITA_DUCKDB_VERSION}" ] && return 0
-        problem="${DUCKDB_BIN} reports DuckDB '${reported:-no version}', not v${QIITA_DUCKDB_VERSION}."
+        # `duckdb --version` prints e.g. `v1.5.5 (Variegata) d8cdaa33fd`. stderr is
+        # kept, so a binary that cannot run says why in the message below.
+        reported=$("${DUCKDB_BIN}" --version 2>&1 | head -n 1) || true
+        [ "${reported%% *}" = "v${QIITA_DUCKDB_VERSION}" ] && return 0
+        problem="\`${DUCKDB_BIN} --version\` printed '${reported:-nothing}'; the data plane links v${QIITA_DUCKDB_VERSION}."
     fi
     cat >&2 <<EOF
 ERROR: ${problem}

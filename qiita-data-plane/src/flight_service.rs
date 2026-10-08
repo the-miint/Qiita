@@ -217,6 +217,7 @@ fn run_producer(
             format!("data plane producer panicked: {what}")
         }
     };
+    eprintln!("error: DoGet stream failed: {message}");
     let _ = tx.blocking_send(Err(FlightError::ExternalError(Box::new(
         std::io::Error::other(message),
     ))));
@@ -234,8 +235,8 @@ fn send_query_batches(
     let mut stmt = conn
         .prepare(sql)
         .map_err(|e| Status::internal(format!("query preparation failed for {table}: {e}")))?;
-    // STREAMING execution, never the materializing `query_arrow` — load-bearing
-    // for memory; see `stream_ducklake_batches`.
+    // Streaming execution, never the materializing `query_arrow`; see
+    // `stream_ducklake_batches` for why.
     let schema = stmt
         .stream_arrow([])
         .map_err(|e| Status::internal(format!("query execution failed for {table}: {e}")))?
@@ -243,10 +244,14 @@ fn send_query_batches(
     let mut produced = false;
     // Fetch with the fallible `step`, not the `ArrowStream` iterator, which
     // panics on a failed fetch: a DuckDB error is an outcome to report, not a bug.
-    while let Some(chunk) = stmt
-        .step()
-        .map_err(|e| Status::internal(format!("query failed mid-stream for {table}: {e}")))?
-    {
+    while let Some(chunk) = stmt.step().map_err(|e| {
+        let when = if produced {
+            "mid-stream"
+        } else {
+            "before its first batch"
+        };
+        Status::internal(format!("query failed {when} for {table}: {e}"))
+    })? {
         produced = true;
         // Receiver dropped (client hung up) — stop early, don't error.
         if tx.blocking_send(Ok(RecordBatch::from(chunk))).is_err() {

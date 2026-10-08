@@ -290,33 +290,34 @@ def test_checkm_image_ships_the_split_and_rebuilds_on_its_edit() -> None:
         )
 
 
-_CHECKM_TOOLS = ("checkm-genome", "pplacer", "hmmer", "prodigal")
-
-
 def _checkm_pins() -> dict[str, str]:
-    """The `tool=version` pins on checkm.def's `micromamba create -n checkm` command."""
-    lines = _CHECKM_DEF.read_text().replace("\\\n", " ").splitlines()
-    create = next((ln for ln in lines if "micromamba create" in ln and "-n checkm" in ln), None)
-    assert create is not None, "checkm.def no longer creates the checkm env"
-    return dict(re.findall(r"\b([a-z][a-z0-9-]*)=([0-9][^\s\"']*)", create))
+    """checkm.def's `CHECKM_PINS`, the one list of `tool=version` the image is built from."""
+    m = re.search(r'^\s*CHECKM_PINS="([^"]*)"$', _CHECKM_DEF.read_text(), re.MULTILINE)
+    assert m, "checkm.def no longer sets CHECKM_PINS"
+    pins = dict(pin.split("=", 1) for pin in m.group(1).split())
+    assert all(pins.values()), f"CHECKM_PINS has an entry with no version: {m.group(1)!r}"
+    return pins
 
 
-def test_checkm_image_pins_its_tools_and_asserts_them_at_build_time() -> None:
-    """Every scoring tool is version-pinned, and %test fails the build on any other.
+def test_checkm_image_builds_from_its_pins_and_checks_each_at_build_time() -> None:
+    """The env is created from CHECKM_PINS alone, and %test checks every pin.
 
-    checkm.def's create line says why the pins exist; this holds them in place.
+    checkm.def's CHECKM_PINS line says why the pins exist; this holds them in place.
     """
     pins = _checkm_pins()
-    defsrc = _CHECKM_DEF.read_text()
+    assert "checkm-genome" in pins, "CheckM itself must be pinned"
+    defsrc = _CHECKM_DEF.read_text().replace("\\\n", " ")
+    create = next(
+        ln for ln in defsrc.splitlines() if "micromamba create" in ln and "-n checkm" in ln
+    )
+    assert create.split()[-1] == "${CHECKM_PINS}", (
+        f"the checkm env must be created from CHECKM_PINS and nothing else: {create.strip()!r}"
+    )
+    assert re.search(r"\$\{CHECKM_PINS\}\s*>\s*/opt/qiita/checkm\.pins", defsrc), (
+        "%post must hand CHECKM_PINS to %test in /opt/qiita/checkm.pins"
+    )
     test_section = defsrc[defsrc.index("\n%test") :]
-    for tool in _CHECKM_TOOLS:
-        assert tool in pins, (
-            f"{tool} is unpinned on checkm.def's `micromamba create -n checkm` line"
-        )
-        assert f"{tool}={pins[tool]}" in test_section, (
-            f"checkm.def pins {tool}={pins[tool]} but its %test never asserts that version, "
-            "so a drifted solve would build and ship green."
-        )
+    assert "< /opt/qiita/checkm.pins" in test_section, "%test must check every pin"
 
 
 def test_checkm_spec_verifies_the_pinned_checkm_version() -> None:
@@ -325,8 +326,9 @@ def test_checkm_spec_verifies_the_pinned_checkm_version() -> None:
     cmd = re.search(r'^VERIFY_CMD="([^"]*)"', spec, re.MULTILINE)
     match = re.search(r'^VERIFY_MATCH="([^"]*)"', spec, re.MULTILINE)
     assert cmd is not None and match is not None, "checkm.env lost VERIFY_CMD/VERIFY_MATCH"
-    assert cmd.group(1).startswith("micromamba list -n checkm"), cmd.group(1)
+    assert cmd.group(1) == "ls /opt/conda/envs/checkm/conda-meta", cmd.group(1)
     pinned = _checkm_pins()["checkm-genome"]
-    # `micromamba list` rows: name, version, build, channel.
-    assert re.search(match.group(1), f"  checkm-genome  {pinned}  pyhdfd78af_0  bioconda")
-    assert not re.search(match.group(1), "  checkm-genome  1.2.4  pyhdfd78af_0  bioconda")
+    # A conda-meta entry is `<name>-<version>-<build>.json`.
+    assert re.search(match.group(1), f"checkm-genome-{pinned}-pyhdfd78af_0.json")
+    assert not re.search(match.group(1), "checkm-genome-1.2.4-pyhdfd78af_0.json")
+    assert not re.search(match.group(1), f"checkm-genome-{pinned}.1-pyhdfd78af_0.json")

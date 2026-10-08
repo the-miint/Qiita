@@ -7,12 +7,11 @@ A DuckDB bump has to land in lockstep across several spots; a past bump moved th
 mismatched libduckdb against the new crate. This test fails that drift loudly
 instead of letting it ship.
 
-Every pin is EXACT, never a floor. miint is built per DuckDB release — the mirror
-publishes `v<duckdb-version>/<platform>/miint.duckdb_extension.gz`, and DuckDB
-namespaces the staged extension directory the same way — so a resolve free to move
-to a newer DuckDB lands on one with no miint build at all (DuckDB 1.5.6 was on PyPI
-and crates.io while the mirror's newest build was 1.5.5). A lockfile protects only
-the environments synced from it.
+Every pin is exact, never a floor. miint is built per DuckDB release, and both the
+mirror and the staged extension directory are laid out by DuckDB version (see
+`qiita_compute_orchestrator.miint_staging._extension_url`), so a resolve free to move
+to a newer DuckDB can land on one with no miint build at all. A lockfile protects
+only the environments synced from it.
 
 What it ties together, each against the crate:
 - `qiita-data-plane/Cargo.toml` `[dependencies].duckdb` — the crate, which decides
@@ -29,8 +28,9 @@ What it ties together, each against the crate:
 - `deploy/_common.sh` `QIITA_DUCKDB_VERSION` — the DuckDB CLI the lake scripts
   require; `qiita_resolve_duckdb_bin` refuses any other and says why.
 - Every tracked Python project's `duckdb` requirements, in any dependency table,
-  and the version its `uv.lock` resolves. The container defs' `python-duckdb` pins are tied to the
-  orchestrator's lock by `test_container_duckdb_matches_the_orchestrator_lock`, so
+  and the version its `uv.lock` resolves. The container defs' `python-duckdb` pins
+  are tied to the orchestrator's lock by `qiita-compute-orchestrator/tests/
+  test_myloasm_split.py::test_container_duckdb_matches_the_orchestrator_lock`, so
   this closes that chain rather than repeating it.
 
 When this fails, bump every spot to the same DuckDB version (and update
@@ -59,8 +59,9 @@ _ACTION_VERSION_DEFAULT_RE = re.compile(
     re.MULTILINE,
 )
 _DEPLOY_VERSION_RE = re.compile(r'^QIITA_DUCKDB_VERSION="([^"]+)"$', re.MULTILINE)
-# A `duckdb` requirement and its specifier; `duckdb-<suffix>` packages don't match.
-_PY_DUCKDB_REQ_RE = re.compile(r"duckdb\s*([=<>!~].*)?")
+# A `duckdb` requirement — any case, extras or not — and its specifier;
+# `duckdb-<suffix>` packages don't match.
+_PY_DUCKDB_REQ_RE = re.compile(r"(?i)duckdb\s*(?:\[[^\]]*\])?\s*([=<>!~].*)?")
 # A Cargo version requirement: an optional operator, then the version.
 _CARGO_REQ_RE = re.compile(r"\s*(>=|<=|=|\^|~|>|<)?\s*(\S+)\s*")
 
@@ -187,8 +188,7 @@ def test_python_duckdb_pin_is_exact_and_matches_data_plane_crate(component: str)
 def test_python_lock_resolves_data_plane_duckdb(component: str) -> None:
     expected = _pinned_duckdb_version()
     lock_path = REPO_ROOT / component / "uv.lock"
-    if not lock_path.exists():
-        pytest.skip(f"{component} has no uv.lock; its pyproject pin is the whole guard")
+    assert lock_path.exists(), f"{component} has no uv.lock; CLAUDE.md requires it committed"
     lock = tomllib.loads(lock_path.read_text())
     declares = bool(
         _duckdb_specifiers(tomllib.loads((REPO_ROOT / component / "pyproject.toml").read_text()))
@@ -222,13 +222,13 @@ def test_duckdb_specifiers_come_from_every_dependency_table() -> None:
     pyproject = {
         "project": {
             "dependencies": ["duckdb==1.5.5", "duckdb-extensions>=1"],
-            "optional-dependencies": {"cli": ["duckdb>=1.5"]},
+            "optional-dependencies": {"cli": ["duckdb>=1.5", "DuckDB[all]<2"]},
         },
         "dependency-groups": {"dev": ["duckdb", {"include-group": "cli"}]},
         "tool": {"uv": {"dev-dependencies": ["duckdb~=1.5.5"]}},
     }
     assert sorted(_duckdb_specifiers(pyproject), key=str) == sorted(
-        ["==1.5.5", ">=1.5", None, "~=1.5.5"], key=str
+        ["==1.5.5", ">=1.5", "<2", None, "~=1.5.5"], key=str
     )
 
 

@@ -895,14 +895,15 @@ def test_split_conn_password_declines_when_it_cannot_key_a_pgpass_entry(connstr:
 
 
 def _required_duckdb_cli_version() -> str:
-    """The CLI version deploy/_common.sh requires — read from it, not restated."""
-    m = re.search(
-        r'^QIITA_DUCKDB_VERSION="([^"]+)"$',
-        (_REPO_ROOT / "deploy" / "_common.sh").read_text(),
-        re.MULTILINE,
-    )
-    assert m, "deploy/_common.sh no longer sets QIITA_DUCKDB_VERSION"
-    return m.group(1)
+    """The CLI version the lake scripts require, as they read it: by sourcing _common.sh."""
+    version = subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; printf %s "$QIITA_DUCKDB_VERSION"'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert version, "deploy/_common.sh no longer sets QIITA_DUCKDB_VERSION"
+    return version
 
 
 def _write_duckdb_stub(path: Path, body: str = "exit 0\n") -> Path:
@@ -1019,10 +1020,10 @@ def test_lake_gc_rejects_unknown_argument() -> None:
 
 
 def _lake_gc_env(tmp_path, *, writable: bool = True) -> dict:
-    """A data-plane env plus a lake dir, with duckdb stubbed by `true` so the
-    script's own logic runs without a catalog. `true` prints nothing, which is the
-    same shape as a maintenance call that reclaims nothing. Resolved via PATH —
-    it is /usr/bin/true on macOS and /bin/true on most Linux."""
+    """A data-plane env plus a lake dir, with duckdb stubbed so the script's own
+    logic runs without a catalog. The stub reports the required version, saves the
+    SQL it is handed, and prints nothing — the same shape as a maintenance call that
+    reclaims nothing."""
     persistent = tmp_path / "persistent"
     (persistent / "ducklake").mkdir(parents=True)
     if not writable:

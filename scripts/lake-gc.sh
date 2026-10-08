@@ -87,7 +87,8 @@
 #
 # Env overrides:
 #   DP_ENV                   data-plane env file (default /etc/qiita/data-plane.env)
-#   QIITA_DUCKDB_BIN         duckdb CLI to run (default: `duckdb` on PATH)
+#   QIITA_DUCKDB_BIN         duckdb CLI to run; must be the version the data plane
+#                            links (default: `duckdb` on PATH)
 #   QIITA_LAKE_THREADS       thread count (default 4)
 #   QIITA_LAKE_MEMORY_LIMIT  memory limit (default 32GB)
 set -euo pipefail
