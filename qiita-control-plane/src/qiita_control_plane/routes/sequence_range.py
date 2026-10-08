@@ -6,11 +6,8 @@ humans never mint sequence ranges. The cap on a single allocation is
 read from Settings.max_sequence_mint_count (so a runaway compute step
 can't burn an unbounded slice of the sequence_idx space).
 
-GET /sequence-range/{prep_sample_idx} reads the row back. Gated on
-`prep_sample:read` OR `sequence_range:mint` (either-or). A
-`prep_sample:read` caller is additionally held to per-study read access on
-the prep_sample; a `sequence_range:mint` caller is not. The access rule and
-its reasons are on `get_sequence_range_route`.
+GET /sequence-range/{prep_sample_idx} reads the row back. Who may read it is
+on `get_sequence_range_route`.
 
 Why a dedicated REST router (not a `LibraryPrimitive` dispatch like
 `MINT_FEATURES` in `actions/library.py`): sequence-range allocation is
@@ -139,34 +136,33 @@ async def get_sequence_range_route(
 ) -> SequenceRange:
     """Return the sequence_range row for `prep_sample_idx`, or 404.
 
-    SECURITY: the two scopes admit two kinds of caller, and they are gated
-    differently.
+    SECURITY: the two scopes admit two kinds of caller (which principals can
+    hold each is in `auth/scopes.py`), and they are gated differently.
 
-    A `prep_sample:read` caller (every human role; no service account can hold
-    it) must also pass `authorize_prep_sample_cohort` at `COHORT_MIN_TIER` —
-    the same per-study rule the other single-prep_sample reads apply. The check
-    runs before the row is fetched, so a caller without access gets 403 for a
-    minted, an unminted and a non-existent prep_sample alike.
+    A caller without `sequence_range:mint` must also pass
+    `authorize_prep_sample_cohort` at `COHORT_MIN_TIER`. The check runs before
+    the row is fetched, so a caller without access gets 403 for a minted, an
+    unminted and a non-existent prep_sample alike.
 
-    A `sequence_range:mint` caller (service accounts only) is not gated per
-    row. Every job presents the same compute service-account token, so the
-    request does not identify the calling work_ticket, and
-    `mint_or_reuse_sequence_range` reads back ranges minted by OTHER tickets to
-    tell the operator which ticket holds the range and in what state. The
-    caller can already mint for any prep_sample.
+    A `sequence_range:mint` caller is not gated per row. Every job presents
+    the same compute service-account token, so the request does not identify
+    the calling work_ticket; a job that finds a range already minted reads it
+    back whichever ticket minted it. The caller can already mint for any
+    prep_sample.
 
-    The row exposes, to a caller who passes:
+    The 200 body gives, to a caller who passes:
 
     - **Read count** for the prep_sample
       (`sequence_idx_stop - sequence_idx_start + 1`).
     - **Mint timestamp** (`created_at`).
-    - **Processing-state existence** (200 vs 404) — whether a range has been
-      minted at all.
-    - **Relative mint order** across samples (compare `sequence_idx_start`).
+    - **The minting work_ticket and its current state**
+      (`minted_by_work_ticket_idx`, `minted_by_work_ticket_state`).
+    - **Whether a range has been minted at all** (200 vs 404).
+    - **Relative mint order** across prep_samples (compare
+      `sequence_idx_start`).
 
-    Not exposed: study membership, biosample metadata, sequence content, the
-    submitter's identity, or whether the work_ticket ultimately succeeded (the
-    row persists after a step failure).
+    It carries no study membership, biosample metadata, sequence content or
+    submitter identity. The 403 detail is `prep_sample_access_denied_detail`'s.
     """
     if not caller.has_scope(str(Scope.SEQUENCE_RANGE_MINT)):
         await authorize_prep_sample_cohort(

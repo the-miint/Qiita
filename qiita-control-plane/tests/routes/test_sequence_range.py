@@ -1,8 +1,7 @@
 """Route tests for /sequence-range.
 
 Covers the POST mint endpoint (service-account + scope guarded), the
-GET read endpoint (prep_sample:read plus per-study access, or
-sequence_range:mint), the auth matrix on both, the FK / unique / cap /
+GET read endpoint, the auth matrix on both, the FK / unique / cap /
 cascade error paths, and concurrent-mint behaviour through the HTTP surface.
 """
 
@@ -17,6 +16,7 @@ from qiita_common.api_paths import (
     URL_SEQUENCE_RANGE_PREFIX,
 )
 from qiita_common.auth_constants import Scope
+from qiita_common.models import Tier
 
 from qiita_control_plane.auth.token import mint_api_token
 from qiita_control_plane.testing.db_seeds import (
@@ -25,6 +25,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
     seed_user_principal,
 )
+
+from .conftest import _grant_study_access, _seed_study, delete_idxs
 
 # The ticket the mint records as the range's minter. No FK, so any positive idx is
 # accepted at the DB layer; the value only ever gets compared for equality.
@@ -38,15 +40,13 @@ pytestmark = pytest.mark.db
 # ---------------------------------------------------------------------------
 
 
-async def _seed_study_with_sample(pool, *, owner_idx, biosample_idx, prep_sample_idx) -> int:
+async def _seed_study_with_prep_sample(
+    seed_ctx, *, owner_idx, biosample_idx, prep_sample_idx
+) -> int:
     """A study owned by `owner_idx` with the biosample and prep_sample linked
     into it; returns the study_idx. Grants nobody else access."""
-    study_idx = await pool.fetchval(
-        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
-        " VALUES ($1, $2, $1) RETURNING idx",
-        owner_idx,
-        f"sr-route-{secrets.token_hex(4)}",
-    )
+    pool = seed_ctx["pool"]
+    study_idx = await _seed_study(seed_ctx, owner_idx=owner_idx, suffix="sr")
     await seed_biosample_to_study_link(
         pool, biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner_idx
     )
@@ -56,14 +56,24 @@ async def _seed_study_with_sample(pool, *, owner_idx, biosample_idx, prep_sample
     return study_idx
 
 
+async def _mint(ctx, prep_sample_idx: int) -> dict:
+    resp = await ctx["sa"].post(
+        URL_SEQUENCE_RANGE_PREFIX,
+        json={"prep_sample_idx": prep_sample_idx, "count": 3, "work_ticket_idx": _WORK_TICKET_IDX},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
 @pytest_asyncio.fixture
 async def ctx(
     postgres_pool,
     regular_user_session,
+    wet_lab_admin_session,
     compute_worker_service_account,
 ):
     """Yield a route-test context with one prep_sample plus the
-    AsyncClient triple needed by every test (anonymous, regular user,
+    AsyncClients the tests need (anonymous, regular user, wet_lab_admin,
     compute SA), and a `created` dict for FK-reverse teardown.
 
     The prep_sample is linked to a study owned by a third principal, on which
@@ -95,22 +105,24 @@ async def ctx(
     bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(
         postgres_pool, owner_idx=principal_idx
     )
-    study_idx = await _seed_study_with_sample(
-        postgres_pool, owner_idx=principal_idx, biosample_idx=bs_idx, prep_sample_idx=ps_idx
-    )
-    await postgres_pool.execute(
-        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
-        " VALUES ($1, $2, 'viewer', $3)",
-        study_idx,
-        regular_user_session["principal_idx"],
-        principal_idx,
-    )
-    created: dict[str, list[int]] = {
+    created: dict[str, list] = {
         "biosample": [bs_idx],
         "prep_sample": [ps_idx],
         "principal": [principal_idx],
-        "study": [study_idx],
+        "study": [],
+        "study_access": [],
     }
+    seed_ctx = {"pool": postgres_pool, "created": created}
+    study_idx = await _seed_study_with_prep_sample(
+        seed_ctx, owner_idx=principal_idx, biosample_idx=bs_idx, prep_sample_idx=ps_idx
+    )
+    await _grant_study_access(
+        seed_ctx,
+        study_idx=study_idx,
+        principal_idx=regular_user_session["principal_idx"],
+        tier=Tier.VIEWER,
+        granted_by_idx=principal_idx,
+    )
 
     async with (
         AsyncClient(transport=transport, base_url="http://test") as anon,
@@ -122,6 +134,11 @@ async def ctx(
         AsyncClient(
             transport=transport,
             base_url="http://test",
+            headers={"Authorization": f"Bearer {wet_lab_admin_session['token']}"},
+        ) as wet,
+        AsyncClient(
+            transport=transport,
+            base_url="http://test",
             headers={"Authorization": f"Bearer {compute_worker_service_account['token']}"},
         ) as sa,
     ):
@@ -129,6 +146,7 @@ async def ctx(
             "pool": postgres_pool,
             "anon": anon,
             "user": user,
+            "wet": wet,
             "sa": sa,
             "user_session": regular_user_session,
             "sa_session": compute_worker_service_account,
@@ -151,9 +169,7 @@ async def ctx(
         "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])",
         created["study"],
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", created["study"]
-    )
+    await delete_idxs(postgres_pool, "study", created["study"])
     await postgres_pool.execute(
         "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])",
         created["prep_sample"],
@@ -170,6 +186,19 @@ async def ctx(
         "DELETE FROM qiita.principal WHERE idx = ANY($1::bigint[])",
         created["principal"],
     )
+
+
+@pytest_asyncio.fixture
+async def foreign_prep_sample(ctx):
+    """A second prep_sample, in a study the regular user holds no tier on."""
+    pool, owner = ctx["pool"], ctx["principal_idx"]
+    bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(pool, owner_idx=owner)
+    await _seed_study_with_prep_sample(
+        ctx, owner_idx=owner, biosample_idx=bs_idx, prep_sample_idx=ps_idx
+    )
+    ctx["created"]["biosample"].append(bs_idx)
+    ctx["created"]["prep_sample"].append(ps_idx)
+    return ps_idx
 
 
 @pytest_asyncio.fixture
@@ -487,37 +516,15 @@ async def test_get_404_when_unminted(ctx):
 
 
 async def test_get_unknown_prep_sample_404_for_sa_403_for_user(ctx):
-    """An unknown prep_sample is a 404 on the mint arm. A user has no study to
-    be authorized against, so the access gate answers first with a 403."""
+    """An unknown prep_sample is a 404 for a `sequence_range:mint` caller. A user
+    has no study to be authorized against, so the access gate answers first
+    with a 403."""
     bogus_idx = (
         await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.prep_sample") + 999
     )
     url = URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=bogus_idx)
     assert (await ctx["sa"].get(url)).status_code == 404
     assert (await ctx["user"].get(url)).status_code == 403
-
-
-@pytest_asyncio.fixture
-async def foreign_prep_sample(ctx):
-    """A second prep_sample, in a study the regular user holds no tier on."""
-    pool, owner = ctx["pool"], ctx["principal_idx"]
-    bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(pool, owner_idx=owner)
-    study_idx = await _seed_study_with_sample(
-        pool, owner_idx=owner, biosample_idx=bs_idx, prep_sample_idx=ps_idx
-    )
-    ctx["created"]["biosample"].append(bs_idx)
-    ctx["created"]["prep_sample"].append(ps_idx)
-    ctx["created"]["study"].append(study_idx)
-    return ps_idx
-
-
-async def _mint(ctx, prep_sample_idx: int) -> dict:
-    resp = await ctx["sa"].post(
-        URL_SEQUENCE_RANGE_PREFIX,
-        json={"prep_sample_idx": prep_sample_idx, "count": 3, "work_ticket_idx": _WORK_TICKET_IDX},
-    )
-    assert resp.status_code == 201, resp.text
-    return resp.json()
 
 
 async def test_get_user_without_study_access_403_minted_or_not(ctx, foreign_prep_sample):
@@ -550,28 +557,19 @@ async def test_get_user_unlinked_prep_sample_403(ctx):
     assert resp.status_code == 403, resp.text
 
 
-async def test_get_wet_lab_admin_bypasses_study_access(
-    ctx, foreign_prep_sample, wet_lab_admin_session
-):
+async def test_get_wet_lab_admin_bypasses_study_access(ctx, foreign_prep_sample):
     """wet_lab_admin reads a range in a study it holds no tier on."""
-    from qiita_control_plane.main import app
-
     minted = await _mint(ctx, foreign_prep_sample)
-    async with AsyncClient(
-        transport=ASGITransport(app=app),
-        base_url="http://test",
-        headers={"Authorization": f"Bearer {wet_lab_admin_session['token']}"},
-    ) as admin:
-        resp = await admin.get(
-            URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=foreign_prep_sample)
-        )
+    resp = await ctx["wet"].get(
+        URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=foreign_prep_sample)
+    )
     assert resp.status_code == 200, resp.text
     assert resp.json()["sequence_idx_start"] == minted["sequence_idx_start"]
 
 
 async def test_get_sa_reads_range_in_study_no_human_granted(ctx, foreign_prep_sample):
-    """The mint arm is not study-gated: the compute SA holds no study tier and
-    reads the range back. `mint_or_reuse_sequence_range` depends on this."""
+    """A `sequence_range:mint` caller is not study-gated: the compute SA holds
+    no study tier and reads the range."""
     minted = await _mint(ctx, foreign_prep_sample)
     resp = await ctx["sa"].get(
         URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=foreign_prep_sample)

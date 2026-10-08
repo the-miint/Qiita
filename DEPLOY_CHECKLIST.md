@@ -43,7 +43,8 @@ _None yet._
   without `viewer` on every study the prep_sample is linked to
   (#fix/sequence-range-get-row-acl).** It answered `200` or `404` to any `prep_sample:read`
   holder before. `wet_lab_admin` and above are unaffected, and so is the compute service
-  account's `sequence_range:mint` read-back; the response body is unchanged.
+  account, which still reads any range with `sequence_range:mint`; the response body is
+  unchanged.
 
 ## Deployed history
 
