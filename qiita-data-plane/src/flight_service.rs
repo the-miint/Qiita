@@ -176,8 +176,7 @@ const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
 /// the client always receives a valid (possibly empty) Arrow table. A DuckDB
 /// error — connect, prepare, execute, or a chunk fetch after batches have already
 /// gone out — surfaces as a trailing `Err` item, so a client never reads a
-/// truncated result as a whole one. A panic in the producer is the exception: it
-/// drops the sender, and the stream ends as if complete.
+/// truncated result as a whole one; so does a panic (see `run_producer`).
 fn stream_ducklake_batches(
     catalog_connstr: String,
     data_path: String,
@@ -190,19 +189,37 @@ fn stream_ducklake_batches(
     // independently, draining into `tx`. Don't `.await`/`.join()` it — the
     // result is delivered through the channel, not the handle.
     tokio::task::spawn_blocking(move || {
-        let produce = || -> Result<(), Status> {
+        run_producer(&tx, || {
             let conn = open_ducklake(&catalog_connstr, &data_path)?;
             send_query_batches(&conn, &sql, &table, &tx)
-        };
-        if let Err(status) = produce() {
-            // Surface the producer error as a stream item (ignore send failure —
-            // the consumer is already gone).
-            let _ = tx.blocking_send(Err(FlightError::ExternalError(Box::new(
-                std::io::Error::other(status.message().to_string()),
-            ))));
-        }
+        })
     });
     ReceiverStream::new(rx)
+}
+
+/// Run `produce`, and send its failure to `tx` as the stream's trailing `Err` item
+/// (a failed send means the consumer is already gone, so it is ignored). A panic is
+/// a failure too: left to unwind, it would drop `tx` and end the stream as though
+/// the result were complete.
+fn run_producer(
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, FlightError>>,
+    produce: impl FnOnce() -> Result<(), Status>,
+) {
+    let message = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(produce)) {
+        Ok(Ok(())) => return,
+        Ok(Err(status)) => status.message().to_string(),
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("a non-string payload");
+            format!("data plane producer panicked: {what}")
+        }
+    };
+    let _ = tx.blocking_send(Err(FlightError::ExternalError(Box::new(
+        std::io::Error::other(message),
+    ))));
 }
 
 /// Execute `sql` on `conn` in streaming mode and push each `RecordBatch` into
@@ -224,16 +241,15 @@ fn send_query_batches(
         .map_err(|e| Status::internal(format!("query execution failed for {table}: {e}")))?
         .get_schema();
     let mut produced = false;
-    // Fetch with the fallible `step`, not the `ArrowStream` iterator: the
-    // iterator panics when a chunk fails to fetch, and a panic here would close
-    // the channel into a clean EOF that reads as a complete result.
+    // Fetch with the fallible `step`, not the `ArrowStream` iterator, which
+    // panics on a failed fetch: a DuckDB error is an outcome to report, not a bug.
     while let Some(chunk) = stmt
         .step()
         .map_err(|e| Status::internal(format!("query failed mid-stream for {table}: {e}")))?
     {
         produced = true;
         // Receiver dropped (client hung up) — stop early, don't error.
-        if tx.blocking_send(Ok(RecordBatch::from(&chunk))).is_err() {
+        if tx.blocking_send(Ok(RecordBatch::from(chunk))).is_err() {
             return Ok(());
         }
     }

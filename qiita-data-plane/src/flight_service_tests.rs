@@ -991,13 +991,12 @@ fn delete_pool_reads_drops_target_idempotently() {
     ));
 }
 
-// DoGet round-trip for read_masked: drive the exact query path do_get uses
-// (build_query → prepare → query_arrow → get_schema → collect, plus the
-// empty-result RecordBatch::new_empty branch) against fixture data, and
-// assert the UTINYINT[] qual column survives as an Arrow List of UInt8.
-// This pins the one read-path behavior the reference tables don't cover
-// (they have no list columns): a UTINYINT[] column round-trips through
-// query_arrow → Arrow.
+// read_masked's UTINYINT[] qual column survives as an Arrow List of UInt8 —
+// the one read-path behavior the reference tables don't cover (they have no list
+// columns). This runs the MATERIALIZING path (build_query → prepare → query_arrow
+// → collect, plus the empty-result RecordBatch::new_empty branch); do_get streams
+// instead, and `stream_ducklake_batches_streams_rows_and_empty_schema_branch`
+// pins the same shape on that path.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -1027,7 +1026,7 @@ fn read_masked_doget_roundtrips_utinyint_array() {
     ))
     .unwrap();
 
-    // Helper that mirrors do_get's query body for read_masked.
+    // build_query → query_arrow for read_masked, with do_get's empty-result branch.
     let run = |filter: &auth::TicketFilter| -> Vec<arrow_array::RecordBatch> {
         let (sql, _) = build_query("read_masked", filter, &[], &[]).unwrap();
         let mut stmt = conn.prepare(&sql).unwrap();
@@ -1090,12 +1089,12 @@ fn read_masked_doget_roundtrips_utinyint_array() {
     ));
 }
 
-// The streaming DoGet helper: drives query_arrow inside a blocking task and
-// hands batches back over a bounded channel (do_get's body). Pins that it
-// streams every row, preserves the UTINYINT[] -> List<UInt8> shape, and
-// emits one empty schema batch for a zero-row result — the same contract
-// the old buffered `.collect()` path had, now without buffering the whole
-// result set in memory.
+// The streaming DoGet helper: runs the query in streaming mode inside a
+// blocking task and hands batches back over a bounded channel (do_get's body).
+// Pins that it streams every row, preserves the UTINYINT[] -> List<UInt8>
+// shape, and emits one empty schema batch for a zero-row result — the same
+// contract the old buffered `.collect()` path had, now without buffering the
+// whole result set in memory.
 #[tokio::test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -1261,6 +1260,30 @@ fn send_query_batches_surfaces_a_mid_stream_failure() {
         "the error names the cause: {}",
         status.message()
     );
+}
+
+// A panic in the producer must not end the stream as if the result were whole:
+// the batches already sent stay sent, and an error follows them.
+#[test]
+fn run_producer_turns_a_panic_into_a_trailing_error() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(DOGET_BATCH_CHANNEL_DEPTH);
+    let batch = RecordBatch::try_from_iter([(
+        "v",
+        Arc::new(arrow_array::Int64Array::from(vec![1])) as arrow_array::ArrayRef,
+    )])
+    .unwrap();
+    run_producer(&tx, || {
+        tx.blocking_send(Ok(batch)).unwrap();
+        panic!("producer boom");
+    });
+    drop(tx);
+    assert!(rx.blocking_recv().expect("the batch").is_ok());
+    let err = rx
+        .blocking_recv()
+        .expect("a trailing item, not a clean end")
+        .expect_err("the trailing item is an error");
+    assert!(err.to_string().contains("producer boom"), "{err}");
+    assert!(rx.blocking_recv().is_none());
 }
 
 // The trailing `Err` that `stream_ducklake_batches` sends after a mid-stream

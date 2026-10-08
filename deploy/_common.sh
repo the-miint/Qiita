@@ -382,18 +382,30 @@ qiita_lake_data_path() { printf '%s/ducklake' "$1"; }
 
 # --- DuckDB CLI + pgpass plumbing, shared by scripts/lake-*.sh ---------------
 
-# The DuckDB CLI must match the version the data plane links — held equal to its
-# `duckdb` crate by qiita-common/tests/test_duckdb_version_sync.py, which says why.
+# The DuckDB CLI the lake scripts require — held equal to the data plane's `duckdb`
+# crate by qiita-common/tests/test_duckdb_version_sync.py.
 QIITA_DUCKDB_VERSION="1.5.5"
 
-# Resolve the duckdb CLI into DUCKDB_BIN, or exit with install instructions.
+# Resolve the duckdb CLI into DUCKDB_BIN and require exactly v${QIITA_DUCKDB_VERSION},
+# or exit with install instructions. Exact, because the CLI opens the data plane's
+# catalog with the ducklake extension of its OWN version — a newer one may migrate
+# the catalog schema under the running data plane — and lake-shell LOADs the miint
+# staged for its own version. A binary that reports no version is refused too.
 # Two install sites because the callers run as different accounts: a human with
 # a home, or a service account (qiita-data) whose home is /dev/null.
 qiita_resolve_duckdb_bin() {
     DUCKDB_BIN="${QIITA_DUCKDB_BIN:-$(command -v duckdb || true)}"
-    [ -n "${DUCKDB_BIN}" ] && return 0
+    local problem reported
+    if [ -z "${DUCKDB_BIN}" ]; then
+        problem="no duckdb CLI on PATH."
+    else
+        # The first word of `duckdb --version`, e.g. `v1.5.5 (Variegata) d8cdaa33fd`.
+        reported=$("${DUCKDB_BIN}" --version 2>/dev/null | awk 'NR == 1 { print $1 }') || true
+        [ "${reported}" = "v${QIITA_DUCKDB_VERSION}" ] && return 0
+        problem="${DUCKDB_BIN} reports DuckDB '${reported:-no version}', not v${QIITA_DUCKDB_VERSION}."
+    fi
     cat >&2 <<EOF
-ERROR: no duckdb CLI on PATH.
+ERROR: ${problem}
 
 Install v${QIITA_DUCKDB_VERSION} — it must match what the data plane links.
 

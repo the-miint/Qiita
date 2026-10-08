@@ -69,9 +69,14 @@ From: mambaorg/micromamba:1.5.8
     # qiita-compute-orchestrator/uv.lock.
     micromamba install -y -n base -c conda-forge python-duckdb=1.5.5
 
-    # One env for this tool. Channels bioconda + conda-forge; versions pinned
-    # loosely here and tightened after the first Linux build resolves the solve.
+    # One env for this tool. Channels bioconda + conda-forge.
     #  - checkm: CheckM + its external binaries (pplacer, hmmer, prodigal).
+    #
+    # PINNED to the versions the deployed image resolved. Completeness and
+    # contamination depend on all four, and an edit to ANY of checkm.env's
+    # HASH_INPUTS rebuilds this image — so an unpinned solve would quietly re-score
+    # under the same workflow version with whatever bioconda carries that day.
+    # %test asserts each pin.
     #
     # Expect a loud, HARMLESS error from checkm-genome's conda post-link script:
     # it tries to `wget` the ~1.4 GB reference DB into the env and fails because
@@ -79,7 +84,8 @@ From: mambaorg/micromamba:1.5.8
     # deliberately not baked in (it is bind-mounted at run time; see the header).
     # Do NOT "fix" it by adding wget: that would silently balloon the image by
     # 1.4 GB and defeat the bind-mount design.
-    micromamba create -y -n checkm -c bioconda -c conda-forge checkm-genome pplacer hmmer prodigal
+    micromamba create -y -n checkm -c bioconda -c conda-forge \
+        checkm-genome=1.2.5 pplacer=1.1.alpha22 hmmer=3.4 prodigal=2.6.3
 
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/checkm.sh
     chmod 0644 /opt/qiita/manifest_writer.py /opt/qiita/lcg_split.py \
@@ -102,6 +108,13 @@ From: mambaorg/micromamba:1.5.8
     # root-owned litter on the build host.
     export HOME="$(mktemp -d)"
     micromamba env list | grep -q checkm
+    # The create line's pins, each one resolved — a solve that drifts despite them
+    # fails the BUILD here rather than re-scoring MAGs under the same version.
+    for pin in checkm-genome=1.2.5 pplacer=1.1.alpha22 hmmer=3.4 prodigal=2.6.3; do
+        micromamba list -n checkm \
+            | awk -v n="${pin%%=*}" -v v="${pin#*=}" '$1 == n && $2 == v { f = 1 } END { exit !f }' \
+            || { echo "checkm env: ${pin%%=*} is not ${pin#*=}" >&2; exit 1; }
+    done
     # CHECKM_DATA_PATH must be set BEFORE CheckM is imported, exactly as
     # checkm.sh does it at run time. Without it, CheckM's DBManager falls through
     # to `setRoot()` and appends to a DATA_CONFIG file INSIDE site-packages — a

@@ -26,14 +26,27 @@ _None yet._
   curl -fsSI https://ftp.microbio.me/pub/miint/v1.5.5/linux_amd64/miint.duckdb_extension.gz | head -1   # expect 200
   ```
 - `[admin]` **Install the DuckDB 1.5.5 CLI for `make lake-shell` / `scripts/lake-gc.sh`.**
-  They must run the version the data plane links, but check only that a `duckdb` is on
-  `PATH`, so a stale 1.5.4 CLI would run silently. Replace any per-account copy in
-  `~/.local/bin` the same way. (#651)
+  Both now refuse any `duckdb` that is not the version the data plane links, so neither
+  runs until this is done. Replace any per-account copy in `~/.local/bin` the same way.
+  (#651)
   ```bash
   ( cd "$(mktemp -d)" \
     && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip \
     && unzip -q duckdb_cli-linux-amd64.zip && sudo install -m 0755 duckdb /usr/local/bin/duckdb )
   sudo -u qiita-data /usr/local/bin/duckdb --version   # expect v1.5.5
+  ```
+- `[operator]` **Before the deploy, confirm the live checkm image runs the tool versions
+  `checkm.def` now pins.** This deploy rebuilds `long-read-assembly-checkm-1.0.1.sif` (its
+  def changed), and the pins are the versions the image built at the 2026-09-15 deploy
+  would have resolved — inferred from bioconda's release dates, not read off the host. If
+  the output differs, **stop**: the pins must change to the live versions first, or the
+  rebuild re-scores MAGs under the same workflow version. (#651)
+  ```bash
+  sudo -u qiita-orch bash -c 'set -a; . /etc/qiita/compute-orchestrator.env; set +a
+  cd /tmp && apptainer exec --no-home "${PATH_DERIVED}/images/long-read-assembly-checkm-1.0.1.sif" \
+    ls /opt/conda/envs/checkm/conda-meta' \
+    | sed -n -E 's/^(checkm-genome|pplacer|hmmer|prodigal)-([^-]+)-[^-]+\.json$/\1=\2/p' | sort
+  # expect exactly: checkm-genome=1.2.5  hmmer=3.4  pplacer=1.1.alpha22  prodigal=2.6.3
   ```
 
 ### 3. Migrations
@@ -75,6 +88,11 @@ _None yet._
     change, so no `FORCE_STAGE_MIINT`. `make verify-deploy`'s `compute-readiness` and
     `cp-miint` checks LOAD the new build.
   - The `assemble` and `checkm` (`-1.0.1`) SIFs auto-rebuild on deploy to pick up 1.5.5.
+    `checkm`'s tools are now pinned, and its build fails if a solve drifts off them.
+  - **Long-read-assembly work started between the bucket-4 restart and the redeploy's miint
+    stage (step 5/8) fails at LOAD.** The services come up on DuckDB 1.5.5 before
+    `v1.5.5/` is staged, so a masked-read stream or native job that starts in that window
+    finds no miint for its version. Resubmit anything that failed there.
   - **Keep `MIINT_EXTENSION_DIRECTORY/v1.5.4/`.** `long-read-assembly` 1.0.0's checkm step
     still runs the frozen `long-read-assembly-checkm-1.0.0.sif` (no build spec since 1.0.1),
     on DuckDB 1.5.4, and LOADs miint from there. Staging never removes an old version dir.

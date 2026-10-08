@@ -2118,8 +2118,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   Arrow iterator, which could not report a failed chunk fetch, so a client received a
   truncated table that looked complete. It now fetches with the crate's fallible `step`
   (public as of `duckdb` 1.10505.0), and the failure reaches the client as the stream's
-  final item. The zero-row schema probe each DoGet ran first is gone too: the streaming
-  result now reports its own schema before the first fetch.
+  final item; a panic in the producer now does the same. The zero-row schema probe each
+  DoGet ran first is gone too: the streaming result now reports its own schema before the
+  first fetch.
 - **An ENA study whose sample repeats an attribute tag no longer fails at resolve (#650).**
   `read_ena_attributes` can return a tag more than once (for example `BioSampleModel` or
   `ENA-FIRST-PUBLIC`), which made the per-sample map fail with `Map keys must be unique`
@@ -4047,8 +4048,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   require, and the long-read-assembly `assemble`/`checkm` images move together. The Python
   pins were floors and the crate a caret range, so a fresh resolve could land on DuckDB
   1.5.6, for which the mirror has no miint build. `test_duckdb_version_sync` now also holds
-  the deploy CLI version, each `pyproject.toml` pin and each `uv.lock` to the crate. The
-  bundled DuckLake moves `d318a545` → `d8a1881e`: bug fixes, no catalog-schema change.
+  the deploy CLI version, and every tracked `pyproject.toml` (any dependency table) and
+  `uv.lock`, to the crate. The lake scripts now refuse a DuckDB CLI of any other version.
+  The long-read-assembly `checkm` image, which this bump rebuilds, now pins CheckM, pplacer,
+  hmmer and prodigal, so the rebuild cannot re-resolve them. The bundled DuckLake moves
+  `d318a545` → `d8a1881e`: bug fixes, no catalog-schema change.
 - **`qiita biosample create-field` validates its flags before reading the auth token
   (#639).** An invalid flag combination now exits 2 naming the flag, where it previously
   reported a missing token first and left the real problem to be found on the retry. The

@@ -288,3 +288,45 @@ def test_checkm_image_ships_the_split_and_rebuilds_on_its_edit() -> None:
             f"{name} is missing from HASH_INPUTS ({hash_inputs.group(1)!r}); editing "
             "it would not rebuild the image"
         )
+
+
+_CHECKM_TOOLS = ("checkm-genome", "pplacer", "hmmer", "prodigal")
+
+
+def _checkm_pins() -> dict[str, str]:
+    """The `tool=version` pins on checkm.def's `micromamba create -n checkm` command."""
+    lines = _CHECKM_DEF.read_text().replace("\\\n", " ").splitlines()
+    create = next((ln for ln in lines if "micromamba create" in ln and "-n checkm" in ln), None)
+    assert create is not None, "checkm.def no longer creates the checkm env"
+    return dict(re.findall(r"\b([a-z][a-z0-9-]*)=([0-9][^\s\"']*)", create))
+
+
+def test_checkm_image_pins_its_tools_and_asserts_them_at_build_time() -> None:
+    """Every scoring tool is version-pinned, and %test fails the build on any other.
+
+    checkm.def's create line says why the pins exist; this holds them in place.
+    """
+    pins = _checkm_pins()
+    defsrc = _CHECKM_DEF.read_text()
+    test_section = defsrc[defsrc.index("\n%test") :]
+    for tool in _CHECKM_TOOLS:
+        assert tool in pins, (
+            f"{tool} is unpinned on checkm.def's `micromamba create -n checkm` line"
+        )
+        assert f"{tool}={pins[tool]}" in test_section, (
+            f"checkm.def pins {tool}={pins[tool]} but its %test never asserts that version, "
+            "so a drifted solve would build and ship green."
+        )
+
+
+def test_checkm_spec_verifies_the_pinned_checkm_version() -> None:
+    """The spec's verify passes the pinned CheckM and refuses any other version."""
+    spec = _CHECKM_ENV.read_text()
+    cmd = re.search(r'^VERIFY_CMD="([^"]*)"', spec, re.MULTILINE)
+    match = re.search(r'^VERIFY_MATCH="([^"]*)"', spec, re.MULTILINE)
+    assert cmd is not None and match is not None, "checkm.env lost VERIFY_CMD/VERIFY_MATCH"
+    assert cmd.group(1).startswith("micromamba list -n checkm"), cmd.group(1)
+    pinned = _checkm_pins()["checkm-genome"]
+    # `micromamba list` rows: name, version, build, channel.
+    assert re.search(match.group(1), f"  checkm-genome  {pinned}  pyhdfd78af_0  bioconda")
+    assert not re.search(match.group(1), "  checkm-genome  1.2.4  pyhdfd78af_0  bioconda")
