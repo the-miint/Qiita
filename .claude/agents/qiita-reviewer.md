@@ -121,6 +121,7 @@ Only rules whose trigger appears in the diff can fire.
 | Two structurally similar code paths; an endpoint reading from two or more sources; a multi-statement mutation | R9 |
 | `baseline_resources` / `action_ceiling`; a memory cap for an embedded sub-process; a `SET threads` / `memory_limit` / `preserve_insertion_order` after a connect helper | R9 |
 | A CLI command's error handling or exit path | R9 |
+| A delete of a row in a table the sweep owns, under `tests/**` or `src/**/testing/**` | R9 |
 | Any new or changed doc, runbook, docstring or comment | R2 |
 | A user-facing string: a runbook, a workflow `description:`, argparse `help=`, an HTTPException `detail`, a failure reason, or a test assertion on one; a `generated_by` value | R11, R2 |
 | A new file, moved code, a helper in a feature-specific module, feature- or platform-specific naming, a one-shot script | R10 |
@@ -252,6 +253,7 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 When two similar code paths solve the same problem differently, factor out the shared part or say why they differ.
 
 - **A copy-pasted parallel handler** is parameterized, not maintained twice. Same for near-duplicate blocks in one file and for a local re-implementation of a helper another module owns.
+- **Tearing down any of the swept tables goes through the entity sweep.** Flag a delete in a teardown — after a fixture's `yield`, in a `finally:`, in a cleanup helper — by any route, of a table the sweep owns: `SWEEP_TIERS` plus `study` / `biosample` / `prep_sample`. A delete that arranges a test's state, or that is itself the assertion, is not a teardown and not this rule. `docs/testing.md` states the obligation, and why it holds even when the entity is expected to have nothing hanging off it. Not a finding: the sweep and the teardowns composed from it, which are the implementation; a fixture in the sweep's test module, which cannot use the function it tests; a genome no prep_sample produced; or a divergence the teardown explains.
 - **Per-invocation setup that belongs once**: an install or version check on every call moves to deploy time; per-connection settings repeated at call sites belong in the shared connect helper [soft].
 - **New native jobs converge with their siblings**: failure-path cleanup of temp files and of declared outputs (a partial output must not be promoted), path validation through the shared validator, intermediate tables that are temporary.
 - **New sequence-bearing storage follows the reference-data pattern**: chunked, hashed, deduplicated, keyed on a minted idx.

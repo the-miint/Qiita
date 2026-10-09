@@ -46,13 +46,10 @@ from .conftest import (
     SPECS,
     _create_linked_entity_for_spec,
     _create_plain_field,
-    _metadata_tracking_key,
     _seed_global_field_for_spec,
     _seed_secondary_studies_for_entity,
     _set_unique_in_study,
     _spec_id,
-    _study_field_tracking_key,
-    _track_to_study_link,
     _write_value,
 )
 
@@ -94,8 +91,6 @@ async def test_propagate_link_upgrade_null_to_non_null_propagates_to_metadata(ct
             value="kept",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
-    ctx["created"][_metadata_tracking_key(spec)].append(meta_idx)
 
     # Upgrade the field to global: clear the inherited columns too so the
     # *_study_field_inheritance_consistent CHECK passes after the UPDATE
@@ -137,7 +132,6 @@ async def test_propagate_link_unlink_with_no_metadata_succeeds(ctx, spec):
             display_name=unique_field_name("unlink_empty"),
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     # Unlink the field. The propagate trigger has nothing to update; the
     # CHECK requires data_type / required non-NULL once unlinked, so the
@@ -189,8 +183,6 @@ async def test_propagate_link_unlink_with_metadata_raises(ctx, spec):
             value="published",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
-    ctx["created"][_metadata_tracking_key(spec)].append(meta_idx)
 
     # Attempt to unlink — trigger refuses, the UPDATE rolls back.
     with pytest.raises(asyncpg.RaiseError, match="cannot unlink"):
@@ -239,7 +231,6 @@ async def test_propagate_link_rebind_raises_unconditionally(ctx, spec):
             display_name=unique_field_name("rebind"),
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     # Attempt to rebind from gf_a to gf_b. Trigger raises even though no
     # metadata exists through this field.
@@ -278,7 +269,8 @@ async def _retire_link(ctx, spec, entity_idx):
 async def _seed_global_value(ctx, spec, entity_idx, value):
     """Write one globally-linked TEXT metadata value while the link is active.
 
-    Returns (metadata_idx, global_field_idx), both tracked for cleanup.
+    Returns (metadata_idx, global_field_idx). The global field is tracked for
+    cleanup.
     """
     gf = await _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT)
     async with ctx["pool"].acquire() as conn, conn.transaction():
@@ -299,8 +291,6 @@ async def _seed_global_value(ctx, spec, entity_idx, value):
             value=value,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
-    ctx["created"][_metadata_tracking_key(spec)].append(metadata_idx)
     return metadata_idx, gf.idx
 
 
@@ -483,8 +473,6 @@ async def test_reject_if_link_retired_allows_global_link_propagation(ctx, spec):
             value="kept",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
-    ctx["created"][_metadata_tracking_key(spec)].append(metadata_idx)
 
     await _retire_link(ctx, spec, entity_idx)
 
@@ -585,8 +573,6 @@ async def test_set_updated_at_bumps_on_global_link_propagation(ctx, spec):
             value="kept",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
-    ctx["created"][_metadata_tracking_key(spec)].append(metadata_idx)
     _, seeded_updated_at = await _fetch_timestamps(ctx, spec, metadata_idx)
 
     # The inherited columns are cleared alongside the link so the
@@ -629,7 +615,6 @@ async def _create_flagged_field(ctx, spec, *, study_idx, data_type, suffix):
             data_type=data_type,
             required=False,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     await _set_unique_in_study(ctx, spec, field_idx, True)
     return field_idx
@@ -692,7 +677,6 @@ async def test_unique_in_study_allows_duplicate_when_flag_false(ctx, spec):
             data_type=FieldDataType.TEXT,
             required=False,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     for entity_idx in (first_entity_idx, second_entity_idx):
         await _write_value(
@@ -728,7 +712,6 @@ async def test_unique_in_study_allows_same_value_in_another_study(ctx, spec):
             study_idx=second_study_idx,
             created_by_idx=ctx["principal_idx"],
         )
-    _track_to_study_link(ctx, spec, entity_idx, second_study_idx)
 
     for study_idx, suffix in ((ctx["study_idx"], "own"), (second_study_idx, "other")):
         field_idx = await _create_flagged_field(
@@ -834,7 +817,6 @@ async def test_unique_in_study_rejected_on_globally_linked_field(ctx, spec):
             display_name=unique_field_name("linked"),
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     with pytest.raises(asyncpg.CheckViolationError):
         await ctx["pool"].execute(
@@ -873,7 +855,6 @@ async def test_unique_in_study_rejected_on_ineligible_data_type(ctx, spec, data_
             required=False,
             terminology_idx=terminology_idx,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     with pytest.raises(asyncpg.CheckViolationError):
         await ctx["pool"].execute(
@@ -902,7 +883,6 @@ async def test_unique_in_study_duplicate_raises_typed_error(ctx, spec):
             required=False,
             unique_in_study=True,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     await _write_value(
         ctx,
@@ -949,7 +929,6 @@ async def test_unique_in_study_missing_marker_raises_typed_error(ctx, spec):
             required=False,
             unique_in_study=True,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     reason_name = f"reason_{secrets.token_hex(4)}"
     reason_idx = await ctx["pool"].fetchval(
@@ -1342,7 +1321,6 @@ async def test_classify_unique_in_study_violation_ignores_other_constraints(ctx,
             data_type=FieldDataType.TEXT,
             required=False,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(first_idx)
     second_idx = await _create_plain_field(ctx, spec, suffix="collide-b")
 
     # Rename the second field onto the first's name: the (study_idx,
@@ -1376,7 +1354,6 @@ async def _write_local(ctx, spec, *, entity_idx, display_name, value, on_conflic
             caller_idx=ctx["principal_idx"],
             on_conflict=on_conflict,
         )
-    ctx["created"][_metadata_tracking_key(spec)].append(result.metadata_idx)
     return result
 
 
@@ -1394,7 +1371,6 @@ async def _seed_unique_field(ctx, spec, *, suffix):
             required=False,
             unique_in_study=True,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
     return display_name, field_idx
 
 
@@ -1577,7 +1553,6 @@ async def _seed_owner_id_migration_cases(ctx):
             display_name=unique_field_name("linked-owner-id"),
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(linked_field)
     await _write_owner_id(ctx, field_idx=linked_field, value="OWNER-LINKED")
 
     # An owner-id field a study already declared unique through the edit route.
@@ -1697,7 +1672,6 @@ async def _publish_prep_for_biosample(ctx, biosample_idx):
             created_by_idx=ctx["principal_idx"],
         )
     ctx["created"]["prep_sample"].append(prep_sample_idx)
-    ctx["created"]["prep_sample_to_study"].append((prep_sample_idx, ctx["study_idx"]))
 
     # The publish action, which no write path performs yet.
     await ctx["pool"].execute(

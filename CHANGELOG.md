@@ -2121,6 +2121,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   final item; a panic in the producer now does the same. The zero-row schema probe each
   DoGet ran first is gone too: the streaming result now reports its own schema before the
   first fetch.
+- **A `/run` redrive of a failed or cancelled `download-ena-study` ticket now fetches runs
+  added since (#671).** The redrive kept the finished ingest step and fast-forwarded over the
+  re-read roster, so a run added after the failure was staged but never downloaded. The
+  redrive now re-runs every step; runs already stored are not fetched again. `/run` is
+  refused with a 409 on a ticket superseded by a newer download ticket for the pool, and on
+  a failed ticket that still has a live download job (cancel it, then re-import the study).
 - **An ENA study whose sample repeats an attribute tag no longer fails at resolve (#650).**
   `read_ena_attributes` can return a tag more than once (for example `BioSampleModel` or
   `ENA-FIRST-PUBLIC`), which made the per-sample map fail with `Map keys must be unique`
@@ -4054,6 +4060,28 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   hmmer and prodigal, so the rebuild cannot re-resolve them. The DuckLake extension
   DuckDB 1.5.5 installs moves `d318a545` → `d8a1881e`: bug fixes, and a catalog created
   under 1.5.4 keeps its schema and version.
+- **`GET /sequence-range/{prep_sample_idx}` checks per-study access for a human caller
+  (#668).** A `prep_sample:read` caller now needs `viewer` or higher on every study the
+  prep_sample is linked to (`wet_lab_admin` and above bypass). A caller without it gets
+  `403` whether or not a range exists, and for an unknown or unlinked prep_sample. A
+  `sequence_range:mint` caller (the compute service account) reads any range as before,
+  and the response body is unchanged.
+- **Tests tear down their fixtures by parent FK rather than by tracked row (#670).** A
+  test passes `teardown_entity_graph` the idxs of its study, biosample and
+  prep_sample, and the helper deletes every row that hangs off them. That now
+  includes rows which a trigger or a cascade created, and which the per-row
+  bookkeeping it replaces could never delete, because nothing had recorded them. The
+  parents above that graph — e.g., pools, runs, principals — are still the caller's own to
+  clean up. Every teardown in the control-plane and the integration suites keys this
+  way; two integration fixtures that seeded a biosample chain and deleted none of it
+  now tear down at all, and the ENA-import teardown that four test modules had each
+  kept their own copy of is now one helper beside the sweep, shared across the
+  control-plane and integration suites. A parity test compares the sweep list against
+  the live schema, and fails when a table carrying one of the four entity key columns
+  is missing from the list, or is swept without naming every key that it carries.
+  Table and column names that these helpers interpolate into SQL are now rejected
+  unless they are bare identifiers. The branch reviewer flags a new fixture that
+  tears that graph down by hand and points at `docs/testing.md`.
 - **`qiita biosample create-field` validates its flags before reading the auth token
   (#639).** An invalid flag combination now exits 2 naming the flag, where it previously
   reported a missing token first and left the real problem to be found on the retry. The

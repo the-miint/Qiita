@@ -93,6 +93,12 @@ _None yet._
   - **A DoGet whose query fails after batches have streamed now ends in an error status**,
     where it used to end like a complete result. A client that reads such a stream to the
     end now raises instead of silently holding a truncated table.
+- **`GET /api/v1/sequence-range/{prep_sample_idx}` now answers `403` to a human caller
+  without `viewer` on every study the prep_sample is linked to
+  (#668).** It answered `200` or `404` to any `prep_sample:read`
+  holder before. `wet_lab_admin` and above are unaffected, and so is the compute service
+  account, which still reads any range with `sequence_range:mint`; the response body is
+  unchanged.
 
 ## Deployed history
 

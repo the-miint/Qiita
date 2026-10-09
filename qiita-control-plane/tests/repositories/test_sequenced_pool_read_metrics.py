@@ -4,14 +4,13 @@ rollup.
 The repo function SUMs the per-stage read counts over a pool's non-retired
 sequenced_samples and reports the sample total / with-metrics count. Each test
 seeds one principal + one run + one pool and attaches samples with controllable
-metrics (and optional retirement) via `pool_ctx.add_sample`; cleanup is
-FK-reverse on the shared postgres_pool fixture.
+metrics (and optional retirement) via the shared `pool_ctx` fixture's
+`add_sample`. The run-level test seeds several pools, so it builds its own.
 """
 
 import secrets
 
 import pytest
-import pytest_asyncio
 
 from qiita_control_plane.repositories.sequencing_run import (
     fetch_sequenced_pool_read_metrics,
@@ -21,112 +20,13 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import (
+    delete_idxs,
+    delete_principal,
+    teardown_entity_graph,
+)
 
 pytestmark = pytest.mark.db
-
-
-@pytest_asyncio.fixture
-async def pool_ctx(postgres_pool):
-    """Seed a principal + one sequencing_run + one sequenced_pool; yield a
-    context whose `add_sample(...)` attaches a sequenced_sample (with optional
-    read metrics / retirement) to the pool. FK-reverse cleanup."""
-    owner_idx = await seed_user_principal(postgres_pool, prefix="poolmetrics", suffix="owner")
-    run_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.sequencing_run (instrument_run_id, platform, created_by_idx)"
-        " VALUES ($1, 'illumina'::qiita.platform, $2) RETURNING idx",
-        f"pm-run-{secrets.token_hex(4)}",
-        owner_idx,
-    )
-    pool_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.sequenced_pool (sequencing_run_idx, created_by_idx)"
-        " VALUES ($1, $2) RETURNING idx",
-        run_idx,
-        owner_idx,
-    )
-    samples: list[tuple[int, int, int]] = []  # (biosample, prep_sample, sequenced_sample)
-
-    async def add_sample(
-        *,
-        raw=None,
-        biological=None,
-        quality_filtered=None,
-        spikein=None,
-        retired=False,
-        ena_status=None,
-        biosample_accession=None,
-        ena_sample_accession=None,
-        ena_experiment_accession=None,
-        ena_run_accession=None,
-    ):
-        bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(
-            postgres_pool, owner_idx=owner_idx
-        )
-        ss_idx = await postgres_pool.fetchval(
-            "INSERT INTO qiita.sequenced_sample"
-            "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
-            " VALUES ($1, $2, $3, $4) RETURNING idx",
-            ps_idx,
-            pool_idx,
-            f"item-{secrets.token_hex(4)}",
-            owner_idx,
-        )
-        if biosample_accession is not None or ena_sample_accession is not None:
-            await postgres_pool.execute(
-                "UPDATE qiita.biosample SET biosample_accession = $2,"
-                " ena_sample_accession = $3 WHERE idx = $1",
-                bs_idx,
-                biosample_accession,
-                ena_sample_accession,
-            )
-        if ena_experiment_accession is not None or ena_run_accession is not None:
-            await postgres_pool.execute(
-                "UPDATE qiita.sequenced_sample SET ena_experiment_accession = $2,"
-                " ena_run_accession = $3 WHERE idx = $1",
-                ss_idx,
-                ena_experiment_accession,
-                ena_run_accession,
-            )
-        if raw is not None:
-            await postgres_pool.execute(
-                "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2 = $2,"
-                " biological_read_count_r1r2 = $3, quality_filtered_read_count_r1r2 = $4,"
-                " spikein_read_count_r1r2 = $5"
-                " WHERE idx = $1",
-                ss_idx,
-                raw,
-                biological,
-                quality_filtered,
-                spikein,
-            )
-        if retired:
-            await postgres_pool.execute(
-                "UPDATE qiita.prep_sample SET retired = true, retired_by_idx = $2,"
-                " retired_at = now(), retire_reason = 'test' WHERE idx = $1",
-                ps_idx,
-                owner_idx,
-            )
-        if ena_status is not None:
-            await postgres_pool.execute(
-                "UPDATE qiita.sequenced_sample SET ena_status = $2,"
-                " ena_availability_checked_at = now() WHERE idx = $1",
-                ss_idx,
-                ena_status,
-            )
-        samples.append((bs_idx, ps_idx, ss_idx))
-        return ss_idx
-
-    yield {"pool": postgres_pool, "pool_idx": pool_idx, "add_sample": add_sample}
-
-    for _bs, _ps, ss_idx in samples:
-        await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    for _bs, ps_idx, _ss in samples:
-        await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps_idx)
-    for bs_idx, _ps, _ss in samples:
-        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs_idx)
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", owner_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", owner_idx)
 
 
 async def test_empty_pool_is_null_sums_zero_counts(pool_ctx):
@@ -389,14 +289,12 @@ async def test_run_level_rollup_sums_across_pools(postgres_pool):
         # unknown run idx is None.
         assert await fetch_sequencing_run_read_metrics(postgres_pool, 999_999_999) is None
     finally:
-        for _bs, _ps, ss_idx in made:
-            await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
-        for pool_idx in pool_idxs:
-            await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
-        await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-        for _bs, ps_idx, _ss in made:
-            await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps_idx)
-        for bs_idx, _ps, _ss in made:
-            await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs_idx)
-        await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", owner_idx)
-        await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", owner_idx)
+        await teardown_entity_graph(
+            postgres_pool,
+            study_idxs=[],
+            biosample_idxs=[bs for bs, _ps, _ss in made],
+            prep_sample_idxs=[ps for _bs, ps, _ss in made],
+        )
+        await delete_idxs(postgres_pool, "sequenced_pool", pool_idxs)
+        await delete_idxs(postgres_pool, "sequencing_run", run_idx)
+        await delete_principal(postgres_pool, [owner_idx])

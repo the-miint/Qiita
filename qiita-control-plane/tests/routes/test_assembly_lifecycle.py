@@ -35,6 +35,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_prep_sample_to_study_link,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -107,15 +108,11 @@ async def lifecycle(postgres_pool, human_admin_session):
         # first, so the narrowing test needs the parent too.
         "bs_done": bs_done,
     }
-    await postgres_pool.execute(
-        "DELETE FROM qiita.assembly_sample WHERE processing_idx = $1", processing_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])",
-        [ps_done, ps_pend, ps_nd],
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", [bs_done, bs_pend, bs_nd]
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[bs_done, bs_pend, bs_nd],
+        prep_sample_idxs=[ps_done, ps_pend, ps_nd],
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.processing WHERE processing_idx = $1", processing_idx
@@ -610,13 +607,11 @@ async def test_a_plain_user_sees_only_the_runs_over_samples_they_may_see(
         assert lifecycle["ps_done"] not in {s["prep_sample_idx"] for s in roster.json()["samples"]}
         assert by_idx.status_code == 200, by_idx.text
     finally:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
+        # Only the study: its biosample and prep_sample belong to the lifecycle
+        # fixture, which tears them down itself.
+        await teardown_entity_graph(
+            postgres_pool, study_idxs=[study_idx], biosample_idxs=[], prep_sample_idxs=[]
         )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
-        )
-        await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
 
 
 async def test_superseded_by_round_trips_and_a_re_deprecate_replaces_it(

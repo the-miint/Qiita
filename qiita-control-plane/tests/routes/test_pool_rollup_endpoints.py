@@ -7,7 +7,7 @@
 
 One fixture seeds a run + pool with three samples: a clean one (never an
 exception), a zero-reads-and-missing-accession one, and an unprocessed +
-no-accessions + failed-ticket one. FK-reverse cleanup.
+no-accessions + failed-ticket one.
 """
 
 import json
@@ -26,6 +26,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_sequenced_sample_subtype,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 from .conftest import make_caller_own_run
 
@@ -145,15 +146,15 @@ async def seeded(ctx):
     await db.execute(
         "DELETE FROM qiita.work_ticket WHERE action_id=$1 AND action_version=$2", *action
     )
-    for _bs, _ps, ss_idx in created:
-        await db.execute("DELETE FROM qiita.sequenced_sample WHERE idx=$1", ss_idx)
+    await teardown_entity_graph(
+        db,
+        study_idxs=[],
+        biosample_idxs=[bs for bs, _ps, _ss in created],
+        prep_sample_idxs=[ps for _bs, ps, _ss in created],
+    )
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx=$1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx=$1", run_idx)
     await db.execute("DELETE FROM qiita.action WHERE action_id=$1 AND version=$2", *action)
-    for _bs, ps_idx, _ss in created:
-        await db.execute("DELETE FROM qiita.prep_sample WHERE idx=$1", ps_idx)
-    for bs_idx, _ps, _ss in created:
-        await db.execute("DELETE FROM qiita.biosample WHERE idx=$1", bs_idx)
 
 
 def _exc_url(run_idx, pool_idx):

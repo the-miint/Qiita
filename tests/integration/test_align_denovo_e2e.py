@@ -33,6 +33,10 @@ from pathlib import Path
 import pytest
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.models import ReadMaskReason
+from qiita_control_plane.testing.db_teardown import (
+    delete_principal,
+    teardown_entity_graph,
+)
 
 from conftest import ducklake_connect
 
@@ -113,7 +117,7 @@ async def seeded(postgres_pool, data_plane, genome):
     principal_idx = await seed_user_principal(
         postgres_pool, prefix="denovo-e2e", suffix=suffix
     )
-    _, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
         postgres_pool, owner_idx=principal_idx
     )
     # A real mask_definition row: `work_ticket.mask_idx` has an FK onto it.
@@ -201,6 +205,19 @@ async def seeded(postgres_pool, data_plane, genome):
         "suffix": suffix,
     }
 
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[prep_sample_idx],
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])",
+        [processing_idx, other_run["processing_idx"]],
+    )
+    await postgres_pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+    await delete_principal(postgres_pool, principal_idx)
+
 
 @pytest.fixture
 async def denovo(seeded, tmp_path, request):
@@ -270,6 +287,10 @@ async def denovo(seeded, tmp_path, request):
         "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
     )
     await pool.execute("DELETE FROM qiita.action WHERE action_id = $1", action_id)
+    # The PENDING gate rows cascade off the identity they are keyed on.
+    await pool.execute(
+        "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
+    )
 
 
 def _install_real_streams(monkeypatch, denovo):

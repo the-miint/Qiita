@@ -194,10 +194,8 @@ def download_ticket_read_roster(work_ticket_state: str | None) -> bool:
     pool's run roster: processing/completed/no_data/queued (queued only
     follows a staged ticket's retry requeue, never precedes the first read).
     pending/None precede the read. failed/cancelled count as not-read since
-    the next dispatch re-reads the roster live -- but a `/run` redrive of a
-    ticket that already completed `ingest_ena_reads` fast-forwards straight
-    over the re-staged roster, so a sample added while failed can still be
-    missed."""
+    the next dispatch re-reads the roster live, and a `/run` redrive re-runs the
+    download against it."""
     return work_ticket_state in _ROSTER_READ_DOWNLOAD_TICKET_STATES
 
 

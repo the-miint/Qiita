@@ -39,6 +39,7 @@ from qiita_common.models import (
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER, REFERENCE_LOAD_CONTAINER
 
 from qiita_control_plane import step_progress
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -4299,8 +4300,12 @@ async def test_fastq_to_parquet_v12_qc_binds_adapter_and_instrument_model(
             "DELETE FROM qiita.action WHERE action_id = 'fastq-to-parquet' AND version = $1",
             version,
         )
-        await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", _bio_idx)
+        await teardown_entity_graph(
+            postgres_pool,
+            study_idxs=[],
+            biosample_idxs=[_bio_idx],
+            prep_sample_idxs=[prep_sample_idx],
+        )
 
 
 async def test_run_workflow_fails_ticket_on_host_filter_resolution_error(
@@ -6023,16 +6028,14 @@ async def _seed_assembly_ticket(pool, *, prefix="mask-consume", steps=None, extr
         await pool.execute(
             "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
         )
-        # No-op unless `steps` declared the gate; keeps the RESTRICT FK from
-        # blocking the prep_sample delete below.
-        await pool.execute(
-            "DELETE FROM qiita.assembly_sample WHERE prep_sample_idx = $1", prep_sample_idx
+        await teardown_entity_graph(
+            pool,
+            study_idxs=[],
+            biosample_idxs=[biosample_idx],
+            prep_sample_idxs=[prep_sample_idx],
         )
         await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-        await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-        await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-        await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-        await pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+        await delete_principal(pool, principal_idx)
 
     return work_ticket_idx, mask_idx, prep_sample_idx, _teardown
 

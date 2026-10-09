@@ -15,13 +15,13 @@ from qiita_common.models import FieldDataType
 
 from qiita_control_plane.main import app
 from qiita_control_plane.testing.db_seeds import seed_terminology
+from qiita_control_plane.testing.db_teardown import delete_idxs
 
 from .conftest import (
     BIOSAMPLE_FIELD_SURFACE,
     PREP_SAMPLE_FIELD_SURFACE,
     SampleFieldSurface,
     _seed_field_global,
-    delete_idxs,
     sibling_field_surface,
 )
 

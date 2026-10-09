@@ -14,12 +14,13 @@ import pytest
 from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.models import Tier
-
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
     seed_prep_sample_to_study_link,
 )
+
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 _INSERTS = {
     "synDNA_16SrRNA_seq_1_gc=0.26": ("syn one", 12),
@@ -116,10 +117,12 @@ async def seeded(postgres_pool, human_admin_session, regular_user_session, data_
 
     yield {"mask_idx": mask_idx, "study_idx": study_idx, "accession": accession}
 
-    await db.execute(
-        "DELETE FROM qiita.syndna_read_count WHERE mask_idx = $1", mask_idx
+    await teardown_entity_graph(
+        db,
+        study_idxs=[study_idx],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[prep_sample_idx],
     )
-    await db.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
     await db.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
     await db.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
@@ -131,16 +134,6 @@ async def seeded(postgres_pool, human_admin_session, regular_user_session, data_
     await db.execute(
         "DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx
     )
-    await db.execute(
-        "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
-    )
-    await db.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
-    )
-    await db.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-    await db.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-    await db.execute("DELETE FROM qiita.study_access WHERE study_idx = $1", study_idx)
-    await db.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
 
 
 def _cells(path, source: str) -> list[tuple]:

@@ -15,11 +15,15 @@ sequenced_pool_item_id 409, and full transaction rollback on
 trigger-raised failures. Also covers the import route's sequencing_run
 advisory-lock critical section: the staged-roster 409, the lock-timeout
 503, lock serialization against a held key, and a native insert landing
-in the roster a concurrent staging read produces.
+in the roster a concurrent staging read produces. The `/run` redrive of a
+download-ena-study ticket is covered here too, as it reuses the roster and
+download-ticket seed helpers.
 """
 
 import asyncio
+import json
 import secrets
+from pathlib import Path
 
 import asyncpg
 import pytest
@@ -35,17 +39,24 @@ from qiita_common.api_paths import (
     URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
     URL_SEQUENCED_SAMPLE_LIST_BY_STUDY,
     URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY,
+    URL_WORK_TICKET_RUN,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import (
+    ComputeTarget,
     FailureType,
     FieldDataType,
     Platform,
     ScopeTargetKind,
+    StepHandleWire,
+    StepProgressState,
+    StepStatus,
+    StepStatusWire,
     WorkTicketFailureStage,
     WorkTicketState,
 )
 
+from qiita_control_plane import step_progress
 from qiita_control_plane.cli._common import CLI_HTTP_TIMEOUT_SECONDS
 from qiita_control_plane.ena_import.submit import (
     DOWNLOAD_ENA_STUDY_ACTION_ID,
@@ -60,7 +71,7 @@ from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADA
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.sequencing_run import POOL_RESOLVE_LOCK_CLASS
 from qiita_control_plane.routes import sequenced_sample as sequenced_sample_routes
-from qiita_control_plane.runner import ENA_RUN_MAP_BINDING, _stage_ena_run_roster
+from qiita_control_plane.runner import ENA_RUN_MAP_BINDING, _stage_ena_run_roster, run_workflow
 from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_HUMAN_TERM_ID,
     delete_action_if_created,
@@ -78,7 +89,18 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_global_field,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import (
+    delete_idxs,
+    delete_principal,
+    teardown_entity_graph,
+)
 from qiita_control_plane.testing.unique_names import unique_accession
+from qiita_control_plane.workspace import (
+    STEP_MANIFEST_FILENAME,
+    step_attempt_dir,
+    step_output_dir,
+    ticket_workspace,
+)
 
 from .conftest import (
     OWNER_INELIGIBILITY_KINDS,
@@ -87,7 +109,6 @@ from .conftest import (
     _seed_study,
     assert_owner_ineligibility_422,
     assert_submission_error_cleared_on_new_attempt,
-    delete_idxs,
     resolve_ineligible_owner_idx,
     unique_instrument_id,
 )
@@ -104,88 +125,36 @@ def _unique_item_id(prefix: str = "ITEM") -> str:
 
 
 # ---------------------------------------------------------------------------
-# FK-reverse cleanup
+# Teardown
 # ---------------------------------------------------------------------------
 
 
 async def _cleanup_tracked(pool, created: dict) -> None:
-    """Drop tracked rows in FK-reverse order.
-
-    Order matters because of ON DELETE RESTRICT FKs throughout the chain:
-      prep_sample_metadata
-      prep_sample_study_field (bulk-scoped to test-owned studies)
-      prep_sample_to_study (composite PK)
-      sequenced_sample
-      work_ticket
-      prep_sample
-      sequenced_pool
-      sequencing_run
-      biosample_to_study (composite PK)
-      biosample
-      study_access (composite of study_idx + principal_idx)
-      study
-      principals
-
-    prep_sample_study_field rows are bulk-deleted by parent study because
-    each test seeds its own study (see _seed_study) — no other test can
-    plant fields on a study this test owns, so the parent-FK delete is
-    safe and avoids the per-row snapshot bookkeeping the response payload
-    used to enable.
-    """
-    await delete_idxs(pool, "prep_sample_metadata", created["prep_sample_metadata"])
-    if created["study"]:
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample_study_field WHERE study_idx = ANY($1::bigint[])",
-            created["study"],
-        )
-    for ps, st in created["prep_sample_to_study"]:
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
-            ps,
-            st,
-        )
-    await delete_idxs(pool, "sequenced_sample", created["sequenced_sample"])
+    """Drop the work tickets, then the sample entity graph, then everything the
+    sweep does not own."""
+    # work_ticket's PK is work_ticket_idx (not idx), so delete_idxs does not apply.
+    await pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+        created["work_ticket"],
+    )
+    await teardown_entity_graph(
+        pool,
+        study_idxs=created["study"],
+        biosample_idxs=created["biosample"],
+        prep_sample_idxs=created["prep_sample"],
+    )
     # host_filter_profile FKs the reference with ON DELETE RESTRICT, so the
     # profiles must go before the references they point at, just below.
     await delete_idxs(pool, "host_filter_profile", created["host_filter_profile"])
-    # References are FK'd by sequenced_sample.host_*_reference_idx (ON DELETE
-    # RESTRICT), so drop them only after the samples above are gone. The
-    # reference PK is reference_idx (not idx), so delete_idxs does not apply.
+    # The reference PK is reference_idx (not idx), so delete_idxs does not apply.
     if created["reference"]:
         await pool.execute(
             "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
             created["reference"],
         )
-    # work_ticket's PK is work_ticket_idx (not idx), so delete_idxs does not
-    # apply; its rows must go before the pool/principal they reference.
-    await pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
-        created["work_ticket"],
-    )
-    await delete_idxs(pool, "prep_sample", created["prep_sample"])
     await delete_idxs(pool, "sequenced_pool", created["sequenced_pool"])
     await delete_idxs(pool, "sequencing_run", created["sequencing_run"])
-    for bs, st in created["biosample_to_study"]:
-        await pool.execute(
-            "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
-            bs,
-            st,
-        )
-    # biosample_metadata references the biosample and its study field; the
-    # field references the (seeded, shared) global field, which we never own.
-    await delete_idxs(pool, "biosample_metadata", created["biosample_metadata"])
-    await delete_idxs(pool, "biosample_study_field", created["biosample_study_field"])
-    await delete_idxs(pool, "biosample", created["biosample"])
-    for st, pr in created["study_access"]:
-        await pool.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
-            st,
-            pr,
-        )
-    await delete_idxs(pool, "study", created["study"])
-    # No inbound FKs left at this point: prep_sample_metadata has been
-    # deleted, so missing_value_reason is unreferenced; prep_sample_study_field
-    # has been bulk-deleted, so prep_sample_global_field is unreferenced.
+    # Both are referenced only by metadata and study-field rows the sweep removed.
     await delete_idxs(pool, "prep_sample_global_field", created["prep_sample_global_field"])
     await delete_idxs(pool, "missing_value_reason", created["missing_value_reason"])
     all_principals = created["user_principals"] + created["service_account_principals"]
@@ -194,17 +163,12 @@ async def _cleanup_tracked(pool, created: dict) -> None:
             "DELETE FROM qiita.api_token WHERE principal_idx = ANY($1::bigint[])",
             all_principals,
         )
-    if created["user_principals"]:
-        await pool.execute(
-            "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
-            created["user_principals"],
-        )
     if created["service_account_principals"]:
         await pool.execute(
             "DELETE FROM qiita.service_account WHERE principal_idx = ANY($1::bigint[])",
             created["service_account_principals"],
         )
-    await delete_idxs(pool, "principal", all_principals)
+    await delete_principal(pool, all_principals)
 
 
 # ---------------------------------------------------------------------------
@@ -214,26 +178,19 @@ async def _cleanup_tracked(pool, created: dict) -> None:
 
 @pytest_asyncio.fixture
 async def ctx(role_keyed_clients):
-    """Per-test fixture: route-keyed clients plus a `created` tracker for
-    FK-reverse teardown over every table the composer writes (plus its
-    inputs the test seeds). Also seeds the download-ena-study action row
+    """Per-test fixture: route-keyed clients plus a `created` tracker.
+
+    Also seeds the download-ena-study action row
     that a staged-roster work_ticket FKs, and removes it afterwards iff
     this test created it."""
     created: dict = {
         "work_ticket": [],
-        "prep_sample_metadata": [],
-        "biosample_metadata": [],
-        "biosample_study_field": [],
         "host_filter_profile": [],
-        "prep_sample_to_study": [],
-        "sequenced_sample": [],
         "reference": [],
         "prep_sample": [],
         "sequenced_pool": [],
         "sequencing_run": [],
-        "biosample_to_study": [],
         "biosample": [],
-        "study_access": [],
         "study": [],
         "prep_sample_global_field": [],
         "missing_value_reason": [],
@@ -274,7 +231,6 @@ async def _seed_biosample_linked_to_study(ctx, *, owner_idx: int, study_idx: int
         study_idx=study_idx,
         created_by_idx=owner_idx,
     )
-    ctx["created"]["biosample_to_study"].append((bs_idx, study_idx))
     return bs_idx
 
 
@@ -322,23 +278,8 @@ async def _post_sequenced_sample(client, ctx, run_idx, pool_idx, **body):
         json=body,
     )
     if resp.status_code == 201:
-        rj = resp.json()
-        ps_idx = rj["prep_sample_idx"]
-        ss_idx = rj["sequenced_sample_idx"]
+        ps_idx = resp.json()["prep_sample_idx"]
         ctx["created"]["prep_sample"].append(ps_idx)
-        ctx["created"]["sequenced_sample"].append(ss_idx)
-        # Track every per-test study link the composer wrote: the primary
-        # plus any secondaries.
-        ctx["created"]["prep_sample_to_study"].append((ps_idx, body["primary_study_idx"]))
-        for st in body.get("secondary_study_idxs", []):
-            ctx["created"]["prep_sample_to_study"].append((ps_idx, st))
-        # Track prep_sample_metadata rows by looking them up after the call.
-        meta_rows = await ctx["pool"].fetch(
-            "SELECT idx FROM qiita.prep_sample_metadata WHERE prep_sample_idx = $1",
-            ps_idx,
-        )
-        for r in meta_rows:
-            ctx["created"]["prep_sample_metadata"].append(r["idx"])
     return resp
 
 
@@ -995,7 +936,6 @@ async def test_import_sequenced_sample_from_run_multi_study_happy_path(ctx):
         study_idx=secondary_idx,
         created_by_idx=ctx["wet_session"]["principal_idx"],
     )
-    ctx["created"]["biosample_to_study"].append((bs_idx, secondary_idx))
     protocol_idx = await _fetch_prep_protocol_idx(ctx)
 
     resp = await _post_sequenced_sample(
@@ -1060,7 +1000,6 @@ async def test_import_sequenced_sample_from_run_duplicate_secondary_dedupes(ctx)
         study_idx=secondary_idx,
         created_by_idx=ctx["wet_session"]["principal_idx"],
     )
-    ctx["created"]["biosample_to_study"].append((bs_idx, secondary_idx))
     protocol_idx = await _fetch_prep_protocol_idx(ctx)
 
     resp = await _post_sequenced_sample(
@@ -1386,7 +1325,6 @@ async def _seed_one_sequenced_sample(
     protocol_idx = await _fetch_prep_protocol_idx(ctx)
     item_id = _unique_item_id(suffix.upper())
 
-    # Land the composite; route tracks each row in ctx for FK-reverse cleanup.
     resp = await _post_sequenced_sample(
         ctx["wet"],
         ctx,
@@ -2354,7 +2292,6 @@ async def test_list_sequenced_sample_idxs_in_study_surfaces_secondary_link(ctx):
         study_idx=secondary_idx,
         created_by_idx=ctx["wet_session"]["principal_idx"],
     )
-    ctx["created"]["biosample_to_study"].append((bs_idx, secondary_idx))
     protocol_idx = await _fetch_prep_protocol_idx(ctx)
 
     # Compose one sequenced_sample whose supertype prep_sample lands a
@@ -3419,23 +3356,21 @@ async def _bind_host_taxon_field(ctx, study_idx):
             display_name="host taxon id",
             created_by_idx=ctx["wet_session"]["principal_idx"],
         )
-    ctx["created"]["biosample_study_field"].append(field_idx)
     return field_idx
 
 
 async def _write_host_taxon(ctx, *, biosample_idx, field_idx, term_idx=None, reason_idx=None):
     """Write the sample's host_taxon_id as either a terminology term or a missing-reason."""
     column = "value_terminology_term_idx" if term_idx is not None else "value_missing_reason_idx"
-    meta_idx = await ctx["pool"].fetchval(
+    await ctx["pool"].execute(
         f"INSERT INTO qiita.biosample_metadata"
         f" (biosample_idx, biosample_study_field_idx, {column}, created_by_idx)"
-        f" VALUES ($1, $2, $3, $4) RETURNING idx",
+        f" VALUES ($1, $2, $3, $4)",
         biosample_idx,
         field_idx,
         term_idx if term_idx is not None else reason_idx,
         ctx["wet_session"]["principal_idx"],
     )
-    ctx["created"]["biosample_metadata"].append(meta_idx)
 
 
 async def _seed_illumina_human_profile(ctx, suffix):
@@ -3616,7 +3551,6 @@ async def test_get_sequenced_sample_in_study_returns_global_and_local_metadata(c
         value="LOCAL-1",
         created_by_idx=ctx["wet_session"]["principal_idx"],
     )
-    ctx["created"]["prep_sample_metadata"].append(metadata_idx)
 
     resp = await ctx["wet"].get(
         URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
@@ -3871,16 +3805,6 @@ async def _patch_sequenced_metadata(
     )
 
 
-async def _track_prep_sample_metadata(ctx, prep_sample_idx):
-    """Track every prep_sample_metadata row for a prep_sample for FK-reverse cleanup."""
-    rows = await ctx["pool"].fetch(
-        "SELECT idx FROM qiita.prep_sample_metadata WHERE prep_sample_idx = $1", prep_sample_idx
-    )
-    for r in rows:
-        if r["idx"] not in ctx["created"]["prep_sample_metadata"]:
-            ctx["created"]["prep_sample_metadata"].append(r["idx"])
-
-
 async def _seed_prep_global_field(ctx, *, data_type=FieldDataType.TEXT):
     """Seed one prep_sample global field; track it.
 
@@ -3927,7 +3851,6 @@ async def test_patch_sequenced_sample_metadata_inserts_global_and_local(ctx):
         {global_name: "GVAL", local_name: "LVAL"},
     )
     assert resp.status_code == 200, resp.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
 
     rj = resp.json()
     expected = {
@@ -3961,7 +3884,6 @@ async def test_patch_sequenced_sample_metadata_updates_existing_value(ctx):
         ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "V1"}
     )
     assert first.status_code == 200, first.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
 
     resp = await _patch_sequenced_metadata(
         ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "V2"}
@@ -3989,7 +3911,6 @@ async def test_patch_sequenced_sample_metadata_unchanged_on_identical_value(ctx)
         ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "SAME"}
     )
     assert first.status_code == 200, first.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
 
     resp = await _patch_sequenced_metadata(
         ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "SAME"}
@@ -4023,7 +3944,6 @@ async def test_patch_sequenced_sample_metadata_internal_name_is_the_read_key(ctx
         {global_name: "GVAL"},
     )
     assert written.status_code == 200, written.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
 
     read = await ctx["wet"].get(
         URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
@@ -4055,7 +3975,6 @@ async def test_patch_sequenced_sample_metadata_internal_name_keying_round_trips(
         global_internal_names=True,
     )
     assert written.status_code == 200, written.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
     assert written.json() == {
         "results": {
             global_internal: {
@@ -4117,7 +4036,6 @@ async def test_patch_sequenced_sample_metadata_foreign_study_409(ctx):
     await seed_biosample_to_study_link(
         ctx["pool"], biosample_idx=bs_idx, study_idx=study_b, created_by_idx=wet_idx
     )
-    ctx["created"]["biosample_to_study"].append((bs_idx, study_b))
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "patch-fs")
     protocol_idx = await _fetch_prep_protocol_idx(ctx)
     post = await _post_sequenced_sample(
@@ -4134,13 +4052,11 @@ async def test_patch_sequenced_sample_metadata_foreign_study_409(ctx):
     )
     assert post.status_code == 201, post.text
     ss_idx = post.json()["sequenced_sample_idx"]
-    prep_idx = post.json()["prep_sample_idx"]
     _global_idx, name, internal_name = await _seed_prep_global_field(ctx)
 
     # Study A writes the global value first (contributing study = A).
     first = await _patch_sequenced_metadata(ctx["wet"], study_a, ss_idx, {name: "VAL-A"})
     assert first.status_code == 200, first.text
-    await _track_prep_sample_metadata(ctx, prep_idx)
 
     # Study B writing a different value to the same global slot collides.
     resp = await _patch_sequenced_metadata(ctx["wet"], study_b, ss_idx, {name: "VAL-B"})
@@ -4213,7 +4129,6 @@ async def test_patch_sequenced_sample_metadata_link_retired_mid_write_404(
             {global_name: "BEFORE"},
         )
         assert seed_resp.status_code == 200, seed_resp.text
-        await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
     await retire_prep_sample_to_study_link(
         ctx["pool"],
         prep_sample_idx=seeded["prep_sample_idx"],
@@ -4332,7 +4247,6 @@ async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
         ctx["user"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "AVAL"}
     )
     assert resp.status_code == 200, resp.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
     assert resp.json() == {
         "results": {
             name: {
@@ -4352,9 +4266,9 @@ async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
 
 async def _seed_roster_case(ctx, suffix: str) -> tuple[int, int, int, int, int]:
     """Seed one roster test's precondition chain: run, pool, study, a
-    biosample linked to the study, and the prep-protocol idx, all tracked for
-    FK-reverse teardown. The wet_lab_admin principal owns every row, so the
-    default POST passes the route's ownership and study-admin gates."""
+    biosample linked to the study, and the prep-protocol idx. The wet_lab_admin
+    principal owns every row, so the default POST passes the route's ownership
+    and study-admin gates."""
     run_idx, pool_idx = await _seed_run_and_pool(ctx, suffix)
     study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix=suffix)
     bs_idx = await _seed_biosample_linked_to_study(
@@ -5100,3 +5014,258 @@ async def test_list_sequenced_pools_in_study_truncates_over_cap(ctx, monkeypatch
     body = resp.json()
     assert body["count"] == 1
     assert body["truncated"] is True
+
+
+# ===========================================================================
+# /run redrive of a download-ena-study ticket
+# ===========================================================================
+
+_DOWNLOAD_STEPS = [
+    {
+        "kind": "step",
+        "name": "ingest_ena_reads",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.ingest_ena_reads",
+        "inputs": ["ena_run_map", "reads_staging_root"],
+        "outputs": ["read_staging_dir"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {"kind": "action", "name": "register-files", "inputs": ["read_staging_dir"], "outputs": []},
+]
+
+
+@pytest_asyncio.fixture
+async def redrive_ctx(ctx, monkeypatch):
+    """`ctx` with the download action carrying its real steps and audience, the
+    compute client set, and dispatch stubbed; the shared action row is restored."""
+    pool = ctx["pool"]
+    where = (DOWNLOAD_ENA_STUDY_ACTION_ID, DOWNLOAD_ENA_STUDY_ACTION_VERSION)
+    saved = await pool.fetchrow(
+        "SELECT steps::text AS steps, audience::text AS audience FROM qiita.action"
+        " WHERE action_id = $1 AND version = $2",
+        *where,
+    )
+    await pool.execute(
+        "UPDATE qiita.action SET steps = $3::jsonb, audience = $4::jsonb"
+        " WHERE action_id = $1 AND version = $2",
+        *where,
+        json.dumps(_DOWNLOAD_STEPS),
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin", "system_admin"]}),
+    )
+    saved_client = getattr(app.state, "compute_backend_client", None)
+    app.state.compute_backend_client = object()
+    monkeypatch.setattr("qiita_control_plane.routes.work_ticket.schedule_dispatch", lambda *_: None)
+    try:
+        yield ctx
+    finally:
+        app.state.compute_backend_client = saved_client
+        await pool.execute(
+            "UPDATE qiita.action SET steps = $3::jsonb, audience = $4::jsonb"
+            " WHERE action_id = $1 AND version = $2",
+            *where,
+            saved["steps"],
+            saved["audience"],
+        )
+
+
+async def _seed_slurm_step(pool, ticket_idx, *, step_index, name, state) -> None:
+    kw = {"work_ticket_idx": ticket_idx, "step_index": step_index, "attempt": 0}
+    await step_progress.record_submitting(
+        pool,
+        **kw,
+        step_name=name,
+        compute_target=ComputeTarget.SLURM,
+        job_name=f"qiita-wt{ticket_idx}-{name}-a0",
+    )
+    await step_progress.record_submitted(pool, **kw, slurm_job_id=4242)
+    if state is StepProgressState.RUNNING:
+        await step_progress.record_running(pool, **kw)
+    elif state is StepProgressState.COMPLETED:
+        await step_progress.record_completed(pool, **kw)
+
+
+async def _step_rows(pool, ticket_idx) -> list[tuple[int, str]]:
+    rows = await pool.fetch(
+        "SELECT step_index, state FROM qiita.work_ticket_step"
+        " WHERE work_ticket_idx = $1 ORDER BY step_index, attempt",
+        ticket_idx,
+    )
+    return [(r["step_index"], r["state"]) for r in rows]
+
+
+class _RosterRecordingBackend:
+    """SLURM-shaped fake: records each submit and the roster file it was given."""
+
+    def __init__(self) -> None:
+        self.submitted: list[str] = []
+        self.attempts: list[int] = []
+        self.roster_at_submit: list[str] = []
+        self.result_calls = 0
+
+    async def submit_step(self, *, step_name, inputs, workspace, work_ticket_idx, attempt=0, **_):
+        import pyarrow.parquet as pq
+
+        self.submitted.append(step_name)
+        self.attempts.append(attempt)
+        self.roster_at_submit = (
+            pq.read_table(inputs["ena_run_map"]).column("ena_run_accession").to_pylist()
+        )
+        return StepHandleWire(
+            compute_target=ComputeTarget.SLURM,
+            step_name=step_name,
+            slurm_job_id=4243,
+            job_name=f"qiita-wt{work_ticket_idx}-{step_name}-a{attempt}",
+            output_path=str(workspace / "output"),
+            logs_path=str(workspace / "logs"),
+        )
+
+    async def status_step(self, handle):
+        return StepStatusWire(status=StepStatus.COMPLETED, raw_state="COMPLETED")
+
+    async def result_step(self, handle, status):
+        self.result_calls += 1
+        out = Path(handle.output_path) / "read_staging_dir"
+        out.mkdir(parents=True, exist_ok=True)
+        return {"read_staging_dir": out}
+
+
+async def _run_ticket(client, ticket_idx):
+    return await client.post(URL_WORK_TICKET_RUN.format(work_ticket_idx=ticket_idx))
+
+
+async def test_redrive_of_failed_download_ticket_downloads_a_natively_added_run(
+    redrive_ctx, tmp_path
+):
+    """A redrive re-runs a completed ingest: a run added while the ticket was
+    failed is in the roster the job is given, instead of the step being
+    fast-forwarded over it. The finished attempt's read-only dir is left behind,
+    so the job lands in a fresh attempt dir."""
+    ctx = redrive_ctx
+    pool = ctx["pool"]
+    run_idx, pool_idx, study_idx, bs_idx, protocol_idx = await _seed_roster_case(ctx, "redrive")
+    accessions = [unique_accession("ERR"), unique_accession("ERR")]
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        **_roster_case_body(
+            ctx,
+            study_idx=study_idx,
+            bs_idx=bs_idx,
+            protocol_idx=protocol_idx,
+            suffix="REDRIVE-A",
+            accession=accessions[0],
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    ticket_idx = await _seed_download_ticket(ctx, pool_idx=pool_idx, state="failed")
+    await _seed_slurm_step(
+        pool, ticket_idx, step_index=0, name="ingest_ena_reads", state=StepProgressState.COMPLETED
+    )
+    stale = step_attempt_dir(ticket_workspace(tmp_path / "ws", ticket_idx), "ingest_ena_reads", 0)
+    stale_output = step_output_dir(stale)
+    stale_output.mkdir(parents=True)
+    (stale_output / STEP_MANIFEST_FILENAME).write_text("{}")
+    (stale_output / "reads.fastq").write_text("")
+    for f in stale_output.iterdir():
+        f.chmod(0o440)
+    stale_output.chmod(0o550)
+    await step_progress.record_submitting(
+        pool,
+        work_ticket_idx=ticket_idx,
+        step_index=1,
+        attempt=0,
+        step_name="register-files",
+        compute_target=ComputeTarget.CONTROL_PLANE,
+    )
+    await step_progress.record_failed(
+        pool,
+        work_ticket_idx=ticket_idx,
+        step_index=1,
+        attempt=0,
+        failure_kind="unknown_permanent",
+        failure_reason="seeded",
+    )
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        **_roster_case_body(
+            ctx,
+            study_idx=study_idx,
+            bs_idx=bs_idx,
+            protocol_idx=protocol_idx,
+            suffix="REDRIVE-B",
+            accession=accessions[1],
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+
+    resp = await _run_ticket(ctx["wet"], ticket_idx)
+    assert resp.status_code == 202, resp.text
+    assert await _step_rows(pool, ticket_idx) == []
+
+    backend = _RosterRecordingBackend()
+    with pytest.raises(RuntimeError, match="register-files: .* contains no Parquet"):
+        await run_workflow(
+            ticket_idx,
+            pool,
+            backend,  # type: ignore[arg-type]
+            signing_key=b"\x00" * 32,
+            data_plane_url="grpc://unused:0",
+            work_ticket_workspace_root=tmp_path / "ws",
+            upload_staging_root=tmp_path / "uploads",
+            poll_interval_seconds=0,
+        )
+    assert backend.submitted == ["ingest_ena_reads"]
+    assert sorted(backend.roster_at_submit) == sorted(accessions)
+    assert backend.attempts == [1]
+    assert await pool.fetchval(
+        "SELECT failure_step_name FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket_idx
+    ) == ("register-files")
+
+
+async def test_run_on_failed_download_ticket_with_live_job_returns_409(redrive_ctx):
+    """A failed ticket can keep a live in-flight attempt (the redrive adopts
+    it); it holds the roster read before the failure, so /run refuses."""
+    ctx = redrive_ctx
+    pool = ctx["pool"]
+    _, pool_idx = await _seed_run_and_pool(ctx, "redrive-live")
+    ticket_idx = await _seed_download_ticket(ctx, pool_idx=pool_idx, state="failed")
+    await _seed_slurm_step(
+        pool, ticket_idx, step_index=0, name="ingest_ena_reads", state=StepProgressState.RUNNING
+    )
+
+    resp = await _run_ticket(ctx["wet"], ticket_idx)
+
+    assert resp.status_code == 409, resp.text
+    assert "cancel" in resp.text and "re-import" in resp.text
+    assert await pool.fetchval(
+        "SELECT state::text FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket_idx
+    ) == (WorkTicketState.FAILED.value)
+    assert await _step_rows(pool, ticket_idx) == [(0, StepProgressState.RUNNING.value)]
+
+
+@pytest.mark.parametrize("state", [WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value])
+async def test_run_on_superseded_download_ticket_returns_409(redrive_ctx, state):
+    """Only the pool's latest download ticket may be redriven: an older one
+    would register runs a newer ticket already owns."""
+    ctx = redrive_ctx
+    pool = ctx["pool"]
+    _, pool_idx = await _seed_run_and_pool(ctx, "redrive-old")
+    older = await _seed_download_ticket(ctx, pool_idx=pool_idx, state=state)
+    newer = await _seed_download_ticket(ctx, pool_idx=pool_idx, state="completed")
+    await _seed_slurm_step(
+        pool, older, step_index=0, name="ingest_ena_reads", state=StepProgressState.COMPLETED
+    )
+
+    resp = await _run_ticket(ctx["wet"], older)
+
+    assert resp.status_code == 409, resp.text
+    assert f"{newer} (completed)" in resp.text
+    assert await pool.fetchval(
+        "SELECT state::text FROM qiita.work_ticket WHERE work_ticket_idx = $1", older
+    ) == (state)
+    assert await _step_rows(pool, older) == [(0, StepProgressState.COMPLETED.value)]

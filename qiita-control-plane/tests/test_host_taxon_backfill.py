@@ -38,6 +38,7 @@ from qiita_control_plane.testing.db_seeds import (
     fetch_ncbi_taxonomy_term,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 # NCBI taxa the live data actually carries, as the sample's OWN taxon_id.
 _HUMAN_GUT_METAGENOME = "408170"
@@ -158,25 +159,13 @@ async def ctx(postgres_pool):
     }
     yield state
 
-    await pool.execute(
-        "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = ANY($1::bigint[])",
-        created["biosample"],
+    await teardown_entity_graph(
+        pool,
+        study_idxs=[study_idx],
+        biosample_idxs=created["biosample"],
+        prep_sample_idxs=[],
     )
-    await pool.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = ANY($1::bigint[])",
-        created["biosample"],
-    )
-    await pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", created["biosample"]
-    )
-    # Bulk-delete by study rather than by tracked idx: the backfill CREATES the
-    # study's host_taxon_id field as a side effect (that is the point), so the
-    # test cannot know every field idx up front. The study is test-owned, so no
-    # other test can have planted a field on it.
-    await pool.execute("DELETE FROM qiita.biosample_study_field WHERE study_idx = $1", study_idx)
-    await pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
-    await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_principal(pool, [principal_idx])
 
 
 async def _seed_biosample_with_taxon(ctx, term_id):

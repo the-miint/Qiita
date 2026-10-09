@@ -31,6 +31,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_genome,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 
 def test_every_genome_source_is_classified_external_or_not():
@@ -109,13 +110,17 @@ async def test_the_source_decides_whether_source_id_is_published(postgres_pool, 
             assert row["export_feature_id"].startswith("QF")
             assert row["export_feature_id"][2:].isdigit()
     finally:
+        # The sweep reaches a genome only through its prep_sample, which an
+        # external-source genome does not carry, so both deletes stay; they
+        # match nothing on the qiita-source pass.
         await postgres_pool.execute(
             "DELETE FROM qiita.exported_feature WHERE genome_idx = $1", genome_idx
         )
         await postgres_pool.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
-        await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-        await postgres_pool.execute(
-            "DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx
+        await teardown_entity_graph(
+            postgres_pool,
+            study_idxs=[],
+            biosample_idxs=[biosample_idx],
+            prep_sample_idxs=[prep_sample_idx],
         )
-        await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+        await delete_principal(postgres_pool, [principal_idx])
