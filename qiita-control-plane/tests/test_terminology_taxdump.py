@@ -177,9 +177,13 @@ def test_build_terms_from_taxdump_member_overlap_over_cap(tmp_path):
     with pytest.raises(ValueError) as raised:
         build_terms_from_taxdump(archive_path)
 
-    message = str(raised.value)
-    assert f"{over_cap_count} total, first {MAX_REPORTED_OFFENDERS}" in message
-    assert tax_ids[-1] not in message
+    expected_message = (
+        "tax_id(s) recorded in more than one member; a taxon is live, merged away,"
+        f" or deleted, never more than one of them — {FIXTURE_NAMES_DMP_MEMBER} and"
+        f" {FIXTURE_DELNODES_DMP_MEMBER}: {over_cap_count} total,"
+        f" first {MAX_REPORTED_OFFENDERS}: {tax_ids[:MAX_REPORTED_OFFENDERS]!r}"
+    )
+    assert str(raised.value) == expected_message
 
 
 def test_build_terms_from_taxdump_taxon_without_scientific_name(tmp_path):
@@ -207,9 +211,12 @@ def test_build_terms_from_taxdump_unnamed_over_cap(tmp_path):
     with pytest.raises(ValueError) as raised:
         build_terms_from_taxdump(archive_path)
 
-    message = str(raised.value)
-    assert f"{over_cap_count} total, first {MAX_REPORTED_OFFENDERS}" in message
-    assert tax_ids[-1] not in message
+    expected_message = (
+        f"{FIXTURE_NAMES_DMP_MEMBER} carries no 'scientific name' for tax_id(s)"
+        f" {over_cap_count} total, first {MAX_REPORTED_OFFENDERS}:"
+        f" {tax_ids[:MAX_REPORTED_OFFENDERS]!r}"
+    )
+    assert str(raised.value) == expected_message
 
 
 def test_build_terms_from_taxdump_missing_member(tmp_path):

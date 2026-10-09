@@ -28,6 +28,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_study,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -94,29 +95,13 @@ async def links(postgres_pool):
         "ps_c": ps_c,
     }
 
-    prep_idxs = [ps_a, ps_b, ps_c]
-    bio_idxs = [bs_a, bs_b, bs_c]
-    studies = [study_1, study_2]
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = ANY($1::bigint[])",
-        prep_idxs,
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[study_1, study_2],
+        biosample_idxs=[bs_a, bs_b, bs_c],
+        prep_sample_idxs=[ps_a, ps_b, ps_c],
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = ANY($1::bigint[])",
-        bio_idxs,
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])", prep_idxs
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", prep_idxs
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", bio_idxs
-    )
-    await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", studies)
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 async def test_batched_lookup_matches_the_per_sample_one(links):

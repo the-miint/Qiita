@@ -122,11 +122,28 @@ class EnaRunRecord(BaseModel):
     fastq_md5: list[str] | None = None
     read_count: int | None = None
     base_count: int | None = None
+    tax_id: str | None = None
+    host_tax_id: str | None = None
+    host: str | None = None
 
-    @field_validator("library_layout", "library_strategy", "library_source", "library_selection")
+    @field_validator("tax_id", "host_tax_id", mode="before")
     @classmethod
-    def _normalize_blank_library_to_none(cls, v: str | None) -> str | None:
-        # read_ena reports a missing library field as "", not NULL -- normalize
+    def _taxon_id_to_str(cls, v: object) -> object:
+        # https://the-miint.github.io/duckdb-miint/insdc_ena/
+        return str(v) if isinstance(v, int) else v
+
+    @field_validator(
+        "library_layout",
+        "library_strategy",
+        "library_source",
+        "library_selection",
+        "tax_id",
+        "host_tax_id",
+        "host",
+    )
+    @classmethod
+    def _normalize_blank_to_none(cls, v: str | None) -> str | None:
+        # read_ena reports a missing text field as "", not NULL -- normalize
         # so a consumer's `is not None` means "ENA reported one", as on
         # EnaStudyHeader.
         if v is not None and not v.strip():

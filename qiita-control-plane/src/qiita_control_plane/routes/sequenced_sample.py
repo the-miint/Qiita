@@ -28,6 +28,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import Field
 from qiita_common.api_paths import (
+    PATH_SEQUENCED_POOL_BY_STUDY,
     PATH_SEQUENCED_SAMPLE_BY_IDX,
     PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX,
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
@@ -54,6 +55,8 @@ from qiita_common.models import (
     SequencedSamplePatchRequest,
     SequencedSampleResponse,
     StudyScopedSequencedSampleResponse,
+    StudySequencedPoolListResponse,
+    StudySequencedPoolSummary,
     Tier,
 )
 
@@ -83,6 +86,7 @@ from ..repositories._sample_helpers import fetch_global_metadata
 from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from ..repositories.sequenced_sample import (
     fetch_sequenced_pool_samples,
+    fetch_sequenced_pools_for_study,
     fetch_sequenced_sample_idxs_for_run,
     fetch_sequenced_sample_idxs_for_study,
     fetch_sequenced_sample_with_prep_sample,
@@ -332,6 +336,9 @@ async def import_sequenced_sample_from_run(
 # two bound conceptually distinct rosters and are sized independently;
 # they are intentionally not factored into a shared constant.
 _SEQUENCED_SAMPLE_HARD_CAP = 500_000
+# A study's distinct pools are far fewer than its samples; this only guards a
+# pathological fan-out across runs.
+_SEQUENCED_POOL_HARD_CAP = 1_000
 
 
 @router.get(PATH_SEQUENCED_SAMPLE_LIST_BY_RUN)
@@ -575,6 +582,51 @@ async def list_sequenced_sample_idxs_in_study(
     )
     return build_idxs_list_response(
         rows, cap=_SEQUENCED_SAMPLE_HARD_CAP, caller_system_role=user.system_role
+    )
+
+
+@study_scoped_router.get(PATH_SEQUENCED_POOL_BY_STUDY)
+async def list_sequenced_pools_in_study(
+    study_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> StudySequencedPoolListResponse:
+    """List the distinct sequenced_pools a study's samples sit in, newest run/pool first.
+
+    The study-first join the run-centric pool routes never expose: every other
+    pool-scoped route takes a `sequenced_pool_idx` the caller must already know
+    (obtainable only by its run). This walks prep_sample_to_study ->
+    sequenced_sample -> sequenced_pool for the path's study and groups to the
+    distinct pool, so the pool-scoped processing routes become reachable from a
+    study.
+
+    Same access contract as the sibling sequenced-sample listing: a HumanUser with
+    Scope.STUDY_READ and viewer tier or higher (wet_lab_admin and system_admin
+    bypass tier); require_study_exists composes alongside require_study_access so
+    an admin-bypass caller still gets 404 on a non-existent study rather than a
+    silent empty list. Excludes retired prep_sample_to_study links, retired
+    prep_samples, and ena_status-flagged samples, matching the roster the sibling
+    returns. `sample_count` counts only this study's qualifying samples in each
+    pool. The `truncated` flag indicates the study spans more pools than the cap.
+    """
+    # Fetch cap+1 rows so a count strictly greater than the cap signals truncation.
+    rows = await fetch_sequenced_pools_for_study(
+        pool,
+        study_idx=study_idx,
+        limit=_SEQUENCED_POOL_HARD_CAP + 1,
+    )
+    truncated = len(rows) > _SEQUENCED_POOL_HARD_CAP
+    rows = rows[:_SEQUENCED_POOL_HARD_CAP]
+    return StudySequencedPoolListResponse(
+        study_idx=study_idx,
+        sequenced_pool=[StudySequencedPoolSummary.model_validate(dict(r)) for r in rows],
+        count=len(rows),
+        truncated=truncated,
     )
 
 

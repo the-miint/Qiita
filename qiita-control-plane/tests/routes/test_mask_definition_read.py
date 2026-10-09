@@ -28,12 +28,12 @@ from qiita_common.models import ScopeTargetKind
 
 from qiita_control_plane.testing.db_seeds import (
     delete_action_if_created,
-    delete_idxs,
     seed_action_if_absent,
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
     seed_sequenced_sample_subtype,
 )
+from qiita_control_plane.testing.db_teardown import delete_idxs, teardown_entity_graph
 
 from .conftest import (  # noqa: F401
     _grant_study_access,
@@ -76,7 +76,6 @@ async def _seed_sample_on_pool(ctx, *, owner_idx: int, study_idx: int | None = N
         owner_idx=owner_idx,
         sequenced_pool_item_id=f"item-{secrets.token_hex(4)}",
     )
-    ctx["created"]["sequenced_sample"].append(ss_idx)
     ctx["created"]["sequenced_pool"].append(pool_idx)
     ctx["created"]["sequencing_run"].append(run_idx)
     if study_idx is not None:
@@ -88,7 +87,6 @@ async def _seed_sample_on_pool(ctx, *, owner_idx: int, study_idx: int | None = N
             study_idx=study_idx,
             created_by_idx=owner_idx,
         )
-        ctx["created"]["biosample_to_study"].append((biosample_idx, study_idx))
         await ctx["pool"].execute(
             "INSERT INTO qiita.prep_sample_to_study (prep_sample_idx, study_idx, created_by_idx)"
             " VALUES ($1, $2, $3)",
@@ -96,7 +94,6 @@ async def _seed_sample_on_pool(ctx, *, owner_idx: int, study_idx: int | None = N
             study_idx,
             owner_idx,
         )
-        ctx["created"]["prep_sample_to_study"].append((prep_sample_idx, study_idx))
     return prep_sample_idx, pool_idx
 
 
@@ -108,7 +105,6 @@ async def _seed_gate_row(ctx, *, mask_idx: int, prep_sample_idx: int, state: str
         prep_sample_idx,
         state,
     )
-    ctx["created"]["mask_sample"].append((mask_idx, prep_sample_idx))
 
 
 async def _seed_mask_ticket(
@@ -169,16 +165,11 @@ async def ctx(role_keyed_clients):  # noqa: F811
     }
     role_keyed_clients["created"] = {
         "work_ticket": [],
-        "mask_sample": [],
         "mask": [],
-        "sequenced_sample": [],
         "sequenced_pool": [],
         "sequencing_run": [],
-        "prep_sample_to_study": [],
-        "biosample_to_study": [],
         "prep_sample": [],
         "biosample": [],
-        "study_access": [],
         "study": [],
     }
     yield role_keyed_clients
@@ -188,39 +179,17 @@ async def ctx(role_keyed_clients):  # noqa: F811
         "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
         created["work_ticket"],
     )
-    for mask_idx, prep_sample_idx in created["mask_sample"]:
-        await pool.execute(
-            "DELETE FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
-            mask_idx,
-            prep_sample_idx,
-        )
+    await teardown_entity_graph(
+        pool,
+        study_idxs=created["study"],
+        biosample_idxs=created["biosample"],
+        prep_sample_idxs=created["prep_sample"],
+    )
     await pool.execute(
         "DELETE FROM qiita.mask_definition WHERE mask_idx = ANY($1::bigint[])", created["mask"]
     )
-    await delete_idxs(pool, "sequenced_sample", created["sequenced_sample"])
     await delete_idxs(pool, "sequenced_pool", created["sequenced_pool"])
     await delete_idxs(pool, "sequencing_run", created["sequencing_run"])
-    for prep_sample_idx, study_idx in created["prep_sample_to_study"]:
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
-            prep_sample_idx,
-            study_idx,
-        )
-    await delete_idxs(pool, "prep_sample", created["prep_sample"])
-    for biosample_idx, study_idx in created["biosample_to_study"]:
-        await pool.execute(
-            "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
-            biosample_idx,
-            study_idx,
-        )
-    await delete_idxs(pool, "biosample", created["biosample"])
-    for study_idx, principal_idx in created["study_access"]:
-        await pool.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
-            study_idx,
-            principal_idx,
-        )
-    await delete_idxs(pool, "study", created["study"])
     for action_id, was_created in actions_created.items():
         await delete_action_if_created(
             pool, action_id=action_id, version=_MASK_ACTION_VERSION, created=was_created
@@ -668,7 +637,6 @@ async def test_user_needs_admin_on_every_linked_study(ctx):
         study_idx=ungranted,
         created_by_idx=admin_idx,
     )
-    ctx["created"]["biosample_to_study"].append((ctx["created"]["biosample"][-1], ungranted))
     await ctx["pool"].execute(
         "INSERT INTO qiita.prep_sample_to_study (prep_sample_idx, study_idx, created_by_idx)"
         " VALUES ($1, $2, $3)",
@@ -676,7 +644,6 @@ async def test_user_needs_admin_on_every_linked_study(ctx):
         ungranted,
         admin_idx,
     )
-    ctx["created"]["prep_sample_to_study"].append((prep_sample_idx, ungranted))
 
     assert (await ctx["user"].get(url)).json()["samples"] == []
 

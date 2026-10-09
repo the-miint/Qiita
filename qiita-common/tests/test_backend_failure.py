@@ -47,6 +47,7 @@ def test_retriable_kinds_are_transient(kind):
         FailureKind.BAD_INPUT,
         FailureKind.EXIT_NONZERO,
         FailureKind.CONTRACT_VIOLATION,
+        FailureKind.RETRIES_EXHAUSTED,
         FailureKind.UNKNOWN_PERMANENT,
     ],
 )
@@ -74,10 +75,10 @@ def test_every_failure_kind_is_classified():
         ).transient
         for kind in FailureKind
     }
-    # 11 retriable + 5 permanent at the time of writing. If you add a
+    # 11 retriable + 6 permanent at the time of writing. If you add a
     # kind, update this count and decide which side it lands on.
     assert sum(classifications.values()) == 11
-    assert len(classifications) == 16
+    assert len(classifications) == 17
 
 
 # ---------------------------------------------------------------------------

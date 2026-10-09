@@ -39,6 +39,11 @@ from qiita_control_plane.testing.db_seeds import (
     retire_principal,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import (
+    delete_principal,
+    resolve_ena_study_idxs,
+    teardown_ena_study_graph,
+)
 from qiita_control_plane.testing.postgres import POSTGRES_POOL_MAX_SIZE
 from qiita_control_plane.testing.unique_names import (
     unique_accession,
@@ -175,8 +180,7 @@ async def admin_principal(postgres_pool):
         retired=False,
     )
     yield principal
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", pidx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", pidx)
+    await delete_principal(postgres_pool, pidx)
 
 
 @pytest_asyncio.fixture
@@ -232,172 +236,37 @@ async def download_ena_study_action(postgres_pool):
 
 
 async def _cleanup_study(postgres_pool, study_accession: str) -> None:
-    """Best-effort FK-reverse cleanup for one study this test created,
-    looked up by either accession column."""
-    study_idx = await postgres_pool.fetchval(
-        "SELECT idx FROM qiita.study WHERE bioproject_accession = $1 OR ena_study_accession = $1",
-        study_accession,
+    """Tear down one study this test created, looked up by either accession
+    column, along with its entity graph and the runs it registered."""
+    study_idxs = await resolve_ena_study_idxs(
+        postgres_pool, [study_accession], by_ena_accession=True
     )
-    if study_idx is None:
-        return
-    # ena_import_batch_item.study_idx FKs (RESTRICT) into qiita.study; clear it
-    # before the study DELETE below.
-    await postgres_pool.execute(
-        "DELETE FROM qiita.ena_import_batch_item WHERE study_idx = $1", study_idx
+    await teardown_ena_study_graph(
+        postgres_pool, study_idxs=study_idxs, run_accessions=[study_accession]
     )
-    ps_rows = await postgres_pool.fetch(
-        "SELECT prep_sample_idx FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
-    )
-    ps_idxs = [r["prep_sample_idx"] for r in ps_rows]
-    if ps_idxs:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])", ps_idxs
-        )
-        # prep_sample_metadata RESTRICTs its prep_sample and study field, so
-        # sweep both before prep_sample / prep_sample_study_field / study below.
-        await postgres_pool.execute(
-            "DELETE FROM qiita.prep_sample_metadata WHERE prep_sample_idx = ANY($1::bigint[])",
-            ps_idxs,
-        )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
-    )
-    if ps_idxs:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", ps_idxs
-        )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample_study_field WHERE study_idx = $1", study_idx
-    )
-    bs_rows = await postgres_pool.fetch(
-        "SELECT biosample_idx FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
-    )
-    bs_idxs = [r["biosample_idx"] for r in bs_rows]
-    if bs_idxs:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = ANY($1::bigint[])", bs_idxs
-        )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample_study_field WHERE study_idx = $1", study_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
-    )
-    if bs_idxs:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", bs_idxs
-        )
-    run_rows = await postgres_pool.fetch(
-        "SELECT idx FROM qiita.sequencing_run WHERE instrument_run_id LIKE $1",
-        f"{study_accession}:%",
-    )
-    run_idxs = [r["idx"] for r in run_rows]
-    if run_idxs:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx IN"
-            " (SELECT idx FROM qiita.sequenced_pool WHERE sequencing_run_idx = ANY($1::bigint[]))",
-            run_idxs,
-        )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.sequenced_pool WHERE sequencing_run_idx = ANY($1::bigint[])",
-            run_idxs,
-        )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.sequencing_run WHERE idx = ANY($1::bigint[])", run_idxs
-        )
-    await postgres_pool.execute("DELETE FROM qiita.study_access WHERE study_idx = $1", study_idx)
-    await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
 
 
 async def _cleanup_two_studies_sharing_biosample(
     postgres_pool, *, study_accessions: list[str], shared_sample_accession: str
 ) -> None:
-    """Teardown twin of `_cleanup_study` where two studies share ONE biosample row:
-    clear both studies' links/prep first, then drop the shared biosample once, then
-    each study -- deleting the biosample early would trip its RESTRICT FK.
+    """Teardown for the case where two studies share ONE biosample row.
+
+    Both studies and the shared biosample go in one call, which is what lets
+    the biosample be dropped once: its inbound links are cleared for every
+    study in range before any entity is deleted. The biosample is named
+    directly because it may carry no link to either study by now.
     """
-    # biosample_metadata FKs (RESTRICT) into biosample_study_field, so clear the shared
-    # biosample's metadata before either study's field rows are dropped below.
-    biosample_idx = await postgres_pool.fetchval(
+    study_idxs = await resolve_ena_study_idxs(postgres_pool, study_accessions)
+    shared_idx = await postgres_pool.fetchval(
         "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1",
         shared_sample_accession,
     )
-    if biosample_idx is not None:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = $1", biosample_idx
-        )
-
-    study_idxs: list[int] = []
-    for accession in study_accessions:
-        study_idx = await postgres_pool.fetchval(
-            "SELECT idx FROM qiita.study WHERE bioproject_accession = $1", accession
-        )
-        if study_idx is None:
-            continue
-        study_idxs.append(study_idx)
-        await postgres_pool.execute(
-            "DELETE FROM qiita.ena_import_batch_item WHERE study_idx = $1", study_idx
-        )
-        ps_rows = await postgres_pool.fetch(
-            "SELECT prep_sample_idx FROM qiita.prep_sample_to_study WHERE study_idx = $1",
-            study_idx,
-        )
-        ps_idxs = [r["prep_sample_idx"] for r in ps_rows]
-        if ps_idxs:
-            await postgres_pool.execute(
-                "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])",
-                ps_idxs,
-            )
-            # prep_sample_metadata RESTRICTs its prep_sample and study field, so
-            # sweep both before prep_sample / prep_sample_study_field / study below.
-            await postgres_pool.execute(
-                "DELETE FROM qiita.prep_sample_metadata WHERE prep_sample_idx = ANY($1::bigint[])",
-                ps_idxs,
-            )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
-        )
-        if ps_idxs:
-            await postgres_pool.execute(
-                "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", ps_idxs
-            )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.prep_sample_study_field WHERE study_idx = $1", study_idx
-        )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.biosample_study_field WHERE study_idx = $1", study_idx
-        )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
-        )
-        run_rows = await postgres_pool.fetch(
-            "SELECT idx FROM qiita.sequencing_run WHERE instrument_run_id LIKE $1",
-            f"{accession}:%",
-        )
-        run_idxs = [r["idx"] for r in run_rows]
-        if run_idxs:
-            await postgres_pool.execute(
-                "DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx IN"
-                " (SELECT idx FROM qiita.sequenced_pool"
-                "  WHERE sequencing_run_idx = ANY($1::bigint[]))",
-                run_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.sequenced_pool WHERE sequencing_run_idx = ANY($1::bigint[])",
-                run_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.sequencing_run WHERE idx = ANY($1::bigint[])", run_idxs
-            )
-
-    if biosample_idx is not None:
-        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-
-    for study_idx in study_idxs:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = $1", study_idx
-        )
-        await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
+    await teardown_ena_study_graph(
+        postgres_pool,
+        study_idxs=study_idxs,
+        run_accessions=study_accessions,
+        extra_biosample_idxs=[] if shared_idx is None else [shared_idx],
+    )
 
 
 @pytest_asyncio.fixture
@@ -573,14 +442,14 @@ async def test_process_one_study_empty_sample_attributes_registers_not_failed(
     assert biosample_row is not None
     assert biosample_row["metadata_checklist_idx"] is not None
 
-    # Nothing harmonized -- there were no attributes; the one global row is the
-    # host-taxon-id marker the import composer enforces.
+    # Nothing harmonized -- there were no attributes; the two global rows are the
+    # taxon fields.
     global_metadata_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.biosample_metadata"
         " WHERE biosample_idx = $1 AND global_field_idx IS NOT NULL",
         biosample_row["idx"],
     )
-    assert global_metadata_count == 1
+    assert global_metadata_count == 2
 
     prep_sample_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.prep_sample_to_study WHERE study_idx = $1",
@@ -651,10 +520,7 @@ async def test_process_one_study_rejects_non_audience_principal_no_ticket_create
     # Drop the batch before its submitting principal -- submitted_by_principal_idx
     # FKs (RESTRICT) into qiita.principal, and batch_cleanup only runs at teardown.
     await postgres_pool.execute("DELETE FROM qiita.ena_import_batch WHERE idx = $1", batch_idx)
-    await postgres_pool.execute(
-        "DELETE FROM qiita.user WHERE principal_idx = $1", non_audience_pidx
-    )
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", non_audience_pidx)
+    await delete_principal(postgres_pool, non_audience_pidx)
 
 
 # ---------------------------------------------------------------------------
@@ -1200,6 +1066,43 @@ async def test_process_one_study_surfaces_per_run_outcomes(
     run = item.ena_runs[0]
     assert run.status == EnaRunRegistrationStatus.REGISTERED.value
     assert run.failure_reason is None
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_run_outcomes_carry_the_metadata_warnings_of_the_biosample_they_created(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """The default fake run has no ENA taxon fields, so both are reported."""
+    accession = unique_ena_accession("PRJNA")
+    batch_idx, _items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+
+    (run,) = status.items[0].ena_runs
+    assert run.status == EnaRunRegistrationStatus.REGISTERED.value
+    assert len(run.metadata_warnings) == 2
+    assert all(f"SAMN-{accession}" in w for w in run.metadata_warnings)
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_stored_run_outcome_without_warnings_still_parses(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    accession = unique_ena_accession("PRJNA")
+    batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+    await postgres_pool.execute(
+        "UPDATE qiita.ena_import_batch_item SET ena_run_outcomes = $2::jsonb WHERE idx = $1",
+        items[0].idx,
+        json.dumps([{"run_accession": "SRR1", "status": "registered", "failure_reason": None}]),
+    )
+
+    status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+
+    assert status.items[0].ena_runs[0].metadata_warnings == []
 
     await _cleanup_study(postgres_pool, accession)
 

@@ -12,9 +12,10 @@ decide:
 
   - retriable + retry_count < max_retries → bump retry_count, transition
     PROCESSING → QUEUED, retry the failing step.
-  - retriable + retry_count >= max_retries → transition to FAILED,
-    persist failure_type='retriable' (so post-mortems can tell
-    "exhausted retries" from "permanent on first attempt").
+  - retriable + retry_count >= max_retries → the runner raises a permanent
+    RETRIES_EXHAUSTED failure wrapping the last one, so the ticket ends
+    FAILED with failure_type='permanent' and a reason starting
+    "retries_exhausted".
   - permanent → skip the retry loop, transition straight to FAILED with
     failure_type='permanent'.
 
@@ -100,15 +101,10 @@ class FailureKind(StrEnum):
     # concurrent update"). NOT a malformed request: the same call succeeds once
     # the contention clears, so a redrive self-heals.
     DATA_PLANE_TRANSIENT = "data_plane_transient"
-    # A native job's fetch from an external (non-Qiita) archive raised a
-    # transport/network error — e.g. `ingest_ena_reads` calling miint's
-    # `read_ena_sequences`, where ENA metadata resolution (the Portal API call
-    # `read_ena_sequences.Bind` makes before any per-run reader exists) fails
-    # outright rather than being internally retried/skipped by miint itself.
-    # A DNS failure, connection reset, or timeout self-heals on a redrive; a
-    # malformed/garbled accession or a genuine format error does NOT belong
-    # here (see BAD_INPUT) — the classification is per-exception, not
-    # per-job, because the same call can fail either way.
+    # A native job's fetch from an external (non-Qiita) archive failed in a way a
+    # re-run may clear: a transport error, an md5 mismatch (miint cannot tell it
+    # from a truncated transfer), or a run miint skipped. A format error does
+    # NOT belong here (see BAD_INPUT).
     EXTERNAL_FETCH_TRANSIENT = "external_fetch_transient"
 
     # ---- Permanent: workflow / input / contract issues -------------------
@@ -124,6 +120,10 @@ class FailureKind(StrEnum):
     # guaranteed repeat. Operator fix: raise the action ceiling or shrink the
     # input. Raised by the runner, never emitted by a backend over the wire.
     RESOURCE_CEILING_EXHAUSTED = "resource_ceiling_exhausted"
+    # A retriable kind that used up the ticket's max_retries. Raised by the
+    # runner, never emitted by a backend; carries the last attempt's kind and
+    # reason so the stored failure_reason still says what failed.
+    RETRIES_EXHAUSTED = "retries_exhausted"
     UNKNOWN_PERMANENT = "unknown_permanent"
 
 

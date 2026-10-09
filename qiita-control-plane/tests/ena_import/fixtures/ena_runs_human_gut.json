@@ -1,0 +1,30 @@
+{
+  "_source": "recorded through miint read_ena(\"PRJNA1150116\", fields=...) (Portal result=read_run) on 2026-10-05; first 3 runs of the study, trimmed to keep the file small; list and integer columns (tax_id is BIGINT) re-typed from the extension's semicolon-joined strings",
+  "columns": [
+    "run_accession",
+    "experiment_accession",
+    "sample_accession",
+    "sample_alias",
+    "study_accession",
+    "status",
+    "library_layout",
+    "library_strategy",
+    "library_source",
+    "library_selection",
+    "instrument_platform",
+    "fastq_ftp",
+    "fastq_aspera",
+    "fastq_bytes",
+    "fastq_md5",
+    "read_count",
+    "base_count",
+    "tax_id",
+    "host_tax_id",
+    "host"
+  ],
+  "rows": [
+    ["SRR30311307", "SRX25771723", "SAMN43270215", "BSMC", "PRJNA1150116", "public", "PAIRED", "AMPLICON", "GENOMIC", "RANDOM", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR303/007/SRR30311307/SRR30311307_1.fastq.gz", "ftp.sra.ebi.ac.uk/vol1/fastq/SRR303/007/SRR30311307/SRR30311307_2.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR303/007/SRR30311307/SRR30311307_1.fastq.gz", "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR303/007/SRR30311307/SRR30311307_2.fastq.gz"], [1098848, 1213640], ["8bd819f3f73e3f8493ea26db049098f9", "6c9338a9617c538e38733c94037f97b9"], 11202, 5559097, 408170, "9606", "Homo sapiens"],
+    ["SRR30311309", "SRX25771721", "SAMN43270231", "JRRHC", "PRJNA1150116", "public", "PAIRED", "AMPLICON", "GENOMIC", "RANDOM", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR303/009/SRR30311309/SRR30311309_1.fastq.gz", "ftp.sra.ebi.ac.uk/vol1/fastq/SRR303/009/SRR30311309/SRR30311309_2.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR303/009/SRR30311309/SRR30311309_1.fastq.gz", "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR303/009/SRR30311309/SRR30311309_2.fastq.gz"], [1410918, 1595478], ["ec6f7546e0610d954b1e4df57ebba378", "2e601b118cf3ea2b9c3ee3ab61f2d511"], 13194, 6509090, 408170, "9606", "Homo sapiens"],
+    ["SRR30311310", "SRX25771720", "SAMN43270230", "JJRQT", "PRJNA1150116", "public", "PAIRED", "AMPLICON", "GENOMIC", "RANDOM", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR303/010/SRR30311310/SRR30311310_1.fastq.gz", "ftp.sra.ebi.ac.uk/vol1/fastq/SRR303/010/SRR30311310/SRR30311310_2.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR303/010/SRR30311310/SRR30311310_1.fastq.gz", "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR303/010/SRR30311310/SRR30311310_2.fastq.gz"], [805127, 871554], ["036f8f07e724cfcbb268b5be55a6e04d", "896e447af6205884ed4001883fb4cde3"], 9549, 4727893, 408170, "9606", "Homo sapiens"]
+  ]
+}

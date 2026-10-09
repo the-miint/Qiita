@@ -1,0 +1,30 @@
+{
+  "_source": "recorded through miint read_ena(\"PRJNA753658\", fields=...) (Portal result=read_run) on 2026-10-05; first 3 runs with a blank tax_id of the study, trimmed to keep the file small; list and integer columns (tax_id is BIGINT) re-typed from the extension's semicolon-joined strings",
+  "columns": [
+    "run_accession",
+    "experiment_accession",
+    "sample_accession",
+    "sample_alias",
+    "study_accession",
+    "status",
+    "library_layout",
+    "library_strategy",
+    "library_source",
+    "library_selection",
+    "instrument_platform",
+    "fastq_ftp",
+    "fastq_aspera",
+    "fastq_bytes",
+    "fastq_md5",
+    "read_count",
+    "base_count",
+    "tax_id",
+    "host_tax_id",
+    "host"
+  ],
+  "rows": [
+    ["SRR15412652", "SRX11714831", "SAMN20703334", null, "PRJNA753658", "public", "PAIRED", "AMPLICON", "METAGENOMIC", "PCR", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR154/052/SRR15412652/SRR15412652.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR154/052/SRR15412652/SRR15412652.fastq.gz"], [8149947], ["33fae8eae0c1bdebc5c761aaf512c5d2"], 49082, 20508994, null, null, null],
+    ["SRR15412653", "SRX11714830", "SAMN20703333", null, "PRJNA753658", "public", "PAIRED", "AMPLICON", "METAGENOMIC", "PCR", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR154/053/SRR15412653/SRR15412653.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR154/053/SRR15412653/SRR15412653.fastq.gz"], [5109683], ["4346b4bf91c48f59018da0434b597a2c"], 30997, 12922916, null, null, null],
+    ["SRR15412654", "SRX11714829", "SAMN20703332", null, "PRJNA753658", "public", "PAIRED", "AMPLICON", "METAGENOMIC", "PCR", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR154/054/SRR15412654/SRR15412654.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR154/054/SRR15412654/SRR15412654.fastq.gz"], [7874804], ["88c12bfc6c68ac79ca60488c384aa105"], 46616, 19581398, null, null, null]
+  ]
+}

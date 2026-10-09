@@ -35,7 +35,7 @@ from qiita_common.auth_constants import Scope
 
 from qiita_control_plane.auth.token import mint_api_token
 from qiita_control_plane.main import app
-from qiita_control_plane.testing.db_seeds import delete_idxs
+from qiita_control_plane.testing.db_teardown import delete_idxs
 
 from .conftest import unique_instrument_id
 

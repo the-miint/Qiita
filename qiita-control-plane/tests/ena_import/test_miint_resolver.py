@@ -191,6 +191,55 @@ def test_resolve_runs_rejects_an_unrecognized_status(monkeypatch):
         MiintEnaResolver().resolve_ena_runs("PRJNA48739")
 
 
+@pytest.mark.parametrize(
+    ("fixture", "expected"),
+    [
+        ("ena_runs_human_gut.json", ("408170", "9606", "Homo sapiens")),
+        ("ena_runs_seawater.json", ("1561972", None, None)),
+        ("ena_runs_host_text_only.json", ("749906", None, "insect5")),
+        ("ena_runs_unseeded_host.json", ("749906", "9823", "Sus scrofa")),
+        ("ena_runs_missing_sample_record.json", (None, None, None)),
+    ],
+)
+def test_resolve_runs_carries_sample_taxon_and_host_fields(monkeypatch, fixture, expected):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    columns, rows = _load_fixture(fixture)
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: (columns, rows))
+
+    run = MiintEnaResolver().resolve_ena_runs("PRJNA48739")[0]
+
+    assert (run.tax_id, run.host_tax_id, run.host) == expected
+
+
+def test_run_record_accepts_the_integer_tax_id_miint_returns():
+    run = EnaRunRecord(
+        run_accession="SRR1",
+        experiment_accession="SRX1",
+        sample_accession="SAMN1",
+        study_accession="PRJNA1",
+        status="public",
+        tax_id=408170,
+        host_tax_id=9606,
+    )
+
+    assert (run.tax_id, run.host_tax_id) == ("408170", "9606")
+
+
+def test_run_record_normalizes_blank_taxon_and_host_to_none():
+    base = {
+        "run_accession": "SRR1",
+        "experiment_accession": "SRX1",
+        "sample_accession": "SAMN1",
+        "study_accession": "PRJNA1",
+        "status": "public",
+    }
+
+    run = EnaRunRecord(**base, tax_id="", host_tax_id=" ", host="")
+
+    assert (run.tax_id, run.host_tax_id, run.host) == (None, None, None)
+
+
 class _FakeCapturingConnection:
     """Fakes `connect_with_miint_staged()`'s context-manager + `execute` shape,
     capturing the last call's SQL params so a test can assert on what fields
@@ -303,7 +352,7 @@ def test_resolve_sample_attributes_orders_tags_so_normalized_collisions_resolve_
 ):
     """`map_ena_attributes` lets the later of two tags that normalize alike win, so the
     map entries must arrive in a fixed (tag-sorted) order."""
-    from qiita_control_plane.ena_import.harmonization import build_biosample_metadata
+    from qiita_control_plane.ena_import.attribute_mapping import map_ena_attributes
     from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
     rows = [
@@ -318,8 +367,8 @@ def test_resolve_sample_attributes_orders_tags_so_normalized_collisions_resolve_
         (sample,) = MiintEnaResolver().resolve_sample_attributes("PRJNA1")
 
     assert list(sample.attributes) == ["Collection_Date", "collection date", "collection_date"]
-    global_metadata, _, _ = build_biosample_metadata(sample.attributes)
-    assert global_metadata["collection date"] == "2017"
+    mapped, _ = map_ena_attributes({tag: v for tag, (v,) in sample.attributes.items()})
+    assert mapped["collection date"] == "2017"
 
 
 @pytest.mark.parametrize("requested, expected", [("PRJNA1", ["SAMN1"]), ("PRJNA2", [])])

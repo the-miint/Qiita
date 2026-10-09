@@ -421,9 +421,7 @@ def compute_reads_staging_path(staging_root: Path, prep_sample_idx: int) -> Path
 # =============================================================================
 # Mints contiguous bigint ranges (`sequence_idx_start..stop`) the data
 # plane uses to key raw sequencing reads. POST is service-account-only
-# (Scope.SEQUENCE_RANGE_MINT); GET accepts Scope.PREP_SAMPLE_READ OR
-# Scope.SEQUENCE_RANGE_MINT (the latter lets the minter read back its own
-# range on the ingest_reads retry/reuse path).
+# (Scope.SEQUENCE_RANGE_MINT); who may GET is on get_sequence_range_route.
 
 PATH_SEQUENCE_RANGE_PREFIX = "/sequence-range"
 PATH_SEQUENCE_RANGE_ROOT = ""  # POST against the prefix itself
@@ -894,6 +892,8 @@ URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
 #   • GET/PATCH /biosample/{biosample_idx}          → its own prefix
 
 PATH_BIOSAMPLE_BY_STUDY = "/{study_idx}/biosample"
+# Bulk import: a sheet's biosamples in one all-or-nothing POST.
+PATH_BIOSAMPLE_BULK_BY_STUDY = "/{study_idx}/biosample/bulk"
 PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 # Study-scoped single biosample: a GET view carrying this study's local
 # metadata alongside the global metadata, and a metadata upsert PATCH. Both
@@ -933,6 +933,7 @@ PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"
+URL_BIOSAMPLE_BULK_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BULK_BY_STUDY}"
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
 URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
@@ -972,6 +973,9 @@ PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/sequenced-sample/{sequenc
 PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
     "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata"
 )
+# The distinct sequenced_pools a study's samples sit in — the study-first join
+# the run-centric pool routes never expose. Composes under PATH_STUDY_PREFIX.
+PATH_SEQUENCED_POOL_BY_STUDY = "/{study_idx}/sequenced-pool"
 # Pool-scoped sibling of LIST_BY_RUN. Returns richer per-sample rows
 # (prep_sample_idx + sequenced_pool_item_id), hence the `list` segment rather
 # than `list-idxs`. Anchored on /sequencing-run so require_sequenced_pool_in_run
@@ -989,6 +993,7 @@ URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL}"
 )
 URL_SEQUENCED_SAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY}"
+URL_SEQUENCED_POOL_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_POOL_BY_STUDY}"
 URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = (
     f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX}"
 )

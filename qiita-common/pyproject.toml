@@ -12,8 +12,9 @@ dependencies = [
     # `qiita_common.analytic` builds SQL text and opens no connection, but the
     # analytic it describes only means anything against duckdb+miint, so its
     # behaviour is pinned by tests that execute it here rather than in a
-    # consumer's suite. Both importing services already declare the same floor.
-    "duckdb>=1.5.4",
+    # consumer's suite. Exact, and equal to every other DuckDB pin in the repo:
+    # see tests/test_duckdb_version_sync.py.
+    "duckdb==1.5.5",
 ]
 
 [dependency-groups]

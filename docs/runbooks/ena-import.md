@@ -60,8 +60,8 @@ A download ticket's roster read also waits at most 90 s
 sequencing_run to commit, so a study of many hundreds of runs cannot fail the
 read by holding that lock past the pool's default 10 s statement budget. A
 download ticket that still fails there is FAILED/RETRIABLE: let the import
-finish, then redrive it with `POST /work-ticket/{idx}/run` — the re-read only
-adds runs.
+finish, then redrive it with `POST /work-ticket/{idx}/run` — the redrive re-runs
+the download against the current roster; runs already stored are not fetched again.
 
 ### Re-importing, and studies we created ourselves
 
@@ -70,7 +70,12 @@ since the last import: runs already registered come back as `skipped_already_pre
 and only the new ones are added. A download ticket reads its pool's run list once, when
 it starts, so new runs never join a pool whose download is in flight or finished — they
 go into a new pool with its own ticket, and the accession reports `done` only once every
-pool's download has. A re-import is also how to retry a failed or cancelled download.
+pool's download has. A re-import is also how to retry a failed or cancelled download,
+as is `POST /work-ticket/{idx}/run` on the pool's latest such ticket, which picks up runs
+added since. `/run` is refused with a 409 on an older ticket (the error names the newer
+one and its state), and on a failed ticket that still has a live download job from before
+the failure, which holds the old roster: cancel it by idx (`work_ticket_idxs`) to reap the
+job, then re-import the study. The ticket stays FAILED and keeps refusing `/run`.
 Nothing schedules this — it is an operator gesture. A native `POST .../sequenced-sample`
 add to a pool whose download has already read (or is reading) its roster is refused the
 same way, 409: create a new `sequenced_pool` on the run and submit its own
@@ -255,7 +260,46 @@ metadata if it doesn't parse (including an INSDC missing-value marker like
 `"missing"`, which real DDBJ submissions do use for `lat_lon`). The three
 environmental-context tags (`env_broad_scale`/`env_local_scale`/`env_medium`, and
 their GSC-MIxS display-name twins) stay unmapped in either vocabulary — see
-"No ENVO / taxon-ontology harmonization" below.
+"No ENVO harmonization or free-text host matching" below.
+
+**Taxon ids come from ENA.** A new biosample's `taxon id` is the run's `tax_id` and its
+`host taxon id` is the run's `host_tax_id`. An id is written only if it is a loaded NCBI
+Taxonomy term (`qiita-admin terminology prepare-taxdump` loads more, but biosamples
+already imported are not revisited); anything else is written as `not provided` and
+listed in the run's `metadata_warnings`. A `host_tax_id` that is loaded is written even
+when it disagrees with the host the biosample's `tax_id` implies, with a warning. A
+`host_tax_id` equal to the biosample's own `tax_id`, or to a taxon in the table (the
+curated list of biosample taxa with an implied host, or none) or to the bare `metagenome`
+taxon, is not a host and is ignored, with a warning.
+
+With no usable `host_tax_id`, a free-text `host` that is not a missing-value term such as
+`missing` gives `not provided` and a warning quoting the text. Otherwise the host comes
+from the table: the listed human and mouse metagenomes give that host, and the listed
+hostless environments such as seawater or soil give `not applicable`, meaning the
+sequenced sample is submitted with no host depletion. A taxon the table does not cover
+gives `not provided`, and host-filter resolution then returns unresolved and submit
+refuses. `qiita-admin backfill host-taxon-id` reads the same table. An attribute tag
+named `taxon id` or `host taxon id` is dropped with a warning, since those fields are
+filled from the run's taxon ids (falling back to the table, `not applicable`, or
+`not provided`).
+
+A warning appears only on the run that created the biosample, so after a re-import or for
+a later run on the same sample, check the creating batch.
+
+A stored `not provided` stops host filtering at submit, and nothing rewrites it:
+`qiita-admin backfill host-taxon-id` skips a biosample that already has a `host taxon id`
+row, and a re-import does not revisit it (#669). To correct one, write the field on that
+biosample with `PATCH /study/{S}/biosample/{B}/metadata` and body
+`{"host taxon id": "<NCBI taxon id>"}`, or from the CLI:
+
+```
+qiita biosample patch-metadata-by-unique-field --study-idx S \
+  --unique-field-display-name "ena sample id" --unique-field-value <sample alias> \
+  --metadata "host taxon id=<NCBI taxon id>"
+```
+
+The value is a loaded NCBI Taxonomy id or a missing-value reason such as `not applicable`.
+Either path takes one biosample per call and needs ADMIN on the study or `wet_lab_admin`.
 
 ## Scope and limits
 
@@ -278,9 +322,9 @@ gaps expected to close soon (except where noted):
   platform string can fail platform mapping for that run alone (isolated, per the
   per-run failure model above) rather than importing correctly. Filling out DDBJ
   coverage is deferred to the backlog.
-- **No ENVO / taxon-ontology harmonization.** Free-text environment and taxonomy
-  fields ENA supplies are kept as study-local text as given; there is no ENVO term
-  resolution or NCBI taxon-id cross-referencing in this path. Also deferred to the
+- **No ENVO harmonization or free-text host matching.** Free-text environment and host
+  fields ENA supplies are kept as study-local text as given; only ENA's numeric
+  `tax_id` and `host_tax_id` are cross-referenced to NCBI Taxonomy. Also deferred to the
   backlog.
 
 ## The duckdb-miint dependency
@@ -298,9 +342,28 @@ not a hand-rolled ENA client:
 **md5 verification is miint's.** `read_ena_sequences` verifies each downloaded FASTQ
 file against ENA's published `fastq_md5` by default (`verify_md5`, duckdb-miint#172;
 see miint's [`insdc_ena` docs](https://the-miint.github.io/duckdb-miint/insdc_ena/)),
-and a mismatch fails the run. Where verification does not apply (an SFF run, a file
-that is not gzip-compressed, no `fastq_md5` from ENA) the run still registers. A run
-that comes back truncated or empty fails loud either way.
+and a mismatch fails the step. miint cannot tell a transfer truncated on a gzip member
+boundary from bytes that really disagree with the digest, so the step is retried up to
+the ticket's retry limit; when the retries run out the ticket ends FAILED with
+failure_type `permanent` and both digests in the reason. A run miint skipped (a failed
+open or a mid-download failure, including a corrupt body that surfaces mid-stream) is
+retried the same way, so a permanent open failure such as a 404 costs the full retry
+limit before it fails.
+
+Where verification does not apply (an SFF run, a file that is not gzip-compressed, no
+`fastq_md5` from ENA) the run still registers. A run that comes back empty with no
+warning fails permanently.
+
+When the retries run out the ticket is FAILED `permanent` and emailed with its reason.
+Read the reason first. A dropped transfer or an ENA outage: redrive the ticket
+(`POST /work-ticket/{idx}/run`) once ENA is healthy; runs already stored are skipped, and
+a redrive resets `retry_count`, so it buys the full budget again. A bad digest or a 404:
+compare against the ENA Portal before redriving, since the same bytes fail the same way;
+if the run is gone or its digest is wrong at ENA, re-import once ENA is corrected. Each
+retry resubmits the whole `ingest_ena_reads` step (resources: `baseline_resources` in
+`workflows/download-ena-study/1.0.0.yaml`), the requeue follows the failure with no
+delay or backoff, and `max_retries` is the ticket's one budget, shared with the OOM and
+timeout retries of that step.
 
 **Network access.** The control-plane host resolves metadata from `www.ebi.ac.uk`, and
 the SLURM compute nodes running `ingest_ena_reads` reach both `www.ebi.ac.uk` and

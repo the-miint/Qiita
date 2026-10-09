@@ -26,6 +26,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -62,19 +63,16 @@ async def _seed(postgres_pool, *, state="completed"):
 
 
 async def _cleanup(postgres_pool, alignment_idx, prep_sample_idx, biosample_idx, principal_idx):
-    await postgres_pool.execute(
-        "DELETE FROM qiita.exported_identifier WHERE prep_sample_idx = $1", prep_sample_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.alignment_sample WHERE prep_sample_idx = $1", prep_sample_idx
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[prep_sample_idx],
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
     )
-    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 @pytest.fixture

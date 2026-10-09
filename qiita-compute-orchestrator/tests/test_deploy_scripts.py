@@ -894,6 +894,29 @@ def test_split_conn_password_declines_when_it_cannot_key_a_pgpass_entry(connstr:
     assert sanitized == connstr, "connstr must be left intact for the caller to use as-is"
 
 
+def _required_duckdb_cli_version() -> str:
+    """The CLI version the lake scripts require, as they read it: by sourcing _common.sh."""
+    version = subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; printf %s "$QIITA_DUCKDB_VERSION"'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert version, "deploy/_common.sh no longer sets QIITA_DUCKDB_VERSION"
+    return version
+
+
+def _write_duckdb_stub(path: Path, body: str = "exit 0\n") -> Path:
+    """A `duckdb` stand-in that reports the required version to `--version` (the
+    resolver checks it) and otherwise runs `body`."""
+    version = _required_duckdb_cli_version()
+    path.write_text(
+        f'#!/bin/sh\nif [ "$1" = --version ]; then echo "v{version} (stub) 0"; exit 0; fi\n' + body
+    )
+    path.chmod(0o755)
+    return path
+
+
 def test_lake_shell_refuses_to_open_without_the_staged_miint_extension(tmp_path: Path) -> None:
     """miint is a core dependency, so the shell must fail LOUD rather than open a
     session whose bioinformatics functions differ from production's. Everything
@@ -913,7 +936,7 @@ def test_lake_shell_refuses_to_open_without_the_staged_miint_extension(tmp_path:
         "DP_ENV": str(dp_env),
         "CP_ENV": str(cp_env),
         "CO_ENV": str(tmp_path / "absent.env"),
-        "QIITA_DUCKDB_BIN": "/bin/true",
+        "QIITA_DUCKDB_BIN": str(_write_duckdb_stub(tmp_path / "duckdb-stub")),
     }
     env.pop("MIINT_EXTENSION_DIRECTORY", None)
 
@@ -997,10 +1020,10 @@ def test_lake_gc_rejects_unknown_argument() -> None:
 
 
 def _lake_gc_env(tmp_path, *, writable: bool = True) -> dict:
-    """A data-plane env plus a lake dir, with duckdb stubbed by `true` so the
-    script's own logic runs without a catalog. `true` prints nothing, which is the
-    same shape as a maintenance call that reclaims nothing. Resolved via PATH —
-    it is /usr/bin/true on macOS and /bin/true on most Linux."""
+    """A data-plane env plus a lake dir, with duckdb stubbed so the script's own
+    logic runs without a catalog. The stub reports the required version, saves the
+    SQL it is handed, and prints nothing — the same shape as a maintenance call that
+    reclaims nothing."""
     persistent = tmp_path / "persistent"
     (persistent / "ducklake").mkdir(parents=True)
     if not writable:
@@ -1014,17 +1037,40 @@ def _lake_gc_env(tmp_path, *, writable: bool = True) -> dict:
     # discard it, leaving the thing these tests are about — dry_run, the
     # transaction split — unasserted: a hardcoded `dry_run := false` would pass.
     captured = tmp_path / "captured.sql"
-    stub = tmp_path / "duckdb-stub"
-    stub.write_text(
-        "#!/bin/sh\n"
+    stub = _write_duckdb_stub(
+        tmp_path / "duckdb-stub",
         "while [ $# -gt 0 ]; do\n"
         f'  if [ "$1" = -f ]; then cat "$2" >> "{captured}"; fi\n'
         "  shift\n"
         "done\n"
-        "exit 0\n"
+        "exit 0\n",
     )
-    stub.chmod(0o755)
     return {**os.environ, "DP_ENV": str(dp_env), "QIITA_DUCKDB_BIN": str(stub)}
+
+
+@pytest.mark.parametrize("script", _LAKE_SCRIPTS, ids=lambda p: p.name)
+@pytest.mark.parametrize(
+    ("stub", "shown"),
+    [
+        ("echo 'v1.0.0 (stub) 0'", "printed 'v1.0.0 (stub) 0'"),
+        (":", "printed 'nothing'"),
+        ("echo 'cannot execute binary file' >&2; exit 126", "printed 'cannot execute binary file'"),
+    ],
+    ids=["other-version", "silent", "unrunnable"],
+)
+def test_lake_script_refuses_a_duckdb_cli_of_another_version(
+    tmp_path: Path, script: Path, stub: str, shown: str
+) -> None:
+    """The CLI must be the DuckDB the data plane links (deploy/_common.sh says why). A
+    binary that cannot say which version it is gets no benefit of the doubt, and the
+    refusal shows what it did print — stderr included, so an unrunnable one says why."""
+    env = _lake_gc_env(tmp_path)
+    Path(env["QIITA_DUCKDB_BIN"]).write_text(f"#!/bin/sh\n{stub}\n")
+    result = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    assert result.returncode != 0, f"a mismatched CLI was accepted:\n{result.stdout}"
+    assert shown in result.stderr, result.stderr
+    assert f"v{_required_duckdb_cli_version()}" in result.stderr, result.stderr
+    assert not (tmp_path / "captured.sql").exists(), "SQL ran on the wrong CLI"
 
 
 def test_lake_gc_defaults_to_report_only(tmp_path) -> None:

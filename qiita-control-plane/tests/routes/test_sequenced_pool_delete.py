@@ -33,6 +33,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
     seed_study,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -74,7 +75,7 @@ async def _seed_pool_with_sample(pool, owner_idx):
     sequenced_sample chain plus the two study links the triggers need.
 
     Returns a dict of every idx so the cascade's per-table effects can be
-    asserted and a blocked delete can be cleaned up FK-reverse."""
+    asserted and a blocked delete can still be torn down."""
     study_idx = await seed_study(
         pool, owner_idx=owner_idx, title=f"pool-del-{secrets.token_hex(4)}"
     )
@@ -110,23 +111,20 @@ async def _seed_pool_with_sample(pool, owner_idx):
 
 
 async def _cleanup(pool, ids):
-    """FK-reverse teardown, tolerant of rows a successful delete already
-    removed."""
+    """Teardown tolerant of rows a successful delete already removed."""
     ps = ids["prep_sample_idx"]
     await pool.execute(
         "DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx = $1", ids["pool_idx"]
     )
     await pool.execute("DELETE FROM qiita.work_ticket WHERE prep_sample_idx = $1", ps)
-    await pool.execute("DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1", ps)
-    await pool.execute("DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = $1", ps)
+    await teardown_entity_graph(
+        pool,
+        study_idxs=[ids["study_idx"]],
+        biosample_idxs=[ids["biosample_idx"]],
+        prep_sample_idxs=[ps],
+    )
     await pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", ids["pool_idx"])
     await pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", ids["run_idx"])
-    await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps)
-    await pool.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1", ids["biosample_idx"]
-    )
-    await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", ids["biosample_idx"])
-    await pool.execute("DELETE FROM qiita.study WHERE idx = $1", ids["study_idx"])
 
 
 async def _seed_pool_work_ticket(pool, pool_idx, state):

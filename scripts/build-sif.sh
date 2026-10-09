@@ -143,8 +143,8 @@ SOURCES_DIR="${IMAGES_DIR}/sources"
 SIF_PATH="${IMAGES_DIR}/${SIF_FILENAME}"
 # Content stamp written next to the SIF. Lets the idempotency check below detect
 # a changed Apptainer.def / entrypoint.sh / manifest_writer.py — none of which
-# VERIFY_MATCH (binary version only) can see, so such an edit would otherwise be
-# skipped and never reach the host, forcing a manual FORCE=1. See the hash helper
+# VERIFY_MATCH (a regex over VERIFY_CMD's output) can see, so such an edit would
+# otherwise be skipped and never reach the host, forcing a manual FORCE=1. See the hash helper
 # qiita_sif_build_inputs_hash in deploy/_common.sh.
 HASH_PATH="${SIF_PATH}.buildhash"
 
@@ -195,7 +195,7 @@ fi
 # leave it alone. `apptainer exec` runs the embedded binary in a fresh
 # namespace. VERIFY_CMD is intentionally word-split (it carries args).
 #
-# The skip now requires BOTH gates to pass: the vendored binary satisfies
+# The skip now requires BOTH gates to pass: VERIFY_CMD's output satisfies
 # VERIFY_MATCH *and* the build-inputs hash matches the stamp from the last
 # build. VERIFY_MATCH alone is blind to the image-baked artifacts (entrypoint.sh,
 # manifest_writer.py, the def's %post) — a fix to one of those used to be skipped

@@ -87,7 +87,8 @@
 #
 # Env overrides:
 #   DP_ENV                   data-plane env file (default /etc/qiita/data-plane.env)
-#   QIITA_DUCKDB_BIN         duckdb CLI to run (default: `duckdb` on PATH)
+#   QIITA_DUCKDB_BIN         duckdb CLI to run; must be the version the data plane
+#                            links (default: `duckdb` on PATH)
 #   QIITA_LAKE_THREADS       thread count (default 4)
 #   QIITA_LAKE_MEMORY_LIMIT  memory limit (default 32GB)
 set -euo pipefail
@@ -203,11 +204,11 @@ MARK="@@lake-gc@@"
 # `.bail on` turns an attach failure into a non-zero exit instead of an empty
 # result that reads like "nothing to reclaim".
 #
-# Measured output shapes under `-noheader -list` (1.5.4): cleanup_old_files and
-# delete_orphaned_files return one bare path per line, which report_paths counts
-# and sizes; expire_snapshots returns a 7-column snapshot row, which is only
-# line-counted here. A shape change in the first two would surface as a 0.00 GB
-# total, so they are what to re-check on a version bump.
+# Measured output shapes under `-noheader -list` (1.5.4; unchanged on 1.5.5):
+# cleanup_old_files and delete_orphaned_files return one bare path per line, which
+# report_paths counts and sizes; expire_snapshots returns a 7-column snapshot row,
+# which is only line-counted here. A shape change in the first two would surface
+# as a 0.00 GB total, so they are what to re-check on a version bump.
 run_maintenance() {
     local sql="${TMPROOT}/gc.sql"
     {

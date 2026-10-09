@@ -78,7 +78,7 @@ From: mambaorg/micromamba:1.5.8
     # `duckdb` version resolved in qiita-compute-orchestrator/uv.lock —
     # a unit test asserts the two match, so a lockfile bump fails the unit suite
     # rather than the next assembly.
-    micromamba install -y -n base -c conda-forge python-duckdb=1.5.4
+    micromamba install -y -n base -c conda-forge python-duckdb=1.5.5
 
     # ONE ENV PER ASSEMBLER, deliberately, even though only one runs per step. A
     # single shared solve couples them: bumping either pin could make the other
@@ -171,7 +171,7 @@ From: mambaorg/micromamba:1.5.8
     # extension with — DuckDB namespaces the staged dir by engine version, so a
     # skew is a LOAD failure at run time. Assert it here so a drifted solve fails
     # the BUILD instead.
-    python3 -c "import duckdb; assert duckdb.__version__ == '1.5.4', duckdb.__version__"
+    python3 -c "import duckdb; assert duckdb.__version__ == '1.5.5', duckdb.__version__"
     # The splitter is %files-copied, so it can go missing independently of the
     # entrypoint that runs it. It cannot be RUN here — it LOADs the deploy-staged
     # miint extension, which does not exist at build time and is bind-mounted only

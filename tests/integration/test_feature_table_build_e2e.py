@@ -61,6 +61,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
 )
 
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
 _THRESHOLD = "0.01"
 
 # Each genome's contigs, in creation order. `feature_idx` ascends with insertion and a
@@ -76,7 +78,13 @@ _LENGTHS = {"A": 10000, "B": 1000, "C.blocked": 100, "C": 1000}
 
 # Lineages as ingest stores them — prefixes stripped, an absent rank NULL. The sidecar
 # restores the prefixes, so `Bacteria` here must come back as `d__Bacteria`.
-_LINEAGE_B = ("Bacteria", "Bacteroidota", "Bacteroidia", "Bacteroidales", "Bacteroidaceae")
+_LINEAGE_B = (
+    "Bacteria",
+    "Bacteroidota",
+    "Bacteroidia",
+    "Bacteroidales",
+    "Bacteroidaceae",
+)
 _LINEAGE_C = (
     "Bacteria",
     "Pseudomonadota",
@@ -208,9 +216,10 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
     samples: list[tuple[int, int, int]] = []
     run_idx = pool_idx = None
     for i in range(2):
-        biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
-            db, owner_idx=owner
-        )
+        (
+            biosample_idx,
+            prep_sample_idx,
+        ) = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
         run_idx, pool_idx, ss_idx = await seed_sequenced_sample_subtype(
             db,
             prep_sample_idx=prep_sample_idx,
@@ -224,7 +233,10 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
             db, biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner
         )
         await seed_prep_sample_to_study_link(
-            db, prep_sample_idx=prep_sample_idx, study_idx=study_idx, created_by_idx=owner
+            db,
+            prep_sample_idx=prep_sample_idx,
+            study_idx=study_idx,
+            created_by_idx=owner,
         )
     prep_sample_idxs = [ps for _, ps, _ in samples]
     ps0, ps1 = prep_sample_idxs
@@ -272,7 +284,7 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
         # "absent from the sidecar" mean "not in the table" and nothing else.
         lake.execute(
             "INSERT INTO qiita_lake.reference_taxonomy"
-            " (reference_idx, feature_idx, domain, phylum, class, \"order\", family,"
+            ' (reference_idx, feature_idx, domain, phylum, class, "order", family,'
             " genus, species, strain) VALUES "
             + ", ".join(
                 f"({reference_idx}, {features[contig]}, {_rank_literals(lineage)})"
@@ -329,32 +341,23 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
         "source_ids": source_ids,
     }
 
-    # Postgres teardown in FK-reverse order. The DuckLake rows stay: the catalog is
-    # module-scoped and reset on the next module, and every id here is freshly minted,
-    # so the signed ticket's filter can only ever match this test's own rows.
+    # The DuckLake rows stay: the catalog is module-scoped and reset on the
+    # next module, and every id here is freshly minted, so the signed ticket's
+    # filter can only ever match this test's own rows.
     bio_idxs = [bs for bs, _, _ in samples]
-    ss_idxs = [ss for _, _, ss in samples]
-    await db.execute(
-        "DELETE FROM qiita.exported_identifier WHERE alignment_idx = $1", alignment_idx
+    await teardown_entity_graph(
+        db,
+        study_idxs=[study_idx],
+        biosample_idxs=bio_idxs,
+        prep_sample_idxs=prep_sample_idxs,
     )
-    await db.execute("DELETE FROM qiita.alignment_sample WHERE alignment_idx = $1", alignment_idx)
     await db.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
     )
-    await db.execute(
-        "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = ANY($1::bigint[])",
-        prep_sample_idxs,
-    )
-    await db.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = ANY($1::bigint[])", bio_idxs
-    )
-    await db.execute("DELETE FROM qiita.sequenced_sample WHERE idx = ANY($1::bigint[])", ss_idxs)
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await db.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", prep_sample_idxs
-    )
-    await db.execute("DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", bio_idxs)
+    # These genomes are refseq rather than qiita-derived, so they carry no
+    # prep_sample_idx and nothing about them was in the sweep's range.
     await db.execute(
         "DELETE FROM qiita.reference_exclusion WHERE feature_idx = ANY($1::bigint[])",
         list(features.values()),
@@ -367,18 +370,14 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
         list(features.values()),
     )
     await db.execute(
-        "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", list(features.values())
+        "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])",
+        list(features.values()),
     )
     await db.execute(
-        "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])", list(genomes.values())
+        "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])",
+        list(genomes.values()),
     )
     await db.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx)
-    await db.execute(
-        "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
-        study_idx,
-        reader,
-    )
-    await db.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
 
 
 def _read_artifact(path, *, fmt: str = "parquet") -> list[tuple]:
@@ -391,7 +390,13 @@ def _read_artifact(path, *, fmt: str = "parquet") -> list[tuple]:
 
 
 async def test_a_user_builds_a_publishable_feature_table(
-    cp_server, data_plane, regular_user_session, publishable_cohort, tmp_path, monkeypatch, capsys
+    cp_server,
+    data_plane,
+    regular_user_session,
+    publishable_cohort,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
     """The whole recipe from the client's side: three verbs, two stores, one file.
 
@@ -473,7 +478,11 @@ async def test_a_user_builds_a_publishable_feature_table(
     described = duckdb.connect(":memory:").execute(
         f"DESCRIBE SELECT * FROM read_parquet('{pooled}')"
     )
-    assert [row[0] for row in described.fetchall()] == ["sample_id", "feature_id", "value"]
+    assert [row[0] for row in described.fetchall()] == [
+        "sample_id",
+        "feature_id",
+        "value",
+    ]
     assert "prep_sample_idx" in json.loads(map_path.read_text())["note"]
     # Every member is named on stdout, so a user knows what the build left behind.
     taxonomy_path = out_dir / "pooled.taxonomy.parquet"

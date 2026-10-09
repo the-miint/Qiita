@@ -22,6 +22,10 @@ from qiita_control_plane.ena_import import (
     DOWNLOAD_ENA_STUDY_ACTION_VERSION,
 )
 from qiita_control_plane.ena_import.batch import build_ena_import_study_semaphore
+from qiita_control_plane.testing.db_teardown import (
+    resolve_ena_study_idxs,
+    teardown_ena_study_graph,
+)
 from qiita_control_plane.testing.unique_names import unique_ena_accession
 
 pytestmark = pytest.mark.db
@@ -276,78 +280,12 @@ async def download_ena_study_action(postgres_pool):
 
 
 async def _cleanup_study(postgres_pool, study_accession: str) -> None:
-    study_idx = await postgres_pool.fetchval(
-        "SELECT idx FROM qiita.study WHERE bioproject_accession = $1", study_accession
+    """Tear down the study registered under this accession, its entity graph,
+    and the runs it registered."""
+    study_idxs = await resolve_ena_study_idxs(postgres_pool, [study_accession])
+    await teardown_ena_study_graph(
+        postgres_pool, study_idxs=study_idxs, run_accessions=[study_accession]
     )
-    if study_idx is None:
-        return
-    await postgres_pool.execute(
-        "DELETE FROM qiita.ena_import_batch_item WHERE study_idx = $1", study_idx
-    )
-    ps_rows = await postgres_pool.fetch(
-        "SELECT prep_sample_idx FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
-    )
-    ps_idxs = [r["prep_sample_idx"] for r in ps_rows]
-    if ps_idxs:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])",
-            ps_idxs,
-        )
-        # prep_sample_metadata RESTRICTs its prep_sample and study field, so
-        # sweep both before prep_sample / prep_sample_study_field / study below.
-        await postgres_pool.execute(
-            "DELETE FROM qiita.prep_sample_metadata WHERE prep_sample_idx = ANY($1::bigint[])",
-            ps_idxs,
-        )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
-    )
-    if ps_idxs:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", ps_idxs
-        )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample_study_field WHERE study_idx = $1", study_idx
-    )
-    bs_rows = await postgres_pool.fetch(
-        "SELECT biosample_idx FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
-    )
-    bs_idxs = [r["biosample_idx"] for r in bs_rows]
-    if bs_idxs:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = ANY($1::bigint[])",
-            bs_idxs,
-        )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample_study_field WHERE study_idx = $1", study_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
-    )
-    if bs_idxs:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", bs_idxs
-        )
-    run_rows = await postgres_pool.fetch(
-        "SELECT idx FROM qiita.sequencing_run WHERE instrument_run_id LIKE $1",
-        f"{study_accession}:%",
-    )
-    run_idxs = [r["idx"] for r in run_rows]
-    if run_idxs:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx IN"
-            " (SELECT idx FROM qiita.sequenced_pool WHERE sequencing_run_idx = ANY($1::bigint[]))",
-            run_idxs,
-        )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.sequenced_pool WHERE sequencing_run_idx = ANY($1::bigint[])",
-            run_idxs,
-        )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.sequencing_run WHERE idx = ANY($1::bigint[])", run_idxs
-        )
-    await postgres_pool.execute("DELETE FROM qiita.study_access WHERE study_idx = $1", study_idx)
-    await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
 
 
 async def _await_batch_tasks(eib_client) -> None:
@@ -531,6 +469,33 @@ async def test_submit_isolates_per_study_failure_and_reports_per_item(
     assert "simulated resolver failure" in by_accession[bad_accession]["failure_reason"]
 
     await _cleanup_study(postgres_pool, ok_accession)
+
+
+async def test_get_returns_metadata_warnings_on_each_run_entry(
+    eib_client, postgres_pool, admin_token, download_ena_study_action
+):
+    accession = unique_ena_accession("PRJNA")
+    token, _ = admin_token
+    resp = await eib_client.post(
+        URL_ENA_IMPORT_BATCH_PREFIX,
+        json={"accessions": [accession]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    batch_idx = resp.json()["ena_import_batch_idx"]
+    eib_client._created_batches.append(batch_idx)
+    await _await_batch_tasks(eib_client)
+
+    get_resp = await eib_client.get(
+        URL_ENA_IMPORT_BATCH_BY_IDX.format(ena_import_batch_idx=batch_idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert get_resp.status_code == 200, get_resp.text
+    (run,) = get_resp.json()["items"][0]["ena_runs"]
+    assert len(run["metadata_warnings"]) == 2
+
+    await _cleanup_study(postgres_pool, accession)
 
 
 # ---------------------------------------------------------------------------

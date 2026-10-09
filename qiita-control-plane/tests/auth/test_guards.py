@@ -17,6 +17,11 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import Tier
 
 from qiita_control_plane.testing.db_seeds import seed_study
+from qiita_control_plane.testing.db_teardown import (
+    delete_idxs,
+    delete_principal,
+    teardown_entity_graph,
+)
 
 
 def _human(*, role=SystemRole.USER, scopes=frozenset(), profile_complete=True):
@@ -434,17 +439,10 @@ async def study_access_ctx(postgres_pool):
         "study_idx": study_idx,
     }
 
-    # FK-reverse cleanup.
-    await postgres_pool.execute("DELETE FROM qiita.study_access WHERE study_idx = $1", study_idx)
-    await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
-    await postgres_pool.execute(
-        "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
-        [caller_idx, owner_idx],
+    await teardown_entity_graph(
+        postgres_pool, study_idxs=[study_idx], biosample_idxs=[], prep_sample_idxs=[]
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.principal WHERE idx = ANY($1::bigint[])",
-        [caller_idx, owner_idx],
-    )
+    await delete_principal(postgres_pool, [caller_idx, owner_idx])
 
 
 @pytest.mark.db
@@ -816,16 +814,9 @@ async def run_and_pool_ctx(postgres_pool):
         "pool_idx": pool_idx,
     }
 
-    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await postgres_pool.execute(
-        "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
-        [creator_idx, stranger_idx],
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.principal WHERE idx = ANY($1::bigint[])",
-        [creator_idx, stranger_idx],
-    )
+    await delete_idxs(postgres_pool, "sequenced_pool", pool_idx)
+    await delete_idxs(postgres_pool, "sequencing_run", run_idx)
+    await delete_principal(postgres_pool, [creator_idx, stranger_idx])
 
 
 @pytest.mark.db
@@ -1135,7 +1126,12 @@ async def test_filter_studies_returns_only_the_readable_subset(study_access_ctx)
         )
         assert got == {readable}
     finally:
-        await study_access_ctx["pool"].execute("DELETE FROM qiita.study WHERE idx = $1", unreadable)
+        await teardown_entity_graph(
+            study_access_ctx["pool"],
+            study_idxs=[unreadable],
+            biosample_idxs=[],
+            prep_sample_idxs=[],
+        )
 
 
 @pytest.mark.db

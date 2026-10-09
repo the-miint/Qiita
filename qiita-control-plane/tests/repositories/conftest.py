@@ -1,19 +1,22 @@
 """Shared fixtures and helpers for the biosample-family repository tests.
 
-The committed-fixture / FK-reverse-cleanup pattern (Pattern 2) lives here so
+The committed-fixture / swept-teardown pattern (Pattern 2) lives here so
 test_biosample.py and test_biosample_metadata.py share a single source of
 truth for principal/study/checklist seeding, in-test setup, and teardown.
 The transaction-rollback pattern (Pattern 1) used by the trigger tests at
 the bottom of test_biosample.py keeps its own conn-style helpers inline
 because those tests neither commit nor share state.
 
-Other repository test files (test_study.py, test_study_access.py,
-test_user_eligibility.py) define their own helpers and do not consume
-this conftest's fixture; the scope here is biosample-family until a
-real second consumer surfaces.
+The `pool_ctx` fixture at the bottom covers the other shared shape in this
+directory: one sequencing_run and one sequenced_pool, with samples attached on
+demand, for the modules that read a pool rather than each seeding the same run
+and pool. A module in this directory that needs neither shape defines its own
+helpers.
 """
 
+import json
 import secrets
+from typing import NamedTuple
 
 import pytest_asyncio
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
@@ -30,12 +33,19 @@ from qiita_control_plane.repositories.biosample import insert_biosample
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.testing.db_seeds import (
-    delete_idxs,
     seed_biosample_global_field,
+    seed_biosample_with_sequenced_prep_sample,
     seed_local_study_field,
     seed_prep_sample_global_field,
     seed_sequenced_prep_sample,
+    seed_sequenced_sample_subtype,
     seed_study,
+    seed_user_principal,
+)
+from qiita_control_plane.testing.db_teardown import (
+    delete_idxs,
+    delete_principal,
+    teardown_entity_graph,
 )
 from qiita_control_plane.testing.unique_names import unique_field_name
 
@@ -53,26 +63,6 @@ METADATA_WRITE_LOCK_TIMEOUT = "3s"
 def _spec_id(spec):
     """Pytest id for the parametrize decorator: spec.entity_kind value."""
     return spec.entity_kind.value
-
-
-def _bare_table_name(qualified_table):
-    """Return the table name alone from a spec field naming it `schema.table`.
-
-    The cleanup buckets are keyed by bare table name while the spec fields carry
-    the qualified form, so the two are bridged in one place rather than at each
-    key.
-    """
-    return qualified_table.split(".")[-1]
-
-
-def _study_field_tracking_key(spec):
-    """Cleanup-dict key for the *_study_field rows seeded by a test."""
-    return _bare_table_name(spec.study_field_table)
-
-
-def _metadata_tracking_key(spec):
-    """Cleanup-dict key for the *_metadata rows seeded by a test."""
-    return _bare_table_name(spec.metadata_table)
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +88,6 @@ async def _create_plain_field(
             required=False,
             terminology_idx=terminology_idx,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
     return field_idx
 
 
@@ -116,7 +105,7 @@ async def _set_unique_in_study(ctx, spec, field_idx, value):
 
 
 async def _write_value(ctx, spec, *, entity_idx, field_idx, data_type, value):
-    """Write one metadata row and track it for cleanup. Returns the row idx."""
+    """Write one metadata row and return its idx."""
     async with ctx["pool"].acquire() as conn, conn.transaction():
         meta_idx = await _insert_metadata(
             conn,
@@ -127,12 +116,11 @@ async def _write_value(ctx, spec, *, entity_idx, field_idx, data_type, value):
             value=value,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_metadata_tracking_key(spec)].append(meta_idx)
     return meta_idx
 
 
 # ---------------------------------------------------------------------------
-# Pool-based seed helpers (Pattern 2 — committed rows, FK-reverse cleanup)
+# Pool-based seed helpers (Pattern 2 — committed rows, swept teardown)
 # ---------------------------------------------------------------------------
 
 
@@ -174,62 +162,22 @@ async def _seed_metadata_checklist(pool, name):
 
 
 # ---------------------------------------------------------------------------
-# FK-reverse cleanup
+# Post-sweep cleanup
 # ---------------------------------------------------------------------------
 
 
 async def _cleanup_tracked(pool, created):
-    """FK-reverse cleanup of every row tracked in `created`.
+    """Delete the tracked rows that hang off no entity.
 
-    The order encodes FK dependencies; do not reorder. biosample_to_study
-    is composite-keyed so it is handled separately from the idx-keyed sweep.
-    Empty lists for tables a given test does not seed are no-ops via
-    `_delete_idxs`, so the sweep is free for tests that only touch the
-    common biosample surface.
+    Anything belonging to a study, biosample or prep_sample is swept by
+    `teardown_entity_graph` before this runs. What is left is FK-reverse among
+    itself: the global fields and terms reference terminology.
     """
-    # Sweep the EAV value rows first; they reference everything else.
-    await delete_idxs(pool, "biosample_metadata", created["biosample_metadata"])
-    # Field rows reference biosample_global_field and terminology.
-    await delete_idxs(pool, "biosample_study_field", created["biosample_study_field"])
-    for bs, st in created["biosample_to_study"]:
-        await pool.execute(
-            "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
-            bs,
-            st,
-        )
-    # prep_sample side, FK-reverse: EAV value rows, then field rows, then
-    # the composite-keyed link, then the prep_sample itself — which must
-    # go before its biosample (prep_sample.biosample_idx FK) is swept just
-    # below. prep_sample_to_study is composite-keyed like biosample_to_study.
-    await delete_idxs(pool, "prep_sample_metadata", created["prep_sample_metadata"])
-    await delete_idxs(pool, "prep_sample_study_field", created["prep_sample_study_field"])
-    for ps, st in created["prep_sample_to_study"]:
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
-            ps,
-            st,
-        )
-    # Subtype rows (sequenced_sample) reference prep_sample with ON DELETE
-    # RESTRICT, so they must go before the prep_sample sweep below. Tests
-    # that don't seed a subtype leave this list empty and the call is a
-    # no-op via _delete_idxs.
-    await delete_idxs(pool, "sequenced_sample", created["sequenced_sample"])
-    await delete_idxs(pool, "prep_sample", created["prep_sample"])
-    await delete_idxs(pool, "biosample", created["biosample"])
-    # study_access references study with ON DELETE RESTRICT, so any
-    # study_access rows seeded by tests must go before the auto-seeded
-    # study row deletion at the end of the fixture.
-    await delete_idxs(pool, "study_access", created["study_access"])
-    # biosample_global_field and terminology_term both reference terminology;
-    # missing_value_reason has no inbound refs left after biosample_metadata.
     await delete_idxs(pool, "biosample_global_field", created["biosample_global_field"])
-    # prep_sample_study_field and prep_sample_metadata were swept above, so
-    # prep_sample_global_field has no inbound refs left at this tier.
     await delete_idxs(pool, "prep_sample_global_field", created["prep_sample_global_field"])
     await delete_idxs(pool, "terminology_term", created["terminology_term"])
     await delete_idxs(pool, "missing_value_reason", created["missing_value_reason"])
     await delete_idxs(pool, "terminology", created["terminology"])
-    await delete_idxs(pool, "study", created["studies"])
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +191,7 @@ async def ctx(postgres_pool):
 
     Each test gets fresh seed rows (suffixed with a token to avoid collisions
     across re-runs) plus an empty `created` dict the test populates with idxs
-    of any rows it inserts. Cleanup runs in FK-reverse order after the test.
+    of any rows it inserts.
 
     Both principals are promoted to user-kind via qiita.user rows so
     they can serve as study.owner_idx and biosample.owner_idx; the
@@ -268,27 +216,19 @@ async def ctx(postgres_pool):
     checklist_name = f"bs-checklist-{token}"
     checklist_idx = await _seed_metadata_checklist(postgres_pool, checklist_name)
 
-    # Test-populated tracking dict; lists hold idxs (or (bs, st) tuples).
-    # `studies` holds idxs of any extra studies the test seeds beyond the
-    # one auto-seeded above; they are deleted after the biosample-side rows
-    # are swept and before the auto-seeded study row is dropped.
+    # Test-populated tracking dict; every list holds idxs. `studies` holds any
+    # extra studies the test seeds beyond the one auto-seeded above. The three
+    # entity lists feed the sweep; the rest hang off no entity. A row belonging
+    # to an entity needs no entry here — the sweep finds it by parent FK.
     created: dict = {
-        "biosample_metadata": [],
-        "biosample_study_field": [],
-        "biosample_to_study": [],
         "biosample": [],
-        "biosample_global_field": [],
-        "prep_sample_metadata": [],
-        "prep_sample_study_field": [],
         "prep_sample": [],
-        "prep_sample_to_study": [],
-        "sequenced_sample": [],
+        "studies": [],
+        "biosample_global_field": [],
         "prep_sample_global_field": [],
         "terminology_term": [],
         "missing_value_reason": [],
         "terminology": [],
-        "study_access": [],
-        "studies": [],
     }
 
     yield {
@@ -301,23 +241,17 @@ async def ctx(postgres_pool):
         "created": created,
     }
 
-    # Sweep test-populated rows then the auto-seeded support rows.
+    # The fixture's own study and any the test added go in one list: the sweep
+    # keys on the parent FK, so both must be in range before either is deleted.
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[study_idx, *created["studies"]],
+        biosample_idxs=created["biosample"],
+        prep_sample_idxs=created["prep_sample"],
+    )
     await _cleanup_tracked(postgres_pool, created)
     await delete_idxs(postgres_pool, "metadata_checklist", checklist_idx)
-    await delete_idxs(postgres_pool, "study", study_idx)
-    # qiita.user → qiita.principal is ON DELETE RESTRICT, so the user rows
-    # must go before the principals they reference. The role-typed
-    # user_no_delete_if_study_owner and user_no_delete_if_biosample_owner
-    # triggers pass because the study and biosample rows above have already
-    # been removed.
-    await postgres_pool.execute(
-        "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
-        [principal_idx, biosample_owner_idx],
-    )
-    # principal FK is DEFERRABLE INITIALLY DEFERRED, so deleting both rows in
-    # one statement is fine — the biosample_owner_idx → principal_idx
-    # reference is checked at commit, after both rows are gone.
-    await delete_idxs(postgres_pool, "principal", [biosample_owner_idx, principal_idx])
+    await delete_principal(postgres_pool, [principal_idx, biosample_owner_idx])
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +272,10 @@ async def _insert_owned_biosample(conn, ctx):
 
 
 async def _create_biosample(ctx):
-    """Helper: create a biosample owned by ctx['principal_idx'], track for cleanup."""
+    """Helper: create a biosample owned by ctx['principal_idx'].
+
+    Recorded on the ctx fixture, which hands it to the sweep as an entity.
+    """
     async with ctx["pool"].acquire() as conn:
         idx = await _insert_owned_biosample(conn, ctx)
     ctx["created"]["biosample"].append(idx)
@@ -346,12 +283,12 @@ async def _create_biosample(ctx):
 
 
 async def _create_biosample_with_link(ctx):
-    """Helper: atomically create a biosample and link it to ctx['study_idx'],
-    tracking both for cleanup.
+    """Helper: atomically create a biosample and link it to ctx['study_idx'].
 
     Both inserts share one connection and one transaction so a failed link
-    cannot leak an orphan biosample row for teardown to mop up. The
-    tracking-dict appends run only after the transaction commits.
+    cannot leak an orphan biosample row for teardown to mop up. The biosample is
+    recorded on the ctx fixture so the sweep is given it as an entity; the link
+    row the sweep finds by parent FK.
     """
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
@@ -364,12 +301,11 @@ async def _create_biosample_with_link(ctx):
                 created_by_idx=ctx["principal_idx"],
             )
     ctx["created"]["biosample"].append(bs_idx)
-    ctx["created"]["biosample_to_study"].append((bs_idx, ctx["study_idx"]))
     return bs_idx
 
 
 async def _create_local_field(ctx, suffix=""):
-    """Helper: create a purely-local biosample_study_field, track for cleanup."""
+    """Helper: create a purely-local biosample_study_field."""
     field_name = f"{unique_field_name()}_{suffix}"
     idx = await seed_local_study_field(
         ctx["pool"],
@@ -379,14 +315,13 @@ async def _create_local_field(ctx, suffix=""):
         created_by_idx=ctx["principal_idx"],
         required=True,
     )
-    ctx["created"]["biosample_study_field"].append(idx)
     return idx
 
 
 async def _create_prep_sample_with_link(ctx):
     """Helper: create a biosample+link, then a sequenced prep_sample linked
-    to ctx['study_idx'], tracking prep_sample / prep_sample_to_study for
-    cleanup. Returns the prep_sample idx.
+    to ctx['study_idx']. Returns the prep_sample idx; both entities are
+    recorded on the ctx fixture for the sweep.
 
     The prep_sample requires its biosample to carry a biosample_to_study
     link (prep_sample_to_study_reject_without_biosample_link trigger), so
@@ -408,7 +343,6 @@ async def _create_prep_sample_with_link(ctx):
                 created_by_idx=ctx["principal_idx"],
             )
     ctx["created"]["prep_sample"].append(ps_idx)
-    ctx["created"]["prep_sample_to_study"].append((ps_idx, ctx["study_idx"]))
     return ps_idx
 
 
@@ -425,7 +359,7 @@ async def _seed_unlinked_entity_for_spec(ctx, spec):
         prep_sample on that biosample (no prep_sample_to_study link).
 
     Returns the entity_idx the caller should pass to insert_entity_to_study.
-    Cleanup is tracked on the ctx fixture.
+    The entity is recorded on the ctx fixture, which hands it to the sweep.
     """
     # biosample branch: bare biosample; the caller is expected to write
     # the link row itself in the test body.
@@ -478,18 +412,18 @@ async def _seed_secondary_studies_for_entity(ctx, spec, entity_idx, count):
                     study_idx=st_idx,
                     created_by_idx=ctx["principal_idx"],
                 )
-            ctx["created"]["biosample_to_study"].append((biosample_idx, st_idx))
     return new_study_idxs
 
 
 async def _seed_global_field_for_spec(
     ctx, spec, data_type=FieldDataType.TEXT, terminology_idx=None, internal_name=None
 ):
-    """Seed one global field of the given data_type for spec.entity_kind
-    and track the row for cleanup. Returns a FieldRow shape so the
-    caller can drive metadata writes against it directly. terminology_idx
-    must be supplied when data_type=TERMINOLOGY (the *_global_field
-    CHECK enforces the iff coupling) and omitted otherwise. internal_name
+    """Seed one global field of the given data_type for spec.entity_kind.
+
+    Returns a FieldRow shape so the caller can drive metadata writes against it
+    directly. terminology_idx must be supplied when data_type=TERMINOLOGY (the
+    *_global_field CHECK enforces the iff coupling) and omitted otherwise.
+    internal_name
     defaults to a generated unique value; pass it when a test keys on the
     internal_name (internal-name resolution), since FieldRow carries only
     the display_name.
@@ -531,26 +465,180 @@ async def _seed_global_field_for_spec(
     )
 
 
-def _track_to_study_link(ctx, spec, entity_idx, study_idx):
-    """Track a (entity_idx, study_idx) link row in the cleanup dict under
-    the key matching spec.entity_kind.
-    """
-    if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
-        ctx["created"]["biosample_to_study"].append((entity_idx, study_idx))
-    else:
-        ctx["created"]["prep_sample_to_study"].append((entity_idx, study_idx))
-
-
 async def _create_linked_entity_for_spec(ctx, spec):
-    """Create an entity linked to ctx['study_idx'] for spec.entity_kind,
-    tracking all rows for cleanup. Returns the new entity_idx.
+    """Create an entity linked to ctx['study_idx'] for spec.entity_kind.
+
+    Returns the new entity_idx; every entity it seeds is recorded on the ctx
+    fixture for the sweep.
 
     Dispatches to the existing per-entity helpers so the prep_sample branch
     transparently seeds the underlying biosample and biosample_to_study link
     that the prep_sample_to_study trigger requires as substrate.
     """
-    # Both branches return an entity_idx with its *_to_study link already
-    # tracked; callers can write metadata against it without further setup.
+    # Both branches return an entity_idx whose *_to_study link is already
+    # written; callers can write metadata against it without further setup.
     if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
         return await _create_biosample_with_link(ctx)
     return await _create_prep_sample_with_link(ctx)
+
+
+# ---------------------------------------------------------------------------
+# Sequenced-pool fixture (sequencing_run → sequenced_pool → sequenced_sample)
+# ---------------------------------------------------------------------------
+
+
+class SeededSample(NamedTuple):
+    """The three idxs one `add_sample` call wrote.
+
+    Named rather than positional so a caller cannot bind the wrong entity: the
+    pool reads are keyed on prep_sample, while the read-count and QC columns
+    live on the sequenced_sample.
+    """
+
+    biosample_idx: int
+    prep_sample_idx: int
+    sequenced_sample_idx: int
+
+
+def _qc_report(point: str) -> str:
+    """One serialized QC-report payload, for a sample seeded with reports.
+
+    The shape is all the pool-report reads care about; no test asserts on the
+    values, only on whether a blob is present.
+    """
+    return json.dumps(
+        {"point": point, "layout": "single", "read_pairs": 1, "mates": {"r1": None, "r2": None}}
+    )
+
+
+@pytest_asyncio.fixture
+async def pool_ctx(postgres_pool):
+    """Seed a principal, one sequencing_run and one sequenced_pool.
+
+    `add_sample(...)` attaches one sequenced_sample to the pool and returns a
+    `SeededSample`. Every keyword is optional, so a bare call attaches a sample
+    carrying no reads, no reports and no accessions; each group of columns is
+    written only when asked for, leaving the rest at their defaults.
+    """
+    owner_idx = await seed_user_principal(postgres_pool, prefix="pool", suffix="owner")
+    run_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.sequencing_run (instrument_run_id, platform, created_by_idx)"
+        " VALUES ($1, 'illumina'::qiita.platform, $2) RETURNING idx",
+        f"pool-run-{secrets.token_hex(4)}",
+        owner_idx,
+    )
+    pool_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.sequenced_pool (sequencing_run_idx, created_by_idx)"
+        " VALUES ($1, $2) RETURNING idx",
+        run_idx,
+        owner_idx,
+    )
+    biosample_idxs: list[int] = []
+    prep_sample_idxs: list[int] = []
+
+    async def add_sample(
+        *,
+        raw=None,
+        biological=None,
+        quality_filtered=None,
+        spikein=None,
+        with_reports=False,
+        retired=False,
+        ena_status=None,
+        biosample_accession=None,
+        ena_sample_accession=None,
+        ena_experiment_accession=None,
+        ena_run_accession=None,
+    ):
+        bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(
+            postgres_pool, owner_idx=owner_idx
+        )
+        _run, _pool, ss_idx = await seed_sequenced_sample_subtype(
+            postgres_pool,
+            prep_sample_idx=ps_idx,
+            owner_idx=owner_idx,
+            sequenced_pool_item_id=f"item-{secrets.token_hex(4)}",
+            sequencing_run_idx=run_idx,
+            sequenced_pool_idx=pool_idx,
+        )
+
+        # The biosample-side accessions travel together; either one asks for the write.
+        if biosample_accession is not None or ena_sample_accession is not None:
+            await postgres_pool.execute(
+                "UPDATE qiita.biosample SET biosample_accession = $2,"
+                " ena_sample_accession = $3 WHERE idx = $1",
+                bs_idx,
+                biosample_accession,
+                ena_sample_accession,
+            )
+        if ena_experiment_accession is not None or ena_run_accession is not None:
+            await postgres_pool.execute(
+                "UPDATE qiita.sequenced_sample SET ena_experiment_accession = $2,"
+                " ena_run_accession = $3 WHERE idx = $1",
+                ss_idx,
+                ena_experiment_accession,
+                ena_run_accession,
+            )
+
+        # `raw` gates the whole read-count group so a caller naming only the
+        # later stages cannot leave a half-populated row.
+        if raw is not None:
+            await postgres_pool.execute(
+                "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2 = $2,"
+                " biological_read_count_r1r2 = $3, quality_filtered_read_count_r1r2 = $4,"
+                " spikein_read_count_r1r2 = $5 WHERE idx = $1",
+                ss_idx,
+                raw,
+                biological,
+                quality_filtered,
+                spikein,
+            )
+        if with_reports:
+            await postgres_pool.execute(
+                "UPDATE qiita.sequenced_sample SET raw_qc_report = $2::jsonb,"
+                " filtered_qc_report = $3::jsonb WHERE idx = $1",
+                ss_idx,
+                _qc_report("raw"),
+                _qc_report("filtered"),
+            )
+
+        # Retirement and the ENA flag are the two exclusion paths the pool reads
+        # filter on, so a test asks for one to assert the sample drops out.
+        if retired:
+            await postgres_pool.execute(
+                "UPDATE qiita.prep_sample SET retired = true, retired_by_idx = $2,"
+                " retired_at = now(), retire_reason = 'test' WHERE idx = $1",
+                ps_idx,
+                owner_idx,
+            )
+        if ena_status is not None:
+            await postgres_pool.execute(
+                "UPDATE qiita.sequenced_sample SET ena_status = $2,"
+                " ena_availability_checked_at = now() WHERE idx = $1",
+                ss_idx,
+                ena_status,
+            )
+
+        biosample_idxs.append(bs_idx)
+        prep_sample_idxs.append(ps_idx)
+        return SeededSample(
+            biosample_idx=bs_idx, prep_sample_idx=ps_idx, sequenced_sample_idx=ss_idx
+        )
+
+    yield {
+        "pool": postgres_pool,
+        "owner_idx": owner_idx,
+        "run_idx": run_idx,
+        "pool_idx": pool_idx,
+        "add_sample": add_sample,
+    }
+
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=biosample_idxs,
+        prep_sample_idxs=prep_sample_idxs,
+    )
+    await delete_idxs(postgres_pool, "sequenced_pool", pool_idx)
+    await delete_idxs(postgres_pool, "sequencing_run", run_idx)
+    await delete_principal(postgres_pool, [owner_idx])

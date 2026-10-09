@@ -32,7 +32,6 @@ from .conftest import (
     SPECS,
     _create_linked_entity_for_spec,
     _create_plain_field,
-    _metadata_tracking_key,
     _seed_global_field_for_spec,
     _set_unique_in_study,
     _spec_id,
@@ -197,7 +196,6 @@ async def test_widen_study_field_to_text_leaves_missing_marker(ctx, spec):
         reason_idx,
         ctx["principal_idx"],
     )
-    ctx["created"][_metadata_tracking_key(spec)].append(marker_meta_idx)
 
     moved = await _widen(ctx, spec, field_idx)
 

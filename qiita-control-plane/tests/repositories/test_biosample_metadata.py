@@ -52,7 +52,6 @@ async def test_biosample_metadata_rejects_value_text_when_data_type_numeric(ctx)
             data_type=FieldDataType.NUMERIC,
             required=True,
         )
-    ctx["created"]["biosample_study_field"].append(field_idx)
 
     # Numeric field, value_text populated — trigger raises.
     async with ctx["pool"].acquire() as conn:
@@ -83,7 +82,6 @@ async def test_biosample_metadata_accepts_value_missing_reason_for_any_data_type
             data_type=FieldDataType.NUMERIC,
             required=True,
         )
-    ctx["created"]["biosample_study_field"].append(field_idx)
 
     # Seed a missing-value reason so the metadata row has something to point at.
     reason_idx = await ctx["pool"].fetchval(
@@ -104,7 +102,6 @@ async def test_biosample_metadata_accepts_value_missing_reason_for_any_data_type
             reason_idx,
             ctx["principal_idx"],
         )
-    ctx["created"]["biosample_metadata"].append(meta_idx)
 
     # Verify the row landed and points at the reason.
     row = await ctx["pool"].fetchrow(
@@ -140,7 +137,6 @@ async def test_biosample_metadata_resolves_data_type_via_global_link(ctx):
         unique_field_name("linked"),
         ctx["principal_idx"],
     )
-    ctx["created"]["biosample_study_field"].append(field_idx)
 
     # value_numeric on a text-typed (linked) field — trigger raises.
     async with ctx["pool"].acquire() as conn:
@@ -169,7 +165,6 @@ async def test_biosample_metadata_resolves_data_type_via_global_link(ctx):
             "ok",
             ctx["principal_idx"],
         )
-    ctx["created"]["biosample_metadata"].append(meta_idx)
 
     row = await ctx["pool"].fetchrow(
         "SELECT value_text, global_field_idx FROM qiita.biosample_metadata WHERE idx = $1",
@@ -216,7 +211,6 @@ async def test_biosample_metadata_rejects_value_text_when_data_type_terminology(
             terminology_idx=terminology_idx,
             required=True,
         )
-    ctx["created"]["biosample_study_field"].append(field_idx)
 
     # value_text on a terminology-typed field — trigger raises.
     async with ctx["pool"].acquire() as conn:
@@ -244,7 +238,6 @@ async def test_biosample_metadata_rejects_value_text_when_data_type_terminology(
             term_idx,
             ctx["principal_idx"],
         )
-    ctx["created"]["biosample_metadata"].append(meta_idx)
 
     row = await ctx["pool"].fetchrow(
         "SELECT value_terminology_term_idx FROM qiita.biosample_metadata WHERE idx = $1",
@@ -273,7 +266,6 @@ async def test_insert_owner_biosample_id_metadata_inserts_flagged_row(ctx):
             value_text="OWNER-SAMPLE-42",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"]["biosample_metadata"].append(meta_idx)
 
     # Verify the SQL literal TRUE landed and the value matches the input.
     row = await ctx["pool"].fetchrow(
@@ -299,14 +291,13 @@ async def test_insert_owner_biosample_id_metadata_rejects_second_flagged_row(ctx
 
     # First owner-biosample-id row succeeds.
     async with ctx["pool"].acquire() as conn:
-        meta_idx = await insert_owner_biosample_id_metadata(
+        await insert_owner_biosample_id_metadata(
             conn,
             biosample_idx=bs_idx,
             biosample_study_field_idx=field1_idx,
             value_text="FIRST-OWNER-ID",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"]["biosample_metadata"].append(meta_idx)
 
     # Second flagged row for the same biosample (different field) must fail
     # the biosample_metadata_unique_owner_biosample_id partial unique index.
@@ -351,7 +342,6 @@ async def test__insert_metadata_allows_many_non_owner_id_rows_per_biosample(ctx)
             value="VAL-B",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"]["biosample_metadata"].extend([m1, m2])
 
     # Both rows are present; the column the shared inserter does not write
     # carries the DB default (FALSE) for both.

@@ -13,6 +13,7 @@ from pydantic import (
     ConfigDict,
     Field,
     computed_field,
+    field_validator,
     model_validator,
 )
 
@@ -121,6 +122,95 @@ class BiosampleImportResponse(BaseModel):
     owner_id_biosample_study_field_created: bool
 
 
+# Size caps for one bulk biosample import. A batch runs in one request and one
+# transaction, so it must finish inside the gateway's 60 s read timeout, fit
+# nginx's default 1 MiB request body on the REST location, and not hold the
+# per-owner insert lock (taken by each biosample INSERT until commit) for long.
+# Cost tracks metadata VALUES, not rows: measured at ~1.4 ms per value (a
+# 75-column sheet row takes ~106 ms), and a real sheet runs ~34 bytes per value.
+# 15,000 values is therefore ~21 s and ~0.5 MiB; the row cap bounds batches of
+# very narrow rows. A sheet over either cap is sent in several requests.
+BIOSAMPLE_BULK_IMPORT_MAX_ROWS = 2_000
+BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES = 15_000
+
+
+class BiosampleBulkImportRequest(BaseModel):
+    """Body for POST /api/v1/study/{study_idx}/biosample/bulk.
+
+    One `rows` entry per biosample, each the SAME shape as the single-biosample
+    import — so a sheet of N biosamples loads in one call instead of N, one row per
+    biosample and one text cell per (biosample, field). The route applies the rows
+    in ONE transaction — all succeed or nothing is written — and a failing row is
+    named by its index (counting from 0) so the caller can fix the sheet and
+    resubmit. See `BiosampleImportRequest` for the per-row contract (text-valued
+    metadata keyed on a field display_name, owner id, accessions,
+    matrix_tube_id).
+
+    A batch is one sheet from one owner: every row names the same `owner_idx`
+    and the same `owner_biosample_id_field_name`. One owner means the batch
+    takes one per-owner insert lock, so two concurrent batches cannot take two
+    owners' locks in opposite orders and deadlock; one id field means a sheet's
+    id column becomes one unique field on the study, not several. Sizes are
+    capped by `BIOSAMPLE_BULK_IMPORT_MAX_ROWS` and
+    `BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[BiosampleImportRequest] = Field(min_length=1)
+
+    @field_validator("rows", mode="before")
+    @classmethod
+    def _cap_batch_size(cls, rows: object) -> object:
+        """Refuse an oversized batch on counts alone, before any row is parsed."""
+        if not isinstance(rows, list):
+            return rows
+        if len(rows) > BIOSAMPLE_BULK_IMPORT_MAX_ROWS:
+            raise ValueError(
+                f"at most {BIOSAMPLE_BULK_IMPORT_MAX_ROWS} rows per request, got"
+                f" {len(rows)}; send the sheet in several requests"
+            )
+        values = sum(
+            len(row["metadata"])
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("metadata"), dict)
+        )
+        if values > BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES:
+            raise ValueError(
+                f"at most {BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES} metadata values"
+                f" per request, got {values} across {len(rows)} rows; send the sheet"
+                " in several requests"
+            )
+        return rows
+
+    @model_validator(mode="after")
+    def _one_owner_and_one_id_field(self) -> BiosampleBulkImportRequest:
+        first = self.rows[0]
+        for i, row in enumerate(self.rows):
+            if row.owner_idx != first.owner_idx:
+                raise ValueError(
+                    f"every row must name the same owner_idx: row 0 has"
+                    f" {first.owner_idx}, row {i} has {row.owner_idx} (rows count from 0)"
+                )
+            if row.owner_biosample_id_field_name != first.owner_biosample_id_field_name:
+                raise ValueError(
+                    "every row must name the same owner_biosample_id_field_name: row 0"
+                    f" has {first.owner_biosample_id_field_name!r}, row {i} has"
+                    f" {row.owner_biosample_id_field_name!r} (rows count from 0)"
+                )
+        return self
+
+
+class BiosampleBulkImportResponse(BaseModel):
+    """Returned by the bulk import on success: one `BiosampleImportResponse` per
+    input row, in request order (the batch is all-or-nothing, so a 2xx means every
+    row was created)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    results: list[BiosampleImportResponse]
+
+
 class OwnerBiosampleIdRow(BaseModel):
     """One row of the owner-id re-identification export.
 
@@ -200,21 +290,26 @@ BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE = "geographic location (latitude)
 BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE = "geographic location (longitude)"
 BIOSAMPLE_DISPLAY_DEPTH = "depth"
 BIOSAMPLE_DISPLAY_HOST_TAXON_ID = "host taxon id"
+BIOSAMPLE_DISPLAY_TAXON_ID = "taxon id"
 
 # The two `qiita.missing_value_reason` names the host-filter resolver RECOGNISES
 # — i.e. the two that say something definite about whether a host exists.
 #
 # Deliberately not an exhaustive enum of the INSDC vocabulary. The other reasons
-# ('not collected', 'not provided', 'restricted access', …) exist in the DB and
+# ('not collected', 'restricted access', …) exist in the DB and
 # have no constant here ON PURPOSE: recognising a reason is an explicit act that
 # promotes it from "abort" to "proceed", and an enum listing every reason would
 # invite exactly the mechanical widening the fail-closed rule is there to stop.
 MISSING_REASON_NOT_APPLICABLE = "not applicable"
 MISSING_REASON_CONTROL_SAMPLE = "missing: control sample"
 
-# The terminology `taxon_id` / `host_taxon_id` name their terms in, and the
-# term_id of the human host. Shared so production code and the test seeds spell
-# them the same way — production must not reach into `testing/` for them.
+# Written by the ENA import for a taxon it cannot fill; the resolver does not recognise it.
+MISSING_REASON_NOT_PROVIDED = "not provided"
+
+# The terminology `taxon_id` / `host_taxon_id` name their terms in, and the term_ids of
+# the human and mouse hosts and the bare `metagenome` root (seeded by the NCBI Taxonomy
+# seed migration). Shared so production code and the test seeds spell them the same
+# way — production must not reach into `testing/` for them.
 #
 # `NCBI_TAXONOMY_HUMAN_TERM_ID` is a STRING even though an NCBI taxon id is a number,
 # and that is not an oversight. It is a `qiita.terminology_term.term_id`, whose column
@@ -229,6 +324,8 @@ MISSING_REASON_CONTROL_SAMPLE = "missing: control sample"
 # that BIGINT.
 NCBI_TAXONOMY_NAME = "NCBI Taxonomy"
 NCBI_TAXONOMY_HUMAN_TERM_ID = "9606"
+NCBI_TAXONOMY_MOUSE_TERM_ID = "10090"
+NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
 
 
 class MissingReasonRef(BaseModel):

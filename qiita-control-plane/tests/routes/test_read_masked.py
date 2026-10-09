@@ -32,6 +32,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -40,7 +41,7 @@ async def _seed_gate(pool, principal_idx, *, state):
     """Seed a real (prep_sample, mask_definition) pair, plus a mask_sample gate row
     in `state` when `state` is not None (no row otherwise). Returns
     `(prep_sample_idx, mask_idx, biosample_idx)`; caller cleans up via
-    `_cleanup_gate` (FK-reverse)."""
+    `_cleanup_gate`."""
     biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
         pool, owner_idx=principal_idx
     )
@@ -64,10 +65,10 @@ async def _seed_gate(pool, principal_idx, *, state):
 
 
 async def _cleanup_gate(pool, prep_sample_idx, mask_idx, biosample_idx):
-    await pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
+    await teardown_entity_graph(
+        pool, study_idxs=[], biosample_idxs=[biosample_idx], prep_sample_idxs=[prep_sample_idx]
+    )
     await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-    await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-    await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
 
 
 # Ed25519 signing seed the test app signs tickets with; the test decodes the
@@ -88,7 +89,7 @@ def _decode_ticket_payload(ticket_b64: str) -> dict:
 @pytest_asyncio.fixture
 async def ctx(postgres_pool, regular_user_session, compute_worker_service_account):
     """Route-test context: the three AsyncClients (anon, regular user, compute
-    SA) plus a seeded principal for FK-reverse mask cleanup."""
+    SA) plus a seeded principal that owns the masks."""
     from qiita_control_plane.config import Settings
     from qiita_control_plane.main import app
 
@@ -130,8 +131,7 @@ async def ctx(postgres_pool, regular_user_session, compute_worker_service_accoun
         "DELETE FROM qiita.mask_definition WHERE created_by_idx = $1",
         compute_worker_service_account["principal_idx"],
     )
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_principal(postgres_pool, principal_idx)
 
 
 @pytest_asyncio.fixture

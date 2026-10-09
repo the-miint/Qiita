@@ -8,8 +8,7 @@ on: the CHECK's value set, the invalidation biconditional, and the updated_at
 trigger.
 
 Each test seeds its own principal + sequenced prep_sample + a qiita.processing
-row, and teardown runs in FK-reverse order so the suite can share the
-postgres_pool fixture.
+row, so the suite can share the postgres_pool fixture.
 """
 
 import secrets
@@ -30,6 +29,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -64,16 +64,18 @@ async def gate(postgres_pool):
         "principal_idx": principal_idx,
     }
 
-    await postgres_pool.execute(
-        "DELETE FROM qiita.assembly_sample WHERE processing_idx = $1", processing_idx
+    # processing goes after the sweep: assembly_sample references both it and
+    # the prep_sample, and the sweep is what clears those rows.
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[prep_sample_idx],
     )
-    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
     await postgres_pool.execute(
         "DELETE FROM qiita.processing WHERE processing_idx = $1", processing_idx
     )
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 async def _write_pending(gate):

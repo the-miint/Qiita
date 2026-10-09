@@ -166,42 +166,17 @@ const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
 ///     whole-reference DoGet (the rype router streaming every genome's
 ///     `chunk_data`) OOM-killed the data plane at ~374 GB. A bounded channel
 ///     alone could never have caught that — the blow-up was upstream of it.
-///   * The `Arrow`/`ArrowStream` iterator borrows the `Statement`, which borrows
-///     the `Connection`; the `DoGetStream` we return must be `'static`, so the
-///     DuckDB iterator cannot be handed out directly. A blocking task owns the
-///     connection for the query's lifetime and pushes each `RecordBatch` into a
-///     bounded channel (`DOGET_BATCH_CHANNEL_DEPTH`); the returned stream drains
-///     the receiver, applying backpressure to the streaming producer.
-///
-/// `stream_arrow` needs the result schema up front (streaming execution doesn't
-/// surface it until a chunk is fetched), so we first probe it with a zero-row
-/// prepare — see the body.
+///   * The `Statement` borrows the `Connection`, and the `DoGetStream` we return
+///     must be `'static`, so neither can be handed out directly. A blocking task
+///     owns the connection for the query's lifetime and pushes each `RecordBatch`
+///     into a bounded channel (`DOGET_BATCH_CHANNEL_DEPTH`); the returned stream
+///     drains the receiver, applying backpressure to the streaming producer.
 ///
 /// A zero-row result still emits one empty `RecordBatch` carrying the schema, so
-/// the client always receives a valid (possibly empty) Arrow table — the same
-/// contract the buffered path had. A connect/prepare/execute error surfaces as a
-/// single `Err` item, never a silently-truncated empty stream.
-///
-/// Caveat — mid-stream truncation is indistinguishable from completion
-/// (pre-existing, shared with the old `.collect()` path, and bounded by the
-/// DuckDB API): the DuckDB Arrow iterator's `Item` is a bare `RecordBatch`, not
-/// a `Result`, so a failure that occurs *mid-iteration* (after at least one
-/// batch has been sent) cannot be surfaced as an error. The iterator simply
-/// terminates early, the channel closes, and the consumer sees a clean EOF —
-/// byte-for-byte identical to a successful, complete stream. A DoGet client
-/// therefore CANNOT tell a truncated result from a whole one on the wire; only
-/// connect/prepare/execute errors, which occur *before* the first batch, become
-/// an `Err` item the client can see.
-///
-/// We accept this rather than work around it: the fix would require the upstream
-/// `duckdb` crate to yield `Result<RecordBatch>` from its Arrow iterator (it does
-/// not today), and there is no in-crate seam to inject a trailing sentinel that
-/// survives the `FlightDataEncoder`. Mid-iteration failures are also rare in
-/// practice — the query is already prepared and executing, and the batches are
-/// read from local/attached storage. Callers that need end-to-end integrity
-/// verify it out-of-band (row counts, digests) rather than trusting stream
-/// termination. If the `duckdb` API ever exposes a fallible per-batch iterator,
-/// revisit this to surface mid-stream errors.
+/// the client always receives a valid (possibly empty) Arrow table. A DuckDB
+/// error — connect, prepare, execute, or a chunk fetch after batches have already
+/// gone out — surfaces as a trailing `Err` item, so a client never reads a
+/// truncated result as a whole one; so does a panic (see `run_producer`).
 fn stream_ducklake_batches(
     catalog_connstr: String,
     data_path: String,
@@ -214,71 +189,80 @@ fn stream_ducklake_batches(
     // independently, draining into `tx`. Don't `.await`/`.join()` it — the
     // result is delivered through the channel, not the handle.
     tokio::task::spawn_blocking(move || {
-        let produce = || -> Result<(), Status> {
+        run_producer(&tx, || {
             let conn = open_ducklake(&catalog_connstr, &data_path)?;
-
-            // Obtain the result schema WITHOUT materializing the result. DuckDB's
-            // streaming execution (below) doesn't expose the schema until the
-            // first chunk is fetched, and `stream_arrow` needs it up front, so
-            // probe with a zero-row prepare: `LIMIT 0` plans the query and returns
-            // its column schema having produced no rows (trivial memory).
-            let schema = {
-                let mut probe = conn
-                    .prepare(&format!("SELECT * FROM ({sql}) AS _schema_probe LIMIT 0"))
-                    .map_err(|e| {
-                        Status::internal(format!(
-                            "schema probe preparation failed for {table}: {e}"
-                        ))
-                    })?;
-                probe
-                    .query_arrow([])
-                    .map_err(|e| {
-                        Status::internal(format!("schema probe execution failed for {table}: {e}"))
-                    })?
-                    .get_schema()
-            };
-
-            let mut stmt = conn.prepare(&sql).map_err(|e| {
-                Status::internal(format!("query preparation failed for {table}: {e}"))
-            })?;
-            // STREAMING execution (duckdb_execute_prepared_streaming): DuckDB
-            // fetches one data chunk at a time instead of materializing the whole
-            // result set. This is load-bearing — the materialized `query_arrow`
-            // buffered the ENTIRE result in DuckDB before the first batch, which
-            // OOM-killed the data plane (~374 GB) on a whole-reference DoGet (the
-            // rype router streaming every genome's `chunk_data`). Peak memory is
-            // now the streaming query's working set (a small hash-join build side
-            // + a few vectors) plus DOGET_BATCH_CHANNEL_DEPTH batches in flight.
-            let stream = stmt.stream_arrow([], schema.clone()).map_err(|e| {
-                Status::internal(format!("query execution failed for {table}: {e}"))
-            })?;
-            let mut produced = false;
-            // `stream`'s Item is a bare `RecordBatch`, not a `Result` — a failure
-            // once iteration has begun cannot be observed here; the loop just ends
-            // and the consumer sees a clean EOF (see the fn-level caveat). Nothing
-            // to do about it until the duckdb API is fallible.
-            for batch in stream {
-                produced = true;
-                // Receiver dropped (client hung up) — stop early, don't error.
-                if tx.blocking_send(Ok(batch)).is_err() {
-                    return Ok(());
-                }
-            }
-            if !produced {
-                // Preserve the schema for a zero-row result.
-                let _ = tx.blocking_send(Ok(RecordBatch::new_empty(schema)));
-            }
-            Ok(())
-        };
-        if let Err(status) = produce() {
-            // Surface the producer error as a stream item (ignore send failure —
-            // the consumer is already gone).
-            let _ = tx.blocking_send(Err(FlightError::ExternalError(Box::new(
-                std::io::Error::other(status.message().to_string()),
-            ))));
-        }
+            send_query_batches(&conn, &sql, &table, &tx)
+        })
     });
     ReceiverStream::new(rx)
+}
+
+/// Run `produce`, and send its failure to `tx` as the stream's trailing `Err` item
+/// (a failed send means the consumer is already gone, so it is ignored). A panic is
+/// a failure too: left to unwind, it would drop `tx` and end the stream as though
+/// the result were complete.
+fn run_producer(
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, FlightError>>,
+    produce: impl FnOnce() -> Result<(), Status>,
+) {
+    let message = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(produce)) {
+        Ok(Ok(())) => return,
+        Ok(Err(status)) => status.message().to_string(),
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("a non-string payload");
+            format!("data plane producer panicked: {what}")
+        }
+    };
+    eprintln!("error: DoGet stream failed: {message}");
+    let _ = tx.blocking_send(Err(FlightError::ExternalError(Box::new(
+        std::io::Error::other(message),
+    ))));
+}
+
+/// Execute `sql` on `conn` in streaming mode and push each `RecordBatch` into
+/// `tx` — the producer half of `stream_ducklake_batches`. Returns early, without
+/// error, once the receiver is gone (the client hung up).
+fn send_query_batches(
+    conn: &Connection,
+    sql: &str,
+    table: &str,
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, FlightError>>,
+) -> Result<(), Status> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| Status::internal(format!("query preparation failed for {table}: {e}")))?;
+    // Streaming execution, never the materializing `query_arrow`; see
+    // `stream_ducklake_batches` for why.
+    let schema = stmt
+        .stream_arrow([])
+        .map_err(|e| Status::internal(format!("query execution failed for {table}: {e}")))?
+        .get_schema();
+    let mut produced = false;
+    // Fetch with the fallible `step`, not the `ArrowStream` iterator, which
+    // panics on a failed fetch: a DuckDB error is an outcome to report, not a bug.
+    while let Some(chunk) = stmt.step().map_err(|e| {
+        let when = if produced {
+            "mid-stream"
+        } else {
+            "before its first batch"
+        };
+        Status::internal(format!("query failed {when} for {table}: {e}"))
+    })? {
+        produced = true;
+        // Receiver dropped (client hung up) — stop early, don't error.
+        if tx.blocking_send(Ok(RecordBatch::from(chunk))).is_err() {
+            return Ok(());
+        }
+    }
+    if !produced {
+        // Preserve the schema for a zero-row result.
+        let _ = tx.blocking_send(Ok(RecordBatch::new_empty(schema)));
+    }
+    Ok(())
 }
 
 /// Canonical staging path for an upload — single source of truth shared by
@@ -654,8 +638,8 @@ impl FlightService for QiitaFlightService {
         // RecordBatches through a bounded channel — so the data plane never
         // buffers the whole result set (the non-blocking, memory-bounded path).
         // Ticket/table/query-shape errors above are returned synchronously;
-        // per-request DB errors (connect/prepare/execute) surface as the first
-        // stream item (see stream_ducklake_batches).
+        // per-request DB errors surface as a stream item (see
+        // stream_ducklake_batches).
         let batch_stream = stream_ducklake_batches(
             self.catalog_connstr.clone(),
             self.data_path.clone(),

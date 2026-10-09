@@ -5,10 +5,13 @@ isolation.
 
 `register_ena_study` commits its own writes (one registration transaction, savepoint
 isolation per run), so nothing can be wrapped in an outer rolled-back transaction;
-`_cleanup` below removes tracked rows FK-reverse.
+`_cleanup` below sweeps each tracked study's entity graph, then its runs and
+principals.
 """
 
+import json
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -36,9 +39,15 @@ from qiita_control_plane.repositories._sample_helpers import (
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.study import get_or_create_study_by_ena_accessions
 from qiita_control_plane.testing.db_seeds import seed_user_principal
+from qiita_control_plane.testing.db_teardown import (
+    delete_principal,
+    teardown_ena_study_graph,
+)
 from qiita_control_plane.testing.unique_names import unique_accession, unique_ena_accession
 
 pytestmark = pytest.mark.db
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +82,9 @@ def _run(
     library_selection: str | None = None,
     instrument_platform: str | None = "ILLUMINA",
     status: EnaStatus = EnaStatus.PUBLIC,
+    tax_id: str | None = None,
+    host_tax_id: str | None = None,
+    host: str | None = None,
 ) -> EnaRunRecord:
     return EnaRunRecord(
         run_accession=run_accession,
@@ -86,7 +98,40 @@ def _run(
         library_source=library_source,
         library_selection=library_selection,
         instrument_platform=instrument_platform,
+        tax_id=tax_id,
+        host_tax_id=host_tax_id,
+        host=host,
     )
+
+
+def _fixture_run(fixture: str, *, study_accession: str, row: int = 0) -> EnaRunRecord:
+    """A recorded run's taxon and host fields under fresh accessions, so reruns never collide."""
+    data = json.loads((FIXTURES / fixture).read_text())
+    recorded = dict(zip(data["columns"], data["rows"][row], strict=True))
+    return _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+        tax_id=recorded["tax_id"] or None,
+        host_tax_id=recorded["host_tax_id"] or None,
+        host=recorded["host"] or None,
+    )
+
+
+async def _taxon_fields(pool, sample_accession: str) -> dict[str, str]:
+    """`host taxon id` / `taxon id` as stored: the term_id, or the missing-reason name."""
+    rows = await pool.fetch(
+        "SELECT gf.display_name, tt.term_id, mvr.name AS reason"
+        " FROM qiita.biosample b"
+        " JOIN qiita.biosample_metadata bm ON bm.biosample_idx = b.idx"
+        " JOIN qiita.biosample_global_field gf ON gf.idx = bm.global_field_idx"
+        " LEFT JOIN qiita.terminology_term tt ON tt.idx = bm.value_terminology_term_idx"
+        " LEFT JOIN qiita.missing_value_reason mvr ON mvr.idx = bm.value_missing_reason_idx"
+        " WHERE b.ena_sample_accession = $1 AND gf.display_name IN ('host taxon id', 'taxon id')",
+        sample_accession,
+    )
+    return {r["display_name"]: r["term_id"] or r["reason"] for r in rows}
 
 
 async def _library_metadata_by_run(pool, run_accessions: list[str]) -> dict[str, dict[str, str]]:
@@ -107,7 +152,7 @@ async def _library_metadata_by_run(pool, run_accessions: list[str]) -> dict[str,
 
 
 # ---------------------------------------------------------------------------
-# Per-test tracker fixture + FK-reverse cleanup
+# Per-test tracker fixture + teardown
 # ---------------------------------------------------------------------------
 
 
@@ -119,95 +164,20 @@ class _Tracker:
 
 
 async def _cleanup(pool, tracker: _Tracker) -> None:
-    study_idxs = tracker.study_idxs
-    if study_idxs:
-        ps_rows = await pool.fetch(
-            "SELECT DISTINCT prep_sample_idx FROM qiita.prep_sample_to_study"
-            " WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-        ps_idxs = [r["prep_sample_idx"] for r in ps_rows]
-        # prep_sample_metadata RESTRICTs its prep_sample and study field, so
-        # sweep both before prep_sample / prep_sample_study_field / study below.
-        if ps_idxs:
-            await pool.execute(
-                "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])",
-                ps_idxs,
-            )
-            await pool.execute(
-                "DELETE FROM qiita.prep_sample_metadata WHERE prep_sample_idx = ANY($1::bigint[])",
-                ps_idxs,
-            )
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-        if ps_idxs:
-            await pool.execute(
-                "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", ps_idxs
-            )
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample_study_field WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-
-        bs_rows = await pool.fetch(
-            "SELECT DISTINCT biosample_idx FROM qiita.biosample_to_study"
-            " WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-        bs_idxs = [r["biosample_idx"] for r in bs_rows]
-        # biosample_metadata / biosample_study_field reference their parents RESTRICT,
-        # so sweep them before biosample_to_study / biosample / study below.
-        if bs_idxs:
-            await pool.execute(
-                "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = ANY($1::bigint[])",
-                bs_idxs,
-            )
-        await pool.execute(
-            "DELETE FROM qiita.biosample_study_field WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-        await pool.execute(
-            "DELETE FROM qiita.biosample_to_study WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-        if bs_idxs:
-            await pool.execute("DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", bs_idxs)
-
-        await pool.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])", study_idxs
-        )
-        await pool.execute("DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", study_idxs)
-
-    if tracker.study_accessions:
-        run_rows = await pool.fetch(
-            "SELECT idx FROM qiita.sequencing_run WHERE instrument_run_id LIKE ANY($1::text[])",
-            [f"{acc}:%" for acc in tracker.study_accessions],
-        )
-        run_idxs = [r["idx"] for r in run_rows]
-        if run_idxs:
-            await pool.execute(
-                "DELETE FROM qiita.sequenced_pool WHERE sequencing_run_idx = ANY($1::bigint[])",
-                run_idxs,
-            )
-            await pool.execute(
-                "DELETE FROM qiita.sequencing_run WHERE idx = ANY($1::bigint[])", run_idxs
-            )
-
-    if tracker.principal_idxs:
-        await pool.execute(
-            "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
-            tracker.principal_idxs,
-        )
-        await pool.execute(
-            "DELETE FROM qiita.principal WHERE idx = ANY($1::bigint[])", tracker.principal_idxs
-        )
+    """Tear down everything a test registered: the studies it tracked, their
+    entity graphs, the runs named after the accessions it tracked, and its
+    principals."""
+    await teardown_ena_study_graph(
+        pool,
+        study_idxs=tracker.study_idxs,
+        run_accessions=tracker.study_accessions,
+    )
+    await delete_principal(pool, tracker.principal_idxs)
 
 
 @pytest_asyncio.fixture
 async def reg(postgres_pool):
-    """Per-test (pool, owner_idx, caller_idx, tracker); tracked rows cleaned FK-reverse."""
+    """Per-test (pool, owner_idx, caller_idx, tracker)."""
     tracker = _Tracker()
     owner_idx = await seed_user_principal(postgres_pool, prefix="ena-owner", suffix="t02")
     caller_idx = await seed_user_principal(postgres_pool, prefix="ena-caller", suffix="t02")
@@ -345,9 +315,8 @@ async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
         "geographic location (latitude)",
         "geographic location (longitude)",
         "depth",
-        # The import composer enforces host_taxon_id; ENA supplies none, so the
-        # marker is written rather than a guessed value.
         "host taxon id",
+        "taxon id",
     }
     assert by_display_name["host taxon id"]["value_text"] is None
     assert by_display_name["host taxon id"]["value_missing_reason_idx"] is not None
@@ -425,13 +394,13 @@ async def test_shared_biosample_harmonizes_once_across_two_studies(reg):
     )
 
     # ONE canonical biosample_metadata value per global field: the five mapped
-    # attributes plus the enforced host-taxon-id marker.
+    # attributes plus the two taxon fields.
     count = await reg["pool"].fetchval(
         "SELECT count(*) FROM qiita.biosample_metadata"
         " WHERE biosample_idx = $1 AND global_field_idx IS NOT NULL",
         biosample_idx,
     )
-    assert count == 6
+    assert count == 7
 
     # Reachable from both studies via biosample_to_study (cross-study de-dup).
     linked_studies = {
@@ -548,9 +517,8 @@ async def test_underscore_mixs_tags_harmonize_to_correct_global_fields(reg):
         "geographic location (latitude)",
         "geographic location (longitude)",
         "depth",
-        # The import composer enforces host_taxon_id; ENA supplies none, so the
-        # marker is written rather than a guessed value.
         "host taxon id",
+        "taxon id",
     }
     assert by_display_name["host taxon id"]["value_text"] is None
     assert by_display_name["collection date"]["value_text"] == "2021-11-15"
@@ -609,6 +577,7 @@ async def test_repeated_handled_tags_register_as_study_local_json_arrays(reg):
     assert {r["display_name"] for r in global_names} == {
         "geographic location (country and/or sea)",
         "host taxon id",
+        "taxon id",
     }
     local_rows = await reg["pool"].fetch(
         "SELECT bsf.display_name, bm.value_text FROM qiita.biosample_metadata bm"
@@ -680,18 +649,139 @@ async def test_empty_sample_attributes_registers_normally(reg):
     biosample_idx = await reg["pool"].fetchval(
         "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
     )
-    # Only the enforced host-taxon-id marker: nothing was harmonized.
+    # Only the two taxon fields: nothing else was harmonized.
     global_metadata_count = await reg["pool"].fetchval(
         "SELECT count(*) FROM qiita.biosample_metadata"
         " WHERE biosample_idx = $1 AND global_field_idx IS NOT NULL",
         biosample_idx,
     )
-    assert global_metadata_count == 1
+    assert global_metadata_count == 2
 
     prep_sample_count = await reg["pool"].fetchval(
         "SELECT count(*) FROM qiita.prep_sample_to_study WHERE study_idx = $1", result.study_idx
     )
     assert prep_sample_count == 1
+
+
+# ---------------------------------------------------------------------------
+# host / sample taxon ids from ENA
+# ---------------------------------------------------------------------------
+
+
+async def test_human_gut_run_stores_host_and_taxon_as_term_references(reg):
+    study_accession = unique_ena_accession("PRJNA")
+    run = _fixture_run("ena_runs_human_gut.json", study_accession=study_accession)
+
+    result = await _register(
+        reg, study_header=_study_header(study_accession=study_accession), ena_runs=[run]
+    )
+
+    assert result.ena_runs[0].status == EnaRunRegistrationStatus.REGISTERED
+    assert result.ena_runs[0].harmonization.warnings == []
+    assert await _taxon_fields(reg["pool"], run.sample_accession) == {
+        "host taxon id": "9606",
+        "taxon id": "408170",
+    }
+
+
+async def test_hostless_environment_stores_not_applicable(reg):
+    study_accession = unique_ena_accession("PRJEB")
+    run = _fixture_run("ena_runs_seawater.json", study_accession=study_accession)
+
+    result = await _register(
+        reg, study_header=_study_header(study_accession=study_accession), ena_runs=[run]
+    )
+
+    assert result.ena_runs[0].status == EnaRunRegistrationStatus.REGISTERED
+    assert result.ena_runs[0].harmonization.warnings == []
+    assert await _taxon_fields(reg["pool"], run.sample_accession) == {
+        "host taxon id": "not applicable",
+        "taxon id": "1561972",
+    }
+
+
+async def test_host_tax_id_outside_the_seeded_terminology_registers_as_not_provided(reg):
+    """An unseeded term would fail the import parse; the loaded-set filter prevents that."""
+    study_accession = unique_ena_accession("PRJNA")
+    run = _fixture_run("ena_runs_unseeded_host.json", study_accession=study_accession)
+
+    result = await _register(
+        reg, study_header=_study_header(study_accession=study_accession), ena_runs=[run]
+    )
+
+    assert result.ena_runs[0].status == EnaRunRegistrationStatus.REGISTERED
+    assert len(result.ena_runs[0].harmonization.warnings) == 2
+    assert await _taxon_fields(reg["pool"], run.sample_accession) == {
+        "host taxon id": "not provided",
+        "taxon id": "not provided",
+    }
+
+
+async def test_every_fixture_study_registers_with_only_seeded_terms_or_missing_reasons(reg):
+    study_accession = unique_ena_accession("PRJNA")
+    runs = [
+        _fixture_run(f, study_accession=study_accession)
+        for f in (
+            "ena_runs_human_gut.json",
+            "ena_runs_seawater.json",
+            "ena_runs_host_text_only.json",
+            "ena_runs_unseeded_host.json",
+            "ena_runs_missing_sample_record.json",
+        )
+    ]
+
+    result = await _register(
+        reg, study_header=_study_header(study_accession=study_accession), ena_runs=runs
+    )
+
+    assert [o.status for o in result.ena_runs] == [EnaRunRegistrationStatus.REGISTERED] * 5
+    for run in runs:
+        stored = await _taxon_fields(reg["pool"], run.sample_accession)
+        assert set(stored) == {"host taxon id", "taxon id"}
+        assert all(v.isdigit() or v in {"not provided", "not applicable"} for v in stored.values())
+
+
+@pytest.mark.parametrize("tag", ["taxon id", "host taxon id"])
+async def test_attribute_tag_naming_a_written_taxon_field_is_skipped_with_a_warning(reg, tag):
+    study_accession = unique_ena_accession("PRJNA")
+    run = _fixture_run("ena_runs_human_gut.json", study_accession=study_accession)
+    attrs = EnaSampleAttributes(
+        sample_accession=run.sample_accession, attributes={tag: ["408170"], "site": ["lab"]}
+    )
+
+    result = await _register(
+        reg,
+        study_header=_study_header(study_accession=study_accession),
+        ena_runs=[run],
+        sample_attributes=[attrs],
+    )
+
+    (outcome,) = result.ena_runs
+    assert outcome.status == EnaRunRegistrationStatus.REGISTERED, outcome.failure_reason
+    assert any(repr(tag) in w for w in outcome.harmonization.warnings)
+    assert outcome.harmonization.retained_unmapped == ["site"]
+    assert await _taxon_fields(reg["pool"], run.sample_accession) == {
+        "host taxon id": "9606",
+        "taxon id": "408170",
+    }
+
+
+async def test_a_second_run_on_the_same_sample_carries_no_warnings(reg):
+    study_accession = unique_ena_accession("PRJNA")
+    first = _fixture_run("ena_runs_host_text_only.json", study_accession=study_accession)
+    second = first.model_copy(
+        update={
+            "run_accession": unique_accession("SRR"),
+            "experiment_accession": unique_accession("SRX"),
+        }
+    )
+
+    result = await _register(
+        reg, study_header=_study_header(study_accession=study_accession), ena_runs=[first, second]
+    )
+
+    warned = [o.harmonization.warnings if o.harmonization else [] for o in result.ena_runs]
+    assert sorted(len(w) > 0 for w in warned) == [False, True]
 
 
 # ---------------------------------------------------------------------------

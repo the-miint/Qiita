@@ -288,11 +288,13 @@ That function also decides the **orphan** case, and decides it differently from 
 
 **The authoring routes deliberately use three different shapes**, because the resources differ in what "ownership" means:
 
-- **biosample POST** (`/study/{idx}/biosample`) — `require_study_access(min_tier=ADMIN)`. A biosample is study-scoped; the natural gate is tier-on-that-study.
+- **biosample POST** (`/study/{idx}/biosample`, and the bulk `/study/{idx}/biosample/bulk`) — `require_study_access(min_tier=ADMIN)`. A biosample is study-scoped; the natural gate is tier-on-that-study.
 - **sequencing-run POST** — no resource gate at all (only scope + complete-profile). A run is an instrument-level container with no parent resource to inherit access from; any user who can write prep-samples may stand one up.
 - **sequenced-pool / sequenced-sample POST** — `require_caller_owns_run` / `require_caller_owns_pool` (caller-creator), because a run/pool has a creator but no tier surface; the sample composer additionally runs `require_caller_has_admin_on_all_studies` over the body's primary + secondary studies.
 
 prep_sample-scoped **work-ticket** submission reuses the same per-study ADMIN check (`_check_prep_sample_study_access` walks the prep_sample's non-retired study links). All four paths bypass at `wet_lab_admin`, so the operator experience is uniform even though the user-facing predicate differs per route.
+
+Listing pools, by contrast, has a **study-first read**: `GET /api/v1/study/{study_idx}/sequenced-pool` returns the distinct pools a study's active samples sit in — `study:read` + `require_study_access(min_tier=VIEWER)` (wet_lab_admin+ bypass), the same gate and exclusions as the study's sequenced-sample idx listing. Each row carries the pool/run idx, the run's `instrument_model`, and this study's `sample_count` in that pool. It **withholds** the run-level `run_preflight_filename` that the run-first pool list (`require_caller_owns_run`) exposes, since a pool can hold other studies' samples and a study viewer need not own the run.
 
 ### Token-vs-OIDC scope source
 

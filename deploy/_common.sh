@@ -171,10 +171,10 @@ qiita_native_checkout_from_python() {
 
 # Content hash of a container workflow's IN-REPO build inputs, used by
 # build-sif.sh's idempotency check to detect a changed Apptainer.def /
-# entrypoint.sh / manifest_writer.py — none of which VERIFY_MATCH (binary version
-# only) can see, so such an edit would otherwise be skipped and never reach the
-# host, forcing a manual FORCE=1. Hashes every file under the workflow dir (minus
-# the spec, gitignore, and generated .sif/.rpm) plus _shared/, keyed by
+# entrypoint.sh / manifest_writer.py — none of which VERIFY_MATCH (a regex over
+# VERIFY_CMD's output) can see, so such an edit would otherwise be skipped and
+# never reach the host, forcing a manual FORCE=1. Hashes every file under the
+# workflow dir (minus the spec, gitignore, and generated .sif/.rpm) plus _shared/, keyed by
 # REPO-RELATIVE path so the digest is identical from the operator clone or an
 # INCOMING stage. Deliberately EXCLUDES the vendored SOURCES (the licensed RPM):
 # re-vendoring 4.5.4-1 → 4.5.4-2 must NOT force a rebuild, matching VERIFY_MATCH's
@@ -382,19 +382,31 @@ qiita_lake_data_path() { printf '%s/ducklake' "$1"; }
 
 # --- DuckDB CLI + pgpass plumbing, shared by scripts/lake-*.sh ---------------
 
-# The DuckDB CLI must match the version the data plane links (duckdb crate
-# 1.10504.0 == DuckDB 1.5.4): the ducklake extension is versioned with DuckDB,
-# and a newer one may want to migrate the catalog schema it opens.
-QIITA_DUCKDB_VERSION="1.5.4"
+# The DuckDB CLI the lake scripts require — held equal to the data plane's `duckdb`
+# crate by qiita-common/tests/test_duckdb_version_sync.py.
+QIITA_DUCKDB_VERSION="1.5.5"
 
-# Resolve the duckdb CLI into DUCKDB_BIN, or exit with install instructions.
+# Resolve the duckdb CLI into DUCKDB_BIN and require exactly v${QIITA_DUCKDB_VERSION},
+# or exit with install instructions. Exact, because the CLI opens the data plane's
+# catalog with the ducklake extension of its own version — a newer one may migrate
+# the catalog schema under the running data plane — and lake-shell LOADs the miint
+# staged for its own version. A binary that reports no version is refused too.
 # Two install sites because the callers run as different accounts: a human with
 # a home, or a service account (qiita-data) whose home is /dev/null.
 qiita_resolve_duckdb_bin() {
     DUCKDB_BIN="${QIITA_DUCKDB_BIN:-$(command -v duckdb || true)}"
-    [ -n "${DUCKDB_BIN}" ] && return 0
+    local problem reported
+    if [ -z "${DUCKDB_BIN}" ]; then
+        problem="no duckdb CLI on PATH."
+    else
+        # `duckdb --version` prints e.g. `v1.5.5 (Variegata) d8cdaa33fd`. stderr is
+        # kept, so a binary that cannot run says why in the message below.
+        reported=$("${DUCKDB_BIN}" --version 2>&1 | head -n 1) || true
+        [ "${reported%% *}" = "v${QIITA_DUCKDB_VERSION}" ] && return 0
+        problem="\`${DUCKDB_BIN} --version\` printed '${reported:-nothing}'; the data plane links v${QIITA_DUCKDB_VERSION}."
+    fi
     cat >&2 <<EOF
-ERROR: no duckdb CLI on PATH.
+ERROR: ${problem}
 
 Install v${QIITA_DUCKDB_VERSION} — it must match what the data plane links.
 

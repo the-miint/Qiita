@@ -1,0 +1,30 @@
+{
+  "_source": "recorded through miint read_ena(\"PRJNA837047\", fields=...) (Portal result=read_run) on 2026-10-05; first 3 runs of the study, trimmed to keep the file small; list and integer columns (tax_id is BIGINT) re-typed from the extension's semicolon-joined strings",
+  "columns": [
+    "run_accession",
+    "experiment_accession",
+    "sample_accession",
+    "sample_alias",
+    "study_accession",
+    "status",
+    "library_layout",
+    "library_strategy",
+    "library_source",
+    "library_selection",
+    "instrument_platform",
+    "fastq_ftp",
+    "fastq_aspera",
+    "fastq_bytes",
+    "fastq_md5",
+    "read_count",
+    "base_count",
+    "tax_id",
+    "host_tax_id",
+    "host"
+  ],
+  "rows": [
+    ["SRR19164799", "SRX15231184", "SAMN28187135", "ef1", "PRJNA837047", "public", "PAIRED", "AMPLICON", "METAGENOMIC", "PCR", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR191/099/SRR19164799/SRR19164799.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR191/099/SRR19164799/SRR19164799.fastq.gz"], [2722494], ["e6b1996132516469595b5f85ab8afdad"], 67503, 28241882, 749906, "9823", "Sus scrofa"],
+    ["SRR19164827", "SRX15231156", "SAMN28187140", "ef6", "PRJNA837047", "public", "PAIRED", "AMPLICON", "METAGENOMIC", "PCR", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR191/027/SRR19164827/SRR19164827.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR191/027/SRR19164827/SRR19164827.fastq.gz"], [3023931], ["27a188aa44774e06fa2ecfb121fec7fa"], 67641, 27982272, 749906, "9823", "Sus scrofa"],
+    ["SRR19164796", "SRX15231187", "SAMN28187138", "ef4", "PRJNA837047", "public", "PAIRED", "AMPLICON", "METAGENOMIC", "PCR", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR191/096/SRR19164796/SRR19164796.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR191/096/SRR19164796/SRR19164796.fastq.gz"], [2763981], ["f579a12a318b0152cc38472c7630af19"], 67180, 28039451, 749906, "9823", "Sus scrofa"]
+  ]
+}

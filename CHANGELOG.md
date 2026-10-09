@@ -21,6 +21,35 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **The branch reviewer is in the repo, and a PR description records its run (#655).**
+  `.claude/agents/qiita-reviewer.md` (the rules) and `.claude/skills/qiita-review/` (the
+  review, fix, re-review loop) were per-developer files that `CLAUDE.md` already pointed
+  at; both are now tracked. The loop ends by printing a `## Reviewer loop` block — the
+  commit reviewed and what was declined, deferred or left unprobed — which the new PR
+  template carries. The `review-loop-check` job (`scripts/check-review-loop.sh`) fails a
+  PR whose description lacks the block or names a commit that is not one of the PR's
+  own; the `no-agent-review` label opts out.
+- **Bulk biosample import — `POST /api/v1/study/{study_idx}/biosample/bulk` (#656).**
+  Creates many biosamples in one all-or-nothing transaction: a single failing row
+  rolls the whole batch back, and the error (whatever status that row produced —
+  422, 409 or 503) names the row by its index, counting from 0, and its
+  `owner_biosample_id_value`, so a partial import can never leave a study
+  half-populated. Each row is the single-biosample create's body and carries its
+  full validation. A batch is one owner and one owner-id field, and is capped at
+  2,000 rows and 15,000 metadata values, so it fits the gateway's request-size
+  limit and read timeout; a larger sheet is sent in several requests. No CLI
+  command or client calls it yet. A single import that waits too long behind
+  another import for the same owner now answers a retryable 503, not a 500.
+- **List a study's sequenced pools: `GET /api/v1/study/{study_idx}/sequenced-pool` (#665).**
+  The distinct sequenced_pools a study's active samples sit in (newest run/pool
+  first), each with its run's `instrument_model` and the study's `sample_count` in
+  that pool. Viewer-tier, the same exclusions as the study's sequenced-sample
+  listing (retired links/prep_samples, ena_status-flagged samples); the run-level
+  `run_preflight_filename` is withheld, as the run-first pool list gates it behind
+  run ownership. The pool routes are otherwise run-first — a `sequenced_pool_idx` was
+  obtainable only by already knowing its run; this is the study-first join that
+  makes a study's pools (and the pool-scoped processing routes behind them)
+  reachable without walking the run.
 - **Studies and biosamples can be named publicly without exposing an internal identifier (#N).**
   A new `qiita.exported_entity` table mints a permanent handle — `QS<n>` for a study, `QB<n>` for
   a biosample — so anything crossing the Qiita boundary can name one without carrying its `*_idx`.
@@ -29,7 +58,6 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `ON DELETE RESTRICT` and neither has a purge path, so a handle cannot be detached from what it
   names, and a retired entity's state is read from the entity rather than copied. The migration
   records the four conditions an entity must satisfy to belong in the table.
-
 - **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
   reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
   biosample, and upsert this study's metadata on it, naming the sample by a
@@ -2093,6 +2121,36 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **`ingest_ena_reads` retries an ENA md5 mismatch and a run miint skipped instead of failing permanently (#661).**
+  miint documents a transfer truncated on a clean gzip member boundary as indistinguishable
+  from a genuinely bad digest and advises bounded retries, so the ticket's `max_retries`
+  is the backstop. A skipped run (a failed open or a mid-download failure) is retried the
+  same way. A genuinely bad digest, a corrupt body or a permanent open failure such as a
+  404 now fails only after the retries are used up. A run with zero reads and no warning
+  still fails permanently. When several runs of a pool fail, a permanent outcome decides
+  the step's kind and the reason gives the first three failed runs in full (a permanent one
+  first) and lists up to 20 more by accession.
+  A ticket that uses up `max_retries` on any retriable kind (`external_fetch_transient`,
+  OOM, timeout) now ends `permanent` with a reason starting `retries_exhausted` (the kind
+  is identified by that prefix, not a stored column) followed by the last attempt's kind
+  and reason, so the notify digest emails it with its reason; before, it ended `retriable`
+  and was withheld. The digest's held line now reads "held after an infrastructure
+  failure": it counts only retriable tickets outside the step retry loop, which a redrive
+  still heals.
+- **A DoGet whose query fails partway through now ends in an error, not a clean end of
+  stream (#651).** The data plane read its streaming result with the `duckdb` crate's
+  Arrow iterator, which could not report a failed chunk fetch, so a client received a
+  truncated table that looked complete. It now fetches with the crate's fallible `step`
+  (public as of `duckdb` 1.10505.0), and the failure reaches the client as the stream's
+  final item; a panic in the producer now does the same. The zero-row schema probe each
+  DoGet ran first is gone too: the streaming result now reports its own schema before the
+  first fetch.
+- **A `/run` redrive of a failed or cancelled `download-ena-study` ticket now fetches runs
+  added since (#671).** The redrive kept the finished ingest step and fast-forwarded over the
+  re-read roster, so a run added after the failure was staged but never downloaded. The
+  redrive now re-runs every step; runs already stored are not fetched again. `/run` is
+  refused with a 409 on a ticket superseded by a newer download ticket for the pool, and on
+  a failed ticket that still has a live download job (cancel it, then re-import the study).
 - **An ENA study whose sample repeats an attribute tag no longer fails at resolve (#650).**
   `read_ena_attributes` can return a tag more than once (for example `BioSampleModel` or
   `ENA-FIRST-PUBLIC`), which made the per-sample map fail with `Map keys must be unique`
@@ -4013,6 +4071,41 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **DuckDB 1.5.4 → 1.5.5 across every component, and every DuckDB pin is now exact
+  (#651).** The team miint mirror now builds against DuckDB 1.5.5 (its 1.5.4 builds stopped
+  updating on Sep 11), so the data-plane crate (`=1.10505.0`), the four Python components
+  (`duckdb==1.5.5`) and their locks, the CI libduckdb default, the CLI the lake scripts
+  require, and the long-read-assembly `assemble`/`checkm` images move together. The Python
+  pins were floors and the crate a caret range, so a fresh resolve could land on DuckDB
+  1.5.6, for which the mirror has no miint build. `test_duckdb_version_sync` now also holds
+  the deploy CLI version, and every tracked `pyproject.toml` (any dependency table) and
+  `uv.lock`, to the crate. The lake scripts now refuse a DuckDB CLI of any other version.
+  The long-read-assembly `checkm` image, which this bump rebuilds, now pins CheckM, pplacer,
+  hmmer and prodigal, so the rebuild cannot re-resolve them. The DuckLake extension
+  DuckDB 1.5.5 installs moves `d318a545` → `d8a1881e`: bug fixes, and a catalog created
+  under 1.5.4 keeps its schema and version.
+- **`GET /sequence-range/{prep_sample_idx}` checks per-study access for a human caller
+  (#668).** A `prep_sample:read` caller now needs `viewer` or higher on every study the
+  prep_sample is linked to (`wet_lab_admin` and above bypass). A caller without it gets
+  `403` whether or not a range exists, and for an unknown or unlinked prep_sample. A
+  `sequence_range:mint` caller (the compute service account) reads any range as before,
+  and the response body is unchanged.
+- **Tests tear down their fixtures by parent FK rather than by tracked row (#670).** A
+  test passes `teardown_entity_graph` the idxs of its study, biosample and
+  prep_sample, and the helper deletes every row that hangs off them. That now
+  includes rows which a trigger or a cascade created, and which the per-row
+  bookkeeping it replaces could never delete, because nothing had recorded them. The
+  parents above that graph — e.g., pools, runs, principals — are still the caller's own to
+  clean up. Every teardown in the control-plane and the integration suites keys this
+  way; two integration fixtures that seeded a biosample chain and deleted none of it
+  now tear down at all, and the ENA-import teardown that four test modules had each
+  kept their own copy of is now one helper beside the sweep, shared across the
+  control-plane and integration suites. A parity test compares the sweep list against
+  the live schema, and fails when a table carrying one of the four entity key columns
+  is missing from the list, or is swept without naming every key that it carries.
+  Table and column names that these helpers interpolate into SQL are now rejected
+  unless they are bare identifiers. The branch reviewer flags a new fixture that
+  tears that graph down by hand and points at `docs/testing.md`.
 - **`qiita biosample create-field` validates its flags before reading the auth token
   (#639).** An invalid flag combination now exits 2 naming the flag, where it previously
   reported a missing token first and left the real problem to be found on the retry. The
@@ -4042,6 +4135,22 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   value could move between samples. A body clearing the policy on a field that carries
   it answers 422; declaring it, and re-sending the policy a field already has, are
   unchanged.
+- **An ENA import now writes `host taxon id` and `taxon id` from ENA instead of
+  `not provided` for every biosample (#653).** Each run's `host_tax_id` and `tax_id` are read with
+  the run list; a taxon id is written only if it is a loaded NCBI Taxonomy term, and
+  otherwise the field is `not provided` and the gap is reported in `metadata_warnings` on
+  the run entry of `GET /ena-import-batch/{idx}`. A `host_tax_id` equal to the
+  biosample's own `tax_id`, to a taxon in the curated table of biosample taxa with an
+  implied host (or none), or to the bare `metagenome` taxon is ignored with a warning, and
+  so is a biosample attribute tagged `taxon id` or `host taxon id`. With no `host_tax_id`,
+  any free-text `host` that is not a missing-value term gives `not provided`; otherwise
+  the host comes from the table, which gains the human, human skin, mouse gut and mouse
+  skin metagenomes and nine natural hostless environments such as soil and marine
+  sediment (`not applicable`). `qiita-admin backfill host-taxon-id` shares the table, so
+  biosamples with those taxa are now written instead of reported unresolved. Biosamples
+  imported earlier are unchanged. The `qiita submit-host-filter-pool` refusal for an
+  unresolved host also names `qiita biosample patch-metadata-by-unique-field`, which
+  replaces a stored `not provided`; the backfill skips it.
 - **Declaring a sample field unique within its study no longer lets a concurrent write
   slip past the new policy (#628).** The propagation that mirrors the policy onto the
   field's stored values read only what was committed, so a metadata write already in

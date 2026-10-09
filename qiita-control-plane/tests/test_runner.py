@@ -39,6 +39,7 @@ from qiita_common.models import (
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER, REFERENCE_LOAD_CONTAINER
 
 from qiita_control_plane import step_progress
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -962,13 +963,12 @@ async def test_retry_uses_isolated_per_attempt_workspace(
     assert not (workspace / "hash" / "attempt-1" / "partial.parquet").exists()
 
 
-async def test_retry_exhausted_marks_failed_with_retriable_type(
+async def test_retry_exhausted_marks_failed_with_permanent_type(
     postgres_pool, pending_work_ticket, library_spy, tmp_path
 ):
     """Transient failures keep retrying until retry_count == max_retries,
-    then transition to FAILED with failure_type='retriable' (the
-    distinguishing post-mortem signal: retries-exhausted vs
-    permanent-on-first-attempt)."""
+    then transition to FAILED with failure_type='permanent' so the notify
+    sweeper emails it; the reason keeps the last attempt's kind."""
     from qiita_common.backend_failure import BackendFailure, FailureKind
 
     workspace_root = tmp_path / "ws"
@@ -993,10 +993,11 @@ async def test_retry_exhausted_marks_failed_with_retriable_type(
     )
     assert row["state"] == "failed"
     assert row["retry_count"] == row["max_retries"] == 3
-    assert row["failure_type"] == "retriable"
+    assert row["failure_type"] == "permanent"
     assert row["failure_stage"] == "step_run"
     assert row["failure_step_name"] == "hash"
-    assert "node_fail" in row["failure_reason"]
+    exhausted = FailureKind.RETRIES_EXHAUSTED.value
+    assert row["failure_reason"].startswith(f"{exhausted} (3/3); last failure [node_fail]")
     # 4 total attempts: 1 initial + 3 retries.
     assert backend.attempts["hash"] == 4
 
@@ -4299,8 +4300,12 @@ async def test_fastq_to_parquet_v12_qc_binds_adapter_and_instrument_model(
             "DELETE FROM qiita.action WHERE action_id = 'fastq-to-parquet' AND version = $1",
             version,
         )
-        await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", _bio_idx)
+        await teardown_entity_graph(
+            postgres_pool,
+            study_idxs=[],
+            biosample_idxs=[_bio_idx],
+            prep_sample_idxs=[prep_sample_idx],
+        )
 
 
 async def test_run_workflow_fails_ticket_on_host_filter_resolution_error(
@@ -4909,6 +4914,42 @@ async def test_resume_skips_terminal_attempt_and_adopts_the_live_one(
     assert [h.slurm_job_id for h in backend.status_handles] == [904]
     # The workspace verified is attempt-1's; verifying attempt-0's is the bug.
     assert backend.result_handles[0].output_path.endswith("attempt-1/output")
+
+
+async def test_resume_with_terminal_attempt_and_spent_budget_fails_retries_exhausted(
+    postgres_pool, slurm_ticket, tmp_path
+):
+    """A restart that finds only a dead attempt and no retry budget left must not
+    buy a fresh submit; it fails permanent with the RETRIES_EXHAUSTED prefix."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_submitted_step(postgres_pool, slurm_ticket, step_name="compute", slurm_job_id=905)
+    await step_progress.record_failed(
+        postgres_pool,
+        work_ticket_idx=slurm_ticket,
+        step_index=0,
+        attempt=0,
+        failure_kind=FailureKind.NODE_FAIL.value,
+        failure_reason="NODE_FAIL (simulated)",
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET retry_count = max_retries WHERE work_ticket_idx = $1",
+        slurm_ticket,
+    )
+
+    backend = FakeSlurmBackendClient(status_script=[], result_script=[])
+    with pytest.raises(BackendFailure) as exc:
+        await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    assert exc.value.kind is FailureKind.RETRIES_EXHAUSTED
+    assert backend.submit_calls == 0
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type, failure_reason FROM qiita.work_ticket"
+        " WHERE work_ticket_idx = $1",
+        slurm_ticket,
+    )
+    assert row["state"] == "failed"
+    assert row["failure_type"] == "permanent"
+    assert row["failure_reason"].startswith(f"{FailureKind.RETRIES_EXHAUSTED.value} (3/3)")
 
 
 async def test_resume_never_started_runs_from_scratch(postgres_pool, slurm_ticket, tmp_path):
@@ -6023,16 +6064,14 @@ async def _seed_assembly_ticket(pool, *, prefix="mask-consume", steps=None, extr
         await pool.execute(
             "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
         )
-        # No-op unless `steps` declared the gate; keeps the RESTRICT FK from
-        # blocking the prep_sample delete below.
-        await pool.execute(
-            "DELETE FROM qiita.assembly_sample WHERE prep_sample_idx = $1", prep_sample_idx
+        await teardown_entity_graph(
+            pool,
+            study_idxs=[],
+            biosample_idxs=[biosample_idx],
+            prep_sample_idxs=[prep_sample_idx],
         )
         await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-        await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-        await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-        await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-        await pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+        await delete_principal(pool, principal_idx)
 
     return work_ticket_idx, mask_idx, prep_sample_idx, _teardown
 

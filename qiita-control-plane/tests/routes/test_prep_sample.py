@@ -14,7 +14,6 @@ from qiita_common.models import FieldDataType
 
 from qiita_control_plane.main import app
 from qiita_control_plane.testing.db_seeds import (
-    delete_idxs,
     fetch_seeded_metagenome_term,
     retire_prep_sample_to_study_link,
     seed_biosample,
@@ -22,6 +21,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_global_field,
     seed_sequenced_prep_sample,
 )
+from qiita_control_plane.testing.db_teardown import delete_idxs, teardown_entity_graph
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
@@ -42,53 +42,29 @@ pytestmark = pytest.mark.db
 
 
 # ---------------------------------------------------------------------------
-# FK-reverse cleanup
+# Teardown
 # ---------------------------------------------------------------------------
 
 
 async def _cleanup_tracked(pool, created: dict) -> None:
-    """Drop tracked rows in FK-reverse order (ON DELETE RESTRICT throughout):
-    prep_sample_to_study, prep_sample, biosample_to_study, biosample,
-    prep_sample_study_field, prep_sample_global_field, study_access, study."""
-    for ps, st in created["prep_sample_to_study"]:
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
-            ps,
-            st,
-        )
-    await delete_idxs(pool, "prep_sample", created["prep_sample"])
-    for bs, st in created["biosample_to_study"]:
-        await pool.execute(
-            "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
-            bs,
-            st,
-        )
-    await delete_idxs(pool, "biosample", created["biosample"])
-    # Study fields reference both their study and, when linked, a global field,
-    # so they drop before either.
-    await delete_idxs(pool, "prep_sample_study_field", created["prep_sample_study_field"])
+    """Drop the sample entity graph, then the global fields that outlive it."""
+    await teardown_entity_graph(
+        pool,
+        study_idxs=created["study"],
+        biosample_idxs=created["biosample"],
+        prep_sample_idxs=created["prep_sample"],
+    )
+    # A global field is referenced by the study-local fields the sweep removed.
     await delete_idxs(pool, "prep_sample_global_field", created["prep_sample_global_field"])
-    for st, principal in created["study_access"]:
-        await pool.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
-            st,
-            principal,
-        )
-    await delete_idxs(pool, "study", created["study"])
 
 
 @pytest_asyncio.fixture
 async def ctx(role_keyed_clients):
-    """Per-test fixture: route-keyed clients plus a `created` tracker for
-    FK-reverse teardown over every table the seeds touch."""
+    """Per-test fixture: route-keyed clients plus a `created` tracker."""
     created: dict = {
-        "prep_sample_to_study": [],
         "prep_sample": [],
-        "biosample_to_study": [],
         "biosample": [],
-        "prep_sample_study_field": [],
         "prep_sample_global_field": [],
-        "study_access": [],
         "study": [],
     }
     yield {**role_keyed_clients, "created": created}
@@ -119,7 +95,6 @@ async def _seed_prep_sample_linked_to_studies(ctx, *, owner_idx: int, study_idxs
             study_idx=study_idx,
             created_by_idx=owner_idx,
         )
-        ctx["created"]["biosample_to_study"].append((biosample_idx, study_idx))
         await ctx["pool"].execute(
             "INSERT INTO qiita.prep_sample_to_study (prep_sample_idx, study_idx, created_by_idx)"
             " VALUES ($1, $2, $3)",
@@ -127,7 +102,6 @@ async def _seed_prep_sample_linked_to_studies(ctx, *, owner_idx: int, study_idxs
             study_idx,
             owner_idx,
         )
-        ctx["created"]["prep_sample_to_study"].append((prep_sample_idx, study_idx))
     return prep_sample_idx
 
 
@@ -409,7 +383,6 @@ async def test_retire_prep_sample_anonymous_401(ctx):
 async def _post_prep_sample_field(client, ctx, study_idx: int, **body):
     """POST the create-field route and, on 201, track the created row."""
     return await post_study_field(
-        ctx,
         surface=PREP_SAMPLE_FIELD_SURFACE,
         client=client,
         study_idx=study_idx,

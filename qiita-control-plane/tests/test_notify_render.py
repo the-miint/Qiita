@@ -217,9 +217,9 @@ def test_held_for_redrive_bucket_is_reported():
         held_total=3,
     )
     assert "No other work tickets of yours are still active." in rendered.text
-    assert "3 held after exhausting infrastructure retries" in rendered.text
+    assert "3 held after an infrastructure failure" in rendered.text
     assert "qiita ticket run" in rendered.text
-    assert "3 held after exhausting infrastructure retries" in rendered.html
+    assert "3 held after an infrastructure failure" in rendered.html
     # The redrive hint is a literal in the HTML, so its angle brackets escape.
     assert "<idx>" not in rendered.html
     assert "&lt;idx&gt;" in rendered.html
@@ -233,8 +233,8 @@ def test_no_held_tickets_renders_no_redrive_line():
         active_rows=[],
         held_total=0,
     )
-    assert "held after exhausting" not in rendered.text
-    assert "held after exhausting" not in rendered.html
+    assert "held after an infrastructure" not in rendered.text
+    assert "held after an infrastructure" not in rendered.html
 
 
 def test_active_states_listed_in_lifecycle_order():
