@@ -215,10 +215,10 @@ jobs:
           } >&2
           exit 1
 
-  # Every PR records what it changed in CHANGELOG.md (the per-change log, distinct
-  # from the operator deploy checklist DEPLOY_CHECKLIST.md). Pure git diff, no
-  # Claude. A PR that genuinely warrants no entry (typo, CI-only, the changelog
-  # tooling itself) opts out with the 'no-changelog' label.
+  # Every PR records what it changed in its own file under
+  # docs/changelog-pending/ (see CHANGELOG.md; distinct from the operator
+  # deploy checklist DEPLOY_CHECKLIST.md). Pure git diff, no Claude. A PR that
+  # warrants no entry (typo, CI-only) opts out with the 'no-changelog' label.
   changelog-check:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -226,7 +226,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - name: Require a CHANGELOG.md entry
+      - name: Require a changelog entry file
         env:
           BASE_REF: ${{ github.base_ref }}
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
@@ -236,15 +236,17 @@ jobs:
             echo "Skipped: 'no-changelog' label present."; exit 0;;
           esac
           git fetch --quiet origin "$BASE_REF"
-          changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
-          if printf '%s\n' "$changed" | grep -qx 'CHANGELOG.md'; then
-            echo "CHANGELOG.md updated."
+          # Added, modified or renamed; a PR that only deletes entries has not added one.
+          entries=$(git diff --name-only --diff-filter=d "origin/$BASE_REF...HEAD" \
+            -- 'docs/changelog-pending/*.md')
+          if [ -n "$entries" ]; then
+            echo "Changelog entry file(s):"; printf '%s\n' "$entries" | sed 's/^/  /'
             exit 0
           fi
           {
-            echo "ERROR: this PR does not touch CHANGELOG.md."
-            echo "Add an entry under '## [Unreleased]' describing what changed, tagged (#N)."
-            echo "If this PR genuinely needs no changelog entry (typo, CI-only change, etc.),"
+            echo "ERROR: this PR adds or changes no file under docs/changelog-pending/."
+            echo "Add one describing what changed, tagged (#N). CHANGELOG.md says how."
+            echo "If this PR needs no changelog entry (typo, CI-only change, etc.),"
             echo "add the 'no-changelog' label to opt out."
           } >&2
           exit 1

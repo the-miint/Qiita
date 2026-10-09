@@ -1,8 +1,8 @@
 ---
-description: After a deploy, archive the Pending-deploy checklist into docs/deploy-archive/ stamped with date + commit
+description: After a deploy, archive the Pending-deploy checklist into docs/deploy-archive/ and the pending changelog entries into docs/changelog-archive/, stamped with date + commit
 ---
 
-You are closing out a deploy: moving the consolidated `## Pending deploy` block out of `DEPLOY_CHECKLIST.md` into its own file under `docs/deploy-archive/`, and leaving an empty Pending section for the next cycle. This is a **maintainer-on-their-own-machine** action run *after* the operator reports a successful deploy — the deploy host has no Claude and the operator doesn't edit the repo. It is a repo edit (commit + push), not an on-host step.
+You are closing out a deploy: moving the consolidated `## Pending deploy` block out of `DEPLOY_CHECKLIST.md` into its own file under `docs/deploy-archive/`, leaving an empty Pending section for the next cycle, and moving the changelog entry files the deploy shipped into their own folder under `docs/changelog-archive/`. This is a **maintainer-on-their-own-machine** action run *after* the operator reports a successful deploy — the deploy host has no Claude and the operator doesn't edit the repo. It is a repo edit (commit + push), not an on-host step.
 
 The archive lives in its own directory precisely so `DEPLOY_CHECKLIST.md` stays short enough to read whole — it is the file every PR folds into. **Never append the archived block back into `DEPLOY_CHECKLIST.md`.**
 
@@ -28,6 +28,23 @@ Preserve the `(#N)` tags in the archived copy — that's the per-deploy provenan
 
 Two invariants the deploy scripts depend on, so don't disturb them when resetting Pending: the literal headings `### 1. Env vars` and `### 3. Migrations` are boundary markers `qiita_buckets_12()` (`deploy/_common.sh`) seds between to decide whether to prompt the operator — anything substantive left between them makes every deploy prompt for steps that don't exist. And `## Deployed history` must remain, as the terminator for the operator's own `sed` range in `redeploy.md` §1. `qiita-compute-orchestrator/tests/test_deploy_scripts.py` pins both against the real file.
 
-## 3. Report
+## 3. Move the changelog entries
 
-Show the user the new `docs/deploy-archive/<...>.md` file and confirm Pending is empty. Remind them to record the deployed commit on the host / ops channel too (redeploy.md step 8). Do not commit unless asked.
+Each PR's changelog entry is its own file under `docs/changelog-pending/` (`CHANGELOG.md` describes the scheme). Move the ones this deploy shipped into a folder carrying the same stamp as the checklist archive:
+
+```bash
+# from the repo root
+sha=<deployed commit>; dest=docs/changelog-archive/<YYYY-MM-DD>-<short SHA>
+git ls-tree --name-only "$sha" docs/changelog-pending/ | while read -r f; do
+  if [ -e "$f" ]; then mkdir -p "$dest" && git mv "$f" "$dest/"
+  else echo "not in the working tree, skipped: $f"; fi
+done
+```
+
+List the files from the **deployed commit**, as above, not from the working tree: an entry merged after that commit has not been deployed and stays in `docs/changelog-pending/`. Move the files as they are — no merging into one file, no edits. A deployed commit with no `docs/changelog-pending/` entries leaves no folder. A skipped name is an entry that was renamed or removed after the deployed commit; report it instead of guessing where it went.
+
+The commit that carries this move adds no entry of its own; if it goes through a PR, that PR takes the `no-changelog` label.
+
+## 4. Report
+
+Show the user the new `docs/deploy-archive/<...>.md` file and the new `docs/changelog-archive/<...>/` folder (or say that the deploy shipped no entries), and confirm Pending is empty. Remind them to record the deployed commit on the host / ops channel too (redeploy.md step 8). Do not commit unless asked.
