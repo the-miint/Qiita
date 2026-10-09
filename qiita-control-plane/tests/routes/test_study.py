@@ -35,10 +35,8 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 
-from qiita_control_plane.testing.db_seeds import (
-    seed_service_principal,
-    seed_user_principal,
-)
+from qiita_control_plane.testing.db_seeds import seed_service_principal, seed_user_principal
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 from qiita_control_plane.testing.unique_names import unique_accession
 
 from .conftest import (
@@ -46,7 +44,6 @@ from .conftest import (
     IneligibilityKind,
     _grant_study_access,
     assert_owner_ineligibility_422,
-    delete_idxs,
     etag_for_row,
     resolve_ineligible_owner_idx,
 )
@@ -63,32 +60,23 @@ def _unique_title(prefix: str = "study") -> str:
 
 
 # ---------------------------------------------------------------------------
-# FK-reverse cleanup
+# Teardown
 # ---------------------------------------------------------------------------
 
 
 async def _cleanup_tracked(pool, created: dict) -> None:
-    """Drop every test-created row in FK-reverse order: study_access →
-    study → user / service subtype rows → principal."""
-    for st, p in created["study_access"]:
-        await pool.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
-            st,
-            p,
-        )
-    await delete_idxs(pool, "study", created["study"])
-    if created["user_principals"]:
-        await pool.execute(
-            "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
-            created["user_principals"],
-        )
+    """Drop every test-created row: the study graph, then the service subtype
+    rows, then the principals."""
+    await teardown_entity_graph(
+        pool, study_idxs=created["study"], biosample_idxs=[], prep_sample_idxs=[]
+    )
     if created["service_account_principals"]:
         await pool.execute(
             "DELETE FROM qiita.service_account WHERE principal_idx = ANY($1::bigint[])",
             created["service_account_principals"],
         )
     all_principals = created["user_principals"] + created["service_account_principals"]
-    await delete_idxs(pool, "principal", all_principals)
+    await delete_principal(pool, all_principals)
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +87,11 @@ async def _cleanup_tracked(pool, created: dict) -> None:
 @pytest_asyncio.fixture
 async def ctx(role_keyed_clients):
     """Per-test fixture wrapping role_keyed_clients with a route-specific
-    `created` tracker for FK-reverse cleanup at teardown.
+    `created` tracker the teardown reads.
 
     The session principals (admin, wet_lab_admin, regular_user) are
     fixture-managed and never go in the cleanup list."""
     created: dict = {
-        "study_access": [],
         "study": [],
         "user_principals": [],
         "service_account_principals": [],
@@ -131,7 +118,6 @@ async def _post_study(client, ctx, **body):
     if resp.status_code == 201:
         rj = resp.json()
         ctx["created"]["study"].append(rj["study_idx"])
-        ctx["created"]["study_access"].append((rj["study_idx"], rj["owner_idx"]))
     return resp
 
 

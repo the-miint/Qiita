@@ -24,8 +24,9 @@ from qiita_common.api_paths import URL_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_I
 from qiita_common.auth_constants import API_PREFIX
 
 from qiita_control_plane.main import app
+from qiita_control_plane.testing.db_teardown import delete_idxs
 
-from .conftest import delete_idxs, make_caller_own_run, unique_instrument_id
+from .conftest import make_caller_own_run, unique_instrument_id
 
 pytestmark = pytest.mark.db
 

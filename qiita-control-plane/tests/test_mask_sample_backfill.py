@@ -20,6 +20,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -99,19 +100,17 @@ async def bf(postgres_pool):
         "DELETE FROM qiita.work_ticket WHERE action_id = 'read-mask' AND action_version = $1",
         version,
     )
-    await postgres_pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
     await postgres_pool.execute(
         "DELETE FROM qiita.action WHERE action_id = 'read-mask' AND version = $1", version
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", [ps_done, ps_inflight]
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", [_bs1, _bs2]
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[_bs1, _bs2],
+        prep_sample_idxs=[ps_done, ps_inflight],
     )
     await postgres_pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 async def _states(pool, mask_idx):

@@ -40,6 +40,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -162,21 +163,12 @@ async def run(postgres_pool):
         "pairs": {(features["lcg"], genomes["lcg"]), (features["mag"], genomes["mag"])},
     }
 
-    # FK-reverse: assembly_membership references genome, and `genome.prep_sample_idx`
-    # is ON DELETE RESTRICT — so the genomes go before the sample that minted them.
-    await postgres_pool.execute(
-        "DELETE FROM qiita.assembly_sample WHERE processing_idx = ANY($1::bigint[])",
-        [minted_run, unminted_run],
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[prep_sample_idx],
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.assembly_membership WHERE processing_idx = ANY($1::bigint[])",
-        [minted_run, unminted_run],
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])", sorted(genomes.values())
-    )
-    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
     await postgres_pool.execute(
         "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])",
         sorted(features.values()),
@@ -185,8 +177,7 @@ async def run(postgres_pool):
         "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])",
         [minted_run, unminted_run],
     )
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_principal(postgres_pool, principal_idx)
 
 
 def _map_url(prep_sample_idx: int, processing_idx: int) -> str:

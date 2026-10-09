@@ -25,8 +25,9 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
-from .conftest import _grant_study_access, _seed_study, delete_idxs
+from .conftest import _grant_study_access, _seed_study
 
 # The ticket the mint records as the range's minter. No FK, so any positive idx is
 # accepted at the DB layer; the value only ever gets compared for equality.
@@ -74,7 +75,7 @@ async def ctx(
 ):
     """Yield a route-test context with one prep_sample plus the
     AsyncClients the tests need (anonymous, regular user, wet_lab_admin,
-    compute SA), and a `created` dict for FK-reverse teardown.
+    compute SA), and a `created` dict the teardown reads.
 
     The prep_sample is linked to a study owned by a third principal, on which
     the regular user holds `viewer` — the GET's per-study read gate passes for
@@ -105,12 +106,11 @@ async def ctx(
     bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(
         postgres_pool, owner_idx=principal_idx
     )
-    created: dict[str, list] = {
+    created: dict[str, list[int]] = {
         "biosample": [bs_idx],
         "prep_sample": [ps_idx],
         "principal": [principal_idx],
         "study": [],
-        "study_access": [],
     }
     seed_ctx = {"pool": postgres_pool, "created": created}
     study_idx = await _seed_study_with_prep_sample(
@@ -156,36 +156,13 @@ async def ctx(
             "created": created,
         }
 
-    # FK-reverse cleanup — sequence_range cascades with prep_sample.
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = ANY($1::bigint[])",
-        created["study"],
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=created["study"],
+        biosample_idxs=created["biosample"],
+        prep_sample_idxs=created["prep_sample"],
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE study_idx = ANY($1::bigint[])",
-        created["study"],
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])",
-        created["study"],
-    )
-    await delete_idxs(postgres_pool, "study", created["study"])
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])",
-        created["prep_sample"],
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])",
-        created["biosample"],
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
-        created["principal"],
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.principal WHERE idx = ANY($1::bigint[])",
-        created["principal"],
-    )
+    await delete_principal(postgres_pool, created["principal"])
 
 
 @pytest_asyncio.fixture

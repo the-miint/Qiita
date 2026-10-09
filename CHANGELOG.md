@@ -4039,6 +4039,22 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `403` whether or not a range exists, and for an unknown or unlinked prep_sample. A
   `sequence_range:mint` caller (the compute service account) reads any range as before,
   and the response body is unchanged.
+- **Tests tear down their fixtures by parent FK rather than by tracked row (#N).** A
+  test passes `teardown_entity_graph` the idxs of its study, biosample and
+  prep_sample, and the helper deletes every row that hangs off them. That now
+  includes rows which a trigger or a cascade created, and which the per-row
+  bookkeeping it replaces could never delete, because nothing had recorded them. The
+  parents above that graph — e.g., pools, runs, principals — are still the caller's own to
+  clean up. Every teardown in the control-plane and the integration suites keys this
+  way; two integration fixtures that seeded a biosample chain and deleted none of it
+  now tear down at all, and the ENA-import teardown that four test modules had each
+  kept their own copy of is now one helper beside the sweep, shared across the
+  control-plane and integration suites. A parity test compares the sweep list against
+  the live schema, and fails when a table carrying one of the four entity key columns
+  is missing from the list, or is swept without naming every key that it carries.
+  Table and column names that these helpers interpolate into SQL are now rejected
+  unless they are bare identifiers. The branch reviewer flags a new fixture that
+  tears that graph down by hand and points at `docs/testing.md`.
 - **`qiita biosample create-field` validates its flags before reading the auth token
   (#639).** An invalid flag combination now exits 2 naming the flag, where it previously
   reported a missing token first and left the real problem to be found on the retry. The

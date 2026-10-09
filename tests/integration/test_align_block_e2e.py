@@ -49,12 +49,11 @@ from pathlib import Path
 import duckdb
 import pytest
 from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 from conftest import ducklake_connect
 
-_ALIGN_YAML_PATH = (
-    Path(__file__).parent.parent.parent / "workflows" / "align" / "1.0.0.yaml"
-)
+_ALIGN_YAML_PATH = Path(__file__).parent.parent.parent / "workflows" / "align" / "1.0.0.yaml"
 
 # Reads per sample. Small — the DuckLake writes are cheap and the exact row count
 # (reads × rows-per-read) is asserted, so keep it tiny.
@@ -209,7 +208,7 @@ async def align_block_pool(postgres_pool, human_admin_session):
     sequenced_sample subtype + a minted sequence_range (4 reads), a minted
     `alignment_definition`, and a PENDING `alignment_sample` gate per sample. Yields
     the ids + a `make_block(members, state)` helper (block + a block work_ticket
-    carrying the alignment_idx + the cover-map), tracked for FK-reverse cleanup."""
+    carrying the alignment_idx + the cover-map)."""
     from qiita_control_plane.repositories.alignment_definition import (
         mint_alignment_definition,
     )
@@ -232,7 +231,7 @@ async def align_block_pool(postgres_pool, human_admin_session):
     bs_a, prep_a = await seed_biosample_with_sequenced_prep_sample(
         postgres_pool, owner_idx=owner
     )
-    run_idx, pool_idx, ss_a = await seed_sequenced_sample_subtype(
+    run_idx, pool_idx, _ss_a = await seed_sequenced_sample_subtype(
         postgres_pool,
         prep_sample_idx=prep_a,
         owner_idx=owner,
@@ -241,10 +240,10 @@ async def align_block_pool(postgres_pool, human_admin_session):
     bs_b, prep_b = await seed_biosample_with_sequenced_prep_sample(
         postgres_pool, owner_idx=owner
     )
-    ss_b = await postgres_pool.fetchval(
+    await postgres_pool.execute(
         "INSERT INTO qiita.sequenced_sample"
         "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
-        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        " VALUES ($1, $2, $3, $4)",
         prep_b,
         pool_idx,
         f"b-{suffix}",
@@ -331,7 +330,7 @@ async def align_block_pool(postgres_pool, human_admin_session):
         "make_block": make_block,
     }
 
-    # FK-reverse Postgres cleanup. The DuckLake `alignment` rows we registered are
+    # The DuckLake `alignment` rows we registered are
     # left as harmless orphans (each test run uses a unique alignment_idx, and the
     # catalog is reset between integration phases) — the same discipline the
     # read-mask block e2e uses for its read_mask rows.
@@ -347,23 +346,17 @@ async def align_block_pool(postgres_pool, human_admin_session):
     await postgres_pool.execute(
         "DELETE FROM qiita.action WHERE action_id = $1", action_id
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.alignment_sample WHERE alignment_idx = $1", alignment_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequenced_sample WHERE idx = ANY($1::bigint[])", [ss_a, ss_b]
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[bs_a, bs_b],
+        prep_sample_idxs=[prep_a, prep_b],
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", [prep_a, prep_b]
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", [bs_a, bs_b]
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx

@@ -5,7 +5,8 @@ isolation.
 
 `register_ena_study` commits its own writes (one registration transaction, savepoint
 isolation per run), so nothing can be wrapped in an outer rolled-back transaction;
-`_cleanup` below removes tracked rows FK-reverse.
+`_cleanup` below sweeps each tracked study's entity graph, then its runs and
+principals.
 """
 
 from decimal import Decimal
@@ -36,6 +37,10 @@ from qiita_control_plane.repositories._sample_helpers import (
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.study import get_or_create_study_by_ena_accessions
 from qiita_control_plane.testing.db_seeds import seed_user_principal
+from qiita_control_plane.testing.db_teardown import (
+    delete_principal,
+    teardown_ena_study_graph,
+)
 from qiita_control_plane.testing.unique_names import unique_accession, unique_ena_accession
 
 pytestmark = pytest.mark.db
@@ -107,7 +112,7 @@ async def _library_metadata_by_run(pool, run_accessions: list[str]) -> dict[str,
 
 
 # ---------------------------------------------------------------------------
-# Per-test tracker fixture + FK-reverse cleanup
+# Per-test tracker fixture + teardown
 # ---------------------------------------------------------------------------
 
 
@@ -119,95 +124,20 @@ class _Tracker:
 
 
 async def _cleanup(pool, tracker: _Tracker) -> None:
-    study_idxs = tracker.study_idxs
-    if study_idxs:
-        ps_rows = await pool.fetch(
-            "SELECT DISTINCT prep_sample_idx FROM qiita.prep_sample_to_study"
-            " WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-        ps_idxs = [r["prep_sample_idx"] for r in ps_rows]
-        # prep_sample_metadata RESTRICTs its prep_sample and study field, so
-        # sweep both before prep_sample / prep_sample_study_field / study below.
-        if ps_idxs:
-            await pool.execute(
-                "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])",
-                ps_idxs,
-            )
-            await pool.execute(
-                "DELETE FROM qiita.prep_sample_metadata WHERE prep_sample_idx = ANY($1::bigint[])",
-                ps_idxs,
-            )
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-        if ps_idxs:
-            await pool.execute(
-                "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", ps_idxs
-            )
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample_study_field WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-
-        bs_rows = await pool.fetch(
-            "SELECT DISTINCT biosample_idx FROM qiita.biosample_to_study"
-            " WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-        bs_idxs = [r["biosample_idx"] for r in bs_rows]
-        # biosample_metadata / biosample_study_field reference their parents RESTRICT,
-        # so sweep them before biosample_to_study / biosample / study below.
-        if bs_idxs:
-            await pool.execute(
-                "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = ANY($1::bigint[])",
-                bs_idxs,
-            )
-        await pool.execute(
-            "DELETE FROM qiita.biosample_study_field WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-        await pool.execute(
-            "DELETE FROM qiita.biosample_to_study WHERE study_idx = ANY($1::bigint[])",
-            study_idxs,
-        )
-        if bs_idxs:
-            await pool.execute("DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", bs_idxs)
-
-        await pool.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])", study_idxs
-        )
-        await pool.execute("DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", study_idxs)
-
-    if tracker.study_accessions:
-        run_rows = await pool.fetch(
-            "SELECT idx FROM qiita.sequencing_run WHERE instrument_run_id LIKE ANY($1::text[])",
-            [f"{acc}:%" for acc in tracker.study_accessions],
-        )
-        run_idxs = [r["idx"] for r in run_rows]
-        if run_idxs:
-            await pool.execute(
-                "DELETE FROM qiita.sequenced_pool WHERE sequencing_run_idx = ANY($1::bigint[])",
-                run_idxs,
-            )
-            await pool.execute(
-                "DELETE FROM qiita.sequencing_run WHERE idx = ANY($1::bigint[])", run_idxs
-            )
-
-    if tracker.principal_idxs:
-        await pool.execute(
-            "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
-            tracker.principal_idxs,
-        )
-        await pool.execute(
-            "DELETE FROM qiita.principal WHERE idx = ANY($1::bigint[])", tracker.principal_idxs
-        )
+    """Tear down everything a test registered: the studies it tracked, their
+    entity graphs, the runs named after the accessions it tracked, and its
+    principals."""
+    await teardown_ena_study_graph(
+        pool,
+        study_idxs=tracker.study_idxs,
+        run_accessions=tracker.study_accessions,
+    )
+    await delete_principal(pool, tracker.principal_idxs)
 
 
 @pytest_asyncio.fixture
 async def reg(postgres_pool):
-    """Per-test (pool, owner_idx, caller_idx, tracker); tracked rows cleaned FK-reverse."""
+    """Per-test (pool, owner_idx, caller_idx, tracker)."""
     tracker = _Tracker()
     owner_idx = await seed_user_principal(postgres_pool, prefix="ena-owner", suffix="t02")
     caller_idx = await seed_user_principal(postgres_pool, prefix="ena-caller", suffix="t02")

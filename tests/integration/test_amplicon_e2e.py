@@ -47,6 +47,7 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport
 from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 from _runner_helpers import LocalComputeBackendClient
 from conftest import ducklake_connect
@@ -222,24 +223,17 @@ async def seeded_pool(postgres_pool, human_admin_session):
     await postgres_pool.execute(
         "DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx = $1", pool_idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequence_range WHERE prep_sample_idx = ANY($1::bigint[])",
-        prep_idxs,
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequenced_sample WHERE sequenced_pool_idx = $1", pool_idx
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=bio_idxs,
+        prep_sample_idxs=prep_idxs,
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", prep_idxs
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", bio_idxs
     )
 
 

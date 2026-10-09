@@ -24,6 +24,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_sequenced_sample_subtype,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 from .conftest import make_caller_own_run
 
@@ -173,7 +174,7 @@ async def _add_pool_ticket(db, *, action, owner, sequenced_pool_idx, state):
 @pytest_asyncio.fixture
 async def seeded_pool(ctx):
     """Seed a run + pool with two samples: one with a COMPLETED read-mask
-    ticket, one with none (not-submitted). FK-reverse cleanup."""
+    ticket, one with none (not-submitted)."""
     db = ctx["pool"]
     owner = ctx["wet_session"]["principal_idx"]
     action = await _seed_fastq_action(db)
@@ -217,18 +218,17 @@ async def seeded_pool(ctx):
     await db.execute(
         "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2", *bcl_action
     )
-    await db.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
+    await teardown_entity_graph(
+        db,
+        study_idxs=[],
+        biosample_idxs=[bs for bs, _ps, _ss in created],
+        prep_sample_idxs=[ps for _bs, ps, _ss in created],
+    )
     await db.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-    for _bs, _ps, ss_idx in created:
-        await db.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
     await db.execute("DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", *action)
     await db.execute("DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", *bcl_action)
-    for _bs, ps_idx, _ss in created:
-        await db.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps_idx)
-    for bs_idx, _ps, _ss in created:
-        await db.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs_idx)
 
 
 def _url(run_idx, pool_idx):
@@ -424,7 +424,7 @@ async def test_get_completion_empty_pool(ctx, seeded_pool):
     db = ctx["pool"]
     owner = ctx["wet_session"]["principal_idx"]
     bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
-    run_idx, pool_idx, ss_idx = await seed_sequenced_sample_subtype(
+    run_idx, pool_idx, _ss_idx = await seed_sequenced_sample_subtype(
         db, prep_sample_idx=ps_idx, owner_idx=owner, sequenced_pool_item_id="empty-compl-1"
     )
     # Retire the only sample so the pool has zero active samples.
@@ -442,11 +442,11 @@ async def test_get_completion_empty_pool(ctx, seeded_pool):
         assert body["samples_not_submitted"] == 0
         assert body["complete"] is False
     finally:
-        await db.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
+        await teardown_entity_graph(
+            db, study_idxs=[], biosample_idxs=[bs_idx], prep_sample_idxs=[ps_idx]
+        )
         await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
         await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-        await db.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps_idx)
-        await db.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs_idx)
 
 
 async def test_get_completion_unknown_pool_404(ctx, seeded_pool):

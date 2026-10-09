@@ -36,6 +36,7 @@ from pathlib import Path
 import duckdb
 import pytest
 from qiita_common.models import WorkTicketState
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 from _runner_helpers import LocalComputeBackendClient
 
@@ -103,12 +104,15 @@ async def smoke_prep_sample(postgres_pool, human_admin_session):
     yield idx
     # The composer used the seeded `short_read_metagenomics` prep_protocol
     # (system-owned), so we don't delete the protocol here.
+    # The ticket references the prep_sample under RESTRICT, so it goes first.
     await postgres_pool.execute(
         "DELETE FROM qiita.work_ticket WHERE prep_sample_idx = $1", idx
     )
-    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", idx)
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[idx],
     )
 
 
@@ -206,9 +210,7 @@ async def test_fastq_to_parquet_through_runner(
     # The runner places each step's outputs in
     # <workspace_root>/<work_ticket_idx>/<step_name>/attempt-0/. fastq is
     # the YAML step name; this is the SINGLETON-attempt-0 path.
-    reads_parquet = (
-        workspace_root / str(work_ticket_idx) / "fastq" / "attempt-0" / "read.parquet"
-    )
+    reads_parquet = workspace_root / str(work_ticket_idx) / "fastq" / "attempt-0" / "read.parquet"
     assert reads_parquet.exists(), f"expected read.parquet at {reads_parquet}"
 
     # Mint helper called exactly once with the fixture's read count.
@@ -227,8 +229,7 @@ async def test_fastq_to_parquet_through_runner(
     # Verify the Parquet's schema and content.
     with duckdb.connect(":memory:") as conn:
         rows = conn.execute(
-            "SELECT column_name, column_type FROM ("
-            f" DESCRIBE SELECT * FROM '{reads_parquet}')"
+            f"SELECT column_name, column_type FROM ( DESCRIBE SELECT * FROM '{reads_parquet}')"
         ).fetchall()
         # DuckDB DESCRIBE column order matches the Parquet's physical order.
         # prep_sample_idx is the DuckLake `read` table's scope/prune column

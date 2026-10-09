@@ -10,7 +10,7 @@ per-sample and the block masking paths.
 Each test seeds one principal + one run + one pool + the masking actions, then
 attaches samples via `add_sample`, per-sample tickets via `add_ticket`, gate rows
 via `add_gate`, and block work via `add_block` (a block, its members, and its
-block-scoped ticket). Cleanup is FK-reverse on the shared postgres_pool fixture.
+block-scoped ticket).
 """
 
 import json
@@ -33,35 +33,35 @@ from qiita_control_plane.repositories.sequencing_run import (
     fetch_sequenced_pool_read_mask_coverage,
     fetch_sequenced_pool_read_mask_ticket_state_counts,
 )
-from qiita_control_plane.testing.db_seeds import (
-    seed_biosample_with_sequenced_prep_sample,
-    seed_user_principal,
-)
 
 pytestmark = pytest.mark.db
 
 
+async def _delete_work_tickets(pool, actions) -> None:
+    """Delete every work_ticket raised against these (action_id, version) pairs.
+
+    Runs before the blocks: work_ticket.block_idx is a NO ACTION FK, so a block
+    still referenced by a live ticket cannot be deleted.
+    """
+    for action_id, version in actions:
+        await pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+            action_id,
+            version,
+        )
+
+
 @pytest_asyncio.fixture
-async def pool_ctx(postgres_pool):
-    """Seed a principal + run + pool + the read-mask, read-mask-block and
-    bcl-convert actions; yield a context with `add_sample()` (attach a
-    sequenced_sample, optionally retired), `add_ticket(prep_sample_idx, state)`
-    (a per-sample read-mask ticket), `add_gate(prep_sample_idx, mask_idx, state)`
-    (a qiita.mask_sample gate row) and `add_block(prep_sample_idxs, state, ...)`
-    (a block, its members, and its block-scoped ticket). FK-reverse cleanup."""
-    owner_idx = await seed_user_principal(postgres_pool, prefix="poolcompl", suffix="owner")
-    run_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.sequencing_run (instrument_run_id, platform, created_by_idx)"
-        " VALUES ($1, 'illumina'::qiita.platform, $2) RETURNING idx",
-        f"pc-run-{secrets.token_hex(4)}",
-        owner_idx,
-    )
-    pool_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.sequenced_pool (sequencing_run_idx, created_by_idx)"
-        " VALUES ($1, $2) RETURNING idx",
-        run_idx,
-        owner_idx,
-    )
+async def pool_ctx(pool_ctx, postgres_pool):
+    """Add the read-mask, read-mask-block, feature-to-profile and bcl-convert
+    actions to the shared pool fixture, plus the helpers built on them:
+    `add_ticket(prep_sample_idx, state)` (a per-sample read-mask ticket),
+    `add_gate(prep_sample_idx, mask_idx, state)` (a qiita.mask_sample gate row)
+    and `add_block(prep_sample_idxs, state, ...)` (a block, its members, and its
+    block-scoped ticket). `add_sample` comes from the shared fixture.
+    """
+    owner_idx = pool_ctx["owner_idx"]
+    pool_idx = pool_ctx["pool_idx"]
     # A read-mask action row so the work_ticket (action_id, action_version)
     # FK resolves. The completion query matches on the bare action_id (a sample
     # is "processed" once it has a mask), so the version is arbitrary here.
@@ -129,8 +129,13 @@ async def pool_ctx(postgres_pool):
         f2p_action_version,
         json.dumps({"service": False, "human_roles": ["user"]}),
     )
+    seeded_actions = (
+        (action_id, action_version),
+        (bcl_action_id, bcl_action_version),
+        (block_action_id, block_action_version),
+        (f2p_action_id, f2p_action_version),
+    )
 
-    samples: list[tuple[int, int, int]] = []  # (biosample, prep_sample, sequenced_sample)
     masks: list[int] = []
     blocks: list[int] = []
 
@@ -161,36 +166,6 @@ async def pool_ctx(postgres_pool):
         if not _default_mask:
             _default_mask.append(await mint_mask())
         return _default_mask[0]
-
-    async def add_sample(*, retired=False, ena_status=None):
-        bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(
-            postgres_pool, owner_idx=owner_idx
-        )
-        ss_idx = await postgres_pool.fetchval(
-            "INSERT INTO qiita.sequenced_sample"
-            "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
-            " VALUES ($1, $2, $3, $4) RETURNING idx",
-            ps_idx,
-            pool_idx,
-            f"item-{secrets.token_hex(4)}",
-            owner_idx,
-        )
-        if retired:
-            await postgres_pool.execute(
-                "UPDATE qiita.prep_sample SET retired = true, retired_by_idx = $2,"
-                " retired_at = now(), retire_reason = 'test' WHERE idx = $1",
-                ps_idx,
-                owner_idx,
-            )
-        if ena_status is not None:
-            await postgres_pool.execute(
-                "UPDATE qiita.sequenced_sample SET ena_status = $2,"
-                " ena_availability_checked_at = now() WHERE idx = $1",
-                ss_idx,
-                ena_status,
-            )
-        samples.append((bs_idx, ps_idx, ss_idx))
-        return ps_idx
 
     async def add_ticket(prep_sample_idx, state, mask_idx=None, gate=True):
         """Attach a per-sample read-mask ticket.
@@ -331,29 +306,23 @@ async def pool_ctx(postgres_pool):
             "test failure" if failed else None,
         )
 
-    yield {
-        "pool": postgres_pool,
-        "pool_idx": pool_idx,
-        "add_sample": add_sample,
-        "add_ticket": add_ticket,
-        "add_demux_ticket": add_demux_ticket,
-        "add_gate": add_gate,
-        "add_block": add_block,
-        "add_f2p_ticket": add_f2p_ticket,
-        "mint_mask": mint_mask,
-    }
+    pool_ctx.update(
+        {
+            "add_ticket": add_ticket,
+            "add_demux_ticket": add_demux_ticket,
+            "add_gate": add_gate,
+            "add_block": add_block,
+            "add_f2p_ticket": add_f2p_ticket,
+            "mint_mask": mint_mask,
+        }
+    )
+    yield pool_ctx
 
-    await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
-        action_id,
-        action_version,
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
-        bcl_action_id,
-        bcl_action_version,
-    )
-    # Gate rows and block membership before the masks and samples they reference.
+    # This fixture finalizes before the shared one, so everything here lands
+    # ahead of the entity sweep — which the work tickets require, since they
+    # reference the prep_samples under RESTRICT.
+    await _delete_work_tickets(postgres_pool, seeded_actions)
+    # Gate rows and block membership before the masks and blocks they reference.
     if masks:
         await postgres_pool.execute(
             "DELETE FROM qiita.mask_sample WHERE mask_idx = ANY($1::bigint[])", masks
@@ -362,57 +331,19 @@ async def pool_ctx(postgres_pool):
         await postgres_pool.execute(
             "DELETE FROM qiita.block_member WHERE block_idx = ANY($1::bigint[])", blocks
         )
-    # Before the blocks: work_ticket.block_idx is a NO ACTION FK, so a block still
-    # referenced by a live ticket cannot be deleted. This delete cascades to the
-    # blocks anyway via qiita.block.work_ticket_idx (ON DELETE CASCADE).
-    await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
-        block_action_id,
-        block_action_version,
-    )
-    if blocks:
         await postgres_pool.execute(
             "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])", blocks
         )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
-        f2p_action_id,
-        f2p_action_version,
-    )
-    # Masks after the work_tickets that referenced them (mask_idx is ON DELETE
-    # SET NULL, so order isn't strictly required, but keep it FK-reverse).
     if masks:
         await postgres_pool.execute(
             "DELETE FROM qiita.mask_definition WHERE mask_idx = ANY($1::bigint[])", masks
         )
-    for _bs, _ps, ss_idx in samples:
-        await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await postgres_pool.execute(
-        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, action_version
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
-        bcl_action_id,
-        bcl_action_version,
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
-        block_action_id,
-        block_action_version,
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
-        f2p_action_id,
-        f2p_action_version,
-    )
-    for _bs, ps_idx, _ss in samples:
-        await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps_idx)
-    for bs_idx, _ps, _ss in samples:
-        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs_idx)
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", owner_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", owner_idx)
+    for seeded_action_id, seeded_version in seeded_actions:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
+            seeded_action_id,
+            seeded_version,
+        )
 
 
 async def test_empty_pool_is_all_zero(pool_ctx):
@@ -439,13 +370,13 @@ async def test_each_terminal_state_buckets(pool_ctx):
     """One sample per bucket: completed, in-flight (processing), no-data, failed,
     and not-submitted — each lands in exactly one count, and the five sum to
     sample_count."""
-    ps_done = await pool_ctx["add_sample"]()
+    ps_done = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_done, "completed")
-    ps_run = await pool_ctx["add_sample"]()
+    ps_run = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_run, "processing")
-    ps_empty = await pool_ctx["add_sample"]()
+    ps_empty = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_empty, "no_data")
-    ps_fail = await pool_ctx["add_sample"]()
+    ps_fail = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_fail, "failed")
     await pool_ctx["add_sample"]()  # not submitted
 
@@ -469,7 +400,7 @@ async def test_each_terminal_state_buckets(pool_ctx):
 async def test_no_data_excluded_from_failed_bucket(pool_ctx):
     """A sample whose only ticket is NO_DATA (an empty well) counts as no_data,
     NOT failed — the whole point of the distinct terminal outcome."""
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "no_data")
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
     assert row["sample_count"] == 1
@@ -482,7 +413,7 @@ async def test_no_data_wins_over_failed_retry(pool_ctx):
     no_data — no_data outranks failed, so an empty well that was retried then
     superseded doesn't get stuck in the failed bucket (and the pool can still
     reach `complete`)."""
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "failed")
     await pool_ctx["add_ticket"](ps, "no_data")
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
@@ -495,9 +426,9 @@ async def test_completed_plus_no_data_makes_pool_complete(pool_ctx):
     """A pool of real data with empty wells: completed + no_data == sample_count,
     so the PoolCompletionStatus `complete` flag fires (verified at the model
     layer; here we assert the buckets the flag reads)."""
-    ps_done = await pool_ctx["add_sample"]()
+    ps_done = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_done, "completed")
-    ps_empty = await pool_ctx["add_sample"]()
+    ps_empty = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_empty, "no_data")
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
     assert row["sample_count"] == 2
@@ -508,7 +439,7 @@ async def test_completed_plus_no_data_makes_pool_complete(pool_ctx):
 async def test_completed_wins_over_failed_retry(pool_ctx):
     """A sample with both a FAILED (first attempt) and a COMPLETED ticket counts
     as completed — completed has top precedence."""
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "failed")
     await pool_ctx["add_ticket"](ps, "completed")
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
@@ -520,7 +451,7 @@ async def test_completed_wins_over_failed_retry(pool_ctx):
 async def test_in_flight_wins_over_failed(pool_ctx):
     """A sample with a FAILED first attempt and a QUEUED resubmission (no
     COMPLETED) counts as in-flight, not failed — work is ongoing."""
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "failed")
     await pool_ctx["add_ticket"](ps, "queued")
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
@@ -531,9 +462,9 @@ async def test_in_flight_wins_over_failed(pool_ctx):
 async def test_retired_sample_excluded(pool_ctx):
     """A retired prep_sample contributes to no bucket, even with a COMPLETED
     ticket — it is out of the pool's active set."""
-    ps_active = await pool_ctx["add_sample"]()
+    ps_active = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_active, "completed")
-    ps_retired = await pool_ctx["add_sample"](retired=True)
+    ps_retired = (await pool_ctx["add_sample"](retired=True)).prep_sample_idx
     await pool_ctx["add_ticket"](ps_retired, "completed")
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
     assert row["sample_count"] == 1
@@ -543,9 +474,9 @@ async def test_retired_sample_excluded(pool_ctx):
 async def test_flagged_sample_excluded(pool_ctx):
     """An ENA-flagged prep_sample contributes to no bucket, even with a
     COMPLETED ticket — the same exclusion as a retired one."""
-    ps_active = await pool_ctx["add_sample"]()
+    ps_active = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_active, "completed")
-    ps_flagged = await pool_ctx["add_sample"](ena_status="suppressed")
+    ps_flagged = (await pool_ctx["add_sample"](ena_status="suppressed")).prep_sample_idx
     await pool_ctx["add_ticket"](ps_flagged, "completed")
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
     assert row["sample_count"] == 1
@@ -553,9 +484,9 @@ async def test_flagged_sample_excluded(pool_ctx):
 
 
 async def test_flagged_sample_excluded_from_read_mask_ticket_state_counts(pool_ctx):
-    ps_active = await pool_ctx["add_sample"]()
+    ps_active = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_active, "completed")
-    ps_flagged = await pool_ctx["add_sample"](ena_status="suppressed")
+    ps_flagged = (await pool_ctx["add_sample"](ena_status="suppressed")).prep_sample_idx
     await pool_ctx["add_ticket"](ps_flagged, "completed")
     counts = await fetch_sequenced_pool_read_mask_ticket_state_counts(
         pool_ctx["pool"], pool_ctx["pool_idx"]
@@ -564,9 +495,9 @@ async def test_flagged_sample_excluded_from_read_mask_ticket_state_counts(pool_c
 
 
 async def test_flagged_sample_excluded_from_read_mask_coverage(pool_ctx):
-    ps_active = await pool_ctx["add_sample"]()
+    ps_active = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_active, "completed")
-    ps_flagged = await pool_ctx["add_sample"](ena_status="suppressed")
+    ps_flagged = (await pool_ctx["add_sample"](ena_status="suppressed")).prep_sample_idx
     await pool_ctx["add_ticket"](ps_flagged, "completed")
     coverage = await fetch_sequenced_pool_read_mask_coverage(pool_ctx["pool"], pool_ctx["pool_idx"])
     assert coverage["sample_count"] == 1
@@ -582,7 +513,7 @@ async def test_withdrawn_run_is_invalidated_not_completed(pool_ctx):
     """A withdrawn run keeps its COMPLETED work ticket, so only the gate can
     report it — see `fetch_sequenced_pool_completion` for why."""
     mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "completed", mask_idx=mask, gate=False)
     await pool_ctx["add_gate"](ps, mask, "invalidated")
 
@@ -597,7 +528,7 @@ async def test_the_ticket_alone_would_have_called_it_completed(pool_ctx):
     counts as completed — so the invalidated result above is attributable to the
     withdrawal and not to the ticket being miscounted."""
     mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "completed", mask_idx=mask, gate=False)
     await pool_ctx["add_gate"](ps, mask, "completed")
 
@@ -610,7 +541,7 @@ async def test_withdrawal_outranks_a_running_remask(pool_ctx):
     """`invalidated` outranks `in_flight`: the sample reads withdrawn even while a
     re-mask runs."""
     mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "completed", mask_idx=mask, gate=False)
     await pool_ctx["add_gate"](ps, mask, "invalidated")
     await pool_ctx["add_ticket"](ps, "queued", mask_idx=mask)
@@ -626,7 +557,7 @@ async def test_a_second_mask_that_completed_keeps_the_sample_usable(pool_ctx):
     invalidated."""
     withdrawn_mask = await pool_ctx["mint_mask"]()
     good_mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_gate"](ps, withdrawn_mask, "invalidated")
     await pool_ctx["add_gate"](ps, good_mask, "completed")
 
@@ -644,7 +575,7 @@ async def test_a_completed_ticket_with_no_gate_row_still_counts_as_masked(pool_c
     sample is `completed` in `GET /mask-definition` and never-submitted here.
     """
     mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "completed", mask_idx=mask, gate=False)
 
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
@@ -657,7 +588,7 @@ async def test_a_gate_row_still_overrides_its_own_ticket(pool_ctx):
     than an OR: where a gate row exists it decides, so a withdrawal is not undone
     by the COMPLETED ticket underneath it."""
     mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "completed", mask_idx=mask, gate=False)
     await pool_ctx["add_gate"](ps, mask, "invalidated")
 
@@ -672,7 +603,7 @@ async def test_a_cancelled_ticket_is_not_reported_as_never_submitted(pool_ctx):
     stop should stay legible, so it gets its own bucket rather than reading as a
     sample nobody tried to mask."""
     mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "cancelled", mask_idx=mask)
 
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
@@ -689,7 +620,7 @@ async def test_a_pending_gate_awaiting_its_flip_is_outstanding_not_unsubmitted(p
     never submitted, which tells the operator to re-submit a sample a block
     re-plan then refuses with BlockMaskResubmitError."""
     mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_gate"](ps, mask, "pending")
     await pool_ctx["add_block"]([ps], "completed", mask_idx=mask)
 
@@ -704,7 +635,7 @@ async def test_a_pending_gate_does_not_hide_a_failed_block(pool_ctx):
     leaves the gate at 'pending' forever, and reading that as outstanding would
     hide the failure behind a bucket that says "still coming"."""
     mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_gate"](ps, mask, "pending")
     await pool_ctx["add_block"]([ps], "failed", mask_idx=mask)
 
@@ -719,7 +650,7 @@ async def test_a_deliberate_stop_outranks_the_failure_it_stopped(pool_ctx):
     failure". An operator cancels to stop a failing retry loop, so the stale
     FAILED is exactly what would hide the cancel if failed outranked it."""
     mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "failed", mask_idx=mask)
     await pool_ctx["add_ticket"](ps, "cancelled", mask_idx=mask)
 
@@ -737,8 +668,8 @@ async def test_block_masked_sample_is_completed_not_not_submitted(pool_ctx):
     """A block ticket carries block_idx with prep_sample_idx NULL, so the gate is
     what makes block-path masking visible here."""
     mask = await pool_ctx["mint_mask"]()
-    ps_a = await pool_ctx["add_sample"]()
-    ps_b = await pool_ctx["add_sample"]()
+    ps_a = (await pool_ctx["add_sample"]()).prep_sample_idx
+    ps_b = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_block"]([ps_a, ps_b], "completed", mask_idx=mask)
     await pool_ctx["add_gate"](ps_a, mask, "completed")
     await pool_ctx["add_gate"](ps_b, mask, "completed")
@@ -758,7 +689,7 @@ async def test_coverage_and_completion_disagree_on_a_block_masked_sample(pool_ct
     has no read-mask ticket of its own. Anything that re-derived one from the
     other would have to make one of these two assertions false."""
     mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_block"]([ps], "completed", mask_idx=mask)
     await pool_ctx["add_gate"](ps, mask, "completed")
 
@@ -775,8 +706,8 @@ async def test_a_running_block_puts_every_member_in_flight(pool_ctx):
     its gate row is still pending. The pending gate rows below are what the plan
     writes in production; the block ticket, not they, is what this asserts."""
     mask = await pool_ctx["mint_mask"]()
-    ps_a = await pool_ctx["add_sample"]()
-    ps_b = await pool_ctx["add_sample"]()
+    ps_a = (await pool_ctx["add_sample"]()).prep_sample_idx
+    ps_b = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_block"]([ps_a, ps_b], "processing", mask_idx=mask)
     await pool_ctx["add_gate"](ps_a, mask, "pending")
     await pool_ctx["add_gate"](ps_b, mask, "pending")
@@ -788,8 +719,8 @@ async def test_a_running_block_puts_every_member_in_flight(pool_ctx):
 
 async def test_a_failed_block_puts_every_member_in_failed(pool_ctx):
     mask = await pool_ctx["mint_mask"]()
-    ps_a = await pool_ctx["add_sample"]()
-    ps_b = await pool_ctx["add_sample"]()
+    ps_a = (await pool_ctx["add_sample"]()).prep_sample_idx
+    ps_b = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_gate"](ps_a, mask, "pending")
     await pool_ctx["add_gate"](ps_b, mask, "pending")
     await pool_ctx["add_block"]([ps_a, ps_b], "failed", mask_idx=mask)
@@ -804,7 +735,7 @@ async def test_a_sample_outside_the_block_is_untouched_by_it(pool_ctx):
     block ticket to a sample, so a sample the block does not cover keeps its own
     classification."""
     mask = await pool_ctx["mint_mask"]()
-    ps_in = await pool_ctx["add_sample"]()
+    ps_in = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_sample"]()  # not a member of the block
     await pool_ctx["add_gate"](ps_in, mask, "pending")
     await pool_ctx["add_block"]([ps_in], "failed", mask_idx=mask)
@@ -820,7 +751,7 @@ async def test_fastq_to_parquet_masking_counts_as_masked(pool_ctx):
     PER_SAMPLE_MASK_ACTION_IDS, not `read-mask` alone, so an ingest-and-mask
     ticket is not invisible to it."""
     mask = await pool_ctx["mint_mask"]()
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_f2p_ticket"](ps, "processing", mask_idx=mask)
 
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
@@ -832,17 +763,17 @@ async def test_every_sample_lands_in_exactly_one_bucket(pool_ctx):
     """One sample per bucket, across both masking paths, asserting the partition
     the docstring promises: the seven buckets sum to sample_count."""
     mask = await pool_ctx["mint_mask"]()
-    ps_done = await pool_ctx["add_sample"]()
+    ps_done = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_done, "completed", mask_idx=mask)
-    ps_gone = await pool_ctx["add_sample"]()
+    ps_gone = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_gate"](ps_gone, mask, "invalidated")
-    ps_run = await pool_ctx["add_sample"]()
+    ps_run = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_block"]([ps_run], "processing", mask_idx=mask)
-    ps_empty = await pool_ctx["add_sample"]()
+    ps_empty = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_empty, "no_data")
-    ps_fail = await pool_ctx["add_sample"]()
+    ps_fail = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_fail, "failed")
-    ps_stopped = await pool_ctx["add_sample"]()
+    ps_stopped = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_stopped, "cancelled")
     await pool_ctx["add_sample"]()  # never submitted
 
@@ -912,9 +843,9 @@ async def test_reference_scoped_completion_distinguishes_per_reference(pool_ctx)
     mask_a = await pool_ctx["mint_mask"](rype_ref=ref_a)
     mask_b = await pool_ctx["mint_mask"](minimap2_ref=ref_b)
 
-    ps_a = await pool_ctx["add_sample"]()
+    ps_a = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_a, "completed", mask_idx=mask_a)
-    ps_b = await pool_ctx["add_sample"]()
+    ps_b = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps_b, "completed", mask_idx=mask_b)
 
     # Reference-agnostic: both masked → both completed.
@@ -944,7 +875,7 @@ async def test_reference_scoped_matches_rype_or_minimap2(pool_ctx):
     a mask that names reference 300 only as its minimap2 reference still counts
     when scoped to 300."""
     mask = await pool_ctx["mint_mask"](minimap2_ref=300)
-    ps = await pool_ctx["add_sample"]()
+    ps = (await pool_ctx["add_sample"]()).prep_sample_idx
     await pool_ctx["add_ticket"](ps, "completed", mask_idx=mask)
     scoped = await fetch_sequenced_pool_completion(
         pool_ctx["pool"], pool_ctx["pool_idx"], reference_idx=300
@@ -989,7 +920,7 @@ async def test_reference_scope_matches_real_build_mask_params_keys(pool_ctx):
         pool_ctx["pool_idx"],
     )
     try:
-        ps = await pool_ctx["add_sample"]()
+        ps = (await pool_ctx["add_sample"]()).prep_sample_idx
         await pool_ctx["add_ticket"](ps, "completed", mask_idx=mask_idx)
         scoped = await fetch_sequenced_pool_completion(db, pool_ctx["pool_idx"], reference_idx=ref)
         assert scoped["samples_completed"] == 1

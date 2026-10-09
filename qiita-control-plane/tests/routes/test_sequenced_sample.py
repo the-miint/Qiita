@@ -78,6 +78,11 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_global_field,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import (
+    delete_idxs,
+    delete_principal,
+    teardown_entity_graph,
+)
 from qiita_control_plane.testing.unique_names import unique_accession
 
 from .conftest import (
@@ -87,7 +92,6 @@ from .conftest import (
     _seed_study,
     assert_owner_ineligibility_422,
     assert_submission_error_cleared_on_new_attempt,
-    delete_idxs,
     resolve_ineligible_owner_idx,
     unique_instrument_id,
 )
@@ -104,88 +108,36 @@ def _unique_item_id(prefix: str = "ITEM") -> str:
 
 
 # ---------------------------------------------------------------------------
-# FK-reverse cleanup
+# Teardown
 # ---------------------------------------------------------------------------
 
 
 async def _cleanup_tracked(pool, created: dict) -> None:
-    """Drop tracked rows in FK-reverse order.
-
-    Order matters because of ON DELETE RESTRICT FKs throughout the chain:
-      prep_sample_metadata
-      prep_sample_study_field (bulk-scoped to test-owned studies)
-      prep_sample_to_study (composite PK)
-      sequenced_sample
-      work_ticket
-      prep_sample
-      sequenced_pool
-      sequencing_run
-      biosample_to_study (composite PK)
-      biosample
-      study_access (composite of study_idx + principal_idx)
-      study
-      principals
-
-    prep_sample_study_field rows are bulk-deleted by parent study because
-    each test seeds its own study (see _seed_study) — no other test can
-    plant fields on a study this test owns, so the parent-FK delete is
-    safe and avoids the per-row snapshot bookkeeping the response payload
-    used to enable.
-    """
-    await delete_idxs(pool, "prep_sample_metadata", created["prep_sample_metadata"])
-    if created["study"]:
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample_study_field WHERE study_idx = ANY($1::bigint[])",
-            created["study"],
-        )
-    for ps, st in created["prep_sample_to_study"]:
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
-            ps,
-            st,
-        )
-    await delete_idxs(pool, "sequenced_sample", created["sequenced_sample"])
+    """Drop the work tickets, then the sample entity graph, then everything the
+    sweep does not own."""
+    # work_ticket's PK is work_ticket_idx (not idx), so delete_idxs does not apply.
+    await pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+        created["work_ticket"],
+    )
+    await teardown_entity_graph(
+        pool,
+        study_idxs=created["study"],
+        biosample_idxs=created["biosample"],
+        prep_sample_idxs=created["prep_sample"],
+    )
     # host_filter_profile FKs the reference with ON DELETE RESTRICT, so the
     # profiles must go before the references they point at, just below.
     await delete_idxs(pool, "host_filter_profile", created["host_filter_profile"])
-    # References are FK'd by sequenced_sample.host_*_reference_idx (ON DELETE
-    # RESTRICT), so drop them only after the samples above are gone. The
-    # reference PK is reference_idx (not idx), so delete_idxs does not apply.
+    # The reference PK is reference_idx (not idx), so delete_idxs does not apply.
     if created["reference"]:
         await pool.execute(
             "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
             created["reference"],
         )
-    # work_ticket's PK is work_ticket_idx (not idx), so delete_idxs does not
-    # apply; its rows must go before the pool/principal they reference.
-    await pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
-        created["work_ticket"],
-    )
-    await delete_idxs(pool, "prep_sample", created["prep_sample"])
     await delete_idxs(pool, "sequenced_pool", created["sequenced_pool"])
     await delete_idxs(pool, "sequencing_run", created["sequencing_run"])
-    for bs, st in created["biosample_to_study"]:
-        await pool.execute(
-            "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
-            bs,
-            st,
-        )
-    # biosample_metadata references the biosample and its study field; the
-    # field references the (seeded, shared) global field, which we never own.
-    await delete_idxs(pool, "biosample_metadata", created["biosample_metadata"])
-    await delete_idxs(pool, "biosample_study_field", created["biosample_study_field"])
-    await delete_idxs(pool, "biosample", created["biosample"])
-    for st, pr in created["study_access"]:
-        await pool.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
-            st,
-            pr,
-        )
-    await delete_idxs(pool, "study", created["study"])
-    # No inbound FKs left at this point: prep_sample_metadata has been
-    # deleted, so missing_value_reason is unreferenced; prep_sample_study_field
-    # has been bulk-deleted, so prep_sample_global_field is unreferenced.
+    # Both are referenced only by metadata and study-field rows the sweep removed.
     await delete_idxs(pool, "prep_sample_global_field", created["prep_sample_global_field"])
     await delete_idxs(pool, "missing_value_reason", created["missing_value_reason"])
     all_principals = created["user_principals"] + created["service_account_principals"]
@@ -194,17 +146,12 @@ async def _cleanup_tracked(pool, created: dict) -> None:
             "DELETE FROM qiita.api_token WHERE principal_idx = ANY($1::bigint[])",
             all_principals,
         )
-    if created["user_principals"]:
-        await pool.execute(
-            "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
-            created["user_principals"],
-        )
     if created["service_account_principals"]:
         await pool.execute(
             "DELETE FROM qiita.service_account WHERE principal_idx = ANY($1::bigint[])",
             created["service_account_principals"],
         )
-    await delete_idxs(pool, "principal", all_principals)
+    await delete_principal(pool, all_principals)
 
 
 # ---------------------------------------------------------------------------
@@ -214,26 +161,19 @@ async def _cleanup_tracked(pool, created: dict) -> None:
 
 @pytest_asyncio.fixture
 async def ctx(role_keyed_clients):
-    """Per-test fixture: route-keyed clients plus a `created` tracker for
-    FK-reverse teardown over every table the composer writes (plus its
-    inputs the test seeds). Also seeds the download-ena-study action row
+    """Per-test fixture: route-keyed clients plus a `created` tracker.
+
+    Also seeds the download-ena-study action row
     that a staged-roster work_ticket FKs, and removes it afterwards iff
     this test created it."""
     created: dict = {
         "work_ticket": [],
-        "prep_sample_metadata": [],
-        "biosample_metadata": [],
-        "biosample_study_field": [],
         "host_filter_profile": [],
-        "prep_sample_to_study": [],
-        "sequenced_sample": [],
         "reference": [],
         "prep_sample": [],
         "sequenced_pool": [],
         "sequencing_run": [],
-        "biosample_to_study": [],
         "biosample": [],
-        "study_access": [],
         "study": [],
         "prep_sample_global_field": [],
         "missing_value_reason": [],
@@ -274,7 +214,6 @@ async def _seed_biosample_linked_to_study(ctx, *, owner_idx: int, study_idx: int
         study_idx=study_idx,
         created_by_idx=owner_idx,
     )
-    ctx["created"]["biosample_to_study"].append((bs_idx, study_idx))
     return bs_idx
 
 
@@ -322,23 +261,8 @@ async def _post_sequenced_sample(client, ctx, run_idx, pool_idx, **body):
         json=body,
     )
     if resp.status_code == 201:
-        rj = resp.json()
-        ps_idx = rj["prep_sample_idx"]
-        ss_idx = rj["sequenced_sample_idx"]
+        ps_idx = resp.json()["prep_sample_idx"]
         ctx["created"]["prep_sample"].append(ps_idx)
-        ctx["created"]["sequenced_sample"].append(ss_idx)
-        # Track every per-test study link the composer wrote: the primary
-        # plus any secondaries.
-        ctx["created"]["prep_sample_to_study"].append((ps_idx, body["primary_study_idx"]))
-        for st in body.get("secondary_study_idxs", []):
-            ctx["created"]["prep_sample_to_study"].append((ps_idx, st))
-        # Track prep_sample_metadata rows by looking them up after the call.
-        meta_rows = await ctx["pool"].fetch(
-            "SELECT idx FROM qiita.prep_sample_metadata WHERE prep_sample_idx = $1",
-            ps_idx,
-        )
-        for r in meta_rows:
-            ctx["created"]["prep_sample_metadata"].append(r["idx"])
     return resp
 
 
@@ -995,7 +919,6 @@ async def test_import_sequenced_sample_from_run_multi_study_happy_path(ctx):
         study_idx=secondary_idx,
         created_by_idx=ctx["wet_session"]["principal_idx"],
     )
-    ctx["created"]["biosample_to_study"].append((bs_idx, secondary_idx))
     protocol_idx = await _fetch_prep_protocol_idx(ctx)
 
     resp = await _post_sequenced_sample(
@@ -1060,7 +983,6 @@ async def test_import_sequenced_sample_from_run_duplicate_secondary_dedupes(ctx)
         study_idx=secondary_idx,
         created_by_idx=ctx["wet_session"]["principal_idx"],
     )
-    ctx["created"]["biosample_to_study"].append((bs_idx, secondary_idx))
     protocol_idx = await _fetch_prep_protocol_idx(ctx)
 
     resp = await _post_sequenced_sample(
@@ -1386,7 +1308,6 @@ async def _seed_one_sequenced_sample(
     protocol_idx = await _fetch_prep_protocol_idx(ctx)
     item_id = _unique_item_id(suffix.upper())
 
-    # Land the composite; route tracks each row in ctx for FK-reverse cleanup.
     resp = await _post_sequenced_sample(
         ctx["wet"],
         ctx,
@@ -2354,7 +2275,6 @@ async def test_list_sequenced_sample_idxs_in_study_surfaces_secondary_link(ctx):
         study_idx=secondary_idx,
         created_by_idx=ctx["wet_session"]["principal_idx"],
     )
-    ctx["created"]["biosample_to_study"].append((bs_idx, secondary_idx))
     protocol_idx = await _fetch_prep_protocol_idx(ctx)
 
     # Compose one sequenced_sample whose supertype prep_sample lands a
@@ -3419,23 +3339,21 @@ async def _bind_host_taxon_field(ctx, study_idx):
             display_name="host taxon id",
             created_by_idx=ctx["wet_session"]["principal_idx"],
         )
-    ctx["created"]["biosample_study_field"].append(field_idx)
     return field_idx
 
 
 async def _write_host_taxon(ctx, *, biosample_idx, field_idx, term_idx=None, reason_idx=None):
     """Write the sample's host_taxon_id as either a terminology term or a missing-reason."""
     column = "value_terminology_term_idx" if term_idx is not None else "value_missing_reason_idx"
-    meta_idx = await ctx["pool"].fetchval(
+    await ctx["pool"].execute(
         f"INSERT INTO qiita.biosample_metadata"
         f" (biosample_idx, biosample_study_field_idx, {column}, created_by_idx)"
-        f" VALUES ($1, $2, $3, $4) RETURNING idx",
+        f" VALUES ($1, $2, $3, $4)",
         biosample_idx,
         field_idx,
         term_idx if term_idx is not None else reason_idx,
         ctx["wet_session"]["principal_idx"],
     )
-    ctx["created"]["biosample_metadata"].append(meta_idx)
 
 
 async def _seed_illumina_human_profile(ctx, suffix):
@@ -3616,7 +3534,6 @@ async def test_get_sequenced_sample_in_study_returns_global_and_local_metadata(c
         value="LOCAL-1",
         created_by_idx=ctx["wet_session"]["principal_idx"],
     )
-    ctx["created"]["prep_sample_metadata"].append(metadata_idx)
 
     resp = await ctx["wet"].get(
         URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
@@ -3871,16 +3788,6 @@ async def _patch_sequenced_metadata(
     )
 
 
-async def _track_prep_sample_metadata(ctx, prep_sample_idx):
-    """Track every prep_sample_metadata row for a prep_sample for FK-reverse cleanup."""
-    rows = await ctx["pool"].fetch(
-        "SELECT idx FROM qiita.prep_sample_metadata WHERE prep_sample_idx = $1", prep_sample_idx
-    )
-    for r in rows:
-        if r["idx"] not in ctx["created"]["prep_sample_metadata"]:
-            ctx["created"]["prep_sample_metadata"].append(r["idx"])
-
-
 async def _seed_prep_global_field(ctx, *, data_type=FieldDataType.TEXT):
     """Seed one prep_sample global field; track it.
 
@@ -3927,7 +3834,6 @@ async def test_patch_sequenced_sample_metadata_inserts_global_and_local(ctx):
         {global_name: "GVAL", local_name: "LVAL"},
     )
     assert resp.status_code == 200, resp.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
 
     rj = resp.json()
     expected = {
@@ -3961,7 +3867,6 @@ async def test_patch_sequenced_sample_metadata_updates_existing_value(ctx):
         ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "V1"}
     )
     assert first.status_code == 200, first.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
 
     resp = await _patch_sequenced_metadata(
         ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "V2"}
@@ -3989,7 +3894,6 @@ async def test_patch_sequenced_sample_metadata_unchanged_on_identical_value(ctx)
         ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "SAME"}
     )
     assert first.status_code == 200, first.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
 
     resp = await _patch_sequenced_metadata(
         ctx["wet"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "SAME"}
@@ -4023,7 +3927,6 @@ async def test_patch_sequenced_sample_metadata_internal_name_is_the_read_key(ctx
         {global_name: "GVAL"},
     )
     assert written.status_code == 200, written.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
 
     read = await ctx["wet"].get(
         URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
@@ -4055,7 +3958,6 @@ async def test_patch_sequenced_sample_metadata_internal_name_keying_round_trips(
         global_internal_names=True,
     )
     assert written.status_code == 200, written.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
     assert written.json() == {
         "results": {
             global_internal: {
@@ -4117,7 +4019,6 @@ async def test_patch_sequenced_sample_metadata_foreign_study_409(ctx):
     await seed_biosample_to_study_link(
         ctx["pool"], biosample_idx=bs_idx, study_idx=study_b, created_by_idx=wet_idx
     )
-    ctx["created"]["biosample_to_study"].append((bs_idx, study_b))
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "patch-fs")
     protocol_idx = await _fetch_prep_protocol_idx(ctx)
     post = await _post_sequenced_sample(
@@ -4134,13 +4035,11 @@ async def test_patch_sequenced_sample_metadata_foreign_study_409(ctx):
     )
     assert post.status_code == 201, post.text
     ss_idx = post.json()["sequenced_sample_idx"]
-    prep_idx = post.json()["prep_sample_idx"]
     _global_idx, name, internal_name = await _seed_prep_global_field(ctx)
 
     # Study A writes the global value first (contributing study = A).
     first = await _patch_sequenced_metadata(ctx["wet"], study_a, ss_idx, {name: "VAL-A"})
     assert first.status_code == 200, first.text
-    await _track_prep_sample_metadata(ctx, prep_idx)
 
     # Study B writing a different value to the same global slot collides.
     resp = await _patch_sequenced_metadata(ctx["wet"], study_b, ss_idx, {name: "VAL-B"})
@@ -4213,7 +4112,6 @@ async def test_patch_sequenced_sample_metadata_link_retired_mid_write_404(
             {global_name: "BEFORE"},
         )
         assert seed_resp.status_code == 200, seed_resp.text
-        await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
     await retire_prep_sample_to_study_link(
         ctx["pool"],
         prep_sample_idx=seeded["prep_sample_idx"],
@@ -4332,7 +4230,6 @@ async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
         ctx["user"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "AVAL"}
     )
     assert resp.status_code == 200, resp.text
-    await _track_prep_sample_metadata(ctx, seeded["prep_sample_idx"])
     assert resp.json() == {
         "results": {
             name: {
@@ -4352,9 +4249,9 @@ async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
 
 async def _seed_roster_case(ctx, suffix: str) -> tuple[int, int, int, int, int]:
     """Seed one roster test's precondition chain: run, pool, study, a
-    biosample linked to the study, and the prep-protocol idx, all tracked for
-    FK-reverse teardown. The wet_lab_admin principal owns every row, so the
-    default POST passes the route's ownership and study-admin gates."""
+    biosample linked to the study, and the prep-protocol idx. The wet_lab_admin
+    principal owns every row, so the default POST passes the route's ownership
+    and study-admin gates."""
     run_idx, pool_idx = await _seed_run_and_pool(ctx, suffix)
     study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix=suffix)
     bs_idx = await _seed_biosample_linked_to_study(

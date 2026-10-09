@@ -17,8 +17,9 @@ from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_SEQUENCING_RUN_SEQUENCED_POOL
 
 from qiita_control_plane.main import app
+from qiita_control_plane.testing.db_teardown import delete_idxs
 
-from .conftest import delete_idxs, unique_instrument_id
+from .conftest import unique_instrument_id
 
 pytestmark = pytest.mark.db
 
