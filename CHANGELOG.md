@@ -4039,7 +4039,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `403` whether or not a range exists, and for an unknown or unlinked prep_sample. A
   `sequence_range:mint` caller (the compute service account) reads any range as before,
   and the response body is unchanged.
-- **Tests tear down their fixtures by parent FK rather than by tracked row (#N).** A
+- **Tests tear down their fixtures by parent FK rather than by tracked row (#670).** A
   test passes `teardown_entity_graph` the idxs of its study, biosample and
   prep_sample, and the helper deletes every row that hangs off them. That now
   includes rows which a trigger or a cascade created, and which the per-row
