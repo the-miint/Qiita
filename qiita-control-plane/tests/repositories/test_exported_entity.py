@@ -5,6 +5,7 @@ import pytest
 from qiita_control_plane.repositories.exported_entity import (
     MissingExportedEntityError,
     fetch_exported_entities,
+    require_export_entity_id,
 )
 from qiita_control_plane.testing.db_seeds import (
     cleanup_exported_entity_probe,
@@ -113,4 +114,25 @@ async def test_fetch_exported_entities_raise_missing(postgres_pool, probe):
 
     actual = {"missing": caught.value.missing, "kind": caught.value.kind}
     expected = {"missing": [_ABSENT_IDX], "kind": "biosample"}
+    assert actual == expected
+
+
+def test_require_export_entity_id():
+    """Tests the case where an entity row carries its export_entity_id."""
+    row = {"idx": 7, "export_entity_id": "QS3"}
+    assert require_export_entity_id(row, kind="study") == "QS3"
+
+
+def test_require_export_entity_id_raise_missing():
+    """Tests the case where an entity row's export_entity_id is NULL.
+
+    The error names the entity by its idx and kind, rather than letting the
+    NULL reach a response.
+    """
+    row = {"idx": 7, "export_entity_id": None}
+    with pytest.raises(MissingExportedEntityError) as caught:
+        require_export_entity_id(row, kind="biosample")
+
+    actual = {"missing": caught.value.missing, "kind": caught.value.kind}
+    expected = {"missing": [7], "kind": "biosample"}
     assert actual == expected

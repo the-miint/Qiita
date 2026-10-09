@@ -1,12 +1,17 @@
 """Reads of `qiita.exported_entity`."""
 
+from collections.abc import Mapping
+from typing import Any, Literal
+
 import asyncpg
 
 from ._exported_identifier_helpers import missing_from
 
+EntityKind = Literal["study", "biosample"]
+
 # The entity column per kind. A column name cannot be bound as a parameter, so the
 # kind selects one from this closed mapping rather than from caller input.
-_ENTITY_COLUMN = {"study": "study_idx", "biosample": "biosample_idx"}
+_ENTITY_COLUMN: dict[EntityKind, str] = {"study": "study_idx", "biosample": "biosample_idx"}
 
 # Every caller-visible column, both kinds in one pass. Study entries come first
 # ascending, then biosample entries ascending: `study_idx IS NULL` is false on a
@@ -21,7 +26,7 @@ _SELECT = (
 
 
 class MissingExportedEntityError(RuntimeError):
-    """Requested entities that have no exported handle.
+    """Requested entities that have no export_entity_id.
 
     Carries the missing identifiers and the kind they belong to. Every existing
     study and biosample holds a handle, so each one names either no entity at all
@@ -32,12 +37,23 @@ class MissingExportedEntityError(RuntimeError):
         self.missing = missing
         self.kind = kind
         super().__init__(
-            f"{len(missing)} {kind}(s) have no exported handle or do not exist: {missing}"
+            f"{len(missing)} {kind}(s) have no export_entity_id or do not exist: {missing}"
         )
 
 
+def require_export_entity_id(row: Mapping[str, Any], *, kind: EntityKind) -> str:
+    """Return the `export_entity_id` of an entity row, which also carries `idx`.
+
+    Raises `MissingExportedEntityError` naming the entity when the value is NULL.
+    """
+    export_entity_id = row["export_entity_id"]
+    if export_entity_id is None:
+        raise MissingExportedEntityError([row["idx"]], kind=kind)
+    return export_entity_id
+
+
 async def fetch_exported_entities(
-    pool: asyncpg.Pool,
+    pool: asyncpg.Pool | asyncpg.Connection,
     *,
     study_idx: list[int],
     biosample_idx: list[int],

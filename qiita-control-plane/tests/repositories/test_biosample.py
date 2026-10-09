@@ -45,6 +45,7 @@ from qiita_control_plane.repositories.biosample_metadata import (
     BiosampleOwnerIdMissingValueError,
 )
 from qiita_control_plane.testing.db_seeds import (
+    fetch_export_entity_id,
     retire_biosample,
     retire_biosample_to_study_link,
     seed_biosample_global_field,
@@ -1323,6 +1324,9 @@ async def test_fetch_biosample_returns_row(ctx):
 
     expected = {
         "idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": ctx["biosample_owner_idx"],
         "metadata_checklist_idx": ctx["checklist_idx"],
         "metadata_checklist_name": ctx["checklist_name"],
@@ -1487,6 +1491,9 @@ async def test_update_biosample_writes_single_field(ctx):
 
     expected = {
         "idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": ctx["biosample_owner_idx"],
         "metadata_checklist_idx": ctx["checklist_idx"],
         "metadata_checklist_name": ctx["checklist_name"],
@@ -1546,6 +1553,9 @@ async def test_update_biosample_writes_all_editable_fields(ctx):
 
     expected = {
         "idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": ctx["principal_idx"],
         "metadata_checklist_idx": None,
         "metadata_checklist_name": None,

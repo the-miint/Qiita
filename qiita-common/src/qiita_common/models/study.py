@@ -86,6 +86,7 @@ class StudyResponse(BaseModel):
     """
 
     study_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     owner_idx: Annotated[int, Field(gt=0)]
     principal_investigator_idx: int | None
     title: str

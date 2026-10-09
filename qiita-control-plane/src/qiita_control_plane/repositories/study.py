@@ -24,7 +24,9 @@ _STUDY_RETURNING_COLS = (
     " description, abstract, funding, ena_study_accession,"
     " bioproject_accession, notes, last_submission_at, submission_error,"
     " extra_metadata, default_tier, created_by_idx,"
-    " created_at, updated_at"
+    " created_at, updated_at,"
+    " (SELECT export_entity_id FROM qiita.exported_entity ee"
+    "  WHERE ee.study_idx = study.idx) AS export_entity_id"
 )
 
 
@@ -324,7 +326,10 @@ async def create_study(
         granted_by_idx=created_by_idx,
     )
 
-    return study_row
+    # Step c: re-read the row, since the INSERT's RETURNING ran before the
+    # AFTER INSERT trigger minted its export_entity_id.
+    created_row = await fetch_study(conn, study_row["idx"])
+    return created_row
 
 
 class EnaStudyAccessionConflictError(Exception):

@@ -84,7 +84,9 @@ _BIOSAMPLE_RETURNING_COLS = (
     " biosample_accession, ena_sample_accession, matrix_tube_id,"
     " last_submission_at, submission_error, last_metadata_change_at,"
     " created_by_idx, created_at, updated_at,"
-    " retired, retired_by_idx, retired_at, retire_reason"
+    " retired, retired_by_idx, retired_at, retire_reason,"
+    " (SELECT export_entity_id FROM qiita.exported_entity ee"
+    "  WHERE ee.biosample_idx = biosample.idx) AS export_entity_id"
 )
 
 

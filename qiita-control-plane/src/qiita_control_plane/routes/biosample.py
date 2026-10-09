@@ -92,6 +92,7 @@ from ..repositories.biosample_metadata import (
     BiosampleOwnerIdFieldCollisionError,
     BiosampleOwnerIdMissingValueError,
 )
+from ..repositories.exported_entity import fetch_exported_entities, require_export_entity_id
 from ._helpers import (
     ETAG_HEADER,
     GENERIC_CHECK_VIOLATION,
@@ -358,8 +359,12 @@ async def _import_one_biosample(
             " for too long; nothing was stored — resubmit the identical request"
         )
 
+    exported_rows = await fetch_exported_entities(
+        conn, study_idx=[], biosample_idx=[result.biosample_idx]
+    )
     return BiosampleImportResponse(
         biosample_idx=result.biosample_idx,
+        export_entity_id=exported_rows[0]["export_entity_id"],
         owner_id_biosample_study_field_idx=result.owner_id_biosample_study_field_idx,
         owner_id_biosample_study_field_created=result.owner_id_biosample_study_field_created,
     )
@@ -966,6 +971,7 @@ def _biosample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
     """
     return {
         "biosample_idx": row["idx"],
+        "export_entity_id": require_export_entity_id(row, kind="biosample"),
         "owner_idx": row["owner_idx"],
         "metadata_checklist": MetadataChecklistRef.from_row(
             row["metadata_checklist_idx"], row["metadata_checklist_name"]

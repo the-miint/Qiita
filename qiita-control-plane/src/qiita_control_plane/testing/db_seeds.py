@@ -32,6 +32,7 @@ from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
 from qiita_common.models import FieldDataType, GenomeSource, ReferenceStatus, TerminologyStatus
 
 from qiita_control_plane.miint import connect_with_miint
+from qiita_control_plane.repositories.exported_entity import _ENTITY_COLUMN, EntityKind
 from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
@@ -75,6 +76,18 @@ async def fetch_missing_value_reason_idx(pool: asyncpg.Pool, name: str) -> int |
     migration ('not applicable', 'not collected', 'missing: control sample', …).
     """
     return await pool.fetchval("SELECT idx FROM qiita.missing_value_reason WHERE name = $1", name)
+
+
+async def fetch_export_entity_id(
+    pool: asyncpg.Pool, *, kind: EntityKind, entity_idx: int
+) -> str | None:
+    """Return the export_entity_id qiita.exported_entity holds for one study or
+    biosample, or None when it holds none."""
+    column = _ENTITY_COLUMN[kind]
+    export_entity_id = await pool.fetchval(
+        f"SELECT export_entity_id FROM qiita.exported_entity WHERE {column} = $1", entity_idx
+    )
+    return export_entity_id
 
 
 async def seed_terminology(

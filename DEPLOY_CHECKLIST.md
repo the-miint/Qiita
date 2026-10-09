@@ -37,7 +37,7 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `[operator]` `make migrate` applies `20261006000000_exported_entity.sql` (new table `qiita.exported_entity`, mint-on-insert triggers on `qiita.study` and `qiita.biosample`, and a backfill of one row per existing study and biosample, all in one transaction). (#feat/exported-entity)
 
 ### 4. Deploy
 
@@ -60,6 +60,12 @@ _None yet._
       python3 -c "import duckdb; print(duckdb.__version__)" | grep -Fxq 1.5.5 \
       || { echo "$s is not on DuckDB 1.5.5"; exit 1; }
   done && echo DUCKDB_155_OK'
+  ```
+- `[operator]` **Every study and biosample has an `exported_entity` row** — the backfill
+  and the triggers left none out. Expect `0`. (#feat/exported-entity)
+  ```bash
+  set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -tAc "SELECT (SELECT count(*) FROM qiita.study s WHERE NOT EXISTS (SELECT 1 FROM qiita.exported_entity e WHERE e.study_idx = s.idx)) + (SELECT count(*) FROM qiita.biosample b WHERE NOT EXISTS (SELECT 1 FROM qiita.exported_entity e WHERE e.biosample_idx = b.idx))"
   ```
 
 ### 6. After the deploy verifies green
@@ -102,6 +108,7 @@ _None yet._
 - (#653) Run entries of `GET /ena-import-batch/{idx}` gain `metadata_warnings` (a list, empty when there is nothing to report); clients validating that shape strictly must accept it.
 - (#653) `qiita-admin backfill host-taxon-id` now also resolves more taxa: human, human skin, mouse gut and mouse skin metagenomes get that host, and soil, marine, sediment, salt marsh, sand, microbial mat, stromatolite and coal metagenomes get `not applicable`. A re-run writes those biosamples instead of reporting them unresolved, so read the default dry-run plan before passing `--execute`.
 - Behavior change (#661): a ticket that exhausts `max_retries` on a retriable failure now ends `failure_type=permanent` in `GET /work-ticket` (reason prefixed `retries_exhausted`) and is emailed in the notify digest instead of being held. Tickets already held as `retriable` are unchanged.
+- (#feat/exported-entity) Study responses (`POST`/`GET`/`PATCH /study`), biosample responses (`GET`/`PATCH /biosample/{idx}` and the study-scoped biosample reads and metadata PATCHes), and each result of a biosample import (single and bulk) gain `export_entity_id` (`QS<n>` / `QB<n>`); clients validating those shapes strictly must accept it.
 
 ## Deployed history
 

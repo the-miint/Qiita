@@ -35,7 +35,11 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 
-from qiita_control_plane.testing.db_seeds import seed_service_principal, seed_user_principal
+from qiita_control_plane.testing.db_seeds import (
+    fetch_export_entity_id,
+    seed_service_principal,
+    seed_user_principal,
+)
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 from qiita_control_plane.testing.unique_names import unique_accession
 
@@ -191,6 +195,10 @@ async def test_post_study_full_body_round_trips(ctx):
         "study_idx": rj["study_idx"],
         "created_at": rj["created_at"],
         "updated_at": rj["updated_at"],
+        # Read from the table independently of the route under test.
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="study", entity_idx=rj["study_idx"]
+        ),
         "owner_idx": caller_idx,
         "principal_investigator_idx": None,
         "title": title,
