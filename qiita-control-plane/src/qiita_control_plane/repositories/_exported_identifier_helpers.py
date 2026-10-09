@@ -1,4 +1,4 @@
-"""Shared pieces of the exported-handle mints."""
+"""Shared pieces of the exported-handle repositories."""
 
 from collections.abc import Mapping, Sequence
 from typing import Any

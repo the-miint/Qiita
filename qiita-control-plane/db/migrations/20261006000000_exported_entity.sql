@@ -86,6 +86,59 @@ CREATE UNIQUE INDEX exported_entity_export_entity_id_unique
     ON qiita.exported_entity (export_entity_id);
 
 
+-- =============================================================================
+-- TRIGGER: mint the handle when its entity is inserted
+--
+-- Every study and biosample holds a handle from the transaction that creates it,
+-- whichever path creates it. The handle is attributed to the entity's creator,
+-- which may be a service account. Writes only to exported_entity, never to the
+-- entity row: an UPDATE there would bump its updated_at and meet its publication
+-- lock.
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION qiita.tg_mint_exported_entity()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_TABLE_NAME = 'study' THEN
+        INSERT INTO qiita.exported_entity (study_idx, created_by_idx)
+        VALUES (NEW.idx, NEW.created_by_idx);
+    ELSIF TG_TABLE_NAME = 'biosample' THEN
+        INSERT INTO qiita.exported_entity (biosample_idx, created_by_idx)
+        VALUES (NEW.idx, NEW.created_by_idx);
+    ELSE
+        RAISE EXCEPTION 'tg_mint_exported_entity has no entity column for qiita.%', TG_TABLE_NAME;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER study_mint_exported_entity
+    AFTER INSERT ON qiita.study
+    FOR EACH ROW EXECUTE FUNCTION qiita.tg_mint_exported_entity();
+
+CREATE TRIGGER biosample_mint_exported_entity
+    AFTER INSERT ON qiita.biosample
+    FOR EACH ROW EXECUTE FUNCTION qiita.tg_mint_exported_entity();
+
+
+-- =============================================================================
+-- BACKFILL: a handle for every entity that predates the trigger
+--
+-- Runs after the triggers are created, in the same transaction: creating them
+-- waits out every in-flight insert and blocks new ones until commit, so each
+-- entity is either visible here or minted by the trigger.
+-- =============================================================================
+
+INSERT INTO qiita.exported_entity (study_idx, created_by_idx)
+SELECT idx, created_by_idx FROM qiita.study ORDER BY idx;
+
+INSERT INTO qiita.exported_entity (biosample_idx, created_by_idx)
+SELECT idx, created_by_idx FROM qiita.biosample ORDER BY idx;
+
+
 -- migrate:down
 
+DROP TRIGGER IF EXISTS study_mint_exported_entity ON qiita.study;
+DROP TRIGGER IF EXISTS biosample_mint_exported_entity ON qiita.biosample;
+DROP FUNCTION IF EXISTS qiita.tg_mint_exported_entity();
 DROP TABLE IF EXISTS qiita.exported_entity;

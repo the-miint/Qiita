@@ -18,6 +18,8 @@ from collections.abc import Iterable
 
 import asyncpg
 
+_Executor = asyncpg.Pool | asyncpg.Connection
+
 STUDY = "study"
 BIOSAMPLE = "biosample"
 PREP_SAMPLE = "prep_sample"
@@ -144,7 +146,7 @@ def _as_idx_list(idxs: int | Iterable[int]) -> list[int]:
     return list(idxs)
 
 
-async def delete_idxs(pool: asyncpg.Pool, table: str, idxs: int | Iterable[int]) -> None:
+async def delete_idxs(pool: _Executor, table: str, idxs: int | Iterable[int]) -> None:
     """Delete rows by idx from qiita.<table>.
 
     `idxs` may be a scalar int or an iterable of ints; an empty iterable is a
@@ -162,7 +164,7 @@ async def delete_idxs(pool: asyncpg.Pool, table: str, idxs: int | Iterable[int])
     )
 
 
-async def _fetch_genome_idxs(pool: asyncpg.Pool, prep_sample_idxs: list[int]) -> list[int]:
+async def _fetch_genome_idxs(pool: _Executor, prep_sample_idxs: list[int]) -> list[int]:
     """Return the idxs of the genomes these prep_samples produced.
 
     Resolved before the sweep runs, because the sweep deletes qiita.genome and
@@ -202,7 +204,7 @@ async def _entity_keyed_candidates(pool: asyncpg.Pool) -> list[asyncpg.Record]:
 
 
 async def _sweep_table(
-    pool: asyncpg.Pool,
+    pool: _Executor,
     table: str,
     keys: tuple[tuple[str, str], ...],
     idxs: dict[str, list[int]],
@@ -223,7 +225,7 @@ async def _sweep_table(
 
 
 async def assert_entity_graph_swept(
-    pool: asyncpg.Pool,
+    pool: _Executor,
     *,
     study_idxs: list[int],
     biosample_idxs: list[int],
@@ -274,7 +276,7 @@ async def assert_entity_graph_swept(
 
 
 async def teardown_entity_graph(
-    pool: asyncpg.Pool,
+    pool: _Executor,
     *,
     study_idxs: list[int],
     biosample_idxs: list[int],

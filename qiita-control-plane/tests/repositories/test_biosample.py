@@ -52,6 +52,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_local_study_field,
     seed_study,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 from qiita_control_plane.testing.unique_names import (
     unique_accession,
     unique_field_name,
@@ -1989,7 +1990,9 @@ async def test_user_delete_succeeds_after_biosample_gone(postgres_pool):
         try:
             owner = await _create_user(conn)
             bs_idx = await _insert_biosample_row(conn, owner_idx=owner)
-            await conn.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs_idx)
+            await teardown_entity_graph(
+                conn, study_idxs=[], biosample_idxs=[bs_idx], prep_sample_idxs=[]
+            )
             await conn.execute("DELETE FROM qiita.user WHERE principal_idx = $1", owner)
             still_there = await conn.fetchval(
                 "SELECT 1 FROM qiita.user WHERE principal_idx = $1", owner
