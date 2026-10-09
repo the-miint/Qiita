@@ -5,8 +5,8 @@ Why this exists
 `checkm lineage_wf` scores a DIRECTORY of FASTA files, one genome per file, and
 keys its output on the filename stem. The assemble step publishes every circular
 contig in one multi-FASTA. Handed that directly, CheckM would report a single
-genome stitched from every LCG in the sample — a green run whose completeness and
-contamination describe nothing, and whose one `"Bin Id"` joins no membership row.
+genome stitched from every LCG in the prep_sample's assembly — a green run whose
+completeness and contamination describe nothing, and whose one `"Bin Id"` joins no membership row.
 So the split is pinned by EXECUTION here, not by spelling.
 
 The stem is the join key

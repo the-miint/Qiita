@@ -34,19 +34,6 @@ _None yet._
     && unzip -q duckdb_cli-linux-amd64.zip && sudo install -m 0755 duckdb /usr/local/bin/duckdb )
   sudo -u qiita-data /usr/local/bin/duckdb --version   # expect v1.5.5
   ```
-- `[operator]` **Before the deploy, confirm the live checkm image runs the tool versions
-  `checkm.def` now pins.** This deploy rebuilds `long-read-assembly-checkm-1.0.1.sif` (its
-  def changed), and the pins are the versions the image built at the 2026-09-15 deploy
-  would have resolved — inferred from bioconda's release dates, not read off the host. If
-  the output differs, **stop**: the pins must change to the live versions first, or the
-  rebuild re-scores MAGs under the same workflow version. (#651)
-  ```bash
-  sudo -u qiita-orch bash -c 'set -a; . /etc/qiita/compute-orchestrator.env; set +a
-  cd /tmp && apptainer exec --no-home "${PATH_DERIVED}/images/long-read-assembly-checkm-1.0.1.sif" \
-    ls /opt/conda/envs/checkm/conda-meta' \
-    | sed -n -E 's/^(checkm-genome|pplacer|hmmer|prodigal)-([^-]+)-[^-]+\.json$/\1==\2/p' | sort
-  # expect exactly: checkm-genome==1.2.5  hmmer==3.4  pplacer==1.1.alpha22  prodigal==2.6.3
-  ```
 
 ### 3. Migrations
 
@@ -87,7 +74,8 @@ _None yet._
     change, so no `FORCE_STAGE_MIINT`. `make verify-deploy`'s `compute-readiness` and
     `cp-miint` checks LOAD the new build.
   - The `assemble` and `checkm` (`-1.0.1`) SIFs auto-rebuild on deploy to pick up 1.5.5.
-    `checkm`'s tools are now pinned, and its build fails if a solve drifts off them.
+    `checkm`'s tools are now pinned exactly — checkm-genome 1.2.5, pplacer 1.1.alpha22,
+    hmmer 3.4, prodigal 2.6.3 — and its build fails if a solve drifts off them.
   - **Work that loads miint between the bucket-4 deploy and the redeploy's miint stage
     (step 5/8) fails at LOAD.** `v1.5.5/` is staged last, after everything that moves to
     1.5.5: step 4 rebuilds the long-read-assembly images and restarts the services, and

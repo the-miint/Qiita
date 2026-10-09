@@ -171,10 +171,10 @@ qiita_native_checkout_from_python() {
 
 # Content hash of a container workflow's IN-REPO build inputs, used by
 # build-sif.sh's idempotency check to detect a changed Apptainer.def /
-# entrypoint.sh / manifest_writer.py — none of which VERIFY_MATCH (binary version
-# only) can see, so such an edit would otherwise be skipped and never reach the
-# host, forcing a manual FORCE=1. Hashes every file under the workflow dir (minus
-# the spec, gitignore, and generated .sif/.rpm) plus _shared/, keyed by
+# entrypoint.sh / manifest_writer.py — none of which VERIFY_MATCH (a regex over
+# VERIFY_CMD's output) can see, so such an edit would otherwise be skipped and
+# never reach the host, forcing a manual FORCE=1. Hashes every file under the
+# workflow dir (minus the spec, gitignore, and generated .sif/.rpm) plus _shared/, keyed by
 # REPO-RELATIVE path so the digest is identical from the operator clone or an
 # INCOMING stage. Deliberately EXCLUDES the vendored SOURCES (the licensed RPM):
 # re-vendoring 4.5.4-1 → 4.5.4-2 must NOT force a rebuild, matching VERIFY_MATCH's
