@@ -101,9 +101,17 @@ def _stub_submit_flow(monkeypatch, captured: dict) -> None:
                     },
                 },
             )
-        if url.endswith("/lookup-by-accession"):  # biosample or study
-            accs = (json or {}).get("accessions", [])
-            return resp(200, {"resolved": {a: 1000 + i for i, a in enumerate(accs)}, "missing": []})
+        if url.endswith("/biosample/resolve-roster"):
+            rows = [
+                {
+                    "item_id": r["item_id"],
+                    "biosample_idx": 1000 + i,
+                    "primary_study_idx": 2000,
+                    "secondary_study_idxs": [],
+                }
+                for i, r in enumerate(json["rows"])
+            ]
+            return resp(200, {"rows": rows})
         if url.endswith("/sequenced-pool"):
             return resp(201, {"sequenced_pool_idx": 50})
         if url.rstrip("/").endswith("/sequencing-run"):

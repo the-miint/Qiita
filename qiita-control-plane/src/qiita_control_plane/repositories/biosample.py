@@ -323,6 +323,45 @@ async def fetch_biosample_idxs_by_natural_key(
     return {r[key]: r["idx"] for r in rows}
 
 
+async def fetch_biosample_identity_by_tube(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    tubes: list[str],
+) -> dict[str, tuple[int, str | None]]:
+    """Return `{matrix_tube_id: (biosample_idx, biosample_accession)}` for every
+    tube in `tubes` carried by a non-retired biosample. Absent tubes are omitted."""
+    if not tubes:
+        return {}
+    rows = await pool_or_conn.fetch(
+        "SELECT idx, matrix_tube_id, biosample_accession FROM qiita.biosample"
+        " WHERE matrix_tube_id = ANY($1::text[])"
+        "   AND retired = false",
+        tubes,
+    )
+    return {r["matrix_tube_id"]: (r["idx"], r["biosample_accession"]) for r in rows}
+
+
+async def fetch_active_study_links(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    biosample_idxs: list[int],
+) -> dict[int, list[int]]:
+    """Return `{biosample_idx: [study_idx, ...]}` (ascending) over the active
+    (non-retired) biosample_to_study links of `biosample_idxs`. A biosample with
+    no active link is omitted."""
+    if not biosample_idxs:
+        return {}
+    rows = await pool_or_conn.fetch(
+        "SELECT biosample_idx, study_idx FROM qiita.biosample_to_study"
+        " WHERE biosample_idx = ANY($1::bigint[])"
+        "   AND retired = false"
+        " ORDER BY biosample_idx, study_idx",
+        biosample_idxs,
+    )
+    links: dict[int, list[int]] = {}
+    for r in rows:
+        links.setdefault(r["biosample_idx"], []).append(r["study_idx"])
+    return links
+
+
 @dataclass(frozen=True)
 class BiosampleImportResult:
     """Result of importing one biosample with its owner-id field.

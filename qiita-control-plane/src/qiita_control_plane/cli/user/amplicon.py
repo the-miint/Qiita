@@ -49,8 +49,8 @@ class _AmpliconPreflightRow(NamedTuple):
     `sequenced_pool_item_id`. `barcode` + `barcodes_are_rc` are the Golay roster the
     demux job matches each read's index against; `barcodes_are_rc` is per-sample
     provenance (whether the stored barcode is the reverse complement of the read
-    index). The project accessions are ENA **bioproject** accessions the study
-    lookup route resolves, matching the Illumina/PacBio rows;
+    index). The project accessions are ENA **bioproject** accessions that
+    resolve-roster resolves, matching the Illumina/PacBio rows;
     `secondary_project_accessions` is populated for controls.
     """
 
@@ -168,7 +168,6 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
             prep_protocol_idx=args.prep_protocol_idx,
             pool_item_id=lambda row: str(row.prepped_sample_idx),
             row_label=lambda row: f"prepped_sample_idx={row.prepped_sample_idx}",
-            row_noun="amplicon_sample",
         )
         sequencing_run_idx = provision.sequencing_run_idx
         sequenced_pool_idx = provision.sequenced_pool_idx

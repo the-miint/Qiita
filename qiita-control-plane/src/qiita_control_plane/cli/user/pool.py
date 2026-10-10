@@ -13,11 +13,10 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import httpx
-from pydantic import BaseModel
 from qiita_common.actions import READ_MASK_ACTION_ID
 from qiita_common.api_paths import (
-    PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_BIOSAMPLE_RESOLVE_ROSTER,
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
@@ -30,8 +29,6 @@ from qiita_common.api_paths import (
     PATH_SEQUENCING_RUN_BY_IDX,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_SEQUENCING_RUN_SEQUENCED_POOL,
-    PATH_STUDY_LOOKUP_BY_ACCESSION,
-    PATH_STUDY_PREFIX,
     PATH_WORK_TICKET_PREFIX,
 )
 from qiita_common.host_filter_plan import (
@@ -43,16 +40,19 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     AlignPlanRequest,
-    BiosampleLookupByAccessionRequest,
     BlockMaskPlanRequest,
     HostFilterResolution,
     Platform,
     ReferenceStatus,
+    RosterResolvedRow,
+    RosterResolveFailure,
+    RosterResolveRequest,
+    RosterResolveResponse,
+    RosterResolveRow,
     ScopeTargetKind,
     SequencedPoolCreateRequest,
     SequencedSampleCreateRequest,
     SequencingRunCreateRequest,
-    StudyLookupByAccessionRequest,
     WorkTicketCreateRequest,
 )
 
@@ -91,25 +91,6 @@ class _PreflightRow(NamedTuple):
     biosample_accession: str
     primary_project_accession: str
     secondary_project_accessions: list[str]
-
-
-def _lookup_accessions(
-    base_url: str,
-    token: str,
-    path: str,
-    accessions: list[str],
-    model_cls: type[BaseModel],
-) -> tuple[dict[str, int], list[str]]:
-    """POST a bulk lookup-by-accession route and return (resolved, missing).
-
-    `model_cls` is the route's request Pydantic model (e.g.
-    `BiosampleLookupByAccessionRequest`); it is constructed from the
-    accession list and json-dumped so the route's wire validation is
-    exercised. The biosample and study lookup routes share this shape.
-    """
-    body = model_cls(accessions=accessions).model_dump(mode="json")
-    resp = _common.call("POST", base_url, token, path, json=body)
-    return resp["resolved"], resp["missing"]
 
 
 def _read_preflight_rows(
@@ -166,110 +147,55 @@ def _read_preflight_rows(
     return parsed
 
 
-def _dedup_accessions(preflight_rows: list[Any]) -> tuple[list[str], list[str]]:
-    """One-pass order-preserving dedup of the biosample + study accessions across
-    `preflight_rows`, so the lookup routes' `missing` echo is deterministic; the
-    study side pools each row's primary + secondaries so controls land their full
-    set. Returns (unique_biosample_accessions, unique_study_accessions).
-
-    Row-shape-agnostic: works on any preflight row exposing `biosample_accession`,
-    `primary_project_accession`, and `secondary_project_accessions` — shared by the
-    Illumina (`_PreflightRow`) and PacBio (`_PacbioPreflightRow`) submit flows."""
-    unique_biosamples: list[str] = []
-    unique_studies: list[str] = []
-    seen_biosample: set[str] = set()
-    seen_study: set[str] = set()
-    for row in preflight_rows:
-        if row.biosample_accession not in seen_biosample:
-            seen_biosample.add(row.biosample_accession)
-            unique_biosamples.append(row.biosample_accession)
-        for study_accession in (row.primary_project_accession, *row.secondary_project_accessions):
-            if study_accession not in seen_study:
-                seen_study.add(study_accession)
-                unique_studies.append(study_accession)
-    return unique_biosamples, unique_studies
-
-
-def _build_missing_section(
-    *,
-    label: str,
-    missing: list[str],
+def _resolve_roster(
+    base_url: str,
+    token: str,
     preflight_rows: list[Any],
-    row_accessions: Callable[[Any], list[str]],
-    row_label: Callable[[Any], str],
-    row_noun: str,
-) -> str | None:
-    """Build one labeled section naming every preflight row that carries
-    a missing accession in this class. Returns None if `missing` is empty.
-
-    `row_accessions` extracts the row's accessions in the relevant class
-    (one for biosamples, primary + secondaries for studies). `row_label`
-    renders a row's per-bullet identifier (e.g. `illumina_sample_idx=5` or
-    `sample sample.1`) and `row_noun` names the row kind in the header, so the
-    Illumina and PacBio flows share this with their own row shapes. The header
-    counts distinct missing accessions and the rows affected, so the per-row
-    bullet count is no longer ambiguous against the dedup count.
-    """
-    if not missing:
-        return None
-    missing_set = set(missing)
-    bullets: list[str] = []
-    for row in preflight_rows:
-        row_misses = [a for a in row_accessions(row) if a in missing_set]
-        if row_misses:
-            bullets.append(f"  - {', '.join(row_misses)} ({row_label(row)})")
-    acc_plural = "s" if len(missing) != 1 else ""
-    rows_plural = "s" if len(bullets) != 1 else ""
-    return (
-        f"{len(missing)} distinct preflight {label} accession{acc_plural}"
-        f" not found in qiita, affecting {len(bullets)} {row_noun} row{rows_plural}:\n"
-        + "\n".join(bullets)
-    )
-
-
-def _print_missing_accession_error(
-    preflight_rows: list[Any],
-    missing_biosamples: list[str],
-    missing_studies: list[str],
     *,
+    pool_item_id: Callable[[Any], str],
     row_label: Callable[[Any], str],
-    row_noun: str,
-) -> None:
-    """Emit one combined stderr block naming every offending preflight row.
+) -> dict[str, RosterResolvedRow]:
+    """Resolve every preflight row to its biosample and studies in one
+    `POST /biosample/resolve-roster` call, keyed by pool item id. The route owns
+    the rules.
 
-    Each present class (biosample, study) gets its own header + bullet list, built
-    by `_build_missing_section`. `row_label` / `row_noun` are threaded through so
-    the Illumina and PacBio flows reuse this with their own row identifiers.
-    """
-    sections = [
-        s
-        for s in (
-            _build_missing_section(
-                label="biosample",
-                missing=missing_biosamples,
-                preflight_rows=preflight_rows,
-                row_accessions=lambda row: [row.biosample_accession],
-                row_label=row_label,
-                row_noun=row_noun,
-            ),
-            _build_missing_section(
-                label="study",
-                missing=missing_studies,
-                preflight_rows=preflight_rows,
-                row_accessions=lambda row: [
-                    row.primary_project_accession,
-                    *row.secondary_project_accessions,
-                ],
-                row_label=row_label,
-                row_noun=row_noun,
-            ),
+    On a roster verdict (a 422 carrying `problems`) prints the route's message and
+    every problem against the sheet's own row label, then raises SystemExit(1)."""
+    body = RosterResolveRequest(
+        rows=[
+            RosterResolveRow(
+                item_id=pool_item_id(row),
+                biosample_accession=row.biosample_accession,
+                primary_project_accession=row.primary_project_accession,
+                secondary_project_accessions=list(row.secondary_project_accessions),
+            )
+            for row in preflight_rows
+        ]
+    ).model_dump(mode="json", exclude_none=True)
+    try:
+        resp = _common.call(
+            "POST",
+            base_url,
+            token,
+            f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_RESOLVE_ROSTER}",
+            json=body,
         )
-        if s is not None
-    ]
-    print(
-        "error: " + "\n".join(sections) + "\nimport the missing record(s) and re-run.",
-        file=sys.stderr,
-    )
+    except httpx.HTTPStatusError as exc:
+        try:
+            body_json = exc.response.json() if exc.response.status_code == 422 else None
+        except ValueError:
+            body_json = None  # a non-JSON 422 (e.g. from a proxy) is not a roster verdict
+        detail = body_json.get("detail") if isinstance(body_json, dict) else None
+        if not isinstance(detail, dict) or "problems" not in detail:
+            raise  # not a roster verdict (e.g. a request-shape 422)
+        failure = RosterResolveFailure.model_validate(detail)
+        label_by_item = {pool_item_id(row): row_label(row) for row in preflight_rows}
+        lines = [f"error: {failure.message}:"]
+        lines += [f"  - {label_by_item[p.item_id]}: {p.message}" for p in failure.problems]
+        lines.append("fix the registry or the preflight and re-run.")
+        print("\n".join(lines), file=sys.stderr)
+        raise SystemExit(1) from exc
+    return {r.item_id: r for r in RosterResolveResponse.model_validate(resp).rows}
 
 
 class _ProvisionedSample(NamedTuple):
@@ -312,20 +238,18 @@ def _provision_run_pool_roster(
     prep_protocol_idx: int,
     pool_item_id: Callable[[Any], str],
     row_label: Callable[[Any], str],
-    row_noun: str,
 ) -> _RunPoolProvision:
     """Shared run → pool → sequenced-sample provisioning for the bundled submit
-    gestures (`submit-bcl-convert`, `submit-pacbio-ingest`).
+    gestures.
 
-    The two platforms differ only in how they read the preflight, how they build
+    The gestures differ only in how they read the preflight, how they build
     `run_body` (platform + instrument source), and what work ticket(s) they submit
     afterwards. Everything in between — resolve the caller's principal, resolve +
-    fail-fast on the biosample/study accessions, POST the run, POST the pool, and
+    fail-fast on the roster (`_resolve_roster`), POST the run, POST the pool, and
     populate the per-sample roster — is identical, so it lives here once. The
-    caller parameterizes the per-row `pool_item_id` (Illumina: illumina_sample_idx;
-    PacBio: pacbio_sample_idx) and the `row_label`/`row_noun` for the
-    missing-accession report, and builds its own summary + ticket tail from the
-    returned roster.
+    caller parameterizes the per-row `pool_item_id` (e.g. illumina_sample_idx) and
+    the `row_label` for the unresolved-row report, and builds its own summary +
+    ticket tail from the returned roster.
 
     Roster creation is CREATE-MISSING, not blind-create: it GETs the pool roster
     first and reuses samples already present, POSTing only the absent ones. So a
@@ -334,38 +258,17 @@ def _provision_run_pool_roster(
     the roster is empty and every sample is created.
 
     Raises SystemExit(1) (after printing one combined block to stderr) if any
-    biosample or study accession is unresolved — before the run/pool are created,
-    so a fixable preflight leaves nothing behind."""
+    row does not resolve — before the run/pool are created, so a fixable
+    preflight leaves nothing behind."""
     # Resolve the caller's principal_idx once for the per-sample owner_idx — the
     # composer requires it and the route does not auto-fill it server-side.
     owner_idx = _common.whoami(base_url, token)["principal_idx"]
 
-    # Resolve every accession before any side effect; both lookups always run so
-    # the operator sees biosample + study misses in a single round trip.
-    unique_biosamples, unique_studies = _dedup_accessions(preflight_rows)
-    resolved_biosamples, missing_biosamples = _lookup_accessions(
-        base_url,
-        token,
-        f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}",
-        unique_biosamples,
-        BiosampleLookupByAccessionRequest,
+    # Resolve every row before any side effect, so a fixable preflight leaves
+    # nothing behind.
+    resolution = _resolve_roster(
+        base_url, token, preflight_rows, pool_item_id=pool_item_id, row_label=row_label
     )
-    resolved_studies, missing_studies = _lookup_accessions(
-        base_url,
-        token,
-        f"{PATH_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}",
-        unique_studies,
-        StudyLookupByAccessionRequest,
-    )
-    if missing_biosamples or missing_studies:
-        _print_missing_accession_error(
-            preflight_rows,
-            missing_biosamples,
-            missing_studies,
-            row_label=row_label,
-            row_noun=row_noun,
-        )
-        raise SystemExit(1)
 
     run_resp, run_status = _common.call_with_status(
         "POST", base_url, token, PATH_SEQUENCING_RUN_PREFIX, json=run_body
@@ -397,9 +300,10 @@ def _provision_run_pool_roster(
     samples: list[_ProvisionedSample] = []
     for row in preflight_rows:
         item_id = pool_item_id(row)
-        biosample_idx = resolved_biosamples[row.biosample_accession]
-        primary_study_idx = resolved_studies[row.primary_project_accession]
-        secondary_study_idxs = [resolved_studies[a] for a in row.secondary_project_accessions]
+        resolved = resolution[item_id]
+        biosample_idx = resolved.biosample_idx
+        primary_study_idx = resolved.primary_study_idx
+        secondary_study_idxs = resolved.secondary_study_idxs
         existing = existing_by_item_id.get(item_id)
         if existing is not None:
             # Reuse is convergent, NOT a silent overwrite: a re-run cannot change an
@@ -503,16 +407,12 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
        from steps 1 and 2, action_id+version pinned at the top of this
        module, action_context carrying the absolute bcl_input_dir.
 
-    Step 2.5 (before any 1/2 side effects): POST
-    /biosample/lookup-by-accession with the deduped preflight biosample
-    accessions, then POST /study/lookup-by-accession with the deduped
-    union of every row's primary + secondary project accessions. Both
-    lookups always run, and if either carries a non-empty `missing`,
-    the CLI emits a single combined stderr block (labeled sub-sections
-    per class) and exits 1 with no side effects — the operator imports
-    the missing biosamples / studies and re-runs. Find-or-create on
-    steps 1 and 2 means a partial-failure retry converges on the same
-    rows.
+    Step 2.5 (before any 1/2 side effects): POST /biosample/resolve-roster
+    with one row per preflight row (`_resolve_roster`). If any row does not
+    resolve, the CLI prints each row's problem and exits 1 with no side
+    effects — the operator fixes the registry or the preflight and re-runs.
+    Find-or-create on steps 1 and 2 means a partial-failure retry converges on
+    the same rows.
 
     All calls share one PAT (one ``run_http_subcommand`` invocation,
     one ``read_token``) so retries use the same credential.
@@ -573,7 +473,6 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
             prep_protocol_idx=args.prep_protocol_idx,
             pool_item_id=lambda row: str(row.illumina_sample_idx),
             row_label=lambda row: f"illumina_sample_idx={row.illumina_sample_idx}",
-            row_noun="illumina_sample",
         )
         sequencing_run_idx = provision.sequencing_run_idx
         sequenced_pool_idx = provision.sequenced_pool_idx

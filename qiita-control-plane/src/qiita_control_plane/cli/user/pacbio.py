@@ -81,8 +81,8 @@ class _PacbioPreflightRow(NamedTuple):
     LOCATE the sample's BAM on disk — it is NOT unique across all PacBio protocols
     and is never used as an identity/pool-item-id.
 
-    The project accessions are ENA **bioproject** accessions (what the study lookup
-    route resolves), matching the Illumina row; `secondary_project_accessions` is
+    The project accessions are ENA **bioproject** accessions (what resolve-roster
+    resolves), matching the Illumina row; `secondary_project_accessions` is
     populated for controls. The three protocol columns (`sheet_type`,
     `twist_adaptor_id`, `syndna_is_twisted`) feed the read-mask mask-chain
     derivation. `smrt_cell` is the SMRT-cell well (`smrt_cell_well_sample_id`, form
@@ -400,7 +400,6 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
             prep_protocol_idx=args.prep_protocol_idx,
             pool_item_id=lambda row: str(row.pacbio_sample_idx),
             row_label=lambda row: f"pacbio_sample_idx {row.pacbio_sample_idx}",
-            row_noun="pacbio_sample",
         )
         sequencing_run_idx = provision.sequencing_run_idx
         sequenced_pool_idx = provision.sequenced_pool_idx

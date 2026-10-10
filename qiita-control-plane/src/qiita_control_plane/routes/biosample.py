@@ -25,6 +25,7 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_METADATA_BY_STUDY,
     PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_BIOSAMPLE_RESOLVE_ROSTER,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_STUDY_PREFIX,
@@ -48,6 +49,9 @@ from qiita_common.models import (
     IdxsListResponse,
     MetadataChecklistRef,
     MetadataEntry,
+    RosterResolveFailure,
+    RosterResolveRequest,
+    RosterResolveResponse,
     SampleMetadataWriteByUniqueFieldRequest,
     SampleMetadataWriteRequest,
     SampleMetadataWriteResponse,
@@ -96,6 +100,7 @@ from ..repositories.biosample_metadata import (
     BiosampleOwnerIdFieldCollisionError,
     BiosampleOwnerIdMissingValueError,
 )
+from ..roster_resolution import classify_roster, fetch_roster_facts
 from ._helpers import (
     ETAG_HEADER,
     GENERIC_CHECK_VIOLATION,
@@ -1248,6 +1253,45 @@ async def lookup_biosample_by_matrix_tube_id(
         fetcher=_biosample_natural_key_fetcher(pool, "matrix_tube_id"),
     )
     return BiosampleLookupByMatrixTubeIdResponse(resolved=resolved, missing=missing)
+
+
+@biosample_router.post(
+    PATH_BIOSAMPLE_RESOLVE_ROSTER,
+    responses={422: {"description": "Rows that did not resolve; detail is a RosterResolveFailure"}},
+)
+async def resolve_biosample_roster(
+    body: RosterResolveRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _study_scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
+) -> RosterResolveResponse:
+    """Resolve a pool roster to biosample_idx + study links, by matrix tube or
+    accession, in one round trip.
+
+    The rules live in `roster_resolution`; this route gathers the facts and
+    maps the outcome. Any unresolved row refuses the whole roster with a 422
+    whose `detail` is a `RosterResolveFailure` naming every problem, so a
+    submitter fixes the sheet once rather than one miss per attempt.
+
+    Auth: `biosample:read` and `study:read`, since the answer names both. No
+    per-row access predicate runs, as in lookup_biosample_by_accession: the
+    response carries only idxs, and creating a prep_sample on a resolved study
+    still passes that route's own study-access check. The facts are read in one
+    read-only snapshot, so a concurrent retire cannot mix two states.
+    """
+    _ = user
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        facts = await fetch_roster_facts(conn, body.rows)
+    resolved, problems = classify_roster(body.rows, facts)
+    if problems:
+        unresolved = len({p.item_id for p in problems})
+        failure = RosterResolveFailure(
+            message=f"{unresolved} of {len(body.rows)} roster rows did not resolve",
+            problems=problems,
+        )
+        raise HTTPException(status_code=422, detail=failure.model_dump(mode="json"))
+    return RosterResolveResponse(rows=resolved)
 
 
 # Substring of the asyncpg.RaiseError message thrown by the role-typed FK

@@ -21,6 +21,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
     URL_BIOSAMPLE_METADATA_BY_STUDY,
     URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
+    URL_BIOSAMPLE_RESOLVE_ROSTER,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
@@ -2983,6 +2984,168 @@ async def test_lookup_by_matrix_tube_id_rejects_bad_format_422(ctx):
         json={"matrix_tube_ids": [unique_matrix_tube_id(), "abc"]},
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /biosample/resolve-roster — tube- or accession-keyed roster resolution
+# ---------------------------------------------------------------------------
+# The route: the facts it gathers from Postgres, the 200 shape, the 422 detail
+# that names every problem, the retired-row exclusions, and its scopes.
+
+
+async def _seed_tube_in_study(ctx, *, study_idx: int, tube: str) -> int:
+    """A biosample carrying `tube`, actively linked to `study_idx`."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    biosample_idx = await _seed_biosample_with_matrix_tube_id(
+        ctx, matrix_tube_id=tube, owner_idx=owner_idx
+    )
+    await seed_biosample_to_study_link(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner_idx
+    )
+    return biosample_idx
+
+
+async def test_resolve_roster_by_tube_returns_biosample_and_study(ctx):
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-ok")
+    tube = unique_matrix_tube_id()
+    biosample_idx = await _seed_tube_in_study(ctx, study_idx=study_idx, tube=tube)
+
+    # The sheet lost the leading zero; the route resolves the stored form.
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_RESOLVE_ROSTER,
+        json={"rows": [{"item_id": "7", "matrix_tube_id": tube.lstrip("0") or "0"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "rows": [
+            {
+                "item_id": "7",
+                "biosample_idx": biosample_idx,
+                "primary_study_idx": study_idx,
+                "secondary_study_idxs": [],
+            }
+        ]
+    }
+
+
+async def test_resolve_roster_422_names_every_problem(ctx):
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-bad")
+    linked = unique_matrix_tube_id()
+    await _seed_tube_in_study(ctx, study_idx=study_idx, tube=linked)
+    unlinked = unique_matrix_tube_id()
+    await _seed_biosample_with_matrix_tube_id(ctx, matrix_tube_id=unlinked, owner_idx=owner_idx)
+    unknown = unique_matrix_tube_id()
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_RESOLVE_ROSTER,
+        json={
+            "rows": [
+                {"item_id": "ok", "matrix_tube_id": linked},
+                {"item_id": "nolink", "matrix_tube_id": unlinked},
+                {"item_id": "gone", "matrix_tube_id": unknown},
+                {"item_id": "plasma", "matrix_tube_id": "800805.001.V1.Plasma"},
+                {"item_id": "blank"},
+            ]
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["message"] == "4 of 5 roster rows did not resolve"
+    assert [(p["item_id"], p["message"]) for p in detail["problems"]] == [
+        ("nolink", f"the biosample with matrix tube {unlinked} belongs to no active study"),
+        ("gone", f"no biosample has matrix tube {unknown}; register it before submitting"),
+        ("plasma", "'800805.001.V1.Plasma' is not a matrix tube id (1 to 10 digits)"),
+        ("blank", "row carries neither a matrix tube nor a biosample accession"),
+    ]
+
+
+async def test_resolve_roster_skips_retired_biosample_and_link(ctx):
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-retired")
+    retired_tube = unique_matrix_tube_id()
+    retired_bs = await _seed_tube_in_study(ctx, study_idx=study_idx, tube=retired_tube)
+    await retire_biosample(ctx["pool"], biosample_idx=retired_bs, retired_by_idx=owner_idx)
+    unlinked_tube = unique_matrix_tube_id()
+    unlinked_bs = await _seed_tube_in_study(ctx, study_idx=study_idx, tube=unlinked_tube)
+    await retire_biosample_to_study_link(
+        ctx["pool"], biosample_idx=unlinked_bs, study_idx=study_idx, retired_by_idx=owner_idx
+    )
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_RESOLVE_ROSTER,
+        json={
+            "rows": [
+                {"item_id": "r", "matrix_tube_id": retired_tube},
+                {"item_id": "u", "matrix_tube_id": unlinked_tube},
+            ]
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert [(p["item_id"], p["message"]) for p in resp.json()["detail"]["problems"]] == [
+        ("r", f"no biosample has matrix tube {retired_tube}; register it before submitting"),
+        ("u", f"the biosample with matrix tube {unlinked_tube} belongs to no active study"),
+    ]
+
+
+async def test_resolve_roster_by_accession(ctx):
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-acc")
+    project = unique_accession("PRJNA")
+    await ctx["pool"].execute(
+        "UPDATE qiita.study SET bioproject_accession = $1 WHERE idx = $2", project, study_idx
+    )
+    accession = unique_accession("SAMN")
+    biosample_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.biosample (owner_idx, created_by_idx, biosample_accession)"
+        " VALUES ($1, $1, $2) RETURNING idx",
+        owner_idx,
+        accession,
+    )
+    ctx["created"]["biosample"].append(biosample_idx)
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_RESOLVE_ROSTER,
+        json={
+            "rows": [
+                {
+                    "item_id": "1",
+                    "biosample_accession": accession,
+                    "primary_project_accession": project,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rows"][0]["biosample_idx"] == biosample_idx
+    assert resp.json()["rows"][0]["primary_study_idx"] == study_idx
+
+
+@pytest.mark.parametrize(
+    "scopes",
+    [[Scope.BIOSAMPLE_READ], [Scope.STUDY_READ]],
+    ids=["no-study-read", "no-biosample-read"],
+)
+async def test_resolve_roster_needs_both_read_scopes(make_pat_client, scopes):
+    client = await make_pat_client(label="roster-scope", scopes=scopes)
+    resp = await client.post(
+        URL_BIOSAMPLE_RESOLVE_ROSTER,
+        json={"rows": [{"item_id": "1", "matrix_tube_id": "1"}]},
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_resolve_roster_anonymous_401(ctx):
+    from qiita_control_plane.main import app
+
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.post(
+            URL_BIOSAMPLE_RESOLVE_ROSTER,
+            json={"rows": [{"item_id": "1", "matrix_tube_id": "1"}]},
+        )
+    assert resp.status_code == 401
 
 
 # ===========================================================================
