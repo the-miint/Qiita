@@ -266,6 +266,55 @@ def test_ticket_submit_without_mem_gb_omits_resource_override(monkeypatch):
     )
     assert rc == 0
     assert "resource_override" not in captured["json"]
+    assert "on_success" not in captured["json"]
+
+
+def test_ticket_submit_chains_a_follow_on(monkeypatch):
+    """The --then-* flags chain any action as the ticket's follow-on, with an
+    empty context when --then-context-json is omitted."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(
+            202,
+            json={"work_ticket_idx": 1, "state": "pending"},
+            request=_httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "submit",
+            "--action-id",
+            "fastq-to-parquet",
+            "--action-version",
+            "1.1.0",
+            "--prep-sample-idx",
+            "5",
+            "--then-action-id",
+            "next-action",
+            "--then-action-version",
+            "2.0.0",
+        ]
+    )
+    assert rc == 0
+    assert captured["json"]["on_success"] == {
+        "action_id": "next-action",
+        "action_version": "2.0.0",
+        "action_context": {},
+    }
 
 
 def test_ticket_run_posts_to_run_endpoint_with_no_body(monkeypatch):

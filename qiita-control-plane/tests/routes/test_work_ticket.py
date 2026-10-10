@@ -4211,3 +4211,620 @@ async def test_get_step_logs_unconfigured_scratch_500(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 500, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Follow-on tickets (on_success)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def follow_on_action(postgres_pool):
+    """A second sequenced_pool action, the shape a follow-on names: requires an
+    integer `trim`, so a context without one is refused."""
+    action_id, version = await _seed_action(
+        postgres_pool,
+        context_schema={
+            "type": "object",
+            "required": ["trim"],
+            "properties": {"trim": {"type": "integer", "minimum": 6}},
+        },
+        target_kind="sequenced_pool",
+        action_id="wt-follow-on-action",
+        scopes=[],
+    )
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+def _with_follow_on(body: dict, action_id: str, version: str, context: dict) -> dict:
+    return {
+        **body,
+        "on_success": {
+            "action_id": action_id,
+            "action_version": version,
+            "action_context": context,
+        },
+    }
+
+
+async def _submit_with_follow_on(
+    wt_client, token, sequenced_pool_action, follow_on_action, pool, ingest_dir, context
+):
+    action_id, version = sequenced_pool_action
+    run_idx, pool_idx = pool
+    body = _with_follow_on(
+        _sequenced_pool_body(action_id, version, pool_idx, run_idx, ingest_dir),
+        *follow_on_action,
+        context,
+    )
+    return await wt_client.post(
+        URL_WORK_TICKET_PREFIX, json=body, headers={"Authorization": f"Bearer {token}"}
+    )
+
+
+async def _complete(postgres_pool, idx: int) -> None:
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET state = $2::qiita.work_ticket_state"
+        " WHERE work_ticket_idx = $1",
+        idx,
+        WorkTicketState.COMPLETED.value,
+    )
+
+
+async def _follow_on_outcome(postgres_pool, parent_idx: int) -> tuple:
+    row = await postgres_pool.fetchrow(
+        "SELECT follow_on_work_ticket_idx, follow_on_error"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        parent_idx,
+    )
+    return tuple(row.values())
+
+
+async def _pool_tickets(postgres_pool, pool, action_id: str) -> list[int]:
+    _, pool_idx = pool
+    rows = await postgres_pool.fetch(
+        "SELECT work_ticket_idx FROM qiita.work_ticket"
+        " WHERE sequenced_pool_idx = $1 AND action_id = $2 ORDER BY work_ticket_idx",
+        pool_idx,
+        action_id,
+    )
+    return [r["work_ticket_idx"] for r in rows]
+
+
+async def test_submit_on_success_persists_and_round_trips(
+    wt_client,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+):
+    """The follow-on is stored with the ticket and returned on GET, with no
+    outcome yet."""
+    token, _ = admin_token
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        follow_on_action,
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {"trim": 150},
+    )
+    assert resp.status_code == 202, resp.text
+    idx = resp.json()["work_ticket_idx"]
+    got = await wt_client.get(
+        URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert got.status_code == 200, got.text
+    ticket = got.json()
+    assert ticket["on_success"] == {
+        "action_id": follow_on_action[0],
+        "action_version": follow_on_action[1],
+        "action_context": {"trim": 150},
+    }
+    assert ticket["follow_on_work_ticket_idx"] is None
+    assert ticket["follow_on_error"] is None
+
+
+async def test_submit_on_success_invalid_context_refused_up_front(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+):
+    """A follow-on that could never pass its own gate refuses the parent, and
+    nothing is inserted."""
+    token, _ = admin_token
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        follow_on_action,
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {"trim": 2},
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "on_success was refused"
+    assert detail["on_success_detail"]["reason"] == (
+        "action_context does not match action.context_schema"
+    )
+    _, pool_idx = sequenced_pool_for_wt
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.work_ticket WHERE sequenced_pool_idx = $1", pool_idx
+        )
+        == 0
+    )
+
+
+async def test_submit_on_success_unknown_action_404(
+    wt_client, admin_token, sequenced_pool_action, sequenced_pool_for_wt, ingest_dir
+):
+    token, _ = admin_token
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        ("no-such-action", "0.0.0"),
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {},
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"]["reason"] == "on_success was refused"
+
+
+async def test_submit_on_success_target_kind_mismatch_422(
+    wt_client,
+    admin_token,
+    sequenced_pool_action,
+    reference_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+):
+    """The follow-on runs on the parent's scope, so its action must target the
+    same kind."""
+    token, _ = admin_token
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        reference_action,
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["on_success_detail"]["reason"] == (
+        "scope_target.kind does not match action.target_kind"
+    )
+
+
+async def test_follow_on_submitted_once_when_parent_completes(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+):
+    """On completion the follow-on is submitted as the originator on the same
+    pool, recorded on the parent, and a second hook call is a no-op."""
+    from qiita_control_plane.follow_on import submit_follow_on
+    from qiita_control_plane.main import app
+
+    token, admin_idx = admin_token
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        follow_on_action,
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {"trim": 150},
+    )
+    parent_idx = resp.json()["work_ticket_idx"]
+    await _complete(postgres_pool, parent_idx)
+
+    await submit_follow_on(app, parent_idx)
+    await submit_follow_on(app, parent_idx)
+
+    _, pool_idx = sequenced_pool_for_wt
+    parent = await postgres_pool.fetchrow(
+        "SELECT follow_on_work_ticket_idx, follow_on_error"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        parent_idx,
+    )
+    assert parent["follow_on_error"] is None
+    children = await postgres_pool.fetch(
+        "SELECT work_ticket_idx, action_id, originator_principal_idx, action_context, state"
+        " FROM qiita.work_ticket WHERE sequenced_pool_idx = $1 AND work_ticket_idx <> $2",
+        pool_idx,
+        parent_idx,
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child["work_ticket_idx"] == parent["follow_on_work_ticket_idx"]
+    assert child["action_id"] == follow_on_action[0]
+    assert child["originator_principal_idx"] == admin_idx
+    assert json.loads(child["action_context"]) == {"trim": 150}
+    assert child["state"] == WorkTicketState.PENDING.value
+
+
+async def test_follow_on_refusal_recorded_on_parent(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+):
+    """A follow-on refused at completion (here: the same action already in
+    flight on the pool) is recorded, not dropped."""
+    from qiita_control_plane.follow_on import submit_follow_on
+    from qiita_control_plane.main import app
+
+    token, _ = admin_token
+    run_idx, pool_idx = sequenced_pool_for_wt
+    blocker = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": follow_on_action[0],
+            "action_version": follow_on_action[1],
+            "scope_target": {
+                "kind": "sequenced_pool",
+                "sequenced_pool_idx": pool_idx,
+                "sequencing_run_idx": run_idx,
+            },
+            "action_context": {"trim": 150},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert blocker.status_code == 202, blocker.text
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        follow_on_action,
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {"trim": 150},
+    )
+    parent_idx = resp.json()["work_ticket_idx"]
+    await _complete(postgres_pool, parent_idx)
+
+    await submit_follow_on(app, parent_idx)
+
+    parent = await postgres_pool.fetchrow(
+        "SELECT follow_on_work_ticket_idx, follow_on_error"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        parent_idx,
+    )
+    assert parent["follow_on_work_ticket_idx"] is None
+    assert parent["follow_on_error"].startswith("HTTP 409: ")
+    assert str(blocker.json()["work_ticket_idx"]) in parent["follow_on_error"]
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        WorkTicketState.FAILED,
+        WorkTicketState.NO_DATA,
+        WorkTicketState.PROCESSING,
+        WorkTicketState.CANCELLED,
+    ],
+)
+async def test_follow_on_not_submitted_unless_completed(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+    state,
+):
+    from qiita_control_plane.follow_on import submit_follow_on
+    from qiita_control_plane.main import app
+
+    token, _ = admin_token
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        follow_on_action,
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {"trim": 150},
+    )
+    parent_idx = resp.json()["work_ticket_idx"]
+    failure = state == WorkTicketState.FAILED
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET state = $2::qiita.work_ticket_state,"
+        " failure_type = $3, failure_stage = $4, failure_reason = $5"
+        " WHERE work_ticket_idx = $1",
+        parent_idx,
+        state.value,
+        "permanent" if failure else None,
+        "finalize" if failure else None,
+        "x" if failure else None,
+    )
+
+    await submit_follow_on(app, parent_idx)
+
+    assert await _follow_on_outcome(postgres_pool, parent_idx) == (None, None)
+    assert await _pool_tickets(postgres_pool, sequenced_pool_for_wt, follow_on_action[0]) == []
+
+
+async def test_reconcile_follow_ons_submits_one_with_no_outcome(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+):
+    """A completed ticket whose follow-on has no outcome (no hook saw it complete)
+    is submitted at startup."""
+    from qiita_control_plane.follow_on import reconcile_follow_ons
+    from qiita_control_plane.main import app
+
+    token, _ = admin_token
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        follow_on_action,
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {"trim": 150},
+    )
+    parent_idx = resp.json()["work_ticket_idx"]
+    await _complete(postgres_pool, parent_idx)
+
+    await reconcile_follow_ons(app)
+
+    children = await _pool_tickets(postgres_pool, sequenced_pool_for_wt, follow_on_action[0])
+    assert await _follow_on_outcome(postgres_pool, parent_idx) == (children[0], None)
+    assert len(children) == 1
+
+
+async def test_follow_on_is_never_created_twice(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+):
+    """The parent records its follow-on in the transaction that creates it, so a
+    second submission — even after the first follow-on FAILED, which no dedupe
+    blocks — is rolled back, and a recorded follow-on is never re-submitted."""
+    from qiita_control_plane.auth.principal import load_human_user
+    from qiita_control_plane.follow_on import reconcile_follow_ons, submit_follow_on
+    from qiita_control_plane.main import app
+    from qiita_control_plane.routes.work_ticket import (
+        FollowOnAlreadyRecordedError,
+        fetch_work_ticket,
+        submit_work_ticket_core,
+    )
+
+    token, admin_idx = admin_token
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        follow_on_action,
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {"trim": 150},
+    )
+    parent_idx = resp.json()["work_ticket_idx"]
+    await _complete(postgres_pool, parent_idx)
+    await submit_follow_on(app, parent_idx)
+    (child_idx,) = await _pool_tickets(postgres_pool, sequenced_pool_for_wt, follow_on_action[0])
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET state = $2::qiita.work_ticket_state,"
+        " failure_type = 'permanent', failure_stage = 'finalize', failure_reason = 'x'"
+        " WHERE work_ticket_idx = $1",
+        child_idx,
+        WorkTicketState.FAILED.value,
+    )
+
+    parent = await fetch_work_ticket(postgres_pool, parent_idx)
+    with pytest.raises(FollowOnAlreadyRecordedError):
+        await submit_work_ticket_core(
+            app=app,
+            principal=await load_human_user(postgres_pool, admin_idx),
+            body=parent.on_success.as_request(parent.scope_target),
+            follow_on_of=parent_idx,
+        )
+    await submit_follow_on(app, parent_idx)
+    await reconcile_follow_ons(app)
+
+    assert await _pool_tickets(postgres_pool, sequenced_pool_for_wt, follow_on_action[0]) == [
+        child_idx
+    ]
+    assert await _follow_on_outcome(postgres_pool, parent_idx) == (child_idx, None)
+
+
+async def test_concurrent_follow_on_submissions_create_one_ticket(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+):
+    """Two callers racing to submit one parent's follow-on (the completion hook
+    and the startup reconcile, say) leave exactly one ticket, recorded as created."""
+    import asyncio
+
+    from qiita_control_plane.follow_on import submit_follow_on
+    from qiita_control_plane.main import app
+
+    token, _ = admin_token
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        follow_on_action,
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {"trim": 150},
+    )
+    parent_idx = resp.json()["work_ticket_idx"]
+    await _complete(postgres_pool, parent_idx)
+
+    await asyncio.gather(*(submit_follow_on(app, parent_idx) for _ in range(4)))
+
+    children = await _pool_tickets(postgres_pool, sequenced_pool_for_wt, follow_on_action[0])
+    assert len(children) == 1
+    assert await _follow_on_outcome(postgres_pool, parent_idx) == (children[0], None)
+
+
+async def test_follow_on_transient_failure_is_left_for_retry(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+    monkeypatch,
+):
+    """A 5xx during submission records nothing, so the startup reconcile
+    submits the follow-on once the cause is gone."""
+    from fastapi import HTTPException
+
+    from qiita_control_plane.follow_on import reconcile_follow_ons, submit_follow_on
+    from qiita_control_plane.main import app
+    from qiita_control_plane.routes import work_ticket as work_ticket_routes
+
+    token, _ = admin_token
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        follow_on_action,
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {"trim": 150},
+    )
+    parent_idx = resp.json()["work_ticket_idx"]
+    await _complete(postgres_pool, parent_idx)
+
+    async def _unavailable(**_kwargs):
+        raise HTTPException(status_code=503, detail="compute backend unavailable")
+
+    with monkeypatch.context() as m:
+        m.setattr(work_ticket_routes, "submit_work_ticket_core", _unavailable)
+        with pytest.raises(HTTPException):
+            await submit_follow_on(app, parent_idx)
+    assert await _follow_on_outcome(postgres_pool, parent_idx) == (None, None)
+
+    await reconcile_follow_ons(app)
+
+    (child_idx,) = await _pool_tickets(postgres_pool, sequenced_pool_for_wt, follow_on_action[0])
+    assert await _follow_on_outcome(postgres_pool, parent_idx) == (child_idx, None)
+
+
+async def test_follow_on_refused_when_the_originator_is_disabled(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+):
+    """The originator is re-loaded at completion; one who can no longer act gets
+    the follow-on refused and recorded, not submitted."""
+    from qiita_control_plane.follow_on import submit_follow_on
+    from qiita_control_plane.main import app
+
+    token, admin_idx = admin_token
+    resp = await _submit_with_follow_on(
+        wt_client,
+        token,
+        sequenced_pool_action,
+        follow_on_action,
+        sequenced_pool_for_wt,
+        ingest_dir,
+        {"trim": 150},
+    )
+    parent_idx = resp.json()["work_ticket_idx"]
+    await _complete(postgres_pool, parent_idx)
+    await postgres_pool.execute(
+        "UPDATE qiita.principal SET disabled = true, disabled_at = now(),"
+        " disabled_by_idx = idx, disable_reason = 'test' WHERE idx = $1",
+        admin_idx,
+    )
+    try:
+        await submit_follow_on(app, parent_idx)
+    finally:
+        await postgres_pool.execute(
+            "UPDATE qiita.principal SET disabled = false, disabled_at = NULL,"
+            " disabled_by_idx = NULL, disable_reason = NULL WHERE idx = $1",
+            admin_idx,
+        )
+
+    created, error = await _follow_on_outcome(postgres_pool, parent_idx)
+    assert created is None
+    assert error.startswith("the submitting user can no longer submit")
+    assert await _pool_tickets(postgres_pool, sequenced_pool_for_wt, follow_on_action[0]) == []
+
+
+async def test_on_success_refused_from_a_service_account(postgres_pool):
+    from fastapi import HTTPException
+    from qiita_common.models import WorkTicketCreateRequest
+
+    from qiita_control_plane.auth.principal import ServiceAccount
+    from qiita_control_plane.routes.work_ticket import _gate_follow_on
+
+    body = WorkTicketCreateRequest.model_validate(
+        {
+            "action_id": "a",
+            "action_version": "1.0.0",
+            "scope_target": {
+                "kind": "sequenced_pool",
+                "sequenced_pool_idx": 1,
+                "sequencing_run_idx": 1,
+            },
+            "on_success": {"action_id": "b", "action_version": "1.0.0"},
+        }
+    )
+    service = ServiceAccount(
+        principal_idx=1, name="svc", scopes=frozenset(), disabled=False, retired=False
+    )
+    with pytest.raises(HTTPException) as exc:
+        await _gate_follow_on(pool=postgres_pool, settings=None, principal=service, parent=body)
+    assert exc.value.status_code == 422
+    assert exc.value.detail == {"reason": "on_success is only accepted from a human caller"}
+
+
+def test_a_follow_on_carries_no_follow_on():
+    from pydantic import ValidationError
+    from qiita_common.models import WorkTicketFollowOn
+
+    with pytest.raises(ValidationError):
+        WorkTicketFollowOn.model_validate(
+            {
+                "action_id": "b",
+                "action_version": "1.0.0",
+                "on_success": {"action_id": "c", "action_version": "1.0.0"},
+            }
+        )

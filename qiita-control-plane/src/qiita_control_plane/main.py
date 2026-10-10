@@ -33,6 +33,7 @@ from .dispatch import (
     reconcile_inflight_tickets,
 )
 from .ena_import.batch import build_ena_import_study_semaphore, reconcile_inflight_batches
+from .follow_on import reconcile_follow_ons
 from .health import aggregate_health
 from .landing import router as landing_router
 from .notify import build_transport, run_sweeper
@@ -99,6 +100,8 @@ async def lifespan(app: FastAPI):
     # cleanly from the filesystem) rather than blanket-failed, so a deploy
     # that stops/starts the CP undrained doesn't nuke running work.
     await reconcile_inflight_tickets(app)
+    # After the re-attach: see reconcile_follow_ons.
+    await reconcile_follow_ons(app)
 
     # ena_import_batch's OWN tracked task set (see ena_import.batch's module
     # docstring for why it doesn't share running_dispatches). Re-drive any

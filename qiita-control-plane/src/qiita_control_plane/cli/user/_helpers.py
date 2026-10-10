@@ -11,7 +11,12 @@ from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import PATH_RUN_FOLDER_INSPECT, PATH_RUN_FOLDER_PREFIX
-from qiita_common.models import Platform, RunFolderInspectRequest, RunFolderInspectResponse
+from qiita_common.models import (
+    Platform,
+    RunFolderInspectRequest,
+    RunFolderInspectResponse,
+    WorkTicketFollowOn,
+)
 
 from .. import _common
 
@@ -86,6 +91,11 @@ def _load_preflight_conn(
     return conn
 
 
+def _validation_messages(exc: ValidationError) -> str:
+    """A ValidationError's errors flattened to one stderr line."""
+    return "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
+
+
 def _build_body(
     model_cls: type[BaseModel],
     args: argparse.Namespace,
@@ -114,8 +124,29 @@ def _build_body(
     try:
         return model_cls(**fields).model_dump(exclude_unset=True, mode="json", by_alias=True)
     except ValidationError as exc:
-        msgs = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
-        parser.error(f"invalid {model_cls.__name__}: {msgs}")
+        parser.error(f"invalid {model_cls.__name__}: {_validation_messages(exc)}")
+
+
+def _follow_on_from_args(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> WorkTicketFollowOn | None:
+    """The follow-on the `--then-*` flags name, or None when none was given.
+
+    Any `--then-*` flag needs both the action id and version; the context is
+    optional. The server checks the follow-on against its action when the
+    parent ticket is submitted."""
+    action_id, action_version = args.then_action_id, args.then_action_version
+    context = _common.parse_json_arg(args.then_context_json, parser, flag="--then-context-json")
+    if action_id is None and action_version is None and context is None:
+        return None
+    if action_id is None or action_version is None:
+        parser.error("a follow-on needs both --then-action-id and --then-action-version")
+    try:
+        return WorkTicketFollowOn(
+            action_id=action_id, action_version=action_version, action_context=context or {}
+        )
+    except ValidationError as exc:
+        parser.error(f"invalid follow-on: {_validation_messages(exc)}")
 
 
 def _fold_flag_values(

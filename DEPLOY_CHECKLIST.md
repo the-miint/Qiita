@@ -37,7 +37,7 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `[operator]` (#685) `make migrate` applies `20261009000000_work_ticket_follow_on.sql` (three nullable columns on `qiita.work_ticket`, two CHECKs, one partial index; no backfill).
 
 ### 4. Deploy
 
@@ -113,6 +113,7 @@ _None yet._
   account, which still reads any range with `sequence_range:mint`; the response body is
   unchanged.
 - (#653) Run entries of `GET /ena-import-batch/{idx}` gain `metadata_warnings` (a list, empty when there is nothing to report); clients validating that shape strictly must accept it.
+- (#685) Work-ticket responses (`GET /work-ticket/{idx}` and the ticket lists) gain `on_success`, `follow_on_work_ticket_idx` and `follow_on_error` (all null for a ticket with no follow-on); clients validating that shape strictly must accept them.
 - (#653) `qiita-admin backfill host-taxon-id` now also resolves more taxa: human, human skin, mouse gut and mouse skin metagenomes get that host, and soil, marine, sediment, salt marsh, sand, microbial mat, stromatolite and coal metagenomes get `not applicable`. A re-run writes those biosamples instead of reporting them unresolved, so read the default dry-run plan before passing `--execute`.
 - Behavior change (#661): a ticket that exhausts `max_retries` on a retriable failure now ends `failure_type=permanent` in `GET /work-ticket` (reason prefixed `retries_exhausted`) and is emailed in the notify digest instead of being held. Tickets already held as `retriable` are unchanged.
 
