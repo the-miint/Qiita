@@ -69,20 +69,15 @@ Phylogeny internal nodes are addressed by `(reference_idx, node_index)` — scop
 
 ### Public handle prefixes
 
-Every public handle Qiita mints is a short letter prefix followed by its table's
-own `idx`, composed by a GENERATED column; it is what crosses the boundary in
-place of an `*_idx` (`CLAUDE.md`, opaque identifiers). The prefixes in use:
+These letter prefixes are taken by Qiita's minted public handles. A new handle
+must not reuse any of them, and adds its own prefix here.
 
-| Prefix | Names | Table |
-|---|---|---|
-| `QM` | a processed sample | `qiita.exported_identifier` |
-| `QF` | a genome or reference feature with no published accession | `qiita.exported_feature` |
-| `QP` | a processing (an alignment) | `qiita.exported_processing` |
-| `QS` / `QB` | a study / a biosample | `qiita.exported_entity` |
-
-Each table's own UNIQUE index keeps its handles distinct, but nothing in the
-database spans the tables, so a new handle table must take a prefix not listed
-here — and add it here.
+| Prefix | Table |
+|---|---|
+| `QM` | `qiita.exported_identifier` |
+| `QF` | `qiita.exported_feature` |
+| `QP` | `qiita.exported_processing` |
+| `QS`, `QB` | `qiita.exported_entity (study, biosample)` |
 
 ### Data plane design
 
