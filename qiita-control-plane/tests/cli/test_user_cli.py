@@ -44,6 +44,7 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_STEP_LOGS,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
+from run_preflight.db import ERR_CATEGORY_MISSING_ACCESSION, PlatformSampleInfo
 
 from qiita_control_plane.cli.user import main
 
@@ -2415,13 +2416,9 @@ def preflight_stub(monkeypatch, tmp_path):
     so the test controls every per-sample input without a real SQLite schema.
 
     Returns `_install(rows=None, raises=None) -> Path`, writing a marker blob at
-    `tmp_path/preflight.db`. `rows` is a list of 4-tuples matching
-    `get_illumina_sample_info`; `raises` is an exception the accessor raises.
-
-    (It used to also mock `project.human_filtering` and `get_illumina_sample_rows`
-    — the reader read the project's host-filter flag off the blob. That flag is
-    gone: host filtering resolves from sample metadata, not from the pre-flight, so
-    the reader no longer touches either.)
+    `tmp_path/preflight.db`. `rows` is a list of (idx, biosample, primary,
+    secondaries) tuples, returned as the library's `PlatformSampleInfo`; `raises`
+    is an exception the accessor raises.
     """
 
     def _install(
@@ -2446,7 +2443,14 @@ def preflight_stub(monkeypatch, tmp_path):
 
             stub_module.get_illumina_sample_info = _get
         else:
-            stub_module.get_illumina_sample_info = lambda _conn: list(captured_rows)
+            # The library's own record type, so the reader is pinned to its fields.
+            # The secondaries list is passed through uncopied so a test can tell
+            # whether the reader copies it.
+            records = [
+                PlatformSampleInfo(idx, "standard", biosample, primary, secondary, None)
+                for idx, biosample, primary, secondary in captured_rows
+            ]
+            stub_module.get_illumina_sample_info = lambda _conn: list(records)
         monkeypatch.setitem(sys.modules, "run_preflight", stub_module)
         return blob
 
@@ -2839,6 +2843,35 @@ def test_submit_bcl_convert_rejects_non_sqlite_preflight(tmp_path, capsys, prefl
     assert "preflight query failed" in err
 
 
+def test_submit_bcl_convert_surfaces_missing_accession_refusal(tmp_path, capsys, preflight_stub):
+    """The library refuses a row missing a required accession; its message,
+    which names the offenders, reaches the operator verbatim."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = preflight_stub(
+        raises=ValueError(
+            f"{ERR_CATEGORY_MISSING_ACCESSION}: illumina_sample_idx=3 (biosample_accession)"
+        ),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "illumina_sample_idx=3 (biosample_accession)" in err
+    assert "verify the file is a kl-run-preflight SQLite" not in err
+
+
 def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
     monkeypatch, tmp_path, preflight_stub
 ):
@@ -3148,10 +3181,8 @@ def test_submit_bcl_convert_surfaces_a_run_folder_rejection(
 
 
 def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
-    """Tests the case where the reader wraps `get_illumina_sample_info`
-    4-tuples into `_PreflightRow` instances — illumina_sample_idx is
-    cast to int and secondary_project_accessions is copied into a fresh
-    list."""
+    """The reader wraps each `PlatformSampleInfo` into a `_PreflightRow`, copying
+    secondary_project_accessions into a fresh list."""
     import argparse
 
     from qiita_control_plane.cli.user import _PreflightRow, _read_preflight_rows
@@ -3172,6 +3203,74 @@ def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
     # library's return — mutating downstream does not contaminate the
     # caller's data.
     assert rows[0].secondary_project_accessions is not library_secondaries
+
+
+_ILLUMINA_CSV = Path(__file__).resolve().parent / "data" / "good_standard_metagv100.csv"
+
+
+@pytest.fixture
+def illumina_preflight(tmp_path):
+    """Build a real Illumina pre-flight with run_preflight's own CSV loader (the
+    sheet is kl-run-preflight's `good_standard_metagv100_wo_replicates.csv`), so
+    the reader meets the true schema and the real `get_illumina_sample_info`.
+
+    `biosample` is the SQL expression for every sample's biosample accession;
+    the project's bioproject is PRJNA<external_project_id>.
+    """
+    from run_preflight.legacy.api import migrate_legacy_csv_to_db_file
+
+    def _build(biosample: str = "'BIO_' || sample_name") -> Path:
+        db = tmp_path / "illumina.db"
+        migrate_legacy_csv_to_db_file(str(_ILLUMINA_CSV), str(db))
+        conn = sqlite3.connect(db)
+        conn.execute(f"UPDATE input_sample SET biosample_accession = {biosample}")
+        conn.execute("UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id")
+        conn.commit()
+        conn.close()
+        return db
+
+    return _build
+
+
+def test__read_preflight_rows_reads_a_real_preflight(illumina_preflight):
+    import argparse
+
+    from qiita_control_plane.cli.user import _read_preflight_rows
+
+    rows = _read_preflight_rows(illumina_preflight(), argparse.ArgumentParser())
+    assert [r.biosample_accession for r in rows] == [
+        "BIO_sample.1",
+        "BIO_sample.2",
+        "BIO_sample.3",
+    ]
+    assert {r.primary_project_accession for r in rows} == {"PRJNA99999"}
+    assert all(r.secondary_project_accessions == [] for r in rows)
+
+
+@pytest.mark.parametrize(
+    ("biosample", "expected"),
+    [
+        ("NULL", "(biosample_accession)"),
+        ("''", "blank or padded biosample_accession"),
+        ("'  '", "blank or padded biosample_accession"),
+        ("' BIO_x '", "blank or padded biosample_accession"),
+    ],
+)
+def test__read_preflight_rows_refuses_a_missing_or_malformed_accession(
+    illumina_preflight, capsys, biosample, expected
+):
+    """A NULL accession is refused by the library, a blank or padded one by the
+    reader; either way the operator sees the row, not a traceback."""
+    import argparse
+
+    from qiita_control_plane.cli.user import _read_preflight_rows
+
+    with pytest.raises(SystemExit) as exc_info:
+        _read_preflight_rows(illumina_preflight(biosample), argparse.ArgumentParser())
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert expected in err
+    assert "illumina_sample_idx" in err
 
 
 def test_submit_bcl_convert_records_no_host_refs(monkeypatch, tmp_path, capsys, preflight_stub):

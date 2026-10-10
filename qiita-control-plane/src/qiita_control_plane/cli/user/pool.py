@@ -58,7 +58,7 @@ from qiita_common.models import (
 
 from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
 from .. import _common
-from ._helpers import _inspect_run_folder, _load_preflight_conn
+from ._helpers import _inspect_run_folder, _load_preflight_conn, _refuse_malformed_accessions
 
 # action_id + version for the bundled bcl-convert submission flow. Pinned
 # here so the CLI does not drift from the workflow YAML the operator's
@@ -79,7 +79,7 @@ _READ_MASK_ACTION_VERSION = "1.0.0"
 class _PreflightRow(NamedTuple):
     """One illumina_sample row pulled from the kl-run-preflight SQLite.
 
-    Mirrors `run_preflight.get_illumina_sample_info`'s 4-tuple.
+    The fields of `run_preflight.PlatformSampleInfo` that ingest needs.
     `secondary_project_accessions` is empty for non-control samples; controls carry
     one entry per non-primary plate project, sorted by accession value.
 
@@ -117,21 +117,24 @@ def _read_preflight_rows(
 ) -> list[_PreflightRow]:
     """Load the preflight SQLite and return one `_PreflightRow` per illumina_sample row.
 
-    Errors that the operator can fix (an unloadable preflight, library raises on a
-    malformed row, a row missing biosample_accession or primary_project_accession)
-    raise via parser.error so the CLI surfaces a single stderr line and exits 2
-    before any network call.
+    Errors that the operator can fix (an unloadable preflight, a library refusal,
+    a blank or padded accession) raise via parser.error so the CLI surfaces a
+    single stderr line and exits 2 before any network call.
     """
     from run_preflight import get_illumina_sample_info  # noqa: PLC0415
 
     conn = _load_preflight_conn(preflight_blob, parser, flag="--preflight-blob")
     try:
         illumina_samples = get_illumina_sample_info(conn)
-    except (sqlite3.DatabaseError, ValueError) as exc:
+    except sqlite3.DatabaseError as exc:
         parser.error(
             f"--preflight-blob {preflight_blob}: preflight query failed ({exc});"
             " verify the file is a kl-run-preflight SQLite"
         )
+    except ValueError as exc:
+        # The library refuses a pre-flight without exactly one run, a control /
+        # project mismatch, or a NULL accession; its message names each offender.
+        parser.error(f"--preflight-blob {preflight_blob}: {exc}")
     finally:
         conn.close()
 
@@ -142,25 +145,14 @@ def _read_preflight_rows(
         )
 
     parsed: list[_PreflightRow] = []
-    for illumina_sample_idx, biosample_accession, primary, secondary in illumina_samples:
-        if not biosample_accession:
-            parser.error(
-                f"--preflight-blob {preflight_blob}: illumina_sample_idx"
-                f" {illumina_sample_idx} carries no biosample_accession; populate"
-                " upstream before re-submitting"
-            )
-        if not primary:
-            parser.error(
-                f"--preflight-blob {preflight_blob}: illumina_sample_idx"
-                f" {illumina_sample_idx} carries no primary_project_accession;"
-                " populate upstream before re-submitting"
-            )
+    for info in illumina_samples:
+        _refuse_malformed_accessions(info, parser, preflight_blob, "illumina_sample_idx")
         parsed.append(
             _PreflightRow(
-                illumina_sample_idx=int(illumina_sample_idx),
-                biosample_accession=biosample_accession,
-                primary_project_accession=primary,
-                secondary_project_accessions=list(secondary),
+                illumina_sample_idx=info.sample_idx,
+                biosample_accession=info.biosample_accession,
+                primary_project_accession=info.primary_bioproject_accession,
+                secondary_project_accessions=list(info.secondary_bioproject_accessions),
             )
         )
     return parsed

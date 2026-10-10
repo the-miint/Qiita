@@ -246,6 +246,22 @@ def test_read_preflight_rows_fails_on_missing_accession(build_case5_preflight):
         _read_pacbio_preflight_rows(db, _RaisingParser())
 
 
+@pytest.mark.parametrize("bioproject", ["", "  ", " PRJNA99999 "])
+def test_read_preflight_rows_fails_on_blank_or_padded_accession(build_case5_preflight, bioproject):
+    """The library refuses a NULL accession but not a blank or padded one; the
+    reader refuses those, naming the sample."""
+    db = build_case5_preflight()
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE project SET bioproject_accession = ?", (bioproject,))
+    conn.commit()
+    conn.close()
+    with pytest.raises(
+        _RaisingParser.Error,
+        match=r"pacbio_sample_idx 1 has a blank or padded primary_bioproject_accession",
+    ):
+        _read_pacbio_preflight_rows(db, _RaisingParser())
+
+
 def test__read_pacbio_preflight_rows_rejects_a_non_sqlite_blob(tmp_path, capsys):
     """Tests the case where --preflight-blob names a file that is not a SQLite
     database at all — the operator pointed at the CSV, or at a truncated copy.
