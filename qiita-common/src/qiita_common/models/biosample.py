@@ -118,6 +118,7 @@ class BiosampleImportResponse(BaseModel):
     """
 
     biosample_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     owner_id_biosample_study_field_idx: Annotated[int, Field(gt=0)]
     owner_id_biosample_study_field_created: bool
 
@@ -427,7 +428,8 @@ class MetadataEntry(BaseModel):
 class BiosampleResponse(BaseModel):
     """Returned by GET /api/v1/biosample/{biosample_idx}.
 
-    Mirrors qiita.biosample's caller-visible columns and embeds a dict
+    Mirrors qiita.biosample's caller-visible columns, adds the biosample's
+    export_entity_id from qiita.exported_entity, and embeds a dict
     of every globally-linked metadata value the biosample carries,
     keyed on biosample_global_field.internal_name. Purely-local
     metadata (including the owner-biosample-id row) and metadata whose
@@ -442,6 +444,7 @@ class BiosampleResponse(BaseModel):
     """
 
     biosample_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     owner_idx: Annotated[int, Field(gt=0)]
     metadata_checklist: MetadataChecklistRef | None
     biosample_accession: str | None

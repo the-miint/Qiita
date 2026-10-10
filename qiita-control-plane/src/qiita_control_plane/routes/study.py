@@ -49,6 +49,7 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
+from ..repositories.exported_entity import require_export_entity_id
 from ..repositories.study import (
     create_study,
     fetch_study,
@@ -113,6 +114,7 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
     return StudyResponse.model_validate(
         {
             "study_idx": row["idx"],
+            "export_entity_id": require_export_entity_id(row, kind="study"),
             "owner_idx": row["owner_idx"],
             "principal_investigator_idx": row["principal_investigator_idx"],
             "title": row["title"],
@@ -282,6 +284,7 @@ async def list_studies(
             studies.append(
                 StudySummary(
                     study_idx=row["idx"],
+                    export_entity_id=require_export_entity_id(row, kind="study"),
                     title=row["title"],
                     alias=row["alias"],
                     bioproject_accession=row["bioproject_accession"],
@@ -346,6 +349,7 @@ async def get_study(
     if view is StudyRecordView.SUMMARY:
         return StudyRecordSummary(
             study_idx=row["idx"],
+            export_entity_id=require_export_entity_id(row, kind="study"),
             title=row["title"],
             alias=row["alias"],
             bioproject_accession=row["bioproject_accession"],

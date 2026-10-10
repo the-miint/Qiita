@@ -32,6 +32,7 @@ from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
 from qiita_common.models import FieldDataType, GenomeSource, ReferenceStatus, TerminologyStatus
 
 from qiita_control_plane.miint import connect_with_miint
+from qiita_control_plane.repositories.exported_entity import ENTITY_COLUMN, EntityKind
 from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
 
 from ..repositories._sample_helpers import (
@@ -74,6 +75,18 @@ async def fetch_missing_value_reason_idx(pool: asyncpg.Pool, name: str) -> int |
     migration ('not applicable', 'not collected', 'missing: control sample', …).
     """
     return await pool.fetchval("SELECT idx FROM qiita.missing_value_reason WHERE name = $1", name)
+
+
+async def fetch_export_entity_id(
+    pool: asyncpg.Pool, *, kind: EntityKind, entity_idx: int
+) -> str | None:
+    """Return the export_entity_id qiita.exported_entity holds for one study or
+    biosample, or None when it holds none."""
+    column = ENTITY_COLUMN[kind]
+    export_entity_id = await pool.fetchval(
+        f"SELECT export_entity_id FROM qiita.exported_entity WHERE {column} = $1", entity_idx
+    )
+    return export_entity_id
 
 
 async def seed_terminology(
@@ -442,6 +455,28 @@ async def seed_study(
         author_idx,
     )
     return study_idx
+
+
+async def seed_exported_entity_probe(
+    pool: asyncpg.Pool,
+    *,
+    prefix: str,
+    study_count: int,
+) -> tuple[int, list[int], int]:
+    """Insert one principal owning `study_count` studies and one biosample;
+    return (principal_idx, study_idxs, biosample_idx).
+    """
+    # A user-kind principal: qiita.biosample.owner_idx is guarded by a role-typed
+    # FK trigger that rejects a service account.
+    principal_idx = await seed_user_principal(pool, prefix=prefix, suffix="probe")
+    study_idxs = [
+        await seed_study(pool, owner_idx=principal_idx, title=f"{prefix} probe {position}")
+        for position in range(study_count)
+    ]
+    biosample_idx = await seed_biosample(
+        pool, owner_idx=principal_idx, created_by_idx=principal_idx
+    )
+    return principal_idx, study_idxs, biosample_idx
 
 
 async def seed_sequenced_prep_sample(

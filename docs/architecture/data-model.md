@@ -125,7 +125,7 @@ study's record has two views:
 | View | Who | Fields |
 |---|---|---|
 | **full** | wet_lab_admin+ by role; the owner; a caller whose tier is at or above the study's `default_tier` (so anyone, on a `public`-default study) | every column of `StudyResponse`: title, alias, description, abstract, funding, notes, `extra_metadata`, accessions, submission state, owner / PI / creator idxs, tiers, timestamps |
-| **summary** | any other grant: a tier below `default_tier` | `study_idx`, title, alias, `bioproject_accession`, `ena_study_accession`, `default_tier`, `updated_at` |
+| **summary** | any other grant: a tier below `default_tier` | `study_idx`, `export_entity_id`, title, alias, `bioproject_accession`, `ena_study_accession`, `default_tier`, `updated_at` |
 
 Anyone else gets nothing (403). The summary is what lets someone a study was
 shared with find it and recognise it, without the fields its tier does not

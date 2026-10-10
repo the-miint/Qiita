@@ -67,6 +67,18 @@ Phylogeny internal nodes are addressed by `(reference_idx, node_index)` — scop
 
 **Hash storage: never carry MD5 as VARCHAR.** DuckDB's `md5(x)` returns the 32-char hex string by default — never write the string form into a column, temp table, or Parquet file. Cast to `UUID` (`md5(x)::uuid`, 128-bit internally) or use `md5_number(x)` for `UHUGEINT`. Both are 16-byte fixed-width, compare/JOIN as integers, and match the Postgres `uuid` column type the wire-side `sequence_hash` already uses — a string-form intermediate forces a CAST at write time and burns memory + I/O between phases. Same rule applies to any other content hash (SHA-256 as fixed-width bytes, etc.); pick the narrowest integer / fixed-width type the hash fits in.
 
+### Public handle prefixes
+
+These letter prefixes are taken by Qiita's minted public handles. A new handle
+must not reuse any of them, and adds its own prefix here.
+
+| Prefix | Table |
+|---|---|
+| `QM` | `qiita.exported_identifier` |
+| `QF` | `qiita.exported_feature` |
+| `QP` | `qiita.exported_processing` |
+| `QS`, `QB` | `qiita.exported_entity (study, biosample)` |
+
 ### Data plane design
 
 The data plane is intentionally "dumb": it only operates on identifiers it receives. Its three Arrow Flight operations map directly to DuckLake:

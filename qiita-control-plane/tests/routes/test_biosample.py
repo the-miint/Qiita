@@ -31,6 +31,7 @@ from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADA
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.routes import biosample as routes_biosample
 from qiita_control_plane.testing.db_seeds import (
+    fetch_export_entity_id,
     fetch_seeded_metagenome_term,
     retire_biosample,
     retire_biosample_to_study_link,
@@ -234,6 +235,10 @@ async def test_post_biosample_wet_lab_admin_self_owner(ctx):
         # The Field(gt=0) constraint on BiosampleImportResponse already
         # rejects a zero idx at the route boundary.
         "biosample_idx": rj["biosample_idx"],
+        # Read from the table independently of the route under test.
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=rj["biosample_idx"]
+        ),
         "owner_id_biosample_study_field_idx": rj["owner_id_biosample_study_field_idx"],
         "owner_id_biosample_study_field_created": True,
     }
@@ -1637,6 +1642,9 @@ async def test_get_biosample_owner_returns_response(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -1686,6 +1694,9 @@ async def test_get_biosample_via_study_access_returns_response(ctx):
     wet_idx = ctx["wet_session"]["principal_idx"]
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": wet_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -1724,6 +1735,9 @@ async def test_get_biosample_wet_lab_admin_bypasses_access(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -1760,6 +1774,9 @@ async def test_get_biosample_system_admin_bypasses_access(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -1832,6 +1849,9 @@ async def test_get_biosample_carries_missing_reason_marker(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": ctx["wet_session"]["principal_idx"],
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -1909,6 +1929,9 @@ async def test_get_biosample_carries_terminology_term(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": ctx["wet_session"]["principal_idx"],
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -2135,6 +2158,9 @@ async def test_get_biosample_in_study_returns_global_and_local_metadata(ctx, own
     rj["global_metadata"].pop("host_taxon_id", None)
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": study_owner_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -2195,6 +2221,9 @@ async def test_get_biosample_in_study_admin_tier_returns_response(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": wet_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -2349,6 +2378,9 @@ async def test_patch_biosample_wet_lab_admin_happy_path(ctx):
     owner_idx = ctx["wet_session"]["principal_idx"]
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
         "biosample_accession": new_acc,
@@ -4883,6 +4915,12 @@ async def test_bulk_import_creates_all_rows(ctx):
     assert all(r["biosample_idx"] > 0 for r in results)
     # The owner-id field is created once (first row) and reused thereafter.
     assert [r["owner_id_biosample_study_field_created"] for r in results] == [True, False, False]
+    # Each row carries its export_entity_id, read from the table independently.
+    expected_ids = [
+        await fetch_export_entity_id(ctx["pool"], kind="biosample", entity_idx=r["biosample_idx"])
+        for r in results
+    ]
+    assert [r["export_entity_id"] for r in results] == expected_ids
 
     count = await ctx["pool"].fetchval(
         "SELECT count(*) FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx

@@ -37,7 +37,7 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `[operator]` `make migrate` applies `20261006000000_exported_entity.sql` (new table `qiita.exported_entity`, mint-on-insert triggers on `qiita.study` and `qiita.biosample`, and a backfill of one row per existing study and biosample, all in one transaction; it aborts and rolls back if any study or biosample is left without a row). (#682)
 
 ### 4. Deploy
 
@@ -115,6 +115,7 @@ _None yet._
 - (#653) Run entries of `GET /ena-import-batch/{idx}` gain `metadata_warnings` (a list, empty when there is nothing to report); clients validating that shape strictly must accept it.
 - (#653) `qiita-admin backfill host-taxon-id` now also resolves more taxa: human, human skin, mouse gut and mouse skin metagenomes get that host, and soil, marine, sediment, salt marsh, sand, microbial mat, stromatolite and coal metagenomes get `not applicable`. A re-run writes those biosamples instead of reporting them unresolved, so read the default dry-run plan before passing `--execute`.
 - Behavior change (#661): a ticket that exhausts `max_retries` on a retriable failure now ends `failure_type=permanent` in `GET /work-ticket` (reason prefixed `retries_exhausted`) and is emailed in the notify digest instead of being held. Tickets already held as `retriable` are unchanged.
+- (#682) Study responses (`POST`/`GET`/`PATCH /study`, including the summary view of `GET /study/{idx}` and each row of the `GET /study` list), biosample responses (`GET`/`PATCH /biosample/{idx}` and the study-scoped biosample reads and metadata PATCHes), and each result of a biosample import (single and bulk) gain `export_entity_id` (`QS<n>` / `QB<n>`); clients validating those shapes strictly must accept it.
 
 ## Deployed history
 

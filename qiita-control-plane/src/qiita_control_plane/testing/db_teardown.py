@@ -18,6 +18,8 @@ from collections.abc import Iterable
 
 import asyncpg
 
+_Executor = asyncpg.Pool | asyncpg.Connection
+
 STUDY = "study"
 BIOSAMPLE = "biosample"
 PREP_SAMPLE = "prep_sample"
@@ -53,6 +55,7 @@ SWEEP_TIERS = (
         ("biosample_to_study", (("biosample_idx", BIOSAMPLE), ("study_idx", STUDY))),
         ("block_member", (("prep_sample_idx", PREP_SAMPLE),)),
         ("ena_import_batch_item", (("study_idx", STUDY),)),
+        ("exported_entity", (("biosample_idx", BIOSAMPLE), ("study_idx", STUDY))),
         ("exported_feature", (("genome_idx", GENOME_OF_PREP_SAMPLE),)),
         ("exported_identifier", (("prep_sample_idx", PREP_SAMPLE),)),
         ("feature_genome", (("genome_idx", GENOME_OF_PREP_SAMPLE),)),
@@ -143,7 +146,7 @@ def _as_idx_list(idxs: int | Iterable[int]) -> list[int]:
     return list(idxs)
 
 
-async def delete_idxs(pool: asyncpg.Pool, table: str, idxs: int | Iterable[int]) -> None:
+async def delete_idxs(pool: _Executor, table: str, idxs: int | Iterable[int]) -> None:
     """Delete rows by idx from qiita.<table>.
 
     `idxs` may be a scalar int or an iterable of ints; an empty iterable is a
@@ -161,7 +164,7 @@ async def delete_idxs(pool: asyncpg.Pool, table: str, idxs: int | Iterable[int])
     )
 
 
-async def _fetch_genome_idxs(pool: asyncpg.Pool, prep_sample_idxs: list[int]) -> list[int]:
+async def _fetch_genome_idxs(pool: _Executor, prep_sample_idxs: list[int]) -> list[int]:
     """Return the idxs of the genomes these prep_samples produced.
 
     Resolved before the sweep runs, because the sweep deletes qiita.genome and
@@ -177,7 +180,7 @@ async def _fetch_genome_idxs(pool: asyncpg.Pool, prep_sample_idxs: list[int]) ->
     return genome_idxs
 
 
-async def _entity_keyed_candidates(pool: asyncpg.Pool) -> list[asyncpg.Record]:
+async def _entity_keyed_candidates(pool: _Executor) -> list[asyncpg.Record]:
     """Return every (table_name, column_name) in qiita keyed on an entity or a genome.
 
     Base tables only: a view carrying one of these columns would report its rows
@@ -201,7 +204,7 @@ async def _entity_keyed_candidates(pool: asyncpg.Pool) -> list[asyncpg.Record]:
 
 
 async def _sweep_table(
-    pool: asyncpg.Pool,
+    pool: _Executor,
     table: str,
     keys: tuple[tuple[str, str], ...],
     idxs: dict[str, list[int]],
@@ -222,7 +225,7 @@ async def _sweep_table(
 
 
 async def assert_entity_graph_swept(
-    pool: asyncpg.Pool,
+    pool: _Executor,
     *,
     study_idxs: list[int],
     biosample_idxs: list[int],
@@ -273,7 +276,7 @@ async def assert_entity_graph_swept(
 
 
 async def teardown_entity_graph(
-    pool: asyncpg.Pool,
+    pool: _Executor,
     *,
     study_idxs: list[int],
     biosample_idxs: list[int],
@@ -322,6 +325,23 @@ async def delete_principal(pool: asyncpg.Pool, principal_idxs: int | Iterable[in
         return
     await pool.execute("DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])", named)
     await delete_idxs(pool, "principal", named)
+
+
+async def cleanup_exported_entity_probe(
+    pool: asyncpg.Pool,
+    *,
+    principal_idx: int,
+    study_idxs: list[int],
+    biosample_idx: int,
+) -> None:
+    """Delete what seed_exported_entity_probe inserted."""
+    await teardown_entity_graph(
+        pool,
+        study_idxs=study_idxs,
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[],
+    )
+    await delete_principal(pool, principal_idx)
 
 
 async def resolve_ena_study_idxs(

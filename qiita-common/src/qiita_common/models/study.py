@@ -94,11 +94,12 @@ class StudyResponse(BaseModel):
 
     Mirrors the qiita.study row's caller-visible columns, with the
     generated search_vector and parent_study_idx (not exposed in v1)
-    omitted.
+    omitted, plus the study's export_entity_id from qiita.exported_entity.
     """
 
     view: Literal[StudyRecordView.FULL] = StudyRecordView.FULL
     study_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     owner_idx: Annotated[int, Field(gt=0)]
     principal_investigator_idx: int | None
     title: str
@@ -144,6 +145,7 @@ class StudySummary(BaseModel):
     """
 
     study_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     title: str
     alias: str | None
     bioproject_accession: str | None
@@ -176,6 +178,7 @@ class StudyRecordSummary(BaseModel):
 
     view: Literal[StudyRecordView.SUMMARY] = StudyRecordView.SUMMARY
     study_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     title: str
     alias: str | None
     bioproject_accession: str | None
