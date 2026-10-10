@@ -17,9 +17,6 @@ from qiita_common.models import StudyAccessionField, Tier
 from . import require_transaction, update_row
 from .exported_entity import export_entity_id_select
 
-# Columns returned by every create_study INSERT ... RETURNING. Covers every
-# caller-visible column on the row; the route consumes the result via
-# named-key access so column order in this string is not load-bearing.
 _STUDY_RETURNING_COLS = (
     "idx, owner_idx, principal_investigator_idx, title, alias,"
     " description, abstract, funding, ena_study_accession,"
@@ -37,10 +34,7 @@ async def fetch_study(
 ) -> asyncpg.Record | None:
     """Return the qiita.study row for the given idx, or None if no match.
 
-    Selects the same caller-visible column set produced by
-    `create_study` (see `_STUDY_RETURNING_COLS`) so a route handler can
-    reuse the same row → response mapping for both POST and GET. The
-    returned record carries `extra_metadata` as a JSONB-text string
+    The returned record carries `extra_metadata` as a JSONB-text string
     when present; the caller is responsible for `json.loads` if a dict
     shape is needed (mirrors the create-route pattern). Accepts either
     a pool or a connection so the helper composes inside an open
@@ -52,8 +46,6 @@ async def fetch_study(
     single-statement transaction releases the lock immediately and
     the flag is a no-op.
     """
-    # Single-row fetch by idx; same column list as the INSERT RETURNING
-    # so route handlers share one row → response shaping path.
     sql = f"SELECT {_STUDY_RETURNING_COLS} FROM qiita.study WHERE idx = $1"
     if for_update:
         sql += " FOR UPDATE"
@@ -145,14 +137,11 @@ async def insert_study(
     notes: str | None = None,
     extra_metadata: dict | None = None,
     default_tier: Tier | None = None,
-) -> asyncpg.Record:
-    """Insert one row into qiita.study and return all caller-visible columns.
+) -> int:
+    """Insert one row into qiita.study and return its idx.
 
     Exposes every column the caller may legitimately set on a fresh row.
-    `default_tier=None` lets the schema default ('member') apply. The
-    generated `search_vector` and the trigger-managed `updated_at` are
-    populated by Postgres and are part of the RETURNING list so the
-    caller has the complete row.
+    `default_tier=None` lets the schema default ('member') apply.
 
     Raises asyncpg.PostgresError on FK violation (e.g., a non-existent
     `principal_investigator_idx`) or trigger rejection (e.g., owner is
@@ -163,7 +152,7 @@ async def insert_study(
 
     # Single INSERT carrying every settable column; defaulted columns
     # receive NULL and the schema-default kicks in for default_tier.
-    return await conn.fetchrow(
+    study_idx = await conn.fetchval(
         "INSERT INTO qiita.study ("
         "    owner_idx, principal_investigator_idx, title, alias,"
         "    description, abstract, funding, ena_study_accession,"
@@ -171,7 +160,7 @@ async def insert_study(
         "    created_by_idx"
         ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb,"
         "          COALESCE($12::qiita.tier, 'member'::qiita.tier), $13)"
-        f" RETURNING {_STUDY_RETURNING_COLS}",
+        " RETURNING idx",
         owner_idx,
         principal_investigator_idx,
         title,
@@ -186,6 +175,7 @@ async def insert_study(
         default_tier,
         created_by_idx,
     )
+    return study_idx
 
 
 async def insert_owner_study_access_admin(
@@ -299,8 +289,8 @@ async def create_study(
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
 
-    # Step a: insert the study row, returning every caller-visible column.
-    study_row = await insert_study(
+    # Step a: insert the study row.
+    study_idx = await insert_study(
         conn,
         owner_idx=owner_idx,
         created_by_idx=created_by_idx,
@@ -320,14 +310,14 @@ async def create_study(
     # Step b: auto-grant the owner ADMIN access on the freshly created study.
     await insert_owner_study_access_admin(
         conn,
-        study_idx=study_row["idx"],
+        study_idx=study_idx,
         owner_idx=owner_idx,
         granted_by_idx=created_by_idx,
     )
 
-    # Step c: re-read the row, since the INSERT's RETURNING ran before the
-    # AFTER INSERT trigger minted its export_entity_id.
-    created_row = await fetch_study(conn, study_row["idx"])
+    # Step c: read the row back. Its export_entity_id is minted by an AFTER
+    # INSERT trigger, so the INSERT's own RETURNING could not carry it.
+    created_row = await fetch_study(conn, study_idx)
     return created_row
 
 
@@ -397,8 +387,8 @@ async def get_or_create_study_by_ena_accessions(
     "reuse the existing row's access grant too" -- catch-and-refetch is
     the race-safe shape available to a composer, not a single INSERT.
 
-    Returns (row, created): row is the same RETURNING/fetch_study column
-    shape either way; created is True only on the insert branch.
+    Returns (row, created): row is the fetch_study column shape either
+    way; created is True only on the insert branch.
     """
     ena_study_accession = (ena_study_accession or "").strip() or None
     existing_row = await _resolve_study_by_ena_accessions(

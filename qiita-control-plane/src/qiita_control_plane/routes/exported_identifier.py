@@ -27,8 +27,7 @@ from qiita_common.models import (
 from ..auth.guards import require_human, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
-from ..repositories._exported_identifier_helpers import IncompleteMintError
-from ..repositories.exported_identifier import mint_exported_identifiers
+from ..repositories.exported_identifier import IncompleteMintError, mint_exported_identifiers
 from ._helpers import authorize_completed_alignment_cohort, first_few
 
 router = APIRouter(prefix=PATH_EXPORTED_IDENTIFIER_PREFIX, tags=["exported-identifier"])

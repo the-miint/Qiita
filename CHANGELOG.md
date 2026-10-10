@@ -81,11 +81,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   it, and the migration backfills one for every existing study and biosample. Study responses
   (the full record, the summary view and each row of the study list), biosample responses, and
   each result of a biosample import carry it as `export_entity_id`. Postgres composes the handle
-  as a generated column, so no caller can supply one and none can be edited after publication. It
-  carries no retirement columns: both parents are referenced `ON DELETE RESTRICT` and neither has
-  a purge path, so a handle cannot be detached from what it names, and a retired entity's state is
-  read from the entity rather than copied. The migration records the four conditions an entity
-  must satisfy to belong in the table.
+  as a generated column, so no caller can supply one and none can be edited after publication.
+  The migration records the conditions an entity must satisfy to belong in the table, and why the
+  table carries no retirement columns.
 - **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
   reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
   biosample, and upsert this study's metadata on it, naming the sample by a

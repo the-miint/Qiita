@@ -94,7 +94,7 @@ class StudyResponse(BaseModel):
 
     Mirrors the qiita.study row's caller-visible columns, with the
     generated search_vector and parent_study_idx (not exposed in v1)
-    omitted.
+    omitted, plus the study's export_entity_id from qiita.exported_entity.
     """
 
     view: Literal[StudyRecordView.FULL] = StudyRecordView.FULL

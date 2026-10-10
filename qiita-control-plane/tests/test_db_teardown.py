@@ -100,7 +100,7 @@ async def _manual_teardown_graph(
     """Delete a seeded graph, its run and pool, and its principal; an entry whose
     idx is not given is skipped.
 
-    Deliberately a hand-written list rather than SWEEP_TIERS or
+    A hand-written list rather than SWEEP_TIERS or
     teardown_entity_graph, so this cleanup is independent of the sweep under test.
     The cost is that _MANUAL_TEARDOWN_ROWS must be kept in step with what
     the fixtures seed: a table that a seed or trigger newly populates loudly fails
@@ -392,7 +392,7 @@ async def test_teardown_entity_graph_sweeps_a_link_row_by_either_side(postgres_p
         }
         assert survivors == {"biosample_to_study": 0, "study": 1}
     finally:
-        # The graph fixture's teardown correctly does not delete the second study,
+        # The graph fixture's teardown does not delete the second study,
         # which it wasn't told about, so that must be manually torn down here.
         await _manual_teardown_graph(postgres_pool, study_idx=other_study_idx)
 

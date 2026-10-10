@@ -428,7 +428,8 @@ class MetadataEntry(BaseModel):
 class BiosampleResponse(BaseModel):
     """Returned by GET /api/v1/biosample/{biosample_idx}.
 
-    Mirrors qiita.biosample's caller-visible columns and embeds a dict
+    Mirrors qiita.biosample's caller-visible columns, adds the biosample's
+    export_entity_id from qiita.exported_entity, and embeds a dict
     of every globally-linked metadata value the biosample carries,
     keyed on biosample_global_field.internal_name. Purely-local
     metadata (including the owner-biosample-id row) and metadata whose

@@ -180,7 +180,7 @@ async def _fetch_genome_idxs(pool: _Executor, prep_sample_idxs: list[int]) -> li
     return genome_idxs
 
 
-async def _entity_keyed_candidates(pool: asyncpg.Pool) -> list[asyncpg.Record]:
+async def _entity_keyed_candidates(pool: _Executor) -> list[asyncpg.Record]:
     """Return every (table_name, column_name) in qiita keyed on an entity or a genome.
 
     Base tables only: a view carrying one of these columns would report its rows
@@ -325,6 +325,23 @@ async def delete_principal(pool: asyncpg.Pool, principal_idxs: int | Iterable[in
         return
     await pool.execute("DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])", named)
     await delete_idxs(pool, "principal", named)
+
+
+async def cleanup_exported_entity_probe(
+    pool: asyncpg.Pool,
+    *,
+    principal_idx: int,
+    study_idxs: list[int],
+    biosample_idx: int,
+) -> None:
+    """Delete what seed_exported_entity_probe inserted."""
+    await teardown_entity_graph(
+        pool,
+        study_idxs=study_idxs,
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[],
+    )
+    await delete_principal(pool, principal_idx)
 
 
 async def resolve_ena_study_idxs(

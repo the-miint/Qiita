@@ -37,7 +37,7 @@ _None yet._
 
 ### 3. Migrations
 
-- `[operator]` `make migrate` applies `20261006000000_exported_entity.sql` (new table `qiita.exported_entity`, mint-on-insert triggers on `qiita.study` and `qiita.biosample`, and a backfill of one row per existing study and biosample, all in one transaction). (#feat/exported-entity)
+- `[operator]` `make migrate` applies `20261006000000_exported_entity.sql` (new table `qiita.exported_entity`, mint-on-insert triggers on `qiita.study` and `qiita.biosample`, and a backfill of one row per existing study and biosample, all in one transaction; it aborts and rolls back if any study or biosample is left without a row). (#feat/exported-entity)
 
 ### 4. Deploy
 
@@ -60,12 +60,6 @@ _None yet._
       python3 -c "import duckdb; print(duckdb.__version__)" | grep -Fxq 1.5.5 \
       || { echo "$s is not on DuckDB 1.5.5"; exit 1; }
   done && echo DUCKDB_155_OK'
-  ```
-- `[operator]` **Every study and biosample has an `exported_entity` row** — the backfill
-  and the triggers left none out. Expect `0`. (#feat/exported-entity)
-  ```bash
-  set -a; . /etc/qiita/control-plane.env; set +a
-  psql "$DATABASE_URL" -tAc "SELECT (SELECT count(*) FROM qiita.study s WHERE NOT EXISTS (SELECT 1 FROM qiita.exported_entity e WHERE e.study_idx = s.idx)) + (SELECT count(*) FROM qiita.biosample b WHERE NOT EXISTS (SELECT 1 FROM qiita.exported_entity e WHERE e.biosample_idx = b.idx))"
   ```
 
 ### 6. After the deploy verifies green

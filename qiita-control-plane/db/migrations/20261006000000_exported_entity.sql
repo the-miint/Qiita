@@ -4,26 +4,26 @@
 -- EXPORTED ENTITY (the public handle for one curated entity)
 -- =============================================================================
 -- Mints the name a study or a biosample is referred to by outside Qiita:
--- 'QS<idx>' for a study, 'QB<idx>' for a biosample.
+-- 'QS<n>' for a study, 'QB<n>' for a biosample, where <n> is this table's own idx
+-- (one sequence shared by both kinds), never the entity's.
 --
--- It exists because an `*_idx` should not leave this system. This table is the
--- alternative, and its identifiers can be used generally outside this system
--- (as in ENA submissions, exported filenames, etc.) with the expectation that
--- they will be permanent and stable.
+-- These identifiers stand in for an `*_idx` wherever one would leave this system
+-- (see CLAUDE.md on opaque identifiers) — ENA submissions, exported filenames,
+-- etc. — and are permanent and stable.
 --
 -- WHAT COUNTS AS AN ENTITY HERE. Study and biosample each satisfy the conditions
 -- below, and the rest of this table's shape follows from them:
 --
 --   1. Standalone identity — named by a single FK column, never by a tuple, because
 --      the uniqueness constraints below key one column per kind.
---   2. No purge path — nothing hard-DELETEs it and every inbound FK is RESTRICT,
---      so a handle never has to outlive the thing it names.
+--   2. No purge path — nothing hard-DELETEs it, so a handle never has to outlive
+--      the thing it names.
 --   3. Its lifecycle (e.g., retirement) is recorded on the entity itself, so a
 --      reader joins the entity for that state instead of reading a copy kept here.
 --   4. Mintable without an accession — the handle must not wait on an external
---      authority, because having a name BEFORE one exists is part of the point.
+--      authority, since it is needed before one exists.
 --
--- Because of condition 3, this table deliberately has NO RETIREMENT COLUMNS.
+-- Because of condition 3, this table has no retirement columns.
 
 CREATE TABLE qiita.exported_entity (
     idx               BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
@@ -32,10 +32,10 @@ CREATE TABLE qiita.exported_entity (
     -- that supplies a value, so it cannot be forged by a caller and cannot be
     -- edited after publication. No code path composes this string.
     --
-    -- NOT NULL is load-bearing rather than decorative. The CASE has no ELSE, so a
-    -- new kind added without extending here composes NULL and the INSERT fails loudly.
-    -- Note that all prefixes must be the same length (2 characters) and composed
-    -- only of letters.
+    -- NOT NULL turns a missing CASE branch into an error: the CASE has no ELSE, so a
+    -- new kind added without extending it composes NULL and the INSERT fails loudly.
+    -- Every prefix is letters only, so with a digits-only idx after it each handle
+    -- splits into prefix and idx one way only.
     export_entity_id  VARCHAR NOT NULL GENERATED ALWAYS AS (
         CASE
             WHEN study_idx     IS NOT NULL THEN 'QS'
@@ -45,7 +45,7 @@ CREATE TABLE qiita.exported_entity (
 
     -- The entity. Exactly one of these is non-null; see the CHECK below.
     --
-    -- RESTRICT on both as neither parent has a hard-delete path to accommodate.
+    -- RESTRICT on both: see condition 2.
     study_idx         BIGINT REFERENCES qiita.study(idx) ON DELETE RESTRICT,
     biosample_idx     BIGINT REFERENCES qiita.biosample(idx) ON DELETE RESTRICT,
 
@@ -64,18 +64,18 @@ CREATE TABLE qiita.exported_entity (
 );
 
 COMMENT ON TABLE qiita.exported_entity IS
-    'Public handle (export_entity_id, ''QS<idx>'' for a study and ''QB<idx>'' for a '
-    'biosample) for one curated entity, so nothing that crosses the Qiita boundary '
+    'Public handle (export_entity_id, ''QS<n>'' for a study and ''QB<n>'' for a '
+    'biosample, <n> being this table''s own idx) for one curated entity, so nothing '
+    'that crosses the Qiita boundary '
     'has to carry an internal *_idx. An entity qualifies here when it has a '
     'standalone single-column identity, no hard-delete path, its own lifecycle '
     'columns, and no dependency on an external accession existing first. '
-    'Deliberately carries no retirement columns: a handle is permanent and its '
+    'Carries no retirement columns: a handle is permanent and its '
     'entity''s retirement is read from the entity.';
 
 COMMENT ON COLUMN qiita.exported_entity.export_entity_id IS
-    'The published handle. GENERATED ALWAYS: unforgeable by a caller, immutable '
-    'after publication, and NOT NULL so a kind added without extending the prefix '
-    'expression fails at insert rather than minting a wrong handle.';
+    'The published handle. GENERATED ALWAYS: unforgeable by a caller and immutable '
+    'after publication.';
 
 -- The published handle is the lookup key for anyone resolving an external usage.
 -- A collision is already impossible while all prefixes follow the requirements
@@ -92,8 +92,8 @@ CREATE UNIQUE INDEX exported_entity_export_entity_id_unique
 -- Every study and biosample holds a handle from the transaction that creates it,
 -- whichever path creates it. The handle is attributed to the entity's creator,
 -- which may be a service account. Writes only to exported_entity, never to the
--- entity row: an UPDATE there would bump its updated_at and meet its publication
--- lock.
+-- entity row: an UPDATE there would bump its updated_at and, on a biosample,
+-- meet its publication lock.
 -- =============================================================================
 
 CREATE OR REPLACE FUNCTION qiita.tg_mint_exported_entity()
@@ -130,10 +130,28 @@ CREATE TRIGGER biosample_mint_exported_entity
 -- =============================================================================
 
 INSERT INTO qiita.exported_entity (study_idx, created_by_idx)
-SELECT idx, created_by_idx FROM qiita.study ORDER BY idx;
+SELECT idx, created_by_idx FROM qiita.study;
 
 INSERT INTO qiita.exported_entity (biosample_idx, created_by_idx)
-SELECT idx, created_by_idx FROM qiita.biosample ORDER BY idx;
+SELECT idx, created_by_idx FROM qiita.biosample;
+
+-- Fail the migration, and so roll all of it back, if any entity was left without
+-- a handle.
+DO $$
+DECLARE
+    unhandled BIGINT;
+BEGIN
+    SELECT (SELECT count(*) FROM qiita.study s
+             WHERE NOT EXISTS (SELECT 1 FROM qiita.exported_entity e
+                                WHERE e.study_idx = s.idx))
+         + (SELECT count(*) FROM qiita.biosample b
+             WHERE NOT EXISTS (SELECT 1 FROM qiita.exported_entity e
+                                WHERE e.biosample_idx = b.idx))
+      INTO unhandled;
+    IF unhandled > 0 THEN
+        RAISE EXCEPTION 'exported_entity backfill left % entities without a handle', unhandled;
+    END IF;
+END $$;
 
 
 -- migrate:down

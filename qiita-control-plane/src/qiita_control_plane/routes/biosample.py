@@ -1042,8 +1042,9 @@ def _biosample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
     """Map a qiita.biosample row's columns to BiosampleResponse field names.
 
     Centralises the column -> field mapping (the idx -> biosample_idx rename
-    aside, every key matches its column). Excludes the metadata dicts and
-    caller_system_role. Runs no DB queries.
+    aside, every key matches its column; export_entity_id is read from
+    qiita.exported_entity). Excludes the metadata dicts and caller_system_role.
+    Runs no DB queries.
     """
     return {
         "biosample_idx": row["idx"],

@@ -240,3 +240,19 @@ async def test_a_purge_does_not_give_the_alignment_idx_back(postgres_pool, probe
     await postgres_pool.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", reminted
     )
+
+
+def test_missing_from_reports_the_gap():
+    """The mint's all-or-nothing guard. Exercised directly because the only thing
+    that makes it fire in production — an alignment purged between the INSERT and
+    the SELECT of one READ COMMITTED transaction — cannot be staged deterministically
+    without racing two connections, and the promise it protects (every requested
+    sample is present or the request fails) is the response's headline claim."""
+    from qiita_control_plane.repositories.exported_identifier import _missing_from
+
+    rows = [{"prep_sample_idx": 4}, {"prep_sample_idx": 9}]
+    assert _missing_from(rows, [4, 9]) == []
+    assert _missing_from(rows, [4, 7, 9, 2]) == [2, 7]
+    assert _missing_from([], [5]) == [5]
+    # Deduped input must not report a phantom gap.
+    assert _missing_from(rows, [4, 4, 9]) == []

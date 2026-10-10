@@ -32,9 +32,8 @@ from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
 from qiita_common.models import FieldDataType, GenomeSource, ReferenceStatus, TerminologyStatus
 
 from qiita_control_plane.miint import connect_with_miint
-from qiita_control_plane.repositories.exported_entity import _ENTITY_COLUMN, EntityKind
+from qiita_control_plane.repositories.exported_entity import ENTITY_COLUMN, EntityKind
 from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
-from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 from ..repositories._sample_helpers import (
     EntityMetadataSpec,
@@ -83,7 +82,7 @@ async def fetch_export_entity_id(
 ) -> str | None:
     """Return the export_entity_id qiita.exported_entity holds for one study or
     biosample, or None when it holds none."""
-    column = _ENTITY_COLUMN[kind]
+    column = ENTITY_COLUMN[kind]
     export_entity_id = await pool.fetchval(
         f"SELECT export_entity_id FROM qiita.exported_entity WHERE {column} = $1", entity_idx
     )
@@ -478,23 +477,6 @@ async def seed_exported_entity_probe(
         pool, owner_idx=principal_idx, created_by_idx=principal_idx
     )
     return principal_idx, study_idxs, biosample_idx
-
-
-async def cleanup_exported_entity_probe(
-    pool: asyncpg.Pool,
-    *,
-    principal_idx: int,
-    study_idxs: list[int],
-    biosample_idx: int,
-) -> None:
-    """Delete what seed_exported_entity_probe inserted, handle rows included."""
-    await teardown_entity_graph(
-        pool,
-        study_idxs=study_idxs,
-        biosample_idxs=[biosample_idx],
-        prep_sample_idxs=[],
-    )
-    await delete_principal(pool, principal_idx)
 
 
 async def seed_sequenced_prep_sample(

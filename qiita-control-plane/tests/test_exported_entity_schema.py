@@ -8,14 +8,17 @@ import asyncpg
 import pytest
 
 from qiita_control_plane.testing.db_seeds import (
-    cleanup_exported_entity_probe,
     retire_biosample,
     seed_biosample,
     seed_exported_entity_probe,
     seed_service_principal,
     seed_study,
 )
-from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
+from qiita_control_plane.testing.db_teardown import (
+    cleanup_exported_entity_probe,
+    delete_principal,
+    teardown_entity_graph,
+)
 
 pytestmark = pytest.mark.db
 

@@ -4,17 +4,19 @@ import pytest
 
 from qiita_control_plane.repositories.exported_entity import (
     MissingExportedEntityError,
+    export_entity_id_select,
     fetch_exported_entities,
     require_export_entity_id,
 )
 from qiita_control_plane.testing.db_seeds import (
-    cleanup_exported_entity_probe,
+    fetch_export_entity_id,
     seed_exported_entity_probe,
 )
+from qiita_control_plane.testing.db_teardown import cleanup_exported_entity_probe
 
 pytestmark = pytest.mark.db
 
-# An idx no entity holds: every identity column starts at 1.
+# An idx no entity holds: identity values are positive.
 _ABSENT_IDX = -1
 
 
@@ -39,20 +41,19 @@ async def probe(postgres_pool):
 async def _expect(postgres_pool, entries):
     """The expected records for `entries`, a list of (study_idx, biosample_idx).
 
-    The handle is minted from the table's identity sequence and so is not
+    The export_entity_id comes from the table's identity sequence and so is not
     predictable, so each one is looked up per entity, independently of the query
     under test. `entries` is in the order the fetch promises — so a row out of
     place, a row missing, or a row too many all still fail the comparison.
     """
     expected = []
     for study, biosample in entries:
-        handle = await postgres_pool.fetchval(
-            "SELECT export_entity_id FROM qiita.exported_entity"
-            " WHERE study_idx IS NOT DISTINCT FROM $1"
-            "   AND biosample_idx IS NOT DISTINCT FROM $2",
-            study,
-            biosample,
-        )
+        if study is not None:
+            handle = await fetch_export_entity_id(postgres_pool, kind="study", entity_idx=study)
+        else:
+            handle = await fetch_export_entity_id(
+                postgres_pool, kind="biosample", entity_idx=biosample
+            )
         expected.append(
             {"study_idx": study, "biosample_idx": biosample, "export_entity_id": handle}
         )
@@ -99,21 +100,25 @@ async def test_fetch_exported_entities_one_kind_alone(postgres_pool, probe):
     assert actual == expected
 
 
-async def test_fetch_exported_entities_raise_missing(postgres_pool, probe):
-    """Tests the case where a request names an entity that has no handle.
+@pytest.mark.parametrize("kind", ["study", "biosample"])
+async def test_fetch_exported_entities_raise_missing(postgres_pool, probe, kind):
+    """Tests the case where a request names an entity of `kind` that has no
+    export_entity_id, beside entities of both kinds that resolve.
 
     The fetch raises rather than returning a short list, and names only the
-    missing entity and its kind, not the ones that resolved beside it.
+    missing entity and its kind: the other kind's rows, NULL in this kind's
+    column, neither satisfy nor hide the gap.
     """
+    study_idx = list(probe["study_idxs"])
+    biosample_idx = [probe["biosample_idx"]]
+    (study_idx if kind == "study" else biosample_idx).append(_ABSENT_IDX)
     with pytest.raises(MissingExportedEntityError) as caught:
         await fetch_exported_entities(
-            postgres_pool,
-            study_idx=probe["study_idxs"],
-            biosample_idx=[probe["biosample_idx"], _ABSENT_IDX],
+            postgres_pool, study_idx=study_idx, biosample_idx=biosample_idx
         )
 
     actual = {"missing": caught.value.missing, "kind": caught.value.kind}
-    expected = {"missing": [_ABSENT_IDX], "kind": "biosample"}
+    expected = {"missing": [_ABSENT_IDX], "kind": kind}
     assert actual == expected
 
 
@@ -136,3 +141,13 @@ def test_require_export_entity_id_raise_missing():
     actual = {"missing": caught.value.missing, "kind": caught.value.kind}
     expected = {"missing": [7], "kind": "biosample"}
     assert actual == expected
+
+
+def test_export_entity_id_select_raise_bad_alias():
+    """Tests the case where the table alias is not a plain identifier.
+
+    The alias is interpolated into SQL text, so anything else is refused before it
+    reaches a query.
+    """
+    with pytest.raises(ValueError, match="plain SQL identifier"):
+        export_entity_id_select("study", alias="s; DROP TABLE qiita.study")

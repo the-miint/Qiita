@@ -5,13 +5,11 @@ from typing import Any, Literal
 
 import asyncpg
 
-from ._exported_identifier_helpers import missing_from
-
 EntityKind = Literal["study", "biosample"]
 
 # The entity column per kind. A column name cannot be bound as a parameter, so the
 # kind selects one from this closed mapping rather than from caller input.
-_ENTITY_COLUMN: dict[EntityKind, str] = {"study": "study_idx", "biosample": "biosample_idx"}
+ENTITY_COLUMN: dict[EntityKind, str] = {"study": "study_idx", "biosample": "biosample_idx"}
 
 # Every caller-visible column, both kinds in one pass. Study entries come first
 # ascending, then biosample entries ascending: `study_idx IS NULL` is false on a
@@ -29,8 +27,9 @@ class MissingExportedEntityError(RuntimeError):
     """Requested entities that have no export_entity_id.
 
     Carries the missing identifiers and the kind they belong to. Every existing
-    study and biosample holds a handle, so each one names either no entity at all
-    or an entity whose handle is unexpectedly absent.
+    study and biosample holds an export_entity_id, so each missing identifier names
+    either no entity at all or an entity whose export_entity_id is unexpectedly
+    absent.
     """
 
     def __init__(self, missing: list[int], *, kind: str) -> None:
@@ -46,9 +45,12 @@ def export_entity_id_select(kind: EntityKind, *, alias: str) -> str:
     `alias` names the entity table in the enclosing query.
 
     A scalar subquery, so an entity without a row reads NULL rather than dropping
-    out of the result.
+    out of the result. `alias` is interpolated into SQL text, so anything but a
+    plain identifier is refused.
     """
-    column = _ENTITY_COLUMN[kind]
+    if not alias.isidentifier():
+        raise ValueError(f"alias must be a plain SQL identifier, got {alias!r}")
+    column = ENTITY_COLUMN[kind]
     expression = (
         "(SELECT export_entity_id FROM qiita.exported_entity ee"
         f" WHERE ee.{column} = {alias}.idx) AS export_entity_id"
@@ -81,9 +83,11 @@ async def fetch_exported_entities(
     requested = {"study": study_idx, "biosample": biosample_idx}
     rows = await pool.fetch(_SELECT, study_idx, biosample_idx)
 
-    # Per kind, so a gap names the entities it is actually about.
-    for kind, column in _ENTITY_COLUMN.items():
-        missing = missing_from(rows, requested[kind], key=column)
+    # Per kind, so a gap names the entities it is actually about. A row of the
+    # other kind carries NULL in this kind's column, so it matches nothing here.
+    for kind, column in ENTITY_COLUMN.items():
+        returned = {row[column] for row in rows}
+        missing = sorted(idx for idx in set(requested[kind]) if idx not in returned)
         if missing:
             raise MissingExportedEntityError(missing, kind=kind)
     return rows
