@@ -3,8 +3,8 @@
 The submitter names a run id; the control plane resolves it to the BCL run
 folder (POST /run-folder/inspect) and reads the instrument identity from its
 RunInfo.xml, just like submit-bcl-convert. The whole pool goes to ONE
-pool-scoped `golay-demux` work ticket, which converts with a no-index dummy sheet
-(every read to Undetermined, the Golay I1 emitted) and demuxes on the Golay
+pool-scoped `golay-demux` work ticket, which converts with a dummy sheet
+(every decodable read to Undetermined, the Golay I1 emitted) and demuxes on the Golay
 barcode.
 
 The per-sample Golay roster (`barcode_map`) rides in action_context, built from

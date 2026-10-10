@@ -1,6 +1,6 @@
 """Golay-barcode demux of a pool's multiplexed 16S run into the DuckLake `read`
 table — the amplicon analogue of ingest_reads. It runs after bcl_convert, which
-sent every read to Undetermined (the dummy no-index sheet) and emitted the Golay
+sent every decodable read to Undetermined (the dummy sheet) and emitted the Golay
 I1 index, and reads that convert_dir's I1/R1/R2 FASTQs directly.
 
 Two halves: demux (build the Golay cloud, pair I1 against R1/R2 by record order with
@@ -24,6 +24,7 @@ from pathlib import Path
 from pydantic import BaseModel
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import StepNoData
+from qiita_common.illumina import GOLAY_BARCODE_LENGTH
 from qiita_common.parquet import validate_parquet_path
 
 from ..cp_client import make_cp_client
@@ -129,7 +130,7 @@ class Inputs(BaseModel):
 
     convert_dir: the bcl_convert step's output dir, holding the pool's Undetermined
         I1/R1/R2 FASTQs (no per-sample demux happened upstream — the dummy sheet
-        sent everything to Undetermined and emitted the Golay I1 index).
+        sent every decodable read to Undetermined and emitted the Golay I1 index).
     barcode_map: runner-staged roster (prep_sample_idx, barcode, barcodes_are_rc);
         the RC flag is per-sample provenance.
     golay_error_threshold: max Golay errors to accept a match (EMP: 1.5). the
@@ -227,11 +228,12 @@ def _run_demux(
         if bad:
             named = ", ".join(f"{r[0]}:{r[1]}" for r in bad)
             raise ValueError(f"barcodes decode to no Golay codeword: {named}")
-        # per-record RC'd 12-nt index read, keyed by record order. sequence1[:12] is
-        # correct at any length (a shorter I1 just won't match a 12-mer codeword).
+        # per-record RC'd barcode-length index read, keyed by record order. The
+        # prefix is correct at any length (a shorter I1 just won't match a codeword).
         conn.execute(
             "CREATE OR REPLACE VIEW idx_reads AS SELECT sequence_index, "
-            "sequence_dna_reverse_complement(upper(sequence1[:12])) AS index_read "
+            "sequence_dna_reverse_complement("
+            f"upper(sequence1[:{GOLAY_BARCODE_LENGTH}])) AS index_read "
             f"FROM read_fastx('{i1}')"
         )
         # per-record R1(+R2), keyed by record order (matches I1's order).

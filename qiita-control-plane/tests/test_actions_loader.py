@@ -371,7 +371,7 @@ def test_load_actions_loads_on_disk_golay_demux_yaml():
     # The vendored golay table is gone — the cloud is generated in-job.
     assert "golay_table_path" not in golay.context_schema["properties"]
 
-    # bcl-convert (dummy no-index sheet) is now in-workflow, then the demux.
+    # bcl-convert (dummy sheet) is now in-workflow, then the demux.
     assert [s.name for s in golay.steps] == [
         "bcl_convert_prep",
         "bcl_convert",

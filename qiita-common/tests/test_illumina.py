@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from qiita_common.illumina import (
+    AMPLICON_PLACEHOLDER_INDEX,
     IlluminaRead,
     InstrumentRunInfo,
     _instrument_model_from_serial,
@@ -274,26 +275,67 @@ def test_read_run_reads_rejects_missing_reads(tmp_path):
         read_run_reads(bcl_input_dir)
 
 
-def test_build_amplicon_dummy_sample_sheet_mirrors_spp():
+def test_build_amplicon_dummy_sample_sheet_follows_runinfo_read_order():
+    """Segments follow RunInfo.xml order, so leading index reads become the
+    leading segments rather than the first template read taking their place."""
+    reads = (
+        IlluminaRead(12, True),
+        IlluminaRead(8, True),
+        IlluminaRead(151, False),
+        IlluminaRead(151, False),
+    )
+    sheet = build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")
+    assert "OverrideCycles,I12;N8;Y151;Y151" in sheet
+
+
+def test_build_amplicon_dummy_sample_sheet_keeps_unequal_template_lengths():
+    reads = (IlluminaRead(151, False), IlluminaRead(12, True), IlluminaRead(101, False))
+    sheet = build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")
+    assert "OverrideCycles,Y151;I12;Y101" in sheet
+    assert "[Reads]\n151\n101\n" in sheet
+
+
+def test_build_amplicon_dummy_sample_sheet_declares_a_placeholder_index():
+    """The Golay read is a 12-cycle index and the one sample carries
+    AMPLICON_PLACEHOLDER_INDEX with no mismatches (see that constant for why)."""
     reads = (IlluminaRead(151, False), IlluminaRead(12, True), IlluminaRead(151, False))
     sheet = build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")
-    assert "OverrideCycles,Y151;N12;Y151" in sheet
+    assert "OverrideCycles,Y151;I12;Y151" in sheet
     assert "CreateFastqForIndexReads,1" in sheet
+    assert "BarcodeMismatchesIndex1,0" in sheet
     assert "MaskShortReads,1" in sheet
     assert "[Reads]\n151\n151" in sheet
-    # one placeholder sample, empty indices -> everything to Undetermined
-    assert sheet.rstrip().endswith("run_SMPL1,,,,,,")
+    assert sheet.rstrip().endswith(f"run_SMPL1,,,,{AMPLICON_PLACEHOLDER_INDEX},,")
+    assert len(AMPLICON_PLACEHOLDER_INDEX) == 12
 
 
-def test_build_amplicon_dummy_sample_sheet_handles_dual_index():
+def test_build_amplicon_dummy_sample_sheet_masks_a_longer_index_tail():
+    reads = (IlluminaRead(151, False), IlluminaRead(13, True), IlluminaRead(151, False))
+    sheet = build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")
+    assert "OverrideCycles,Y151;I12N1;Y151" in sheet
+
+
+def test_build_amplicon_dummy_sample_sheet_masks_the_second_index_read():
+    reads = (
+        IlluminaRead(151, False),
+        IlluminaRead(12, True),
+        IlluminaRead(8, True),
+        IlluminaRead(151, False),
+    )
+    sheet = build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")
+    assert "OverrideCycles,Y151;I12;N8;Y151" in sheet
+
+
+def test_build_amplicon_dummy_sample_sheet_refuses_a_short_golay_read():
+    """The Golay barcode is 12 nt; an index read shorter than that cannot carry it."""
     reads = (
         IlluminaRead(151, False),
         IlluminaRead(8, True),
         IlluminaRead(8, True),
         IlluminaRead(151, False),
     )
-    sheet = build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")
-    assert "OverrideCycles,Y151;N8;N8;Y151" in sheet
+    with pytest.raises(ValueError, match="12"):
+        build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")
 
 
 @pytest.mark.parametrize(

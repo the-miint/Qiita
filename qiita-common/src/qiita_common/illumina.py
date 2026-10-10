@@ -135,14 +135,28 @@ def read_run_reads(bcl_input_dir: Path) -> tuple[IlluminaRead, ...]:
     return tuple(reads)
 
 
-def build_amplicon_dummy_sample_sheet(reads: tuple[IlluminaRead, ...], sample_id: str) -> str:
-    """Return the bcl-convert no-index dummy sample sheet for an amplicon run.
+# The Golay barcode is a 12-nt index read.
+GOLAY_BARCODE_LENGTH = 12
 
-    Mirrors qp-knight-lab-processing's ``generate_dummy_sample_sheet``: one
-    placeholder sample with empty indices (so every read lands in Undetermined),
-    the two template reads' cycle counts, and OverrideCycles that mask the index
-    cycles while ``CreateFastqForIndexReads`` still emits them as a FASTQ, which is
-    what carries the in-index Golay barcode out to golay_demux.
+# The one index the amplicon dummy sheet names. bcl-convert (4.5.4) refuses
+# CreateFastqForIndexReads unless the sheet has an index (and an index of only
+# A/C/G/T), so the sheet names one placeholder sample with exactly this index and
+# no mismatches: a read lands there only when its index read IS this sequence,
+# and every other read goes to Undetermined with its I1. Its reverse complement
+# (the form golay_demux decodes) is 4 bits from the nearest Golay codeword,
+# beyond the correctable 3, so a read it captures is one the demux would have
+# dropped anyway.
+AMPLICON_PLACEHOLDER_INDEX = "A" * GOLAY_BARCODE_LENGTH
+
+
+def build_amplicon_dummy_sample_sheet(reads: tuple[IlluminaRead, ...], sample_id: str) -> str:
+    """Return the bcl-convert dummy sample sheet for an amplicon run.
+
+    Sends every decodable read to Undetermined and writes its index read as I1,
+    which is what carries the in-index Golay barcode out to golay_demux. OverrideCycles
+    follows RunInfo.xml's read order: template reads as reads, the first index
+    read as the 12-cycle Golay index (any tail masked), any other index read
+    masked. See AMPLICON_PLACEHOLDER_INDEX for why the sheet names an index.
     """
     template = [r for r in reads if not r.is_indexed]
     index = [r for r in reads if r.is_indexed]
@@ -150,9 +164,24 @@ def build_amplicon_dummy_sample_sheet(reads: tuple[IlluminaRead, ...], sample_id
         raise ValueError(
             f"expected 2 template reads and 1-2 index reads, got {len(template)} and {len(index)}"
         )
-    non_index_cycles = template[0].num_cycles
-    masked = ";".join(f"N{r.num_cycles}" for r in index)
-    override_cycles = f"Y{non_index_cycles};{masked};Y{non_index_cycles}"
+    golay_read = index[0]
+    if golay_read.num_cycles < GOLAY_BARCODE_LENGTH:
+        raise ValueError(
+            f"the first index read has {golay_read.num_cycles} cycles; the Golay barcode"
+            f" needs {GOLAY_BARCODE_LENGTH}"
+        )
+
+    def segment(read: IlluminaRead) -> str:
+        if not read.is_indexed:
+            return f"Y{read.num_cycles}"
+        if read is not golay_read:
+            return f"N{read.num_cycles}"
+        tail = read.num_cycles - GOLAY_BARCODE_LENGTH
+        return f"I{GOLAY_BARCODE_LENGTH}" + (f"N{tail}" if tail else "")
+
+    # bcl-convert reads OverrideCycles segments in RunInfo.xml read order, which
+    # need not be R1/I1/I2/R2.
+    override_cycles = ";".join(segment(r) for r in reads)
     lines = [
         "[Header]",
         "IEMFileVersion,4",
@@ -160,17 +189,18 @@ def build_amplicon_dummy_sample_sheet(reads: tuple[IlluminaRead, ...], sample_id
         "Application,FASTQ Only",
         "",
         "[Reads]",
-        str(non_index_cycles),
-        str(non_index_cycles),
+        str(template[0].num_cycles),
+        str(template[1].num_cycles),
         "",
         "[Settings]",
         f"OverrideCycles,{override_cycles}",
         "MaskShortReads,1",
         "CreateFastqForIndexReads,1",
+        "BarcodeMismatchesIndex1,0",
         "",
         "[Data]",
         "Sample_ID,Sample_Plate,Sample_Well,I7_Index_ID,index,I5_Index_ID,index2",
-        f"{sample_id},,,,,,",
+        f"{sample_id},,,,{AMPLICON_PLACEHOLDER_INDEX},,",
         "",
     ]
     return "\n".join(lines)

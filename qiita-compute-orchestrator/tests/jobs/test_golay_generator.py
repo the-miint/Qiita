@@ -13,8 +13,11 @@ import math
 from pathlib import Path
 
 import pytest
+from qiita_common.illumina import AMPLICON_PLACEHOLDER_INDEX
 
 from qiita_compute_orchestrator.jobs.golay_demux import (
+    _BITS_TO_NT,
+    _MAX_CORRECTABLE,
     _bits_to_dna,
     _correctable_radius,
     _golay_cloud_rows,
@@ -46,6 +49,18 @@ def test_4096_distinct_codewords_min_distance_8():
     assert _golay_codeword(0) == 0
     min_weight = min(bin(cw).count("1") for cw in codewords if cw != 0)
     assert min_weight == 8
+
+
+def test_the_dummy_sheet_placeholder_index_is_never_decodable():
+    """The placeholder's decoded form (its reverse complement) is beyond
+    _MAX_CORRECTABLE of every codeword (see AMPLICON_PLACEHOLDER_INDEX for why)."""
+    complement = str.maketrans("ACGT", "TGCA")
+    decoded_form = AMPLICON_PLACEHOLDER_INDEX[::-1].translate(complement)
+    word = 0
+    for nt in decoded_form:
+        word = (word << 2) | _BITS_TO_NT.index(nt)
+    nearest = min(bin(word ^ _golay_codeword(m)).count("1") for m in range(4096))
+    assert nearest > _MAX_CORRECTABLE
 
 
 def test_codeword_zero_is_all_c():

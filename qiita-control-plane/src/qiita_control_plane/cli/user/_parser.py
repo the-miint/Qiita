@@ -2036,7 +2036,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Submit a golay-demux work-ticket end-to-end. The run folder is resolved"
             " from --instrument-run-id server-side; the ticket converts it with a"
-            " no-index dummy sheet (every read to Undetermined, the Golay I1 emitted)"
+            " dummy sheet (every decodable read to Undetermined, the Golay I1 emitted)"
             " and demuxes on the Golay barcode. The per-sample Golay barcode_map is"
             " read from the preflight's amplicon_sample rows and carried in"
             " action_context; at run time the runner re-checks it against the"
