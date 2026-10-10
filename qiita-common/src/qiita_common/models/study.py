@@ -145,6 +145,7 @@ class StudySummary(BaseModel):
     """
 
     study_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     title: str
     alias: str | None
     bioproject_accession: str | None
@@ -177,6 +178,7 @@ class StudyRecordSummary(BaseModel):
 
     view: Literal[StudyRecordView.SUMMARY] = StudyRecordView.SUMMARY
     study_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     title: str
     alias: str | None
     bioproject_accession: str | None

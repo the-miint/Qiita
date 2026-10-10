@@ -41,6 +41,21 @@ class MissingExportedEntityError(RuntimeError):
         )
 
 
+def export_entity_id_select(kind: EntityKind, *, alias: str) -> str:
+    """Return the select-list expression for an entity's `export_entity_id`, where
+    `alias` names the entity table in the enclosing query.
+
+    A scalar subquery, so an entity without a row reads NULL rather than dropping
+    out of the result.
+    """
+    column = _ENTITY_COLUMN[kind]
+    expression = (
+        "(SELECT export_entity_id FROM qiita.exported_entity ee"
+        f" WHERE ee.{column} = {alias}.idx) AS export_entity_id"
+    )
+    return expression
+
+
 def require_export_entity_id(row: Mapping[str, Any], *, kind: EntityKind) -> str:
     """Return the `export_entity_id` of an entity row, which also carries `idx`.
 

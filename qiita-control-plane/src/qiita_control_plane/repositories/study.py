@@ -15,6 +15,7 @@ import asyncpg
 from qiita_common.models import StudyAccessionField, Tier
 
 from . import require_transaction, update_row
+from .exported_entity import export_entity_id_select
 
 # Columns returned by every create_study INSERT ... RETURNING. Covers every
 # caller-visible column on the row; the route consumes the result via
@@ -24,9 +25,7 @@ _STUDY_RETURNING_COLS = (
     " description, abstract, funding, ena_study_accession,"
     " bioproject_accession, notes, last_submission_at, submission_error,"
     " extra_metadata, default_tier, created_by_idx,"
-    " created_at, updated_at,"
-    " (SELECT export_entity_id FROM qiita.exported_entity ee"
-    "  WHERE ee.study_idx = study.idx) AS export_entity_id"
+    " created_at, updated_at, " + export_entity_id_select("study", alias="study")
 )
 
 
@@ -546,6 +545,7 @@ async def fetch_study_list_candidates(
     return await pool_or_conn.fetch(
         "SELECT s.idx, s.title, s.alias, s.bioproject_accession, s.ena_study_accession,"
         "       s.default_tier, s.owner_idx, s.updated_at, sa.access_tier,"
+        f"      {export_entity_id_select('study', alias='s')},"
         f"      ($3::text IS NOT NULL AND {_STUDY_SUMMARY_TSVECTOR}"
         "        @@ websearch_to_tsquery('english', $3)) AS summary_match"
         " FROM qiita.study s"

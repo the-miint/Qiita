@@ -284,6 +284,7 @@ async def list_studies(
             studies.append(
                 StudySummary(
                     study_idx=row["idx"],
+                    export_entity_id=require_export_entity_id(row, kind="study"),
                     title=row["title"],
                     alias=row["alias"],
                     bioproject_accession=row["bioproject_accession"],
@@ -348,6 +349,7 @@ async def get_study(
     if view is StudyRecordView.SUMMARY:
         return StudyRecordSummary(
             study_idx=row["idx"],
+            export_entity_id=require_export_entity_id(row, kind="study"),
             title=row["title"],
             alias=row["alias"],
             bioproject_accession=row["bioproject_accession"],

@@ -657,6 +657,7 @@ async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant,
         assert set(body) == {
             "view",
             "study_idx",
+            "export_entity_id",
             "title",
             "alias",
             "bioproject_accession",
@@ -664,6 +665,9 @@ async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant,
             "default_tier",
             "updated_at",
         }
+        assert body["export_entity_id"] == await fetch_export_entity_id(
+            ctx["pool"], kind="study", entity_idx=study_idx
+        )
         assert "ETag" not in resp.headers
     else:
         assert body["notes"] == "private note"
@@ -1362,6 +1366,11 @@ async def test_list_studies_shows_owned_shared_and_public_only(ctx):
     assert rows[idxs["shared"]]["record_view"] == "summary"
     assert rows[idxs["public"]]["record_view"] == "full"
     assert rows[idxs["own"]]["record_view"] == "full"
+    # Each row carries its export_entity_id, read from the table independently.
+    expected_ids = {
+        idx: await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=idx) for idx in rows
+    }
+    assert {idx: row["export_entity_id"] for idx, row in rows.items()} == expected_ids
     # Newest first.
     assert [r["study_idx"] for r in body["studies"]] == sorted(rows, reverse=True)
 
