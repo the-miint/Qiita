@@ -11,23 +11,12 @@ Two surfaces, pure-unit (no Postgres):
 
 from __future__ import annotations
 
-import gzip
-import sqlite3
-from pathlib import Path
-
 import httpx
 import pytest
 
 from qiita_control_plane.cli import _common
 from qiita_control_plane.cli.user import main
 from qiita_control_plane.cli.user.amplicon import _read_amplicon_preflight_rows
-
-# The migrated preflight SQLite Qiita-MIINT actually consumes, committed directly
-# (gzipped) rather than a Qiita-classic prep template migrated at test time —
-# Qiita-MIINT knows nothing about classic prep files. To regenerate after a
-# preflight schema change: migrate the source prep sheet with run_preflight and
-# gzip the result over this file.
-_AMPLICON_V1_SQLITE_GZ = Path(__file__).parent / "data" / "good_amplicon_v1.sqlite.gz"
 
 _RUN_ID = "20260925_SL00377_0008_ASC2267726-SC3"
 _RESOLVED_BCL_DIR = f"/sequencing/{_RUN_ID}"
@@ -44,32 +33,13 @@ class _RaisingParser:
         raise self.Error(message)
 
 
-def _build_amplicon_preflight(tmp_path: Path, *, populate_accessions: bool = True) -> Path:
-    """Materialize the committed migrated preflight SQLite under tmp_path.
-
-    Decompresses the stored preflight DB (the artifact Qiita-MIINT consumes) rather
-    than migrating a classic prep template at test time, then populates the
-    biosample + bioproject accessions the reader REQUIRES (left NULL by the fixture;
-    set upstream in production) via plain sqlite.
-    """
-    db = tmp_path / "amplicon_v1.db"
-    db.write_bytes(gzip.decompress(_AMPLICON_V1_SQLITE_GZ.read_bytes()))
-    if populate_accessions:
-        conn = sqlite3.connect(db)
-        conn.execute("UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name")
-        conn.execute("UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id")
-        conn.commit()
-        conn.close()
-    return db
-
-
 # ---------------------------------------------------------------------------
 # _read_amplicon_preflight_rows — the preflight reader, against a REAL preflight
 # ---------------------------------------------------------------------------
 
 
-def test_read_amplicon_preflight_rows_v1(tmp_path):
-    db = _build_amplicon_preflight(tmp_path)
+def test_read_amplicon_preflight_rows_v1(build_amplicon_preflight):
+    db = build_amplicon_preflight()
     rows = _read_amplicon_preflight_rows(db, _RaisingParser())
 
     assert len(rows) == 181
@@ -83,10 +53,10 @@ def test_read_amplicon_preflight_rows_v1(tmp_path):
     assert len({r.prepped_sample_idx for r in rows}) == len(rows)
 
 
-def test_read_amplicon_preflight_rows_fails_on_missing_accession(tmp_path):
+def test_read_amplicon_preflight_rows_fails_on_missing_accession(build_amplicon_preflight):
     """A preflight without the required biosample/bioproject accessions fails
     fast: `get_amplicon_sample_info` raises and the CLI surfaces its message."""
-    db = _build_amplicon_preflight(tmp_path, populate_accessions=False)
+    db = build_amplicon_preflight(populate_accessions=False)
     with pytest.raises(_RaisingParser.Error):
         _read_amplicon_preflight_rows(db, _RaisingParser())
 
@@ -152,8 +122,10 @@ def _stub_submit_flow(monkeypatch, captured: dict) -> None:
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
 
 
-def test_submit_golay_demux_builds_barcode_map_and_one_ticket(monkeypatch, tmp_path):
-    db = _build_amplicon_preflight(tmp_path)
+def test_submit_golay_demux_builds_barcode_map_and_one_ticket(
+    monkeypatch, build_amplicon_preflight
+):
+    db = build_amplicon_preflight()
 
     captured: dict = {}
     _stub_submit_flow(monkeypatch, captured)
@@ -205,10 +177,10 @@ def test_submit_golay_demux_builds_barcode_map_and_one_ticket(monkeypatch, tmp_p
     assert run_posts[0]["json"]["instrument_model"] == "Illumina MiSeq i100"
 
 
-def test_submit_golay_demux_requires_run_id(monkeypatch, tmp_path):
+def test_submit_golay_demux_requires_run_id(monkeypatch, build_amplicon_preflight):
     """--instrument-run-id is required; without it argparse exits 2 before any
     network call (there is no run folder to resolve otherwise)."""
-    db = _build_amplicon_preflight(tmp_path)
+    db = build_amplicon_preflight()
 
     captured: dict = {}
     _stub_submit_flow(monkeypatch, captured)

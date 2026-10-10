@@ -38,9 +38,10 @@ counts asserted below are reproducible without a Linux/SLURM stack.
 
 from __future__ import annotations
 
+import gzip
 import json
-import secrets
 import shutil
+import sqlite3
 import uuid
 from pathlib import Path
 
@@ -67,6 +68,45 @@ _BARCODES = (
     "AGCCCGCAAAGG",
 )
 _READS_PER_SAMPLE = 500
+
+# The committed amplicon pre-flight the control-plane tests use; the e2e pool
+# stores a cut-down copy so the runner can check barcode_map against it.
+_AMPLICON_PREFLIGHT_GZ = (
+    _REPO_ROOT
+    / "qiita-control-plane"
+    / "tests"
+    / "cli"
+    / "data"
+    / "good_amplicon_v1.sqlite.gz"
+)
+
+
+def _pool_preflight(tmp_path: Path) -> bytes:
+    """The committed amplicon pre-flight reduced to one sample per `_BARCODES`
+    entry: prepped_sample_idx k+1 carries _BARCODES[k], reverse-complemented,
+    with the accessions the reader requires. The seeded pool's sequenced
+    samples take item ids "1".."N" to match, as the amplicon composer assigns."""
+    db = tmp_path / "amplicon_e2e_preflight.db"
+    db.write_bytes(gzip.decompress(_AMPLICON_PREFLIGHT_GZ.read_bytes()))
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "DELETE FROM amplicon_sample WHERE prepped_sample_idx > ?", (len(_BARCODES),)
+    )
+    for k, barcode in enumerate(_BARCODES, start=1):
+        conn.execute(
+            "UPDATE amplicon_sample SET barcode = ? WHERE prepped_sample_idx = ?",
+            (barcode, k),
+        )
+    conn.execute("UPDATE amplicon_run SET barcodes_are_rc = 1")
+    conn.execute("UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name")
+    conn.execute(
+        "UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id"
+    )
+    conn.commit()
+    conn.close()
+    return db.read_bytes()
+
+
 _TOTAL_READS = _READS_PER_SAMPLE * len(_BARCODES)
 
 # Deblur is deterministic over this fixture + reference; pinned from the run.
@@ -188,8 +228,9 @@ async def synced_amplicon_actions(postgres_pool, tmp_path):
 
 
 @pytest.fixture
-async def seeded_pool(postgres_pool, human_admin_session):
-    """A sequenced_pool with one prep_sample per barcode; reverse-FK cleanup."""
+async def seeded_pool(postgres_pool, human_admin_session, tmp_path):
+    """A sequenced_pool with one prep_sample per barcode and the run pre-flight
+    that names them; reverse-FK cleanup."""
     from qiita_control_plane.testing.db_seeds import (
         seed_biosample_with_sequenced_prep_sample,
         seed_sequenced_sample_subtype,
@@ -198,7 +239,7 @@ async def seeded_pool(postgres_pool, human_admin_session):
     owner = human_admin_session["principal_idx"]
     samples: list[tuple[int, int, int]] = []
     run_idx = pool_idx = None
-    for _ in _BARCODES:
+    for k, _ in enumerate(_BARCODES, start=1):
         (
             biosample_idx,
             prep_sample_idx,
@@ -209,11 +250,19 @@ async def seeded_pool(postgres_pool, human_admin_session):
             postgres_pool,
             prep_sample_idx=prep_sample_idx,
             owner_idx=owner,
-            sequenced_pool_item_id=f"amplicon-e2e-{secrets.token_hex(4)}",
+            sequenced_pool_item_id=str(k),
             sequencing_run_idx=run_idx,
             sequenced_pool_idx=pool_idx,
         )
         samples.append((biosample_idx, prep_sample_idx, ss_idx))
+
+    await postgres_pool.execute(
+        "UPDATE qiita.sequenced_pool"
+        " SET run_preflight_blob = $1, run_preflight_filename = 'amplicon_e2e_preflight.db'"
+        " WHERE idx = $2",
+        _pool_preflight(tmp_path),
+        pool_idx,
+    )
 
     yield {"pool_idx": pool_idx, "run_idx": run_idx, "samples": samples}
 

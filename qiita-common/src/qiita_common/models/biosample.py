@@ -124,15 +124,17 @@ class BiosampleImportResponse(BaseModel):
 
 
 # Size caps for one bulk biosample import. A batch runs in one request and one
-# transaction, so it must finish inside the gateway's 60 s read timeout, fit
-# nginx's default 1 MiB request body on the REST location, and not hold the
-# per-owner insert lock (taken by each biosample INSERT until commit) for long.
-# Cost tracks metadata VALUES, not rows: measured at ~1.4 ms per value (a
-# 75-column sheet row takes ~106 ms), and a real sheet runs ~34 bytes per value.
-# 15,000 values is therefore ~21 s and ~0.5 MiB; the row cap bounds batches of
-# very narrow rows. A sheet over either cap is sent in several requests.
+# transaction, so it must fit nginx's default 1 MiB request body on the REST
+# location, finish well inside the gateway's 60 s read timeout, and not hold the
+# per-owner insert lock (taken by each biosample INSERT until commit) past the
+# pool's 10 s command timeout, which would fail other imports for that owner.
+# The request body binds first: a real sheet runs ~34 bytes per metadata value,
+# so 25,000 values is ~0.85 MiB. With the batch writing its metadata in a few
+# statements, a 75-column sheet imports at ~9 ms per row, so that is ~3 s. The
+# row cap bounds batches of very narrow rows. A sheet over either cap is sent
+# in several requests.
 BIOSAMPLE_BULK_IMPORT_MAX_ROWS = 2_000
-BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES = 15_000
+BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES = 25_000
 
 
 class BiosampleBulkImportRequest(BaseModel):

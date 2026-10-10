@@ -731,7 +731,7 @@ URL_USER_ME = f"{URL_USER_PREFIX}{PATH_USER_ME}"
 # / URL_SEQUENCED_SAMPLE_LIST_BY_STUDY below compose against this prefix.
 
 PATH_STUDY_PREFIX = "/study"
-PATH_STUDY_ROOT = ""  # POST against the prefix itself
+PATH_STUDY_ROOT = ""  # POST (create) and GET (list) against the prefix itself
 PATH_STUDY_BY_IDX = "/{study_idx}"
 # Bulk lookup of study_idx by a selectable study accession column
 # (ena_study_accession or bioproject_accession; default bioproject); same

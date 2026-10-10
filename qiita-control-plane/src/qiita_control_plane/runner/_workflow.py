@@ -139,6 +139,19 @@ from ._upload import (
 )
 
 
+def _require_sequenced_pool_scope(scope_target: dict[str, Any]) -> None:
+    """golay-demux's `barcode_map` is a sequenced_pool's roster — its resolver
+    joins the pool's stored pre-flight to the pool's members. Refuse the binding
+    on any other scope as the submitter's bad input, before `_resolve_barcode_map`
+    reads the `sequencing_run_idx` / `sequenced_pool_idx` keys a non-pool
+    `scope_target` does not even carry."""
+    if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
+        raise _submission_bad_input(
+            "a workflow taking barcode_map must be scoped to a sequenced_pool,"
+            f" not {scope_target['kind']}"
+        )
+
+
 async def run_workflow(
     work_ticket_idx: int,
     pool: asyncpg.Pool,
@@ -354,7 +367,16 @@ async def run_workflow(
             bound.update(await _resolve_sample_map(bound, workspace))
         # golay-demux consumes the same shape: a barcode roster + the staging root.
         if _workflow_declares_input(action.steps, BARCODE_MAP_BINDING):
-            bound.update(await _resolve_barcode_map(bound, workspace))
+            _require_sequenced_pool_scope(scope_target)
+            bound.update(
+                await _resolve_barcode_map(
+                    pool,
+                    bound,
+                    workspace,
+                    sequencing_run_idx=scope_target["sequencing_run_idx"],
+                    sequenced_pool_idx=scope_target["sequenced_pool_idx"],
+                )
+            )
         if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
 

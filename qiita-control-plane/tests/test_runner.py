@@ -29,6 +29,7 @@ from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
     ComputeTarget,
     FoundJobWire,
+    ScopeTargetKind,
     StepHandleWire,
     StepProgressState,
     StepStatus,
@@ -626,6 +627,28 @@ async def test_refuses_disabled_action(postgres_pool, pending_work_ticket, tmp_p
 async def test_refuses_unknown_ticket(postgres_pool, tmp_path):
     with pytest.raises(RuntimeError, match="not found"):
         await _run(999_999_999, postgres_pool, FakeBackendClient(), tmp_path)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        ScopeTargetKind.PREP_SAMPLE.value,
+        ScopeTargetKind.BLOCK.value,
+        ScopeTargetKind.REFERENCE.value,
+    ],
+)
+def test_barcode_map_requires_a_sequenced_pool_scope(kind):
+    """A barcode_map workflow is a sequenced_pool's roster: the scope guard accepts
+    a sequenced_pool and refuses every other scope as the submitter's bad input,
+    before the resolver reads the pool keys a non-pool scope_target lacks."""
+    from qiita_control_plane.runner._workflow import _require_sequenced_pool_scope
+
+    _require_sequenced_pool_scope({"kind": ScopeTargetKind.SEQUENCED_POOL.value})  # no raise
+    with pytest.raises(BackendFailure) as exc:
+        _require_sequenced_pool_scope({"kind": kind})
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "must be scoped to a sequenced_pool" in exc.value.reason
+    assert kind in exc.value.reason
 
 
 async def test_register_files_globs_staging_dir(

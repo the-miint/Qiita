@@ -1,4 +1,4 @@
-"""qiita user CLI — study subcommands: create, and access list/grant/set-tier/revoke."""
+"""qiita user CLI — study subcommands: create, list, and access list/grant/set-tier/revoke."""
 
 import argparse
 
@@ -38,6 +38,32 @@ def _handle_study_create(args: argparse.Namespace, parser: argparse.ArgumentPars
 
 _ACCESS_PATH = f"{PATH_STUDY_PREFIX}{PATH_STUDY_ACCESS}"
 _ACCESS_BY_PRINCIPAL_PATH = f"{PATH_STUDY_PREFIX}{PATH_STUDY_ACCESS_BY_PRINCIPAL}"
+
+
+def _list_studies(base_url: str, token: str, args: argparse.Namespace) -> dict:
+    """GET /study, following `next_after_study_idx` across pages with --all.
+    One page otherwise, cursor included so a caller can ask for the next.
+
+    Defaults to the caller's own and shared studies (min_tier=viewer): on a
+    deploy with many public studies, those otherwise bury the handful a
+    person actually works on. --min-tier public lists everything readable."""
+    params: dict = {"limit": args.limit, "min_tier": args.min_tier}
+    if args.query:
+        params["q"] = args.query
+    if args.after_study_idx is not None:
+        params["after_study_idx"] = args.after_study_idx
+    studies: list = []
+    while True:
+        page = _common.call("GET", base_url, token, PATH_STUDY_PREFIX, params=params)
+        studies.extend(page["studies"])
+        cursor = page["next_after_study_idx"]
+        if not args.all_pages or cursor is None:
+            return {"studies": studies, "next_after_study_idx": cursor}
+        params["after_study_idx"] = cursor
+
+
+def _handle_study_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    return _common.run_http_subcommand(lambda t: _list_studies(args.base_url, t, args))
 
 
 def _handle_study_access_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

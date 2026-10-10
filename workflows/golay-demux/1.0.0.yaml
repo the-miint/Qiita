@@ -20,9 +20,12 @@ description: >
 
   The per-sample barcode roster (`barcode_map`, each entry carrying its
   `barcodes_are_rc` provenance flag) is embedded in action_context and
-  materialized by the runner (the orchestrator has no DB access). `bcl_input_dir`
-  is resolved from the submitted run id server-side; the Golay [24,12,8] decode
-  cloud is generated in-job (no vendored table / fixed path).
+  materialized by the runner (the orchestrator has no DB access). Before
+  materializing it, the runner rebuilds the roster from the pre-flight stored on
+  the pool and fails the ticket (bad input) if the submitted one differs in any
+  sample, barcode or orientation, or if the pool stores no pre-flight to check
+  against. `bcl_input_dir` is resolved from the submitted run id server-side; the
+  Golay [24,12,8] decode cloud is generated in-job (no vendored table / fixed path).
 
 scopes: []
 

@@ -4,7 +4,8 @@ Writes apply their mutation inside one connection-scoped transaction,
 delegating multi-table work to the biosample composer.
 """
 
-from collections.abc import Awaitable, Callable
+import contextlib
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated
 
 import asyncpg
@@ -70,6 +71,7 @@ from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx
 from ..repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     MetadataMissingRequiredFieldsError,
+    ResolvedFieldValue,
     StudyFieldDataTypeNotTextError,
     StudyFieldNotUniqueInStudyError,
     UniqueInStudyViolation,
@@ -77,6 +79,8 @@ from ..repositories._sample_helpers import (
     fetch_global_fields,
     fetch_global_metadata,
     fetch_study_fields_for_study,
+    insert_new_entities_metadata_batch,
+    write_resolved_metadata_entries,
 )
 from ..repositories.biosample import (
     BiosampleLookupKey,
@@ -177,7 +181,7 @@ async def import_biosample(
     """
     async with tx() as conn:
         await _require_eligible_import_owner(conn, body.owner_idx)
-        return await _import_one_biosample(
+        response, _ = await _import_one_biosample(
             conn,
             study_idx=study_idx,
             body=body,
@@ -186,6 +190,7 @@ async def import_biosample(
                 conn, body.metadata_checklist_name
             ),
         )
+        return response
 
 
 async def _require_eligible_import_owner(conn: asyncpg.Connection, owner_idx: int) -> None:
@@ -202,7 +207,8 @@ async def _import_one_biosample(
     body: BiosampleImportRequest,
     caller_idx: int,
     metadata_checklist_idx: int | None,
-) -> BiosampleImportResponse:
+    defer_metadata_write: bool = False,
+) -> tuple[BiosampleImportResponse, Sequence[ResolvedFieldValue] | None]:
     """Import ONE biosample within an EXISTING transaction, mapping composer and DB
     errors to HTTPException.
 
@@ -212,15 +218,17 @@ async def _import_one_biosample(
     tx()` and rolls its whole unit back — which is what makes the bulk route
     all-or-nothing. The bulk route catches and re-raises with the failing row's index.
 
+    Returns the response and, with `defer_metadata_write`, the row's validated
+    metadata for the caller to write in a batch (`import_biosamples_bulk`).
+
     The caller has already checked the owner's eligibility
     (`_require_eligible_import_owner`) and resolved the checklist name, so a bulk
     batch does each once rather than once per row.
     """
-    # Map known composer-side validation errors and DB-level violations to
-    # user-friendly 422 / 409 responses. Composer-specific exceptions are
-    # caught first so their detail wins over the generic asyncpg fallbacks.
-    try:
-        result = await import_biosample_from_owner_biosample_id(
+    result = await _with_import_error_mapping(
+        conn,
+        body,
+        lambda: import_biosample_from_owner_biosample_id(
             conn,
             primary_study_idx=study_idx,
             owner_idx=body.owner_idx,
@@ -233,7 +241,36 @@ async def _import_one_biosample(
             ena_sample_accession=body.ena_sample_accession,
             matrix_tube_id=body.matrix_tube_id,
             global_internal_names=body.global_internal_names,
-        )
+            defer_metadata_write=defer_metadata_write,
+        ),
+    )
+    exported_rows = await fetch_exported_entities(
+        conn, study_idx=[], biosample_idx=[result.biosample_idx]
+    )
+    response = BiosampleImportResponse(
+        biosample_idx=result.biosample_idx,
+        export_entity_id=exported_rows[0]["export_entity_id"],
+        owner_id_biosample_study_field_idx=result.owner_id_biosample_study_field_idx,
+        owner_id_biosample_study_field_created=result.owner_id_biosample_study_field_created,
+    )
+    return response, result.deferred_metadata
+
+
+async def _with_import_error_mapping[T](
+    conn: asyncpg.Connection,
+    body: BiosampleImportRequest,
+    operation: Callable[[], Awaitable[T]],
+) -> T:
+    """Run one import step, mapping composer and DB errors to HTTPException.
+
+    The single place a biosample import's failures are translated, so the per-row
+    import and the bulk route's metadata fallback answer identically. Known
+    composer-side validation errors and DB-level violations become 422 / 409
+    responses; composer-specific exceptions are caught first so their detail wins
+    over the generic asyncpg fallbacks.
+    """
+    try:
+        return await operation()
     except BiosampleOwnerIdFieldCollisionError as exc:
         raise HTTPException(
             status_code=422,
@@ -359,15 +396,41 @@ async def _import_one_biosample(
             " for too long; nothing was stored — resubmit the identical request"
         )
 
-    exported_rows = await fetch_exported_entities(
-        conn, study_idx=[], biosample_idx=[result.biosample_idx]
-    )
-    return BiosampleImportResponse(
-        biosample_idx=result.biosample_idx,
-        export_entity_id=exported_rows[0]["export_entity_id"],
-        owner_id_biosample_study_field_idx=result.owner_id_biosample_study_field_idx,
-        owner_id_biosample_study_field_created=result.owner_id_biosample_study_field_created,
-    )
+
+@contextlib.asynccontextmanager
+async def _named_row_errors(i: int, row: BiosampleImportRequest, study_idx: int):
+    """Name the bulk row a failure came from. A transient 503 (a deadlock, or a
+    lock wait that timed out) is the batch's, not the row's: it keeps its
+    Retry-After and gets the batch's own wording. Any other HTTPException gets
+    the row prefix; an unmapped exception stays a 500 with its traceback and a
+    note naming the row."""
+    try:
+        yield
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "the batch waited on another import or edit on this study or"
+                    " for this owner and was interrupted; nothing was stored —"
+                    " resubmit the identical request"
+                ),
+                headers=exc.headers,
+            ) from exc
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=(
+                f"row {i} (counting from 0; owner_biosample_id_value="
+                f"{row.owner_biosample_id_value!r}): {exc.detail}"
+            ),
+            headers=exc.headers,
+        ) from exc
+    except Exception as exc:
+        exc.add_note(
+            f"bulk biosample import, study {study_idx}: failed at row {i}"
+            f" (counting from 0; owner_biosample_id_value={row.owner_biosample_id_value!r})"
+        )
+        raise
 
 
 @router.post(PATH_BIOSAMPLE_BULK_BY_STUDY, status_code=201)
@@ -411,52 +474,65 @@ async def import_biosamples_bulk(
         await _require_eligible_import_owner(conn, body.rows[0].owner_idx)
         checklist_idx_for: dict[str | None, int | None] = {}
         results: list[BiosampleImportResponse] = []
+        deferred: list[tuple[int, Sequence[ResolvedFieldValue]]] = []
+        # Phase 1, per row: create, link, write the owner id, and validate the
+        # metadata -- but defer writing it, so the batch can write all of it at once.
         for i, row in enumerate(body.rows):
-            try:
+            async with _named_row_errors(i, row, study_idx):
                 name = row.metadata_checklist_name
                 if name not in checklist_idx_for:
                     checklist_idx_for[name] = await resolve_metadata_checklist_idx(conn, name)
-                results.append(
-                    await _import_one_biosample(
+                response, resolved = await _import_one_biosample(
+                    conn,
+                    study_idx=study_idx,
+                    body=row,
+                    caller_idx=user.principal_idx,
+                    metadata_checklist_idx=checklist_idx_for[name],
+                    defer_metadata_write=True,
+                )
+                results.append(response)
+                deferred.append((response.biosample_idx, resolved or ()))
+        # Phase 2: every row's metadata in a few statements. A rejected batch
+        # rolls back to before it and is written again row by row through the
+        # per-value path, which raises the same diagnosed error, for the same
+        # row, as an import that never batched.
+        # The batch write re-raises a transient DB error (deadlock, serialization,
+        # lock-wait timeout) rather than returning False; map it to the same
+        # retryable 503 the single import and phase 1 send, not a 500. A
+        # non-transient failure still returns False and falls through to the
+        # row-by-row replay below. The batch is not one row, so it maps against the
+        # first -- only the transient arms, which read no row fields, can fire here
+        # (every mappable non-transient returns False instead of raising).
+        written = await _with_import_error_mapping(
+            conn,
+            body.rows[0],
+            lambda: insert_new_entities_metadata_batch(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                study_idx=study_idx,
+                caller_idx=user.principal_idx,
+                entries=deferred,
+            ),
+        )
+        if not written:
+            for i, (row, (biosample_idx, resolved)) in enumerate(
+                zip(body.rows, deferred, strict=True)
+            ):
+                async with _named_row_errors(i, row, study_idx):
+                    await _with_import_error_mapping(
                         conn,
-                        study_idx=study_idx,
-                        body=row,
-                        caller_idx=user.principal_idx,
-                        metadata_checklist_idx=checklist_idx_for[name],
-                    )
-                )
-            except HTTPException as exc:
-                if exc.status_code == 503:
-                    # Transient (a deadlock, or a lock wait that timed out): the
-                    # batch as a whole lost to concurrent work, not this row.
-                    # Keep the Retry-After hint, drop the row prefix.
-                    raise HTTPException(
-                        status_code=503,
-                        detail=(
-                            "the batch waited on another import or edit on this study or"
-                            " for this owner and was interrupted; nothing was stored —"
-                            " resubmit the identical request"
+                        row,
+                        lambda biosample_idx=biosample_idx, resolved=resolved: (
+                            write_resolved_metadata_entries(
+                                conn,
+                                spec=BIOSAMPLE_METADATA_SPEC,
+                                entity_idx=biosample_idx,
+                                study_idx=study_idx,
+                                caller_idx=user.principal_idx,
+                                resolved_metadata=resolved,
+                            )
                         ),
-                        headers=exc.headers,
-                    ) from exc
-                # Atomic: annotate with the offending row and re-raise so the
-                # caller's `async with tx()` rolls the whole batch back.
-                raise HTTPException(
-                    status_code=exc.status_code,
-                    detail=(
-                        f"row {i} (counting from 0; owner_biosample_id_value="
-                        f"{row.owner_biosample_id_value!r}): {exc.detail}"
-                    ),
-                    headers=exc.headers,
-                ) from exc
-            except Exception as exc:
-                # Unexpected: leave it a 500 with its traceback, but say which row.
-                exc.add_note(
-                    f"bulk biosample import, study {study_idx}: failed at row {i}"
-                    f" (counting from 0; owner_biosample_id_value="
-                    f"{row.owner_biosample_id_value!r})"
-                )
-                raise
+                    )
     return BiosampleBulkImportResponse(results=results)
 
 

@@ -21,6 +21,30 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **golay-demux checks its submitted barcode roster against the pool's stored
+  pre-flight (#657).** The CLI builds `barcode_map` client-side; a transposed roster
+  would route one sample's reads under another's `prep_sample_idx` with nothing
+  downstream to notice. Before running, the runner rebuilds the roster from the
+  pre-flight blob stored on the pool (`preflight.amplicon_barcode_from_blob`, joined
+  to the pool's sequenced samples) and fails the ticket as bad input, naming each
+  differing sample, if the submitted one differs in samples, barcodes or
+  orientation. The CLI and the runner validate the pre-flight through one function
+  (`preflight.amplicon_samples`), so they refuse the same sheets: not an amplicon
+  pre-flight, no samples, or a sample missing its barcode or a required accession.
+  The expected roster is the pool's ACTIVE set (retired and ena_status-flagged
+  samples excluded, as the CLI's roster read does), barcodes compare
+  case-insensitively (the job upper-cases them), and a stored blob that cannot be
+  READ (unreadable, or a newer pre-flight schema than this deployment ships) fails
+  as a deployment error rather than the submitter's bad input. The `barcode_map`
+  input and the workflow version are unchanged.
+- **List the studies you can read: `GET /api/v1/study` and `qiita study list` (#660).**
+  Returns owned studies, studies shared with you at any tier, and public-default
+  studies (every study for wet_lab_admin+), newest first, each with your
+  `caller_tier`, why you can read it (`access_via`), and which view of its record
+  you get (`record_view`). Filters: full-text `q` (a summary reader matches only the
+  summary fields; accessions are searchable), `min_tier` on your own tier, and cursor
+  paging. The CLI defaults to your own and shared studies; `--min-tier public` widens
+  it to public studies. Someone granted access no longer needs to be told a study's idx to find it.
 - **The branch reviewer is in the repo, and a PR description records its run (#655).**
   `.claude/agents/qiita-reviewer.md` (the rules) and `.claude/skills/qiita-review/` (the
   review, fix, re-review loop) were per-developer files that `CLAUDE.md` already pointed
@@ -2123,6 +2147,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **CI pins the Python interpreter to 3.14.** `requires-python` is open-ended
+  (`>=3.14`), so once CPython 3.15.0 was published `uv` began downloading it in
+  CI and `pydantic-core`'s `pyo3` build failed against a Python newer than pyo3
+  supports. Each `astral-sh/setup-uv` step now passes `python-version: "3.14"`.
 - **`ingest_ena_reads` retries an ENA md5 mismatch and a run miint skipped instead of failing permanently (#661).**
   miint documents a transfer truncated on a clean gzip member boundary as indistinguishable
   from a genuinely bad digest and advises bounded retries, so the ticket's `max_retries`
@@ -4073,6 +4101,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **A grant below a study's `default_tier` reads the study's summary (#660).**
+  `GET /api/v1/study/{idx}` previously answered 403 to any caller whose tier was
+  below the study's `default_tier` (`member` unless set). It now returns them a
+  summary — title, alias, accessions, tiers, `updated_at`, marked `"view":
+  "summary"` — so a study shared with someone can be found and recognised; the full
+  record still requires a tier at or above `default_tier`, and carries `"view":
+  "full"` (on POST and PATCH responses too). What each tier reads is defined in
+  `docs/architecture/data-model.md`.
 - **DuckDB 1.5.4 → 1.5.5 across every component, and every DuckDB pin is now exact
   (#651).** The team miint mirror now builds against DuckDB 1.5.5 (its 1.5.4 builds stopped
   updating on Sep 11), so the data-plane crate (`=1.10505.0`), the four Python components
@@ -4108,6 +4144,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   Table and column names that these helpers interpolate into SQL are now rejected
   unless they are bare identifiers. The branch reviewer flags a new fixture that
   tears that graph down by hand and points at `docs/testing.md`.
+- **The bulk biosample import writes a batch's metadata in a few statements (#662).**
+  It previously wrote each value in its own savepoint and INSERT (~1.4 ms per
+  value); a 75-column sheet now imports at ~9 ms per row instead of ~106 ms. A
+  batch the database rejects is written again row by row, so the error and the
+  row it names are unchanged. The per-request cap rises from 15,000 to 25,000
+  metadata values (~0.85 MiB, inside the gateway's default request-size limit). A
+  transient DB error (deadlock, or a lock wait past the command timeout) during the
+  batched write now answers the same retryable 503 the single import and phase 1 do,
+  rather than a 500.
 - **`qiita biosample create-field` validates its flags before reading the auth token
   (#639).** An invalid flag combination now exits 2 naming the flag, where it previously
   reported a missing token first and left the real problem to be found on the retry. The

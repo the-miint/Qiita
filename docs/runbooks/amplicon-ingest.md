@@ -37,8 +37,11 @@ see [`getting-started.md`](getting-started.md).
   a no-index dummy sheet (every read to Undetermined, the Golay I1 emitted), then
   `golay_demux` demultiplexes on the Golay barcode. The per-sample `barcode_map`
   roster is built from the preflight's `amplicon_sample` rows and submitted in
-  action_context (the runner materializes it to a parquet; the orchestrator has no
-  DB access). Loads per-sample reads into `read`.
+  action_context. Before running, the runner rebuilds the roster from the
+  preflight stored on the pool and fails the ticket (bad input) if the submitted
+  one differs in any sample, barcode or orientation, or if the pool stores no
+  preflight to check against; it then materializes it to a parquet (the
+  orchestrator has no DB access). Loads per-sample reads into `read`.
 
 ## Submit amplicon (denoise)
 

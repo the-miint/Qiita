@@ -121,6 +121,7 @@ from .study import (
     _handle_study_access_revoke,
     _handle_study_access_set_tier,
     _handle_study_create,
+    _handle_study_list,
 )
 from .ticket import (
     _handle_ticket_list,
@@ -321,6 +322,36 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_create.set_defaults(handler=_handle_study_create)
 
     study_by_idx_path = f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}"
+
+    p_study_list = p_study_sub.add_parser(
+        "list",
+        help="List your own and shared studies, newest first (GET /study)",
+    )
+    p_study_list.add_argument(
+        "--query",
+        help=(
+            "full-text search: title, alias and accessions, plus abstract, description,"
+            " notes and funding where you can read the full record; whole English words"
+        ),
+    )
+    p_study_list.add_argument(
+        "--min-tier",
+        choices=tuple(t.value for t in Tier),
+        default=Tier.VIEWER.value,
+        help=(
+            "only studies where your own tier is at least this (default: viewer, i.e. your"
+            " own and shared studies); public also lists public studies you have no grant"
+            " on, and for wet_lab_admin+ every study"
+        ),
+    )
+    p_study_list.add_argument("--limit", type=int, default=100, help="page size (max 500)")
+    p_study_list.add_argument(
+        "--after-study-idx", type=int, help="cursor: a page's next_after_study_idx"
+    )
+    p_study_list.add_argument(
+        "--all", dest="all_pages", action="store_true", help="follow the cursor to the end"
+    )
+    p_study_list.set_defaults(handler=_handle_study_list)
 
     p_study_get = p_study_sub.add_parser(
         "get",
@@ -2008,9 +2039,10 @@ def _build_parser() -> argparse.ArgumentParser:
             " no-index dummy sheet (every read to Undetermined, the Golay I1 emitted)"
             " and demuxes on the Golay barcode. The per-sample Golay barcode_map is"
             " read from the preflight's amplicon_sample rows and carried in"
-            " action_context. Run + pool are find-or-create and the per-sample roster"
-            " is create-missing, so a re-run after a partial failure converges without"
-            " operator cleanup."
+            " action_context; at run time the runner re-checks it against the"
+            " preflight stored on the pool and fails the ticket if it differs. Run +"
+            " pool are find-or-create and the per-sample roster is create-missing, so a"
+            " re-run after a partial failure converges without operator cleanup."
         ),
     )
     p_submit_golay.add_argument(

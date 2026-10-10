@@ -18,9 +18,11 @@ from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
 
 from . import require_transaction, update_row
 from ._sample_helpers import (
+    ResolvedFieldValue,
     assert_required_global_fields_supplied,
     fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
+    preflight_sample_metadata,
     resolve_local_study_field,
     validate_primary_secondary_studies,
     write_local_metadata_or_diagnose,
@@ -337,6 +339,9 @@ class BiosampleImportResult:
     biosample_idx: int
     owner_id_biosample_study_field_idx: int
     owner_id_biosample_study_field_created: bool
+    # With defer_metadata_write: the validated, parsed metadata NOT yet written,
+    # for the caller to write in a batch. None when the composer wrote it.
+    deferred_metadata: Sequence[ResolvedFieldValue] | None = None
 
 
 async def import_biosample_from_owner_biosample_id(
@@ -354,8 +359,15 @@ async def import_biosample_from_owner_biosample_id(
     ena_sample_accession: str | None = None,
     matrix_tube_id: str | None = None,
     global_internal_names: bool = False,
+    defer_metadata_write: bool = False,
 ) -> BiosampleImportResult:
     """Import one biosample with its owner-id and any supplied metadata.
+
+    With `defer_metadata_write`, the metadata is validated and parsed exactly
+    as it would be for the write, but returned in `deferred_metadata` instead of
+    written; the caller must write it (`insert_new_entities_metadata_batch`, or
+    `write_resolved_metadata_entries`) in the same transaction. The bulk import
+    uses this to write a whole batch's metadata at once.
 
     Creates the biosample, links it to primary_study_idx plus every
     entry in secondary_study_idxs, writes any supplied metadata on
@@ -526,20 +538,33 @@ async def import_biosample_from_owner_biosample_id(
     # global field writes through its slot, an existing study-local field
     # writes locally. The pre-resolved marker set is reused so no second
     # missing-reason lookup runs; allow_local admits the local-field path.
-    await write_sample_metadata(
-        conn,
-        spec=BIOSAMPLE_METADATA_SPEC,
-        entity_idx=bs_idx,
-        study_idx=primary_study_idx,
-        metadata=metadata,
-        caller_idx=caller_idx,
-        allow_local=True,
-        known_missing_reasons=known_missing_reasons,
-        global_internal_names=global_internal_names,
-    )
+    if defer_metadata_write:
+        deferred = await preflight_sample_metadata(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=primary_study_idx,
+            metadata=metadata,
+            known_missing_reasons=known_missing_reasons,
+            allow_local=True,
+            global_internal_names=global_internal_names,
+        )
+    else:
+        deferred = None
+        await write_sample_metadata(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            entity_idx=bs_idx,
+            study_idx=primary_study_idx,
+            metadata=metadata,
+            caller_idx=caller_idx,
+            allow_local=True,
+            known_missing_reasons=known_missing_reasons,
+            global_internal_names=global_internal_names,
+        )
 
     return BiosampleImportResult(
         biosample_idx=bs_idx,
         owner_id_biosample_study_field_idx=field_idx,
         owner_id_biosample_study_field_created=field_created,
+        deferred_metadata=deferred,
     )

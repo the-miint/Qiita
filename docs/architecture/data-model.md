@@ -110,6 +110,28 @@ When enforcement is built, the effective required tier for a field or value is t
 
 This is the mechanism that will ultimately decide who can see or change the owner-biosample-id (a study-local field pinned to `member` tier) and any other tier-restricted field or value — replacing today's coarse interim rule, which clamps to admin-tier callers every study-scoped route that reads or writes sample-family metadata, or that mints a study-local field. The idx-listing reads stay at viewer tier: they expose no metadata. Field creation sits under the clamp only for want of the finer gate — when enforcement lands it returns to member tier, since minting a study-local field is work a study member is meant to do.
 
+### What a tier reads of a study's own record
+
+This is the definition, and it supersedes, for the study's own record, the
+comment on `qiita.study` in the applied migration `20260501000006_study.sql`
+(an applied migration cannot be edited in place). It is enforced by
+`auth.guards.study_record_view`, which `GET /api/v1/study/{idx}` and the
+`GET /api/v1/study` listing both decide through.
+
+A caller's tier on a study is their `qiita.study_access` row (`admin` for the
+study's owner, with or without a row), or `public` when they hold none. The
+study's record has two views:
+
+| View | Who | Fields |
+|---|---|---|
+| **full** | wet_lab_admin+ by role; the owner; a caller whose tier is at or above the study's `default_tier` (so anyone, on a `public`-default study) | every column of `StudyResponse`: title, alias, description, abstract, funding, notes, `extra_metadata`, accessions, submission state, owner / PI / creator idxs, tiers, timestamps |
+| **summary** | any other grant: a tier below `default_tier` | `study_idx`, title, alias, `bioproject_accession`, `ena_study_accession`, `default_tier`, `updated_at` |
+
+Anyone else gets nothing (403). The summary is what lets someone a study was
+shared with find it and recognise it, without the fields its tier does not
+reach. Search follows the same line: a summary reader's `q` matches only the
+summary fields, so a match cannot disclose a word in a field they cannot read.
+
 ## Raw Data Fingerprint
 
 A SHA-256 fingerprint of uploaded raw data is recorded per `prep_sample_idx` at upload time in the control plane. Its purpose is **upload-time duplicate detection only** — it is not the processing deduplication key:

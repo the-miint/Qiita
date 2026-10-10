@@ -1,19 +1,19 @@
 """Study create / read / patch routes.
 
 POST creates a study and gates on caller scope plus the lab-tech-on-behalf
-rule; GET reads a study by idx and gates on the per-study default_tier
-policy with admin / wet_lab_admin bypass; PATCH edits the editable
-post-create columns and gates on caller scope plus per-study Tier.ADMIN
-(wet_lab_admin bypass). The three handlers share the row → StudyResponse
-mapping via a helper in this module. DELETE / search endpoints are
-deferred.
+rule; GET /study lists the studies the caller may read, and GET /study/{idx}
+reads one, both deciding through `auth.guards.study_record_view` (the full
+record, its summary, or nothing); PATCH edits the editable post-create columns and gates on caller
+scope plus per-study Tier.ADMIN (wet_lab_admin bypass). POST, GET-by-idx and
+PATCH share the row → StudyResponse mapping via a helper in this module.
+DELETE is deferred.
 """
 
 import json
 from typing import Annotated
 
 import asyncpg
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_STUDY_BY_IDX,
@@ -27,17 +27,25 @@ from qiita_common.models import (
     StudyLookupByAccessionRequest,
     StudyLookupByAccessionResponse,
     StudyPatchRequest,
+    StudyRecordSummary,
+    StudyRecordView,
     StudyResponse,
+    StudySummary,
+    StudySummaryListResponse,
     Tier,
 )
 
 from ..auth.guards import (
+    caller_effective_tier,
+    caller_tier_reaches,
     require_complete_profile,
     require_eligible_owner,
     require_human,
     require_scope,
     require_study_access,
     require_study_exists,
+    study_access_via,
+    study_record_view,
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
@@ -46,8 +54,10 @@ from ..repositories.study import (
     create_study,
     fetch_study,
     fetch_study_idxs_by_accession,
+    fetch_study_list_candidates,
     update_study,
 )
+from ..repositories.study_access import CallerStudyAccessRow, fetch_caller_study_access
 from ._helpers import (
     ETAG_HEADER,
     GENERIC_FK_VIOLATION,
@@ -76,6 +86,17 @@ _UNIQUE_VIOLATION_MESSAGES: dict[str, str] = {
     "study_bioproject_accession_unique": "bioproject_accession already in use",
 }
 _GENERIC_UNIQUE_VIOLATION = "conflicts with an existing study"
+
+# GET /study page size. Bounded so a wet_lab_admin (who may read every study)
+# cannot ask for the whole table in one response. What a page costs is in
+# `repositories.study.fetch_study_list_candidates`.
+_DEFAULT_LIST_LIMIT = 100
+_MAX_LIST_LIMIT = 500
+_MAX_LIST_QUERY_LENGTH = 200
+# Candidate batches one GET /study may read while filling a page whose rows the
+# access check keeps dropping. Bounds the work per request; a page that runs
+# out returns short with a cursor, which the client follows like any other.
+_MAX_LIST_FILL_ROUNDS = 5
 
 
 def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
@@ -193,40 +214,146 @@ async def create_study_route(
     return _study_response_from_row(row)
 
 
-@router.get(PATH_STUDY_BY_IDX)
+@router.get(PATH_STUDY_ROOT)
+async def list_studies(
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    principal: Principal = Depends(require_scope(Scope.STUDY_READ)),
+    q: Annotated[
+        str | None,
+        Query(
+            min_length=1,
+            max_length=_MAX_LIST_QUERY_LENGTH,
+            # Postgres text cannot hold NUL; refuse it here, not as a DB error.
+            pattern=r"^[^\x00]*$",
+            description="Full-text search, web-search syntax. Words are stemmed English and"
+            " match whole (`soil` finds 'soils'; `micro` does not find 'microbiome')."
+            " Searches title, alias and the accessions, plus abstract, description, notes"
+            " and funding on studies whose full record the caller may read.",
+        ),
+    ] = None,
+    min_tier: Annotated[
+        Tier | None,
+        Query(description="Only studies where the caller's own tier is at least this."),
+    ] = None,
+    after_study_idx: Annotated[
+        int | None, Query(gt=0, description="Cursor: the previous page's next_after_study_idx.")
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = _DEFAULT_LIST_LIMIT,
+) -> StudySummaryListResponse:
+    """The studies the caller may read, newest first: the same set
+    GET /study/{idx} answers (owned, shared with them at any tier, or
+    public-default; every study for wet_lab_admin+). Each row says which view
+    of the record that answer is."""
+    # A min_tier above public asks about the caller's own grants, so a role
+    # bypass and ungranted public studies cannot contribute rows.
+    relationship_only = min_tier is not None and min_tier is not Tier.PUBLIC
+    bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN) and not relationship_only
+    studies: list[StudySummary] = []
+    cursor = after_study_idx
+    more = True
+    for _ in range(_MAX_LIST_FILL_ROUNDS):
+        rows = await fetch_study_list_candidates(
+            pool,
+            principal_idx=principal.principal_idx,
+            all_studies=bypass,
+            include_ungranted_public=not relationship_only,
+            query=q,
+            after_study_idx=cursor,
+            limit=limit,
+        )
+        for i, row in enumerate(rows):
+            # The cursor is the last row CONSIDERED, so rows the access check
+            # drops are never re-scanned and a returned row is never repeated.
+            cursor = row["idx"]
+            access = CallerStudyAccessRow(
+                owner_idx=row["owner_idx"],
+                access_tier=Tier(row["access_tier"]) if row["access_tier"] is not None else None,
+                default_tier=Tier(row["default_tier"]),
+            )
+            view = study_record_view(access, caller=principal)
+            if view is None:
+                continue
+            if min_tier is not None and not caller_tier_reaches(
+                access, caller=principal, tier=min_tier
+            ):
+                continue
+            # A summary reader is held to the summary fields: matching words
+            # only in a field they cannot read would disclose that field.
+            if q is not None and view is StudyRecordView.SUMMARY and not row["summary_match"]:
+                continue
+            studies.append(
+                StudySummary(
+                    study_idx=row["idx"],
+                    title=row["title"],
+                    alias=row["alias"],
+                    bioproject_accession=row["bioproject_accession"],
+                    ena_study_accession=row["ena_study_accession"],
+                    default_tier=access.default_tier,
+                    caller_tier=caller_effective_tier(access, caller=principal),
+                    access_via=study_access_via(access, caller=principal),
+                    record_view=view,
+                    updated_at=row["updated_at"],
+                )
+            )
+            if len(studies) == limit:
+                # Page full: more may follow unless this was the last row of a
+                # short (final) batch.
+                more = i < len(rows) - 1 or len(rows) == limit
+                break
+        else:
+            if len(rows) < limit:  # the candidate set ran out
+                more = False
+                break
+            continue
+        break
+    # Rounds spent without filling the page or running out: short page + cursor.
+    next_after = cursor if more else None
+    return StudySummaryListResponse(studies=studies, next_after_study_idx=next_after)
+
+
+@router.get(
+    PATH_STUDY_BY_IDX,
+    response_model=Annotated[StudyResponse | StudyRecordSummary, Field(discriminator="view")],
+)
 async def get_study(
     study_idx: Annotated[int, Field(gt=0)],
     response: Response,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
+    principal: Principal = Depends(require_scope(Scope.STUDY_READ)),
     _exists: None = Depends(require_study_exists),
-    _access: None = Depends(require_study_access(bypass_role=SystemRole.WET_LAB_ADMIN)),
-) -> StudyResponse:
-    """Return the qiita.study row for the path's idx as a StudyResponse.
+) -> StudyResponse | StudyRecordSummary:
+    """Return the study's record at the view `study_record_view` gives the
+    caller: the full `StudyResponse` (with an `ETag` header, fed back as
+    If-Match on PATCH), the `StudyRecordSummary`, or 403.
 
-    Access policy: any wet_lab_admin or higher passes; otherwise the
-    caller's effective tier on this study (public-by-absence when no
-    qiita.study_access row) must be at or above the study's
-    `default_tier`. require_study_exists composes alongside
-    require_study_access so admin-bypass callers still get 404 on a
-    non-existent study_idx (the access guard's bypass path returns
-    without any DB lookup, so it cannot surface that 404 on its own);
-    the access guard then emits the 401 / 403 responses for callers
-    that fail the tier policy.
-
-    The response carries an `ETag` header derived from the row's
-    `updated_at`, so a caller can feed it as the If-Match value on a
-    subsequent PATCH; the value is opaque-by-contract.
+    require_study_exists answers 404 first, for every caller including the
+    wet_lab_admin+ that `study_record_view` admits without a lookup.
     """
-    # The guard chain has already validated existence + access; the
-    # fetch is therefore expected to find the row, but a None defends
-    # against the (theoretically possible) race where the study is
-    # deleted between the guard and the handler.
+    access = await fetch_caller_study_access(
+        pool, principal_idx=principal.principal_idx, study_idx=study_idx
+    )
+    if access is None:
+        # Deleted between the existence guard and here.
+        raise HTTPException(status_code=404, detail=f"study {study_idx} not found")
+    view = study_record_view(access, caller=principal)
+    if view is None:
+        raise HTTPException(
+            status_code=403,
+            detail=f"requires a grant on study {study_idx}",
+        )
     row = await fetch_study(pool, study_idx)
     if row is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"study {study_idx} not found",
+        # Deleted between the existence guard and here.
+        raise HTTPException(status_code=404, detail=f"study {study_idx} not found")
+    if view is StudyRecordView.SUMMARY:
+        return StudyRecordSummary(
+            study_idx=row["idx"],
+            title=row["title"],
+            alias=row["alias"],
+            bioproject_accession=row["bioproject_accession"],
+            ena_study_accession=row["ena_study_accession"],
+            default_tier=row["default_tier"],
+            updated_at=row["updated_at"],
         )
     response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
     return _study_response_from_row(row)
