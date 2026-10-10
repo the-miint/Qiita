@@ -43,6 +43,14 @@ see [`getting-started.md`](getting-started.md).
   preflight to check against; it then materializes it to a parquet (the
   orchestrator has no DB access). Loads per-sample reads into `read`.
 
+- To take the run straight on to ASV counts, chain the amplicon run:
+  `--then-action-id amplicon --then-action-version 1.0.0 --then-context-json
+  '{"trim": 150, "sortmerna_reference_idx": <idx>}'`. The control plane submits
+  it, as you, on the same pool once demux completes. It is checked against the
+  amplicon action when golay-demux is submitted; `GET /work-ticket/{idx}` on the
+  golay-demux ticket shows the amplicon ticket it created
+  (`follow_on_work_ticket_idx`) or why it was refused (`follow_on_error`).
+
 ## Submit amplicon (denoise)
 
 - _(TODO)_ context: `sortmerna_reference_idx`, `trim`, optional `primer` /
@@ -58,6 +66,10 @@ see [`getting-started.md`](getting-started.md).
   `processing_idx`, and `amplicon_membership` is replace-keyed on
   `(prep_sample_idx, processing_idx)`, so the re-run replaces its own rows rather
   than doubling the counts.
+- A chained follow-on is always submitted without `--force`, even when its parent
+  was forced. Chaining amplicon onto a forced golay-demux re-run over a pool whose
+  amplicon run already completed is therefore refused at completion (recorded in
+  `follow_on_error`); submit that amplicon run by hand with `--force` instead.
 
 ## Deriving the ASV-reference-match feature table
 

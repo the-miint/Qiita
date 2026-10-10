@@ -146,6 +146,24 @@ def _add_global_internal_names_arg(subparser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_follow_on_args(subparser: argparse.ArgumentParser) -> None:
+    """Declare the flags that chain a follow-on ticket (`_follow_on_from_args`)."""
+    group = subparser.add_argument_group(
+        "follow-on",
+        "Chain a second ticket: once this one completes, the control plane submits"
+        " the named action as you, on the same target (for submit-golay-demux, the"
+        " same pool), without --force. It is checked against that action when this"
+        " ticket is submitted, so a bad context is refused then rather than at"
+        " completion.",
+    )
+    group.add_argument("--then-action-id", help="action_id of the follow-on ticket")
+    group.add_argument("--then-action-version", help="action_version of the follow-on ticket")
+    group.add_argument(
+        "--then-context-json",
+        help="the follow-on's action context as a JSON object (default {})",
+    )
+
+
 def _add_unique_field_args(subparser: argparse.ArgumentParser) -> None:
     """Declare the flags that name one biosample by a unique-in-study field."""
     subparser.add_argument("--study-idx", type=int, required=True)
@@ -1408,6 +1426,7 @@ def _build_parser() -> argparse.ArgumentParser:
             " step's workflow default."
         ),
     )
+    _add_follow_on_args(p_ticket_submit)
     p_ticket_submit.set_defaults(handler=_handle_ticket_submit)
 
     p_ticket_status = p_ticket_sub.add_parser(
@@ -2084,6 +2103,7 @@ def _build_parser() -> argparse.ArgumentParser:
             " DuckLake has no uniqueness). Requires wet_lab_admin or system_admin."
         ),
     )
+    _add_follow_on_args(p_submit_golay)
     p_submit_golay.set_defaults(handler=_handle_submit_golay_demux)
 
     p_delete_pool = sub.add_parser(

@@ -14,7 +14,7 @@ from qiita_common.models import (
 )
 
 from .. import _common
-from ._helpers import _build_body
+from ._helpers import _build_body, _follow_on_from_args
 
 
 def _post_work_ticket(base_url: str, token: str, body: dict) -> dict:
@@ -129,8 +129,9 @@ def _handle_ticket_submit(args: argparse.Namespace, parser: argparse.ArgumentPar
     """Submit a work-ticket. Construct the scope_target from the convenience
     --prep-sample-idx flag when supplied; otherwise parse --scope-target-json
     verbatim. action_context comes from --context-json (or stays {} when
-    omitted). All JSON parsing flows through parse_json_arg so a malformed
-    paste lands as a clean exit 2.
+    omitted), and the `--then-*` flags chain an optional follow-on. All JSON
+    parsing flows through parse_json_arg so a malformed paste lands as a clean
+    exit 2.
     """
     if args.prep_sample_idx is not None:
         args.scope_target = {
@@ -151,6 +152,10 @@ def _handle_ticket_submit(args: argparse.Namespace, parser: argparse.ArgumentPar
     # _build_body picks up. Only set it when supplied so unset stays "not set".
     if args.mem_gb is not None:
         args.resource_override = {"mem_gb": args.mem_gb}
+
+    follow_on = _follow_on_from_args(args, parser)
+    if follow_on is not None:
+        args.on_success = follow_on.model_dump(mode="json")
 
     body = _build_body(WorkTicketCreateRequest, args, parser)
     return _common.run_http_subcommand(lambda t: _post_work_ticket(args.base_url, t, body))

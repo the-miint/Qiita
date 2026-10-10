@@ -133,6 +133,8 @@ Work ticket fields (per `qiita.work_ticket` migration `20260504000001_work_ticke
 - `failure_step_name` — YAML step name when `failure_stage = step_run`; NULL otherwise (CHECK enforced)
 - `failure_reason` — human-readable explanation
 - `created_at`, `updated_at` — timestamps
+- `on_success` — an optional follow-on `{action_id, action_version, action_context}` the control plane submits as the originator, on the same scope target, once the ticket COMPLETES (`qiita_control_plane.follow_on`; human submitters only)
+- `follow_on_work_ticket_idx` / `follow_on_error` — the follow-on's outcome, at most one set: the ticket it created (recorded in that ticket's INSERT transaction, so it is created at most once), or why it was refused
 
 The schema does not carry per-step provenance fields (slurm_job_id, log paths, current_step / total_steps, provenance JSONB, completed_at). The runner is synchronous and waits inline for each step; SLURM-side log retrieval is on the orchestrator and not surfaced on the work_ticket row.
 
@@ -162,7 +164,11 @@ completed (rebuilding their `bound` outputs from the shared workspace),
 re-attaches a still-running SLURM job by its persisted `slurm_job_id` (or
 adopts an orphan by its deterministic name via `find-by-name`), finalizes a
 job that succeeded during the outage, and decides a purged job from its
-on-disk output manifest. This is the deliberate consequence of deploys
+on-disk output manifest. The startup hook then calls `reconcile_follow_ons`,
+which submits the follow-on of every completed ticket that records no outcome
+(one that completed while no process ran its completion hook, or whose
+submission failed with anything but a refusal). That is the only retry: such a
+follow-on waits for the next CP start. This is the deliberate consequence of deploys
 stopping/starting CP+CO without draining — a restart with live in-flight
 work is routine, so it must never nuke running jobs (the pre-decoupling
 `recover_orphaned_tickets` blanket-failed them). The reconcile assumes no

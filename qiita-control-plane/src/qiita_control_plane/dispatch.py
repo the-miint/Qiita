@@ -37,6 +37,7 @@ from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
 
 from .fanout_dispatch import cohort_for_work_ticket, held_cohorts, top_up_dispatch
+from .follow_on import submit_follow_on
 from .runner import run_workflow
 
 if TYPE_CHECKING:
@@ -142,6 +143,23 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fal
         # cohort (see fanout_dispatch); on success it refills. No-op for a
         # non-fan-out ticket.
         await _pump_ticket_cohort(app, work_ticket_idx)
+        await _submit_follow_on(app, work_ticket_idx)
+
+
+async def _submit_follow_on(app: FastAPI, work_ticket_idx: int) -> None:
+    """Submit the follow-on of a ticket that just COMPLETED (no-op otherwise).
+
+    `follow_on` records refusals on the parent row itself; anything else reaches
+    here having recorded nothing, and the startup reconcile retries it — so log
+    it and keep the dispatch task clean."""
+    try:
+        await submit_follow_on(app, work_ticket_idx)
+    except Exception:
+        _log.exception(
+            "follow-on after work_ticket %d was not submitted; the next startup"
+            " reconcile re-drives it",
+            work_ticket_idx,
+        )
 
 
 async def _pump_ticket_cohort(app: FastAPI, work_ticket_idx: int) -> None:

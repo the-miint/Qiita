@@ -227,6 +227,28 @@ LIVE_STEP_PROGRESS_STATES: tuple[StepProgressState, ...] = tuple(
 )
 
 
+class WorkTicketFollowOn(BaseModel):
+    """A ticket the control plane submits once its parent COMPLETES, on the
+    parent's scope target, as the parent's originator — so it names only the
+    action and its context. A follow-on carries no follow-on of its own (see
+    `qiita_control_plane.follow_on` for the protocol)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
+    action_context: dict[str, Any] = Field(default_factory=dict)
+
+    def as_request(self, scope_target: ScopeTarget) -> WorkTicketCreateRequest:
+        """The submission this follow-on makes on `scope_target`."""
+        return WorkTicketCreateRequest(
+            action_id=self.action_id,
+            action_version=self.action_version,
+            scope_target=scope_target,
+            action_context=self.action_context,
+        )
+
+
 class WorkTicket(BaseModel):
     """Control-plane record of an action invocation.
 
@@ -284,6 +306,12 @@ class WorkTicket(BaseModel):
     # explainable instead of silent.
     transient_reason: str | None = None
     transient_since: AwareDatetime | None = None
+    # The follow-on this ticket submits once it COMPLETES, and what became of
+    # it: the ticket it created, or why it was refused. Mirrors the
+    # qiita.work_ticket columns of the same names.
+    on_success: WorkTicketFollowOn | None = None
+    follow_on_work_ticket_idx: int | None = None
+    follow_on_error: str | None = None
     created_at: AwareDatetime
     updated_at: AwareDatetime
 
@@ -340,6 +368,9 @@ class WorkTicketCreateRequest(BaseModel):
     scope_target: ScopeTarget
     action_context: dict[str, Any] = Field(default_factory=dict)
     resource_override: ResourceOverride | None = None
+    # Submitted on this ticket's scope target once it COMPLETES; human callers
+    # only (see `qiita_control_plane.follow_on`).
+    on_success: WorkTicketFollowOn | None = None
     force: bool = Field(
         default=False,
         description=(
