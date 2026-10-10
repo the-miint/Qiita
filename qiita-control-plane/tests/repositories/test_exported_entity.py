@@ -111,7 +111,11 @@ async def test_fetch_exported_entities_raise_missing(postgres_pool, probe, kind)
     """
     study_idx = list(probe["study_idxs"])
     biosample_idx = [probe["biosample_idx"]]
-    (study_idx if kind == "study" else biosample_idx).append(_ABSENT_IDX)
+    # Add the absent idx to the list of the kind under test.
+    if kind == "study":
+        study_idx = [*study_idx, _ABSENT_IDX]
+    else:
+        biosample_idx = [*biosample_idx, _ABSENT_IDX]
     with pytest.raises(MissingExportedEntityError) as caught:
         await fetch_exported_entities(
             postgres_pool, study_idx=study_idx, biosample_idx=biosample_idx

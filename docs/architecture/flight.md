@@ -158,25 +158,18 @@ data plane can resolve**, and no call's columns exist out there. It is not a
 policy exception and it does not generalize — anything whose columns do live in
 the lake still goes through a ticket.
 
-**The exported-handle tables are one namespace, not four conventions.** Each is
-a table whose public handle is a GENERATED, UNIQUE column, so the guarantee that
-two things never publish under one name is a database fact rather than a client
-assertion; each is idempotent, so a rebuild renames nobody. Each owns its own
-prefixes — `QM` (`exported_identifier`), `QF` (`exported_feature`), `QP`
-(`exported_processing`), `QS`/`QB` (`exported_entity`) — and nothing enforces
-that across tables, so a new table must pick prefixes none of these use. The
-three handle tables for processing outputs retire rather than delete, because a
-published handle is a promise; `exported_entity`, which names studies and
-biosamples, has no retirement at all, because neither entity can be deleted and
-each records its own lifecycle. `exported_feature` is the hybrid — an accession
-wins wherever the entity has one no live row has already published, and a minted
-`QF<n>` covers the rest — which is why a bundle names its rows `GCF_000006605`
-rather than replacing a handle people know. The shape, the rejected
-alternatives, and what a new *kind* must update are in the migrations
-(`20260810000000_exported_identifier.sql`, `20260813000000_exported_feature.sql`,
-`20260813000001_exported_processing.sql`, `20261006000000_exported_entity.sql`);
-the FORWARD PLAN comment in each of the first three is the copy to read before
-adding one there.
+**The three mints are one namespace, not three conventions.** Each is a table
+whose public handle is a GENERATED, UNIQUE column, so the guarantee that two
+things never publish under one name is a database fact rather than a client
+assertion; each is idempotent, so a rebuild renames nobody; and each retires
+rather than deletes, because a published handle is a promise. `exported_feature`
+is the hybrid — an accession wins wherever the entity has one no live row has
+already published, and a minted `QF<n>` covers the rest — which is why a bundle
+names its rows `GCF_000006605` rather than replacing a handle people know. The
+shape, the rejected alternatives, and what a new *kind* must update are in the
+three migrations (`20260810000000_exported_identifier.sql`,
+`20260813000000_exported_feature.sql`, `20260813000001_exported_processing.sql`);
+the FORWARD PLAN comment in each is the copy to read before adding one.
 
 **The exported identifier is the boundary where our identifiers stop.** A
 published table names its samples `QM<n>`, never `prep_sample_idx` — see the

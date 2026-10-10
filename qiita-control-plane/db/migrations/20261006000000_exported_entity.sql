@@ -66,11 +66,10 @@ CREATE TABLE qiita.exported_entity (
 COMMENT ON TABLE qiita.exported_entity IS
     'Public handle (export_entity_id, ''QS<n>'' for a study and ''QB<n>'' for a '
     'biosample, <n> being this table''s own idx) for one curated entity, so nothing '
-    'that crosses the Qiita boundary '
-    'has to carry an internal *_idx. An entity qualifies here when it has a '
-    'standalone single-column identity, no hard-delete path, its own lifecycle '
-    'columns, and no dependency on an external accession existing first. '
-    'Carries no retirement columns: a handle is permanent and its '
+    'that crosses the Qiita boundary has to carry an internal *_idx. An entity '
+    'qualifies here when it has a standalone single-column identity, no hard-delete '
+    'path, its own lifecycle columns, and no dependency on an external accession '
+    'existing first. Carries no retirement columns: a handle is permanent and its '
     'entity''s retirement is read from the entity.';
 
 COMMENT ON COLUMN qiita.exported_entity.export_entity_id IS

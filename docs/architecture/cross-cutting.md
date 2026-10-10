@@ -67,6 +67,23 @@ Phylogeny internal nodes are addressed by `(reference_idx, node_index)` — scop
 
 **Hash storage: never carry MD5 as VARCHAR.** DuckDB's `md5(x)` returns the 32-char hex string by default — never write the string form into a column, temp table, or Parquet file. Cast to `UUID` (`md5(x)::uuid`, 128-bit internally) or use `md5_number(x)` for `UHUGEINT`. Both are 16-byte fixed-width, compare/JOIN as integers, and match the Postgres `uuid` column type the wire-side `sequence_hash` already uses — a string-form intermediate forces a CAST at write time and burns memory + I/O between phases. Same rule applies to any other content hash (SHA-256 as fixed-width bytes, etc.); pick the narrowest integer / fixed-width type the hash fits in.
 
+### Public handle prefixes
+
+Every public handle Qiita mints is a short letter prefix followed by its table's
+own `idx`, composed by a GENERATED column; it is what crosses the boundary in
+place of an `*_idx` (`CLAUDE.md`, opaque identifiers). The prefixes in use:
+
+| Prefix | Names | Table |
+|---|---|---|
+| `QM` | a processed sample | `qiita.exported_identifier` |
+| `QF` | a genome or reference feature with no published accession | `qiita.exported_feature` |
+| `QP` | a processing (an alignment) | `qiita.exported_processing` |
+| `QS` / `QB` | a study / a biosample | `qiita.exported_entity` |
+
+Each table's own UNIQUE index keeps its handles distinct, but nothing in the
+database spans the tables, so a new handle table must take a prefix not listed
+here — and add it here.
+
 ### Data plane design
 
 The data plane is intentionally "dumb": it only operates on identifiers it receives. Its three Arrow Flight operations map directly to DuckLake:
