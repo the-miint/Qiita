@@ -74,7 +74,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   obtainable only by already knowing its run; this is the study-first join that
   makes a study's pools (and the pool-scoped processing routes behind them)
   reachable without walking the run.
-- **Studies and biosamples can be named publicly without exposing an internal identifier (#N).**
+- **Studies and biosamples can be named publicly without exposing an internal identifier (#682).**
   A new `qiita.exported_entity` table mints a permanent handle — `QS<n>` for a study, `QB<n>` for
   a biosample — so anything crossing the Qiita boundary can name one without carrying its `*_idx`.
   A trigger mints the handle in the transaction that inserts its entity, whichever path inserts
