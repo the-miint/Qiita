@@ -53,7 +53,7 @@ Every rule has one home. Spawn a family only if one of its rules fired in step 2
 ## Scope discipline
 
 - **Flag-but-defer what is wider than the PR.** A pre-existing problem in a sibling file, or a fix that would sprawl, is flagged with a proposed follow-up issue, not a request to expand the PR. Don't fail a PR for a problem it inherited. An existing sibling doing the same thing does not excuse a new site: flag the new one, offer the old ones as the follow-up.
-- **Write a deferral so it survives being handed on.** Each deferred or `[needs-probe]` finding states why it is out of scope ("pre-existing in a sibling", "needs the deploy host") and whether it pre-dates this branch or was introduced by it. Bare "deferred" is not a reason. A deferred finding also carries a title for its follow-up issue and what would close it: the caller opens that issue before the PR is opened, and the PR description names it by number.
+- **Write a deferral so it survives being handed on.** Each deferred or `[needs-probe]` finding states why it is out of scope ("pre-existing in a sibling", "needs the deploy host") and whether it pre-dates this branch or was introduced by it. Bare "deferred" is not a reason. A deferred finding also carries a title for its follow-up issue and what would close it; the `qiita-review` skill says when that issue is opened.
 - **Verify your premises.** A finding that rests on a claim about a file you have not read ("this diverges from how the runner does it") is confirmed by opening that file, or softened to a question. A claim about what DuckDB, Arrow, Parquet or a tool does with a type or a value is a premise too: it is `[needs-probe]`, and the probe must exercise the path the code uses.
 
 ## Standing policies

@@ -55,7 +55,7 @@ Give every finding exactly one disposition, and write it into the ledger:
 |---|---|---|
 | `fixed` | You changed the code | Name the commit or `path:line` |
 | `declined` | Correct rule, wrong here | Record the **reason** — it goes into the next prompt |
-| `deferred` | Real, but wider than this PR (the reviewer's Scope discipline) | Open the issue and record its number, then drop it from the loop |
+| `deferred` | Real, but wider than this PR (the reviewer's Scope discipline) | Record the issue's number, or its draft title and body until it is opened (see the PR-body block), then drop it from the loop |
 | `probed` | Was `[needs-probe]`; you ran it | Record the result — confirmed or refuted |
 
 Then apply the fixes and run the tests the change actually touches: always the
@@ -143,8 +143,9 @@ diff:
 - **Separate what is pre-existing from what this branch introduced.** A reviewer
   inheriting the list needs to know which items the PR is answerable for.
 
-The reviewer owes you the raw material for all three — a reason and pre-existing-or-not
-are on its **Scope discipline**, a refutation target on its **Verification handoff**. What is yours is the shape:
+The reviewer owes you the raw material for all three — a reason, pre-existing-or-not, and
+a deferred finding's issue title and closing condition are on its **Scope discipline**, a
+refutation target on its **Verification handoff**. What is yours is the shape:
 grouping, brevity, and writing it for someone who has not read the diff.
 
 Keep it short — a few grouped lines, not a report. If nothing is open, say that in one
@@ -175,8 +176,9 @@ included:
 - `Reviewed at` is a commit on the branch. If commits land after the last round, say so
   on that line ("plus 1 later commit: changelog tag") instead of moving the sha.
 - Write `none` under a heading with no entries; do not drop the heading.
-- A deferred item names its issue by number. Open every deferred issue before the PR
-  is opened, so the description carries `#N` from its first version; `issue to file`
-  is not an entry. If you cannot open issues, stop before the block and hand the
-  author each issue's title and body to open.
+- A deferred item names its issue by number. Every deferred issue is opened before
+  the PR is, so the description carries `#N` from its first version; `issue to file`
+  is not an entry. Open them yourself only when the author has asked you to. Otherwise,
+  or when you lack access, put each issue's title and body after the prose list in
+  place of the block, and print the block once the author gives you the numbers.
 - Do not edit the PR description yourself unless asked; hand the block to the author.
