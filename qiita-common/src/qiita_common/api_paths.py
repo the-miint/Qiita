@@ -613,6 +613,20 @@ URL_ASSEMBLY_PREP_SAMPLE = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_PREP_SAMPLE}"
 
 
 # =============================================================================
+# /amplicon/* — an amplicon run's feature table
+# =============================================================================
+# Keyed on the run's processing_idx, the identity a completed amplicon ticket
+# minted; the pool rides the query string because one processing_idx spans every
+# pool denoised with the same parameters.
+
+PATH_AMPLICON_PREFIX = "/amplicon"
+PATH_AMPLICON_FEATURE_TABLE = "/{processing_idx}/feature-table"
+
+URL_AMPLICON_PREFIX = f"{API_PREFIX}{PATH_AMPLICON_PREFIX}"
+URL_AMPLICON_FEATURE_TABLE = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE}"
+
+
+# =============================================================================
 # /processing/* — assembly run identity and its lifecycle
 # =============================================================================
 # A processing_idx is minted by the runner, not by a route: it is the

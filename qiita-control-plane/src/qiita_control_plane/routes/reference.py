@@ -23,6 +23,10 @@ import httpx
 import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import Field, ValidationError
+from qiita_common.amplicon_constants import (
+    AMPLICON_MEMBERSHIP_TABLE,
+    AMPLICON_SEQUENCE_CHUNKS_TABLE,
+)
 from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_DOGET,
@@ -914,6 +918,10 @@ _DOGET_ALLOWED_TABLES = frozenset(
         # Per-subject assembly quality, signed by the human assembly run mint
         # (routes/assembly.py) and in-process by the feature-table resolver.
         BIN_QUALITY_TABLE,
+        # One amplicon run's ASV counts and sequences over a cohort, signed
+        # in-process by the amplicon feature-table route (routes/amplicon.py).
+        AMPLICON_MEMBERSHIP_TABLE,
+        AMPLICON_SEQUENCE_CHUNKS_TABLE,
     }
 )
 
@@ -935,7 +943,8 @@ _DOGET_ALLOWED_TABLES = frozenset(
 # prep_sample first. The feature-table resolver signs it in-process
 # (`runner/_feature_table.py`). Excluding it here keeps a reference-scoped ticket
 # from naming it, which `test_doget_bin_quality_not_signable_via_reference_route`
-# pins.
+# pins. The amplicon surfaces are excluded for the same reason: keyed on one
+# amplicon run, signed only by the amplicon feature-table route.
 _REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
     {
         READ_MASKED_TABLE,
@@ -945,6 +954,8 @@ _REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
         ASSEMBLED_SEQUENCE_TABLE,
         ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
         BIN_QUALITY_TABLE,
+        AMPLICON_MEMBERSHIP_TABLE,
+        AMPLICON_SEQUENCE_CHUNKS_TABLE,
     }
 )
 

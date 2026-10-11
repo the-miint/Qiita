@@ -196,6 +196,10 @@ LONG_READ_ASSEMBLY_ACTION_ID = "long-read-assembly"
 # readers that key on the constant above key on this one.
 ALIGN_DENOVO_ACTION_ID = "align-denovo"
 
+# The amplicon denoise action's bare id (workflows/amplicon/<version>.yaml), and so
+# the `qiita.processing.workflow` of every amplicon run.
+AMPLICON_ACTION_ID = "amplicon"
+
 
 class Audience(BaseModel):
     """Who may invoke this action — answers "may invoke", not "may execute".

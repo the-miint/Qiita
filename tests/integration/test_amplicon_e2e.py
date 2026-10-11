@@ -48,6 +48,10 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport
 from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_control_plane.amplicon_feature_table import (
+    fetch_amplicon_run,
+    render_feature_table_tsv,
+)
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 from _runner_helpers import LocalComputeBackendClient
@@ -557,3 +561,31 @@ async def test_golay_demux_then_amplicon(
     assert {r[0] for r in rows} == set(prep_idxs)
     assert len({r[1] for r in rows}) == 1  # one processing_idx for the whole run
     assert all(r[3] > 0 for r in rows)
+
+    # 3. The feature table's read path: the control plane's signed run-scoped
+    # tickets stream exactly the lake rows above, and every counted ASV has its
+    # sequence in the chunks.
+    processing_idx = rows[0][1]
+    membership, chunks = await fetch_amplicon_run(
+        data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
+        signing_key=data_plane["secret"],
+        processing_idx=processing_idx,
+        prep_sample_idxs=sorted(prep_idxs),
+    )
+    streamed = set(
+        zip(
+            membership["prep_sample_idx"].to_pylist(),
+            membership["processing_idx"].to_pylist(),
+            membership["feature_idx"].to_pylist(),
+            membership["count"].to_pylist(),
+            strict=True,
+        )
+    )
+    assert streamed == set(rows)
+    assert set(chunks["feature_idx"].to_pylist()) == {r[2] for r in rows}
+    labels = {p: f"S{i}" for i, p in enumerate(sorted(prep_idxs))}
+    table = render_feature_table_tsv(membership, chunks, labels).splitlines()
+    assert len(table) == 1 + _EXPECTED_FEATURES
+    assert sum(int(c) for line in table[1:] for c in line.split("\t")[1:]) == sum(
+        r[3] for r in rows
+    )

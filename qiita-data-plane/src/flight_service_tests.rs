@@ -4595,7 +4595,7 @@ fn build_query_assembly_membership_reaches_no_output_column() {
 }
 
 /// A well-formed `bin_quality` ticket filter: one run, over a cohort.
-fn bin_quality_scope(prep_sample_idx: &[i64], processing_idx: i64) -> auth::TicketFilter {
+fn run_cohort_filter(prep_sample_idx: &[i64], processing_idx: i64) -> auth::TicketFilter {
     filter_of(&[
         (
             "prep_sample_idx",
@@ -4614,7 +4614,7 @@ fn build_query_bin_quality_scopes_the_run_on_its_own_columns() {
     // run key itself, which is why it is a separate builder rather than another
     // `is_assembly_run_surface` arm.
     let (sql, full) =
-        build_query("bin_quality", &bin_quality_scope(&[42, 43], 7), &[], &[]).unwrap();
+        build_query("bin_quality", &run_cohort_filter(&[42, 43], 7), &[], &[]).unwrap();
     assert_eq!(full, "qiita_lake.bin_quality");
     assert_eq!(
         sql,
@@ -4694,7 +4694,7 @@ fn build_query_bin_quality_takes_no_projection_and_no_members() {
     assert!(
         build_query(
             "bin_quality",
-            &bin_quality_scope(&[42], 7),
+            &run_cohort_filter(&[42], 7),
             &[],
             &columns(&["completeness"])
         )
@@ -4704,7 +4704,7 @@ fn build_query_bin_quality_takes_no_projection_and_no_members() {
     assert!(
         build_query(
             "bin_quality",
-            &bin_quality_scope(&[42], 7),
+            &run_cohort_filter(&[42], 7),
             &block_members(),
             &[]
         )
@@ -6387,5 +6387,114 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
             "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = {id};"
         ))
         .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Amplicon run surfaces: amplicon_membership and the ASV sequence chunks, both
+// scoped by one run (processing_idx) over a cohort (prep_sample_idx).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn amplicon_surfaces_are_doget_allowed() {
+    for readable in ["amplicon_membership", "amplicon_sequence_chunks"] {
+        assert!(
+            ALLOWED_TABLES.contains(&readable),
+            "{readable:?} must be DoGet-readable"
+        );
+    }
+}
+
+#[test]
+fn build_query_amplicon_membership_scopes_the_run_on_its_own_columns() {
+    let (sql, full) = build_query(
+        "amplicon_membership",
+        &run_cohort_filter(&[42, 43], 7),
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(full, "qiita_lake.amplicon_membership");
+    assert_eq!(
+        sql,
+        "SELECT * FROM qiita_lake.amplicon_membership \
+         WHERE processing_idx = 7 AND prep_sample_idx IN (42, 43)",
+        "got: {sql}"
+    );
+}
+
+#[test]
+fn build_query_amplicon_sequence_chunks_resolve_the_run_through_membership() {
+    let (sql, full) = build_query(
+        "amplicon_sequence_chunks",
+        &run_cohort_filter(&[42, 43], 7),
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(full, "qiita_lake.amplicon_sequence_chunks");
+    assert_eq!(
+        sql,
+        "SELECT * FROM qiita_lake.amplicon_sequence_chunks WHERE feature_idx IN (\
+         SELECT feature_idx FROM qiita_lake.amplicon_membership \
+         WHERE processing_idx = 7 AND prep_sample_idx IN (42, 43))",
+        "got: {sql}"
+    );
+}
+
+#[test]
+fn build_query_amplicon_requires_exactly_the_run_key() {
+    let empty = auth::TicketFilter::new();
+    let cases: &[(&str, auth::TicketFilter)] = &[
+        ("empty filter", empty.clone()),
+        (
+            "prep_sample_idx alone",
+            filter_of(&[("prep_sample_idx", vec![serde_json::json!(42)])]),
+        ),
+        (
+            "processing_idx alone",
+            filter_of(&[("processing_idx", vec![serde_json::json!(7)])]),
+        ),
+        (
+            "two runs",
+            filter_of(&[
+                ("prep_sample_idx", vec![serde_json::json!(42)]),
+                (
+                    "processing_idx",
+                    vec![serde_json::json!(7), serde_json::json!(8)],
+                ),
+            ]),
+        ),
+        (
+            "the run plus a named ASV",
+            filter_of(&[
+                ("prep_sample_idx", vec![serde_json::json!(42)]),
+                ("processing_idx", vec![serde_json::json!(7)]),
+                ("feature_idx", vec![serde_json::json!(11)]),
+            ]),
+        ),
+        ("an ASV roster alone", feature_scope(&[11, 22, 33])),
+    ];
+    for table in ["amplicon_membership", "amplicon_sequence_chunks"] {
+        for (label, filter) in cases {
+            assert!(
+                build_query(table, filter, &[], &[]).is_err(),
+                "{table} must reject {label}"
+            );
+        }
+        assert!(
+            build_query(
+                table,
+                &run_cohort_filter(&[42], 7),
+                &[],
+                &columns(&["feature_idx"])
+            )
+            .is_err(),
+            "{table} must reject a projection column list"
+        );
+        assert!(
+            build_query(table, &run_cohort_filter(&[42], 7), &block_members(), &[]).is_err(),
+            "{table} must reject a block members selector"
+        );
     }
 }

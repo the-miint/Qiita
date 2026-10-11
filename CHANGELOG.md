@@ -21,6 +21,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **An amplicon run's ASV feature table over REST (#687).**
+  `GET /amplicon/{processing_idx}/feature-table?sequenced_pool_idx=` serves the
+  counts one run produced over one pool as TSV, rows named by ASV sequence and
+  columns by biosample accession (BioSample, else ENA sample); `study_idx` narrows
+  the cohort to one study. Access is all-or-nothing over the cohort, and a counted
+  prep_sample with no accession, or two sharing one biosample, is refused. The data plane
+  serves `amplicon_membership` and `amplicon_sequence_chunks` as DoGet surfaces
+  scoped to exactly one run over a cohort.
+
 - **golay-demux checks its submitted barcode roster against the pool's stored
   pre-flight (#657).** The CLI builds `barcode_map` client-side; a transposed roster
   would route one sample's reads under another's `prep_sample_idx` with nothing

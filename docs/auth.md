@@ -422,6 +422,12 @@ General `reference:read` resolvers, unrelated to the curation blocklist above.
 | `/api/v1/reference/{reference_idx}/genome-map` | GET | The whole reference's `feature_idx` → `(genome_idx, source, source_id)` lookup, the inverse direction of the member route above, ordered by `(feature_idx, genome_idx)`. A shared plasmid contributes one entry per genome, so the count is of PAIRS. `404` for an unknown reference but `200` with `entries: []` for one with no genome-bearing features (a 16S reference legitimately has none). **`413`, not a truncated `200`, above the hard cap**, naming the real size — a lookup table silently missing rows yields a *wrong* feature table rather than a partial one. Requires `reference:read`; no new scope. |
 | `/api/v1/reference/{reference_idx}/genome-map/parquet` | GET | The same rows as the JSON route above, as a Parquet body (`application/vnd.apache.parquet`), with **no cap** — the projection is shared SQL text, so the two forms cannot disagree. This is the form the client-side `feature-table build` recipe reads, the JSON route's cap being below what the deploy's references need. Completeness needs no flag because a truncated Parquet body fails to parse. Same `404` / empty behaviour, same `reference:read`; no new scope. |
 
+### Amplicon
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/amplicon/{processing_idx}/feature-table` | GET | One amplicon run's ASV counts over one pool, as TSV (`text/tab-separated-values`): rows named by ASV sequence, columns by the counted prep_samples' biosample accession (BioSample, else ENA sample). `sequenced_pool_idx` is required — a `processing_idx` is the denoise knobs, shared by every pool denoised with them — and `study_idx` optionally narrows the cohort to one study's prep_samples. Requires `prep_sample:read` and a complete profile; **all-or-nothing** over the pool's population (`authorize_prep_sample_cohort` at `COHORT_MIN_TIER`), so a reader of one study in a multi-study pool passes `study_idx`. The control plane signs the two run-scoped DoGet surfaces (`amplicon_membership`, `amplicon_sequence_chunks`) in-process; they are not on the reference mint. `404` for a run that is not amplicon, a pool with no prep_samples (in that study), or a run that counted none of them; `409` when a counted prep_sample's biosample has no accession, one outside `[A-Za-z0-9._-]`, or two counted prep_samples share a biosample; `502` when the data plane read fails. |
+
 ### Assembly
 
 The de novo arm: two DoGet mints over one assembly run's contigs, the run-scoped

@@ -59,6 +59,20 @@ see [`getting-started.md`](getting-started.md).
   `(prep_sample_idx, processing_idx)`, so the re-run replaces its own rows rather
   than doubling the counts.
 
+## Reading the ASV feature table
+
+- `GET /api/v1/amplicon/{processing_idx}/feature-table?sequenced_pool_idx=<pool>`
+  returns the run's ASV counts over that pool as TSV (`#OTU ID`, the BIOM TSV
+  header): one row per ASV, named by its own sequence, and one column per prep_sample
+  the run counted, named by its biosample accession (the BioSample accession, else the
+  ENA sample accession). The pool is required because a `processing_idx` is the
+  denoise knobs, shared by every pool denoised with them.
+- Access is all-or-nothing over the pool's prep_samples; a reader of one study in a
+  multi-study pool adds `&study_idx=<study>` to get that study's share.
+- Refused (409) when a counted prep_sample's biosample has no accession yet (or one
+  unsafe as a column name), or when two counted prep_samples share a biosample — two
+  columns with one name could not say which prep_sample a count came from.
+
 ## Deriving the ASV-reference-match feature table
 
 - _(TODO — tracked follow-up, not in this PR)_ The feature table is derived on
