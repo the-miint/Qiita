@@ -356,7 +356,8 @@ async def test_ingest_ena_reads_downloads_a_real_small_run_into_ducklake(
     try:
         outputs = await ingest_ena_reads.execute(inputs, tmp_path / "ws")
     except BackendFailure as exc:
-        if exc.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT:
+        transport = ingest_ena_reads.TRANSIENT_FETCH_ERROR_TEXT in exc.reason
+        if exc.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT and transport:
             pytest.skip(f"ENA appears unreachable from this host: {exc.reason}")
         raise
 

@@ -481,6 +481,30 @@ async def fetch_sequenced_pool_samples(
     return list(rows)
 
 
+async def fetch_sequenced_pool_item_prep_sample_idxs(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
+) -> dict[str, int]:
+    """The pool's ACTIVE sequenced_samples as `{sequenced_pool_item_id:
+    prep_sample_idx}` — the join from a pre-flight's per-sample facts (keyed on
+    item id) to the prep_sample they belong to, against which a submitted roster
+    is checked.
+
+    Excludes retired prep_samples and ena_status-flagged samples, matching
+    `fetch_sequenced_pool_samples` (the CLI's roster read) so the runner's
+    expected roster and the CLI's agree on a pool's membership: `retire` drops a
+    well from the active set the same way on both sides."""
+    rows = await pool_or_conn.fetch(
+        "SELECT ss.sequenced_pool_item_id, ss.prep_sample_idx"
+        "  FROM qiita.sequenced_sample ss"
+        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE ss.sequenced_pool_idx = $1"
+        "   AND ps.retired = false"
+        "   AND ss.ena_status IS NULL",
+        sequenced_pool_idx,
+    )
+    return {r["sequenced_pool_item_id"]: r["prep_sample_idx"] for r in rows}
+
+
 async def fetch_pool_members(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
 ) -> list[tuple[int, int, int]]:

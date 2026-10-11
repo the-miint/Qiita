@@ -45,6 +45,7 @@ from qiita_control_plane.repositories.biosample_metadata import (
     BiosampleOwnerIdMissingValueError,
 )
 from qiita_control_plane.testing.db_seeds import (
+    fetch_export_entity_id,
     retire_biosample,
     retire_biosample_to_study_link,
     seed_biosample_global_field,
@@ -52,6 +53,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_local_study_field,
     seed_study,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 from qiita_control_plane.testing.unique_names import (
     unique_accession,
     unique_field_name,
@@ -1322,6 +1324,9 @@ async def test_fetch_biosample_returns_row(ctx):
 
     expected = {
         "idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": ctx["biosample_owner_idx"],
         "metadata_checklist_idx": ctx["checklist_idx"],
         "metadata_checklist_name": ctx["checklist_name"],
@@ -1486,6 +1491,9 @@ async def test_update_biosample_writes_single_field(ctx):
 
     expected = {
         "idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": ctx["biosample_owner_idx"],
         "metadata_checklist_idx": ctx["checklist_idx"],
         "metadata_checklist_name": ctx["checklist_name"],
@@ -1545,6 +1553,9 @@ async def test_update_biosample_writes_all_editable_fields(ctx):
 
     expected = {
         "idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": ctx["principal_idx"],
         "metadata_checklist_idx": None,
         "metadata_checklist_name": None,
@@ -1989,7 +2000,9 @@ async def test_user_delete_succeeds_after_biosample_gone(postgres_pool):
         try:
             owner = await _create_user(conn)
             bs_idx = await _insert_biosample_row(conn, owner_idx=owner)
-            await conn.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs_idx)
+            await teardown_entity_graph(
+                conn, study_idxs=[], biosample_idxs=[bs_idx], prep_sample_idxs=[]
+            )
             await conn.execute("DELETE FROM qiita.user WHERE principal_idx = $1", owner)
             still_there = await conn.fetchval(
                 "SELECT 1 FROM qiita.user WHERE principal_idx = $1", owner

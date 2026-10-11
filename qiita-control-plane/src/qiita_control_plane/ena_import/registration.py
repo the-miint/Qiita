@@ -43,7 +43,7 @@ from enum import StrEnum
 from operator import itemgetter
 
 import asyncpg
-from qiita_common.models import FieldDataType, Platform, WorkTicketState
+from qiita_common.models import NCBI_TAXONOMY_NAME, FieldDataType, Platform, WorkTicketState
 from qiita_common.models.ena import (
     EnaRunRecord,
     EnaSampleAttributes,
@@ -51,9 +51,11 @@ from qiita_common.models.ena import (
     EnaStudyHeader,
 )
 
+from qiita_control_plane.host_by_sample_taxon import implied_hosts
 from qiita_control_plane.repositories import require_transaction
 from qiita_control_plane.repositories._sample_helpers import (
     fetch_metadata_checklist_idx_by_name,
+    fetch_terminology_term_idxs_by_term_ids,
     insert_entity_to_study,
     resolve_local_study_field,
     write_local_metadata_on_resolved_field,
@@ -77,6 +79,7 @@ from qiita_control_plane.repositories.sequencing_run import (
     insert_sequencing_run,
     lock_sequencing_run,
 )
+from qiita_control_plane.repositories.terminology import fetch_terminology_idx_by_name
 
 from .harmonization import HarmonizationResult, build_biosample_metadata
 from .platform_mapping import UnmappableEnaPlatformError, map_ena_platform
@@ -253,8 +256,7 @@ async def register_ena_study(
     before platform mapping even runs.
     It does raise -- before any run is written -- when a study-local field at
     one of the four `library_*` display names cannot hold these values (see
-    `_ensure_library_fields`), so the whole accession fails loudly rather
-    than run by run.
+    `_ensure_library_fields`), so the whole accession fails loudly rather than run by run.
     """
     # A run whose sample has no entry here harmonizes against an empty map
     # rather than failing.
@@ -302,10 +304,13 @@ async def register_ena_study(
         # Outside the transaction below: the field rows are per-study
         # constants that survive a failed attempt (see _ensure_library_fields).
         library_field_idxs: dict[str, int] = {}
+        implied_host_by_taxon: dict[str, str | None] = {}
+        loaded_term_ids: frozenset[str] = frozenset()
         if any(acc not in already_present for acc in platform_by_accession):
             library_field_idxs = await _ensure_library_fields(
                 conn, study_idx=study_idx, created_by_idx=caller_idx
             )
+            implied_host_by_taxon, loaded_term_ids = await _taxon_lookups(conn, ena_runs)
 
         # One transaction spans pool resolution and every run insert so the
         # sequencing_run lock `_resolve_platform_pools` takes is held until the
@@ -349,6 +354,8 @@ async def register_ena_study(
                     metadata_checklist_idx=metadata_checklist_idx,
                     attrs_by_sample_accession=attrs_by_sample_accession,
                     library_field_idxs=library_field_idxs,
+                    implied_host_by_taxon=implied_host_by_taxon,
+                    loaded_term_ids=loaded_term_ids,
                 )
 
     # Return per-run outcomes in the caller's input order.
@@ -416,6 +423,26 @@ async def _resolve_platform_pools(
         for idx in pool_idxs
     ]
     return pools, target_pool_idx
+
+
+async def _taxon_lookups(
+    conn: asyncpg.Connection, ena_runs: list[EnaRunRecord]
+) -> tuple[dict[str, str | None], frozenset[str]]:
+    """The curated implied hosts for these runs' taxa, and which candidate taxon ids are loaded."""
+    sample_taxa = {r.tax_id for r in ena_runs if r.tax_id}
+    implied = implied_hosts(sample_taxa)
+    candidates = (
+        sample_taxa
+        | {r.host_tax_id for r in ena_runs if r.host_tax_id}
+        | {h for h in implied.values() if h}
+    )
+    terminology_idx = await fetch_terminology_idx_by_name(conn, NCBI_TAXONOMY_NAME)
+    if terminology_idx is None:
+        return implied, frozenset()
+    loaded = await fetch_terminology_term_idxs_by_term_ids(
+        conn, terminology_idx=terminology_idx, term_ids=candidates
+    )
+    return implied, frozenset(loaded)
 
 
 def _library_metadata(ena_run: EnaRunRecord) -> dict[str, str]:
@@ -486,6 +513,8 @@ async def _register_one_ena_run(
     metadata_checklist_idx: int,
     attrs_by_sample_accession: dict[str, EnaSampleAttributes],
     library_field_idxs: dict[str, int],
+    implied_host_by_taxon: dict[str, str | None],
+    loaded_term_ids: frozenset[str],
 ) -> EnaRunRegistrationOutcome:
     """Register one ENA run in its own savepoint within the registration
     transaction (per-run atomicity: a partial failure rolls back only this
@@ -497,7 +526,10 @@ async def _register_one_ena_run(
         async with conn.transaction():
             sample_attrs = attrs_by_sample_accession.get(ena_run.sample_accession)
             metadata, local_metadata, harmonization = build_biosample_metadata(
-                sample_attrs.attributes if sample_attrs is not None else {}
+                sample_attrs.attributes if sample_attrs is not None else {},
+                ena_run=ena_run,
+                implied_hosts=implied_host_by_taxon,
+                loaded_term_ids=loaded_term_ids,
             )
             biosample_idx, biosample_created = await resolve_or_import_biosample_by_ena_accession(
                 conn,

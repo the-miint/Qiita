@@ -14,8 +14,15 @@ import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
-from qiita_common.models import Tier
+from qiita_common.models import StudyRecordView, Tier
 
+from qiita_control_plane.auth.guards import (
+    caller_effective_tier,
+    caller_tier_reaches,
+    study_access_via,
+    study_record_view,
+)
+from qiita_control_plane.repositories.study_access import CallerStudyAccessRow
 from qiita_control_plane.testing.db_seeds import seed_study
 from qiita_control_plane.testing.db_teardown import (
     delete_idxs,
@@ -585,88 +592,6 @@ async def test_require_study_access_nonexistent_study_raises_404(study_access_ct
 
 
 # ---------------------------------------------------------------------------
-# require_study_access — min_tier=None resolves to study.default_tier
-# ---------------------------------------------------------------------------
-# When the factory is called without an explicit min_tier, the inner _dep
-# uses the study's own default_tier as the per-request floor.
-
-
-@pytest.mark.db
-async def test_require_study_access_min_tier_none_passes_caller_at_default_tier(
-    study_access_ctx,
-):
-    # Study's default_tier is the schema-default 'member'; granting the
-    # caller a member access row meets that floor.
-    from qiita_control_plane.auth.guards import require_study_access
-
-    await study_access_ctx["pool"].execute(
-        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier)"
-        " VALUES ($1, $2, $3)",
-        study_access_ctx["study_idx"],
-        study_access_ctx["caller_idx"],
-        Tier.MEMBER,
-    )
-    dep = require_study_access()
-    caller = _human_with_idx(study_access_ctx["caller_idx"])
-    result = await dep(
-        study_idx=study_access_ctx["study_idx"],
-        p=caller,
-        pool=study_access_ctx["pool"],
-    )
-    assert result is None
-
-
-@pytest.mark.db
-async def test_require_study_access_min_tier_none_403_when_below_default_tier(
-    study_access_ctx,
-):
-    # Study default_tier=member; caller has only viewer → 403.
-    from qiita_control_plane.auth.guards import require_study_access
-
-    await study_access_ctx["pool"].execute(
-        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier)"
-        " VALUES ($1, $2, $3)",
-        study_access_ctx["study_idx"],
-        study_access_ctx["caller_idx"],
-        Tier.VIEWER,
-    )
-    dep = require_study_access()
-    caller = _human_with_idx(study_access_ctx["caller_idx"])
-    with pytest.raises(HTTPException) as exc:
-        await dep(
-            study_idx=study_access_ctx["study_idx"],
-            p=caller,
-            pool=study_access_ctx["pool"],
-        )
-    assert exc.value.status_code == 403
-    # The 403 detail names the resolved minimum, not the literal None.
-    assert "'member'" in exc.value.detail
-
-
-@pytest.mark.db
-async def test_require_study_access_min_tier_none_passes_when_default_is_public(
-    study_access_ctx,
-):
-    # Study default_tier=public; caller with no access row has effective
-    # tier public-by-absence which meets the floor.
-    from qiita_control_plane.auth.guards import require_study_access
-
-    await study_access_ctx["pool"].execute(
-        "UPDATE qiita.study SET default_tier = $1 WHERE idx = $2",
-        Tier.PUBLIC,
-        study_access_ctx["study_idx"],
-    )
-    dep = require_study_access()
-    caller = _human_with_idx(study_access_ctx["caller_idx"])
-    result = await dep(
-        study_idx=study_access_ctx["study_idx"],
-        p=caller,
-        pool=study_access_ctx["pool"],
-    )
-    assert result is None
-
-
-# ---------------------------------------------------------------------------
 # require_study_access — bypass_role parameterization
 # ---------------------------------------------------------------------------
 
@@ -680,7 +605,7 @@ async def test_require_study_access_bypass_role_wet_lab_admin_bypasses(
     # would otherwise require member.
     from qiita_control_plane.auth.guards import require_study_access
 
-    dep = require_study_access(bypass_role=SystemRole.WET_LAB_ADMIN)
+    dep = require_study_access(Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
     caller = _human_with_idx(study_access_ctx["caller_idx"], role=SystemRole.WET_LAB_ADMIN)
     result = await dep(
         study_idx=study_access_ctx["study_idx"],
@@ -699,7 +624,7 @@ async def test_require_study_access_bypass_role_wet_lab_admin_does_not_bypass_re
     # study's default_tier=member yields 403.
     from qiita_control_plane.auth.guards import require_study_access
 
-    dep = require_study_access(bypass_role=SystemRole.WET_LAB_ADMIN)
+    dep = require_study_access(Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
     caller = _human_with_idx(study_access_ctx["caller_idx"])
     with pytest.raises(HTTPException) as exc:
         await dep(
@@ -718,7 +643,7 @@ async def test_require_study_access_bypass_role_wet_lab_admin_admits_system_admi
     # a WET_LAB_ADMIN bypass threshold trivially.
     from qiita_control_plane.auth.guards import require_study_access
 
-    dep = require_study_access(bypass_role=SystemRole.WET_LAB_ADMIN)
+    dep = require_study_access(Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
     caller = _human_with_idx(study_access_ctx["caller_idx"], role=SystemRole.SYSTEM_ADMIN)
     result = await dep(
         study_idx=study_access_ctx["study_idx"],
@@ -1173,3 +1098,77 @@ async def test_filter_studies_empty_input_is_empty(study_access_ctx):
         min_tier=Tier.VIEWER,
     )
     assert got == set()
+
+
+# ---------------------------------------------------------------------------
+# Study-record read rule (study_record_view, caller_effective_tier, caller_tier_reaches)
+# ---------------------------------------------------------------------------
+
+
+def _access_row(*, owner_idx=99, access_tier=None, default_tier=Tier.MEMBER):
+    return CallerStudyAccessRow(
+        owner_idx=owner_idx, access_tier=access_tier, default_tier=default_tier
+    )
+
+
+@pytest.mark.parametrize(
+    ("default_tier", "grant", "expected"),
+    [
+        (Tier.MEMBER, None, None),
+        (Tier.MEMBER, Tier.VIEWER, StudyRecordView.SUMMARY),
+        (Tier.ADMIN, Tier.VIEWER, StudyRecordView.SUMMARY),
+        (Tier.ADMIN, Tier.MEMBER, StudyRecordView.SUMMARY),
+        (Tier.MEMBER, Tier.MEMBER, StudyRecordView.FULL),
+        (Tier.VIEWER, Tier.VIEWER, StudyRecordView.FULL),
+        (Tier.PUBLIC, None, StudyRecordView.FULL),
+    ],
+)
+def test_study_record_view_is_full_at_default_tier_and_summary_below(default_tier, grant, expected):
+    row = _access_row(access_tier=grant, default_tier=default_tier)
+    assert study_record_view(row, caller=_human_with_idx(7)) is expected
+
+
+def test_study_record_view_owner_is_full_even_without_a_row():
+    row = _access_row(owner_idx=7, default_tier=Tier.ADMIN)
+    assert study_record_view(row, caller=_human_with_idx(7)) is StudyRecordView.FULL
+
+
+def test_study_record_view_bypass_role_is_full():
+    caller = _human_with_idx(7, role=SystemRole.WET_LAB_ADMIN)
+    assert study_record_view(_access_row(), caller=caller) is StudyRecordView.FULL
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        (_access_row(owner_idx=7), Tier.ADMIN),  # owner, no row
+        (_access_row(owner_idx=7, access_tier=Tier.VIEWER), Tier.ADMIN),
+        (_access_row(access_tier=Tier.MEMBER), Tier.MEMBER),
+        (_access_row(), Tier.PUBLIC),
+    ],
+)
+def test_caller_effective_tier_reports_an_owner_as_admin(row, expected):
+    assert caller_effective_tier(row, caller=_human_with_idx(7)) is expected
+
+
+def test_caller_tier_reaches_ignores_a_bypass_role():
+    """min_tier filters on the caller's relationship to the study, so a role
+    that reads every study does not reach `viewer` on one it holds no grant on."""
+    caller = _human_with_idx(7, role=SystemRole.WET_LAB_ADMIN)
+    assert not caller_tier_reaches(_access_row(), caller=caller, tier=Tier.VIEWER)
+    shared = _access_row(access_tier=Tier.MEMBER)
+    assert caller_tier_reaches(shared, caller=caller, tier=Tier.MEMBER)
+    assert not caller_tier_reaches(shared, caller=caller, tier=Tier.ADMIN)
+
+
+@pytest.mark.parametrize(
+    ("row", "role", "expected"),
+    [
+        (_access_row(owner_idx=7, access_tier=Tier.ADMIN), SystemRole.USER, "owner"),
+        (_access_row(access_tier=Tier.VIEWER, default_tier=Tier.PUBLIC), SystemRole.USER, "grant"),
+        (_access_row(default_tier=Tier.PUBLIC), SystemRole.WET_LAB_ADMIN, "public"),
+        (_access_row(), SystemRole.WET_LAB_ADMIN, "role"),
+    ],
+)
+def test_study_access_via_names_the_strongest_reason(row, role, expected):
+    assert study_access_via(row, caller=_human_with_idx(7, role=role)) == expected

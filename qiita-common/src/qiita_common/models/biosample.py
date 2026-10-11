@@ -118,20 +118,23 @@ class BiosampleImportResponse(BaseModel):
     """
 
     biosample_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     owner_id_biosample_study_field_idx: Annotated[int, Field(gt=0)]
     owner_id_biosample_study_field_created: bool
 
 
 # Size caps for one bulk biosample import. A batch runs in one request and one
-# transaction, so it must finish inside the gateway's 60 s read timeout, fit
-# nginx's default 1 MiB request body on the REST location, and not hold the
-# per-owner insert lock (taken by each biosample INSERT until commit) for long.
-# Cost tracks metadata VALUES, not rows: measured at ~1.4 ms per value (a
-# 75-column sheet row takes ~106 ms), and a real sheet runs ~34 bytes per value.
-# 15,000 values is therefore ~21 s and ~0.5 MiB; the row cap bounds batches of
-# very narrow rows. A sheet over either cap is sent in several requests.
+# transaction, so it must fit nginx's default 1 MiB request body on the REST
+# location, finish well inside the gateway's 60 s read timeout, and not hold the
+# per-owner insert lock (taken by each biosample INSERT until commit) past the
+# pool's 10 s command timeout, which would fail other imports for that owner.
+# The request body binds first: a real sheet runs ~34 bytes per metadata value,
+# so 25,000 values is ~0.85 MiB. With the batch writing its metadata in a few
+# statements, a 75-column sheet imports at ~9 ms per row, so that is ~3 s. The
+# row cap bounds batches of very narrow rows. A sheet over either cap is sent
+# in several requests.
 BIOSAMPLE_BULK_IMPORT_MAX_ROWS = 2_000
-BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES = 15_000
+BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES = 25_000
 
 
 class BiosampleBulkImportRequest(BaseModel):
@@ -290,21 +293,26 @@ BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE = "geographic location (latitude)
 BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE = "geographic location (longitude)"
 BIOSAMPLE_DISPLAY_DEPTH = "depth"
 BIOSAMPLE_DISPLAY_HOST_TAXON_ID = "host taxon id"
+BIOSAMPLE_DISPLAY_TAXON_ID = "taxon id"
 
 # The two `qiita.missing_value_reason` names the host-filter resolver RECOGNISES
 # — i.e. the two that say something definite about whether a host exists.
 #
 # Deliberately not an exhaustive enum of the INSDC vocabulary. The other reasons
-# ('not collected', 'not provided', 'restricted access', …) exist in the DB and
+# ('not collected', 'restricted access', …) exist in the DB and
 # have no constant here ON PURPOSE: recognising a reason is an explicit act that
 # promotes it from "abort" to "proceed", and an enum listing every reason would
 # invite exactly the mechanical widening the fail-closed rule is there to stop.
 MISSING_REASON_NOT_APPLICABLE = "not applicable"
 MISSING_REASON_CONTROL_SAMPLE = "missing: control sample"
 
-# The terminology `taxon_id` / `host_taxon_id` name their terms in, and the
-# term_id of the human host. Shared so production code and the test seeds spell
-# them the same way — production must not reach into `testing/` for them.
+# Written by the ENA import for a taxon it cannot fill; the resolver does not recognise it.
+MISSING_REASON_NOT_PROVIDED = "not provided"
+
+# The terminology `taxon_id` / `host_taxon_id` name their terms in, and the term_ids of
+# the human and mouse hosts and the bare `metagenome` root (seeded by the NCBI Taxonomy
+# seed migration). Shared so production code and the test seeds spell them the same
+# way — production must not reach into `testing/` for them.
 #
 # `NCBI_TAXONOMY_HUMAN_TERM_ID` is a STRING even though an NCBI taxon id is a number,
 # and that is not an oversight. It is a `qiita.terminology_term.term_id`, whose column
@@ -319,6 +327,8 @@ MISSING_REASON_CONTROL_SAMPLE = "missing: control sample"
 # that BIGINT.
 NCBI_TAXONOMY_NAME = "NCBI Taxonomy"
 NCBI_TAXONOMY_HUMAN_TERM_ID = "9606"
+NCBI_TAXONOMY_MOUSE_TERM_ID = "10090"
+NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
 
 
 class MissingReasonRef(BaseModel):
@@ -418,7 +428,8 @@ class MetadataEntry(BaseModel):
 class BiosampleResponse(BaseModel):
     """Returned by GET /api/v1/biosample/{biosample_idx}.
 
-    Mirrors qiita.biosample's caller-visible columns and embeds a dict
+    Mirrors qiita.biosample's caller-visible columns, adds the biosample's
+    export_entity_id from qiita.exported_entity, and embeds a dict
     of every globally-linked metadata value the biosample carries,
     keyed on biosample_global_field.internal_name. Purely-local
     metadata (including the owner-biosample-id row) and metadata whose
@@ -433,6 +444,7 @@ class BiosampleResponse(BaseModel):
     """
 
     biosample_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     owner_idx: Annotated[int, Field(gt=0)]
     metadata_checklist: MetadataChecklistRef | None
     biosample_accession: str | None

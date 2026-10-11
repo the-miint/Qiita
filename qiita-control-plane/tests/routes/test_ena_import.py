@@ -471,6 +471,33 @@ async def test_submit_isolates_per_study_failure_and_reports_per_item(
     await _cleanup_study(postgres_pool, ok_accession)
 
 
+async def test_get_returns_metadata_warnings_on_each_run_entry(
+    eib_client, postgres_pool, admin_token, download_ena_study_action
+):
+    accession = unique_ena_accession("PRJNA")
+    token, _ = admin_token
+    resp = await eib_client.post(
+        URL_ENA_IMPORT_BATCH_PREFIX,
+        json={"accessions": [accession]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    batch_idx = resp.json()["ena_import_batch_idx"]
+    eib_client._created_batches.append(batch_idx)
+    await _await_batch_tasks(eib_client)
+
+    get_resp = await eib_client.get(
+        URL_ENA_IMPORT_BATCH_BY_IDX.format(ena_import_batch_idx=batch_idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert get_resp.status_code == 200, get_resp.text
+    (run,) = get_resp.json()["items"][0]["ena_runs"]
+    assert len(run["metadata_warnings"]) == 2
+
+    await _cleanup_study(postgres_pool, accession)
+
+
 # ---------------------------------------------------------------------------
 # GET /api/v1/ena-import-batch/{idx}
 # ---------------------------------------------------------------------------

@@ -1,5 +1,10 @@
 """Tests for the server-side run-preflight reader (`qiita_control_plane.preflight`).
 
+The amplicon tests pin `amplicon_samples`, the one validation the ingest CLI
+(`cli/user/amplicon.py`, at submit) and the runner (checking a golay-demux
+barcode_map against the pool's stored blob) share, to the CLI's rows in both
+barcode orientations, and pin what both refuse.
+
 The stored blob is the single source of truth for a sample's intake intent, and
 BOTH the ingest CLI (`cli/user/pacbio.py`, at submit) and the pool-roster route (at
 read-back) parse it. They call the same kl-run-preflight accessor
@@ -25,12 +30,105 @@ import sqlite3
 
 import pytest
 
+from qiita_control_plane.cli.user.amplicon import _read_amplicon_preflight_rows
 from qiita_control_plane.cli.user.pacbio import _read_pacbio_preflight_rows
 from qiita_control_plane.preflight import (
     SHEET_TYPE_PACBIO_ABSQUANT,
+    AmpliconBarcode,
+    AmpliconPreflightError,
+    amplicon_barcode_from_blob,
     is_pacbio_sheet_type,
     pacbio_protocol_from_blob,
 )
+
+
+def test_amplicon_barcode_keys_on_prepped_sample_idx(build_amplicon_preflight):
+    """`str(prepped_sample_idx)` IS the sequenced_pool_item_id the amplicon composer
+    assigns, so this map joins the pool's sequenced samples directly."""
+    roster = amplicon_barcode_from_blob(build_amplicon_preflight().read_bytes())
+    assert len(roster) == 181
+    assert all(item_id.isdigit() for item_id in roster)
+
+
+@pytest.mark.parametrize("barcodes_are_rc", [True, False])
+def test_amplicon_barcode_carries_the_runs_orientation(build_amplicon_preflight, barcodes_are_rc):
+    """Both orientations, so a reader that hard-codes either one fails."""
+    db = build_amplicon_preflight(barcodes_are_rc=barcodes_are_rc)
+    roster = amplicon_barcode_from_blob(db.read_bytes())
+    assert {b.barcodes_are_rc for b in roster.values()} == {barcodes_are_rc}
+    assert all(b.barcode for b in roster.values())
+
+
+@pytest.mark.parametrize("barcodes_are_rc", [True, False])
+def test_cli_and_server_amplicon_readers_agree(build_amplicon_preflight, barcodes_are_rc):
+    """The CLI's submit-time rows and the runner's roster come from the same
+    validator and agree sample for sample, in both orientations."""
+    db = build_amplicon_preflight(barcodes_are_rc=barcodes_are_rc)
+    roster = amplicon_barcode_from_blob(db.read_bytes())
+    rows = _read_amplicon_preflight_rows(db, argparse.ArgumentParser())
+    assert {
+        str(r.prepped_sample_idx): AmpliconBarcode(r.barcode, r.barcodes_are_rc) for r in rows
+    } == roster
+
+
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        (
+            "UPDATE amplicon_sample SET barcode = ''"
+            " WHERE rowid = (SELECT min(rowid) FROM amplicon_sample)",
+            "carries no Golay barcode",
+        ),
+        (
+            "UPDATE input_sample SET biosample_accession = ''"
+            " WHERE rowid = (SELECT min(rowid) FROM input_sample)",
+            "carries no biosample_accession",
+        ),
+        (
+            "UPDATE project SET bioproject_accession = ''",
+            "no primary bioproject",
+        ),
+        ("DELETE FROM amplicon_sample", "no amplicon_sample rows"),
+    ],
+)
+def test_amplicon_samples_refuse_what_the_cli_refuses(build_amplicon_preflight, sql, message):
+    """One validator for both sides: the server refuses exactly the sheets the
+    CLI does, with the same message, naming the sample."""
+    db = build_amplicon_preflight()
+    conn = sqlite3.connect(db)
+    conn.execute(sql)
+    conn.commit()
+    conn.close()
+    with pytest.raises(AmpliconPreflightError, match=message):
+        amplicon_barcode_from_blob(db.read_bytes())
+
+    class _Parser:
+        def error(self, msg):
+            raise RuntimeError(msg)
+
+    with pytest.raises(RuntimeError, match=message):
+        _read_amplicon_preflight_rows(db, _Parser())
+
+
+def test_amplicon_samples_refuse_a_non_amplicon_preflight(build_case5_preflight):
+    """A PacBio pre-flight is refused by name, not read as an empty roster."""
+    with pytest.raises(AmpliconPreflightError, match="not an amplicon pre-flight"):
+        amplicon_barcode_from_blob(build_case5_preflight().read_bytes())
+
+
+def test_amplicon_barcode_raises_on_missing_accession(build_amplicon_preflight):
+    """`get_amplicon_sample_info` REQUIRES the accessioned state, so the barcode
+    lookup asks for the same pre-flight the submission does. The accessor's
+    "missing required accession" is surfaced as `AmpliconPreflightError` (bad
+    pre-flight content), not a bare `ValueError` that "not a SQLite file" also is."""
+    blob = build_amplicon_preflight(populate_accessions=False).read_bytes()
+    with pytest.raises(AmpliconPreflightError, match="missing required accession"):
+        amplicon_barcode_from_blob(blob)
+
+
+def test_amplicon_barcode_raises_on_unreadable_blob():
+    with pytest.raises((ValueError, sqlite3.DatabaseError)):
+        amplicon_barcode_from_blob(b"this is not a sqlite file")
 
 
 def test_pacbio_protocol_keys_on_pacbio_sample_idx(build_case5_preflight):

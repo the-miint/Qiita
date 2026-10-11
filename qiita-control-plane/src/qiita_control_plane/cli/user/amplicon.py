@@ -30,6 +30,7 @@ from qiita_common.models import (
     WorkTicketCreateRequest,
 )
 
+from ...preflight import AmpliconPreflightError, amplicon_samples
 from .. import _common
 from ._helpers import _resolve_run_folder
 from .pool import _provision_run_pool_roster
@@ -66,12 +67,14 @@ def _read_amplicon_preflight_rows(
 ) -> list[_AmpliconPreflightRow]:
     """One `_AmpliconPreflightRow` per amplicon_sample.
 
-    Operator-actionable errors (not a SQLite, empty sample set, a missing barcode,
-    or a missing biosample/primary-project accession) raise via parser.error so the
-    CLI surfaces one stderr line and exits 2 before any network call — matching
+    Validation is `preflight.amplicon_samples`, the same check the runner applies
+    to the pool's stored blob, so a sheet the CLI accepts is one the runner
+    accepts. Every refusal (not a SQLite, not an amplicon sheet, no samples, a
+    missing barcode or accession) raises via parser.error so the CLI surfaces one
+    stderr line and exits 2 before any network call — matching
     `pool.py::_read_preflight_rows`.
     """
-    from run_preflight import get_amplicon_sample_info, load_file  # noqa: PLC0415
+    from run_preflight import load_file  # noqa: PLC0415
 
     try:
         conn = load_file(str(preflight_blob))
@@ -81,7 +84,9 @@ def _read_amplicon_preflight_rows(
         # legacy CSV). All mean "not a usable preflight file" here.
         parser.error(f"--preflight-blob {preflight_blob}: not a readable SQLite file: {exc}")
     try:
-        infos = get_amplicon_sample_info(conn)
+        samples = amplicon_samples(conn)
+    except AmpliconPreflightError as exc:
+        parser.error(f"--preflight-blob {preflight_blob}: {exc}")
     except (sqlite3.DatabaseError, ValueError) as exc:
         parser.error(
             f"--preflight-blob {preflight_blob}: preflight query failed ({exc});"
@@ -90,42 +95,17 @@ def _read_amplicon_preflight_rows(
     finally:
         conn.close()
 
-    if not infos:
-        parser.error(
-            f"--preflight-blob {preflight_blob} contains no amplicon_sample rows;"
-            " a golay-demux submission needs at least one sample to demultiplex"
+    return [
+        _AmpliconPreflightRow(
+            prepped_sample_idx=sample.prepped_sample_idx,
+            barcode=sample.barcode,
+            barcodes_are_rc=sample.barcodes_are_rc,
+            biosample_accession=sample.biosample_accession,
+            primary_project_accession=sample.primary_bioproject_accession,
+            secondary_project_accessions=list(sample.secondary_bioproject_accessions),
         )
-
-    parsed: list[_AmpliconPreflightRow] = []
-    for info in infos:
-        acr = info.kind_row
-        if not acr.barcode:
-            parser.error(
-                f"--preflight-blob {preflight_blob}: prepped_sample_idx {info.sample_idx}"
-                " carries no Golay barcode; a sample cannot be demultiplexed without it"
-            )
-        if not info.biosample_accession:
-            parser.error(
-                f"--preflight-blob {preflight_blob}: prepped_sample_idx {info.sample_idx}"
-                " carries no biosample_accession; populate upstream before re-submitting"
-            )
-        if not info.primary_bioproject_accession:
-            parser.error(
-                f"--preflight-blob {preflight_blob}: prepped_sample_idx {info.sample_idx}"
-                " carries no primary bioproject accession; populate upstream before"
-                " re-submitting"
-            )
-        parsed.append(
-            _AmpliconPreflightRow(
-                prepped_sample_idx=info.sample_idx,
-                barcode=acr.barcode,
-                barcodes_are_rc=bool(acr.barcodes_are_rc),
-                biosample_accession=info.biosample_accession,
-                primary_project_accession=info.primary_bioproject_accession,
-                secondary_project_accessions=list(info.secondary_bioproject_accessions),
-            )
-        )
-    return parsed
+        for sample in samples
+    ]
 
 
 def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

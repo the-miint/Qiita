@@ -61,12 +61,13 @@ class EnaRunImportOutcome(BaseModel):
     `status` is the `EnaRunRegistrationStatus` value (`registered` /
     `skipped_already_present` / `excluded` / `failed` / `flagged_unavailable` /
     `held_not_downloaded`). `failure_reason` is set on every status but the
-    first two.
+    first two. `metadata_warnings`: harmonization gaps on the biosample this run created.
     """
 
     run_accession: str
     status: str
     failure_reason: str | None = None
+    metadata_warnings: list[str] = Field(default_factory=list)
 
 
 class BatchImportItem(BaseModel):

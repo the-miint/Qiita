@@ -1,0 +1,30 @@
+{
+  "_source": "recorded through miint read_ena(\"PRJEB54586\", fields=...) (Portal result=read_run) on 2026-10-05; first 3 runs of the study, trimmed to keep the file small; list and integer columns (tax_id is BIGINT) re-typed from the extension's semicolon-joined strings",
+  "columns": [
+    "run_accession",
+    "experiment_accession",
+    "sample_accession",
+    "sample_alias",
+    "study_accession",
+    "status",
+    "library_layout",
+    "library_strategy",
+    "library_source",
+    "library_selection",
+    "instrument_platform",
+    "fastq_ftp",
+    "fastq_aspera",
+    "fastq_bytes",
+    "fastq_md5",
+    "read_count",
+    "base_count",
+    "tax_id",
+    "host_tax_id",
+    "host"
+  ],
+  "rows": [
+    ["ERR9922291", "ERX9465099", "SAMEA110278108", "65916:f7084606-7f7a-47c4-b15a-ee4fb9d7b2a0", "PRJEB54586", "public", "PAIRED", "AMPLICON", "METAGENOMIC", "PCR", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/ERR992/001/ERR9922291/ERR9922291_1.fastq.gz", "ftp.sra.ebi.ac.uk/vol1/fastq/ERR992/001/ERR9922291/ERR9922291_2.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/ERR992/001/ERR9922291/ERR9922291_1.fastq.gz", "fasp.sra.ebi.ac.uk:/vol1/fastq/ERR992/001/ERR9922291/ERR9922291_2.fastq.gz"], [38887920, 57116131], ["573b976ce375d8fad7c1310fb5415662", "7373de62ebd1521b45f2f992de718e73"], 577568, 173620105, 1561972, null, null],
+    ["ERR9922296", "ERX9465104", "SAMEA110278113", "65911:f7084606-7f7a-47c4-b15a-ee4fb9d7b2a0", "PRJEB54586", "public", "PAIRED", "AMPLICON", "METAGENOMIC", "PCR", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/ERR992/006/ERR9922296/ERR9922296_1.fastq.gz", "ftp.sra.ebi.ac.uk/vol1/fastq/ERR992/006/ERR9922296/ERR9922296_2.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/ERR992/006/ERR9922296/ERR9922296_1.fastq.gz", "fasp.sra.ebi.ac.uk:/vol1/fastq/ERR992/006/ERR9922296/ERR9922296_2.fastq.gz"], [20753016, 27499819], ["625d43a8dcdf21afed81a90007a206d6", "553335233673488945342de4d6074b83"], 302318, 90723351, 1561972, null, null],
+    ["ERR9922297", "ERX9465105", "SAMEA110278114", "65910:f7084606-7f7a-47c4-b15a-ee4fb9d7b2a0", "PRJEB54586", "public", "PAIRED", "AMPLICON", "METAGENOMIC", "PCR", "ILLUMINA", ["ftp.sra.ebi.ac.uk/vol1/fastq/ERR992/007/ERR9922297/ERR9922297_1.fastq.gz", "ftp.sra.ebi.ac.uk/vol1/fastq/ERR992/007/ERR9922297/ERR9922297_2.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/ERR992/007/ERR9922297/ERR9922297_1.fastq.gz", "fasp.sra.ebi.ac.uk:/vol1/fastq/ERR992/007/ERR9922297/ERR9922297_2.fastq.gz"], [12895938, 18281813], ["74a73825bddb3273779955673b18fb67", "b045148af9a7d0b804fc4621bfb66ced"], 141674, 42588433, 1561972, null, null]
+  ]
+}

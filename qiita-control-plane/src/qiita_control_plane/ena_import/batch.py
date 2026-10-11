@@ -183,6 +183,7 @@ def _ena_run_outcomes(outcomes: list[EnaRunRegistrationOutcome]) -> list[dict[st
             "run_accession": o.run_accession,
             "status": o.status.value,
             "failure_reason": o.failure_reason,
+            "metadata_warnings": o.harmonization.warnings if o.harmonization else [],
         }
         for o in outcomes
     ]

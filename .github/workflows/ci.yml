@@ -54,6 +54,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Pin the interpreter to the version this repo targets. requires-python
+          # is open-ended (">=3.14"), so without this uv downloads the newest
+          # CPython it can find (3.15 once released) and pydantic-core's pyo3
+          # build fails against a Python newer than pyo3 supports.
+          python-version: "3.14"
       - run: make lint-python
 
   # Lint and test the Rust workspace in one job: clippy/fmt and the test build
@@ -103,6 +109,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Pin the interpreter to the version this repo targets. requires-python
+          # is open-ended (">=3.14"), so without this uv downloads the newest
+          # CPython it can find (3.15 once released) and pydantic-core's pyo3
+          # build fails against a Python newer than pyo3 supports.
+          python-version: "3.14"
       - run: make test-python
 
   test-control-plane-with-db:
@@ -115,6 +127,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Pin the interpreter to the version this repo targets. requires-python
+          # is open-ended (">=3.14"), so without this uv downloads the newest
+          # CPython it can find (3.15 once released) and pydantic-core's pyo3
+          # build fails against a Python newer than pyo3 supports.
+          python-version: "3.14"
       - uses: ./.github/actions/setup-host-postgres
         if: runner.os == 'macOS'
       - run: make test-control-plane-with-db
@@ -129,6 +147,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Pin the interpreter to the version this repo targets. requires-python
+          # is open-ended (">=3.14"), so without this uv downloads the newest
+          # CPython it can find (3.15 once released) and pydantic-core's pyo3
+          # build fails against a Python newer than pyo3 supports.
+          python-version: "3.14"
       # make test-integration builds the data-plane debug binary and the Rust
       # DuckLake test binary, which without a cargo cache recompiles ~all deps
       # (incl. the duckdb crate) cold — ~80s, the single largest slice of this

@@ -31,6 +31,7 @@ from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADA
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.routes import biosample as routes_biosample
 from qiita_control_plane.testing.db_seeds import (
+    fetch_export_entity_id,
     fetch_seeded_metagenome_term,
     retire_biosample,
     retire_biosample_to_study_link,
@@ -234,6 +235,10 @@ async def test_post_biosample_wet_lab_admin_self_owner(ctx):
         # The Field(gt=0) constraint on BiosampleImportResponse already
         # rejects a zero idx at the route boundary.
         "biosample_idx": rj["biosample_idx"],
+        # Read from the table independently of the route under test.
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=rj["biosample_idx"]
+        ),
         "owner_id_biosample_study_field_idx": rj["owner_id_biosample_study_field_idx"],
         "owner_id_biosample_study_field_created": True,
     }
@@ -1637,6 +1642,9 @@ async def test_get_biosample_owner_returns_response(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -1686,6 +1694,9 @@ async def test_get_biosample_via_study_access_returns_response(ctx):
     wet_idx = ctx["wet_session"]["principal_idx"]
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": wet_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -1724,6 +1735,9 @@ async def test_get_biosample_wet_lab_admin_bypasses_access(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -1760,6 +1774,9 @@ async def test_get_biosample_system_admin_bypasses_access(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -1832,6 +1849,9 @@ async def test_get_biosample_carries_missing_reason_marker(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": ctx["wet_session"]["principal_idx"],
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -1909,6 +1929,9 @@ async def test_get_biosample_carries_terminology_term(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": ctx["wet_session"]["principal_idx"],
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -2135,6 +2158,9 @@ async def test_get_biosample_in_study_returns_global_and_local_metadata(ctx, own
     rj["global_metadata"].pop("host_taxon_id", None)
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": study_owner_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -2195,6 +2221,9 @@ async def test_get_biosample_in_study_admin_tier_returns_response(ctx):
     rj = resp.json()
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": wet_idx,
         "metadata_checklist": None,
         "biosample_accession": None,
@@ -2349,6 +2378,9 @@ async def test_patch_biosample_wet_lab_admin_happy_path(ctx):
     owner_idx = ctx["wet_session"]["principal_idx"]
     expected = {
         "biosample_idx": bs_idx,
+        "export_entity_id": await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=bs_idx
+        ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
         "biosample_accession": new_acc,
@@ -4883,6 +4915,12 @@ async def test_bulk_import_creates_all_rows(ctx):
     assert all(r["biosample_idx"] > 0 for r in results)
     # The owner-id field is created once (first row) and reused thereafter.
     assert [r["owner_id_biosample_study_field_created"] for r in results] == [True, False, False]
+    # Each row carries its export_entity_id, read from the table independently.
+    expected_ids = [
+        await fetch_export_entity_id(ctx["pool"], kind="biosample", entity_idx=r["biosample_idx"])
+        for r in results
+    ]
+    assert [r["export_entity_id"] for r in results] == expected_ids
 
     count = await ctx["pool"].fetchval(
         "SELECT count(*) FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
@@ -5061,6 +5099,32 @@ async def test_import_waiting_on_the_owner_lock_past_the_timeout_is_a_503(ctx, p
     assert bulk.headers.get("Retry-After")
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [asyncpg.DeadlockDetectedError("probe"), asyncpg.QueryCanceledError("probe")],
+)
+async def test_bulk_import_phase2_transient_is_a_503(ctx, monkeypatch, exc):
+    """A transient DB error raised from the phase-2 batched metadata write (a
+    deadlock, or a lock wait that timed out on the batched statement) is the
+    batch's, not the row's: a retryable 503 with a Retry-After, not a 500. Phase 2
+    is the slow statement most likely to hit the pool's command timeout, so it must
+    map transients like the single import and phase 1 do."""
+
+    async def boom(*args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(routes_biosample, "insert_new_entities_metadata_batch", boom)
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="bulk-phase2")
+    rows = _bulk_rows(wet_idx, unique_field_name("BulkId"), ["A", "B"])
+    for row in rows:
+        row["metadata"] = {"host taxon id": "not applicable"}
+
+    resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
+    assert resp.status_code == 503, resp.text
+    assert resp.headers.get("Retry-After")
+
+
 async def test_bulk_import_unexpected_error_names_the_row(ctx, monkeypatch):
     """A failure that is not mapped to an HTTP status stays a 500 with its
     traceback, carrying a note that names the row."""
@@ -5139,3 +5203,74 @@ async def test_bulk_import_empty_rows_422(ctx):
         URL_BIOSAMPLE_BULK_BY_STUDY.format(study_idx=study_idx), json={"rows": []}
     )
     assert resp.status_code == 422, resp.text
+
+
+def _spy_per_value_writes(monkeypatch) -> list[int]:
+    """Count the bulk route's per-value fallback writes (one call per row)."""
+    calls: list[int] = []
+    real = routes_biosample.write_resolved_metadata_entries
+
+    async def spy(*args, **kwargs):
+        calls.append(kwargs["entity_idx"])
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(routes_biosample, "write_resolved_metadata_entries", spy)
+    return calls
+
+
+async def test_bulk_import_writes_every_rows_metadata_in_one_batch(ctx, monkeypatch):
+    """The batched write stores each row's values, local and global, without
+    touching the per-value path."""
+    per_value = _spy_per_value_writes(monkeypatch)
+    study_idx, field_name, field_idx = await _seed_study_with_unique_field(
+        ctx, suffix="bulk-batch", unique_in_study=False
+    )
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    rows = _bulk_rows(wet_idx, unique_field_name("BulkId"), ["A", "B", "C"])
+    for i, row in enumerate(rows):
+        row["metadata"] = {field_name: f"depth {i}"}
+
+    resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
+    assert resp.status_code == 201, resp.text
+    assert per_value == []
+    biosample_idxs = [r["biosample_idx"] for r in resp.json()["results"]]
+    stored = await ctx["pool"].fetch(
+        "SELECT biosample_idx, value_text FROM qiita.biosample_metadata"
+        " WHERE biosample_study_field_idx = $1 ORDER BY biosample_idx",
+        field_idx,
+    )
+    assert [(r["biosample_idx"], r["value_text"]) for r in stored] == [
+        (idx, f"depth {i}") for i, idx in enumerate(biosample_idxs)
+    ]
+    # The global host taxon id (a missing-value marker here) went in too, once per row.
+    host = await ctx["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_metadata m"
+        " JOIN qiita.biosample_global_field g ON g.idx = m.global_field_idx"
+        " WHERE g.internal_name = 'host_taxon_id' AND m.biosample_idx = ANY($1::bigint[])",
+        biosample_idxs,
+    )
+    assert host == 3
+
+
+async def test_bulk_import_conflict_found_at_write_falls_back_and_names_the_row(ctx, monkeypatch):
+    """Rows 0 and 2 give the same value to a unique_in_study field. Validation
+    cannot see that; the batched INSERT can, and only as an anonymous unique
+    violation. The batch rolls back and replays row by row, so the caller gets
+    the per-value diagnosis for row 2 and nothing is stored."""
+    per_value = _spy_per_value_writes(monkeypatch)
+    study_idx, field_name, _ = await _seed_study_with_unique_field(ctx, suffix="bulk-uniqfall")
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    rows = _bulk_rows(wet_idx, unique_field_name("BulkId"), ["A", "B", "C"])
+    for row, value in zip(rows, ["SAME", "OTHER", "SAME"], strict=True):
+        row["metadata"] = {field_name: value}
+
+    resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"].startswith(
+        "row 2 (counting from 0; owner_biosample_id_value='C'): "
+    )
+    assert len(per_value) == 3  # replayed rows 0, 1, 2; row 2 raised
+    links = await ctx["pool"].fetchval(
+        "SELECT count(*) FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
+    )
+    assert links == 0

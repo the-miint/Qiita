@@ -442,14 +442,14 @@ async def test_process_one_study_empty_sample_attributes_registers_not_failed(
     assert biosample_row is not None
     assert biosample_row["metadata_checklist_idx"] is not None
 
-    # Nothing harmonized -- there were no attributes; the one global row is the
-    # host-taxon-id marker the import composer enforces.
+    # Nothing harmonized -- there were no attributes; the two global rows are the
+    # taxon fields.
     global_metadata_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.biosample_metadata"
         " WHERE biosample_idx = $1 AND global_field_idx IS NOT NULL",
         biosample_row["idx"],
     )
-    assert global_metadata_count == 1
+    assert global_metadata_count == 2
 
     prep_sample_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.prep_sample_to_study WHERE study_idx = $1",
@@ -1066,6 +1066,43 @@ async def test_process_one_study_surfaces_per_run_outcomes(
     run = item.ena_runs[0]
     assert run.status == EnaRunRegistrationStatus.REGISTERED.value
     assert run.failure_reason is None
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_run_outcomes_carry_the_metadata_warnings_of_the_biosample_they_created(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """The default fake run has no ENA taxon fields, so both are reported."""
+    accession = unique_ena_accession("PRJNA")
+    batch_idx, _items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+
+    status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+
+    (run,) = status.items[0].ena_runs
+    assert run.status == EnaRunRegistrationStatus.REGISTERED.value
+    assert len(run.metadata_warnings) == 2
+    assert all(f"SAMN-{accession}" in w for w in run.metadata_warnings)
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_stored_run_outcome_without_warnings_still_parses(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    accession = unique_ena_accession("PRJNA")
+    batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
+    batch_cleanup.append(batch_idx)
+    await postgres_pool.execute(
+        "UPDATE qiita.ena_import_batch_item SET ena_run_outcomes = $2::jsonb WHERE idx = $1",
+        items[0].idx,
+        json.dumps([{"run_accession": "SRR1", "status": "registered", "failure_reason": None}]),
+    )
+
+    status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
+
+    assert status.items[0].ena_runs[0].metadata_warnings == []
 
     await _cleanup_study(postgres_pool, accession)
 

@@ -20,6 +20,12 @@ import secrets
 
 import pytest
 import pytest_asyncio
+from qiita_common.models import (
+    NCBI_TAXONOMY_HUMAN_TERM_ID,
+    NCBI_TAXONOMY_METAGENOME_TERM_ID,
+    NCBI_TAXONOMY_MOUSE_TERM_ID,
+    NCBI_TAXONOMY_NAME,
+)
 
 from qiita_control_plane.backfill.host_taxon import (
     HostTaxonSource,
@@ -27,6 +33,7 @@ from qiita_control_plane.backfill.host_taxon import (
     classify,
     plan_backfill,
 )
+from qiita_control_plane.host_by_sample_taxon import implied_hosts
 from qiita_control_plane.repositories._sample_helpers import (
     _get_or_create_globally_linked_study_field,
     insert_entity_to_study,
@@ -34,7 +41,6 @@ from qiita_control_plane.repositories._sample_helpers import (
 from qiita_control_plane.repositories.biosample import insert_biosample
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.testing.db_seeds import (
-    NCBI_TAXONOMY_HUMAN_TERM_ID,
     fetch_ncbi_taxonomy_term,
     seed_user_principal,
 )
@@ -43,7 +49,11 @@ from qiita_control_plane.testing.db_teardown import delete_principal, teardown_e
 # NCBI taxa the live data actually carries, as the sample's OWN taxon_id.
 _HUMAN_GUT_METAGENOME = "408170"
 _SEAWATER_METAGENOME = "1561972"
-_GENERIC_METAGENOME = "256318"  # the bare root — names no environment
+_GENERIC_METAGENOME = NCBI_TAXONOMY_METAGENOME_TERM_ID  # the bare root — names no environment
+_HUMAN_METAGENOME = "646099"
+_MOUSE_GUT_METAGENOME = "410661"
+_SOIL_METAGENOME = "410658"
+_MOUSE = NCBI_TAXONOMY_MOUSE_TERM_ID
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +86,55 @@ def test_seawater_metagenome_implies_no_host():
     assert a.source is HostTaxonSource.NO_HOST
     assert a.missing_reason == "not applicable"
     assert a.host_term_id is None
+
+
+@pytest.mark.parametrize(
+    ("sample_taxon", "host"),
+    [
+        (_HUMAN_METAGENOME, NCBI_TAXONOMY_HUMAN_TERM_ID),
+        ("539655", NCBI_TAXONOMY_HUMAN_TERM_ID),
+        (_MOUSE_GUT_METAGENOME, _MOUSE),
+        ("540485", _MOUSE),
+    ],
+)
+def test_host_associated_metagenome_implies_its_host(sample_taxon, host):
+    a = _classify(sample_taxon_term_id=sample_taxon)
+    assert a.source is HostTaxonSource.TAXON
+    assert a.host_term_id == host
+
+
+@pytest.mark.parametrize(
+    "sample_taxon",
+    [
+        _SOIL_METAGENOME,
+        "412755",
+        "556182",
+        "408172",
+        "1504975",
+        "1671699",
+        "527640",
+        "496921",
+        "1260732",
+    ],
+)
+def test_hostless_environment_implies_no_host(sample_taxon):
+    a = _classify(sample_taxon_term_id=sample_taxon)
+    assert a.source is HostTaxonSource.NO_HOST
+    assert a.missing_reason == "not applicable"
+
+
+@pytest.mark.parametrize("sample_taxon", ["942017", "1076179", "1768876"])
+def test_engineered_environment_stays_unresolved(sample_taxon):
+    """An engineered environment can have a host, so the environment alone settles nothing."""
+    assert _classify(sample_taxon_term_id=sample_taxon).source is HostTaxonSource.UNRESOLVED
+
+
+def test_implied_hosts_restricts_the_table_to_the_given_taxa():
+    """An absent key is unresolved; None is a decision that the environment has no host."""
+    assert implied_hosts([_HUMAN_GUT_METAGENOME, _SEAWATER_METAGENOME, _GENERIC_METAGENOME]) == {
+        _HUMAN_GUT_METAGENOME: NCBI_TAXONOMY_HUMAN_TERM_ID,
+        _SEAWATER_METAGENOME: None,
+    }
 
 
 def test_control_wins_over_its_taxon():
@@ -149,7 +208,7 @@ async def ctx(postgres_pool):
             created_by_idx=principal_idx,
         )
 
-    created: dict[str, list[int]] = {"biosample": []}
+    created: dict[str, list[int]] = {"biosample": [], "term": []}
     state = {
         "pool": pool,
         "principal_idx": principal_idx,
@@ -164,6 +223,9 @@ async def ctx(postgres_pool):
         study_idxs=[study_idx],
         biosample_idxs=created["biosample"],
         prep_sample_idxs=[],
+    )
+    await pool.execute(
+        "DELETE FROM qiita.terminology_term WHERE idx = ANY($1::bigint[])", created["term"]
     )
     await delete_principal(pool, [principal_idx])
 
@@ -184,7 +246,14 @@ async def _seed_biosample_with_taxon(ctx, term_id):
     ctx["created"]["biosample"].append(bs_idx)
 
     term = await fetch_ncbi_taxonomy_term(ctx["pool"], term_id)
-    assert term is not None, f"NCBI term {term_id} should be seeded"
+    if term is None:
+        term = await ctx["pool"].fetchrow(
+            "INSERT INTO qiita.terminology_term (terminology_idx, term_id, label)"
+            " SELECT idx, $2, $2 FROM qiita.terminology WHERE name = $1 RETURNING idx",
+            NCBI_TAXONOMY_NAME,
+            term_id,
+        )
+        ctx["created"]["term"].append(term["idx"])
     await ctx["pool"].execute(
         "INSERT INTO qiita.biosample_metadata"
         " (biosample_idx, biosample_study_field_idx, value_terminology_term_idx, created_by_idx)"
@@ -238,6 +307,19 @@ async def test_plan_then_apply_writes_the_resolvable_and_skips_the_rest(ctx):
     assert (await _host_taxon_of(ctx, human))["term_id"] == NCBI_TAXONOMY_HUMAN_TERM_ID
     assert (await _host_taxon_of(ctx, water))["reason"] == "not applicable"
     assert await _host_taxon_of(ctx, generic) is None
+
+
+@pytest.mark.db
+async def test_backfill_writes_not_applicable_for_a_hostless_taxon_added_to_the_table(ctx):
+    soil = await _seed_biosample_with_taxon(ctx, _SOIL_METAGENOME)
+
+    plan = await plan_backfill(ctx["pool"])
+    mine = [a for a in plan.assignments if a.biosample_idx == soil]
+    written = await apply_backfill(ctx["pool"], mine, principal_idx=ctx["principal_idx"])
+
+    assert [a.source for a in mine] == [HostTaxonSource.NO_HOST]
+    assert written == 1
+    assert (await _host_taxon_of(ctx, soil))["reason"] == "not applicable"
 
 
 @pytest.mark.db

@@ -231,7 +231,7 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **The orchestrator has no database access**: no Postgres driver, no `qiita.<table>` query, no DB credentials, no path that reads or writes DB state except through the control plane's REST API.
 - **A native `module:` step imports only declared dependencies** (`CLAUDE.md`, "Workflow runtimes"). A trust-boundary dependency is pinned directly, not inherited transitively.
 - **A component owns its schema.** Inline SQL against another component's tables means the owner is missing an accessor.
-- **An `_idx` does not leave the system** (`CLAUDE.md`, opaque identifiers). Ask whether `qiita.exported_identifier` applies.
+- **An `_idx` does not leave the system** (`CLAUDE.md`, opaque identifiers). Ask whether `qiita.exported_identifier` (or, for a study or biosample, `qiita.exported_entity`) applies.
 - When `CLAUDE.md` or `docs/architecture/` declares a component contract, flag a violation even if it works.
 
 ### R8 — Query and model shaping

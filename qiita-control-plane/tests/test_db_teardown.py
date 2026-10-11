@@ -45,6 +45,31 @@ from qiita_control_plane.testing.db_teardown import (
 )
 from qiita_control_plane.testing.unique_names import unique_ena_accession
 
+# What the graph fixtures seed, and what their tests leave for the teardown under
+# test to remove, in reverse FK order. Each entry is a table, the predicate that
+# matches the seeded rows, and the seeded idx bound to $1.
+_MANUAL_TEARDOWN_ROWS = (
+    (
+        "feature_genome",
+        "genome_idx IN (SELECT genome_idx FROM qiita.genome WHERE prep_sample_idx = $1)",
+        "prep_sample_idx",
+    ),
+    ("genome", "prep_sample_idx = $1", "prep_sample_idx"),
+    ("sequenced_sample", "prep_sample_idx = $1", "prep_sample_idx"),
+    ("prep_sample_to_study", "prep_sample_idx = $1", "prep_sample_idx"),
+    ("biosample_to_study", "biosample_idx = $1", "biosample_idx"),
+    ("biosample_to_study", "study_idx = $1", "study_idx"),
+    ("exported_entity", "biosample_idx = $1", "biosample_idx"),
+    ("exported_entity", "study_idx = $1", "study_idx"),
+    ("prep_sample", "idx = $1", "prep_sample_idx"),
+    ("biosample", "idx = $1", "biosample_idx"),
+    ("study", "idx = $1", "study_idx"),
+    ("sequenced_pool", "idx = $1", "pool_idx"),
+    ("sequencing_run", "idx = $1", "run_idx"),
+    ("user", "principal_idx = $1", "principal_idx"),
+    ("principal", "idx = $1", "principal_idx"),
+)
+
 
 def _sweep_drift_message(drift: dict[str, list[str]]) -> str:
     return (
@@ -62,14 +87,43 @@ async def _count(pool, table, column, idxs) -> int:
     return await pool.fetchval(sql, idxs)
 
 
+async def _manual_teardown_graph(
+    pool,
+    *,
+    study_idx: int | None = None,
+    biosample_idx: int | None = None,
+    prep_sample_idx: int | None = None,
+    pool_idx: int | None = None,
+    run_idx: int | None = None,
+    principal_idx: int | None = None,
+) -> None:
+    """Delete a seeded graph, its run and pool, and its principal; an entry whose
+    idx is not given is skipped.
+
+    A hand-written list rather than SWEEP_TIERS or
+    teardown_entity_graph, so this cleanup is independent of the sweep under test.
+    The cost is that _MANUAL_TEARDOWN_ROWS must be kept in step with what
+    the fixtures seed: a table that a seed or trigger newly populates loudly fails
+    the entity delete if it references under RESTRICT, and is left behind silently
+    if under SET NULL or CASCADE.
+    """
+    seeded = {
+        "study_idx": study_idx,
+        "biosample_idx": biosample_idx,
+        "prep_sample_idx": prep_sample_idx,
+        "pool_idx": pool_idx,
+        "run_idx": run_idx,
+        "principal_idx": principal_idx,
+    }
+    for table, predicate, key in _MANUAL_TEARDOWN_ROWS:
+        if seeded[key] is None:
+            continue
+        await pool.execute(f"DELETE FROM qiita.{table} WHERE {predicate}", seeded[key])
+
+
 @pytest.fixture
 async def graph(postgres_pool):
-    """A principal owning a study, a biosample, and a sequenced prep_sample.
-
-    The teardown here is best-effort and tolerant: it runs whether or not the
-    function under test did its job, so a failing run leaves nothing behind for
-    the rest of the session.
-    """
+    """A principal owning a study, a biosample, and a sequenced prep_sample."""
     principal_idx = await seed_user_principal(postgres_pool, prefix="teardown", suffix="probe")
     study_idx = await seed_study(postgres_pool, owner_idx=principal_idx, title="teardown probe")
     biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
@@ -90,41 +144,15 @@ async def graph(postgres_pool):
         "prep_sample_idx": prep_sample_idx,
     }
 
-    # The genome-derived rows go first: the tier replay below deletes
-    # qiita.genome, which they reference, and this runs after a failed test as
-    # readily as a passing one.
-    for table in ("feature_genome", "exported_feature"):
-        await postgres_pool.execute(
-            f"DELETE FROM qiita.{table} WHERE genome_idx IN"
-            " (SELECT genome_idx FROM qiita.genome WHERE prep_sample_idx = $1)",
-            prep_sample_idx,
-        )
-    # This replay inherits whatever the function under test misses, since both
-    # read the same list; test_sweep_tiers_matches_the_live_schema is what
-    # catches a table missing from it. Each column is matched on its own entity,
-    # the way the function under test does. Handing every column all three idxs
-    # would delete another test's rows whenever the idxs collide, which they do:
-    # study.idx and prep_sample.idx both restart at 25000, so the Nth of each
-    # carries the same number.
-    seeded = {STUDY: study_idx, BIOSAMPLE: biosample_idx, PREP_SAMPLE: prep_sample_idx}
-    for tier in SWEEP_TIERS:
-        for table, keys in tier:
-            for column, key in keys:
-                if key not in seeded:
-                    continue
-                await postgres_pool.execute(
-                    f"DELETE FROM qiita.{table} WHERE {column} = ANY($1::bigint[])",
-                    [seeded[key]],
-                )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.genome WHERE prep_sample_idx = $1", prep_sample_idx
+    await _manual_teardown_graph(
+        postgres_pool,
+        study_idx=study_idx,
+        biosample_idx=biosample_idx,
+        prep_sample_idx=prep_sample_idx,
+        pool_idx=pool_idx,
+        run_idx=run_idx,
+        principal_idx=principal_idx,
     )
-    await delete_idxs(postgres_pool, PREP_SAMPLE, prep_sample_idx)
-    await delete_idxs(postgres_pool, BIOSAMPLE, biosample_idx)
-    await delete_idxs(postgres_pool, STUDY, study_idx)
-    await delete_idxs(postgres_pool, "sequenced_pool", pool_idx)
-    await delete_idxs(postgres_pool, "sequencing_run", run_idx)
-    await delete_principal(postgres_pool, principal_idx)
 
 
 @pytest.mark.db
@@ -364,13 +392,9 @@ async def test_teardown_entity_graph_sweeps_a_link_row_by_either_side(postgres_p
         }
         assert survivors == {"biosample_to_study": 0, "study": 1}
     finally:
-        # The fixture's replay cannot reach this study, and its owner is the
-        # principal that replay deletes under RESTRICT, so a failed assert here
-        # would otherwise surface as a foreign-key error in teardown.
-        await postgres_pool.execute(
-            "DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", other_study_idx
-        )
-        await delete_idxs(postgres_pool, STUDY, other_study_idx)
+        # The graph fixture's teardown does not delete the second study,
+        # which it wasn't told about, so that must be manually torn down here.
+        await _manual_teardown_graph(postgres_pool, study_idx=other_study_idx)
 
 
 @pytest.mark.db
@@ -476,10 +500,6 @@ async def ena_graph(postgres_pool):
     Shaped the way an ENA import leaves things: the study carries both accession
     columns, the biosample and prep_sample reach it only through their link
     rows, and the sequencing run is named after the accession.
-
-    Teardown is best-effort and tolerant, so a run that fails mid-test leaves
-    nothing behind. It names the rows directly rather than calling the function
-    under test.
     """
     accession = unique_ena_accession("PRJNA")
     ena_accession = unique_ena_accession("ERP")
@@ -529,21 +549,15 @@ async def ena_graph(postgres_pool):
         "pool_idx": pool_idx,
     }
 
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = $1", prep_sample_idx
+    await _manual_teardown_graph(
+        postgres_pool,
+        study_idx=study_idx,
+        biosample_idx=biosample_idx,
+        prep_sample_idx=prep_sample_idx,
+        pool_idx=pool_idx,
+        run_idx=run_idx,
+        principal_idx=principal_idx,
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1", prep_sample_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1", biosample_idx
-    )
-    await delete_idxs(postgres_pool, PREP_SAMPLE, prep_sample_idx)
-    await delete_idxs(postgres_pool, BIOSAMPLE, biosample_idx)
-    await delete_idxs(postgres_pool, STUDY, study_idx)
-    await delete_idxs(postgres_pool, "sequenced_pool", pool_idx)
-    await delete_idxs(postgres_pool, "sequencing_run", run_idx)
-    await delete_principal(postgres_pool, principal_idx)
 
 
 @pytest.mark.db

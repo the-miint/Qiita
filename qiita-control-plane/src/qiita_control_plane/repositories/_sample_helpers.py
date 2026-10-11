@@ -3189,6 +3189,77 @@ async def write_resolved_metadata_entries(
     return results
 
 
+async def insert_new_entities_metadata_batch(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    caller_idx: int,
+    entries: Sequence[tuple[int, Sequence[ResolvedFieldValue]]],
+) -> bool:
+    """Write the resolved metadata of many entities CREATED IN THIS TRANSACTION
+    in a few statements, instead of a savepoint and an INSERT per value.
+
+    `write_resolved_metadata_entries` wraps every value in its own SAVEPOINT so
+    a rejected INSERT can be diagnosed field by field; that is ~1.4 ms per value,
+    where one batched INSERT of the same rows is ~0.04 ms with every trigger
+    still firing. This is the batched write, inside ONE savepoint: each global
+    field's study-local row is minted once, then one executemany per value
+    column. Entities created in this transaction cannot already hold a value in
+    any slot, so the batch needs no per-slot diagnosis on its success path.
+
+    Returns True when everything was written. On a database error that is not
+    transient, the savepoint rolls back -- the mints and every inserted value
+    -- and this returns False; the caller then writes entity by entity through
+    `write_resolved_metadata_entries`, whose per-value savepoints raise the
+    same diagnosed error, for the same value, that the batch would otherwise
+    have hidden. A transient error (deadlock, serialization, a cancelled
+    statement) re-raises: replaying slowly would not make it go away.
+    """
+    require_transaction(conn)
+    try:
+        async with conn.transaction():
+            minted: dict[tuple[int, str], int] = {}
+            rows_by_column: dict[str, list[tuple[int, int, object, int]]] = {}
+            for entity_idx, resolved_metadata in entries:
+                for resolved_field, parsed_value in resolved_metadata:
+                    if resolved_field.scope == "global":
+                        key = (resolved_field.global_field_idx, resolved_field.canonical_display)
+                        if key not in minted:
+                            minted[key], _ = await _get_or_create_globally_linked_study_field(
+                                conn,
+                                spec=spec,
+                                study_idx=study_idx,
+                                global_field_idx=resolved_field.global_field_idx,
+                                display_name=resolved_field.canonical_display,
+                                created_by_idx=caller_idx,
+                            )
+                        field_idx = minted[key]
+                    else:
+                        field_idx = resolved_field.study_field_idx
+                    value_column, bound_value = _resolve_value_column_and_bind(
+                        parsed_value, resolved_field.data_type
+                    )
+                    rows_by_column.setdefault(value_column, []).append(
+                        (entity_idx, field_idx, bound_value, caller_idx)
+                    )
+            # Identifiers are module constants (spec fields, value-column names
+            # from _resolve_value_column_and_bind), never caller input.
+            for value_column, rows in rows_by_column.items():
+                await conn.executemany(
+                    f"INSERT INTO {spec.metadata_table} ("
+                    f"    {spec.entity_key_column}, {spec.study_field_idx_column},"
+                    f"    {value_column}, created_by_idx"
+                    f") VALUES ($1, $2, $3, $4)",
+                    rows,
+                )
+    except asyncpg.TransactionRollbackError, asyncpg.QueryCanceledError:
+        raise
+    except asyncpg.PostgresError:
+        return False
+    return True
+
+
 async def write_sample_metadata(
     conn: asyncpg.Connection,
     *,
