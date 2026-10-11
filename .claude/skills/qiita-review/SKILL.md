@@ -143,7 +143,7 @@ diff:
 - **Separate what is pre-existing from what this branch introduced.** A reviewer
   inheriting the list needs to know which items the PR is answerable for.
 
-The reviewer owes you the raw material for all three — a reason, pre-existing-or-not, and
+The reviewer owes you the raw material — a reason, pre-existing-or-not, and
 a deferred finding's issue title and closing condition are on its **Scope discipline**, a
 refutation target on its **Verification handoff**. What is yours is the shape:
 grouping, brevity, and writing it for someone who has not read the diff.
@@ -157,7 +157,8 @@ between a clean stop and a forgotten one.
 A PR records that this loop ran and what it left open. `review-loop-check` in CI fails
 a PR whose description lacks the block (the `no-agent-review` label opts out; see
 `CLAUDE.md`, "Reviewing a branch"). After the prose list, print the block filled in from
-the ledger. It replaces the template's whole `## Reviewer loop` section, heading
+the ledger (or, while a deferred finding has no issue number, what the last rule below
+says instead). It replaces the template's whole `## Reviewer loop` section, heading
 included:
 
 ```markdown
