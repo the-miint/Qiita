@@ -55,7 +55,7 @@ Give every finding exactly one disposition, and write it into the ledger:
 |---|---|---|
 | `fixed` | You changed the code | Name the commit or `path:line` |
 | `declined` | Correct rule, wrong here | Record the **reason** — it goes into the next prompt |
-| `deferred` | Real, but wider than this PR (the reviewer's Scope discipline) | File or draft the issue, then drop it from the loop |
+| `deferred` | Real, but wider than this PR (the reviewer's Scope discipline) | Open the issue and record its number, then drop it from the loop |
 | `probed` | Was `[needs-probe]`; you ran it | Record the result — confirmed or refuted |
 
 Then apply the fixes and run the tests the change actually touches: always the
@@ -175,5 +175,8 @@ included:
 - `Reviewed at` is a commit on the branch. If commits land after the last round, say so
   on that line ("plus 1 later commit: changelog tag") instead of moving the sha.
 - Write `none` under a heading with no entries; do not drop the heading.
-- A deferred item names its issue. File it first, or write `issue to file` and why.
+- A deferred item names its issue by number. Open every deferred issue before the PR
+  is opened, so the description carries `#N` from its first version; `issue to file`
+  is not an entry. If you cannot open issues, stop before the block and hand the
+  author each issue's title and body to open.
 - Do not edit the PR description yourself unless asked; hand the block to the author.
