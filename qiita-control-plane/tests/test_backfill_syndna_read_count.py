@@ -27,6 +27,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_reference_membership,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -103,15 +104,16 @@ async def world(postgres_pool, tmp_path):
         "masked_sample": masked_sample,
     }
 
-    await pool.execute("DELETE FROM qiita.syndna_read_count WHERE mask_idx = $1", mask_idx)
     await pool.execute(
         "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])", tickets
     )
-    await pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
+    await teardown_entity_graph(
+        pool,
+        study_idxs=[],
+        biosample_idxs=[bs for bs, _ps in samples],
+        prep_sample_idxs=[ps for _bs, ps in samples],
+    )
     await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-    for biosample_idx, ps in samples:
-        await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps)
-        await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
     await cleanup_reference_graph(pool, reference_idx=reference_idx, feature_idxs=inserts)
     await delete_action_if_created(
         pool, action_id=READ_MASK_ACTION_ID, version=_VERSION, created=action_created

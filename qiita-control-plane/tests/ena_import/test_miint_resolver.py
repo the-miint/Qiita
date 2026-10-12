@@ -1,13 +1,16 @@
 """Tests for `MiintEnaResolver`, driving DuckDB + the miint
 `read_ena` / `read_ena_attributes` table functions.
 
-Network-free: the module-level query functions (`_query_ena_*`) are monkeypatched by
-fully-qualified name. Fixtures under `fixtures/` are real rows from public study
-PRJNA48739."""
+Network-free: the study/run query functions (`_query_ena_*`) are monkeypatched by
+fully-qualified name; the attribute query runs its own SQL on plain DuckDB behind a
+`read_ena_attributes` stand-in. Fixtures under `fixtures/` are real rows from public
+study PRJNA48739 and BioSample SAMN45806981."""
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
+import duckdb
 import pytest
 from pydantic import ValidationError
 from qiita_common.models.ena import EnaRunRecord, EnaSampleAttributes, EnaStatus, EnaStudyHeader
@@ -73,24 +76,34 @@ def assert_prjna48739_runs(runs: list[EnaRunRecord]) -> None:
     assert paired.base_count == 87391853
 
 
-def _group_fixture_rows(columns, rows):
-    """Group the recorded narrow `(sample_accession, tag, value)` fixture the way
-    `_query_ena_sample_attributes`' SQL now does, so the fixture keeps its
-    recorded-from-ENA shape while the fake matches what DuckDB returns."""
-    sample_i, tag_i, value_i = (columns.index(c) for c in ("sample_accession", "tag", "value"))
-    grouped: dict[str, dict[str, str]] = {}
-    for row in rows:
-        grouped.setdefault(row[sample_i], {})[row[tag_i]] = row[value_i]
-    return sorted(grouped.items())
+@contextmanager
+def _duckdb_attributes(monkeypatch, rows, study="PRJNA1"):
+    """Serve `rows` as `read_ena_attributes(study)` from plain DuckDB so the resolver's own
+    SQL runs; the stand-in filters on its argument like the real function."""
+    con = duckdb.connect()
+    con.execute(
+        "CREATE TEMP TABLE attrs"
+        " (study_accession VARCHAR, sample_accession VARCHAR, tag VARCHAR, value VARCHAR)"
+    )
+    con.executemany("INSERT INTO attrs VALUES (?, ?, ?, ?)", [(study, *row) for row in rows])
+    con.execute(
+        "CREATE TEMP MACRO read_ena_attributes(accession) AS TABLE"
+        " SELECT sample_accession, tag, value FROM attrs WHERE study_accession = accession"
+    )
+    monkeypatch.setattr(miint_resolver, "connect_with_miint_staged", lambda: con)
+    try:
+        yield
+    finally:
+        con.close()
 
 
 def assert_prjna48739_sample_attributes(attrs: list[EnaSampleAttributes]) -> None:
     assert len(attrs) == 1
     sample = attrs[0]
     assert sample.sample_accession == "SAMN00199006"
-    assert sample.attributes["strain"] == "GA17570"
-    assert sample.attributes["organism"] == "Streptococcus pneumoniae GA17570"
-    assert sample.attributes["ENA-FIRST-PUBLIC"] == "2011-01-25"
+    assert sample.attributes["strain"] == ["GA17570"]
+    assert sample.attributes["organism"] == ["Streptococcus pneumoniae GA17570"]
+    assert sample.attributes["ENA-FIRST-PUBLIC"] == ["2011-01-25"]
     assert len(sample.attributes) == 7
 
 
@@ -178,6 +191,55 @@ def test_resolve_runs_rejects_an_unrecognized_status(monkeypatch):
         MiintEnaResolver().resolve_ena_runs("PRJNA48739")
 
 
+@pytest.mark.parametrize(
+    ("fixture", "expected"),
+    [
+        ("ena_runs_human_gut.json", ("408170", "9606", "Homo sapiens")),
+        ("ena_runs_seawater.json", ("1561972", None, None)),
+        ("ena_runs_host_text_only.json", ("749906", None, "insect5")),
+        ("ena_runs_unseeded_host.json", ("749906", "9823", "Sus scrofa")),
+        ("ena_runs_missing_sample_record.json", (None, None, None)),
+    ],
+)
+def test_resolve_runs_carries_sample_taxon_and_host_fields(monkeypatch, fixture, expected):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    columns, rows = _load_fixture(fixture)
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: (columns, rows))
+
+    run = MiintEnaResolver().resolve_ena_runs("PRJNA48739")[0]
+
+    assert (run.tax_id, run.host_tax_id, run.host) == expected
+
+
+def test_run_record_accepts_the_integer_tax_id_miint_returns():
+    run = EnaRunRecord(
+        run_accession="SRR1",
+        experiment_accession="SRX1",
+        sample_accession="SAMN1",
+        study_accession="PRJNA1",
+        status="public",
+        tax_id=408170,
+        host_tax_id=9606,
+    )
+
+    assert (run.tax_id, run.host_tax_id) == ("408170", "9606")
+
+
+def test_run_record_normalizes_blank_taxon_and_host_to_none():
+    base = {
+        "run_accession": "SRR1",
+        "experiment_accession": "SRX1",
+        "sample_accession": "SAMN1",
+        "study_accession": "PRJNA1",
+        "status": "public",
+    }
+
+    run = EnaRunRecord(**base, tax_id="", host_tax_id=" ", host="")
+
+    assert (run.tax_id, run.host_tax_id, run.host) == (None, None, None)
+
+
 class _FakeCapturingConnection:
     """Fakes `connect_with_miint_staged()`'s context-manager + `execute` shape,
     capturing the last call's SQL params so a test can assert on what fields
@@ -225,12 +287,98 @@ def test_query_ena_runs_requests_exactly_the_model_fields(monkeypatch):
 def test_resolve_sample_attributes_pivots_by_sample(monkeypatch):
     from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
-    columns, rows = _load_fixture("sample_attributes.json")
-    monkeypatch.setattr(_QUERY_ATTRS, lambda accession: _group_fixture_rows(columns, rows))
+    _, rows = _load_fixture("sample_attributes.json")
 
-    attrs = MiintEnaResolver().resolve_sample_attributes("PRJNA48739")
+    with _duckdb_attributes(monkeypatch, rows):
+        attrs = MiintEnaResolver().resolve_sample_attributes("PRJNA1")
 
     assert_prjna48739_sample_attributes(attrs)
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["recorded", "reversed"])
+def test_resolve_sample_attributes_keeps_repeated_tag_values_as_sorted_lists(monkeypatch, reverse):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    _, rows = _load_fixture("sample_attributes_repeated_tags.json")
+    if reverse:
+        rows = rows[::-1]
+
+    with _duckdb_attributes(monkeypatch, rows, study="PRJNA1197483"):
+        (sample,) = MiintEnaResolver().resolve_sample_attributes("PRJNA1197483")
+
+    assert sample.sample_accession == "SAMN45806981"
+    assert len(sample.attributes) == 13
+    assert sample.attributes["BioSampleModel"] == [
+        "MIGS/MIMS/MIMARKS.human-associated",
+        "MIMARKS.survey",
+    ]
+    assert sample.attributes["ENA-FIRST-PUBLIC"] == ["2024-12-13", "2024-12-13T01:09:31Z"]
+    assert sample.attributes["ENA-LAST-UPDATE"] == ["2024-12-13", "2024-12-13T01:09:31Z"]
+    assert sample.attributes["organism"] == ["human metagenome"]
+
+
+def test_resolve_sample_attributes_dedupes_values(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    rows = [("SAMN1", "tag", "y"), ("SAMN1", "tag", "x"), ("SAMN1", "tag", "y")]
+
+    with _duckdb_attributes(monkeypatch, rows):
+        (sample,) = MiintEnaResolver().resolve_sample_attributes("PRJNA1")
+
+    assert sample.attributes == {"tag": ["x", "y"]}
+
+
+def test_resolve_sample_attributes_drops_null_values(monkeypatch):
+    """miint returns an empty `<VALUE>` as NULL: it is dropped, and a tag with no value left
+    is absent rather than failing the sample."""
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    rows = [
+        ("SAMN1", "tag", "x"),
+        ("SAMN1", "tag", None),
+        ("SAMN1", "only_null", None),
+        ("SAMN2", "only_null", None),
+    ]
+
+    with _duckdb_attributes(monkeypatch, rows):
+        samples = MiintEnaResolver().resolve_sample_attributes("PRJNA1")
+
+    assert [(s.sample_accession, s.attributes) for s in samples] == [("SAMN1", {"tag": ["x"]})]
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["recorded", "reversed"])
+def test_resolve_sample_attributes_orders_tags_so_normalized_collisions_resolve_stably(
+    monkeypatch, reverse
+):
+    """`map_ena_attributes` lets the later of two tags that normalize alike win, so the
+    map entries must arrive in a fixed (tag-sorted) order."""
+    from qiita_control_plane.ena_import.attribute_mapping import map_ena_attributes
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    rows = [
+        ("SAMN1", "collection_date", "2017"),
+        ("SAMN1", "collection date", "2019-06-01"),
+        ("SAMN1", "Collection_Date", "2020"),
+    ]
+    if reverse:
+        rows = rows[::-1]
+
+    with _duckdb_attributes(monkeypatch, rows):
+        (sample,) = MiintEnaResolver().resolve_sample_attributes("PRJNA1")
+
+    assert list(sample.attributes) == ["Collection_Date", "collection date", "collection_date"]
+    mapped, _ = map_ena_attributes({tag: v for tag, (v,) in sample.attributes.items()})
+    assert mapped["collection date"] == "2017"
+
+
+@pytest.mark.parametrize("requested, expected", [("PRJNA1", ["SAMN1"]), ("PRJNA2", [])])
+def test_resolve_sample_attributes_queries_the_requested_study(monkeypatch, requested, expected):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    with _duckdb_attributes(monkeypatch, [("SAMN1", "tag", "a")], study="PRJNA1"):
+        samples = MiintEnaResolver().resolve_sample_attributes(requested)
+
+    assert [s.sample_accession for s in samples] == expected
 
 
 def test_resolve_sample_attributes_zero_rows_returns_empty_list(monkeypatch):

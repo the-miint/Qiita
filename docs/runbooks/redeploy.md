@@ -372,7 +372,10 @@ A maintainer then, in a local checkout, runs `/deploy-archive <sha>`
 `HEAD`, which may have moved on). It moves the just-deployed `## Pending
 deploy` block out of `DEPLOY_CHECKLIST.md` into its own file under
 [`docs/deploy-archive/`](../deploy-archive/), empties Pending for the next
-cycle, and the maintainer commits + pushes.
-No Claude? Do the same move by hand, copying the shape of the newest file in
-`docs/deploy-archive/`. Either way, also record the deployed commit somewhere
+cycle, and moves the changelog entry files the deploy shipped from
+`docs/changelog-pending/` into a folder with the same stamp under
+[`docs/changelog-archive/`](../changelog-archive/); the maintainer commits + pushes.
+No Claude? Do the same two moves by hand, copying the shape of the newest file in
+`docs/deploy-archive/` and running the `git mv` loop in
+`.claude/commands/deploy-archive.md`. Either way, also record the deployed commit somewhere
 durable (deploy log, ops channel).

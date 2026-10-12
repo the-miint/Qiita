@@ -94,6 +94,7 @@ def _study(*, description: str | None) -> StudyResponse:
     stamp = datetime(2026, 3, 11, tzinfo=UTC)
     return StudyResponse(
         study_idx=25001,
+        export_entity_id="QS25001",
         owner_idx=1,
         principal_investigator_idx=None,
         title=_STUDY_TITLE,

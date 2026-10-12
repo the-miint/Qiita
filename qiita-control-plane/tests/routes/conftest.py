@@ -1,10 +1,12 @@
 """Shared fixtures and helpers for control-plane route tests.
 
-Holds the three-role AsyncClient triple, a PAT-minting client factory used
-by the per-route no-scope fixtures, a generic FK-reverse delete helper, and
-the parametrise source + driver for the owner-eligibility 422 surface. Each
-route test still owns its own `ctx` and `_cleanup_tracked` because the
-tracked table set differs per route.
+Holds the three-role AsyncClient triple, a factory that mints a PAT carrying a
+caller-chosen scope set, and the pair that drives the ineligible-owner
+cases — `IneligibilityKind`, which tests parametrize over, and
+`resolve_ineligible_owner_idx`, which turns one of its kinds into a principal
+idx a route will reject with 422. Each route test owns its own `ctx`, because
+what a route needs seeded differs per route; teardown does not, and goes
+through the ordered sweep.
 """
 
 import secrets
@@ -46,8 +48,10 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
     seed_sequenced_sample_subtype,
     seed_service_principal,
+    seed_study,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 
@@ -310,12 +314,7 @@ async def make_caller_own_run(ctx, run_idx: int, *, principal_idx: int) -> None:
 
 
 async def _grant_study_access(ctx, *, study_idx, principal_idx, tier, granted_by_idx):
-    """Insert a study_access row at the named tier; track for cleanup.
-
-    Appends (study_idx, principal_idx) to ctx['created']['study_access'];
-    the consuming file's _cleanup_tracked deletes those rows before its
-    own study delete.
-    """
+    """Insert a study_access row at the named tier."""
     await ctx["pool"].execute(
         "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
         " VALUES ($1, $2, $3::qiita.tier, $4)",
@@ -324,21 +323,19 @@ async def _grant_study_access(ctx, *, study_idx, principal_idx, tier, granted_by
         tier,
         granted_by_idx,
     )
-    ctx["created"]["study_access"].append((study_idx, principal_idx))
 
 
 async def _seed_study(ctx, *, owner_idx: int, suffix: str) -> int:
     """Insert a minimal study owned by `owner_idx`, append its idx to
-    `ctx['created']['study']` for FK-reverse teardown, and return the idx.
+    `ctx['created']['study']` so the sweep is given it, and return the idx.
 
     The title is uniquified with `suffix` plus a random token so concurrent
     tests never collide.
     """
-    study_idx = await ctx["pool"].fetchval(
-        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
-        " VALUES ($1, $2, $1) RETURNING idx",
-        owner_idx,
-        f"route-study-{suffix}-{secrets.token_hex(4)}",
+    study_idx = await seed_study(
+        ctx["pool"],
+        owner_idx=owner_idx,
+        title=f"route-study-{suffix}-{secrets.token_hex(4)}",
     )
     ctx["created"]["study"].append(study_idx)
     return study_idx
@@ -361,7 +358,6 @@ class SampleFieldSurface(NamedTuple):
     url_template: str  # create and list share this study-scoped path
     by_idx_url_template: str  # the edit path, addressing one field under a study
     idx_key: str  # response key naming the study-local row
-    created_key: str  # ctx cleanup bucket for created study-local rows
     global_fk_key: str  # request/response key naming the global-field link
     seed_global_field: Callable[..., Awaitable[int]]
     global_created_key: str  # ctx cleanup bucket for created global rows
@@ -391,7 +387,6 @@ BIOSAMPLE_FIELD_SURFACE = SampleFieldSurface(
     url_template=URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     by_idx_url_template=URL_BIOSAMPLE_STUDY_FIELD_BY_IDX,
     idx_key="biosample_study_field_idx",
-    created_key="biosample_study_field",
     global_fk_key="biosample_global_field_idx",
     seed_global_field=seed_biosample_global_field,
     global_created_key="biosample_global_field",
@@ -405,7 +400,6 @@ PREP_SAMPLE_FIELD_SURFACE = SampleFieldSurface(
     url_template=URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     by_idx_url_template=URL_PREP_SAMPLE_STUDY_FIELD_BY_IDX,
     idx_key="prep_sample_study_field_idx",
-    created_key="prep_sample_study_field",
     global_fk_key="prep_sample_global_field_idx",
     seed_global_field=seed_prep_sample_global_field,
     global_created_key="prep_sample_global_field",
@@ -475,11 +469,9 @@ async def seed_sample_with_value(
     await seed_biosample_to_study_link(
         pool, biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner_idx
     )
-    ctx["created"]["biosample_to_study"].append((biosample_idx, study_idx))
     await seed_prep_sample_to_study_link(
         pool, prep_sample_idx=prep_sample_idx, study_idx=study_idx, created_by_idx=owner_idx
     )
-    ctx["created"]["prep_sample_to_study"].append((prep_sample_idx, study_idx))
 
     missing_reason_idx = None
     if missing_reason_name is not None:
@@ -490,18 +482,17 @@ async def seed_sample_with_value(
             f"no missing_value_reason named {missing_reason_name!r}"
         )
 
-    metadata_idx = await pool.fetchval(
+    await pool.execute(
         f"INSERT INTO {spec.metadata_table}"
         f" ({spec.entity_key_column}, {spec.study_field_idx_column},"
         f" {value_column}, value_missing_reason_idx, created_by_idx)"
-        " VALUES ($1, $2, $3, $4, $5) RETURNING idx",
+        " VALUES ($1, $2, $3, $4, $5)",
         entity_idx,
         study_field_idx,
         value,
         missing_reason_idx,
         owner_idx,
     )
-    ctx["created"][spec.metadata_table.removeprefix("qiita.")].append(metadata_idx)
 
     if publish:
         # The publish action: FALSE -> TRUE on the link. OLD.is_published is
@@ -541,16 +532,13 @@ def sibling_field_surface(surface: SampleFieldSurface) -> SampleFieldSurface:
     return sibling
 
 
-async def post_study_field(ctx, *, surface: SampleFieldSurface, client, study_idx: int, **body):
-    """POST one entity's create-field route and, on 201, track the created row."""
+async def post_study_field(*, surface: SampleFieldSurface, client, study_idx: int, **body):
+    """POST one entity's create-field route."""
     resp = await client.post(surface.url_template.format(study_idx=study_idx), json=body)
-    if resp.status_code == 201:
-        ctx["created"][surface.created_key].append(resp.json()[surface.idx_key])
     return resp
 
 
 async def patch_study_field(
-    ctx,
     *,
     surface: SampleFieldSurface,
     client,
@@ -561,8 +549,7 @@ async def patch_study_field(
 ):
     """PATCH one entity's edit-field route and return the response untouched.
 
-    if_match None omits the header, which is how the 428 case is driven; the
-    row is already tracked by whoever created it, so nothing is tracked here.
+    if_match None omits the header, which is how the 428 case is driven.
     """
     headers = {} if if_match is None else {"If-Match": if_match}
     return await client.patch(
@@ -573,12 +560,9 @@ async def patch_study_field(
 
 
 async def get_study_field(
-    ctx, *, surface: SampleFieldSurface, client, study_idx: int, study_field_idx: int
+    *, surface: SampleFieldSurface, client, study_idx: int, study_field_idx: int
 ):
-    """GET one entity's read-field route and return the response untouched.
-
-    Nothing is tracked: a read creates no row.
-    """
+    """GET one entity's read-field route and return the response untouched."""
     return await client.get(
         surface.by_idx_url_template.format(study_idx=study_idx, study_field_idx=study_field_idx)
     )
@@ -682,7 +666,6 @@ async def assert_study_field_authz(
 async def _send_study_field_create(ctx, surface, client, study_idx):
     """Issue the create request one access case needs."""
     return await post_study_field(
-        ctx,
         surface=surface,
         client=client,
         study_idx=study_idx,
@@ -789,7 +772,6 @@ async def _send_study_field_get(ctx, surface, client, study_idx):
     before the path's field idx is looked up either way.
     """
     seeded = await post_study_field(
-        ctx,
         surface=surface,
         client=ctx["wet"],
         study_idx=study_idx,
@@ -798,7 +780,6 @@ async def _send_study_field_get(ctx, surface, client, study_idx):
     )
     study_field_idx = seeded.json()[surface.idx_key] if seeded.status_code == 201 else 1
     return await get_study_field(
-        ctx,
         surface=surface,
         client=client,
         study_idx=study_idx,
@@ -847,7 +828,6 @@ async def assert_study_field_create_conflict(
         global_a = await _seed_field_global(ctx, surface=surface, label="cfa")
         global_b = await _seed_field_global(ctx, surface=surface, label="cfb")
         first = await post_study_field(
-            ctx,
             surface=surface,
             client=ctx["user"],
             study_idx=study_idx,
@@ -858,7 +838,6 @@ async def assert_study_field_create_conflict(
         body = {"display_name": display_name, surface.global_fk_key: global_b}
     else:
         first = await post_study_field(
-            ctx,
             surface=surface,
             client=ctx["user"],
             study_idx=study_idx,
@@ -868,9 +847,7 @@ async def assert_study_field_create_conflict(
         assert first.status_code == 201, first.text
         body = {"display_name": display_name, "data_type": "text"}
 
-    resp = await post_study_field(
-        ctx, surface=surface, client=ctx["user"], study_idx=study_idx, **body
-    )
+    resp = await post_study_field(surface=surface, client=ctx["user"], study_idx=study_idx, **body)
     assert resp.status_code == expected_status, resp.text
     if case == "duplicate_name":
         assert "already" in resp.json()["detail"]
@@ -961,25 +938,8 @@ async def assert_study_scoped_sample_authz(
 
 
 # ---------------------------------------------------------------------------
-# Generic FK-reverse delete helper
+# ETag helpers for If-Match PATCH routes
 # ---------------------------------------------------------------------------
-
-
-async def delete_idxs(pool, table: str, idxs) -> None:
-    """Bulk-delete by idx; tolerates a bare int or an iterable; empty is a no-op.
-
-    Used by per-route `_cleanup_tracked` to drop test-created rows in
-    FK-reverse order. The table name is interpolated, so callers must pass
-    a static schema-qualified suffix (e.g., 'study', not user-input).
-    """
-    if isinstance(idxs, int):
-        idxs = [idxs]
-    if not idxs:
-        return
-    await pool.execute(
-        f"DELETE FROM qiita.{table} WHERE idx = ANY($1::bigint[])",
-        idxs,
-    )
 
 
 async def etag_for_row(pool, *, table: UpdatableTable, row_idx: int) -> str:
@@ -1056,14 +1016,13 @@ async def resolve_ineligible_owner_idx(
     prefix: str,
     created: dict,
 ) -> int:
-    """Resolve the owner_idx for one ineligibility kind; track any seeded
-    rows in `created` for FK-reverse cleanup at teardown.
+    """Resolve the owner_idx for one ineligibility kind, seeding a principal
+    when the kind needs one.
 
     Caller passes the route-specific `prefix` (e.g., 'bs-route-elig',
-    'st-route-elig') so seeded principal display_names stay scoped to the
-    suite. Caller is also responsible for passing a `created` dict with the
-    standard 'user_principals' / 'service_account_principals' keys used by
-    the route's _cleanup_tracked.
+    'st-route-elig') so seeded display_names stay scoped to the suite, and a
+    `created` dict carrying the 'user_principals' and
+    'service_account_principals' keys this appends to.
     """
     # The system principal exists but has no qiita.user row → is_user=False.
     if kind is IneligibilityKind.SYSTEM_PRINCIPAL:
@@ -1219,13 +1178,13 @@ async def pool_alignment_seed(role_keyed_clients):
     authorization boundary with no second check behind it, that difference is the
     single most important thing in this fixture. Do not narrow it to one study.
 
-    Tracks and tears down everything it creates, including its own studies and
-    study_access rows, so it composes with any module's `ctx`.
+    Seeds and tears down its own studies and their grants, so it composes with
+    any module's `ctx`.
     """
     db = role_keyed_clients["pool"]
     owner = role_keyed_clients["wet_session"]["principal_idx"]
     reader = role_keyed_clients["user_session"]["principal_idx"]
-    tracked = {"pool": db, "created": {"study": [], "study_access": []}}
+    tracked = {"pool": db, "created": {"study": []}}
 
     study_1 = await _seed_study(tracked, owner_idx=owner, suffix="align-disc-1")
     study_2 = await _seed_study(tracked, owner_idx=owner, suffix="align-disc-2")
@@ -1295,39 +1254,15 @@ async def pool_alignment_seed(role_keyed_clients):
         "reader_idx": reader,
     }
 
-    prep_idxs = [ps for _, ps, _ in samples]
-    bio_idxs = [bs for bs, _, _ in samples]
-    ss_idxs = [ss for _, _, ss in samples]
-    # Before anything else: exported_identifier holds prep_sample under RESTRICT
-    # (a published handle must outlive the alignment it names, so it cannot ride a
-    # cascade), which would block the prep_sample delete below for any test that
-    # minted one. Keyed on prep_sample rather than alignment because a row whose
-    # alignment was purged has had its alignment_idx nulled.
-    await db.execute(
-        "DELETE FROM qiita.exported_identifier WHERE prep_sample_idx = ANY($1::bigint[])",
-        prep_idxs,
-    )
-    await db.execute(
-        "DELETE FROM qiita.alignment_sample WHERE alignment_idx = ANY($1::bigint[])",
-        [align_1, align_2],
+    await teardown_entity_graph(
+        db,
+        study_idxs=[study_1, study_2],
+        biosample_idxs=[bs for bs, _, _ in samples],
+        prep_sample_idxs=[ps for _, ps, _ in samples],
     )
     await db.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = ANY($1::bigint[])",
         [align_1, align_2],
     )
-    await db.execute(
-        "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = ANY($1::bigint[])",
-        prep_idxs,
-    )
-    await db.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = ANY($1::bigint[])", bio_idxs
-    )
-    await db.execute("DELETE FROM qiita.sequenced_sample WHERE idx = ANY($1::bigint[])", ss_idxs)
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await db.execute("DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", prep_idxs)
-    await db.execute("DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", bio_idxs)
-    await db.execute(
-        "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])", [study_1, study_2]
-    )
-    await db.execute("DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", [study_1, study_2])

@@ -6,10 +6,10 @@ work_ticket link, the cover-map member inserts (PK + min<=max CHECK), the
 atomic state transition, the idempotent PENDING gate materialization, and the
 work_ticket back-fill that closes the mint-ordering cycle.
 
-Each test seeds its own principal + sequenced prep_samples + a mask_definition
-so cleanup runs in FK-reverse order and the suite can run against the shared
-postgres_pool fixture. Blocks a test creates are tracked in `blk['created_blocks']`
-so teardown targets exactly those rows (parallel-safe — no global block sweep).
+Each test seeds its own principal + sequenced prep_samples + a mask_definition,
+so the suite can run against the shared postgres_pool fixture. Blocks that a
+test creates are tracked in `blk['created_blocks']` so teardown targets exactly
+those rows (parallel-safe — no global block sweep).
 """
 
 import secrets
@@ -41,6 +41,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -65,10 +66,9 @@ async def _new_block(blk) -> int:
 async def blk(postgres_pool):
     """Seed a principal, two sequenced prep_samples, and a mask_definition.
 
-    Yields the ids + pool + a `created_blocks` list tests append to. FK-reverse
-    cleanup sweeps exactly the tracked block rows (block_member cascades), the
-    mask_sample gate rows for this mask, then the sample chain, the mask, the
-    user, and the principal."""
+    Yields the ids + pool + a `created_blocks` list tests append to. Teardown
+    clears exactly the tracked block rows (block_member cascades), sweeps the
+    entity graph, then drops the mask and the principal."""
     suffix = secrets.token_hex(4)
     principal_idx = await seed_user_principal(postgres_pool, prefix="block-test", suffix=suffix)
     bs1, ps1 = await seed_biosample_with_sequenced_prep_sample(
@@ -97,26 +97,25 @@ async def blk(postgres_pool):
         "created_blocks": created_blocks,
     }
 
-    # FK-reverse. Any work_ticket referencing a tracked block first (NO ACTION
-    # on work_ticket.block_idx), then the blocks (block_member cascades), then
-    # the gate rows, sample chain, mask, user, principal.
+    # Work tickets hold the tracked blocks under RESTRICT, so they go first; the
+    # sweep then clears the gate rows and the sample chain, leaving the block and
+    # the mask definition to follow.
     if created_blocks:
         await postgres_pool.execute(
             "DELETE FROM qiita.work_ticket WHERE block_idx = ANY($1::bigint[])", created_blocks
         )
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[bs1, bs2],
+        prep_sample_idxs=[ps1, ps2],
+    )
+    if created_blocks:
         await postgres_pool.execute(
             "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])", created_blocks
         )
-    await postgres_pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", [ps1, ps2]
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", [bs1, bs2]
-    )
     await postgres_pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 # ---------------------------------------------------------------------------

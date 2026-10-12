@@ -7,11 +7,11 @@ references a user.
 
 Tests use Pattern 1 (transaction-rollback per test): all seed and
 assertions happen inside a single transaction that is rolled back at
-the end. No shared fixture, no FK-reverse cleanup. This pattern fits
+the end. No shared fixture, no teardown at all. This pattern fits
 trigger tests because triggers fire per-statement and the test does not
 need to commit. Tests that exercise commit-time behavior or
-cross-transaction scenarios use Pattern 2 (committed fixture +
-FK-reverse cleanup) — see tests/repositories/test_biosample.py.
+cross-transaction scenarios use Pattern 2 (committed fixture + swept
+teardown) — see tests/repositories/test_biosample.py.
 """
 
 import json
@@ -32,6 +32,7 @@ from qiita_control_plane.repositories.study import (
     get_or_create_study_by_ena_accessions,
     update_study,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -1029,15 +1030,13 @@ async def test_get_or_create_study_by_ena_accessions_collision_refetch_resolves_
             assert row["idx"] == winner_idx
         finally:
             await tr.rollback()
-            if winner_idx is not None:
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.study_access WHERE study_idx = $1", winner_idx
-                )
-                await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", winner_idx)
-            await postgres_pool.execute(
-                "DELETE FROM qiita.user WHERE principal_idx = $1", winner_owner
+            await teardown_entity_graph(
+                postgres_pool,
+                study_idxs=[winner_idx] if winner_idx is not None else [],
+                biosample_idxs=[],
+                prep_sample_idxs=[],
             )
-            await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", winner_owner)
+            await delete_principal(postgres_pool, [winner_owner])
 
 
 async def test_get_or_create_study_by_ena_accessions_collision_refetch_resolves_by_bioproject(
@@ -1086,15 +1085,13 @@ async def test_get_or_create_study_by_ena_accessions_collision_refetch_resolves_
             assert row["idx"] == winner_idx
         finally:
             await tr.rollback()
-            if winner_idx is not None:
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.study_access WHERE study_idx = $1", winner_idx
-                )
-                await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", winner_idx)
-            await postgres_pool.execute(
-                "DELETE FROM qiita.user WHERE principal_idx = $1", winner_owner
+            await teardown_entity_graph(
+                postgres_pool,
+                study_idxs=[winner_idx] if winner_idx is not None else [],
+                biosample_idxs=[],
+                prep_sample_idxs=[],
             )
-            await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", winner_owner)
+            await delete_principal(postgres_pool, [winner_owner])
 
 
 # ---------------------------------------------------------------------------

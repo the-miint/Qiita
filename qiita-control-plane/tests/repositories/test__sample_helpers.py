@@ -13,8 +13,8 @@ and a prep_sample-spec sanity test that proves
 PREP_SAMPLE_METADATA_SPEC's identifiers and callables are correctly
 bound.
 
-Biosample tests use the ctx fixture (Pattern 2: committed rows + FK-reverse
-cleanup) so the diagnostic SELECT sees the prior writer's committed row.
+Biosample tests use the ctx fixture (Pattern 2: committed rows + swept
+teardown) so the diagnostic SELECT sees the prior writer's committed row.
 The prep_sample sanity test uses Pattern 1 (per-test transaction rollback)
 because the prep_sample side has no committed-fixture pattern yet.
 parse_text_for_data_type tests are pure-unit and need no fixture.
@@ -114,6 +114,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_global_field,
     seed_local_study_field,
     seed_prep_sample_global_field,
+    seed_study,
 )
 from qiita_control_plane.testing.unique_names import unique_field_name
 
@@ -125,10 +126,8 @@ from .conftest import (
     _create_prep_sample_with_link,
     _seed_global_field_for_spec,
     _seed_secondary_studies_for_entity,
-    _seed_study,
     _seed_unlinked_entity_for_spec,
     _set_unique_in_study,
-    _track_to_study_link,
     _write_value,
 )
 
@@ -189,8 +188,6 @@ async def _commit_write(
                 caller_idx=caller_idx,
                 on_conflict=on_conflict,
             )
-    ctx["created"]["biosample_study_field"].append(result.study_field_idx)
-    ctx["created"]["biosample_metadata"].append(result.metadata_idx)
     return result
 
 
@@ -199,8 +196,8 @@ async def _create_second_study_and_link_biosample(ctx, bs_idx):
     Used by the two different-study collision tests.
     """
     # Second study owned by the ctx principal so role-typed FK triggers pass.
-    second_study_idx = await _seed_study(
-        ctx["pool"], ctx["principal_idx"], f"second-{secrets.token_hex(4)}"
+    second_study_idx = await seed_study(
+        ctx["pool"], owner_idx=ctx["principal_idx"], title=f"second-{secrets.token_hex(4)}"
     )
     ctx["created"]["studies"].append(second_study_idx)
     async with ctx["pool"].acquire() as conn:
@@ -211,7 +208,6 @@ async def _create_second_study_and_link_biosample(ctx, bs_idx):
             second_study_idx,
             ctx["principal_idx"],
         )
-    ctx["created"]["biosample_to_study"].append((bs_idx, second_study_idx))
     return second_study_idx
 
 
@@ -686,7 +682,6 @@ async def test_write_global_metadata_or_diagnose_slot_held_by_missing_reason_rai
         display_name_first,
         ctx["principal_idx"],
     )
-    ctx["created"]["biosample_study_field"].append(study_field_idx)
 
     # Seed a missing-value reason so the metadata row has something to
     # reference.
@@ -709,7 +704,6 @@ async def test_write_global_metadata_or_diagnose_slot_held_by_missing_reason_rai
         reason_idx,
         ctx["principal_idx"],
     )
-    ctx["created"]["biosample_metadata"].append(seeded_meta_idx)
 
     # write_global_metadata_or_diagnose now sees the slot occupied via the
     # second display_name's path; the diagnostic SELECT sees
@@ -942,16 +936,15 @@ async def test_write_global_metadata_or_diagnose_propagates_study_field_conflict
     display_name = unique_field_name("sfconf")
 
     # Pre-create a study_field at this (study, display_name) bound to gf_a.
-    study_field_idx = await ctx["pool"].fetchval(
+    await ctx["pool"].execute(
         "INSERT INTO qiita.biosample_study_field"
         "  (study_idx, biosample_global_field_idx, display_name, created_by_idx)"
-        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        " VALUES ($1, $2, $3, $4)",
         ctx["study_idx"],
         gf_a,
         display_name,
         ctx["principal_idx"],
     )
-    ctx["created"]["biosample_study_field"].append(study_field_idx)
 
     # write_global_metadata_or_diagnose for gf_b at the same display_name
     # surfaces StudyFieldConflictError from get_or_create unchanged.
@@ -1243,8 +1236,6 @@ async def _commit_local_write(
                 required=required,
                 on_conflict=on_conflict,
             )
-    ctx["created"]["biosample_study_field"].append(result.study_field_idx)
-    ctx["created"]["biosample_metadata"].append(result.metadata_idx)
     return result
 
 
@@ -1460,7 +1451,6 @@ async def test_write_local_metadata_or_diagnose_upsert_outcomes_on_unique_field(
             required=False,
             unique_in_study=True,
         )
-    ctx["created"]["biosample_study_field"].append(field_idx)
 
     async def _upsert(value):
         return await _commit_local_write(
@@ -1553,7 +1543,6 @@ async def test_write_local_metadata_or_diagnose_unique_value_rewrite_after_relax
             required=False,
             unique_in_study=True,
         )
-    ctx["created"]["biosample_study_field"].append(field_idx)
 
     async def _upsert(value):
         return await _commit_local_write(
@@ -1639,7 +1628,6 @@ async def test_write_local_metadata_or_diagnose_slot_held_by_missing_reason_rais
         display_name,
         ctx["principal_idx"],
     )
-    ctx["created"]["biosample_study_field"].append(study_field_idx)
 
     # Seed a missing-value reason so the metadata row has something to
     # reference.
@@ -1660,7 +1648,6 @@ async def test_write_local_metadata_or_diagnose_slot_held_by_missing_reason_rais
         reason_idx,
         ctx["principal_idx"],
     )
-    ctx["created"]["biosample_metadata"].append(seeded_meta_idx)
 
     # write_local_metadata_or_diagnose collides on unique_per_field; the
     # diagnostic SELECT sees the missing-reason row -> raises
@@ -1752,7 +1739,6 @@ async def test_write_local_metadata_or_diagnose_raises_on_globally_linked_field(
         display_name,
         ctx["principal_idx"],
     )
-    ctx["created"]["biosample_study_field"].append(study_field_idx)
 
     # write_local sees the resolved row's biosample_global_field_idx is
     # non-None and refuses the write before any INSERT runs.
@@ -2272,7 +2258,6 @@ async def test_fetch_study_fields_by_display_names_returns_local_and_linked(ctx,
     """
     study_idx = ctx["study_idx"]
     created_by = ctx["principal_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
 
     # Purely-local field owns its own NUMERIC data_type; the globally-linked
     # field is bound to a seeded DATE global field under a distinct label, so
@@ -2299,7 +2284,6 @@ async def test_fetch_study_fields_by_display_names_returns_local_and_linked(ctx,
                 display_name=linked_name,
                 created_by_idx=created_by,
             )
-    ctx["created"][study_field_key].extend([local_idx, linked_idx])
 
     async with ctx["pool"].acquire() as conn:
         result = await fetch_study_fields_by_display_names(
@@ -2342,8 +2326,6 @@ async def test_fetch_study_fields_by_display_names_scoped_to_study(ctx, spec):
     study: the fetch is scoped to study_idx, so the field is absent from the
     result. Empty input short-circuits to an empty dict.
     """
-    study_field_key = f"{spec.entity_kind}_study_field"
-
     # Seed a field in ctx's study, then query a freshly-seeded other study.
     field_name = unique_field_name()
     async with ctx["pool"].acquire() as conn:
@@ -2355,10 +2337,9 @@ async def test_fetch_study_fields_by_display_names_scoped_to_study(ctx, spec):
                 display_name=field_name,
                 created_by_idx=ctx["principal_idx"],
             )
-    ctx["created"][study_field_key].append(field_idx)
 
-    other_study_idx = await _seed_study(
-        ctx["pool"], ctx["principal_idx"], f"other-{secrets.token_hex(4)}"
+    other_study_idx = await seed_study(
+        ctx["pool"], owner_idx=ctx["principal_idx"], title=f"other-{secrets.token_hex(4)}"
     )
     ctx["created"]["studies"].append(other_study_idx)
 
@@ -2466,8 +2447,8 @@ async def _seed_global_field(
 
 
 async def _seed_local_study_field(ctx, *, spec, display_name: str, required: bool = False) -> int:
-    """Seed a purely-local *_study_field row via the shared seeder, track
-    for cleanup.
+    """Seed a purely-local *_study_field row via the shared seeder, return
+    its idx.
     """
     idx = await seed_local_study_field(
         ctx["pool"],
@@ -2477,7 +2458,6 @@ async def _seed_local_study_field(ctx, *, spec, display_name: str, required: boo
         created_by_idx=ctx["principal_idx"],
         required=required,
     )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
     return idx
 
 
@@ -2508,7 +2488,6 @@ async def test__get_or_create_globally_linked_study_field_creates_new_row(ctx, s
             display_name=display_name,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
 
     # First call inserts the row; created flag must report True.
     assert created is True
@@ -2570,7 +2549,6 @@ async def test__get_or_create_globally_linked_study_field_returns_existing(ctx, 
             display_name=display_name,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(first_idx)
 
     # First call inserts; second call resolves via the fallback SELECT branch.
     assert first_created is True
@@ -2650,7 +2628,6 @@ async def test__get_or_create_globally_linked_study_field_raises_on_global_misma
             display_name=display_name,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(existing_idx)
 
     # Asking for the same display_name with global_b must raise; the row
     # already binds to global_a.
@@ -2692,7 +2669,6 @@ async def test__get_or_create_local_study_field_creates_purely_local(ctx, spec):
             created_by_idx=ctx["principal_idx"],
             required=True,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
 
     # First call inserts the row; created flag reports True and the resolved
     # global_field_idx is None because the create branch always produces a
@@ -2742,7 +2718,6 @@ async def test__get_or_create_local_study_field_stores_unique_in_study(ctx, spec
             created_by_idx=ctx["principal_idx"],
             unique_in_study=True,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
 
     assert created is True
     stored = await ctx["pool"].fetchval(
@@ -2771,7 +2746,6 @@ async def test__get_or_create_local_study_field_unique_in_study_defaults_false(c
             display_name=field_name,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
 
     stored = await ctx["pool"].fetchval(
         f"SELECT unique_in_study FROM {spec.study_field_table} WHERE idx = $1",
@@ -2813,7 +2787,6 @@ async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
             display_name=field_name,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(first_idx)
 
     # First call inserts (created=True); second call resolves via the
     # fallback SELECT branch (created=False) and converges on the same idx.
@@ -2877,7 +2850,6 @@ async def test__insert_metadata_writes_typed_value(ctx, spec, data_type, value, 
             data_type=data_type,
             required=True,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(field_idx)
 
     # Insert via the shared typed inserter.
     async with ctx["pool"].acquire() as conn:
@@ -2890,7 +2862,6 @@ async def test__insert_metadata_writes_typed_value(ctx, spec, data_type, value, 
             value=value,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][f"{spec.entity_kind}_metadata"].append(meta_idx)
 
     # Full-row assert: the matching value_* column carries the value, the
     # other two typed columns are NULL. The spec drives both table name
@@ -2943,7 +2914,6 @@ async def test__insert_metadata_writes_missing_reason_value(ctx, spec):
             data_type=FieldDataType.NUMERIC,
             required=True,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(field_idx)
 
     async with ctx["pool"].acquire() as conn:
         meta_idx = await _insert_metadata(
@@ -2955,7 +2925,6 @@ async def test__insert_metadata_writes_missing_reason_value(ctx, spec):
             value=MissingReasonRef(idx=reason_idx, name="ignored_in_insert"),
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][f"{spec.entity_kind}_metadata"].append(meta_idx)
 
     # Full-row assert: missing-reason column carries the FK; every typed
     # value column is NULL.
@@ -3023,12 +2992,10 @@ async def _seed_globally_linked_metadata(
     terminology_idx: int | None = None,
 ):
     """Test helper: seed a *_global_field for the entity named by spec,
-    link a study field to it, write one metadata row of the matching
-    typed-column flavor via the shared inserter, and track the
-    *_global_field / *_study_field / *_metadata idxs for fixture cleanup.
-    Returns the global field idx for callers that want to inspect or
-    extend the row. terminology_idx is required when
-    data_type=TERMINOLOGY.
+    link a study field to it, and write one metadata row of the matching
+    typed-column flavor via the shared inserter. Returns the global field
+    idx for callers that want to inspect or extend the row.
+    terminology_idx is required when data_type=TERMINOLOGY.
     """
     # Seed the global field; *_global_field rows persist beyond the test
     # so the helper tracks them on the cleanup dict.
@@ -3064,7 +3031,7 @@ async def _seed_globally_linked_metadata(
             display_name=display_name,
             created_by_idx=ctx["principal_idx"],
         )
-        meta_idx = await _insert_metadata(
+        await _insert_metadata(
             conn,
             spec=spec,
             entity_idx=entity_idx,
@@ -3073,8 +3040,6 @@ async def _seed_globally_linked_metadata(
             value=value,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(field_idx)
-    ctx["created"][f"{spec.entity_kind}_metadata"].append(meta_idx)
     return global_idx
 
 
@@ -3211,7 +3176,7 @@ async def test_fetch_global_metadata_excludes_purely_local_rows(ctx, spec):
     local_field_idx = await _create_local_field(ctx, suffix=f"plain_{suffix}")
     owner_id_field_idx = await _create_local_field(ctx, suffix=f"owner_{suffix}")
     async with ctx["pool"].acquire() as conn:
-        local_meta = await _insert_metadata(
+        await _insert_metadata(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             entity_idx=bs_idx,
@@ -3220,14 +3185,13 @@ async def test_fetch_global_metadata_excludes_purely_local_rows(ctx, spec):
             value="LOCAL-VAL",
             created_by_idx=ctx["principal_idx"],
         )
-        owner_meta = await insert_owner_biosample_id_metadata(
+        await insert_owner_biosample_id_metadata(
             conn,
             biosample_idx=bs_idx,
             biosample_study_field_idx=owner_id_field_idx,
             value_text="OWNER-ID-VAL",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"]["biosample_metadata"].extend([local_meta, owner_meta])
 
     result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=bs_idx)
 
@@ -3251,10 +3215,10 @@ async def test_fetch_global_metadata_excludes_purely_local_rows(ctx, spec):
 
 async def _seed_local_metadata(ctx, *, spec, entity_idx, display_name, value):
     """Seed a purely-local study_field plus one TEXT metadata row for
-    entity_idx, tracking both for cleanup; returns the study_field idx."""
+    entity_idx; returns the study_field idx."""
     field_idx = await _seed_local_study_field(ctx, spec=spec, display_name=display_name)
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        meta_idx = await _insert_metadata(
+        await _insert_metadata(
             conn,
             spec=spec,
             entity_idx=entity_idx,
@@ -3263,7 +3227,6 @@ async def _seed_local_metadata(ctx, *, spec, entity_idx, display_name, value):
             value=value,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][f"{spec.entity_kind}_metadata"].append(meta_idx)
     return field_idx
 
 
@@ -3338,9 +3301,8 @@ async def test_fetch_local_metadata_scopes_to_study(ctx):
         display_name=second_name,
         created_by_idx=ctx["principal_idx"],
     )
-    ctx["created"]["biosample_study_field"].append(second_field_idx)
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        second_meta = await _insert_metadata(
+        await _insert_metadata(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             entity_idx=bs_idx,
@@ -3349,7 +3311,6 @@ async def test_fetch_local_metadata_scopes_to_study(ctx):
             value="SECOND",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"]["biosample_metadata"].append(second_meta)
 
     first_result = await fetch_local_metadata(
         ctx["pool"], spec=BIOSAMPLE_METADATA_SPEC, entity_idx=bs_idx, study_idx=ctx["study_idx"]
@@ -3382,14 +3343,13 @@ async def test_fetch_local_metadata_includes_owner_sample_id_row(ctx):
         ctx, spec=BIOSAMPLE_METADATA_SPEC, display_name=owner_field_name
     )
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        owner_meta = await insert_owner_biosample_id_metadata(
+        await insert_owner_biosample_id_metadata(
             conn,
             biosample_idx=bs_idx,
             biosample_study_field_idx=owner_field_idx,
             value_text="OWNER-123",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"]["biosample_metadata"].append(owner_meta)
 
     result = await fetch_local_metadata(
         ctx["pool"], spec=BIOSAMPLE_METADATA_SPEC, entity_idx=bs_idx, study_idx=ctx["study_idx"]
@@ -3587,7 +3547,6 @@ async def test_insert_entity_to_study_links_entity(ctx, spec):
             study_idx=ctx["study_idx"],
             created_by_idx=ctx["principal_idx"],
         )
-    _track_to_study_link(ctx, spec, entity_idx, ctx["study_idx"])
 
     # Verify the link row matches the expected non-retired shape. The
     # column list is built from the spec so the assertion stays
@@ -3624,7 +3583,6 @@ async def test_insert_entity_to_study_rejects_duplicate(ctx, spec):
             study_idx=ctx["study_idx"],
             created_by_idx=ctx["principal_idx"],
         )
-    _track_to_study_link(ctx, spec, entity_idx, ctx["study_idx"])
 
     # Second insert of the same (entity, study) pair must raise on the PK.
     async with ctx["pool"].acquire() as conn:
@@ -3660,7 +3618,6 @@ async def test_insert_entity_to_study_on_conflict_ignore_is_idempotent(ctx, spec
                 created_by_idx=ctx["principal_idx"],
                 on_conflict="ignore",
             )
-    _track_to_study_link(ctx, spec, entity_idx, ctx["study_idx"])
 
     count = await ctx["pool"].fetchval(
         f"SELECT count(*) FROM {spec.link_table}"
@@ -3736,9 +3693,6 @@ async def test_link_entity_to_studies_links_primary_and_unique_secondaries(ctx, 
                 secondary_study_idxs=[sec_a, sec_b, sec_a],
                 caller_idx=ctx["principal_idx"],
             )
-    for st in [ctx["study_idx"], sec_a, sec_b]:
-        _track_to_study_link(ctx, spec, entity_idx, st)
-
     # The persisted link set is exactly {primary, sec_a, sec_b}.
     rows = await ctx["pool"].fetch(
         f"SELECT study_idx FROM {spec.link_table} WHERE {spec.link_entity_key_column} = $1",
@@ -3766,7 +3720,6 @@ async def test_link_entity_to_studies_empty_secondaries_links_primary_only(ctx, 
                 secondary_study_idxs=[],
                 caller_idx=ctx["principal_idx"],
             )
-    _track_to_study_link(ctx, spec, entity_idx, ctx["study_idx"])
 
     rows = await ctx["pool"].fetch(
         f"SELECT study_idx FROM {spec.link_table} WHERE {spec.link_entity_key_column} = $1",
@@ -4028,33 +3981,14 @@ async def test_write_resolved_metadata_entries_writes_each_entry(ctx, spec):
         ),
     ]
 
-    # Recover the persisted rows and track each for FK-reverse cleanup;
-    # the metadata-side teardown depends on the matching study_field row
-    # being recorded too.
+    # Recover the persisted values, ordered so the comparison is deterministic.
     rows = await ctx["pool"].fetch(
-        f"SELECT m.idx AS metadata_idx, m.value_text,"
-        f" m.{spec.study_field_idx_column} AS study_field_idx"
+        "SELECT m.value_text"
         f" FROM {spec.metadata_table} m"
         f" WHERE m.{spec.entity_key_column} = $1"
         f" ORDER BY m.value_text",
         entity_idx,
     )
-    metadata_key = (
-        "biosample_metadata"
-        if spec.entity_kind is SampleEntityKind.BIOSAMPLE
-        else "prep_sample_metadata"
-    )
-    study_field_key = (
-        "biosample_study_field"
-        if spec.entity_kind is SampleEntityKind.BIOSAMPLE
-        else "prep_sample_study_field"
-    )
-    seen_field_idxs: set[int] = set()
-    for r in rows:
-        ctx["created"][metadata_key].append(r["metadata_idx"])
-        if r["study_field_idx"] not in seen_field_idxs:
-            ctx["created"][study_field_key].append(r["study_field_idx"])
-            seen_field_idxs.add(r["study_field_idx"])
 
     assert [r["value_text"] for r in rows] == ["alpha", "beta"]
 
@@ -4239,7 +4173,6 @@ async def test_preflight_sample_metadata_allow_local_partitions_global_and_local
     local field's own data_type) — mirroring input order.
     """
     study_idx = ctx["study_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
     gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
     local_name = unique_field_name()
     async with ctx["pool"].acquire() as conn, conn.transaction():
@@ -4251,7 +4184,6 @@ async def test_preflight_sample_metadata_allow_local_partitions_global_and_local
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.NUMERIC,
         )
-    ctx["created"][study_field_key].append(local_idx)
 
     # Global name first, local name second; the list preserves that order.
     metadata = {gf_row.display_name: "hi", local_name: "42"}
@@ -4314,7 +4246,6 @@ async def test_preflight_sample_metadata_allow_local_writes_alias_through(ctx, s
     written through to that global field while recording the alias row.
     """
     study_idx = ctx["study_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
     gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
     alias_name = unique_field_name()
     async with ctx["pool"].acquire() as conn, conn.transaction():
@@ -4326,7 +4257,6 @@ async def test_preflight_sample_metadata_allow_local_writes_alias_through(ctx, s
             display_name=alias_name,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][study_field_key].append(alias_idx)
 
     async with ctx["pool"].acquire() as conn:
         resolved = await preflight_sample_metadata(
@@ -4362,7 +4292,6 @@ async def test_preflight_sample_metadata_allow_local_raises_on_alias_and_global_
     from two columns is rejected with DuplicateGlobalFieldTargetError.
     """
     study_idx = ctx["study_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
     gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
     alias_name = unique_field_name()
     async with ctx["pool"].acquire() as conn, conn.transaction():
@@ -4374,7 +4303,6 @@ async def test_preflight_sample_metadata_allow_local_raises_on_alias_and_global_
             display_name=alias_name,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][study_field_key].append(alias_idx)
 
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(DuplicateGlobalFieldTargetError) as excinfo:
@@ -4401,7 +4329,6 @@ async def test_preflight_sample_metadata_allow_local_raises_on_two_aliases_same_
     DuplicateGlobalFieldTargetError even though the global's own label is absent.
     """
     study_idx = ctx["study_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
     gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
     alias_a = unique_field_name()
     alias_b = unique_field_name()
@@ -4422,7 +4349,6 @@ async def test_preflight_sample_metadata_allow_local_raises_on_two_aliases_same_
             display_name=alias_b,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][study_field_key].extend([a_idx, b_idx])
 
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(DuplicateGlobalFieldTargetError) as excinfo:
@@ -4449,7 +4375,6 @@ async def test_preflight_sample_metadata_allow_local_routes_missing_marker(ctx, 
     MissingReasonRef.
     """
     study_idx = ctx["study_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
     local_name = unique_field_name()
     async with ctx["pool"].acquire() as conn, conn.transaction():
         local_idx, _, _ = await _get_or_create_local_study_field(
@@ -4460,7 +4385,6 @@ async def test_preflight_sample_metadata_allow_local_routes_missing_marker(ctx, 
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.NUMERIC,
         )
-    ctx["created"][study_field_key].append(local_idx)
     suffix = secrets.token_hex(4)
     reason_name = f"mv_marker_{suffix}"
     reason_idx = await _seed_missing_value_reason(ctx, reason_name)
@@ -4499,7 +4423,6 @@ async def test_preflight_sample_metadata_allow_local_raises_on_purely_local_shad
     column is rejected with StudyFieldConflictError.
     """
     study_idx = ctx["study_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
     gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
     # A purely-local study field sharing the global field's display_name.
     async with ctx["pool"].acquire() as conn, conn.transaction():
@@ -4511,7 +4434,6 @@ async def test_preflight_sample_metadata_allow_local_raises_on_purely_local_shad
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.TEXT,
         )
-    ctx["created"][study_field_key].append(local_idx)
 
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(StudyFieldConflictError) as excinfo:
@@ -4539,7 +4461,6 @@ async def test_preflight_sample_metadata_allow_local_raises_on_different_global_
     with StudyFieldConflictError naming both global idxs.
     """
     study_idx = ctx["study_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
     gf_target = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
     gf_other = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
     # A study field sharing gf_target's display_name but linked to gf_other.
@@ -4552,7 +4473,6 @@ async def test_preflight_sample_metadata_allow_local_raises_on_different_global_
             display_name=gf_target.display_name,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][study_field_key].append(shadow_idx)
 
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(StudyFieldConflictError) as excinfo:
@@ -4579,7 +4499,6 @@ async def test_preflight_sample_metadata_allow_local_same_global_puppet_resolves
     same global field): the value resolves normally at global scope.
     """
     study_idx = ctx["study_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
     gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
     async with ctx["pool"].acquire() as conn, conn.transaction():
         puppet_idx, _ = await _get_or_create_globally_linked_study_field(
@@ -4590,7 +4509,6 @@ async def test_preflight_sample_metadata_allow_local_same_global_puppet_resolves
             display_name=gf_row.display_name,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][study_field_key].append(puppet_idx)
 
     async with ctx["pool"].acquire() as conn:
         resolved = await preflight_sample_metadata(
@@ -4647,7 +4565,6 @@ async def test_preflight_sample_metadata_global_internal_names_falls_through_to_
     internal_name falls through to an existing study-local field by display_name.
     """
     study_idx = ctx["study_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
     internal_name = f"gf_int_{secrets.token_hex(4)}"
     gf_row = await _seed_global_field_for_spec(
         ctx, spec, FieldDataType.TEXT, internal_name=internal_name
@@ -4662,7 +4579,6 @@ async def test_preflight_sample_metadata_global_internal_names_falls_through_to_
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.NUMERIC,
         )
-    ctx["created"][study_field_key].append(local_idx)
 
     # Global internal_name first, local display_name second; order preserved.
     metadata = {internal_name: "hi", local_name: "42"}
@@ -4729,7 +4645,6 @@ async def test_preflight_sample_metadata_global_internal_names_suppresses_shadow
     no misroute), whereas plain display-name resolution routes to the other global.
     """
     study_idx = ctx["study_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
     collide = f"collide_{secrets.token_hex(4)}"
     # The global whose internal_name is the colliding token.
     gf_internal = await _seed_global_field_for_spec(
@@ -4746,7 +4661,6 @@ async def test_preflight_sample_metadata_global_internal_names_suppresses_shadow
             display_name=collide,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][study_field_key].append(alias_idx)
 
     # Flag on: the internal-name match wins, resolving to the internal global.
     async with ctx["pool"].acquire() as conn:
@@ -4792,7 +4706,6 @@ async def test_preflight_sample_metadata_global_internal_names_duplicate_target(
     to it, which is rejected with DuplicateGlobalFieldTargetError.
     """
     study_idx = ctx["study_idx"]
-    study_field_key = f"{spec.entity_kind}_study_field"
     internal_name = f"gf_int_{secrets.token_hex(4)}"
     gf_row = await _seed_global_field_for_spec(
         ctx, spec, FieldDataType.TEXT, internal_name=internal_name
@@ -4807,7 +4720,6 @@ async def test_preflight_sample_metadata_global_internal_names_duplicate_target(
             display_name=alias_name,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][study_field_key].append(alias_idx)
 
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(DuplicateGlobalFieldTargetError) as excinfo:
@@ -4845,7 +4757,6 @@ async def test_write_resolved_metadata_entries_persists_local(ctx):
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.TEXT,
         )
-    ctx["created"]["biosample_study_field"].append(local_idx)
 
     # The field is pre-resolved: the local-scope entry writes to local_idx
     # directly and must not create a study_field.
@@ -4883,7 +4794,6 @@ async def test_write_resolved_metadata_entries_persists_local(ctx):
         bs_idx,
         local_idx,
     )
-    ctx["created"]["biosample_metadata"].append(metadata_idx)
     actual = await _fetch_metadata_row(ctx["pool"], metadata_idx)
     # A purely-local write leaves global_field_idx NULL (no global link).
     expected = _expected_metadata_row(
@@ -4933,7 +4843,6 @@ async def test__insert_metadata_writes_terminology_term_value(ctx, spec):
             required=True,
             terminology_idx=terminology_idx,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(field_idx)
 
     async with ctx["pool"].acquire() as conn:
         meta_idx = await _insert_metadata(
@@ -4949,7 +4858,6 @@ async def test__insert_metadata_writes_terminology_term_value(ctx, spec):
             ),
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][f"{spec.entity_kind}_metadata"].append(meta_idx)
 
     # Full-row assert: value_terminology_term_idx carries the FK; every
     # other typed value_* column is NULL.
@@ -5284,21 +5192,6 @@ async def test_fetch_global_metadata_surfaces_terminology_term_rows(ctx, spec, m
 # ---------------------------------------------------------------------------
 
 
-async def _track_entity_metadata_and_fields(ctx, spec, entity_idx):
-    """Track every metadata row (and its source study_field) the entity
-    carries so FK-reverse teardown sweeps whatever write_sample_metadata
-    created. Duplicate study_field idxs are harmless — the delete is by ANY().
-    """
-    rows = await ctx["pool"].fetch(
-        f"SELECT idx, {spec.study_field_idx_column} AS study_field_idx"
-        f" FROM {spec.metadata_table} WHERE {spec.entity_key_column} = $1",
-        entity_idx,
-    )
-    for r in rows:
-        ctx["created"][f"{spec.entity_kind}_metadata"].append(r["idx"])
-        ctx["created"][f"{spec.entity_kind}_study_field"].append(r["study_field_idx"])
-
-
 async def test_write_sample_metadata_writes_global_and_local(ctx):
     """Tests the case where allow_local is True and metadata names both a
     global field and an existing purely-local study field: one globally-linked
@@ -5316,7 +5209,6 @@ async def test_write_sample_metadata_writes_global_and_local(ctx):
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.TEXT,
         )
-    ctx["created"]["biosample_study_field"].append(local_idx)
 
     async with ctx["pool"].acquire() as conn, conn.transaction():
         results = await write_sample_metadata(
@@ -5328,7 +5220,6 @@ async def test_write_sample_metadata_writes_global_and_local(ctx):
             caller_idx=ctx["principal_idx"],
             allow_local=True,
         )
-    await _track_entity_metadata_and_fields(ctx, BIOSAMPLE_METADATA_SPEC, entity_idx)
 
     # Per-field results come back in the caller's metadata key order: the
     # global field first, the local field second, each scoped and INSERTED.
@@ -5387,7 +5278,6 @@ async def test_write_sample_metadata_upsert_reports_outcomes(ctx):
     inserted = await _upsert("v1")
     updated = await _upsert("v2")
     unchanged = await _upsert("v2")
-    await _track_entity_metadata_and_fields(ctx, BIOSAMPLE_METADATA_SPEC, entity_idx)
 
     assert inserted == [
         SampleMetadataFieldResult(
@@ -5462,7 +5352,6 @@ async def test_write_sample_metadata_upsert_numeric_compares_stored_form(
 
     await _upsert(first_text)
     second = await _upsert(second_text)
-    await _track_entity_metadata_and_fields(ctx, spec, entity_idx)
 
     # The result is compared with its value rendered rather than as a Decimal:
     # Decimal equality cannot see scale, and NaN is not even equal to itself,
@@ -5502,7 +5391,6 @@ async def test_write_sample_metadata_global_internal_names_echoes_caller_key(ctx
             allow_local=False,
             global_internal_names=True,
         )
-    await _track_entity_metadata_and_fields(ctx, BIOSAMPLE_METADATA_SPEC, entity_idx)
 
     # The result key is the caller's internal_name, not the display_name.
     assert results == [
@@ -5537,14 +5425,13 @@ async def test_write_sample_metadata_rejects_owner_sample_id_field(ctx):
         ctx, spec=BIOSAMPLE_METADATA_SPEC, display_name=owner_field_name
     )
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        owner_meta = await insert_owner_biosample_id_metadata(
+        await insert_owner_biosample_id_metadata(
             conn,
             biosample_idx=bs_idx,
             biosample_study_field_idx=owner_field_idx,
             value_text="OWNER-123",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"]["biosample_metadata"].append(owner_meta)
 
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(OwnerSampleIdMetadataWriteError) as excinfo:
@@ -5585,7 +5472,6 @@ async def test_write_sample_metadata_global_only_writes_entry(ctx, spec):
             caller_idx=ctx["principal_idx"],
             allow_local=False,
         )
-    await _track_entity_metadata_and_fields(ctx, spec, entity_idx)
 
     rows = await ctx["pool"].fetch(
         f"SELECT value_text, global_field_idx FROM {spec.metadata_table}"
@@ -5611,7 +5497,6 @@ async def test_write_sample_metadata_allow_local_false_rejects_local_field(ctx):
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.TEXT,
         )
-    ctx["created"]["biosample_study_field"].append(local_idx)
 
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(MetadataUnknownFieldsError) as excinfo:
@@ -5680,7 +5565,6 @@ async def test_write_sample_metadata_resolves_missing_reason(ctx, spec):
             caller_idx=ctx["principal_idx"],
             allow_local=True,
         )
-    await _track_entity_metadata_and_fields(ctx, spec, entity_idx)
 
     row = await ctx["pool"].fetchrow(
         f"SELECT value_text, value_missing_reason_idx FROM {spec.metadata_table}"
@@ -6278,7 +6162,6 @@ async def test_create_study_field_local(ctx, spec):
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.NUMERIC,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
 
     actual = await _fetch_raw_study_field(ctx, spec=spec, idx=idx)
     expected = {
@@ -6324,7 +6207,6 @@ async def test_create_study_field_globally_linked(ctx, spec):
             global_field_idx=global_idx,
             description="linked field",
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
 
     actual = await _fetch_raw_study_field(ctx, spec=spec, idx=idx)
     expected = {
@@ -6384,6 +6266,8 @@ async def test_create_study_field_raise_already_exists_local(ctx, spec):
     """
     display_name = f"Dup Local {secrets.token_hex(4)}"
     existing_idx = await _seed_local_study_field(ctx, spec=spec, display_name=display_name)
+    existing_row_sql = f"SELECT * FROM {spec.study_field_table} WHERE idx = $1"
+    before = await ctx["pool"].fetchrow(existing_row_sql, existing_idx)
 
     async with ctx["pool"].acquire() as conn, conn.transaction():
         with pytest.raises(StudyFieldAlreadyExistsError) as excinfo:
@@ -6399,7 +6283,8 @@ async def test_create_study_field_raise_already_exists_local(ctx, spec):
     assert excinfo.value.study_idx == ctx["study_idx"]
     assert excinfo.value.display_name == display_name
     # The raise left the pre-existing row untouched.
-    assert existing_idx in ctx["created"][f"{spec.entity_kind}_study_field"]
+    after = await ctx["pool"].fetchrow(existing_row_sql, existing_idx)
+    assert dict(after) == dict(before)
 
 
 @pytest.mark.parametrize(
@@ -6424,7 +6309,7 @@ async def test_create_study_field_raise_already_exists_linked(ctx, spec):
         data_type=FieldDataType.TEXT,
     )
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        first_idx = await create_study_field(
+        await create_study_field(
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
@@ -6432,7 +6317,6 @@ async def test_create_study_field_raise_already_exists_linked(ctx, spec):
             created_by_idx=ctx["principal_idx"],
             global_field_idx=global_idx,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(first_idx)
 
     async with ctx["pool"].acquire() as conn, conn.transaction():
         with pytest.raises(StudyFieldAlreadyExistsError):
@@ -6473,7 +6357,7 @@ async def test_create_study_field_raise_conflict_on_different_global(ctx, spec):
         data_type=FieldDataType.TEXT,
     )
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        first_idx = await create_study_field(
+        await create_study_field(
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
@@ -6481,7 +6365,6 @@ async def test_create_study_field_raise_conflict_on_different_global(ctx, spec):
             created_by_idx=ctx["principal_idx"],
             global_field_idx=global_a,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(first_idx)
 
     async with ctx["pool"].acquire() as conn, conn.transaction():
         with pytest.raises(StudyFieldConflictError) as excinfo:
@@ -6555,7 +6438,6 @@ async def test_fetch_study_field_local(ctx, spec):
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.NUMERIC,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
 
     row = await fetch_study_field(ctx["pool"], spec=spec, idx=idx)
     expected = {
@@ -6605,7 +6487,6 @@ async def test_fetch_study_field_globally_linked_inherits(ctx, spec):
             created_by_idx=ctx["principal_idx"],
             global_field_idx=global_idx,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
 
     row = await fetch_study_field(ctx["pool"], spec=spec, idx=idx)
     expected = {
@@ -6688,7 +6569,6 @@ async def test_create_study_field_and_read_back_globally_linked(ctx, spec):
             global_field_idx=global_idx,
             description="linked",
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(record["idx"])
 
     expected = {
         # Auto-generated; copy actual into expected so the equality confirms
@@ -6753,7 +6633,6 @@ async def test_fetch_study_fields_for_study_orders_and_resolves(ctx, spec):
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.TEXT,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].extend([linked_idx, local_idx])
 
     rows = await fetch_study_fields_for_study(ctx["pool"], spec=spec, study_idx=ctx["study_idx"])
     expected = [
@@ -6816,7 +6695,7 @@ async def test_fetch_study_fields_for_study_scoped_to_study(ctx, spec):
     """
     display_name = f"Scoped {secrets.token_hex(4)}"
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        idx = await create_study_field(
+        await create_study_field(
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
@@ -6824,7 +6703,6 @@ async def test_fetch_study_fields_for_study_scoped_to_study(ctx, spec):
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.TEXT,
         )
-    ctx["created"][f"{spec.entity_kind}_study_field"].append(idx)
 
     other_study_idx = await ctx["pool"].fetchval(
         "SELECT COALESCE(MAX(idx), 0) + 100000 FROM qiita.study"

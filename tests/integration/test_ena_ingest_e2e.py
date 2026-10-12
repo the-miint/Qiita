@@ -25,6 +25,7 @@ import pytest
 import yaml
 from qiita_common.actions import ActionDefinition, WorkflowAction
 from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 from conftest import ducklake_connect
 
@@ -161,8 +162,7 @@ async def _run_register_files(
 @pytest.fixture
 async def two_ena_prep_samples(postgres_pool, human_admin_session):
     """Two sequenced prep_samples (distinct biosamples), one paired-end, one
-    single-end. `qiita.sequence_range` rows cascade off `prep_sample` deletion
-    (ON DELETE CASCADE), so the minted ranges need no separate cleanup."""
+    single-end."""
     from qiita_control_plane.testing.db_seeds import (
         seed_biosample_with_sequenced_prep_sample,
     )
@@ -175,13 +175,11 @@ async def two_ena_prep_samples(postgres_pool, human_admin_session):
         postgres_pool, owner_idx=admin_idx
     )
     yield {"paired": prep_paired, "single": prep_single}
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1)",
-        [prep_paired, prep_single],
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1)",
-        [biosample_paired, biosample_single],
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_paired, biosample_single],
+        prep_sample_idxs=[prep_paired, prep_single],
     )
 
 

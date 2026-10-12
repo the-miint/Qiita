@@ -87,7 +87,7 @@ Deployment shape, monorepo tree, Makefile targets, GitHub Actions.
 
 ### [Wiring and Cross-cutting Structure](architecture/cross-cutting.md)
 
-Wiring notes, component map and ports, identifier ownership, data-plane design, the runner.
+Wiring notes, component map and ports, identifier ownership, public handle prefixes, data-plane design, the runner.
 
 - [Wiring Notes](architecture/cross-cutting.md#wiring-notes)
 - [Cross-cutting structure](architecture/cross-cutting.md#cross-cutting-structure)

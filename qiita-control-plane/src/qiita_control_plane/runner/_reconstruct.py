@@ -100,7 +100,8 @@ def _attempt_is_unowned(
     prior process owns the dir, so it is NOT unowned (return False; leave the dir
     alone). No such row means the attempt is unowned: either a first dispatch
     (dir absent — the caller just mkdirs it) or a re-run whose row was
-    deliberately dropped (a `/run` redrive clearing dead rows, or `update-lane`
+    deliberately dropped (a `/run` redrive clearing dead rows, a download-ticket
+    redrive clearing completed ones, or `update-lane`
     invalidating a completed prep row). In the re-run case the prior attempt left
     stale, read-only (0o440) output + manifest on disk that must not be reused;
     the caller advances to a fresh attempt dir rather than deleting it (the

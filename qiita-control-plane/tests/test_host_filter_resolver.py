@@ -39,6 +39,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_host_reference,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -119,9 +120,7 @@ async def ctx(postgres_pool):
     # SECOND study (the cross-study uniqueness test); the auto-seeded pair above
     # is torn down separately at the end.
     created: dict[str, list[int]] = {
-        "biosample_metadata": [],
         "biosample": [],
-        "biosample_study_field": [],
         "studies": [],
     }
     state = {
@@ -137,23 +136,12 @@ async def ctx(postgres_pool):
     }
     yield state
 
-    # FK-reverse teardown.
-    await pool.execute(
-        "DELETE FROM qiita.biosample_metadata WHERE idx = ANY($1::bigint[])",
-        created["biosample_metadata"],
+    await teardown_entity_graph(
+        pool,
+        study_idxs=[study_idx, *created["studies"]],
+        biosample_idxs=created["biosample"],
+        prep_sample_idxs=[],
     )
-    await pool.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = ANY($1::bigint[])",
-        created["biosample"],
-    )
-    await pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", created["biosample"]
-    )
-    await pool.execute(
-        "DELETE FROM qiita.biosample_study_field WHERE idx = ANY($1::bigint[])",
-        created["biosample_study_field"],
-    )
-    await pool.execute("DELETE FROM qiita.biosample_study_field WHERE idx = $1", field_idx)
     await pool.execute(
         "DELETE FROM qiita.host_filter_profile WHERE created_by_idx = $1", principal_idx
     )
@@ -161,10 +149,7 @@ async def ctx(postgres_pool):
         "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
         [rype_idx, minimap2_idx],
     )
-    await pool.execute("DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", created["studies"])
-    await pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
-    await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_principal(pool, [principal_idx])
 
 
 async def _make_biosample(ctx):
@@ -188,34 +173,32 @@ async def _make_biosample(ctx):
 
 async def _set_host_term(ctx, biosample_idx, term_idx):
     """Write host_taxon_id as a terminology term on the biosample."""
-    meta_idx = await ctx["pool"].fetchval(
+    await ctx["pool"].execute(
         "INSERT INTO qiita.biosample_metadata"
         " (biosample_idx, biosample_study_field_idx, value_terminology_term_idx,"
         "  created_by_idx)"
-        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        " VALUES ($1, $2, $3, $4)",
         biosample_idx,
         ctx["field_idx"],
         term_idx,
         ctx["principal_idx"],
     )
-    ctx["created"]["biosample_metadata"].append(meta_idx)
 
 
 async def _set_host_missing_reason(ctx, biosample_idx, reason_name):
     """Write host_taxon_id as a missing-reason on the biosample."""
     reason_idx = await fetch_missing_value_reason_idx(ctx["pool"], reason_name)
     assert reason_idx is not None, f"missing_value_reason {reason_name!r} should be seeded"
-    meta_idx = await ctx["pool"].fetchval(
+    await ctx["pool"].execute(
         "INSERT INTO qiita.biosample_metadata"
         " (biosample_idx, biosample_study_field_idx, value_missing_reason_idx,"
         "  created_by_idx)"
-        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        " VALUES ($1, $2, $3, $4)",
         biosample_idx,
         ctx["field_idx"],
         reason_idx,
         ctx["principal_idx"],
     )
-    ctx["created"]["biosample_metadata"].append(meta_idx)
 
 
 # ---------------------------------------------------------------------------
@@ -442,11 +425,10 @@ async def test_prep_sample_expected_empty_control_end_to_end(ctx):
         # A prep_sample_idx that doesn't exist → fail-safe False.
         assert await _prep_sample_is_expected_empty_control(pool, 9_999_999_999) is False
     finally:
-        # Delete the prep_samples so the fixture's biosample teardown (ON DELETE
+        # Clear the prep_samples so the fixture's biosample teardown (ON DELETE
         # RESTRICT) isn't blocked.
-        await pool.execute(
-            "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])",
-            [control_ps, data_ps],
+        await teardown_entity_graph(
+            pool, study_idxs=[], biosample_idxs=[], prep_sample_idxs=[control_ps, data_ps]
         )
 
 
@@ -501,7 +483,6 @@ async def test_a_biosample_cannot_carry_two_host_taxon_id_values(ctx):
             study_idx=other_study_idx,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"]["biosample_study_field"].append(other_field_idx)
 
     # Same biosample, same global field, DIFFERENT study field — rejected.
     with pytest.raises(asyncpg.UniqueViolationError):

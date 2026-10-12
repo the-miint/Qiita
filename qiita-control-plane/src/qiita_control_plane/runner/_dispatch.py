@@ -381,13 +381,30 @@ def _terminal_attempts_exhausted_failure(
     every reconcile would buy another submit. Fail with the budget's own verdict
     instead."""
     return BackendFailure(
-        kind=FailureKind.UNKNOWN_PERMANENT,
+        kind=FailureKind.RETRIES_EXHAUSTED,
         stage=WorkTicketFailureStage.STEP_RUN,
         step_name=entry.name,
         reason=(
-            f"every prior attempt of step {entry.name!r} is terminal and the retry "
-            f"budget is spent ({retry_count}/{max_retries}); not submitting a fresh "
-            "attempt. Redrive with /run once the underlying cause is fixed."
+            f"{FailureKind.RETRIES_EXHAUSTED.value} ({retry_count}/{max_retries}); "
+            f"every prior attempt of step {entry.name!r} is terminal; not submitting "
+            "a fresh attempt. Redrive with /run once the underlying cause is fixed."
+        ),
+    )
+
+
+def _retries_exhausted_failure(
+    cause: BackendFailure, *, retry_count: int, max_retries: int
+) -> BackendFailure:
+    """Build the permanent ``RETRIES_EXHAUSTED`` failure raised when a transient
+    failure arrives with the retry budget spent. The reason leads with the kind
+    (it is not a stored column) and keeps the last failure's kind and reason."""
+    return BackendFailure(
+        kind=FailureKind.RETRIES_EXHAUSTED,
+        stage=cause.stage,
+        step_name=cause.step_name,
+        reason=(
+            f"{FailureKind.RETRIES_EXHAUSTED.value} ({retry_count}/{max_retries}); "
+            f"last failure [{cause.kind.value}]: {cause.reason}"
         ),
     )
 

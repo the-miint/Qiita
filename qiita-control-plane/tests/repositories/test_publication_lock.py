@@ -42,7 +42,7 @@ pytestmark = pytest.mark.db
 
 
 # ---------------------------------------------------------------------------
-# Seed helper (committed; cleanup via the ctx fixture's FK-reverse sweep)
+# Seed helper (committed; cleanup via the ctx fixture's entity sweep)
 # ---------------------------------------------------------------------------
 
 
@@ -68,7 +68,6 @@ async def _seed_prep(ctx, *, publish=False):
         ctx["study_idx"],
         ctx["principal_idx"],
     )
-    ctx["created"]["biosample_to_study"].append((biosample_idx, ctx["study_idx"]))
     # The minimal sequenced_sample subtype row, no pool linkage so the
     # co-populated pool/pool_item_id pair stays NULL/NULL.
     sequenced_sample_idx = await pool.fetchval(
@@ -77,7 +76,6 @@ async def _seed_prep(ctx, *, publish=False):
         prep_sample_idx,
         ctx["principal_idx"],
     )
-    ctx["created"]["sequenced_sample"].append(sequenced_sample_idx)
     await pool.execute(
         "INSERT INTO qiita.prep_sample_to_study"
         " (prep_sample_idx, study_idx, created_by_idx) VALUES ($1, $2, $3)",
@@ -85,7 +83,6 @@ async def _seed_prep(ctx, *, publish=False):
         ctx["study_idx"],
         ctx["principal_idx"],
     )
-    ctx["created"]["prep_sample_to_study"].append((prep_sample_idx, ctx["study_idx"]))
 
     if publish:
         # The publish action: FALSE -> TRUE on the link. OLD.is_published
@@ -245,7 +242,6 @@ async def test_published_prep_does_not_freeze_sibling_prep(ctx):
         ctx["study_idx"],
         ctx["principal_idx"],
     )
-    ctx["created"]["prep_sample_to_study"].append((sibling_prep_idx, ctx["study_idx"]))
 
     # The biosample is frozen — it reaches the published prep.
     with pytest.raises(asyncpg.RaiseError, match="biosample .* is referenced by a published"):

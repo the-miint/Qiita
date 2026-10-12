@@ -1,18 +1,21 @@
 """Control plane FastAPI application."""
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import asyncpg
 from fastapi import Depends, FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import (
     get_redoc_html,
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
 )
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from qiita_common.log import configure_logging, install_authorization_scrub
 from qiita_common.models import HealthResponse, HealthStatus
@@ -177,6 +180,23 @@ app = FastAPI(
     redoc_url=None,
 )
 app.include_router(api_router)
+
+# A 422 echoes each offending value back as `input`, which helps for a bad
+# field and is wrong for an oversized list: a bulk request over its row cap
+# would come back at its own size. Same response as FastAPI's default handler,
+# minus any `input` larger than this.
+_MAX_ECHOED_INPUT_BYTES = 1024
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    errors = jsonable_encoder(exc.errors())
+    for error in errors:
+        if "input" in error and len(json.dumps(error["input"])) > _MAX_ECHOED_INPUT_BYTES:
+            del error["input"]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
 app.include_router(landing_router)
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 

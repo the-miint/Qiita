@@ -262,6 +262,47 @@ class SequencedPoolListResponse(BaseModel):
     truncated: bool = False
 
 
+class StudySequencedPoolSummary(BaseModel):
+    """One sequenced_pool a study's samples sit in, as carried in
+    StudySequencedPoolListResponse.
+
+    `sample_count` is how many of *this study's* active sequenced_samples fall in
+    the pool (not the pool's full size — a pool can hold samples from other
+    studies). `instrument_model` comes from the pool's run and is None when unset.
+    `run_preflight_filename` is deliberately NOT surfaced here: it is run-level
+    operator metadata the run-first pool list gates behind run ownership, so a
+    study viewer (who may not own the run, and whose pool can hold other studies'
+    samples) does not see it. No read-metric rollup, matching SequencedPoolSummary:
+    a per-pool aggregate would make the list cost a scan.
+    """
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    instrument_model: str | None
+    sample_count: Annotated[int, Field(ge=0)]
+    created_at: AwareDatetime
+
+
+class StudySequencedPoolListResponse(BaseModel):
+    """Returned by GET /api/v1/study/{study_idx}/sequenced-pool.
+
+    The distinct sequenced_pools reachable from a study's active sequenced_samples
+    (newest run/pool first), capped at the route's hard limit; `truncated` is True
+    when the study spans more pools than the page. `study_idx` is echoed so a
+    stored response is self-describing.
+
+    The pool routes are otherwise run-first — a `sequenced_pool_idx` is obtainable
+    only by already knowing its run. This is the study-first join that makes a
+    study's pools (and the pool-scoped processing routes behind them) reachable
+    without walking the run.
+    """
+
+    study_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool: list[StudySequencedPoolSummary]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool = False
+
+
 class SampleQCReport(BaseModel):
     """One pool member's persisted QC reports, as carried in PoolQCReport.samples.
 

@@ -25,6 +25,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
 )
 
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
 _CHUNK_BP = 4_096
 
 # name -> (length, [(run, kind, bin_id, circularity)])
@@ -161,32 +163,21 @@ async def seeded(postgres_pool, human_admin_session, regular_user_session, data_
         "sequences": sequences,
     }
 
-    await db.execute(
-        "DELETE FROM qiita.assembly_membership WHERE processing_idx = ANY($1::bigint[])",
-        list(runs.values()),
+    await teardown_entity_graph(
+        db,
+        study_idxs=[study_idx],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[prep_sample_idx],
     )
-    await db.execute(
-        "DELETE FROM qiita.assembly_sample WHERE processing_idx = ANY($1::bigint[])",
-        list(runs.values()),
-    )
+    # The assembly rows naming these processing runs went with the sweep.
     await db.execute(
         "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])",
         list(runs.values()),
     )
     await db.execute(
-        "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
-    )
-    await db.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
-    )
-    await db.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-    await db.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-    await db.execute(
         "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])",
         list(features.values()),
     )
-    await db.execute("DELETE FROM qiita.study_access WHERE study_idx = $1", study_idx)
-    await db.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
 
 
 def _fasta(path) -> list[tuple[str, str]]:

@@ -15,7 +15,7 @@ Hello,
 No other work tickets of yours are still active.
 {% endif %}
 {% if held_total %}
-{{ held_total }} held after exhausting infrastructure retries — redrive with `qiita ticket run <idx>`.
+{{ held_total }} held after an infrastructure failure — redrive with `qiita ticket run <idx>`.
 {% endif %}
 
 Details:

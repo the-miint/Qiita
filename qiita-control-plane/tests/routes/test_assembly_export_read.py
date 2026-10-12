@@ -38,6 +38,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -176,38 +177,21 @@ async def export(postgres_pool, regular_user_session):
         "pool_idx": pool_idx,
     }
 
-    runs = [p, q]
-    await db.execute(
-        "DELETE FROM qiita.assembly_membership WHERE processing_idx = ANY($1::bigint[])", runs
+    await teardown_entity_graph(
+        db,
+        study_idxs=[viewed, other],
+        biosample_idxs=list(biosamples.values()),
+        prep_sample_idxs=list(samples.values()),
     )
     await db.execute(
-        "DELETE FROM qiita.assembly_sample WHERE processing_idx = ANY($1::bigint[])", runs
+        "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])", [p, q]
     )
-    await db.execute("DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])", runs)
-    await db.execute("DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = $1", samples["a"])
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
     await db.execute(
-        "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = ANY($1::bigint[])",
-        [viewed, other],
-    )
-    await db.execute(
-        "DELETE FROM qiita.biosample_to_study WHERE study_idx = ANY($1::bigint[])",
-        [viewed, other],
-    )
-    await db.execute("DELETE FROM qiita.study_access WHERE study_idx = $1", viewed)
-    await db.execute("DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", [viewed, other])
-    await db.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", list(samples.values())
-    )
-    await db.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", list(biosamples.values())
-    )
-    await db.execute(
         "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", list(features.values())
     )
-    await db.execute("DELETE FROM qiita.user WHERE principal_idx = $1", owner)
-    await db.execute("DELETE FROM qiita.principal WHERE idx = $1", owner)
+    await delete_principal(db, owner)
 
 
 def _membership_url(prep_sample_idx: int, processing_idx: int, *, parquet: bool = False) -> str:

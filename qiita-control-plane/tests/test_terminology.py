@@ -28,6 +28,7 @@ from qiita_control_plane.repositories.terminology import (
     fetch_terminology,
 )
 from qiita_control_plane.terminology import (
+    _TERMS_SOURCE_NAME,
     CLOSURE_TSV_COLUMNS,
     CLOSURE_TSV_FILENAME,
     MANIFEST_FILENAME,
@@ -713,9 +714,12 @@ def test__parse_terms_tsv_duplicate_term_id_over_cap(tmp_path):
     with pytest.raises(ValueError) as excinfo:
         _parse_terms_tsv(path)
 
-    message = str(excinfo.value)
-    assert f"{over_cap_count} total, first {MAX_REPORTED_OFFENDERS}" in message
-    assert term_ids[-1] not in message
+    expected_message = (
+        f"{_TERMS_SOURCE_NAME} at {path} carries duplicate term_id(s)"
+        f" {over_cap_count} total, first {MAX_REPORTED_OFFENDERS}:"
+        f" {term_ids[:MAX_REPORTED_OFFENDERS]!r}"
+    )
+    assert str(excinfo.value) == expected_message
 
 
 def test_write_closure_tsv_stub(tmp_path):

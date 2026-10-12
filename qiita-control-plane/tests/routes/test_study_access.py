@@ -22,8 +22,9 @@ from qiita_common.models import Tier
 
 from qiita_control_plane.routes.study_access import _MSG_ACCOUNT_INACTIVE, _MSG_CONCURRENT
 from qiita_control_plane.testing.db_seeds import seed_user_principal
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
-from .conftest import _grant_study_access, _seed_study, delete_idxs
+from .conftest import _grant_study_access, _seed_study
 
 pytestmark = pytest.mark.db
 
@@ -32,21 +33,17 @@ _PREFIX = "sa-route"
 
 @pytest_asyncio.fixture
 async def ctx(role_keyed_clients):
-    created: dict = {"study_access": [], "study": [], "user_principals": []}
+    created: dict = {"study": [], "user_principals": []}
     yield {**role_keyed_clients, "created": created}
     await _cleanup(role_keyed_clients["pool"], created)
 
 
 async def _cleanup(pool, created: dict) -> None:
-    """study_access → the study_access_* auth_events on these studies → study →
+    """The study_access_* auth_events on these studies → the study graph →
     seeded principals. auth_event is append-only (a BEFORE DELETE trigger raises),
     so the trigger is disabled around the one DELETE and re-enabled after."""
     studies = created["study"]
     async with pool.acquire() as conn, conn.transaction():
-        if studies:
-            await conn.execute(
-                "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])", studies
-            )
         await conn.execute("ALTER TABLE qiita.auth_event DISABLE TRIGGER auth_event_no_delete")
         try:
             await conn.execute(
@@ -59,13 +56,8 @@ async def _cleanup(pool, created: dict) -> None:
             )
         finally:
             await conn.execute("ALTER TABLE qiita.auth_event ENABLE TRIGGER auth_event_no_delete")
-    await delete_idxs(pool, "study", studies)
-    if created["user_principals"]:
-        await pool.execute(
-            "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
-            created["user_principals"],
-        )
-    await delete_idxs(pool, "principal", created["user_principals"])
+    await teardown_entity_graph(pool, study_idxs=studies, biosample_idxs=[], prep_sample_idxs=[])
+    await delete_principal(pool, created["user_principals"])
 
 
 async def _seed_person(ctx, suffix: str, **kwargs) -> tuple[int, str]:

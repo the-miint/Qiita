@@ -37,6 +37,11 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import (
+    delete_idxs,
+    delete_principal,
+    teardown_entity_graph,
+)
 
 
 def _step(name: str, params: dict | None = None) -> WorkflowStep:
@@ -75,8 +80,8 @@ def test_workflow_needs_mask_false_without_mask_param():
 @pytest_asyncio.fixture
 async def seeded(postgres_pool):
     """Seed principal + biosample + sequenced prep_sample + sequenced_sample
-    subtype; yield the ids plus `adapter_reference(sequences)`, and clean up
-    FK-reverse. Adapter references go through the tracker so the principal
+    subtype; yield the ids plus `adapter_reference(sequences)`. The entities go
+    to the sweep; adapter references go through the tracker so the principal
     cleanup below is not blocked by reference.created_by_idx (ON DELETE
     RESTRICT)."""
     principal_idx = await seed_user_principal(postgres_pool, prefix="mask-mint", suffix="owner")
@@ -109,13 +114,15 @@ async def seeded(postgres_pool):
     }
     for reference_idx in references:
         await delete_reference_with_sequences(postgres_pool, reference_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[prep_sample_idx],
+    )
+    await delete_idxs(postgres_pool, "sequenced_pool", pool_idx)
+    await delete_idxs(postgres_pool, "sequencing_run", run_idx)
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 @pytest.mark.db

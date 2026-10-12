@@ -27,6 +27,7 @@ import asyncpg
 import pytest
 
 from qiita_control_plane.testing.db_seeds import seed_user_principal
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -173,9 +174,10 @@ async def scaffold(postgres_pool):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx
     )
-    await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await teardown_entity_graph(
+        postgres_pool, study_idxs=[study_idx], biosample_idxs=[], prep_sample_idxs=[]
+    )
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 async def test_distinct_shards_coexist_in_flight(scaffold):

@@ -37,6 +37,11 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import (
+    delete_idxs,
+    delete_principal,
+    teardown_entity_graph,
+)
 from qiita_control_plane.testing.unique_names import unique_ena_accession
 
 pytestmark = pytest.mark.db
@@ -61,21 +66,13 @@ async def eib(postgres_pool):
         "created_studies": created_studies,
     }
 
-    # FK-reverse: batches first (CASCADE removes their items, which is what
-    # RESTRICTs a study delete), then studies, then the principal.
-    if created_batches:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.ena_import_batch WHERE idx = ANY($1::bigint[])", created_batches
-        )
-    if created_studies:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])", created_studies
-        )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", created_studies
-        )
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    # Batches go first so their items CASCADE away with them; the sweep would
+    # otherwise reach those items by study_idx and leave the batch behind.
+    await delete_idxs(postgres_pool, "ena_import_batch", created_batches)
+    await teardown_entity_graph(
+        postgres_pool, study_idxs=created_studies, biosample_idxs=[], prep_sample_idxs=[]
+    )
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 async def _new_batch_item(eib, *, accession: str | None = None) -> tuple[int, int]:
@@ -364,7 +361,7 @@ async def sequenced_pool_ctx(postgres_pool):
     biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
         postgres_pool, owner_idx=principal_idx
     )
-    run_idx, pool_idx, sequenced_sample_idx = await seed_sequenced_sample_subtype(
+    run_idx, pool_idx, _sequenced_sample_idx = await seed_sequenced_sample_subtype(
         postgres_pool,
         prep_sample_idx=prep_sample_idx,
         owner_idx=principal_idx,
@@ -388,15 +385,15 @@ async def sequenced_pool_ctx(postgres_pool):
     await delete_action_if_created(
         postgres_pool, action_id=action_id, version=version, created=created
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequenced_sample WHERE idx = $1", sequenced_sample_idx
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[prep_sample_idx],
     )
-    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_idxs(postgres_pool, "sequenced_pool", pool_idx)
+    await delete_idxs(postgres_pool, "sequencing_run", run_idx)
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 async def _seed_work_ticket(ctx, *, state: str = "pending") -> int:

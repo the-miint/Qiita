@@ -4,9 +4,10 @@ Drives a DuckDB session with the miint extension loaded and calls `read_ena`
 (study header + runs) and `read_ena_attributes` (per-sample attributes). See
 `duckdb-miint/docs/insdc_ena.md` for the table functions.
 
-The three `_query_ena_*` functions are the `connect_with_miint()`-touching seam: each
-opens its own connection, runs one query, returns `(columns, rows)`. They are
-module-level so unit tests can monkeypatch them by name instead of needing a live
+The three `_query_ena_*` functions are the `connect_with_miint_staged()`-touching seam:
+each opens its own connection and runs one query. The study and run queries return
+`(columns, rows)`; the attribute query returns `(sample_accession, attributes)` rows. They
+are module-level so unit tests can monkeypatch them by name instead of needing a live
 DuckDB+miint session (mirrors `runner._stream_masked_reads_to_fastq`)."""
 
 from __future__ import annotations
@@ -45,17 +46,20 @@ def _query_ena_runs(accession: str) -> tuple[list[str], list[tuple]]:
         return [d[0] for d in rel.description], rel.fetchall()
 
 
-def _query_ena_sample_attributes(accession: str) -> list[tuple[str, dict[str, str]]]:
-    """`read_ena_attributes(accession)` — one `(sample_accession, attributes)`
-    row per sample under the study, the narrow `(sample_accession, tag, value)`
-    rows grouped into a MAP by DuckDB rather than in Python. Sends one row per
-    sample instead of one per attribute, and DuckDB hands the MAP back as a
-    plain `dict`."""
+def _query_ena_sample_attributes(accession: str) -> list[tuple[str, dict[str, list[str]]]]:
+    """One `(sample_accession, attributes)` row per sample, mapping each tag to its distinct
+    non-NULL values sorted. Entries are tag-ordered so a collision of normalised tags resolves
+    the same way every run."""
     with connect_with_miint_staged() as con:
         return con.execute(
             "SELECT sample_accession,"
-            "       map_from_entries(list(struct_pack(k := tag, v := value))) AS attributes"
-            " FROM read_ena_attributes($accession)"
+            "       map_from_entries(list(struct_pack(k := tag, v := vals) ORDER BY tag))"
+            "         AS attributes"
+            " FROM ("
+            "   SELECT sample_accession, tag, list(DISTINCT value ORDER BY value) AS vals"
+            "   FROM read_ena_attributes($accession)"
+            "   WHERE value IS NOT NULL"
+            "   GROUP BY sample_accession, tag)"
             " GROUP BY sample_accession"
             " ORDER BY sample_accession",
             {"accession": accession},

@@ -19,6 +19,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_sequenced_sample_subtype,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 from .conftest import make_caller_own_run
 
@@ -27,15 +28,15 @@ pytestmark = pytest.mark.db
 
 @pytest.fixture
 def ctx(role_keyed_clients):
-    """Alias the shared role-keyed clients ({pool, wet, user, wet_session, ...});
-    this route needs no per-test `created` tracker (seeded_pool owns cleanup)."""
+    """Alias the shared role-keyed clients ({pool, wet, user, wet_session, ...}).
+    `seeded_pool` owns every row these tests read, and tears them down."""
     return role_keyed_clients
 
 
 @pytest_asyncio.fixture
 async def seeded_pool(ctx):
     """Seed a run + pool + one processed sequenced_sample (raw=1000, bio=900,
-    qf=850) owned by the wet-admin principal; FK-reverse cleanup."""
+    qf=850) owned by the wet-admin principal."""
     db = ctx["pool"]
     owner = ctx["wet_session"]["principal_idx"]
     bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
@@ -49,11 +50,11 @@ async def seeded_pool(ctx):
         ss_idx,
     )
     yield {"run_idx": run_idx, "pool_idx": pool_idx, "ss_idx": ss_idx}
-    await db.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
+    await teardown_entity_graph(
+        db, study_idxs=[], biosample_idxs=[bs_idx], prep_sample_idxs=[ps_idx]
+    )
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await db.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps_idx)
-    await db.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs_idx)
 
 
 def _url(run_idx, pool_idx):

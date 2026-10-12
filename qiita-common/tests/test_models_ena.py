@@ -318,12 +318,12 @@ def test_ena_sample_attributes_pivot():
     attrs = EnaSampleAttributes(
         sample_accession="SAMEA3610311",
         attributes={
-            "collection date": "2013-01-01",
-            "geographic location (country and/or sea)": "USA",
+            "collection date": ["2013-01-01"],
+            "geographic location (country and/or sea)": ["USA"],
         },
     )
     assert attrs.sample_accession == "SAMEA3610311"
-    assert attrs.attributes["collection date"] == "2013-01-01"
+    assert attrs.attributes["collection date"] == ["2013-01-01"]
     assert len(attrs.attributes) == 2
 
 
@@ -338,7 +338,7 @@ def test_ena_sample_attributes_rejects_blank_tag():
     from qiita_common.models.ena import EnaSampleAttributes
 
     with pytest.raises(ValidationError):
-        EnaSampleAttributes(sample_accession="SAMEA3610311", attributes={"": "USA"})
+        EnaSampleAttributes(sample_accession="SAMEA3610311", attributes={"": ["USA"]})
 
 
 def test_ena_sample_attributes_defaults_to_empty_map():

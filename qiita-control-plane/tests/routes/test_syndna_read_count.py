@@ -168,10 +168,6 @@ async def test_a_caller_without_viewer_on_a_linked_study_is_refused(ctx):
         other,
         ctx["admin_session"]["principal_idx"],
     )
-    biosample_idx = await ctx["pool"].fetchval(
-        "SELECT biosample_idx FROM qiita.prep_sample WHERE idx = $1", ps
-    )
-    ctx["created"]["biosample_to_study"].append((biosample_idx, other))
     await ctx["pool"].execute(
         "INSERT INTO qiita.prep_sample_to_study (prep_sample_idx, study_idx, created_by_idx)"
         " VALUES ($1, $2, $3)",
@@ -179,7 +175,6 @@ async def test_a_caller_without_viewer_on_a_linked_study_is_refused(ctx):
         other,
         ctx["admin_session"]["principal_idx"],
     )
-    ctx["created"]["prep_sample_to_study"].append((ps, other))
 
     by_study = await ctx["user"].get(_url(mask_idx), params={"study_idx": readable})
     by_name = await ctx["user"].get(_url(mask_idx), params={"prep_sample_idx": [ps]})

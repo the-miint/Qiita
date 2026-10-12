@@ -4,13 +4,15 @@ Writes apply their mutation inside one connection-scoped transaction,
 delegating multi-table work to the biosample composer.
 """
 
-from collections.abc import Awaitable, Callable
+import contextlib
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated
 
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import Field
 from qiita_common.api_paths import (
+    PATH_BIOSAMPLE_BULK_BY_STUDY,
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_BY_STUDY,
     PATH_BIOSAMPLE_BY_STUDY_AND_IDX,
@@ -29,6 +31,8 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
+    BiosampleBulkImportRequest,
+    BiosampleBulkImportResponse,
     BiosampleGlobalFieldResponse,
     BiosampleImportRequest,
     BiosampleImportResponse,
@@ -67,6 +71,7 @@ from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx
 from ..repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     MetadataMissingRequiredFieldsError,
+    ResolvedFieldValue,
     StudyFieldDataTypeNotTextError,
     StudyFieldNotUniqueInStudyError,
     UniqueInStudyViolation,
@@ -74,6 +79,8 @@ from ..repositories._sample_helpers import (
     fetch_global_fields,
     fetch_global_metadata,
     fetch_study_fields_for_study,
+    insert_new_entities_metadata_batch,
+    write_resolved_metadata_entries,
 )
 from ..repositories.biosample import (
     BiosampleLookupKey,
@@ -89,6 +96,7 @@ from ..repositories.biosample_metadata import (
     BiosampleOwnerIdFieldCollisionError,
     BiosampleOwnerIdMissingValueError,
 )
+from ..repositories.exported_entity import fetch_exported_entities, require_export_entity_id
 from ._helpers import (
     ETAG_HEADER,
     GENERIC_CHECK_VIOLATION,
@@ -172,158 +180,360 @@ async def import_biosample(
     non-existent study_idx rather than slipping through to an FK violation.
     """
     async with tx() as conn:
-        # Owner eligibility pre-flight; collapses every ineligibility case to
-        # one 422.
-        await require_eligible_owner(
+        await _require_eligible_import_owner(conn, body.owner_idx)
+        response, _ = await _import_one_biosample(
             conn,
-            candidate_idx=body.owner_idx,
-            detail=_MSG_OWNER_NOT_ELIGIBLE,
+            study_idx=study_idx,
+            body=body,
+            caller_idx=user.principal_idx,
+            metadata_checklist_idx=await resolve_metadata_checklist_idx(
+                conn, body.metadata_checklist_name
+            ),
         )
+        return response
 
-        # Map known composer-side validation errors and DB-level violations to
-        # user-friendly 422 / 409 responses. Composer-specific exceptions are
-        # caught first so their detail wins over the generic asyncpg fallbacks.
-        # Resolve the checklist name to its idx before the write; an
-        # unknown name surfaces as a clean 422 rather than an FK violation.
-        metadata_checklist_idx = await resolve_metadata_checklist_idx(
-            conn, body.metadata_checklist_name
-        )
 
-        try:
-            result = await import_biosample_from_owner_biosample_id(
-                conn,
-                primary_study_idx=study_idx,
-                owner_idx=body.owner_idx,
-                owner_biosample_id_field_name=body.owner_biosample_id_field_name,
-                owner_biosample_id_value=body.owner_biosample_id_value,
-                caller_idx=user.principal_idx,
-                metadata=body.metadata,
-                metadata_checklist_idx=metadata_checklist_idx,
-                biosample_accession=body.biosample_accession,
-                ena_sample_accession=body.ena_sample_accession,
-                matrix_tube_id=body.matrix_tube_id,
-                global_internal_names=body.global_internal_names,
-            )
-        except BiosampleOwnerIdFieldCollisionError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"metadata key {exc.display_name!r} collides with owner_biosample_id_field_name"
-                ),
-            )
-        except BiosampleOwnerIdMissingValueError as exc:
-            # owner_biosample_id_value matches a missing_value_reason name.
-            # The owner-id row carries an identifier; a missing-value
-            # marker is incompatible with that contract.
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"owner_biosample_id_value {exc.owner_biosample_id_value!r}"
-                    " cannot be a missing-value marker"
-                ),
-            )
-        except MetadataMissingRequiredFieldsError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "missing required metadata field(s):"
-                    f" {', '.join(exc.missing_display_names)}."
-                    " A field may be given a missing-value marker (e.g."
-                    " 'not applicable') — declining to answer is allowed, silence"
-                    " is not."
-                ),
-            )
-        except SAMPLE_METADATA_WRITE_ERRORS as exc:
-            # Shared metadata-write arms (parse / unknown / conflict /
-            # duplicate-global-target / slot-collision / transient-race) map
-            # through one place. The owner-id and asyncpg arms below stay
-            # route-specific. SlotOccupiedError is unreachable through this POST
-            # (a fresh biosample per call cannot pre-occupy a slot) but is
-            # handled for the shared PATCH path that reuses this composer.
-            await raise_http_for_sample_metadata_write_error(conn, exc)
-        except LocalWriteOnGloballyLinkedFieldError as exc:
-            # The requested owner-biosample-id field name resolves to a
-            # field already globally linked on this study. The owner-id
-            # row is purely-local identifier and must not be written through a
-            # cross-study global slot; the caller must pick a different
-            # owner_biosample_id_field_name. Its own exception family,
-            # independent of the asyncpg.UniqueViolationError catch below.
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"owner_biosample_id_field_name {exc.display_name!r} is"
-                    " already bound to a global field on this study"
-                ),
-            )
-        except StudyFieldNotUniqueInStudyError as exc:
-            # The named field exists on this study but does not declare that
-            # its values are unique within it, so it cannot serve as the
-            # owner's identifier. Resolving it is the study's call — make that
-            # field unique, or name a different one — so the refusal says which
-            # field rather than choosing for them.
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"owner_biosample_id_field_name {exc.display_name!r} does not"
-                    " declare its values unique within this study; make it unique or"
-                    " name a different field"
-                ),
-            )
-        except StudyFieldDataTypeNotTextError as exc:
-            # The named field exists on this study but stores something other
-            # than text, so it cannot hold the identifier as submitted. Naming
-            # a different field is the study's call, so the refusal says which
-            # field and what it stores rather than choosing for them.
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"owner_biosample_id_field_name {exc.display_name!r} does not store"
-                    f" text (data_type is {exc.data_type!r}); name a different field"
-                ),
-            )
-        except asyncpg.UniqueViolationError as exc:
-            # A repeated owner id through one field trips that field's own
-            # uniqueness index rather than any of the biosample-level
-            # constraints, and the generic message would not say so. The scope
-            # is the field, not the study: a study may record owner ids through
-            # more than one local field, and the same value through a different
-            # one is not a repeat.
-            if (
-                classify_unique_in_study_violation(exc, spec=BIOSAMPLE_METADATA_SPEC)
-                is UniqueInStudyViolation.DUPLICATE_VALUE
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"owner_biosample_id_value {body.owner_biosample_id_value!r} is"
-                        " already used by another biosample through"
-                        f" {body.owner_biosample_id_field_name!r}"
-                    ),
-                )
-            raise_for_unique_violation(
-                exc,
-                constraint_messages=_UNIQUE_VIOLATION_MESSAGES,
-                generic=_GENERIC_UNIQUE_VIOLATION,
-            )
-        except asyncpg.ForeignKeyViolationError as exc:
-            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
-            raise HTTPException(status_code=422, detail=detail)
-        except asyncpg.CheckViolationError as exc:
-            detail = _CHECK_VIOLATION_MESSAGES.get(
-                exc.constraint_name, f"{GENERIC_CHECK_VIOLATION} biosample"
-            )
-            raise HTTPException(status_code=422, detail=detail)
-        except asyncpg.DeadlockDetectedError:
-            raise_transient_retry(
-                "a concurrent edit of one of this study's fields interrupted the"
-                " import; nothing was stored — resubmit the identical request"
-            )
+async def _require_eligible_import_owner(conn: asyncpg.Connection, owner_idx: int) -> None:
+    """Owner eligibility pre-flight for an import; collapses every
+    ineligibility case to one 422. Once per request: a bulk batch has one
+    owner (BiosampleBulkImportRequest enforces it)."""
+    await require_eligible_owner(conn, candidate_idx=owner_idx, detail=_MSG_OWNER_NOT_ELIGIBLE)
 
-    return BiosampleImportResponse(
+
+async def _import_one_biosample(
+    conn: asyncpg.Connection,
+    *,
+    study_idx: int,
+    body: BiosampleImportRequest,
+    caller_idx: int,
+    metadata_checklist_idx: int | None,
+    defer_metadata_write: bool = False,
+) -> tuple[BiosampleImportResponse, Sequence[ResolvedFieldValue] | None]:
+    """Import ONE biosample within an EXISTING transaction, mapping composer and DB
+    errors to HTTPException.
+
+    Shared by the single POST (`import_biosample`) and the bulk POST
+    (`import_biosamples_bulk`) so both surface identical errors. The CALLER owns the
+    transaction: a raised HTTPException propagates out of the caller's `async with
+    tx()` and rolls its whole unit back — which is what makes the bulk route
+    all-or-nothing. The bulk route catches and re-raises with the failing row's index.
+
+    Returns the response and, with `defer_metadata_write`, the row's validated
+    metadata for the caller to write in a batch (`import_biosamples_bulk`).
+
+    The caller has already checked the owner's eligibility
+    (`_require_eligible_import_owner`) and resolved the checklist name, so a bulk
+    batch does each once rather than once per row.
+    """
+    result = await _with_import_error_mapping(
+        conn,
+        body,
+        lambda: import_biosample_from_owner_biosample_id(
+            conn,
+            primary_study_idx=study_idx,
+            owner_idx=body.owner_idx,
+            owner_biosample_id_field_name=body.owner_biosample_id_field_name,
+            owner_biosample_id_value=body.owner_biosample_id_value,
+            caller_idx=caller_idx,
+            metadata=body.metadata,
+            metadata_checklist_idx=metadata_checklist_idx,
+            biosample_accession=body.biosample_accession,
+            ena_sample_accession=body.ena_sample_accession,
+            matrix_tube_id=body.matrix_tube_id,
+            global_internal_names=body.global_internal_names,
+            defer_metadata_write=defer_metadata_write,
+        ),
+    )
+    exported_rows = await fetch_exported_entities(
+        conn, study_idx=[], biosample_idx=[result.biosample_idx]
+    )
+    response = BiosampleImportResponse(
         biosample_idx=result.biosample_idx,
+        export_entity_id=exported_rows[0]["export_entity_id"],
         owner_id_biosample_study_field_idx=result.owner_id_biosample_study_field_idx,
         owner_id_biosample_study_field_created=result.owner_id_biosample_study_field_created,
     )
+    return response, result.deferred_metadata
+
+
+async def _with_import_error_mapping[T](
+    conn: asyncpg.Connection,
+    body: BiosampleImportRequest,
+    operation: Callable[[], Awaitable[T]],
+) -> T:
+    """Run one import step, mapping composer and DB errors to HTTPException.
+
+    The single place a biosample import's failures are translated, so the per-row
+    import and the bulk route's metadata fallback answer identically. Known
+    composer-side validation errors and DB-level violations become 422 / 409
+    responses; composer-specific exceptions are caught first so their detail wins
+    over the generic asyncpg fallbacks.
+    """
+    try:
+        return await operation()
+    except BiosampleOwnerIdFieldCollisionError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"metadata key {exc.display_name!r} collides with owner_biosample_id_field_name"
+            ),
+        )
+    except BiosampleOwnerIdMissingValueError as exc:
+        # owner_biosample_id_value matches a missing_value_reason name.
+        # The owner-id row carries an identifier; a missing-value
+        # marker is incompatible with that contract.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"owner_biosample_id_value {exc.owner_biosample_id_value!r}"
+                " cannot be a missing-value marker"
+            ),
+        )
+    except MetadataMissingRequiredFieldsError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "missing required metadata field(s):"
+                f" {', '.join(exc.missing_display_names)}."
+                " A field may be given a missing-value marker (e.g."
+                " 'not applicable') — declining to answer is allowed, silence"
+                " is not."
+            ),
+        )
+    except SAMPLE_METADATA_WRITE_ERRORS as exc:
+        # Shared metadata-write arms (parse / unknown / conflict /
+        # duplicate-global-target / slot-collision / transient-race) map
+        # through one place. The owner-id and asyncpg arms below stay
+        # route-specific. SlotOccupiedError is unreachable through this POST
+        # (a fresh biosample per call cannot pre-occupy a slot) but is
+        # handled for the shared PATCH path that reuses this composer.
+        await raise_http_for_sample_metadata_write_error(conn, exc)
+    except LocalWriteOnGloballyLinkedFieldError as exc:
+        # The requested owner-biosample-id field name resolves to a
+        # field already globally linked on this study. The owner-id
+        # row is purely-local identifier and must not be written through a
+        # cross-study global slot; the caller must pick a different
+        # owner_biosample_id_field_name. Its own exception family,
+        # independent of the asyncpg.UniqueViolationError catch below.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"owner_biosample_id_field_name {exc.display_name!r} is"
+                " already bound to a global field on this study"
+            ),
+        )
+    except StudyFieldNotUniqueInStudyError as exc:
+        # The named field exists on this study but does not declare that
+        # its values are unique within it, so it cannot serve as the
+        # owner's identifier. Resolving it is the study's call — make that
+        # field unique, or name a different one — so the refusal says which
+        # field rather than choosing for them.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"owner_biosample_id_field_name {exc.display_name!r} does not"
+                " declare its values unique within this study; make it unique or"
+                " name a different field"
+            ),
+        )
+    except StudyFieldDataTypeNotTextError as exc:
+        # The named field exists on this study but stores something other
+        # than text, so it cannot hold the identifier as submitted. Naming
+        # a different field is the study's call, so the refusal says which
+        # field and what it stores rather than choosing for them.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"owner_biosample_id_field_name {exc.display_name!r} does not store"
+                f" text (data_type is {exc.data_type!r}); name a different field"
+            ),
+        )
+    except asyncpg.UniqueViolationError as exc:
+        # A repeated owner id through one field trips that field's own
+        # uniqueness index rather than any of the biosample-level
+        # constraints, and the generic message would not say so. The scope
+        # is the field, not the study: a study may record owner ids through
+        # more than one local field, and the same value through a different
+        # one is not a repeat.
+        if (
+            classify_unique_in_study_violation(exc, spec=BIOSAMPLE_METADATA_SPEC)
+            is UniqueInStudyViolation.DUPLICATE_VALUE
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"owner_biosample_id_value {body.owner_biosample_id_value!r} is"
+                    " already used by another biosample through"
+                    f" {body.owner_biosample_id_field_name!r}"
+                ),
+            )
+        raise_for_unique_violation(
+            exc,
+            constraint_messages=_UNIQUE_VIOLATION_MESSAGES,
+            generic=_GENERIC_UNIQUE_VIOLATION,
+        )
+    except asyncpg.ForeignKeyViolationError as exc:
+        detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
+        raise HTTPException(status_code=422, detail=detail)
+    except asyncpg.CheckViolationError as exc:
+        detail = _CHECK_VIOLATION_MESSAGES.get(
+            exc.constraint_name, f"{GENERIC_CHECK_VIOLATION} biosample"
+        )
+        raise HTTPException(status_code=422, detail=detail)
+    except asyncpg.DeadlockDetectedError:
+        raise_transient_retry(
+            "a concurrent edit of one of this study's fields interrupted the"
+            " import; nothing was stored — resubmit the identical request"
+        )
+    except TimeoutError, asyncpg.QueryCanceledError:
+        # Each biosample INSERT takes a per-owner lock held until commit, so an
+        # import waits behind any other open import for the same owner -- a bulk
+        # batch holds it for its whole run. Waiting past the pool's command
+        # timeout lands here: nothing was written, and it clears once the other
+        # import commits.
+        raise_transient_retry(
+            "another import for this biosample owner held a lock this one needed"
+            " for too long; nothing was stored — resubmit the identical request"
+        )
+
+
+@contextlib.asynccontextmanager
+async def _named_row_errors(i: int, row: BiosampleImportRequest, study_idx: int):
+    """Name the bulk row a failure came from. A transient 503 (a deadlock, or a
+    lock wait that timed out) is the batch's, not the row's: it keeps its
+    Retry-After and gets the batch's own wording. Any other HTTPException gets
+    the row prefix; an unmapped exception stays a 500 with its traceback and a
+    note naming the row."""
+    try:
+        yield
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "the batch waited on another import or edit on this study or"
+                    " for this owner and was interrupted; nothing was stored —"
+                    " resubmit the identical request"
+                ),
+                headers=exc.headers,
+            ) from exc
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=(
+                f"row {i} (counting from 0; owner_biosample_id_value="
+                f"{row.owner_biosample_id_value!r}): {exc.detail}"
+            ),
+            headers=exc.headers,
+        ) from exc
+    except Exception as exc:
+        exc.add_note(
+            f"bulk biosample import, study {study_idx}: failed at row {i}"
+            f" (counting from 0; owner_biosample_id_value={row.owner_biosample_id_value!r})"
+        )
+        raise
+
+
+@router.post(PATH_BIOSAMPLE_BULK_BY_STUDY, status_code=201)
+async def import_biosamples_bulk(
+    study_idx: Annotated[int, Field(gt=0)],
+    body: BiosampleBulkImportRequest,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> BiosampleBulkImportResponse:
+    """Create many biosamples on a study in ONE transaction — the wetlab front door.
+
+    A sheet's biosamples in a single call instead of N. Same per-row contract,
+    guards (Tier.ADMIN on the study, or wet_lab_admin+), and error mapping as the
+    single import — each row runs through the shared `_import_one_biosample`. The
+    batch is ALL-OR-NOTHING: a failing row rolls back every row, and the error
+    names the failing row (counting from 0) and its owner_biosample_id_value so
+    the caller can fix the sheet and resubmit. The request model enforces one
+    owner and one id field per batch, and the size caps.
+    """
+    # Two rows naming the same owner id would collide on the id field's unique
+    # index mid-write, and the error would blame "another biosample" that is in
+    # fact this request. Refuse before writing, naming both rows.
+    first_row_for: dict[str, int] = {}
+    for i, row in enumerate(body.rows):
+        j = first_row_for.setdefault(row.owner_biosample_id_value, i)
+        if j != i:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"rows {j} and {i} (counting from 0) both give owner_biosample_id_value"
+                    f" {row.owner_biosample_id_value!r}; each biosample needs its own"
+                ),
+            )
+
+    async with tx() as conn:
+        await _require_eligible_import_owner(conn, body.rows[0].owner_idx)
+        checklist_idx_for: dict[str | None, int | None] = {}
+        results: list[BiosampleImportResponse] = []
+        deferred: list[tuple[int, Sequence[ResolvedFieldValue]]] = []
+        # Phase 1, per row: create, link, write the owner id, and validate the
+        # metadata -- but defer writing it, so the batch can write all of it at once.
+        for i, row in enumerate(body.rows):
+            async with _named_row_errors(i, row, study_idx):
+                name = row.metadata_checklist_name
+                if name not in checklist_idx_for:
+                    checklist_idx_for[name] = await resolve_metadata_checklist_idx(conn, name)
+                response, resolved = await _import_one_biosample(
+                    conn,
+                    study_idx=study_idx,
+                    body=row,
+                    caller_idx=user.principal_idx,
+                    metadata_checklist_idx=checklist_idx_for[name],
+                    defer_metadata_write=True,
+                )
+                results.append(response)
+                deferred.append((response.biosample_idx, resolved or ()))
+        # Phase 2: every row's metadata in a few statements. A rejected batch
+        # rolls back to before it and is written again row by row through the
+        # per-value path, which raises the same diagnosed error, for the same
+        # row, as an import that never batched.
+        # The batch write re-raises a transient DB error (deadlock, serialization,
+        # lock-wait timeout) rather than returning False; map it to the same
+        # retryable 503 the single import and phase 1 send, not a 500. A
+        # non-transient failure still returns False and falls through to the
+        # row-by-row replay below. The batch is not one row, so it maps against the
+        # first -- only the transient arms, which read no row fields, can fire here
+        # (every mappable non-transient returns False instead of raising).
+        written = await _with_import_error_mapping(
+            conn,
+            body.rows[0],
+            lambda: insert_new_entities_metadata_batch(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                study_idx=study_idx,
+                caller_idx=user.principal_idx,
+                entries=deferred,
+            ),
+        )
+        if not written:
+            for i, (row, (biosample_idx, resolved)) in enumerate(
+                zip(body.rows, deferred, strict=True)
+            ):
+                async with _named_row_errors(i, row, study_idx):
+                    await _with_import_error_mapping(
+                        conn,
+                        row,
+                        lambda biosample_idx=biosample_idx, resolved=resolved: (
+                            write_resolved_metadata_entries(
+                                conn,
+                                spec=BIOSAMPLE_METADATA_SPEC,
+                                entity_idx=biosample_idx,
+                                study_idx=study_idx,
+                                caller_idx=user.principal_idx,
+                                resolved_metadata=resolved,
+                            )
+                        ),
+                    )
+    return BiosampleBulkImportResponse(results=results)
 
 
 @router.post(PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY, status_code=201)
@@ -832,11 +1042,13 @@ def _biosample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
     """Map a qiita.biosample row's columns to BiosampleResponse field names.
 
     Centralises the column -> field mapping (the idx -> biosample_idx rename
-    aside, every key matches its column). Excludes the metadata dicts and
-    caller_system_role. Runs no DB queries.
+    aside, every key matches its column; export_entity_id is read from
+    qiita.exported_entity). Excludes the metadata dicts and caller_system_role.
+    Runs no DB queries.
     """
     return {
         "biosample_idx": row["idx"],
+        "export_entity_id": require_export_entity_id(row, kind="biosample"),
         "owner_idx": row["owner_idx"],
         "metadata_checklist": MetadataChecklistRef.from_row(
             row["metadata_checklist_idx"], row["metadata_checklist_name"]

@@ -274,7 +274,8 @@ Beyond the kind / role / scope guards above, `auth.guards` carries resource-acce
 
 | Guard | Predicate |
 |---|---|
-| `require_study_access(min_tier, bypass_role)` | factory; caller's tier on the path's `study_idx` ≥ `min_tier`. Study owner bypasses the tier comparison; `min_tier=None` resolves to the study's `default_tier`. |
+| `require_study_access(min_tier, bypass_role)` | factory; caller's tier on the path's `study_idx` ≥ `min_tier`. Study owner bypasses the tier comparison. |
+| `study_record_view(row, caller)` | the full / summary / none view of a study's own record; the rule is in `architecture/data-model.md`. `GET /study/{idx}` and the `GET /study` listing both decide through it, so a study is listed exactly when it can be opened. |
 | `require_caller_owns_run(bypass_role)` | factory; `sequencing_run.created_by_idx == caller`. |
 | `require_caller_owns_pool(bypass_role)` | factory; `sequenced_pool.created_by_idx == caller`. |
 | `require_caller_has_tier_on_all_studies(min_tier, ...)` | body-time helper (not a `Depends`); caller has `min_tier` (or owns, or bypasses) on **every** study in a list — used where the studies come from the request body, not the path. Comparison goes through `_TIER_ORDER`, never the `Tier` members, which are a `StrEnum` and compare *lexically* (`'admin' < 'member' < 'public' < 'viewer'`). |
@@ -288,11 +289,13 @@ That function also decides the **orphan** case, and decides it differently from 
 
 **The authoring routes deliberately use three different shapes**, because the resources differ in what "ownership" means:
 
-- **biosample POST** (`/study/{idx}/biosample`) — `require_study_access(min_tier=ADMIN)`. A biosample is study-scoped; the natural gate is tier-on-that-study.
+- **biosample POST** (`/study/{idx}/biosample`, and the bulk `/study/{idx}/biosample/bulk`) — `require_study_access(min_tier=ADMIN)`. A biosample is study-scoped; the natural gate is tier-on-that-study.
 - **sequencing-run POST** — no resource gate at all (only scope + complete-profile). A run is an instrument-level container with no parent resource to inherit access from; any user who can write prep-samples may stand one up.
 - **sequenced-pool / sequenced-sample POST** — `require_caller_owns_run` / `require_caller_owns_pool` (caller-creator), because a run/pool has a creator but no tier surface; the sample composer additionally runs `require_caller_has_admin_on_all_studies` over the body's primary + secondary studies.
 
 prep_sample-scoped **work-ticket** submission reuses the same per-study ADMIN check (`_check_prep_sample_study_access` walks the prep_sample's non-retired study links). All four paths bypass at `wet_lab_admin`, so the operator experience is uniform even though the user-facing predicate differs per route.
+
+Listing pools, by contrast, has a **study-first read**: `GET /api/v1/study/{study_idx}/sequenced-pool` returns the distinct pools a study's active samples sit in — `study:read` + `require_study_access(min_tier=VIEWER)` (wet_lab_admin+ bypass), the same gate and exclusions as the study's sequenced-sample idx listing. Each row carries the pool/run idx, the run's `instrument_model`, and this study's `sample_count` in that pool. It **withholds** the run-level `run_preflight_filename` that the run-first pool list (`require_caller_owns_run`) exposes, since a pool can hold other studies' samples and a study viewer need not own the run.
 
 ### Token-vs-OIDC scope source
 
@@ -343,6 +346,26 @@ The system principal (`idx=1`) is rejected by every mutation endpoint above (`di
 | `/api/v1/user` | POST | Admin-only (`require_human_with_role("system_admin") + require_scope("admin:user")`). Creates a new principal + user row in one transaction; the new principal's `created_by_idx` points at the requesting admin. Returns `409` on email collision (case-insensitive via CITEXT). In production, OIDC first-login is the typical user-creation path; this route exists for admins to onboard PIs imported from external systems. |
 | `/api/v1/user/me` | GET | Returns the authenticated user's profile. `require_human` (rejects service-kind 403). |
 | `/api/v1/user/me` | PATCH | Updates profile fields (`affiliation`, `address`, `phone`, `orcid`, `receive_processing_emails`). Requires `self:profile`. `email` and status fields are absent from `UserUpdate` and are silently dropped — email-change requires re-verification via OIDC, status is admin-only. |
+
+### Reading and listing studies
+
+What a caller may read of a study's own record — the **full** record, its
+**summary**, or nothing — is defined in
+[`architecture/data-model.md`](architecture/data-model.md) ("What a tier reads
+of a study's own record"). `GET /api/v1/study/{idx}` returns the view the caller
+has (`view` in the body says which; only the full view carries an `ETag`).
+
+`GET /api/v1/study` lists the studies the caller can read at either view, newest
+first, `study:read`. Query parameters: `q` (full-text, web-search syntax:
+stemmed English words matched whole, over title, alias and the accessions, plus
+abstract, description, notes and funding on studies whose full record the caller
+reads; NUL is refused), `min_tier` (only studies where the caller's *own* tier
+reaches it — an owner counts as `admin`; above `public` it also drops public
+studies they hold no grant on and role-only reads), `after_study_idx` (the
+previous page's `next_after_study_idx`) and `limit` (≤ 500). Each row carries the
+caller's `caller_tier`, `access_via` (`owner` / `grant` / `public` / `role`) and
+`record_view`. A page can come back shorter than `limit` with a cursor when many
+candidates were filtered out; follow the cursor.
 
 ### Study access (`qiita.study_access`)
 
@@ -465,6 +488,7 @@ End-user companion to `qiita-admin`, installed as the `qiita` console script via
 | `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. |
 | `profile set [--affiliation ... --address ... --phone ... --orcid ... --[no-]receive-processing-emails]` | HTTP | Calls `PATCH /api/v1/user/me` with only the fields the caller actually supplied (matches the server's `exclude_unset` semantics). Used to fill `affiliation`/`address`/`phone` so `qiita.user.profile_complete` flips to true. |
 | `study create --title T [--alias … --description … …]` | HTTP | Calls `POST /api/v1/study`. Caller is always the owner; the `--owner-idx` (lab-tech-on-behalf) path is intentionally not exposed. |
+| `study list [--query Q] [--min-tier T] [--limit N] [--after-study-idx C] [--all]` | HTTP | Calls `GET /api/v1/study`. Defaults to your own and shared studies (`--min-tier viewer`); `--min-tier public` lists every study you can read (for wet_lab_admin+, every study); `--all` follows the cursor to the end. |
 | `study access list --study-idx S` | HTTP | Calls `GET /api/v1/study/{S}/access`. |
 | `study access grant --study-idx S --email E --tier T` | HTTP | Calls `POST /api/v1/study/{S}/access`. `--tier` is `viewer`, `member` or `admin`. |
 | `study access set-tier --study-idx S --principal-idx P --tier T` | HTTP | Calls `PATCH /api/v1/study/{S}/access/{P}`. |

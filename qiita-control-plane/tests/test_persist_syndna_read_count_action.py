@@ -23,6 +23,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_reference_membership,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 
 def _write_alignment(path: Path, rows: list[tuple[int, int, int]]) -> Path:
@@ -85,13 +86,18 @@ async def seeded(postgres_pool):
         "inserts": inserts,
         "masks": masks,
     }
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[prep_sample_idx],
+    )
     await postgres_pool.execute(
         "DELETE FROM qiita.mask_definition WHERE mask_idx = ANY($1::bigint[])",
         list(masks.values()),
     )
     await cleanup_reference_graph(postgres_pool, reference_idx=reference_idx, feature_idxs=inserts)
-    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 async def _stored(pool, mask_idx, prep_sample_idx) -> dict[int, int]:

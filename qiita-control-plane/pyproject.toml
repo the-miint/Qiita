@@ -15,7 +15,7 @@ dependencies = [
     "cryptography>=44",
     "httpx>=0.28",
     "pyyaml>=6",
-    "duckdb>=1.5.4",
+    "duckdb==1.5.5",
     "jsonschema>=4.20",
     "jinja2>=3.1",
     # Async SMTP client for the email-notification transport.

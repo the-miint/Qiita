@@ -1,0 +1,30 @@
+{
+  "_source": "recorded through miint read_ena(\"PRJNA664719\", fields=...) (Portal result=read_run) on 2026-10-05; first 3 runs of the study, trimmed to keep the file small; list and integer columns (tax_id is BIGINT) re-typed from the extension's semicolon-joined strings",
+  "columns": [
+    "run_accession",
+    "experiment_accession",
+    "sample_accession",
+    "sample_alias",
+    "study_accession",
+    "status",
+    "library_layout",
+    "library_strategy",
+    "library_source",
+    "library_selection",
+    "instrument_platform",
+    "fastq_ftp",
+    "fastq_aspera",
+    "fastq_bytes",
+    "fastq_md5",
+    "read_count",
+    "base_count",
+    "tax_id",
+    "host_tax_id",
+    "host"
+  ],
+  "rows": [
+    ["SRR12682332", "SRX9162447", "SAMN16231075", "adult2", "PRJNA664719", "public", "SINGLE", "AMPLICON", "METAGENOMIC", "PCR", "PACBIO_SMRT", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR126/032/SRR12682332/SRR12682332_subreads.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR126/032/SRR12682332/SRR12682332_subreads.fastq.gz"], [1343747], ["c96f14f0845b0f8397dfe5b83e05f459"], 70075, 21092575, 749906, null, "insect5"],
+    ["SRR12682333", "SRX9162446", "SAMN16231074", "adult1", "PRJNA664719", "public", "SINGLE", "AMPLICON", "METAGENOMIC", "PCR", "PACBIO_SMRT", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR126/033/SRR12682333/SRR12682333_subreads.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR126/033/SRR12682333/SRR12682333_subreads.fastq.gz"], [719952], ["0861e27916bcc3a70d84afd7a4461f0c"], 34154, 10280354, 749906, null, "insect4"],
+    ["SRR12682334", "SRX9162445", "SAMN16231073", "larva3", "PRJNA664719", "public", "SINGLE", "AMPLICON", "METAGENOMIC", "PCR", "PACBIO_SMRT", ["ftp.sra.ebi.ac.uk/vol1/fastq/SRR126/034/SRR12682334/SRR12682334_subreads.fastq.gz"], ["fasp.sra.ebi.ac.uk:/vol1/fastq/SRR126/034/SRR12682334/SRR12682334_subreads.fastq.gz"], [853535], ["e5156c8d40487442458de049b9fde49c"], 39882, 12004482, 749906, null, "insect3"]
+  ]
+}

@@ -1693,3 +1693,65 @@ def test_terminology_manifest_file_non_bare_path(declared_path):
     value that was declared."""
     with pytest.raises(ValidationError, match="not a bare filename"):
         TerminologyManifestFile(path=declared_path, sha256="a" * 64)
+
+
+# ---------------------------------------------------------------------------
+# BiosampleBulkImportRequest — size caps and one-sheet rules
+# ---------------------------------------------------------------------------
+
+
+def _bulk_row(value: str, *, owner_idx: int = 7, field: str = "id", keys: int = 0) -> dict:
+    return {
+        "owner_idx": owner_idx,
+        "owner_biosample_id_field_name": field,
+        "owner_biosample_id_value": value,
+        "metadata": {f"k{k}": "x" for k in range(keys)},
+    }
+
+
+def test_bulk_import_request_accepts_exactly_the_caps():
+    from qiita_common.models.biosample import (
+        BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES,
+        BIOSAMPLE_BULK_IMPORT_MAX_ROWS,
+        BiosampleBulkImportRequest,
+    )
+
+    rows = [_bulk_row(f"v{i}") for i in range(BIOSAMPLE_BULK_IMPORT_MAX_ROWS)]
+    assert len(BiosampleBulkImportRequest(rows=rows).rows) == BIOSAMPLE_BULK_IMPORT_MAX_ROWS
+    keys = 100
+    rows = [
+        _bulk_row(f"v{i}", keys=keys)
+        for i in range(BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES // keys)
+    ]
+    BiosampleBulkImportRequest(rows=rows)
+
+
+@pytest.mark.parametrize("over", ["rows", "values"])
+def test_bulk_import_request_refuses_one_over_a_cap(over):
+    from qiita_common.models.biosample import (
+        BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES,
+        BIOSAMPLE_BULK_IMPORT_MAX_ROWS,
+        BiosampleBulkImportRequest,
+    )
+
+    if over == "rows":
+        rows = [_bulk_row(f"v{i}") for i in range(BIOSAMPLE_BULK_IMPORT_MAX_ROWS + 1)]
+    else:
+        rows = [_bulk_row("v0", keys=BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES)]
+        rows.append(_bulk_row("one-more", keys=1))
+    with pytest.raises(ValidationError, match="send the sheet in several requests"):
+        BiosampleBulkImportRequest(rows=rows)
+
+
+@pytest.mark.parametrize(
+    ("second", "message"),
+    [
+        ({"owner_idx": 8}, "same owner_idx"),
+        ({"field": "other"}, "same owner_biosample_id_field_name"),
+    ],
+)
+def test_bulk_import_request_is_one_owner_and_one_id_field(second, message):
+    from qiita_common.models.biosample import BiosampleBulkImportRequest
+
+    with pytest.raises(ValidationError, match=message):
+        BiosampleBulkImportRequest(rows=[_bulk_row("a"), _bulk_row("b", **second)])

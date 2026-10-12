@@ -24,6 +24,7 @@ from qiita_control_plane import align_planner
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.repositories.sequence_range import mint_sequence_range
 from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -216,36 +217,27 @@ async def planned(ctx, monkeypatch):
         "owner": owner,
     }
 
-    # Cleanup (FK-reverse, id-scoped).
     await db.execute(
         "DELETE FROM qiita.work_ticket WHERE block_idx IN"
         " (SELECT bm.block_idx FROM qiita.block_member bm"
         "   WHERE bm.prep_sample_idx = ANY($1::bigint[]))",
         prep_samples,
     )
+    # Resolved through block_member, which the sweep clears, so it runs first.
     await db.execute(
         "DELETE FROM qiita.block WHERE block_idx IN"
         " (SELECT block_idx FROM qiita.block_member WHERE prep_sample_idx = ANY($1::bigint[]))",
         prep_samples,
     )
-    await db.execute(
-        "DELETE FROM qiita.alignment_sample WHERE prep_sample_idx = ANY($1::bigint[])", prep_samples
+    await teardown_entity_graph(
+        db, study_idxs=[], biosample_idxs=biosamples, prep_sample_idxs=prep_samples
     )
     await db.execute(
         "DELETE FROM qiita.alignment_definition WHERE (params->>'mask_idx')::bigint = $1",
         mask_idx,
     )
-    await db.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
-    await db.execute(
-        "DELETE FROM qiita.sequence_range WHERE prep_sample_idx = ANY($1::bigint[])", prep_samples
-    )
-    await db.execute(
-        "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])", prep_samples
-    )
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await db.execute("DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", prep_samples)
-    await db.execute("DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", biosamples)
     await db.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
     await db.execute("DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx)
     await db.execute(
@@ -539,15 +531,13 @@ async def test_align_plan_skips_sample_with_no_gate_row(ctx, planned):
             " (SELECT block_idx FROM qiita.block_member WHERE prep_sample_idx = $1)",
             ps,
         )
+        # Resolved through block_member, which the sweep clears, so it runs first.
         await db.execute(
             "DELETE FROM qiita.block WHERE block_idx IN"
             " (SELECT block_idx FROM qiita.block_member WHERE prep_sample_idx = $1)",
             ps,
         )
-        await db.execute("DELETE FROM qiita.sequence_range WHERE prep_sample_idx = $1", ps)
-        await db.execute("DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = $1", ps)
-        await db.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps)
-        await db.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs)
+        await teardown_entity_graph(db, study_idxs=[], biosample_idxs=[bs], prep_sample_idxs=[ps])
 
 
 async def test_align_plan_flagged_sample_excluded_not_counted_no_reads(ctx, planned):
@@ -578,9 +568,7 @@ async def test_align_plan_flagged_sample_excluded_not_counted_no_reads(ctx, plan
         assert body["samples_planned"] == 2
         assert body["samples_skipped_no_reads"] == 0
     finally:
-        await db.execute("DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = $1", ps)
-        await db.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps)
-        await db.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs)
+        await teardown_entity_graph(db, study_idxs=[], biosample_idxs=[bs], prep_sample_idxs=[ps])
 
 
 async def test_align_plan_resubmit_over_completed_409(ctx, planned):

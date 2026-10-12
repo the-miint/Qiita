@@ -31,7 +31,7 @@ import httpx
 import pytest
 from qiita_common.api_paths import URL_UPLOAD_PREFIX
 from qiita_common.models import WorkTicketState
-
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 from qiita_control_plane.testing.unique_names import unique_ena_accession
 
 # 1.3.0, not 1.0.0: this smoke submits UPLOAD HANDLES (a USER may not name a
@@ -350,31 +350,19 @@ async def test_user_authoring_smoke_via_cli(
         # valid WorkTicketState.
         assert status["state"] in _WORK_TICKET_STATES
     finally:
-        # FK-reverse cleanup of every row the flow created. The server
-        # committed these to the shared test DB; teardown runs them
-        # through the test's own pool.
+        # The server committed these to the shared test DB;
+        # teardown runs them through the test's own pool.
         if created_ticket_idxs:
             await postgres_pool.execute(
                 "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
                 created_ticket_idxs,
             )
-        if created_prep_sample_idxs:
-            await postgres_pool.execute(
-                "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])",
-                created_prep_sample_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.prep_sample_metadata WHERE prep_sample_idx = ANY($1::bigint[])",
-                created_prep_sample_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = ANY($1::bigint[])",
-                created_prep_sample_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])",
-                created_prep_sample_idxs,
-            )
+        await teardown_entity_graph(
+            postgres_pool,
+            study_idxs=created_study_idxs,
+            biosample_idxs=created_biosample_idxs,
+            prep_sample_idxs=created_prep_sample_idxs,
+        )
         if created_sequenced_pool_idxs:
             await postgres_pool.execute(
                 "DELETE FROM qiita.sequenced_pool WHERE idx = ANY($1::bigint[])",
@@ -384,34 +372,6 @@ async def test_user_authoring_smoke_via_cli(
             await postgres_pool.execute(
                 "DELETE FROM qiita.sequencing_run WHERE idx = ANY($1::bigint[])",
                 created_sequencing_run_idxs,
-            )
-        if created_biosample_idxs:
-            await postgres_pool.execute(
-                "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = ANY($1::bigint[])",
-                created_biosample_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = ANY($1::bigint[])",
-                created_biosample_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])",
-                created_biosample_idxs,
-            )
-        if created_study_idxs:
-            await postgres_pool.execute(
-                "DELETE FROM qiita.biosample_study_field WHERE study_idx = ANY($1::bigint[])",
-                created_study_idxs,
-            )
-            # POST /study auto-grants the owner an ADMIN study_access row
-            # inside the same transaction; drop it before the study.
-            await postgres_pool.execute(
-                "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])",
-                created_study_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])",
-                created_study_idxs,
             )
 
 
@@ -451,4 +411,9 @@ async def test_user_cannot_author_on_study_without_admin_access(
         )
         assert "http error 403" in result.stderr
     finally:
-        await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
+        await teardown_entity_graph(
+            postgres_pool,
+            study_idxs=[study_idx],
+            biosample_idxs=[],
+            prep_sample_idxs=[],
+        )

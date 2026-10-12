@@ -14,8 +14,10 @@ The data plane is deployed as multiple systemd instances of the `qiita-data-plan
 qiita/
 ├── Makefile                        # unified entry point: build, test, lint, deploy, migrate
 ├── .github/
+│   ├── pull_request_template.md    # PR description skeleton, incl. the Reviewer loop block
 │   └── workflows/
-│       └── ci.yml                  # lint + unit/integration tests across components (no CI deploy)
+│       ├── ci.yml                  # lint + unit/integration tests across components (no CI deploy)
+│       └── review-loop-check.yml   # the PR description carries the Reviewer loop block
 ├── qiita-common/
 │   ├── pyproject.toml              # shared Pydantic models, config, client utilities
 │   └── src/

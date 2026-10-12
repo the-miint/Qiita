@@ -122,11 +122,28 @@ class EnaRunRecord(BaseModel):
     fastq_md5: list[str] | None = None
     read_count: int | None = None
     base_count: int | None = None
+    tax_id: str | None = None
+    host_tax_id: str | None = None
+    host: str | None = None
 
-    @field_validator("library_layout", "library_strategy", "library_source", "library_selection")
+    @field_validator("tax_id", "host_tax_id", mode="before")
     @classmethod
-    def _normalize_blank_library_to_none(cls, v: str | None) -> str | None:
-        # read_ena reports a missing library field as "", not NULL -- normalize
+    def _taxon_id_to_str(cls, v: object) -> object:
+        # https://the-miint.github.io/duckdb-miint/insdc_ena/
+        return str(v) if isinstance(v, int) else v
+
+    @field_validator(
+        "library_layout",
+        "library_strategy",
+        "library_source",
+        "library_selection",
+        "tax_id",
+        "host_tax_id",
+        "host",
+    )
+    @classmethod
+    def _normalize_blank_to_none(cls, v: str | None) -> str | None:
+        # read_ena reports a missing text field as "", not NULL -- normalize
         # so a consumer's `is not None` means "ENA reported one", as on
         # EnaStudyHeader.
         if v is not None and not v.strip():
@@ -135,19 +152,17 @@ class EnaRunRecord(BaseModel):
 
 
 class EnaSampleAttributes(BaseModel):
-    """One BioSample's submitter-defined tag -> value attribute map —
+    """One BioSample's submitter-defined tag -> distinct values map —
     `read_ena_attributes(accession)`, pivoted from its (sample_accession, tag,
-    value) row shape into one map per sample."""
+    value) rows into one map per sample. A tag ENA repeats has several values."""
 
     sample_accession: str = Field(min_length=1)
-    attributes: dict[str, str] = Field(default_factory=dict)
+    attributes: dict[str, list[str]] = Field(default_factory=dict)
 
     @field_validator("attributes")
     @classmethod
-    def _validate_tags(cls, v: dict[str, str]) -> dict[str, str]:
-        for tag, value in v.items():
+    def _validate_tags(cls, v: dict[str, list[str]]) -> dict[str, list[str]]:
+        for tag in v:
             if not tag or not tag.strip():
                 raise ValueError(f"attribute tag must be a non-empty string; got {tag!r}")
-            if not isinstance(value, str):
-                raise ValueError(f"attribute value for tag {tag!r} must be a string; got {value!r}")
         return v

@@ -51,6 +51,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -189,9 +190,10 @@ async def _setup(postgres_pool, tmp_path, *, label):
 
 
 async def _teardown(pool, *, prep_sample_idx, reference_idx, feature_idxs):
-    """FK-reverse, and the order matters: qiita.genome cannot go while a
-    feature_genome row points at it (bare FK) or an assembly_membership row does
-    (likewise). Robust to a test that failed part-way, which is when it runs."""
+    """The order matters: qiita.genome cannot go while a feature_genome row
+    points at it (bare FK) or an assembly_membership row does (likewise). Robust
+    to a test that failed part-way, which is when it runs, and to a test that
+    deleted the prep_sample itself as its subject."""
     await pool.execute(
         "DELETE FROM qiita.assembly_membership WHERE prep_sample_idx = $1", prep_sample_idx
     )
@@ -203,11 +205,29 @@ async def _teardown(pool, *, prep_sample_idx, reference_idx, feature_idxs):
     await pool.execute(
         "DELETE FROM qiita.feature_genome WHERE feature_idx = ANY($1::bigint[])", feature_idxs
     )
-    await pool.execute("DELETE FROM qiita.genome WHERE prep_sample_idx = $1", prep_sample_idx)
     await pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
     )
     await pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx)
+
+    # The sample chain and its owner are derived rather than passed: `_setup`
+    # seeds them for every test and nothing here was clearing them. The genome
+    # goes with the sweep, which reaches it through this prep_sample.
+    owner = await pool.fetchrow(
+        "SELECT b.idx AS biosample_idx, b.owner_idx FROM qiita.prep_sample p"
+        " JOIN qiita.biosample b ON b.idx = p.biosample_idx"
+        " WHERE p.idx = $1",
+        prep_sample_idx,
+    )
+    if owner is None:
+        return
+    await teardown_entity_graph(
+        pool,
+        study_idxs=[],
+        biosample_idxs=[owner["biosample_idx"]],
+        prep_sample_idxs=[prep_sample_idx],
+    )
+    await delete_principal(pool, [owner["owner_idx"]])
 
 
 async def _subjects(pool, prep_sample_idx):

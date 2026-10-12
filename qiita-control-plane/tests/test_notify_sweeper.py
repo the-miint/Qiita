@@ -534,7 +534,7 @@ async def test_digest_reports_tickets_held_for_redrive(env):
     assert result.digests_sent == 1
     _to, rendered, _mid = transport.sent[0]
     assert "No other work tickets of yours are still active." in rendered.text
-    assert "2 held after exhausting infrastructure retries" in rendered.text
+    assert "2 held after an infrastructure failure" in rendered.text
     # Reporting the count must not stamp them — they stay owed for a redrive.
     for wt in held:
         assert await env.notified_at(wt) is None

@@ -18,12 +18,12 @@ since real submitters use both: the GSC-MIxS display-name form ENA's checklists 
     (`"<lat> <N|S> <lon> <E|W>"`); parsed and signed (S/W negate). A value not matching
     that exact shape (including an INSDC missing marker) is left UNMAPPED, not guessed.
 
-Deliberately NOT mapped: `host` (free-text name, not an NCBI Taxonomy id), anything
-resolving `taxon_id`/`host_taxon_id`, and the three GSC-MIxS environmental-context tags
-(`env_broad_scale`/`env_local_scale`/`env_medium`). The last are TERMINOLOGY-typed
-(bound to ENVO), resolving against an ENVO CURIE, but ENA's raw values are submitter free
-text -- mapping directly would fabricate an ENVO-resolution step this ticket doesn't own.
-All stay unmapped so a real taxon/ENVO-resolution ticket can own them.
+Deliberately NOT mapped: `host` (free-text name, not an NCBI Taxonomy id) and the three
+GSC-MIxS environmental-context tags (`env_broad_scale`/`env_local_scale`/`env_medium`).
+The latter are TERMINOLOGY-typed (bound to ENVO), but ENA's raw values are submitter free
+text, so mapping them would fabricate an ENVO-resolution step. `taxon id` and
+`host taxon id` come from the run's `tax_id`/`host_tax_id` in `ena_import.harmonization`,
+not from attributes.
 
 Normalization (whitespace-collapsed, lower-cased, underscore-folded-to-space) only
 smooths spacing/casing/vocabulary quirks; the lookup is exact-match on the normalized

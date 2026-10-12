@@ -36,6 +36,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -176,11 +177,11 @@ async def _cleanup(pool, s):
     await pool.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", s["alignment_idx"]
     )
-    await pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", s["prep_sample_idxs"]
-    )
-    await pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", s["biosample_idxs"]
+    await teardown_entity_graph(
+        pool,
+        study_idxs=[],
+        biosample_idxs=s["biosample_idxs"],
+        prep_sample_idxs=s["prep_sample_idxs"],
     )
     await pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", s["reference_idx"]
@@ -191,13 +192,14 @@ async def _cleanup(pool, s):
     await pool.execute(
         "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", s["feature_idxs"]
     )
+    # These genomes carry no prep_sample_idx, so the sweep above cannot reach
+    # them — that is also why the prep_samples could go before them.
     await pool.execute(
         "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])", s["genome_idxs"]
     )
     await pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", s["reference_idx"])
-    # Principal last — biosample/reference/alignment_definition all RESTRICT-ref it.
-    await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", s["principal_idx"])
-    await pool.execute("DELETE FROM qiita.principal WHERE idx = $1", s["principal_idx"])
+    # Principal last — reference and alignment_definition both RESTRICT-ref it.
+    await delete_principal(pool, [s["principal_idx"]])
 
 
 async def test_resolver_happy_path_stages_genome_map(postgres_pool, tmp_path):

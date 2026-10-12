@@ -3896,7 +3896,8 @@ def test_submit_host_filter_pool_minimap2_ref_missing_minimap2_index_no_posts(mo
 def test_submit_host_filter_pool_unresolved_sample_aborts_no_posts(monkeypatch, capsys):
     """One sample the server could not resolve (no host_taxon_id) aborts the whole
     submission with zero POSTs, and the message names the sample and points at the
-    backfill. Refusing beats masking it against the wrong thing — or nothing."""
+    backfill and at the per-biosample patch. Refusing beats masking it against the
+    wrong thing — or nothing."""
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
@@ -3913,6 +3914,7 @@ def test_submit_host_filter_pool_unresolved_sample_aborts_no_posts(monkeypatch, 
     assert "no resolvable host" in err
     assert "11" in err
     assert "backfill host-taxon-id" in err
+    assert "patch-metadata-by-unique-field" in err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
